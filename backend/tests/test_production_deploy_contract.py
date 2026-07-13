@@ -205,6 +205,75 @@ server
     assert configurator.active_upstream_port(configured) == "3009"
 
 
+def test_nginx_cutover_accepts_production_map_entries():
+    configurator = _load_nginx_configurator()
+    original = """map $http_upgrade $connection_upgrade {
+    default upgrade;
+    '' close;
+}
+server {
+    listen 80;
+}
+server {
+    listen 443 ssl;
+    location / { proxy_pass http://127.0.0.1:3009; }
+}
+"""
+
+    assert configurator.active_upstream_port(original) == "3009"
+    configured, server_count = configurator.configure_site(original, "3008", "3009")
+    assert server_count == 2
+    assert configured.count(configurator.REDACTED_ACCESS_LOG) == 2
+    assert "    '' close;" in configured
+
+    effective = f"""http {{
+{configurator.REDACTED_LOG_FORMAT.strip()}
+map $http_upgrade $connection_upgrade {{
+    default upgrade;
+    '' close;
+}}
+server {{ {configurator.REDACTED_ACCESS_LOG} listen 80; }}
+server {{
+    {configurator.REDACTED_ACCESS_LOG}
+    location / {{ proxy_pass http://127.0.0.1:3009; }}
+}}
+}}
+"""
+    assert configurator.audit_effective_config(effective) == (2, 2)
+
+
+@pytest.mark.parametrize("map_include", ['"include"', r"incl\ude"])
+def test_nginx_cutover_rejects_quoted_or_escaped_map_include(map_include):
+    configurator = _load_nginx_configurator()
+    original = f"""map $http_upgrade $connection_upgrade {{
+    {map_include} /etc/nginx/map-values.conf;
+}}
+server {{ location / {{ proxy_pass http://127.0.0.1:3008; }} }}
+"""
+
+    with pytest.raises(ValueError, match="map include"):
+        configurator.configure_site(original, "3008", "3009")
+
+
+@pytest.mark.parametrize(
+    "nested_map",
+    [
+        'map $x $y { "access_log" /tmp/raw.log; }',
+        'location /nested { map $x $y { "proxy_pass" http://127.0.0.1:3009; } }',
+    ],
+)
+def test_nginx_cutover_rejects_map_entries_in_request_contexts(nested_map):
+    configurator = _load_nginx_configurator()
+    original = f"""server {{
+    {nested_map}
+    location / {{ proxy_pass http://127.0.0.1:3008; }}
+}}
+"""
+
+    with pytest.raises(ValueError, match="map entry has an invalid context"):
+        configurator.configure_site(original, "3008", "3009")
+
+
 def test_nginx_cutover_rejects_server_scoped_include():
     configurator = _load_nginx_configurator()
     original = """server {

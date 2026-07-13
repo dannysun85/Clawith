@@ -28,6 +28,7 @@ SAFE_LOG_VARIABLES = {
     "$upstream_status",
 }
 SAFE_ACCESS_LOG_ARGUMENTS = ("/var/log/nginx/access.log", "astra_no_args")
+MAP_ENTRY_NAME = "__map_entry__"
 
 
 @dataclass(frozen=True)
@@ -72,6 +73,30 @@ def _directive_name(token: _Token) -> str:
     if any(character in token.value for character in ("'", '"', "\\")):
         raise ValueError("quoted or escaped Nginx directive names are not allowed")
     return token.value
+
+
+def _statement_name(token: _Token, stack: list[_Block]) -> str:
+    """Return a directive name while recognizing data rows inside `map` blocks.
+
+    A `map` body is a table rather than an ordinary directive-only block, so a
+    valid source string such as ``''`` can be the first token of a terminated
+    statement. Quoted or escaped names remain forbidden everywhere else. An
+    `include`-shaped map token is also rejected because it could expand input
+    that this single-file cutover cannot audit safely.
+    """
+
+    try:
+        return _directive_name(token)
+    except ValueError:
+        if not stack or stack[-1].name != "map":
+            raise
+        map_context = tuple(block.name for block in stack[:-1])
+        if map_context not in {(), ("http",), ("stream",)}:
+            raise ValueError("quoted or escaped Nginx map entry has an invalid context")
+        normalized = re.sub(r"['\"\\\\]", "", token.value).casefold()
+        if normalized == "include":
+            raise ValueError("quoted or escaped Nginx map include is not allowed")
+        return MAP_ENTRY_NAME
 
 
 def _tokenize_nginx(text: str) -> list[_Token]:
@@ -148,7 +173,7 @@ def _parse_nginx(text: str) -> _ParsedConfig:
                 raise ValueError("empty Nginx directive")
             directives.append(
                 _Directive(
-                    name=_directive_name(directive_tokens[0]),
+                    name=_statement_name(directive_tokens[0], stack),
                     arguments=tuple(directive_tokens[1:]),
                     start=directive_tokens[0].start,
                     end=token.end,
