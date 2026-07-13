@@ -415,8 +415,39 @@ ln -sfnT "$RELEASE" "$CURRENT"
 sudo systemctl reload nginx
 NGINX_SWITCHED=1
 
-curl -fsS "$PUBLIC_URL/api/health" >/dev/null
-curl -fsS "$PUBLIC_URL/api/version" | tee "$BACKUP/version.public.json"
+echo "[remote] verifying public cutover identity"
+PUBLIC_READY=0
+PUBLIC_HEALTH=""
+PUBLIC_VERSION=""
+for _ in $(seq 1 30); do
+    PUBLIC_HEALTH="$(curl -fsS -H 'Cache-Control: no-cache' "$PUBLIC_URL/api/health?release=$RELEASE_ID" || true)"
+    PUBLIC_VERSION="$(curl -fsS -H 'Cache-Control: no-cache' "$PUBLIC_URL/api/version?release=$RELEASE_ID" || true)"
+    if python3 - "$PUBLIC_HEALTH" "$PUBLIC_VERSION" "$VERSION" "$COMMIT" 2>/dev/null <<'PY'
+import json
+import sys
+
+health = json.loads(sys.argv[1])
+version = json.loads(sys.argv[2])
+expected_version = sys.argv[3]
+expected_commit = sys.argv[4]
+if health.get("status") != "ok" or health.get("version") != expected_version:
+    raise SystemExit(1)
+if version.get("version") != expected_version or version.get("commit") != expected_commit:
+    raise SystemExit(1)
+PY
+    then
+        PUBLIC_READY=1
+        break
+    fi
+    sleep 1
+done
+printf '%s\n%s\n' "$PUBLIC_HEALTH" "$PUBLIC_VERSION"
+if [ "$PUBLIC_READY" != "1" ]; then
+    echo "public cutover did not expose expected release $VERSION/$COMMIT" >&2
+    exit 1
+fi
+printf '%s\n' "$PUBLIC_HEALTH" > "$BACKUP/health.public.json"
+printf '%s\n' "$PUBLIC_VERSION" > "$BACKUP/version.public.json"
 
 if [ "$ACTIVE_SLOT" != "legacy" ]; then
     compose_project "$OLD_PROJECT" "$PREVIOUS/.env" "$PREVIOUS/$COMPOSE_FILE" stop worker

@@ -28,6 +28,19 @@ def test_production_deploy_health_checks_candidate_before_nginx_cutover():
     assert "run --rm --no-deps -T --entrypoint alembic backend upgrade head < /dev/null" in script
 
 
+def test_production_deploy_verifies_public_release_identity_before_stopping_old_slot():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+
+    public_gate = script.index('echo "[remote] verifying public cutover identity"')
+    old_worker_stop = script.index('compose_project "$OLD_PROJECT"', public_gate)
+    assert public_gate < old_worker_stop
+    assert "'Cache-Control: no-cache'" in script[public_gate:old_worker_stop]
+    assert 'health.get("version") != expected_version' in script[public_gate:old_worker_stop]
+    assert 'version.get("commit") != expected_commit' in script[public_gate:old_worker_stop]
+    assert 'if [ "$PUBLIC_READY" != "1" ]' in script[public_gate:old_worker_stop]
+    assert 'exit 1' in script[public_gate:old_worker_stop]
+
+
 def test_production_deploy_does_not_rebuild_the_live_project_in_place():
     script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
 

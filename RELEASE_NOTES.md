@@ -1,3 +1,16 @@
+# v1.10.11 — Verified Public Blue/Green Cutover
+
+## Release Safety
+
+- Blue/green deployment now verifies the public health payload, release version, and exact commit after Nginx reload and before stopping the previous application slot.
+- Public verification bypasses intermediary caches with a release-specific query and `Cache-Control: no-cache`, retries boundedly for reload propagation, and records the verified health/version evidence in the rollback backup directory.
+- If the public endpoint does not expose the expected version and commit, deployment exits through the existing rollback trap: Nginx, the `current` symlink, and any stopped previous services are restored instead of accepting a partially switched release.
+
+## Validation
+
+- The deployment contract test fixes the ordering requirement: strict public identity verification must occur before the old worker or application is stopped.
+- This release includes the complete v1.10.10 WebSocket monitoring signal-integrity fix. It does not change Credits, model routing, plan entitlements, credentials, media settlement, automation, or tenant authorization.
+
 # v1.10.10 — WebSocket Monitoring Signal Integrity
 
 ## Bug Fixes
