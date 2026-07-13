@@ -6,7 +6,7 @@ from datetime import datetime, timezone as tz
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import cast, select, func, String
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -75,6 +75,7 @@ class PatchSessionIn(BaseModel):
     title: Optional[str] = None
     model_tier: Optional[str] = None
     model_modality: Optional[str] = None
+    preference_revision: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def require_update(self):
@@ -82,6 +83,8 @@ class PatchSessionIn(BaseModel):
             raise ValueError("At least one session field must be provided")
         if "title" in self.model_fields_set and self.title is None:
             raise ValueError("Session title cannot be null")
+        if "preference_revision" in self.model_fields_set and "model_tier" not in self.model_fields_set:
+            raise ValueError("preference_revision requires model_tier")
         return self
 
 
@@ -100,6 +103,27 @@ async def _resolve_session_model_selection(
         requested_modality,
         strict=strict,
     )
+
+
+async def _lock_user_chat_preference(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+) -> User | None:
+    """Lock and refresh the tenant User used by chat-tier compare-and-set.
+
+    Authentication loads the same User into this session's identity map before
+    this endpoint runs. ``populate_existing`` is therefore required: a second
+    request may wait on the row lock after another transaction has incremented
+    the revision, and CAS must compare against that newly committed value.
+    """
+
+    result = await db.execute(
+        select(User)
+        .where(User.id == user_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    return result.scalar_one_or_none()
 
 
 @router.get("/{agent_id}/sessions")
@@ -327,7 +351,12 @@ async def create_session(
     agent, _ = await check_agent_access(db, current_user, agent_id)
 
     explicit_selection = bool({"model_tier", "model_modality"} & body.model_fields_set)
-    default_tier = getattr(agent, "preferred_tier", None)
+    # A user's latest explicit chat choice follows them across Agents. Agent
+    # preferences remain the fallback and still drive background automation.
+    default_tier = (
+        getattr(current_user, "preferred_chat_tier", None)
+        or getattr(agent, "preferred_tier", None)
+    )
     default_modality = getattr(agent, "preferred_modality", None)
     model_tier: str | None = None
     model_modality: str | None = None
@@ -341,7 +370,6 @@ async def create_session(
             )
         except InvalidAgentPlanSelection as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
-
     now = datetime.now(tz.utc)
     new_id = uuid.uuid4()
     session = ChatSession(
@@ -421,6 +449,28 @@ async def rename_session(
             )
         except InvalidAgentPlanSelection as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
+        if "model_tier" in selection_fields:
+            owner = await _lock_user_chat_preference(db, current_user.id)
+            if owner is None:
+                raise HTTPException(status_code=401, detail="User not found or inactive")
+            current_revision = int(getattr(owner, "preferred_chat_tier_revision", 0) or 0)
+            if (
+                body.preference_revision is not None
+                and body.preference_revision != current_revision
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "chat_tier_preference_conflict",
+                        "message": "Model tier changed in another session; refresh and try again",
+                        "preferred_chat_tier": getattr(owner, "preferred_chat_tier", None),
+                        "preferred_chat_tier_revision": current_revision,
+                    },
+                )
+            owner.preferred_chat_tier = model_tier
+            owner.preferred_chat_tier_revision = current_revision + 1
+            current_user.preferred_chat_tier = model_tier
+            current_user.preferred_chat_tier_revision = current_revision + 1
         session.model_tier = model_tier
         session.model_modality = model_modality
 
@@ -432,6 +482,10 @@ async def rename_session(
         response.update({
             "model_tier": session.model_tier,
             "model_modality": session.model_modality,
+            "preferred_chat_tier": getattr(current_user, "preferred_chat_tier", None),
+            "preferred_chat_tier_revision": int(
+                getattr(current_user, "preferred_chat_tier_revision", 0) or 0
+            ),
         })
     return response
 

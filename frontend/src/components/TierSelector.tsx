@@ -47,6 +47,8 @@ export default function TierSelector({ value, onChange, allowedTiers, disabled, 
                     <button
                         key={tier.key}
                         type="button"
+                        aria-pressed={selected}
+                        data-tier-selected={selected ? 'true' : 'false'}
                         disabled={disabled || !allowed}
                         onClick={() => allowed && onChange(tier.key)}
                         title={allowed ? t(tier.descKey) : t('tier.notAllowed', '当前套餐不包含此档位')}

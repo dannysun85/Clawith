@@ -315,10 +315,15 @@ async def test_create_session_snapshots_agent_model_default(monkeypatch):
         return agent, "use"
 
     monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
+    current_user = SimpleNamespace(
+        id=user_id,
+        role="member",
+        preferred_chat_tier=None,
+    )
 
     session = await chat_sessions_api.create_session(
         agent_id=agent_id,
-        current_user=SimpleNamespace(id=user_id, role="member"),
+        current_user=current_user,
         db=db,
     )
 
@@ -326,6 +331,75 @@ async def test_create_session_snapshots_agent_model_default(monkeypatch):
     assert session.model_modality == "image"
     assert db.added[0].model_tier == "ultra"
     assert db.added[0].model_modality == "image"
+    assert current_user.preferred_chat_tier is None
+
+
+@pytest.mark.asyncio
+async def test_create_session_prefers_users_cross_agent_chat_tier(monkeypatch):
+    user_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    agent = SimpleNamespace(
+        id=agent_id,
+        tenant_id=None,
+        preferred_tier="lite",
+        preferred_modality="text",
+    )
+    current_user = SimpleNamespace(
+        id=user_id,
+        role="member",
+        preferred_chat_tier="ultra",
+    )
+    db = RecordingDB()
+
+    async def fake_check_agent_access(_db, _user, _agent_id):
+        return agent, "use"
+
+    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
+
+    session = await chat_sessions_api.create_session(
+        agent_id=agent_id,
+        current_user=current_user,
+        db=db,
+    )
+
+    assert session.model_tier == "ultra"
+    assert db.added[0].model_tier == "ultra"
+    assert current_user.preferred_chat_tier == "ultra"
+
+
+@pytest.mark.asyncio
+async def test_create_session_explicit_snapshot_does_not_change_user_preference(monkeypatch):
+    user_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    agent = SimpleNamespace(
+        id=agent_id,
+        tenant_id=None,
+        preferred_tier="lite",
+        preferred_modality="text",
+    )
+    current_user = SimpleNamespace(
+        id=user_id,
+        role="member",
+        preferred_chat_tier="lite",
+        preferred_chat_tier_revision=3,
+    )
+    db = RecordingDB()
+
+    async def fake_check_agent_access(_db, _user, _agent_id):
+        return agent, "use"
+
+    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
+
+    session = await chat_sessions_api.create_session(
+        agent_id=agent_id,
+        body=chat_sessions_api.CreateSessionIn(model_tier="ultra"),
+        current_user=current_user,
+        db=db,
+    )
+
+    assert session.model_tier == "ultra"
+    assert current_user.preferred_chat_tier == "lite"
+    assert current_user.preferred_chat_tier_revision == 3
 
 
 @pytest.mark.asyncio
@@ -350,7 +424,13 @@ async def test_session_owner_can_persist_model_selection(monkeypatch):
         model_tier="lite",
         model_modality="text",
     )
-    db = RecordingDB(responses=[DummyResult([session])])
+    current_user = SimpleNamespace(
+        id=user_id,
+        role="member",
+        preferred_chat_tier="lite",
+        preferred_chat_tier_revision=4,
+    )
+    db = RecordingDB(responses=[DummyResult([session]), DummyResult([current_user])])
 
     async def fake_check_agent_access(_db, _user, _agent_id):
         return agent, "use"
@@ -360,8 +440,12 @@ async def test_session_owner_can_persist_model_selection(monkeypatch):
     result = await chat_sessions_api.rename_session(
         agent_id=agent_id,
         session_id=session_id,
-        body=chat_sessions_api.PatchSessionIn(model_tier="ultra", model_modality="image"),
-        current_user=SimpleNamespace(id=user_id, role="member"),
+        body=chat_sessions_api.PatchSessionIn(
+            model_tier="ultra",
+            model_modality="image",
+            preference_revision=4,
+        ),
+        current_user=current_user,
         db=db,
     )
 
@@ -370,10 +454,69 @@ async def test_session_owner_can_persist_model_selection(monkeypatch):
         "title": "Current chat",
         "model_tier": "ultra",
         "model_modality": "image",
+        "preferred_chat_tier": "ultra",
+        "preferred_chat_tier_revision": 5,
     }
     assert session.model_tier == "ultra"
     assert session.model_modality == "image"
+    assert current_user.preferred_chat_tier == "ultra"
+    assert current_user.preferred_chat_tier_revision == 5
     assert db.committed is True
+
+
+@pytest.mark.asyncio
+async def test_stale_chat_tier_revision_cannot_overwrite_newer_preference(monkeypatch):
+    user_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    session_id = uuid.uuid4()
+    agent = SimpleNamespace(
+        id=agent_id,
+        tenant_id=None,
+        preferred_tier="lite",
+        preferred_modality="text",
+    )
+    session = SimpleNamespace(
+        id=session_id,
+        agent_id=agent_id,
+        peer_agent_id=None,
+        user_id=user_id,
+        title="Current chat",
+        source_channel="web",
+        is_group=False,
+        model_tier="ultra",
+        model_modality="text",
+    )
+    current_user = SimpleNamespace(
+        id=user_id,
+        role="member",
+        preferred_chat_tier="ultra",
+        preferred_chat_tier_revision=7,
+    )
+    db = RecordingDB(responses=[DummyResult([session]), DummyResult([current_user])])
+
+    async def fake_check_agent_access(_db, _user, _agent_id):
+        return agent, "use"
+
+    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await chat_sessions_api.rename_session(
+            agent_id=agent_id,
+            session_id=session_id,
+            body=chat_sessions_api.PatchSessionIn(
+                model_tier="pro",
+                preference_revision=6,
+            ),
+            current_user=current_user,
+            db=db,
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["code"] == "chat_tier_preference_conflict"
+    assert session.model_tier == "ultra"
+    assert current_user.preferred_chat_tier == "ultra"
+    assert current_user.preferred_chat_tier_revision == 7
+    assert db.committed is False
 
 
 @pytest.mark.asyncio

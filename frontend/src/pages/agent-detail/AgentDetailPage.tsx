@@ -30,6 +30,7 @@ import { displaySessionTitle } from '../../utils/sessionDisplay';
 import {
     resolveChatSessionModality,
     resolveChatSessionTier,
+    shouldApplyChatTierPreferenceResponse,
 } from '../../utils/chatSessionModelSelection';
 import {
     buildMediaPrompt,
@@ -2024,8 +2025,8 @@ export default function AgentDetailPage() {
         enabled: !!id,
     });
 
-    // Chat-side tier picker. Users pick Lite/Pro/Ultra per chat; the backend
-    // resolves tier+modality to a concrete model via model_routes.
+    // Chat-side tier picker. A user's explicit Lite/Pro/Ultra choice follows
+    // them across Agents; each touched session snapshots the effective route.
     const [chatTier, setChatTier] = useState<SaasTier | null>(null);
     const [chatModality, setChatModality] = useState<string>('text');
     const allowedTiers = useAllowedTiers();
@@ -2152,6 +2153,7 @@ export default function AgentDetailPage() {
     // Websocket chat state (for 'me' conversation)
     const token = useAuthStore((s) => s.token);
     const currentUser = useAuthStore((s) => s.user);
+    const setCurrentUser = useAuthStore((s) => s.setUser);
     /** Chat sidebar: who may list all sessions & read others' threads (matches backend scope=all). */
     const canViewAllAgentChatSessions =
         currentUser?.role === 'platform_admin' ||
@@ -2167,6 +2169,7 @@ export default function AgentDetailPage() {
     const sessionMsgAbortRef = useRef<AbortController | null>(null);
     const sessionLoadSeqRef = useRef(0);
     const modelSelectionSaveSeqRef = useRef(0);
+    const modelSelectionAbortControllersRef = useRef<Set<AbortController>>(new Set());
 
     const buildSessionRuntimeKey = (agentId: string, sessionId: string) => `${agentId}:${sessionId}`;
 
@@ -2260,6 +2263,9 @@ export default function AgentDetailPage() {
             activeSession?.model_tier,
             agent?.preferred_tier,
             allowedTiers,
+            !activeSession || isWritableSession(activeSession)
+                ? currentUser?.preferred_chat_tier
+                : null,
         );
         const nextModality = resolveChatSessionModality(
             activeSession?.model_modality,
@@ -2274,15 +2280,23 @@ export default function AgentDetailPage() {
         agent?.preferred_tier,
         agent?.preferred_modality,
         allowedTiers,
+        chatScope,
+        currentUser?.preferred_chat_tier,
     ]);
 
     const handleTierChange = async (newTier: SaasTier) => {
         const sessionId = activeSession?.id ? String(activeSession.id) : null;
-        if (!id || !sessionId || !isWritableSession(activeSession)) return;
+        const requestUserId = currentUser?.id ? String(currentUser.id) : null;
+        if (!id || !sessionId || !requestUserId || !isWritableSession(activeSession)) return;
 
         const previousTier = activeSession.model_tier ?? null;
         const previousModality = activeSession.model_modality ?? null;
+        const preferenceRevision = currentUser?.preferred_chat_tier_revision ?? 0;
         const sequence = ++modelSelectionSaveSeqRef.current;
+        const controller = new AbortController();
+        modelSelectionAbortControllersRef.current.add(controller);
+        const requestUserIsCurrent = () =>
+            String(useAuthStore.getState().user?.id || '') === requestUserId;
         const optimistic = { model_tier: newTier };
         setChatTier(newTier);
         setActiveSession((prev: any) => prev && String(prev.id) === sessionId ? { ...prev, ...optimistic } : prev);
@@ -2298,33 +2312,97 @@ export default function AgentDetailPage() {
                     'Content-Type': 'application/json',
                     Authorization: `Bearer ${tkn}`,
                 },
-                body: JSON.stringify({ model_tier: newTier }),
+                body: JSON.stringify({
+                    model_tier: newTier,
+                    preference_revision: preferenceRevision,
+                }),
+                signal: controller.signal,
             });
             if (!res.ok) {
                 const error = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }));
-                throw new Error(String(error.detail || `HTTP ${res.status}`));
+                const detail = error.detail;
+                if (
+                    res.status === 409
+                    && detail
+                    && typeof detail === 'object'
+                    && detail.code === 'chat_tier_preference_conflict'
+                ) {
+                    const latestUser = useAuthStore.getState().user;
+                    if (
+                        latestUser
+                        && shouldApplyChatTierPreferenceResponse(
+                            sequence,
+                            modelSelectionSaveSeqRef.current,
+                            requestUserId,
+                            latestUser.id,
+                            detail.preferred_chat_tier_revision,
+                            latestUser.preferred_chat_tier_revision,
+                        )
+                    ) {
+                        setCurrentUser({
+                            ...latestUser,
+                            preferred_chat_tier: detail.preferred_chat_tier ?? null,
+                            preferred_chat_tier_revision: detail.preferred_chat_tier_revision ?? 0,
+                        });
+                    }
+                }
+                throw new Error(
+                    typeof detail === 'object' && detail?.message
+                        ? String(detail.message)
+                        : String(detail || `HTTP ${res.status}`),
+                );
             }
             const saved = await res.json();
-            if (sequence !== modelSelectionSaveSeqRef.current || activeSessionIdRef.current !== sessionId) return;
+            if (sequence !== modelSelectionSaveSeqRef.current || !requestUserIsCurrent()) return;
             const persisted = {
                 model_tier: saved.model_tier,
                 model_modality: saved.model_modality,
             };
+            const latestUser = useAuthStore.getState().user;
+            const savedRevision = saved.preferred_chat_tier_revision ?? preferenceRevision + 1;
+            if (
+                latestUser
+                && shouldApplyChatTierPreferenceResponse(
+                    sequence,
+                    modelSelectionSaveSeqRef.current,
+                    requestUserId,
+                    latestUser.id,
+                    savedRevision,
+                    latestUser.preferred_chat_tier_revision,
+                )
+            ) {
+                setCurrentUser({
+                    ...latestUser,
+                    preferred_chat_tier: saved.preferred_chat_tier || saved.model_tier,
+                    preferred_chat_tier_revision: savedRevision,
+                });
+            }
+            if (activeSessionIdRef.current !== sessionId) return;
             setActiveSession((prev: any) => prev && String(prev.id) === sessionId ? normalizeChatSession({ ...prev, ...persisted }) : prev);
             setSessions(prev => prev.map((item: any) => String(item.id) === sessionId ? normalizeChatSession({ ...item, ...persisted }) : item));
             setAllSessions(prev => prev.map((item: any) => String(item.id) === sessionId ? normalizeChatSession({ ...item, ...persisted }) : item));
         } catch (err: any) {
-            if (sequence !== modelSelectionSaveSeqRef.current || activeSessionIdRef.current !== sessionId) return;
+            if (sequence !== modelSelectionSaveSeqRef.current || !requestUserIsCurrent()) return;
             const rollback = { model_tier: previousTier, model_modality: previousModality };
             setActiveSession((prev: any) => prev && String(prev.id) === sessionId ? { ...prev, ...rollback } : prev);
             setSessions(prev => prev.map((item: any) => String(item.id) === sessionId ? { ...item, ...rollback } : item));
             setAllSessions(prev => prev.map((item: any) => String(item.id) === sessionId ? { ...item, ...rollback } : item));
-            setChatTier(resolveChatSessionTier(previousTier, agent?.preferred_tier, allowedTiers));
+            if (activeSessionIdRef.current === sessionId) {
+                setChatTier(resolveChatSessionTier(
+                    previousTier,
+                    agent?.preferred_tier,
+                    allowedTiers,
+                    currentUser?.preferred_chat_tier,
+                ));
+            }
             toast.error(t('agent.chat.modelSelectionSaveFailed', '模型档位保存失败'), {
                 details: String(err?.message || err),
             });
         } finally {
-            if (sequence === modelSelectionSaveSeqRef.current) setModelSelectionSaving(false);
+            modelSelectionAbortControllersRef.current.delete(controller);
+            if (sequence === modelSelectionSaveSeqRef.current && requestUserIsCurrent()) {
+                setModelSelectionSaving(false);
+            }
         }
     };
 
@@ -2965,6 +3043,10 @@ export default function AgentDetailPage() {
 
     // Switching login account or token must not leave another user's sessions/messages in memory.
     useEffect(() => {
+        modelSelectionSaveSeqRef.current += 1;
+        modelSelectionAbortControllersRef.current.forEach((controller) => controller.abort());
+        modelSelectionAbortControllersRef.current.clear();
+        setModelSelectionSaving(false);
         setSessions([]);
         setAllSessions([]);
         setChatScope('mine');
@@ -2990,6 +3072,11 @@ export default function AgentDetailPage() {
         });
         wsMapRef.current = {};
         wsRef.current = null;
+        return () => {
+            modelSelectionSaveSeqRef.current += 1;
+            modelSelectionAbortControllersRef.current.forEach((controller) => controller.abort());
+            modelSelectionAbortControllersRef.current.clear();
+        };
     }, [currentUser?.id, token]);
 
     useEffect(() => {
@@ -4239,10 +4326,14 @@ export default function AgentDetailPage() {
         queryClient.refetchQueries({ queryKey: ['subscription-entitlements'] });
     }, [activeTab, location.key, queryClient]);
 
+    const userChatTierPreference = !activeSession || isWritableSession(activeSession)
+        ? currentUser?.preferred_chat_tier
+        : null;
     const effectiveChatTier = resolveChatSessionTier(
         activeSession ? activeSession.model_tier : chatTier,
         agent?.preferred_tier,
         allowedTiers,
+        userChatTierPreference,
     );
     const effectiveChatModality = resolveChatSessionModality(
         activeSession ? activeSession.model_modality : chatModality,

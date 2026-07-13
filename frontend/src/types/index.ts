@@ -10,6 +10,8 @@ export interface User {
     is_platform_admin?: boolean;
     tenant_id?: string;
     title?: string;
+    preferred_chat_tier?: 'lite' | 'pro' | 'ultra' | null;
+    preferred_chat_tier_revision?: number;
     feishu_open_id?: string;
     is_active: boolean;
     email_verified?: boolean;

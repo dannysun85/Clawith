@@ -2,6 +2,7 @@
 
 import uuid
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, EmailStr, Field
 
@@ -158,6 +159,8 @@ class UserOut(BaseModel):
     title: str | None = None
     primary_mobile: str | None = None
     registration_source: str | None = None
+    preferred_chat_tier: Literal["lite", "pro", "ultra"] | None = None
+    preferred_chat_tier_revision: int = 0
     is_active: bool
     email_verified: bool = True
     created_at: datetime

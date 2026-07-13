@@ -142,7 +142,7 @@ async def test_websocket_accepts_owners_private_web_session():
 
 
 @pytest.mark.asyncio
-async def test_websocket_persists_resolved_session_model_selection(monkeypatch):
+async def test_websocket_persists_session_route_without_overwriting_user_preference(monkeypatch):
     websocket = FakeWebSocket()
     agent_id = uuid.uuid4()
     user_id = uuid.uuid4()
@@ -160,7 +160,7 @@ async def test_websocket_persists_resolved_session_model_selection(monkeypatch):
     monkeypatch.setattr("app.api.websocket.async_session", lambda: RecordingDBContext(db))
 
     handler = WebSocketChatHandler(websocket, agent_id, "token", str(session_id))
-    handler.user = SimpleNamespace(id=user_id)
+    handler.user = SimpleNamespace(id=user_id, preferred_chat_tier=None)
     handler.conv_id = str(session_id)
 
     await handler._persist_session_model_selection("pro", "text")
@@ -169,6 +169,7 @@ async def test_websocket_persists_resolved_session_model_selection(monkeypatch):
     assert session.model_modality == "text"
     assert handler.session_model_tier == "pro"
     assert handler.session_model_modality == "text"
+    assert handler.user.preferred_chat_tier is None
     assert db.committed is True
 
 

@@ -5,8 +5,9 @@ export function resolveChatSessionTier(
     sessionTier: string | null | undefined,
     agentDefaultTier: string | null | undefined,
     allowedTiers?: string[],
+    userPreferredTier?: string | null,
 ): SaasTier | null {
-    return resolveAllowedTier(sessionTier || agentDefaultTier, allowedTiers);
+    return resolveAllowedTier(userPreferredTier || sessionTier || agentDefaultTier, allowedTiers);
 }
 
 export function resolveChatSessionModality(
@@ -14,4 +15,18 @@ export function resolveChatSessionModality(
     agentDefaultModality: string | null | undefined,
 ): string {
     return canonicalizeModality(sessionModality || agentDefaultModality || 'text');
+}
+
+export function shouldApplyChatTierPreferenceResponse(
+    responseSequence: number,
+    latestSequence: number,
+    requestUserId: string | null | undefined,
+    currentUserId: string | null | undefined,
+    incomingRevision: number | null | undefined,
+    currentRevision: number | null | undefined,
+): boolean {
+    if (responseSequence !== latestSequence) return false;
+    if (!requestUserId || requestUserId !== currentUserId) return false;
+    if (incomingRevision == null) return true;
+    return incomingRevision >= (currentRevision ?? 0);
 }

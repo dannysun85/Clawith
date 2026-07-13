@@ -3,8 +3,7 @@
 import uuid
 from datetime import datetime
 
-import sqlalchemy as sa
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String, func
+from sqlalchemy import Boolean, CheckConstraint, DateTime, Enum, ForeignKey, Integer, String, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.ext.associationproxy import association_proxy
@@ -56,6 +55,12 @@ class User(Base):
     """
 
     __tablename__ = "users"
+    __table_args__ = (
+        CheckConstraint(
+            "preferred_chat_tier IS NULL OR preferred_chat_tier IN ('lite', 'pro', 'ultra')",
+            name="ck_users_preferred_chat_tier",
+        ),
+    )
     # Note: Unique constraints for (tenant_id, username), (tenant_id, email) and (tenant_id, primary_mobile)
     # are handled via partial unique indexes in migration to allow NULL values
 
@@ -80,6 +85,16 @@ class User(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
     registration_source: Mapped[str | None] = mapped_column(String(50), default="web")
+
+    # The user's latest explicit Lite/Pro/Ultra choice for first-party chats.
+    # Agent defaults remain authoritative for automations and background work.
+    preferred_chat_tier: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    preferred_chat_tier_revision: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        server_default="0",
+        nullable=False,
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

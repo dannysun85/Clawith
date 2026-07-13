@@ -123,7 +123,7 @@ INSERT INTO billing_rules (
 SQL
 
 .venv/bin/alembic upgrade head
-.venv/bin/alembic current | grep -F "add_production_issue_monitoring (head)"
+.venv/bin/alembic current | grep -F "add_user_chat_tier_preference (head)"
 
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
 DO $$
@@ -162,6 +162,31 @@ BEGIN
       AND indexname = 'ix_production_issue_events_issue_created'
   ) THEN
     RAISE EXCEPTION 'missing production issue monitoring indexes';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'llm_credentials'
+      AND column_name = 'modality_status'
+  ) THEN
+    RAISE EXCEPTION 'missing credential modality circuit state';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'users'
+      AND column_name = 'preferred_chat_tier'
+  ) OR NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'users'
+      AND column_name = 'preferred_chat_tier_revision'
+  ) THEN
+    RAISE EXCEPTION 'missing versioned cross-Agent user chat tier preference';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'users'::regclass
+      AND conname = 'ck_users_preferred_chat_tier'
+  ) THEN
+    RAISE EXCEPTION 'missing user chat tier check constraint';
   END IF;
   IF NOT EXISTS (
     SELECT 1 FROM information_schema.columns
@@ -362,8 +387,33 @@ SQL
 PYTHONPATH=. .venv/bin/python ../scripts/a2a-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/media-generation-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/production-issue-postgres-smoke.py
+PYTHONPATH=. .venv/bin/python ../scripts/chat-tier-preference-postgres-smoke.py
+
+psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+INSERT INTO users (
+  id, tenant_id, display_name, role, is_active, registration_source,
+  preferred_chat_tier, preferred_chat_tier_revision,
+  quota_message_limit, quota_message_period, quota_messages_used,
+  quota_max_agents, quota_agent_ttl_hours
+) VALUES (
+  '07500000-0000-4000-8000-000000000070',
+  '07500000-0000-4000-8000-000000000002',
+  'Migration Preference', 'member', true, 'migration-smoke',
+  'ultra', 7, 50, 'permanent', 0, 2, 0
+);
+SQL
 
 .venv/bin/alembic downgrade seed_saas_mvp_catalog
 .venv/bin/alembic current | grep -F "seed_saas_mvp_catalog"
+psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 --tuples-only --no-align <<'SQL' | grep -Fx 'ultra|7'
+SELECT preferred_chat_tier || '|' || preferred_chat_tier_revision
+FROM users
+WHERE id = '07500000-0000-4000-8000-000000000070';
+SQL
 .venv/bin/alembic upgrade head
-.venv/bin/alembic current | grep -F "add_production_issue_monitoring (head)"
+.venv/bin/alembic current | grep -F "add_user_chat_tier_preference (head)"
+psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 --tuples-only --no-align <<'SQL' | grep -Fx 'ultra|7'
+SELECT preferred_chat_tier || '|' || preferred_chat_tier_revision
+FROM users
+WHERE id = '07500000-0000-4000-8000-000000000070';
+SQL
