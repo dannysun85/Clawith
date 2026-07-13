@@ -13,6 +13,63 @@ from sqlalchemy import select
 
 from app.database import async_session
 from app.models.channel_config import ChannelConfig
+from app.services.channel_issue_reporting import record_channel_issue
+
+
+class _WeComIssueLogger:
+    """Translate SDK-only errors into bounded, privacy-safe production issues."""
+
+    def __init__(self, agent_id: uuid.UUID):
+        self.agent_id = agent_id
+        self._reported_codes: set[str] = set()
+
+    def debug(self, _message: str, *_args) -> None:
+        # The SDK's debug messages may include its raw authentication frame.
+        return None
+
+    def info(self, _message: str, *_args) -> None:
+        return None
+
+    def warn(self, _message: str, *_args) -> None:
+        return None
+
+    def error(self, message: str, *_args) -> None:
+        normalized = str(message).strip().lower()
+        if normalized.startswith("authentication failed"):
+            error_code = "authentication_failed"
+        elif normalized.startswith("max reconnect attempts"):
+            error_code = "retry_exhausted"
+        elif normalized.startswith("websocket connection failed"):
+            error_code = "connection_failed"
+        elif normalized.startswith("reconnect attempt"):
+            error_code = "reconnect_failed"
+        elif normalized.startswith("heartbeat error"):
+            error_code = "heartbeat_failed"
+        else:
+            error_code = "sdk_error"
+
+        logger.error(
+            "[WeCom SDK] agent_id={} error_code={}",
+            self.agent_id,
+            error_code,
+        )
+        if error_code in self._reported_codes:
+            return
+        self._reported_codes.add(error_code)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(
+            record_channel_issue(
+                channel="wecom",
+                operation="connect",
+                agent_id=self.agent_id,
+                error_code=error_code,
+                severity="critical" if error_code == "retry_exhausted" else "error",
+            ),
+            name=f"wecom-issue-{str(self.agent_id)[:8]}-{error_code}",
+        )
 
 
 def _disable_wecom_sdk_proxy() -> None:
@@ -113,6 +170,7 @@ class WeComStreamManager:
                 "secret": bot_secret,
                 "max_reconnect_attempts": -1,  # infinite reconnect
                 "heartbeat_interval": 30000,   # 30s heartbeat
+                "logger": _WeComIssueLogger(agent_id),
             })
             self._clients[agent_id] = client
 

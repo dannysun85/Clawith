@@ -1,12 +1,17 @@
+import asyncio
 import uuid
+
+import pytest
 
 from app.services.wecom_stream import (
     _build_wecom_conv_id,
     _extract_wecom_chat_id,
     _extract_wecom_chat_type,
     _extract_wecom_sender_id,
+    _WeComIssueLogger,
     WeComStreamManager,
 )
+from app.services import wecom_stream
 
 
 def test_extract_wecom_context_from_official_sdk_shape():
@@ -59,3 +64,27 @@ def test_status_reports_connected_agent():
     manager._connected[agent_id] = True
 
     assert manager.status() == {str(agent_id): True}
+
+
+@pytest.mark.asyncio
+async def test_sdk_auth_error_is_reported_once_without_provider_text(monkeypatch):
+    captured = []
+
+    async def fake_record_channel_issue(**kwargs):
+        captured.append(kwargs)
+
+    monkeypatch.setattr(wecom_stream, "record_channel_issue", fake_record_channel_issue)
+    agent_id = uuid.uuid4()
+    sdk_logger = _WeComIssueLogger(agent_id)
+
+    sdk_logger.error("Authentication failed: invalid bot_id or secret=must-not-survive")
+    sdk_logger.error("Authentication failed: another provider response")
+    await asyncio.sleep(0)
+
+    assert captured == [{
+        "channel": "wecom",
+        "operation": "connect",
+        "agent_id": agent_id,
+        "error_code": "authentication_failed",
+        "severity": "error",
+    }]
