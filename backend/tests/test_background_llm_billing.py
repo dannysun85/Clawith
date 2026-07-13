@@ -142,7 +142,10 @@ async def test_prepare_agent_llm_invocation_uses_platform_route_and_billing_pref
     assert invocation.credential_id == credential_id
     resolve_route.assert_awaited_once_with(agent)
     billing_preflight.assert_awaited_once_with(agent_id, routed_model, invocation.route_meta)
-    resolve_key.assert_awaited_once_with(routed_model)
+    resolve_key.assert_awaited_once_with(
+        routed_model,
+        capability_modality="text",
+    )
 
 
 @pytest.mark.asyncio

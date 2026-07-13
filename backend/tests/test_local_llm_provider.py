@@ -64,3 +64,55 @@ async def test_platform_openai_model_still_requires_credential_pool_entry(monkey
 
     with pytest.raises(NoCredentialAvailable):
         await caller.resolve_model_key(model)
+
+
+@pytest.mark.asyncio
+async def test_minimax_m3_uses_routed_capability_but_general_quota(monkeypatch):
+    model = SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=None,
+        provider="minimax",
+        model="MiniMax-M3",
+        modality="multimodal",
+        base_url="https://api.minimaxi.com/v1",
+    )
+    credential = SimpleNamespace(
+        id=uuid.uuid4(),
+        base_url=None,
+    )
+    pick = AsyncMock(return_value=credential)
+    monkeypatch.setattr(caller, "pick_credential", pick)
+    monkeypatch.setattr(caller, "get_credential_api_key", lambda _credential: "platform-key")
+
+    result = await caller.resolve_model_key(model, capability_modality="image")
+
+    assert result == ("platform-key", "https://api.minimaxi.com/v1", credential.id)
+    pick.assert_awaited_once_with(
+        "minimax",
+        "image",
+        quota_modality="plan",
+    )
+
+
+@pytest.mark.asyncio
+async def test_minimax_m3_defaults_abstract_multimodal_model_to_text_capability(monkeypatch):
+    model = SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=None,
+        provider="minimax",
+        model="MiniMax-M3",
+        modality="multimodal",
+        base_url=None,
+    )
+    credential = SimpleNamespace(id=uuid.uuid4(), base_url=None)
+    pick = AsyncMock(return_value=credential)
+    monkeypatch.setattr(caller, "pick_credential", pick)
+    monkeypatch.setattr(caller, "get_credential_api_key", lambda _credential: "platform-key")
+
+    await caller.resolve_model_key(model)
+
+    pick.assert_awaited_once_with(
+        "minimax",
+        "text",
+        quota_modality="plan",
+    )

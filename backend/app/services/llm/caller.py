@@ -680,7 +680,37 @@ async def _process_tool_call(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-async def resolve_model_key(model: "LLMModel") -> tuple[str, str | None, uuid.UUID | None]:
+def _llm_capability_modality(
+    model: "LLMModel",
+    route_meta: RouteMeta | None = None,
+) -> str | None:
+    """Resolve the credential capability required by an LLM request."""
+
+    routed = str(getattr(route_meta, "modality", "") or "").strip().lower()
+    if routed:
+        return routed
+    configured = str(getattr(model, "modality", "") or "").strip().lower()
+    # A multimodal model row describes several concrete request capabilities;
+    # the credential pool does not advertise an abstract "multimodal" flag.
+    return "text" if configured == "multimodal" else configured or None
+
+
+def _llm_quota_modality(model: "LLMModel", capability_modality: str | None) -> str | None:
+    """Resolve the provider allowance consumed by an LLM request."""
+
+    if str(getattr(model, "provider", "") or "").strip().lower() == "minimax":
+        # Current MiniMax Token Plan usage is shared across text and media.
+        # M3 image/video inputs are understanding requests, but a 2056 response
+        # still indicates exhaustion of the same plan-wide allowance.
+        return "plan"
+    return capability_modality
+
+
+async def resolve_model_key(
+    model: "LLMModel",
+    *,
+    capability_modality: str | None = None,
+) -> tuple[str, str | None, uuid.UUID | None]:
     """Resolve (api_key, base_url, credential_id) for a model.
 
     Platform model (tenant_id=null): pick from the credential pool (load balanced).
@@ -690,8 +720,13 @@ async def resolve_model_key(model: "LLMModel") -> tuple[str, str | None, uuid.UU
     if not _is_persisted_model(model):
         return get_model_api_key(model) or "test-key", getattr(model, "base_url", None), None
     if getattr(model, "tenant_id", None) is None:
+        capability_modality = capability_modality or _llm_capability_modality(model)
         try:
-            cred = await pick_credential(model.provider, model.modality)
+            cred = await pick_credential(
+                model.provider,
+                capability_modality,
+                quota_modality=_llm_quota_modality(model, capability_modality),
+            )
         except NoCredentialAvailable:
             spec = get_provider_spec(model.provider)
             if spec and not spec.requires_api_key:
@@ -922,7 +957,10 @@ async def call_llm(
     # Create the unified LLM client
     # Resolve API key: platform model → credential pool; tenant model → its own key.
     try:
-        _api_key, _base_url, _cred_id = await resolve_model_key(model)
+        _api_key, _base_url, _cred_id = await resolve_model_key(
+            model,
+            capability_modality=_llm_capability_modality(model, route_meta),
+        )
     except NoCredentialAvailable as exc:
         await _record_llm_product_issue(
             category="credential",
@@ -1055,7 +1093,10 @@ async def call_llm(
                     _cred_id,
                     e,
                     log_context="LLM",
-                    modality=getattr(route_meta, "modality", None) or getattr(model, "modality", None),
+                    modality=_llm_quota_modality(
+                        model,
+                        _llm_capability_modality(model, route_meta),
+                    ),
                 )
             await _finalize_llm_usage(billable=False)
             await client.close()
@@ -1082,7 +1123,10 @@ async def call_llm(
                     _cred_id,
                     e,
                     log_context="LLM",
-                    modality=getattr(route_meta, "modality", None) or getattr(model, "modality", None),
+                    modality=_llm_quota_modality(
+                        model,
+                        _llm_capability_modality(model, route_meta),
+                    ),
                 )
             await _finalize_llm_usage(billable=False)
             await client.close()
@@ -1445,7 +1489,10 @@ async def prepare_agent_llm_invocation(
         route_meta = replace(route_meta, action=action)
 
     tenant_id = await _prepare_llm_billing_context(agent.id, primary_model, route_meta)
-    api_key, base_url, credential_id = await resolve_model_key(primary_model)
+    api_key, base_url, credential_id = await resolve_model_key(
+        primary_model,
+        capability_modality=_llm_capability_modality(primary_model, route_meta),
+    )
     return AgentLLMInvocation(
         model=primary_model,
         fallback_model=fallback_model,
@@ -1622,7 +1669,10 @@ async def call_agent_llm_with_tools(
             )
 
         try:
-            _api_key, _base_url, _cred_id = await resolve_model_key(model)
+            _api_key, _base_url, _cred_id = await resolve_model_key(
+                model,
+                capability_modality=_llm_capability_modality(model, route_meta),
+            )
         except NoCredentialAvailable as exc:
             await _record_llm_product_issue(
                 category="credential",
@@ -1699,7 +1749,10 @@ async def call_agent_llm_with_tools(
                             _cred_id,
                             e,
                             log_context="call_agent_llm_with_tools",
-                            modality=getattr(route_meta, "modality", None) or getattr(model, "modality", None),
+                            modality=_llm_quota_modality(
+                                model,
+                                _llm_capability_modality(model, route_meta),
+                            ),
                         )
                     raise
 

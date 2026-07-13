@@ -93,6 +93,75 @@ async def test_pick_skips_only_the_quota_blocked_modality():
 
 
 @pytest.mark.asyncio
+async def test_pick_scopes_non_text_quota_to_the_concrete_model():
+    hailuo_02_blocked = _cred(
+        priority=10,
+        modality_status={
+            "video:minimax-hailuo-02": {"status": "quota_exceeded"},
+        },
+    )
+    fallback = _cred(priority=0)
+
+    sess, _ = _patch_session(execute_result=[hailuo_02_blocked, fallback])
+    with sess:
+        chosen = await pick_credential(
+            "minimax",
+            "video",
+            quota_modality="video",
+            quota_model="MiniMax-Hailuo-02",
+        )
+    assert chosen.id == fallback.id
+
+    sess, _ = _patch_session(execute_result=[hailuo_02_blocked, fallback])
+    with sess:
+        chosen = await pick_credential(
+            "minimax",
+            "video",
+            quota_modality="video",
+            quota_model="MiniMax-Hailuo-2.3",
+        )
+    assert chosen.id == hailuo_02_blocked.id
+
+
+@pytest.mark.asyncio
+async def test_understanding_route_uses_shared_plan_without_media_generation_circuit():
+    credential = _cred(
+        capabilities=["text", "image", "video"],
+        modality_status={
+            "image:image-01": {"status": "quota_exceeded"},
+        },
+    )
+    sess, _ = _patch_session(execute_result=[credential])
+    with sess:
+        chosen = await pick_credential(
+            "minimax",
+            "image",
+            quota_modality="plan",
+        )
+    assert chosen.id == credential.id
+
+
+@pytest.mark.asyncio
+async def test_shared_plan_circuit_blocks_every_capability():
+    plan_blocked = _cred(
+        priority=10,
+        capabilities=["text", "image", "video"],
+        modality_status={"plan": {"status": "quota_exceeded"}},
+    )
+    fallback = _cred(priority=0, capabilities=["text", "image", "video"])
+
+    sess, _ = _patch_session(execute_result=[plan_blocked, fallback])
+    with sess:
+        chosen = await pick_credential(
+            "minimax",
+            "video",
+            quota_modality="video",
+            quota_model="MiniMax-Hailuo-2.3",
+        )
+    assert chosen.id == fallback.id
+
+
+@pytest.mark.asyncio
 async def test_pick_uses_only_the_centrally_funded_platform_pool():
     cred = _cred()
     sess, fake_db = _patch_session(execute_result=[cred])
@@ -149,6 +218,20 @@ async def test_success_resets_prior_error_count():
         await increment_credential_usage(cred.id, weight=1)
     assert cred.error_count == 0
     assert cred.status == "healthy"
+
+
+@pytest.mark.asyncio
+async def test_success_closes_only_the_shared_plan_circuit():
+    cred = _cred(
+        modality_status={
+            "plan": {"status": "quota_exceeded"},
+            "video:minimax-hailuo-02": {"status": "quota_exceeded"},
+        },
+    )
+    sess, _ = _patch_session(get_value=cred)
+    with sess:
+        await increment_credential_usage(cred.id, weight=1)
+    assert set(cred.modality_status) == {"video:minimax-hailuo-02"}
 
 
 @pytest.mark.asyncio
@@ -233,7 +316,7 @@ async def test_reset_daily_resets_all_counters_but_only_restores_local_daily_cap
     assert degraded.status == "degraded" and degraded.error_count == 5 and degraded.used_today == 0
     assert provider_exhausted.status == "quota_exceeded" and provider_exhausted.used_today == 0
     assert healthy.status == "healthy" and healthy.used_today == 0
-    assert set(healthy.modality_status) == {"text"}
+    assert set(healthy.modality_status) == {"text", "video"}
 
 
 @pytest.mark.asyncio
@@ -266,6 +349,33 @@ async def test_modality_quota_mutators_do_not_poison_global_status():
 
 
 @pytest.mark.asyncio
+async def test_model_quota_mutators_preserve_other_models():
+    cred = _cred()
+    sess, _ = _patch_session(get_value=cred)
+    with sess:
+        await load_balancer.mark_credential_modality_quota_exceeded(
+            cred.id,
+            "video",
+            error_code="2056",
+            model="MiniMax-Hailuo-02",
+        )
+    assert set(cred.modality_status) == {"video:minimax-hailuo-02"}
+    assert cred.modality_status["video:minimax-hailuo-02"]["reset_scope"] == "provider_evidence"
+
+    cred.modality_status["video:minimax-hailuo-2.3"] = {
+        "status": "quota_exceeded",
+    }
+    sess, _ = _patch_session(get_value=cred)
+    with sess:
+        assert await load_balancer.clear_credential_modality_quota(
+            cred.id,
+            "video",
+            model="MiniMax-Hailuo-02",
+        ) is True
+    assert set(cred.modality_status) == {"video:minimax-hailuo-2.3"}
+
+
+@pytest.mark.asyncio
 async def test_pick_skips_when_no_modality_filter():
     """modality=None → no capabilities filter (picks any healthy cred)."""
     cred = _cred(priority=0, weight=1, capabilities=None)
@@ -273,3 +383,16 @@ async def test_pick_skips_when_no_modality_filter():
     with sess:
         chosen = await pick_credential("minimax", None)
     assert chosen.id == cred.id
+
+
+@pytest.mark.asyncio
+async def test_pick_without_capability_still_honors_shared_plan_circuit():
+    plan_blocked = _cred(
+        priority=10,
+        modality_status={"plan": {"status": "quota_exceeded"}},
+    )
+    fallback = _cred(priority=0)
+    sess, _ = _patch_session(execute_result=[plan_blocked, fallback])
+    with sess:
+        chosen = await pick_credential("minimax", None)
+    assert chosen.id == fallback.id

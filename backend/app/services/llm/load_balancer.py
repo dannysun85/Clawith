@@ -33,10 +33,9 @@ from app.services.modalities import canonicalize_modalities, modality_match_valu
 _KEY_PREFIX = "cred:rate:"
 _KEY_RPM = _KEY_PREFIX + "rpm:{cred_id}"        # sorted set of request timestamps (score=ts, member=nonce)
 _KEY_TPM = _KEY_PREFIX + "tpm:{cred_id}"        # sorted set of token counts (score=ts, member=f"ts:tokens")
-_KEY_5H = _KEY_PREFIX + "5h:{cred_id}"          # integer counter w/ TTL at 5-hour boundary (MiniMax Token Plan)
 _RPM_WINDOW = 60                                # 60 second window for RPM
 _TPM_WINDOW = 60                                # 60 second window for TPM
-_5H_WINDOW = 5 * 3600                           # 5 hours for MiniMax Token Plan windows
+PLAN_QUOTA_RESOURCE = "plan"
 
 
 class CredentialUnavailableReason(str, Enum):
@@ -95,30 +94,98 @@ def _canonical_modality(modality: str) -> str:
     return canonical[0] if canonical else str(modality).strip().lower()
 
 
-def credential_blocked_modalities(credential: LLMCredential) -> set[str]:
-    """Return provider-quota-blocked modalities from a backward-safe JSON map."""
+def _normalize_quota_resource(resource: str) -> str:
+    """Normalize a quota resource while preserving an optional model suffix."""
+
+    raw = str(resource or "").strip().lower()
+    modality, separator, model = raw.partition(":")
+    normalized_modality = _canonical_modality(modality)
+    if not separator or not model.strip() or normalized_modality == "text":
+        return normalized_modality
+    return f"{normalized_modality}:{model.strip()}"
+
+
+def credential_quota_resource_key(modality: str, model: str | None = None) -> str:
+    """Return the provider quota key for a modality and optional concrete model.
+
+    Current MiniMax Token Plan usage is shared across modalities and is stored
+    under ``plan``. A concrete media-model circuit remains supported for
+    provider responses such as an Ultra tier's additional daily video cap and
+    for backward compatibility with legacy plans.
+    """
+
+    normalized = _canonical_modality(modality)
+    if normalized in {"text", PLAN_QUOTA_RESOURCE} or not str(model or "").strip():
+        return normalized
+    return _normalize_quota_resource(f"{normalized}:{model}")
+
+
+def credential_blocked_quota_resources(credential: LLMCredential) -> set[str]:
+    """Return provider-quota-blocked resources from a backward-safe JSON map."""
 
     raw = getattr(credential, "modality_status", None)
     if not isinstance(raw, dict):
         return set()
     blocked: set[str] = set()
-    for modality, value in raw.items():
+    for resource, value in raw.items():
         status = value.get("status") if isinstance(value, dict) else value
         if str(status or "").strip().lower() == "quota_exceeded":
-            blocked.add(_canonical_modality(str(modality)))
+            blocked.add(_normalize_quota_resource(str(resource)))
     return blocked
 
 
+def credential_blocked_modalities(credential: LLMCredential) -> set[str]:
+    """Return legacy modality-wide quota circuits only.
+
+    Model-specific circuits must not make an entire media modality unavailable:
+    another configured model may still have quota.
+    """
+
+    return {
+        resource
+        for resource in credential_blocked_quota_resources(credential)
+        if ":" not in resource
+    }
+
+
 def credential_modality_is_blocked(credential: LLMCredential, modality: str | None) -> bool:
+    blocked = credential_blocked_modalities(credential)
+    if PLAN_QUOTA_RESOURCE in blocked:
+        return True
     if not modality:
         return False
     requested = {_canonical_modality(value) for value in modality_match_values(modality)}
-    return bool(requested.intersection(credential_blocked_modalities(credential)))
+    return bool(requested.intersection(blocked))
+
+
+def credential_quota_is_blocked(
+    credential: LLMCredential,
+    modality: str | None,
+    model: str | None = None,
+) -> bool:
+    """Return whether either the legacy modality or exact model circuit is open."""
+
+    blocked = credential_blocked_quota_resources(credential)
+    if PLAN_QUOTA_RESOURCE in blocked:
+        return True
+    if not modality:
+        return False
+    requested_modalities = {
+        _canonical_modality(value) for value in modality_match_values(modality)
+    }
+    if requested_modalities.intersection(blocked):
+        return True
+    if model:
+        return credential_quota_resource_key(modality, model) in blocked
+    return False
 
 
 def _diagnose_base_filter_failure(
     credentials: list[LLMCredential],
     modality: str | None,
+    *,
+    quota_modality: str | None = None,
+    quota_model: str | None = None,
 ) -> CredentialUnavailableReason:
     if not credentials:
         return CredentialUnavailableReason.NOT_CONFIGURED
@@ -142,7 +209,11 @@ def _diagnose_base_filter_failure(
     modality_available = [
         credential
         for credential in quota_available
-        if not credential_modality_is_blocked(credential, modality)
+        if not credential_quota_is_blocked(
+            credential,
+            quota_modality if quota_modality is not None else modality,
+            quota_model,
+        )
     ]
     if not modality_available:
         return CredentialUnavailableReason.QUOTA_EXHAUSTED
@@ -155,10 +226,6 @@ def _cred_rpm_key(cred_id: uuid.UUID) -> str:
 
 def _cred_tpm_key(cred_id: uuid.UUID) -> str:
     return _KEY_TPM.format(cred_id=cred_id)
-
-
-def _cred_5h_key(cred_id: uuid.UUID) -> str:
-    return _KEY_5H.format(cred_id=cred_id)
 
 
 async def _get_redis_or_none():
@@ -205,31 +272,6 @@ async def _record_request(redis, cred_id: uuid.UUID, tokens_used: int = 0) -> No
         await pipe.execute()
 
 
-async def _record_5h_usage(redis, cred_id: uuid.UUID, tokens: int, limit: int | None) -> None:
-    """Increment 5h window token counter for MiniMax Token Plan keys."""
-    if redis is None or limit is None:
-        return
-    key = _cred_5h_key(cred_id)
-    # INCR + EXPIRE: if new key, set TTL to align with next 5h boundary
-    async with redis.pipeline(transaction=True) as pipe:
-        pipe.incrby(key, tokens)
-        pipe.ttl(key)
-        _, ttl = await pipe.execute()
-    if int(ttl) < 0:
-        # Key didn't have TTL — align to next 5h boundary from top of hour.
-        now = time.time()
-        secs_into_window = now % _5H_WINDOW
-        ttl_secs = int(_5H_WINDOW - secs_into_window)
-        await redis.expire(key, ttl_secs)
-
-
-async def _get_5h_usage(redis, cred_id: uuid.UUID) -> int:
-    if redis is None:
-        return 0
-    val = await redis.get(_cred_5h_key(cred_id))
-    return int(val) if val else 0
-
-
 async def _get_current_tpm(redis, cred_id: uuid.UUID) -> int:
     """Return total tokens in the TPM window."""
     if redis is None:
@@ -257,21 +299,30 @@ async def pick_credential(
     provider: str,
     modality: str | None = None,
     estimated_tokens: int = 0,
+    *,
+    quota_modality: str | None = None,
+    quota_model: str | None = None,
 ) -> LLMCredential:
     """Pick a credential from the pool for (provider, modality).
 
     Filters: provider + enabled + healthy + (daily_quota ok) + (RPM not saturated)
-          + (TPM not saturated for estimated tokens) + (5h window not saturated)
-          + (capabilities ⊇ modality).
+          + (TPM not saturated for estimated tokens) + (capabilities ⊇ modality)
+          + (provider quota resource available).
     Priority group (top) → weighted pick within group.
 
     Args:
         provider: Provider name (e.g. "minimax").
-        modality: Modality tag used for capability filtering.
+        modality: Modality tag used only for capability filtering.
         estimated_tokens: Pre-call token estimate for TPM pre-check (prompt+max_tokens
             estimate). 0 = skip TPM pre-check (only enforced post-call for RPM).
+        quota_modality: Provider allowance consumed by this call. Defaults to
+            ``modality``. Multimodal understanding should pass ``text`` while
+            retaining image/video as the capability modality.
+        quota_model: Optional concrete non-text provider model. A depleted media
+            model then does not poison other models in the same modality.
     """
     redis = await _get_redis_or_none()
+    effective_quota_modality = quota_modality if quota_modality is not None else modality
 
     async with async_session() as db:
         conditions = [
@@ -309,7 +360,11 @@ async def pick_credential(
         all_creds = [
             credential
             for credential in result.scalars().all()
-            if not credential_modality_is_blocked(credential, modality)
+            if not credential_quota_is_blocked(
+                credential,
+                effective_quota_modality,
+                quota_model,
+            )
         ]
         if not all_creds:
             diagnostic_result = await db.execute(
@@ -319,11 +374,19 @@ async def pick_credential(
                 )
             )
             pool = list(diagnostic_result.scalars().all())
-            reason_code = _diagnose_base_filter_failure(pool, modality)
+            reason_code = _diagnose_base_filter_failure(
+                pool,
+                modality,
+                quota_modality=effective_quota_modality,
+                quota_model=quota_model,
+            )
             logger.warning(
-                "[load_balancer] no credential provider={} modality={} reason_code={}",
+                "[load_balancer] no credential provider={} modality={} quota_resource={} reason_code={}",
                 provider,
                 modality,
+                credential_quota_resource_key(effective_quota_modality, quota_model)
+                if effective_quota_modality
+                else None,
                 reason_code.value,
             )
             raise NoCredentialAvailable(
@@ -343,7 +406,6 @@ async def pick_credential(
         for c in top_group:
             rpm_limit = getattr(c, 'rpm_limit', None)
             tpm_limit = getattr(c, 'tpm_limit', None)
-            win_5h = getattr(c, 'window_5h_limit', None)
             ok, rpm_count = await _check_rate_window(redis, _cred_rpm_key(c.id), _RPM_WINDOW, rpm_limit)
             if not ok:
                 skip_reasons[str(c.id)] = f"rpm={rpm_count}>={rpm_limit}"
@@ -355,13 +417,6 @@ async def pick_credential(
                 cur_tpm = await _get_current_tpm(redis, c.id)
                 if cur_tpm + estimated_tokens > tpm_limit:
                     skip_reasons[str(c.id)] = f"tpm={cur_tpm}+{estimated_tokens}>={tpm_limit}"
-                    continue
-
-            # 5-hour window (MiniMax Token Plan)
-            if win_5h is not None:
-                used_5h = await _get_5h_usage(redis, c.id)
-                if used_5h >= win_5h:
-                    skip_reasons[str(c.id)] = f"5h_window={used_5h}>={win_5h}"
                     continue
 
             eligible.append(c)
@@ -376,7 +431,6 @@ async def pick_credential(
                 for c in grp:
                     rpm_limit = getattr(c, 'rpm_limit', None)
                     tpm_limit = getattr(c, 'tpm_limit', None)
-                    win_5h = getattr(c, 'window_5h_limit', None)
                     ok, rpm_count = await _check_rate_window(redis, _cred_rpm_key(c.id), _RPM_WINDOW, rpm_limit)
                     if not ok:
                         skip_reasons[str(c.id)] = f"rpm={rpm_count}>={rpm_limit}"
@@ -385,11 +439,6 @@ async def pick_credential(
                         cur_tpm = await _get_current_tpm(redis, c.id)
                         if cur_tpm + estimated_tokens > tpm_limit:
                             skip_reasons[str(c.id)] = f"tpm={cur_tpm}+{estimated_tokens}>={tpm_limit}"
-                            continue
-                    if win_5h is not None:
-                        used_5h = await _get_5h_usage(redis, c.id)
-                        if used_5h >= win_5h:
-                            skip_reasons[str(c.id)] = f"5h_window={used_5h}>={win_5h}"
                             continue
                     eligible.append(c)
                 if eligible:
@@ -459,8 +508,8 @@ async def record_credential_call(
     weight: int | None = None,  # backward-compatible alias for weight_daily
 ) -> None:
     """Record a successful call: bump used_today (daily quota), RPM/TPM windows,
-    and 5h window token counter. Clear the consecutive-failure counter and mark
-    quota_exceeded if at daily cap.
+    Clear the consecutive-failure counter and mark quota_exceeded if at the
+    optional local daily cap.
 
     Call after a successful LLM invocation to update both DB and Redis counters.
     """
@@ -477,6 +526,14 @@ async def record_credential_call(
         # so old transient errors must not accumulate forever and eventually
         # remove an otherwise healthy shared account from every modality.
         cred.error_count = 0
+        if str(getattr(cred, "provider", "")).lower() == "minimax":
+            # Any successful covered call proves the shared Token Plan pool is
+            # currently usable. Model-specific caps remain independent.
+            statuses = dict(getattr(cred, "modality_status", None) or {})
+            for key in list(statuses):
+                if _normalize_quota_resource(str(key)) == PLAN_QUOTA_RESOURCE:
+                    statuses.pop(key, None)
+            cred.modality_status = statuses
         if was_healthy and cred.daily_quota and cred.used_today >= cred.daily_quota:
             cred.status = "quota_exceeded"
         await db.commit()
@@ -495,10 +552,6 @@ async def record_credential_call(
             pipe.zadd(tpm_key, {f"{now}:{tokens_used}:{nonce}": now})
             pipe.expire(tpm_key, _TPM_WINDOW * 2)
             await pipe.execute()
-        # 5h window (MiniMax Token Plan)
-        win_5h = getattr(cred, 'window_5h_limit', None)
-        if win_5h:
-            await _record_5h_usage(redis, credential_id, tokens_used, win_5h)
 
 
 # Backward-compatible alias: callers using increment_credential_usage still work
@@ -548,34 +601,39 @@ async def mark_credential_modality_quota_exceeded(
     modality: str,
     *,
     error_code: str = "2056",
+    model: str | None = None,
 ) -> None:
-    """Open only one provider-model circuit without poisoning the shared key."""
+    """Open one provider allowance circuit without poisoning the shared key."""
 
     normalized = _canonical_modality(modality)
+    resource = credential_quota_resource_key(normalized, model)
     async with async_session() as db:
         cred = await db.get(LLMCredential, credential_id)
         if not cred:
             return
         statuses = dict(getattr(cred, "modality_status", None) or {})
-        existing = statuses.get(normalized)
+        existing = statuses.get(resource)
         if (
             isinstance(existing, dict)
             and existing.get("status") == "quota_exceeded"
             and str(existing.get("error_code") or "") == str(error_code)
         ):
             return
-        statuses[normalized] = {
+        status_entry = {
             "status": "quota_exceeded",
             "error_code": str(error_code),
             "detected_at": datetime.now(timezone.utc).isoformat(),
-            "reset_scope": "rolling_5h" if normalized == "text" else "daily",
+            "reset_scope": "provider_evidence",
         }
+        if model:
+            status_entry["model"] = str(model).strip()
+        statuses[resource] = status_entry
         cred.modality_status = statuses
         cred.error_count += 1
         logger.warning(
-            "[load_balancer] credential {} modality={} marked quota_exceeded",
+            "[load_balancer] credential {} quota_resource={} marked quota_exceeded",
             credential_id,
-            normalized,
+            resource,
         )
         await db.commit()
 
@@ -583,18 +641,25 @@ async def mark_credential_modality_quota_exceeded(
 async def clear_credential_modality_quota(
     credential_id: uuid.UUID,
     modality: str,
+    *,
+    model: str | None = None,
 ) -> bool:
     """Close a scoped quota circuit after explicit provider recovery evidence."""
 
     normalized = _canonical_modality(modality)
+    resource = credential_quota_resource_key(normalized, model)
     async with async_session() as db:
         cred = await db.get(LLMCredential, credential_id)
         if not cred:
             return False
         statuses = dict(getattr(cred, "modality_status", None) or {})
         removed = False
+        # Exact success/provider evidence retires the exact circuit. Also
+        # remove the old modality-wide circuit so deployments upgraded from
+        # the legacy schema are not permanently over-blocked.
+        removal_keys = {resource, normalized}
         for key in list(statuses):
-            if _canonical_modality(str(key)) == normalized:
+            if _normalize_quota_resource(str(key)) in removal_keys:
                 statuses.pop(key, None)
                 removed = True
         if removed:
@@ -635,18 +700,9 @@ async def reset_daily_usage() -> int:
             if hit_local_daily_cap:
                 c.error_count = 0
                 c.status = "healthy"
-            # MiniMax non-text Token Plan resources reset daily. Text uses a
-            # rolling window and is recovered by the provider quota poller.
-            statuses = dict(getattr(c, "modality_status", None) or {})
-            c.modality_status = {
-                key: value
-                for key, value in statuses.items()
-                if not (
-                    isinstance(value, dict)
-                    and value.get("status") == "quota_exceeded"
-                    and value.get("reset_scope") == "daily"
-                )
-            }
+            # Provider quota circuits are cleared only by an observed success
+            # or the remains endpoint. Local midnight may not match the
+            # provider's reset boundary and must not re-admit a depleted model.
             reset_count += 1
         if creds:
             await db.commit()

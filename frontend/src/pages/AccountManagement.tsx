@@ -12,7 +12,7 @@ interface Credential {
     base_url?: string | null;
     api_key_masked: string;
     capabilities?: string[] | null;
-    modality_status?: Record<string, { status: string; error_code?: string; reset_scope?: string }> | null;
+    modality_status?: Record<string, { status: string; error_code?: string; reset_scope?: string; model?: string | null }> | null;
     daily_quota?: number | null;
     rpm_limit?: number | null;
     tpm_limit?: number | null;
@@ -32,7 +32,7 @@ interface Health {
     label: string;
     status: string;
     enabled: boolean;
-    modality_status?: Record<string, { status: string; error_code?: string; reset_scope?: string }> | null;
+    modality_status?: Record<string, { status: string; error_code?: string; reset_scope?: string; model?: string | null }> | null;
     used_today: number;
     daily_quota?: number | null;
     error_count: number;
@@ -64,7 +64,7 @@ const emptyForm = {
     provider: 'minimax', label: '', api_key: '', base_url: '',
     capabilities: [...MODALITIES] as string[],
     daily_quota: '', weight: '1', priority: '0',
-    rpm_limit: '', tpm_limit: '', window_5h_limit: '',
+    rpm_limit: '', tpm_limit: '',
 };
 
 export default function AccountManagement() {
@@ -134,7 +134,6 @@ export default function AccountManagement() {
             priority: String(credential.priority || 0),
             rpm_limit: credential.rpm_limit == null ? '' : String(credential.rpm_limit),
             tpm_limit: credential.tpm_limit == null ? '' : String(credential.tpm_limit),
-            window_5h_limit: credential.window_5h_limit == null ? '' : String(credential.window_5h_limit),
         });
         setShowForm(true);
     };
@@ -147,7 +146,6 @@ export default function AccountManagement() {
             daily_quota: form.daily_quota ? Number(form.daily_quota) : null,
             rpm_limit: form.rpm_limit ? Number(form.rpm_limit) : null,
             tpm_limit: form.tpm_limit ? Number(form.tpm_limit) : null,
-            window_5h_limit: form.window_5h_limit ? Number(form.window_5h_limit) : null,
             weight: Number(form.weight) || 1,
             priority: Number(form.priority) || 0,
         };
@@ -215,7 +213,9 @@ export default function AccountManagement() {
                     <div className="form-group"><label className="form-label">每日配额 (可选)</label><input className="form-input" type="number" value={form.daily_quota} onChange={(e) => setForm({ ...form, daily_quota: e.target.value })} placeholder="留空=不限" /></div>
                     <div className="form-group"><label className="form-label" title="每分钟最大请求数">RPM 限流 (每分钟请求数)</label><input className="form-input" type="number" value={form.rpm_limit} onChange={(e) => setForm({ ...form, rpm_limit: e.target.value })} placeholder="留空=不限, e.g. 200" /></div>
                     <div className="form-group"><label className="form-label" title="每分钟最大 token 数">TPM 限流 (每分钟 tokens)</label><input className="form-input" type="number" value={form.tpm_limit} onChange={(e) => setForm({ ...form, tpm_limit: e.target.value })} placeholder="留空=不限, e.g. 10000000" /></div>
-                    <div className="form-group"><label className="form-label" title="MiniMax Token Plan 5小时窗口配额 (token)">5小时窗口配额 (可选)</label><input className="form-input" type="number" value={form.window_5h_limit} onChange={(e) => setForm({ ...form, window_5h_limit: e.target.value })} placeholder="MiniMax订阅key的5h窗口" /></div>
+                    <div className="form-group" style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>
+                        {t('account.providerQuotaNotice', 'Token Plan 的 5 小时/周额度由供应商用量接口自动同步，不使用本地 token 阈值。')}
+                    </div>
                     <div className="form-group"><label className="form-label">weight</label><input className="form-input" type="number" value={form.weight} onChange={(e) => setForm({ ...form, weight: e.target.value })} /></div>
                     <div className="form-group"><label className="form-label">priority</label><input className="form-input" type="number" value={form.priority} onChange={(e) => setForm({ ...form, priority: e.target.value })} /></div>
                     <div className="form-group" style={{ gridColumn: 'span 2' }}>
@@ -247,7 +247,10 @@ export default function AccountManagement() {
                     const h = healthMap.get(c.id);
                     const blockedModalities = Object.entries(c.modality_status || {})
                         .filter(([, value]) => value?.status === 'quota_exceeded')
-                        .map(([modality]) => modality);
+                        .map(([resource, value]) => {
+                            const modality = resource.split(':', 1)[0];
+                            return value.model ? `${modality} (${value.model})` : modality;
+                        });
                     return (
                         <div key={c.id} className="card" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                             <div style={{ flex: 1 }}>

@@ -88,6 +88,9 @@ async def test_successful_probe_promotes_credential_to_healthy(monkeypatch):
         daily_quota=None,
         used_today=0,
         status="unverified",
+        modality_status={
+            "video:minimax-hailuo-02": {"status": "quota_exceeded"},
+        },
         error_count=9,
         weight=1,
         priority=0,
@@ -113,6 +116,7 @@ async def test_successful_probe_promotes_credential_to_healthy(monkeypatch):
     assert result.model_count == 3
     assert credential.status == "healthy"
     assert credential.error_count == 0
+    assert set(credential.modality_status) == {"video:minimax-hailuo-02"}
     assert db.commits == 1
 
 

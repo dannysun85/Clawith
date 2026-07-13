@@ -1,22 +1,49 @@
-# v1.10.12 — Privacy-Safe Production Diagnostics
+# v1.10.12 — Safe MiniMax M3 Routing and Bounded Automation
 
-## Bug Fixes
+## Model Routing and Multimodal Understanding
 
-- Audited production runtime paths no longer include chat prompts, assistant response previews, tool arguments/results, channel message text, OAuth/provider response bodies, credential prefixes, external sender/message identifiers, or user-controlled file paths in operational logs. Diagnostics use server-generated Trace IDs plus code-owned operation/type, status/error code, content length, and aggregate counts.
-- Central exception formatting no longer renders exception values or diagnostic local variables. It retains the exception type and a bounded function/line trace shape for investigation without exposing customer or credential data. Standard-library records retain only safe diagnostic shape (`source`, `level`, message length, argument shape, bounded HTTP status, and exception type), while a source-level contract rejects direct logging of sensitive values in application and startup-seeder paths.
-- HTTP request contexts always use a server-generated 12-hex Trace ID; successful and handled-error responses expose it through `X-Trace-Id`. Client-supplied `X-Trace-Id` content is ignored so correlation headers cannot inject customer or credential data into operational logs.
-- The same privacy contract now covers WebSocket chat, LLM/tool execution, Heartbeat and scheduled work, AgentBay control, OAuth, and Feishu, DingTalk, WeCom, Teams, Slack, and Discord channel paths.
-- MiniMax `2056` media-plan exhaustion remains a recorded production issue and still isolates only the affected modality, but it is logged as an expected provider-capacity warning rather than a platform `ERROR`. Unknown, authentication, transport, persistence, and code failures remain errors.
+- Lite, Pro, and Ultra understanding routes are seeded through the centrally managed `MiniMax-M3` pool for `text`, `image`, and `video` inputs. Chat uploads select the concrete attachment route, and the OpenAI-compatible caller converts image/video markers into structured content parts instead of sending them as plain text.
+- `audio` and `music` remain generation-tool capabilities rather than chat-understanding routes. Image, speech, music, and video generation continue through the explicit media tools, plan entitlements, reservation, and exactly-once Credits settlement paths.
+- Fixed a production-facing account-pool regression where a routed M3 model declared the abstract `multimodal` model type while credentials advertised concrete `text/image/video` capabilities. The selector now separates request capability from provider quota scope, so a healthy platform credential is no longer rejected as “平台账号池暂无可用 API key.”
+- The model selector remains a centrally funded shared-pool policy. This release does **not** add tenant-level or LLM-model-object-level authorization.
 
-## Credits and Routing Evidence
+## MiniMax Token Plan Correctness
 
-- A production Lite video request reached MiniMax and was rejected with provider code `2056`. Its 280-Credit reservation was released, no video consumption transaction was created, the tenant retained `reserved=0`, and only the successful six-Credit text turn was charged.
-- The shared MiniMax credential remained globally `healthy`; only its `video` modality circuit was marked `quota_exceeded`. Text and unrelated media routing were not disabled, and this release does not introduce tenant-level or model-object-level authorization.
+- MiniMax Token Plan capacity is treated as one provider `plan` circuit shared by text, image, audio, music, and video, matching the current provider contract. An exhausted shared plan can no longer leave another capability incorrectly routable.
+- Provider-specific media allowances are tracked with an exact model scope when MiniMax reports a separate or legacy model cap. Exhausting one concrete video model therefore does not automatically poison unrelated media models.
+- Removed the local `window_5h_limit` raw-token gate. MiniMax applies resource-weighted, cross-modal five-hour and weekly allowances, so a local raw-token counter could falsely reject a valid Code Plan before the provider had exhausted it. The stored field remains for schema compatibility but is no longer enforced or editable in the SaaS console.
+- The account-pool monitor periodically reads MiniMax `/v1/token_plan/remains` evidence. Unknown status values and authentication/probe failures never masquerade as quota depletion or recovery; provider success clears only the quota circuits it actually proves usable.
+- Read-only credential verification no longer clears every scoped quota state. Replacing an API key resets the old state, while relabeling a credential or changing its endpoint cannot silently re-enable exhausted capacity.
+
+## Automation and Production Safety
+
+- Platform-seeded OKR/CEO automation is disabled by default through migration `094_disable_system_okr_automation.py` and `OKR_AUTOMATION_ENABLED=false`. Explicit user-triggered work, user-managed schedules, durable A2A delivery, and media reconciliation remain available.
+- Trigger claiming and execution are bounded by `TRIGGER_MAX_CONCURRENCY` and `TRIGGER_CLAIM_BATCH_SIZE`, preventing a backlog from starting an unbounded number of Agent runs at once.
+- Production issue ingestion has a bounded fallback queue, so a temporary persistence outage cannot create unlimited in-memory growth while the monitor continues collecting privacy-safe operational evidence.
+
+## Privacy-Safe Diagnostics
+
+- Audited runtime paths no longer put prompts, response previews, tool payloads, channel messages, provider bodies, credential prefixes, external message identifiers, or user-controlled paths into operational logs. Server-generated Trace IDs and bounded code-owned diagnostic shapes remain available for correlation.
+- Central exception formatting excludes exception values and local variables. HTTP responses expose a server-generated `X-Trace-Id` and ignore client-supplied trace content, preventing customer data from entering log correlation fields.
+- The privacy contract covers HTTP, WebSocket, LLM/tool execution, automation, AgentBay, OAuth, and the supported enterprise channel adapters. Source-level tests reject known payload/preview logging patterns.
+
+## Credits and Failure Isolation
+
+- Provider failures continue to release media reservations without creating consumption transactions. Quota state is kept separate from credential authentication health, and unknown, transport, persistence, validation, and code failures do not falsely disable the shared account pool.
+- MiniMax `2056` capacity failures remain recorded production issues but are treated as expected provider-capacity warnings. Exact media-task settlement and release remain idempotent under concurrent reconciliation.
 
 ## Validation
 
-- New source-level privacy contracts reject known payload/preview logging patterns, and unit tests verify that diagnostic shape summaries cannot contain values or mapping keys.
-- Local release gates passed with 650 backend tests, 57 frontend tests, a production frontend build, and the complete PostgreSQL migration/rollback/re-upgrade smoke covering Credits settlement, production issue aggregation, and preference/queue concurrency contracts. Production cutover and post-release observation remain separate gates.
+- The complete backend suite passes: **682 tests**.
+- The complete frontend suite passes: **57 tests**, followed by a production frontend build covering 6,994 modules.
+- PostgreSQL release smoke passes full historical upgrade, targeted downgrade/re-upgrade, a single Alembic head, Credits/media exactly-once settlement, durable trigger delivery, production-issue aggregation/alerting, and chat-tier compare-and-swap checks.
+- Changed-file Ruff checks, Python bytecode compilation, Compose configuration validation, and `git diff --check` are release gates for the local candidate. Production cutover and post-release observation remain separate gates and are not claimed by this local release candidate.
+
+## Upgrade Notes
+
+- Review `OKR_AUTOMATION_ENABLED`, `TRIGGER_DAEMON_ENABLED`, `TRIGGER_MAX_CONCURRENCY`, and `TRIGGER_CLAIM_BATCH_SIZE` before cutover. The safe defaults keep the trigger daemon active for explicit/durable work while preventing the platform-seeded CEO/OKR loop from running automatically.
+- MiniMax Token Plan has provider-enforced five-hour and weekly windows shared across modalities. Production high availability still requires pay-as-you-go fallback or a genuinely independent secondary provider credential; increasing `max_output_tokens` does not increase plan allowance.
+- Existing `window_5h_limit` database values are retained but ignored. No tenant balances, subscriptions, Credits ledger rows, model ownership, or model-object permissions are migrated by this release.
 
 # v1.10.11 — Verified Public Blue/Green Cutover
 

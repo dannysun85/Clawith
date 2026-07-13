@@ -79,7 +79,10 @@ class LLMCredential(Base):
     # NULL means "no limit enforced" (provider default or unlimited).
     rpm_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)  # max requests per minute
     tpm_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)  # max tokens per minute
-    window_5h_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)  # MiniMax Token Plan 5h window (token units)
+    # Legacy manual threshold retained for schema compatibility. Current
+    # MiniMax Token Plan usage is price-weighted across modalities and cannot
+    # be reproduced safely from a local raw-token counter.
+    window_5h_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
     tenant_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=True, index=True
     )  # null = platform pool / set = tenant-owned key

@@ -120,6 +120,10 @@ async def update_credential(credential_id: uuid.UUID, data: CredentialUpdateIn, 
     if base_url_changed or api_key_changed:
         cred.status = "unverified"
         cred.error_count = 0
+    if api_key_changed:
+        # A replacement key is a different provider account, so inherited
+        # model-quota circuits are no longer relevant. Changing only the API
+        # host is not quota-recovery evidence for the same account.
         cred.modality_status = {}
     await db.commit()
     await db.refresh(cred)
@@ -140,9 +144,9 @@ async def verify_credential(credential_id: uuid.UUID, db: AsyncSession = Depends
         # degraded shared credential. Ordinary successful calls may clear a
         # consecutive counter, but must not silently re-admit an isolated key.
         cred.error_count = 0
-        # An administrator verification is also the explicit recovery
-        # boundary after a provider top-up or plan reset.
-        cred.modality_status = {}
+        # Authentication verification does not prove that every independent
+        # text/media allowance recovered. Scoped circuits are closed by an
+        # observed successful call or the MiniMax remains poller.
     await db.commit()
     return CredentialVerificationOut(
         ok=result.ok,

@@ -9492,7 +9492,12 @@ async def _generate_image(
                     return f"⚠️ {exc.message}"
                 raise
         try:
-            cred = await pick_credential("minimax", modality="image")
+            cred = await pick_credential(
+                "minimax",
+                modality="image",
+                quota_modality="image",
+                quota_model=model,
+            )
             minimax_cred_id = cred.id
             api_key = get_credential_api_key(cred)
             base_url = _minimax_default_base_url(cred.base_url)
@@ -9592,7 +9597,12 @@ async def _generate_image(
                 )
             except Exception as e:
                 if minimax_cred_id:
-                    await _mark_minimax_tool_credential_failure(minimax_cred_id, e, modality="image")
+                    await _mark_minimax_tool_credential_failure(
+                        minimax_cred_id,
+                        e,
+                        modality="image",
+                        model=model,
+                    )
                 raise
         else:
             return f"❌ Unknown image generation provider: {provider}. Supported: siliconflow, openai, google, custom, minimax"
@@ -9624,6 +9634,7 @@ async def _generate_image(
                     minimax_cred_id,
                     tier=minimax_tier or "lite",
                     modality="image",
+                    model=model,
                 )
             if minimax_tenant_id and minimax_credit_cost > 0:
                 await _charge_minimax_tool_credits(
@@ -9837,6 +9848,7 @@ async def _record_minimax_tool_success(
     *,
     tier: str | None,
     modality: str,
+    model: str | None = None,
 ) -> None:
     """Record successful MiniMax tool usage without failing the user result path."""
     from app.services.llm.load_balancer import clear_credential_modality_quota, record_credential_call
@@ -9847,7 +9859,12 @@ async def _record_minimax_tool_success(
     except Exception as e:
         logger.warning(f"[MiniMaxTool] Failed to record MiniMax credential usage: {e}")
     try:
-        await clear_credential_modality_quota(credential_id, modality)
+        model_kwargs = {"model": model} if model else {}
+        await clear_credential_modality_quota(
+            credential_id,
+            modality,
+            **model_kwargs,
+        )
     except Exception as e:
         logger.warning(f"[MiniMaxTool] Failed to clear recovered {modality} quota state: {e}")
     await consume_agent_llm_quota(agent_id, model_tier=tier)
@@ -9858,6 +9875,7 @@ async def _mark_minimax_tool_credential_failure(
     error: Exception,
     *,
     modality: str,
+    model: str | None = None,
 ) -> None:
     """Apply the same credential health policy used by MiniMax text calls."""
     from app.services.llm.failover import (
@@ -9878,10 +9896,12 @@ async def _mark_minimax_tool_credential_failure(
     elif action is CredentialFailureAction.MODALITY_QUOTA_EXCEEDED:
         from app.services.llm.failover import extract_minimax_code
 
+        model_kwargs = {"model": model} if model else {}
         await mark_credential_modality_quota_exceeded(
             credential_id,
             modality,
             error_code=extract_minimax_code(str(error)) or "2056",
+            **model_kwargs,
         )
 
 
@@ -10020,6 +10040,7 @@ async def _prepare_minimax_tool_credential(
     agent_id: uuid.UUID,
     modality: str,
     tier: str = "lite",
+    model: str | None = None,
 ) -> tuple[_MiniMaxToolCredential | None, str | None]:
     quota_error = await _check_minimax_tool_allowed(agent_id, modality=modality, tier=tier)
     if quota_error:
@@ -10029,7 +10050,12 @@ async def _prepare_minimax_tool_credential(
     from app.services.llm.utils import get_credential_api_key
 
     try:
-        cred = await pick_credential("minimax", modality=modality)
+        cred = await pick_credential(
+            "minimax",
+            modality=modality,
+            quota_modality=modality,
+            quota_model=model,
+        )
     except NoCredentialAvailable as exc:
         await _record_minimax_tool_product_issue(
             agent_id,
@@ -10144,6 +10170,7 @@ async def _generate_speech_minimax(
         agent_id,
         modality="audio",
         tier=tier,
+        model=model,
     )
     if error:
         return error
@@ -10182,7 +10209,13 @@ async def _generate_speech_minimax(
             language_boost=config.get("language_boost") or "auto",
         )
         full_save_path.write_bytes(audio_bytes)
-        await _record_minimax_tool_success(agent_id, credential.id, tier=tier, modality="audio")
+        await _record_minimax_tool_success(
+            agent_id,
+            credential.id,
+            tier=tier,
+            modality="audio",
+            model=model,
+        )
         if tenant_id and credit_cost > 0:
             await _charge_minimax_tool_credits(
                 tenant_id=tenant_id,
@@ -10198,7 +10231,12 @@ async def _generate_speech_minimax(
         from app.services.quota_guard import QuotaExceeded
         if isinstance(exc, QuotaExceeded):
             return f"⚠️ {exc.message}"
-        await _mark_minimax_tool_credential_failure(credential.id, exc, modality="audio")
+        await _mark_minimax_tool_credential_failure(
+            credential.id,
+            exc,
+            modality="audio",
+            model=model,
+        )
         await _record_minimax_tool_product_issue(
             agent_id,
             "audio",
@@ -10243,6 +10281,7 @@ async def _generate_music_minimax(
         agent_id,
         modality="music",
         tier=tier,
+        model=model,
     )
     if error:
         return error
@@ -10277,7 +10316,13 @@ async def _generate_music_minimax(
             bitrate=int(profile.bitrate or 256000),
         )
         full_save_path.write_bytes(audio_bytes)
-        await _record_minimax_tool_success(agent_id, credential.id, tier=tier, modality="music")
+        await _record_minimax_tool_success(
+            agent_id,
+            credential.id,
+            tier=tier,
+            modality="music",
+            model=model,
+        )
         if tenant_id and credit_cost > 0:
             await _charge_minimax_tool_credits(
                 tenant_id=tenant_id,
@@ -10293,7 +10338,12 @@ async def _generate_music_minimax(
         from app.services.quota_guard import QuotaExceeded
         if isinstance(exc, QuotaExceeded):
             return f"⚠️ {exc.message}"
-        await _mark_minimax_tool_credential_failure(credential.id, exc, modality="music")
+        await _mark_minimax_tool_credential_failure(
+            credential.id,
+            exc,
+            modality="music",
+            model=model,
+        )
         await _record_minimax_tool_product_issue(
             agent_id,
             "music",
@@ -10367,17 +10417,20 @@ async def _generate_video_minimax(
     if prompt_optimizer is None:
         prompt_optimizer = True
 
+    # MiniMax documents first+last frame mode only for Hailuo-02. Resolve the
+    # concrete model before account selection so one exhausted video model does
+    # not unnecessarily block another.
+    model = "MiniMax-Hailuo-02" if last_frame_image else profile.model
     credential, error = await _prepare_minimax_tool_credential(
         agent_id,
         modality="video",
         tier=tier,
+        model=model,
     )
     if error:
         return error
     assert credential is not None
 
-    # MiniMax documents first+last frame mode only for Hailuo-02.
-    model = "MiniMax-Hailuo-02" if last_frame_image else profile.model
     duration, resolution = constrain_minimax_video_request(
         tier,
         profile,
@@ -10482,7 +10535,13 @@ async def _generate_video_minimax(
             last_frame_image=last_frame_image,
             prompt_optimizer=bool(prompt_optimizer),
         )
-        await _record_minimax_tool_success(agent_id, credential.id, tier=tier, modality="video")
+        await _record_minimax_tool_success(
+            agent_id,
+            credential.id,
+            tier=tier,
+            modality="video",
+            model=model,
+        )
         metadata = {
             "provider": "minimax",
             "task_record_id": str(record_id),
@@ -10583,7 +10642,12 @@ async def _generate_video_minimax(
                     )
                 except Exception:
                     logger.exception("[MiniMaxVideo] Failed to persist recovery metadata")
-            await _mark_minimax_tool_credential_failure(credential.id, exc, modality="video")
+            await _mark_minimax_tool_credential_failure(
+                credential.id,
+                exc,
+                modality="video",
+                model=model,
+            )
             logger.warning(f"[MiniMaxVideo] Submitted task queued for automatic recovery: {exc}")
             return (
                 f"⏳ MiniMax video task was submitted and automatic recovery is continuing. "
@@ -10608,7 +10672,12 @@ async def _generate_video_minimax(
                 await _release_minimax_tool_reservation(reservation_id)
             except Exception:
                 pass
-        await _mark_minimax_tool_credential_failure(credential.id, exc, modality="video")
+        await _mark_minimax_tool_credential_failure(
+            credential.id,
+            exc,
+            modality="video",
+            model=model,
+        )
         if not incident_recorded:
             await _record_minimax_tool_product_issue(
                 agent_id,
@@ -10737,6 +10806,9 @@ async def _check_video_minimax(agent_id: uuid.UUID, ws: Path, arguments: dict) -
                     uuid.UUID(str(credential_id_raw)),
                     exc,
                     modality="video",
+                    model=(str(metadata.get("model") or "") or None)
+                    if "metadata" in locals()
+                    else None,
                 )
             except Exception:
                 pass

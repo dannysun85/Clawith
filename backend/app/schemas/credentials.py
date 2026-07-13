@@ -17,7 +17,7 @@ class CredentialCreateIn(BaseModel):
     priority: int = 0
     rpm_limit: int | None = None  # max requests per minute (client-side throttle)
     tpm_limit: int | None = None  # max tokens per minute
-    window_5h_limit: int | None = None  # MiniMax Token Plan 5h window (token units)
+    window_5h_limit: int | None = None  # Deprecated compatibility field; not enforced.
 
 
 class CredentialUpdateIn(BaseModel):
