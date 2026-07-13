@@ -25,6 +25,7 @@ class PlanOut(BaseModel):
     features: dict | None = None
     is_active: bool
     sort_order: int
+    updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -51,7 +52,7 @@ class PlanCreateIn(BaseModel):
 
 
 class PlanUpdateIn(BaseModel):
-    """Admin updates a plan (all fields optional; code immutable)."""
+    """Admin updates a plan with a required optimistic-lock precondition."""
 
     name: str | None = None
     tier: int | None = None
@@ -69,6 +70,7 @@ class PlanUpdateIn(BaseModel):
     features: dict | None = None
     is_active: bool | None = None
     sort_order: int | None = None
+    expected_updated_at: datetime
 
 
 class EntitlementsOut(BaseModel):

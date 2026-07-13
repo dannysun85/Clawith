@@ -8,6 +8,7 @@ Covers:
 """
 
 import uuid
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -55,7 +56,7 @@ class MockDB:
     def add(self, v):
         self.added.append(v)
 
-    async def get(self, _model, _id):
+    async def get(self, _model, _id, **_kwargs):
         return self._get_value
 
     async def commit(self):
@@ -103,11 +104,16 @@ def test_plan_create_in_defaults():
     assert p.tier == 0  # plan tier (rank), not model tier
 
 
-def test_plan_update_in_all_optional():
-    p = PlanUpdateIn()
+def test_plan_update_requires_concurrency_precondition():
+    with pytest.raises(ValidationError):
+        PlanUpdateIn()
+
+    expected_updated_at = datetime.now(timezone.utc)
+    p = PlanUpdateIn(expected_updated_at=expected_updated_at)
     assert p.name is None
     assert p.allowed_modalities is None
     assert p.is_active is None
+    assert p.expected_updated_at == expected_updated_at
 
 
 def test_billing_rule_schema_rejects_unknown_tier_and_negative_cost():
@@ -168,7 +174,10 @@ async def test_update_plan_not_found_404():
     with pytest.raises(HTTPException) as exc:
         await update_plan(
             uuid.uuid4(),
-            PlanUpdateIn(allowed_modalities=["text"]),
+            PlanUpdateIn(
+                allowed_modalities=["text"],
+                expected_updated_at=datetime.now(timezone.utc),
+            ),
             current_user=_admin_user(),
             db=db,
         )
@@ -177,22 +186,78 @@ async def test_update_plan_not_found_404():
 
 @pytest.mark.asyncio
 async def test_update_plan_applies_fields():
+    current_updated_at = datetime.now(timezone.utc)
     existing = Plan(
         code="pro",
         name="Pro",
         allowed_modalities=["text"],
         allowed_tiers=["standard"],
         is_active=True,
+        updated_at=current_updated_at,
     )
     db = MockDB(get_value=existing)
     await update_plan(
         uuid.uuid4(),
-        PlanUpdateIn(allowed_modalities=["text", "vision"], is_active=False),
+        PlanUpdateIn(
+            allowed_modalities=["text", "vision"],
+            is_active=False,
+            expected_updated_at=current_updated_at,
+        ),
         current_user=_admin_user(),
         db=db,
     )
     assert existing.allowed_modalities == ["text", "vision"]
     assert existing.is_active is False
+    assert db.committed
+
+
+@pytest.mark.asyncio
+async def test_update_plan_rejects_stale_admin_snapshot():
+    current_updated_at = datetime.now(timezone.utc)
+    existing = Plan(
+        code="pro",
+        name="Pro",
+        price_cents=100,
+        updated_at=current_updated_at,
+    )
+    db = MockDB(get_value=existing)
+
+    with pytest.raises(HTTPException) as exc:
+        await update_plan(
+            uuid.uuid4(),
+            PlanUpdateIn(
+                price_cents=200,
+                expected_updated_at=current_updated_at - timedelta(seconds=1),
+            ),
+            current_user=_admin_user(),
+            db=db,
+        )
+
+    assert exc.value.status_code == 409
+    assert existing.price_cents == 100
+    assert not db.committed
+
+
+@pytest.mark.asyncio
+async def test_update_plan_accepts_matching_admin_snapshot_without_persisting_cas_field():
+    current_updated_at = datetime.now(timezone.utc)
+    existing = Plan(
+        code="pro",
+        name="Pro",
+        price_cents=100,
+        updated_at=current_updated_at,
+    )
+    db = MockDB(get_value=existing)
+
+    await update_plan(
+        uuid.uuid4(),
+        PlanUpdateIn(price_cents=200, expected_updated_at=current_updated_at),
+        current_user=_admin_user(),
+        db=db,
+    )
+
+    assert existing.price_cents == 200
+    assert "expected_updated_at" not in existing.__dict__
     assert db.committed
 
 
@@ -259,7 +324,10 @@ def test_non_admin_cannot_create_plan():
 
 def test_non_admin_cannot_update_plan():
     client = TestClient(_app_with_non_admin())
-    r = client.patch(f"/subscription/plans/{uuid.uuid4()}", json={})
+    r = client.patch(
+        f"/subscription/plans/{uuid.uuid4()}",
+        json={"expected_updated_at": datetime.now(timezone.utc).isoformat()},
+    )
     assert r.status_code == 403
 
 
@@ -273,7 +341,10 @@ def test_tenant_org_admin_cannot_mutate_global_plan_catalog():
     client = TestClient(_app_with_user(role="org_admin", email="org-admin@example.com"))
 
     assert client.post("/subscription/plans", json={"code": "x", "name": "X"}).status_code == 403
-    assert client.patch(f"/subscription/plans/{uuid.uuid4()}", json={}).status_code == 403
+    assert client.patch(
+        f"/subscription/plans/{uuid.uuid4()}",
+        json={"expected_updated_at": datetime.now(timezone.utc).isoformat()},
+    ).status_code == 403
     assert client.delete(f"/subscription/plans/{uuid.uuid4()}").status_code == 403
 
 

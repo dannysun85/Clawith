@@ -125,10 +125,18 @@ async def update_plan(
     db: AsyncSession = Depends(get_db),
 ):
     """Update a plan (admin only). code is immutable."""
-    plan = await db.get(Plan, plan_id)
+    plan = await db.get(Plan, plan_id, with_for_update=True)
     if not plan:
         raise HTTPException(status_code=404, detail="Plan not found")
-    for k, v in data.model_dump(exclude_unset=True).items():
+    if plan.updated_at != data.expected_updated_at:
+        raise HTTPException(
+            status_code=409,
+            detail="套餐已被其他管理员更新，请载入最新数据后重试。",
+        )
+    for k, v in data.model_dump(
+        exclude_unset=True,
+        exclude={"expected_updated_at"},
+    ).items():
         setattr(plan, k, v)
     await db.commit()
     await db.refresh(plan)

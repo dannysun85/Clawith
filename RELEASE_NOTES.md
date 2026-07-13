@@ -1,3 +1,10 @@
+# v1.10.9 — Explicit SaaS Media Entitlements
+
+- The SaaS plan editor now shows chat-model permissions and media-generation permissions as separate controls. Administrators can directly verify and edit image, audio, music, video, and Lite / Pro / Ultra generation access without interpreting raw `features` JSON.
+- Saving a plan requires a minimal compare-and-swap update: unrelated feature flags and future extension values are preserved, while missing or stale administrator snapshots are rejected before they can overwrite newer settings. `generation_modalities` and `generation_tiers` continue through the existing entitlement contract; no production balances, subscriptions, model routes, or credential ownership rules are migrated or rewritten.
+- The PostgreSQL release gate now verifies the plan-update row lock, successful compare-and-swap, stale-snapshot rejection, and restoration against a disposable migrated database.
+- Includes all shared-pool isolation, bounded media recovery, Credits exactly-once, model-tier persistence, and production monitoring changes from v1.10.8.
+
 # v1.10.8 — Shared-Pool Isolation and Production Issue Monitoring
 
 ## What's New

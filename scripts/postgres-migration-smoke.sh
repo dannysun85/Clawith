@@ -124,6 +124,7 @@ SQL
 
 .venv/bin/alembic upgrade head
 .venv/bin/alembic current | grep -F "add_user_chat_tier_preference (head)"
+PYTHONPATH=. .venv/bin/python ../scripts/plan-update-postgres-smoke.py
 
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
 DO $$
