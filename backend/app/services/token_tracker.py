@@ -68,7 +68,7 @@ def extract_token_usage(usage: dict | None) -> TokenUsage | None:
             )
             if isinstance(details, dict)
         ]
-        cached = _token_counter(
+        cache_read_tokens = _token_counter(
             usage,
             "cached_tokens",
             "cache_read_tokens",
@@ -80,7 +80,7 @@ def extract_token_usage(usage: dict | None) -> TokenUsage | None:
             "cache_creation_input_tokens",
         )
         for details in detail_sources:
-            cached += _token_counter(
+            cache_read_tokens += _token_counter(
                 details,
                 "cached_tokens",
                 "cache_read_tokens",
@@ -91,10 +91,10 @@ def extract_token_usage(usage: dict | None) -> TokenUsage | None:
                 "cache_creation_tokens",
                 "cache_creation_input_tokens",
             )
-        if cached or cache_creation:
+        if cache_read_tokens or cache_creation:
             logger.info(
                 f"[Token Cache] API Provider -> Created: {cache_creation} tokens, "
-                f"Read: {cached} tokens"
+                f"Read: {cache_read_tokens} tokens"
             )
         input_tokens = _int_token(usage.get("prompt_tokens", usage.get("input_tokens", 0)))
         output_tokens = _int_token(usage.get("completion_tokens", usage.get("output_tokens", 0)))
@@ -103,7 +103,7 @@ def extract_token_usage(usage: dict | None) -> TokenUsage | None:
             total_tokens=total_tokens,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            cache_read_tokens=cached,
+            cache_read_tokens=cache_read_tokens,
             cache_creation_tokens=cache_creation,
         )
 
@@ -238,7 +238,7 @@ async def record_token_usage(
 
                 await db.commit()
                 logger.debug(
-                    f"Recorded {usage.total_tokens:,} tokens for agent {agent.name} "
+                    f"Recorded {usage.total_tokens:,} tokens for agent {agent.id} "
                     f"(cache_read={usage.cache_read_tokens:,})"
                 )
 

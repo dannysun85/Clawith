@@ -41,12 +41,12 @@ async def _execute_schedule(schedule_id: uuid.UUID, agent_id: uuid.UUID, instruc
                 return
 
             if agent.status != "running":
-                logger.info(f"Schedule {schedule_id}: agent {agent.name} not running, skipping")
+                logger.info(f"Schedule {schedule_id}: agent {agent.id} not running, skipping")
                 return
 
             from app.core.permissions import is_agent_expired
             if is_agent_expired(agent):
-                logger.info(f"Schedule {schedule_id}: agent {agent.name} has expired, skipping")
+                logger.info(f"Schedule {schedule_id}: agent {agent.id} has expired, skipping")
                 return
 
             # Build context and call LLM with failover support
@@ -76,7 +76,12 @@ async def _execute_schedule(schedule_id: uuid.UUID, agent_id: uuid.UUID, instruc
                 detail={"schedule_id": str(schedule_id), "instruction": instruction, "reply": reply[:500]},
             )
 
-            logger.info(f"Schedule {schedule_id} executed for agent {agent.name}: {reply[:80]}")
+            logger.info(
+                "Schedule {} executed for agent {} reply_chars={}",
+                schedule_id,
+                agent.id,
+                len(reply),
+            )
 
     except Exception as e:
         logger.exception(f"Schedule {schedule_id} execution error: {e}")
@@ -121,11 +126,11 @@ async def _tick():
                 asyncio.create_task(
                     _execute_schedule(sched.id, sched.agent_id, sched.instruction)
                 )
-                logger.info(f"Triggered schedule '{sched.name}' (next: {next_run})")
+                logger.info(f"Triggered schedule {sched.id} (next: {next_run})")
 
     except Exception as e:
         logger.exception(f"Scheduler tick error: {e}")
-        await write_audit_log("schedule_error", {"error": str(e)[:300]})
+        await write_audit_log("schedule_error", {"error_type": type(e).__name__})
 
 
 async def start_scheduler():

@@ -122,5 +122,8 @@ async def settle_tasks(
     results = await asyncio.gather(*tasks, return_exceptions=True)
     for task, result in zip(tasks, results, strict=True):
         if task in done and isinstance(result, BaseException):
-            logger.warning("[Process] Stream reader failed: {}", result)
+            logger.warning(
+                "[Process] Stream reader failed error_type={}",
+                type(result).__name__,
+            )
     return results

@@ -715,7 +715,7 @@ async def _seed_okr_triggers(db, agent_id: uuid.UUID) -> None:
             )
         )
         if existing.scalar_one_or_none():
-            logger.info(f"[AgentSeeder] Trigger '{t['name']}' already exists, skipping")
+            logger.info("[AgentSeeder] System trigger already exists; skipping")
             continue
 
         trigger = AgentTrigger(
@@ -730,7 +730,7 @@ async def _seed_okr_triggers(db, agent_id: uuid.UUID) -> None:
             is_enabled=True,
         )
         db.add(trigger)
-        logger.info(f"[AgentSeeder] Created system trigger '{t['name']}' for OKR Agent")
+        logger.info("[AgentSeeder] Created system trigger for OKR Agent")
 
 
 async def _ensure_okr_tool_rows_exist(required_tool_names: list[str]) -> dict[str, Tool]:
@@ -753,7 +753,9 @@ async def _ensure_okr_tool_rows_exist(required_tool_names: list[str]) -> dict[st
     missing = [name for name in required_tool_names if name not in tool_rows]
     if missing:
         logger.warning(
-            f"[AgentSeeder] Missing OKR tool rows {missing}; re-running builtin tool seeder"
+            "[AgentSeeder] Missing OKR tool rows missing_count={}; "
+            "re-running builtin tool seeder",
+            len(missing),
         )
         from app.services.tool_seeder import seed_builtin_tools
         await seed_builtin_tools()

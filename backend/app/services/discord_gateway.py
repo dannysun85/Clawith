@@ -72,10 +72,7 @@ class DiscordGatewayManager:
 
         @client.event
         async def on_ready():
-            logger.info(
-                f"[Discord GW] Bot connected for agent {agent_id}: "
-                f"{client.user.name}#{client.user.discriminator} ({client.user.id})"
-            )
+            logger.info(f"[Discord GW] Bot connected for agent {agent_id}")
 
         @client.event
         async def on_message(message: discord.Message):
@@ -100,8 +97,10 @@ class DiscordGatewayManager:
                 return
 
             logger.info(
-                f"[Discord GW] Message for agent {agent_id} from "
-                f"{message.author.name}: {user_text[:80]}"
+                "[Discord GW] Message received agent={} content_chars={} group={}",
+                agent_id,
+                len(user_text),
+                message.guild is not None,
             )
 
             # Show typing indicator while processing
@@ -243,7 +242,11 @@ class DiscordGatewayManager:
                 user_id=platform_user_id,
                 session_id=session_conv_id,
             )
-            logger.info(f"[Discord GW] LLM reply for {agent_id}: {reply_text[:80]}")
+            logger.info(
+                "[Discord GW] LLM reply generated agent={} reply_chars={}",
+                agent_id,
+                len(reply_text),
+            )
 
             # ── Phase 3: Save reply (new short transaction) ──
             async with async_session() as _save_db:

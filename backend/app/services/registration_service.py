@@ -134,11 +134,7 @@ class RegistrationService:
         final_username = username
         if username and await identity_dao.is_username_taken(username):
             final_username = f"{username}_{uuid.uuid4().hex[:6]}"
-            logger.info(
-                "Username '%s' already taken; assigned '%s' to new identity",
-                username,
-                final_username,
-            )
+            logger.info("Registration assigned a generated unique username")
 
         # Hash password if not pre-hashed
         if not password_hash and password:
@@ -335,7 +331,7 @@ class RegistrationService:
             return user, is_new, None
 
         except Exception:
-            logger.exception("SSO registration failed for %s provider", provider_type)
+            logger.exception("SSO registration failed provider={}", provider_type)
             return None, False, f"SSO registration failed"
 
     # ── Tenant for registration ──────────────────────────────────────────────

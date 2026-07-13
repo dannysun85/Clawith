@@ -49,7 +49,7 @@ def store_temp_screenshot(raw_bytes: bytes, *, grid_options: Optional[dict] = No
     img_id = str(_uuid_mod.uuid4())
     _memory_image_cache[img_id] = (raw_bytes, time.monotonic(), grid_options or {})
     cache_size = len(_memory_image_cache)
-    logger.debug(f"[VisionInject] Stored temp screenshot id={img_id}, cache_size={cache_size}")
+    logger.debug("[VisionInject] Stored temp screenshot cache_size={}", cache_size)
     return img_id
 
 
@@ -255,7 +255,7 @@ def compress_screenshot_to_base64(
     Returns None if the file doesn't exist or processing fails.
     """
     if not file_path.exists():
-        logger.warning(f"[VisionInject] Screenshot file not found: {file_path}")
+        logger.warning("[VisionInject] Screenshot file not found")
         return None
     try:
         raw_bytes = file_path.read_bytes()
@@ -304,7 +304,9 @@ def try_inject_screenshot_vision(
         entry = pop_temp_screenshot(img_id)
         if entry is None:
             # Cache miss (expired or already consumed) — degrade gracefully
-            logger.warning(f"[VisionInject] ImageID {img_id} not found in cache (expired?)")
+            logger.warning(
+                "[VisionInject] Image cache entry not found (expired or consumed)"
+            )
             return None
         raw_bytes, grid_options = entry
         data_url = compress_bytes_to_base64(

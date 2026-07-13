@@ -1,11 +1,9 @@
 """Enterprise management API routes: LLM pool, enterprise info, approvals, audit logs."""
 
 import uuid
-import logging
-
-logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
+from loguru import logger
 from pydantic import BaseModel
 from sqlalchemy import select, func, update, or_
 from sqlalchemy.exc import SQLAlchemyError
@@ -138,7 +136,7 @@ async def _load_llm_test_key_and_base_url(
                 cred = await pick_credential(existing.provider, existing.modality)
                 return get_credential_api_key(cred), cred.base_url or existing.base_url
             except Exception as e:
-                logging.warning(f"[llm-test] Failed to pick credential for platform model: {e}")
+                logger.warning(f"[llm-test] Failed to pick credential for platform model: {e}")
                 return None, existing.base_url
         return get_model_api_key(existing), existing.base_url
 
@@ -406,7 +404,7 @@ async def update_llm_model(
         await db.commit()
         await db.refresh(model)
         return LLMModelOut.model_validate(model)
-    except SQLAlchemyError as e:
+    except SQLAlchemyError:
         await db.rollback()
         raise HTTPException(status_code=500, detail="Failed to update model")
 
@@ -1359,8 +1357,6 @@ async def delete_identity_provider(
 
 # ─── Org Structure ──────────────────────────────────────
 
-from app.models.org import OrgDepartment, OrgMember
-
 
 @router.get("/org/departments")
 async def list_org_departments(
@@ -1424,10 +1420,6 @@ async def list_org_departments(
         ],
         "total_member": total_member,
     }
-
-
-
-from sqlalchemy import or_
 
 @router.get("/org/members")
 async def list_org_members(
@@ -1643,16 +1635,13 @@ async def wecom_callback_verify_universal(
     # Verify signature to authenticate the request as coming from WeCom servers
     expected_sig = _verify_signature(token, timestamp, nonce, echostr)
     if expected_sig != msg_signature:
-        logger.warning(
-            f"[WeCom Callback] Signature mismatch: token={token[:8]}... "
-            f"expected={expected_sig[:16]}... got={msg_signature[:16]}..."
-        )
+        logger.warning("[WeCom Callback] Signature mismatch")
         return _Response(status_code=403)
 
     # Decrypt echostr and return plaintext to complete WeCom URL verification
     try:
         decrypted, _ = _decrypt_msg(aes_key, echostr)
-        logger.info(f"[WeCom Callback] Universal callback verified successfully for token={token[:8]}...")
+        logger.info("[WeCom Callback] Universal callback verified successfully")
         return _Response(content=decrypted, media_type="text/plain")
     except Exception as e:
         logger.error(f"[WeCom Callback] Failed to decrypt echostr: {e}")

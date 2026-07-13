@@ -109,12 +109,12 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
             primary_model, fallback_model, route_meta = await resolve_agent_model(agent)
             model = primary_model or fallback_model
             if not model:
-                logger.warning(f"Agent {agent.name} has no LLM model, skipping trigger invocation")
+                logger.warning(f"Agent {agent.id} has no LLM model, skipping trigger invocation")
                 if execution_ids:
                     await mark_trigger_executions_failed(execution_ids, "Agent has no LLM model configured")
                 return
             if not model.enabled:
-                logger.warning(f"Agent {agent.name}'s model is unavailable, skipping trigger invocation")
+                logger.warning(f"Agent {agent.id} model is unavailable, skipping trigger invocation")
                 if execution_ids:
                     await mark_trigger_executions_failed(execution_ids, "Agent model is unavailable or disabled")
                 return
@@ -170,10 +170,7 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
                                 if len(persisted_message) > 32000:
                                     matched_message += "\n…(message truncated at 32,000 characters)"
                         except (TypeError, ValueError):
-                            logger.warning(
-                                "Ignoring invalid A2A source message id {!r}",
-                                source_message_id,
-                            )
+                            logger.warning("Ignoring invalid A2A source message id")
                     part += (
                         f"\n收到来自 {cfg.get('_matched_from', '?')} 的消息："
                         f"\n\"{matched_message}\""
@@ -417,8 +414,6 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
             await mark_trigger_executions_completed(execution_ids)
     except Exception as e:
         logger.error(f"Failed to invoke agent {agent_id} for triggers: {e}")
-        import traceback
-        traceback.print_exc()
         execution_ids = [
             uuid.UUID(str((t.config or {}).get("_execution_id")))
             for t in triggers

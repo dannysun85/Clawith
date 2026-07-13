@@ -50,6 +50,5 @@ async def send_notification(
     db.add(notif)
     await db.flush()
     recipient = f"user {user_id}" if user_id else f"agent {agent_id}"
-    logger.info(f"Notification [{type}] sent to {recipient}: {title}")
+    logger.info(f"Notification [{type}] sent to {recipient} title_chars={len(title)}")
     return notif
-

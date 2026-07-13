@@ -23,7 +23,7 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
-from app.core.logging_config import get_trace_id
+from app.core.logging_config import get_trace_id, privacy_safe_shape
 from app.database import async_session
 from app.services.credit_service import charge_credits, check_credit_balance
 from app.services.provider_pricing import provider_text_credits
@@ -516,7 +516,11 @@ async def _process_tool_call(
     fn = tc["function"]
     tool_name = fn["name"]
     raw_args = fn.get("arguments", "{}")
-    logger.info(f"[LLM] Calling tool: {tool_name}({json.dumps(raw_args, ensure_ascii=False)})")
+    logger.info(
+        "[LLM] Calling tool: {} argument_shape={}",
+        tool_name,
+        privacy_safe_shape(raw_args),
+    )
 
     try:
         args = json.loads(raw_args) if raw_args else {}
@@ -573,7 +577,7 @@ async def _process_tool_call(
         saas_tier=route_meta.saas_tier if route_meta else None,
         on_output=_on_output,
     )
-    logger.debug(f"[LLM] Tool result: {result[:100]}")
+    logger.debug(f"[LLM] Tool result chars={len(result)}")
 
     # ── Vision injection for screenshot tools ──
     tool_content: str | list = str(result)
@@ -944,7 +948,7 @@ async def call_llm(
                 _unsaved_usage = TokenUsage()
                 _, _token_limit_msg = await _get_agent_config(agent_id)
                 if _token_limit_msg:
-                    logger.warning(f"[LLM] Token limit exceeded mid-loop: {_token_limit_msg}")
+                    logger.warning(f"[LLM] Token limit exceeded mid-loop agent={agent_id}")
                     await _finalize_llm_usage(billable=False)
                     await client.close()
                     return _token_limit_msg
@@ -1118,9 +1122,8 @@ async def call_llm(
                 raise
             except Exception as e:
                 logger.exception(
-                    "[LLM] Tool execution failed after provider usage: {}: {}",
+                    "[LLM] Tool execution failed after provider usage error_type={}",
                     type(e).__name__,
-                    str(e)[:300],
                 )
                 await _finalize_llm_usage(billable=False)
                 await client.close()
@@ -1208,8 +1211,9 @@ async def call_llm_with_failover(
     if not is_retryable_error(primary_result):
         if _is_llm_error_result(primary_result):
             logger.warning(
-                "[Failover] Skipped: primary model returned a non-retryable error: {}",
-                primary_result[:150],
+                "[Failover] Skipped: primary model returned a non-retryable error "
+                "result_shape={}",
+                privacy_safe_shape(primary_result),
             )
         else:
             logger.debug("[Failover] Primary model completed successfully; no failover needed")
@@ -1481,7 +1485,7 @@ async def call_agent_llm(
         return reply
     except Exception as e:
         error_msg = str(e) or repr(e)
-        logger.error(f"[call_agent_llm] Unexpected error: {error_msg}")
+        logger.error(f"[call_agent_llm] Unexpected error error_type={type(e).__name__}")
         return f"⚠️ 调用模型出错: {error_msg[:150]}"
 
 
@@ -1594,7 +1598,9 @@ async def call_agent_llm_with_tools(
                         _unsaved_usage = TokenUsage()
                         _, _token_limit_msg = await _get_agent_config(agent_id)
                         if _token_limit_msg:
-                            logger.warning(f"[call_agent_llm_with_tools] Token limit exceeded mid-loop: {_token_limit_msg}")
+                            logger.warning(
+                                f"[call_agent_llm_with_tools] Token limit exceeded mid-loop agent={agent_id}"
+                            )
                             await _finalize_background_usage()
                             await client.close()
                             return _token_limit_msg, False, tool_executed

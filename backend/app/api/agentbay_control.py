@@ -10,25 +10,24 @@ Cookie export occurs automatically when the Take Control session ends.
 
 import asyncio
 import json
-import logging
 import time
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from loguru import logger
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.core.logging_config import privacy_safe_shape
 from app.core.permissions import check_agent_access
 from app.core.security import encrypt_data, get_current_user
 from app.database import get_db
 from app.models.agent_credential import AgentCredential
 from app.models.user import User
-
-logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/agents/{agent_id}/control", tags=["agentbay-control"])
 
@@ -70,7 +69,7 @@ def is_session_locked(agent_id: str, session_id: str) -> bool:
         return False
     _user_id, locked_at, _env_type = _take_control_locks[key]
     if time.time() - locked_at > _LOCK_TIMEOUT_SECONDS:
-        logger.info(f"[TakeControl] Auto-expired stale lock for session={session_id[:8]}")
+        logger.info(f"[TakeControl] Auto-expired stale lock agent={agent_id}")
         del _take_control_locks[key]
         return False
     return True
@@ -178,7 +177,7 @@ async def _get_client(agent_id: uuid.UUID, session_id: str, env_type: str = "bro
                 _agentbay_sessions[cache_key] = (client, now)
                 logger.info(
                     f"[TakeControl] Found existing {image_type} session (exact match) for "
-                    f"agent={agent_id}, session={session_id[:8]} "
+                    f"agent={agent_id} "
                     f"(requested env_type={env_type})"
                 )
                 if image_type in ("browser", "browser_latest") and cache_key not in _browser_initialized:
@@ -220,8 +219,7 @@ async def _get_client(agent_id: uuid.UUID, session_id: str, env_type: str = "bro
         _agentbay_sessions[best_cache_key] = (best_client, now)
         logger.info(
             f"[TakeControl] Found existing {best_image_type} session (agent-id fallback) for "
-            f"agent={agent_id} (requested session={session_id[:8]}, "
-            f"actual session={best_cache_key[1][:8]}, env_type={env_type})"
+            f"agent={agent_id} env_type={env_type}"
         )
         if best_image_type in ("browser", "browser_latest") and best_cache_key not in _browser_initialized:
             try:
@@ -286,7 +284,10 @@ async def _cdp_exec(client, script: str, timeout_ms: int = 15000) -> dict:
         timeout_ms=5000,
     )
     if not write_result.get("success"):
-        logger.error(f"[TakeControl] Failed to write CDP script: {write_result}")
+        logger.error(
+            "[TakeControl] Failed to write CDP script result_shape={}",
+            privacy_safe_shape(write_result),
+        )
         return {"success": False, "output": "Failed to write script", "stderr": str(write_result)[:200]}
 
     result = await client.command_exec(
@@ -299,8 +300,13 @@ async def _cdp_exec(client, script: str, timeout_ms: int = 15000) -> dict:
     tc_success = "TC_OK" in stdout
 
     logger.info(
-        f"[TakeControl] CDP exec: cmd_success={cmd_success}, tc_ok={tc_success}, "
-        f"stdout={stdout[:200]}, stderr={stderr[:200]}, exit_code={result.get('exit_code', 'N/A')}"
+        "[TakeControl] CDP exec cmd_success={} tc_ok={} stdout_chars={} "
+        "stderr_chars={} exit_code={}",
+        cmd_success,
+        bool(tc_success),
+        len(stdout),
+        len(stderr),
+        result.get("exit_code", "N/A"),
     )
     return {"success": tc_success, "output": stdout[:500], "stderr": stderr[:200]}
 
@@ -324,7 +330,11 @@ async def _eval_cdp_script(client, script_body: str) -> dict:
         stderr = getattr(result, 'stderr', '') or ''
         
         if not success:
-            logger.error(f"[TakeControl] CDP execution failed. Output: {output}, Stderr: {stderr}")
+            logger.error(
+                "[TakeControl] CDP execution failed output_chars={} stderr_chars={}",
+                len(output),
+                len(stderr),
+            )
             return {"success": False, "output": f"Node error: {stderr[:200]}"}
             
         return {"success": True, "output": output}
@@ -423,8 +433,9 @@ const { chromium } = require('/usr/local/lib/node_modules/playwright');
 """
         res = await _eval_cdp_script(cleanup_client, cleanup_script)
         logger.info(
-            f"[TakeControl] Cleanup: {res.get('output', 'no output')[:100]} "
-            f"for session={session_id[:8]}"
+            "[TakeControl] Cleanup completed agent={} output_chars={}",
+            agent_id,
+            len(res.get("output") or ""),
         )
     except Exception as e:
         logger.warning(f"[TakeControl] Cleanup failed (non-fatal): {e}")
@@ -496,7 +507,10 @@ const {{ chromium }} = require('/usr/local/lib/node_modules/playwright');
             client._session.computer.click_mouse, x, y, button
         )
         success = getattr(result, 'success', False)
-        logger.info(f"[TakeControl] Computer click at ({x}, {y}): success={success}")
+        logger.info(
+            "[TakeControl] Computer click completed success={}",
+            bool(success),
+        )
         return {"success": success, "method": "computer_click", "output": f"Clicked at ({x}, {y})"}
     except Exception as e:
         logger.warning(f"[TakeControl] Computer click failed: {e}")
@@ -511,7 +525,7 @@ async def _perform_type(client, text: str):
     Browser sessions use CDP keyboard API; desktop sessions use computer.input_text.
     """
     image_type = getattr(client, '_image_type', 'unknown')
-    logger.info(f"[TakeControl] Type text: '{text[:30]}', image_type={image_type}")
+    logger.info(f"[TakeControl] Type text chars={len(text)} image_type={image_type}")
 
     if _is_browser_session(client):
         import urllib.parse
@@ -544,7 +558,7 @@ const {{ chromium }} = require('/usr/local/lib/node_modules/playwright');
             client._session.computer.input_text, text
         )
         success = getattr(result, 'success', False)
-        logger.info(f"[TakeControl] Computer input_text: success={success}")
+        logger.info("[TakeControl] Computer input_text success={}", bool(success))
         return {"success": success, "method": "computer_input", "output": "Text typed"}
     except Exception as e:
         logger.warning(f"[TakeControl] Computer input_text failed: {e}")
@@ -559,7 +573,7 @@ async def _perform_press_keys(client, keys: list[str]):
     Browser sessions use CDP keyboard API; desktop sessions use computer.press_keys.
     """
     key_desc = "+".join(keys)
-    logger.info(f"[TakeControl] Press keys: {key_desc}")
+    logger.info(f"[TakeControl] Press keys count={len(keys)}")
 
     if _is_browser_session(client):
         # Convert key names to the Playwright format (e.g. 'ctrl' → 'Control')
@@ -596,7 +610,7 @@ const {{ chromium }} = require('/usr/local/lib/node_modules/playwright');
             client._session.computer.press_keys, keys
         )
         success = getattr(result, 'success', False)
-        logger.info(f"[TakeControl] Computer press_keys: success={success}")
+        logger.info("[TakeControl] Computer press_keys success={}", bool(success))
         return {"success": success, "method": "computer_keys", "output": f"Pressed {key_desc}"}
     except Exception as e:
         logger.warning(f"[TakeControl] Computer press_keys failed: {e}")
@@ -938,7 +952,7 @@ async def control_lock(
     _take_control_locks[key] = (str(current_user.id), time.time(), env_type)
     is_reentry = existing is not None
     logger.info(
-        f"[TakeControl] Lock acquired: agent={agent_id}, session={data.session_id}, "
+        f"[TakeControl] Lock acquired: agent={agent_id}, "
         f"user={current_user.id}, env_type={env_type}, re_entry={is_reentry}"
     )
     return {"status": "locked", "locked_by": str(current_user.id)}
@@ -961,7 +975,7 @@ async def control_unlock(
 
     key = (str(agent_id), data.session_id)
     if key not in _take_control_locks:
-        logger.info(f"[TakeControl] Unlock called but no lock found: agent={agent_id}, session={data.session_id}")
+        logger.info(f"[TakeControl] Unlock called but no lock found agent={agent_id}")
         return {"status": "not_locked"}
 
     exported = False
@@ -978,17 +992,18 @@ async def control_unlock(
                 )
                 exported = True
                 logger.info(
-                    f"[TakeControl] Cookies exported: agent={agent_id}, "
-                    f"platform={data.platform_hint}, count={export_count}"
+                    "[TakeControl] Cookies exported agent={} platform_present={} "
+                    "exported_any={}",
+                    agent_id,
+                    bool(data.platform_hint),
+                    bool(export_count),
                 )
             except Exception as e:
                 logger.warning(f"[TakeControl] Cookie export failed (non-fatal): {e}")
     finally:
         # ALWAYS release the lock, even if cookie export fails
         _take_control_locks.pop(key, None)
-        logger.info(
-            f"[TakeControl] Lock released: agent={agent_id}, session={data.session_id}"
-        )
+        logger.info(f"[TakeControl] Lock released agent={agent_id}")
         # Reset browser initialization flag so the next agentbay browser tool
         # call re-initializes the SDK's browser.operator. This clears any stale
         # page references left by TC's CDP interactions that would otherwise
@@ -999,10 +1014,7 @@ async def control_unlock(
             if _ck in _agentbay_sessions:
                 _tc_client, _ts = _agentbay_sessions[_ck]
                 _tc_client._browser_initialized = False
-                logger.info(
-                    f"[TakeControl] Reset _browser_initialized after TC unlock "
-                    f"for session={data.session_id[:8]}"
-                )
+                logger.info(f"[TakeControl] Reset browser state after unlock agent={agent_id}")
         # Clear from the control-layer initialization tracking set as well
         _browser_initialized.discard((agent_id, data.session_id, "browser"))
         _browser_initialized.discard((agent_id, data.session_id, "browser_latest"))
@@ -1089,15 +1101,24 @@ let browser;
     write_result = await client.command_exec(
         f"echo '{script_b64}' | /usr/bin/base64 -d > tc_export_cookies.js"
     )
-    logger.info(f"[TakeControl] Cookie export script write: success={write_result.get('success')}, stderr={write_result.get('stderr', '')[:100]}")
+    logger.info(
+        "[TakeControl] Cookie export script write success={} stderr_chars={}",
+        write_result.get("success"),
+        len(write_result.get("stderr", "")),
+    )
     
     result = await client.command_exec("node tc_export_cookies.js", timeout_ms=15000)
     stdout = result.get("stdout", "")
     stderr = result.get("stderr", "")
-    logger.info(f"[TakeControl] Cookie export script exec: success={result.get('success')}, stdout_len={len(stdout)}, stderr={stderr[:200]}")
+    logger.info(
+        "[TakeControl] Cookie export script exec success={} stdout_chars={} stderr_chars={}",
+        result.get("success"),
+        len(stdout),
+        len(stderr),
+    )
 
     if "COOKIES_EXPORT:" not in stdout:
-        logger.warning(f"[TakeControl] Cookie export script failed: {stdout}")
+        logger.warning(f"[TakeControl] Cookie export script failed stdout_chars={len(stdout)}")
         return 0
 
     # Parse the exported cookies JSON

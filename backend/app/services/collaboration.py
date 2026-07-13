@@ -64,7 +64,12 @@ class CollaborationService:
         ))
         await db.flush()
 
-        logger.info(f"Agent {from_agent.name} delegated task to {to_agent.name}: {task_title}")
+        logger.info(
+            "Agent {} delegated task to {} title_chars={}",
+            from_agent.id,
+            to_agent.id,
+            len(task_title),
+        )
         return {
             "task_id": str(task.id),
             "from_agent": from_agent.name,

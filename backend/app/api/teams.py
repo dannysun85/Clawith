@@ -106,12 +106,10 @@ async def _get_teams_access_token(config: ChannelConfig) -> str | None:
                 error_body = resp.text
                 try:
                     error_json = resp.json()
-                    error_description = error_json.get("error_description", "No description")
                     error_code = error_json.get("error", "unknown")
-                    logger.error(f"Teams: OAuth token request failed for agent {agent_id}: status={resp.status_code}, error={error_code}, description={error_description}")
+                    logger.error(f"Teams: OAuth token request failed for agent {agent_id}: status={resp.status_code}, error={error_code}")
                 except:
-                    logger.error(f"Teams: OAuth token request failed for agent {agent_id}: status={resp.status_code}, response={error_body[:500]}")
-                logger.error(f"Teams: Token URL={token_url}, tenant_id={tenant_id}, client_id={app_id[:20]}...")
+                    logger.error(f"Teams: OAuth token request failed for agent {agent_id}: status={resp.status_code}, response_chars={len(error_body)}")
                 return None
             token_data = resp.json()
             access_token = token_data["access_token"]
@@ -121,19 +119,17 @@ async def _get_teams_access_token(config: ChannelConfig) -> str | None:
                 "access_token": access_token,
                 "expires_at": time.time() + expires_in,
             }
-            logger.info(f"Teams: Successfully obtained access token for agent {agent_id}, expires in {expires_in}s")
+            logger.info("Teams: Successfully obtained access token for agent {}", agent_id)
             return access_token
     except httpx.HTTPStatusError as e:
         error_body = e.response.text if hasattr(e, 'response') and e.response else "No response body"
         try:
             if hasattr(e, 'response') and e.response:
                 error_json = e.response.json()
-                error_description = error_json.get("error_description", "No description")
                 error_code = error_json.get("error", "unknown")
-                logger.error(f"Teams: OAuth token HTTP error for agent {agent_id}: status={e.response.status_code}, error={error_code}, description={error_description}")
+                logger.error(f"Teams: OAuth token HTTP error for agent {agent_id}: status={e.response.status_code}, error={error_code}")
         except:
-            logger.error(f"Teams: OAuth token HTTP error for agent {agent_id}: status={e.response.status_code if hasattr(e, 'response') and e.response else 'unknown'}, response={error_body[:500]}")
-        logger.error(f"Teams: Token URL={token_url}, tenant_id={tenant_id}, client_id={app_id[:20]}...")
+            logger.error(f"Teams: OAuth token HTTP error for agent {agent_id}: status={e.response.status_code if hasattr(e, 'response') and e.response else 'unknown'}, response_chars={len(error_body)}")
         return None
     except Exception as e:
         logger.exception(f"Teams: Failed to get access token for agent {agent_id}: {e}")
@@ -192,25 +188,21 @@ async def _send_teams_message_single_chunk(access_token: str, service_url: str, 
                 error_body = resp.text
                 try:
                     error_json = resp.json()
-                    error_description = error_json.get("error", {}).get("message", error_json.get("message", "No description"))
                     error_code = error_json.get("error", {}).get("code", "unknown")
-                    logger.error(f"Teams: Failed to send message: status={resp.status_code}, error={error_code}, description={error_description}")
+                    logger.error(f"Teams: Failed to send message: status={resp.status_code}, error={error_code}")
                 except:
-                    logger.error(f"Teams: Failed to send message: status={resp.status_code}, response={error_body[:500]}")
-                logger.error(f"Teams: POST URL={post_url}, conversation_id={conversation_id}, service_url={service_url}")
+                    logger.error(f"Teams: Failed to send message: status={resp.status_code}, response_chars={len(error_body)}")
             resp.raise_for_status()
-            logger.info(f"Teams: Sent message to conversation {conversation_id}")
+            logger.info("Teams: Sent message")
     except httpx.HTTPStatusError as e:
         error_body = e.response.text if hasattr(e, 'response') and e.response else "No response body"
         try:
             if hasattr(e, 'response') and e.response:
                 error_json = e.response.json()
-                error_description = error_json.get("error", {}).get("message", error_json.get("message", "No description"))
                 error_code = error_json.get("error", {}).get("code", "unknown")
-                logger.error(f"Teams: HTTP error sending message: status={e.response.status_code}, error={error_code}, description={error_description}")
+                logger.error(f"Teams: HTTP error sending message: status={e.response.status_code}, error={error_code}")
         except:
-            logger.error(f"Teams: HTTP error sending message: status={e.response.status_code if hasattr(e, 'response') and e.response else 'unknown'}, response={error_body[:500]}")
-        logger.error(f"Teams: POST URL={post_url}, conversation_id={conversation_id}, service_url={service_url}")
+            logger.error(f"Teams: HTTP error sending message: status={e.response.status_code if hasattr(e, 'response') and e.response else 'unknown'}, response_chars={len(error_body)}")
         raise
 
 
@@ -356,7 +348,11 @@ async def teams_event_webhook(
         try:
             body = json.loads(body_bytes)
         except json.JSONDecodeError as e:
-            logger.error(f"Teams: Failed to parse JSON body: {e}, body={body_bytes[:200]}")
+            logger.error(
+                "Teams: Failed to parse JSON body error_type={} body_bytes={}",
+                type(e).__name__,
+                len(body_bytes),
+            )
             return Response(status_code=400, content="Invalid JSON")
         
         # Microsoft Teams Bot Framework sends the activity directly in the body (not wrapped in "activity" key)
@@ -366,10 +362,21 @@ async def teams_event_webhook(
         elif isinstance(body, dict) and "activity" in body:
             activity = body["activity"]
         else:
-            logger.warning(f"Teams: Unexpected body structure for agent {agent_id}: {list(body.keys()) if isinstance(body, dict) else type(body)}")
+            logger.warning(
+                "Teams: Unexpected body structure for agent {} body_type={} field_count={}",
+                agent_id,
+                type(body).__name__,
+                len(body) if isinstance(body, dict) else 0,
+            )
             activity = body if isinstance(body, dict) else {}
         
-        logger.info(f"Teams: Webhook received for agent {agent_id}, activity type={activity.get('type')}, from={activity.get('from', {}).get('id', 'unknown')}, text={activity.get('text', '')[:50] if activity.get('text') else 'no text'}")
+        logger.info(
+            "Teams: Webhook received for agent {} activity_type={} sender_present={} text_chars={}",
+            agent_id,
+            activity.get("type"),
+            bool(activity.get("from", {}).get("id")),
+            len(activity.get("text") or ""),
+        )
 
         # Teams Bot Framework uses a simple token for authentication, not HMAC for incoming webhooks
         # For now, we rely on the unguessable URL token.
@@ -395,7 +402,7 @@ async def teams_event_webhook(
                 config.is_connected = True
                 await db.flush()
                 await db.commit()
-                logger.info(f"Teams: Updated service_url for agent {agent_id} to {service_url}")
+                logger.info(f"Teams: Updated service_url for agent {agent_id}")
 
         # Dedup
         activity_id = activity.get("id")
@@ -433,7 +440,12 @@ async def teams_event_webhook(
             logger.warning(f"Teams: Missing conversation_id or sender_id in activity for agent {agent_id}")
             return {"ok": True}
 
-        logger.info(f"Teams: Message from={sender_id}, conversation={conversation_id}: {user_text[:80]}")
+        logger.info(
+            "Teams: Message received agent={} content_chars={} group={}",
+            agent_id,
+            len(user_text),
+            bool(activity.get("conversation", {}).get("isGroup")),
+        )
 
         # Load agent (must happen before user resolution for tenant_id)
         agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
@@ -522,7 +534,11 @@ async def teams_event_webhook(
                 user_id=platform_user_id,
                 session_id=session_conv_id,
             )
-            logger.info(f"Teams: LLM reply generated: {reply_text[:80]}")
+            logger.info(
+                "Teams: LLM reply generated agent={} reply_chars={}",
+                agent_id,
+                len(reply_text),
+            )
         except Exception as e:
             logger.exception(f"Teams: Failed to call LLM for agent {agent_id}: {e}")
             reply_text = "Sorry, I encountered an error processing your message."
@@ -541,7 +557,7 @@ async def teams_event_webhook(
                 if _sess_fresh:
                     _sess_fresh.last_message_at = datetime.now(timezone.utc)
                 await _save_db.commit()
-            logger.info(f"Teams: Saved reply to database for conversation {conversation_id}")
+            logger.info(f"Teams: Saved reply to database for agent {agent_id}")
         except Exception as e:
             logger.exception(f"Teams: Failed to save reply to database: {e}")
 
@@ -574,7 +590,7 @@ async def teams_event_webhook(
                     "replyToId": reply_to_id,  # Reply to the specific incoming message
                     "text": reply_text,
                 }
-                logger.info(f"Teams: Attempting to send reply to conversation {conversation_id}, from={bot_channel_account.get('id')}, recipient={user_account.get('id')}")
+                logger.info(f"Teams: Attempting to send reply for agent {agent_id}")
                 await _send_teams_message(config, conversation_id, reply_activity)
                 logger.info(f"Teams: Successfully sent reply to Teams")
             except Exception as e:

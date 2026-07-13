@@ -14,6 +14,7 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.logging_config import privacy_safe_shape
 from app.models.agent import Agent
 from app.models.audit import ApprovalRequest, AuditLog
 from app.models.channel_config import ChannelConfig
@@ -58,7 +59,7 @@ class AutonomyService:
 
         if level == "L1":
             # Auto-execute, just log
-            logger.info(f"L1: Auto-executing {action_type} for agent {agent.name}")
+            logger.info(f"L1: Auto-executing {action_type} for agent {agent.id}")
             return {
                 "allowed": True,
                 "level": "L1",
@@ -67,7 +68,7 @@ class AutonomyService:
 
         elif level == "L2":
             # Auto-execute but notify creator
-            logger.info(f"L2: Executing {action_type} for agent {agent.name} with notification")
+            logger.info(f"L2: Executing {action_type} for agent {agent.id} with notification")
             await self._notify_creator(db, agent, action_type, details)
             return {
                 "allowed": True,
@@ -85,7 +86,7 @@ class AutonomyService:
             db.add(approval)
             await db.flush()
 
-            logger.info(f"L3: Approval required for {action_type} by agent {agent.name}")
+            logger.info(f"L3: Approval required for {action_type} by agent {agent.id}")
             await self._request_approval(db, agent, approval)
 
             return {
@@ -142,7 +143,11 @@ class AutonomyService:
             execution_result = await self._execute_approved_action(
                 approval.agent_id, approval.action_type, approval.details
             )
-            logger.info(f"Post-approval execution for {approval.action_type}: {execution_result}")
+            logger.info(
+                "Post-approval execution action_type={} result_shape={}",
+                approval.action_type,
+                privacy_safe_shape(execution_result),
+            )
 
         # Web notification to agent creator about the result
         if agent:

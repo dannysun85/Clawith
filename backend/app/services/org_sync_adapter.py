@@ -260,7 +260,7 @@ class BaseOrgSyncAdapter(ABC):
                 except Exception as e:
                     partial_failure = True
                     errors.append(f"Department {dept.external_id}: {str(e)}")
-                    logger.error(f"[OrgSync] Failed to sync department {dept.external_id}: {e}")
+                    logger.error(f"[OrgSync] Failed to sync department error_type={type(e).__name__}")
 
             await self._rebuild_department_paths(db, provider.id)
             await db.flush()
@@ -271,7 +271,7 @@ class BaseOrgSyncAdapter(ABC):
                     users = await self.fetch_users(dept.external_id)
                 except Exception as e:
                     partial_failure = True
-                    logger.error(f"[OrgSync] Failed to fetch users in department {dept.external_id}: {e}")
+                    logger.error(f"[OrgSync] Failed to fetch department users error_type={type(e).__name__}")
                     errors.append(f"Fetch users in dept {dept.external_id}: {str(e)}")
                     continue
 
@@ -286,7 +286,7 @@ class BaseOrgSyncAdapter(ABC):
                         member_count += 1
                     except Exception as e:
                         partial_failure = True
-                        logger.error(f"[OrgSync] Failed to sync member {user.external_id} ({user.name}): {e}")
+                        logger.error(f"[OrgSync] Failed to sync member error_type={type(e).__name__}")
                         errors.append(f"Member {user.external_id}: {str(e)}")
 
             await self._refresh_member_department_paths(db, provider.id)
@@ -314,8 +314,7 @@ class BaseOrgSyncAdapter(ABC):
                 await db.flush()
 
         except Exception as e:
-            import traceback
-            logger.error(f"[OrgSync] Critical error during sync: {e}\n{traceback.format_exc()}")
+            logger.exception("[OrgSync] Critical error during sync")
             errors.append(f"Critical: {str(e)}")
 
         return {
@@ -832,7 +831,10 @@ class FeishuOrgSyncAdapter(BaseOrgSyncAdapter):
                     data = resp.json()
 
                     if data.get("code") != 0:
-                        logger.error(f"Feishu fetch departments list error for parent {parent_id}: {data}")
+                        logger.error(
+                            "Feishu fetch departments list failed error_code={}",
+                            data.get("code") or data.get("errcode") or "unknown",
+                        )
                         break
 
                     res_data = data.get("data", {})
@@ -912,8 +914,7 @@ class FeishuOrgSyncAdapter(BaseOrgSyncAdapter):
                     error_code = data.get("code")
                     error_msg = data.get("msg", "")
                     logger.error(
-                        f"Feishu fetch users error for dept {department_external_id}: "
-                        f"code={error_code}, msg={error_msg}"
+                        f"Feishu fetch users error code={error_code}"
                     )
                     # Provide targeted guidance based on error code
                     if error_code == 40060:

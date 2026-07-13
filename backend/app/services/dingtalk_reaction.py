@@ -45,10 +45,14 @@ async def add_thinking_reaction(
                 },
             )
             if resp.status_code == 200:
-                logger.info(f"[DingTalk Reaction] Thinking reaction added for msg {message_id[:16]}")
+                logger.info("[DingTalk Reaction] Thinking reaction added")
                 return True
             else:
-                logger.warning(f"[DingTalk Reaction] Add failed: {resp.status_code} {resp.text[:200]}")
+                logger.warning(
+                    "[DingTalk Reaction] Add failed status={} response_chars={}",
+                    resp.status_code,
+                    len(resp.text),
+                )
                 return False
     except Exception as e:
         logger.warning(f"[DingTalk Reaction] Add thinking reaction error: {e}")
@@ -100,11 +104,11 @@ async def recall_thinking_reaction(
                     },
                 )
                 if resp.status_code == 200:
-                    logger.info(f"[DingTalk Reaction] Thinking reaction recalled for msg {message_id[:16]}")
+                    logger.info("[DingTalk Reaction] Thinking reaction recalled")
                     return
                 else:
                     logger.warning(f"[DingTalk Reaction] Recall attempt failed: {resp.status_code}")
         except Exception as e:
             logger.warning(f"[DingTalk Reaction] Recall error: {e}")
 
-    logger.warning(f"[DingTalk Reaction] All recall attempts failed for msg {message_id[:16]}")
+    logger.warning("[DingTalk Reaction] All recall attempts failed")

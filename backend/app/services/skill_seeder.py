@@ -1003,10 +1003,10 @@ async def seed_skills():
                         existing_file = existing_paths[f["path"]]
                         if existing_file.content != f["content"]:
                             existing_file.content = f["content"]
-                            logger.info(f"[SkillSeeder] Updated {f['path']} in {skill_data['name']}")
+                            logger.info("[SkillSeeder] Updated builtin skill file")
                     else:
                         db.add(SkillFile(skill_id=existing.id, path=f["path"], content=f["content"]))
-                        logger.info(f"[SkillSeeder] Added file {f['path']} to {skill_data['name']}")
+                        logger.info("[SkillSeeder] Added builtin skill file")
             else:
                 skill = Skill(
                     name=skill_data["name"],
@@ -1021,7 +1021,7 @@ async def seed_skills():
                 await db.flush()
                 for f in skill_data["files"]:
                     db.add(SkillFile(skill_id=skill.id, path=f["path"], content=f["content"]))
-                logger.info(f"[SkillSeeder] Created skill: {skill_data['name']}")
+                logger.info("[SkillSeeder] Created builtin skill")
         await db.commit()
         logger.info("[SkillSeeder] Skills seeded")
 
@@ -1104,7 +1104,11 @@ async def push_default_skills_to_existing_agents():
                     await storage.delete(legacy_key)
                     removed_legacy += 1
                 except Exception as exc:
-                    logger.warning(f"[SkillSeeder] Failed to remove legacy MCP_INSTALLER.md for agent {agent.id}: {exc}")
+                    logger.warning(
+                        "[SkillSeeder] Failed to remove legacy MCP installer "
+                        "error_type={}",
+                        type(exc).__name__,
+                    )
             for skill in default_skills:
                 if not skill.files:
                     continue
@@ -1118,7 +1122,7 @@ async def push_default_skills_to_existing_agents():
                     key = f"{agent_prefix}/skills/{skill.folder_name}/{sf.path}"
                     await storage.write_text(key, sf.content, encoding="utf-8")
                     pushed += 1
-                logger.info(f"[SkillSeeder] Pushed new default skill '{skill.name}' to agent {agent.id}")
+                logger.info("[SkillSeeder] Pushed new default skill to existing agent")
 
         # Save/update the sync hash in settings
         if setting:

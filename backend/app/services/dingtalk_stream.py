@@ -22,6 +22,11 @@ from app.services.dingtalk_token import dingtalk_token_manager
 from app.services.storage import store_agent_upload
 
 
+def _handler_error_ack(stream_module):
+    """Return a provider ACK without exposing the caught exception to DingTalk."""
+    return stream_module.AckMessage.STATUS_SYSTEM_EXCEPTION, "handler error"
+
+
 # ─── DingTalk Media Helpers ─────────────────────────────
 
 
@@ -40,7 +45,11 @@ async def _get_media_download_url(
             url = data.get("downloadUrl")
             if url:
                 return url
-            logger.error(f"[DingTalk] Failed to get download URL: {data}")
+            logger.error(
+                "[DingTalk] Failed to get download URL status={} error_code={}",
+                resp.status_code,
+                data.get("code") or data.get("errcode") or "unknown",
+            )
             return None
     except Exception as e:
         logger.error(f"[DingTalk] Error getting download URL: {e}")
@@ -120,7 +129,7 @@ async def _process_media_message(
             file_bytes,
             content_type="image/jpeg",
         )
-        logger.info(f"[DingTalk] Saved image to {workspace_path} ({len(file_bytes)} bytes)")
+        logger.info(f"[DingTalk] Saved image upload bytes={len(file_bytes)}")
 
         b64_data = base64.b64encode(file_bytes).decode("ascii")
         image_marker = f"[image_data:data:image/jpeg;base64,{b64_data}]"
@@ -150,7 +159,7 @@ async def _process_media_message(
                             file_bytes,
                             content_type="image/jpeg",
                         )
-                        logger.info(f"[DingTalk] Saved rich text image to {workspace_path}")
+                        logger.info("[DingTalk] Saved rich text image")
 
                         b64_data = base64.b64encode(file_bytes).decode("ascii")
                         image_marker = f"[image_data:data:image/jpeg;base64,{b64_data}]"
@@ -172,7 +181,7 @@ async def _process_media_message(
         content = msg_data.get("content", {})
         recognition = content.get("recognition", "")
         if recognition:
-            logger.info(f"[DingTalk] Audio with recognition: {recognition[:80]}")
+            logger.info(f"[DingTalk] Audio recognition received chars={len(recognition)}")
             return f"[Voice message] {recognition}", None, None
 
         download_code = content.get("downloadCode", "")
@@ -182,7 +191,7 @@ async def _process_media_message(
                 duration = content.get("duration", "unknown")
                 filename = f"dingtalk_audio_{uuid.uuid4().hex[:8]}.amr"
                 _, workspace_path, _ = await store_agent_upload(agent_id, filename, file_bytes)
-                logger.info(f"[DingTalk] Saved audio to {workspace_path} ({len(file_bytes)} bytes)")
+                logger.info(f"[DingTalk] Saved audio upload bytes={len(file_bytes)}")
                 return (
                     f"[User sent a voice message, duration {duration}ms, saved to {filename}]",
                     None,
@@ -199,7 +208,7 @@ async def _process_media_message(
                 duration = content.get("duration", "unknown")
                 filename = f"dingtalk_video_{uuid.uuid4().hex[:8]}.mp4"
                 _, workspace_path, _ = await store_agent_upload(agent_id, filename, file_bytes)
-                logger.info(f"[DingTalk] Saved video to {workspace_path} ({len(file_bytes)} bytes)")
+                logger.info(f"[DingTalk] Saved video upload bytes={len(file_bytes)}")
                 return (
                     f"[User sent a video, duration {duration}ms, saved to {filename}]",
                     None,
@@ -216,10 +225,7 @@ async def _process_media_message(
             if file_bytes:
                 safe_name = f"dingtalk_{uuid.uuid4().hex[:8]}_{original_filename}"
                 _, workspace_path, _ = await store_agent_upload(agent_id, safe_name, file_bytes)
-                logger.info(
-                    f"[DingTalk] Saved file '{original_filename}' to {workspace_path} "
-                    f"({len(file_bytes)} bytes)"
-                )
+                logger.info(f"[DingTalk] Saved file upload bytes={len(file_bytes)}")
                 return (
                     f"[file:{original_filename}]",
                     None,
@@ -257,7 +263,7 @@ async def _upload_dingtalk_media(
 
     file_p = Path(file_path)
     if not file_p.exists():
-        logger.error(f"[DingTalk] Upload failed: file not found: {file_path}")
+        logger.error("[DingTalk] Upload failed: file not found")
         return None
 
     try:
@@ -276,11 +282,12 @@ async def _upload_dingtalk_media(
             # Legacy API returns media_id (snake_case), new API returns mediaId
             media_id = data.get("media_id") or data.get("mediaId")
             if media_id and data.get("errcode", 0) == 0:
-                logger.info(
-                    f"[DingTalk] Uploaded {media_type} '{file_p.name}' -> mediaId={media_id[:20]}..."
-                )
+                logger.info(f"[DingTalk] Uploaded {media_type} bytes={len(file_bytes)}")
                 return media_id
-            logger.error(f"[DingTalk] Upload failed: {data}")
+            logger.error(
+                "[DingTalk] Upload failed error_code={}",
+                data.get("errcode") or data.get("code") or "unknown",
+            )
             return None
     except Exception as e:
         logger.error(f"[DingTalk] Upload error: {e}")
@@ -372,12 +379,16 @@ async def _send_dingtalk_media_message(
 
             data = resp.json()
             if resp.status_code >= 400 or data.get("errcode"):
-                logger.error(f"[DingTalk] Send media failed: {data}")
+                logger.error(
+                    "[DingTalk] Send media failed error_code={}",
+                    data.get("errcode") or data.get("code") or "unknown",
+                )
                 return False
 
             logger.info(
-                f"[DingTalk] Sent {media_type} message to {target_id[:16]}... "
-                f"(conv_type={conversation_type})"
+                "[DingTalk] Sent {} message conv_type={}",
+                media_type,
+                conversation_type,
             )
             return True
     except Exception as e:
@@ -414,7 +425,7 @@ class DingTalkStreamManager:
             logger.warning(f"[DingTalk Stream] Missing credentials for {agent_id}, skipping")
             return
 
-        logger.info(f"[DingTalk Stream] Starting client for agent {agent_id} (AppKey: {app_key[:8]}...)")
+        logger.info(f"[DingTalk Stream] Starting client for agent {agent_id}")
 
         # Capture the main event loop so threads can dispatch coroutines back
         if self._main_loop is None:
@@ -487,9 +498,7 @@ class DingTalkStreamManager:
                     conversation_type = incoming.conversation_type or "1"
                     session_webhook = incoming.session_webhook or ""
 
-                    logger.info(
-                        f"[DingTalk Stream] Received {msgtype} message from {sender_staff_id}"
-                    )
+                    logger.info(f"[DingTalk Stream] Received {msgtype} message for agent {agent_id}")
 
                     if msgtype == "text":
                         # Plain text: use existing logic
@@ -499,7 +508,9 @@ class DingTalkStreamManager:
                             return dingtalk_stream.AckMessage.STATUS_OK, "empty message"
 
                         logger.info(
-                            f"[DingTalk Stream] Text from {sender_staff_id}: {user_text[:80]}"
+                            "[DingTalk Stream] Text received agent={} content_chars={}",
+                            agent_id,
+                            len(user_text),
                         )
 
                         from app.api.dingtalk import process_dingtalk_message
@@ -551,9 +562,7 @@ class DingTalkStreamManager:
                     return dingtalk_stream.AckMessage.STATUS_OK, "ok"
                 except Exception as e:
                     logger.error(f"[DingTalk Stream] Error in message handler: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    return dingtalk_stream.AckMessage.STATUS_SYSTEM_EXCEPTION, str(e)
+                    return _handler_error_ack(dingtalk_stream)
 
         while not stop_event.is_set() and retries <= MAX_RETRIES:
             try:

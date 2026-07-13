@@ -10,6 +10,7 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.logging_config import privacy_safe_shape
 from app.core.permissions import check_agent_access, is_agent_creator
 from app.core.security import get_current_user
 from app.database import get_db
@@ -373,8 +374,9 @@ async def process_dingtalk_message(
 
         has_media = bool(image_base64_list or saved_file_paths)
         logger.info(
-            f"[DingTalk] LLM reply ({'media' if has_media else 'text'} input): "
-            f"{reply_text[:100]}"
+            "[DingTalk] LLM reply generated input_type={} reply_chars={}",
+            "media" if has_media else "text",
+            len(reply_text),
         )
 
         # Reply via session webhook (markdown)
@@ -462,13 +464,19 @@ async def dingtalk_callback(
         token_data = await auth_provider.exchange_code_for_token(authCode)
         access_token = token_data.get("access_token")
         if not access_token:
-            logger.error(f"DingTalk token exchange failed: {token_data}")
+            logger.error(
+                "DingTalk token exchange failed error_code={}",
+                token_data.get("errcode") or token_data.get("code") or "unknown",
+            )
             return HTMLResponse(f"Auth failed: Token exchange error")
 
         # Step 2: Get user info using modern v1.0 API
         user_info = await auth_provider.get_user_info(access_token)
         if not user_info.provider_union_id:
-            logger.error(f"DingTalk user info missing unionId: {user_info.raw_data}")
+            logger.error(
+                "DingTalk user info missing unionId response_shape={}",
+                privacy_safe_shape(user_info.raw_data),
+            )
             return HTMLResponse("Auth failed: No unionid returned")
 
         # Step 3: Find or create user (handles OrgMember linking)
@@ -505,6 +513,9 @@ async def dingtalk_callback(
                     </body></html>"""
                 )
         except Exception as e:
-            logger.exception("Failed to update SSO session (dingtalk) %s", e)
+            logger.exception(
+                "Failed to update SSO session (dingtalk) error_type={}",
+                type(e).__name__,
+            )
 
     return HTMLResponse(f"Logged in. Token: {token}")

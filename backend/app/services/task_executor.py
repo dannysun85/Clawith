@@ -99,7 +99,7 @@ You are now in TASK EXECUTION MODE (not a conversation). A task has been assigne
     from app.services.llm import call_agent_llm_with_tools
     
     try:
-        logger.info(f"[TaskExec] Calling LLM with tools for task: {task_title}")
+        logger.info(f"[TaskExec] Calling LLM with tools for task {task_id}")
         
         async with async_session() as db:
             reply = await call_agent_llm_with_tools(
@@ -111,10 +111,14 @@ You are now in TASK EXECUTION MODE (not a conversation). A task has been assigne
                 session_id=str(task_id),
             )
             
-        logger.info(f"[TaskExec] LLM reply: {reply[:80]}")
+        logger.info(f"[TaskExec] LLM reply generated task={task_id} reply_chars={len(reply)}")
     except Exception as e:
         error_msg = str(e) or repr(e)
-        logger.error(f"[TaskExec] Error: {error_msg}")
+        logger.error(
+            "[TaskExec] Execution failed task={} error_type={}",
+            task_id,
+            type(e).__name__,
+        )
         await _log_error(task_id, f"执行出错: {error_msg[:150]}")
         if task_type == 'supervision':
             await _restore_supervision_status(task_id)
@@ -148,7 +152,7 @@ You are now in TASK EXECUTION MODE (not a conversation). A task has been assigne
 
 async def _log_error(task_id: uuid.UUID, message: str) -> None:
     """Add an error log to the task."""
-    logger.error(f"[TaskExec] Error for {task_id}: {message}")
+    logger.error(f"[TaskExec] Error recorded for task {task_id}")
     async with async_session() as db:
         db.add(TaskLog(task_id=task_id, content=f"❌ {message}"))
         await db.commit()

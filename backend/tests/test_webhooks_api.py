@@ -168,3 +168,47 @@ async def test_receive_webhook_fails_closed_without_valid_signature(
 
     assert response.status_code == expected_status
     enqueue.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_webhook_keeps_user_visible_trigger_context_without_token(
+    monkeypatch,
+    client,
+):
+    agent_id = uuid.uuid4()
+    trigger = SimpleNamespace(
+        id=uuid.uuid4(),
+        agent_id=agent_id,
+        name="customer-visible-trigger",
+        type="webhook",
+        config={"token": "private_token", "secret": "webhook-secret"},
+        is_enabled=True,
+    )
+    agent = SimpleNamespace(id=agent_id, webhook_rate_limit=5)
+    session = FakeSession(triggers=[trigger], agent=agent)
+    monkeypatch.setattr(webhooks_api, "async_session", FakeAsyncSessionFactory(session))
+
+    async def fake_record_and_count_hits(_token):
+        return 6
+
+    enqueue = AsyncMock()
+    monkeypatch.setattr(webhooks_api, "_record_and_count_hits", fake_record_and_count_hits)
+    monkeypatch.setattr(webhooks_api, "enqueue_webhook_execution", enqueue)
+
+    async with await client() as ac:
+        response = await ac.post(
+            "/api/webhooks/t/private_token",
+            content=b'{}',
+            headers={"content-type": "application/json"},
+        )
+
+    assert response.status_code == 429
+    audit = session.added[0]
+    assert audit.action == "webhook_rate_limited"
+    assert audit.details == {
+        "trigger_id": str(trigger.id),
+        "trigger_name": "customer-visible-trigger",
+        "limit": 5,
+    }
+    assert "token" not in audit.details
+    enqueue.assert_not_awaited()

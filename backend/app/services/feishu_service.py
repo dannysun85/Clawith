@@ -118,8 +118,12 @@ class FeishuService:
             data = resp.json()
         except Exception as e:
             logger.warning(
-                f"[Feishu] {stage} returned non-JSON response "
-                f"(http_status={resp.status_code}, message_id={message_id}): {e}"
+                "[Feishu] {} returned non-JSON response http_status={} "
+                "message_id_present={} error_type={}",
+                stage,
+                resp.status_code,
+                bool(message_id),
+                type(e).__name__,
             )
             raise RuntimeError(f"Feishu {stage} returned invalid JSON")
 
@@ -129,16 +133,21 @@ class FeishuService:
 
         if resp.status_code >= 400:
             logger.warning(
-                f"[Feishu] {stage} HTTP failure "
-                f"(http_status={resp.status_code}, message_id={message_id}, body={str(data)[:300]})"
+                "[Feishu] {} HTTP failure http_status={} message_id_present={} response_fields={}",
+                stage,
+                resp.status_code,
+                bool(message_id),
+                len(data) if isinstance(data, dict) else 0,
             )
 
         code = data.get("code")
         msg = data.get("msg", "")
         if code is not None and code != 0:
             logger.warning(
-                f"[Feishu] {stage} business failure "
-                f"(message_id={message_id}, code={code}, msg={msg})"
+                "[Feishu] {} business failure message_id_present={} code={}",
+                stage,
+                bool(message_id),
+                code,
             )
             raise FeishuAPIError(
                 stage=stage,
@@ -595,9 +604,11 @@ class FeishuService:
                 )
                 if text_resp.status_code != 200:
                     logger.error(
-                        f"[Feishu] Failed to send text accompany message: "
-                        f"status={text_resp.status_code}, body={text_resp.text}, "
-                        f"receive_id={receive_id}, receive_id_type={receive_id_type}"
+                        "[Feishu] Failed to send text accompany message status={} "
+                        "response_chars={} receive_id_type={}",
+                        text_resp.status_code,
+                        len(text_resp.text),
+                        receive_id_type,
                     )
 
             # Send file message
@@ -609,10 +620,11 @@ class FeishuService:
             )
             if resp.status_code != 200:
                 logger.error(
-                    f"[Feishu] Failed to send file message: "
-                    f"status={resp.status_code}, body={resp.text}, "
-                    f"receive_id={receive_id}, receive_id_type={receive_id_type}, "
-                    f"file_key={file_key}"
+                    "[Feishu] Failed to send file message status={} response_chars={} "
+                    "receive_id_type={}",
+                    resp.status_code,
+                    len(resp.text),
+                    receive_id_type,
                 )
             return resp.json()
 
@@ -830,7 +842,7 @@ class FeishuService:
             # Evict the oldest entry if the cache is at capacity.
             if len(self._lark_clients) >= self._LARK_CLIENT_CACHE_MAX:
                 evicted_key, _ = self._lark_clients.popitem(last=False)
-                logger.debug(f"[Feishu] _lark_clients LRU evict: {evicted_key[:8]}...")
+                logger.debug("[Feishu] _lark_clients LRU evict")
             client = lark.Client.builder().app_id(app_id).app_secret(app_secret).build()
             self._lark_clients[cache_key] = client
         else:
@@ -859,8 +871,9 @@ class FeishuService:
         try:
             resp = await client.cardkit.v1.card.acreate(request)
             logger.info(
-                f"[Feishu CardKit] create_card_entity response: "
-                f"code={resp.code}, msg={resp.msg}"
+                "[Feishu CardKit] create_card_entity response code={} success={}",
+                resp.code,
+                resp.success(),
             )
             if not resp.success():
                 raise RuntimeError(
@@ -924,9 +937,10 @@ class FeishuService:
         try:
             resp = await client.cardkit.v1.card_element.acontent(request)
             logger.info(
-                f"[Feishu CardKit] stream_card_content response: "
-                f"code={resp.code}, msg={resp.msg}, card_id={card_id}, "
-                f"element_id={element_id}, sequence={sequence}"
+                "[Feishu CardKit] stream_card_content response code={} success={} sequence={}",
+                resp.code,
+                resp.success(),
+                sequence,
             )
             if not resp.success():
                 raise RuntimeError(
@@ -965,9 +979,12 @@ class FeishuService:
         try:
             resp = await client.cardkit.v1.card.asettings(request)
             logger.info(
-                f"[Feishu CardKit] set_card_streaming_mode response: "
-                f"code={resp.code}, msg={resp.msg}, card_id={card_id}, "
-                f"streaming_mode={streaming_mode}, sequence={sequence}"
+                "[Feishu CardKit] set_card_streaming_mode response code={} success={} "
+                "streaming_mode={} sequence={}",
+                resp.code,
+                resp.success(),
+                streaming_mode,
+                sequence,
             )
             if not resp.success():
                 raise RuntimeError(
@@ -1010,9 +1027,10 @@ class FeishuService:
         try:
             resp = await client.cardkit.v1.card.aupdate(request)
             logger.info(
-                f"[Feishu CardKit] update_cardkit_card response: "
-                f"code={resp.code}, msg={resp.msg}, card_id={card_id}, "
-                f"sequence={sequence}"
+                "[Feishu CardKit] update_cardkit_card response code={} success={} sequence={}",
+                resp.code,
+                resp.success(),
+                sequence,
             )
             if not resp.success():
                 raise RuntimeError(

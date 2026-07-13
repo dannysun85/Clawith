@@ -102,7 +102,12 @@ class FeishuWSManager:
             try:
                 # The data object carries the raw event body
                 raw_body = getattr(data, "raw_body", None)
-                logger.info(f"[Feishu WS] Received event: {data}")
+                logger.info(
+                    "[Feishu WS] Received event agent={} payload_type={} raw_body_present={}",
+                    agent_id,
+                    type(data).__name__,
+                    bool(raw_body),
+                )
                 if not raw_body:
                     # Some SDK versions pass the dict directly
                     if isinstance(data, dict):
@@ -231,7 +236,7 @@ class FeishuWSManager:
             logger.warning(f"[Feishu WS] Missing app_id or app_secret for {agent_id}, skipping")
             return
 
-        logger.info(f"[Feishu WS] Starting async WS client for agent {agent_id} (App ID: {app_id})")
+        logger.info(f"[Feishu WS] Starting async WS client for agent {agent_id}")
 
         # Stop existing client task if any
         if stop_existing and agent_id in self._tasks:
@@ -312,9 +317,9 @@ class FeishuWSManager:
                     if conn is None:
                         if not _was_disconnected:
                             logger.warning(
-                                f"[Feishu WS] Connection lost for agent {agent_id} "
-                                f"(last conn_id={_last_conn_id}), "
-                                "waiting for SDK auto-reconnect..."
+                                "[Feishu WS] Connection lost for agent {}; "
+                                "waiting for SDK auto-reconnect",
+                                agent_id,
                             )
                             _was_disconnected = True
                     elif hasattr(conn, 'closed') and conn.closed:
@@ -327,14 +332,14 @@ class FeishuWSManager:
                     else:
                         if _was_disconnected:
                             logger.info(
-                                f"[Feishu WS] Connection restored for agent {agent_id} "
-                                f"(new conn_id={curr_conn_id})"
+                                "[Feishu WS] Connection restored for agent {}",
+                                agent_id,
                             )
                             _was_disconnected = False
                         if curr_conn_id != _last_conn_id and curr_conn_id:
                             logger.info(
-                                f"[Feishu WS] Connection ID changed for agent {agent_id}: "
-                                f"{_last_conn_id} → {curr_conn_id}"
+                                "[Feishu WS] Connection identity changed for agent {}",
+                                agent_id,
                             )
                             _last_conn_id = curr_conn_id
                 except asyncio.CancelledError:

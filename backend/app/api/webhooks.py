@@ -59,13 +59,13 @@ async def receive_webhook(token: str, request: Request):
     # We'll check per-agent rate limit after finding the trigger below.
     # For now, apply a generous global ceiling to prevent memory abuse.
     if hit_count >= 60:  # hard ceiling: 60/min regardless of config
-        logger.warning(f"Webhook hard rate limit exceeded for token {token[:8]}...")
+        logger.warning("Webhook hard rate limit exceeded")
         return JSONResponse({"ok": True}, status_code=429)
 
     # Payload size check
     body = await request.body()
     if len(body) > MAX_PAYLOAD_SIZE:
-        logger.warning(f"Webhook payload too large for token {token[:8]}...: {len(body)} bytes")
+        logger.warning(f"Webhook payload too large: {len(body)} bytes")
         return JSONResponse({"ok": True}, status_code=413)
 
     # Look up trigger
@@ -96,6 +96,7 @@ async def receive_webhook(token: str, request: Request):
         agent_rate_limit = (agent_obj.webhook_rate_limit if agent_obj else None) or RATE_LIMIT
 
         # Retrieve all needed scalar fields and expunge from db session to prevent MissingGreenlet errors.
+        target_id = target.id
         target_name = target.name
         target_agent_id = target.agent_id
         target_config = target.config or {}
@@ -105,7 +106,7 @@ async def receive_webhook(token: str, request: Request):
 
         # Re-check hits against agent-specific limit (hits already collected above)
         if hit_count > agent_rate_limit:  # > because current hit is already counted
-            logger.warning(f"Webhook per-agent rate limit ({agent_rate_limit}/min) for token {token[:8]}...")
+            logger.warning(f"Webhook per-agent rate limit exceeded ({agent_rate_limit}/min)")
             # Log audit entry so user can see dropped webhooks
             try:
                 db.add(
@@ -113,9 +114,9 @@ async def receive_webhook(token: str, request: Request):
                         agent_id=target_agent_id,
                         action="webhook_rate_limited",
                         details={
+                            "trigger_id": str(target_id),
                             "trigger_name": target_name,
                             "limit": agent_rate_limit,
-                            "token_prefix": token[:8],
                         },
                     )
                 )
@@ -128,7 +129,7 @@ async def receive_webhook(token: str, request: Request):
         # delivery therefore requires an independent HMAC secret.
         secret = str(target_config.get("secret") or "").strip()
         if not secret:
-            logger.error(f"Blocked legacy unsigned webhook trigger {target_name}")
+            logger.error(f"Blocked legacy unsigned webhook trigger {target_id}")
             return JSONResponse({"ok": False, "error": "webhook signing is not configured"}, status_code=403)
 
         sig_header = (
@@ -137,7 +138,7 @@ async def receive_webhook(token: str, request: Request):
         )
         expected_sig = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(sig_header, expected_sig):
-            logger.warning(f"Webhook signature mismatch for trigger {target_name}")
+            logger.warning(f"Webhook signature mismatch for trigger {target_id}")
             return JSONResponse({"ok": False, "error": "invalid signature"}, status_code=401)
 
         # Parse payload
@@ -163,9 +164,9 @@ async def receive_webhook(token: str, request: Request):
             request_headers={k.lower(): v for k, v in request.headers.items()},
         )
         if not created:
-            logger.info(f"Webhook duplicate ignored for trigger {target_name}")
+            logger.info(f"Webhook duplicate ignored for trigger {target_id}")
             return JSONResponse({"ok": True})
 
-        logger.info(f"Webhook queued for trigger {target_name} (agent {target_agent_id})")
+        logger.info(f"Webhook queued for trigger {target_id} (agent {target_agent_id})")
 
     return JSONResponse({"ok": True})

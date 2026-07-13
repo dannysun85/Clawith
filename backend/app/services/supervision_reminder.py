@@ -120,8 +120,8 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
 
     try:
         invocation = await prepare_agent_llm_invocation(target_agent, action="chat")
-    except QuotaExceeded as exc:
-        logger.warning(f"Supervision reply skipped for agent {target_agent.id}: {exc.message}")
+    except QuotaExceeded:
+        logger.warning(f"Supervision reply skipped for agent {target_agent.id}: quota exceeded")
         return None
     if invocation is None:
         return None
@@ -292,7 +292,11 @@ async def _send_supervision_reminder(task: Task, agent_name: str):
                             participant_id=tgt_part.id if tgt_part else None,
                         ))
                         send_method = f"agent消息+回复({reply[:40]})"
-                        logger.info(f"📋 Target agent {target_agent.name} replied: {reply[:80]}")
+                        logger.info(
+                            "📋 Target agent replied agent={} reply_chars={}",
+                            target_agent.id,
+                            len(reply),
+                        )
                 except Exception as e:
                     logger.warning(f"Target agent reply failed: {e}")
             else:
@@ -357,7 +361,7 @@ async def _send_supervision_reminder(task: Task, agent_name: str):
             db.add(activity)
             await db.commit()
 
-            logger.info(f"📋 Supervision reminder for '{task.title}' -> {target_name}, sent={sent}")
+            logger.info(f"📋 Supervision reminder task={task.id} sent={sent}")
 
     except Exception as e:
         logger.exception(f"Supervision reminder error for task {task.id}: {e}")
@@ -398,7 +402,7 @@ async def _supervision_tick():
                     last_reminded = last_log.created_at if last_log else None
 
                     if _is_reminder_due(task.remind_schedule, last_reminded, now):
-                        logger.info(f"[supervision] FIRING reminder for '{task.title}' -> {task.supervision_target_name}")
+                        logger.info(f"[supervision] FIRING reminder task={task.id}")
                         await write_audit_log(
                             "supervision_fire",
                             {"task_id": str(task.id), "title": task.title, "target": task.supervision_target_name},
@@ -411,7 +415,7 @@ async def _supervision_tick():
 
     except Exception as e:
         logger.exception(f"Supervision tick error: {e}")
-        await write_audit_log("supervision_error", {"error": str(e)[:300]})
+        await write_audit_log("supervision_error", {"error_type": type(e).__name__})
 
 
 async def start_supervision_reminder():

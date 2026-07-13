@@ -25,7 +25,10 @@ async def get_wecom_access_token(corp_id: str, secret: str) -> dict:
                 "expires_in": data.get("expires_in"),
             }
         else:
-            logger.error(f"[WeCom] Failed to get access_token: {data}")
+            logger.error(
+                "[WeCom] Failed to get access_token error_code={}",
+                data.get("errcode", "unknown"),
+            )
             return {"errcode": data.get("errcode"), "errmsg": data.get("errmsg")}
 
 
@@ -80,8 +83,11 @@ async def send_wecom_message(
         data = resp.json()
 
         if data.get("errcode") == 0:
-            logger.info(f"[WeCom] Message sent to {user_id}")
+            logger.info("[WeCom] Message sent")
             return data
         else:
-            logger.error(f"[WeCom] Failed to send message: {data}")
+            logger.error(
+                "[WeCom] Failed to send message error_code={}",
+                data.get("errcode", "unknown"),
+            )
             return data

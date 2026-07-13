@@ -359,7 +359,8 @@ class WebSocketChatHandler:
                 self.ctx_size = self.agent.context_window_size or 100
                 self.user_display_name = (self.user.display_name or "").strip() or "there"
                 logger.info(
-                    f"[WS] Agent: {self.agent_name}, type: {self.agent_type}, model_id: {self.agent.primary_model_id}, ctx: {self.ctx_size}"
+                    f"[WS] Agent={self.agent_id} type={self.agent_type} "
+                    f"model_id={self.agent.primary_model_id} ctx={self.ctx_size}"
                 )
 
                 # Load models
@@ -382,7 +383,7 @@ class WebSocketChatHandler:
         # Connect connection manager
         agent_id_str = str(self.agent_id)
         await manager.connect(agent_id_str, self.websocket, self.conv_id, str(user_id))
-        logger.info(f"[WS] Ready! Agent={self.agent_name}")
+        logger.info(f"[WS] Ready agent={self.agent_id}")
 
         # Send session_id to frontend
         await self.websocket.send_json({"type": "connected", "session_id": self.conv_id})
@@ -500,8 +501,7 @@ class WebSocketChatHandler:
             data = await self._receive_next_message()
 
             # Set a unique trace ID for this specific message processing.
-            trace_id = str(uuid.uuid4())[:12]
-            set_trace_id(trace_id)
+            set_trace_id(uuid.uuid4().hex[:12])
 
             content = data.get("content", "")
             display_content = data.get("display_content", "")
@@ -509,7 +509,13 @@ class WebSocketChatHandler:
             chat_tier = data.get("tier") or self.session_model_tier
             chat_modality = data.get("modality") or self.session_model_modality
             is_onboarding_trigger = data.get("kind") == "onboarding_trigger"
-            logger.info(f"[WS] Received: {content[:50]}" + (" [onboarding]" if is_onboarding_trigger else ""))
+            logger.info(
+                "[WS] Received message content_chars={} display_chars={} file_attached={} kind={}",
+                len(content),
+                len(display_content),
+                bool(file_name),
+                "onboarding_trigger" if is_onboarding_trigger else "chat",
+            )
 
             if not content and not is_onboarding_trigger:
                 continue
@@ -1030,10 +1036,10 @@ class WebSocketChatHandler:
                 assistant_response = (
                     (partial_text + "\n\n*[Generation stopped]*") if partial_text else "*[Generation stopped]*"
                 )
-                logger.info(f"[WS] LLM aborted, partial: {assistant_response[:80]}")
+                logger.info(f"[WS] LLM aborted partial_chars={len(assistant_response)}")
             else:
                 assistant_response = await llm_task
-                logger.info(f"[WS] LLM response: {assistant_response[:80]}")
+                logger.info(f"[WS] LLM response complete chars={len(assistant_response)}")
 
             assistant_response = append_authoritative_artifacts(
                 assistant_response,
@@ -1135,7 +1141,11 @@ class WebSocketChatHandler:
                 "ok": not _pending_approval,
                 "pendingApproval": _pending_approval,
             }
-            logger.info(f"[WS][Workspace] activity: {_done_tool_name} → {_ws_path}")
+            logger.info(
+                "[WS][Workspace] activity path_present={} pending_approval={}",
+                bool(_ws_path),
+                _pending_approval,
+            )
 
     async def _save_completed_tool_call_to_db(self, data: dict):
         """Persist completed tool calls in ChatMessage DB logs."""

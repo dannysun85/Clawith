@@ -2,8 +2,8 @@ apiVersion: v2
 name: clawith
 description: A Helm chart for Clawith application deployment
 type: application
-version: 1.10.11
-appVersion: "1.10.11"
+version: 1.10.12
+appVersion: "1.10.12"
 keywords:
   - clawith
   - agent

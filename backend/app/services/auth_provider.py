@@ -319,7 +319,7 @@ class FeishuAuthProvider(BaseAuthProvider):
                 self.FEISHU_USER_INFO_URL, headers={"Authorization": f"Bearer {access_token}"}
             )
             info_data = info_resp.json().get("data", {})
-            logger.info(f"Feishu user info: {info_data}")
+            logger.info(f"Feishu user info fetched field_count={len(info_data)}")
 
             return ExternalUserInfo(
                 provider_type=self.provider_type,
@@ -389,12 +389,16 @@ class DingTalkAuthProvider(BaseAuthProvider):
             resp_data = resp.json()
             if not isinstance(resp_data, dict):
                 logger.error(
-                    "DingTalk token exchange returned an invalid JSON payload: %r",
-                    resp_data,
+                    "DingTalk token exchange returned invalid payload type={}",
+                    type(resp_data).__name__,
                 )
                 return {}
             if resp.status_code != 200:
-                logger.error(f"DingTalk token exchange failed (HTTP {resp.status_code}): {resp_data}")
+                logger.error(
+                    "DingTalk token exchange failed status={} error_code={}",
+                    resp.status_code,
+                    resp_data.get("code") or resp_data.get("errcode") or "unknown",
+                )
                 return {}
 
             # New DingTalk OAuth2 returns flat JSON with camelCase fields
@@ -410,7 +414,10 @@ class DingTalkAuthProvider(BaseAuthProvider):
             info_resp = await client.get(self.DINGTALK_USER_INFO_URL, headers=headers)
             info_data = info_resp.json()
             if not isinstance(info_data, dict):
-                logger.error("DingTalk user info returned an invalid JSON payload: %r", info_data)
+                logger.error(
+                    "DingTalk user info returned invalid payload type={}",
+                    type(info_data).__name__,
+                )
                 raise Exception("Failed to fetch user info: invalid response payload")
             if info_resp.status_code != 200:
                 # Common error: errCode=403 means Contact.User.Read scope not granted.
@@ -418,14 +425,14 @@ class DingTalkAuthProvider(BaseAuthProvider):
                 # that the app has been authorized by the employee in the login flow.
                 err_msg = info_data.get('message') or info_data.get('errmsg') or str(info_data)
                 logger.error(
-                    f"DingTalk user info fetch failed (HTTP {info_resp.status_code}): {info_data}. "
-                    "This usually means the 'Contact.User.Read' OAuth scope is missing from "
-                    "the authorization URL, or the app lacks the corresponding permission."
+                    "DingTalk user info fetch failed status={} error_code={}",
+                    info_resp.status_code,
+                    info_data.get("code") or info_data.get("errCode") or "unknown",
                 )
                 raise Exception(f"Failed to fetch user info: {err_msg}")
 
             # DingTalk new OAuth2 returns openId, unionId, nick, avatarUrl, mobile, email
-            logger.info(f"DingTalk user info: {info_data}")
+            logger.info(f"DingTalk user info fetched field_count={len(info_data)}")
             return ExternalUserInfo(
                 provider_type=self.provider_type,
                 provider_union_id=info_data.get("unionId"),
@@ -510,7 +517,10 @@ class WeComAuthProvider(BaseAuthProvider):
             token_data = token_resp.json()
             access_token = token_data.get("access_token")
             if not access_token:
-                logger.error(f"[WeCom SSO] gettoken failed: {token_data}")
+                logger.error(
+                    "[WeCom SSO] gettoken failed error_code={}",
+                    token_data.get("errcode", "unknown"),
+                )
                 return {}
 
             # Step 2: Exchange OAuth code for userid + user_ticket
@@ -526,7 +536,10 @@ class WeComAuthProvider(BaseAuthProvider):
             userid = info_data.get("userid") or info_data.get("UserId", "")
             user_ticket = info_data.get("user_ticket", "")
             if not userid:
-                logger.error(f"[WeCom SSO] getuserinfo missing userid: {info_data}")
+                logger.error(
+                    "[WeCom SSO] getuserinfo missing userid error_code={}",
+                    info_data.get("errcode", "unknown"),
+                )
                 return {}
 
             # Step 3a: Fetch sensitive profile fields using user_ticket.
@@ -544,14 +557,17 @@ class WeComAuthProvider(BaseAuthProvider):
                     detail_json = detail_resp.json()
                     if detail_json.get("errcode") == 0:
                         sensitive_data = detail_json
-                        logger.info(f"[WeCom SSO] getuserdetail succeeded for {userid}")
+                        logger.info("[WeCom SSO] getuserdetail succeeded")
                     else:
-                        logger.warning(f"[WeCom SSO] getuserdetail failed: {detail_json}")
+                        logger.warning(
+                            "[WeCom SSO] getuserdetail failed error_code={}",
+                            detail_json.get("errcode", "unknown"),
+                        )
                 except Exception as e:
                     logger.warning(f"[WeCom SSO] getuserdetail error: {e}")
             else:
                 logger.info(
-                    f"[WeCom SSO] No user_ticket for {userid}; "
+                    "[WeCom SSO] No user_ticket; "
                     "sensitive fields (avatar/email/mobile) will be unavailable. "
                     "Ensure the WeCom app has 'snsapi_privateinfo' scope."
                 )
@@ -568,9 +584,12 @@ class WeComAuthProvider(BaseAuthProvider):
                 get_json = get_resp.json()
                 if get_json.get("errcode") == 0:
                     basic_data = get_json
-                    logger.info(f"[WeCom SSO] user/get succeeded for {userid}")
+                    logger.info("[WeCom SSO] user/get succeeded")
                 else:
-                    logger.warning(f"[WeCom SSO] user/get failed: {get_json}")
+                    logger.warning(
+                        "[WeCom SSO] user/get failed error_code={}",
+                        get_json.get("errcode", "unknown"),
+                    )
             except Exception as e:
                 logger.warning(f"[WeCom SSO] user/get error: {e}")
 
@@ -816,7 +835,11 @@ class GoogleAuthProvider(BaseAuthProvider):
             )
             data = resp.json()
             if resp.status_code != 200:
-                logger.error(f"Google token exchange failed (HTTP {resp.status_code}): {data}")
+                logger.error(
+                    "Google token exchange failed status={} error_code={}",
+                    resp.status_code,
+                    data.get("error", "unknown"),
+                )
                 return {}
             return data
 
@@ -879,7 +902,11 @@ class GitHubAuthProvider(BaseAuthProvider):
             )
             data = resp.json()
             if resp.status_code != 200:
-                logger.error(f"GitHub token exchange failed (HTTP {resp.status_code}): {data}")
+                logger.error(
+                    "GitHub token exchange failed status={} error_code={}",
+                    resp.status_code,
+                    data.get("error", "unknown"),
+                )
                 return {}
             return data
 

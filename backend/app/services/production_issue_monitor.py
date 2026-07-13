@@ -244,8 +244,17 @@ def issue_requires_alert(issue: ProductionIssue, threshold: int) -> bool:
     )
 
 
+def _production_issue_alert_log_level(severity: str) -> str:
+    """Keep warning-class incidents out of the platform error log stream."""
+    return "warning" if severity == "warning" else "error"
+
+
 def _production_issue_notification(issue: ProductionIssue, user_id: uuid.UUID) -> Notification:
-    level = "严重" if issue.severity == "critical" else "错误"
+    level = {
+        "critical": "严重",
+        "error": "错误",
+        "warning": "警告",
+    }.get(issue.severity, "错误")
     location = issue.route or issue.operation or issue.category
     return Notification(
         user_id=user_id,
@@ -304,7 +313,16 @@ async def dispatch_production_issue_alerts() -> int:
                 "last_seen_at": issue.last_seen_at.isoformat(),
                 "release_version": issue.release_version,
             }
-            logger.error("[PRODUCTION_ISSUE_ALERT] {}", payload)
+            alert_log = getattr(logger, _production_issue_alert_log_level(issue.severity))
+            alert_log(
+                "[PRODUCTION_ISSUE_ALERT] issue_id={} severity={} category={} "
+                "event_count={} release_version={}",
+                issue.id,
+                issue.severity,
+                issue.category,
+                issue.event_count,
+                issue.release_version,
+            )
             for owner_id in owner_ids:
                 db.add(_production_issue_notification(issue, owner_id))
             if settings.PRODUCTION_ISSUE_ALERT_WEBHOOK_URL:

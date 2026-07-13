@@ -37,6 +37,42 @@ def test_manual_video_check_is_available_to_every_agent_by_default():
     assert "check_video_minimax" in tool_seeder.SYNC_IS_DEFAULT_TOOL_NAMES
 
 
+@pytest.mark.asyncio
+async def test_media_failure_issue_keeps_provider_quota_out_of_error_severity(monkeypatch):
+    captured: list[dict] = []
+
+    async def capture_issue(**kwargs):
+        captured.append(kwargs)
+
+    monkeypatch.setattr(
+        "app.services.production_issue_monitor.record_production_issue",
+        capture_issue,
+    )
+    task = SimpleNamespace(
+        id=uuid.uuid4(),
+        reservation_id=uuid.uuid4(),
+        modality="video",
+        tenant_id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        provider="minimax",
+        model="MiniMax-Hailuo-2.3",
+        provider_task_id="provider-task",
+        attempt_count=1,
+        consecutive_error_count=1,
+    )
+
+    await media_generation._record_media_failure_issue(
+        task,
+        "MiniMax API error (2056): resource limit",
+    )
+    await media_generation._record_media_failure_issue(task, "provider socket closed")
+
+    assert captured[0]["error_code"] == "2056"
+    assert captured[0]["severity"] == "warning"
+    assert captured[1]["severity"] == "error"
+
+
 def test_legacy_backfill_claims_reserved_tasks_without_cross_worker_races():
     statement = media_generation._legacy_reserved_video_reservations_query()
     sql = str(statement.compile(dialect=postgresql.dialect()))

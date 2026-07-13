@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import logging
 import smtplib
 import ssl
 import uuid
@@ -20,9 +19,9 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formataddr, make_msgid
 
-from app.core.email import force_ipv4, send_smtp_email
+from loguru import logger
 
-logger = logging.getLogger(__name__)
+from app.core.email import force_ipv4, send_smtp_email
 
 
 @dataclass(slots=True)
@@ -95,7 +94,7 @@ async def send_system_email(to: str, subject: str, body: str, db=None) -> None:
     config = await resolve_email_config_async()
 
     if not config:
-        logger.warning(f"System email not configured, skipped sending to {to}")
+        logger.warning("System email not configured, skipped one delivery")
         return
 
     await asyncio.to_thread(_send_email_with_config_sync, config, to, subject, body)
@@ -180,7 +179,7 @@ async def deliver_broadcast_emails(recipients: Iterable[BroadcastEmailRecipient]
         try:
             await send_system_email(recipient.email, recipient.subject, recipient.body)
         except Exception as exc:
-            logger.warning("Failed to deliver broadcast email to %s: %s", recipient.email, exc)
+            logger.warning("Failed to deliver one broadcast email: {}", exc)
 
 
 # ── Email Templates ──────────────────────────────────────────────────────────

@@ -208,7 +208,7 @@ async def collect_all_focus_updates(
                         f"  - {agent.name} / {kr.title}: {prev_value} → {value} ({kr.status})"
                     )
 
-            except Exception as exc:
+            except Exception:
                 logger.exception(f"[OKRScheduler] Failed to process focus.md for agent {agent.id}")
                 error_count += 1
 
@@ -408,7 +408,10 @@ async def _safe_write_report(okr_agent_id: uuid.UUID, filename: str, content: st
             content_type="text/markdown; charset=utf-8",
         )
     except Exception as exc:
-        logger.warning(f"[OKRScheduler] Could not write report file {filename}: {exc}")
+        logger.warning(
+            "[OKRScheduler] Could not write report file error_type={}",
+            type(exc).__name__,
+        )
 
 
 async def generate_daily_report(

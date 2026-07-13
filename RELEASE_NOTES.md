@@ -1,3 +1,23 @@
+# v1.10.12 — Privacy-Safe Production Diagnostics
+
+## Bug Fixes
+
+- Audited production runtime paths no longer include chat prompts, assistant response previews, tool arguments/results, channel message text, OAuth/provider response bodies, credential prefixes, external sender/message identifiers, or user-controlled file paths in operational logs. Diagnostics use server-generated Trace IDs plus code-owned operation/type, status/error code, content length, and aggregate counts.
+- Central exception formatting no longer renders exception values or diagnostic local variables. It retains the exception type and a bounded function/line trace shape for investigation without exposing customer or credential data. Standard-library records retain only safe diagnostic shape (`source`, `level`, message length, argument shape, bounded HTTP status, and exception type), while a source-level contract rejects direct logging of sensitive values in application and startup-seeder paths.
+- HTTP request contexts always use a server-generated 12-hex Trace ID; successful and handled-error responses expose it through `X-Trace-Id`. Client-supplied `X-Trace-Id` content is ignored so correlation headers cannot inject customer or credential data into operational logs.
+- The same privacy contract now covers WebSocket chat, LLM/tool execution, Heartbeat and scheduled work, AgentBay control, OAuth, and Feishu, DingTalk, WeCom, Teams, Slack, and Discord channel paths.
+- MiniMax `2056` media-plan exhaustion remains a recorded production issue and still isolates only the affected modality, but it is logged as an expected provider-capacity warning rather than a platform `ERROR`. Unknown, authentication, transport, persistence, and code failures remain errors.
+
+## Credits and Routing Evidence
+
+- A production Lite video request reached MiniMax and was rejected with provider code `2056`. Its 280-Credit reservation was released, no video consumption transaction was created, the tenant retained `reserved=0`, and only the successful six-Credit text turn was charged.
+- The shared MiniMax credential remained globally `healthy`; only its `video` modality circuit was marked `quota_exceeded`. Text and unrelated media routing were not disabled, and this release does not introduce tenant-level or model-object-level authorization.
+
+## Validation
+
+- New source-level privacy contracts reject known payload/preview logging patterns, and unit tests verify that diagnostic shape summaries cannot contain values or mapping keys.
+- Local release gates passed with 650 backend tests, 57 frontend tests, a production frontend build, and the complete PostgreSQL migration/rollback/re-upgrade smoke covering Credits settlement, production issue aggregation, and preference/queue concurrency contracts. Production cutover and post-release observation remain separate gates.
+
 # v1.10.11 — Verified Public Blue/Green Cutover
 
 ## Release Safety

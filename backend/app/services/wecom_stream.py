@@ -16,6 +16,9 @@ from app.models.channel_config import ChannelConfig
 from app.services.channel_issue_reporting import record_channel_issue
 
 
+WECOM_PROCESSING_ERROR_MESSAGE = "Processing error. Please retry."
+
+
 class _WeComIssueLogger:
     """Translate SDK-only errors into bounded, privacy-safe production issues."""
 
@@ -133,7 +136,7 @@ class WeComStreamManager:
             logger.warning(f"[WeCom Stream] Missing bot_id or bot_secret for {agent_id}, skipping")
             return
 
-        logger.info(f"[WeCom Stream] Starting client for agent {agent_id} (BotID: {bot_id[:12]}...)")
+        logger.info(f"[WeCom Stream] Starting client for agent {agent_id}")
 
         # Stop existing client if any
         if stop_existing:
@@ -186,8 +189,9 @@ class WeComStreamManager:
                     sender_id = _extract_wecom_sender_id(body)
                     if not sender_id:
                         logger.warning(
-                            f"[WeCom Stream] Missing sender id in text payload for agent {agent_id}: "
-                            f"body_keys={list(body.keys())}"
+                            "[WeCom Stream] Missing sender id in text payload for agent {} field_count={}",
+                            agent_id,
+                            len(body),
                         )
                         stream_id = generate_req_id("stream")
                         await client.reply_stream(
@@ -202,11 +206,13 @@ class WeComStreamManager:
                     chat_id = _extract_wecom_chat_id(body)
                     is_group_msg = chat_type in {"group", "groupchat", "group_chat"} and bool(chat_id)
 
-                    # Debug: log full body to understand the data structure
                     logger.info(
-                        f"[WeCom Stream] Text from {sender_id}, "
-                        f"chat_type={chat_type}, is_group={is_group_msg}, chat_id={chat_id or 'N/A'}, "
-                        f"body_keys={list(body.keys())}: {user_text[:80]}"
+                        "[WeCom Stream] Text received agent={} is_group={} "
+                        "content_chars={} event_fields={}",
+                        agent_id,
+                        bool(is_group_msg),
+                        len(user_text),
+                        len(body),
                     )
 
                     # Process message and get reply
@@ -221,10 +227,17 @@ class WeComStreamManager:
                     # Reply via streaming
                     stream_id = generate_req_id("stream")
                     await client.reply_stream(frame, stream_id, reply_text, finish=True)
-                    logger.info(f"[WeCom Stream] Replied to {sender_id}: {reply_text[:80]}")
+                    logger.info(
+                        "[WeCom Stream] Reply sent agent={} reply_chars={}",
+                        agent_id,
+                        len(reply_text),
+                    )
 
                 except Exception as e:
-                    logger.error(f"[WeCom Stream] Error handling text message: {e}")
+                    logger.error(
+                        "[WeCom Stream] Error handling text message error_type={}",
+                        type(e).__name__,
+                    )
                     from app.services.channel_issue_reporting import record_channel_issue
 
                     await record_channel_issue(
@@ -233,13 +246,11 @@ class WeComStreamManager:
                         agent_id=agent_id,
                         error_code=type(e).__name__,
                     )
-                    import traceback
-                    traceback.print_exc()
                     try:
                         stream_id = generate_req_id("stream")
                         await client.reply_stream(
                             frame, stream_id,
-                            f"Processing error: {str(e)[:100]}",
+                            WECOM_PROCESSING_ERROR_MESSAGE,
                             finish=True,
                         )
                     except Exception:
@@ -248,9 +259,7 @@ class WeComStreamManager:
             # ── Message handler: image ──
             async def on_image(frame):
                 try:
-                    body = frame.body or {}
-                    sender_id = _extract_wecom_sender_id(body)
-                    logger.info(f"[WeCom Stream] Image message from {sender_id} (not yet handled)")
+                    logger.info(f"[WeCom Stream] Image message received for agent {agent_id} (not yet handled)")
                     stream_id = generate_req_id("stream")
                     await client.reply_stream(
                         frame, stream_id,
@@ -271,9 +280,7 @@ class WeComStreamManager:
             # ── Message handler: file ──
             async def on_file(frame):
                 try:
-                    body = frame.body or {}
-                    sender_id = _extract_wecom_sender_id(body)
-                    logger.info(f"[WeCom Stream] File message from {sender_id} (not yet handled)")
+                    logger.info(f"[WeCom Stream] File message received for agent {agent_id} (not yet handled)")
                     stream_id = generate_req_id("stream")
                     await client.reply_stream(
                         frame, stream_id,
@@ -382,8 +389,6 @@ class WeComStreamManager:
                 error_code=type(e).__name__,
                 severity="critical",
             )
-            import traceback
-            traceback.print_exc()
         finally:
             self._connected.pop(agent_id, None)
             self._clients.pop(agent_id, None)
@@ -524,7 +529,11 @@ async def _process_wecom_stream_message(
         history=history, user_id=platform_user_id,
         session_id=session_conv_id,
     )
-    logger.info(f"[WeCom Stream] LLM reply: {reply_text[:100]}")
+    logger.info(
+        "[WeCom Stream] LLM reply generated agent={} reply_chars={}",
+        agent_id,
+        len(reply_text),
+    )
 
     # ── Phase 3: Save assistant reply (new short transaction) ──
     async with async_session() as _save_db:

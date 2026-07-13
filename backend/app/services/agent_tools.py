@@ -268,7 +268,7 @@ async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Opt
     # Check cache first
     cached = _get_cached_tool_config(agent_id, tool_name)
     if cached is not None:
-        logger.debug(f"[ToolConfig] Cache hit for {tool_name}, agent_id={agent_id}: {cached}")
+        logger.debug(f"[ToolConfig] Cache hit for {tool_name}, agent_id={agent_id}")
         return cached
 
     from app.models.tool import Tool, AgentTool
@@ -2520,8 +2520,8 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                 # return HTTP 400 "Tool names must be unique".
                 if t.name in db_tool_names:
                     logger.warning(
-                        f"[Tools] Duplicate tool name '{t.name}' found in DB "
-                        f"(id={t.id}). Skipping to avoid LLM error. "
+                        f"[Tools] Duplicate tool name found in DB (id={t.id}). "
+                        "Skipping to avoid LLM error. "
                         "Run: DELETE FROM tools WHERE id IN (SELECT id FROM "
                         "(SELECT id, ROW_NUMBER() OVER (PARTITION BY name "
                         "ORDER BY created_at DESC) AS rn FROM tools) t WHERE rn > 1);"
@@ -2533,8 +2533,8 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
 
             if default_included_names:
                 logger.info(
-                    f"[Tools] agent={agent_id} included via default fallback (no AgentTool record): "
-                    f"{sorted(default_included_names)}"
+                    f"[Tools] agent={agent_id} included via default fallback "
+                    f"count={len(default_included_names)}"
                 )
 
             if result:
@@ -2548,7 +2548,7 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                         always_added.append(fn_name)
                 if always_added:
                     logger.debug(
-                        f"[Tools] agent={agent_id} added from _always_tools: {always_added}"
+                        f"[Tools] agent={agent_id} added from _always_tools count={len(always_added)}"
                     )
                 result = _append_douyin_tools(
                     result,
@@ -2562,13 +2562,11 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                 if not _a2a_async:
                     result = _strip_a2a_msg_type(result)
                 # Final diagnostic: log the complete tool list and assignment stats
-                final_names = sorted(t["function"]["name"] for t in result)
                 logger.info(
                     f"[Tools] agent={agent_id} FINAL {len(result)} tools "
                     f"(assignments={len(assignments)}, "
                     f"disabled={len(explicitly_disabled_names)}, "
-                    f"default_fallback={len(default_included_names)}): "
-                    f"{final_names}"
+                    f"default_fallback={len(default_included_names)})"
                 )
                 return result
             # If DB loading fails, do not expose the full hardcoded tool catalog: that
@@ -3076,7 +3074,11 @@ async def _execute_tool_direct(
                 session_id=None,
             )
         elif tool_name in ("execute_code", "execute_code_e2b"):
-            logger.info(f"[DirectTool] Executing code ({tool_name}) with arguments: {arguments}")
+            logger.info(
+                "[DirectTool] Executing code ({}) argument_count={}",
+                tool_name,
+                len(arguments),
+            )
             return await _run_with_temp_workspace(
                 agent_id,
                 _agent_tenant_id,
@@ -3562,7 +3564,11 @@ async def execute_tool(
                     "状态：等待人工审批；审批前不会回复评论。"
                 )
         elif tool_name in ("execute_code", "execute_code_e2b"):
-            logger.info(f"[DirectTool] Executing code ({tool_name}) with arguments: {arguments}")
+            logger.info(
+                "[DirectTool] Executing code ({}) argument_count={}",
+                tool_name,
+                len(arguments),
+            )
             result = await _run_with_temp_workspace(
                 agent_id,
                 _agent_tenant_id,
@@ -6526,7 +6532,11 @@ async def _send_feishu_message(agent_id: uuid.UUID, args: dict) -> str:
                         return f"✅ 消息已发送（user_id: {direct_user_id}）"
                     return f"❌ 发送失败：{resp.get('msg')} (code {resp.get('code')})"
                 except FeishuAPIError as user_id_err:
-                    logger.info(f"❌ 发送失败(user_id): {user_id_err.msg}")
+                    logger.info(
+                        "[Feishu] Send failed via direct user_id http_status={} error_code={}",
+                        user_id_err.http_status,
+                        user_id_err.code,
+                    )
                     return f"❌ 飞书发送失败：{user_id_err.user_message}"
 
             # Find the relationship member by name
@@ -6545,12 +6555,16 @@ async def _send_feishu_message(agent_id: uuid.UUID, args: dict) -> str:
                     break
 
             if not target_member:
-                logger.info(f"❌ {member_name} has no Feishu user_id in relationship")   
+                logger.info("[Feishu] Relationship target not found")
                 return f"❌ {member_name} 不是我的关系"
                 
-            logger.info(f"target_member={target_member.external_id}, {target_member.open_id}, {target_member.email}, {target_member.phone}")
+            logger.info(
+                "[Feishu] Relationship target resolved external_id_present={} open_id_present={}",
+                bool(target_member.external_id),
+                bool(target_member.open_id),
+            )
             if not target_member.external_id:
-                logger.error(f"❌ {member_name} has no linked Feishu user_id")
+                logger.error(f"[Feishu] Relationship {target_member.id} has no linked user_id")
                 return f"❌ {member_name} 没有关联可用的飞书 user_id"
 
             content = json.dumps({"text": message_text}, ensure_ascii=False)
@@ -6598,7 +6612,7 @@ async def _send_feishu_message(agent_id: uuid.UUID, args: dict) -> str:
                     ))
                     sess.last_message_at = _dt.now(_tz.utc)
                     await db.commit()
-                    logger.info(f"[Feishu] Saved outgoing message to session {sess.id} (user_id: {feishu_user_id})")
+                    logger.info(f"[Feishu] Saved outgoing message to session {sess.id}")
                 except Exception as e:
                     logger.error(f"[Feishu] Failed to save outgoing message to history: {e}")
 
@@ -6607,10 +6621,18 @@ async def _send_feishu_message(agent_id: uuid.UUID, args: dict) -> str:
                 if resp.get("code") == 0:
                     await _save_outgoing_to_feishu_session(target_member.external_id)
                     return f"✅ Successfully sent message to {member_name}"
-                logger.info(f"❌ Failed to send message to {target_member.external_id} via Feishu (user_id): {resp}")
+                logger.info(
+                    "[Feishu] Send failed via user_id error_code={}",
+                    resp.get("code") if isinstance(resp, dict) else "unknown",
+                )
                 return f"发送失败: {resp.get('msg')} (code {resp.get('code')})"
             except FeishuAPIError as user_id_err:
-                logger.info(f"❌ Failed to send message to {target_member.external_id} via Feishu (user_id): {user_id_err}")
+                logger.info(
+                    "[Feishu] Send failed via relationship={} http_status={} error_code={}",
+                    target_member.id,
+                    user_id_err.http_status,
+                    user_id_err.code,
+                )
                 return f"❌ 飞书发送失败：{user_id_err.user_message}"
     except Exception as e:
         return f"❌ Message send error: {str(e)[:200]}"
@@ -6681,7 +6703,10 @@ async def _send_channel_message(agent_id: uuid.UUID, args: dict) -> str:
             else:
                 if len(rows) > 1:
                     available = [_normalize_provider_type(p.provider_type) for _, _, p in rows if p]
-                    logger.warning(f"[ChannelMessage] Ambiguous member '{member_name}' found in multiple channels: {available}")
+                    logger.warning(
+                        "[ChannelMessage] Ambiguous member lookup channel_count={}",
+                        len(available),
+                    )
                     # Pick the first one as before, but mention others if possible
                 
                 rel, member, provider = rows[0]
@@ -6705,8 +6730,8 @@ async def _send_channel_message(agent_id: uuid.UUID, args: dict) -> str:
                             or member_name
                         )
                         logger.info(
-                            "[ChannelMessage] %s is a platform user; rerouting send_channel_message -> send_platform_message",
-                            member_name,
+                            "[ChannelMessage] Platform relationship {} rerouted to send_platform_message",
+                            target_member.id,
                         )
                         return await _send_platform_message(
                             agent_id,
@@ -6726,7 +6751,11 @@ async def _send_channel_message(agent_id: uuid.UUID, args: dict) -> str:
                         "If they are a platform user, use send_platform_message instead."
                     )
 
-            logger.info(f"[ChannelMessage] Sending to {member_name} via {provider_type}")
+            logger.info(
+                "[ChannelMessage] Sending via {} relationship={}",
+                provider_type,
+                target_member.id,
+            )
 
             # 3. Route to appropriate channel
             if provider_type == "feishu":
@@ -6781,7 +6810,7 @@ async def _send_dingtalk_message(
                 if not user_id:
                     return f"❌ {member_name} has no DingTalk user_id"
 
-            logger.info(f"[DingTalk] Sending to user_id: {user_id}")
+            logger.info(f"[DingTalk] Sending via relationship={target_member.id}")
 
             # Get agent_id from extra_config (required for DingTalk API)
             agent_id_dingtalk = config.extra_config.get("agent_id") if config.extra_config else None
@@ -6837,7 +6866,10 @@ async def _send_dingtalk_message(
                 return f"✅ Message sent to {member_name} via DingTalk"
             else:
                 errmsg = result.get("errmsg", "Unknown error")
-                logger.error(f"[DingTalk] Send failed: {result}")
+                logger.error(
+                    "[DingTalk] Send failed error_code={}",
+                    result.get("errcode") if isinstance(result, dict) else "unknown",
+                )
                 return f"❌ DingTalk send failed: {errmsg}"
 
     except Exception as e:
@@ -6876,7 +6908,7 @@ async def _send_wecom_message(
                 if not user_id:
                     return f"❌ {member_name} has no WeCom user_id"
 
-            logger.info(f"[WeCom] Sending to user_id: {user_id}")
+            logger.info(f"[WeCom] Sending via relationship={target_member.id}")
 
             # 3. Send message via WeCom service
             result = await send_wecom_message(
@@ -6927,7 +6959,10 @@ async def _send_wecom_message(
                 return f"✅ Message sent to {member_name} via WeCom"
             else:
                 errmsg = result.get("errmsg", "Unknown error")
-                logger.error(f"[WeCom] Send failed: {result}")
+                logger.error(
+                    "[WeCom] Send failed error_code={}",
+                    result.get("errcode") if isinstance(result, dict) else "unknown",
+                )
                 return f"❌ WeCom send failed: {errmsg}"
 
     except Exception as e:
@@ -7458,10 +7493,9 @@ async def _send_file_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
         # This ensures the target agent sees the file delivery in its
         # conversation context when send_message_to_agent is called next.
         logger.info(
-            "[A2A-File] Injecting file delivery message: from=%s to=%s file=%s",
-            source_name,
-            target_name,
-            delivered_name,
+            "[A2A-File] Injecting file delivery message from_agent={} to_agent={}",
+            from_agent_id,
+            target_id,
         )
         try:
             from app.models.audit import ChatMessage
@@ -7521,9 +7555,9 @@ async def _send_file_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
                 chat_session.last_message_at = ts
                 await db2.commit()
                 logger.info(
-                    "[A2A-File] Injected file delivery message into session %s for %s",
+                    "[A2A-File] Injected file delivery message into session {} for agent {}",
                     chat_session.id,
-                    target_name,
+                    target_id,
                 )
         except Exception as e:
             logger.error(f"[A2A-File] FAILED to inject file delivery message: {e}")
@@ -7738,11 +7772,11 @@ async def _cleanup_failed_delegate(
                 trigger.is_enabled = False
                 await db.commit()
     except Exception as exc:
-        logger.warning(f"[A2A] Failed to disable callback {trigger_name}: {exc}")
+        logger.warning(f"[A2A] Failed to disable callback for agent {agent_id}: {exc}")
     try:
         await complete_focus_item(agent_id, key=focus_ref)
     except Exception as exc:
-        logger.warning(f"[A2A] Failed to close focus {focus_ref}: {exc}")
+        logger.warning(f"[A2A] Failed to close focus for agent {agent_id}: {exc}")
 
 
 async def _wake_agent_async(
@@ -8060,7 +8094,7 @@ async def _a2a_handle_notify(ctx: A2AContext) -> str:
                 source_message_id=ctx.source_message_id,
             )
         except Exception as e:
-            logger.exception(f"[A2A] Failed to queue notify for {ctx.target_agent.name}: {e}")
+            logger.exception(f"[A2A] Failed to queue notify for {ctx.target_agent.id}: {e}")
             return f"❌ Notification delivery failed ({type(e).__name__}): {str(e)[:200]}"
         if not accepted:
             return f"❌ Notification to {ctx.target_agent.name} could not be queued. Please retry."
@@ -8132,7 +8166,7 @@ async def _a2a_handle_task_delegate(ctx: A2AContext) -> str:
                 source_message_id=ctx.source_message_id,
             )
         except Exception as e:
-            logger.exception(f"[A2A] Failed to queue delegate for {ctx.target_agent.name}: {e}")
+            logger.exception(f"[A2A] Failed to queue delegate for {ctx.target_agent.id}: {e}")
             await _cleanup_failed_delegate(ctx.source_agent.id, trigger_name, focus_id)
             return f"❌ Task delivery failed ({type(e).__name__}): {str(e)[:200]}"
         if not accepted:
@@ -8918,7 +8952,7 @@ async def _handle_set_trigger(
             system=False,
         )
     except Exception as e:
-        logger.warning(f"[Trigger] Failed to ensure Focus item for trigger {name}: {e}")
+        logger.warning(f"[Trigger] Failed to ensure Focus item for agent {agent_id}: {e}")
         focus_ref = focus_ref or name
 
     # Validate type-specific config
@@ -9866,7 +9900,7 @@ async def _record_minimax_tool_product_issue(
     """Capture a failed media operation without storing prompt or response data."""
 
     from app.core.logging_config import get_trace_id
-    from app.services.llm.failover import extract_minimax_code
+    from app.services.llm.failover import MINIMAX_QUOTA_CODES, extract_minimax_code
     from app.services.production_issue_monitor import record_production_issue
 
     try:
@@ -9876,6 +9910,11 @@ async def _record_minimax_tool_product_issue(
     resolved_error_code = error_code or (
         extract_minimax_code(str(error)) if error is not None else None
     ) or (type(error).__name__ if error is not None else "media_operation_failed")
+    effective_severity = (
+        "warning"
+        if severity == "error" and resolved_error_code in MINIMAX_QUOTA_CODES
+        else severity
+    )
     await record_production_issue(
         source="minimax_media_tool",
         category=category,
@@ -9884,7 +9923,7 @@ async def _record_minimax_tool_product_issue(
             if category == "credential"
             else "Media generation operation failed before a usable asset was delivered"
         ),
-        severity=severity,
+        severity=effective_severity,
         error_code=resolved_error_code,
         operation=modality,
         tenant_id=tenant_id,
@@ -9898,6 +9937,28 @@ async def _record_minimax_tool_product_issue(
             "saas_tier": tier,
             "error_type": type(error).__name__ if error is not None else None,
         },
+    )
+
+
+def _minimax_operation_log_level(error: Exception) -> str:
+    """Return the operational log level for a MiniMax media failure."""
+    from app.services.llm.failover import MINIMAX_QUOTA_CODES, extract_minimax_code
+
+    error_code = extract_minimax_code(str(error)) or "unknown"
+    return "warning" if error_code in MINIMAX_QUOTA_CODES else "error"
+
+
+def _log_minimax_operation_failure(component: str, error: Exception) -> None:
+    """Keep expected provider-capacity limits out of the platform-error stream."""
+    from app.services.llm.failover import extract_minimax_code
+
+    error_code = extract_minimax_code(str(error)) or "unknown"
+    log = getattr(logger, _minimax_operation_log_level(error))
+    log(
+        "[{}] operation failed error_type={} error_code={}",
+        component,
+        type(error).__name__,
+        error_code,
     )
 
 
@@ -10134,7 +10195,6 @@ async def _generate_speech_minimax(
                 credits=credit_cost,
             )
     except Exception as exc:
-        from app.services.llm.failover import extract_minimax_code
         from app.services.quota_guard import QuotaExceeded
         if isinstance(exc, QuotaExceeded):
             return f"⚠️ {exc.message}"
@@ -10147,11 +10207,7 @@ async def _generate_speech_minimax(
             tier=tier,
             user_id=user_id,
         )
-        logger.error(
-            "[MiniMaxSpeech] operation failed error_type={} error_code={}",
-            type(exc).__name__,
-            extract_minimax_code(str(exc)) or "unknown",
-        )
+        _log_minimax_operation_failure("MiniMaxSpeech", exc)
         return f"❌ Speech generation failed (minimax): {str(exc)[:400]}"
 
     size_kb = len(audio_bytes) / 1024
@@ -10234,7 +10290,6 @@ async def _generate_music_minimax(
                 credits=credit_cost,
             )
     except Exception as exc:
-        from app.services.llm.failover import extract_minimax_code
         from app.services.quota_guard import QuotaExceeded
         if isinstance(exc, QuotaExceeded):
             return f"⚠️ {exc.message}"
@@ -10247,11 +10302,7 @@ async def _generate_music_minimax(
             tier=tier,
             user_id=user_id,
         )
-        logger.error(
-            "[MiniMaxMusic] operation failed error_type={} error_code={}",
-            type(exc).__name__,
-            extract_minimax_code(str(exc)) or "unknown",
-        )
+        _log_minimax_operation_failure("MiniMaxMusic", exc)
         return f"❌ Music generation failed (minimax): {str(exc)[:400]}"
 
     size_kb = len(audio_bytes) / 1024
@@ -10567,10 +10618,7 @@ async def _generate_video_minimax(
                 tier=tier,
                 user_id=user_id,
             )
-        logger.error(
-            "[MiniMaxVideo] operation failed error_type={}",
-            type(exc).__name__,
-        )
+        _log_minimax_operation_failure("MiniMaxVideo", exc)
         return f"❌ Video generation failed (minimax): {str(exc)[:400]}"
 
     if downloaded_path:
@@ -10699,10 +10747,7 @@ async def _check_video_minimax(agent_id: uuid.UUID, ws: Path, arguments: dict) -
             model=(str(metadata.get("model") or "") or None) if "metadata" in locals() else None,
             tier=(str(metadata.get("tier") or "") or None) if "metadata" in locals() else None,
         )
-        logger.error(
-            "[MiniMaxVideoCheck] operation failed error_type={}",
-            type(exc).__name__,
-        )
+        _log_minimax_operation_failure("MiniMaxVideoCheck", exc)
         return f"❌ MiniMax video check failed: {str(exc)[:400]}"
 
 
@@ -12341,9 +12386,12 @@ async def _feishu_doc_create(agent_id: uuid.UUID, arguments: dict) -> str:
             if parent_node_token:
                 body["parent_node_token"] = parent_node_token
 
-            import logging
-            _wiki_log = logging.getLogger("feishu_wiki_create")
-            _wiki_log.info(f"Creating wiki node in space={wiki_space_id}, body={body}")
+            logger.info(
+                "[Feishu Wiki] Creating node space_present={} parent_present={} title_chars={}",
+                bool(wiki_space_id),
+                bool(parent_node_token),
+                len(title),
+            )
 
             async with httpx.AsyncClient(timeout=15) as client:
                 resp = await client.post(
@@ -12352,7 +12400,11 @@ async def _feishu_doc_create(agent_id: uuid.UUID, arguments: dict) -> str:
                     headers={"Authorization": f"Bearer {tenant_token}"},
                 )
             result = resp.json()
-            _wiki_log.info(f"Wiki create response: code={result.get('code')}, msg={result.get('msg')}")
+            logger.info(
+                "[Feishu Wiki] Create response code={} success={}",
+                result.get("code", "unknown"),
+                result.get("code") == 0,
+            )
             err = _check_feishu_err(result)
             if err:
                 return err
@@ -13105,7 +13157,7 @@ async def _feishu_calendar_create(agent_id: uuid.UUID, arguments: dict) -> str:
     if user_email:
         organizer_open_id = await _feishu_resolve_open_id(token, user_email)
         if not organizer_open_id:
-            logger.warning(f"[Feishu Calendar] Could not resolve open_id for '{user_email}', continuing without organizer invite")
+            logger.warning("[Feishu Calendar] Could not resolve organizer, continuing without invite")
 
     try:
         agent_cal_id, cal_err = await _get_agent_calendar_id(token)
@@ -13165,7 +13217,10 @@ async def _feishu_calendar_create(agent_id: uuid.UUID, arguments: dict) -> str:
                 attendee_open_ids.append(_oid)
                 attendee_display.append(aname)
         else:
-            logger.warning(f"[Calendar] Could not resolve attendee '{aname}': {_sr[:100]}")
+            logger.warning(
+                "[Calendar] Could not resolve attendee search_result_chars={}",
+                len(_sr),
+            )
 
     # 3. From explicit attendee_emails
     attendee_emails: list[str] = list(arguments.get("attendee_emails") or [])
@@ -13653,7 +13708,7 @@ def _agentbay_save_image_to_workspace(
     screenshot_path = ws / rel_path
     screenshot_path.parent.mkdir(parents=True, exist_ok=True)
     screenshot_path.write_bytes(raw_bytes)
-    logger.info(f"[AgentBay] Explicit screenshot saved to workspace: {rel_path}")
+    logger.info(f"[AgentBay] Explicit screenshot saved agent={agent_id} bytes={len(raw_bytes)}")
     return (
         f"Screenshot saved to `{rel_path}`.\n"
         f"![{label}](/api/agents/{agent_id}/files/download?path={rel_path})"
@@ -13687,7 +13742,11 @@ async def _agentbay_browser_navigate(agent_id: Optional[uuid.UUID], ws: Path, ar
         if result.get("content"):
             content = result["content"][:3000]
             parts.append(f"内容:\n{content}")
-        logger.info(f"[AgentBay] Browser navigate result: {result.get('title')}")
+        logger.info(
+            "[AgentBay] Browser navigate complete title_chars={} content_chars={}",
+            len(result.get("title") or ""),
+            len(result.get("content") or ""),
+        )
 
         screenshot_data = result.get("screenshot")
         if screenshot_data:
@@ -13701,7 +13760,7 @@ async def _agentbay_browser_navigate(agent_id: Optional[uuid.UUID], ws: Path, ar
                     f"Internal screenshot captured for analysis. [ImageID: {img_id}]\n"
                     f"NOTE: This screenshot is for LLM vision only and is not saved to the user's workspace."
                 )
-                logger.info(f"[AgentBay] Browser navigate screenshot stored in memory (id={img_id})")
+                logger.info("[AgentBay] Browser navigate screenshot stored in memory")
 
         return "\n\n".join(parts)
 
@@ -13743,7 +13802,7 @@ async def _agentbay_browser_screenshot(agent_id: Optional[uuid.UUID], ws: Path, 
         # Store in memory only — vision_inject.py will consume it for LLM vision
         from app.services.vision_inject import store_temp_screenshot
         img_id = store_temp_screenshot(raw_bytes)
-        logger.info(f"[AgentBay] Browser screenshot stored in memory (id={img_id})")
+        logger.info("[AgentBay] Browser screenshot stored in memory")
         return (
             f"Internal screenshot captured for analysis. [ImageID: {img_id}]\n"
             f"NOTE: This screenshot is for LLM vision only and is not saved to the user's workspace."
@@ -14567,7 +14626,7 @@ async def _agentbay_computer_screenshot(agent_id: Optional[uuid.UUID], ws: Path,
                 "pixel_scale": crop_scale,
             }
         img_id = store_temp_screenshot(analysis_bytes, grid_options=grid_options)
-        logger.info(f"[AgentBay] Desktop screenshot stored in memory (id={img_id})")
+        logger.info("[AgentBay] Desktop screenshot stored in memory")
         screen_width, screen_height, screen_note = await _agentbay_get_screen_metadata(client)
         image_width, image_height = _agentbay_image_dimensions(raw_bytes)
         coordinate_note = _agentbay_desktop_coordinate_note(
@@ -16600,7 +16659,7 @@ async def _vercel_deploy(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
             # 1. Ensure project exists
             project_res = await client.get(f"https://api.vercel.com/v9/projects/{project_name}", headers=headers)
             if project_res.status_code == 200:
-                logger.info(f"Vercel project '{project_name}' exists.")
+                logger.info("Vercel project exists")
             else:
                 payload = {"name": project_name}
                 if framework:
@@ -16616,9 +16675,13 @@ async def _vercel_deploy(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
             }
             patch_res = await client.patch(f"https://api.vercel.com/v9/projects/{project_name}", headers=headers, json=patch_payload)
             if patch_res.status_code == 200:
-                logger.info(f"Successfully disabled deployment protection for project '{project_name}'")
+                logger.info("Successfully disabled deployment protection")
             else:
-                logger.warning(f"Failed to disable deployment protection: {patch_res.text}")
+                logger.warning(
+                    "Failed to disable deployment protection status={} response_chars={}",
+                    patch_res.status_code,
+                    len(patch_res.text),
+                )
                 
             dep_id = None
             dep_url = None
@@ -16634,7 +16697,11 @@ async def _vercel_deploy(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
                 }
                 link_res = await client.post(f"https://api.vercel.com/v9/projects/{project_name}/link", headers=headers, json=link_payload)
                 if link_res.status_code not in (200, 201, 409):
-                    logger.warning(f"Repo linking returned status {link_res.status_code}: {link_res.text}")
+                    logger.warning(
+                        "Repo linking failed status={} response_chars={}",
+                        link_res.status_code,
+                        len(link_res.text),
+                    )
                 
                 # Trigger a git deployment
                 deploy_payload = {
@@ -16669,7 +16736,10 @@ async def _vercel_deploy(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
                         try:
                             file_bytes = file_path.read_bytes()
                         except Exception as e:
-                            logger.warning(f"Could not read file {file_path}: {e}")
+                            logger.warning(
+                                "Could not read deployment file error_type={}",
+                                type(e).__name__,
+                            )
                             continue
                             
                         sha1 = hashlib.sha1(file_bytes).hexdigest()
@@ -16683,7 +16753,11 @@ async def _vercel_deploy(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
                         }
                         upload_res = await client.post("https://api.vercel.com/v2/files", headers=file_headers, content=file_bytes)
                         if upload_res.status_code not in (200, 201):
-                            logger.error(f"Failed to upload file {rel_path}: {upload_res.text}")
+                            logger.error(
+                                "Failed to upload deployment file status={} response_chars={}",
+                                upload_res.status_code,
+                                len(upload_res.text),
+                            )
                             
                         files_payload.append({
                             "file": str(rel_path),
@@ -16919,7 +16993,11 @@ async def _vercel_manage_domain(agent_id: uuid.UUID, arguments: dict) -> str:
                 if avail_res.status_code == 200:
                     available = avail_res.json().get("available", False)
                 else:
-                    logger.warning(f"Failed to check domain availability: {avail_res.text}")
+                    logger.warning(
+                        "Failed to check domain availability status={} response_chars={}",
+                        avail_res.status_code,
+                        len(avail_res.text),
+                    )
                     
                 # Check pricing
                 price = 0
@@ -16927,7 +17005,11 @@ async def _vercel_manage_domain(agent_id: uuid.UUID, arguments: dict) -> str:
                 if price_res.status_code == 200:
                     price = price_res.json().get("price", 0)
                 else:
-                    logger.warning(f"Failed to check domain price: {price_res.text}")
+                    logger.warning(
+                        "Failed to check domain price status={} response_chars={}",
+                        price_res.status_code,
+                        len(price_res.text),
+                    )
                     
                 avail_str = "Yes" if available else "No"
                 return (

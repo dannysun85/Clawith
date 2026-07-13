@@ -68,7 +68,7 @@ class AgentBayClient:
 
         self._session = result.session
         self._browser_initialized = False
-        logger.info(f"[AgentBay] Created session with image {image_id}")
+        logger.info("[AgentBay] Created session")
         return AgentBaySession(
             session_id=self._session.session_id,
             image=image,
@@ -133,7 +133,7 @@ class AgentBayClient:
                 timeout=40.0,
             )
         except asyncio.TimeoutError:
-            logger.warning(f"[AgentBay] navigate to {url!r} timed out after 40 s")
+            logger.warning("[AgentBay] navigate timed out after 40 s")
             raise RuntimeError(
                 f"Navigation to '{url}' timed out (>40 s). "
                 "The browser may be busy or the page is unreachable. "
@@ -542,9 +542,9 @@ class AgentBayClient:
         try:
             result = await asyncio.to_thread(self._session.get_link)
             if result.success and result.data:
-                logger.info(f"[AgentBay] Got live URL: {str(result.data)[:80]}...")
+                logger.info("[AgentBay] Got live URL")
                 return result.data
-            logger.warning(f"[AgentBay] get_link() failed: {result.error_message}")
+            logger.warning("[AgentBay] get_link() failed")
             return None
         except Exception as e:
             logger.warning(f"[AgentBay] Failed to get live URL: {e}")
@@ -815,7 +815,7 @@ async def get_agentbay_client_for_agent(agent_id: uuid.UUID, image_type: str, se
             return client
         else:
             # Session expired, close and remove
-            logger.info(f"[AgentBay] Session expired for {image_type} (session={session_id[:8]}), closing")
+            logger.info(f"[AgentBay] Session expired for {image_type}; closing")
             await client.close_session()
             del _agentbay_sessions[cache_key]
 
@@ -851,7 +851,7 @@ async def get_agentbay_client_for_agent(agent_id: uuid.UUID, image_type: str, se
         # Read OS preference from tool config (default: windows)
         os_type = (tool_config or {}).get("os_type", "windows")
         computer_image = "windows_latest" if os_type == "windows" else "linux_latest"
-        logger.info(f"[AgentBay] Creating computer session with OS: {os_type} (image: {computer_image}) for session={session_id[:8]}")
+        logger.info(f"[AgentBay] Creating computer session OS={os_type} image={computer_image}")
         await client.create_session(computer_image)
     else:
         await client.create_session("code_latest")
@@ -870,7 +870,7 @@ async def cleanup_agentbay_sessions():
     for cache_key in expired:
         client, _ = _agentbay_sessions.pop(cache_key)
         agent_id, session_id, image_type = cache_key
-        logger.info(f"[AgentBay] Cleaning up expired {image_type} session for agent {agent_id} (session={session_id[:8]})")
+        logger.info(f"[AgentBay] Cleaning up expired {image_type} session for agent {agent_id}")
         await client.close_session()
 
 
@@ -999,7 +999,10 @@ const { chromium } = require('/usr/local/lib/node_modules/playwright');
             f"echo '{script_b64}' | /usr/bin/base64 -d > tc_inject_cookies.js",
         )
         write_ok = getattr(write_result, 'success', False)
-        logger.info(f"[AgentBay] Cookie inject script write: success={write_ok}")
+        logger.info(
+            "[AgentBay] Cookie inject script write success={}",
+            bool(write_ok),
+        )
 
         # Execute the injection script
         exec_result = await asyncio.to_thread(
@@ -1011,7 +1014,7 @@ const { chromium } = require('/usr/local/lib/node_modules/playwright');
         stderr = getattr(exec_result, 'stderr', '') or ''
 
         if "INJECT_OK" in stdout:
-            logger.info(f"[AgentBay] Cookie injection successful for agent {agent_id}: {stdout.strip()[:100]}")
+            logger.info(f"[AgentBay] Cookie injection successful for agent {agent_id}")
             # Update last_injected_at for all injected credentials
             try:
                 from datetime import timezone as tz
@@ -1024,6 +1027,10 @@ const { chromium } = require('/usr/local/lib/node_modules/playwright');
             except Exception as e:
                 logger.warning(f"[AgentBay] Failed to update last_injected_at: {e}")
         else:
-            logger.warning(f"[AgentBay] Cookie injection may have failed: stdout={stdout[:200]}, stderr={stderr[:200]}")
+            logger.warning(
+                "[AgentBay] Cookie injection may have failed stdout_chars={} stderr_chars={}",
+                len(stdout),
+                len(stderr),
+            )
     except Exception as e:
         logger.warning(f"[AgentBay] Cookie injection error: {e}")

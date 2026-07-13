@@ -65,7 +65,7 @@ def extract_text(file_bytes: bytes, filename: str) -> str | None:
         elif ext == ".pptx":
             return _extract_pptx(file_bytes)
     except Exception as e:
-        logger.error(f"[TextExtractor] Failed to extract from {filename}: {e}")
+        logger.error(f"[TextExtractor] Failed to extract type={ext or 'unknown'}: {e}")
         return None
     
     return None
@@ -83,7 +83,7 @@ def save_extracted_text(save_path: Path, file_bytes: bytes, filename: str) -> Pa
 
     md_path = save_path.parent / f"{save_path.stem}.md"
     md_path.write_text(text, encoding="utf-8")
-    logger.info(f"[TextExtractor] Extracted {len(text)} chars from {filename} -> {md_path.name}")
+    logger.info(f"[TextExtractor] Extracted {len(text)} chars type={Path(filename).suffix.lower() or 'unknown'}")
     return md_path
 
 

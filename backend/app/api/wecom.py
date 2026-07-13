@@ -141,9 +141,7 @@ async def serve_wecom_verify_file(
         verify_files: dict = config.get("wecom_verify_files", {})
         if filename in verify_files:
             content = verify_files[filename]
-            logger.info(
-                f"[WeCom Verify] Serving {filename} for tenant {provider.tenant_id}"
-            )
+            logger.info(f"[WeCom Verify] Serving verification file for tenant {provider.tenant_id}")
             return Response(content=content, media_type="text/plain")
 
     return Response(status_code=404)
@@ -337,7 +335,7 @@ async def wecom_verify_webhook(
     # Verify signature
     expected_sig = _verify_signature(token, timestamp, nonce, echostr)
     if expected_sig != msg_signature:
-        logger.warning(f"[WeCom] Signature mismatch: expected={expected_sig}, got={msg_signature}")
+        logger.warning("[WeCom] Signature mismatch")
         return Response(status_code=403)
 
     # Decrypt echostr and return plaintext
@@ -421,7 +419,12 @@ async def wecom_event_webhook(
         if len(_processed_wecom_events) > 1000:
             _processed_wecom_events.clear()
 
-    logger.info(f"[WeCom] Message type={msg_type}, from={from_user}, msg_id={msg_id}, chat_id={chat_id or 'N/A'}")
+    logger.info(
+        "[WeCom] Message received type={} group={} message_id_present={}",
+        msg_type,
+        bool(chat_id),
+        bool(msg_id),
+    )
 
     if msg_type == "text":
         user_text = msg_root.findtext("Content", "").strip()
@@ -483,11 +486,18 @@ async def _process_wecom_kf_event(agent_id: uuid.UUID, config_obj: ChannelConfig
                 else:
                     payload["cursor"] = current_cursor
 
-                logger.info(f"[WeCom KF] Calling sync_msg with payload: {payload}")
+                logger.info(
+                    "[WeCom KF] Calling sync_msg field_count={} cursor_present={}",
+                    len(payload),
+                    bool(current_cursor),
+                )
                 sync_resp = await client.post(f"https://qyapi.weixin.qq.com/cgi-bin/kf/sync_msg?access_token={access_token}", json=payload)
                 sync_data = sync_resp.json()
                 if sync_data.get("errcode") != 0:
-                    logger.error(f"[WeCom KF] sync_msg error: {sync_data}")
+                    logger.error(
+                        "[WeCom KF] sync_msg error code={}",
+                        sync_data.get("errcode", "unknown"),
+                    )
                     break
 
                 has_more = sync_data.get("has_more", 0)
@@ -503,7 +513,7 @@ async def _process_wecom_kf_event(agent_id: uuid.UUID, config_obj: ChannelConfig
                         _processed_kf_msgids.add(mid)
                         text = msg.get("text", {}).get("content", "").strip()
                         if text:
-                            logger.info(f"[WeCom KF] Found msg from {msg.get('external_userid')}: {text[:20]}...")
+                            logger.info(f"[WeCom KF] Found text message chars={len(text)}")
                             # _process_wecom_text manages its own sessions internally
                             await _process_wecom_text(
                                 agent_id, config,
@@ -610,7 +620,11 @@ async def _process_wecom_text(
             history=history, user_id=platform_user_id,
             session_id=session_conv_id,
         )
-        logger.info(f"[WeCom] LLM reply: {reply_text[:100]}")
+        logger.info(
+            "[WeCom] LLM reply generated agent={} reply_chars={}",
+            agent_id,
+            len(reply_text),
+        )
 
         # Send reply via WeCom API
         wecom_agent_id = (config.extra_config or {}).get("wecom_agent_id", "")
@@ -628,12 +642,12 @@ async def _process_wecom_text(
                             f"https://qyapi.weixin.qq.com/cgi-bin/kf/service_state/trans?access_token={access_token}", 
                             json={"open_kfid": open_kfid, "external_userid": from_user, "service_state": 1}
                         )
-                        logger.info(f"[WeCom KF] trans state result: {res_state.json()}")
+                        logger.info(f"[WeCom KF] Transition response status={res_state.status_code}")
                         res_send = await client.post(
                             f"https://qyapi.weixin.qq.com/cgi-bin/kf/send_msg?access_token={access_token}", 
                             json={"touser": from_user, "open_kfid": open_kfid, "msgtype": "text", "text": {"content": reply_text}}
                         )
-                        logger.info(f"[WeCom KF] send_msg result: {res_send.json()}")
+                        logger.info(f"[WeCom KF] Send response status={res_send.status_code}")
                     else:
                         # Default legacy Send as text
                         await client.post(
@@ -761,6 +775,9 @@ async def wecom_callback(
                     </body></html>"""
                 )
         except Exception as e:
-            logger.exception("Failed to update SSO session (wecom) %s", e)
+            logger.exception(
+                "Failed to update SSO session (wecom) error_type={}",
+                type(e).__name__,
+            )
 
     return HTMLResponse(f"Logged in. Token: {token}")

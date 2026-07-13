@@ -98,7 +98,10 @@ async def _handle_google_sso_callback(
         token_data = await auth_provider.exchange_code_for_token(code)
         access_token = token_data.get("access_token")
         if not access_token:
-            logger.error(f"Google Workspace token exchange failed: {token_data}")
+            logger.error(
+                "Google Workspace token exchange failed error_code={}",
+                token_data.get("error", "unknown"),
+            )
             return HTMLResponse("Auth failed: Token exchange error")
 
         user_info = await auth_provider.get_user_info(access_token)
@@ -132,7 +135,10 @@ async def _handle_google_sso_callback(
                     </body></html>"""
                 )
         except Exception as e:
-            logger.exception("Failed to update SSO session (google_workspace) %s", e)
+            logger.exception(
+                "Failed to update SSO session (google_workspace) error_type={}",
+                type(e).__name__,
+            )
 
     return HTMLResponse(f"Logged in. Token: {token}")
 

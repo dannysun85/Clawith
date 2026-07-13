@@ -54,10 +54,13 @@ class DingTalkTokenManager:
 
                     if token:
                         self._cache[app_key] = (token, time.time() + expires_in)
-                        logger.debug(f"[DingTalk Token] Refreshed for {app_key[:8]}..., expires in {expires_in}s")
+                        logger.debug(f"[DingTalk Token] Refreshed, expires in {expires_in}s")
                         return token
 
-                    logger.error(f"[DingTalk Token] Failed to get token: {data}")
+                    logger.error(
+                        "[DingTalk Token] Failed to get token error_code={}",
+                        data.get("errcode") or data.get("code") or "unknown",
+                    )
                     return None
             except Exception as e:
                 logger.error(f"[DingTalk Token] Error getting token: {e}")

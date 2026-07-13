@@ -15,7 +15,7 @@ from datetime import datetime, timezone, timedelta
 from loguru import logger
 
 from app.config import get_settings
-from app.core.logging_config import new_trace_id
+from app.core.logging_config import new_trace_id, privacy_safe_shape
 from sqlalchemy import select, update, or_
 from app.services.storage import agent_storage_key, get_storage_backend
 from app.services.quota_guard import QuotaExceeded
@@ -326,7 +326,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                     from app.services.llm.caller import _get_agent_config
                     _, _token_limit_msg = await _get_agent_config(agent_id)
                     if _token_limit_msg:
-                        logger.warning(f"[Heartbeat] Token limit exceeded mid-loop: {_token_limit_msg}")
+                        logger.warning(f"[Heartbeat] Token limit exceeded mid-loop agent={agent_id}")
                         reply = _token_limit_msg
                         break
 
@@ -391,11 +391,20 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                     fn = tc["function"]
                     tool_name = fn["name"]
                     raw_args = fn.get("arguments", "{}")
-                    logger.info(f"[Heartbeat] Raw arguments for {tool_name} (len={len(raw_args) if raw_args else 0}): {repr(raw_args[:300]) if raw_args else 'None'}")
+                    logger.info(
+                        "[Heartbeat] Tool call {} argument_shape={}",
+                        tool_name,
+                        privacy_safe_shape(raw_args),
+                    )
                     try:
                         args = parse_tool_arguments(raw_args)
                     except json.JSONDecodeError as je:
-                        logger.warning(f"[Heartbeat] JSON parse failed for {tool_name}: {je}. Raw: {repr(raw_args[:200])}")
+                        logger.warning(
+                            "[Heartbeat] JSON parse failed for {} error_type={} argument_shape={}",
+                            tool_name,
+                            type(je).__name__,
+                            privacy_safe_shape(raw_args),
+                        )
                         args = {}
 
                     # Guard: if a tool that requires arguments received empty args,
@@ -446,10 +455,15 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                 detail={"reply": reply[:500]},
             )
 
-        logger.info(f"💓 Heartbeat for {agent_name}: {'OK' if is_ok else reply[:60]}")
+        logger.info(
+            "💓 Heartbeat completed agent={} success={} reply_chars={}",
+            agent_id,
+            is_ok,
+            len(reply),
+        )
 
-    except QuotaExceeded as e:
-        logger.warning(f"Heartbeat skipped for agent {agent_id}: {e.message}")
+    except QuotaExceeded:
+        logger.warning(f"Heartbeat skipped for agent {agent_id}: quota exceeded")
     except Exception as e:
         logger.exception(f"Heartbeat error for agent {agent_id}: {e}")
     finally:
@@ -558,11 +572,11 @@ async def _heartbeat_tick():
                 await db.commit()
 
                 # Fire heartbeat only after the DB claim has been committed.
-                logger.info(f"💓 Triggering heartbeat for {agent.name}")
+                logger.info(f"💓 Triggering heartbeat for {agent.id}")
                 try:
                     await write_audit_log("heartbeat_fire", {"agent_name": agent.name}, agent_id=agent.id)
                 except Exception as e:
-                    logger.warning(f"Failed to write heartbeat_fire audit log for {agent.name}: {e}")
+                    logger.warning(f"Failed to write heartbeat_fire audit log for {agent.id}: {e}")
                 asyncio.create_task(_execute_heartbeat(agent.id))
                 triggered += 1
 
@@ -576,7 +590,7 @@ async def _heartbeat_tick():
 
     except Exception as e:
         logger.exception(f"Heartbeat tick error: {e}")
-        await write_audit_log("heartbeat_error", {"error": str(e)[:300]})
+        await write_audit_log("heartbeat_error", {"error_type": type(e).__name__})
 
 
 async def start_heartbeat():
@@ -610,7 +624,7 @@ async def _notify_oneshot_error(
                 sender_name=agent_name,
             ))
             await db.commit()
-        logger.info(f"[Oneshot] Notified user {triggered_by_user_id} about {agent_name} failure")
+        logger.info(f"[Oneshot] Failure notification created agent={agent_id} user={triggered_by_user_id}")
     except Exception as e:
         logger.warning(f"[Oneshot] Failed to create error notification: {e}")
 
@@ -711,7 +725,7 @@ async def run_agent_oneshot(
             )
         except Exception as e:
             msg = f"Failed to initialise the LLM client: {e}"
-            logger.error(f"[Oneshot] Failed to create LLM client for {agent_name}: {e}")
+            logger.error(f"[Oneshot] Failed to create LLM client for {agent_id}: {e}")
             await _notify_oneshot_error(triggered_by_user_id, agent_id, agent_name, msg)
             return ""
 
@@ -738,7 +752,7 @@ async def run_agent_oneshot(
                     from app.services.llm.caller import _get_agent_config
                     _, _token_limit_msg = await _get_agent_config(agent_id)
                     if _token_limit_msg:
-                        logger.warning(f"[Oneshot] Token limit exceeded mid-loop: {_token_limit_msg}")
+                        logger.warning(f"[Oneshot] Token limit exceeded mid-loop agent={agent_id}")
                         reply = _token_limit_msg
                         break
 
@@ -805,7 +819,12 @@ async def run_agent_oneshot(
                     except json.JSONDecodeError:
                         args = {}
 
-                    logger.info(f"[Oneshot:{agent_name}] Tool call: {tool_name}({list(args.keys())})")
+                    logger.info(
+                        "[Oneshot] Tool call agent={} tool={} argument_count={}",
+                        agent_id,
+                        tool_name,
+                        len(args),
+                    )
                     tool_result = await execute_tool(tool_name, args, agent_id, agent_creator_id)
 
                     llm_messages.append(LLMMessage(
@@ -853,11 +872,14 @@ async def run_agent_oneshot(
             except Exception as e:
                 logger.warning(f"[Oneshot] Failed to clear error notifications: {e}")
 
-        logger.info(f"[Oneshot] {agent_name} completed ({round_i + 1} rounds, {accumulated_usage.total_tokens} tokens)")
+        logger.info(
+            f"[Oneshot] Agent {agent_id} completed "
+            f"({round_i + 1} rounds, {accumulated_usage.total_tokens} tokens)"
+        )
         return reply
 
     except QuotaExceeded as e:
-        logger.warning(f"[Oneshot] Skipped agent {agent_id}: {e.message}")
+        logger.warning(f"[Oneshot] Skipped agent {agent_id}: quota exceeded")
         await _notify_oneshot_error(triggered_by_user_id, agent_id, str(agent_id), e.message)
         return ""
     except Exception as e:

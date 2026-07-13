@@ -258,11 +258,11 @@ async def lifespan(app: FastAPI):
                         _new_dir = _data_dir / f"enterprise_info_{_tenant.id}"
                         if not _new_dir.exists():
                             shutil.copytree(str(_old_dir), str(_new_dir))
-                            print(f"[startup] ✅ Migrated enterprise_info → enterprise_info_{_tenant.id}", flush=True)
+                            logger.info(f"[startup] ✅ Migrated enterprise_info for tenant {_tenant.id}")
                         else:
-                            print(f"[startup] ℹ️ enterprise_info_{_tenant.id} already exists, skipping migration", flush=True)
+                            logger.info(f"[startup] ℹ️ enterprise_info exists for tenant {_tenant.id}; skipping migration")
         except Exception as e:
-            print(f"[startup] ⚠️ enterprise_info migration failed: {e}", flush=True)
+            logger.warning(f"[startup] ⚠️ enterprise_info migration failed: {e}")
 
         try:
             from app.services.tool_seeder import seed_builtin_tools, clean_orphaned_mcp_tools
@@ -352,9 +352,6 @@ async def lifespan(app: FastAPI):
                     ),
                     name=f"capture-crash-{t.get_name()}",
                 )
-                import traceback
-                traceback.print_tb(exc.__traceback__)
-
         task_specs = []
         if _role_enabled("all", "worker"):
             task_specs.append(("trigger_daemon", start_trigger_daemon()))
@@ -379,8 +376,6 @@ async def lifespan(app: FastAPI):
         logger.info("[startup] all background tasks created!")
     except Exception as e:
         logger.error(f"[startup] Background tasks failed: {e}")
-        import traceback
-        traceback.print_exc()
 
     # Start ss-local SOCKS5 proxy for Discord API calls (non-fatal)
     ss_task = asyncio.create_task(_start_ss_local(), name="ss-local-proxy")

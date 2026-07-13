@@ -9,6 +9,7 @@ from app.services.wecom_stream import (
     _extract_wecom_chat_type,
     _extract_wecom_sender_id,
     _WeComIssueLogger,
+    WECOM_PROCESSING_ERROR_MESSAGE,
     WeComStreamManager,
 )
 from app.services import wecom_stream
@@ -46,6 +47,13 @@ def test_extract_wecom_context_from_nested_legacy_shape():
 
 def test_build_wecom_conv_id_falls_back_to_sender_for_missing_group_chat_id():
     assert _build_wecom_conv_id("wangwu", "", "group") == "wecom_p2p_wangwu"
+
+
+def test_wecom_processing_error_response_is_provider_and_customer_safe():
+    provider_secret = "provider said secret=must-not-survive"
+
+    assert WECOM_PROCESSING_ERROR_MESSAGE == "Processing error. Please retry."
+    assert provider_secret not in WECOM_PROCESSING_ERROR_MESSAGE
 
 
 def test_status_uses_connection_state_not_task_liveness():

@@ -80,7 +80,7 @@ async def _get_feishu_bot_open_id(config: ChannelConfig) -> str | None:
 
         tenant_token = await feishu_service.get_tenant_access_token(app_id, app_secret)
         if not tenant_token:
-            logger.warning(f"[Feishu] Cannot resolve bot identity for app_id={app_id}: no tenant token")
+            logger.warning("[Feishu] Cannot resolve bot identity: no tenant token")
             return None
         async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.get(
@@ -90,14 +90,15 @@ async def _get_feishu_bot_open_id(config: ChannelConfig) -> str | None:
         data = response.json()
         if response.status_code >= 400 or data.get("code", 0) != 0:
             logger.warning(
-                f"[Feishu] Cannot resolve bot identity for app_id={app_id}: "
-                f"HTTP {response.status_code}, code={data.get('code')}, msg={data.get('msg', '')}"
+                "[Feishu] Cannot resolve bot identity http_status={} error_code={}",
+                response.status_code,
+                data.get("code", "unknown"),
             )
             return None
         bot = data.get("bot") or (data.get("data") or {}).get("bot") or {}
         bot_open_id = bot.get("open_id") if isinstance(bot, dict) else None
         if not isinstance(bot_open_id, str) or not bot_open_id:
-            logger.warning(f"[Feishu] Bot identity response has no open_id for app_id={app_id}")
+            logger.warning("[Feishu] Bot identity response has no open_id")
             return None
         _feishu_bot_identity_cache[app_id] = (
             now + _FEISHU_BOT_IDENTITY_TTL_SECONDS,
@@ -105,7 +106,10 @@ async def _get_feishu_bot_open_id(config: ChannelConfig) -> str | None:
         )
         return bot_open_id
     except Exception as exc:
-        logger.warning(f"[Feishu] Bot identity lookup failed for app_id={app_id}: {exc}")
+        logger.warning(
+            "[Feishu] Bot identity lookup failed error_type={}",
+            type(exc).__name__,
+        )
         return None
 
 
@@ -439,7 +443,10 @@ async def feishu_oauth_callback(
                     </body></html>"""
                 )
         except Exception as e:
-            logger.exception("Failed to update SSO session (feishu) %s", e)
+            logger.exception(
+                "Failed to update SSO session (feishu) error_type={}",
+                type(e).__name__,
+            )
 
     return TokenResponse(access_token=token, user=UserOut.model_validate(user))
 
@@ -631,7 +638,12 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
         chat_type = message.get("chat_type", "p2p")  # p2p or group
         chat_id = message.get("chat_id", "")
 
-        logger.info(f"[Feishu] Received {msg_type} message, chat_type={chat_type}, open_id={sender_open_id!r}, user_id_from_event={sender_user_id_from_event!r}")
+        logger.info(
+            "[Feishu] Received {} message chat_type={} sender_resolved={}",
+            msg_type,
+            chat_type,
+            bool(sender_open_id or sender_user_id_from_event),
+        )
 
         # Group messages are gated before parsing files, downloading images,
         # resolving users, loading history, or spending LLM Credits. Existing
@@ -692,12 +704,12 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
                             _img_bytes,
                             content_type="image/jpeg",
                         )
-                        logger.info(f"[Feishu] Saved post image to {_workspace_path} ({len(_img_bytes)} bytes)")
+                        logger.info(f"[Feishu] Saved post image bytes={len(_img_bytes)}")
                         # Embed as base64 marker for vision models
                         _b64_data = _b64.b64encode(_img_bytes).decode("ascii")
                         _image_markers.append(f"[image_data:data:image/jpeg;base64,{_b64_data}]")
-                    except Exception as _dl_err:
-                        logger.error(f"[Feishu] Failed to download post image {_ik}: {_dl_err}")
+                    except Exception:
+                        logger.exception("[Feishu] Failed to download post image")
             # Build final text with embedded images
             if not _extracted_text and _image_markers:
                 _extracted_text = "[用户发送了图片，请看图片内容]"
@@ -707,7 +719,11 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
             # Rewrite as text message so existing handler processes it
             message["content"] = _json_post.dumps({"text": _final_content})
             msg_type = "text"
-            logger.info(f"[Feishu] Normalized post → text='{_extracted_text[:100]}', images={len(_image_markers)}")
+            logger.info(
+                "[Feishu] Normalized post text_chars={} images={}",
+                len(_extracted_text),
+                len(_image_markers),
+            )
 
         if msg_type in ("file", "image"):
             import asyncio as _asyncio
@@ -801,7 +817,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
                             headers={"Authorization": f"Bearer {_app_token}"},
                         )
                         _user_data = _user_resp.json()
-                        logger.info(f"[Feishu] Sender resolve: code={_user_data.get('code')}, msg={_user_data.get('msg', '')}")
+                        logger.info(f"[Feishu] Sender resolve code={_user_data.get('code')}")
                         if _user_data.get("code") == 0:
                             _user_info = _user_data.get("data", {}).get("user", {})
                             sender_name = _user_info.get("name", "")
@@ -829,7 +845,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
                                 "unionid": _user_info.get("union_id"),
                                 "open_id": sender_open_id,
                             }
-                            logger.info(f"[Feishu] Resolved sender: {sender_name} (user_id={sender_user_id_feishu})")
+                            logger.info("[Feishu] Sender resolved")
                             # Cache sender info so feishu_user_search can find them by name
                             if sender_name and sender_open_id:
                                 try:
@@ -958,7 +974,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
                         f"如果用户的指令涉及这篇文章、这个文件、这份文档等，"
                         f"请立即调用 read_document(path=\"{_ws_rel_path}\") 读取内容，不要先用 list_files 验证，直接读取即可。]"
                     )
-                    logger.info(f"[Feishu] Injected recent file hint: {_ws_rel_path}")
+                    logger.info("[Feishu] Injected recent file hint")
             except Exception as _fe:
                 logger.error(f"[Feishu] File injection error: {_fe}")
 
@@ -1052,7 +1068,11 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
                             stage=stage,
                         )
                     except Exception as e:
-                        logger.warning(f"[Feishu] Patch failed (stage={stage}, message_id={_patch_msg_id}): {e}")
+                        logger.warning(
+                            "[Feishu] Patch failed stage={} error_type={}",
+                            stage,
+                            type(e).__name__,
+                        )
 
                 _patch_queue.enqueue(_job)
 
@@ -1179,7 +1199,11 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
                         pass
                 _cfs.reset(_cfs_token)
                 _cfso.reset(_cfso_token)
-            logger.info(f"[Feishu] LLM reply: {reply_text[:100]}")
+            logger.info(
+                "[Feishu] LLM reply generated agent={} reply_chars={}",
+                agent_id,
+                len(reply_text),
+            )
 
             # If task creation detected, create a real Task record
             if task_match:
@@ -1210,7 +1234,10 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
                             _task_id = str(task_obj.id)
                         _asyncio.create_task(execute_task(_task_id, agent_id))
                         reply_text += f"\n\n📋 已同步创建任务到任务面板：【{task_title}】"
-                        logger.info(f"[Feishu] Created task: {task_title}")
+                        logger.info(
+                            "[Feishu] Created task title_chars={}",
+                            len(task_title),
+                        )
                     except Exception as e:
                         logger.error(f"[Feishu] Failed to create task: {e}")
                         reply_text += f"\n\n⚠️ 任务已识别，但写入任务面板失败：{str(e)[:150]}"
@@ -1364,7 +1391,7 @@ async def _handle_feishu_file(
             file_bytes,
             content_type="image/jpeg" if msg_type == "image" else None,
         )
-        logger.info(f"[Feishu] Saved {msg_type} to {workspace_path} ({len(file_bytes)} bytes)")
+        logger.info(f"[Feishu] Saved {msg_type} upload bytes={len(file_bytes)}")
     except Exception as e:
         logger.error(f"[Feishu] Failed to download {msg_type}: {e}")
         if isinstance(e, FeishuResourceTooLargeError):
@@ -1567,7 +1594,11 @@ async def _handle_feishu_file(
                         stage=_stage,
                     )
                 except Exception as _e_patch:
-                    logger.warning(f"[Feishu] Image patch failed (stage={_stage}, message_id={_patch_msg_id}): {_e_patch}")
+                    logger.warning(
+                        "[Feishu] Image patch failed stage={} error_type={}",
+                        _stage,
+                        type(_e_patch).__name__,
+                    )
 
             _img_patch_queue.enqueue(_job)
 
@@ -1627,7 +1658,11 @@ async def _handle_feishu_file(
                 except Exception:
                     pass
 
-        logger.info(f"[Feishu] Image LLM reply: {reply_text[:100]}")
+        logger.info(
+            "[Feishu] Image LLM reply generated agent={} reply_chars={}",
+            agent_id,
+            len(reply_text),
+        )
 
         # Send final card or fallback text
         if _patch_msg_id:
@@ -1703,9 +1738,9 @@ async def _download_post_images(agent_id, config, message_id, image_keys):
                 file_bytes,
                 content_type="image/jpeg",
             )
-            logger.info(f"[Feishu] Saved post image to {workspace_path} ({len(file_bytes)} bytes)")
+            logger.info(f"[Feishu] Saved post image bytes={len(file_bytes)}")
         except Exception as e:
-                logger.error(f"[Feishu] Failed to download post image {ik}: {e}")
+                logger.error(f"[Feishu] Failed to download post image: {e}")
 
 
 async def _load_agent_and_model(
@@ -1834,15 +1869,12 @@ async def _call_llm_with_config(
                 )
                 return f"⚠️ Model response timed out (>{int(_fb_timeout)}s). Please retry or shorten your request."
             except Exception as e2:
-                import traceback
-                traceback.print_exc()
+                logger.error(f"[LLM] Fallback model failed error_type={type(e2).__name__}: {e2}")
                 return f"⚠️ Model error: Primary Timeout | Fallback: {str(e2)[:80]}"
         return f"⚠️ Model response timed out (>{int(_timeout)}s). Please retry or shorten your request."
     except Exception as e:
-        import traceback
-        traceback.print_exc()
         error_msg = str(e) or repr(e)
-        logger.error(f"[LLM] Primary model error: {error_msg}")
+        logger.error(f"[LLM] Primary model error error_type={type(e).__name__}")
         if fallback_model:
             logger.info(f"[LLM] Retrying with fallback model: {fallback_model.model}")
             try:
@@ -1872,7 +1904,7 @@ async def _call_llm_with_config(
                 )
                 return f"⚠️ Model error: Primary: {str(e)[:80]} | Fallback Timeout"
             except Exception as e2:
-                traceback.print_exc()
+                logger.error(f"[LLM] Fallback model failed error_type={type(e2).__name__}: {e2}")
                 return f"⚠️ Model error: Primary: {str(e)[:80]} | Fallback: {str(e2)[:80]}"
         return f"⚠️ 调用模型出错: {error_msg[:150]}"
 

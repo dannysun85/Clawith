@@ -47,7 +47,10 @@ async def get_desktop_screenshot(agent_id: uuid.UUID, session_id: str = "") -> O
                     logger.info(f"[AgentBay_DEBUG] Fuzzy-matched computer session for agent {agent_id}")
                     break
             else:
-                logger.info(f"[AgentBay_DEBUG] No computer session for agent {agent_id}. Keys available: {list(_agentbay_sessions.keys())}")
+                logger.info(
+                    f"[AgentBay_DEBUG] No computer session for agent {agent_id}; "
+                    f"active_sessions={len(_agentbay_sessions)}"
+                )
                 return None
 
     logger.info(f"[AgentBay_DEBUG] Found computer session for {agent_id}!")
@@ -82,7 +85,10 @@ async def get_browser_snapshot(agent_id: uuid.UUID, session_id: str = "") -> Opt
                     logger.info(f"[AgentBay_DEBUG] Fuzzy-matched browser session for agent {agent_id}")
                     break
             else:
-                logger.info(f"[AgentBay_DEBUG] No browser session for agent {agent_id} (searchstr: {str(agent_id)}). Keys available: {list(_agentbay_sessions.keys())}")
+                logger.info(
+                    f"[AgentBay_DEBUG] No browser session for agent {agent_id}; "
+                    f"active_sessions={len(_agentbay_sessions)}"
+                )
                 return None
 
     logger.info(f"[AgentBay_DEBUG] Found browser session for {agent_id}! Calling get_browser_snapshot_base64...")

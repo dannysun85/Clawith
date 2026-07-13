@@ -420,9 +420,9 @@ async def import_mcp_from_smithery(
                     }
                     for t in raw_tools if t.get("name")
                 ]
-                logger.info(f"[ResourceDiscovery] Got {len(tools_discovered)} tools from registry for {qualified_name}")
+                logger.info(f"[ResourceDiscovery] Got {len(tools_discovered)} tools from registry")
             else:
-                logger.warning(f"[ResourceDiscovery] Could not fetch detail for {qualified_name}: HTTP {detail_resp.status_code}")
+                logger.warning(f"[ResourceDiscovery] Could not fetch server detail: HTTP {detail_resp.status_code}")
     except Exception as e:
         logger.error(f"[ResourceDiscovery] Could not fetch server detail: {e}")
 
@@ -496,15 +496,16 @@ async def import_mcp_from_smithery(
                 ]
                 if live_tools_normalized:
                     logger.info(
-                        f"[ResourceDiscovery] Using live tools/list for {qualified_name}: "
+                        "[ResourceDiscovery] Using live tools/list: "
                         f"{len(live_tools_normalized)} tool(s) override registry's "
                         f"{len(tools_discovered)}"
                     )
                     tools_discovered = live_tools_normalized
-        except Exception as e:
+        except Exception as exc:
             logger.warning(
-                f"[ResourceDiscovery] Live tools/list failed for {qualified_name}, "
-                f"falling back to registry schema: {e}"
+                "[ResourceDiscovery] Live tools/list failed; falling back to registry schema "
+                "error_type={}",
+                type(exc).__name__,
             )
 
     # Merge smithery_config + user config for AgentTool
@@ -666,9 +667,9 @@ async def import_mcp_direct(
     try:
         client = MCPClient(full_url)
         tools_discovered = await client.list_tools()
-        logger.info(f"[DirectImport] Got {len(tools_discovered)} tools from {mcp_url}")
+        logger.info(f"[DirectImport] Got {len(tools_discovered)} tools from configured server")
     except Exception as e:
-        logger.error(f"[DirectImport] Could not list tools from {mcp_url}: {e}")
+        logger.error(f"[DirectImport] Could not list tools from configured server: {e}")
 
     # Config to store in AgentTool
     agent_tool_config = {}
@@ -780,7 +781,7 @@ async def seed_atlassian_rovo_tools(api_key: str) -> None:
     """
     from app.services.mcp_client import MCPClient
 
-    logger.info(f"[AtlassianRovo] Connecting to {ATLASSIAN_ROVO_MCP_URL} ...")
+    logger.info("[AtlassianRovo] Connecting to configured server")
     try:
         client = MCPClient(ATLASSIAN_ROVO_MCP_URL, api_key=api_key)
         tools_discovered = await client.list_tools()

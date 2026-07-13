@@ -277,7 +277,13 @@ async def discord_interaction_webhook(
         _is_group_discord = bool(body.get("guild_id"))
         conv_id = f"discord_{channel_id}" if channel_id else f"discord_dm_{sender_id}"
 
-        logger.info(f"[Discord] /{command_name} from {sender_id}: {user_text[:80]}")
+        logger.info(
+            "[Discord] Command received name={} agent={} content_chars={} group={}",
+            command_name,
+            agent_id,
+            len(user_text),
+            _is_group_discord,
+        )
 
         # Defer response immediately (Discord requires response within 3 seconds)
         # We return type 5 (DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE) and reply later
@@ -371,7 +377,11 @@ async def discord_interaction_webhook(
                 user_id=platform_user_id,
                 session_id=session_conv_id,
             )
-            logger.info(f"[Discord] LLM reply: {reply_text[:80]}")
+            logger.info(
+                "[Discord] LLM reply generated agent={} reply_chars={}",
+                agent_id,
+                len(reply_text),
+            )
 
             # ── Phase 3: Save reply + send (new short transaction) ──
             async with async_session() as _save_db:

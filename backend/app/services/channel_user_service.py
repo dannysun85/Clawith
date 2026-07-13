@@ -200,9 +200,7 @@ class ChannelUserService:
                     linked_user_id=user.id
                 )
             await db.flush()
-        logger.info(
-            f"[{channel_type}] Created new user: {user.id} for external_id: {external_user_id}"
-        )
+        logger.info(f"[{channel_type}] Created new user {user.id}")
 
         return user
 
@@ -631,7 +629,7 @@ async def get_platform_user_by_org_member(
     org_member.user_id = user.id
     await db.flush()
 
-    logger.info(f"[channel_user_service] Created User {user.id} for OrgMember {org_member.id} ({name})")
+    logger.info(f"[channel_user_service] Created User {user.id} for OrgMember {org_member.id}")
     
     # Eagerly load/refresh User.identity before returning
     user_res = await db.execute(

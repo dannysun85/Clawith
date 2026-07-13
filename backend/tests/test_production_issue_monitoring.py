@@ -158,6 +158,12 @@ def test_alert_gate_is_first_alert_only(status, severity, event_count, alerted, 
     assert production_issue_monitor.issue_requires_alert(issue, threshold=3) is expected
 
 
+def test_warning_issue_alert_stays_out_of_error_log_stream():
+    assert production_issue_monitor._production_issue_alert_log_level("warning") == "warning"
+    assert production_issue_monitor._production_issue_alert_log_level("error") == "error"
+    assert production_issue_monitor._production_issue_alert_log_level("critical") == "error"
+
+
 @pytest.mark.asyncio
 async def test_issue_capture_stores_only_sanitized_occurrence_metadata(monkeypatch):
     expected_id = uuid.uuid4()
@@ -298,3 +304,19 @@ def test_first_alert_creates_a_privacy_safe_saas_owner_notification():
     assert notification.link == "/admin/saas?tab=production-issues"
     assert "prompt" not in notification.body.lower()
     assert str(issue.id) not in notification.body
+
+
+def test_warning_alert_notification_is_not_labeled_as_error():
+    issue = SimpleNamespace(
+        id=uuid.uuid4(),
+        severity="warning",
+        summary="Provider media plan is temporarily exhausted",
+        event_count=3,
+        route=None,
+        operation="video",
+        category="media",
+    )
+
+    notification = production_issue_monitor._production_issue_notification(issue, uuid.uuid4())
+
+    assert notification.title == "[警告] 生产问题告警"

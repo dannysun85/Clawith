@@ -302,11 +302,11 @@ class AgentManager:
             agent.last_active_at = datetime.now(timezone.utc)
             self.clear_error(agent)
 
-            logger.info(f"Started container {container.id[:12]} for agent {agent.name} on port {container_port}")
+            logger.info(f"Started container {container.id[:12]} for agent {agent.id} on port {container_port}")
             return container.id
 
         except DockerException as e:
-            logger.error(f"Failed to start container for agent {agent.name}: {e}")
+            logger.error(f"Failed to start container for agent {agent.id}: {e}")
             self.mark_error(agent, f"container_start: {type(e).__name__}: {str(e)[:1500]}")
             return None
 
@@ -320,7 +320,7 @@ class AgentManager:
             container = self.docker_client.containers.get(agent.container_id)
             container.stop(timeout=10)
             agent.status = "stopped"
-            logger.info(f"Stopped container {agent.container_id[:12]} for agent {agent.name}")
+            logger.info(f"Stopped container {agent.container_id[:12]} for agent {agent.id}")
             return True
         except NotFound:
             agent.status = "stopped"
@@ -341,7 +341,7 @@ class AgentManager:
             container.remove()
             agent.container_id = None
             agent.container_port = None
-            logger.info(f"Removed container for agent {agent.name}")
+            logger.info(f"Removed container for agent {agent.id}")
             return True
         except NotFound:
             agent.container_id = None
@@ -360,7 +360,7 @@ class AgentManager:
         dest = archive_dir / f"{agent_id}_{timestamp}"
         if agent_dir.exists():
             shutil.move(str(agent_dir), str(dest))
-            logger.info(f"Archived agent files to {dest}")
+            logger.info("Archived agent files")
         else:
             dest.mkdir(parents=True, exist_ok=True)
         return dest

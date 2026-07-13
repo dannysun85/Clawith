@@ -162,7 +162,7 @@ async def _tick():
                             logger.warning(
                                 f"[A2A Safety] Agent {trigger.agent_id} hit "
                                 f"on_message rate limit ({_ON_MSG_RATE_LIMIT}/hr). "
-                                f"Auto-disabling trigger '{trigger.name}'."
+                                f"Auto-disabling trigger {trigger.id}."
                             )
                             async with async_session() as db:
                                 result = await db.execute(
@@ -177,7 +177,7 @@ async def _tick():
                         _on_msg_fire_log[trigger.agent_id] = recent
                     await enqueue_due_trigger(trigger, now)
         except Exception as e:
-            logger.warning(f"Error evaluating trigger {trigger.name}: {e}")
+            logger.warning(f"Error evaluating trigger {trigger.id}: {e}")
 
     # Claim queued executions with a DB lease so only one worker handles each event.
     try:
@@ -327,6 +327,7 @@ async def wake_agent_with_context(
         if source_message_id:
             payload["_source_message_id"] = str(source_message_id)
 
+        trigger_id = trigger.id
         _execution, created = await enqueue_trigger_execution(
             db,
             trigger=trigger,
@@ -336,9 +337,9 @@ async def wake_agent_with_context(
         )
         if not created:
             logger.info(
-                "[A2A] Delivery already queued for agent {} with key {}",
+                "[A2A] Delivery already queued for agent {} trigger={}",
                 agent_id,
-                delivery_key,
+                trigger_id,
             )
         return True
 
@@ -353,8 +354,6 @@ async def start_trigger_daemon():
             await _tick()
         except Exception as e:
             logger.error(f"Trigger Daemon error: {e}")
-            import traceback
-            traceback.print_exc()
 
         # Run heartbeat check every 4th tick (~60 seconds) only when the
         # independent global kill switch is enabled. Explicit triggers above

@@ -446,8 +446,11 @@ async def _background_agent_setup(
                 )
                 if result_msg.startswith("❌"):
                     logger.warning(
-                        f"[create_agent] background MCP pre-install for '{server_id}' "
-                        f"on agent {agent_id} reported error: {result_msg[:200]}"
+                        "[create_agent] background MCP pre-install server={} agent={} "
+                        "reported error result_chars={}",
+                        server_id,
+                        agent_id,
+                        len(result_msg),
                     )
                 else:
                     logger.info(

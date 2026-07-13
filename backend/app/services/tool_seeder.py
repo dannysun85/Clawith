@@ -3622,7 +3622,7 @@ async def seed_builtin_tools():
                 await db.flush()  # get tool.id
                 if t["is_default"]:
                     new_tool_ids.append(tool.id)
-                logger.info(f"[ToolSeeder] Created builtin tool: {t['name']}")
+                logger.info("[ToolSeeder] Created builtin tool")
             else:
                 # Sync fields that may evolve
                 updated_fields = []
@@ -3675,7 +3675,10 @@ async def seed_builtin_tools():
                     existing.parameters_schema = t["parameters_schema"]
                     updated_fields.append("parameters_schema")
                 if updated_fields:
-                    logger.info(f"[ToolSeeder] Updated {', '.join(updated_fields)}: {t['name']}")
+                    logger.info(
+                        "[ToolSeeder] Updated builtin tool field_count={}",
+                        len(updated_fields),
+                    )
 
         # Auto-assign new default tools to all existing agents
         if new_tool_ids:

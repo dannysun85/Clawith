@@ -16,6 +16,8 @@ from typing import Any, Callable, Coroutine, Literal
 import httpx
 from loguru import logger
 
+from app.core.logging_config import privacy_safe_shape
+
 
 # ============================================================================
 # Data Models
@@ -302,7 +304,11 @@ class OpenAICompatibleClient(LLMClient):
     ) -> dict[str, Any]:
         """Build request payload."""
         messages_payload = self._messages_to_openai_payload(messages)
-        logger.debug(f"[LLM-Debug] OpenAICompatibleClient payload messages for model {self.model}: {json.dumps(messages_payload, indent=2, ensure_ascii=False)}")
+        logger.debug(
+            "[LLM-Debug] OpenAICompatibleClient payload for model {} message_shape={}",
+            self.model,
+            privacy_safe_shape(messages_payload),
+        )
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages_payload,
@@ -851,17 +857,15 @@ class OpenAIResponsesClient(LLMClient):
 
         if orphaned_fco:
             logger.warning(
-                "[OpenAIResponses] Removing %d orphaned function_call_output item(s) "
-                "with no matching function_call: %s",
+                "[OpenAIResponses] Removing {} orphaned function_call_output item(s) "
+                "with no matching function_call",
                 len(orphaned_fco),
-                orphaned_fco,
             )
         if orphaned_fc:
             logger.warning(
-                "[OpenAIResponses] Removing %d orphaned function_call item(s) "
-                "with no matching function_call_output: %s",
+                "[OpenAIResponses] Removing {} orphaned function_call item(s) "
+                "with no matching function_call_output",
                 len(orphaned_fc),
-                orphaned_fc,
             )
 
         # Filter out orphaned items
@@ -1001,14 +1005,15 @@ class OpenAIResponsesClient(LLMClient):
         return None
 
     def _build_error_log_context(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Build compact context for error logs."""
+        """Build compact, provider-content-free context for error logs."""
+        last_error = data.get("last_error")
         return {
             "provider": "openai-response",
             "model": self.model,
-            "response_id": data.get("id"),
             "status": data.get("status"),
-            "incomplete_details": data.get("incomplete_details"),
-            "last_error": data.get("last_error"),
+            "error_type": last_error.get("type") if isinstance(last_error, dict) else None,
+            "error_code": last_error.get("code") if isinstance(last_error, dict) else None,
+            "incomplete": data.get("incomplete_details") is not None,
             "has_output": bool(data.get("output")),
         }
 
@@ -1036,9 +1041,14 @@ class OpenAIResponsesClient(LLMClient):
         if api_error:
             ctx = self._build_error_log_context(data)
             logger.error(
-                "OpenAIResponses API error: %s | context=%s",
-                api_error,
-                ctx,
+                "OpenAIResponses API error model={} status={} error_type={} "
+                "error_code={} incomplete={} output_present={}",
+                ctx["model"],
+                ctx["status"],
+                ctx["error_type"],
+                ctx["error_code"],
+                ctx["incomplete"],
+                ctx["has_output"],
             )
             raise LLMError(api_error)
 

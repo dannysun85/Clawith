@@ -164,7 +164,7 @@ async def _send_verification_email_task(
         identity = await identity_dao.get(user.identity_id)
 
         if not identity:
-            logger.warning(f"No identity found for user {user.id} ({user.email}). Cannot send verification.")
+            logger.warning(f"No identity found for user {user.id}. Cannot send verification.")
             return
 
         raw_code, expires_at = await email_verification_service.create_email_verification_token(
@@ -180,8 +180,8 @@ async def _send_verification_email_task(
             expiry_minutes,
         )
     except Exception as exc:
-        logger.error(f"Failed to create verification token for {user.email}: {exc}")
-        logger.warning(f"Failed to send verification email for {user.email}: {exc}")
+        logger.error(f"Failed to create verification token for user {user.id}: {exc}")
+        logger.warning(f"Failed to send verification email for user {user.id}: {exc}")
 
 
 @router.post("/register", response_model=Any, status_code=status.HTTP_201_CREATED)
@@ -222,7 +222,7 @@ async def register_init(
     from app.services.registration_service import registration_service
 
     settings = get_settings()
-    logger.info(f"[REGISTER_INIT] Starting registration for email={data.email}")
+    logger.info("[REGISTER_INIT] Starting registration")
 
     # 1. Resolve email config outside transaction
     email_config = await resolve_email_config_async()
@@ -240,9 +240,7 @@ async def register_init(
     if identity:
         # Defense-in-depth: verify the returned identity actually belongs to the submitted email.
         if identity.email and identity.email != data.email:
-            logger.warning(
-                f"[REGISTER_INIT] Identity email mismatch: submitted={data.email} returned={identity.email} — rejecting"
-            )
+            logger.warning(f"[REGISTER_INIT] Identity email mismatch identity={identity.id} — rejecting")
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Username already taken. Please choose a different username.",
@@ -398,7 +396,7 @@ async def register_sso(
 
 async def _handle_normal_register(data: UserRegister, background_tasks: BackgroundTasks, settings):
     """Legacy normal registration handler."""
-    logger.info(f"[REGISTER_LEGACY] email={data.email}")
+    logger.info("[REGISTER_LEGACY] Starting registration")
 
     from app.services.registration_service import registration_service
     from app.services.system_email_service import resolve_email_config_async
@@ -463,9 +461,7 @@ async def _handle_normal_register(data: UserRegister, background_tasks: Backgrou
 
         # Defense-in-depth: verify the returned identity actually belongs to the submitted email.
         if identity.email and identity.email != data.email:
-            logger.warning(
-                f"[REGISTER_LEGACY] Identity email mismatch: submitted={data.email} returned={identity.email} — rejecting"
-            )
+            logger.warning(f"[REGISTER_LEGACY] Identity email mismatch identity={identity.id} — rejecting")
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Username already taken. Please choose a different username.",
@@ -533,9 +529,7 @@ async def login(data: UserLogin, background_tasks: BackgroundTasks):
         or not identity.password_hash
         or not await verify_password_async(data.password, identity.password_hash)
     ):
-        logger.warning(
-            f"[LOGIN] Invalid credentials for {data.login_identifier} identity_id={identity.id if identity else 'None'}"
-        )
+        logger.warning(f"[LOGIN] Invalid credentials identity_found={identity is not None}")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
     # 2. Check Global Activity & Verification
@@ -740,7 +734,7 @@ async def forgot_password(
             expiry_minutes,
         )
     except Exception as exc:
-        logger.warning(f"Failed to process password reset email for {data.email}: {exc}")
+        logger.warning(f"Failed to process password reset email identity={identity.id}: {exc}")
 
     return generic_response
 

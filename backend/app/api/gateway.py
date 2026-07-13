@@ -71,7 +71,7 @@ async def poll_messages(
     Returns all pending messages and marks them as delivered.
     Also updates openclaw_last_seen for online status tracking.
     """
-    logger.info(f"[Gateway] poll called, key_prefix={x_api_key[:8]}...")
+    logger.info("[Gateway] poll called")
     agent = await _get_agent_by_key(x_api_key, db)
 
     # Update last seen
@@ -200,7 +200,7 @@ async def report_result(
     """OpenClaw agent reports the result of a processed message."""
     if not x_api_key:
         raise HTTPException(status_code=401, detail="Missing X-Api-Key header")
-    logger.info(f"[Gateway] report called, key_prefix={x_api_key[:8]}..., msg_id={body.message_id}")
+    logger.info("[Gateway] report called message_id_present={}", bool(body.message_id))
     agent = await _get_agent_by_key(x_api_key, db)
 
     result = await db.execute(
@@ -306,7 +306,7 @@ async def _send_to_agent_background(
     Accepts plain values (not ORM objects) to avoid stale session references
     since this runs after the request's DB session has closed.
     """
-    logger.info(f"[Gateway] _send_to_agent_background started: {source_agent_name} -> {target_agent_name}")
+    logger.info(f"[Gateway] Background send started source={source_agent_id} target={target_agent_id}")
     try:
         from app.services.llm import call_llm, resolve_agent_model
         from app.models.agent import Agent
@@ -319,17 +319,17 @@ async def _send_to_agent_background(
             )
             target_agent = target_agent_result.scalar_one_or_none()
             if not target_agent:
-                logger.warning(f"Target agent {target_agent_name} no longer exists")
+                logger.warning(f"Target agent {target_agent_id} no longer exists")
                 return
 
             model, fallback_model, route_meta = await resolve_agent_model(target_agent)
             model = model or fallback_model
             if not model:
-                logger.warning(f"Target agent {target_agent_name} has no LLM model")
+                logger.warning(f"Target agent {target_agent_id} has no LLM model")
                 return
             # Skip if model is disabled by admin
             if not model.enabled:
-                logger.warning(f"Target agent {target_agent_name}'s model {model.model} is disabled, skipping")
+                logger.warning(f"Target agent {target_agent_id} model {model.model} is disabled, skipping")
                 return
 
             # Create or find a ChatSession for this agent pair
@@ -466,12 +466,10 @@ async def _send_to_agent_background(
             db.add(gw_reply)
             await db.commit()
 
-        logger.info(f"[Gateway] Agent {target_agent_name} replied to {source_agent_name}")
+        logger.info(f"[Gateway] Background send completed source={source_agent_id} target={target_agent_id}")
 
     except Exception as e:
         logger.error(f"[Gateway] send_to_agent_background failed: {e}")
-        import traceback
-        traceback.print_exc()
 
 
 @router.post("/send-message")
@@ -514,7 +512,13 @@ async def send_message(
             target_agent = candidate
             break
 
-    logger.info(f"[Gateway] send_message: target='{target_name}', found_agent={target_agent.name if target_agent else None}, agent_type={getattr(target_agent, 'agent_type', None) if target_agent else None}, channel_hint='{channel_hint}'")
+    logger.info(
+        "[Gateway] send_message target_found={} target_agent={} agent_type={} channel_hint_present={}",
+        target_agent is not None,
+        target_agent.id if target_agent else None,
+        getattr(target_agent, "agent_type", None) if target_agent else None,
+        bool(channel_hint),
+    )
 
     if target_agent and (not channel_hint or channel_hint == "agent"):
         conv_id = f"gw_agent_{agent.id}_{target_agent.id}"

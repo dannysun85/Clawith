@@ -28,7 +28,12 @@ from app.services.credit_service import (
     finalize_reserved_credits_in_session,
     release_reserved_credits_in_session,
 )
-from app.services.llm.failover import FailoverErrorType, classify_error, extract_minimax_code
+from app.services.llm.failover import (
+    MINIMAX_QUOTA_CODES,
+    FailoverErrorType,
+    classify_error,
+    extract_minimax_code,
+)
 from app.services.storage import agent_storage_key, get_storage_backend
 
 
@@ -83,12 +88,13 @@ async def _record_media_failure_issue(task: MediaGenerationTask, reason: str) ->
 
     task_id = getattr(task, "id", None)
     reservation_id = getattr(task, "reservation_id", None)
+    error_code = extract_minimax_code(reason) or "media_task_failed"
     await record_production_issue(
         source="media_generation",
         category="media",
         summary="Media generation task failed before a usable asset was delivered",
-        severity="error",
-        error_code=extract_minimax_code(reason) or "media_task_failed",
+        severity="warning" if error_code in MINIMAX_QUOTA_CODES else "error",
+        error_code=error_code,
         operation=getattr(task, "modality", None),
         tenant_id=getattr(task, "tenant_id", None),
         user_id=getattr(task, "user_id", None),
@@ -467,7 +473,12 @@ async def reconcile_minimax_video_task(
                 )
             except Exception:
                 logger.exception("[media] failed to persist terminal metadata task_id={}", record_id)
-            logger.warning("[media] MiniMax video reconciliation failed task_id={} error={}", record_id, reason)
+            logger.warning(
+                "[media] MiniMax video reconciliation failed task_id={} error_type={} error_code={}",
+                record_id,
+                type(exc).__name__,
+                extract_minimax_code(str(exc)) or "unknown",
+            )
             return MediaGenerationOutcome(status="failed", error=reason)
         try:
             retry_task = await record_media_generation_retry(record_id, exc)
@@ -476,7 +487,12 @@ async def reconcile_minimax_video_task(
             retry_task = None
         if retry_task and retry_task.status == "failed":
             return MediaGenerationOutcome(status="failed", error=retry_task.last_error)
-        logger.warning("[media] MiniMax video reconciliation retry task_id={} error={}", record_id, _safe_error(exc))
+        logger.warning(
+            "[media] MiniMax video reconciliation retry task_id={} error_type={} error_code={}",
+            record_id,
+            type(exc).__name__,
+            extract_minimax_code(str(exc)) or "unknown",
+        )
         return MediaGenerationOutcome(status="retrying", error=_safe_error(exc), retryable=True)
 
 

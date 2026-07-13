@@ -225,7 +225,13 @@ async def slack_event_webhook(
     _is_group_slack = bool(channel_id) and not channel_id.startswith("D")
     conv_id = f"slack_{channel_id}" if channel_id else f"slack_dm_{sender_id}"
 
-    logger.info(f"[Slack] Message from={sender_id}, channel={channel_id}: {user_text[:80]}")
+    logger.info(
+        "[Slack] Message received agent={} content_chars={} files={} group={}",
+        agent_id,
+        len(user_text),
+        len(slack_files),
+        _is_group_slack,
+    )
 
     # Load history
     from app.models.audit import ChatMessage
@@ -269,7 +275,10 @@ async def slack_event_webhook(
                     _slack_email = _profile.get("email", "")
                     _slack_avatar = _profile.get("image_512") or _profile.get("image_original") or _profile.get("image_192") or ""
         except Exception as _e_info:
-            logger.error(f"[Slack] Failed to fetch user info for {sender_id}: {_e_info}")
+            logger.error(
+                "[Slack] Failed to fetch user info error_type={}",
+                type(_e_info).__name__,
+            )
 
     _extra_info = {
         "name": _slack_real_name or f"Slack User {sender_id[:8]}",
@@ -340,9 +349,12 @@ async def slack_event_webhook(
                     content_type=_ct or None,
                 )
             _file_user_messages.append(_workspace_path)
-            logger.info(f"[Slack] Saved file {_fname} ({len(_r.content)} bytes)")
+            logger.info(f"[Slack] Saved uploaded file ({len(_r.content)} bytes)")
         except Exception as _e:
-            logger.error(f"[Slack] Failed to download file {_fname}: {_e}")
+            logger.error(
+                "[Slack] Failed to download file error_type={}",
+                type(_e).__name__,
+            )
 
 
     if not user_text and not _file_user_messages and slack_files:
@@ -429,7 +441,11 @@ async def slack_event_webhook(
         session_id=session_conv_id,
     )
     _cfs_s.reset(_cfs_s_token)
-    logger.info(f"[Slack] LLM reply: {reply_text[:80]}")
+    logger.info(
+        "[Slack] LLM reply generated agent={} reply_chars={}",
+        agent_id,
+        len(reply_text),
+    )
 
     # Save reply (new short transaction)
     async with _async_session() as _save_db:

@@ -120,7 +120,7 @@ async def handle_okr_report_trigger(trigger: AgentTrigger, now: datetime) -> boo
         await generate_company_monthly_report(tenant_id, previous_month_end)
 
     await mark_trigger_fired(trigger.id, now)
-    logger.info(f"[Trigger] Auto-generated OKR report for trigger {trigger.name}")
+    logger.info(f"[Trigger] Auto-generated OKR report for trigger {trigger.id}")
     return True
 
 
@@ -144,7 +144,7 @@ async def handle_okr_collection_trigger(trigger: AgentTrigger, now: datetime) ->
 
     await trigger_daily_collection_for_tenant(tenant_id)
     await mark_trigger_fired(trigger.id, now)
-    logger.info(f"[Trigger] Deterministic OKR collection sent for trigger {trigger.name}")
+    logger.info(f"[Trigger] Deterministic OKR collection sent for trigger {trigger.id}")
     return True
 
 
@@ -212,12 +212,12 @@ async def evaluate_trigger(trigger: AgentTrigger, now: datetime) -> bool:
             if local_now >= next_run:
                 if await should_skip_non_workday(trigger, local_now):
                     await mark_trigger_skipped(trigger.id, now)
-                    logger.info(f"[Trigger] Skipped {trigger.name} on non-workday {local_now.date()}")
+                    logger.info(f"[Trigger] Skipped {trigger.id} on non-workday {local_now.date()}")
                     return False
                 return True
             return False
         except Exception as e:
-            logger.warning(f"Invalid cron expr '{expr}' for trigger {trigger.name}: {e}")
+            logger.warning(f"Invalid cron expr for trigger {trigger.id}: {e}")
             return False
 
     if t == "once":
@@ -267,7 +267,7 @@ async def poll_check(trigger: AgentTrigger) -> bool:
     if not url:
         return False
     if is_private_url(url):
-        logger.warning(f"Poll blocked for trigger {trigger.name}: private/internal URL '{url}'")
+        logger.warning(f"Poll blocked for trigger {trigger.id}: private/internal URL")
         return False
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -295,11 +295,11 @@ async def poll_check(trigger: AgentTrigger) -> bool:
                 )
                 await db.commit()
         except Exception as e:
-            logger.warning(f"Failed to persist poll _last_value for {trigger.name}: {e}")
+            logger.warning(f"Failed to persist poll _last_value for {trigger.id}: {e}")
 
         return should_fire
     except Exception as e:
-        logger.warning(f"Poll failed for trigger {trigger.name}: {e}")
+        logger.warning(f"Poll failed for trigger {trigger.id}: {e}")
         return False
 
 
@@ -361,9 +361,8 @@ async def check_new_agent_messages(trigger: AgentTrigger) -> bool:
                         source_id = uuid.UUID(str(from_agent_id))
                     except (TypeError, ValueError):
                         logger.warning(
-                            "Invalid from_agent_id on trigger {}: {!r}",
-                            trigger.name,
-                            from_agent_id,
+                            "Invalid from_agent_id on trigger {}",
+                            trigger.id,
                         )
                         return False
                     source_query = select(AgentModel).where(
@@ -506,7 +505,7 @@ async def check_new_agent_messages(trigger: AgentTrigger) -> bool:
                 cfg["_matched_from"] = from_user_name
                 return True
     except Exception as e:
-        logger.warning(f"on_message check failed for trigger {trigger.name}: {e}")
+        logger.warning(f"on_message check failed for trigger {trigger.id}: {e}")
         return False
 
     return False
