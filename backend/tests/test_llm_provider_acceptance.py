@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 
+from app.services.llm import caller as llm_caller
 from app.services.llm.client import (
+    AnthropicClient,
     GeminiClient,
     LLMError,
     LLMMessage,
     OpenAICompatibleClient,
+    OpenAIResponsesClient,
     llm_provider_may_have_accepted,
 )
 
@@ -21,6 +25,18 @@ class _InterruptedSSE(httpx.AsyncByteStream):
     async def __aiter__(self):
         yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
         raise httpx.ReadError("stream disconnected")
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _SSESequence(httpx.AsyncByteStream):
+    def __init__(self, *chunks: bytes):
+        self._chunks = chunks
+
+    async def __aiter__(self):
+        for chunk in self._chunks:
+            yield chunk
 
     async def aclose(self) -> None:
         return None
@@ -139,6 +155,232 @@ async def test_http_failures_release_only_deterministic_rejections(
         await client.close()
 
     assert llm_provider_may_have_accepted(client) is provider_may_have_accepted
+
+
+@pytest.mark.asyncio
+async def test_minimax_business_error_in_http_200_releases_provider_hold():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+                "base_resp": {
+                    "status_code": 2056,
+                    "status_msg": "quota exhausted",
+                },
+            },
+            request=request,
+        )
+
+    client = OpenAICompatibleClient(
+        api_key="test-key",
+        base_url="https://provider.test/v1",
+        model="MiniMax-M3",
+    )
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    try:
+        with pytest.raises(LLMError, match="code=2056"):
+            await client.complete(messages=[LLMMessage(role="user", content="hello")])
+    finally:
+        await client.close()
+
+    assert client.provider_response_started is False
+    assert client.provider_output_started is False
+    assert llm_provider_may_have_accepted(client) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output_before_error", [False, True])
+async def test_stream_business_error_releases_only_before_provider_output(
+    output_before_error,
+):
+    chunks = []
+    if output_before_error:
+        chunks.append(b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n')
+    chunks.append(
+        b'data: {"base_resp":{"status_code":1000,"status_msg":"transient"}}\n\n'
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=_SSESequence(*chunks), request=request)
+
+    client = OpenAICompatibleClient(
+        api_key="test-key",
+        base_url="https://provider.test/v1",
+        model="MiniMax-M3",
+    )
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    try:
+        with pytest.raises(LLMError, match="code=1000"):
+            await client.stream(messages=[LLMMessage(role="user", content="hello")])
+    finally:
+        await client.close()
+
+    assert client.provider_output_started is output_before_error
+    assert llm_provider_may_have_accepted(client) is output_before_error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("client_class", "payload"),
+    [
+        (GeminiClient, {"error": {"code": 400, "message": "bad request"}}),
+        (AnthropicClient, {"type": "error", "error": {"type": "invalid_request"}}),
+    ],
+)
+async def test_native_provider_explicit_business_error_releases_hold(
+    client_class,
+    payload,
+):
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload, request=request)
+
+    client = client_class(
+        api_key="test-key",
+        base_url="https://provider.test",
+        model="test-model",
+    )
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    try:
+        with pytest.raises(LLMError, match="API error"):
+            await client.complete(messages=[LLMMessage(role="user", content="hello")])
+    finally:
+        await client.close()
+
+    assert llm_provider_may_have_accepted(client) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "provider_may_have_accepted"),
+    [
+        (
+            {"status": "failed", "error": {"message": "rejected"}, "output": []},
+            False,
+        ),
+        (
+            {"status": "incomplete", "incomplete_details": {"reason": "timeout"}},
+            True,
+        ),
+    ],
+)
+async def test_responses_api_releases_only_deterministic_failed_payloads(
+    payload,
+    provider_may_have_accepted,
+):
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload, request=request)
+
+    client = OpenAIResponsesClient(
+        api_key="test-key",
+        base_url="https://provider.test/v1",
+        model="test-model",
+    )
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    try:
+        with pytest.raises(LLMError):
+            await client.complete(messages=[LLMMessage(role="user", content="hello")])
+    finally:
+        await client.close()
+
+    assert llm_provider_may_have_accepted(client) is provider_may_have_accepted
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        "[Error] Too many tool call rounds",
+        "[Error] Tool execution failed: RuntimeError",
+        "[Error] Credits settlement failed",
+    ],
+)
+def test_local_runtime_errors_never_trigger_model_failover(result):
+    assert llm_caller.is_retryable_error(result) is False
+
+
+def test_client_creation_failure_can_still_use_fallback():
+    assert llm_caller.is_retryable_error(
+        "[Error] Failed to create LLM client: connection unavailable"
+    ) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("guard_state", ["ambiguous", "work_started"])
+async def test_failover_is_blocked_when_primary_provider_cannot_be_safely_replayed(
+    monkeypatch,
+    guard_state,
+):
+    primary = SimpleNamespace(provider="minimax", model="MiniMax-M3")
+    fallback = SimpleNamespace(
+        provider="minimax",
+        model="MiniMax-M3",
+        supports_vision=False,
+    )
+    calls = []
+
+    async def fake_call(model, *_args, failover_guard=None, **_kwargs):
+        calls.append(model)
+        if model is primary:
+            if guard_state == "ambiguous":
+                failover_guard.mark_provider_outcome_ambiguous()
+            else:
+                failover_guard.mark_provider_work_started()
+            return "[LLM call error] timeout"
+        return "fallback result"
+
+    monkeypatch.setattr(llm_caller, "call_llm", fake_call)
+
+    result = await llm_caller.call_llm_with_failover(
+        primary,
+        fallback,
+        messages=[],
+        agent_name="agent",
+        role_description="worker",
+    )
+
+    assert result == "[LLM call error] timeout"
+    assert calls == [primary]
+
+
+@pytest.mark.asyncio
+async def test_failover_remains_available_after_deterministic_connection_rejection(
+    monkeypatch,
+):
+    primary = SimpleNamespace(provider="minimax", model="MiniMax-M3")
+    fallback = SimpleNamespace(
+        provider="minimax",
+        model="MiniMax-M3",
+        supports_vision=False,
+    )
+    calls = []
+
+    async def fake_call(model, *_args, failover_guard=None, **_kwargs):
+        calls.append(model)
+        if model is primary:
+            return "[LLM call error] connection refused"
+        return "fallback result"
+
+    monkeypatch.setattr(llm_caller, "call_llm", fake_call)
+
+    result = await llm_caller.call_llm_with_failover(
+        primary,
+        fallback,
+        messages=[],
+        agent_name="agent",
+        role_description="worker",
+    )
+
+    assert result == "fallback result"
+    assert calls == [primary, fallback]
 
 
 @pytest.mark.asyncio

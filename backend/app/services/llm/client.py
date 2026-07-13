@@ -215,10 +215,12 @@ class LLMClient(ABC):
         # held for reconciliation instead of guessing that no bill exists.
         self.provider_request_started = False
         self.provider_response_started = False
+        self.provider_output_started = False
 
     def _reset_provider_state(self) -> None:
         self.provider_request_started = False
         self.provider_response_started = False
+        self.provider_output_started = False
 
     def _mark_provider_request_started(self) -> None:
         self.provider_request_started = True
@@ -227,11 +229,45 @@ class LLMClient(ABC):
         self.provider_request_started = True
         self.provider_response_started = True
 
+    def _mark_provider_output_started(self) -> None:
+        """Record billable evidence returned by the provider."""
+
+        self.provider_request_started = True
+        self.provider_response_started = True
+        self.provider_output_started = True
+
     def _mark_provider_rejected(self) -> None:
         """Record a failure that is known not to have produced provider debt."""
 
         self.provider_request_started = False
         self.provider_response_started = False
+        self.provider_output_started = False
+
+    def _mark_explicit_provider_failure(self) -> None:
+        """Release a provider hold only when no output/usage preceded the error.
+
+        Some providers encode quota, validation, or authentication failures in
+        an HTTP 200 response.  Those are deterministic rejections when the
+        response contains no billable evidence.  An error arriving after a
+        stream chunk or usage record remains ambiguous and must be reconciled.
+        """
+
+        if not self.provider_output_started:
+            self._mark_provider_rejected()
+
+    @staticmethod
+    def _has_billable_usage(usage: Any) -> bool:
+        """Return whether a provider usage payload contains a non-zero amount."""
+
+        if isinstance(usage, bool):
+            return usage
+        if isinstance(usage, (int, float)):
+            return usage > 0
+        if isinstance(usage, dict):
+            return any(LLMClient._has_billable_usage(value) for value in usage.values())
+        if isinstance(usage, (list, tuple)):
+            return any(LLMClient._has_billable_usage(value) for value in usage)
+        return False
 
     def _mark_provider_http_error(self, status_code: int) -> None:
         """Release only deterministic client-side rejections.
@@ -507,12 +543,19 @@ class OpenAICompatibleClient(LLMClient):
                 json_buffer = ""
             return chunk, in_think, tag_buffer, json_buffer
 
+        # A non-empty choice or usage record is provider evidence even when it
+        # only contains an assistant role prelude and no visible text yet.
+        if data.get("choices") or self._has_billable_usage(data.get("usage")):
+            self._mark_provider_output_started()
+
         if "error" in data:
+            self._mark_explicit_provider_failure()
             raise LLMError(f"Stream error: {data['error']}")
 
         # Check for provider-specific business errors (e.g. MiniMax base_resp.status_code in SSE frames)
         base_resp = data.get("base_resp")
         if base_resp and base_resp.get("status_code", 0) != 0:
+            self._mark_explicit_provider_failure()
             code = base_resp.get("status_code")
             msg = base_resp.get("status_msg", "")
             raise LLMError(f"Stream error (code={code}): {msg}")
@@ -625,11 +668,17 @@ class OpenAICompatibleClient(LLMClient):
         data = response.json()
 
         if "error" in data:
+            if data.get("choices") or self._has_billable_usage(data.get("usage")):
+                self._mark_provider_output_started()
+            self._mark_explicit_provider_failure()
             raise LLMError(f"API error: {data['error']}")
 
         # Check for provider-specific business errors (e.g. MiniMax base_resp.status_code)
         base_resp = data.get("base_resp")
         if base_resp and base_resp.get("status_code", 0) != 0:
+            if data.get("choices") or self._has_billable_usage(data.get("usage")):
+                self._mark_provider_output_started()
+            self._mark_explicit_provider_failure()
             code = base_resp.get("status_code")
             msg = base_resp.get("status_msg", "")
             raise LLMError(f"API error (code={code}): {msg}")
@@ -638,6 +687,13 @@ class OpenAICompatibleClient(LLMClient):
         msg = choice.get("message", {})
 
         content = msg.get("content", "") or ""
+        if (
+            content
+            or msg.get("tool_calls")
+            or msg.get("reasoning_content")
+            or self._has_billable_usage(data.get("usage"))
+        ):
+            self._mark_provider_output_started()
         # Strip <think> tags for providers that emit inline reasoning (DeepSeek-R1, MiniMax-M3, etc.)
         if self.strip_think_tags_nonstream and content:
             content = re.sub(r"<think>[\s\S]*?</think>\s*", "", content, flags=re.DOTALL).strip()
@@ -698,6 +754,14 @@ class OpenAICompatibleClient(LLMClient):
 
                         if chunk.is_finished:
                             break
+
+                        if (
+                            chunk.content
+                            or chunk.reasoning_content
+                            or chunk.tool_call
+                            or self._has_billable_usage(chunk.usage)
+                        ):
+                            self._mark_provider_output_started()
 
                         if chunk.content:
                             full_content += chunk.content
@@ -1115,6 +1179,10 @@ class OpenAIResponsesClient(LLMClient):
         data = response.json()
         api_error = self._extract_api_error(data)
         if api_error:
+            if data.get("output") or self._has_billable_usage(data.get("usage")):
+                self._mark_provider_output_started()
+            if data.get("error") or data.get("status") == "failed":
+                self._mark_explicit_provider_failure()
             ctx = self._build_error_log_context(data)
             logger.error(
                 "OpenAIResponses API error model={} status={} error_type={} "
@@ -1128,7 +1196,15 @@ class OpenAIResponsesClient(LLMClient):
             )
             raise LLMError(api_error)
 
-        return self._parse_response_data(data)
+        parsed = self._parse_response_data(data)
+        if (
+            parsed.content
+            or parsed.tool_calls
+            or parsed.reasoning_content
+            or self._has_billable_usage(parsed.usage)
+        ):
+            self._mark_provider_output_started()
+        return parsed
 
     async def stream(
         self,
@@ -1539,9 +1615,15 @@ class GeminiClient(LLMClient):
         self._mark_provider_response_started()
         data = response.json()
         if isinstance(data, dict) and data.get("error"):
+            if data.get("candidates") or self._has_billable_usage(data.get("usageMetadata")):
+                self._mark_provider_output_started()
+            self._mark_explicit_provider_failure()
             raise LLMError(f"API error: {data['error']}")
 
-        return self._parse_response_data(data)
+        parsed = self._parse_response_data(data)
+        if parsed.content or parsed.tool_calls or self._has_billable_usage(parsed.usage):
+            self._mark_provider_output_started()
+        return parsed
 
     async def stream(
         self,
@@ -1610,28 +1692,39 @@ class GeminiClient(LLMClient):
                     except json.JSONDecodeError:
                         continue
 
+                    if isinstance(data, dict) and (
+                        data.get("candidates")
+                        or self._has_billable_usage(data.get("usageMetadata"))
+                    ):
+                        self._mark_provider_output_started()
                     if isinstance(data, dict) and data.get("error"):
+                        self._mark_explicit_provider_failure()
                         raise LLMError(f"API error: {data['error']}")
 
                     usage = self._normalize_usage(data.get("usageMetadata"))
                     if usage:
+                        if self._has_billable_usage(usage):
+                            self._mark_provider_output_started()
                         final_usage = usage
 
                     candidates = data.get("candidates") or []
                     if not candidates:
                         continue
+                    self._mark_provider_output_started()
                     candidate = candidates[0]
                     final_finish_reason = candidate.get("finishReason") or final_finish_reason
                     content_obj = candidate.get("content", {}) or {}
                     for part in content_obj.get("parts", []) or []:
                         text = part.get("text")
                         if text:
+                            self._mark_provider_output_started()
                             full_text += text
                             if on_chunk:
                                 await on_chunk(text)
 
                         function_call = part.get("functionCall")
                         if function_call:
+                            self._mark_provider_output_started()
                             name = function_call.get("name", "")
                             args = function_call.get("args", {})
                             args_str = json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=False)
@@ -1836,6 +1929,9 @@ class AnthropicClient(LLMClient):
         self._mark_provider_response_started()
         data = response.json()
         if data.get("type") == "error":
+            if data.get("content") or self._has_billable_usage(data.get("usage")):
+                self._mark_provider_output_started()
+            self._mark_explicit_provider_failure()
             raise LLMError(f"API error: {data.get('error', {})}")
 
         full_content = ""
@@ -1867,6 +1963,9 @@ class AnthropicClient(LLMClient):
                 "cache_creation_input_tokens": data["usage"].get("cache_creation_input_tokens", 0),
                 "cache_read_input_tokens": data["usage"].get("cache_read_input_tokens", 0),
             }
+
+        if full_content or full_reasoning or tool_calls or self._has_billable_usage(usage):
+            self._mark_provider_output_started()
 
         return LLMResponse(
             content=full_content,
@@ -1940,16 +2039,19 @@ class AnthropicClient(LLMClient):
 
                     # Handle events
                     if current_event == "message_start":
+                        self._mark_provider_output_started()
                         msg = data.get("message", {})
                         if msg.get("model"):
                             final_model = msg["model"]
                         if msg.get("usage"):
+                            self._mark_provider_output_started()
                             final_usage = msg["usage"]
 
                     elif current_event == "content_block_start":
                         block = data.get("content_block", {})
                         idx = data.get("index", 0)
                         if block.get("type") == "tool_use":
+                            self._mark_provider_output_started()
                             tool_call_index_map[idx] = len(tool_calls_data)
                             tool_calls_data.append({
                                 "id": block.get("id"),
@@ -1973,12 +2075,16 @@ class AnthropicClient(LLMClient):
 
                         if delta_type == "text_delta":
                             text = delta.get("text", "")
+                            if text:
+                                self._mark_provider_output_started()
                             full_content += text
                             if on_chunk:
                                 await on_chunk(text)
 
                         elif delta_type == "thinking_delta":
                             thought = delta.get("thinking", "")
+                            if thought:
+                                self._mark_provider_output_started()
                             full_reasoning += thought
                             if on_thinking:
                                 await on_thinking(thought)
@@ -1988,6 +2094,7 @@ class AnthropicClient(LLMClient):
 
                         elif delta_type == "input_json_delta":
                             if idx in tool_call_index_map:
+                                self._mark_provider_output_started()
                                 tc_idx = tool_call_index_map[idx]
                                 tool_calls_data[tc_idx]["function"]["arguments"] += delta.get("partial_json", "")
                                 if on_tool_delta:
@@ -2006,10 +2113,12 @@ class AnthropicClient(LLMClient):
                             last_finish_reason = delta["stop_reason"]
                         if data.get("usage"):
                             # message_delta usage is cumulative
+                            self._mark_provider_output_started()
                             final_usage = data["usage"]
 
                     elif current_event == "error":
                         error_info = data.get("error", {})
+                        self._mark_explicit_provider_failure()
                         raise LLMError(f"Anthropic stream error ({error_info.get('type')}): {error_info.get('message')}")
 
                     elif current_event == "message_stop":

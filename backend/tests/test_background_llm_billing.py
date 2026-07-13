@@ -41,6 +41,16 @@ class FakeCompleteLLMClient:
         return self._response
 
 
+class FakeAmbiguousCompleteFailureClient:
+    def __init__(self, error):
+        self._error = error
+        self.provider_request_started = True
+        self.close = AsyncMock()
+
+    async def complete(self, **_kwargs):
+        raise self._error
+
+
 class FakeScalarResult:
     def __init__(self, value):
         self._value = value
@@ -745,6 +755,7 @@ async def test_call_llm_settles_completed_rounds_when_cancelled(
     )
     first_reservation_id = uuid.uuid4()
     second_reservation_id = uuid.uuid4()
+    failover_guard = llm_caller.FailoverGuard()
 
     with (
         patch.object(llm_caller, "_get_agent_config", AsyncMock(return_value=(2, None))),
@@ -778,6 +789,7 @@ async def test_call_llm_settles_completed_rounds_when_cancelled(
                 agent_id=agent_id,
                 user_id=uuid.uuid4(),
                 route_meta=route_meta,
+                failover_guard=failover_guard,
             )
 
     settle_round.assert_awaited_once()
@@ -785,6 +797,12 @@ async def test_call_llm_settles_completed_rounds_when_cancelled(
     release_round.assert_awaited_once()
     assert release_round.await_args.args == (second_reservation_id,)
     assert release_round.await_args.kwargs["provider_failed"] is provider_failed
+    assert failover_guard.provider_work_started is True
+    assert (
+        failover_guard.provider_outcome_ambiguous
+        is provider_may_have_accepted
+    )
+    assert failover_guard.can_failover() is False
     settle_quota.assert_awaited_once()
     assert settle_quota.await_args.kwargs["charge_credits_enabled"] is False
     client.close.assert_awaited_once()
@@ -1057,6 +1075,91 @@ async def test_heartbeat_finally_settles_usage_when_tool_execution_is_cancelled(
     assert settle_credits.await_args.kwargs["user_id"] == creator_id
     assert settle_credits.await_args.kwargs["usage"].total_tokens == 100
     settle_round.assert_awaited_once()
+    client.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_background_llm_blocks_fallback_when_primary_outcome_is_ambiguous():
+    agent_id = uuid.uuid4()
+    tenant_id = uuid.uuid4()
+    credential_id = uuid.uuid4()
+    agent = SimpleNamespace(
+        id=agent_id,
+        name="Autonomous agent",
+        creator_id=uuid.uuid4(),
+    )
+    primary_model = SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=None,
+        provider="minimax",
+        model="MiniMax-M3",
+        modality="text",
+        tier="basic",
+        temperature=0.2,
+        max_output_tokens=256,
+        request_timeout=120,
+    )
+    fallback_model = SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=None,
+        provider="minimax",
+        model="MiniMax-M3",
+        modality="text",
+        tier="basic",
+        temperature=0.2,
+        max_output_tokens=256,
+        request_timeout=120,
+    )
+    route_meta = llm_caller.RouteMeta(saas_tier="lite", modality="text")
+    client = FakeAmbiguousCompleteFailureClient(llm_caller.LLMError("timeout"))
+    db = FakeSessionContext(agent)
+
+    with (
+        patch.object(
+            llm_caller,
+            "resolve_agent_model",
+            AsyncMock(return_value=(primary_model, fallback_model, route_meta)),
+        ),
+        patch.object(
+            llm_caller,
+            "get_agent_tools_for_llm",
+            AsyncMock(return_value=[]),
+        ),
+        patch.object(
+            llm_caller,
+            "_prepare_llm_billing_context",
+            AsyncMock(return_value=tenant_id),
+        ),
+        patch.object(
+            llm_caller,
+            "resolve_model_key",
+            AsyncMock(return_value=("key", None, credential_id)),
+        ),
+        patch.object(llm_caller, "create_llm_client", return_value=client) as create_client,
+        patch.object(
+            llm_caller,
+            "reserve_llm_round_credits",
+            AsyncMock(return_value=uuid.uuid4()),
+        ),
+        patch.object(
+            llm_caller,
+            "release_llm_round_credits",
+            AsyncMock(),
+        ) as release_round,
+        patch.object(llm_caller, "_record_llm_product_issue", AsyncMock()),
+        patch.object(llm_caller, "_apply_credential_failure_policy", AsyncMock()),
+    ):
+        result = await llm_caller.call_agent_llm_with_tools(
+            db,
+            agent_id,
+            "system",
+            "run",
+            max_rounds=1,
+        )
+
+    assert result == "[LLM Error] timeout"
+    create_client.assert_called_once()
+    assert release_round.await_args.kwargs["provider_failed"] is False
     client.close.assert_awaited_once()
 
 

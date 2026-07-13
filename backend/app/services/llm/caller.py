@@ -394,6 +394,8 @@ class FailoverGuard:
     def __init__(self):
         self.tool_executed = False
         self.streaming_started = False
+        self.provider_work_started = False
+        self.provider_outcome_ambiguous = False
         self.failover_done = False
 
     def mark_tool_executed(self):
@@ -403,6 +405,14 @@ class FailoverGuard:
     def mark_streaming_started(self):
         """Mark that streaming output has started."""
         self.streaming_started = True
+
+    def mark_provider_work_started(self):
+        """Mark that the primary provider completed at least one model round."""
+        self.provider_work_started = True
+
+    def mark_provider_outcome_ambiguous(self):
+        """Mark that replay could duplicate an accepted provider request."""
+        self.provider_outcome_ambiguous = True
 
     def mark_failover_done(self):
         """Mark that failover has already happened once."""
@@ -416,6 +426,10 @@ class FailoverGuard:
             return False  # Don't failover after side effects
         if self.streaming_started:
             return False  # Don't failover after streaming started
+        if self.provider_work_started:
+            return False  # Don't replay provider work already billed/settled
+        if self.provider_outcome_ambiguous:
+            return False  # Don't replay a request with an unknown outcome
         return True
 
 
@@ -424,9 +438,14 @@ def is_retryable_error(result: str) -> bool:
     
     Uses unified classification from failover.py.
     """
-    if not (result.startswith("[LLM Error]") or result.startswith("[LLM call error]") or result.startswith("[Error]")):
+    provider_error = result.startswith(("[LLM Error]", "[LLM call error]"))
+    client_creation_error = result.startswith("[Error] Failed to create LLM client")
+    if not (provider_error or client_creation_error):
+        # Tool failures, settlement failures, and tool-round exhaustion are
+        # local outcomes. Replaying the model can duplicate provider charges or
+        # side effects, so generic ``[Error]`` values never trigger failover.
         return False
-        
+
     return classify_error(Exception(result)) != FailoverErrorType.NON_RETRYABLE
 
 
@@ -1143,6 +1162,7 @@ async def call_llm(
     current_user_name_override: str | None = None,
     system_prompt_suffix: str | None = None,
     route_meta: RouteMeta | None = None,
+    failover_guard: FailoverGuard | None = None,
 ) -> str:
     """Call LLM via unified client with function-calling tool loop."""
     # Get agent config for tool rounds
@@ -1314,6 +1334,12 @@ async def call_llm(
         finally:
             _usage_finalized = True
 
+    def _record_provider_failure_outcome() -> bool:
+        provider_may_have_accepted = llm_provider_may_have_accepted(client)
+        if provider_may_have_accepted and failover_guard is not None:
+            failover_guard.mark_provider_outcome_ambiguous()
+        return provider_may_have_accepted
+
     # Tool-calling loop
     consecutive_invalid_tool_calls = 0
     for round_i in range(_max_tool_rounds):
@@ -1410,6 +1436,7 @@ async def call_llm(
                 **request_options,
             )
         except asyncio.CancelledError:
+            _provider_may_have_accepted = _record_provider_failure_outcome()
             await release_llm_round_credits(
                 _round_reservation_id,
                 model=model,
@@ -1417,12 +1444,13 @@ async def call_llm(
                 agent_id=agent_id,
                 user_id=user_id,
                 tenant_id=_tenant_id,
-                provider_failed=not llm_provider_may_have_accepted(client),
+                provider_failed=not _provider_may_have_accepted,
             )
             await _finalize_llm_usage()
             await client.close()
             raise
         except QuotaExceeded as e:
+            _provider_may_have_accepted = _record_provider_failure_outcome()
             await release_llm_round_credits(
                 _round_reservation_id,
                 model=model,
@@ -1430,12 +1458,13 @@ async def call_llm(
                 agent_id=agent_id,
                 user_id=user_id,
                 tenant_id=_tenant_id,
-                provider_failed=not llm_provider_may_have_accepted(client),
+                provider_failed=not _provider_may_have_accepted,
             )
             await _finalize_llm_usage()
             await client.close()
             return f"⚠️ {e.message}"
         except LLMError as e:
+            _provider_may_have_accepted = _record_provider_failure_outcome()
             await release_llm_round_credits(
                 _round_reservation_id,
                 model=model,
@@ -1443,7 +1472,7 @@ async def call_llm(
                 agent_id=agent_id,
                 user_id=user_id,
                 tenant_id=_tenant_id,
-                provider_failed=not llm_provider_may_have_accepted(client),
+                provider_failed=not _provider_may_have_accepted,
             )
             logger.error(
                 "[LLM] provider operation failed provider={} model={} error_type={} error_code={}",
@@ -1475,6 +1504,7 @@ async def call_llm(
             await client.close()
             return f"[LLM Error] {e}"
         except Exception as e:
+            _provider_may_have_accepted = _record_provider_failure_outcome()
             await release_llm_round_credits(
                 _round_reservation_id,
                 model=model,
@@ -1482,7 +1512,7 @@ async def call_llm(
                 agent_id=agent_id,
                 user_id=user_id,
                 tenant_id=_tenant_id,
-                provider_failed=not llm_provider_may_have_accepted(client),
+                provider_failed=not _provider_may_have_accepted,
             )
             logger.error(
                 "[LLM] unexpected provider failure provider={} model={} error_type={} error_code={}",
@@ -1515,6 +1545,8 @@ async def call_llm(
             return f"[LLM call error] {type(e).__name__}: {str(e)[:200]}"
 
         # Track tokens for this round
+        if failover_guard is not None:
+            failover_guard.mark_provider_work_started()
         _usage_this_round = _usage_from_response_or_estimate(response, api_messages)
         _accumulated_usage.add(_usage_this_round)
         _unsaved_usage.add(_usage_this_round)
@@ -1709,6 +1741,7 @@ async def call_llm_with_failover(
         current_user_name_override=current_user_name_override,
         system_prompt_suffix=system_prompt_suffix,
         route_meta=route_meta,
+        failover_guard=guard,
     )
 
     # Check if we need to failover
@@ -1729,6 +1762,10 @@ async def call_llm_with_failover(
             logger.warning("[Failover] Blocked: side-effecting tool already executed")
         elif guard.streaming_started:
             logger.warning("[Failover] Blocked: streaming already started")
+        elif guard.provider_work_started:
+            logger.warning("[Failover] Blocked: primary provider work already started")
+        elif guard.provider_outcome_ambiguous:
+            logger.warning("[Failover] Blocked: primary provider outcome is ambiguous")
         elif guard.failover_done:
             logger.warning("[Failover] Blocked: failover already done once")
         return primary_result
@@ -1782,6 +1819,7 @@ async def call_llm_with_failover(
         current_user_name_override=current_user_name_override,
         system_prompt_suffix=system_prompt_suffix,
         route_meta=route_meta,
+        failover_guard=fallback_guard,
     )
 
     # Combine error messages if fallback also failed
@@ -2063,14 +2101,16 @@ async def call_agent_llm_with_tools(
     tools_for_llm = await get_agent_tools_for_llm(agent_id)
     allowed_tool_names = _allowed_tool_names(tools_for_llm)
 
-    async def _try_model(model: LLMModel) -> tuple[str, bool, bool]:
-        """Try to complete with a model. Returns (response, success, tool_executed)."""
+    async def _try_model(model: LLMModel) -> tuple[str, bool, bool, bool]:
+        """Return response, success, tool side effects, and replay safety."""
         _accumulated_usage = TokenUsage()
         _unsaved_usage = TokenUsage()
         _usage_finalized = False
         _cred_id = None
         client = None
         tool_executed = False
+        provider_replay_unsafe = False
+        provider_error = False
         tenant_id = await _prepare_llm_billing_context(agent_id, model, route_meta)
 
         async def _finalize_background_usage() -> None:
@@ -2150,7 +2190,12 @@ async def call_agent_llm_with_tools(
                 route_meta=route_meta,
                 severity=("critical" if exc.reason_code.value == "all_unhealthy" else "error"),
             )
-            return f"⚠️ {no_credential_user_message(exc)}", False, tool_executed
+            return (
+                f"⚠️ {no_credential_user_message(exc)}",
+                False,
+                tool_executed,
+                provider_replay_unsafe,
+            )
         try:
             client = create_llm_client(
                 provider=model.provider,
@@ -2193,7 +2238,12 @@ async def call_agent_llm_with_tools(
                             )
                             await _finalize_background_usage()
                             await client.close()
-                            return _token_limit_msg, False, tool_executed
+                            return (
+                                _token_limit_msg,
+                                False,
+                                tool_executed,
+                                provider_replay_unsafe,
+                            )
 
                 _round_reservation_id = None
                 try:
@@ -2227,6 +2277,7 @@ async def call_agent_llm_with_tools(
                         "⚠️ Credits 预留暂时不可用，模型尚未调用，请稍后重试。",
                         False,
                         tool_executed,
+                        provider_replay_unsafe,
                     )
 
                 try:
@@ -2238,6 +2289,11 @@ async def call_agent_llm_with_tools(
                         **request_options,
                     )
                 except QuotaExceeded:
+                    _provider_may_have_accepted = llm_provider_may_have_accepted(client)
+                    provider_replay_unsafe = (
+                        provider_replay_unsafe or _provider_may_have_accepted
+                    )
+                    provider_error = True
                     await release_llm_round_credits(
                         _round_reservation_id,
                         model=model,
@@ -2245,10 +2301,15 @@ async def call_agent_llm_with_tools(
                         agent_id=agent_id,
                         user_id=agent.creator_id,
                         tenant_id=tenant_id,
-                        provider_failed=not llm_provider_may_have_accepted(client),
+                        provider_failed=not _provider_may_have_accepted,
                     )
                     raise
                 except Exception as e:
+                    _provider_may_have_accepted = llm_provider_may_have_accepted(client)
+                    provider_replay_unsafe = (
+                        provider_replay_unsafe or _provider_may_have_accepted
+                    )
+                    provider_error = True
                     await release_llm_round_credits(
                         _round_reservation_id,
                         model=model,
@@ -2256,7 +2317,7 @@ async def call_agent_llm_with_tools(
                         agent_id=agent_id,
                         user_id=agent.creator_id,
                         tenant_id=tenant_id,
-                        provider_failed=not llm_provider_may_have_accepted(client),
+                        provider_failed=not _provider_may_have_accepted,
                     )
                     logger.error(
                         "[call_agent_llm_with_tools] agent={} provider={} model={} "
@@ -2289,6 +2350,7 @@ async def call_agent_llm_with_tools(
                     raise
 
                 # Track tokens for this round
+                provider_replay_unsafe = True
                 _usage_this_round = _usage_from_response_or_estimate(response, api_messages)
                 _accumulated_usage.add(_usage_this_round)
                 _unsaved_usage.add(_usage_this_round)
@@ -2312,6 +2374,7 @@ async def call_agent_llm_with_tools(
                         "⚠️ Credits 结算暂时不可用，本轮结果未执行，请稍后重试。",
                         False,
                         tool_executed,
+                        provider_replay_unsafe,
                     )
 
                 if not response.tool_calls:
@@ -2331,7 +2394,12 @@ async def call_agent_llm_with_tools(
                     if finish_call.valid:
                         await _finalize_background_usage()
                         await client.close()
-                        return finish_call.content, True, tool_executed
+                        return (
+                            finish_call.content,
+                            True,
+                            tool_executed,
+                            provider_replay_unsafe,
+                        )
                     api_messages.append(LLMMessage(
                         role="assistant",
                         content=response.content or None,
@@ -2385,7 +2453,12 @@ async def call_agent_llm_with_tools(
 
             await _finalize_background_usage()
             await client.close()
-            return "[Error] Too many tool call rounds", False, tool_executed
+            return (
+                "[Error] Too many tool call rounds",
+                False,
+                tool_executed,
+                provider_replay_unsafe,
+            )
 
         except asyncio.CancelledError:
             await _finalize_background_usage()
@@ -2396,29 +2469,50 @@ async def call_agent_llm_with_tools(
             await _finalize_background_usage()
             if client is not None:
                 await client.close()
-            return f"[Error] {e}", False, tool_executed
+            prefix = "[LLM Error]" if provider_error else "[Error]"
+            return (
+                f"{prefix} {e}",
+                False,
+                tool_executed,
+                provider_replay_unsafe,
+            )
 
     # Try primary model
     try:
-        reply, success, primary_tool_executed = await _try_model(primary_model)
+        (
+            reply,
+            success,
+            primary_tool_executed,
+            primary_provider_replay_unsafe,
+        ) = await _try_model(primary_model)
     except QuotaExceeded as e:
         return f"⚠️ {e.message}"
     if success:
         return reply
 
     # Primary failed - check if retryable
-    error_type = classify_error(Exception(reply))
-    if error_type == FailoverErrorType.NON_RETRYABLE or not fallback_model:
+    if not is_retryable_error(reply) or not fallback_model:
         return reply
 
     if primary_tool_executed:
         logger.warning("[call_agent_llm_with_tools] Blocked fallback: side-effecting tool already executed")
         return reply
 
+    if primary_provider_replay_unsafe:
+        logger.warning(
+            "[call_agent_llm_with_tools] Blocked fallback: primary provider replay is unsafe"
+        )
+        return reply
+
     # Try fallback model
     logger.info(f"[call_agent_llm_with_tools] Retrying with fallback: {fallback_model.model}")
     try:
-        reply2, success2, _fallback_tool_executed = await _try_model(fallback_model)
+        (
+            reply2,
+            success2,
+            _fallback_tool_executed,
+            _fallback_provider_replay_unsafe,
+        ) = await _try_model(fallback_model)
     except QuotaExceeded as e:
         return f"⚠️ {e.message}"
     if success2:
