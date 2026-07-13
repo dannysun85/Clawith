@@ -1,4 +1,5 @@
 import { useTranslation } from 'react-i18next';
+import { useQueryClient } from '@tanstack/react-query';
 import { IconBrain, IconDna, IconHeartbeat } from '@tabler/icons-react';
 
 import type { FileBrowserApi } from '../../../components/FileBrowser';
@@ -13,6 +14,7 @@ export default function MindTab({
     canEdit: boolean;
 }) {
     const { t } = useTranslation();
+    const queryClient = useQueryClient();
     const adapter: FileBrowserApi = {
         list: (path) => fileApi.list(agentId, path),
         read: (path) => fileApi.read(agentId, path),
@@ -30,7 +32,16 @@ export default function MindTab({
                 <p style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginBottom: '12px' }}>
                     {t('agent.mind.soulDesc', 'Core identity, personality, and behavior boundaries.')}
                 </p>
-                <FileBrowser api={adapter} singleFile="soul.md" title="" features={{ edit: canEdit }} />
+                <FileBrowser
+                    api={adapter}
+                    singleFile="soul.md"
+                    title=""
+                    features={{ edit: canEdit }}
+                    onRefresh={() => {
+                        queryClient.invalidateQueries({ queryKey: ['agent', agentId] });
+                        queryClient.invalidateQueries({ queryKey: ['agents'] });
+                    }}
+                />
             </div>
 
             <div>

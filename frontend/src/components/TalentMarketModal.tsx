@@ -22,6 +22,10 @@ interface Template {
 interface Props {
     open: boolean;
     onClose: () => void;
+    initialSearchQuery?: string;
+    agentLimitReached?: boolean;
+    agentLimitMessage?: string;
+    onAgentLimitReached?: () => void;
 }
 
 // Curated list for the "Popular" tab — covers one role from each broad need
@@ -31,6 +35,7 @@ const FEATURED_TEMPLATE_NAMES = new Set<string>([
     'Private Assistant',
     'Chief of Staff',
     'Project Manager',
+    'Douyin Operations Manager',
     'Growth Hacker',
     'Content Creator',
     'Frontend Developer',
@@ -44,7 +49,14 @@ const FEATURED_TEMPLATE_NAMES = new Set<string>([
 
 type TabId = 'popular' | 'software-development' | 'marketing' | 'office' | 'trading';
 
-export default function TalentMarketModal({ open, onClose }: Props) {
+export default function TalentMarketModal({
+    open,
+    onClose,
+    initialSearchQuery = '',
+    agentLimitReached = false,
+    agentLimitMessage,
+    onAgentLimitReached,
+}: Props) {
     const { t, i18n } = useTranslation();
     const isChinese = i18n.language.startsWith('zh');
     // Chosen template → hands off to PostHireSettingsModal. The market modal
@@ -59,6 +71,12 @@ export default function TalentMarketModal({ open, onClose }: Props) {
         queryFn: () => agentApi.templates(),
         enabled: open,
     });
+
+    useEffect(() => {
+        if (!open) return;
+        setSearchQuery(initialSearchQuery);
+        if (!initialSearchQuery) setActiveTab('popular');
+    }, [open, initialSearchQuery]);
 
     const tabs: Array<{ id: TabId; label: string }> = [
         { id: 'popular', label: t('talentMarket.tabPopular', isChinese ? '热门推荐' : 'Popular') },
@@ -78,6 +96,14 @@ export default function TalentMarketModal({ open, onClose }: Props) {
     }, [open, onClose, pendingTemplate, customModalOpen]);
 
     if (!open) return null;
+
+    const guardCreate = (next: () => void) => {
+        if (agentLimitReached) {
+            onAgentLimitReached?.();
+            return;
+        }
+        next();
+    };
 
     const builtins: Template[] = templates.filter((t: Template) => t.is_builtin);
     const trimmedQuery = searchQuery.trim().toLowerCase();
@@ -250,7 +276,9 @@ export default function TalentMarketModal({ open, onClose }: Props) {
                     )}
                     {!isLoading && (
                         <CustomCard
-                            onClick={() => setCustomModalOpen(true)}
+                            onClick={() => guardCreate(() => setCustomModalOpen(true))}
+                            limitReached={agentLimitReached}
+                            limitMessage={agentLimitMessage}
                         />
                     )}
                     {!isLoading && visibleTemplates.length === 0 && (
@@ -266,7 +294,8 @@ export default function TalentMarketModal({ open, onClose }: Props) {
                             tpl={tpl}
                             hiring={false}
                             isChinese={isChinese}
-                            onHire={() => setPendingTemplate(tpl)}
+                            limitReached={agentLimitReached}
+                            onHire={() => guardCreate(() => setPendingTemplate(tpl))}
                         />
                     ))}
                 </div>
@@ -296,11 +325,12 @@ export default function TalentMarketModal({ open, onClose }: Props) {
     );
 }
 
-function TemplateCard({ tpl, hiring, isChinese, onHire }: {
+function TemplateCard({ tpl, hiring, isChinese, onHire, limitReached }: {
     tpl: Template;
     hiring: boolean;
     isChinese: boolean;
     onHire: () => void;
+    limitReached?: boolean;
 }) {
     const { t } = useTranslation();
     const localized = translateTemplate(tpl, isChinese);
@@ -351,18 +381,31 @@ function TemplateCard({ tpl, hiring, isChinese, onHire }: {
                 disabled={hiring}
                 style={{ marginTop: '16px', width: '100%' }}
             >
-                {hiring ? t('talentMarket.hiring', isChinese ? '聘用中…' : 'Hiring...') : t('talentMarket.hire', isChinese ? '聘用' : 'Hire')}
+                {hiring
+                    ? t('talentMarket.hiring', isChinese ? '聘用中…' : 'Hiring...')
+                    : limitReached
+                        ? t('talentMarket.upgradeToHire', isChinese ? '升级套餐' : 'Upgrade plan')
+                        : t('talentMarket.hire', isChinese ? '聘用' : 'Hire')}
             </button>
         </div>
     );
 }
 
-function CustomCard({ onClick }: { onClick: () => void }) {
+function CustomCard({
+    onClick,
+    limitReached,
+    limitMessage,
+}: {
+    onClick: () => void;
+    limitReached?: boolean;
+    limitMessage?: string;
+}) {
     const { t, i18n } = useTranslation();
     const isChinese = i18n.language.startsWith('zh');
     return (
         <div
             onClick={onClick}
+            title={limitReached ? limitMessage : undefined}
             style={{
                 border: '1.5px dashed var(--border-subtle)', borderRadius: '10px',
                 padding: '18px', display: 'flex', flexDirection: 'column',
@@ -419,8 +462,8 @@ function CustomCard({ onClick }: { onClick: () => void }) {
                 position: 'relative', zIndex: 1,
             }}>
                 {t('talentMarket.customDescription', isChinese
-                    ? '创建本地 Native Agent，按你的需求定义身份、权限和工具。'
-                    : 'Create a native agent, then define its identity, permissions, and tools.')}
+                    ? (limitReached ? '当前套餐智能体数量已满，升级后可继续创建。' : '创建本地 Native Agent，按你的需求定义身份、权限和工具。')
+                    : (limitReached ? 'Your plan is at the agent limit. Upgrade to create more.' : 'Create a native agent, then define its identity, permissions, and tools.'))}
             </p>
             <div style={{
                 marginTop: '14px',

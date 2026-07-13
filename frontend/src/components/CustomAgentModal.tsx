@@ -3,27 +3,22 @@ import { useNavigate } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import {
-    IconAlertTriangle,
     IconCheck,
     IconCpu,
     IconPlugConnected,
-    IconSettings,
     IconSparkles,
     IconUser,
     IconX,
 } from '@tabler/icons-react';
-import { agentApi, authApi, enterpriseApi, tenantApi } from '../services/api';
+import { agentApi, fetchJson } from '../services/api';
 import { useDialog } from './Dialog/DialogProvider';
 import LinearCopyButton from './LinearCopyButton';
+import TierSelector, { type SaasTier } from './TierSelector';
+import { canonicalizeModalities, MODALITIES } from '../constants/modalities';
+import { SUBSCRIPTION_UPGRADE_PATH } from '../hooks/useAgentCreationLimit';
 
 type Mode = 'native' | 'openclaw';
 type Visibility = 'company' | 'only_me' | 'custom';
-
-interface Model {
-    id: string;
-    label?: string;
-    enabled?: boolean;
-}
 
 interface CreatedAgent {
     id: string;
@@ -48,45 +43,24 @@ export default function CustomAgentModal({ open, initialMode = 'native', onClose
     const [name, setName] = useState('');
     const [roleDescription, setRoleDescription] = useState('');
     const [visibility, setVisibility] = useState<Visibility>('only_me');
-    const [modelId, setModelId] = useState('');
+    const [preferredTier, setPreferredTier] = useState<SaasTier>('pro');
+    const [preferredModality, setPreferredModality] = useState('text');
     const [createdExternal, setCreatedExternal] = useState<CreatedAgent | null>(null);
 
-    const { data: myTenant } = useQuery({
-        queryKey: ['tenant', 'me'],
-        queryFn: () => tenantApi.me(),
+    const { data: entitlements } = useQuery({
+        queryKey: ['subscription-entitlements'],
+        queryFn: () => fetchJson<any | null>('/subscription/my-entitlements'),
         enabled: open,
         staleTime: 5 * 60 * 1000,
     });
-
-    const { data: currentUser } = useQuery({
-        queryKey: ['auth', 'me'],
-        queryFn: authApi.me,
-        enabled: open,
-        staleTime: 5 * 60 * 1000,
-    });
-
-    const { data: models = [] } = useQuery({
-        queryKey: ['llm-models'],
-        queryFn: enterpriseApi.llmModels,
-        enabled: open,
-    });
-
-    const enabledModels = useMemo(
-        () => (models as Model[]).filter((m) => m.enabled !== false),
-        [models],
+    const allowedTiers = useMemo(
+        () => entitlements?.allowed_tiers?.length ? entitlements.allowed_tiers : ['lite', 'pro', 'ultra'],
+        [entitlements?.allowed_tiers],
     );
-
-    const canManageModels = currentUser?.role === 'platform_admin'
-        || currentUser?.role === 'org_admin'
-        || !!currentUser?.is_platform_admin;
-    const nativeHasNoModel = mode === 'native' && enabledModels.length === 0;
-    const disabledByNoModel = nativeHasNoModel
-        ? t('customAgentModal.noModelButtonHint')
-        : undefined;
-    const openModelSettings = () => {
-        (onDone || onClose)();
-        navigate('/enterprise#llm');
-    };
+    const allowedModalities = useMemo(() => {
+        const canonical = canonicalizeModalities(entitlements?.allowed_modalities);
+        return canonical.length ? canonical : ['text'];
+    }, [entitlements?.allowed_modalities]);
 
     useEffect(() => {
         if (!open) return;
@@ -94,12 +68,14 @@ export default function CustomAgentModal({ open, initialMode = 'native', onClose
     }, [open, initialMode]);
 
     useEffect(() => {
-        if (!open || modelId) return;
-        const preferred = myTenant?.default_model_id && enabledModels.find((m) => m.id === myTenant.default_model_id)
-            ? myTenant.default_model_id
-            : (enabledModels[0]?.id || '');
-        if (preferred) setModelId(preferred);
-    }, [open, modelId, myTenant?.default_model_id, enabledModels]);
+        if (!open) return;
+        if (!allowedTiers.includes(preferredTier)) {
+            setPreferredTier((allowedTiers[0] as SaasTier) || 'lite');
+        }
+        if (!allowedModalities.includes(preferredModality)) {
+            setPreferredModality(allowedModalities[0] || 'text');
+        }
+    }, [open, allowedTiers, allowedModalities, preferredTier, preferredModality]);
 
     useEffect(() => {
         if (!open) {
@@ -107,7 +83,8 @@ export default function CustomAgentModal({ open, initialMode = 'native', onClose
             setName('');
             setRoleDescription('');
             setVisibility('only_me');
-            setModelId('');
+            setPreferredTier('pro');
+            setPreferredModality('text');
             setCreatedExternal(null);
         }
     }, [open, initialMode]);
@@ -128,11 +105,8 @@ export default function CustomAgentModal({ open, initialMode = 'native', onClose
             if (!trimmedName) {
                 throw new Error(t('customAgentModal.nameRequired'));
             }
-            if (mode === 'native' && enabledModels.length === 0) {
-                throw new Error(t('customAgentModal.noModelError'));
-            }
-            if (mode === 'native' && !modelId) {
-                throw new Error(t('customAgentModal.modelRequired'));
+            if (mode === 'native' && !preferredTier) {
+                throw new Error(t('customAgentModal.modelRequired', '请选择模型档位'));
             }
 
             const currentTenant = localStorage.getItem('current_tenant_id');
@@ -148,7 +122,8 @@ export default function CustomAgentModal({ open, initialMode = 'native', onClose
             };
 
             if (mode === 'native') {
-                payload.primary_model_id = modelId || undefined;
+                payload.preferred_tier = preferredTier;
+                payload.preferred_modality = preferredModality || 'text';
             }
 
             const agent = await agentApi.create(payload);
@@ -156,6 +131,7 @@ export default function CustomAgentModal({ open, initialMode = 'native', onClose
         },
         onSuccess: ({ agent, chatNow }: { agent: CreatedAgent; chatNow: boolean }) => {
             queryClient.invalidateQueries({ queryKey: ['agents'] });
+            queryClient.invalidateQueries({ queryKey: ['subscription-seats'] });
             if (mode === 'openclaw') {
                 setCreatedExternal(agent);
                 return;
@@ -164,6 +140,23 @@ export default function CustomAgentModal({ open, initialMode = 'native', onClose
             if (chatNow) navigate(`/agents/${agent.id}#chat`);
         },
         onError: async (err: any) => {
+            const upgradeUrl = err?.detail?.details?.upgrade_url || err?.detail?.upgrade_url || (err?.status === 402 ? SUBSCRIPTION_UPGRADE_PATH : '');
+            if (upgradeUrl) {
+                queryClient.invalidateQueries({ queryKey: ['subscription-seats'] });
+                const goToSubscription = await dialog.confirm(
+                    err?.message || t('agent.limit.title', 'Agent limit reached'),
+                    {
+                        title: t('agent.limit.title', 'Agent limit reached'),
+                        confirmLabel: t('subscription.goToDetail', 'Go to subscription'),
+                        cancelLabel: t('common.cancel', 'Cancel'),
+                    },
+                );
+                if (goToSubscription) {
+                    onClose();
+                    navigate(upgradeUrl);
+                }
+                return;
+            }
             await dialog.alert(t('customAgentModal.creationFailed'), {
                 type: 'error',
                 details: String(err?.message || err),
@@ -318,30 +311,24 @@ export default function CustomAgentModal({ open, initialMode = 'native', onClose
                                 </section>
 
                                 {mode === 'native' && (
-                                    <Field label={t('customAgentModal.model')} required>
-                                        {enabledModels.length === 0 ? (
-                                            <NoModelsNotice
-                                                canManageModels={canManageModels}
-                                                onConfigure={openModelSettings}
-                                                t={t}
-                                                allowExternalHint
-                                            />
-                                        ) : (
-                                            <select
-                                                className="form-input"
-                                                value={modelId}
-                                                onChange={(e) => setModelId(e.target.value)}
-                                                disabled={busy}
-                                                style={{ width: '100%' }}
-                                            >
-                                                {enabledModels.map((m) => (
-                                                    <option key={m.id} value={m.id}>
-                                                        {m.label || t('customAgentModal.modelFallback')}
-                                                        {myTenant?.default_model_id === m.id ? ` · ${t('customAgentModal.defaultModel')}` : ''}
-                                                    </option>
-                                                ))}
-                                            </select>
-                                        )}
+                                    <Field label={t('customAgentModal.model', '模型档位')} required>
+                                        <TierSelector
+                                            value={preferredTier}
+                                            onChange={setPreferredTier}
+                                            allowedTiers={allowedTiers}
+                                            disabled={busy}
+                                        />
+                                        <select
+                                            className="form-input"
+                                            value={preferredModality}
+                                            onChange={(e) => setPreferredModality(e.target.value)}
+                                            disabled={busy}
+                                            style={{ width: '100%' }}
+                                        >
+                                            {MODALITIES.filter((m) => allowedModalities.includes(m)).map((m) => (
+                                                <option key={m} value={m}>{m}</option>
+                                            ))}
+                                        </select>
                                     </Field>
                                 )}
                             </div>
@@ -353,32 +340,20 @@ export default function CustomAgentModal({ open, initialMode = 'native', onClose
                             </button>
                             {mode === 'native' ? (
                                 <>
-                                    <span
-                                        title={disabledByNoModel}
-                                        style={{ display: 'inline-flex', cursor: nativeHasNoModel ? 'not-allowed' : undefined }}
+                                    <button
+                                        className="btn btn-secondary"
+                                        disabled={busy}
+                                        onClick={() => createAgent.mutate({ chatNow: false })}
                                     >
-                                        <button
-                                            className="btn btn-secondary"
-                                            disabled={busy || nativeHasNoModel}
-                                            style={{ pointerEvents: nativeHasNoModel ? 'none' : undefined }}
-                                            onClick={() => createAgent.mutate({ chatNow: false })}
-                                        >
-                                            {t('customAgentModal.createOnly')}
-                                        </button>
-                                    </span>
-                                    <span
-                                        title={disabledByNoModel}
-                                        style={{ display: 'inline-flex', cursor: nativeHasNoModel ? 'not-allowed' : undefined }}
+                                        {t('customAgentModal.createOnly')}
+                                    </button>
+                                    <button
+                                        className="btn btn-primary"
+                                        disabled={busy}
+                                        onClick={() => createAgent.mutate({ chatNow: true })}
                                     >
-                                        <button
-                                            className="btn btn-primary"
-                                            disabled={busy || nativeHasNoModel}
-                                            style={{ pointerEvents: nativeHasNoModel ? 'none' : undefined }}
-                                            onClick={() => createAgent.mutate({ chatNow: true })}
-                                        >
-                                            {busy ? t('customAgentModal.creating') : t('customAgentModal.chatNow')}
-                                        </button>
-                                    </span>
+                                        {busy ? t('customAgentModal.creating') : t('customAgentModal.chatNow')}
+                                    </button>
                                 </>
                             ) : (
                                 <button
@@ -392,62 +367,6 @@ export default function CustomAgentModal({ open, initialMode = 'native', onClose
                         </div>
                     </>
                 )}
-            </div>
-        </div>
-    );
-}
-
-function NoModelsNotice({
-    canManageModels,
-    onConfigure,
-    t,
-    allowExternalHint,
-}: {
-    canManageModels: boolean;
-    onConfigure: () => void;
-    t: (key: string) => string;
-    allowExternalHint?: boolean;
-}) {
-    return (
-        <div
-            role="status"
-            style={{
-                display: 'flex',
-                gap: '10px',
-                alignItems: 'flex-start',
-                padding: '10px 12px',
-                borderRadius: '9px',
-                border: '1px solid rgba(217,119,6,0.28)',
-                background: 'rgba(245,158,11,0.08)',
-            }}
-        >
-            <IconAlertTriangle size={17} stroke={1.8} style={{ marginTop: '1px', color: '#b45309', flexShrink: 0 }} />
-            <div style={{ minWidth: 0 }}>
-                <div style={{ fontSize: '13px', fontWeight: 650, color: 'var(--text-primary)' }}>
-                    {t('customAgentModal.noModelsTitle')}
-                </div>
-                <div style={{ marginTop: '3px', fontSize: '12px', lineHeight: 1.5, color: 'var(--text-secondary)' }}>
-                    {canManageModels
-                        ? t('customAgentModal.noModelsAdminHint')
-                        : t('customAgentModal.noModelsMemberHint')}
-                    {!canManageModels && allowExternalHint ? (
-                        <span>
-                            {' '}
-                            {t('customAgentModal.noModelsExternalHint')}
-                        </span>
-                    ) : null}
-                </div>
-                {canManageModels ? (
-                    <button
-                        type="button"
-                        className="btn btn-secondary"
-                        onClick={onConfigure}
-                        style={{ marginTop: '9px', height: '30px', padding: '0 10px', fontSize: '12px', display: 'inline-flex', alignItems: 'center', gap: '6px' }}
-                    >
-                        <IconSettings size={14} stroke={1.7} />
-                        {t('customAgentModal.configureModels')}
-                    </button>
-                ) : null}
             </div>
         </div>
     );
@@ -643,17 +562,17 @@ function ExternalSuccess({
 
 function buildOpenClawInstruction(apiKey: string) {
     const origin = window.location.origin;
-    return `Please create a skill file at skills/clawith_sync.md with the following content, then add "Check Clawith inbox using the clawith_sync skill and process any pending messages" to your HEARTBEAT.md:
+    return `Please create a skill file at skills/clawith_sync.md with the following content, then add "Check Astra inbox using the clawith_sync skill and process any pending messages" to your HEARTBEAT.md:
 
 ---
 name: clawith_sync
-description: Sync with Clawith platform — check inbox, submit results, and send messages.
+description: Sync with Astra platform — check inbox, submit results, and send messages.
 ---
 
-# Clawith Sync
+# Astra Sync
 
 ## When to use
-Check for new messages from the Clawith platform during every heartbeat cycle.
+Check for new messages from the Astra platform during every heartbeat cycle.
 You can also proactively send messages to people and agents in your relationships.
 
 ## Instructions
@@ -666,7 +585,7 @@ Make an HTTP GET request:
 The response contains a \`messages\` array. Each message includes:
 - \`id\` — unique message ID (use this for reporting)
 - \`content\` — the message text
-- \`sender_user_name\` — name of the Clawith user who sent it
+- \`sender_user_name\` — name of the Astra user who sent it
 - \`sender_user_id\` — unique ID of the sender
 - \`conversation_id\` — the conversation this message belongs to
 - \`history\` — array of previous messages in this conversation for context

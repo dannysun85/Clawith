@@ -49,6 +49,19 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
+Build an image reference without emitting a leading slash when the registry
+prefix is intentionally empty (for images preloaded into a local cluster).
+*/}}
+{{- define "clawith.image" -}}
+{{- $registry := trimSuffix "/" (default "" .registry) -}}
+{{- if $registry -}}
+{{- printf "%s/%s:%s" $registry .repository .tag -}}
+{{- else -}}
+{{- printf "%s:%s" .repository .tag -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 PostgreSQL host
 */}}
 {{- define "clawith.postgresql.host" -}}
@@ -104,6 +117,18 @@ PostgreSQL password
 {{- end }}
 
 {{/*
+PostgreSQL URL with credentials escaped for RFC 3986 userinfo.
+*/}}
+{{- define "clawith.postgresql.url" -}}
+{{- $username := include "clawith.postgresql.username" . -}}
+{{- $password := include "clawith.postgresql.password" . -}}
+{{- $host := include "clawith.postgresql.host" . -}}
+{{- $port := include "clawith.postgresql.port" . -}}
+{{- $database := include "clawith.postgresql.database" . -}}
+{{- printf "postgresql+asyncpg://%s:%s@%s:%s/%s" ($username | urlquery) ($password | urlquery) $host $port ($database | urlquery) -}}
+{{- end }}
+
+{{/*
 Redis host
 */}}
 {{- define "clawith.redis.host" -}}
@@ -126,13 +151,31 @@ Redis port
 {{- end }}
 
 {{/*
+Redis URL. External deployments may opt into password authentication; the
+in-cluster Redis remains reachable only through its ClusterIP Service.
+*/}}
+{{- define "clawith.redis.url" -}}
+{{- $host := include "clawith.redis.host" . -}}
+{{- $port := include "clawith.redis.port" . -}}
+{{- $database := int (default 0 .Values.redis.external.database) -}}
+{{- $password := "" -}}
+{{- if not .Values.redis.enabled -}}
+{{- $password = default "" .Values.redis.external.password -}}
+{{- end -}}
+{{- if $password -}}
+{{- printf "redis://:%s@%s:%s/%d" ($password | urlquery) $host $port $database -}}
+{{- else -}}
+{{- printf "redis://%s:%s/%d" $host $port $database -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Secret name
 */}}
 {{- define "clawith.secretName" -}}
 {{- if .Values.secrets.create }}
 {{- printf "%s-secrets" (include "clawith.fullname" .) }}
 {{- else }}
-{{- .Values.secrets.existingSecret }}
+{{- required "secrets.existingSecret must be set when secrets.create=false" .Values.secrets.existingSecret }}
 {{- end }}
 {{- end }}
-

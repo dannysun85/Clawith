@@ -21,14 +21,30 @@ spec:
     spec:
       containers:
       - name: frontend
-        image: "{{ .Values.global.imageRegistry }}/{{ .Values.frontend.image.repository }}:{{ .Values.frontend.image.tag }}"
+        image: {{ include "clawith.image" (dict "registry" .Values.global.imageRegistry "repository" .Values.frontend.image.repository "tag" .Values.frontend.image.tag) | quote }}
         imagePullPolicy: {{ .Values.frontend.image.pullPolicy }}
         ports:
         - containerPort: {{ .Values.frontend.service.targetPort }}
           name: http
         env:
-        - name: VITE_API_URL
-          value: {{ .Values.frontend.env.viteApiUrl | quote }}
+        - name: API_UPSTREAM
+          value: {{ default (printf "%s-backend:%v" (include "clawith.fullname" .) .Values.backend.service.port) .Values.frontend.env.apiUpstream | quote }}
+        {{- if .Values.frontend.env.minioUpstream }}
+        - name: MINIO_UPSTREAM
+          value: {{ .Values.frontend.env.minioUpstream | quote }}
+        {{- end }}
+        readinessProbe:
+          httpGet:
+            path: /
+            port: http
+          initialDelaySeconds: 3
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 20
         {{- with .Values.frontend.resources }}
         resources:
           {{- toYaml . | nindent 10 }}
@@ -53,4 +69,3 @@ spec:
     targetPort: http
     name: http
 {{- end }}
-

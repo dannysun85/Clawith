@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from app.services.auth_provider import FeishuAuthProvider
+from app.services.auth_provider import DingTalkAuthProvider, FeishuAuthProvider
 from app.services.auth_registry import AuthProviderRegistry
 from app.services.identity_provider_lookup import get_preferred_identity_provider
 from app.services.google_workspace_oauth import (
@@ -18,8 +18,9 @@ from app.services.google_workspace_oauth import (
 
 
 class _DummyResponse:
-    def __init__(self, payload):
+    def __init__(self, payload, status_code=200):
         self._payload = payload
+        self.status_code = status_code
 
     def json(self):
         return self._payload
@@ -36,6 +37,9 @@ class _DummyAsyncClient:
         return False
 
     async def get(self, *args, **kwargs):
+        return self._responses.pop(0)
+
+    async def post(self, *args, **kwargs):
         return self._responses.pop(0)
 
 
@@ -85,6 +89,28 @@ async def test_feishu_auth_provider_get_user_info():
     assert user_info.name == "Alice"
     assert user_info.email == "alice@example.com"
     assert user_info.mobile == "13800000000"
+
+
+@pytest.mark.asyncio
+async def test_dingtalk_token_exchange_rejects_null_payload_without_crashing():
+    provider = DingTalkAuthProvider(config={"app_key": "key", "app_secret": "secret"})
+    with patch(
+        "app.services.auth_provider.httpx.AsyncClient",
+        return_value=_DummyAsyncClient([_DummyResponse(None)]),
+    ):
+        token = await provider.exchange_code_for_token("code")
+    assert token == {}
+
+
+@pytest.mark.asyncio
+async def test_dingtalk_user_info_rejects_null_payload_with_clear_error():
+    provider = DingTalkAuthProvider(config={"app_key": "key", "app_secret": "secret"})
+    with patch(
+        "app.services.auth_provider.httpx.AsyncClient",
+        return_value=_DummyAsyncClient([_DummyResponse(None)]),
+    ):
+        with pytest.raises(Exception, match="invalid response payload"):
+            await provider.get_user_info("token")
 
 
 

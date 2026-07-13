@@ -88,10 +88,9 @@ async def resolve_trigger_delivery_target(agent: Agent, triggers: list[AgentTrig
 async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTrigger]):
     from app.models.audit import ChatMessage
     from app.models.chat_session import ChatSession
-    from app.models.llm import LLMModel
     from app.models.participant import Participant
     from app.services.audit_logger import write_audit_log
-    from app.services.llm import call_llm
+    from app.services.llm import call_llm, resolve_agent_model
 
     try:
         execution_ids = [
@@ -107,17 +106,17 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
                     await mark_trigger_executions_failed(execution_ids, "Agent not found or is expired")
                 return
 
-            if not agent.primary_model_id:
+            primary_model, fallback_model, route_meta = await resolve_agent_model(agent)
+            model = primary_model or fallback_model
+            if not model:
                 logger.warning(f"Agent {agent.name} has no LLM model, skipping trigger invocation")
                 if execution_ids:
                     await mark_trigger_executions_failed(execution_ids, "Agent has no LLM model configured")
                 return
-            result = await db.execute(select(LLMModel).where(LLMModel.id == agent.primary_model_id))
-            model = result.scalar_one_or_none()
-            if not model or not model.enabled:
+            if not model.enabled:
                 logger.warning(f"Agent {agent.name}'s model is unavailable, skipping trigger invocation")
                 if execution_ids:
-                    await mark_trigger_executions_failed(execution_ids, "Agent primary model is unavailable or disabled")
+                    await mark_trigger_executions_failed(execution_ids, "Agent model is unavailable or disabled")
                 return
 
             context_parts = []
@@ -145,8 +144,51 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
                 if t.focus_ref:
                     part += f"\n关联 Focus：{t.focus_ref}"
                 cfg = t.config or {}
-                if t.type == "on_message" and cfg.get("_matched_message"):
-                    part += f"\n收到来自 {cfg.get('_matched_from', '?')} 的消息：\n\"{cfg['_matched_message'][:500]}\""
+                if t.type in {"on_message", "a2a"} and cfg.get("_matched_message"):
+                    matched_message = str(cfg["_matched_message"])
+                    source_message_id = cfg.get("_source_message_id") or cfg.get(
+                        "_matched_message_id"
+                    )
+                    if source_message_id:
+                        try:
+                            source_query = select(ChatMessage.content).where(
+                                ChatMessage.id == uuid.UUID(str(source_message_id))
+                            )
+                            expected_conversation_id = cfg.get(
+                                "_a2a_session_id"
+                            ) or cfg.get("expected_conversation_id")
+                            if expected_conversation_id:
+                                source_query = source_query.where(
+                                    ChatMessage.conversation_id
+                                    == str(expected_conversation_id)
+                                )
+                            persisted_message = (
+                                await db.execute(source_query)
+                            ).scalar_one_or_none()
+                            if persisted_message is not None:
+                                matched_message = persisted_message[:32000]
+                                if len(persisted_message) > 32000:
+                                    matched_message += "\n…(message truncated at 32,000 characters)"
+                        except (TypeError, ValueError):
+                            logger.warning(
+                                "Ignoring invalid A2A source message id {!r}",
+                                source_message_id,
+                            )
+                    part += (
+                        f"\n收到来自 {cfg.get('_matched_from', '?')} 的消息："
+                        f"\n\"{matched_message}\""
+                    )
+                    if t.type == "a2a":
+                        if cfg.get("_a2a_kind") == "task_delegate":
+                            part += (
+                                "\n执行要求：这是明确委派给你的任务。请完成任务并给出可直接交付给"
+                                "发送方的最终结果；不要把它当作无需回复的通知。"
+                            )
+                        else:
+                            part += (
+                                "\n执行要求：这是另一位数字员工发送的通知。请确认其影响，更新必要的"
+                                "工作状态，并仅在确有后续行动时采取行动。"
+                            )
                 if t.type == "on_message" and cfg.get("okr_member_id") and cfg.get("okr_report_date"):
                     part += (
                         "\n执行要求：这是一次日报回复入库事件。"
@@ -258,6 +300,7 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
             on_chunk=on_chunk,
             on_tool_call=on_tool_call,
             current_user_name_override=from_agent_name,
+            route_meta=route_meta,
         )
 
         async with async_session() as db:
@@ -302,7 +345,10 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
                     logger.warning(f"[A2A] Failed to save reply to A2A session {a2a_sid}: {e}")
                 break
 
-        is_a2a_internal = all(t.name == "a2a_wake" for t in triggers)
+        is_a2a_internal = all(
+            t.type == "a2a" or t.name in {"a2a_wake", "__a2a_wake__"}
+            for t in triggers
+        )
         delivery_target = None if is_a2a_internal else await resolve_trigger_delivery_target(agent, triggers)
 
         if final_reply and delivery_target and not delivered_platform_message_via_tool:

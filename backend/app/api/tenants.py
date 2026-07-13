@@ -9,6 +9,7 @@ import secrets
 import uuid
 import io
 from datetime import datetime
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
@@ -18,12 +19,14 @@ from sqlalchemy import func as sqla_func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.core.secret_detection import looks_like_secret
 from app.core.security import get_current_user, require_role, get_authenticated_user
 from app.database import get_db
 from app.models.agent import Agent
 from app.models.tenant import Tenant
 from app.models.user import User
 from app.services.storage import ensure_local_path, get_storage_backend, normalize_storage_key
+from app.services.subscription_lifecycle import ensure_free_subscription_for_tenant
 
 router = APIRouter(prefix="/tenants", tags=["tenants"])
 
@@ -61,6 +64,16 @@ class TenantUpdate(BaseModel):
     sso_enabled: bool | None = None
     sso_domain: str | None = None
     a2a_async_enabled: bool | None = None
+
+
+def _validated_tenant_name(name: str) -> str:
+    normalized = name.strip()
+    if looks_like_secret(normalized):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Company name looks like a credential. Rotate the credential if it was pasted here, then enter a public company name.",
+        )
+    return normalized
 
 
 def _tenant_logo_key(tenant_id: uuid.UUID) -> str:
@@ -175,10 +188,12 @@ async def self_create_company(
     if not allowed and current_user.role != "platform_admin":
         raise HTTPException(status_code=403, detail="Company self-creation is currently disabled")
 
-    slug = _slugify(data.name)
-    tenant = Tenant(name=data.name, slug=slug, im_provider="web_only")
+    company_name = _validated_tenant_name(data.name)
+    slug = _slugify(company_name)
+    tenant = Tenant(name=company_name, slug=slug, im_provider="web_only")
     db.add(tenant)
     await db.flush()
+    await ensure_free_subscription_for_tenant(db, tenant.id, granted_by=current_user.id)
 
     access_token = None
 
@@ -396,13 +411,26 @@ async def resolve_tenant_by_domain(
 ):
     """Resolve a tenant by its sso_domain or subdomain slug.
 
-    sso_domain is stored as a full URL (e.g. "https://acme.clawith.ai" or "http://1.2.3.4:3009").
+    sso_domain is stored as a full URL (e.g. "https://acme.astra.ai" or "http://1.2.3.4:3009").
     The incoming `domain` parameter is the host (without protocol).
 
     Lookup precedence:
     1. Exact match on tenant.sso_domain ending with the host (strips protocol)
-    2. Extract slug from "{slug}.clawith.ai" and match tenant.slug
+    2. Extract slug from "{slug}.astra.ai" and match tenant.slug
     """
+    normalized_domain = domain.strip().lower().rstrip(".")
+    public_base_url = str(get_settings().PUBLIC_BASE_URL or "").strip()
+    parsed_public_url = urlsplit(
+        public_base_url if "://" in public_base_url else f"//{public_base_url}"
+    )
+    public_host = parsed_public_url.netloc.lower().rstrip(".")
+    if public_host and normalized_domain == public_host:
+        # The platform root is intentionally tenant-neutral.  A successful
+        # empty response avoids treating the expected fallback as a browser
+        # network error while retaining 404 for unknown tenant-specific hosts.
+        return None
+
+    domain = normalized_domain
     tenant = None
 
     from app.models.system_settings import SystemSetting
@@ -414,7 +442,7 @@ async def resolve_tenant_by_domain(
 
     if sso_redirect_enabled:
         # 1. Match by stripping protocol from stored sso_domain
-        # sso_domain = "https://acme.clawith.ai" → compare against "acme.clawith.ai"
+        # sso_domain = "https://acme.astra.ai" → compare against "acme.astra.ai"
         for proto in ("https://", "http://"):
             result = await db.execute(
                 select(Tenant).where(Tenant.sso_domain == f"{proto}{domain}")
@@ -437,7 +465,7 @@ async def resolve_tenant_by_domain(
     # 3. Fallback: extract slug from subdomain pattern
     if not tenant:
         import re
-        m = re.match(r"^([a-z0-9][a-z0-9\-]*[a-z0-9])\.clawith\.ai$", domain.lower())
+        m = re.match(r"^([a-z0-9][a-z0-9\-]*[a-z0-9])\.astra\.ai$", domain.lower())
         if m:
             slug = m.group(1)
             result = await db.execute(select(Tenant).where(Tenant.slug == slug))
@@ -565,6 +593,8 @@ async def update_tenant(
         raise HTTPException(status_code=404, detail="Tenant not found")
 
     update_data = data.model_dump(exclude_unset=True)
+    if update_data.get("name") is not None:
+        update_data["name"] = _validated_tenant_name(update_data["name"])
     
     # SSO configuration is managed exclusively by the company's own org_admin
     # via the Enterprise Settings page. Platform admins should not override it here.

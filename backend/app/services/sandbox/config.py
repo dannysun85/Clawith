@@ -3,7 +3,7 @@
 from loguru import logger
 from enum import Enum
 from typing import Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class SandboxType(str, Enum):
@@ -20,6 +20,8 @@ class SandboxType(str, Enum):
 
 class SandboxConfig(BaseModel):
     """Configuration for sandbox backend."""
+
+    model_config = ConfigDict(use_enum_values=True)
 
     type: SandboxType = SandboxType.SUBPROCESS
     enabled: bool = True
@@ -46,9 +48,6 @@ class SandboxConfig(BaseModel):
         "node": "javascript",
         "javascript": "javascript",
     })
-
-    class Config:
-        use_enum_values = True
 
     @classmethod
     def from_dict(

@@ -246,7 +246,7 @@ class LLMClient(ABC):
 # ============================================================================
 
 class OpenAICompatibleClient(LLMClient):
-    """Client for OpenAI-compatible APIs (OpenAI, DeepSeek, Qwen, etc.)."""
+    """Client for OpenAI-compatible APIs (OpenAI, DeepSeek, Qwen, MiniMax, etc.)."""
 
     DEFAULT_BASE_URL = "https://api.openai.com/v1"
 
@@ -257,11 +257,19 @@ class OpenAICompatibleClient(LLMClient):
         model: str | None = None,
         timeout: float = 120.0,
         supports_tool_choice: bool = True,
+        supports_parallel_tool_calls: bool = True,
         supports_cache_control: bool = False,
+        extra_body: dict[str, Any] | None = None,
+        max_tokens_param: str = "max_tokens",
+        strip_think_tags_nonstream: bool = True,
     ):
         super().__init__(api_key, base_url or self.DEFAULT_BASE_URL, model, timeout)
         self.supports_tool_choice = supports_tool_choice
+        self.supports_parallel_tool_calls = supports_parallel_tool_calls
         self.supports_cache_control = supports_cache_control
+        self.extra_body = extra_body
+        self.max_tokens_param = max_tokens_param
+        self.strip_think_tags_nonstream = strip_think_tags_nonstream
         self._client: httpx.AsyncClient | None = None
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -271,10 +279,10 @@ class OpenAICompatibleClient(LLMClient):
         return self._client
 
     def _get_headers(self) -> dict[str, str]:
-        return {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-        }
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
 
     def _normalize_base_url(self) -> str:
         """Normalize base URL by stripping trailing /chat/completions."""
@@ -300,6 +308,11 @@ class OpenAICompatibleClient(LLMClient):
             "messages": messages_payload,
             "stream": stream,
         }
+
+        # Inject provider-specific defaults first (kwargs can override these)
+        if self.extra_body:
+            payload.update(self.extra_body)
+
         if temperature is not None:
             payload["temperature"] = temperature
 
@@ -308,15 +321,16 @@ class OpenAICompatibleClient(LLMClient):
             payload["stream_options"] = {"include_usage": True}
 
         if max_tokens:
-            payload["max_tokens"] = max_tokens
+            payload[self.max_tokens_param] = max_tokens
 
         if tools:
             payload["tools"] = tools
             if self.supports_tool_choice:
                 payload["tool_choice"] = "auto"
+            if self.supports_parallel_tool_calls:
                 payload["parallel_tool_calls"] = True
 
-        # Add any additional kwargs
+        # Add any additional kwargs (overrides extra_body)
         payload.update(kwargs)
 
         return payload
@@ -442,6 +456,13 @@ class OpenAICompatibleClient(LLMClient):
         if "error" in data:
             raise LLMError(f"Stream error: {data['error']}")
 
+        # Check for provider-specific business errors (e.g. MiniMax base_resp.status_code in SSE frames)
+        base_resp = data.get("base_resp")
+        if base_resp and base_resp.get("status_code", 0) != 0:
+            code = base_resp.get("status_code")
+            msg = base_resp.get("status_msg", "")
+            raise LLMError(f"Stream error (code={code}): {msg}")
+
         # Parse usage from stream (returned in the final chunk with include_usage)
         if data.get("usage"):
             chunk.usage = data["usage"]
@@ -544,12 +565,25 @@ class OpenAICompatibleClient(LLMClient):
         if "error" in data:
             raise LLMError(f"API error: {data['error']}")
 
+        # Check for provider-specific business errors (e.g. MiniMax base_resp.status_code)
+        base_resp = data.get("base_resp")
+        if base_resp and base_resp.get("status_code", 0) != 0:
+            code = base_resp.get("status_code")
+            msg = base_resp.get("status_msg", "")
+            raise LLMError(f"API error (code={code}): {msg}")
+
         choice = data.get("choices", [{}])[0]
         msg = choice.get("message", {})
 
+        content = msg.get("content", "") or ""
+        # Strip <think> tags for providers that emit inline reasoning (DeepSeek-R1, MiniMax-M3, etc.)
+        if self.strip_think_tags_nonstream and content:
+            content = re.sub(r"<think>[\s\S]*?</think>\s*", "", content, flags=re.DOTALL).strip()
+
         return LLMResponse(
-            content=msg.get("content", ""),
+            content=content,
             tool_calls=msg.get("tool_calls", []),
+            reasoning_content=msg.get("reasoning_content"),
             finish_reason=choice.get("finish_reason"),
             usage=data.get("usage"),
             model=data.get("model"),
@@ -1905,8 +1939,18 @@ class ProviderSpec:
     protocol: Literal["openai_compatible", "anthropic", "openai_responses", "gemini"]
     default_base_url: str | None
     supports_tool_choice: bool = True
+    supports_parallel_tool_calls: bool = True
+    requires_api_key: bool = True
     default_max_tokens: int = 4096
     model_max_tokens: dict[str, int] = field(default_factory=dict)
+    max_configurable_tokens: int | None = None
+    extra_body: dict[str, Any] | None = None  # Provider-specific default params (e.g. thinking disabled)
+    max_tokens_param: str = "max_tokens"  # Parameter name for max output tokens (e.g. "max_completion_tokens")
+    strip_think_tags_nonstream: bool = True  # Strip <think> tags in non-streaming complete() responses
+    # Some local runtimes/models do not reliably call a synthetic finish tool.
+    # For those providers, a non-empty response with no tool calls is a valid
+    # final answer instead of a reason to enter another tool round.
+    accepts_plain_text_final: bool = False
 
 
 # Provider aliases accepted for compatibility
@@ -1953,6 +1997,7 @@ PROVIDER_REGISTRY: dict[str, ProviderSpec] = {
         protocol="openai_compatible",
         default_base_url="https://api.deepseek.com/v1",
         default_max_tokens=8192,
+        max_configurable_tokens=393216,
     ),
     "qwen": ProviderSpec(
         provider="qwen",
@@ -1973,6 +2018,16 @@ PROVIDER_REGISTRY: dict[str, ProviderSpec] = {
         protocol="openai_compatible",
         default_base_url="https://api.minimaxi.com/v1",
         default_max_tokens=16384,
+        model_max_tokens={
+            "MiniMax-M3": 131072,
+            "MiniMax-M2.7-highspeed": 65536,
+            "MiniMax-M2.7": 65536,
+        },
+        # MiniMax's OpenAI-compatible endpoint does not document either the
+        # OpenAI `parallel_tool_calls` extension or a top-level `thinking`
+        # object. Sending them causes business error 2013 on some models.
+        supports_parallel_tool_calls=False,
+        max_tokens_param="max_completion_tokens",
     ),
     "openrouter": ProviderSpec(
         provider="openrouter",
@@ -2015,6 +2070,7 @@ PROVIDER_REGISTRY: dict[str, ProviderSpec] = {
         display_name="vLLM",
         protocol="openai_compatible",
         default_base_url="http://localhost:8000/v1",
+        requires_api_key=False,
         default_max_tokens=4096,
     ),
     "ollama": ProviderSpec(
@@ -2022,13 +2078,16 @@ PROVIDER_REGISTRY: dict[str, ProviderSpec] = {
         display_name="Ollama",
         protocol="openai_compatible",
         default_base_url="http://localhost:11434/v1",
+        requires_api_key=False,
         default_max_tokens=4096,
+        accepts_plain_text_final=True,
     ),
     "sglang": ProviderSpec(
         provider="sglang",
         display_name="SGLang",
         protocol="openai_compatible",
         default_base_url="http://localhost:30000/v1",
+        requires_api_key=False,
         default_max_tokens=4096,
     ),
     "custom": ProviderSpec(
@@ -2062,9 +2121,12 @@ def get_provider_manifest() -> list[dict[str, Any]]:
             "protocol": spec.protocol,
             "default_base_url": spec.default_base_url,
             "supports_tool_choice": spec.supports_tool_choice,
+            "requires_api_key": spec.requires_api_key,
             "default_max_tokens": spec.default_max_tokens,
             "model_max_tokens": spec.model_max_tokens,
-            "aliases": [k for k, v in PROVIDER_ALIASES.items() if v == spec.provider],
+                "max_configurable_tokens": spec.max_configurable_tokens,
+                "accepts_plain_text_final": spec.accepts_plain_text_final,
+                "aliases": [k for k, v in PROVIDER_ALIASES.items() if v == spec.provider],
         })
     return out
 
@@ -2131,6 +2193,8 @@ def get_max_tokens(provider: str, model: str | None = None, max_output_tokens: i
 
     # Highest priority: per-model DB override
     if isinstance(max_output_tokens, int) and max_output_tokens > 0:
+        if spec and spec.max_configurable_tokens:
+            return min(max_output_tokens, spec.max_configurable_tokens)
         return max_output_tokens
 
     # Check model-specific limits
@@ -2206,7 +2270,11 @@ def create_llm_client(
             model=model,
             timeout=timeout,
             supports_tool_choice=supports_tool_choice,
+            supports_parallel_tool_calls=spec.supports_parallel_tool_calls if spec else True,
             supports_cache_control=normalized_provider == "qwen",
+            extra_body=spec.extra_body if spec else None,
+            max_tokens_param=spec.max_tokens_param if spec else "max_tokens",
+            strip_think_tags_nonstream=spec.strip_think_tags_nonstream if spec else True,
         )
     else:
         # Default to OpenAI-compatible for unknown providers

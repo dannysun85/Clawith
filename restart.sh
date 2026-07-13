@@ -77,7 +77,19 @@ cleanup() {
 
     for pidfile in "$BACKEND_PID" "$FRONTEND_PID"; do
         if [ -f "$pidfile" ]; then
-            kill -9 "$(cat "$pidfile")" 2>/dev/null || true
+            pid=$(cat "$pidfile" 2>/dev/null || true)
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                # Source-mode daemons are process-group leaders. Stop the
+                # complete tree so Vite/uvicorn workers are not orphaned.
+                kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+                for _ in $(seq 1 10); do
+                    kill -0 "$pid" 2>/dev/null || break
+                    sleep 0.2
+                done
+                if kill -0 "$pid" 2>/dev/null; then
+                    kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+                fi
+            fi
             rm -f "$pidfile"
         fi
     done
@@ -97,15 +109,24 @@ cleanup() {
 # 等待端口就绪
 # ═══════════════════════════════════════════════════════
 wait_for_port() {
-    local port=$1 name=$2 max=${3:-10}
+    local port=$1 name=$2 max=${3:-30} pid_file=${4:-} log_file=${5:-}
     for i in $(seq 1 "$max"); do
         if curl -s -o /dev/null -m 1 "http://localhost:$port" 2>/dev/null; then
             echo -e "  ${GREEN}✅ $name ready (${i}s)${NC}"
             return 0
         fi
+        if [ -n "$pid_file" ] && [ -f "$pid_file" ]; then
+            service_pid=$(cat "$pid_file" 2>/dev/null || true)
+            if [ -n "$service_pid" ] && ! kill -0 "$service_pid" 2>/dev/null; then
+                echo -e "  ${RED}❌ $name exited before opening port $port${NC}"
+                [ -n "$log_file" ] && [ -f "$log_file" ] && tail -n 40 "$log_file"
+                return 1
+            fi
+        fi
         sleep 1
     done
     echo -e "  ${RED}❌ $name failed to start in ${max}s${NC}"
+    [ -n "$log_file" ] && [ -f "$log_file" ] && tail -n 40 "$log_file"
     return 1
 }
 
@@ -133,6 +154,10 @@ os.setsid()
 second_pid = os.fork()
 if second_pid:
     os._exit(0)
+
+# Make the daemon PID the process-group ID recorded below. This lets cleanup
+# stop the service and all descendants with one bounded group shutdown.
+os.setpgid(0, 0)
 
 os.chdir(cwd)
 os.umask(0o022)
@@ -237,7 +262,7 @@ start_backend() {
             PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-}" \
             DATABASE_URL="$DATABASE_URL" \
             .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port $BACKEND_PORT
-    wait_for_port $BACKEND_PORT "Backend" 10
+    wait_for_port $BACKEND_PORT "Backend" 30 "$BACKEND_PID" "$BACKEND_LOG"
 }
 
 # ═══════════════════════════════════════════════════════
@@ -251,7 +276,7 @@ start_frontend() {
     # keeping the normal dev server behavior.
     start_detached "$FRONTEND_DIR" "$FRONTEND_LOG" "$FRONTEND_PID" \
         env CI=true BACKEND_PORT=$BACKEND_PORT node_modules/.bin/vite --host 0.0.0.0 --port $FRONTEND_PORT --strictPort
-    wait_for_port $FRONTEND_PORT "Frontend" 8
+    wait_for_port $FRONTEND_PORT "Frontend" 30 "$FRONTEND_PID" "$FRONTEND_LOG"
 }
 
 # ═══════════════════════════════════════════════════════

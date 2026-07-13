@@ -16,6 +16,8 @@ settings = get_settings()
 
 PRESENCE_TTL_SECONDS = 180
 PUBSUB_PREFIX = "realtime:ws"
+PUBSUB_RETRY_MIN_SECONDS = 1.0
+PUBSUB_RETRY_MAX_SECONDS = 30.0
 
 
 class RealtimeRouter:
@@ -154,30 +156,52 @@ class RealtimeRouter:
         self._started = False
 
     async def _subscriber_loop(self, deliver_local) -> None:
-        redis = await get_redis()
-        pubsub = redis.pubsub()
-        await pubsub.subscribe(self._instance_channel())
-        try:
-            while True:
-                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
-                if not message:
-                    await asyncio.sleep(0.05)
-                    continue
-                try:
-                    data = json.loads(message["data"])
-                    await deliver_local(
-                        agent_id=data["agent_id"],
-                        payload=data["message"],
-                        session_id=data.get("session_id"),
-                        user_id=data.get("user_id"),
-                    )
-                except Exception as exc:
-                    logger.warning(f"[Realtime] Failed to deliver pubsub message: {exc}")
-        except asyncio.CancelledError:
-            raise
-        finally:
-            await pubsub.unsubscribe(self._instance_channel())
-            await pubsub.aclose()
+        retry_delay = PUBSUB_RETRY_MIN_SECONDS
+        while True:
+            pubsub = None
+            try:
+                redis = await get_redis()
+                pubsub = redis.pubsub()
+                await pubsub.subscribe(self._instance_channel())
+                retry_delay = PUBSUB_RETRY_MIN_SECONDS
+
+                while True:
+                    message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                    if not message:
+                        await asyncio.sleep(0.05)
+                        continue
+                    try:
+                        data = json.loads(message["data"])
+                        await deliver_local(
+                            agent_id=data["agent_id"],
+                            payload=data["message"],
+                            session_id=data.get("session_id"),
+                            user_id=data.get("user_id"),
+                        )
+                    except Exception as exc:
+                        logger.warning(f"[Realtime] Failed to deliver pubsub message: {exc}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    f"[Realtime] Pubsub connection lost: {exc}; retrying in {retry_delay:.1f}s"
+                )
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, PUBSUB_RETRY_MAX_SECONDS)
+            finally:
+                if pubsub is not None:
+                    # Redis may already be unavailable during orchestrated
+                    # shutdown. Cleanup is best effort; the supervisor will
+                    # either reconnect or let cancellation finish normally.
+                    try:
+                        await pubsub.unsubscribe(self._instance_channel())
+                    except Exception as exc:
+                        logger.debug(f"[Realtime] Pubsub unsubscribe skipped: {exc}")
+                    finally:
+                        try:
+                            await pubsub.aclose()
+                        except Exception as exc:
+                            logger.debug(f"[Realtime] Pubsub close skipped: {exc}")
 
     async def _list_presence(self, agent_id: str) -> list[dict[str, str]]:
         redis = await get_redis()

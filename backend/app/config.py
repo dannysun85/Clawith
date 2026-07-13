@@ -78,8 +78,9 @@ class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
     # App
-    APP_NAME: str = "Clawith"
+    APP_NAME: str = "Astra"
     APP_VERSION: str = _read_version()
+    ENVIRONMENT: str = "development"
     DEBUG: bool = False
     SECRET_KEY: str = "change-me-in-production"
     API_PREFIX: str = "/api"
@@ -118,6 +119,10 @@ class Settings(BaseSettings):
     # Process role
     PROCESS_ROLE: str = "all"
 
+    # Emergency kill switch for proactive Agent heartbeat execution. Explicit
+    # cron/interval/webhook/on_message triggers remain independent.
+    HEARTBEAT_ENABLED: bool = False
+
     # Docker (for Agent containers)
     DOCKER_NETWORK: str = "clawith_network"
     OPENCLAW_IMAGE: str = "openclaw:local"
@@ -129,6 +134,44 @@ class Settings(BaseSettings):
     FEISHU_REDIRECT_URI: str = ""
     PUBLIC_BASE_URL: str = ""
     HTTP_PROXY: str = ""
+
+    # Douyin official OpenAPI. In hosted SaaS mode the platform owns this app,
+    # while each company only OAuth-connects its own Douyin account.
+    DOUYIN_CLIENT_KEY: str = ""
+    DOUYIN_CLIENT_SECRET: str = ""
+    DOUYIN_REDIRECT_URI: str = ""
+    DOUYIN_SCOPES: str = "user_info,h5.share,aweme.share,aweme.forward,open.get.ticket,video.comment,data.external.user,data.external.item"
+    DOUYIN_API_BASE_URL: str = "https://open.douyin.com"
+    DOUYIN_AUTHORIZE_URL: str = "https://open.douyin.com/platform/oauth/connect"
+    DOUYIN_REQUEST_TIMEOUT_SECONDS: int = 15
+    DOUYIN_DIRECT_PUBLISH_ENABLED: bool = False
+
+    # Billing checkout provider. "manual" keeps local/admin-only orders; "stripe"
+    # creates real Checkout Sessions and requires signed webhooks.
+    BILLING_PROVIDER: str = "manual"
+    STRIPE_SECRET_KEY: str = ""
+    STRIPE_WEBHOOK_SECRET: str = ""
+    STRIPE_API_BASE_URL: str = "https://api.stripe.com"
+    STRIPE_SUCCESS_URL: str = ""
+    STRIPE_CANCEL_URL: str = ""
+    BILLING_SUCCESS_URL: str = ""
+    BILLING_CANCEL_URL: str = ""
+    BILLING_RECONCILIATION_INTERVAL_SECONDS: int = 60 * 60 * 24
+    BILLING_RESERVATION_EXPIRY_SWEEP_SECONDS: int = 60 * 10
+    MEDIA_GENERATION_POLL_INTERVAL_SECONDS: int = 15
+    MEDIA_GENERATION_BATCH_SIZE: int = 20
+    MEDIA_GENERATION_SUBMISSION_TIMEOUT_SECONDS: int = 60 * 10
+    MEDIA_GENERATION_MAX_AGE_SECONDS: int = 60 * 60 * 48
+    MEDIA_GENERATION_MAX_CONSECUTIVE_ERRORS: int = 12
+    PRODUCTION_ISSUE_MONITOR_ENABLED: bool = True
+    PRODUCTION_ISSUE_MONITOR_INTERVAL_SECONDS: int = 30
+    PRODUCTION_ISSUE_ALERT_THRESHOLD: int = 1
+    PRODUCTION_ISSUE_RETENTION_DAYS: int = 30
+    PRODUCTION_ISSUE_ALERT_WEBHOOK_URL: str = ""
+
+    # SaaS console owner. This is intentionally narrower than platform_admin:
+    # production SaaS billing/model/quota configuration belongs to this account.
+    SAAS_ADMIN_EMAIL: str = "admin@reeftotem.ai"
 
     # CORS
     CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://localhost:5173"]
@@ -157,6 +200,22 @@ class Settings(BaseSettings):
         "case_sensitive": True,
         "extra": "ignore",
     }
+
+    def validate_runtime_secrets(self) -> None:
+        """Reject known development secrets whenever the app runs in production."""
+        if self.ENVIRONMENT.strip().lower() not in {"production", "prod"}:
+            return
+
+        insecure = []
+        if "change-me" in self.SECRET_KEY.lower():
+            insecure.append("SECRET_KEY")
+        if "change-me" in self.JWT_SECRET_KEY.lower():
+            insecure.append("JWT_SECRET_KEY")
+        if insecure:
+            raise RuntimeError(
+                "Production startup refused: replace insecure default values for "
+                + ", ".join(insecure)
+            )
 
 
 @lru_cache

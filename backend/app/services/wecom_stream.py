@@ -397,7 +397,7 @@ async def _process_wecom_stream_message(
         sess.last_message_at = datetime.now(timezone.utc)
 
         # Pre-load agent/model before releasing connection
-        _agent_model, _llm_model, _fallback_model = await _load_agent_and_model(db, agent_id)
+        _agent_model, _llm_model, _fallback_model, _route_meta = await _load_agent_and_model(db, agent_id)
 
         await db.commit()
         # ── Phase 1 complete: release connection before slow LLM call ──

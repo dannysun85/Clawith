@@ -7,10 +7,20 @@ from pydantic import BaseModel
 from sqlalchemy import select
 
 from app.api.auth import get_current_user
+from app.core.permissions import check_agent_access
 from app.database import async_session
 from app.models.trigger import AgentTrigger
 
 router = APIRouter(prefix="/api/agents", tags=["triggers"])
+REDACTED_TRIGGER_SECRET = "********"
+INTERNAL_A2A_TRIGGER_NAME = "__a2a_wake__"
+
+
+def _public_trigger_config(config: dict | None) -> dict:
+    visible = dict(config or {})
+    if visible.get("secret"):
+        visible["secret"] = REDACTED_TRIGGER_SECRET
+    return visible
 
 
 class TriggerResponse(BaseModel):
@@ -43,9 +53,13 @@ class TriggerUpdate(BaseModel):
 async def list_agent_triggers(agent_id: uuid.UUID, user=Depends(get_current_user)):
     """List all triggers for an agent."""
     async with async_session() as db:
+        await check_agent_access(db, user, agent_id)
         result = await db.execute(
             select(AgentTrigger)
-            .where(AgentTrigger.agent_id == agent_id)
+            .where(
+                AgentTrigger.agent_id == agent_id,
+                AgentTrigger.name != INTERNAL_A2A_TRIGGER_NAME,
+            )
             .order_by(AgentTrigger.created_at.desc())
         )
         triggers = result.scalars().all()
@@ -55,7 +69,7 @@ async def list_agent_triggers(agent_id: uuid.UUID, user=Depends(get_current_user
             id=str(t.id),
             name=t.name,
             type=t.type,
-            config=t.config or {},
+            config=_public_trigger_config(t.config),
             reason=t.reason or "",
             focus_ref=t.focus_ref,
             is_enabled=t.is_enabled,
@@ -80,6 +94,9 @@ async def update_trigger(
 ):
     """Update a trigger (from frontend management UI)."""
     async with async_session() as db:
+        _, access_level = await check_agent_access(db, user, agent_id)
+        if access_level != "manage":
+            raise HTTPException(403, "Manage access required")
         result = await db.execute(
             select(AgentTrigger).where(
                 AgentTrigger.id == trigger_id,
@@ -89,12 +106,40 @@ async def update_trigger(
         trigger = result.scalar_one_or_none()
         if not trigger:
             raise HTTPException(404, "Trigger not found")
+        if getattr(trigger, "name", "") == INTERNAL_A2A_TRIGGER_NAME:
+            raise HTTPException(403, "Internal delivery triggers cannot be modified")
+        if getattr(trigger, "is_system", False) and any(
+            value is not None
+            for value in (
+                body.config,
+                body.reason,
+                body.max_fires,
+                body.cooldown_seconds,
+                body.expires_at,
+            )
+        ):
+            raise HTTPException(403, "System triggers only support enable/disable")
 
         if body.config is not None:
-            trigger.config = body.config
+            old_config = dict(trigger.config or {})
+            incoming_config = dict(body.config)
+            if incoming_config.get("secret") == REDACTED_TRIGGER_SECRET:
+                incoming_config.pop("secret")
+            if trigger.type == "webhook":
+                for protected_key in ("token", "secret"):
+                    if not str(incoming_config.get(protected_key) or "").strip():
+                        if old_config.get(protected_key):
+                            incoming_config[protected_key] = old_config[protected_key]
+            trigger.config = {**old_config, **incoming_config}
         if body.reason is not None:
             trigger.reason = body.reason
         if body.is_enabled is not None:
+            if (
+                body.is_enabled
+                and trigger.type == "webhook"
+                and not str((trigger.config or {}).get("secret") or "").strip()
+            ):
+                raise HTTPException(400, "Webhook triggers require an HMAC secret before they can be enabled")
             trigger.is_enabled = body.is_enabled
         if body.max_fires is not None:
             trigger.max_fires = body.max_fires
@@ -103,6 +148,13 @@ async def update_trigger(
         if body.expires_at is not None:
             from datetime import datetime
             trigger.expires_at = datetime.fromisoformat(body.expires_at)
+
+        if (
+            trigger.type == "webhook"
+            and trigger.is_enabled
+            and not str((trigger.config or {}).get("secret") or "").strip()
+        ):
+            raise HTTPException(400, "Webhook triggers require an HMAC secret before they can be enabled")
 
         await db.commit()
 
@@ -117,6 +169,9 @@ async def delete_trigger(
 ):
     """Delete a trigger entirely."""
     async with async_session() as db:
+        _, access_level = await check_agent_access(db, user, agent_id)
+        if access_level != "manage":
+            raise HTTPException(403, "Manage access required")
         result = await db.execute(
             select(AgentTrigger).where(
                 AgentTrigger.id == trigger_id,
@@ -126,6 +181,8 @@ async def delete_trigger(
         trigger = result.scalar_one_or_none()
         if not trigger:
             raise HTTPException(404, "Trigger not found")
+        if getattr(trigger, "is_system", False):
+            raise HTTPException(403, "System triggers cannot be deleted")
 
         await db.delete(trigger)
         await db.commit()

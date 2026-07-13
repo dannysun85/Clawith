@@ -2,7 +2,7 @@
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,6 +11,7 @@ from app.core.security import get_current_user
 from app.database import get_db
 from app.models.published_page import PublishedPage
 from app.models.user import User
+from app.services.platform_service import platform_service
 from app.services.storage import get_storage_backend, normalize_storage_key
 
 # Public router — no /api prefix, no auth
@@ -61,6 +62,7 @@ async def render_page(short_id: str, db: AsyncSession = Depends(get_db)):
 @router.get("/list")
 async def list_pages(
     agent_id: uuid.UUID,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -74,6 +76,7 @@ async def list_pages(
         .order_by(PublishedPage.created_at.desc())
     )
     pages = result.scalars().all()
+    public_base = await platform_service.get_public_base_url(db, request)
     return [
         {
             "id": str(p.id),
@@ -82,7 +85,7 @@ async def list_pages(
             "title": p.title,
             "view_count": p.view_count,
             "created_at": p.created_at.isoformat() if p.created_at else None,
-            "url": f"/p/{p.short_id}",
+            "url": f"{public_base.rstrip('/')}/p/{p.short_id}",
         }
         for p in pages
     ]

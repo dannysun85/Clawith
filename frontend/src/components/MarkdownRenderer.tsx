@@ -12,6 +12,7 @@ import {
     IconRefresh,
     IconX,
 } from '@tabler/icons-react';
+import { mediaUrlExtension } from '../utils/mediaUrl';
 
 function escapeHtml(str: string): string {
     return str
@@ -37,12 +38,6 @@ function prepareUrl(url: string, kind: 'link' | 'image' = 'link'): string | null
 
     if (!isAllowed) return null;
 
-    if (finalUrl.startsWith('/api/agents/')) {
-        const token = localStorage.getItem('token');
-        if (token && !finalUrl.includes('token=')) {
-            finalUrl += (finalUrl.includes('?') ? '&' : '?') + `token=${encodeURIComponent(token)}`;
-        }
-    }
     return finalUrl;
 }
 
@@ -50,6 +45,45 @@ function renderLink(url: string, label: string): string {
     const finalUrl = prepareUrl(url);
     if (!finalUrl) return label;
     return `<a href="${escapeAttribute(finalUrl)}" target="_blank" rel="noopener noreferrer" style="color:var(--accent-primary);text-decoration:underline;text-underline-offset:2px;word-break:break-all">${label}</a>`;
+}
+
+const IMG_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp']);
+const AUDIO_EXTS = new Set(['mp3', 'wav', 'ogg', 'm4a', 'flac', 'aac', 'opus']);
+const VIDEO_EXTS = new Set(['mp4', 'webm', 'mov', 'avi', 'mkv', 'm4v']);
+
+/** Render a media element (image/audio/video) based on URL extension. */
+function renderMedia(alt: string, url: string): string | null {
+    const finalUrl = prepareUrl(url, 'image');
+    if (!finalUrl) return null;
+    const safeUrl = escapeAttribute(finalUrl);
+    const safeAlt = escapeAttribute(alt);
+    const ext = mediaUrlExtension(finalUrl);
+
+    if (AUDIO_EXTS.has(ext)) {
+        return (
+            `<div class="markdown-media-wrap" style="margin:8px 0">` +
+            `<audio controls preload="metadata" src="${safeUrl}" style="width:100%;max-width:420px"></audio>` +
+            (alt ? `<div style="font-size:11px;color:var(--text-tertiary);margin-top:2px">${escapeHtml(alt)}</div>` : '') +
+            `</div>`
+        );
+    }
+    if (VIDEO_EXTS.has(ext)) {
+        return (
+            `<div class="markdown-media-wrap" style="margin:8px 0">` +
+            `<video controls preload="metadata" src="${safeUrl}" style="max-width:100%;max-height:480px;border-radius:8px"></video>` +
+            (alt ? `<div style="font-size:11px;color:var(--text-tertiary);margin-top:2px">${escapeHtml(alt)}</div>` : '') +
+            `</div>`
+        );
+    }
+    // Default: image (also covers IMG_EXTS and unknown)
+    return (
+        `<span class="markdown-image-wrap" data-markdown-image-wrap="1">` +
+        `<img src="${safeUrl}" alt="${safeAlt}" class="markdown-inline-image" data-markdown-image-src="${safeUrl}" data-markdown-image-alt="${safeAlt}" />` +
+        `<button type="button" class="markdown-image-download-btn" data-markdown-image-download="${safeUrl}" data-markdown-image-alt="${safeAlt}" aria-label="Download image" title="Download image">` +
+        `↓` +
+        `</button>` +
+        `</span>`
+    );
 }
 
 function autolinkBareUrls(html: string): string {
@@ -83,20 +117,11 @@ function renderInline(text: string): string {
     let working = text
         // Inline code
         .replace(/`([^`]+)`/g, (_match, code) => stash(`<code style="background:var(--bg-secondary);padding:1px 4px;border-radius:3px;font-family:monospace;font-size:0.9em">${escapeHtml(code)}</code>`))
-        // Images
+        // Images / audio / video (extension-based branching)
         .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (match, alt, url) => {
-            const finalUrl = prepareUrl(url, 'image');
-            if (!finalUrl) return escapeHtml(match);
-            const safeUrl = escapeAttribute(finalUrl);
-            const safeAlt = escapeAttribute(alt);
-            return stash(
-                `<span class="markdown-image-wrap" data-markdown-image-wrap="1">` +
-                `<img src="${safeUrl}" alt="${safeAlt}" class="markdown-inline-image" data-markdown-image-src="${safeUrl}" data-markdown-image-alt="${safeAlt}" />` +
-                `<button type="button" class="markdown-image-download-btn" data-markdown-image-download="${safeUrl}" data-markdown-image-alt="${safeAlt}" aria-label="Download image" title="Download image">` +
-                `↓` +
-                `</button>` +
-                `</span>`
-            );
+            const media = renderMedia(alt, url);
+            if (!media) return escapeHtml(match);
+            return stash(media);
         })
         // Links
         .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_match, label, url) => stash(renderLink(url, escapeHtml(label))));

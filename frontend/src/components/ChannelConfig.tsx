@@ -35,8 +35,10 @@ interface ChannelField {
     key: string;
     label: string;
     placeholder?: string;
-    type?: 'text' | 'password';
+    type?: 'text' | 'password' | 'select';
     required?: boolean;
+    defaultValue?: string;
+    options?: Array<{ value: string; label: string }>;
 }
 
 interface GuideConfig {
@@ -158,6 +160,18 @@ const CHANNEL_REGISTRY: ChannelDef[] = [
             { key: 'app_id', label: 'App ID', placeholder: 'cli_xxxxxxxxxxxxxxxx', required: true },
             { key: 'app_secret', label: 'App Secret', type: 'password', required: true },
             { key: 'encrypt_key', label: 'Encrypt Key', type: 'password' },
+            {
+                key: 'activation_mode',
+                label: 'Group message activation',
+                type: 'select',
+                required: true,
+                defaultValue: 'mention',
+                options: [
+                    { value: 'mention', label: 'Only when @mentioned (recommended)' },
+                    { value: 'always', label: 'Every group message' },
+                    { value: 'silent', label: 'Ignore all group messages' },
+                ],
+            },
         ],
         guide: { prefix: 'channelGuide.feishu', steps: 8 },
         wsGuide: { prefix: 'channelGuide.feishu', steps: 8 },
@@ -352,7 +366,7 @@ export default function ChannelConfig({ mode, agentId, canManage = true, values,
     });
     const { data: slackConfig } = useQuery({
         queryKey: ['slack-channel', agentId],
-        queryFn: () => fetchAuth<any>(`/agents/${agentId}/slack-channel`).catch(() => null),
+        queryFn: () => fetchAuth<any>(`/agents/${agentId}/slack-channel?missing_ok=true`),
         enabled: enabled,
     });
     const { data: slackWebhook } = useQuery({
@@ -362,7 +376,7 @@ export default function ChannelConfig({ mode, agentId, canManage = true, values,
     });
     const { data: discordConfig } = useQuery({
         queryKey: ['discord-channel', agentId],
-        queryFn: () => fetchAuth<any>(`/agents/${agentId}/discord-channel`).catch(() => null),
+        queryFn: () => fetchAuth<any>(`/agents/${agentId}/discord-channel?missing_ok=true`),
         enabled: enabled,
     });
     const { data: discordWebhook } = useQuery({
@@ -372,7 +386,7 @@ export default function ChannelConfig({ mode, agentId, canManage = true, values,
     });
     const { data: teamsConfig } = useQuery({
         queryKey: ['teams-channel', agentId],
-        queryFn: () => fetchAuth<any>(`/agents/${agentId}/teams-channel`).catch(() => null),
+        queryFn: () => fetchAuth<any>(`/agents/${agentId}/teams-channel?missing_ok=true`),
         enabled: enabled,
     });
     const { data: teamsWebhook } = useQuery({
@@ -382,17 +396,17 @@ export default function ChannelConfig({ mode, agentId, canManage = true, values,
     });
     const { data: dingtalkConfig } = useQuery({
         queryKey: ['dingtalk-channel', agentId],
-        queryFn: () => fetchAuth<any>(`/agents/${agentId}/dingtalk-channel`).catch(() => null),
+        queryFn: () => fetchAuth<any>(`/agents/${agentId}/dingtalk-channel?missing_ok=true`),
         enabled: enabled,
     });
     const { data: wechatConfig } = useQuery({
         queryKey: ['wechat-channel', agentId],
-        queryFn: () => fetchAuth<any>(`/agents/${agentId}/wechat-channel`).catch(() => null),
+        queryFn: () => fetchAuth<any>(`/agents/${agentId}/wechat-channel?missing_ok=true`),
         enabled: enabled,
     });
     const { data: wecomConfig } = useQuery({
         queryKey: ['wecom-channel', agentId],
-        queryFn: () => fetchAuth<any>(`/agents/${agentId}/wecom-channel`).catch(() => null),
+        queryFn: () => fetchAuth<any>(`/agents/${agentId}/wecom-channel?missing_ok=true`),
         enabled: enabled,
     });
     const { data: wecomWebhook } = useQuery({
@@ -402,7 +416,7 @@ export default function ChannelConfig({ mode, agentId, canManage = true, values,
     });
     const { data: atlassianConfig } = useQuery({
         queryKey: ['atlassian-channel', agentId],
-        queryFn: () => fetchAuth<any>(`/agents/${agentId}/atlassian-channel`).catch(() => null),
+        queryFn: () => fetchAuth<any>(`/agents/${agentId}/atlassian-channel?missing_ok=true`),
         enabled: enabled,
     });
     // Helper: get config data for a channel
@@ -644,7 +658,10 @@ export default function ChannelConfig({ mode, agentId, canManage = true, values,
                 app_id: form.app_id,
                 app_secret: form.app_secret,
                 encrypt_key: form.encrypt_key || undefined,
-                extra_config: { connection_mode: connectionModes.feishu || 'websocket' },
+                extra_config: {
+                    connection_mode: connectionModes.feishu || 'websocket',
+                    activation_mode: form.activation_mode || 'mention',
+                },
             };
         }
         if (ch.id === 'wecom') {
@@ -748,14 +765,27 @@ export default function ChannelConfig({ mode, agentId, canManage = true, values,
                     {!field.required && <span style={{ fontWeight: 400, color: 'var(--text-tertiary)' }}> (Optional)</span>}
                 </label>
                 <div style={{ position: 'relative' }}>
-                    <input
-                        className={mode === 'edit' ? 'input' : 'form-input'}
-                        type={isSecret && !showPwds[fieldId] ? 'password' : 'text'}
-                        value={fieldValue}
-                        onChange={e => onFieldChange(e.target.value)}
-                        placeholder={placeholderText || ''}
-                        style={mode === 'edit' ? { fontSize: '12px', paddingRight: isSecret ? '36px' : undefined, width: '100%' } : undefined}
-                    />
+                    {field.type === 'select' ? (
+                        <select
+                            className={mode === 'edit' ? 'input' : 'form-input'}
+                            value={fieldValue || field.defaultValue || ''}
+                            onChange={e => onFieldChange(e.target.value)}
+                            style={mode === 'edit' ? { fontSize: '12px', width: '100%' } : undefined}
+                        >
+                            {(field.options || []).map(option => (
+                                <option key={option.value} value={option.value}>{option.label}</option>
+                            ))}
+                        </select>
+                    ) : (
+                        <input
+                            className={mode === 'edit' ? 'input' : 'form-input'}
+                            type={isSecret && !showPwds[fieldId] ? 'password' : 'text'}
+                            value={fieldValue}
+                            onChange={e => onFieldChange(e.target.value)}
+                            placeholder={placeholderText || ''}
+                            style={mode === 'edit' ? { fontSize: '12px', paddingRight: isSecret ? '36px' : undefined, width: '100%' } : undefined}
+                        />
+                    )}
                     {isSecret && (
                         <button type="button" onClick={() => togglePwd(fieldId)}
                             style={{ position: 'absolute', right: '8px', top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-tertiary)', padding: '2px', display: 'flex', alignItems: 'center' }}>
@@ -885,7 +915,7 @@ export default function ChannelConfig({ mode, agentId, canManage = true, values,
                 : activeFields;
 
         // Check if all required fields are filled
-        const allRequired = formFields.filter(f => f.required).every(f => form[f.key]);
+        const allRequired = formFields.filter(f => f.required).every(f => form[f.key] || f.defaultValue);
 
         return (
             <div key={ch.id} style={{ border: '1px solid var(--border-subtle)', borderRadius: '8px', overflow: 'hidden', marginBottom: '12px' }}>
@@ -1066,6 +1096,7 @@ export default function ChannelConfig({ mode, agentId, canManage = true, values,
                                                     prefill.app_id = config.app_id || '';
                                                     prefill.app_secret = config.app_secret || '';
                                                     prefill.encrypt_key = config.encrypt_key || '';
+                                                    prefill.activation_mode = config.extra_config?.activation_mode || 'mention';
                                                     setConnectionModes(prev => ({ ...prev, feishu: config.extra_config?.connection_mode || 'websocket' }));
                                                 } else if (ch.id === 'wecom') {
                                                     const cm = config.extra_config?.connection_mode === 'websocket' ? 'websocket' : 'webhook';

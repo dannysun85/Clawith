@@ -1,36 +1,40 @@
 /* ═══════════════════════════════════════════════════════
-   Clawith — Design System (Linear-inspired Dark Theme)
+   Astra — Cosmic Design System (Dark Theme, violet-cosmic)
    ═══════════════════════════════════════════════════════ */
 
 :root,
 [data-theme="dark"] {
-  /* Colors — Dark Theme (Linear-style) */
-  --bg-primary: #0a0a0f;
-  --bg-secondary: #111119;
-  --bg-tertiary: #18181f;
-  --bg-elevated: #1c1c26;
-  --bg-hover: #22222e;
-  --bg-active: #2a2a3a;
+  /* Colors — Dark Theme (Cosmic navy-black with violet undertones).
+     Surface tokens are opaque to guarantee text contrast/legibility.
+     The html-level aurora/starfield is visible only in gaps, margins, and
+     on dedicated glass surfaces (sidebar, chat shell) that manage their
+     own backdrop-blur. */
+  --bg-primary: #07070F;
+  --bg-secondary: #0E0E1A;
+  --bg-tertiary: #161729;
+  --bg-elevated: #1B1D32;
+  --bg-hover: #252742;
+  --bg-active: #2F3255;
 
-  --border-default: #26263a;
-  --border-subtle: #1e1e30;
-  --border-strong: #35354a;
+  --border-default: #2A2D48;
+  --border-subtle: #1D2036;
+  --border-strong: #3B3F5E;
 
-  --text-primary: #e1e1e8;
-  --text-secondary: #8b8b9e;
-  --text-tertiary: #5c5c70;
-  --text-inverse: #0a0a0f;
+  --text-primary: #EDEBF5;
+  --text-secondary: #9A9AB8;
+  --text-tertiary: #626387;
+  --text-inverse: #07070F;
 
-  --accent-primary: #e1e1e8;
-  --accent-hover: #ffffff;
-  --accent-subtle: rgba(225, 225, 232, 0.08);
-  --accent-text: #c0c0cc;
+  --accent-primary: #8B7CFF;
+  --accent-hover: #A495FF;
+  --accent-subtle: rgba(139, 124, 255, 0.16);
+  --accent-text: #BFB3FF;
 
   --segment-active-bg: var(--accent-primary);
   --segment-active-text: var(--text-inverse);
 
   /* Select chevron — @tabler/icons chevron-down, colored to --text-secondary */
-  --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%238b8b9e' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath stroke='none' d='M0 0h24v24H0z' fill='none'/%3E%3Cpath d='M6 9l6 6l6 -6'/%3E%3C/svg%3E");
+  --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%239A9AB8' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath stroke='none' d='M0 0h24v24H0z' fill='none'/%3E%3Cpath d='M6 9l6 6l6 -6'/%3E%3C/svg%3E");
 
   --success: #22c55e;
   --success-subtle: rgba(34, 197, 94, 0.12);
@@ -40,13 +44,13 @@
   --error-subtle: rgba(239, 68, 68, 0.12);
   --info: #3b82f6;
   --info-subtle: rgba(59, 130, 246, 0.12);
-  --info-card-accent: #818cf8;
-  --info-card-accent-end: #a78bfa;
+  --info-card-accent: #8B7CFF;
+  --info-card-accent-end: #C39DFF;
 
   /* Status colors */
   --status-running: #22c55e;
-  --status-idle: #8b8b9e;
-  --status-stopped: #5c5c70;
+  --status-idle: #9A9AB8;
+  --status-stopped: #626387;
   --status-error: #ef4444;
 
   /* Spacing */
@@ -62,7 +66,8 @@
 
   /* Typography */
   --font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+  --font-serif: 'Newsreader', Georgia, 'Times New Roman', serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 
   --text-xs: 11px;
   --text-sm: 13px;
@@ -74,15 +79,15 @@
 
   /* Border Radius */
   --radius-sm: 4px;
-  --radius-md: 6px;
-  --radius-lg: 8px;
-  --radius-xl: 12px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
   --radius-full: 9999px;
 
-  /* Shadows */
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
-  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.35);
-  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.45);
+  /* Shadows — cosmic violet-tinted depth */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.45);
+  --shadow-md: 0 6px 18px rgba(2, 2, 12, 0.55);
+  --shadow-lg: 0 12px 40px rgba(2, 2, 12, 0.65), 0 0 0 1px rgba(139, 124, 255, 0.06);
 
   /* Transitions */
   --transition-fast: 120ms ease;
@@ -98,7 +103,7 @@
   /* Notification bar */
   --notification-bar-height: 0px;
   --notification-bar-bg: var(--accent-primary);
-  --notification-bar-text: var(--bg-primary);
+  --notification-bar-text: var(--text-inverse);
   --notification-bar-close-hover: rgba(0, 0, 0, 0.1);
 }
 
@@ -218,32 +223,32 @@
 }
 
 [data-theme="light"] {
-  --bg-primary: #f8f8f7;
-  --bg-secondary: #f5f5f3;
-  --bg-tertiary: #efefec;
-  --bg-elevated: #fffefd;
-  --bg-hover: #ededeb;
-  --bg-active: #e2e2dd;
+  --bg-primary: #F7F7FB;
+  --bg-secondary: #F1F1F8;
+  --bg-tertiary: #E9E9F3;
+  --bg-elevated: #FFFFFF;
+  --bg-hover: #E4E4EF;
+  --bg-active: #D6D6E6;
 
-  --border-default: #d5d4cd;
-  --border-subtle: #e3e2dc;
-  --border-strong: #c3c1b9;
+  --border-default: #D4D4E3;
+  --border-subtle: #E5E5F0;
+  --border-strong: #B4B4CC;
 
-  --text-primary: #1a1a22;
-  --text-secondary: #6b6b80;
-  --text-tertiary: #9898a8;
-  --text-inverse: #ffffff;
+  --text-primary: #11101D;
+  --text-secondary: #59587A;
+  --text-tertiary: #8888A8;
+  --text-inverse: #FFFFFF;
 
-  --accent-primary: #3a3a42;
-  --accent-hover: #28282e;
-  --accent-subtle: rgba(58, 58, 66, 0.08);
-  --accent-text: #3a3a42;
+  --accent-primary: #6D5BD0;
+  --accent-hover: #5A49BE;
+  --accent-subtle: rgba(109, 91, 208, 0.10);
+  --accent-text: #6D5BD0;
 
-  --segment-active-bg: var(--bg-elevated);
-  --segment-active-text: var(--text-primary);
+  --segment-active-bg: var(--accent-primary);
+  --segment-active-text: #ffffff;
 
   /* Select chevron — @tabler/icons chevron-down, colored to --text-secondary */
-  --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%236b6b80' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath stroke='none' d='M0 0h24v24H0z' fill='none'/%3E%3Cpath d='M6 9l6 6l6 -6'/%3E%3C/svg%3E");
+  --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%2359587A' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath stroke='none' d='M0 0h24v24H0z' fill='none'/%3E%3Cpath d='M6 9l6 6l6 -6'/%3E%3C/svg%3E");
 
   --success: #16a34a;
   --success-subtle: rgba(22, 163, 74, 0.08);
@@ -253,20 +258,21 @@
   --error-subtle: rgba(220, 38, 38, 0.08);
   --info: #2563eb;
   --info-subtle: rgba(37, 99, 235, 0.08);
-  --info-card-accent: #6366f1;
-  --info-card-accent-end: #8b5cf6;
+  --info-card-accent: #8B7CFF;
+  --info-card-accent-end: #B097FF;
 
   --status-running: #16a34a;
-  --status-idle: #9898a8;
-  --status-stopped: #d0d0d8;
+  --status-idle: #8888A8;
+  --status-stopped: #D4D4E3;
   --status-error: #dc2626;
 
-  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.06);
-  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.08);
-  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.12);
+  --shadow-sm: 0 1px 2px rgba(20, 16, 50, 0.05);
+  --shadow-md: 0 4px 14px rgba(20, 16, 50, 0.08);
+  --shadow-lg: 0 10px 32px rgba(20, 16, 50, 0.12);
 
-  /* Light mode: notification bar always white text */
-  --notification-bar-text: var(--bg-primary); /* For light mode, bg-primary is #fff */
+  /* Light mode: notification bar uses accent bg */
+  --notification-bar-bg: var(--accent-primary);
+  --notification-bar-text: #ffffff;
   --notification-bar-close-hover: rgba(255, 255, 255, 0.2);
 }
 
@@ -310,6 +316,59 @@ body {
   background: var(--bg-primary);
   color: var(--text-primary);
   line-height: 1.5;
+  min-height: 100vh;
+  min-height: 100dvh;
+  position: relative;
+  overflow-x: hidden;
+  isolation: isolate;
+}
+
+/* ── Subtle cosmic ambient: soft violet/blue edge-glow + sparse stars.
+   Painted on body::before with z-index:-1 so it sits BETWEEN body's
+   background and its children — meaning solid panels fully cover it
+   (text stays readable), while explicit glass surfaces (sidebar, chat)
+   and the login/onboarding flow reveal it. ── */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(ellipse 55% 45% at 15% 90%, rgba(139,124,255,0.12), transparent 65%),
+    radial-gradient(ellipse 50% 40% at 88% 10%, rgba(91,141,239,0.09), transparent 65%);
+}
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-image:
+    radial-gradient(1px 1px at 22% 16%, rgba(255,255,255,0.35), transparent 50%),
+    radial-gradient(1px 1px at 76% 34%, rgba(255,255,255,0.22), transparent 50%),
+    radial-gradient(1.2px 1.2px at 40% 60%, rgba(200,195,255,0.40), transparent 50%),
+    radial-gradient(1px 1px at 86% 82%, rgba(255,255,255,0.22), transparent 50%),
+    radial-gradient(1px 1px at 10% 72%, rgba(255,255,255,0.18), transparent 50%),
+    radial-gradient(1.1px 1.1px at 62% 22%, rgba(180,180,255,0.32), transparent 50%),
+    radial-gradient(1px 1px at 28% 30%, rgba(255,255,255,0.22), transparent 50%),
+    radial-gradient(1.1px 1.1px at 70% 68%, rgba(220,215,255,0.30), transparent 50%),
+    radial-gradient(1px 1px at 94% 48%, rgba(200,195,255,0.25), transparent 50%),
+    radial-gradient(1.2px 1.2px at 6% 88%, rgba(180,180,255,0.32), transparent 50%);
+  background-size: 100% 100%;
+  opacity: 0.55;
+}
+[data-theme="light"] body::before {
+  background:
+    radial-gradient(ellipse 50% 35% at 88% 10%, rgba(109,91,208,0.05), transparent 70%),
+    radial-gradient(ellipse 45% 30% at 10% 92%, rgba(91,141,239,0.04), transparent 70%);
+}
+[data-theme="light"] body::after {
+  opacity: 0;
+}
+
+#root {
+  min-height: 100vh;
   min-height: 100dvh;
 }
 
@@ -380,8 +439,16 @@ select:focus {
 /* ─── Layout ────────────────────────────────────────── */
 
 .app-layout {
+  display: -webkit-flex;
   display: flex;
+  min-height: calc(100vh - var(--notification-bar-height));
   min-height: calc(100dvh - var(--notification-bar-height));
+}
+
+.mobile-app-bar,
+.mobile-sidebar-backdrop,
+.mobile-sidebar-close {
+  display: none;
 }
 
 .app-layout.sidebar-collapsed {
@@ -390,7 +457,11 @@ select:focus {
 
 .sidebar {
   width: var(--sidebar-width);
+  min-width: var(--sidebar-width);
   background: var(--bg-secondary);
+  background: color-mix(in srgb, var(--bg-secondary) 82%, transparent);
+  backdrop-filter: blur(18px) saturate(1.4);
+  -webkit-backdrop-filter: blur(18px) saturate(1.4);
   border-right: 1px solid var(--border-subtle);
   display: flex;
   flex-direction: column;
@@ -402,6 +473,10 @@ select:focus {
   max-height: calc(100dvh - var(--notification-bar-height));
   z-index: 10;
   transition: width var(--transition-default);
+  -webkit-flex-shrink: 0;
+  flex-shrink: 0;
+  -webkit-transform: translateZ(0);
+  transform: translateZ(0);
   /* Allow account language submenu to extend to the right; vertical scroll stays in .sidebar-scrollable */
   overflow-x: visible;
   overflow-y: hidden;
@@ -413,7 +488,7 @@ select:focus {
   flex-shrink: 0;
   position: relative;
   z-index: 1;
-  background: var(--bg-secondary);
+  background: transparent;
 }
 
 .sidebar-scrollable {
@@ -423,7 +498,7 @@ select:focus {
   min-height: 0;
   position: relative;
   z-index: 0;
-  background: var(--bg-secondary);
+  background: transparent;
 }
 
 /* Custom scrollbar for sidebar */
@@ -451,9 +526,10 @@ select:focus {
   gap: 8px;
   padding: 2px 14px 6px;
   color: var(--text-tertiary);
+  font-family: var(--font-mono);
   font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.05em;
+  font-weight: 500;
+  letter-spacing: 0.12em;
   text-transform: uppercase;
 }
 
@@ -1537,12 +1613,17 @@ select:focus {
 
 .main-content {
   margin-left: var(--sidebar-width);
-  flex: 1;
+  -webkit-box-flex: 1;
+  -webkit-flex: 1 1 0;
+  flex: 1 1 0;
+  min-width: 0;
   min-height: calc(100dvh - var(--notification-bar-height));
   padding: var(--space-8);
   width: calc(100vw - var(--sidebar-width));
   max-width: calc(100vw - var(--sidebar-width));
   overflow-x: clip;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
   box-sizing: border-box;
   transition: all var(--transition-default);
 }
@@ -1556,7 +1637,7 @@ select:focus {
   overflow: hidden;
   display: flex;
   flex-direction: column;
-  padding: 0;
+  padding: 12px;
 }
 
 .main-content.agent-settings-page {
@@ -2201,14 +2282,16 @@ select:focus {
 /* When inside the chat page (main-content.chat-page removes outer padding),
    give page-header its own padding to replicate the normal main-content spacing */
 .main-content.chat-page .page-header {
-  padding: var(--space-8) var(--space-8) 0;
+  padding: var(--space-6) var(--space-2) var(--space-3);
   flex-shrink: 0;
 }
 
 
 .page-title {
   font-size: var(--text-2xl);
-  font-weight: 600;
+  font-weight: 400;
+  font-family: var(--font-serif);
+  letter-spacing: -0.01em;
 }
 
 .page-subtitle {
@@ -2261,8 +2344,8 @@ select:focus {
 .login-page {
   display: flex;
   min-height: calc(100dvh - var(--notification-bar-height));
-  background: #f8f8f6;
-  color: #111114;
+  background: transparent;
+  color: var(--text-primary);
 }
 
 /* ── Left: Hero Branding Panel ── */
@@ -2274,18 +2357,15 @@ select:focus {
   justify-content: center;
   overflow: hidden;
   min-height: calc(100dvh - var(--notification-bar-height));
-  background: #f8f8f6;
+  background: transparent;
 }
 
 .login-hero-bg {
   position: absolute;
   inset: 0;
   background:
-    radial-gradient(circle at 20% 22%, rgba(17, 17, 20, 0.055), transparent 0 1px, transparent 1.5px),
-    radial-gradient(circle at 78% 18%, rgba(124, 124, 114, 0.09), transparent 32%),
-    radial-gradient(circle at 22% 76%, rgba(160, 166, 151, 0.13), transparent 36%),
-    linear-gradient(125deg, rgba(255, 255, 255, 0.92), rgba(245, 245, 240, 0.34) 46%, rgba(255,255,255,0.72)),
-    #f8f8f6;
+    radial-gradient(ellipse 60% 50% at 30% 70%, rgba(139, 124, 255, 0.20), transparent 60%),
+    radial-gradient(ellipse 50% 40% at 75% 25%, rgba(91, 141, 239, 0.15), transparent 60%);
   z-index: 0;
 }
 
@@ -2294,13 +2374,13 @@ select:focus {
   position: absolute;
   inset: 0;
   background-image:
-    linear-gradient(rgba(17, 17, 20, 0.035) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(17, 17, 20, 0.035) 1px, transparent 1px);
-  background-size: 72px 72px;
-  mask-image:
-    linear-gradient(90deg, rgba(0,0,0,0.12), rgba(0,0,0,0.04) 70%, transparent),
-    linear-gradient(180deg, transparent 0%, rgba(0,0,0,0.7) 12%, rgba(0,0,0,0.95) 76%, transparent 100%);
-  mask-composite: intersect;
+    radial-gradient(1px 1px at var(--sx, 20%) 22%, rgba(255,255,255,0.4), transparent 50%);
+  opacity: 0;
+}
+[data-theme="light"] .login-hero-bg {
+  background:
+    radial-gradient(ellipse 60% 50% at 30% 70%, rgba(109, 91, 208, 0.10), transparent 60%),
+    radial-gradient(ellipse 50% 40% at 75% 25%, rgba(91, 141, 239, 0.07), transparent 60%);
 }
 
 .login-hero-bg::after {
@@ -2466,8 +2546,14 @@ select:focus {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: #f8f8f6;
+  background: color-mix(in srgb, var(--bg-elevated) 78%, transparent);
+  backdrop-filter: blur(20px) saturate(1.4);
+  -webkit-backdrop-filter: blur(20px) saturate(1.4);
+  border-left: 1px solid var(--border-subtle);
   position: relative;
+}
+[data-theme="light"] .login-form-panel {
+  background: rgba(255, 255, 255, 0.75);
 }
 
 .login-form-wrapper {
@@ -2720,12 +2806,7 @@ select:focus {
   display: flex;
   align-items: center;
   justify-content: center;
-  background:
-    radial-gradient(circle at 18% 20%, rgba(17, 17, 20, 0.055), transparent 0 1px, transparent 1.5px),
-    radial-gradient(circle at 78% 18%, rgba(124, 124, 114, 0.08), transparent 34%),
-    radial-gradient(circle at 24% 78%, rgba(160, 166, 151, 0.11), transparent 38%),
-    linear-gradient(125deg, rgba(255, 255, 255, 0.92), rgba(245, 245, 240, 0.35) 46%, rgba(255,255,255,0.72)),
-    var(--bg-primary);
+  background: transparent;
   padding: 40px 20px;
   position: relative;
   overflow: hidden;
@@ -2742,11 +2823,8 @@ select:focus {
 
 /* ─── Dark cosmic theme for CompanySetup ──────────────── */
 .company-setup-page--dark {
-  background:
-    radial-gradient(ellipse 80% 60% at 50% 35%, rgba(40, 60, 110, 0.18), transparent 70%),
-    radial-gradient(ellipse 60% 50% at 80% 25%, rgba(80, 60, 140, 0.12), transparent 70%),
-    #08090d;
-  color: #f5f5f7;
+  background: transparent;
+  color: var(--text-primary);
 }
 
 .cosmic-particles {
@@ -3694,7 +3772,7 @@ select:focus {
 }
 
 .main-content.chat-page .agent-detail-page--chat .agent-detail-header {
-  padding: 6px var(--space-8) 6px 20px;
+  padding: 6px var(--space-2) 6px var(--space-2);
   margin-bottom: 4px;
 }
 
@@ -4238,14 +4316,14 @@ select:focus {
   font-weight: 700;
   line-height: 1.1;
   letter-spacing: -0.03em;
-  background: linear-gradient(135deg, #1f2328 0%, #6b7280 100%);
+  background: linear-gradient(135deg, #11101D 0%, #59587A 100%);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
   width: fit-content;
 }
 [data-theme="dark"] .agent-info-token-hero-value {
-  background: linear-gradient(135deg, #e1e1e8 0%, #8b8b9e 100%);
+  background: linear-gradient(135deg, #EDEBF5 0%, #9A9AB8 100%);
   -webkit-background-clip: text;
   background-clip: text;
 }
@@ -4435,12 +4513,16 @@ select:focus {
   flex: 1;
   min-height: 0;
   box-sizing: border-box;
-  background: rgba(255, 255, 255, 0.55);
-  backdrop-filter: blur(12px) saturate(1.6);
-  -webkit-backdrop-filter: blur(12px) saturate(1.6);
+  background: color-mix(in srgb, var(--bg-elevated) 70%, transparent);
+  backdrop-filter: blur(20px) saturate(1.6);
+  -webkit-backdrop-filter: blur(20px) saturate(1.6);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-xl);
+  overflow: hidden;
 }
 [data-theme="dark"] .agent-chat-shell {
-  background: rgba(22, 22, 30, 0.7);
+  background: color-mix(in srgb, var(--bg-elevated) 55%, transparent);
+  box-shadow: 0 20px 60px rgba(2, 2, 18, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.04);
 }
 
 .agent-chat-area.has-live-panel {
@@ -6487,6 +6569,28 @@ select:focus {
   background: #fff;
 }
 
+.workspace-op-media-preview {
+  min-height: 180px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: #090b10;
+  border-radius: 10px;
+}
+
+.workspace-op-video {
+  display: block;
+  width: min(100%, 960px);
+  max-height: 68vh;
+  border-radius: 8px;
+  background: #000;
+}
+
+.workspace-op-audio {
+  width: min(100%, 640px);
+}
+
 .workspace-op-modal-overlay {
   position: absolute;
   inset: 0;
@@ -8023,4 +8127,273 @@ select:focus {
 
 .enterprise-tool-source-tabs {
   margin-bottom: 16px;
+}
+
+/* ─── Mobile application shell ────────────────────────
+   Keep the complete desktop navigation available as an off-canvas drawer.
+   This avoids shrinking the main workspace to an unusable sliver on phones
+   while preserving every company, Agent, account, and admin entry point. */
+@media (max-width: 768px) {
+  .app-layout,
+  .app-layout.sidebar-collapsed {
+    --sidebar-width: 0px;
+  }
+
+  .mobile-app-bar {
+    position: fixed;
+    top: var(--notification-bar-height);
+    left: 0;
+    right: 0;
+    z-index: 10000;
+    height: var(--header-height);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 14px;
+    padding-left: max(14px, env(safe-area-inset-left));
+    padding-right: max(14px, env(safe-area-inset-right));
+    border-bottom: 1px solid var(--border-subtle);
+    background: var(--bg-secondary);
+    background: color-mix(in srgb, var(--bg-secondary) 92%, transparent);
+    -webkit-backdrop-filter: blur(18px) saturate(1.3);
+    backdrop-filter: blur(18px) saturate(1.3);
+  }
+
+  .mobile-navigation-toggle,
+  .mobile-sidebar-close {
+    width: 34px;
+    height: 34px;
+    flex: 0 0 34px;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    background: var(--bg-primary);
+    color: var(--text-secondary);
+    cursor: pointer;
+  }
+
+  .mobile-navigation-toggle {
+    display: inline-flex;
+  }
+
+  .mobile-sidebar-close {
+    display: inline-flex;
+    margin-left: auto;
+  }
+
+  .mobile-workspace-name {
+    min-width: 0;
+    margin-left: auto;
+    overflow: hidden;
+    color: var(--text-tertiary);
+    font-size: 12px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .mobile-sidebar-backdrop {
+    position: fixed;
+    inset: var(--notification-bar-height) 0 0;
+    z-index: 10010;
+    display: block;
+    width: 100%;
+    border: 0;
+    background: rgba(0, 0, 0, 0.48);
+    -webkit-backdrop-filter: blur(2px);
+    backdrop-filter: blur(2px);
+  }
+
+  .sidebar,
+  .sidebar.collapsed {
+    --sidebar-width: min(86vw, 320px);
+    width: var(--sidebar-width);
+    min-width: var(--sidebar-width);
+    z-index: 10020;
+    -webkit-transform: translateX(-100%) translateZ(0);
+    transform: translateX(-100%) translateZ(0);
+    transition: transform var(--transition-default);
+    box-shadow: var(--shadow-lg);
+  }
+
+  .app-layout.mobile-sidebar-open .sidebar {
+    -webkit-transform: translateX(0) translateZ(0);
+    transform: translateX(0) translateZ(0);
+  }
+
+  .sidebar-logo {
+    justify-content: flex-start;
+  }
+
+  .sidebar-collapse-btn {
+    display: none !important;
+  }
+
+  .tenant-switcher-popover {
+    z-index: 10040;
+    width: min(304px, calc(100vw - 24px));
+  }
+
+  .main-content,
+  .main-content.agent-settings-page {
+    width: 100vw;
+    max-width: 100vw;
+    min-width: 0;
+    margin-left: 0;
+    padding: calc(var(--header-height) + 16px) 16px 24px;
+    overflow-x: hidden;
+    transition: none;
+  }
+
+  .main-content.chat-page {
+    width: 100vw;
+    max-width: 100vw;
+    height: calc(100dvh - var(--notification-bar-height));
+    margin-left: 0;
+    padding: calc(var(--header-height) + 8px) 8px 8px;
+  }
+
+  .page-header {
+    min-width: 0;
+  }
+
+  .page-title {
+    font-size: 22px;
+    line-height: 1.2;
+  }
+
+  .tabs {
+    top: calc(var(--notification-bar-height) + var(--header-height));
+    max-width: 100%;
+    margin-bottom: var(--space-4);
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+
+  .tabs::-webkit-scrollbar {
+    display: none;
+  }
+
+  .tab {
+    flex: 0 0 auto;
+    padding: var(--space-2) var(--space-3);
+    white-space: nowrap;
+  }
+
+  .plaza-layout {
+    flex-direction: column;
+    gap: 16px !important;
+  }
+
+  .plaza-layout > * {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .plaza-sidebar {
+    position: static !important;
+    width: 100% !important;
+  }
+
+  .plaza-stats > div {
+    min-width: 0;
+    padding: 12px 10px !important;
+  }
+
+  .plaza-composer-footer,
+  .plaza-post-content,
+  .plaza-post-actions,
+  .plaza-comments {
+    padding-left: 0 !important;
+  }
+
+  .plaza-composer-footer {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .agent-chat-shell {
+    flex-direction: column !important;
+    height: calc(100dvh - var(--header-height) - 72px) !important;
+    margin: 0 !important;
+  }
+
+  .agent-chat-shell .session-sidebar:not(.collapsed) {
+    width: 100% !important;
+    flex: 0 0 190px;
+    border-right: 0 !important;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .agent-chat-shell .agent-chat-area {
+    width: 100%;
+    min-height: 0;
+  }
+
+  .subscription-detail-page {
+    padding: 16px 0 32px !important;
+  }
+
+  .subscription-detail-header {
+    align-items: stretch !important;
+    flex-direction: column;
+  }
+
+  .subscription-detail-actions {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .subscription-detail-actions .btn {
+    flex: 1 1 140px;
+  }
+
+  .subscription-usage-card {
+    padding: 18px !important;
+  }
+
+  .subscription-usage-grid {
+    grid-template-columns: minmax(0, 1fr) !important;
+    gap: 14px !important;
+  }
+
+  .subscription-plan-card {
+    min-height: 0 !important;
+    padding: 18px !important;
+  }
+
+  .subscription-usage-metric {
+    padding: 18px !important;
+  }
+
+  .subscription-usage-metric-main {
+    align-items: stretch !important;
+    flex-direction: column;
+    gap: 12px !important;
+  }
+
+  .subscription-usage-metric-value {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .subscription-usage-metric-value > span:last-child {
+    white-space: nowrap;
+  }
+
+  .subscription-detail-page table {
+    min-width: 620px;
+  }
+
+  .skill-registry-header {
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .skill-registry-actions {
+    width: 100%;
+    flex-wrap: wrap;
+  }
 }

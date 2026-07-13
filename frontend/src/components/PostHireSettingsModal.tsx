@@ -2,10 +2,13 @@ import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { IconAlertTriangle, IconSettings, IconX } from '@tabler/icons-react';
-import { agentApi, authApi, enterpriseApi, tenantApi } from '../services/api';
+import { IconClock, IconLink, IconShieldCheck, IconX } from '@tabler/icons-react';
+import { agentApi, fetchJson } from '../services/api';
 import { translateTemplate } from '../i18n/templateTranslations';
 import { useDialog } from './Dialog/DialogProvider';
+import TierSelector, { type SaasTier } from './TierSelector';
+import { canonicalizeModalities, MODALITIES } from '../constants/modalities';
+import { SUBSCRIPTION_UPGRADE_PATH } from '../hooks/useAgentCreationLimit';
 
 interface Template {
     id: string;
@@ -13,14 +16,6 @@ interface Template {
     description?: string;
     icon?: string;
     category?: string;
-}
-
-interface Model {
-    id: string;
-    provider: string;
-    model: string;
-    label?: string;
-    enabled?: boolean;
 }
 
 interface Props {
@@ -35,6 +30,8 @@ interface Props {
 
 type Visibility = 'company' | 'only_me' | 'custom';
 
+const DOUYIN_TEMPLATE_NAME = 'Douyin Operations Manager';
+
 export default function PostHireSettingsModal({ template, open, onClose, onDone }: Props) {
     const { t, i18n } = useTranslation();
     const navigate = useNavigate();
@@ -43,61 +40,51 @@ export default function PostHireSettingsModal({ template, open, onClose, onDone 
     const isChinese = i18n.language.startsWith('zh');
 
     const [visibility, setVisibility] = useState<Visibility>('company');
-    const [modelId, setModelId] = useState<string>('');
+    const [preferredTier, setPreferredTier] = useState<SaasTier>('pro');
+    const [preferredModality, setPreferredModality] = useState('text');
+    const isDouyinTemplate = template?.name === DOUYIN_TEMPLATE_NAME;
 
-    const { data: myTenant } = useQuery({
-        queryKey: ['tenant', 'me'],
-        queryFn: () => tenantApi.me(),
+    const { data: entitlements } = useQuery({
+        queryKey: ['subscription-entitlements'],
+        queryFn: () => fetchJson<any | null>('/subscription/my-entitlements'),
         enabled: open,
         staleTime: 5 * 60 * 1000,
     });
-
-    const { data: currentUser } = useQuery({
-        queryKey: ['auth', 'me'],
-        queryFn: authApi.me,
-        enabled: open,
-        staleTime: 5 * 60 * 1000,
-    });
-
-    const { data: models = [] } = useQuery({
-        queryKey: ['llm-models'],
-        queryFn: enterpriseApi.llmModels,
-        enabled: open,
-    });
-
-    const enabledModels = useMemo(
-        () => (models as Model[]).filter(m => m.enabled !== false),
-        [models],
+    const allowedTiers = useMemo(
+        () => entitlements?.allowed_tiers?.length ? entitlements.allowed_tiers : ['lite', 'pro', 'ultra'],
+        [entitlements?.allowed_tiers],
     );
+    const allowedModalities = useMemo(() => {
+        const canonical = canonicalizeModalities(entitlements?.allowed_modalities);
+        return canonical.length ? canonical : ['text'];
+    }, [entitlements?.allowed_modalities]);
+    const douyinPreferredTier = useMemo<SaasTier>(() => {
+        const tiers = allowedTiers as SaasTier[];
+        if (tiers.includes('pro')) return 'pro';
+        if (tiers.includes('lite')) return 'lite';
+        return tiers[0] || 'lite';
+    }, [allowedTiers]);
+    const douyinPreferredModality = useMemo(() => {
+        if (allowedModalities.includes('text')) return 'text';
+        return allowedModalities[0] || 'text';
+    }, [allowedModalities]);
 
-    const canManageModels = currentUser?.role === 'platform_admin'
-        || currentUser?.role === 'org_admin'
-        || !!currentUser?.is_platform_admin;
-    const hasNoModel = enabledModels.length === 0;
-    const disabledByNoModel = hasNoModel
-        ? t('postHire.noModelButtonHint')
-        : undefined;
-    const openModelSettings = () => {
-        (onDone || onClose)();
-        navigate('/enterprise#llm');
-    };
-
-    // Default the model picker to the tenant default (or first enabled)
-    // once both are available.
     useEffect(() => {
         if (!open) return;
-        if (modelId) return;
-        const preferred = myTenant?.default_model_id && enabledModels.find(m => m.id === myTenant.default_model_id)
-            ? myTenant.default_model_id
-            : (enabledModels[0]?.id || '');
-        if (preferred) setModelId(preferred);
-    }, [open, myTenant?.default_model_id, enabledModels, modelId]);
+        if (!allowedTiers.includes(preferredTier)) {
+            setPreferredTier((allowedTiers[0] as SaasTier) || 'lite');
+        }
+        if (!allowedModalities.includes(preferredModality)) {
+            setPreferredModality(allowedModalities[0] || 'text');
+        }
+    }, [open, allowedTiers, allowedModalities, preferredTier, preferredModality]);
 
     // Reset local form whenever the modal closes so the next open is clean.
     useEffect(() => {
         if (!open) {
             setVisibility('company');
-            setModelId('');
+            setPreferredTier('pro');
+            setPreferredModality('text');
         }
     }, [open]);
 
@@ -111,11 +98,12 @@ export default function PostHireSettingsModal({ template, open, onClose, onDone 
     const hire = useMutation({
         mutationFn: (navigateAfter: boolean) => {
             if (!template) return Promise.reject(new Error('No template'));
-            if (enabledModels.length === 0) {
-                return Promise.reject(new Error(t('postHire.noModelError')));
-            }
-            if (!modelId) {
-                return Promise.reject(new Error(t('postHire.modelRequired')));
+            const effectivePreferredTier = isDouyinTemplate ? douyinPreferredTier : preferredTier;
+            const effectivePreferredModality = isDouyinTemplate
+                ? douyinPreferredModality
+                : (preferredModality || 'text');
+            if (!effectivePreferredTier) {
+                return Promise.reject(new Error(t('postHire.modelRequired', '请选择模型档位')));
             }
             // Localize name + role_description when the UI is in Chinese so
             // the agent persists with the same labels the user saw on the
@@ -130,7 +118,8 @@ export default function PostHireSettingsModal({ template, open, onClose, onDone 
                 name: localized.name,
                 role_description: localized.description,
                 template_id: template.id,
-                primary_model_id: modelId || undefined,
+                preferred_tier: effectivePreferredTier,
+                preferred_modality: effectivePreferredModality,
                 permission_access_level: 'manage',
             };
             payload.permission_scope_type = visibility === 'company'
@@ -143,12 +132,30 @@ export default function PostHireSettingsModal({ template, open, onClose, onDone 
         },
         onSuccess: ({ agent, navigateAfter }) => {
             queryClient.invalidateQueries({ queryKey: ['agents'] });
+            queryClient.invalidateQueries({ queryKey: ['subscription-seats'] });
             (onDone || onClose)();
             // "立即对话" → open directly on the chat tab (not the default status
             // tab). AgentDetail picks up the hash on mount.
             if (navigateAfter) navigate(`/agents/${agent.id}#chat`);
         },
         onError: async (err: any) => {
+            const upgradeUrl = err?.detail?.details?.upgrade_url || err?.detail?.upgrade_url || (err?.status === 402 ? SUBSCRIPTION_UPGRADE_PATH : '');
+            if (upgradeUrl) {
+                queryClient.invalidateQueries({ queryKey: ['subscription-seats'] });
+                const goToSubscription = await dialog.confirm(
+                    err?.message || t('agent.limit.title', 'Agent limit reached'),
+                    {
+                        title: t('agent.limit.title', 'Agent limit reached'),
+                        confirmLabel: t('subscription.goToDetail', 'Go to subscription'),
+                        cancelLabel: t('common.cancel', 'Cancel'),
+                    },
+                );
+                if (goToSubscription) {
+                    onClose();
+                    navigate(upgradeUrl);
+                }
+                return;
+            }
             await dialog.alert(t('postHire.createFailed'), {
                 type: 'error',
                 details: String(err?.message || err),
@@ -158,7 +165,6 @@ export default function PostHireSettingsModal({ template, open, onClose, onDone 
 
     if (!open || !template) return null;
 
-    const labelFor = (m: Model) => m.label || `${m.provider} · ${m.model}`;
     const busy = hire.isPending;
 
     return (
@@ -219,113 +225,160 @@ export default function PostHireSettingsModal({ template, open, onClose, onDone 
                         </div>
                     </section>
 
-                    {/* Model */}
-                    <section>
-                        <div style={{ fontSize: '13px', fontWeight: 600, marginBottom: '8px' }}>
-                            {t('postHire.model')}
-                        </div>
-                        {enabledModels.length === 0 ? (
-                            <NoModelsNotice
-                                canManageModels={canManageModels}
-                                onConfigure={openModelSettings}
-                                t={t}
-                            />
-                        ) : (
-                            <select
-                                className="form-input"
-                                value={modelId}
-                                onChange={e => setModelId(e.target.value)}
-                                disabled={busy}
-                                style={{ width: '100%' }}
-                            >
-                                {enabledModels.map(m => (
-                                    <option key={m.id} value={m.id}>
-                                        {labelFor(m)}{myTenant?.default_model_id === m.id ? ` · ${t('postHire.defaultSuffix')}` : ''}
-                                    </option>
-                                ))}
-                            </select>
-                        )}
-                    </section>
+                    {!isDouyinTemplate && (
+                        <section>
+                            <div style={{ fontSize: '13px', fontWeight: 600, marginBottom: '8px' }}>
+                                {t('postHire.model', '模型档位')}
+                            </div>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                                <TierSelector
+                                    value={preferredTier}
+                                    onChange={setPreferredTier}
+                                    allowedTiers={allowedTiers}
+                                    disabled={busy}
+                                />
+                                <select
+                                    className="form-input"
+                                    value={preferredModality}
+                                    onChange={e => setPreferredModality(e.target.value)}
+                                    disabled={busy}
+                                    style={{ width: '100%' }}
+                                >
+                                    {MODALITIES.filter((m) => allowedModalities.includes(m)).map((m) => (
+                                        <option key={m} value={m}>{m}</option>
+                                    ))}
+                                </select>
+                            </div>
+                        </section>
+                    )}
+
+                    {isDouyinTemplate && (
+                        <DouyinSetupPanel disabled={busy} />
+                    )}
                 </div>
 
                 <div style={{ padding: '16px 26px 20px', display: 'flex', justifyContent: 'flex-end', gap: '8px', borderTop: '1px solid var(--border-subtle)', marginTop: '12px' }}>
-                    <span
-                        title={disabledByNoModel}
-                        style={{ display: 'inline-flex', cursor: hasNoModel ? 'not-allowed' : undefined }}
+                    <button
+                        className="btn btn-secondary"
+                        disabled={busy}
+                        onClick={() => hire.mutate(false)}
                     >
-                        <button
-                            className="btn btn-secondary"
-                            disabled={busy || hasNoModel}
-                            style={{ pointerEvents: hasNoModel ? 'none' : undefined }}
-                            onClick={() => hire.mutate(false)}
-                        >
-                            {busy && !hire.variables ? '...' : t('postHire.createOnly')}
-                        </button>
-                    </span>
-                    <span
-                        title={disabledByNoModel}
-                        style={{ display: 'inline-flex', cursor: hasNoModel ? 'not-allowed' : undefined }}
+                        {busy && !hire.variables
+                            ? '...'
+                            : isDouyinTemplate
+                                ? t('postHire.douyin.createLater', isChinese ? '稍后连接，先创建' : 'Create, connect later')
+                                : t('postHire.createOnly')}
+                    </button>
+                    <button
+                        className="btn btn-primary"
+                        disabled={busy}
+                        onClick={() => hire.mutate(true)}
                     >
-                        <button
-                            className="btn btn-primary"
-                            disabled={busy || hasNoModel}
-                            style={{ pointerEvents: hasNoModel ? 'none' : undefined }}
-                            onClick={() => hire.mutate(true)}
-                        >
-                            {busy ? t('postHire.creating') : t('postHire.chatNow')}
-                        </button>
-                    </span>
+                        {busy
+                            ? t('postHire.creating')
+                            : isDouyinTemplate
+                                ? t('postHire.douyin.chatNow', isChinese ? '创建并开始对话' : 'Create and chat')
+                                : t('postHire.chatNow')}
+                    </button>
                 </div>
             </div>
         </div>
     );
 }
 
-function NoModelsNotice({
-    canManageModels,
-    onConfigure,
-    t,
-}: {
-    canManageModels: boolean;
-    onConfigure: () => void;
-    t: (key: string) => string;
-}) {
+function DouyinSetupPanel({ disabled }: { disabled: boolean }) {
+    const { t, i18n } = useTranslation();
+    const isChinese = i18n.language.startsWith('zh');
+
     return (
-        <div
-            role="status"
+        <section
             style={{
-                display: 'flex',
-                gap: '10px',
-                alignItems: 'flex-start',
-                padding: '10px 12px',
-                borderRadius: '9px',
-                border: '1px solid rgba(217,119,6,0.28)',
-                background: 'rgba(245,158,11,0.08)',
+                border: '1px solid var(--border-subtle)',
+                borderRadius: '8px',
+                padding: '12px',
+                background: 'var(--bg-secondary)',
             }}
         >
-            <IconAlertTriangle size={17} stroke={1.8} style={{ marginTop: '1px', color: '#b45309', flexShrink: 0 }} />
-            <div style={{ minWidth: 0 }}>
-                <div style={{ fontSize: '13px', fontWeight: 650, color: 'var(--text-primary)' }}>
-                    {t('postHire.noModelsTitle')}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '12px' }}>
+                <div style={{ minWidth: 0 }}>
+                    <div style={{ fontSize: '13px', fontWeight: 600 }}>
+                        {t('postHire.douyin.title', isChinese ? '抖音账号设置' : 'Douyin account setup')}
+                    </div>
+                    <div style={{ marginTop: '4px', fontSize: '11.5px', color: 'var(--text-tertiary)', lineHeight: 1.5 }}>
+                        {t(
+                            'postHire.douyin.hint',
+                            isChinese
+                                ? '连接账号后，这个 Agent 才能读取数据、创建发布包和评论回复审批任务。'
+                                : 'After account connection, this agent can read metrics and create publish packages plus reply approval tasks.',
+                        )}
+                    </div>
                 </div>
-                <div style={{ marginTop: '3px', fontSize: '12px', lineHeight: 1.5, color: 'var(--text-secondary)' }}>
-                    {canManageModels
-                        ? t('postHire.noModelsAdminHint')
-                        : t('postHire.noModelsMemberHint')}
-                </div>
-                {canManageModels ? (
-                    <button
-                        type="button"
-                        className="btn btn-secondary"
-                        onClick={onConfigure}
-                        style={{ marginTop: '9px', height: '30px', padding: '0 10px', fontSize: '12px', display: 'inline-flex', alignItems: 'center', gap: '6px' }}
-                    >
-                        <IconSettings size={14} stroke={1.7} />
-                        {t('postHire.configureModels')}
-                    </button>
-                ) : null}
+                <span
+                    style={{
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: '4px',
+                        padding: '4px 7px',
+                        borderRadius: '999px',
+                        background: 'var(--bg-primary)',
+                        color: 'var(--text-secondary)',
+                        fontSize: '11px',
+                        whiteSpace: 'nowrap',
+                    }}
+                >
+                    <IconClock size={12} stroke={1.6} />
+                    {t('postHire.douyin.pending', isChinese ? '待连接' : 'Not connected')}
+                </span>
             </div>
-        </div>
+
+            <div style={{ marginTop: '10px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                <div style={{ fontSize: '12px', color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+                    {t(
+                        'postHire.douyin.modelAuto',
+                        isChinese
+                            ? '模型配置由系统自动选择适合运营对话的默认配置，不需要在创建时设置。'
+                            : 'Model routing is selected automatically for operations conversations; no setup is needed here.',
+                    )}
+                </div>
+                <div style={{ display: 'flex', gap: '8px', alignItems: 'flex-start', fontSize: '12px', color: 'var(--text-secondary)', lineHeight: 1.5 }}>
+                    <IconShieldCheck size={15} stroke={1.6} style={{ marginTop: '1px', flexShrink: 0, color: 'var(--text-tertiary)' }} />
+                    <span>
+                        {t(
+                            'postHire.douyin.mode',
+                            isChinese
+                                ? '默认接管方式：审批后执行。发布作品会先生成发布包，由用户在抖音端确认。'
+                                : 'Default operating mode: approval before execution. Publishing becomes a package that the user confirms in Douyin.',
+                        )}
+                    </span>
+                </div>
+                <button
+                    type="button"
+                    className="btn btn-secondary"
+                    disabled
+                    title={t(
+                        'postHire.douyin.connectDisabledTitle',
+                        isChinese ? '官方 OAuth 接入完成后启用' : 'Enabled after official OAuth integration is available',
+                    )}
+                    style={{
+                        width: '100%',
+                        justifyContent: 'center',
+                        opacity: disabled ? 0.5 : 0.62,
+                        cursor: 'not-allowed',
+                    }}
+                >
+                    <IconLink size={14} stroke={1.6} />
+                    {t('postHire.douyin.connect', isChinese ? '连接抖音账号' : 'Connect Douyin account')}
+                </button>
+                <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', lineHeight: 1.45 }}>
+                    {t(
+                        'postHire.douyin.officialOnly',
+                        isChinese
+                            ? '账号连接将走抖音官方 OAuth；未连接前不会发布、回复或显示已授权状态。'
+                            : 'Account connection will use official Douyin OAuth; before that, nothing is published, replied to, or marked authorized.',
+                    )}
+                </div>
+            </div>
+        </section>
     );
 }
 

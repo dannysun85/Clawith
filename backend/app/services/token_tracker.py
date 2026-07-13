@@ -241,5 +241,13 @@ async def record_token_usage(
                     f"Recorded {usage.total_tokens:,} tokens for agent {agent.name} "
                     f"(cache_read={usage.cache_read_tokens:,})"
                 )
+
+        # Also accumulate at tenant level (tenant_usage.tokens_used) for plan
+        # credit enforcement. Independent session; failures must not break the call.
+        try:
+            from app.services.quota_guard import record_tenant_tokens
+            await record_tenant_tokens(agent.tenant_id, usage.total_tokens)
+        except Exception as te:
+            logger.warning(f"Failed to record tenant tokens for {agent.tenant_id}: {te}")
     except Exception as e:
         logger.warning(f"Failed to record token usage for agent {agent_id}: {e}")

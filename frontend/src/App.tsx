@@ -3,6 +3,8 @@ import { useAuthStore } from './stores';
 import { Suspense, lazy, useEffect, useLayoutEffect, useState, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { authApi } from './services/api';
+import { canAccessSaasAdmin } from './utils/saasAdmin';
+import { consumeSessionTokenFromUrl } from './utils/authTransport';
 
 const Login = lazy(() => import('./pages/Login'));
 const ForgotPassword = lazy(() => import('./pages/ForgotPassword'));
@@ -19,6 +21,10 @@ const Messages = lazy(() => import('./pages/Messages'));
 const EnterpriseSettings = lazy(() => import('./pages/EnterpriseSettings'));
 const InvitationCodes = lazy(() => import('./pages/InvitationCodes'));
 const AdminCompanies = lazy(() => import('./pages/AdminCompanies'));
+const AccountManagement = lazy(() => import('./pages/AccountManagement'));
+const SubscriptionDetail = lazy(() => import('./pages/SubscriptionDetail'));
+const BillingSuccess = lazy(() => import('./pages/BillingSuccess'));
+const SaasAdmin = lazy(() => import('./pages/SaasAdmin'));
 const OAuthCallback = lazy(() => import('./pages/OAuthCallback'));
 const SSOEntry = lazy(() => import('./pages/SSOEntry'));
 const OKR = lazy(() => import('./pages/OKR'));
@@ -27,8 +33,11 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
     const token = useAuthStore((s) => s.token);
     const user = useAuthStore((s) => s.user);
     if (!token) return <Navigate to="/login" replace />;
-    // Force company setup for users without a tenant
-    if (user && !user.tenant_id) return <Navigate to="/setup-company" replace />;
+    // Global platform administrators intentionally have no tenant. Do not trap
+    // them in tenant onboarding; their landing surface is the platform console.
+    if (user && !user.tenant_id && user.role !== 'platform_admin' && !(user as any).is_platform_admin) {
+        return <Navigate to="/setup-company" replace />;
+    }
     
     // Force email verification if not active/verified
     if (user && !user.is_active) return <Navigate to="/verify-email" state={{ email: user.email }} replace />;
@@ -40,6 +49,12 @@ function CompanyAdminRoute({ children }: { children: React.ReactNode }) {
     const user = useAuthStore((s) => s.user);
     const canAccessCompanySettings = user?.role === 'platform_admin' || user?.role === 'org_admin' || !!(user as any)?.is_platform_admin;
     if (!canAccessCompanySettings) return <Navigate to="/" replace />;
+    return <>{children}</>;
+}
+
+function SaasAdminRoute({ children }: { children: React.ReactNode }) {
+    const user = useAuthStore((s) => s.user);
+    if (!canAccessSaasAdmin(user)) return <Navigate to="/" replace />;
     return <>{children}</>;
 }
 
@@ -217,33 +232,22 @@ export default function App() {
         const savedTheme = localStorage.getItem('theme') || 'light';
         document.documentElement.setAttribute('data-theme', savedTheme);
 
-        // Cross-domain tenant switch: the backend appends ?token=<jwt> to the redirect URL
-        // so the new domain receives a fresh scoped token. Consume it here (before any other
-        // auth logic) so it always takes precedence over a stale token in localStorage.
-        //
-        // IMPORTANT: Only apply this on paths that do NOT use ?token= for their own purposes.
-        // /reset-password and /verify-email both receive a one-time token for their own flow —
-        // consuming it here as a session JWT would call /auth/me, fail, log out the user,
-        // and redirect them to /login instead of showing the correct page.
-        const urlParams = new URLSearchParams(window.location.search);
-        const urlToken = urlParams.get('token');
-        const currentPath = window.location.pathname;
+        // Cross-domain tenant switching transports the scoped JWT in a URL
+        // fragment, which browsers do not send to the server or access logs.
+        // Legacy query links are consumed once for backward compatibility.
         const pathsWithOwnToken = ['/reset-password', '/verify-email'];
+        const currentUrl = new URL(window.location.href);
+        const urlToken = consumeSessionTokenFromUrl(currentUrl, pathsWithOwnToken);
         let effectiveToken = token;
 
-        if (urlToken && !pathsWithOwnToken.includes(currentPath)) {
+        if (urlToken) {
             // Persist the new token and update the zustand store's in-memory value
             localStorage.setItem('token', urlToken);
             useAuthStore.setState({ token: urlToken, user: null });
             effectiveToken = urlToken;
 
-            // Remove token from URL to prevent it from leaking into browser history
-            // and to avoid re-applying it on a manual page refresh.
-            urlParams.delete('token');
-            const cleanSearch = urlParams.toString();
-            const cleanUrl = window.location.pathname
-                + (cleanSearch ? `?${cleanSearch}` : '')
-                + window.location.hash;
+            // Remove the one-time transport fragment/query before auth calls.
+            const cleanUrl = currentUrl.pathname + currentUrl.search + currentUrl.hash;
             window.history.replaceState({}, '', cleanUrl);
         }
 
@@ -279,6 +283,7 @@ export default function App() {
                 <Route path="/oauth/callback/:provider" element={<OAuthCallback />} />
                 <Route path="/sso/entry" element={<SSOEntry />} />
                 <Route path="/setup-company" element={<CompanySetup />} />
+                <Route path="/admin/saas" element={<SaasAdminRoute><SaasAdmin /></SaasAdminRoute>} />
                 <Route path="/onboarding" element={<ProtectedRoute><Onboarding /></ProtectedRoute>} />
                 <Route path="/" element={<ProtectedRoute><Layout /></ProtectedRoute>}>
                     <Route index element={<Navigate to="/plaza" replace />} />
@@ -293,6 +298,9 @@ export default function App() {
                     <Route path="okr" element={<OKR />} />
                     <Route path="invitations" element={<InvitationCodes />} />
                     <Route path="admin/platform-settings" element={<AdminCompanies />} />
+                    <Route path="account" element={<AccountManagement />} />
+                    <Route path="account/subscription" element={<SubscriptionDetail />} />
+                    <Route path="billing/success" element={<BillingSuccess />} />
                 </Route>
             </Routes>
             </Suspense>

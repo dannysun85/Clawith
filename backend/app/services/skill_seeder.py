@@ -4,6 +4,7 @@ from loguru import logger
 from sqlalchemy import select
 from app.database import async_session
 from app.models.skill import Skill, SkillFile
+from app.services.skill_scope import resolve_agent_skills
 
 
 BUILTIN_SKILLS = [
@@ -890,14 +891,14 @@ If the user only requests static frontend pages without a database or backend AP
   1. Visit https://vercel.com/signup to register (supports GitHub / Email sign up).
   2. Once logged in, go to https://vercel.com/account/tokens.
   3. Click "Create" to generate a new token (suggested name: "clawith", Scope: "Full Account").
-  4. Copy the generated token, return to the Clawith tool settings page, and paste it into the "Vercel Access Token" configuration field for "Deploy to Vercel" or any other Vercel tools.
+  4. Copy the generated token, return to the Astra tool settings page, and paste it into the "Vercel Access Token" configuration field for "Deploy to Vercel" or any other Vercel tools.
 
 ### 0.3 Guide the User to Sign Up for Neon and Get an API Key
 - If the project requires a database (Postgres), guide the user:
   1. Visit https://neon.tech to register (recommending GitHub OAuth for instant registration).
   2. Once registered, go to the API Keys section in the console settings (https://console.neon.tech/app/settings/api-keys).
   3. Click "Create new API Key", name it (e.g., "clawith"), and copy the generated key.
-  4. Return to the Clawith tool settings page, find the `Create Postgres Database` tool, and paste the key into the "Neon API Key" configuration field.
+  4. Return to the Astra tool settings page, find the `Create Postgres Database` tool, and paste the key into the "Neon API Key" configuration field.
 
 ---
 
@@ -975,7 +976,10 @@ async def seed_skills():
     async with async_session() as db:
         for skill_data in BUILTIN_SKILLS:
             result = await db.execute(
-                select(Skill).where(Skill.folder_name == skill_data["folder_name"])
+                select(Skill).where(
+                    Skill.tenant_id.is_(None),
+                    Skill.folder_name == skill_data["folder_name"],
+                )
             )
             existing = result.scalar_one_or_none()
             is_default = skill_data.get("is_default", False)
@@ -1037,18 +1041,39 @@ async def push_default_skills_to_existing_agents():
     import hashlib
 
     async with async_session() as db:
-        # Load all is_default skills with their files
-        default_skills_r = await db.execute(
-            select(Skill).where(Skill.is_default == True).options(selectinload(Skill.files))
+        # Load the registry once. Resolution below applies each agent's tenant
+        # view and uses tenant overrides for matching global default folders.
+        skills_r = await db.execute(
+            select(Skill).options(selectinload(Skill.files))
         )
-        default_skills = default_skills_r.scalars().all()
-        if not default_skills:
+        all_skills = skills_r.scalars().all()
+        global_default_folders = {
+            skill.folder_name
+            for skill in all_skills
+            if skill.tenant_id is None and skill.is_default
+        }
+        relevant_skills = [
+            skill
+            for skill in all_skills
+            if skill.is_default or skill.folder_name in global_default_folders
+        ]
+        if not relevant_skills:
             return
 
-        # Compute a hash of default skill folder names to detect newly added skills
+        # Include owner and identity so a new tenant override triggers a safe
+        # scoped rescan without ever copying it into another tenant.
         hasher = hashlib.sha256()
-        for skill in sorted(default_skills, key=lambda s: s.folder_name):
-            hasher.update(skill.folder_name.encode("utf-8"))
+        for skill in sorted(
+            relevant_skills,
+            key=lambda item: (
+                str(item.tenant_id or ""),
+                item.folder_name,
+                str(item.id),
+            ),
+        ):
+            hasher.update(
+                f"{skill.tenant_id}:{skill.id}:{skill.folder_name}:{skill.is_default}".encode()
+            )
         current_hash = hasher.hexdigest()
 
         # Check if we already synced this version of default skills
@@ -1068,6 +1093,10 @@ async def push_default_skills_to_existing_agents():
         removed_legacy = 0
         storage = get_storage_backend()
         for agent in agents:
+            default_skills = resolve_agent_skills(
+                relevant_skills,
+                agent.tenant_id,
+            )
             agent_prefix = agent_manager._agent_storage_prefix(agent.id)
             legacy_key = f"{agent_prefix}/skills/MCP_INSTALLER.md"
             if await storage.is_file(legacy_key):

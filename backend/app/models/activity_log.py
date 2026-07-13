@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, ForeignKey, String, Text, func, UniqueConstraint, Integer
+from sqlalchemy import DateTime, Enum, ForeignKey, Integer, String, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSON, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -21,7 +21,8 @@ class AgentActivityLog(Base):
         Enum(
             "chat_reply", "tool_call", "feishu_msg_sent", "agent_msg_sent",
             "web_msg_sent", "task_created", "task_updated", "file_written", "error",
-            "schedule_run", "heartbeat", "plaza_post",
+            "schedule_run", "heartbeat", "plaza_post", "agent_file_sent",
+            "agent_file_received", "oneshot_task",
             name="activity_action_enum",
             create_constraint=False,
         ),

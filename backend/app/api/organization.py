@@ -28,11 +28,11 @@ async def list_users(
     query = (
         select(User)
         .options(selectinload(User.identity))
-        .where(User.is_active == True)
+        .where(User.is_active.is_(True))
     )
 
     target_tenant_id = current_user.tenant_id
-    if current_user.role in ("platform_admin", "org_admin") and tenant_id:
+    if current_user.role == "platform_admin" and tenant_id:
         target_tenant_id = tenant_id
     if target_tenant_id:
         query = query.where(User.tenant_id == target_tenant_id)
@@ -58,6 +58,11 @@ async def admin_update_user(
     user = result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+
+    if current_user.role != "platform_admin" and user.tenant_id != current_user.tenant_id:
+        raise HTTPException(status_code=403, detail="Cannot modify users outside your organization")
+    if current_user.role != "platform_admin" and user.role == "platform_admin":
+        raise HTTPException(status_code=403, detail="Platform administrators can only be modified by a platform administrator")
 
     update_data = data.model_dump(exclude_unset=True)
 

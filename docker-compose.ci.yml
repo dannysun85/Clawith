@@ -31,6 +31,17 @@ services:
 
   backend:
     image: clawith-backend:${IMAGE_TAG:-new}
+    stop_grace_period: 30s
+    shm_size: "1gb"
+    # bubblewrap needs mount/user namespace support inside the container.
+    # Keep CI aligned with the supported Docker deployment so execute_code is
+    # exercised instead of silently shipping a runtime that only passes health.
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
     environment:
       DATABASE_URL: postgresql+asyncpg://clawith:clawith@postgres:5432/clawith
       REDIS_URL: redis://redis:6379/0
@@ -39,7 +50,8 @@ services:
       SECRET_KEY: ci-test-secret
       JWT_SECRET_KEY: ci-test-jwt-secret
       PROCESS_ROLE: all
-      CORS_ORIGINS: '["*"]'
+      HEARTBEAT_ENABLED: "false"
+      CORS_ORIGINS: '[]'
     networks:
       - default
     depends_on:
@@ -58,7 +70,8 @@ services:
     networks:
       - default
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
 
 networks:
   default:

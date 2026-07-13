@@ -65,9 +65,9 @@ backend:
 
 postgresql:
   image:
-    registry: docker.io/bitnami  # Change to your image registry
+    registry: docker.io  # Change to your image registry
   auth:
-    password: "clawith123456"  # Strongly recommended to change to a strong password!
+    password: ""  # Required: generate a unique value per deployment with `openssl rand -base64 32`
   primary:
     persistence:
       existingClaim: ""  # If using existing PVC, enter PVC name
@@ -85,13 +85,14 @@ redis:
 # 4. Configure Domain
 frontend:
   ingress:
+    enabled: true
     host: "clawith.example.com"  # Change to your domain
 
 # 5. Modify Application Secrets (Important!)
 backend:
   secrets:
-    secretKey: "your-secret-key-at-least-50-characters-long"
-    jwtSecretKey: "your-jwt-secret-key-at-least-32-characters"
+    secretKey: ""  # Required: paste unique output from `openssl rand -hex 32`
+    jwtSecretKey: ""  # Required: run it again and paste a different value
 
 # 6. Enable hostCerts if private certificate signing support is needed
 backend:
@@ -191,9 +192,9 @@ frontend:
 
 postgresql:
   image:
-    registry: registry.example.com/bitnami
-    repository: bitnami/postgresql
-    tag: 15.3.0-debian-11-r7
+    registry: registry.example.com
+    repository: postgres
+    tag: 15-alpine
 
 redis:
   image:
@@ -482,7 +483,7 @@ backend:
 
 postgresql:
   auth:
-    password: "Generate a strong password"  # Do not use default clawith123456
+    password: "Generate a strong password"  # Use a unique password for every deployment
 ```
 
 Methods to generate random passwords:

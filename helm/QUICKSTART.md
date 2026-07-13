@@ -65,9 +65,9 @@ backend:
 
 postgresql:
   image:
-    registry: docker.io/bitnami  # 修改为你的镜像仓库
+    registry: docker.io  # 修改为你的镜像仓库
   auth:
-    password: "clawith123456"  # 强烈建议修改为强密码！
+    password: ""  # 必填：使用 `openssl rand -base64 32` 为每次部署生成独立强密码
   primary:
     persistence:
       existingClaim: ""  # 如果使用现有 PVC，填入 PVC 名称
@@ -85,13 +85,14 @@ redis:
 # 4. 配置域名
 frontend:
   ingress:
+    enabled: true
     host: "clawith.example.com"  # 修改为你的域名
 
 # 5. 修改应用密钥（重要！）
 backend:
   secrets:
-    secretKey: "your-secret-key-at-least-50-characters-long"
-    jwtSecretKey: "your-jwt-secret-key-at-least-32-characters"
+    secretKey: ""  # 必填：粘贴 `openssl rand -hex 32` 的独立输出
+    jwtSecretKey: ""  # 必填：再次运行命令并粘贴不同的输出
 
 # 6. 如果需要私签证书支持，启用 hostCerts
 backend:
@@ -191,9 +192,9 @@ frontend:
 
 postgresql:
   image:
-    registry: registry.example.com/bitnami
-    repository: bitnami/postgresql
-    tag: 15.3.0-debian-11-r7
+    registry: registry.example.com
+    repository: postgres
+    tag: 15-alpine
 
 redis:
   image:
@@ -482,7 +483,7 @@ backend:
 
 postgresql:
   auth:
-    password: "生成一个强密码"  # 不要使用默认的 clawith123456
+    password: "生成一个强密码"  # 每次部署都应使用独立密码
 ```
 
 生成随机密码的方法：

@@ -28,6 +28,13 @@ const CHART_COLORS = [
     '#06b6d4', '#ec4899', '#84cc16', '#f97316', '#6366f1',
 ];
 
+// Recharts starts ResponsiveContainer at -1 x -1 unless an initial size is
+// provided. The dashboard is mounted immediately after route navigation, so
+// giving it a real first-frame size avoids layout warnings and chart flicker
+// while ResizeObserver resolves the actual responsive dimensions.
+const TREND_CHART_INITIAL_DIMENSION = { width: 320, height: 240 };
+const DISTRIBUTION_CHART_INITIAL_DIMENSION = { width: 320, height: 280 };
+
 // ─── InfoTooltip ─────────────────────────────────────────
 
 /**
@@ -213,7 +220,7 @@ export default function PlatformDashboard() {
     const ChartCard = ({ title, tooltip, dataKeyTotal, dataKeyNew, color }: {
         title: string; tooltip: string; dataKeyTotal: string; dataKeyNew: string; color: string;
     }) => (
-        <div className="card" style={{ flex: 1, minWidth: '300px', padding: '20px' }}>
+        <div className="card" style={{ flex: 1, minWidth: 'min(300px, 100%)', padding: '20px' }}>
             <div style={{ fontSize: '13px', fontWeight: 600, marginBottom: '20px', color: 'var(--text-secondary)', display: 'flex', alignItems: 'center' }}>
                 {title}
                 <InfoTooltip text={tooltip} />
@@ -222,7 +229,11 @@ export default function PlatformDashboard() {
                 {loadingStats ? (
                     <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-tertiary)', fontSize: '12px' }}>Loading...</div>
                 ) : (
-                    <ResponsiveContainer width="100%" height="100%">
+                    <ResponsiveContainer
+                        width="100%"
+                        height="100%"
+                        initialDimension={TREND_CHART_INITIAL_DIMENSION}
+                    >
                         <LineChart data={timeSeriesData} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
                             <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="var(--border-subtle)" />
                             <XAxis dataKey="date" tick={{ fontSize: 10, fill: 'var(--text-tertiary)' }} tickLine={false} axisLine={false} tickFormatter={(val) => val.substring(5)} />
@@ -243,7 +254,7 @@ export default function PlatformDashboard() {
         title: string; tooltip: string;
         lines: { key: string; name: string; color: string }[];
     }) => (
-        <div className="card" style={{ flex: 1, minWidth: '300px', padding: '20px' }}>
+        <div className="card" style={{ flex: 1, minWidth: 'min(300px, 100%)', padding: '20px' }}>
             <div style={{ fontSize: '13px', fontWeight: 600, marginBottom: '20px', color: 'var(--text-secondary)', display: 'flex', alignItems: 'center' }}>
                 {title}
                 <InfoTooltip text={tooltip} />
@@ -252,7 +263,11 @@ export default function PlatformDashboard() {
                 {loadingStats ? (
                     <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-tertiary)', fontSize: '12px' }}>Loading...</div>
                 ) : (
-                    <ResponsiveContainer width="100%" height="100%">
+                    <ResponsiveContainer
+                        width="100%"
+                        height="100%"
+                        initialDimension={TREND_CHART_INITIAL_DIMENSION}
+                    >
                         <LineChart data={timeSeriesData} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
                             <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="var(--border-subtle)" />
                             <XAxis dataKey="date" tick={{ fontSize: 10, fill: 'var(--text-tertiary)' }} tickLine={false} axisLine={false} tickFormatter={(val) => val.substring(5)} />
@@ -275,7 +290,7 @@ export default function PlatformDashboard() {
         const data = enhanced?.channel_distribution || [];
         const total = data.reduce((s: number, d: any) => s + d.count, 0);
         return (
-            <div className="card" style={{ flex: 1, minWidth: '300px', padding: '20px' }}>
+            <div className="card" style={{ flex: 1, minWidth: 'min(300px, 100%)', padding: '20px' }}>
                 <div style={{ fontSize: '13px', fontWeight: 600, marginBottom: '20px', color: 'var(--text-secondary)', display: 'flex', alignItems: 'center' }}>
                     Channel Distribution
                     <InfoTooltip text="Distribution of chat sessions by source channel in the last 30 days" />
@@ -286,7 +301,11 @@ export default function PlatformDashboard() {
                     ) : data.length === 0 ? (
                         <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-tertiary)', fontSize: '12px' }}>No data</div>
                     ) : (
-                        <ResponsiveContainer width="100%" height="100%">
+                        <ResponsiveContainer
+                            width="100%"
+                            height="100%"
+                            initialDimension={DISTRIBUTION_CHART_INITIAL_DIMENSION}
+                        >
                             <PieChart>
                                 <Pie
                                     data={data}
@@ -318,7 +337,7 @@ export default function PlatformDashboard() {
     const ToolBarChart = () => {
         const data = enhanced?.tool_category_top10 || [];
         return (
-            <div className="card" style={{ flex: 1, minWidth: '300px', padding: '20px' }}>
+            <div className="card" style={{ flex: 1, minWidth: 'min(300px, 100%)', padding: '20px' }}>
                 <div style={{ fontSize: '13px', fontWeight: 600, marginBottom: '20px', color: 'var(--text-secondary)', display: 'flex', alignItems: 'center' }}>
                     Top 10 Tool Categories
                     <InfoTooltip text="Most popular tool categories across all active agent configurations" />
@@ -329,7 +348,11 @@ export default function PlatformDashboard() {
                     ) : data.length === 0 ? (
                         <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-tertiary)', fontSize: '12px' }}>No data</div>
                     ) : (
-                        <ResponsiveContainer width="100%" height="100%">
+                        <ResponsiveContainer
+                            width="100%"
+                            height="100%"
+                            initialDimension={DISTRIBUTION_CHART_INITIAL_DIMENSION}
+                        >
                             <BarChart data={data} layout="vertical" margin={{ top: 5, right: 20, left: 60, bottom: 5 }}>
                                 <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="var(--border-subtle)" />
                                 <XAxis type="number" tick={{ fontSize: 10, fill: 'var(--text-tertiary)' }} tickLine={false} axisLine={false} />
@@ -413,7 +436,7 @@ export default function PlatformDashboard() {
         title: string; tooltip: string; items: any[];
         renderItem: (item: any, i: number) => React.ReactNode;
     }) => (
-        <div className="card" style={{ flex: 1, minWidth: '300px', padding: '0', overflow: 'hidden' }}>
+        <div className="card" style={{ flex: 1, minWidth: 'min(300px, 100%)', padding: '0', overflow: 'hidden' }}>
             <div style={{
                 padding: '20px',
                 fontSize: '13px',

@@ -149,6 +149,46 @@ async def test_execute_tool_list_files_does_not_create_persistent_workspace(monk
 
 
 @pytest.mark.asyncio
+async def test_edit_workspace_missing_text_is_an_idempotent_warning(monkeypatch, tmp_path):
+    agent_id = uuid.uuid4()
+    storage_key = f"{agent_id}/workspace/notes.md"
+    storage = MemoryStorageBackend({storage_key: b"already updated\n"})
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+
+    result = await agent_tools._execute_workspace_mutation(
+        "edit_file",
+        {
+            "path": "workspace/notes.md",
+            "old_string": "stale text",
+            "new_string": "replacement",
+        },
+        agent_id=agent_id,
+        base_dir=tmp_path / str(agent_id),
+        session_id=None,
+    )
+
+    assert result.startswith("⚠️ No changes made")
+    assert storage.files[storage_key] == b"already updated\n"
+
+
+def test_legacy_edit_file_missing_text_is_an_idempotent_warning(tmp_path):
+    workspace = tmp_path / "agent"
+    workspace.mkdir()
+    target = workspace / "notes.md"
+    target.write_text("already updated\n", encoding="utf-8")
+
+    result = agent_tools._edit_file(
+        workspace,
+        "notes.md",
+        "stale text",
+        "replacement",
+    )
+
+    assert result.startswith("⚠️ No changes made")
+    assert target.read_text(encoding="utf-8") == "already updated\n"
+
+
+@pytest.mark.asyncio
 async def test_write_workspace_file_does_not_mirror_to_local_for_non_local_storage(monkeypatch, tmp_path):
     agent_id = uuid.uuid4()
     storage = MemoryStorageBackend()
@@ -173,6 +213,63 @@ async def test_write_workspace_file_does_not_mirror_to_local_for_non_local_stora
     assert result.ok is True
     assert storage.files[f"{agent_id}/workspace/test.md"] == b"hello"
     assert not (tmp_path / str(agent_id) / "workspace" / "test.md").exists()
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("## Identity\n- **Role**: Incident Response Lead\n", "Incident Response Lead"),
+        ("## 身份\n- **角色**：增长运营负责人\n", "增长运营负责人"),
+        ("# Soul\nNo explicit role field here.\n", None),
+    ],
+)
+def test_extract_soul_role_description(content, expected):
+    assert workspace_collaboration._extract_soul_role_description(content) == expected
+
+
+@pytest.mark.asyncio
+async def test_write_soul_syncs_agent_role_description(monkeypatch, tmp_path):
+    agent_id = uuid.uuid4()
+    storage = MemoryStorageBackend()
+    agent = type("AgentRecord", (), {"role_description": "Old role"})()
+
+    class ScalarResult:
+        def scalar_one_or_none(self):
+            return agent
+
+    class RoleDB:
+        def __init__(self):
+            self.flush_calls = 0
+
+        async def execute(self, _statement):
+            return ScalarResult()
+
+        async def flush(self):
+            self.flush_calls += 1
+
+    db = RoleDB()
+    monkeypatch.setattr(workspace_collaboration, "get_storage_backend", lambda: storage)
+
+    async def _noop_revision(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(workspace_collaboration, "record_revision", _noop_revision)
+
+    result = await workspace_collaboration.write_workspace_file(
+        db=db,
+        agent_id=agent_id,
+        base_dir=tmp_path / str(agent_id),
+        path="soul.md",
+        content="## Identity\n- **Role**: Reliability Engineer\n",
+        actor_type="user",
+        actor_id=uuid.uuid4(),
+        enforce_human_lock=False,
+    )
+
+    assert result.ok is True
+    assert agent.role_description == "Reliability Engineer"
+    assert db.flush_calls == 1
+    assert storage.files[f"{agent_id}/soul.md"].decode() == "## Identity\n- **Role**: Reliability Engineer\n"
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/slogan.png" alt="Clawith — OpenClaw for Teams" width="800" />
+  <img src="assets/slogan.png" alt="Astra — 基于 OpenClaw 构建" width="800" />
 </p>
 
 <p align="center">

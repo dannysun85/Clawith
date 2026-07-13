@@ -9,13 +9,10 @@ from urllib.parse import quote, urlencode
 import httpx
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import create_access_token, hash_password
 from app.models.identity import IdentityProvider
 from app.models.user import User, Identity
 from app.services.google_workspace_oauth import GOOGLE_HTTP_PROXY
@@ -364,7 +361,6 @@ class DingTalkAuthProvider(BaseAuthProvider):
     async def get_authorization_url(self, redirect_uri: str, state: str) -> str:
         app_id = self.app_key or ""
         base_url = "https://login.dingtalk.com/oauth2/auth"
-        from urllib.parse import quote
         # Contact.User.Read is required for GET /v1.0/contact/users/me (user info on callback)
         # contact.user.mobile requires the fieldMobile permission in DingTalk console
         # fieldEmail requires the fieldEmail permission in DingTalk console
@@ -391,6 +387,12 @@ class DingTalkAuthProvider(BaseAuthProvider):
                 },
             )
             resp_data = resp.json()
+            if not isinstance(resp_data, dict):
+                logger.error(
+                    "DingTalk token exchange returned an invalid JSON payload: %r",
+                    resp_data,
+                )
+                return {}
             if resp.status_code != 200:
                 logger.error(f"DingTalk token exchange failed (HTTP {resp.status_code}): {resp_data}")
                 return {}
@@ -407,6 +409,9 @@ class DingTalkAuthProvider(BaseAuthProvider):
             headers = {"x-acs-dingtalk-access-token": access_token}
             info_resp = await client.get(self.DINGTALK_USER_INFO_URL, headers=headers)
             info_data = info_resp.json()
+            if not isinstance(info_data, dict):
+                logger.error("DingTalk user info returned an invalid JSON payload: %r", info_data)
+                raise Exception("Failed to fetch user info: invalid response payload")
             if info_resp.status_code != 200:
                 # Common error: errCode=403 means Contact.User.Read scope not granted.
                 # Ensure 'Contact.User.Read' is included in the OAuth scope AND
@@ -472,7 +477,6 @@ class WeComAuthProvider(BaseAuthProvider):
         to authenticate with their WeCom account then returns them to redirect_uri
         with a code parameter.
         """
-        from urllib.parse import quote
         base_url = "https://open.work.weixin.qq.com/wwlogin/sso/login"
         params = (
             f"loginType=CorpPinCorp"
@@ -666,7 +670,6 @@ class GoogleWorkspaceAuthProvider(BaseAuthProvider):
         access_type: str = "online",
         prompt: str = "select_account",
     ) -> str:
-        from urllib.parse import quote
 
         scope_value = scopes or self.scope
         if isinstance(scope_value, list):

@@ -16,6 +16,20 @@ class FakeScalarResult:
     def scalar_one_or_none(self):
         return self._value
 
+    def scalars(self):
+        return self
+
+    def all(self):
+        if self._value is None:
+            return []
+        if isinstance(self._value, list):
+            return self._value
+        return [self._value]
+
+    def first(self):
+        values = self.all()
+        return values[0] if values else None
+
 
 class TrapList(list):
     def __iter__(self):
@@ -87,6 +101,7 @@ class QueryField:
 
 class FakeSkill:
     folder_name = QueryField()
+    name = QueryField()
     tenant_id = QueryField()
     files = RaiseOnInstanceAccess()
 
@@ -132,6 +147,7 @@ def client():
 async def test_org_admin_can_delete_custom_skill_via_browse(monkeypatch, client, org_admin_user):
     skill = SimpleNamespace(
         id=uuid.uuid4(),
+        name="Tenant Skill",
         folder_name="tenant-skill",
         tenant_id=org_admin_user.tenant_id,
         is_builtin=False,
@@ -157,6 +173,7 @@ async def test_org_admin_can_delete_custom_skill_via_browse(monkeypatch, client,
 async def test_org_admin_can_delete_custom_skill_directly(monkeypatch, client, org_admin_user):
     skill = SimpleNamespace(
         id=uuid.uuid4(),
+        name="Tenant Skill",
         folder_name="tenant-skill",
         tenant_id=org_admin_user.tenant_id,
         is_builtin=False,
@@ -186,6 +203,7 @@ async def test_browse_write_creates_tenant_skill_without_iterating_lazy_files(
     monkeypatch.setattr(skills_api, "async_session", FakeAsyncSessionFactory(session))
     monkeypatch.setattr(skills_api, "select", lambda *_args, **_kwargs: FakeQuery())
     monkeypatch.setattr(skills_api, "selectinload", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(skills_api, "or_", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(skills_api, "Skill", FakeSkill)
     app.dependency_overrides[get_current_user] = lambda: platform_admin_user
 

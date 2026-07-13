@@ -4,13 +4,17 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response, status
 from loguru import logger
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.security import (
+    clear_browser_session_cookie,
     create_access_token,
     get_authenticated_user,
     get_current_user,
     hash_password_async,
+    set_browser_session_cookie,
     verify_password_async,
 )
 from app.dao import identity_dao, system_setting_dao, tenant_dao, user_dao
@@ -39,15 +43,84 @@ from app.schemas.schemas import (
     UserUpdate,
     VerifyEmailRequest,
 )
+from app.services.subscription_lifecycle import ensure_free_subscription_for_tenant
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+def serialize_user(user: User | None) -> UserOut | None:
+    if user is None:
+        return None
+    data = UserOut.model_validate(user)
+    is_platform_admin = bool(getattr(getattr(user, "identity", None), "is_platform_admin", False))
+    if isinstance(data, dict):
+        data["is_platform_admin"] = is_platform_admin
+    else:
+        data.is_platform_admin = is_platform_admin
+    return data
+
+
+def _normalize_invitation_code(code: str | None) -> str:
+    """Normalize human-entered registration/invitation codes."""
+    return (code or "").strip().upper()
+
+
+async def _get_valid_signup_code(
+    db: AsyncSession,
+    invitation_code: str | None,
+):
+    """Return a valid active code for signup gating.
+
+    Platform registration codes have ``tenant_id IS NULL`` and are consumed by
+    registration. Tenant invitation codes have ``tenant_id IS NOT NULL`` and are
+    allowed to satisfy the signup gate, but remain consumed by /tenants/join.
+    """
+    from app.models.invitation_code import InvitationCode
+
+    code = _normalize_invitation_code(invitation_code)
+    if not code:
+        raise HTTPException(status_code=400, detail="Registration code is required")
+
+    result = await db.execute(
+        select(InvitationCode).where(
+            InvitationCode.code == code,
+            InvitationCode.is_active == True,  # noqa: E712
+        )
+    )
+    code_obj = result.scalar_one_or_none()
+    if not code_obj:
+        raise HTTPException(status_code=400, detail="Invalid registration code")
+    if code_obj.used_count >= code_obj.max_uses:
+        raise HTTPException(status_code=400, detail="Registration code has reached its usage limit")
+    return code_obj
+
+
+async def _prepare_signup_code_if_required(
+    db: AsyncSession,
+    invitation_code: str | None,
+    *,
+    is_first_user: bool,
+):
+    """Validate signup code for all non-bootstrap signups."""
+    if is_first_user:
+        return None
+    return await _get_valid_signup_code(db, invitation_code)
+
+
+def _consume_signup_code_if_needed(code_obj) -> None:
+    """Consume the code only after a new account/user record was created."""
+    if code_obj is not None:
+        code_obj.used_count += 1
 
 
 @router.get("/registration-config")
 async def get_registration_config():
     """Public endpoint — returns registration requirements (no auth needed)."""
-    enabled = await system_setting_dao.is_invitation_code_enabled()
-    return {"invitation_code_required": enabled}
+    # The first account is the platform bootstrap user and is already exempted
+    # by register_init. Expose the same rule to the UI so a fresh deployment is
+    # not deadlocked waiting for a code that no administrator exists to create.
+    is_first_user = await identity_dao.is_empty()
+    return {"invitation_code_required": not is_first_user}
 
 
 @router.get("/check-duplicate")
@@ -189,6 +262,12 @@ async def register_init(
             )
 
     async with transaction() as session:
+        signup_code = await _prepare_signup_code_if_required(
+            session,
+            data.invitation_code,
+            is_first_user=is_first_user,
+        )
+
         # Find or Create Identity inside transaction (handles concurrent creation safely)
         identity = await registration_service.find_or_create_identity(
             email=data.email,
@@ -212,8 +291,10 @@ async def register_init(
                     }
                 )
             tenant_uuid = tenant.id
+            await ensure_free_subscription_for_tenant(session, tenant.id)
 
         # Create User (tenant-scoped)
+        created_user = False
         if tenant_uuid:
             user = await user_dao.get_by_identity_and_tenant(identity.id, tenant_uuid)
         else:
@@ -230,8 +311,12 @@ async def register_init(
             user.is_active = is_first_user  # Active immediately if first user
             user.email_verified = identity.email_verified
             await session.flush()
+            created_user = True
         else:
             user.identity = identity
+
+        if created_user:
+            _consume_signup_code_if_needed(signup_code)
 
     # 5. Generate token outside transaction
     token = create_access_token(str(user.id), user.role)
@@ -244,7 +329,7 @@ async def register_init(
         user_id=user.id,
         email=identity.email,
         access_token=token,
-        user=UserOut.model_validate(user),
+        user=serialize_user(user),
         message="Registration initiated. Please verify your email."
         if not identity.email_verified
         else "Registration successful.",
@@ -265,6 +350,7 @@ async def register_sso(
     from app.services.registration_service import registration_service
 
     logger.info(f"[REGISTER_SSO] Starting SSO registration: provider={data.provider}")
+    is_first_user = await user_dao.is_empty()
 
     # Move provider lookup outside transaction
     auth_provider = await auth_provider_registry.get_provider(data.provider)
@@ -272,6 +358,12 @@ async def register_sso(
         raise HTTPException(status_code=400, detail=f"Provider '{data.provider}' not supported")
 
     async with transaction() as session:
+        signup_code = await _prepare_signup_code_if_required(
+            session,
+            data.invitation_code,
+            is_first_user=is_first_user,
+        )
+
         # Perform SSO registration
         user, is_new, error = await registration_service.register_with_sso(
             data.provider, data.code, auth_provider
@@ -289,6 +381,9 @@ async def register_sso(
                 user.tenant_id = tenant.id
                 await session.flush()
 
+        if is_new:
+            _consume_signup_code_if_needed(signup_code)
+
     # Move token generation outside transaction
     token = create_access_token(str(user.id), user.role)
 
@@ -296,7 +391,7 @@ async def register_sso(
 
     return TokenResponse(
         access_token=token,
-        user=UserOut.model_validate(user),
+        user=serialize_user(user),
         needs_company_setup=user.tenant_id is None,
     )
 
@@ -327,6 +422,12 @@ async def _handle_normal_register(data: UserRegister, background_tasks: Backgrou
         )
 
     async with transaction() as session:
+        signup_code = await _prepare_signup_code_if_required(
+            session,
+            data.invitation_code,
+            is_first_user=is_first_user,
+        )
+
         # Resolve tenant
         tenant_uuid = None
         if is_first_user:
@@ -340,6 +441,7 @@ async def _handle_normal_register(data: UserRegister, background_tasks: Backgrou
                     }
                 )
             tenant_uuid = tenant.id
+            await ensure_free_subscription_for_tenant(session, tenant.id)
             role = "platform_admin"
         else:
             tenant, _ = await registration_service.get_tenant_for_registration(
@@ -383,6 +485,7 @@ async def _handle_normal_register(data: UserRegister, background_tasks: Backgrou
             registration_source="web",
             email_config=email_config,
         )
+        _consume_signup_code_if_needed(signup_code)
 
     # 5. Seed default agents for first user outside main registration transaction block
     if is_first_user:
@@ -402,7 +505,7 @@ async def _handle_normal_register(data: UserRegister, background_tasks: Backgrou
         user_id=user.id,
         email=user.email,
         access_token=token,
-        user=UserOut.model_validate(user),
+        user=serialize_user(user),
         message="Registration successful. Please verify your email."
         if not identity.email_verified
         else "Registration successful.",
@@ -483,10 +586,24 @@ async def login(data: UserLogin, background_tasks: BackgroundTasks):
             status_code=status.HTTP_404_NOT_FOUND, detail="No organization associated with this account."
         )
 
-    # 4. Handle Tenant Selection
+    # 4. Handle Tenant Selection. A global platform administrator must remain
+    # able to enter the platform console even when the same Identity is also a
+    # member of one or more tenants. The tenant picker cannot represent the
+    # global record with tenant_id=null as a selectable tenant, so prefer that
+    # canonical record explicitly.
+    platform_user = next(
+        (
+            candidate
+            for candidate in valid_users
+            if candidate.tenant_id is None and candidate.role == "platform_admin"
+        ),
+        None,
+    )
     if not data.tenant_id:
+        if identity.is_platform_admin and platform_user is not None:
+            user = platform_user
         # If multiple tenants, return choice
-        if len(valid_users) > 1:
+        elif len(valid_users) > 1:
             tenant_ids = [u.tenant_id for u in valid_users if u.tenant_id]
             tenants_map = {}
             if tenant_ids:
@@ -511,8 +628,9 @@ async def login(data: UserLogin, background_tasks: BackgroundTasks):
                 tenants=tenant_choices,
             )
 
-        # Only one tenant
-        user = valid_users[0]
+        else:
+            # Only one tenant
+            user = valid_users[0]
     else:
         # Specific tenant requested (Dedicated Link flow)
         user = next((u for u in valid_users if u.tenant_id == data.tenant_id), None)
@@ -536,7 +654,7 @@ async def login(data: UserLogin, background_tasks: BackgroundTasks):
     token = create_access_token(str(user.id), user.role)
     return TokenResponse(
         access_token=token,
-        user=UserOut.model_validate(user),
+        user=serialize_user(user),
         identity=IdentityOut.model_validate(identity),
         needs_company_setup=user.tenant_id is None,
     )
@@ -655,9 +773,34 @@ async def reset_password(data: ResetPasswordRequest):
 @router.get("/me", response_model=UserOut)
 async def get_me(current_user: User = Depends(get_authenticated_user)):
     """Get current user profile."""
-    data = UserOut.model_validate(current_user)
-    data.is_platform_admin = bool(getattr(getattr(current_user, "identity", None), "is_platform_admin", False))
-    return data
+    return serialize_user(current_user)
+
+
+@router.post("/browser-session", status_code=status.HTTP_204_NO_CONTENT)
+async def create_browser_session(
+    request: Request,
+    response: Response,
+    current_user: User = Depends(get_authenticated_user),
+):
+    """Mirror a validated bearer token into a same-origin HttpOnly cookie."""
+    authorization = request.headers.get("authorization") or ""
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
+    # Returning FastAPI's injected Response object bypasses the decorator's
+    # response construction. Give it an explicit status so Starlette does not
+    # emit ``http.response.start`` with ``status=None``.
+    response.status_code = status.HTTP_204_NO_CONTENT
+    set_browser_session_cookie(response, token.strip(), request)
+    return response
+
+
+@router.delete("/browser-session", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_browser_session(request: Request, response: Response):
+    """Clear the browser-only credential during logout or account switching."""
+    response.status_code = status.HTTP_204_NO_CONTENT
+    clear_browser_session_cookie(response, request)
+    return response
 
 
 @router.patch("/me", response_model=UserOut)
@@ -715,7 +858,7 @@ async def update_me(
                 sync_phone="primary_mobile" in update_data,
             )
 
-        return UserOut.model_validate(user)
+        return serialize_user(user)
 
 
 @router.get("/my-tenants", response_model=list[TenantChoice])
@@ -784,10 +927,10 @@ async def switch_tenant(
                 session, tenant, request, sso_redirect_enabled=sso_redirect_enabled
             )
 
-    # Include token in redirect URL for cross-domain switching if needed
+    # URL fragments are not sent to reverse proxies or access logs.
     if redirect_url:
-        separator = "&" if "?" in redirect_url else "?"
-        redirect_url = f"{redirect_url}{separator}token={token}"
+        separator = "&" if "#" in redirect_url else "#"
+        redirect_url = f"{redirect_url}{separator}session_token={token}"
 
     return TenantSwitchResponse(access_token=token, redirect_url=redirect_url, message="Switching organization...")
 
@@ -963,7 +1106,7 @@ async def oauth_callback(
         jwt_token = create_access_token(str(user.id), user.role)
         return TokenResponse(
             access_token=jwt_token,
-            user=UserOut.model_validate(user),
+            user=serialize_user(user),
             needs_company_setup=user.tenant_id is None,
         )
 
@@ -1052,7 +1195,7 @@ async def oauth_callback(
     jwt_token = create_access_token(str(user.id), user.role)
     return TokenResponse(
         access_token=jwt_token,
-        user=UserOut.model_validate(user),
+        user=serialize_user(user),
         needs_company_setup=user.tenant_id is None,
     )
 
@@ -1113,7 +1256,7 @@ async def bind_identity(
         raise HTTPException(status_code=500, detail="Failed to bind identity")
 
     user = await user_dao.get(current_user.id)
-    return UserOut.model_validate(user)
+    return serialize_user(user)
 
 
 @router.post("/{provider}/unbind", response_model=UserOut)
@@ -1131,7 +1274,7 @@ async def unbind_identity(
             raise HTTPException(status_code=404, detail=f"No linked identity found for provider '{provider}'")
 
         user = await user_dao.get(current_user.id)
-        return UserOut.model_validate(user)
+        return serialize_user(user)
 
 
 # ─── Email Verification Endpoints ──────────────────────────────────────
@@ -1182,7 +1325,7 @@ async def verify_email(data: VerifyEmailRequest):
 
     return TokenResponse(
         access_token=token,
-        user=UserOut.model_validate(user) if user else None,
+        user=serialize_user(user),
         identity=IdentityOut.model_validate(identity),
         needs_company_setup=user.tenant_id is None if user else True,
     )

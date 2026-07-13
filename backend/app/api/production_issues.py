@@ -1,0 +1,182 @@
+"""Client issue intake and SaaS-owner production issue console APIs."""
+
+from __future__ import annotations
+
+import uuid
+from datetime import datetime, timedelta, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from sqlalchemy import distinct, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.security import get_current_user, get_saas_admin
+from app.database import get_db
+from app.models.audit import AuditLog
+from app.models.production_issue import ProductionIssue, ProductionIssueEvent
+from app.models.user import User
+from app.schemas.production_issue import (
+    ClientIssueReportIn,
+    ProductionIssueEventOut,
+    ProductionIssueOut,
+    ProductionIssueStatusIn,
+    ProductionIssueSummaryOut,
+)
+from app.services.production_issue_monitor import record_production_issue
+
+
+client_router = APIRouter(prefix="/production-issues", tags=["production-issues"])
+admin_router = APIRouter(prefix="/saas/production-issues", tags=["saas-production-issues"])
+
+
+@client_router.post("/client-report", status_code=status.HTTP_202_ACCEPTED)
+async def report_client_issue(
+    data: ClientIssueReportIn,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    """Accept only operational metadata; prompts, bodies and messages are rejected by allowlist."""
+
+    summaries = {
+        "api": "Client observed an API operation failure",
+        "runtime": "Client runtime operation failed",
+        "websocket": "Client WebSocket operation failed",
+    }
+    await record_production_issue(
+        source=f"client_{data.category}",
+        category=data.category,
+        summary=summaries[data.category],
+        severity=data.severity,
+        error_code=data.error_code,
+        route=data.route,
+        operation=data.operation,
+        tenant_id=current_user.tenant_id,
+        user_id=current_user.id,
+        trace_id=getattr(request.state, "trace_id", None),
+        metadata=data.metadata,
+    )
+    return {"accepted": True}
+
+
+def _issue_out(issue: ProductionIssue, affected_tenant_count: int) -> ProductionIssueOut:
+    return ProductionIssueOut.model_validate(issue).model_copy(
+        update={"affected_tenant_count": int(affected_tenant_count or 0)}
+    )
+
+
+@admin_router.get("", response_model=list[ProductionIssueOut])
+async def list_production_issues(
+    issue_status: str | None = Query(default="open", alias="status"),
+    severity: str | None = None,
+    category: str | None = None,
+    limit: int = Query(default=100, ge=1, le=200),
+    current_user: User = Depends(get_saas_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    tenant_counts = (
+        select(
+            ProductionIssueEvent.issue_id.label("issue_id"),
+            func.count(distinct(ProductionIssueEvent.tenant_id)).label("tenant_count"),
+        )
+        .where(ProductionIssueEvent.tenant_id.is_not(None))
+        .group_by(ProductionIssueEvent.issue_id)
+        .subquery()
+    )
+    query = (
+        select(ProductionIssue, func.coalesce(tenant_counts.c.tenant_count, 0))
+        .outerjoin(tenant_counts, tenant_counts.c.issue_id == ProductionIssue.id)
+        .order_by(ProductionIssue.last_seen_at.desc())
+        .limit(limit)
+    )
+    if issue_status:
+        query = query.where(ProductionIssue.status == issue_status)
+    if severity:
+        query = query.where(ProductionIssue.severity == severity)
+    if category:
+        query = query.where(ProductionIssue.category == category)
+    result = await db.execute(query)
+    return [_issue_out(issue, tenant_count) for issue, tenant_count in result.all()]
+
+
+@admin_router.get("/summary", response_model=ProductionIssueSummaryOut)
+async def production_issue_summary(
+    current_user: User = Depends(get_saas_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    open_counts = await db.execute(
+        select(
+            func.count(ProductionIssue.id),
+            func.count(ProductionIssue.id).filter(ProductionIssue.severity == "warning"),
+            func.count(ProductionIssue.id).filter(ProductionIssue.severity == "error"),
+            func.count(ProductionIssue.id).filter(ProductionIssue.severity == "critical"),
+        ).where(ProductionIssue.status == "open")
+    )
+    total, warning, error, critical = open_counts.one()
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    recent = await db.execute(
+        select(
+            func.count(ProductionIssueEvent.id),
+            func.count(distinct(ProductionIssueEvent.tenant_id)),
+        ).where(ProductionIssueEvent.created_at >= cutoff)
+    )
+    event_count, tenant_count = recent.one()
+    return ProductionIssueSummaryOut(
+        open_total=int(total or 0),
+        open_warning=int(warning or 0),
+        open_error=int(error or 0),
+        open_critical=int(critical or 0),
+        events_last_24h=int(event_count or 0),
+        affected_tenants_last_24h=int(tenant_count or 0),
+    )
+
+
+@admin_router.get("/{issue_id}/events", response_model=list[ProductionIssueEventOut])
+async def list_production_issue_events(
+    issue_id: uuid.UUID,
+    limit: int = Query(default=100, ge=1, le=500),
+    current_user: User = Depends(get_saas_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    if not await db.get(ProductionIssue, issue_id):
+        raise HTTPException(status_code=404, detail="Production issue not found")
+    result = await db.execute(
+        select(ProductionIssueEvent)
+        .where(ProductionIssueEvent.issue_id == issue_id)
+        .order_by(ProductionIssueEvent.created_at.desc())
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
+@admin_router.patch("/{issue_id}", response_model=ProductionIssueOut)
+async def update_production_issue_status(
+    issue_id: uuid.UUID,
+    data: ProductionIssueStatusIn,
+    current_user: User = Depends(get_saas_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    issue = await db.get(ProductionIssue, issue_id, with_for_update=True)
+    if not issue:
+        raise HTTPException(status_code=404, detail="Production issue not found")
+    now = datetime.now(timezone.utc)
+    before = issue.status
+    issue.status = data.status
+    issue.acknowledged_at = now if data.status == "acknowledged" else None
+    issue.resolved_at = now if data.status in {"resolved", "ignored"} else None
+    if data.status == "open":
+        issue.alerted_at = None
+    db.add(AuditLog(
+        user_id=current_user.id,
+        action="production_issue_status_update",
+        details={"issue_id": str(issue.id), "before": before, "after": data.status},
+    ))
+    await db.commit()
+    await db.refresh(issue)
+    tenant_count = (
+        await db.execute(
+            select(func.count(distinct(ProductionIssueEvent.tenant_id))).where(
+                ProductionIssueEvent.issue_id == issue.id,
+                ProductionIssueEvent.tenant_id.is_not(None),
+            )
+        )
+    ).scalar_one()
+    return _issue_out(issue, tenant_count)

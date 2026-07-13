@@ -243,9 +243,10 @@ async def configure_wecom_channel(
     return config_out
 
 
-@router.get("/agents/{agent_id}/wecom-channel", response_model=ChannelConfigOut)
+@router.get("/agents/{agent_id}/wecom-channel", response_model=ChannelConfigOut | None)
 async def get_wecom_channel(
     agent_id: uuid.UUID,
+    missing_ok: bool = False,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -258,11 +259,14 @@ async def get_wecom_channel(
     )
     config = result.scalar_one_or_none()
     if not config:
+        if missing_ok:
+            return None
         raise HTTPException(status_code=404, detail="WeCom not configured")
 
     config_out = ChannelConfigOut.model_validate(config)
     if (config.extra_config or {}).get("connection_mode") == "websocket":
-        config_out.is_connected = wecom_stream_manager.status().get(str(agent_id), False)
+        from app.services import wecom_stream
+        config_out.is_connected = wecom_stream.wecom_stream_manager.status().get(str(agent_id), False)
     else:
         config_out.is_connected = False
     return config_out
@@ -592,7 +596,7 @@ async def _process_wecom_text(
 
         # Pre-load agent/model for LLM call
         from app.api.feishu import _load_agent_and_model
-        _agent_model, _llm_model, _fallback_model = await _load_agent_and_model(db, agent_id)
+        _agent_model, _llm_model, _fallback_model, _route_meta = await _load_agent_and_model(db, agent_id)
 
         await db.commit()
         # ── Phase 1 complete: release connection before slow LLM/HTTP work ──

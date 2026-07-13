@@ -18,8 +18,20 @@ class InvitationCodeDAO(BaseDAO[InvitationCode]):
             result = await db.execute(
                 select(InvitationCode).where(
                     InvitationCode.code == code,
-                    InvitationCode.is_active == True,
+                    InvitationCode.is_active.is_(True),
                     InvitationCode.tenant_id.is_not(None),
+                )
+            )
+            return result.scalar_one_or_none()
+
+    async def get_active_registration_code(self, code: str) -> InvitationCode | None:
+        """Find an active platform registration code."""
+        async with self.session() as db:
+            result = await db.execute(
+                select(InvitationCode).where(
+                    InvitationCode.code == code,
+                    InvitationCode.is_active.is_(True),
+                    InvitationCode.tenant_id.is_(None),
                 )
             )
             return result.scalar_one_or_none()

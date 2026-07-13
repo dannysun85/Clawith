@@ -2,14 +2,38 @@
 
 import asyncio
 import json
-import os
-import re
+import sys
+import types
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
 
 from app.services.document_conversion.chrome_renderer import chrome_executable
+from app.services.process_utils import terminate_popen_process_group
+
+
+def _install_weasyprint_stub_if_unavailable() -> None:
+    """Keep WeasyPrint mockable when native system libraries are missing."""
+    if "weasyprint" in sys.modules:
+        return
+    try:
+        __import__("weasyprint")
+        return
+    except Exception as exc:
+        unavailable_error = str(exc)
+        module = types.ModuleType("weasyprint")
+
+        class _UnavailableHTML:
+            def __init__(self, *args, **kwargs):
+                raise RuntimeError(f"WeasyPrint unavailable: {unavailable_error}")
+
+        module.HTML = _UnavailableHTML
+        module.__clawith_unavailable_error__ = exc
+        sys.modules["weasyprint"] = module
+
+
+_install_weasyprint_stub_if_unavailable()
 
 
 async def convert_html_to_pdf(src_file: Path, tgt_file: Path, target_path: str, arguments: dict[str, Any]) -> str:
@@ -56,6 +80,7 @@ async def convert_html_to_pdf(src_file: Path, tgt_file: Path, target_path: str, 
                 chrome_args,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                start_new_session=True,
             )
             try:
                 base = f"http://127.0.0.1:{port}"
@@ -147,14 +172,7 @@ async def convert_html_to_pdf(src_file: Path, tgt_file: Path, target_path: str, 
                     tgt_file.write_bytes(base64.b64decode(data))
                     return True
             finally:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=2)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
+                terminate_popen_process_group(proc)
                 profile_dir.cleanup()
 
         try:

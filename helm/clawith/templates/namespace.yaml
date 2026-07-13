@@ -5,6 +5,7 @@ metadata:
   labels:
     {{- include "clawith.labels" . | nindent 4 }}
 {{- if .Values.secrets.create }}
+---
 apiVersion: v1
 kind: Secret
 metadata:
@@ -14,7 +15,6 @@ metadata:
     {{- include "clawith.labels" . | nindent 4 }}
 type: Opaque
 stringData:
-  secret-key: {{ .Values.backend.secrets.secretKey | quote }}
-  jwt-secret-key: {{ .Values.backend.secrets.jwtSecretKey | quote }}
+  secret-key: {{ required "backend.secrets.secretKey must be set when secrets.create=true" .Values.backend.secrets.secretKey | quote }}
+  jwt-secret-key: {{ required "backend.secrets.jwtSecretKey must be set when secrets.create=true" .Values.backend.secrets.jwtSecretKey | quote }}
 {{- end }}
-

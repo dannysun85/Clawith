@@ -4,6 +4,21 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.services.llm.caller import _build_runtime_capability_manifest
+
+
+def test_runtime_capability_manifest_is_exact_sorted_and_deduplicated():
+    manifest = _build_runtime_capability_manifest([
+        {"type": "function", "function": {"name": "send_file_to_agent"}},
+        {"type": "function", "function": {"name": "finish"}},
+        {"type": "function", "function": {"name": "send_file_to_agent"}},
+        {"type": "function", "function": {"name": ""}},
+    ])
+
+    assert '["finish", "send_file_to_agent"]' in manifest
+    assert "complete set of tools enabled for this turn" in manifest
+    assert "Never invent, rename, or assume tools outside this list" in manifest
+
 
 class FakeStreamClient:
     def __init__(self, responses):
@@ -76,6 +91,14 @@ def _model():
         max_output_tokens=256,
         request_timeout=1,
     )
+
+
+def _ollama_model():
+    model = _model()
+    model.provider = "ollama"
+    model.model = "qwen3:8b"
+    model.base_url = "http://localhost:11434/v1"
+    return model
 
 
 def test_finish_tool_schema_is_default_and_requires_content():
@@ -186,6 +209,36 @@ async def test_call_llm_requires_finish_tool_to_stop(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_ollama_plain_text_is_a_valid_final_response(monkeypatch):
+    from app.services.llm import caller
+
+    fake_client = FakeStreamClient([_plain_response("你好，我可以帮你。")])
+
+    monkeypatch.setattr(caller, "_get_agent_config", lambda _agent_id: _async_return((50, None)))
+    monkeypatch.setattr(caller, "_get_user_name", lambda _user_id: _async_return("Ray"))
+    monkeypatch.setattr(
+        "app.services.agent_context.build_agent_context",
+        lambda *_args, **_kwargs: _async_return(("static", "dynamic")),
+    )
+    monkeypatch.setattr(caller, "get_agent_tools_for_llm", lambda _agent_id: _async_return([]))
+    monkeypatch.setattr(caller, "create_llm_client", lambda **_kwargs: fake_client)
+    monkeypatch.setattr(caller, "record_token_usage", lambda *_args, **_kwargs: _async_return(None))
+
+    result = await caller.call_llm(
+        _ollama_model(),
+        [{"role": "user", "content": "你好"}],
+        "Agent",
+        "",
+        agent_id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+    )
+
+    assert result == "你好，我可以帮你。"
+    assert len(fake_client.messages_seen) == 1
+    assert fake_client.closed is True
+
+
+@pytest.mark.asyncio
 async def test_invalid_finish_does_not_stop_and_is_returned_as_tool_error(monkeypatch):
     from app.services.llm import caller
 
@@ -234,6 +287,38 @@ async def test_invalid_finish_does_not_stop_and_is_returned_as_tool_error(monkey
         and "content" in str(msg.content)
         for msg in second_round_messages
     )
+
+
+@pytest.mark.asyncio
+async def test_repeated_malformed_tool_json_trips_non_billable_circuit_breaker(monkeypatch):
+    from app.services.llm import caller
+
+    malformed = _finish_response_with_arguments('{"content":"unterminated')
+    fake_client = FakeStreamClient([malformed, malformed, malformed])
+
+    monkeypatch.setattr(caller, "_get_agent_config", lambda _agent_id: _async_return((50, None)))
+    monkeypatch.setattr(caller, "_get_user_name", lambda _user_id: _async_return("Ray"))
+    monkeypatch.setattr(
+        "app.services.agent_context.build_agent_context",
+        lambda *_args, **_kwargs: _async_return(("static", "dynamic")),
+    )
+    monkeypatch.setattr(caller, "get_agent_tools_for_llm", lambda _agent_id: _async_return([]))
+    monkeypatch.setattr(caller, "create_llm_client", lambda **_kwargs: fake_client)
+    monkeypatch.setattr(caller, "record_token_usage", lambda *_args, **_kwargs: _async_return(None))
+
+    result = await caller.call_llm(
+        _model(),
+        [{"role": "user", "content": "create a large deck"}],
+        "Agent",
+        "",
+        agent_id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+    )
+
+    assert "连续 3 次无效" in result
+    assert "不会扣除" in result
+    assert len(fake_client.messages_seen) == 3
+    assert fake_client.closed is True
 
 
 @pytest.mark.asyncio

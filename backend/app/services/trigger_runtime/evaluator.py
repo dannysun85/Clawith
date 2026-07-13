@@ -330,8 +330,9 @@ async def check_new_agent_messages(trigger: AgentTrigger) -> bool:
         except (json.JSONDecodeError, TypeError):
             cfg = {}
     from_agent_name = cfg.get("from_agent_name")
+    from_agent_id = cfg.get("from_agent_id")
     from_user_name = cfg.get("from_user_name")
-    if not from_agent_name and not from_user_name:
+    if not from_agent_name and not from_agent_id and not from_user_name:
         return False
 
     since = trigger.last_fired_at or trigger.created_at
@@ -345,16 +346,58 @@ async def check_new_agent_messages(trigger: AgentTrigger) -> bool:
 
     try:
         async with async_session() as db:
-            if from_agent_name:
+            if from_agent_name or from_agent_id:
                 from app.models.participant import Participant
                 from app.models.agent import Agent as AgentModel
-                if isinstance(from_agent_name, list):
-                    from_agent_name = from_agent_name[0] if from_agent_name else ""
-                if not isinstance(from_agent_name, str):
-                    return False
-                safe_agent_name = from_agent_name.replace("%", "").replace("_", r"\_")
-                agent_r = await db.execute(select(AgentModel).where(AgentModel.name.ilike(f"%{safe_agent_name}%")))
-                source_agent = agent_r.scalars().first()
+                target_r = await db.execute(
+                    select(AgentModel.tenant_id).where(
+                        AgentModel.id == trigger.agent_id
+                    )
+                )
+                target_tenant_id = target_r.scalar_one_or_none()
+                source_agent = None
+                if from_agent_id:
+                    try:
+                        source_id = uuid.UUID(str(from_agent_id))
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "Invalid from_agent_id on trigger {}: {!r}",
+                            trigger.name,
+                            from_agent_id,
+                        )
+                        return False
+                    source_query = select(AgentModel).where(
+                        AgentModel.id == source_id
+                    )
+                    if target_tenant_id:
+                        source_query = source_query.where(
+                            AgentModel.tenant_id == target_tenant_id
+                        )
+                    else:
+                        source_query = source_query.where(
+                            AgentModel.tenant_id.is_(None)
+                        )
+                    agent_r = await db.execute(source_query)
+                    source_agent = agent_r.scalar_one_or_none()
+                else:
+                    if isinstance(from_agent_name, list):
+                        from_agent_name = from_agent_name[0] if from_agent_name else ""
+                    if not isinstance(from_agent_name, str):
+                        return False
+                    safe_agent_name = from_agent_name.replace("%", "").replace("_", r"\_")
+                    source_query = select(AgentModel).where(
+                        AgentModel.name.ilike(f"%{safe_agent_name}%")
+                    )
+                    if target_tenant_id:
+                        source_query = source_query.where(
+                            AgentModel.tenant_id == target_tenant_id
+                        )
+                    else:
+                        source_query = source_query.where(
+                            AgentModel.tenant_id.is_(None)
+                        )
+                    agent_r = await db.execute(source_query)
+                    source_agent = agent_r.scalars().first()
                 if not source_agent:
                     return False
                 result = await db.execute(
@@ -364,7 +407,7 @@ async def check_new_agent_messages(trigger: AgentTrigger) -> bool:
                 if not from_participant:
                     return False
                 from sqlalchemy import String as SaString, cast as sa_cast
-                result = await db.execute(
+                message_query = (
                     select(ChatMessage)
                     .join(ChatSession, ChatMessage.conversation_id == sa_cast(ChatSession.id, SaString))
                     .where(
@@ -377,14 +420,23 @@ async def check_new_agent_messages(trigger: AgentTrigger) -> bool:
                         # sessions to avoid cross-trigger false matches.
                         ChatSession.source_channel != "trigger",
                     )
-                    .order_by(ChatMessage.created_at.desc())
-                    .limit(1)
                 )
+                expected_conversation_id = cfg.get("expected_conversation_id")
+                if expected_conversation_id:
+                    message_query = message_query.where(
+                        ChatMessage.conversation_id == str(expected_conversation_id)
+                    )
+                message_query = message_query.order_by(
+                    ChatMessage.created_at.desc()
+                ).limit(1)
+                result = await db.execute(message_query)
                 msg = result.scalar_one_or_none()
                 if not msg:
                     return False
                 cfg["_matched_message"] = (msg.content or "")[:2000]
-                cfg["_matched_from"] = from_agent_name
+                cfg["_matched_from"] = from_agent_name or source_agent.name
+                cfg["_matched_from_agent_id"] = str(source_agent.id)
+                cfg["_matched_message_id"] = str(msg.id)
                 return True
 
             if from_user_name:

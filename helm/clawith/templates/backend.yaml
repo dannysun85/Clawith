@@ -41,8 +41,12 @@ spec:
     spec:
       containers:
       - name: backend
-        image: "{{ .Values.global.imageRegistry }}/{{ .Values.backend.image.repository }}:{{ .Values.backend.image.tag }}"
+        image: {{ include "clawith.image" (dict "registry" .Values.global.imageRegistry "repository" .Values.backend.image.repository "tag" .Values.backend.image.tag) | quote }}
         imagePullPolicy: {{ .Values.backend.image.pullPolicy }}
+        {{- with .Values.backend.containerSecurityContext }}
+        securityContext:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
         {{- if .Values.backend.hostCerts.enabled }}
         lifecycle:
           postStart:
@@ -61,13 +65,15 @@ spec:
           name: http
         env:
         - name: DATABASE_URL
-          value: "postgresql+asyncpg://{{ include "clawith.postgresql.username" . }}:{{ include "clawith.postgresql.password" . }}@{{ include "clawith.postgresql.host" . }}:{{ include "clawith.postgresql.port" . }}/{{ include "clawith.postgresql.database" . }}"
+          value: {{ include "clawith.postgresql.url" . | quote }}
         - name: REDIS_URL
-          value: "redis://{{ include "clawith.redis.host" . }}:{{ include "clawith.redis.port" . }}/{{ .Values.redis.external.database | default 0 }}"
+          value: {{ include "clawith.redis.url" . | quote }}
         - name: AGENT_DATA_DIR
           value: {{ .Values.backend.env.agentDataDir | quote }}
         - name: AGENT_TEMPLATE_DIR
           value: {{ .Values.backend.env.agentTemplateDir | quote }}
+        - name: HEARTBEAT_ENABLED
+          value: {{ .Values.backend.env.heartbeatEnabled | quote }}
         {{- if .Values.backend.hostCerts.enabled }}
         - name: SSL_CERT_FILE
           value: {{ .Values.backend.hostCerts.containerPaths.sslCertFile | quote }}

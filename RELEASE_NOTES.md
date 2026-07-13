@@ -1,4 +1,174 @@
+# v1.10.8 — Shared-Pool Isolation and Production Issue Monitoring
+
+## What's New
+
+- **Production issue monitoring**: Browser, API, WebSocket, LLM, background-worker, and media failures are aggregated into privacy-safe rollups in the SaaS console. The monitor keeps bounded occurrence evidence, sends a first-alert notification to the SaaS owner, writes a structured alert log, and can optionally deliver a webhook.
+- **Actionable incident workflow**: SaaS owners can review open/acknowledged/resolved/ignored problems, see affected-company counts and release/Trace metadata, and reopen a resolved issue when it recurs.
+- **Structured account-pool diagnostics**: Missing configuration, unhealthy credentials, provider quota exhaustion, rate saturation, and capability mismatch now have distinct internal reason codes and customer-safe messages.
+
+## Bug Fixes
+
+- **Shared credential isolation**: MiniMax transient, rate-limit, validation, content-policy, network, and unknown task failures no longer degrade the global credential pool. Only confirmed authentication failures isolate a credential; confirmed provider billing or plan exhaustion is tracked separately.
+- **Safe credential recovery**: A degraded or externally exhausted account returns to routing only after an explicit read-only verification succeeds. Daily usage resets no longer re-admit invalid credentials, API-key replacements require re-verification, and the account-pool health route can no longer be shadowed by the credential UUID route.
+- **Bounded media recovery**: Asynchronous media tasks check their absolute deadline before calling the provider, stop after a configurable consecutive-error budget, and release reserved Credits transactionally when they fail. A valid `Processing` response resets the consecutive-error counter.
+- **Exactly-once media settlement**: Concurrent success or failure reconciliation cannot double-consume, double-release, or duplicate the user notification. Previously poisoned production tasks remain terminal and cannot be claimed again.
+- **Credits clarity**: Historical product-incident refunds keep their original amounts while the subscription ledger now identifies them as platform incident compensation initiated by the system administrator.
+- **Monitoring safety**: Secret-shaped route, operation, error-code, and metadata values are redacted before persistence. Client-side duplicate errors are suppressed for 30 seconds so a render or network error storm cannot flood the intake endpoint.
+- **Retry correctness**: Incidental words such as `load balancing` or `authoritative` no longer cause timeout failures to be misclassified as non-retryable.
+
+## Validation
+
+- The complete backend test suite and frontend unit/build suites pass.
+- Fresh PostgreSQL upgrade, downgrade/re-upgrade, A2A durability, media success/failure concurrency, Credits exactly-once, and production-monitor aggregation/alert smoke tests pass through `add_production_issue_monitoring`.
+- Production release uses the committed blue/green deployment path with database backup, candidate migrations, health checks, public cutover verification, and rollback protection.
+- Post-cutover gates include credential verification, ledger/reservation drift checks, two-tenant product flows, browser media/file access, and continuous issue monitoring.
+
+## Upgrade Notes
+
+- Alembic migration `089_bound_media_generation_retries.py` adds the media consecutive-error counter; migration `090_add_production_issue_monitoring.py` adds the monitoring rollup and occurrence tables. Both are additive and retain evidence during an application rollback.
+- Monitoring defaults to enabled with a 30-second scan interval, first-event alerting, and 30-day occurrence retention. Configure `PRODUCTION_ISSUE_ALERT_WEBHOOK_URL` only with a reviewed operations endpoint.
+- This release preserves the centrally funded shared account pool and does **not** add tenant-level or model-object-level authorization.
+- Cross-tenant failure pollution is fixed, but production currently has one verified MiniMax credential. Provider-account high availability still requires a genuinely independent second credential.
+
 ---
+
+# v1.10.7 — SaaS Media Routing and Reliable Creative Assets
+
+## What's New
+
+- **Explicit media routing matrix**: The SaaS console now manages MiniMax image, speech, music, and video routes independently for Lite, Pro, and Ultra. Text-only M2.5/M2.7 models remain text routes; this release does not add model-object authorization.
+- **Platform-owned routing with a shared account pool**: Provider model and quality policy are controlled centrally, while credentials remain secret in the shared account pool. Tenant or Agent tool overrides can no longer silently replace the platform media model.
+- **Reference-driven video**: Agents can send a workspace image, public URL, or validated data URL as a first frame, and optionally a last frame, so an uploaded product or visual subject can drive the video instead of being treated as text.
+- **Deterministic media copy**: Exact Chinese or English copy can be rendered after image/video generation with installed fonts and ffmpeg, avoiding diffusion-generated garbled text.
+
+## Bug Fixes
+
+- Binary images, videos, presentations, and documents are no longer decoded as UTF-8 text and returned as mojibake. Agents receive the correct reference/preview workflow instead.
+- Generated images are validated, normalized to match their filename format, and persisted before Credits and quota usage settle. Invalid provider output or a failed workspace write does not charge the tenant.
+- Video generation validates reference dimensions before the paid provider call, stores only non-sensitive reference metadata, and keeps Credits reserved until a valid MP4 is durably stored.
+- SaaS text-model APIs now reject incompatible media-generation routes. Video quality controls expose only provider-valid duration/resolution combinations for each tier.
+- The stale `tts/tts/pro` fixed billing rule is disabled; MiniMax media continues to use provider-parameter-based dynamic Credits.
+
+## Validation
+
+- Complete backend and frontend unit suites pass.
+- PostgreSQL migrations pass historical upgrade, downgrade, and re-upgrade smoke tests through `seed_minimax_media_routes`.
+- Frontend production compilation and the focused media/settlement regression suite pass.
+- Production deployment remains blue/green with database backup, candidate migration, health checks, and rollback before traffic cutover.
+
+## Upgrade Notes
+
+- Alembic migration `088_seed_minimax_media_routes.py` writes explicit Lite/Pro/Ultra defaults onto the four global MiniMax media tools without storing credentials.
+- The production backend image now installs `ffmpeg`; the existing Noto CJK font package is used for deterministic video copy rendering.
+
+---
+
+# v1.10.6 — Production Stability, Artifact Integrity, and Safe Delivery
+
+## What's New
+
+### Reliable product workflows
+- **Server-authoritative artifacts**: Agent replies now use verified document, image, audio, and video paths returned by tools instead of model-invented download links. Existing successful media jobs can be backfilled into the durable task ledger.
+- **Consistent model selection**: Lite, Pro, and Ultra remain session-scoped across navigation and refresh. SaaS routing continues to use the shared credential pool and Credits ledger; this release does not introduce per-model object authorization.
+- **Honest multimodal capabilities**: The runtime tells Agents exactly which native vision and media tools are available, and MiniMax image, speech, music, and video profiles remain available to eligible Lite, Pro, and Ultra plans.
+- **Visible automation controls**: Managers can enable or disable Agent schedules from the Agent detail page, including schedules whose historical Focus record no longer exists. Global heartbeat and company-assignment background execution remain disabled by default in production.
+
+## Bug Fixes
+
+- **Credits correctness**: Failed, cancelled, malformed, or circuit-broken LLM runs no longer consume chat Credits. Repeated invalid tool calls stop after a bounded threshold instead of burning tokens indefinitely. Refund grants are now idempotent and production incident remediation is auditable and safe to rerun.
+- **Channel model routing**: Fixed the shared model-route contract used by WeChat, WeCom, DingTalk, Discord, Slack, Teams, and WhatsApp adapters.
+- **Media exactly-once settlement**: Prevented duplicate provider task identities from charging the same generated media more than once, released failed reservations, and made legacy finalized tasks recoverable.
+- **PPT and file delivery**: Canonicalized generated-document links, removed hallucinated same-Agent URLs, and made stale frontend chunks recover with one guarded reload after deployment.
+- **Authentication transport**: Browser sessions now use secure HttpOnly cookies or WebSocket subprotocol authentication, and cookie bootstrap/cleanup always return an explicit successful status. Download and WebSocket URLs no longer add bearer tokens to query strings, and Nginx access logs omit query parameters.
+- **Tenant secret protection**: Company names and slugs that resemble API keys or bearer credentials are rejected without echoing the value. A remediation command can sanitize historical records and disable any matching shared model credential without exposing it.
+- **Background routing**: OKR generation now uses the unified SaaS route and failover path rather than tenant-level legacy keys.
+- **Deployment continuity**: Production delivery now uses blue/green application slots, database backup and migration before startup, candidate health checks before cutover, exact Nginx upstream replacement, connection draining, rollback, separate API/worker roles, and a one-time JWT rotation for the historical URL-token exposure.
+
+## Validation
+
+- Complete backend test suite and frontend unit suite pass.
+- Historical PostgreSQL migrations pass both full upgrade and downgrade/re-upgrade smoke tests through the new refund-idempotency migration.
+- Frontend production compilation and production Compose validation pass.
+- Production release requires candidate health checks before traffic is switched and preserves the previous slot for rollback/draining.
+
+## Upgrade Notes
+
+- Alembic migration `087_make_refunds_idempotent.py` extends the ledger uniqueness guard to incident refunds.
+- Existing browser bearer tokens are invalidated once during the first production deployment of this release; users may need to sign in again.
+- Review Agent schedules after upgrade. System schedules may be disabled but cannot be edited or deleted; internal A2A delivery triggers remain protected.
+
+---
+
+# v1.10.5 — SaaS Credits, Runtime Hardening, and Release Reliability
+
+## What's New
+
+### Unified SaaS Model Access and Credits
+- **Platform-managed model pool**: Model credentials and routes are managed centrally by SaaS administrators and consumed through the shared Credits balance. Agents no longer require per-model object authorization.
+- **Subscription and billing foundation**: Added plan entitlements, seat reconciliation, credit reservations/ledger reconciliation, provider pricing, and guarded billing lifecycle jobs.
+- **Safe first-run onboarding**: The first account can bootstrap a deployment without an invitation code; later registrations remain invitation-controlled. New Free tenants receive 1,000 Credits and one active default Agent.
+- **Session-scoped model tier**: Lite, Pro, and Ultra selection is persisted per chat session, survives navigation and refresh, and remains constrained by the tenant plan. The managed MiniMax text routes are differentiated as M2.5, M2.7, and M2.7-highspeed respectively.
+- **MiniMax media generation**: Added plan-aware image, speech, music, and video tools. Free users can try the Lite profile; successful work settles Credits, asynchronous video reserves before settlement, and provider failures do not create media charges.
+- **Verified shared credentials**: New provider accounts remain `unverified` until a read-only provider probe succeeds. Existing accounts can be relabeled or have capabilities edited without returning or re-entering their secret key.
+
+### Runtime and Integration Reliability
+- **Durable A2A and trigger execution**: Added delivery state, idempotent trigger execution records, per-session realtime routing, and recovery diagnostics for interrupted Agent work.
+- **Channel hardening**: Improved Feishu, DingTalk, WeCom, Discord, webhook, email, and local-model compatibility, including bounded uploads/streams and safer signature validation.
+- **Tenant-safe skills and files**: Scoped tenant skills, tightened upload/path/delete checks, and repaired document pagination, workspace collaboration, and published Page URLs.
+
+## Bug Fixes
+
+- **Sandbox and process lifecycle**: Reap subprocess trees on completion, timeout, and cancellation; validate bubblewrap with a real release smoke test; keep Uvicorn as PID 1 and allow graceful container shutdown.
+- **Reproducible backend images**: Added a universal `uv.lock`, fixed Python to the supported 3.12 line, and made production images install only frozen dependency versions.
+- **Authentication and authorization**: Protected platform administrators, trigger mutations, private chat sessions, logout state, WebSocket sessions, tenant resources, and unsigned webhook entry points.
+- **LLM/tool execution**: Restored multi-turn tool-call context, normalized provider payloads and token limits, improved MiniMax/local-provider failover, and made missing-code/tool errors actionable.
+- **MiniMax routing stability**: Normalized media base URLs to prevent `/v1/v1`, made Lite/Pro/Ultra media profiles deterministic, billed highspeed text at its provider rate, and reset account health errors after a successful call so unrelated transient failures cannot accumulate forever.
+- **Background Credits billing**: Heartbeat and other autonomous Agent runs now settle against the tenant Credits ledger; reconciliation covers balances and in-flight reservations without charging failed media generation.
+- **Agent stability**: Prevented duplicate default Agents, repaired native Agent lifecycle handling, made A2A delivery durable, and surfaced recoverable Agent failures.
+- **Frontend stability**: Fixed approval payload crashes, local-time session titles, A2A message placement, mobile navigation/layout overlap, deep workspace trees, stale Agent profile metadata, unavailable media actions that previously gave users no path to enable the required tool, and the expected platform-domain SSO fallback that produced a login-page 404 console error.
+- **Deployment safety**: Removed shared Helm passwords, required deployment secrets, fixed PostgreSQL credential encoding, added frontend probes/upstreams, aligned Docker/Kubernetes sandbox permissions, propagated authenticated smoke-test inputs safely, stripped macOS archive metadata, kept long SSH deploys alive, and made `/api/version` report the deployed commit from the release environment.
+
+## Upgrade Guide
+
+### Docker Deployment
+
+```bash
+git pull origin main
+docker compose down
+docker compose up -d --build
+```
+
+### Source Deployment
+
+```bash
+git pull origin main
+
+cd backend
+uv sync --frozen --extra dev
+cd ../frontend
+npm ci
+npm run build
+cd ..
+
+./restart.sh
+```
+
+### Kubernetes / Helm
+
+```bash
+helm upgrade clawith helm/clawith/ -f values.yaml
+```
+
+## Notes
+
+- Database migrations run automatically on backend startup; no manual Alembic command is required.
+- Helm deployments must set `backend.secrets.secretKey`, `backend.secrets.jwtSecretKey`, and `postgresql.auth.password`, or reference an existing Secret.
+- Local `execute_code` remains fail-closed. Docker/Kubernetes deployments must enable the chart/Compose sandbox security settings or configure a supported remote sandbox.
+- Model access follows the SaaS global model route and Credits ledger. This release intentionally does not add per-model object-level authorization.
+- MiniMax text routes and media-generation tools are deliberately separate: `model_routes` remains a Chat Completion routing table, while image/audio/music/video generation is exposed through Agent tools and plan capabilities.
+
+---
+
 # v1.10.3 — Agent-to-Agent Messaging Session Consistency
 
 ## What's New

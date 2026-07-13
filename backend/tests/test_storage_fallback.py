@@ -1,3 +1,5 @@
+import pytest
+
 from app.services.storage_runtime.base import StorageBackend, StorageEntry
 from app.services.storage_runtime.fallback import FallbackStorageBackend
 
@@ -48,6 +50,7 @@ class MemoryStorageBackend(StorageBackend):
         return StorageEntry(name=key.rsplit("/", 1)[-1], key=key, is_dir=False, size=len(self.files[key]))
 
 
+@pytest.mark.asyncio
 async def test_fallback_storage_backfills_primary_on_read():
     primary = MemoryStorageBackend()
     fallback = MemoryStorageBackend({"agent-id/focus.md": b"# Focus\n\n- [ ] migrate me\n"})
@@ -59,6 +62,7 @@ async def test_fallback_storage_backfills_primary_on_read():
     assert primary.files["agent-id/focus.md"] == fallback.files["agent-id/focus.md"]
 
 
+@pytest.mark.asyncio
 async def test_fallback_storage_writes_only_to_primary():
     primary = MemoryStorageBackend()
     fallback = MemoryStorageBackend()

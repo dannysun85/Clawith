@@ -172,9 +172,10 @@ async def get_wechat_qrcode_image(
     return Response(content=resp.content, media_type=media_type)
 
 
-@router.get("/agents/{agent_id}/wechat-channel", response_model=ChannelConfigOut)
+@router.get("/agents/{agent_id}/wechat-channel", response_model=ChannelConfigOut | None)
 async def get_wechat_channel(
     agent_id: uuid.UUID,
+    missing_ok: bool = False,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -187,6 +188,8 @@ async def get_wechat_channel(
     )
     config = result.scalar_one_or_none()
     if not config:
+        if missing_ok:
+            return None
         raise HTTPException(status_code=404, detail="WeChat not configured")
     return ChannelConfigOut.model_validate(config)
 

@@ -22,7 +22,7 @@ async def test_get_platform_settings_sso_toggle_default():
     """Verify that get_platform_settings returns sso_custom_domain_redirect_enabled by default."""
     db = RecordingDB(responses=[
         DummyResult(),  # allow_self_create_company lookup -> None (default True)
-        DummyResult(),  # invitation_code_enabled lookup -> None (default False)
+        DummyResult(),  # invitation_code_enabled lookup -> None (default True)
         DummyResult(),  # sso_custom_domain_redirect_enabled lookup -> None (default True)
     ])
     
@@ -31,7 +31,7 @@ async def test_get_platform_settings_sso_toggle_default():
     
     assert settings.sso_custom_domain_redirect_enabled is True
     assert settings.allow_self_create_company is True
-    assert settings.invitation_code_enabled is False
+    assert settings.invitation_code_enabled is True
 
 
 @pytest.mark.asyncio
@@ -76,6 +76,24 @@ async def test_resolve_tenant_by_domain_sso_toggle():
 
 
 @pytest.mark.asyncio
+async def test_resolve_platform_root_domain_returns_empty_success(monkeypatch):
+    """The public platform host is not a tenant-specific SSO domain."""
+    monkeypatch.setattr(
+        tenants_api,
+        "get_settings",
+        lambda: SimpleNamespace(PUBLIC_BASE_URL="https://opc.reeftotem.ai"),
+    )
+    db = RecordingDB(responses=[DummyResult()])
+
+    result = await tenants_api.resolve_tenant_by_domain(
+        domain="opc.reeftotem.ai",
+        db=db,
+    )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
 async def test_get_tenant_sso_base_url_toggle():
     """Verify that get_tenant_sso_base_url respects the sso_redirect_enabled kwarg."""
     tenant = SimpleNamespace(slug="acme", sso_domain="https://acme.com")
@@ -87,11 +105,11 @@ async def test_get_tenant_sso_base_url_toggle():
     assert url == "https://acme.com"
 
     # 2. Disabled: falls back to public base URL
-    with patch.object(platform_service, "get_public_base_url", return_value="https://try.clawith.ai"):
+    with patch.object(platform_service, "get_public_base_url", return_value="https://try.astra.ai"):
         url = await platform_service.get_tenant_sso_base_url(
             db=None, tenant=tenant, sso_redirect_enabled=False
         )
-        assert url == "https://try.clawith.ai"
+        assert url == "https://try.astra.ai"
 
 
 @pytest.mark.asyncio
@@ -120,6 +138,8 @@ async def test_switch_tenant_sso_toggle():
         assert res.access_token == "jwt-token"
         assert res.redirect_url is not None
         assert "https://acme.com" in res.redirect_url
+        assert "?token=" not in res.redirect_url
+        assert "#session_token=jwt-token" in res.redirect_url
 
     # Case 2: Toggle disabled -> redirect_url is None
     setting_disabled = SimpleNamespace(key="sso_custom_domain_redirect_enabled", value={"enabled": False})

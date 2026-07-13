@@ -1,4 +1,4 @@
-import type { Dispatch, ReactNode, SetStateAction } from 'react';
+import { useMemo, type Dispatch, type ReactNode, type SetStateAction } from 'react';
 import { IconTools, IconWorld } from '@tabler/icons-react';
 import { useTranslation } from 'react-i18next';
 
@@ -6,10 +6,13 @@ import AgentCredentials from '../../../components/AgentCredentials';
 import ChannelConfig from '../../../components/ChannelConfig';
 import OpenClawSettings from '../../OpenClawSettings';
 import { agentApi } from '../../../services/api';
+import { useEntitlements } from '../../../hooks/useLlmModels';
+import TierSelector, { resolveAllowedTier } from '../../../components/TierSelector';
+import { canonicalizeModalities, MODALITIES } from '../../../constants/modalities';
 
 type SettingsFormState = {
-    primary_model_id: string;
-    fallback_model_id: string;
+    preferred_tier: string;
+    preferred_modality: string;
     context_window_size: number;
     max_tool_rounds: number;
     max_tokens_per_day: string | number;
@@ -23,7 +26,6 @@ interface Props {
     agent: any;
     agentId: string;
     canManage: boolean;
-    llmModels: any[];
     settingsForm: SettingsFormState;
     setSettingsForm: Dispatch<SetStateAction<SettingsFormState>>;
     settingsSaved: boolean;
@@ -48,7 +50,6 @@ export default function SettingsTab(props: Props) {
         agent,
         agentId,
         canManage,
-        llmModels,
         settingsForm,
         setSettingsForm,
         settingsSaved,
@@ -68,6 +69,20 @@ export default function SettingsTab(props: Props) {
         onDeleteAgent,
     } = props;
     const { t, i18n } = useTranslation();
+    const { data: entitlements } = useEntitlements();
+    const allowedTiers = useMemo(
+        () => entitlements?.allowed_tiers?.length ? entitlements.allowed_tiers : ['lite', 'pro', 'ultra'],
+        [entitlements?.allowed_tiers],
+    );
+    const allowedModalities = useMemo(() => {
+        const canonical = canonicalizeModalities(entitlements?.allowed_modalities);
+        return canonical.length ? canonical : ['text'];
+    }, [entitlements?.allowed_modalities]);
+    const selectedTier = resolveAllowedTier(
+        settingsForm.preferred_tier || agent?.preferred_tier,
+        allowedTiers,
+    );
+    const selectedModality = settingsForm.preferred_modality || agent?.preferred_modality || allowedModalities[0] || 'text';
     const readOnly = !canManage;
     const canSave = canManage && hasChanges && !settingsSaving;
 
@@ -104,46 +119,33 @@ export default function SettingsTab(props: Props) {
                 <h4 style={{ marginBottom: '12px' }}>{t('agent.settings.modelConfig')}</h4>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
                     <div>
-                        <label style={{ display: 'block', fontSize: '13px', fontWeight: 500, marginBottom: '6px' }}>{t('agent.settings.primaryModel')}</label>
-                        <select
-                            className="input"
-                            value={settingsForm.primary_model_id}
-                            onChange={(e) => setSettingsForm((form) => ({ ...form, primary_model_id: e.target.value }))}
-                        >
-                            <option value="">--</option>
-                            {llmModels.filter((m: any) => m.enabled || m.id === settingsForm.primary_model_id).map((m: any) => (
-                                <option key={m.id} value={m.id}>
-                                    {m.label || m.model}
-                                </option>
-                            ))}
-                        </select>
-                        {settingsForm.primary_model_id && llmModels.some((m: any) => m.id === settingsForm.primary_model_id && !m.enabled) && (
-                            <div style={{ fontSize: '11px', color: 'var(--error)', marginTop: '4px' }}>
-                                {t('agent.settings.modelDisabledWarning', 'This model has been disabled by admin. The agent will automatically use the fallback model.')}
-                            </div>
-                        )}
-                        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('agent.settings.primaryModel')}</div>
+                        <label style={{ display: 'block', fontSize: '13px', fontWeight: 500, marginBottom: '6px' }}>{t('agent.modelConfig.tier', 'Tier')}</label>
+                        <TierSelector
+                            value={selectedTier}
+                            onChange={(tier) => setSettingsForm((form) => ({ ...form, preferred_tier: tier }))}
+                            allowedTiers={allowedTiers}
+                            disabled={readOnly}
+                        />
+                        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
+                            {t('agent.settings.modelRouteHint', '具体模型由 SaaS 后台的模型路由按档位自动解析。')}
+                        </div>
                     </div>
                     <div>
-                        <label style={{ display: 'block', fontSize: '13px', fontWeight: 500, marginBottom: '6px' }}>{t('agent.settings.fallbackModel')}</label>
+                        <label style={{ display: 'block', fontSize: '13px', fontWeight: 500, marginBottom: '6px' }}>{t('agent.modelConfig.conversationModality', '对话输入模型类型')}</label>
                         <select
                             className="input"
-                            value={settingsForm.fallback_model_id}
-                            onChange={(e) => setSettingsForm((form) => ({ ...form, fallback_model_id: e.target.value }))}
+                            value={selectedModality}
+                            onChange={(e) => setSettingsForm((form) => ({ ...form, preferred_modality: e.target.value }))}
                         >
-                            <option value="">--</option>
-                            {llmModels.filter((m: any) => m.enabled || m.id === settingsForm.fallback_model_id).map((m: any) => (
-                                <option key={m.id} value={m.id}>
-                                    {m.label || m.model}
+                            {MODALITIES.filter((m) => allowedModalities.includes(m)).map((m) => (
+                                <option key={m} value={m}>
+                                    {m}
                                 </option>
                             ))}
                         </select>
-                        {settingsForm.fallback_model_id && llmModels.some((m: any) => m.id === settingsForm.fallback_model_id && !m.enabled) && (
-                            <div style={{ fontSize: '11px', color: 'var(--error)', marginTop: '4px' }}>
-                                {t('agent.settings.modelDisabledWarning', 'This model has been disabled by admin. The agent will automatically use the fallback model.')}
-                            </div>
-                        )}
-                        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('agent.settings.fallbackModel')}</div>
+                        <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
+                            {t('agent.settings.conversationModalityHint', '这里只控制对话输入；图片、语音、音乐和视频输出请从聊天框的生成入口使用。')}
+                        </div>
                     </div>
                 </div>
             </div>
@@ -331,7 +333,7 @@ export default function SettingsTab(props: Props) {
                         <label style={{ position: 'relative', display: 'inline-block', width: '44px', height: '24px', cursor: canManage ? 'pointer' : 'default' }}>
                             <input
                                 type="checkbox"
-                                checked={agent?.heartbeat_enabled ?? true}
+                                checked={agent?.heartbeat_enabled ?? false}
                                 disabled={!canManage}
                                 onChange={async (e) => {
                                     if (!canManage) return;
@@ -340,8 +342,8 @@ export default function SettingsTab(props: Props) {
                                 }}
                                 style={{ opacity: 0, width: 0, height: 0 }}
                             />
-                            <span style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, background: (agent?.heartbeat_enabled ?? true) ? 'var(--accent-primary)' : 'var(--bg-tertiary)', borderRadius: '12px', transition: 'background 0.2s', opacity: canManage ? 1 : 0.6 }}>
-                                <span style={{ position: 'absolute', top: '3px', left: (agent?.heartbeat_enabled ?? true) ? '23px' : '3px', width: '18px', height: '18px', background: 'white', borderRadius: '50%', transition: 'left 0.2s' }} />
+                            <span style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, background: (agent?.heartbeat_enabled ?? false) ? 'var(--accent-primary)' : 'var(--bg-tertiary)', borderRadius: '12px', transition: 'background 0.2s', opacity: canManage ? 1 : 0.6 }}>
+                                <span style={{ position: 'absolute', top: '3px', left: (agent?.heartbeat_enabled ?? false) ? '23px' : '3px', width: '18px', height: '18px', background: 'white', borderRadius: '50%', transition: 'left 0.2s' }} />
                             </span>
                         </label>
                     </div>

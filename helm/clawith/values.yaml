@@ -5,8 +5,9 @@
 global:
   # Namespace to deploy to
   namespace: clawith
-  # Image registry
-  imageRegistry: your docker image registry, e.g. docker.io/yourusername
+  # Optional registry prefix for the application images. Leave empty only
+  # when clawith-backend and clawith-frontend are preloaded on every node.
+  imageRegistry: ""
 
 # Backend configuration
 backend:
@@ -18,14 +19,25 @@ backend:
     tag: latest
     pullPolicy: IfNotPresent
 
+  # The default local execute_code backend uses bubblewrap. Kubernetes must
+  # allow nested mounts/user namespaces or execution fails closed. Override
+  # this only when every agent uses a remote sandbox backend.
+  containerSecurityContext:
+    privileged: true
+    allowPrivilegeEscalation: true
+    seccompProfile:
+      type: Unconfined
+
   service:
     type: ClusterIP
     port: 8000
 
   # Secrets - will be used if secrets.create is true
   secrets:
-    secretKey: "change-me-to-your-secret-key-at-least-50-characters-long"
-    jwtSecretKey: "change-me-to-your-jwt-secret-key-at-least-32-characters"
+    # Both values are required when secrets.create=true. Never commit shared
+    # deployment secrets to a values file.
+    secretKey: ""
+    jwtSecretKey: ""
 
   # SSL certificates from host (for private/self-signed certificates)
   # Only enable this if you need to mount custom CA certificates
@@ -45,6 +57,8 @@ backend:
     # Agent data directory
     agentDataDir: /data/agents
     agentTemplateDir: /app/agent_template
+    # Global kill switch for proactive Agent heartbeat. Explicit triggers are unaffected.
+    heartbeatEnabled: false
     # Add custom environment variables here
     # custom: {}
 
@@ -55,7 +69,7 @@ backend:
     existingClaim: ""
     # Storage class for dynamic provisioning
     # If empty, uses default storage class
-    storageClass: "your storage class, e.g. nfs-client"
+    storageClass: ""
     accessMode: ReadWriteOnce
     size: 10Gi
 
@@ -83,16 +97,19 @@ frontend:
     targetPort: 3000
 
   env:
-    viteApiUrl: "http://clawith-backend:8000"
+    # Optional overrides. API_UPSTREAM defaults to the backend Service created
+    # by this release. MINIO_UPSTREAM is omitted unless explicitly configured.
+    apiUpstream: ""
+    minioUpstream: ""
 
   ingress:
-    enabled: true
+    enabled: false
     className: nginx
     annotations:
       nginx.ingress.kubernetes.io/rewrite-target: /
       # cert-manager.io/cluster-issuer: "letsencrypt-prod"
       # nginx.ingress.kubernetes.io/ssl-redirect: "true"
-    host: your ingress host, e.g. clawith.example.com
+    host: clawith.example.com
     tls:
       enabled: false
       secretName: clawith-tls-secret
@@ -111,16 +128,17 @@ postgresql:
   # Set to false if using external PostgreSQL
 
   image:
-    repository: bitnami/postgresql
-    registry: your docker image registry, e.g. docker.io/yourusername
-    tag: 15.3.0-debian-11-r7
+    repository: postgres
+    registry: docker.io
+    tag: 15-alpine
     pullPolicy: IfNotPresent
 
   auth:
     database: clawith
     username: postgres
-    # Password will be base64 encoded
-    password: clawith123456
+    # Required when postgresql.enabled=true. Never ship a shared default.
+    # Generate one per deployment, for example: openssl rand -base64 32
+    password: ""
 
   primary:
     service:
@@ -132,7 +150,7 @@ postgresql:
       # If using existing PVC, set existingClaim
       existingClaim: ""
       # Storage class for dynamic provisioning
-      storageClass: "nfs-client"
+      storageClass: ""
       accessMode: ReadWriteOnce
       size: 8Gi
 
@@ -141,11 +159,9 @@ postgresql:
         cpu: 250m
         memory: 256Mi
 
-    podSecurityContext:
-      fsGroup: 1001
+    podSecurityContext: {}
 
-    containerSecurityContext:
-      runAsUser: 1001
+    containerSecurityContext: {}
 
   # External PostgreSQL settings (if postgresql.enabled = false)
   external:
@@ -162,7 +178,7 @@ redis:
 
   image:
     repository: redis
-    registry: your docker image registry, e.g. docker.io/yourusername
+    registry: docker.io
     tag: 7-alpine
     pullPolicy: IfNotPresent
 
@@ -175,7 +191,7 @@ redis:
     # If using existing PVC, set existingClaim
     existingClaim: ""
     # Storage class for dynamic provisioning
-    storageClass: "your storage class, e.g. nfs-client"
+    storageClass: ""
     accessMode: ReadWriteOnce
     size: 2Gi
 
@@ -213,16 +229,3 @@ storageClass:
   parameters: {}
     # type: gp2
     # fsType: ext4
-apiVersion: v2
-name: clawith
-description: A Helm chart for Clawith application deployment
-type: application
-version: 1.0.0
-appVersion: "v260331"
-keywords:
-  - clawith
-  - agent
-  - ai
-maintainers:
-  - name: Clawith Team
-home: https://github.com/clawith/clawith

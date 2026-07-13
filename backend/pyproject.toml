@@ -2,7 +2,7 @@
 name = "clawith-backend"
 version = "0.1.0"
 description = "Backend workspace for the Clawith enterprise digital employee platform."
-requires-python = ">=3.11"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "fastapi[standard]>=0.115.0",
     "uvicorn[standard]>=0.30.0",
@@ -59,7 +59,7 @@ dev = [
 ]
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py312"
 line-length = 120
 
 [tool.pytest.ini_options]

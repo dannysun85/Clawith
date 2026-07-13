@@ -23,6 +23,8 @@ def runtime_execution_payload(trigger: AgentTrigger) -> dict:
     for key in (
         "_matched_message",
         "_matched_from",
+        "_matched_from_agent_id",
+        "_matched_message_id",
         "okr_member_id",
         "okr_member_type",
         "okr_report_date",
@@ -31,6 +33,8 @@ def runtime_execution_payload(trigger: AgentTrigger) -> dict:
         "_origin_user_id",
         "_origin_source_channel",
         "_a2a_session_id",
+        "_a2a_kind",
+        "_source_message_id",
     ):
         if key in cfg and cfg.get(key) is not None:
             payload[key] = cfg.get(key)

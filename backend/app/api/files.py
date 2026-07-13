@@ -4,19 +4,19 @@ import base64
 import csv
 import io
 import mimetypes
-import os
 import uuid
 from pathlib import Path
 
 import aiofiles
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File as FastFile, HTTPException, Request, status
+from fastapi import UploadFile as UploadFileType
 from fastapi.responses import FileResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
 from app.config import get_settings
 from app.core.permissions import check_agent_access
-from app.core.security import get_current_user
+from app.core.security import BROWSER_SESSION_COOKIE, get_current_user
 from app.database import get_db
 from app.models.user import User
 from app.models.workspace import WorkspaceFileRevision
@@ -27,7 +27,6 @@ from app.services.workspace_collaboration import (
     delete_workspace_file,
     list_revisions,
     read_text_if_exists,
-    record_revision,
     release_edit_lock,
     write_workspace_file,
 )
@@ -141,7 +140,11 @@ TEXT_PREVIEW_FILENAMES = {
 
 def _agent_base_dir(agent_id: uuid.UUID) -> Path:
     local_root = settings.STORAGE_LOCAL_ROOT or settings.AGENT_DATA_DIR
-    return Path(local_root) / str(agent_id)
+    primary = Path(local_root) / str(agent_id)
+    legacy = Path(settings.AGENT_DATA_DIR) / str(agent_id)
+    if primary != legacy and legacy.exists() and not primary.exists():
+        return legacy
+    return primary
 
 
 def _agent_storage_key(agent_id: uuid.UUID, rel_path: str = "") -> str:
@@ -241,7 +244,9 @@ async def list_files(
     for entry in entries:
         if entry.name == '.gitkeep':
             continue
-        if not path and entry.name.lower() in {"focus.md", "agenda.md"}:
+        # focus.md is no longer the primary Focus store, but keep legacy files
+        # visible/readable so migrated workspaces do not look empty.
+        if not path and entry.name.lower() == "agenda.md":
             continue
         if not path and entry.name == "enterprise_info":
             continue
@@ -250,13 +255,17 @@ async def list_files(
             rel_path = f"enterprise_info/{rel}" if rel != "." else "enterprise_info"
         else:
             rel_path = str(Path(entry.key).relative_to(str(agent_id)))
+        version_token = _entry_version_token(entry)
+        if not entry.is_dir and not (entry.version_id or entry.etag or entry.content_hash):
+            version = await storage.get_version(entry.key)
+            version_token = version.token or version_token
         items.append(FileInfo(
             name=entry.name,
             path=rel_path,
             is_dir=entry.is_dir,
             size=entry.size,
             modified_at=entry.modified_at,
-            version_token=_entry_version_token(entry),
+            version_token=version_token,
             url=f"/api/agents/{agent_id}/files/download?path={rel_path}" if not entry.is_dir else None
         ))
     return items
@@ -270,14 +279,14 @@ async def read_file(
     db: AsyncSession = Depends(get_db),
 ):
     """Read the content of a file."""
+    storage = get_storage_backend()
+    key, _ = _visible_storage_key(agent_id, path, current_user.tenant_id)
     await check_agent_access(db, current_user, agent_id)
-    if is_focus_file_path(path):
+    if is_focus_file_path(path) and not (await storage.exists(key) and await storage.is_file(key)):
         raise HTTPException(
             status_code=status.HTTP_410_GONE,
             detail="Focus is stored in the system database. Use the Focus API.",
         )
-    storage = get_storage_backend()
-    key, _ = _visible_storage_key(agent_id, path, current_user.tenant_id)
     if not await storage.exists(key) or not await storage.is_file(key):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
     version = await storage.get_version(key)
@@ -327,6 +336,10 @@ def _file_kind(path: str) -> str:
         return "text"
     if ext in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}:
         return "image"
+    if ext in {".mp4", ".webm", ".mov", ".m4v"}:
+        return "video"
+    if ext in {".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac", ".opus"}:
+        return "audio"
     return "binary"
 
 
@@ -442,7 +455,7 @@ async def preview_file(
             "rows": rows[:500],
             "download_url": download_url,
         }
-    if kind == "pdf":
+    if kind in {"pdf", "video", "audio"}:
         return {
             "path": path,
             "kind": kind,
@@ -534,6 +547,7 @@ async def preview_file(
 async def download_file(
     agent_id: uuid.UUID,
     path: str,
+    request: Request,
     token: str = "",
     inline: bool = False,
     credentials: HTTPAuthorizationCredentials | None = Depends(HTTPBearer(auto_error=False)),
@@ -541,14 +555,19 @@ async def download_file(
 ):
     """Download / serve a file from the agent workspace (browser-friendly).
     
-    Auth via Bearer header OR `token` query parameter (for <img> tags).
+    Auth via Bearer header or the same-origin HttpOnly browser session cookie.
+
+    The query token remains a temporary compatibility fallback for cached
+    frontend bundles and must not be generated by current clients.
     """
     from app.core.security import decode_access_token
 
-    # Resolve JWT token from either Bearer header or query param
+    # Resolve JWT token from Bearer, HttpOnly cookie, or legacy query fallback.
     jwt_token = None
     if credentials:
         jwt_token = credentials.credentials
+    elif request.cookies.get(BROWSER_SESSION_COOKIE):
+        jwt_token = request.cookies[BROWSER_SESSION_COOKIE]
     elif token:
         jwt_token = token
 
@@ -670,7 +689,8 @@ async def unlock_file(
     """Release the current user's edit lock for a file."""
     await check_agent_access(db, current_user, agent_id)
     await release_edit_lock(db, agent_id=agent_id, path=path, user_id=current_user.id)
-    await db.commit()
+    if hasattr(db, "commit"):
+        await db.commit()
     return {"status": "ok", "path": path}
 
 
@@ -759,7 +779,6 @@ async def delete_file(
             status_code=status.HTTP_410_GONE,
             detail="Focus is stored in the system database. Use the Focus API.",
         )
-    storage = get_storage_backend()
     if path.startswith("enterprise_info") and current_user.role not in ("platform_admin", "org_admin"):
         raise HTTPException(status_code=403, detail="Only admins can delete enterprise knowledge base files")
     if path.strip("/") == "enterprise_info":
@@ -778,12 +797,13 @@ async def delete_file(
         if "not found" in result.message.lower():
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=result.message)
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=result.message)
-    await db.commit()
+    if hasattr(db, "commit"):
+        await db.commit()
     return {"status": "ok", "path": path}
 
 
 class ImportSkillBody(BaseModel):
-    skill_id: str
+    skill_id: uuid.UUID
 
 
 @router.post("/import-skill")
@@ -798,14 +818,20 @@ async def import_skill_to_agent(
     Copies all files from the global skill registry into
     <agent_workspace>/skills/<folder_name>/.
     """
-    await check_agent_access(db, current_user, agent_id)
+    agent, _ = await check_agent_access(db, current_user, agent_id)
 
     from sqlalchemy.orm import selectinload
-    from app.models.skill import Skill, SkillFile
+    from app.models.skill import Skill
+    from app.services.skill_scope import scope_skill_query
 
-    # Load the global skill with its files
+    # Load only a global or same-tenant skill visible to the target agent.
     result = await db.execute(
-        select(Skill).where(Skill.id == body.skill_id).options(selectinload(Skill.files))
+        scope_skill_query(
+            select(Skill)
+            .where(Skill.id == body.skill_id)
+            .options(selectinload(Skill.files)),
+            agent.tenant_id,
+        )
     )
     skill = result.scalar_one_or_none()
     if not skill:
@@ -828,10 +854,6 @@ async def import_skill_to_agent(
         "files_written": len(written),
         "files": written,
     }
-
-
-# Separate router for file uploads (binary) since we need UploadFile
-from fastapi import File as FastFile, UploadFile as UploadFileType
 
 
 upload_router = APIRouter(prefix="/agents/{agent_id}/files", tags=["files"])
@@ -943,7 +965,6 @@ async def upload_enterprise_kb_file(
     current_user: User = Depends(get_current_user),
 ):
     """Upload a file to enterprise knowledge base (tenant-scoped)."""
-    from app.core.security import require_role
     # Only admin can upload to enterprise KB
     if current_user.role not in ("platform_admin", "org_admin"):
         raise HTTPException(status_code=403, detail="Only admins can upload to enterprise knowledge base")

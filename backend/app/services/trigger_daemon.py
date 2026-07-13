@@ -10,7 +10,9 @@ import uuid
 from datetime import datetime, timezone, timedelta
 from loguru import logger
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
+from app.config import get_settings
 from app.core.logging_config import new_trace_id
 from app.database import async_session
 from app.models.trigger import AgentTrigger
@@ -26,14 +28,13 @@ from app.services.trigger_runtime.invoker import invoke_agent_for_triggers as in
 from app.services.trigger_runtime import (
     claim_ready_trigger_invocations,
     enqueue_due_trigger,
-    mark_trigger_executions_completed,
-    mark_trigger_executions_failed,
+    enqueue_trigger_execution,
 )
+
+settings = get_settings()
 
 TICK_INTERVAL = 15  # seconds
 DEDUP_WINDOW = 30   # seconds — same agent won't be invoked twice within this window
-MIN_POLL_INTERVAL_MINUTES = 5  # minimum poll interval to prevent abuse
-
 # Safety: per-agent on_message fire rate limiter
 _ON_MSG_RATE_WINDOW = 3600  # 1 hour window
 _ON_MSG_RATE_LIMIT = 30     # max on_message fires per agent per hour
@@ -41,9 +42,7 @@ _on_msg_fire_log: dict[uuid.UUID, list[datetime]] = {}  # agent_id -> list of fi
 
 _last_invoke: dict[uuid.UUID, datetime] = {}
 
-_A2A_WAKE_CHAIN: dict[str, int] = {}
-_A2A_WAKE_CHAIN_TTL = 300
-_A2A_MAX_WAKE_DEPTH = 3
+_A2A_WAKE_TRIGGER_NAME = "__a2a_wake__"
 
 
 def _cleanup_stale_invoke_cache():
@@ -89,6 +88,29 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
     await invoke_agent_for_triggers_runtime(agent_id, triggers)
 
 
+def _build_invocation_batches(triggers: list[AgentTrigger]) -> list[list[AgentTrigger]]:
+    """Keep durable A2A messages isolated while preserving queue order."""
+    batches: list[list[AgentTrigger]] = []
+    ordinary: list[AgentTrigger] = []
+    for trigger in triggers:
+        if trigger.type == "a2a":
+            if ordinary:
+                batches.append(ordinary)
+                ordinary = []
+            batches.append([trigger])
+        else:
+            ordinary.append(trigger)
+    if ordinary:
+        batches.append(ordinary)
+    return batches
+
+
+async def _invoke_agent_batches(agent_id: uuid.UUID, batches: list[list[AgentTrigger]]) -> None:
+    """Run one agent's claimed work sequentially to avoid merged A2A replies."""
+    for triggers in batches:
+        await _invoke_agent_for_triggers(agent_id, triggers)
+
+
 # ── Main Tick Loop ──────────────────────────────────────────────────
 
 async def _tick():
@@ -98,7 +120,7 @@ async def _tick():
 
     async with async_session() as db:
         result = await db.execute(
-            select(AgentTrigger).where(AgentTrigger.is_enabled == True)
+            select(AgentTrigger).where(AgentTrigger.is_enabled.is_(True))
         )
         all_triggers = result.scalars().all()
         # Expunge each object before session.close() is called.
@@ -205,89 +227,126 @@ async def _tick():
         except Exception as e:
             logger.warning(f"Failed to pre-update trigger state: {e}")
 
-        asyncio.create_task(_invoke_agent_for_triggers(agent_id, agent_triggers))
+        asyncio.create_task(_invoke_agent_batches(agent_id, _build_invocation_batches(agent_triggers)))
 
 
-async def wake_agent_with_context(agent_id: uuid.UUID, message_context: str, *, from_agent_id: uuid.UUID | None = None, skip_dedup: bool = False, a2a_session_id: str | None = None) -> None:
-    """Public API: wake an agent asynchronously with a message context.
+async def wake_agent_with_context(
+    agent_id: uuid.UUID,
+    message_context: str,
+    *,
+    from_agent_id: uuid.UUID | None = None,
+    skip_dedup: bool = False,
+    a2a_session_id: str | None = None,
+    message_kind: str = "notify",
+    idempotency_key: str | None = None,
+    source_message_id: uuid.UUID | None = None,
+) -> bool:
+    """Durably queue an A2A wake through the trigger execution ledger.
 
-    Creates a synthetic trigger invocation so the agent processes the
-    message in a Reflection Session via the standard trigger path.
-    If a2a_session_id is provided, the agent's reply will also be saved
-    to the A2A chat session for visibility in the admin chat history.
-    Safe to call from any async context.
+    The queue record is committed before this function reports success. A
+    worker claims it with a DB lease, so a process restart cannot silently
+    discard the message. Reusing an idempotency key is treated as an already
+    accepted delivery.
 
     Args:
         agent_id: The agent to wake.
         message_context: The message to deliver.
-        from_agent_id: The agent that initiated this wake (for chain depth tracking).
-        skip_dedup: If True, bypass the dedup window check.
+        from_agent_id: The agent that initiated this wake.
+        skip_dedup: Retained for API compatibility; durable A2A events are
+            deduplicated by ``idempotency_key`` instead of an in-memory timer.
         a2a_session_id: Optional A2A chat session ID to mirror the reply into.
+        message_kind: ``notify`` or ``task_delegate``.
+        idempotency_key: Stable key for safe retries.
+        source_message_id: Persisted chat message used to recover full content.
     """
-    import time as _time
+    del skip_dedup
+    if message_kind not in {"notify", "task_delegate"}:
+        raise ValueError(f"Unsupported A2A message kind: {message_kind}")
 
-    now = datetime.now(timezone.utc)
+    from app.models.agent import Agent as AgentModel
 
-    if from_agent_id:
-        chain_key = f"{from_agent_id}->{agent_id}"
-        current_depth = _A2A_WAKE_CHAIN.get(chain_key, 0)
-        if current_depth >= _A2A_MAX_WAKE_DEPTH:
-            logger.warning(
-                f"[A2A] Wake chain depth {current_depth} reached for {chain_key}, "
-                f"stopping to prevent wake storm"
+    delivery_key = (idempotency_key or f"a2a:{uuid.uuid4()}")[:255]
+    async with async_session() as db:
+        from_agent_name = ""
+        if from_agent_id:
+            sender_result = await db.execute(
+                select(AgentModel.name).where(AgentModel.id == from_agent_id)
             )
-            return
+            from_agent_name = sender_result.scalar_one_or_none() or ""
 
-        _A2A_WAKE_CHAIN[chain_key] = current_depth + 1
+        trigger_result = await db.execute(
+            select(AgentTrigger).where(
+                AgentTrigger.agent_id == agent_id,
+                AgentTrigger.name == _A2A_WAKE_TRIGGER_NAME,
+            )
+        )
+        trigger = trigger_result.scalar_one_or_none()
+        if trigger is None:
+            trigger = AgentTrigger(
+                agent_id=agent_id,
+                name=_A2A_WAKE_TRIGGER_NAME,
+                type="a2a",
+                config={},
+                reason="Process a durably queued agent-to-agent message.",
+                is_enabled=True,
+                is_system=True,
+                cooldown_seconds=0,
+            )
+            db.add(trigger)
+            try:
+                await db.flush()
+            except IntegrityError:
+                # Another worker may have created the per-agent system trigger.
+                await db.rollback()
+                trigger_result = await db.execute(
+                    select(AgentTrigger).where(
+                        AgentTrigger.agent_id == agent_id,
+                        AgentTrigger.name == _A2A_WAKE_TRIGGER_NAME,
+                    )
+                )
+                trigger = trigger_result.scalar_one_or_none()
+                if trigger is None:
+                    raise
 
-        def _decay_chain():
-            _A2A_WAKE_CHAIN.pop(chain_key, None)
-        asyncio.get_running_loop().call_later(_A2A_WAKE_CHAIN_TTL, _decay_chain)
+        trigger.type = "a2a"
+        trigger.is_enabled = True
+        trigger.is_system = True
+        trigger.cooldown_seconds = 0
+        await db.commit()
 
-    if not skip_dedup and agent_id in _last_invoke:
-        elapsed = (now - _last_invoke[agent_id]).total_seconds()
-        if elapsed < DEDUP_WINDOW:
+        payload = {
+            "from_agent_name": from_agent_name,
+            "_matched_from": from_agent_name or "agent",
+            "_matched_message": message_context[:8000],
+            "_a2a_kind": message_kind,
+        }
+        if from_agent_id:
+            payload["_matched_from_agent_id"] = str(from_agent_id)
+        if a2a_session_id:
+            payload["_a2a_session_id"] = a2a_session_id
+        if source_message_id:
+            payload["_source_message_id"] = str(source_message_id)
+
+        _execution, created = await enqueue_trigger_execution(
+            db,
+            trigger=trigger,
+            source="a2a",
+            idempotency_key=delivery_key,
+            payload_obj=payload,
+        )
+        if not created:
             logger.info(
-                f"[A2A] Skipping wake for agent {agent_id} — "
-                f"invoked {elapsed:.0f}s ago (dedup window {DEDUP_WINDOW}s)"
+                "[A2A] Delivery already queued for agent {} with key {}",
+                agent_id,
+                delivery_key,
             )
-            return
-
-    _last_invoke[agent_id] = now
-
-    from_agent_name = ""
-    if from_agent_id:
-        try:
-            async with async_session() as db:
-                from app.models.agent import Agent as AgentModel
-                r = await db.execute(select(AgentModel.name).where(AgentModel.id == from_agent_id))
-                from_agent_name = r.scalar() or ""
-        except Exception as e:
-            logger.warning(f"Failed to lookup sender agent name: {e}")
-
-    dummy_trigger = AgentTrigger(
-        id=uuid.uuid4(),
-        agent_id=agent_id,
-        name="a2a_wake",
-        type="on_message",
-        config={"from_agent_name": from_agent_name, "_matched_message": message_context[:2000], "_matched_from": "agent", "_a2a_session_id": a2a_session_id},
-        reason=(
-            "You received a notification from another agent. "
-            "Read the message content above, update your focus and memory if needed, "
-            "and take any action you deem necessary. "
-            "Do NOT reply back to the sender unless you have a genuine question — "
-            "this was a notification, not a request for response."
-        ),
-        is_enabled=True,
-        last_fired_at=now,
-        fire_count=0,
-    )
-    asyncio.create_task(_invoke_agent_for_triggers(agent_id, [dummy_trigger]))
+        return True
 
 
 async def start_trigger_daemon():
     """Start the background trigger daemon loop. Called from FastAPI startup."""
-    logger.info("⚡ Trigger Daemon started (15s tick, heartbeat every ~60s)")
+    heartbeat_state = "enabled (~60s check)" if settings.HEARTBEAT_ENABLED else "disabled"
+    logger.info(f"⚡ Trigger Daemon started (15s tick, heartbeat {heartbeat_state})")
     _heartbeat_counter = 0
     while True:
         try:
@@ -297,8 +356,11 @@ async def start_trigger_daemon():
             import traceback
             traceback.print_exc()
 
-        # Run heartbeat check every 4th tick (~60 seconds)
-        _heartbeat_counter += 1
+        # Run heartbeat check every 4th tick (~60 seconds) only when the
+        # independent global kill switch is enabled. Explicit triggers above
+        # continue running regardless of this setting.
+        if settings.HEARTBEAT_ENABLED:
+            _heartbeat_counter += 1
         if _heartbeat_counter >= 4:
             _heartbeat_counter = 0
             _cleanup_stale_invoke_cache()

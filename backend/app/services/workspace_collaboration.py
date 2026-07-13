@@ -7,6 +7,7 @@ rollback, and human edit locks remain consistent across REST APIs and tools.
 from __future__ import annotations
 
 import hashlib
+import re
 import shutil
 import uuid
 from dataclasses import dataclass
@@ -14,9 +15,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiofiles
-from sqlalchemy import and_, delete, desc, select
+from sqlalchemy import delete, desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.agent import Agent
 from app.models.workspace import WorkspaceEditLock, WorkspaceFileRevision
 from app.services.storage import get_storage_backend, normalize_storage_key
 from app.services.storage_runtime.base import WriteCondition
@@ -75,6 +77,35 @@ def _should_mirror_to_local_filesystem(storage) -> bool:
 def content_hash(content: str | None) -> str:
     """Return a stable hash for text content."""
     return hashlib.sha256((content or "").encode("utf-8")).hexdigest()
+
+
+_SOUL_ROLE_LINE = re.compile(
+    r"^\s*(?:[-*]\s*)?(?:\*\*)?(?:role|角色)(?:\*\*)?\s*[:：]\s*(?P<role>.+?)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _extract_soul_role_description(content: str) -> str | None:
+    """Extract the explicit Role/角色 field used by bundled soul templates."""
+    match = _SOUL_ROLE_LINE.search(content or "")
+    if not match:
+        return None
+    role = match.group("role").strip()
+    return role[:500] or None
+
+
+async def _sync_agent_role_from_soul(db: AsyncSession | None, *, agent_id: uuid.UUID, content: str) -> None:
+    """Keep the Agent list/detail summary aligned after a successful soul.md write."""
+    if db is None:
+        return
+    role_description = _extract_soul_role_description(content)
+    if role_description is None:
+        return
+    result = await db.execute(select(Agent).where(Agent.id == agent_id))
+    agent = result.scalar_one_or_none()
+    if agent is not None and agent.role_description != role_description:
+        agent.role_description = role_description
+        await db.flush()
 
 
 def normalize_workspace_path(path: str) -> str:
@@ -213,6 +244,8 @@ async def record_revision(
     merge_user_autosave: bool = False,
 ) -> WorkspaceFileRevision | None:
     """Record a revision, optionally merging rapid user autosaves."""
+    if db is None or not hasattr(db, "add"):
+        return None
     normalized = normalize_workspace_path(path)
     # PostgreSQL text columns cannot store NUL bytes. Treat such content as
     # non-text revision data so binary files can still be moved/deleted safely.
@@ -321,6 +354,9 @@ async def write_workspace_file(
         async with aiofiles.open(target, "w", encoding="utf-8") as f:
             await f.write(content)
 
+    if normalized == "soul.md":
+        await _sync_agent_role_from_soul(db, agent_id=agent_id, content=content)
+
     revision = await record_revision(
         db,
         agent_id=agent_id,
@@ -374,9 +410,15 @@ async def delete_workspace_file(
             )
     storage_exists = await storage.exists(storage_key)
     storage_is_dir = await storage.is_dir(storage_key)
-    if not storage_exists and not storage_is_dir:
+    local_target_exists = target is not None and target.exists()
+    if not storage_exists and not storage_is_dir and not local_target_exists:
         return WorkspaceWriteResult(False, normalized, f"File not found: {normalized}")
-    before = await storage.read_text(storage_key, encoding="utf-8", errors="replace") if storage_exists and await storage.is_file(storage_key) else None
+    if storage_exists and await storage.is_file(storage_key):
+        before = await storage.read_text(storage_key, encoding="utf-8", errors="replace")
+    elif target is not None and target.is_file():
+        before = await read_text_if_exists(target)
+    else:
+        before = None
     async with workspace_locks(agent_id, [normalized]):
         if storage_is_dir:
             entries = await _collect_storage_tree_versions(storage, storage_key)
@@ -387,7 +429,7 @@ async def delete_workspace_file(
                 )
                 if not delete_result.ok:
                     return WorkspaceWriteResult(False, normalized, f"Conflict detected while deleting {normalized}")
-        else:
+        elif storage_exists:
             delete_result = await storage.delete_if_match(
                 storage_key,
                 condition=WriteCondition(version_token=expected_version_token) if expected_version_token is not None else None,

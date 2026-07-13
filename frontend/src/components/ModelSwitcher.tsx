@@ -1,17 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { IconChevronDown, IconCheck } from '@tabler/icons-react';
-import { enterpriseApi } from '../services/api';
-
-interface Model {
-    id: string;
-    provider: string;
-    model: string;
-    label?: string;
-    enabled?: boolean;
-}
+import { IconAlertTriangle, IconChevronDown, IconCheck } from '@tabler/icons-react';
+import { useLlmModels, type LlmModelInfo } from '../hooks/useLlmModels';
 
 interface Props {
     // Current selection — parent-controlled so the override persists across re-renders
@@ -39,15 +30,11 @@ export default function ModelSwitcher({ value, onChange, tenantDefaultId, disabl
         { top: number; bottom: number; left: number; width: number; placement: 'above' | 'below'; maxHeight: number } | null
     >(null);
 
-    const { data: models = [] } = useQuery({
-        queryKey: ['llm-models'],
-        queryFn: enterpriseApi.llmModels,
-    });
+    const { models, blockedCurrentId } = useLlmModels({ keepModelId: value ?? undefined });
 
-    const enabled = (models as Model[]).filter(m => m.enabled !== false);
-    const selected = enabled.find(m => m.id === value)
-        || enabled.find(m => tenantDefaultId && m.id === tenantDefaultId)
-        || enabled[0]
+    const selected = models.find(m => m.id === value)
+        || models.find(m => tenantDefaultId && m.id === tenantDefaultId)
+        || models[0]
         || null;
 
     // Click-outside to close. Includes the popover so clicking inside doesn't
@@ -106,9 +93,9 @@ export default function ModelSwitcher({ value, onChange, tenantDefaultId, disabl
         };
     }, [open]);
 
-    if (enabled.length === 0) return null;
+    if (models.length === 0) return null;
 
-    const labelFor = (m: Model) => m.label || `${m.provider} · ${m.model}`;
+    const labelFor = (m: LlmModelInfo) => m.label || `${m.provider} · ${m.model}`;
 
     return (
         <div ref={ref} style={{ position: 'relative', display: 'inline-block' }}>
@@ -168,9 +155,10 @@ export default function ModelSwitcher({ value, onChange, tenantDefaultId, disabl
                         zIndex: 10001, padding: '4px',
                     }}
                 >
-                    {enabled.map(m => {
+                    {models.map(m => {
                         const isSelected = selected?.id === m.id;
                         const isDefault = tenantDefaultId && m.id === tenantDefaultId;
+                        const isBlocked = blockedCurrentId === m.id;
                         return (
                             <button
                                 key={m.id}
@@ -189,8 +177,15 @@ export default function ModelSwitcher({ value, onChange, tenantDefaultId, disabl
                                 <span style={{ width: '14px', display: 'inline-flex' }}>
                                     {isSelected && <IconCheck size={14} stroke={2} />}
                                 </span>
-                                <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
                                     {labelFor(m)}
+                                    {isBlocked && (
+                                        <IconAlertTriangle
+                                            size={13}
+                                            style={{ color: 'var(--warning)', flexShrink: 0 }}
+                                            title={t('chat.modelSwitcher.modelBlocked', '当前套餐不含此模型，调用会被拦截')}
+                                        />
+                                    )}
                                 </span>
                                 {isDefault && (
                                     <span style={{

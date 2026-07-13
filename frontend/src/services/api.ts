@@ -1,6 +1,9 @@
 /** API service layer */
 
 import type { Agent, TokenResponse, User, Task, ChatMessage } from '../types';
+import { clearAuthStorage } from '../utils/authStorage';
+import { buildWorkspaceDownloadUrl } from '../utils/authTransport';
+import { reportClientIssue } from './productionIssueReporter';
 
 const API_BASE = '/api';
 
@@ -11,9 +14,30 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
     };
 
-    const res = await fetch(`${API_BASE}${url}`, { ...options, headers });
+    let res: Response;
+    try {
+        res = await fetch(`${API_BASE}${url}`, { ...options, headers });
+    } catch (error) {
+        reportClientIssue({
+            category: 'api',
+            error_code: error instanceof Error ? error.name : 'NetworkError',
+            route: `${API_BASE}${url}`,
+            operation: options.method || 'GET',
+            metadata: { component: 'fetch' },
+        });
+        throw error;
+    }
 
     if (!res.ok) {
+        if (res.status >= 500) {
+            reportClientIssue({
+                category: 'api',
+                error_code: `http_${res.status}`,
+                route: `${API_BASE}${url}`,
+                operation: options.method || 'GET',
+                metadata: { status_code: res.status, component: 'fetch' },
+            });
+        }
         // Auto-logout on expired/invalid token (but not on auth endpoints — let them show errors)
         const isAuthEndpoint = url.startsWith('/auth/login')
             || url.startsWith('/auth/register')
@@ -22,8 +46,7 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
             || url.startsWith('/auth/forgot-password')
             || url.startsWith('/auth/reset-password');
         if (res.status === 401 && !isAuthEndpoint) {
-            localStorage.removeItem('token');
-            localStorage.removeItem('user');
+            clearAuthStorage();
             window.location.href = '/login';
             throw new Error('Session expired');
         }
@@ -93,6 +116,15 @@ async function uploadFile(url: string, file: File, extraFields?: Record<string, 
         body: formData,
     });
     if (!res.ok) {
+        if (res.status >= 500) {
+            reportClientIssue({
+                category: 'api',
+                error_code: `http_${res.status}`,
+                route: `${API_BASE}${url}`,
+                operation: 'POST',
+                metadata: { status_code: res.status, component: 'upload' },
+            });
+        }
         const error = await res.json().catch(() => ({ detail: 'Upload failed' }));
         throw new Error(error.detail || `HTTP ${res.status}`);
     }
@@ -154,6 +186,9 @@ export function uploadFileWithProgress(
 
 // ─── Auth ─────────────────────────────────────────────
 export const authApi = {
+    registrationConfig: () =>
+        request<{ invitation_code_required: boolean }>('/auth/registration-config'),
+
     register: (data: { username?: string; email: string; password: string; display_name: string; invitation_code?: string; provider?: string; provider_code?: string }) =>
         request<{ user_id: string; email: string; access_token: string; message: string; user?: any; needs_company_setup: boolean }>('/auth/register', { method: 'POST', body: JSON.stringify(data) }),
 
@@ -240,6 +275,21 @@ export const adminApi = {
 
     updatePlatformSettings: (data: any) =>
         request<any>('/admin/platform-settings', { method: 'PUT', body: JSON.stringify(data) }),
+
+    listRegistrationCodes: (params: { page?: number; page_size?: number; search?: string } = {}) => {
+        const qs = new URLSearchParams();
+        if (params.page) qs.set('page', String(params.page));
+        if (params.page_size) qs.set('page_size', String(params.page_size));
+        if (params.search) qs.set('search', params.search);
+        const suffix = qs.toString() ? `?${qs.toString()}` : '';
+        return request<any>(`/admin/registration-codes${suffix}`);
+    },
+
+    createRegistrationCodes: (data: { count: number; max_uses: number }) =>
+        request<any>('/admin/registration-codes', { method: 'POST', body: JSON.stringify(data) }),
+
+    deactivateRegistrationCode: (id: string) =>
+        request<any>(`/admin/registration-codes/${id}`, { method: 'DELETE' }),
 };
 
 // ─── Agents ───────────────────────────────────────────
@@ -262,6 +312,9 @@ export const agentApi = {
 
     stop: (id: string) =>
         request<Agent>(`/agents/${id}/stop`, { method: 'POST' }),
+
+    recover: (id: string) =>
+        request<Agent>(`/agents/${id}/recover`, { method: 'POST' }),
 
     metrics: (id: string) =>
         request<any>(`/agents/${id}/metrics`),
@@ -362,10 +415,7 @@ export const fileApi = {
         }),
 
     downloadUrl: (agentId: string, path: string, options?: { inline?: boolean }) => {
-        const token = localStorage.getItem('token');
-        const params = new URLSearchParams({ path, token: token || '' });
-        if (options?.inline) params.set('inline', '1');
-        return `${API_BASE}/agents/${agentId}/files/download?${params.toString()}`;
+        return buildWorkspaceDownloadUrl(agentId, path, options);
     },
 };
 
@@ -400,7 +450,7 @@ export const focusApi = {
 // ─── Channel Config ───────────────────────────────────
 export const channelApi = {
     get: (agentId: string) =>
-        request<any>(`/agents/${agentId}/channel`).catch(() => null),
+        request<any>(`/agents/${agentId}/channel?missing_ok=true`),
 
     create: (agentId: string, data: any) =>
         request<any>(`/agents/${agentId}/channel`, { method: 'POST', body: JSON.stringify(data) }),

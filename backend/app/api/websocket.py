@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import uuid
+from collections import deque
 from datetime import datetime, timezone as tz
 from time import perf_counter
 
@@ -13,9 +14,13 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.logging_config import set_trace_id
+from app.core.logging_config import get_trace_id, set_trace_id
 from app.core.permissions import check_agent_access, is_agent_expired
-from app.core.security import decode_access_token
+from app.core.security import (
+    decode_access_token,
+    extract_websocket_access_token,
+    websocket_response_subprotocol,
+)
 from app.database import async_session
 from app.models.agent import Agent
 from app.models.audit import ChatMessage
@@ -24,18 +29,21 @@ from app.models.llm import LLMModel
 from app.models.task import Task
 from app.models.user import User
 from app.services.activity_logger import log_activity
+from app.services.artifact_contract import append_authoritative_artifacts, verified_tool_artifacts
 from app.services.agentbay_live import detect_agentbay_env, get_browser_snapshot, get_desktop_screenshot
 from app.services.chat_session_service import ensure_primary_platform_session
 from app.services.llm import call_llm_with_failover
+from app.services.llm.caller import RouteMeta
 from app.services.llm.utils import convert_chat_messages_to_llm_format, truncate_messages_with_pair_integrity
 from app.services.onboarding import is_onboarded, mark_onboarding_phase, resolve_onboarding_prompt
 from app.services.quota_guard import (
     AgentExpired,
     QuotaExceeded,
     check_agent_expired,
+    check_agent_llm_quota,
     check_conversation_quota,
-    increment_agent_llm_usage,
     increment_conversation_usage,
+    quota_error_payload,
 )
 from app.services.realtime import realtime_router
 from app.services.task_executor import execute_task
@@ -227,12 +235,13 @@ async def maybe_mark_session_read_for_active_viewer(
 async def websocket_chat(
     websocket: WebSocket,
     agent_id: uuid.UUID,
-    token: str = Query(...),
+    token: str | None = Query(None),
     session_id: str = Query(None),
     lang: str = Query("en"),
 ):
     """WebSocket endpoint for real-time chat with an agent."""
-    handler = WebSocketChatHandler(websocket, agent_id, token, session_id, lang)
+    access_token = extract_websocket_access_token(websocket, token)
+    handler = WebSocketChatHandler(websocket, agent_id, access_token, session_id, lang)
     await handler.run()
 
 
@@ -243,7 +252,7 @@ class WebSocketChatHandler:
         self,
         websocket: WebSocket,
         agent_id: uuid.UUID,
-        token: str,
+        token: str | None,
         session_id: str | None = None,
         lang: str = "en",
     ):
@@ -264,10 +273,14 @@ class WebSocketChatHandler:
         self.user_display_name: str = ""
         self.llm_model: LLMModel | None = None
         self.fallback_llm_model: LLMModel | None = None
+        self.current_route_meta: RouteMeta | None = None
         self.conv_id: str | None = None
+        self.session_model_tier: str | None = None
+        self.session_model_modality: str | None = None
         self.history_messages: list[ChatMessage] = []
         self.conversation: list[dict] = []
         self.current_user_text: str = ""
+        self.pending_messages: deque[dict] = deque()
 
     async def run(self):
         """Main entry point for handling the lifecycle of the WebSocket connection."""
@@ -285,12 +298,28 @@ class WebSocketChatHandler:
             await manager.disconnect(str(self.agent_id), self.websocket)
         except Exception as e:
             logger.exception(f"[WS] Unexpected error: {e}")
+            from app.services.production_issue_monitor import record_production_issue
+
+            await record_production_issue(
+                source="websocket",
+                category="websocket",
+                summary="WebSocket product session terminated unexpectedly",
+                severity="error",
+                error_code=type(e).__name__,
+                route="/ws/chat/{agent_id}",
+                operation="session",
+                tenant_id=getattr(self.agent, "tenant_id", None),
+                user_id=getattr(self.user, "id", None),
+                agent_id=self.agent_id,
+                trace_id=get_trace_id(),
+                metadata={"error_type": type(e).__name__},
+            )
             await manager.disconnect(str(self.agent_id), self.websocket)
 
     async def setup(self) -> bool:
         """Accepts connection, authenticates user, verifies agent access, loads models, resolves session & history."""
         # Accept immediately so browser sees onopen without waiting for DB setup
-        await self.websocket.accept()
+        await self.websocket.accept(subprotocol=websocket_response_subprotocol(self.websocket))
 
         # Authenticate
         try:
@@ -391,6 +420,7 @@ class WebSocketChatHandler:
     async def _resolve_chat_session(self, db: AsyncSession, user_id: uuid.UUID) -> str | None:
         """Resolves existing session or creates a new one."""
         conv_id = self.session_id_param
+        selected_session: ChatSession | None = None
         if conv_id:
             try:
                 _sid = uuid.UUID(conv_id)
@@ -398,19 +428,21 @@ class WebSocketChatHandler:
                 conv_id = None
                 _existing = None
             else:
-                _sr = await db.execute(
-                    select(ChatSession).where(
-                        ChatSession.id == _sid,
-                        ChatSession.agent_id == self.agent_id,
-                    )
-                )
+                _sr = await db.execute(select(ChatSession).where(ChatSession.id == _sid))
                 _existing = _sr.scalar_one_or_none()
                 if not _existing:
                     conv_id = None
-                elif _existing.source_channel != "agent" and str(_existing.user_id) != str(user_id):
+                elif (
+                    str(_existing.agent_id) != str(self.agent_id)
+                    or str(_existing.user_id) != str(user_id)
+                    or _existing.source_channel != "web"
+                    or bool(getattr(_existing, "is_group", False))
+                ):
                     await self.websocket.send_json({"type": "error", "content": "Not authorized for this session"})
                     await self.websocket.close(code=4003)
                     return None
+                else:
+                    selected_session = _existing
         if not conv_id:
             _sr = await db.execute(
                 select(ChatSession)
@@ -427,12 +459,17 @@ class WebSocketChatHandler:
             _latest = _sr.scalar_one_or_none()
             if _latest:
                 conv_id = str(_latest.id)
+                selected_session = _latest
             else:
                 _new_session = await ensure_primary_platform_session(db, self.agent_id, user_id)
                 await db.commit()
                 await db.refresh(_new_session)
                 conv_id = str(_new_session.id)
+                selected_session = _new_session
                 logger.info(f"[WS] Selected primary session {conv_id}")
+        if selected_session is not None:
+            self.session_model_tier = getattr(selected_session, "model_tier", None)
+            self.session_model_modality = getattr(selected_session, "model_modality", None)
         return conv_id
 
     async def _load_history(self, db: AsyncSession):
@@ -460,7 +497,7 @@ class WebSocketChatHandler:
             await self.websocket.send_json({"type": "done", "role": "assistant", "content": self.welcome_message})
 
         while True:
-            data = await self.websocket.receive_json()
+            data = await self._receive_next_message()
 
             # Set a unique trace ID for this specific message processing.
             trace_id = str(uuid.uuid4())[:12]
@@ -469,7 +506,8 @@ class WebSocketChatHandler:
             content = data.get("content", "")
             display_content = data.get("display_content", "")
             file_name = data.get("file_name", "")
-            override_model_id = data.get("model_id")
+            chat_tier = data.get("tier") or self.session_model_tier
+            chat_modality = data.get("modality") or self.session_model_modality
             is_onboarding_trigger = data.get("kind") == "onboarding_trigger"
             logger.info(f"[WS] Received: {content[:50]}" + (" [onboarding]" if is_onboarding_trigger else ""))
 
@@ -482,10 +520,30 @@ class WebSocketChatHandler:
                 content = "Please begin the onboarding."
 
             self.current_user_text = content
-            effective_llm_model = await self._resolve_effective_model(override_model_id)
 
-            # Quota Checks
-            if not await self._check_quotas():
+            # Resolve effective model from SaaS tier/modality (legacy model_id no longer trusted)
+            try:
+                effective_llm_model, _effective_fallback = await self._resolve_route(
+                    tier=chat_tier,
+                    modality=chat_modality,
+                )
+            except QuotaExceeded as qe:
+                quota_error = quota_error_payload(qe)
+                await self.websocket.send_json({
+                    "type": "done",
+                    "role": "assistant",
+                    "content": f"⚠️ {qe.message}",
+                    "quota_error": quota_error,
+                })
+                continue
+
+            if self.current_route_meta is not None:
+                chat_tier = self.current_route_meta.saas_tier
+                chat_modality = self.current_route_meta.modality
+                await self._persist_session_model_selection(chat_tier, chat_modality)
+
+            # Quota Checks (use resolved SaaS tier for weighting)
+            if not await self._check_quotas(saas_tier=chat_tier):
                 continue
 
             # Add user message to in-memory context
@@ -509,12 +567,14 @@ class WebSocketChatHandler:
             # Invoke LLM and stream response
             if effective_llm_model:
                 assistant_response, thinking_content, queued_messages = await self._run_llm_and_stream(
-                    effective_llm_model, is_onboarding_trigger
+                    effective_llm_model,
+                    is_onboarding_trigger,
+                    route_meta=self.current_route_meta,
                 )
             else:
                 assistant_response = (
                     f"⚠️ {self.agent_name} has no LLM model configured. "
-                    "Please select a model in the agent's Settings tab."
+                    "Please select a tier in the agent's Settings tab or ask an admin to configure model routes."
                 )
                 thinking_content = []
                 queued_messages = []
@@ -532,9 +592,15 @@ class WebSocketChatHandler:
             # Final 'done' packet
             await self.websocket.send_json({"type": "done", "role": "assistant", "content": assistant_response})
 
-            # Re-process any queued messages (if user sent something during generation)
-            for qm in queued_messages:
-                pass
+            # Messages arriving during generation are processed in arrival order on
+            # the next loop iterations instead of being silently discarded.
+            self.pending_messages.extend(queued_messages)
+
+    async def _receive_next_message(self) -> dict:
+        """Return queued input before reading the socket again."""
+        if self.pending_messages:
+            return self.pending_messages.popleft()
+        return await self.websocket.receive_json()
 
     async def _handle_onboarding_trigger_guard(self) -> bool:
         """Returns True if the onboarding trigger was ignored (already onboarded)."""
@@ -550,61 +616,94 @@ class WebSocketChatHandler:
                 return True
         return False
 
-    async def _resolve_effective_model(self, override_model_id: str | None) -> LLMModel | None:
-        """Reloads model config and resolves effective model (taking overrides into account)."""
+    async def _resolve_route(
+        self,
+        tier: str | None,
+        modality: str | None,
+    ) -> tuple[LLMModel | None, LLMModel | None]:
+        """Resolve effective LLM model(s) from SaaS tier/modality or legacy config.
+
+        Stores resolved models on self.llm_model / self.fallback_llm_model.
+        """
+        from app.services.llm.caller import resolve_agent_model
+
         async with async_session() as _mdb:
             _agent_r = await _mdb.execute(select(Agent).where(Agent.id == self.agent_id))
             _agent_cur = _agent_r.scalar_one_or_none()
-            if _agent_cur:
-                if _agent_cur.primary_model_id:
-                    _m_r = await _mdb.execute(select(LLMModel).where(LLMModel.id == _agent_cur.primary_model_id))
-                    _m = _m_r.scalar_one_or_none()
-                    self.llm_model = _m if (_m and _m.enabled) else None
-                else:
-                    self.llm_model = None
+            if not _agent_cur:
+                self.llm_model = None
+                self.fallback_llm_model = None
+                self.current_route_meta = None
+                return None, None
 
-                if _agent_cur.fallback_model_id:
-                    _fb_r = await _mdb.execute(select(LLMModel).where(LLMModel.id == _agent_cur.fallback_model_id))
-                    _fb = _fb_r.scalar_one_or_none()
-                    self.fallback_llm_model = _fb if (_fb and _fb.enabled) else None
-                else:
-                    self.fallback_llm_model = None
-
-                if not self.llm_model and self.fallback_llm_model:
-                    self.llm_model = self.fallback_llm_model
-                    self.fallback_llm_model = None
-
-        effective_llm_model = self.llm_model
-        if override_model_id:
             try:
-                _ovr_uuid = uuid.UUID(str(override_model_id))
-                async with async_session() as _mdb:
-                    _mr = await _mdb.execute(select(LLMModel).where(LLMModel.id == _ovr_uuid))
-                    _ovr = _mr.scalar_one_or_none()
-                    if (
-                        _ovr
-                        and _ovr.enabled
-                        and _ovr.tenant_id
-                        and (not self.llm_model or _ovr.tenant_id == self.llm_model.tenant_id)
-                    ):
-                        effective_llm_model = _ovr
-                    else:
-                        logger.warning(
-                            f"[WS] model override {override_model_id} rejected (missing/disabled/tenant mismatch)"
-                        )
-            except (ValueError, TypeError):
-                logger.warning(f"[WS] model override {override_model_id!r} is not a valid UUID")
+                primary, fallback, route_meta = await resolve_agent_model(
+                    _agent_cur,
+                    tier=tier,
+                    modality=modality,
+                )
+            except QuotaExceeded as qe:
+                # Propagate as a user-facing message; caller will render it.
+                self.llm_model = None
+                self.fallback_llm_model = None
+                self.current_route_meta = None
+                raise qe
 
-        return effective_llm_model
+            self.llm_model = primary
+            self.fallback_llm_model = fallback
+            self.current_route_meta = route_meta
+            return primary, fallback
 
-    async def _check_quotas(self) -> bool:
+    async def _persist_session_model_selection(self, tier: str, modality: str) -> None:
+        """Persist the resolved route on the owning first-party web session."""
+        if not self.conv_id or not self.user:
+            return
+        if self.session_model_tier == tier and self.session_model_modality == modality:
+            return
+        try:
+            session_uuid = uuid.UUID(self.conv_id)
+        except (TypeError, ValueError):
+            return
+
+        try:
+            async with async_session() as db:
+                result = await db.execute(
+                    select(ChatSession).where(
+                        ChatSession.id == session_uuid,
+                        ChatSession.agent_id == self.agent_id,
+                        ChatSession.user_id == self.user.id,
+                        ChatSession.source_channel == "web",
+                        ChatSession.is_group.is_(False),
+                    )
+                )
+                session = result.scalar_one_or_none()
+                if not session:
+                    return
+                session.model_tier = tier
+                session.model_modality = modality
+                await db.commit()
+            self.session_model_tier = tier
+            self.session_model_modality = modality
+        except Exception as exc:
+            # A persistence outage must not discard a valid chat response. The
+            # frontend PATCH path will retry on the next explicit selection.
+            logger.warning(f"[WS] Failed to persist session model selection: {exc}")
+
+    async def _check_quotas(self, saas_tier: str | None = None) -> bool:
         """Checks conversation and agent LLM quotas. Sends message and returns False if exceeded."""
         try:
             await check_conversation_quota(self.user.id)
             await check_agent_expired(self.agent_id)
+            await check_agent_llm_quota(self.agent_id, model_tier=saas_tier)
             return True
         except QuotaExceeded as qe:
-            await self.websocket.send_json({"type": "done", "role": "assistant", "content": f"⚠️ {qe.message}"})
+            quota_error = quota_error_payload(qe)
+            await self.websocket.send_json({
+                "type": "done",
+                "role": "assistant",
+                "content": f"⚠️ {qe.message}",
+                "quota_error": quota_error,
+            })
             return False
         except AgentExpired as ae:
             await self.websocket.send_json({"type": "done", "role": "assistant", "content": f"⚠️ {ae.message}"})
@@ -677,7 +776,10 @@ class WebSocketChatHandler:
         )
 
     async def _run_llm_and_stream(
-        self, effective_llm_model: LLMModel, is_onboarding_trigger: bool
+        self,
+        effective_llm_model: LLMModel,
+        is_onboarding_trigger: bool,
+        route_meta: "RouteMeta | None" = None,
     ) -> tuple[str, list[str], list[dict]]:
         """Calls the LLM and streams response chunks to WebSocket."""
         start_gen = perf_counter()
@@ -688,6 +790,7 @@ class WebSocketChatHandler:
             partial_chunks: list[str] = []
             # Track how many characters of finish-tool content have been streamed
             finish_content_sent_len = 0
+            completed_artifact_paths: list[str] = []
 
             # Set inside _call_with_failover when an onboarding prompt was injected
             needs_onboarding_mark = False
@@ -729,6 +832,20 @@ class WebSocketChatHandler:
                 if data.get("status") == "done":
                     # Inject Live Preview & Workspace Activities
                     await self._inject_live_preview_and_workspace_metadata(data)
+                    verified = await verified_tool_artifacts(
+                        self.agent_id,
+                        str(data.get("name") or ""),
+                        data.get("args") if isinstance(data.get("args"), dict) else None,
+                        str(data.get("result") or ""),
+                    )
+                    if verified:
+                        data["artifacts"] = [
+                            {"path": path, "verified": True}
+                            for path in verified
+                        ]
+                        completed_artifact_paths.extend(
+                            path for path in verified if path not in completed_artifact_paths
+                        )
 
                 await self.websocket.send_json({"type": "tool_call", **data})
 
@@ -880,6 +997,7 @@ class WebSocketChatHandler:
                     on_failover=_on_failover,
                     skip_tools=skip_tools_for_greeting,
                     on_code_output=code_output_to_ws,
+                    route_meta=route_meta,
                 )
 
             llm_task = asyncio.create_task(_call_with_failover())
@@ -917,6 +1035,12 @@ class WebSocketChatHandler:
                 assistant_response = await llm_task
                 logger.info(f"[WS] LLM response: {assistant_response[:80]}")
 
+            assistant_response = append_authoritative_artifacts(
+                assistant_response,
+                self.agent_id,
+                completed_artifact_paths,
+            )
+
             # Raise error on prefix for failover matching
             _llm_error_prefixes = ("[LLM Error]", "[LLM call error]", "[Error]")
             if (
@@ -933,9 +1057,32 @@ class WebSocketChatHandler:
 
         except WebSocketDisconnect:
             raise
+        except QuotaExceeded:
+            raise
         except Exception as e:
             gen_duration = perf_counter() - start_gen
             logger.exception(f"[WS] LLM error after {gen_duration:.3f}s: {e}")
+            from app.services.production_issue_monitor import record_production_issue
+
+            await record_production_issue(
+                source="websocket",
+                category="llm",
+                summary="Web chat model operation failed",
+                severity="error",
+                error_code=type(e).__name__,
+                route="/ws/chat/{agent_id}",
+                operation="chat",
+                tenant_id=getattr(self.agent, "tenant_id", None),
+                user_id=getattr(self.user, "id", None),
+                agent_id=self.agent_id,
+                trace_id=get_trace_id(),
+                metadata={
+                    "error_type": type(e).__name__,
+                    "duration_ms": round(gen_duration * 1000),
+                    "model": getattr(self.llm_model, "model", None),
+                    "provider": getattr(self.llm_model, "provider", None),
+                },
+            )
             return f"[LLM call error] {str(e)[:200]}", [], []
 
     async def _inject_live_preview_and_workspace_metadata(self, data: dict):
@@ -1030,7 +1177,6 @@ class WebSocketChatHandler:
 
         try:
             await increment_conversation_usage(self.user.id)
-            await increment_agent_llm_usage(self.agent_id)
         except Exception:
             pass
 

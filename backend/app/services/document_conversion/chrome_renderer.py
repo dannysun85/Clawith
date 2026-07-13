@@ -9,6 +9,8 @@ from typing import Any
 
 from loguru import logger
 
+from app.services.process_utils import terminate_popen_process_group
+
 
 def chrome_executable() -> str | None:
     """Return a local Chrome/Chromium executable path if one is available."""
@@ -86,6 +88,7 @@ async def collect_browser_layout(
         chrome_args,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        start_new_session=True,
     )
     try:
         base = f"http://127.0.0.1:{port}"
@@ -473,12 +476,5 @@ roots = [body];
         logger.warning(f"Browser layout extraction failed, falling back to DOM flow conversion: {layout_exc}")
         return None
     finally:
-        try:
-            proc.terminate()
-            proc.wait(timeout=2)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
+        terminate_popen_process_group(proc)
         profile_dir.cleanup()

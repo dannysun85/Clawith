@@ -1,6 +1,7 @@
 import React, { Component, ErrorInfo, ReactNode } from 'react';
 import { withTranslation, WithTranslation } from 'react-i18next';
 import { IconAlertTriangle } from '@tabler/icons-react';
+import { reportClientIssue } from '../services/productionIssueReporter';
 
 interface Props extends WithTranslation {
     children?: ReactNode;
@@ -24,6 +25,13 @@ class ErrorBoundary extends Component<Props, State> {
 
     public componentDidCatch(error: Error, errorInfo: ErrorInfo) {
         console.error('Uncaught error:', error, errorInfo);
+        reportClientIssue({
+            category: 'runtime',
+            error_code: error.name || 'ReactRenderError',
+            route: window.location.pathname,
+            operation: 'render',
+            metadata: { component: 'ErrorBoundary' },
+        });
     }
 
     public render() {

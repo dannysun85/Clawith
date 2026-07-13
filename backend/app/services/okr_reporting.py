@@ -27,8 +27,7 @@ from app.models.llm import LLMModel
 from app.models.okr import CompanyReport, MemberDailyReport, OKRSettings
 from app.models.org import AgentAgentRelationship, AgentRelationship, OrgMember
 from app.models.user import User
-from app.services.llm.client import chat_complete
-from app.services.llm.utils import get_model_api_key, get_max_tokens
+from app.services.llm import RouteMeta, call_llm_with_failover, resolve_agent_model
 
 
 MEMBER_DAILY_CHAR_LIMIT = 2000
@@ -60,6 +59,8 @@ class ResolvedReportModels:
     primary: LLMModel | None
     fallback: LLMModel | None
     okr_agent_id: uuid.UUID | None
+    agent: Agent | None
+    route_meta: RouteMeta | None
 
 
 def _truncate_report_content(content: str) -> str:
@@ -120,36 +121,36 @@ async def _resolve_report_models(tenant_id: uuid.UUID) -> ResolvedReportModels:
         )
         settings = settings_result.scalar_one_or_none()
         if not settings or not settings.okr_agent_id:
-            return ResolvedReportModels(primary=None, fallback=None, okr_agent_id=None)
+            return ResolvedReportModels(
+                primary=None,
+                fallback=None,
+                okr_agent_id=None,
+                agent=None,
+                route_meta=None,
+            )
 
         agent_result = await db.execute(select(Agent).where(Agent.id == settings.okr_agent_id))
         agent = agent_result.scalar_one_or_none()
         if not agent:
-            return ResolvedReportModels(primary=None, fallback=None, okr_agent_id=settings.okr_agent_id)
-
-        primary: LLMModel | None = None
-        fallback: LLMModel | None = None
-
-        if agent.primary_model_id:
-            primary_result = await db.execute(
-                select(LLMModel).where(LLMModel.id == agent.primary_model_id)
+            return ResolvedReportModels(
+                primary=None,
+                fallback=None,
+                okr_agent_id=settings.okr_agent_id,
+                agent=None,
+                route_meta=None,
             )
-            primary = primary_result.scalar_one_or_none()
 
-        if agent.fallback_model_id:
-            fallback_result = await db.execute(
-                select(LLMModel).where(LLMModel.id == agent.fallback_model_id)
-            )
-            fallback = fallback_result.scalar_one_or_none()
+    primary, fallback, route_meta = await resolve_agent_model(agent)
+    if not primary and fallback:
+        primary, fallback = fallback, None
 
-        if not primary and fallback:
-            primary, fallback = fallback, None
-
-        return ResolvedReportModels(
-            primary=primary,
-            fallback=fallback,
-            okr_agent_id=settings.okr_agent_id,
-        )
+    return ResolvedReportModels(
+        primary=primary,
+        fallback=fallback,
+        okr_agent_id=settings.okr_agent_id,
+        agent=agent,
+        route_meta=route_meta,
+    )
 
 
 async def list_company_members(tenant_id: uuid.UUID) -> list[CompanyMember]:
@@ -472,7 +473,7 @@ async def _generate_llm_report_content(
 ) -> str:
     """Generate a structured company report with the OKR Agent model."""
     models = await _resolve_report_models(tenant_id)
-    if not models.primary:
+    if not models.primary or not models.agent:
         return fallback_content
 
     title, period_key = _default_report_headings(report_type)
@@ -514,40 +515,31 @@ async def _generate_llm_report_content(
         f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
     )
 
-    async def _try_model(model: LLMModel) -> str:
-        response = await chat_complete(
-            provider=model.provider,
-            api_key=get_model_api_key(model),
-            model=model.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            base_url=model.base_url,
-            temperature=model.temperature,
-            max_tokens=min(get_max_tokens(model.provider, model.model, getattr(model, "max_output_tokens", None)), 1800),
-            timeout=float(getattr(model, "request_timeout", None) or 120.0),
+    try:
+        generated = await call_llm_with_failover(
+            primary_model=models.primary,
+            fallback_model=models.fallback,
+            messages=[{"role": "user", "content": user_prompt}],
+            agent_name=models.agent.name,
+            role_description=models.agent.role_description or "OKR reporting copilot",
+            agent_id=models.agent.id,
+            user_id=None,
+            session_id="",
+            supports_vision=False,
+            skip_tools=True,
+            system_prompt_suffix=f"\n\n## OKR report instructions\n{system_prompt}",
+            route_meta=models.route_meta,
         )
-        return (
-            response.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "")
-            .strip()
+        if generated.startswith(("[LLM Error]", "[LLM call error]", "[Error]", "⚠️")):
+            raise RuntimeError(generated[:200])
+        normalized = _sanitize_llm_report_output(report_type, period_start, period_end, generated)
+        if normalized:
+            return normalized
+    except Exception as exc:
+        logger.warning(
+            f"[OKR] Unified LLM company report generation failed tenant={tenant_id} "
+            f"report_type={report_type} model={getattr(models.primary, 'model', '?')}: {exc}"
         )
-
-    for candidate in (models.primary, models.fallback):
-        if not candidate:
-            continue
-        try:
-            generated = await _try_model(candidate)
-            normalized = _sanitize_llm_report_output(report_type, period_start, period_end, generated)
-            if normalized:
-                return normalized
-        except Exception as exc:
-            logger.warning(
-                f"[OKR] LLM company report generation failed tenant={tenant_id} "
-                f"report_type={report_type} model={getattr(candidate, 'model', '?')}: {exc}"
-            )
 
     return fallback_content
 

@@ -19,6 +19,7 @@ class AgentTrigger(Base):
     - interval: fire every N minutes, e.g. {"minutes": 30}
     - poll: HTTP poll with change detection, e.g. {"url": "...", "json_path": "$.status", ...}
     - on_message: fire when receiving a message from a specific agent
+    - a2a: internal durable delivery queue for agent-to-agent messages
     """
 
     __tablename__ = "agent_triggers"
@@ -28,7 +29,7 @@ class AgentTrigger(Base):
         UUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE"), nullable=False, index=True
     )
     name: Mapped[str] = mapped_column(String(100), nullable=False)
-    type: Mapped[str] = mapped_column(String(20), nullable=False)  # cron|once|interval|poll|on_message
+    type: Mapped[str] = mapped_column(String(20), nullable=False)  # cron|once|interval|poll|on_message|a2a
     config: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
     focus_ref: Mapped[str | None] = mapped_column(String(200))  # optional: related focus item identifier

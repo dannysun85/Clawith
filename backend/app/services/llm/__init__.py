@@ -26,12 +26,24 @@ from .caller import (
     call_llm_with_failover,
     call_agent_llm,
     call_agent_llm_with_tools,
+    prepare_agent_llm_invocation,
+    settle_agent_llm_invocation,
+    resolve_agent_model,
+    RouteMeta,
+    AgentLLMInvocation,
     FailoverGuard,
     is_retryable_error,
 )
 from .client import LLMClient, LLMResponse, LLMError, LLMMessage
 from .failover import classify_error, FailoverErrorType
-from .utils import create_llm_client, get_max_tokens, get_model_api_key, get_provider_base_url, get_provider_manifest
+from .utils import (
+    create_llm_client,
+    get_max_tokens,
+    get_model_api_key,
+    get_provider_base_url,
+    get_provider_manifest,
+    get_provider_spec,
+)
 
 __all__ = [
     # Core caller functions
@@ -39,6 +51,11 @@ __all__ = [
     "call_llm_with_failover",
     "call_agent_llm",
     "call_agent_llm_with_tools",
+    "prepare_agent_llm_invocation",
+    "settle_agent_llm_invocation",
+    "resolve_agent_model",
+    "RouteMeta",
+    "AgentLLMInvocation",
     # Failover utilities
     "FailoverGuard",
     "is_retryable_error",
@@ -55,4 +72,5 @@ __all__ = [
     "get_model_api_key",
     "get_provider_base_url",
     "get_provider_manifest",
+    "get_provider_spec",
 ]

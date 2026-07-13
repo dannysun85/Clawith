@@ -1,4 +1,7 @@
+import hashlib
+import hmac
 import uuid
+from unittest.mock import AsyncMock
 import pytest
 from types import SimpleNamespace
 import httpx
@@ -80,7 +83,7 @@ async def test_receive_webhook_success(monkeypatch, client):
         agent_id=agent_id,
         name="test-trigger",
         type="webhook",
-        config={"token": "valid_token"},
+        config={"token": "valid_token", "secret": "webhook-secret"},
         is_enabled=True,
     )
     agent = SimpleNamespace(id=agent_id, webhook_rate_limit=5)
@@ -102,10 +105,66 @@ async def test_receive_webhook_success(monkeypatch, client):
 
     monkeypatch.setattr(webhooks_api, "enqueue_webhook_execution", fake_enqueue_webhook_execution)
 
+    body = b'{"event":"test"}'
+    signature = "sha256=" + hmac.new(b"webhook-secret", body, hashlib.sha256).hexdigest()
     async with await client() as ac:
-        response = await ac.post("/api/webhooks/t/valid_token", json={"event": "test"})
+        response = await ac.post(
+            "/api/webhooks/t/valid_token",
+            content=body,
+            headers={
+                "content-type": "application/json",
+                "x-hub-signature-256": signature,
+            },
+        )
 
     assert response.status_code == 200
     assert response.json() == {"ok": True}
     assert trigger in session.expunged
     assert agent in session.expunged
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("config", "headers", "expected_status"),
+    [
+        ({"token": "valid_token", "secret": "webhook-secret"}, {}, 401),
+        ({"token": "valid_token", "secret": "webhook-secret"}, {"x-hub-signature-256": "sha256=bad"}, 401),
+        ({"token": "valid_token"}, {}, 403),
+    ],
+)
+async def test_receive_webhook_fails_closed_without_valid_signature(
+    monkeypatch,
+    client,
+    config,
+    headers,
+    expected_status,
+):
+    agent_id = uuid.uuid4()
+    trigger = SimpleNamespace(
+        id=uuid.uuid4(),
+        agent_id=agent_id,
+        name="test-trigger",
+        type="webhook",
+        config=config,
+        is_enabled=True,
+    )
+    agent = SimpleNamespace(id=agent_id, webhook_rate_limit=5)
+    session = FakeSession(triggers=[trigger], agent=agent)
+    monkeypatch.setattr(webhooks_api, "async_session", FakeAsyncSessionFactory(session))
+
+    async def fake_record_and_count_hits(_token):
+        return 1
+
+    enqueue = AsyncMock()
+    monkeypatch.setattr(webhooks_api, "_record_and_count_hits", fake_record_and_count_hits)
+    monkeypatch.setattr(webhooks_api, "enqueue_webhook_execution", enqueue)
+
+    async with await client() as ac:
+        response = await ac.post(
+            "/api/webhooks/t/valid_token",
+            content=b'{"event":"test"}',
+            headers={"content-type": "application/json", **headers},
+        )
+
+    assert response.status_code == expected_status
+    enqueue.assert_not_awaited()

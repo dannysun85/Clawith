@@ -5,7 +5,8 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, exists, or_, select
+from sqlalchemy.orm import aliased
 
 from app.config import get_settings
 from app.database import async_session
@@ -55,20 +56,54 @@ async def claim_pending_trigger_executions(
     now = datetime.now(timezone.utc)
     lease_until = now + timedelta(minutes=5)
     claimed_pairs: list[tuple[TriggerExecution, AgentTrigger]] = []
-    sources = sources or ["webhook", "cron", "once", "interval", "poll", "on_message"]
+    sources = sources or ["webhook", "cron", "once", "interval", "poll", "on_message", "a2a"]
+    eligible_execution = or_(
+        TriggerExecution.status == "pending",
+        (TriggerExecution.status == "processing")
+        & (
+            TriggerExecution.lease_expires_at.is_(None)
+            | (TriggerExecution.lease_expires_at < now)
+        ),
+    )
+    a2a_head_only = True
+    if "a2a" in sources:
+        earlier_execution = aliased(TriggerExecution)
+        earlier_is_eligible = or_(
+            earlier_execution.status == "pending",
+            (earlier_execution.status == "processing")
+            & (
+                earlier_execution.lease_expires_at.is_(None)
+                | (earlier_execution.lease_expires_at < now)
+            ),
+        )
+        a2a_head_only = or_(
+            TriggerExecution.source != "a2a",
+            ~exists(
+                select(1).where(
+                    earlier_execution.source == "a2a",
+                    earlier_execution.agent_id == TriggerExecution.agent_id,
+                    earlier_is_eligible,
+                    or_(
+                        earlier_execution.scheduled_at
+                        < TriggerExecution.scheduled_at,
+                        and_(
+                            earlier_execution.scheduled_at
+                            == TriggerExecution.scheduled_at,
+                            earlier_execution.id < TriggerExecution.id,
+                        ),
+                    ),
+                )
+            ),
+        )
     async with async_session() as db:
         result = await db.execute(
             select(TriggerExecution, AgentTrigger)
             .join(AgentTrigger, AgentTrigger.id == TriggerExecution.trigger_id)
             .where(
                 TriggerExecution.source.in_(sources),
-                AgentTrigger.is_enabled == True,
-                or_(
-                    TriggerExecution.status == "pending",
-                    (TriggerExecution.status == "processing") & (
-                        (TriggerExecution.lease_expires_at == None) | (TriggerExecution.lease_expires_at < now)
-                    ),
-                ),
+                AgentTrigger.is_enabled.is_(True),
+                eligible_execution,
+                a2a_head_only,
             )
             .order_by(TriggerExecution.scheduled_at.asc())
             .with_for_update(skip_locked=True)

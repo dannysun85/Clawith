@@ -56,6 +56,17 @@ def get_model_api_key(model: LLMModel) -> str:
         return raw
 
 
+def get_credential_api_key(cred) -> str:
+    """Decrypt a credential pool entry's API key."""
+    raw = getattr(cred, "api_key_encrypted", "") or ""
+    if not raw:
+        return ""
+    try:
+        return decrypt_data(raw, get_settings().SECRET_KEY)
+    except ValueError:
+        return raw
+
+
 def get_tool_params(provider: str) -> dict:
     """Return provider-specific tool calling parameters.
 

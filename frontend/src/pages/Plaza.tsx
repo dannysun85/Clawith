@@ -222,7 +222,7 @@ function StatsBar({ stats }: { stats: PlazaStats }) {
     ];
 
     return (
-        <div style={{
+        <div className="plaza-stats" style={{
             display: 'grid', gridTemplateColumns: `repeat(${items.length}, 1fr)`, gap: '1px',
             background: 'var(--border-subtle)', borderRadius: 'var(--radius-lg)',
             overflow: 'hidden', marginBottom: '24px',
@@ -602,7 +602,7 @@ export default function Plaza() {
     const runningAgents = agents.filter((a: Agent) => a.status === 'running');
 
     return (
-        <div>
+        <div className="plaza-page">
             {/* ─── Header ─── */}
             <div style={{
                 display: 'flex', justifyContent: 'space-between',
@@ -625,11 +625,11 @@ export default function Plaza() {
             {stats && <StatsBar stats={stats} />}
 
             {/* ─── Two-Column Layout ─── */}
-            <div style={{ display: 'flex', gap: '24px', alignItems: 'flex-start' }}>
+            <div className="plaza-layout" style={{ display: 'flex', gap: '24px', alignItems: 'flex-start' }}>
                 {/* ─── Main Feed ─── */}
                 <div style={{ flex: 1, minWidth: 0 }}>
                     {/* Composer */}
-                    <div style={{
+                    <div className="plaza-composer" style={{
                         border: '1px solid var(--border-subtle)',
                         borderRadius: 'var(--radius-lg)', padding: '14px 16px',
                         marginBottom: '16px',
@@ -645,7 +645,7 @@ export default function Plaza() {
                                 multiline
                             />
                         </div>
-                        <div style={{
+                        <div className="plaza-composer-footer" style={{
                             display: 'flex', justifyContent: 'space-between',
                             alignItems: 'center', marginTop: '10px', paddingLeft: '42px',
                         }}>
@@ -734,7 +734,7 @@ export default function Plaza() {
                                     </div>
 
                                     {/* Content */}
-                                    <div style={{
+                                    <div className="plaza-post-content" style={{
                                         fontSize: 'var(--text-sm)', lineHeight: 1.65,
                                         color: 'var(--text-primary)',
                                         marginBottom: '10px', whiteSpace: 'pre-wrap',
@@ -744,7 +744,7 @@ export default function Plaza() {
                                     </div>
 
                                     {/* Actions */}
-                                    <div style={{
+                                    <div className="plaza-post-actions" style={{
                                         display: 'flex', gap: '2px', paddingLeft: '40px',
                                         justifyContent: 'space-between', alignItems: 'center',
                                     }}>
@@ -774,7 +774,7 @@ export default function Plaza() {
 
                                     {/* Comments */}
                                     {expandedPost === post.id && (
-                                        <div style={{
+                                        <div className="plaza-comments" style={{
                                             marginTop: '10px', paddingTop: '10px', paddingLeft: '40px',
                                             borderTop: '1px solid var(--border-subtle)',
                                         }}>
@@ -845,7 +845,7 @@ export default function Plaza() {
                 </div>
 
                 {/* ─── Sidebar ─── */}
-                <div style={{
+                <div className="plaza-sidebar" style={{
                     width: '260px', flexShrink: 0,
                     display: 'flex', flexDirection: 'column', gap: '12px',
                     position: 'sticky', top: 'calc(20px + var(--notification-bar-height))',

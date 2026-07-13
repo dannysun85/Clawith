@@ -34,7 +34,7 @@ steps:
     commands:
       - git config --global core.compression 0
       - git config --global http.postBuffer 524288000
-      - git clone --no-single-branch https://github.com/dataelement/Clawith.git .
+      - git clone --no-single-branch "$DRONE_GIT_HTTP_URL" .
       # 将 shallow clone 转换为完整克隆，获取完整 commit 历史
       - git fetch --unshallow --tags || git fetch --tags
       - git checkout $DRONE_COMMIT
@@ -143,6 +143,10 @@ steps:
       # 验证 health endpoint (通过 docker compose exec 直接在容器内 curl)
       - echo "验证 health endpoint..."
       - timeout 10s bash -c 'until docker compose -f docker-compose.ci.yml exec -T backend curl -sf http://localhost:8000/api/health > /dev/null 2>&1; do sleep 2; done' || (echo "❌ health endpoint 不可达" && exit 1)
+
+      # 健康检查不能证明 execute_code 可用；实际运行 bubblewrap 沙箱。
+      - echo "验证本地 execute_code 沙箱..."
+      - docker compose -f docker-compose.ci.yml exec -T -u clawith backend python -m app.scripts.sandbox_smoke
       
       # 清理环境
       - echo "清理测试环境..."

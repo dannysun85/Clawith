@@ -1,16 +1,19 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
+import { useNavigate, useOutletContext } from 'react-router-dom';
 import { saveAccentColor, getSavedAccentColor, resetAccentColor, PRESET_COLORS } from '../utils/theme';
+import { useAuthStore } from '../stores';
 import UserManagement from './UserManagement';
 import InvitationCodes from './InvitationCodes';
 import { useDialog } from '../components/Dialog/DialogProvider';
 import { useToast } from '../components/Toast/ToastProvider';
 import { buildCompanyRegions, type CompanyRegion } from '../utils/companyRegions';
+import { canAccessSaasAdmin } from '../utils/saasAdmin';
 import OrgTab from './enterprise-settings/tabs/OrgTab';
 import SkillsTab from './enterprise-settings/tabs/SkillsTab';
 import OkrTab from './enterprise-settings/tabs/OkrTab';
-import LlmTab from './enterprise-settings/tabs/LlmTab';
+import SubscriptionTab from './enterprise-settings/tabs/SubscriptionTab';
 import EnterpriseKBBrowser from './enterprise-settings/components/EnterpriseKBBrowser';
 import { A2AAsyncToggle, CompanyLogoEditor, CompanyNameEditor, CompanyTimezoneEditor } from './enterprise-settings/components/CompanyInfoEditors';
 import {
@@ -20,9 +23,11 @@ import {
     IconClock,
     IconCheck,
     IconFileText,
+    IconLink,
     IconMessageCircle,
     IconSearch,
     IconSettings,
+    IconShieldCheck,
     IconTerminal2,
     IconTools,
     IconUser,
@@ -117,22 +122,215 @@ function ThemeColorPicker() {
     );
 }
 
+function DouyinAccountTab({ onCreateAgent }: { onCreateAgent: () => void }) {
+    const { t } = useTranslation();
+    const qc = useQueryClient();
+    const toast = useToast();
+    const { data, isLoading } = useQuery({
+        queryKey: ['douyin-status'],
+        queryFn: () => fetchJson<any>('/douyin/status'),
+        refetchInterval: 30000,
+    });
+    const accounts = data?.accounts || [];
+    const primaryAccount = accounts[0];
+    const configured = !!data?.configured;
+    const capabilityRows: Array<[string, string]> = primaryAccount?.capabilities?.length
+        ? primaryAccount.capabilities.map((row: any): [string, string] => [row.label, row.status === 'ready' ? t('enterprise.douyin.ready', '已授权') : t('enterprise.douyin.missing', '缺权限')])
+        : [
+            [t('enterprise.douyin.dataRead', '数据读取'), t('enterprise.douyin.pendingAuth', '待授权')],
+            [t('enterprise.douyin.publishApproval', '协作发布'), t('enterprise.douyin.pendingAuth', '待授权')],
+            [t('enterprise.douyin.replyApproval', '评论回复审批'), t('enterprise.douyin.pendingAuth', '待授权')],
+        ];
+    const ruleRows: Array<[string, string]> = [
+        [t('enterprise.douyin.publishWork', '发布作品'), t('enterprise.douyin.approvalTask', '生成发布包，用户确认')],
+        [t('enterprise.douyin.replyComment', '回复评论'), t('enterprise.douyin.approvalTask', '生成审批任务')],
+        [t('enterprise.douyin.sensitiveAction', '敏感操作'), t('enterprise.douyin.humanConfirm', '人工确认')],
+    ];
+    const startOAuth = useMutation({
+        mutationFn: () => fetchJson<any>('/douyin/oauth/start', {
+            method: 'POST',
+            body: JSON.stringify({ redirect_after: '/enterprise#douyin' }),
+        }),
+        onSuccess: (res) => {
+            if (res?.authorization_url) {
+                window.location.href = res.authorization_url;
+                return;
+            }
+            toast.error(res?.message || t('enterprise.douyin.notConfigured', '抖音开放平台应用尚未配置'));
+        },
+        onError: (err: any) => toast.error(t('common.error.operationFailed', '操作失败'), { details: String(err?.message || err) }),
+    });
+    const syncAccount = useMutation({
+        mutationFn: (accountId: string) => fetchJson<any>(`/douyin/accounts/${accountId}/sync`, { method: 'POST' }),
+        onSuccess: () => {
+            qc.invalidateQueries({ queryKey: ['douyin-status'] });
+            toast.success(t('enterprise.douyin.syncStarted', '同步完成'));
+        },
+        onError: (err: any) => toast.error(t('enterprise.douyin.syncFailed', '同步失败'), { details: String(err?.message || err) }),
+    });
+    const disconnectAccount = useMutation({
+        mutationFn: (accountId: string) => fetchJson(`/douyin/accounts/${accountId}`, { method: 'DELETE' }),
+        onSuccess: () => qc.invalidateQueries({ queryKey: ['douyin-status'] }),
+    });
+
+    return (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '16px', paddingBottom: '32px' }}>
+            <section className="card" style={{ padding: '20px', display: 'flex', alignItems: 'flex-start', gap: '16px', flexWrap: 'wrap' }}>
+                <div
+                    aria-hidden="true"
+                    style={{
+                        width: 44,
+                        height: 44,
+                        borderRadius: 8,
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        background: 'var(--bg-secondary)',
+                        border: '1px solid var(--border-subtle)',
+                        fontWeight: 750,
+                        letterSpacing: 0,
+                    }}
+                >
+                    DY
+                </div>
+                <div style={{ flex: '1 1 320px', minWidth: 240 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+                        <h3 style={{ margin: 0, fontSize: 18 }}>{t('enterprise.douyin.title', '抖音账号')}</h3>
+                        <span className={`badge ${primaryAccount ? (primaryAccount.status === 'active' ? 'badge-success' : 'badge-warning') : configured ? 'badge-warning' : 'badge-error'}`}>
+                            {isLoading
+                                ? t('common.loading')
+                                : primaryAccount
+                                    ? (primaryAccount.status === 'active' ? t('enterprise.douyin.connected', '已连接') : primaryAccount.status)
+                                    : configured
+                                        ? t('enterprise.douyin.notConnected', '未连接')
+                                        : t('enterprise.douyin.notConfiguredShort', '未配置')}
+                        </span>
+                    </div>
+                    <p style={{ margin: '8px 0 0', color: 'var(--text-tertiary)', fontSize: 13, lineHeight: 1.6, maxWidth: 760 }}>
+                        {configured
+                            ? t('enterprise.douyin.description', '每家公司连接自己的官方抖音账号。授权前，抖音运营经理不会读取数据、回复评论或生成发布包。')
+                            : t('enterprise.douyin.notConfiguredDesc', '当前组织还未开通抖音连接。平台完成抖音开放平台注册后，公司管理员即可扫码授权账号。')}
+                    </p>
+                    {primaryAccount && (
+                        <div style={{ marginTop: 10, display: 'flex', flexWrap: 'wrap', gap: 12, fontSize: 12, color: 'var(--text-tertiary)' }}>
+                            <span>{primaryAccount.nickname || primaryAccount.open_id}</span>
+                            <span>{t('enterprise.douyin.lastSync', '最后同步')}: {primaryAccount.last_sync_at ? new Date(primaryAccount.last_sync_at).toLocaleString() : t('enterprise.douyin.neverSynced', '未同步')}</span>
+                        </div>
+                    )}
+                </div>
+                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginLeft: 'auto' }}>
+                    <button
+                        className="btn btn-secondary"
+                        type="button"
+                        onClick={onCreateAgent}
+                    >
+                        {t('enterprise.douyin.createAgent', '创建抖音运营经理')}
+                    </button>
+                    <button
+                        className="btn btn-primary"
+                        type="button"
+                        disabled={!configured || startOAuth.isPending}
+                        title={!configured ? t('enterprise.douyin.notConfigured', '抖音连接暂未开通') : t('enterprise.douyin.oauthTitle', '通过抖音官方授权连接账号')}
+                        onClick={() => startOAuth.mutate()}
+                    >
+                        <IconLink size={14} stroke={1.7} />
+                        {startOAuth.isPending ? t('common.loading') : t('enterprise.douyin.connectAccount', '连接抖音账号')}
+                    </button>
+                </div>
+            </section>
+
+            {accounts.length > 0 && (
+                <section className="card" style={{ padding: '18px' }}>
+                    <h4 style={{ margin: '0 0 12px', fontSize: 14 }}>{t('enterprise.douyin.connectedAccounts', '已连接账号')}</h4>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                        {accounts.map((account: any) => (
+                            <div key={account.id} style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', border: '1px solid var(--border-subtle)', borderRadius: 8, padding: 12 }}>
+                                <div style={{ flex: '1 1 240px', minWidth: 220 }}>
+                                    <div style={{ fontWeight: 600, fontSize: 13 }}>{account.nickname || account.open_id}</div>
+                                    <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginTop: 3 }}>
+                                        {account.open_id} · {account.status}
+                                    </div>
+                                    {account.last_error && <div style={{ fontSize: 12, color: 'var(--error)', marginTop: 5 }}>{account.last_error}</div>}
+                                </div>
+                                <button className="btn btn-secondary" type="button" onClick={() => syncAccount.mutate(account.id)} disabled={syncAccount.isPending}>
+                                    {t('enterprise.douyin.syncNow', '同步')}
+                                </button>
+                                <button className="btn btn-ghost" type="button" onClick={() => disconnectAccount.mutate(account.id)} disabled={disconnectAccount.isPending}>
+                                    {t('enterprise.douyin.disconnect', '解绑')}
+                                </button>
+                            </div>
+                        ))}
+                    </div>
+                </section>
+            )}
+
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '16px' }}>
+                <section className="card" style={{ padding: '18px' }}>
+                    <h4 style={{ margin: '0 0 12px', fontSize: 14, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <IconShieldCheck size={17} stroke={1.8} />
+                        {t('enterprise.douyin.authStatus', '授权状态')}
+                    </h4>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                        {capabilityRows.map(([label, status]) => (
+                            <div key={label} style={{ display: 'flex', justifyContent: 'space-between', gap: '12px', alignItems: 'center' }}>
+                                <span style={{ color: 'var(--text-secondary)', fontSize: 13 }}>{label}</span>
+                                <span className={`badge ${status === t('enterprise.douyin.ready', '已授权') ? 'badge-success' : 'badge-warning'}`}>{status}</span>
+                            </div>
+                        ))}
+                    </div>
+                </section>
+
+                <section className="card" style={{ padding: '18px' }}>
+                    <h4 style={{ margin: '0 0 12px', fontSize: 14, display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <IconClock size={17} stroke={1.8} />
+                        {t('enterprise.douyin.executionMode', '执行方式')}
+                    </h4>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                        {ruleRows.map(([label, value]) => (
+                            <div key={label} style={{ display: 'flex', justifyContent: 'space-between', gap: '12px', alignItems: 'center' }}>
+                                <span style={{ color: 'var(--text-secondary)', fontSize: 13 }}>{label}</span>
+                                <span style={{ color: 'var(--text-primary)', fontSize: 13, fontWeight: 600 }}>{value}</span>
+                            </div>
+                        ))}
+                    </div>
+                </section>
+            </div>
+        </div>
+    );
+}
 
 
 
 
 export default function EnterpriseSettings() {
     const { t } = useTranslation();
+    const navigate = useNavigate();
+    const outletContext = useOutletContext<{ openTalentMarket?: (options?: { initialSearchQuery?: string }) => void }>();
+    const user = useAuthStore((s) => s.user);
     const dialog = useDialog();
     const toast = useToast();
     const qc = useQueryClient();
-    type TabKey = 'llm' | 'org' | 'info' | 'approvals' | 'audit' | 'tools' | 'skills' | 'quotas' | 'users' | 'invites' | 'okr';
-    const VALID_TABS: TabKey[] = ['info', 'llm', 'tools', 'skills', 'okr', 'invites', 'quotas', 'users', 'org', 'approvals', 'audit'];
+    type VisibleTabKey = 'info' | 'douyin' | 'subscription' | 'tools' | 'skills' | 'okr' | 'invites' | 'quotas' | 'users' | 'org' | 'approvals' | 'audit';
+    type TabKey = VisibleTabKey | 'llm' | 'plans';
+    const VISIBLE_TABS: VisibleTabKey[] = ['info', 'douyin', 'subscription', 'tools', 'skills', 'okr', 'invites', 'quotas', 'users', 'org', 'approvals', 'audit'];
+    const VALID_TABS: TabKey[] = [...VISIBLE_TABS, 'llm', 'plans'];
     const getTabFromHash = (): TabKey => {
         const hash = window.location.hash.replace('#', '') as TabKey;
         return VALID_TABS.includes(hash) ? hash : 'info';
     };
     const [activeTab, setActiveTab] = useState<TabKey>(getTabFromHash);
+    const canAccessSaas = canAccessSaasAdmin(user);
+
+    useEffect(() => {
+        if (activeTab !== 'llm' && activeTab !== 'plans') return;
+        if (canAccessSaas) {
+            navigate(`/admin/saas?tab=${activeTab === 'llm' ? 'model-routes' : 'plans'}`, { replace: true });
+            return;
+        }
+        window.location.hash = 'subscription';
+        setActiveTab('subscription');
+    }, [activeTab, canAccessSaas, navigate]);
+
     // Sync hash ↔ activeTab: hashchange navigation (back/forward) updates state
     useEffect(() => {
         const handler = () => setActiveTab(getTabFromHash());
@@ -477,7 +675,7 @@ export default function EnterpriseSettings() {
                 </div>
 
                 <div className="tabs">
-                    {(['info', 'llm', 'tools', 'skills', 'okr', 'invites', 'quotas', 'users', 'org', 'approvals', 'audit'] as const).map(tab => (
+                    {VISIBLE_TABS.map(tab => (
                         <div
                             key={tab}
                             className={`tab ${activeTab === tab ? 'active' : ''}`}
@@ -494,8 +692,20 @@ export default function EnterpriseSettings() {
 
                 {activeTab === 'okr' && <OkrTab tenantId={selectedTenantId} t={t} />}
 
-                {/* ── LLM Model Pool ── */}
-                {activeTab === 'llm' && <LlmTab selectedTenantId={selectedTenantId} />}
+                {/* ── Subscription ── */}
+                {activeTab === 'subscription' && <SubscriptionTab />}
+
+                {activeTab === 'douyin' && (
+                    <DouyinAccountTab
+                        onCreateAgent={() => {
+                            if (outletContext.openTalentMarket) {
+                                outletContext.openTalentMarket({ initialSearchQuery: '抖音' });
+                                return;
+                            }
+                            navigate('/plaza');
+                        }}
+                    />
+                )}
 
                 {/* ── Org Structure ── */}
                 {activeTab === 'org' && <OrgTab tenant={currentTenant} />}
@@ -602,7 +812,7 @@ export default function EnterpriseSettings() {
                                 className="form-input"
                                 value={companyIntro}
                                 onChange={e => setCompanyIntro(e.target.value)}
-                                placeholder={`# Company Name\nClawith\n\n# About\nOpenClaw\uD83E\uDD9E For Teams\nOpen Source \u00B7 Multi-OpenClaw Collaboration\n\nOpenClaw empowers individuals.\nClawith scales it to frontier organizations.`}
+                                placeholder={`# Company Name\nAstra\n\n# About\nAstra \u2014 built on OpenClaw \uD83E\uDD9E\nOpen Source \u00B7 Multi-Agent Collaboration\n\nOpenClaw empowers individuals.\nAstra scales it to frontier organizations.`}
                                 style={{
                                     minHeight: '200px', resize: 'vertical',
                                     fontFamily: 'var(--font-mono)', fontSize: '13px',

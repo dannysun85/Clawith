@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from datetime import datetime, timezone
 
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,12 +23,14 @@ async def enqueue_trigger_execution(
     payload_obj: dict | None = None,
 ) -> tuple[TriggerExecution | None, bool]:
     """Insert a generic trigger execution record."""
+    trigger_id = trigger.id
+    delivery_key = idempotency_key[:255]
     execution = TriggerExecution(
-        trigger_id=trigger.id,
+        trigger_id=trigger_id,
         agent_id=trigger.agent_id,
         source=source,
         status="pending",
-        idempotency_key=idempotency_key[:255],
+        idempotency_key=delivery_key,
         payload=payload_obj if isinstance(payload_obj, dict) else {},
         payload_text=payload_text[:8000],
         scheduled_at=datetime.now(timezone.utc),
@@ -38,7 +41,15 @@ async def enqueue_trigger_execution(
         return execution, True
     except IntegrityError:
         await db.rollback()
-        return None, False
+        existing = await db.execute(
+            select(TriggerExecution.id).where(
+                TriggerExecution.trigger_id == trigger_id,
+                TriggerExecution.idempotency_key == delivery_key,
+            )
+        )
+        if existing.scalar_one_or_none() is not None:
+            return None, False
+        raise
 
 
 async def enqueue_webhook_execution(

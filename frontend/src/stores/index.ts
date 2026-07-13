@@ -2,6 +2,8 @@
 
 import { create } from 'zustand';
 import type { User, Agent } from '../types';
+import { clearAuthStorage } from '../utils/authStorage';
+import { clearBrowserSession, establishBrowserSession } from '../utils/authTransport';
 
 interface AuthStore {
     user: User | null;
@@ -18,6 +20,7 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
 
     setAuth: (user, token) => {
         localStorage.setItem('token', token);
+        establishBrowserSession(token);
         set({ user, token });
     },
 
@@ -26,8 +29,10 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
     },
 
     logout: () => {
-        localStorage.removeItem('token');
+        clearBrowserSession();
+        clearAuthStorage();
         set({ user: null, token: null });
+        useAppStore.getState().setSelectedAgent(null);
     },
 
     isAuthenticated: () => !!get().token,

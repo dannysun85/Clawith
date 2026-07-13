@@ -238,7 +238,7 @@ async def _ensure_smithery_connection(api_key: str, mcp_url: str, display_name: 
             else:
                 create_ns = await client.post(
                     "https://api.smithery.ai/namespaces",
-                    json={"name": "clawith"},
+                    json={"name": "astra"},
                     headers=headers,
                 )
                 if create_ns.status_code not in (200, 201):

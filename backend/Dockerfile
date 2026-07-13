@@ -12,15 +12,20 @@ RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
     apt-get install -y --no-install-recommends gcc libpq-dev libcairo2 libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 shared-mime-info pango1.0-tools && \
     rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml ./
+COPY pyproject.toml uv.lock ./
 ARG CLAWITH_PIP_INDEX_URL
 ARG CLAWITH_PIP_TRUSTED_HOST
 RUN if [ -n "$CLAWITH_PIP_INDEX_URL" ] && [ -n "$CLAWITH_PIP_TRUSTED_HOST" ]; then \
-        pip install --no-cache-dir --index-url "$CLAWITH_PIP_INDEX_URL" --trusted-host "$CLAWITH_PIP_TRUSTED_HOST" . uv; \
+        pip install --no-cache-dir --index-url "$CLAWITH_PIP_INDEX_URL" --trusted-host "$CLAWITH_PIP_TRUSTED_HOST" "uv==0.11.26" && \
+        uv sync --frozen --no-dev --no-install-project --no-cache \
+            --default-index "$CLAWITH_PIP_INDEX_URL" --allow-insecure-host "$CLAWITH_PIP_TRUSTED_HOST"; \
     elif [ -n "$CLAWITH_PIP_INDEX_URL" ]; then \
-        pip install --no-cache-dir --index-url "$CLAWITH_PIP_INDEX_URL" . uv; \
+        pip install --no-cache-dir --index-url "$CLAWITH_PIP_INDEX_URL" "uv==0.11.26" && \
+        uv sync --frozen --no-dev --no-install-project --no-cache \
+            --default-index "$CLAWITH_PIP_INDEX_URL"; \
     else \
-        pip install --no-cache-dir . uv; \
+        pip install --no-cache-dir "uv==0.11.26" && \
+        uv sync --frozen --no-dev --no-install-project --no-cache; \
     fi
 
 # ─── Production ─────────────────────────────────────────
@@ -37,9 +42,19 @@ RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
     fc-cache -fv && \
     rm -rf /var/lib/apt/lists/*
 
+# Keep the large browser/font runtime layer cacheable. ffmpeg changes independently
+# and is needed by the media pipeline for deterministic video text overlays.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ffmpeg && \
+    rm -rf /var/lib/apt/lists/*
+
 # Copy installed packages from deps stage
 COPY --from=deps /usr/local/lib/python3.12/site-packages/ /usr/local/lib/python3.12/site-packages/
 COPY --from=deps /usr/local/bin/ /usr/local/bin/
+COPY --from=deps /app/.venv/ /app/.venv/
+
+ENV VIRTUAL_ENV=/app/.venv \
+    PATH="/app/.venv/bin:${PATH}"
 
 # Copy application code
 COPY . .

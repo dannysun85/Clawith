@@ -12,9 +12,10 @@ The agent reads/writes these files directly. No per-concept tools needed.
 """
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 import fnmatch
 import json
+import math
 import multiprocessing as mp
 import os
 import queue
@@ -24,7 +25,7 @@ import unicodedata
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional, Any
+from typing import TYPE_CHECKING, Optional, Any
 import re
 
 from loguru import logger
@@ -73,6 +74,10 @@ from app.services.llm.finish import (
     find_finish_call,
     parse_tool_arguments,
 )
+from app.services.process_utils import settle_tasks, terminate_process_group
+
+if TYPE_CHECKING:
+    from app.models.llm import LLMModel
 
 
 _settings = get_settings()
@@ -82,6 +87,107 @@ TOOL_MATERIALIZE_MAX_TOTAL_BYTES = 100 * 1024 * 1024
 TEMP_WORKSPACE_DEFAULT_PATHS = ["workspace", "memory", "skills", "focus.md", "soul.md", "HEARTBEAT.md"]
 MAX_EXEC_STDOUT_CAPTURE_BYTES = 1_000_000
 MAX_EXEC_STDERR_CAPTURE_BYTES = 500_000
+DOUYIN_AGENT_TEMPLATE_NAME = "Douyin Operations Manager"
+
+DOUYIN_AGENT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "douyin_account_snapshot",
+            "description": "Read the connected Douyin account status, capabilities, and data freshness. Never publishes or replies.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "douyin_video_metrics",
+            "description": "Read stored Douyin video/account metric snapshots with freshness labels. Never calls external write APIs.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "account_id": {"type": "string", "description": "Optional Douyin account id."},
+                    "video_id": {"type": "string", "description": "Optional external Douyin item/video id."},
+                    "limit": {"type": "integer", "description": "Maximum snapshots to return, default 5."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "douyin_fetch_comments",
+            "description": "Read stored Douyin comments and risk labels for planning replies. Never posts replies.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id": {"type": "string", "description": "Optional external Douyin item id."},
+                    "limit": {"type": "integer", "description": "Maximum comments to return, default 20."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "douyin_make_operation_plan",
+            "description": "Generate a Douyin operation plan from stored metrics, comments, and a business goal. Does not write to Douyin.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal": {"type": "string", "description": "Optional business objective for the plan."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "douyin_create_publish_job",
+            "description": "Create a Douyin collaborative publish task. This does not publish; after approval it generates a Douyin H5/SDK package for the user to confirm in Douyin.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Publish task title."},
+                    "body": {"type": "string", "description": "Caption/body text for review."},
+                    "hashtags": {"type": "array", "items": {"type": "string"}},
+                    "asset_refs": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": "Asset references. Use public video_path/video_url or image_path/image_url for H5 user-confirmed publishing.",
+                    },
+                    "account_id": {"type": "string", "description": "Optional connected Douyin account id."},
+                },
+                "required": ["title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "douyin_reply_comment",
+            "description": "Create a human approval task for a Douyin comment reply. Approval is required before the reply is submitted.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "comment_id": {"type": "string", "description": "Douyin comment id."},
+                    "reply_text": {"type": "string", "description": "Reply text for human review."},
+                    "item_id": {"type": "string", "description": "Optional Douyin item id."},
+                    "account_id": {"type": "string", "description": "Optional connected Douyin account id."},
+                },
+                "required": ["comment_id", "reply_text"],
+            },
+        },
+    },
+]
+
+
+@dataclass
+class _MiniMaxToolCredential:
+    id: uuid.UUID
+    api_key: str
+    base_url: str
+
 
 # ─── Tool Config Cache ──────────────────────────────────────────
 # Cache tool configurations to avoid frequent DB queries
@@ -216,7 +322,10 @@ async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Opt
             _set_cached_tool_config(agent_id, tool_name, decrypted)
             return decrypted
 
-    logger.error(f"[ToolConfig] No DB config found for {tool_name}, agent_id={agent_id}")
+    # Missing configuration is normal for optional tools and for lookups that
+    # intentionally fall back to environment/platform defaults. The concrete
+    # tool handler reports a user-facing error if configuration is mandatory.
+    logger.debug(f"[ToolConfig] No DB config found for {tool_name}, agent_id={agent_id}")
     return None
 
 # ContextVar set by each channel handler so send_channel_file knows where to send
@@ -503,7 +612,7 @@ AGENT_TOOLS = [
                     },
                     "config": {
                         "type": "object",
-                        "description": "Type-specific config. cron: {\"expr\": \"0 9 * * *\"}. once: {\"at\": \"2026-03-10T09:00:00+08:00\"}. interval: {\"minutes\": 30}. poll: {\"url\": \"...\", \"json_path\": \"$.status\", \"fire_on\": \"change\", \"interval_min\": 5}. on_message: {\"from_agent_name\": \"Morty\"} or {\"from_user_name\": \"张三\"} (for human users on Feishu/Slack/Discord). webhook: {\"secret\": \"optional_hmac_secret\"} (system auto-generates the URL)",
+                        "description": "Type-specific config. cron: {\"expr\": \"0 9 * * *\"}. once: {\"at\": \"2026-03-10T09:00:00+08:00\"}. interval: {\"minutes\": 30}. poll: {\"url\": \"...\", \"json_path\": \"$.status\", \"fire_on\": \"change\", \"interval_min\": 5}. on_message: {\"from_agent_name\": \"Morty\"} or {\"from_user_name\": \"张三\"} (for human users on Feishu/Slack/Discord). webhook: {} (system auto-generates both the URL token and required HMAC secret)",
                     },
                     "reason": {
                         "type": "string",
@@ -661,7 +770,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "send_platform_message",
-            "description": "Send a message to a user on the Clawith first-party platform (web or app). The message will appear in their platform chat history and be pushed in real-time if they are online. Use this to proactively notify platform users.",
+            "description": "Send a message to a user on the Astra first-party platform (web or app). The message will appear in their platform chat history and be pushed in real-time if they are online. Use this to proactively notify platform users.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -807,7 +916,24 @@ AGENT_TOOLS = [
                     "path": {
                         "type": "string",
                         "description": "Document file path, e.g.: workspace/knowledge_base/report.pdf, enterprise_info/knowledge_base/policy.docx",
-                    }
+                    },
+                    "page_start": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "First page to read for PDF/PPTX documents (1-based, default 1)",
+                    },
+                    "max_pages": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "description": "Maximum PDF/PPTX pages to read from page_start (default 50)",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20000,
+                        "description": "Maximum extracted characters to return (default 8000)",
+                    },
                 },
                 "required": ["path"],
             },
@@ -990,6 +1116,117 @@ AGENT_TOOLS = [
                     },
                 },
                 "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_image_minimax",
+            "description": "Generate an image via MiniMax image-01. China-friendly, high quality. Returns a URL and saves to workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Detailed image description.",
+                    },
+                    "aspect_ratio": {
+                        "type": "string",
+                        "description": "Aspect ratio: '1:1', '16:9', '4:3', '3:4', '9:16', '2:3', '3:2'. Default: '1:1'.",
+                    },
+                    "reference_image": {
+                        "type": "string",
+                        "description": "Optional workspace image path, public URL, or image data URL. MiniMax subject reference is best for a person/character; use video first_frame_image to preserve a product exactly.",
+                    },
+                    "overlay_text": {
+                        "type": "string",
+                        "description": "Optional exact Chinese/English copy rendered after generation with a real font. Do not ask the image model to draw this text in the prompt.",
+                    },
+                    "overlay_position": {
+                        "type": "string",
+                        "enum": ["top", "center", "bottom"],
+                        "description": "Position for overlay_text. Default: bottom.",
+                    },
+                    "save_path": {
+                        "type": "string",
+                        "description": "Workspace path to save the image (e.g. workspace/images/cat.png).",
+                    },
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_speech_minimax",
+            "description": "Generate speech audio via MiniMax T2A and save it to workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "Text to synthesize."},
+                    "voice_id": {"type": "string", "description": "MiniMax voice_id. Defaults to the tool config."},
+                    "format": {"type": "string", "description": "Audio format: mp3, wav, flac, or pcm. Default: mp3."},
+                    "save_path": {"type": "string", "description": "Workspace path to save the audio file."},
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_music_minimax",
+            "description": "Generate a song via MiniMax Music and save it to workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "Music style and mood prompt."},
+                    "lyrics": {"type": "string", "description": "Lyrics for the song."},
+                    "format": {"type": "string", "description": "Audio format. Default: mp3."},
+                    "save_path": {"type": "string", "description": "Workspace path to save the audio file."},
+                },
+                "required": ["prompt", "lyrics"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_video_minimax",
+            "description": "Create a MiniMax text-to-video task. Optionally wait and save the video if it finishes in time.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "Text description of the video."},
+                    "duration": {"type": "integer", "description": "Video duration in seconds. Default: 6."},
+                    "resolution": {"type": "string", "description": "Video resolution, e.g. 1080P or 768P. Default: 1080P."},
+                    "first_frame_image": {"type": "string", "description": "Optional workspace image path, public URL, or image data URL used as the video's first frame. Use this to preserve an uploaded product or visual subject."},
+                    "last_frame_image": {"type": "string", "description": "Optional workspace image path, public URL, or image data URL used as the last frame. Requires first_frame_image."},
+                    "prompt_optimizer": {"type": "boolean", "description": "Whether MiniMax may optimize the motion prompt. Default: true."},
+                    "overlay_text": {"type": "string", "description": "Optional exact Chinese/English copy rendered deterministically after the video is downloaded."},
+                    "overlay_position": {"type": "string", "enum": ["top", "center", "bottom"], "description": "Position for overlay_text. Default: bottom."},
+                    "wait_for_completion": {"type": "boolean", "description": "Poll and download if completed before timeout. Default: false."},
+                    "poll_timeout_seconds": {"type": "integer", "description": "Maximum wait time when wait_for_completion=true. Default: 180."},
+                    "save_path": {"type": "string", "description": "Workspace path to save the video if completed."},
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_video_minimax",
+            "description": "Check a MiniMax video task metadata file and download the video when it is ready.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_meta_path": {"type": "string", "description": "Workspace path returned by generate_video_minimax."},
+                    "save_path": {"type": "string", "description": "Workspace path to save the completed video."},
+                },
+                "required": ["task_meta_path"],
             },
         },
     },
@@ -2142,6 +2379,27 @@ def _strip_a2a_msg_type(tools: list[dict]) -> list[dict]:
     return result
 
 
+def _append_douyin_tools(
+    tools: list[dict],
+    *,
+    enabled: bool,
+    existing_names: set[str] | None = None,
+    disabled_names: set[str] | None = None,
+) -> list[dict]:
+    """Append Douyin tools only for the Douyin operator template."""
+    if not enabled:
+        return tools
+    existing = set(existing_names or set())
+    disabled = set(disabled_names or set())
+    for tool in DOUYIN_AGENT_TOOLS:
+        name = tool["function"]["name"]
+        if name in existing or name in disabled:
+            continue
+        tools.append(tool)
+        existing.add(name)
+    return tools
+
+
 async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
     """Load enabled tools for an agent from DB (OpenAI function-calling format).
 
@@ -2165,16 +2423,20 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
     # Check tenant-level a2a_async_enabled flag
     _a2a_async = False
     is_system_agent = False
+    is_douyin_operator = False
     agent_tenant_id = None
     try:
         from app.models.tenant import Tenant
-        from app.models.agent import Agent as AgentModel
+        from app.models.agent import Agent as AgentModel, AgentTemplate
         async with async_session() as _flag_db:
             _ag_r = await _flag_db.execute(select(AgentModel).where(AgentModel.id == agent_id))
             _agent = _ag_r.scalar_one_or_none()
             _tid = _agent.tenant_id if _agent else None
             agent_tenant_id = _tid
             is_system_agent = bool(_agent and _agent.is_system)
+            if _agent and _agent.template_id:
+                _tpl_r = await _flag_db.execute(select(AgentTemplate.name).where(AgentTemplate.id == _agent.template_id))
+                is_douyin_operator = _tpl_r.scalar_one_or_none() == DOUYIN_AGENT_TEMPLATE_NAME
             if _tid:
                 _t_r = await _flag_db.execute(select(Tenant).where(Tenant.id == _tid))
                 _tenant = _t_r.scalar_one_or_none()
@@ -2288,6 +2550,12 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                     logger.debug(
                         f"[Tools] agent={agent_id} added from _always_tools: {always_added}"
                     )
+                result = _append_douyin_tools(
+                    result,
+                    enabled=is_douyin_operator,
+                    existing_names=db_tool_names,
+                    disabled_names=explicitly_disabled_names,
+                )
                 # Inject OS-aware paths into computer-related tool descriptions
                 result = _patch_computer_tool_descriptions(result, computer_os_type)
                 # Strip msg_type from send_message_to_agent when async A2A is disabled
@@ -2314,7 +2582,8 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
     # If DB loading fails, do not expose the full hardcoded tool catalog: that
     # can leak disabled tools (for example search tools) into the LLM. Keep only
     # the minimal always-available core/channel tools.
-    fallback = _patch_computer_tool_descriptions(_always_tools, computer_os_type)
+    fallback = _append_douyin_tools(list(_always_tools), enabled=is_douyin_operator)
+    fallback = _patch_computer_tool_descriptions(fallback, computer_os_type)
     if not _a2a_async:
         fallback = _strip_a2a_msg_type(fallback)
     return fallback
@@ -2584,6 +2853,7 @@ _TOOL_AUTONOMY_MAP = {
     "web_search": "web_search",
     "execute_code": "execute_code",
     "execute_code_e2b": "execute_code",
+    "douyin_run_publish_job": "douyin_publish_job",
 }
 
 
@@ -2751,7 +3021,10 @@ async def _execute_workspace_mutation(
 
         content = await storage.read_text(storage_key, encoding="utf-8", errors="replace")
         if old_string not in content:
-            return f"❌ 'old_string' not found in {path}. Please check the exact text including whitespace and newlines."
+            return (
+                f"⚠️ No changes made: 'old_string' was not found in {path}. "
+                "The file may already be up to date."
+            )
         count = content.count(old_string)
         if count > 1 and not replace_all:
             return f"❌ 'old_string' appears {count} times in {path}. Use replace_all=true or provide more context to make the match unique."
@@ -2837,6 +3110,44 @@ async def _execute_tool_direct(
             )
         elif tool_name == "send_file_to_agent":
             return await _send_file_to_agent(agent_id, arguments)
+        elif tool_name == "douyin_run_publish_job":
+            from app.services.douyin.operations import douyin_operations_service
+            job_id = uuid.UUID(str(arguments.get("job_id")))
+            async with async_session() as _ddb:
+                job = await douyin_operations_service.run_publish_job(_ddb, job_id=job_id)
+                await _ddb.commit()
+                return json.dumps(
+                    {
+                        "job_id": str(job.id),
+                        "status": job.status,
+                        "message": (job.response_summary or {}).get("message"),
+                        "item_id": job.external_item_id,
+                        "share_id": job.share_id,
+                        "share_schema_url": job.share_schema_url,
+                    },
+                    ensure_ascii=False,
+                )
+        elif tool_name == "douyin_reply_comment":
+            from app.services.douyin.operations import douyin_operations_service
+            operation_id = arguments.get("operation_id")
+            if not operation_id:
+                return "❌ Missing approved Douyin reply operation_id"
+            async with async_session() as _ddb:
+                op = await douyin_operations_service.run_comment_reply_operation(
+                    _ddb,
+                    operation_id=uuid.UUID(str(operation_id)),
+                    reply_text=arguments.get("reply_text"),
+                    item_id=arguments.get("item_id"),
+                )
+                await _ddb.commit()
+                return json.dumps(
+                    {
+                        "operation_id": str(op.id),
+                        "status": op.status,
+                        "message": (op.response_summary or {}).get("message"),
+                    },
+                    ensure_ascii=False,
+                )
         else:
             return f"Tool {tool_name} does not support post-approval execution"
     except Exception as e:
@@ -2850,6 +3161,7 @@ async def execute_tool(
     agent_id: uuid.UUID,
     user_id: uuid.UUID,
     session_id: str = "",
+    saas_tier: str | None = None,
     on_output=None,
 ) -> str:
     """Execute a tool call and return the result as a string.
@@ -2970,7 +3282,12 @@ async def execute_tool(
             if not path:
                 return "❌ Missing required argument 'path' for read_document"
             max_chars = min(int(arguments.get("max_chars", 8000)), 20000)
-            result = await _read_document_from_storage(agent_id, path, max_chars=max_chars, tenant_id=_agent_tenant_id)
+            page_start = max(int(arguments.get("page_start", 1)), 1)
+            max_pages = min(max(int(arguments.get("max_pages", 50)), 1), 50)
+            result = await _read_document_from_storage(
+                agent_id, path, max_chars=max_chars, tenant_id=_agent_tenant_id,
+                page_start=page_start, max_pages=max_pages,
+            )
         elif tool_name in {"write_file", "move_file", "delete_file", "edit_file"}:
             result = await _execute_workspace_mutation(
                 tool_name,
@@ -3107,6 +3424,143 @@ async def execute_tool(
             result = await _plaza_create_post(agent_id, arguments)
         elif tool_name == "plaza_add_comment":
             result = await _plaza_add_comment(agent_id, arguments)
+        # ── Douyin official OpenAPI operation tools ──
+        elif tool_name == "douyin_account_snapshot":
+            from app.services.douyin.operations import douyin_operations_service
+            async with async_session() as _ddb:
+                result = await douyin_operations_service.account_snapshot_tool(_ddb, agent_id=agent_id)
+        elif tool_name == "douyin_make_operation_plan":
+            from app.services.douyin.operations import douyin_operations_service
+            async with async_session() as _ddb:
+                result = await douyin_operations_service.make_operation_plan_tool(
+                    _ddb,
+                    agent_id=agent_id,
+                    goal=arguments.get("goal"),
+                )
+        elif tool_name == "douyin_video_metrics":
+            from app.models.douyin import DouyinMetricSnapshot
+            tenant_id = await _get_agent_tenant_id(agent_id)
+            if not tenant_id:
+                result = "需要先将 Agent 归属到企业后才能读取抖音指标。"
+            else:
+                limit = max(1, min(int(arguments.get("limit", 5) or 5), 20))
+                async with async_session() as _ddb:
+                    query = select(DouyinMetricSnapshot).where(DouyinMetricSnapshot.tenant_id == uuid.UUID(tenant_id))
+                    if arguments.get("account_id"):
+                        query = query.where(DouyinMetricSnapshot.account_id == uuid.UUID(str(arguments["account_id"])))
+                    if arguments.get("video_id"):
+                        query = query.where(DouyinMetricSnapshot.external_item_id == str(arguments["video_id"]))
+                    rows = (
+                        await _ddb.execute(query.order_by(DouyinMetricSnapshot.captured_at.desc()).limit(limit))
+                    ).scalars().all()
+                if not rows:
+                    result = "暂无抖音指标快照。请先在企业设置执行账号同步，或等待定时同步。"
+                else:
+                    result = json.dumps(
+                        [
+                            {
+                                "metric_type": row.metric_type,
+                                "freshness": row.data_freshness,
+                                "captured_at": row.captured_at.isoformat() if row.captured_at else None,
+                                "metrics": row.metrics_json,
+                            }
+                            for row in rows
+                        ],
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+        elif tool_name == "douyin_fetch_comments":
+            from app.models.douyin import DouyinComment
+            tenant_id = await _get_agent_tenant_id(agent_id)
+            if not tenant_id:
+                result = "需要先将 Agent 归属到企业后才能读取抖音评论。"
+            else:
+                limit = max(1, min(int(arguments.get("limit", 20) or 20), 50))
+                async with async_session() as _ddb:
+                    query = select(DouyinComment).where(DouyinComment.tenant_id == uuid.UUID(tenant_id))
+                    if arguments.get("item_id"):
+                        query = query.where(DouyinComment.external_item_id == str(arguments["item_id"]))
+                    rows = (await _ddb.execute(query.order_by(DouyinComment.updated_at.desc()).limit(limit))).scalars().all()
+                if not rows:
+                    result = "暂无已同步的抖音评论。请先同步评论数据。"
+                else:
+                    result = json.dumps(
+                        [
+                            {
+                                "comment_id": row.comment_id,
+                                "item_id": row.external_item_id,
+                                "content": row.content[:300],
+                                "sentiment": row.sentiment,
+                                "intent": row.intent,
+                                "risk_level": row.risk_level,
+                                "needs_reply": row.needs_reply,
+                            }
+                            for row in rows
+                        ],
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+        elif tool_name == "douyin_create_publish_job":
+            from app.services.douyin.operations import douyin_operations_service
+            tenant_id = await _get_agent_tenant_id(agent_id)
+            title = str(arguments.get("title") or "").strip()
+            if not tenant_id:
+                result = "❌ 需要先将 Agent 归属到企业后才能创建抖音发布任务。"
+            elif not title:
+                result = "❌ Missing required argument 'title' for douyin_create_publish_job"
+            else:
+                account_id = uuid.UUID(str(arguments["account_id"])) if arguments.get("account_id") else None
+                async with async_session() as _ddb:
+                    job = await douyin_operations_service.create_publish_job(
+                        _ddb,
+                        tenant_id=uuid.UUID(tenant_id),
+                        user_id=user_id,
+                        agent_id=agent_id,
+                        account_id=account_id,
+                        content_type=str(arguments.get("content_type") or "video"),
+                        title=title,
+                        body=str(arguments.get("body") or ""),
+                        hashtags=list(arguments.get("hashtags") or []),
+                        visibility=str(arguments.get("visibility") or "public_after_review"),
+                        asset_refs=list(arguments.get("asset_refs") or []),
+                        scheduled_at=None,
+                        idempotency_key=arguments.get("idempotency_key"),
+                    )
+                    await _ddb.commit()
+                result = (
+                    f"已创建抖音发布审批任务：{job.title}\n"
+                    f"任务ID：{job.id}\n审批ID：{job.approval_id}\n"
+                    "状态：等待人工审批；审批后会生成抖音确认发布包，不会无感发布。"
+                )
+        elif tool_name == "douyin_reply_comment":
+            from app.services.douyin.operations import douyin_operations_service
+            tenant_id = await _get_agent_tenant_id(agent_id)
+            comment_id = str(arguments.get("comment_id") or "").strip()
+            reply_text = str(arguments.get("reply_text") or "").strip()
+            if not tenant_id:
+                result = "❌ 需要先将 Agent 归属到企业后才能创建抖音评论回复任务。"
+            elif not comment_id or not reply_text:
+                result = "❌ Missing required arguments 'comment_id' and 'reply_text' for douyin_reply_comment"
+            else:
+                account_id = uuid.UUID(str(arguments["account_id"])) if arguments.get("account_id") else None
+                async with async_session() as _ddb:
+                    op = await douyin_operations_service.create_comment_reply_operation(
+                        _ddb,
+                        tenant_id=uuid.UUID(tenant_id),
+                        user_id=user_id,
+                        agent_id=agent_id,
+                        account_id=account_id,
+                        comment_id=comment_id,
+                        reply_text=reply_text,
+                        item_id=arguments.get("item_id"),
+                        idempotency_key=arguments.get("idempotency_key"),
+                    )
+                    await _ddb.commit()
+                result = (
+                    f"已创建抖音评论回复审批任务。\n"
+                    f"操作ID：{op.id}\n审批ID：{op.approval_id}\n"
+                    "状态：等待人工审批；审批前不会回复评论。"
+                )
         elif tool_name in ("execute_code", "execute_code_e2b"):
             logger.info(f"[DirectTool] Executing code ({tool_name}) with arguments: {arguments}")
             result = await _run_with_temp_workspace(
@@ -3149,6 +3603,54 @@ async def execute_tool(
                 agent_id,
                 _agent_tenant_id,
                 lambda temp_ws: _generate_image(agent_id, temp_ws, arguments, "custom"),
+                sync_back=True,
+            )
+        elif tool_name == "generate_image_minimax":
+            result = await _run_with_temp_workspace(
+                agent_id,
+                _agent_tenant_id,
+                lambda temp_ws: _generate_image(
+                    agent_id,
+                    temp_ws,
+                    arguments,
+                    "minimax",
+                    user_id=user_id,
+                    saas_tier=saas_tier,
+                ),
+                sync_back=True,
+            )
+        elif tool_name == "generate_speech_minimax":
+            result = await _run_with_temp_workspace(
+                agent_id,
+                _agent_tenant_id,
+                lambda temp_ws: _generate_speech_minimax(
+                    agent_id, temp_ws, arguments, user_id=user_id, saas_tier=saas_tier
+                ),
+                sync_back=True,
+            )
+        elif tool_name == "generate_music_minimax":
+            result = await _run_with_temp_workspace(
+                agent_id,
+                _agent_tenant_id,
+                lambda temp_ws: _generate_music_minimax(
+                    agent_id, temp_ws, arguments, user_id=user_id, saas_tier=saas_tier
+                ),
+                sync_back=True,
+            )
+        elif tool_name == "generate_video_minimax":
+            result = await _run_with_temp_workspace(
+                agent_id,
+                _agent_tenant_id,
+                lambda temp_ws: _generate_video_minimax(
+                    agent_id, temp_ws, arguments, user_id=user_id, saas_tier=saas_tier
+                ),
+                sync_back=True,
+            )
+        elif tool_name == "check_video_minimax":
+            result = await _run_with_temp_workspace(
+                agent_id,
+                _agent_tenant_id,
+                lambda temp_ws: _check_video_minimax(agent_id, temp_ws, arguments),
                 sync_back=True,
             )
         elif tool_name == "discover_resources":
@@ -3642,7 +4144,7 @@ async def _read_webpage(arguments: dict) -> str:
     include_links = bool(arguments.get("include_links", False))
     max_bytes = 2_000_000
     headers = {
-        "User-Agent": "ClawithBot/1.0 (+https://clawith.ai) Mozilla/5.0",
+        "User-Agent": "AstraBot/1.0 (+https://astra.ai) Mozilla/5.0",
         "Accept": "text/html, text/plain, application/json, application/xml;q=0.9, text/*;q=0.8, */*;q=0.5",
     }
 
@@ -4282,6 +4784,7 @@ async def _execute_mcp_tool(tool_name: str, arguments: dict, agent_id=None) -> s
 
         mcp_url = tool.mcp_server_url
         mcp_name = tool.mcp_tool_name or tool_name
+        arguments = _coerce_mcp_arguments(arguments, tool.parameters_schema or {})
 
         # Detect Smithery-hosted MCP servers (*.run.tools URLs)
         # These need Smithery Connect to route tool calls
@@ -4305,6 +4808,72 @@ async def _execute_mcp_tool(tool_name: str, arguments: dict, agent_id=None) -> s
     except Exception as e:
         logger.exception(f"[MCP] Tool execution error: {tool_name}")
         return f"❌ MCP tool execution error: {str(e)[:200]}"
+
+
+def _coerce_mcp_arguments(arguments: dict, schema: dict) -> dict:
+    """Coerce JSON values only where the MCP tool schema explicitly requires it.
+
+    LLM function-call JSON sometimes represents numeric form values as strings.
+    Several strict MCP servers reject those values even though their advertised
+    schema says ``integer`` or ``number``. Keep this conversion conservative:
+    unknown properties and values that do not parse losslessly are untouched so
+    the upstream server remains the final validator.
+    """
+    if not isinstance(arguments, dict) or not isinstance(schema, dict):
+        return arguments
+    coerced = _coerce_mcp_value(arguments, schema)
+    return coerced if isinstance(coerced, dict) else arguments
+
+
+def _coerce_mcp_value(value: Any, schema: dict) -> Any:
+    if not isinstance(schema, dict):
+        return value
+
+    declared_type = schema.get("type")
+    if isinstance(declared_type, list):
+        non_null_types = [item for item in declared_type if item != "null"]
+        declared_type = non_null_types[0] if len(non_null_types) == 1 else None
+
+    if declared_type == "object" and isinstance(value, dict):
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return dict(value)
+        return {
+            key: _coerce_mcp_value(item, properties.get(key, {}))
+            for key, item in value.items()
+        }
+
+    if declared_type == "array" and isinstance(value, list):
+        item_schema = schema.get("items")
+        if not isinstance(item_schema, dict):
+            return list(value)
+        return [_coerce_mcp_value(item, item_schema) for item in value]
+
+    if not isinstance(value, str):
+        return value
+
+    candidate = value.strip()
+    if declared_type == "integer" and re.fullmatch(r"[+-]?\d+", candidate):
+        try:
+            return int(candidate)
+        except ValueError:
+            return value
+
+    if declared_type == "number":
+        try:
+            number = float(candidate)
+        except ValueError:
+            return value
+        return number if math.isfinite(number) else value
+
+    if declared_type == "boolean":
+        lowered = candidate.lower()
+        if lowered == "true":
+            return True
+        if lowered == "false":
+            return False
+
+    return value
 
 
 async def _execute_via_smithery_connect(mcp_url: str, tool_name: str, arguments: dict, config: dict, agent_id=None) -> str:
@@ -4573,6 +5142,39 @@ def _display_size(size_bytes: int) -> str:
     return f"{size_bytes}B" if size_bytes < 1024 else f"{size_bytes / 1024:.1f}KB"
 
 
+_BINARY_READ_SUFFIXES = {
+    ".aac", ".avi", ".bmp", ".doc", ".docx", ".flac", ".gif", ".gz",
+    ".ico", ".jpeg", ".jpg", ".m4a", ".m4v", ".mkv", ".mov", ".mp3",
+    ".mp4", ".ogg", ".opus", ".pdf", ".png", ".ppt", ".pptx", ".tar",
+    ".wav", ".webm", ".webp", ".xls", ".xlsx", ".zip",
+}
+
+
+def _binary_read_guidance(rel_path: str) -> str:
+    suffix = Path(rel_path).suffix.lower()
+    if suffix in {".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"}:
+        action = "Use read_document to extract its text."
+    elif suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}:
+        action = "Pass this workspace path directly as reference_image or first_frame_image; do not decode it as text."
+    else:
+        action = "Use the file preview/download path or a media-specific tool instead."
+    return f"❌ {rel_path} is a binary file and cannot be read as UTF-8 text. {action}"
+
+
+def _looks_like_binary(raw: bytes) -> bool:
+    sample = raw[:8192]
+    if not sample:
+        return False
+    if b"\x00" in sample:
+        return True
+    try:
+        sample.decode("utf-8")
+    except UnicodeDecodeError:
+        return True
+    control_count = sum(byte < 9 or 13 < byte < 32 for byte in sample)
+    return control_count / len(sample) > 0.02
+
+
 async def _storage_list_dir(agent_id: uuid.UUID, rel_path: str, tenant_id: str | None = None) -> str:
     storage = get_storage_backend()
     storage_key, normalized, is_enterprise = _tool_storage_key(agent_id, rel_path, tenant_id)
@@ -4626,7 +5228,10 @@ async def _storage_read_file(
     if not await storage.is_file(storage_key):
         return f"File not found: {rel_path}"
     try:
-        content = await storage.read_text(storage_key, encoding="utf-8", errors="replace")
+        raw = await storage.read_bytes(storage_key)
+        if Path(normalized).suffix.lower() in _BINARY_READ_SUFFIXES or _looks_like_binary(raw):
+            return _binary_read_guidance(rel_path)
+        content = raw.decode("utf-8")
         lines = content.splitlines()
         total_lines = len(lines)
         start = max(0, offset)
@@ -4820,7 +5425,10 @@ def _read_file(ws: Path, rel_path: str, tenant_id: str | None = None, offset: in
         return f"File not found: {rel_path}"
 
     try:
-        content = file_path.read_text(encoding="utf-8", errors="replace")
+        raw = file_path.read_bytes()
+        if file_path.suffix.lower() in _BINARY_READ_SUFFIXES or _looks_like_binary(raw):
+            return _binary_read_guidance(rel_path)
+        content = raw.decode("utf-8")
         lines = content.splitlines()
         total_lines = len(lines)
 
@@ -4872,7 +5480,10 @@ def _safe_document_cell_text(value: Any) -> str:
     return text
 
 
-def _read_document_sync(ws: Path, rel_path: str, max_chars: int = 8000, tenant_id: str | None = None) -> str:
+def _read_document_sync(
+    ws: Path, rel_path: str, max_chars: int = 8000, tenant_id: str | None = None,
+    page_start: int = 1, max_pages: int = 50,
+) -> str:
     """Synchronous document extraction. Must run outside the uvicorn event loop."""
     max_chars = min(max(int(max_chars), 1), 20000)
     try:
@@ -4900,7 +5511,9 @@ def _read_document_sync(ws: Path, rel_path: str, max_chars: int = 8000, tenant_i
             import pdfplumber
             text_parts = []
             with pdfplumber.open(str(file_path)) as pdf:
-                for i, page in enumerate(pdf.pages[:50]):  # Limit to 50 pages
+                start_index = max(page_start - 1, 0)
+                selected_pages = pdf.pages[start_index:start_index + max_pages]
+                for i, page in enumerate(selected_pages, start=start_index):
                     page_text = page.extract_text() or ""
                     if page_text:
                         text_parts.append(f"--- Page {i+1} ---\n{page_text}")
@@ -4988,7 +5601,8 @@ def _read_document_sync(ws: Path, rel_path: str, max_chars: int = 8000, tenant_i
             from pptx import Presentation
             prs = Presentation(str(file_path))
             slides = []
-            for i, slide in enumerate(prs.slides[:50]):
+            start_index = max(page_start - 1, 0)
+            for i, slide in enumerate(prs.slides[start_index:start_index + max_pages], start=start_index):
                 texts = []
                 for shape in slide.shapes:
                     if hasattr(shape, "text") and shape.text.strip():
@@ -5019,14 +5633,22 @@ def _read_document_worker(
     rel_path: str,
     max_chars: int,
     tenant_id: str | None,
+    page_start: int,
+    max_pages: int,
 ) -> None:
     try:
-        out_queue.put(("ok", _read_document_sync(Path(ws_str), rel_path, max_chars=max_chars, tenant_id=tenant_id)))
+        out_queue.put(("ok", _read_document_sync(
+            Path(ws_str), rel_path, max_chars=max_chars, tenant_id=tenant_id,
+            page_start=page_start, max_pages=max_pages,
+        )))
     except BaseException as exc:
         out_queue.put(("error", f"Document read failed: {str(exc)[:200]}"))
 
 
-def _read_pdf_fast_sync(ws: Path, rel_path: str, max_chars: int = 8000, tenant_id: str | None = None) -> str:
+def _read_pdf_fast_sync(
+    ws: Path, rel_path: str, max_chars: int = 8000, tenant_id: str | None = None,
+    page_start: int = 1, max_pages: int = 50,
+) -> str:
     """Fast PDF text extraction fallback for files that make pdfplumber/pdfminer hang."""
     max_chars = min(max(int(max_chars), 1), 20000)
     try:
@@ -5044,7 +5666,8 @@ def _read_pdf_fast_sync(ws: Path, rel_path: str, max_chars: int = 8000, tenant_i
 
         text_parts = []
         with fitz.open(str(file_path)) as doc:
-            for i, page in enumerate(doc[:50]):
+            start_index = max(page_start - 1, 0)
+            for i, page in enumerate(doc[start_index:start_index + max_pages], start=start_index):
                 page_text = page.get_text("text") or ""
                 if page_text:
                     text_parts.append(f"--- Page {i+1} ---\n{page_text}")
@@ -5066,19 +5689,27 @@ def _read_pdf_fast_worker(
     rel_path: str,
     max_chars: int,
     tenant_id: str | None,
+    page_start: int,
+    max_pages: int,
 ) -> None:
     try:
-        out_queue.put(("ok", _read_pdf_fast_sync(Path(ws_str), rel_path, max_chars=max_chars, tenant_id=tenant_id)))
+        out_queue.put(("ok", _read_pdf_fast_sync(
+            Path(ws_str), rel_path, max_chars=max_chars, tenant_id=tenant_id,
+            page_start=page_start, max_pages=max_pages,
+        )))
     except BaseException as exc:
         out_queue.put(("error", f"PDF fallback extraction failed: {str(exc)[:200]}"))
 
 
-def _read_pdf_fast_with_timeout(ws: Path, rel_path: str, max_chars: int = 8000, tenant_id: str | None = None) -> str:
+def _read_pdf_fast_with_timeout(
+    ws: Path, rel_path: str, max_chars: int = 8000, tenant_id: str | None = None,
+    page_start: int = 1, max_pages: int = 50,
+) -> str:
     ctx = mp.get_context("spawn")
     out_queue: mp.Queue = ctx.Queue(maxsize=1)
     proc = ctx.Process(
         target=_read_pdf_fast_worker,
-        args=(out_queue, str(ws), rel_path, max_chars, tenant_id),
+        args=(out_queue, str(ws), rel_path, max_chars, tenant_id, page_start, max_pages),
         daemon=True,
     )
     proc.start()
@@ -5105,13 +5736,16 @@ def _read_pdf_fast_with_timeout(ws: Path, rel_path: str, max_chars: int = 8000, 
     return str(payload)
 
 
-def _read_document_with_timeout(ws: Path, rel_path: str, max_chars: int = 8000, tenant_id: str | None = None) -> str:
+def _read_document_with_timeout(
+    ws: Path, rel_path: str, max_chars: int = 8000, tenant_id: str | None = None,
+    page_start: int = 1, max_pages: int = 50,
+) -> str:
     """Run document parsing in a killable child process so one bad file cannot freeze the site."""
     ctx = mp.get_context("spawn")
     out_queue: mp.Queue = ctx.Queue(maxsize=1)
     proc = ctx.Process(
         target=_read_document_worker,
-        args=(out_queue, str(ws), rel_path, max_chars, tenant_id),
+        args=(out_queue, str(ws), rel_path, max_chars, tenant_id, page_start, max_pages),
         daemon=True,
     )
     proc.start()
@@ -5123,7 +5757,10 @@ def _read_document_with_timeout(ws: Path, rel_path: str, max_chars: int = 8000, 
             proc.kill()
             proc.join(1)
         if Path(rel_path).suffix.lower() == ".pdf":
-            return _read_pdf_fast_with_timeout(ws, rel_path, max_chars=max_chars, tenant_id=tenant_id)
+            return _read_pdf_fast_with_timeout(
+                ws, rel_path, max_chars=max_chars, tenant_id=tenant_id,
+                page_start=page_start, max_pages=max_pages,
+            )
         return (
             f"Document read timed out after {_READ_DOCUMENT_TIMEOUT_SECONDS}s. "
             "The file may be too large or too complex to extract safely. "
@@ -5140,9 +5777,14 @@ def _read_document_with_timeout(ws: Path, rel_path: str, max_chars: int = 8000, 
     return str(payload)
 
 
-async def _read_document(ws: Path, rel_path: str, max_chars: int = 8000, tenant_id: str | None = None) -> str:
+async def _read_document(
+    ws: Path, rel_path: str, max_chars: int = 8000, tenant_id: str | None = None,
+    page_start: int = 1, max_pages: int = 50,
+) -> str:
     """Read content from office documents (PDF, DOCX, XLSX, PPTX)."""
-    return await asyncio.to_thread(_read_document_with_timeout, ws, rel_path, max_chars, tenant_id)
+    return await asyncio.to_thread(
+        _read_document_with_timeout, ws, rel_path, max_chars, tenant_id, page_start, max_pages,
+    )
 
 
 async def _read_document_from_storage(
@@ -5150,10 +5792,15 @@ async def _read_document_from_storage(
     rel_path: str,
     max_chars: int = 8000,
     tenant_id: str | None = None,
+    page_start: int = 1,
+    max_pages: int = 50,
 ) -> str:
     temp_workspace = await _prepare_temp_workspace(agent_id, tenant_id=tenant_id, paths=[rel_path])
     try:
-        return await _read_document(temp_workspace.root, rel_path, max_chars=max_chars, tenant_id=None)
+        return await _read_document(
+            temp_workspace.root, rel_path, max_chars=max_chars, tenant_id=None,
+            page_start=page_start, max_pages=max_pages,
+        )
     finally:
         temp_workspace.cleanup()
 
@@ -5550,7 +6197,10 @@ def _edit_file(ws: Path, rel_path: str, old_string: str, new_string: str, replac
         content = file_path.read_text(encoding="utf-8")
 
         if old_string not in content:
-            return f"❌ 'old_string' not found in {rel_path}. Please check the exact text including whitespace and newlines."
+            return (
+                f"⚠️ No changes made: 'old_string' was not found in {rel_path}. "
+                "The file may already be up to date."
+            )
 
         if replace_all:
             new_content = content.replace(old_string, new_string)
@@ -5846,8 +6496,33 @@ async def _send_feishu_message(agent_id: uuid.UUID, args: dict) -> str:
                         receive_id_type="user_id",
                     )
                     if resp.get("code") == 0:
-                        # Save to history session
-                        await _save_outgoing_to_feishu_session(direct_user_id)
+                        try:
+                            agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
+                            agent_obj = agent_r.scalar_one_or_none()
+                            platform_user = await get_platform_user_by_org_member(
+                                db=db,
+                                org_member=direct_rel.member,
+                                agent_tenant_id=agent_obj.tenant_id if agent_obj else None,
+                            )
+                            sess = await find_or_create_channel_session(
+                                db=db,
+                                agent_id=agent_id,
+                                user_id=platform_user.id,
+                                external_conv_id=f"feishu_p2p_{direct_user_id}",
+                                source_channel="feishu",
+                                first_message_title=f"[Agent → {direct_user_id}]",
+                            )
+                            db.add(ChatMessage(
+                                agent_id=agent_id,
+                                user_id=platform_user.id,
+                                role="assistant",
+                                content=message_text,
+                                conversation_id=str(sess.id),
+                            ))
+                            sess.last_message_at = datetime.now(timezone.utc)
+                            await db.commit()
+                        except Exception as history_error:
+                            logger.error(f"[Feishu] Failed to save outgoing message to history: {history_error}")
                         return f"✅ 消息已发送（user_id: {direct_user_id}）"
                     return f"❌ 发送失败：{resp.get('msg')} (code {resp.get('code')})"
                 except FeishuAPIError as user_id_err:
@@ -6521,14 +7196,20 @@ async def _send_platform_message(agent_id: uuid.UUID, args: dict) -> str:
             if await ensure_access_granted_platform_relationships(db, agent, created_by_user_id=agent.creator_id):
                 await db.flush()
 
-            # 1. Look up target user by username or display_name within tenant
+            # 1. Look up target user by username or display_name within tenant.
+            # User.username is an association_proxy and cannot be used as a SQL
+            # column expression.  Join the canonical Identity table explicitly.
+            from app.models.user import Identity
 
-            query = select(UserModel).where(
+            query = select(UserModel).join(
+                Identity,
+                UserModel.identity_id == Identity.id,
+            ).where(
                 or_(
-                    UserModel.username == username,
+                    Identity.username == username,
                     UserModel.display_name == username,
                 )
-            )
+            ).options(selectinload(UserModel.identity))
             if agent.tenant_id:
                 query = query.where(UserModel.tenant_id == agent.tenant_id)
 
@@ -6536,12 +7217,16 @@ async def _send_platform_message(agent_id: uuid.UUID, args: dict) -> str:
             target_user = u_result.scalar_one_or_none()
             if not target_user:
                 # List available users for the agent to pick from (within the same tenant)
-                list_query = select(UserModel.username, UserModel.display_name).limit(20)
+                list_query = (
+                    select(Identity.username, UserModel.display_name)
+                    .join(Identity, UserModel.identity_id == Identity.id)
+                    .limit(20)
+                )
                 if agent.tenant_id:
                     list_query = list_query.where(UserModel.tenant_id == agent.tenant_id)
                 
                 all_r = await db.execute(list_query)
-                names = [f"{r.display_name or r.username}" for r in all_r.all()]
+                names = [display_name or identity_username for identity_username, display_name in all_r.all()]
                 return f"❌ No user named '{username}' found in your organization. Available users: {', '.join(names) if names else 'none'}"
 
             rel_result = await db.execute(
@@ -6867,6 +7552,8 @@ async def _resolve_a2a_target(
     base_filter = [AgentModel.id != from_agent_id]
     if source_tenant_id:
         base_filter.append(AgentModel.tenant_id == source_tenant_id)
+    else:
+        base_filter.append(AgentModel.tenant_id.is_(None))
 
     exact_result = await db.execute(
         select(AgentModel).where(AgentModel.name == agent_name, *base_filter)
@@ -6932,6 +7619,8 @@ async def _create_on_message_trigger(
     trigger_name: str,
     from_agent_name: str,
     reason: str,
+    from_agent_id: uuid.UUID | None = None,
+    expected_conversation_id: str | None = None,
     focus_ref: str | None = None,
     notification_summary: str | None = None,
     origin_session_id: str | None = None,
@@ -6948,6 +7637,10 @@ async def _create_on_message_trigger(
     )
 
     config: dict = {"from_agent_name": from_agent_name}
+    if from_agent_id:
+        config["from_agent_id"] = str(from_agent_id)
+    if expected_conversation_id:
+        config["expected_conversation_id"] = expected_conversation_id
     if notification_summary:
         config["_notification_summary"] = notification_summary
     if origin_session_id:
@@ -7024,19 +7717,60 @@ async def _append_focus_item(agent_id: uuid.UUID, identifier: str, description: 
         logger.warning(f"[A2A] Failed to update Focus for agent {agent_id}: {e}")
 
 
-async def _wake_agent_async(agent_id: uuid.UUID, reason_context: str, *, from_agent_id: uuid.UUID | None = None, skip_dedup: bool = False, a2a_session_id: str | None = None) -> None:
+async def _cleanup_failed_delegate(
+    agent_id: uuid.UUID,
+    trigger_name: str,
+    focus_ref: str,
+) -> None:
+    """Disable callback state when the delegated task was not queued."""
+    try:
+        from app.models.trigger import AgentTrigger
+
+        async with async_session() as db:
+            result = await db.execute(
+                select(AgentTrigger).where(
+                    AgentTrigger.agent_id == agent_id,
+                    AgentTrigger.name == trigger_name,
+                )
+            )
+            trigger = result.scalar_one_or_none()
+            if trigger:
+                trigger.is_enabled = False
+                await db.commit()
+    except Exception as exc:
+        logger.warning(f"[A2A] Failed to disable callback {trigger_name}: {exc}")
+    try:
+        await complete_focus_item(agent_id, key=focus_ref)
+    except Exception as exc:
+        logger.warning(f"[A2A] Failed to close focus {focus_ref}: {exc}")
+
+
+async def _wake_agent_async(
+    agent_id: uuid.UUID,
+    reason_context: str,
+    *,
+    from_agent_id: uuid.UUID | None = None,
+    skip_dedup: bool = False,
+    a2a_session_id: str | None = None,
+    message_kind: str = "notify",
+    idempotency_key: str | None = None,
+    source_message_id: uuid.UUID | None = None,
+) -> bool:
     """Wake an agent asynchronously via the trigger invocation path.
 
     Delegates to the public wake_agent_with_context API in trigger_daemon.
     """
     from app.services.trigger_daemon import wake_agent_with_context
-    kwargs = {"from_agent_id": from_agent_id, "skip_dedup": skip_dedup}
+    kwargs = {
+        "from_agent_id": from_agent_id,
+        "skip_dedup": skip_dedup,
+        "message_kind": message_kind,
+        "idempotency_key": idempotency_key,
+        "source_message_id": source_message_id,
+    }
     if a2a_session_id is not None:
         kwargs["a2a_session_id"] = a2a_session_id
-    await wake_agent_with_context(agent_id, reason_context, **kwargs)
-
-
-from dataclasses import dataclass, field
+    return await wake_agent_with_context(agent_id, reason_context, **kwargs)
 
 
 @dataclass
@@ -7044,6 +7778,7 @@ class A2AContext:
     source_agent: AgentModel
     target_agent: AgentModel
     chat_session_id: str
+    source_message_id: uuid.UUID
     session_agent_id: uuid.UUID
     owner_id: uuid.UUID
     src_participant_id: uuid.UUID | None
@@ -7054,7 +7789,7 @@ class A2AContext:
     origin_session_id: str | None
     primary_model: Optional["LLMModel"] = None
     fallback_model: Optional["LLMModel"] = None
-    conversation_history: list[dict] = field(default_factory=list)
+    conversation_history: list[dict] = dataclass_field(default_factory=list)
 
 
 async def _build_a2a_context(
@@ -7074,8 +7809,6 @@ async def _build_a2a_context(
     try:
         from app.models.participant import Participant
         from app.models.llm import LLMModel
-        from app.services.llm.utils import get_model_api_key
-
         origin_source_channel = "web"
         
         async with async_session() as db:
@@ -7101,6 +7834,8 @@ async def _build_a2a_context(
             base_filter = [AgentModel.id != from_agent_id]
             if source_tenant_id:
                 base_filter.append(AgentModel.tenant_id == source_tenant_id)
+            else:
+                base_filter.append(AgentModel.tenant_id.is_(None))
 
             # Find target agent by name — exact match first, then fuzzy
             target = None
@@ -7178,7 +7913,9 @@ async def _build_a2a_context(
             session_id = str(chat_session.id)
 
             # Save source message (common to all paths)
+            source_message_id = uuid.uuid4()
             db.add(ChatMessage(
+                id=source_message_id,
                 agent_id=session_agent_id,
                 user_id=owner_id,
                 role="user",
@@ -7194,6 +7931,7 @@ async def _build_a2a_context(
                     source_agent=source_agent,
                     target_agent=target,
                     chat_session_id=session_id,
+                    source_message_id=source_message_id,
                     session_agent_id=session_agent_id,
                     owner_id=owner_id,
                     src_participant_id=src_participant_id,
@@ -7258,6 +7996,7 @@ async def _build_a2a_context(
                 source_agent=source_agent,
                 target_agent=target,
                 chat_session_id=session_id,
+                source_message_id=source_message_id,
                 session_agent_id=session_agent_id,
                 owner_id=owner_id,
                 src_participant_id=src_participant_id,
@@ -7310,6 +8049,23 @@ async def _a2a_handle_openclaw(ctx: A2AContext) -> str:
 async def _a2a_handle_notify(ctx: A2AContext) -> str:
     try:
         try:
+            accepted = await _wake_agent_async(
+                ctx.target_agent.id,
+                f"[From {ctx.source_agent.name}] {ctx.message_text}",
+                from_agent_id=ctx.source_agent.id,
+                skip_dedup=True,
+                a2a_session_id=ctx.chat_session_id,
+                message_kind="notify",
+                idempotency_key=f"a2a:{ctx.source_message_id}",
+                source_message_id=ctx.source_message_id,
+            )
+        except Exception as e:
+            logger.exception(f"[A2A] Failed to queue notify for {ctx.target_agent.name}: {e}")
+            return f"❌ Notification delivery failed ({type(e).__name__}): {str(e)[:200]}"
+        if not accepted:
+            return f"❌ Notification to {ctx.target_agent.name} could not be queued. Please retry."
+
+        try:
             from app.services.activity_logger import log_activity
             await log_activity(
                 ctx.source_agent.id, "agent_msg_sent",
@@ -7319,17 +8075,6 @@ async def _a2a_handle_notify(ctx: A2AContext) -> str:
         except Exception:
             pass
 
-        try:
-            await _wake_agent_async(
-                ctx.target_agent.id,
-                f"[From {ctx.source_agent.name}] {ctx.message_text}",
-                from_agent_id=ctx.source_agent.id,
-                skip_dedup=True,
-                a2a_session_id=ctx.chat_session_id,
-            )
-        except Exception as e:
-            logger.warning(f"[A2A] Failed to wake {ctx.target_agent.name} for notify: {e}")
-
         return f"✅ Notification sent to {ctx.target_agent.name}. They will process it asynchronously."
     except Exception as e:
         logger.exception(f"[A2A] _a2a_handle_notify failed: from={ctx.source_agent.id}, to={ctx.target_agent.id}")
@@ -7338,15 +8083,11 @@ async def _a2a_handle_notify(ctx: A2AContext) -> str:
 
 async def _a2a_handle_task_delegate(ctx: A2AContext) -> str:
     try:
-        focus_id = f"wait_{ctx.target_agent.name.lower().replace(' ', '_')}_task"
+        target_slug = re.sub(r"[^a-z0-9]+", "_", ctx.target_agent.name.lower()).strip("_")[:32] or "agent"
+        task_suffix = ctx.source_message_id.hex
+        focus_id = f"wait_{target_slug}_{task_suffix}"
         focus_desc = f"Waiting for {ctx.target_agent.name} to complete delegated task: {ctx.message_text[:100]}"
-
-        try:
-            await _append_focus_item(ctx.source_agent.id, focus_id, focus_desc)
-        except Exception as e:
-            logger.warning(f"[A2A] Failed to write focus for delegate: {e}")
-
-        trigger_name = f"a2a_wait_{ctx.target_agent.name.lower().replace(' ', '_')}"
+        trigger_name = f"a2a_wait_{target_slug}_{task_suffix}"
         trigger_reason = (
             f"{ctx.target_agent.name} has replied with the result of a delegated task. "
             f"Original task: {ctx.message_text[:200]}. "
@@ -7366,6 +8107,8 @@ async def _a2a_handle_task_delegate(ctx: A2AContext) -> str:
                 agent_id=ctx.source_agent.id,
                 trigger_name=trigger_name,
                 from_agent_name=ctx.target_agent.name,
+                from_agent_id=ctx.target_agent.id,
+                expected_conversation_id=ctx.chat_session_id,
                 reason=trigger_reason,
                 focus_ref=focus_id,
                 notification_summary=f"等待{ctx.target_agent.name}完成任务并回复",
@@ -7374,7 +8117,32 @@ async def _a2a_handle_task_delegate(ctx: A2AContext) -> str:
                 origin_source_channel=ctx.origin_source_channel,
             )
         except Exception as e:
-            logger.warning(f"[A2A] Failed to create trigger for delegate: {e}")
+            logger.exception(f"[A2A] Failed to create callback for delegate: {e}")
+            return f"❌ Task delegation setup failed ({type(e).__name__}): {str(e)[:200]}"
+
+        try:
+            accepted = await _wake_agent_async(
+                ctx.target_agent.id,
+                f"[From {ctx.source_agent.name}] {ctx.message_text}",
+                from_agent_id=ctx.source_agent.id,
+                skip_dedup=True,
+                a2a_session_id=ctx.chat_session_id,
+                message_kind="task_delegate",
+                idempotency_key=f"a2a:{ctx.source_message_id}",
+                source_message_id=ctx.source_message_id,
+            )
+        except Exception as e:
+            logger.exception(f"[A2A] Failed to queue delegate for {ctx.target_agent.name}: {e}")
+            await _cleanup_failed_delegate(ctx.source_agent.id, trigger_name, focus_id)
+            return f"❌ Task delivery failed ({type(e).__name__}): {str(e)[:200]}"
+        if not accepted:
+            await _cleanup_failed_delegate(ctx.source_agent.id, trigger_name, focus_id)
+            return f"❌ Task for {ctx.target_agent.name} could not be queued. Please retry."
+
+        try:
+            await _append_focus_item(ctx.source_agent.id, focus_id, focus_desc)
+        except Exception as e:
+            logger.warning(f"[A2A] Failed to write focus for delegate: {e}")
 
         try:
             from app.services.activity_logger import log_activity
@@ -7385,17 +8153,6 @@ async def _a2a_handle_task_delegate(ctx: A2AContext) -> str:
             )
         except Exception:
             pass
-
-        try:
-            await _wake_agent_async(
-                ctx.target_agent.id,
-                f"[From {ctx.source_agent.name}] {ctx.message_text}",
-                from_agent_id=ctx.source_agent.id,
-                skip_dedup=True,
-                a2a_session_id=ctx.chat_session_id,
-            )
-        except Exception as e:
-            logger.warning(f"[A2A] Failed to wake {ctx.target_agent.name} for delegate: {e}")
 
         return f"✅ Task delegated to {ctx.target_agent.name}. You will be notified when they complete it."
     except Exception as e:
@@ -7989,6 +8746,8 @@ async def _execute_code_legacy(ws: Path, arguments: dict, allow_network: bool = 
 
     # Write code to a temp file inside workspace
     script_path = work_dir / f"_exec_tmp{ext}"
+    proc = None
+    reader_tasks: list[asyncio.Task] = []
     try:
         script_path.write_text(code, encoding="utf-8")
 
@@ -8003,6 +8762,7 @@ async def _execute_code_legacy(ws: Path, arguments: dict, allow_network: bool = 
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=safe_env,
+            start_new_session=True,
         )
 
         stdout_data = bytearray()
@@ -8025,17 +8785,19 @@ async def _execute_code_legacy(ws: Path, arguments: dict, allow_network: bool = 
                     except Exception:
                         pass
 
-        task1 = asyncio.create_task(read_stream(proc.stdout, stdout_data, "stdout"))
-        task2 = asyncio.create_task(read_stream(proc.stderr, stderr_data, "stderr"))
+        reader_tasks = [
+            asyncio.create_task(read_stream(proc.stdout, stdout_data, "stdout")),
+            asyncio.create_task(read_stream(proc.stderr, stderr_data, "stderr")),
+        ]
 
         is_timeout = False
         try:
             await asyncio.wait_for(proc.wait(), timeout=timeout)
         except asyncio.TimeoutError:
-            proc.kill()
             is_timeout = True
+            await terminate_process_group(proc)
 
-        await asyncio.gather(task1, task2)
+        await settle_tasks(reader_tasks)
         stdout = bytes(stdout_data)
         stderr = bytes(stderr_data)
 
@@ -8063,6 +8825,9 @@ async def _execute_code_legacy(ws: Path, arguments: dict, allow_network: bool = 
     except Exception as e:
         return f"❌ Execution error: {str(e)[:200]}"
     finally:
+        if proc is not None and proc.returncode is None:
+            await terminate_process_group(proc)
+        await settle_tasks(reader_tasks)
         # Clean up temp script
         try:
             script_path.unlink(missing_ok=True)
@@ -8124,12 +8889,22 @@ async def _handle_set_trigger(
 
     name = arguments.get("name", "").strip()
     ttype = arguments.get("type", "").strip()
-    config = dict(arguments.get("config", {}) or {})
+    raw_config = arguments.get("config", {}) or {}
+    if isinstance(raw_config, str):
+        try:
+            raw_config = json.loads(raw_config)
+        except json.JSONDecodeError:
+            return "❌ Invalid trigger config: expected a JSON object"
+    if not isinstance(raw_config, dict):
+        return "❌ Invalid trigger config: expected a JSON object"
+    config = dict(raw_config)
     reason = arguments.get("reason", "").strip()
     focus_ref = arguments.get("focus_ref", "") or arguments.get("agenda_ref", "")  # backward compat
 
     if not name:
         return "❌ Missing required argument 'name'"
+    if name == "__a2a_wake__":
+        return "❌ This trigger name is reserved for internal message delivery"
     if ttype not in VALID_TRIGGER_TYPES:
         return f"❌ Invalid trigger type '{ttype}'. Valid types: {', '.join(VALID_TRIGGER_TYPES)}"
     if not reason:
@@ -8188,10 +8963,12 @@ async def _handle_set_trigger(
         except Exception:
             pass  # Fallback to trigger.created_at in the daemon
     elif ttype == "webhook":
-        # Auto-generate a unique token for the webhook URL
+        # URL possession alone is not authentication. Generate a strong URL
+        # token plus an independent HMAC secret for every webhook trigger.
         import secrets
-        token = secrets.token_urlsafe(8)  # ~11 chars, URL-safe
-        config["token"] = token
+        config["token"] = secrets.token_urlsafe(24)
+        if not str(config.get("secret") or "").strip():
+            config["secret"] = secrets.token_urlsafe(32)
 
     # Record the session that created this trigger so trigger results can later be routed to
     # the correct destination instead of being broadcast to every live web session.
@@ -8223,12 +9000,27 @@ async def _handle_set_trigger(
             _agent_obj = _a_result.scalar_one_or_none()
             agent_max_triggers = (_agent_obj.max_triggers if _agent_obj else None) or MAX_TRIGGERS_PER_AGENT
 
+            # Tenant-level trigger quota (Plan max_triggers). No-op without subscription.
+            try:
+                from app.services.quota_guard import check_trigger_quota
+                tenant_id_for_quota = getattr(_agent_obj, "tenant_id", None)
+                if tenant_id_for_quota:
+                    try:
+                        tenant_id_for_quota = uuid.UUID(str(tenant_id_for_quota))
+                    except (TypeError, ValueError):
+                        tenant_id_for_quota = None
+                if tenant_id_for_quota:
+                    await check_trigger_quota(tenant_id_for_quota)
+            except Exception as _tq:
+                return f"❌ {_tq.message if hasattr(_tq, 'message') else _tq}"
+
             # Check max triggers
             from sqlalchemy import func as sa_func
             result = await db.execute(
                 select(sa_func.count()).select_from(AgentTrigger).where(
                     AgentTrigger.agent_id == agent_id,
-                    AgentTrigger.is_enabled == True,
+                    AgentTrigger.is_enabled.is_(True),
+                    AgentTrigger.is_system.is_(False),
                 )
             )
             count = result.scalar() or 0
@@ -8244,15 +9036,21 @@ async def _handle_set_trigger(
             )
             existing = result.scalar_one_or_none()
             if existing:
+                if existing.is_system:
+                    return f"❌ System trigger '{name}' cannot be replaced"
                 if existing.is_enabled:
                     return f"❌ Trigger '{name}' already exists and is active. Use update_trigger to modify it, or cancel_trigger first."
                 else:
                     # Re-enable disabled trigger with new config (preserve fire history)
                     # For webhook triggers: reuse the old token so the URL stays stable
                     if ttype == "webhook":
-                        old_token = (existing.config or {}).get("token")
+                        old_webhook_config = existing.config or {}
+                        old_token = old_webhook_config.get("token")
                         if old_token:
                             config["token"] = old_token
+                        old_secret = old_webhook_config.get("secret")
+                        if old_secret:
+                            config["secret"] = old_secret
                     existing.type = ttype
                     existing.config = config
                     existing.reason = reason
@@ -8263,6 +9061,17 @@ async def _handle_set_trigger(
                     if existing.max_fires and existing.fire_count >= existing.max_fires:
                         existing.fire_count = 0
                     await db.commit()
+                    if ttype == "webhook":
+                        from app.services.platform_service import platform_service
+
+                        base = await platform_service.get_public_base_url(db)
+                        webhook_url = f"{base.rstrip('/')}/api/webhooks/t/{config['token']}"
+                        return (
+                            f"✅ Webhook trigger '{name}' re-enabled.\n\n"
+                            f"Webhook URL: {webhook_url}\n"
+                            f"HMAC secret: {config['secret']}\n"
+                            "Unsigned requests are rejected."
+                        )
                     return f"✅ Trigger '{name}' re-enabled with new configuration ({ttype}, fired {existing.fire_count} times so far)"
 
             trigger = AgentTrigger(
@@ -8294,10 +9103,16 @@ async def _handle_set_trigger(
         # Return webhook URL for webhook triggers
         if ttype == "webhook":
             from app.services.platform_service import platform_service
-            base = await platform_service.get_public_base_url()
+            base = await platform_service.get_public_base_url(db)
             webhook_url = f"{base.rstrip('/')}/api/webhooks/t/{config['token']}"
 
-            return f"✅ Webhook trigger '{name}' created.\n\nWebhook URL: {webhook_url}\n\nTell the user to configure this URL in their external service (e.g. GitHub, Grafana). When the service sends a POST to this URL, you will be woken up with the payload as context."
+            return (
+                f"✅ Webhook trigger '{name}' created.\n\n"
+                f"Webhook URL: {webhook_url}\n"
+                f"HMAC secret: {config['secret']}\n"
+                "Signature header: X-Hub-Signature-256: sha256=<hex HMAC-SHA256 of the raw request body>\n\n"
+                "Configure both the URL and secret in the external service. Unsigned requests are rejected."
+            )
 
         return f"✅ Trigger '{name}' created ({ttype}). It will fire according to your config and wake you up with the reason as context."
 
@@ -8316,6 +9131,14 @@ async def _handle_update_trigger(agent_id: uuid.UUID, arguments: dict) -> str:
     new_config = arguments.get("config")
     new_reason = arguments.get("reason")
 
+    if isinstance(new_config, str):
+        try:
+            new_config = json.loads(new_config)
+        except json.JSONDecodeError:
+            return "❌ Invalid trigger config: expected a JSON object"
+    if new_config is not None and not isinstance(new_config, dict):
+        return "❌ Invalid trigger config: expected a JSON object"
+
     if new_config is None and new_reason is None:
         return "❌ Provide at least one of 'config' or 'reason' to update"
 
@@ -8330,12 +9153,24 @@ async def _handle_update_trigger(agent_id: uuid.UUID, arguments: dict) -> str:
             trigger = result.scalar_one_or_none()
             if not trigger:
                 return f"❌ Trigger '{name}' not found"
+            if trigger.is_system:
+                return f"❌ System trigger '{name}' cannot be modified"
 
             changes = []
             if new_config is not None:
-                old_config = trigger.config
-                trigger.config = new_config
-                changes.append(f"config: {old_config} → {new_config}")
+                old_config = dict(trigger.config or {})
+                merged_config = {**old_config, **new_config}
+                if trigger.type == "webhook":
+                    # Never remove the stable URL token or required signing
+                    # secret through a partial settings update.
+                    for protected_key in ("token", "secret"):
+                        if not str(new_config.get(protected_key) or "").strip():
+                            if old_config.get(protected_key):
+                                merged_config[protected_key] = old_config[protected_key]
+                    if not str(merged_config.get("secret") or "").strip():
+                        return "❌ Webhook triggers require an HMAC secret"
+                trigger.config = merged_config
+                changes.append("config updated")
             if new_reason is not None:
                 trigger.reason = new_reason
                 changes.append(f"reason updated")
@@ -8375,6 +9210,8 @@ async def _handle_cancel_trigger(agent_id: uuid.UUID, arguments: dict) -> str:
             trigger = result.scalar_one_or_none()
             if not trigger:
                 return f"❌ Trigger '{name}' not found"
+            if trigger.is_system:
+                return f"❌ System trigger '{name}' cannot be cancelled"
             if not trigger.is_enabled:
                 return f"ℹ️ Trigger '{name}' is already disabled"
 
@@ -8402,6 +9239,7 @@ async def _handle_list_triggers(agent_id: uuid.UUID) -> str:
             result = await db.execute(
                 select(AgentTrigger).where(
                     AgentTrigger.agent_id == agent_id,
+                    AgentTrigger.name != "__a2a_wake__",
                 ).order_by(AgentTrigger.created_at.desc())
             )
             triggers = result.scalars().all()
@@ -8412,7 +9250,10 @@ async def _handle_list_triggers(agent_id: uuid.UUID) -> str:
         lines = ["| Name | Type | Config | Reason | Status | Fires |", "|------|------|--------|--------|--------|-------|"]
         for t in triggers:
             status = "✅ active" if t.is_enabled else "⏸ disabled"
-            config_str = str(t.config)[:50]
+            visible_config = dict(t.config or {})
+            if "secret" in visible_config:
+                visible_config["secret"] = "********"
+            config_str = str(visible_config)[:80]
             reason_str = t.reason[:40] if t.reason else ""
             lines.append(f"| {t.name} | {t.type} | {config_str} | {reason_str} | {status} | {t.fire_count} |")
 
@@ -8540,7 +9381,14 @@ async def _upload_image(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
 
 # ─── Image Generation (Multi-Provider) ────────────────────────────────────────
 
-async def _generate_image(agent_id: uuid.UUID, ws: Path, arguments: dict, provider: str) -> str:
+async def _generate_image(
+    agent_id: uuid.UUID,
+    ws: Path,
+    arguments: dict,
+    provider: str,
+    user_id: uuid.UUID | None = None,
+    saas_tier: str | None = None,
+) -> str:
     """Generate an image using the configured provider and save to workspace.
 
     Supported providers:
@@ -8561,6 +9409,14 @@ async def _generate_image(agent_id: uuid.UUID, ws: Path, arguments: dict, provid
 
     size = arguments.get("size", "1024x1024")
     save_path = arguments.get("save_path", "")
+    overlay_text = (arguments.get("overlay_text") or "").strip()
+    overlay_position = (arguments.get("overlay_position") or "bottom").strip().lower()
+    from app.services.media_assets import MAX_OVERLAY_TEXT_CHARS
+
+    if len(overlay_text) > MAX_OVERLAY_TEXT_CHARS:
+        return f"❌ overlay_text must be at most {MAX_OVERLAY_TEXT_CHARS} characters"
+    if overlay_position not in {"top", "center", "bottom"}:
+        return "❌ overlay_position must be top, center, or bottom"
 
     # Load tool config (global -> per-agent override)
     tool_key = f"generate_image_{provider}"
@@ -8568,8 +9424,57 @@ async def _generate_image(agent_id: uuid.UUID, ws: Path, arguments: dict, provid
     model = config.get("model", "")
     api_key = config.get("api_key", "")
     base_url = config.get("base_url", "")
+    minimax_cred_id: uuid.UUID | None = None
+    minimax_tier: str | None = None
+    minimax_tenant_id: uuid.UUID | None = None
+    minimax_credit_cost = 0
 
-    if not api_key:
+    # MiniMax uses the central credential pool (账号池) instead of per-tool config
+    if provider == "minimax":
+        from app.services.llm.load_balancer import NoCredentialAvailable, no_credential_user_message, pick_credential
+        from app.services.llm.utils import get_credential_api_key
+        from app.services.minimax_media_profiles import load_platform_minimax_media_profile
+        from app.services.provider_pricing import minimax_image_credits
+        minimax_tier = await _resolve_minimax_tool_tier(agent_id, config, saas_tier)
+        profile = await load_platform_minimax_media_profile("image", minimax_tier)
+        if not profile.enabled:
+            return f"❌ MiniMax image generation is disabled for the {minimax_tier} tier."
+        model = profile.model
+        quota_error = await _check_minimax_tool_allowed(
+            agent_id,
+            modality="image",
+            tier=minimax_tier,
+        )
+        if quota_error:
+            return quota_error
+        minimax_credit_cost = minimax_image_credits(model or "image-01", images=1)
+        minimax_tenant_id = await _get_minimax_tenant_uuid(agent_id)
+        if minimax_tenant_id:
+            try:
+                await _check_minimax_credit_amount(minimax_tenant_id, minimax_credit_cost)
+            except Exception as exc:
+                from app.services.quota_guard import QuotaExceeded
+                if isinstance(exc, QuotaExceeded):
+                    return f"⚠️ {exc.message}"
+                raise
+        try:
+            cred = await pick_credential("minimax", modality="image")
+            minimax_cred_id = cred.id
+            api_key = get_credential_api_key(cred)
+            base_url = _minimax_default_base_url(cred.base_url)
+        except NoCredentialAvailable as exc:
+            await _record_minimax_tool_product_issue(
+                agent_id,
+                "image",
+                error_code=exc.reason_code.value,
+                model=model,
+                tier=minimax_tier,
+                user_id=user_id,
+                category="credential",
+                severity="critical" if exc.reason_code.value == "all_unhealthy" else "error",
+            )
+            return f"❌ {no_credential_user_message(exc)}"
+    elif not api_key:
         return (
             "❌ Image generation API key not configured. "
             "Ask your admin to configure it in Enterprise Settings → Tools → Generate Image."
@@ -8585,8 +9490,12 @@ async def _generate_image(agent_id: uuid.UUID, ws: Path, arguments: dict, provid
 
     # Ensure the target directory exists and path is within workspace
     full_save_path = (ws / save_path).resolve()
-    if not str(full_save_path).startswith(str(ws.resolve())):
+    try:
+        full_save_path.relative_to(ws.resolve())
+    except ValueError:
         return "❌ Access denied: save path is outside the workspace"
+    if full_save_path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
+        return "❌ Unsupported image output format. Use .png, .jpg, .jpeg, or .webp."
     full_save_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -8624,18 +9533,75 @@ async def _generate_image(agent_id: uuid.UUID, ws: Path, arguments: dict, provid
                 prompt=prompt,
                 size=size,
             )
+        elif provider == "minimax":
+            from app.services.media_assets import image_reference_for_provider
+
+            reference_image = image_reference_for_provider(
+                ws,
+                arguments.get("reference_image"),
+                label="Reference image",
+            )
+            provider_prompt = prompt
+            if overlay_text:
+                provider_prompt = (
+                    f"{prompt}\nCreate only the visual scene. Do not render words, letters, captions, "
+                    "logos, or watermarks; exact copy will be added after generation."
+                )
+            try:
+                image_bytes = await _generate_image_minimax(
+                    api_key=api_key,
+                    base_url=base_url,
+                    model=model,
+                    prompt=provider_prompt,
+                    aspect_ratio=arguments.get("aspect_ratio", "1:1"),
+                    reference_image=reference_image,
+                )
+            except Exception as e:
+                if minimax_cred_id:
+                    await _mark_minimax_tool_credential_failure(minimax_cred_id, e)
+                raise
         else:
-            return f"❌ Unknown image generation provider: {provider}. Supported: siliconflow, openai, google, custom"
+            return f"❌ Unknown image generation provider: {provider}. Supported: siliconflow, openai, google, custom, minimax"
 
         if not image_bytes:
             return "❌ Image generation returned empty result. Please try a different prompt."
 
-        # Save the generated image to workspace
+        from app.services.media_assets import apply_image_text_overlay, validate_generated_image
+
+        validate_generated_image(image_bytes)
+        image_bytes = apply_image_text_overlay(
+            image_bytes,
+            overlay_text,
+            position=overlay_position,
+            output_format=full_save_path.suffix,
+        )
+        validate_generated_image(image_bytes)
+
+        # Persist before usage/credit settlement. A valid provider response is
+        # not a billable product result until the workspace artifact exists.
         full_save_path.write_bytes(image_bytes)
+
+        # Settle only after provider validation, deterministic post-process,
+        # and local workspace persistence have all succeeded.
+        if provider == "minimax":
+            if minimax_cred_id:
+                await _record_minimax_tool_success(agent_id, minimax_cred_id, tier=minimax_tier or "lite")
+            if minimax_tenant_id and minimax_credit_cost > 0:
+                await _charge_minimax_tool_credits(
+                    tenant_id=minimax_tenant_id,
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    action="image",
+                    modality="image",
+                    tier=minimax_tier or "lite",
+                    model=model or "image-01",
+                    credits=minimax_credit_cost,
+                )
+
         size_kb = len(image_bytes) / 1024
 
-        # Build the API path for inline display in chat
-        # The MarkdownRenderer will auto-inject the auth token for /api/agents/ paths
+        # Build the same-origin API path for inline display in chat. Browser
+        # media requests authenticate through the HttpOnly session cookie.
         api_image_path = f"/api/agents/{agent_id}/files/download?path={save_path}"
 
         return (
@@ -8644,16 +9610,1285 @@ async def _generate_image(agent_id: uuid.UUID, ws: Path, arguments: dict, provid
             f"Display this image to the user using this exact markdown:\n"
             f"![generated image]({api_image_path})"
         )
-    except httpx.TimeoutException:
+    except httpx.TimeoutException as exc:
+        if provider == "minimax":
+            await _record_minimax_tool_product_issue(
+                agent_id,
+                "image",
+                error=exc,
+                model=model,
+                tier=minimax_tier,
+                user_id=user_id,
+            )
         logger.error(f"[GenerateImage] Timeout ({provider}): took longer than 120 seconds or network unreachable.")
         return (
             f"❌ Image generation failed ({provider}): API request timed out after 120 seconds. "
             f"This is usually caused by network issues or the model taking too long to generate."
         )
     except Exception as e:
+        if provider == "minimax":
+            await _record_minimax_tool_product_issue(
+                agent_id,
+                "image",
+                error=e,
+                model=model,
+                tier=minimax_tier,
+                user_id=user_id,
+            )
         err_msg = str(e) or type(e).__name__
         logger.error(f"[GenerateImage] Error ({provider}): {err_msg}")
         return f"❌ Image generation failed ({provider}): {err_msg[:400]}"
+
+
+async def _check_minimax_tool_allowed(agent_id: uuid.UUID, modality: str, tier: str) -> str | None:
+    """Return a user-facing denial message if a MiniMax tool call is not allowed."""
+    from app.services.quota_guard import (
+        QuotaExceeded,
+        check_agent_llm_quota,
+        check_plan_generation_entitlement,
+    )
+
+    try:
+        await check_plan_generation_entitlement(
+            agent_id,
+            modality=modality,
+            saas_tier=tier,
+        )
+        await check_agent_llm_quota(agent_id, model_tier=tier)
+    except QuotaExceeded as e:
+        return f"⚠️ {e.message}"
+    return None
+
+
+_SAAS_MINIMAX_TIERS = {"lite", "pro", "ultra"}
+_LEGACY_MINIMAX_TIER_MAP = {"basic": "lite", "standard": "pro", "premium": "ultra"}
+
+
+async def _get_agent_preferred_tier(agent_id: uuid.UUID) -> str | None:
+    try:
+        async with async_session() as db:
+            result = await db.execute(
+                select(AgentModel.preferred_tier, AgentModel.tenant_id).where(AgentModel.id == agent_id)
+            )
+            row = result.one_or_none()
+        if row:
+            from app.services.agent_plan_selection import resolve_agent_plan_selection
+            from app.services.entitlements import get_tenant_entitlements
+
+            tier, tenant_id = row
+            entitlements = await get_tenant_entitlements(tenant_id) if tenant_id else None
+            effective_tier, _ = resolve_agent_plan_selection(
+                entitlements,
+                tier,
+                None,
+                strict=False,
+            )
+            return effective_tier
+    except Exception:
+        return None
+    return None
+
+
+async def _resolve_minimax_tool_tier(
+    agent_id: uuid.UUID,
+    config: dict | None,
+    invocation_tier: str | None = None,
+) -> str:
+    invocation = str(invocation_tier or "").strip().lower()
+    if invocation in _SAAS_MINIMAX_TIERS:
+        return invocation
+
+    agent_tier = await _get_agent_preferred_tier(agent_id)
+    if agent_tier in _SAAS_MINIMAX_TIERS:
+        return agent_tier
+
+    configured = str((config or {}).get("tier") or "").strip().lower()
+    if configured in _SAAS_MINIMAX_TIERS:
+        return configured
+
+    if configured in _LEGACY_MINIMAX_TIER_MAP:
+        return _LEGACY_MINIMAX_TIER_MAP[configured]
+    return "lite"
+
+
+async def _get_minimax_tenant_uuid(agent_id: uuid.UUID) -> uuid.UUID | None:
+    tenant_id = await _get_agent_tenant_id(agent_id)
+    if not tenant_id:
+        return None
+    try:
+        return uuid.UUID(str(tenant_id))
+    except (TypeError, ValueError):
+        return None
+
+
+async def _check_minimax_credit_amount(tenant_id: uuid.UUID, credits: int) -> None:
+    from app.services.credit_service import check_credit_amount
+
+    await check_credit_amount(tenant_id, credits)
+
+
+async def _charge_minimax_tool_credits(
+    *,
+    tenant_id: uuid.UUID,
+    user_id: uuid.UUID | None,
+    agent_id: uuid.UUID,
+    action: str,
+    modality: str,
+    tier: str,
+    model: str,
+    credits: int,
+) -> None:
+    from app.services.credit_service import charge_credits
+
+    await charge_credits(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        agent_id=agent_id,
+        action=action,
+        modality=modality,
+        saas_tier=tier,
+        provider="minimax",
+        model=model,
+        delta=credits,
+    )
+
+
+async def _reserve_minimax_tool_credits(
+    *,
+    tenant_id: uuid.UUID,
+    user_id: uuid.UUID | None,
+    agent_id: uuid.UUID,
+    action: str,
+    modality: str,
+    tier: str,
+    model: str,
+    credits: int,
+):
+    from app.services.credit_service import reserve_credits
+
+    return await reserve_credits(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        agent_id=agent_id,
+        action=action,
+        modality=modality,
+        saas_tier=tier,
+        provider="minimax",
+        model=model,
+        amount=credits,
+        ref_type="minimax_task",
+    )
+
+
+async def _finalize_minimax_tool_reservation(reservation_id: uuid.UUID) -> None:
+    from app.services.credit_service import finalize_reserved_credits
+
+    await finalize_reserved_credits(reservation_id)
+
+
+async def _release_minimax_tool_reservation(reservation_id: uuid.UUID) -> None:
+    from app.services.credit_service import release_reserved_credits
+
+    await release_reserved_credits(reservation_id)
+
+
+async def _record_minimax_tool_success(agent_id: uuid.UUID, credential_id: uuid.UUID, *, tier: str | None) -> None:
+    """Record successful MiniMax tool usage without failing the user result path."""
+    from app.services.llm.load_balancer import record_credential_call
+    from app.services.quota_guard import consume_agent_llm_quota
+
+    try:
+        await record_credential_call(credential_id, tokens_used=0)
+    except Exception as e:
+        logger.warning(f"[MiniMaxTool] Failed to record MiniMax credential usage: {e}")
+    await consume_agent_llm_quota(agent_id, model_tier=tier)
+
+
+async def _mark_minimax_tool_credential_failure(credential_id: uuid.UUID, error: Exception) -> None:
+    """Apply the same credential health policy used by MiniMax text calls."""
+    from app.services.llm.failover import (
+        CredentialFailureAction,
+        credential_failure_action,
+    )
+    from app.services.llm.load_balancer import (
+        mark_credential_degraded,
+        mark_credential_quota_exceeded,
+    )
+
+    action = credential_failure_action(error)
+    if action is CredentialFailureAction.DEGRADE:
+        await mark_credential_degraded(credential_id, immediate=True)
+    elif action is CredentialFailureAction.QUOTA_EXCEEDED:
+        await mark_credential_quota_exceeded(credential_id)
+
+
+async def _record_minimax_tool_product_issue(
+    agent_id: uuid.UUID,
+    modality: str,
+    *,
+    error: Exception | None = None,
+    error_code: str | None = None,
+    model: str | None = None,
+    tier: str | None = None,
+    user_id: uuid.UUID | None = None,
+    category: str = "media",
+    severity: str = "error",
+) -> None:
+    """Capture a failed media operation without storing prompt or response data."""
+
+    from app.core.logging_config import get_trace_id
+    from app.services.llm.failover import extract_minimax_code
+    from app.services.production_issue_monitor import record_production_issue
+
+    try:
+        tenant_id = await _get_minimax_tenant_uuid(agent_id)
+    except Exception:
+        tenant_id = None
+    resolved_error_code = error_code or (
+        extract_minimax_code(str(error)) if error is not None else None
+    ) or (type(error).__name__ if error is not None else "media_operation_failed")
+    await record_production_issue(
+        source="minimax_media_tool",
+        category=category,
+        summary=(
+            "Platform media credential route was unavailable"
+            if category == "credential"
+            else "Media generation operation failed before a usable asset was delivered"
+        ),
+        severity=severity,
+        error_code=resolved_error_code,
+        operation=modality,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        agent_id=agent_id,
+        trace_id=get_trace_id(),
+        metadata={
+            "provider": "minimax",
+            "model": model,
+            "modality": modality,
+            "saas_tier": tier,
+            "error_type": type(error).__name__ if error is not None else None,
+        },
+    )
+
+
+def _minimax_default_base_url(base_url: str | None = None) -> str:
+    normalized = str(base_url or "https://api.minimaxi.com").strip().rstrip("/")
+    if normalized.lower().endswith("/v1"):
+        normalized = normalized[:-3].rstrip("/")
+    return normalized or "https://api.minimaxi.com"
+
+
+def _minimax_headers(api_key: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+
+def _slugify_tool_filename(text: str, fallback: str) -> str:
+    raw = "_".join(str(text or "").split()[:6]).lower()
+    normalized = unicodedata.normalize("NFKD", raw)
+    slug = "".join(c for c in normalized if c.isalnum() or c in {"_", "-"})
+    return (slug[:48] or fallback).strip("_-") or fallback
+
+
+def _resolve_workspace_output_path(
+    ws: Path,
+    save_path: str | None,
+    default_dir: str,
+    prefix: str,
+    extension: str,
+    slug_source: str,
+) -> tuple[str, Path]:
+    if not save_path:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        slug = _slugify_tool_filename(slug_source, prefix)
+        save_path = f"{default_dir.rstrip('/')}/{prefix}_{slug}_{ts}.{extension.lstrip('.')}"
+
+    rel_path = str(save_path).strip()
+    full_path = (ws / rel_path).resolve()
+    try:
+        full_path.relative_to(ws.resolve())
+    except ValueError as exc:
+        raise ValueError("Access denied: save path is outside the workspace") from exc
+    full_path.parent.mkdir(parents=True, exist_ok=True)
+    return rel_path, full_path
+
+
+def _resolve_workspace_read_path(ws: Path, rel_path: str) -> Path:
+    target = (ws / str(rel_path).strip()).resolve()
+    try:
+        target.relative_to(ws.resolve())
+    except ValueError as exc:
+        raise ValueError("Access denied: path is outside the workspace") from exc
+    return target
+
+
+def _agent_file_download_url(agent_id: uuid.UUID, rel_path: str) -> str:
+    return f"/api/agents/{agent_id}/files/download?path={rel_path}"
+
+
+async def _prepare_minimax_tool_credential(
+    agent_id: uuid.UUID,
+    modality: str,
+    tier: str = "lite",
+) -> tuple[_MiniMaxToolCredential | None, str | None]:
+    quota_error = await _check_minimax_tool_allowed(agent_id, modality=modality, tier=tier)
+    if quota_error:
+        return None, quota_error
+
+    from app.services.llm.load_balancer import NoCredentialAvailable, no_credential_user_message, pick_credential
+    from app.services.llm.utils import get_credential_api_key
+
+    try:
+        cred = await pick_credential("minimax", modality=modality)
+    except NoCredentialAvailable as exc:
+        await _record_minimax_tool_product_issue(
+            agent_id,
+            modality,
+            error_code=exc.reason_code.value,
+            tier=tier,
+            category="credential",
+            severity="critical" if exc.reason_code.value == "all_unhealthy" else "error",
+        )
+        return None, f"❌ {no_credential_user_message(exc)}"
+
+    api_key = get_credential_api_key(cred)
+    if not api_key:
+        await _record_minimax_tool_product_issue(
+            agent_id,
+            modality,
+            error_code="credential_missing_key",
+            tier=tier,
+            category="credential",
+            severity="critical",
+        )
+        return None, "❌ MiniMax credential is missing an API key. Ask your admin to re-save the credential."
+
+    return (
+        _MiniMaxToolCredential(
+            id=cred.id,
+            api_key=api_key,
+            base_url=_minimax_default_base_url(cred.base_url),
+        ),
+        None,
+    )
+
+
+async def _load_minimax_tool_credential_by_id(credential_id: uuid.UUID) -> _MiniMaxToolCredential:
+    from app.models.llm import LLMCredential
+    from app.services.llm.utils import get_credential_api_key
+
+    async with async_session() as db:
+        cred = await db.get(LLMCredential, credential_id)
+        if (
+            not cred
+            or cred.provider != "minimax"
+            or cred.tenant_id is not None
+            or not cred.enabled
+        ):
+            raise ValueError("MiniMax credential is not available for this task")
+        api_key = get_credential_api_key(cred)
+        if not api_key:
+            raise ValueError("MiniMax credential is missing an API key")
+        return _MiniMaxToolCredential(
+            id=cred.id,
+            api_key=api_key,
+            base_url=_minimax_default_base_url(cred.base_url),
+        )
+
+
+def _raise_for_minimax_base_resp(data: dict, default_label: str = "MiniMax API") -> None:
+    base_resp = data.get("base_resp") or {}
+    status_code = base_resp.get("status_code", 0)
+    if status_code not in (0, "0", None):
+        status_msg = base_resp.get("status_msg") or "unknown error"
+        raise ValueError(f"{default_label} error ({status_code}): {status_msg}")
+
+
+def _minimax_http_error(resp) -> ValueError:
+    try:
+        data = resp.json()
+        base_resp = data.get("base_resp", {}) if isinstance(data, dict) else {}
+        code = base_resp.get("status_code", resp.status_code)
+        msg = (
+            base_resp.get("status_msg")
+            or (data.get("message") if isinstance(data, dict) else None)
+            or resp.text[:300]
+        )
+    except Exception:
+        code = resp.status_code
+        msg = resp.text[:300]
+    return ValueError(f"MiniMax API error ({code}): {msg}")
+
+
+def _minimax_audio_hex_to_bytes(data: dict, label: str) -> bytes:
+    _raise_for_minimax_base_resp(data, label)
+    payload = data.get("data") or {}
+    audio_hex = payload.get("audio")
+    if not isinstance(audio_hex, str) or not audio_hex:
+        raise ValueError(f"No audio hex payload in {label} response")
+    try:
+        return bytes.fromhex(audio_hex)
+    except ValueError as exc:
+        raise ValueError(f"Invalid audio hex payload in {label} response") from exc
+
+
+async def _generate_speech_minimax(
+    agent_id: uuid.UUID,
+    ws: Path,
+    arguments: dict,
+    user_id: uuid.UUID | None = None,
+    saas_tier: str | None = None,
+) -> str:
+    text = (arguments.get("text") or "").strip()
+    if not text:
+        return "❌ Missing required argument 'text' for generate_speech_minimax"
+
+    config = await _get_tool_config(agent_id, "generate_speech_minimax") or {}
+    tier = await _resolve_minimax_tool_tier(agent_id, config, saas_tier)
+    from app.services.minimax_media_profiles import load_platform_minimax_media_profile
+    profile = await load_platform_minimax_media_profile("audio", tier)
+    if not profile.enabled:
+        return f"❌ MiniMax speech generation is disabled for the {tier} tier."
+    model = profile.model
+    credential, error = await _prepare_minimax_tool_credential(
+        agent_id,
+        modality="audio",
+        tier=tier,
+    )
+    if error:
+        return error
+    assert credential is not None
+
+    audio_format = (arguments.get("format") or config.get("format") or "mp3").strip().lower()
+    if audio_format not in {"mp3", "wav", "flac", "pcm"}:
+        return "❌ Unsupported audio format. Use mp3, wav, flac, or pcm."
+
+    try:
+        from app.services.provider_pricing import minimax_tts_credits
+        credit_cost = minimax_tts_credits(model, characters=len(text))
+        tenant_id = await _get_minimax_tenant_uuid(agent_id)
+        if tenant_id:
+            await _check_minimax_credit_amount(tenant_id, credit_cost)
+        save_path, full_save_path = _resolve_workspace_output_path(
+            ws,
+            arguments.get("save_path"),
+            "workspace/audio",
+            "minimax_tts",
+            audio_format,
+            text,
+        )
+        audio_bytes = await _minimax_tts_http(
+            api_key=credential.api_key,
+            base_url=credential.base_url,
+            model=model,
+            text=text,
+            voice_id=arguments.get("voice_id") or config.get("voice_id") or "English_expressive_narrator",
+            audio_format=audio_format,
+            speed=float(config.get("speed") or 1.0),
+            volume=float(config.get("volume") or config.get("vol") or 1.0),
+            pitch=int(config.get("pitch") or 0),
+            sample_rate=int(profile.sample_rate or 32000),
+            bitrate=int(profile.bitrate or 128000),
+            language_boost=config.get("language_boost") or "auto",
+        )
+        full_save_path.write_bytes(audio_bytes)
+        await _record_minimax_tool_success(agent_id, credential.id, tier=tier)
+        if tenant_id and credit_cost > 0:
+            await _charge_minimax_tool_credits(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                agent_id=agent_id,
+                action="audio",
+                modality="audio",
+                tier=tier,
+                model=model,
+                credits=credit_cost,
+            )
+    except Exception as exc:
+        from app.services.llm.failover import extract_minimax_code
+        from app.services.quota_guard import QuotaExceeded
+        if isinstance(exc, QuotaExceeded):
+            return f"⚠️ {exc.message}"
+        await _mark_minimax_tool_credential_failure(credential.id, exc)
+        await _record_minimax_tool_product_issue(
+            agent_id,
+            "audio",
+            error=exc,
+            model=model,
+            tier=tier,
+            user_id=user_id,
+        )
+        logger.error(
+            "[MiniMaxSpeech] operation failed error_type={} error_code={}",
+            type(exc).__name__,
+            extract_minimax_code(str(exc)) or "unknown",
+        )
+        return f"❌ Speech generation failed (minimax): {str(exc)[:400]}"
+
+    size_kb = len(audio_bytes) / 1024
+    return (
+        f"✅ Speech generated and saved to: {save_path}\n"
+        f"Size: {size_kb:.1f} KB | Provider: minimax | Model: {model}\n\n"
+        f"🔊 Play the audio:\n![]({_agent_file_download_url(agent_id, save_path)})"
+    )
+
+
+async def _generate_music_minimax(
+    agent_id: uuid.UUID,
+    ws: Path,
+    arguments: dict,
+    user_id: uuid.UUID | None = None,
+    saas_tier: str | None = None,
+) -> str:
+    prompt = (arguments.get("prompt") or "").strip()
+    lyrics = (arguments.get("lyrics") or "").strip()
+    if not prompt:
+        return "❌ Missing required argument 'prompt' for generate_music_minimax"
+    if not lyrics:
+        return "❌ Missing required argument 'lyrics' for generate_music_minimax"
+
+    config = await _get_tool_config(agent_id, "generate_music_minimax") or {}
+    tier = await _resolve_minimax_tool_tier(agent_id, config, saas_tier)
+    from app.services.minimax_media_profiles import load_platform_minimax_media_profile
+    profile = await load_platform_minimax_media_profile("music", tier)
+    if not profile.enabled:
+        return f"❌ MiniMax music generation is disabled for the {tier} tier."
+    model = profile.model
+    credential, error = await _prepare_minimax_tool_credential(
+        agent_id,
+        modality="music",
+        tier=tier,
+    )
+    if error:
+        return error
+    assert credential is not None
+
+    audio_format = (arguments.get("format") or config.get("format") or "mp3").strip().lower()
+    if audio_format not in {"mp3", "wav"}:
+        return "❌ Unsupported music format. Use mp3 or wav."
+
+    try:
+        from app.services.provider_pricing import minimax_music_credits
+        credit_cost = minimax_music_credits(model)
+        tenant_id = await _get_minimax_tenant_uuid(agent_id)
+        if tenant_id:
+            await _check_minimax_credit_amount(tenant_id, credit_cost)
+        save_path, full_save_path = _resolve_workspace_output_path(
+            ws,
+            arguments.get("save_path"),
+            "workspace/audio",
+            "minimax_music",
+            audio_format,
+            prompt,
+        )
+        audio_bytes = await _minimax_music_http(
+            api_key=credential.api_key,
+            base_url=credential.base_url,
+            model=model,
+            prompt=prompt,
+            lyrics=lyrics,
+            audio_format=audio_format,
+            sample_rate=int(profile.sample_rate or 44100),
+            bitrate=int(profile.bitrate or 256000),
+        )
+        full_save_path.write_bytes(audio_bytes)
+        await _record_minimax_tool_success(agent_id, credential.id, tier=tier)
+        if tenant_id and credit_cost > 0:
+            await _charge_minimax_tool_credits(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                agent_id=agent_id,
+                action="music",
+                modality="music",
+                tier=tier,
+                model=model,
+                credits=credit_cost,
+            )
+    except Exception as exc:
+        from app.services.llm.failover import extract_minimax_code
+        from app.services.quota_guard import QuotaExceeded
+        if isinstance(exc, QuotaExceeded):
+            return f"⚠️ {exc.message}"
+        await _mark_minimax_tool_credential_failure(credential.id, exc)
+        await _record_minimax_tool_product_issue(
+            agent_id,
+            "music",
+            error=exc,
+            model=model,
+            tier=tier,
+            user_id=user_id,
+        )
+        logger.error(
+            "[MiniMaxMusic] operation failed error_type={} error_code={}",
+            type(exc).__name__,
+            extract_minimax_code(str(exc)) or "unknown",
+        )
+        return f"❌ Music generation failed (minimax): {str(exc)[:400]}"
+
+    size_kb = len(audio_bytes) / 1024
+    return (
+        f"✅ Music generated and saved to: {save_path}\n"
+        f"Size: {size_kb:.1f} KB | Provider: minimax | Model: {model}\n\n"
+        f"🎵 Play the music:\n![]({_agent_file_download_url(agent_id, save_path)})"
+    )
+
+
+async def _generate_video_minimax(
+    agent_id: uuid.UUID,
+    ws: Path,
+    arguments: dict,
+    user_id: uuid.UUID | None = None,
+    saas_tier: str | None = None,
+) -> str:
+    prompt = (arguments.get("prompt") or "").strip()
+    if not prompt:
+        return "❌ Missing required argument 'prompt' for generate_video_minimax"
+
+    config = await _get_tool_config(agent_id, "generate_video_minimax") or {}
+    tier = await _resolve_minimax_tool_tier(agent_id, config, saas_tier)
+    from app.services.minimax_media_profiles import (
+        constrain_minimax_video_request,
+        load_platform_minimax_media_profile,
+    )
+    profile = await load_platform_minimax_media_profile("video", tier)
+    if not profile.enabled:
+        return f"❌ MiniMax video generation is disabled for the {tier} tier."
+
+    from app.services.media_assets import (
+        MAX_OVERLAY_TEXT_CHARS,
+        image_reference_for_provider,
+    )
+
+    try:
+        first_frame_image = image_reference_for_provider(
+            ws,
+            arguments.get("first_frame_image"),
+            label="First-frame image",
+            require_video_dimensions=True,
+        )
+        last_frame_image = image_reference_for_provider(
+            ws,
+            arguments.get("last_frame_image"),
+            label="Last-frame image",
+            require_video_dimensions=True,
+        )
+    except ValueError as exc:
+        return f"❌ Video reference image is invalid: {exc}"
+    if last_frame_image and not first_frame_image:
+        return "❌ last_frame_image requires first_frame_image"
+
+    overlay_text = (arguments.get("overlay_text") or "").strip()
+    if len(overlay_text) > MAX_OVERLAY_TEXT_CHARS:
+        return f"❌ overlay_text must be at most {MAX_OVERLAY_TEXT_CHARS} characters"
+    overlay_position = (arguments.get("overlay_position") or "bottom").strip().lower()
+    if overlay_position not in {"top", "center", "bottom"}:
+        return "❌ overlay_position must be top, center, or bottom"
+    prompt_optimizer = arguments.get("prompt_optimizer")
+    if prompt_optimizer is None:
+        prompt_optimizer = True
+
+    credential, error = await _prepare_minimax_tool_credential(
+        agent_id,
+        modality="video",
+        tier=tier,
+    )
+    if error:
+        return error
+    assert credential is not None
+
+    # MiniMax documents first+last frame mode only for Hailuo-02.
+    model = "MiniMax-Hailuo-02" if last_frame_image else profile.model
+    duration, resolution = constrain_minimax_video_request(
+        tier,
+        profile,
+        arguments.get("duration"),
+        arguments.get("resolution"),
+    )
+    wait_for_completion = bool(arguments.get("wait_for_completion") or config.get("wait_for_completion") or False)
+    poll_timeout_seconds = int(arguments.get("poll_timeout_seconds") or config.get("poll_timeout_seconds") or 180)
+    provider_prompt = prompt
+    if overlay_text:
+        provider_prompt = (
+            f"{prompt}\nCreate only the moving visual scene. Do not render words, letters, captions, "
+            "logos, or watermarks; exact copy will be added after generation."
+        )
+
+    reservation_id: uuid.UUID | None = None
+    record_id: uuid.UUID | None = None
+    provider_task_id: str | None = None
+    meta_path = ""
+    full_meta_path: Path | None = None
+    metadata: dict[str, Any] = {}
+    try:
+        from app.services.media_generation import (
+            ProviderTaskIdentityCollision,
+            create_minimax_video_task_record,
+            find_media_generation_task,
+            mark_minimax_video_task_submitted,
+            reconcile_minimax_video_task,
+        )
+        from app.services.provider_pricing import minimax_video_credits
+
+        credit_cost = minimax_video_credits(model, duration=duration, resolution=resolution)
+        tenant_id = await _get_minimax_tenant_uuid(agent_id)
+        if tenant_id:
+            await _check_minimax_credit_amount(tenant_id, credit_cost)
+        if tenant_id and credit_cost > 0:
+            reservation = await _reserve_minimax_tool_credits(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                agent_id=agent_id,
+                action="video",
+                modality="video",
+                tier=tier,
+                model=model,
+                credits=credit_cost,
+            )
+            reservation_id = reservation.id
+
+        record_id = uuid.uuid4()
+        output_path, _ = _resolve_workspace_output_path(
+            ws,
+            arguments.get("save_path"),
+            "workspace/videos",
+            f"minimax_video_{record_id.hex[:12]}",
+            "mp4",
+            prompt,
+        )
+        meta_path, full_meta_path = _resolve_workspace_output_path(
+            ws,
+            arguments.get("task_meta_path"),
+            "workspace/videos",
+            f"minimax_video_task_{record_id.hex}",
+            "json",
+            prompt,
+        )
+        created_at = datetime.now(timezone.utc).isoformat()
+        request_metadata = {
+            "credit_cost": credit_cost,
+            "model": model,
+            "prompt": prompt,
+            "duration": duration,
+            "resolution": resolution,
+            "created_at": created_at,
+            "generation_mode": "first_last_frame" if last_frame_image else "image_to_video" if first_frame_image else "text_to_video",
+            "has_first_frame": bool(first_frame_image),
+            "has_last_frame": bool(last_frame_image),
+            "prompt_optimizer": bool(prompt_optimizer),
+            "overlay_text": overlay_text,
+            "overlay_position": overlay_position,
+        }
+        await create_minimax_video_task_record(
+            record_id=record_id,
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+            user_id=user_id,
+            credential_id=credential.id,
+            reservation_id=reservation_id,
+            model=model,
+            metadata_path=meta_path,
+            output_path=output_path,
+            request_metadata=request_metadata,
+        )
+
+        provider_task_id = await _minimax_create_video_task(
+            api_key=credential.api_key,
+            base_url=credential.base_url,
+            model=model,
+            prompt=provider_prompt,
+            duration=duration,
+            resolution=resolution,
+            first_frame_image=first_frame_image,
+            last_frame_image=last_frame_image,
+            prompt_optimizer=bool(prompt_optimizer),
+        )
+        await _record_minimax_tool_success(agent_id, credential.id, tier=tier)
+        metadata = {
+            "provider": "minimax",
+            "task_record_id": str(record_id),
+            "task_id": provider_task_id,
+            "credential_id": str(credential.id),
+            "reservation_id": str(reservation_id) if reservation_id else "",
+            **request_metadata,
+            "status": "submitted",
+            "save_path": output_path,
+        }
+        full_meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        canonical_record_id = await mark_minimax_video_task_submitted(
+            record_id,
+            provider_task_id=provider_task_id,
+            metadata=metadata,
+            poll_after_seconds=poll_timeout_seconds + 10 if wait_for_completion else 0,
+        )
+        if canonical_record_id != record_id:
+            record_id = canonical_record_id
+            metadata["task_record_id"] = str(canonical_record_id)
+            durable_task = await find_media_generation_task(
+                agent_id=agent_id,
+                provider_task_id=provider_task_id,
+            )
+            if durable_task:
+                metadata["credential_id"] = str(durable_task.credential_id or "")
+                metadata["reservation_id"] = str(durable_task.reservation_id or "")
+                metadata["save_path"] = durable_task.output_path
+                reservation_id = durable_task.reservation_id
+
+        downloaded_path = None
+        status = "submitted"
+        if wait_for_completion:
+            status_data = await _poll_minimax_video_until_done(
+                credential,
+                provider_task_id,
+                timeout_seconds=poll_timeout_seconds,
+            )
+            status = _minimax_video_status(status_data)
+            metadata["status"] = status
+            metadata["last_response"] = status_data
+            outcome = await reconcile_minimax_video_task(record_id, status_data=status_data)
+            if outcome.status == "succeeded":
+                downloaded_path = outcome.output_path
+                metadata["status"] = "Success"
+                metadata["reservation_status"] = "finalized" if reservation_id else "not_required"
+                metadata["downloaded_path"] = downloaded_path
+                metadata["completed_at"] = datetime.now(timezone.utc).isoformat()
+            elif outcome.status == "failed":
+                status = "Fail"
+                metadata["status"] = "Fail"
+                metadata["reservation_status"] = "released" if reservation_id else "not_required"
+                metadata["error"] = outcome.error or "MiniMax video generation failed"
+
+        full_meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    except ProviderTaskIdentityCollision:
+        logger.error("[MiniMaxVideo] Provider task identity collision blocked for agent {}", agent_id)
+        await _record_minimax_tool_product_issue(
+            agent_id,
+            "video",
+            error_code="provider_task_identity_collision",
+            model=model,
+            tier=tier,
+            user_id=user_id,
+            severity="critical",
+        )
+        return "❌ Video task could not be recorded safely. No new Credits were charged. Please retry."
+    except Exception as exc:
+        from app.services.quota_guard import QuotaExceeded
+        if isinstance(exc, QuotaExceeded):
+            return f"⚠️ {exc.message}"
+
+        # Once the provider returned a task id, never release the reservation
+        # on a transient poll/storage error. The durable worker owns recovery.
+        if record_id and provider_task_id:
+            try:
+                from app.services.media_generation import record_media_generation_retry
+
+                await record_media_generation_retry(record_id, exc)
+            except Exception:
+                pass
+            if full_meta_path is not None:
+                metadata.update({
+                    "task_record_id": str(record_id),
+                    "task_id": provider_task_id,
+                    "status": "retrying",
+                    "last_error": str(exc)[:400],
+                })
+                full_meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+                try:
+                    from app.services.storage import store_agent_bytes
+
+                    await store_agent_bytes(
+                        agent_id,
+                        meta_path,
+                        json.dumps(metadata, ensure_ascii=False, indent=2).encode("utf-8"),
+                        content_type="application/json",
+                    )
+                except Exception:
+                    logger.exception("[MiniMaxVideo] Failed to persist recovery metadata")
+            await _mark_minimax_tool_credential_failure(credential.id, exc)
+            logger.warning(f"[MiniMaxVideo] Submitted task queued for automatic recovery: {exc}")
+            return (
+                f"⏳ MiniMax video task was submitted and automatic recovery is continuing. "
+                f"Task metadata: {meta_path}"
+            )
+
+        incident_recorded = False
+        if record_id:
+            try:
+                from app.services.media_generation import mark_media_generation_submission_failed
+
+                await mark_media_generation_submission_failed(record_id, exc)
+                incident_recorded = True
+            except Exception:
+                if reservation_id:
+                    try:
+                        await _release_minimax_tool_reservation(reservation_id)
+                    except Exception:
+                        pass
+        elif reservation_id:
+            try:
+                await _release_minimax_tool_reservation(reservation_id)
+            except Exception:
+                pass
+        await _mark_minimax_tool_credential_failure(credential.id, exc)
+        if not incident_recorded:
+            await _record_minimax_tool_product_issue(
+                agent_id,
+                "video",
+                error=exc,
+                model=model,
+                tier=tier,
+                user_id=user_id,
+            )
+        logger.error(
+            "[MiniMaxVideo] operation failed error_type={}",
+            type(exc).__name__,
+        )
+        return f"❌ Video generation failed (minimax): {str(exc)[:400]}"
+
+    if downloaded_path:
+        return (
+            f"✅ Video generated and saved to: {downloaded_path}\n"
+            f"Task metadata: {meta_path}\n\n"
+            f"▶️ Play the video:\n![]({_agent_file_download_url(agent_id, downloaded_path)})"
+        )
+    if wait_for_completion and status != "Success":
+        return (
+            f"⏳ MiniMax video task is still {status}. Task metadata saved to: {meta_path}\n"
+            "The system will keep checking automatically and save the video when it is ready."
+        )
+    return (
+        f"✅ MiniMax video task submitted. task_id={provider_task_id}\n"
+        f"Task metadata saved to: {meta_path}\n"
+        "The system will keep checking automatically and save the video when it is ready."
+    )
+
+
+async def _check_video_minimax(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
+    task_meta_path = (arguments.get("task_meta_path") or "").strip()
+    if not task_meta_path:
+        return "❌ Missing required argument 'task_meta_path' for check_video_minimax"
+
+    try:
+        full_meta_path = _resolve_workspace_read_path(ws, task_meta_path)
+        metadata = json.loads(full_meta_path.read_text(encoding="utf-8"))
+        task_id = metadata.get("task_id")
+        credential_id = uuid.UUID(str(metadata.get("credential_id")))
+        if not task_id:
+            return "❌ Invalid MiniMax video metadata: missing task_id"
+        reservation_id = None
+        if metadata.get("reservation_id"):
+            reservation_id = uuid.UUID(str(metadata.get("reservation_id")))
+
+        credential = await _load_minimax_tool_credential_by_id(credential_id)
+        status_data = await _minimax_query_video_task(credential.api_key, credential.base_url, task_id)
+        status = _minimax_video_status(status_data)
+        metadata["status"] = status
+        metadata["last_checked_at"] = datetime.now(timezone.utc).isoformat()
+        metadata["last_response"] = status_data
+
+        from app.services.media_generation import find_media_generation_task, reconcile_minimax_video_task
+
+        durable_task = await find_media_generation_task(agent_id=agent_id, provider_task_id=str(task_id))
+        if durable_task:
+            outcome = await reconcile_minimax_video_task(durable_task.id, status_data=status_data)
+            if outcome.status == "succeeded":
+                metadata["status"] = "Success"
+                metadata["reservation_status"] = "finalized" if reservation_id else "not_required"
+                metadata["downloaded_path"] = outcome.output_path
+                metadata["completed_at"] = datetime.now(timezone.utc).isoformat()
+                full_meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+                return (
+                    f"✅ MiniMax video is ready and saved to: {outcome.output_path}\n\n"
+                    f"▶️ Play the video:\n![]({_agent_file_download_url(agent_id, outcome.output_path or durable_task.output_path)})"
+                )
+            if outcome.status == "failed":
+                metadata["status"] = "Fail"
+                metadata["reservation_status"] = "released" if reservation_id else "not_required"
+                metadata["error"] = outcome.error or "unknown"
+                full_meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+                return f"❌ MiniMax video task failed: {outcome.error or 'unknown'}"
+            full_meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+            return "⏳ MiniMax video task is still processing. The system will continue checking automatically."
+
+        if status == "Success":
+            save_path = arguments.get("save_path") or metadata.get("save_path") or ""
+            downloaded_path = await _download_minimax_video_from_status(
+                credential,
+                status_data,
+                ws,
+                save_path,
+                metadata.get("prompt") or task_id,
+                task_id,
+            )
+            # Legacy fallback preserves the same invariant as the durable path:
+            # the asset must exist before Credits are finalized.
+            if reservation_id:
+                await _finalize_minimax_tool_reservation(reservation_id)
+                metadata["reservation_status"] = "finalized"
+            metadata["downloaded_path"] = downloaded_path
+            metadata["completed_at"] = datetime.now(timezone.utc).isoformat()
+            full_meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+            return (
+                f"✅ MiniMax video is ready and saved to: {downloaded_path}\n\n"
+                f"▶️ Play the video:\n![]({_agent_file_download_url(agent_id, downloaded_path)})"
+            )
+
+        full_meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        if status == "Fail":
+            if reservation_id:
+                await _release_minimax_tool_reservation(reservation_id)
+                metadata["reservation_status"] = "released"
+                full_meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+            fail_reason = status_data.get("fail_reason") or status_data.get("base_resp", {}).get("status_msg") or "unknown"
+            await _record_minimax_tool_product_issue(
+                agent_id,
+                "video",
+                error_code="provider_task_failed",
+                model=str(metadata.get("model") or "") or None,
+                tier=str(metadata.get("tier") or "") or None,
+            )
+            return f"❌ MiniMax video task failed: {fail_reason}"
+        return f"⏳ MiniMax video task status: {status}. Check again later with task_meta_path='{task_meta_path}'."
+    except Exception as exc:
+        credential_id_raw = None
+        try:
+            credential_id_raw = json.loads(full_meta_path.read_text(encoding="utf-8")).get("credential_id")
+        except Exception:
+            credential_id_raw = None
+        if credential_id_raw:
+            try:
+                await _mark_minimax_tool_credential_failure(uuid.UUID(str(credential_id_raw)), exc)
+            except Exception:
+                pass
+        await _record_minimax_tool_product_issue(
+            agent_id,
+            "video",
+            error=exc,
+            model=(str(metadata.get("model") or "") or None) if "metadata" in locals() else None,
+            tier=(str(metadata.get("tier") or "") or None) if "metadata" in locals() else None,
+        )
+        logger.error(
+            "[MiniMaxVideoCheck] operation failed error_type={}",
+            type(exc).__name__,
+        )
+        return f"❌ MiniMax video check failed: {str(exc)[:400]}"
+
+
+async def _minimax_tts_http(
+    api_key: str,
+    base_url: str,
+    model: str,
+    text: str,
+    voice_id: str,
+    audio_format: str,
+    speed: float,
+    volume: float,
+    pitch: int,
+    sample_rate: int,
+    bitrate: int,
+    language_boost: str,
+) -> bytes:
+    import httpx
+
+    payload = {
+        "model": model,
+        "text": text,
+        "stream": False,
+        "output_format": "hex",
+        "voice_setting": {
+            "voice_id": voice_id,
+            "speed": speed,
+            "vol": volume,
+            "pitch": pitch,
+        },
+        "audio_setting": {
+            "sample_rate": sample_rate,
+            "bitrate": bitrate,
+            "format": audio_format,
+            "channel": 1,
+        },
+    }
+    if language_boost:
+        payload["language_boost"] = language_boost
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post(
+            f"{base_url.rstrip('/')}/v1/t2a_v2",
+            json=payload,
+            headers=_minimax_headers(api_key),
+        )
+        if resp.status_code != 200:
+            raise _minimax_http_error(resp)
+        return _minimax_audio_hex_to_bytes(resp.json(), "MiniMax TTS")
+
+
+async def _minimax_music_http(
+    api_key: str,
+    base_url: str,
+    model: str,
+    prompt: str,
+    lyrics: str,
+    audio_format: str,
+    sample_rate: int,
+    bitrate: int,
+) -> bytes:
+    import httpx
+
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "lyrics": lyrics,
+        "audio_setting": {
+            "sample_rate": sample_rate,
+            "bitrate": bitrate,
+            "format": audio_format,
+        },
+    }
+
+    async with httpx.AsyncClient(timeout=180) as client:
+        resp = await client.post(
+            f"{base_url.rstrip('/')}/v1/music_generation",
+            json=payload,
+            headers=_minimax_headers(api_key),
+        )
+        if resp.status_code != 200:
+            raise _minimax_http_error(resp)
+        return _minimax_audio_hex_to_bytes(resp.json(), "MiniMax Music")
+
+
+async def _minimax_create_video_task(
+    api_key: str,
+    base_url: str,
+    model: str,
+    prompt: str,
+    duration: int,
+    resolution: str,
+    first_frame_image: str | None = None,
+    last_frame_image: str | None = None,
+    prompt_optimizer: bool = True,
+) -> str:
+    import httpx
+
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "duration": duration,
+        "resolution": resolution,
+        "prompt_optimizer": prompt_optimizer,
+    }
+    if first_frame_image:
+        payload["first_frame_image"] = first_frame_image
+    if last_frame_image:
+        payload["last_frame_image"] = last_frame_image
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post(
+            f"{base_url.rstrip('/')}/v1/video_generation",
+            json=payload,
+            headers=_minimax_headers(api_key),
+        )
+        if resp.status_code != 200:
+            raise _minimax_http_error(resp)
+        data = resp.json()
+        _raise_for_minimax_base_resp(data)
+        task_id = data.get("task_id") or (data.get("data") or {}).get("task_id")
+        if not task_id:
+            raise ValueError(f"No task_id in MiniMax video response: {data}")
+        return str(task_id)
+
+
+async def _minimax_query_video_task(api_key: str, base_url: str, task_id: str) -> dict:
+    import httpx
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.get(
+            f"{base_url.rstrip('/')}/v1/query/video_generation",
+            params={"task_id": task_id},
+            headers=_minimax_headers(api_key),
+        )
+        if resp.status_code != 200:
+            raise _minimax_http_error(resp)
+        data = resp.json()
+        _raise_for_minimax_base_resp(data)
+        return data
+
+
+def _minimax_video_status(data: dict) -> str:
+    return str(data.get("status") or (data.get("data") or {}).get("status") or "Unknown")
+
+
+def _minimax_video_file_id(data: dict) -> str | None:
+    value = data.get("file_id") or (data.get("data") or {}).get("file_id")
+    return str(value) if value else None
+
+
+async def _poll_minimax_video_until_done(
+    credential: _MiniMaxToolCredential,
+    task_id: str,
+    timeout_seconds: int,
+) -> dict:
+    deadline = datetime.now(timezone.utc) + timedelta(seconds=max(timeout_seconds, 0))
+    last_response: dict = {}
+    while True:
+        last_response = await _minimax_query_video_task(credential.api_key, credential.base_url, task_id)
+        if _minimax_video_status(last_response) in {"Success", "Fail"}:
+            return last_response
+        if datetime.now(timezone.utc) >= deadline:
+            return last_response
+        await asyncio.sleep(5)
+
+
+async def _download_minimax_video_from_status(
+    credential: _MiniMaxToolCredential,
+    status_data: dict,
+    ws: Path,
+    save_path: str | None,
+    prompt: str,
+    task_id: str,
+) -> str:
+    file_id = _minimax_video_file_id(status_data)
+    if not file_id:
+        raise ValueError(f"No file_id in completed MiniMax video response: {status_data}")
+    download_url = await _minimax_retrieve_file_download_url(credential.api_key, credential.base_url, file_id)
+    video_bytes = await _minimax_download_file(download_url)
+    rel_path, full_path = _resolve_workspace_output_path(
+        ws,
+        save_path,
+        "workspace/videos",
+        f"minimax_video_{_slugify_tool_filename(task_id, 'task')}",
+        "mp4",
+        prompt,
+    )
+    full_path.write_bytes(video_bytes)
+    return rel_path
+
+
+async def _minimax_retrieve_file_download_url(api_key: str, base_url: str, file_id: str) -> str:
+    import httpx
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.get(
+            f"{base_url.rstrip('/')}/v1/files/retrieve",
+            params={"file_id": file_id},
+            headers=_minimax_headers(api_key),
+        )
+        if resp.status_code != 200:
+            raise _minimax_http_error(resp)
+        data = resp.json()
+        _raise_for_minimax_base_resp(data)
+        file_payload = data.get("file") or (data.get("data") or {}).get("file") or {}
+        download_url = file_payload.get("download_url") or data.get("download_url")
+        if not download_url:
+            raise ValueError(f"No download_url in MiniMax file response: {data}")
+        return str(download_url)
+
+
+async def _minimax_download_file(download_url: str) -> bytes:
+    import httpx
+
+    async with httpx.AsyncClient(timeout=180) as client:
+        resp = await client.get(download_url)
+        resp.raise_for_status()
+        return resp.content
 
 
 async def _generate_image_siliconflow(
@@ -9083,6 +11318,65 @@ async def _generate_image_google(
         )
 
 
+async def _generate_image_minimax(
+    api_key: str,
+    base_url: str,
+    model: str,
+    prompt: str,
+    aspect_ratio: str,
+    reference_image: str | None = None,
+) -> bytes:
+    """Generate image via MiniMax image-01 API.
+
+    MiniMax returns a temporary URL (expires in ~24 hours), so we download
+    the image bytes immediately after generation.
+    """
+    import httpx
+
+    url = f"{base_url.rstrip('/')}/v1/image_generation"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": model or "image-01",
+        "prompt": prompt,
+        "response_format": "url",
+    }
+    if aspect_ratio:
+        payload["aspect_ratio"] = aspect_ratio
+    if reference_image:
+        payload["subject_reference"] = [
+            {"type": "character", "image_file": reference_image}
+        ]
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post(url, json=payload, headers=headers)
+        if resp.status_code != 200:
+            try:
+                err_body = resp.json()
+                br = err_body.get("base_resp", {})
+                err_msg = br.get("status_msg") or err_body.get("message", resp.text[:300])
+                err_code = br.get("status_code", resp.status_code)
+            except Exception:
+                err_msg = resp.text[:300]
+                err_code = resp.status_code
+            raise ValueError(f"MiniMax API error ({err_code}): {err_msg}")
+        data = resp.json()
+
+        base_resp = data.get("base_resp", {})
+        if base_resp.get("status_code", 0) != 0:
+            raise ValueError(
+                f"MiniMax API error ({base_resp.get('status_code')}): {base_resp.get('status_msg')}"
+            )
+
+        image_data = data.get("data", {})
+        image_urls = image_data.get("image_urls", [])
+        if not image_urls:
+            raise ValueError(f"No image URL in MiniMax response: {data}")
+
+        img_resp = await client.get(image_urls[0], timeout=60)
+        img_resp.raise_for_status()
+        return img_resp.content
+
+
 # ─── Feishu Helper ────────────────────────────────────────────────────────────
 
 async def _get_feishu_token(agent_id: uuid.UUID) -> tuple[str, str] | None:
@@ -9166,19 +11460,24 @@ async def _feishu_resolve_open_id(token: str, email: str) -> str | None:
     return None
 
 
-def _iso_to_ts(iso_str: str) -> float:
-    """Convert ISO 8601 string to Unix timestamp."""
+def _iso_to_ts(iso_str: str, timezone_name: str = "Asia/Shanghai") -> float:
+    """Convert ISO 8601 text to a timezone-stable Unix timestamp."""
     from datetime import datetime as _dt
-    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S"):
+    from zoneinfo import ZoneInfo
+
+    normalized = str(iso_str or "").strip()
+    if normalized.endswith("Z"):
+        normalized = f"{normalized[:-1]}+00:00"
+    try:
+        value = _dt.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValueError(f"Cannot parse datetime: {iso_str!r}") from exc
+    if value.tzinfo is None:
         try:
-            if iso_str.endswith("Z"):
-                d = _dt.fromisoformat(iso_str.replace("Z", "+00:00"))
-            else:
-                d = _dt.strptime(iso_str, fmt)
-            return d.timestamp()
-        except ValueError:
-            continue
-    raise ValueError(f"Cannot parse datetime: {iso_str!r}")
+            value = value.replace(tzinfo=ZoneInfo(timezone_name))
+        except Exception as exc:
+            raise ValueError(f"Unknown timezone: {timezone_name!r}") from exc
+    return value.timestamp()
 
 
 async def _get_feishu_credentials(agent_id: uuid.UUID) -> tuple[str, str]:
@@ -10748,11 +13047,25 @@ async def _feishu_calendar_create(agent_id: uuid.UUID, arguments: dict) -> str:
         if not v:
             return f"❌ Missing required argument '{f}'"
 
+    tz = str(arguments.get("timezone") or "Asia/Shanghai").strip()
+    try:
+        start_ts = int(_iso_to_ts(start_time, tz))
+        end_ts = int(_iso_to_ts(end_time, tz))
+    except (TypeError, ValueError) as exc:
+        return f"❌ Invalid calendar time: {exc}"
+    if end_ts <= start_ts:
+        return "❌ Invalid calendar time: end_time must be later than start_time"
+
     app_id, app_secret = await _get_feishu_credentials(agent_id)
     if not app_id or not app_secret:
         return "❌ Agent has no Feishu channel configured."
     from app.services.feishu_service import feishu_service
-    token = await feishu_service.get_tenant_access_token(app_id, app_secret)
+    try:
+        token = await feishu_service.get_tenant_access_token(app_id, app_secret)
+    except Exception as exc:
+        return f"❌ Failed to authenticate with Feishu Calendar: {str(exc)[:200]}"
+    if not token:
+        return "❌ Failed to authenticate with Feishu Calendar: empty access token"
 
     # Resolve organizer open_id from email — soft failure
     organizer_open_id: str | None = None
@@ -10761,33 +13074,39 @@ async def _feishu_calendar_create(agent_id: uuid.UUID, arguments: dict) -> str:
         if not organizer_open_id:
             logger.warning(f"[Feishu Calendar] Could not resolve open_id for '{user_email}', continuing without organizer invite")
 
-    agent_cal_id, cal_err = await _get_agent_calendar_id(token)
+    try:
+        agent_cal_id, cal_err = await _get_agent_calendar_id(token)
+    except Exception as exc:
+        return f"❌ Failed to retrieve Feishu calendar: {str(exc)[:200]}"
     if not agent_cal_id:
         return cal_err or "❌ Failed to retrieve agent's primary calendar ID."
 
-    tz = arguments.get("timezone", "Asia/Shanghai")
     body: dict = {
         "summary": summary,
-        "start_time": {"timestamp": str(int(_iso_to_ts(start_time))), "timezone": tz},
-        "end_time": {"timestamp": str(int(_iso_to_ts(end_time))), "timezone": tz},
+        "start_time": {"timestamp": str(start_ts), "timezone": tz},
+        "end_time": {"timestamp": str(end_ts), "timezone": tz},
     }
     if arguments.get("description"):
         body["description"] = arguments["description"]
     if arguments.get("location"):
         body["location"] = {"name": arguments["location"]}
 
-    async with httpx.AsyncClient(timeout=20) as client:
-        resp = await client.post(
-            f"https://open.feishu.cn/open-apis/calendar/v4/calendars/{agent_cal_id}/events",
-            json=body,
-            headers={"Authorization": f"Bearer {token}"},
-        )
-
-    data = resp.json()
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post(
+                f"https://open.feishu.cn/open-apis/calendar/v4/calendars/{agent_cal_id}/events",
+                json=body,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        data = resp.json()
+    except Exception as exc:
+        return f"❌ Feishu Calendar request failed: {str(exc)[:200]}"
     if data.get("code") != 0:
         return f"❌ Failed to create event: {data.get('msg')} (code {data.get('code')})"
 
     event_id = data.get("data", {}).get("event", {}).get("event_id", "")
+    if not event_id:
+        return "❌ Feishu Calendar returned success without an event ID"
 
     # Collect all attendee open_ids to invite
     attendee_open_ids: list[str] = []
@@ -10813,7 +13132,7 @@ async def _feishu_calendar_create(agent_id: uuid.UUID, arguments: dict) -> str:
                 attendee_open_ids.append(_oid)
                 attendee_display.append(aname)
         else:
-                logger.warning(f"[Calendar] Could not resolve attendee '{aname}': {_sr[:100]}")
+            logger.warning(f"[Calendar] Could not resolve attendee '{aname}': {_sr[:100]}")
 
     # 3. From explicit attendee_emails
     attendee_emails: list[str] = list(arguments.get("attendee_emails") or [])
@@ -10830,18 +13149,32 @@ async def _feishu_calendar_create(agent_id: uuid.UUID, arguments: dict) -> str:
     if sender_oid and sender_oid not in attendee_open_ids:
         attendee_open_ids.append(sender_oid)
 
-    if attendee_open_ids and event_id:
+    invited_count = 0
+    invite_errors: list[str] = []
+    if attendee_open_ids:
         async with httpx.AsyncClient(timeout=20) as client:
             for oid in attendee_open_ids:
-                await client.post(
-                    f"https://open.feishu.cn/open-apis/calendar/v4/calendars/{agent_cal_id}/events/{event_id}/attendees",
-                    json={"attendees": [{"type": "user", "user_id": oid}]},
-                    headers={"Authorization": f"Bearer {token}"},
-                    params={"user_id_type": "open_id"},
-                )
+                try:
+                    invite_resp = await client.post(
+                        f"https://open.feishu.cn/open-apis/calendar/v4/calendars/{agent_cal_id}/events/{event_id}/attendees",
+                        json={"attendees": [{"type": "user", "user_id": oid}]},
+                        headers={"Authorization": f"Bearer {token}"},
+                        params={"user_id_type": "open_id"},
+                    )
+                    invite_data = invite_resp.json()
+                    if invite_data.get("code") == 0:
+                        invited_count += 1
+                    else:
+                        invite_errors.append(
+                            f"{oid}: {invite_data.get('msg')} (code {invite_data.get('code')})"
+                        )
+                except Exception as exc:
+                    invite_errors.append(f"{oid}: {str(exc)[:120]}")
 
     att_str = f"\n**参与人**: {', '.join(attendee_display)}" if attendee_display else ""
-    invite_note = "\n（已向您发送日历邀请，请在飞书日历中确认）" if attendee_open_ids else ""
+    invite_note = "\n（已发送日历邀请，请在飞书日历中确认）" if invited_count else ""
+    if invite_errors:
+        invite_note += f"\n⚠️ 日程已创建，但 {len(invite_errors)} 个邀请发送失败：{'；'.join(invite_errors)}"
     return (
         f"✅ 日历事件已创建！\n"
         f"**标题**: {summary}\n"
@@ -10873,17 +13206,26 @@ async def _feishu_calendar_update(agent_id: uuid.UUID, arguments: dict) -> str:
         return cal_err or "❌ Failed to retrieve agent's primary calendar ID."
 
     patch: dict = {}
-    tz = arguments.get("timezone", "Asia/Shanghai")
+    tz = str(arguments.get("timezone") or "Asia/Shanghai").strip()
     if arguments.get("summary"):
         patch["summary"] = arguments["summary"]
     if arguments.get("description"):
         patch["description"] = arguments["description"]
     if arguments.get("location"):
         patch["location"] = {"name": arguments["location"]}
-    if arguments.get("start_time"):
-        patch["start_time"] = {"timestamp": str(int(_iso_to_ts(arguments["start_time"]))), "timezone": tz}
-    if arguments.get("end_time"):
-        patch["end_time"] = {"timestamp": str(int(_iso_to_ts(arguments["end_time"]))), "timezone": tz}
+    try:
+        if arguments.get("start_time"):
+            patch["start_time"] = {
+                "timestamp": str(int(_iso_to_ts(arguments["start_time"], tz))),
+                "timezone": tz,
+            }
+        if arguments.get("end_time"):
+            patch["end_time"] = {
+                "timestamp": str(int(_iso_to_ts(arguments["end_time"], tz))),
+                "timezone": tz,
+            }
+    except (TypeError, ValueError) as exc:
+        return f"❌ Invalid calendar time: {exc}"
 
     if not patch:
         return "ℹ️ No fields to update."
@@ -11038,7 +13380,7 @@ async def _feishu_user_search(agent_id: uuid.UUID, arguments: dict) -> str:
             )
             _tid = _agent_tenant_id.scalar_one_or_none()
             _query = select(OrgMember).where(
-                AgentModel.status == "active",
+                OrgMember.status == "active",
                 OrgMember.name.ilike(f"%{name}%"),
                 OrgMember.tenant_id == _tid
             )
@@ -11088,20 +13430,9 @@ async def _feishu_user_search(agent_id: uuid.UUID, arguments: dict) -> str:
     except Exception:
         pass
 
-    total = len(_cached_users)
-    if total == 0:
-        return (
-            f"❌ 本地通讯录缓存为空，暂时无法搜索「{name}」。\n\n"
-            "通讯录缓存会在同事向机器人发消息时自动建立。\n"
-            "如果「覃睿」从未给机器人发过消息，可以请他先给机器人发一条消息，"
-            "之后就能直接搜索到他了。\n\n"
-            "或者，请直接告诉我「覃睿」的飞书 open_id 或邮箱，我可以立刻操作。"
-        )
     return (
-        f"❌ 未在本地通讯录（已缓存 {total} 人）中找到「{name}」。\n\n"
-        "通讯录缓存来自给机器人发过消息的同事。\n"
-        "如果「{name}」从未给机器人发消息，请他先发一条，之后即可自动识别。\n"
-        "或者请直接提供其飞书 open_id / 工作邮箱。"
+        f"❌ 未在公司通讯录中找到「{name}」。\n\n"
+        "请确认姓名，或直接提供其飞书 user_id、open_id 或工作邮箱。"
     )
 
 
@@ -11121,13 +13452,27 @@ async def _feishu_contacts_refresh(agent_id: uuid.UUID) -> None:
 async def _get_email_config(agent_id: uuid.UUID) -> dict:
     """Retrieve per-agent email config from the send_email tool's AgentTool config."""
     from app.models.tool import Tool, AgentTool
+    from app.services.tool_config import get_tool_company_config
 
     async with async_session() as db:
-        # Find the send_email tool
-        r = await db.execute(select(Tool).where(Tool.name == "send_email"))
+        # Runtime must use the same tenant-scoped company configuration as the
+        # settings/test UI. Builtin Tool.config is capability metadata and must
+        # not be treated as shared company credentials.
+        r = await db.execute(
+            select(Tool).where(
+                Tool.name == "send_email",
+                Tool.source == "builtin",
+            )
+        )
         tool = r.scalar_one_or_none()
         if not tool:
             return {}
+
+        tenant_r = await db.execute(
+            select(AgentModel.tenant_id).where(AgentModel.id == agent_id)
+        )
+        tenant_id = tenant_r.scalar_one_or_none()
+        company_config = await get_tool_company_config(db, tool, tenant_id)
 
         # Get per-agent config
         at_r = await db.execute(
@@ -11138,8 +13483,8 @@ async def _get_email_config(agent_id: uuid.UUID) -> dict:
         )
         at = at_r.scalar_one_or_none()
         agent_config = (at.config or {}) if at else {}
-        merged = {**(tool.config or {}), **agent_config}
-        return _decrypt_sensitive_fields(merged, tool.config_schema)
+        decrypted_agent_config = _decrypt_sensitive_fields(agent_config, tool.config_schema)
+        return {**company_config, **decrypted_agent_config}
 
 
 # ── Pages: public HTML hosting ──────────────────────────
@@ -11186,6 +13531,7 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
 
     # Create record
     from app.models.published_page import PublishedPage
+    from app.services.platform_service import platform_service
     try:
         async with async_session() as db:
             page = PublishedPage(
@@ -11198,35 +13544,17 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
             )
             db.add(page)
             await db.commit()
+            public_base = await platform_service.get_public_base_url(db)
     except Exception as e:
         return f"Failed to publish: {e}"
 
-    # Build public URL from the same settings loader used by the app. Reading
-    # os.environ directly misses values that come from the local .env file.
-    try:
-        from app.config import get_settings as _get_publish_settings
-        public_base = (_get_publish_settings().PUBLIC_BASE_URL or os.environ.get("PUBLIC_BASE_URL", "")).rstrip("/")
-    except Exception:
-        public_base = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
-    if not public_base:
-        # Relative path works inside the same deployment; include a note so
-        # the user can configure PUBLIC_BASE_URL for a fully-qualified link.
-        url = f"/p/{short_id}"
-        url_note = (
-            "\n\n> Note: PUBLIC_BASE_URL is not configured on this server. "
-            "The link above is a relative path — prepend your server's domain "
-            "to get the full URL. Set PUBLIC_BASE_URL in your .env to have "
-            "the agent generate complete links automatically."
-        )
-    else:
-        url = f"{public_base}/p/{short_id}"
-        url_note = ""
+    url = f"{public_base.rstrip('/')}/p/{short_id}"
 
     return (
         f"Published successfully!\n\n"
         f"Public URL: {url}\n"
         f"Title: {title}\n\n"
-        f"Anyone can access this page without logging in.{url_note}"
+        "Anyone can access this page without logging in."
     )
 
 
@@ -11234,14 +13562,11 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
 async def _list_published_pages(agent_id: uuid.UUID) -> str:
     """List all published pages for this agent."""
     from app.models.published_page import PublishedPage
-    try:
-        from app.config import get_settings as _get_publish_settings
-        public_base = (_get_publish_settings().PUBLIC_BASE_URL or os.environ.get("PUBLIC_BASE_URL", "")).rstrip("/")
-    except Exception:
-        public_base = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+    from app.services.platform_service import platform_service
 
     try:
         async with async_session() as db:
+            public_base = await platform_service.get_public_base_url(db)
             result = await db.execute(
                 select(PublishedPage)
                 .where(PublishedPage.agent_id == agent_id)
@@ -11254,7 +13579,7 @@ async def _list_published_pages(agent_id: uuid.UUID) -> str:
 
         lines = [f"Published pages ({len(pages)} total):\n"]
         for p in pages:
-            url = f"{public_base}/p/{p.short_id}" if public_base else f"/p/{p.short_id}"
+            url = f"{public_base.rstrip('/')}/p/{p.short_id}"
             lines.append(f"- {p.title or 'Untitled'}")
             lines.append(f"  URL: {url}")
             lines.append(f"  Source: {p.source_path}")
@@ -12934,7 +15259,7 @@ async def _agentbay_file_transfer(agent_id: Optional[uuid.UUID], ws: Path, argum
       - env        → workspace: download_file(remote_path, local_workspace_path) [single SDK call]
       - env A      → env B:    download to /tmp/<uuid>, upload to env B, cleanup /tmp [transparent]
 
-    The 'local' side of the SDK calls is always the Clawith backend server,
+    The 'local' side of the SDK calls is always the Astra backend server,
     which has access to the agent workspace directory.
     """
     if not agent_id:

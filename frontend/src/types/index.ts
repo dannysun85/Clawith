@@ -23,9 +23,13 @@ export interface Agent {
     role_description: string;
     bio?: string;
     status: 'creating' | 'running' | 'idle' | 'stopped' | 'error';
+    last_error?: string | null;
+    last_error_at?: string | null;
     creator_id: string;
     primary_model_id?: string;
     fallback_model_id?: string;
+    preferred_tier?: 'lite' | 'pro' | 'ultra' | string;
+    preferred_modality?: string;
     autonomy_policy: Record<string, string>;
     tokens_used_today: number;
     tokens_used_month: number;
@@ -48,6 +52,8 @@ export interface Agent {
     openclaw_last_seen?: string;
     access_mode?: 'company' | 'private' | 'custom';
     company_access_level?: 'use' | 'manage';
+    is_system?: boolean;
+    is_expired?: boolean;
     unread_count?: number;
     // True when the viewing user has already been onboarded to this agent.
     // Defaults to true on list endpoints that don't compute per-viewer state.

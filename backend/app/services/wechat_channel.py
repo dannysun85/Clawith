@@ -88,7 +88,7 @@ async def send_wechat_text_message(
                     "msg": {
                         "from_user_id": "",
                         "to_user_id": to_user_id,
-                        "client_id": f"clawith-wechat:{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}",
+                        "client_id": f"astra-wechat:{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}",
                         "message_type": 2,
                         "message_state": 2,
                         "context_token": context_token,
@@ -260,7 +260,7 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
         sess.last_message_at = datetime.now(timezone.utc)
 
         # Pre-load agent/model before releasing the connection
-        _agent_model, _llm_model, _fallback_model = await _load_agent_and_model(db, agent_id)
+        _agent_model, _llm_model, _fallback_model, _route_meta = await _load_agent_and_model(db, agent_id)
 
         await db.commit()
         # ── Phase 1 complete: release connection before slow LLM call ──

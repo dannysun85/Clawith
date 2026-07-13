@@ -16,7 +16,7 @@ from app.models.user import User  # noqa: F401
 from app.models.agent import Agent, AgentPermission, AgentTemplate  # noqa: F401
 from app.models.task import Task, TaskLog  # noqa: F401
 from app.models.channel_config import ChannelConfig  # noqa: F401
-from app.models.llm import LLMModel  # noqa: F401
+from app.models.llm import LLMCredential, LLMModel  # noqa: F401
 from app.models.audit import AuditLog, ApprovalRequest, ChatMessage, EnterpriseInfo  # noqa: F401
 from app.models.skill import Skill, SkillFile  # noqa: F401
 from app.models.chat_session import ChatSession  # noqa: F401
@@ -30,8 +30,34 @@ from app.models.system_settings import SystemSetting  # noqa: F401
 from app.models.tenant import Tenant  # noqa: F401
 from app.models.tool import Tool  # noqa: F401
 from app.models.trigger import AgentTrigger  # noqa: F401
+from app.models.trigger_execution import TriggerExecution  # noqa: F401
 from app.models.agent_credential import AgentCredential  # noqa: F401
 from app.models.onboarding import UserTenantOnboarding  # noqa: F401
+from app.models.douyin import (  # noqa: F401
+    DouyinAccount,
+    DouyinComment,
+    DouyinMetricSnapshot,
+    DouyinOAuthState,
+    DouyinOperation,
+    DouyinPublishJob,
+    DouyinToken,
+)
+from app.models.subscription import (  # noqa: F401
+    BillingRule,
+    BillingProfile,
+    BillingWebhookEvent,
+    CreditBalance,
+    CreditPack,
+    CreditReservation,
+    CreditTransaction,
+    ModelRoute,
+    PaymentOrder,
+    Plan,
+    Subscription,
+    TenantUsage,
+)
+from app.models.media_generation import MediaGenerationTask  # noqa: F401
+from app.models.notification import Notification  # noqa: F401
 
 config = context.config
 settings = get_settings()

@@ -67,4 +67,7 @@ else
 fi
 
 echo "[entrypoint] Step 2: Starting uvicorn..."
-exec /bin/bash -lc "$START_COMMAND"
+# The command itself must replace the shell so the application becomes PID 1.
+# Do not start a login shell here: bash would rebuild PATH and hide the locked
+# virtual environment installed at /app/.venv.
+exec /bin/bash -c "exec $START_COMMAND"

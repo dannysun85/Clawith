@@ -172,6 +172,126 @@ async def test_login_unverified_email():
 
 
 # ---------------------------------------------------------------------------
+# Registration code gate tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_registration_config_allows_bootstrap_without_code(monkeypatch):
+    is_empty = AsyncMock(return_value=True)
+    monkeypatch.setattr(auth_api.identity_dao, "is_empty", is_empty)
+
+    result = await auth_api.get_registration_config()
+
+    assert result == {"invitation_code_required": False}
+    is_empty.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_registration_config_requires_code_after_bootstrap(monkeypatch):
+    is_empty = AsyncMock(return_value=False)
+    monkeypatch.setattr(auth_api.identity_dao, "is_empty", is_empty)
+
+    result = await auth_api.get_registration_config()
+
+    assert result == {"invitation_code_required": True}
+    is_empty.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_signup_code_gate_allows_bootstrap_without_code(monkeypatch):
+    enabled = AsyncMock(return_value=True)
+    monkeypatch.setattr(auth_api.system_setting_dao, "is_invitation_code_enabled", enabled)
+
+    result = await auth_api._prepare_signup_code_if_required(
+        RecordingDB(),
+        None,
+        is_first_user=True,
+    )
+
+    assert result is None
+    enabled.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_signup_code_gate_rejects_missing_code(monkeypatch):
+    monkeypatch.setattr(
+        auth_api.system_setting_dao,
+        "is_invitation_code_enabled",
+        AsyncMock(return_value=True),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await auth_api._prepare_signup_code_if_required(
+            RecordingDB(),
+            "",
+            is_first_user=False,
+        )
+
+    assert exc.value.status_code == 400
+    assert "required" in str(exc.value.detail).lower()
+
+
+@pytest.mark.asyncio
+async def test_signup_code_gate_rejects_invalid_code(monkeypatch):
+    monkeypatch.setattr(
+        auth_api.system_setting_dao,
+        "is_invitation_code_enabled",
+        AsyncMock(return_value=True),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await auth_api._prepare_signup_code_if_required(
+            RecordingDB(responses=[DummyResult()]),
+            "bad-code",
+            is_first_user=False,
+        )
+
+    assert exc.value.status_code == 400
+    assert "invalid" in str(exc.value.detail).lower()
+
+
+@pytest.mark.asyncio
+async def test_signup_code_gate_rejects_exhausted_code(monkeypatch):
+    monkeypatch.setattr(
+        auth_api.system_setting_dao,
+        "is_invitation_code_enabled",
+        AsyncMock(return_value=True),
+    )
+    code = SimpleNamespace(code="FULL", tenant_id=None, used_count=3, max_uses=3)
+
+    with pytest.raises(HTTPException) as exc:
+        await auth_api._prepare_signup_code_if_required(
+            RecordingDB(responses=[DummyResult(values=[code])]),
+            "full",
+            is_first_user=False,
+        )
+
+    assert exc.value.status_code == 400
+    assert "usage limit" in str(exc.value.detail).lower()
+
+
+@pytest.mark.asyncio
+async def test_signup_code_gate_consumes_valid_code(monkeypatch):
+    monkeypatch.setattr(
+        auth_api.system_setting_dao,
+        "is_invitation_code_enabled",
+        AsyncMock(return_value=True),
+    )
+    code = SimpleNamespace(code="OPEN123", tenant_id=None, used_count=0, max_uses=2)
+
+    result = await auth_api._prepare_signup_code_if_required(
+        RecordingDB(responses=[DummyResult(values=[code])]),
+        " open123 ",
+        is_first_user=False,
+    )
+    auth_api._consume_signup_code_if_needed(result)
+
+    assert result is code
+    assert code.used_count == 1
+
+
+# ---------------------------------------------------------------------------
 # /me tests
 # ---------------------------------------------------------------------------
 

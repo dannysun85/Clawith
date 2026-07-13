@@ -14,7 +14,7 @@ async def test_invitation_email_preflight_rejects_disabled_system_email(monkeypa
         if include_disabled:
             return SystemEmailConfig(
                 from_address="bot@example.com",
-                from_name="Clawith",
+                from_name="Astra",
                 smtp_host="smtp.example.com",
                 smtp_port=465,
                 smtp_username="bot@example.com",
@@ -42,7 +42,7 @@ async def test_invitation_email_preflight_accepts_enabled_system_email(monkeypat
     async def fake_resolve_email_config_async(_db, *, include_disabled: bool = False):
         return SystemEmailConfig(
             from_address="bot@example.com",
-            from_name="Clawith",
+            from_name="Astra",
             smtp_host="smtp.example.com",
             smtp_port=465,
             smtp_username="bot@example.com",

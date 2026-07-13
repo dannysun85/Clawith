@@ -50,10 +50,16 @@ class Agent(Base):
     )
     container_id: Mapped[str | None] = mapped_column(String(100))
     container_port: Mapped[int | None] = mapped_column(Integer)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    last_error_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     # LLM config
     primary_model_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("llm_models.id"))
     fallback_model_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("llm_models.id"))
+
+    # SaaS tier selection (Lite/Pro/Ultra) — preferred over legacy primary_model_id
+    preferred_tier: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    preferred_modality: Mapped[str | None] = mapped_column(String(20), nullable=True, default="text")
 
     # Autonomy policy (L1/L2/L3)
     autonomy_policy: Mapped[dict] = mapped_column(
@@ -118,7 +124,7 @@ class Agent(Base):
     template_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("agent_templates.id"))
 
     # Heartbeat (proactive agent awareness)
-    heartbeat_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    heartbeat_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     heartbeat_interval_minutes: Mapped[int] = mapped_column(Integer, default=240)
     heartbeat_active_hours: Mapped[str] = mapped_column(String(20), default="09:00-18:00")
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

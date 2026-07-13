@@ -13,13 +13,31 @@ import PromptModal from '../../components/PromptModal';
 import { appendLiveCodeOutput, type LivePreviewState } from '../../components/AgentBayLivePanel';
 import AgentSidePanel, { SidePanelTab } from '../../components/AgentSidePanel';
 import type { WorkspaceActivity, WorkspaceLiveDraft } from '../../components/WorkspaceOperationPanel';
-import { activityApi, agentApi, channelApi, enterpriseApi, fileApi, focusApi, scheduleApi, skillApi, taskApi, tenantApi, triggerApi, uploadFileWithProgress } from '../../services/api';
+import { activityApi, agentApi, channelApi, fileApi, focusApi, scheduleApi, skillApi, taskApi, triggerApi, uploadFileWithProgress } from '../../services/api';
+import { websocketAuthProtocols } from '../../utils/authTransport';
+import { reportClientIssue } from '../../services/productionIssueReporter';
 import type { FocusApiItem } from '../../services/api';
-import ModelSwitcher from '../../components/ModelSwitcher';
+import { isA2AMessageLeft } from '../../utils/a2aMessageSide';
+import TierSelector, { resolveAllowedTier, type SaasTier } from '../../components/TierSelector';
+import { useAllowedTiers } from '../../hooks/useLlmModels';
+import { SUBSCRIPTION_UPGRADE_PATH } from '../../hooks/useAgentCreationLimit';
 import { useAppStore } from '../../stores';
 import { useAuthStore } from '../../stores';
 import { copyToClipboard } from '../../utils/clipboard';
 import { formatFileSize } from '../../utils/formatFileSize';
+import { canAccessSaasAdmin } from '../../utils/saasAdmin';
+import { displaySessionTitle } from '../../utils/sessionDisplay';
+import {
+    resolveChatSessionModality,
+    resolveChatSessionTier,
+} from '../../utils/chatSessionModelSelection';
+import {
+    buildMediaPrompt,
+    mediaCapabilityState,
+    type MediaCapabilitiesResponse,
+    type MediaCapability,
+    type MediaModality,
+} from '../../utils/mediaCapabilities';
 import {
     IconBrain,
     IconBrowser,
@@ -36,7 +54,9 @@ import {
     IconLock,
     IconMailForward,
     IconMessageCircle,
+    IconMusic,
     IconPaperclip,
+    IconPhoto,
     IconPlugConnected,
     IconRobot,
     IconSearch,
@@ -45,6 +65,8 @@ import {
     IconTerminal2,
     IconTools,
     IconUser,
+    IconVideo,
+    IconVolume,
     IconWorld,
     IconBolt,
     IconAlertTriangle,
@@ -52,6 +74,7 @@ import {
 import { useDropZone } from '../../hooks/useDropZone';
 import ApprovalsTab from './tabs/ApprovalsTab';
 import { AGENT_DETAIL_TABS } from './agentDetailTabs';
+import DouyinTab from './tabs/DouyinTab';
 import MindTab from './tabs/MindTab';
 import SettingsTab from './tabs/SettingsTab';
 import SkillsTab from './tabs/SkillsTab';
@@ -249,6 +272,23 @@ function synthesizeFocusForTrigger(trig: any): FocusItem {
         synthetic: true,
         system: isSystem,
     };
+}
+
+function appendSyntheticTriggerFocusItems(focusItems: FocusItem[], triggers: any[]): FocusItem[] {
+    const knownFocusNames = new Set(focusItems.map((item) => item.name));
+    const syntheticItems = new Map<string, FocusItem>();
+
+    for (const trigger of triggers) {
+        const focusRef = trigger?.focus_ref ? String(trigger.focus_ref) : '';
+        if (focusRef && knownFocusNames.has(focusRef)) continue;
+
+        const synthetic = synthesizeFocusForTrigger(trigger);
+        if (!knownFocusNames.has(synthetic.name) && !syntheticItems.has(synthetic.name)) {
+            syntheticItems.set(synthetic.name, synthetic);
+        }
+    }
+
+    return [...focusItems, ...syntheticItems.values()];
 }
 
 function parseAgentBayTransferArgs(rawArgs: any): NonNullable<LivePreviewState['transfer']> {
@@ -1984,31 +2024,11 @@ export default function AgentDetailPage() {
         enabled: !!id,
     });
 
-    // Tenant default model — used to render the "默认" tag and as a visual
-    // fallback when an agent has no explicit primary model.
-    const { data: myTenant } = useQuery({
-        queryKey: ['tenant', 'me'],
-        queryFn: () => tenantApi.me(),
-        staleTime: 5 * 60 * 1000,
-        refetchOnMount: 'always',
-    });
-
-    // Chat-side picker. The saved agent model is still the default source,
-    // but ordinary collaborators must be able to pick a per-chat override
-    // without needing permission to edit agent settings. Users with manage
-    // access keep the previous behavior: picking here also updates the saved
-    // agent default.
-    const [overrideModelId, setOverrideModelId] = useState<string | null>(null);
-    useEffect(() => {
-        if (agent?.primary_model_id && agent.primary_model_id !== overrideModelId) {
-            setOverrideModelId(agent.primary_model_id);
-        }
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [agent?.primary_model_id]);
-
-    const handleModelChange = useCallback((newModelId: string | null) => {
-        setOverrideModelId(newModelId);
-    }, []);
+    // Chat-side tier picker. Users pick Lite/Pro/Ultra per chat; the backend
+    // resolves tier+modality to a concrete model via model_routes.
+    const [chatTier, setChatTier] = useState<SaasTier | null>(null);
+    const [chatModality, setChatModality] = useState<string>('text');
+    const allowedTiers = useAllowedTiers();
 
     // Track onboarding kickoff per (agent, session) so the agent only greets
     // once per session. The agent opens the conversation itself — no visible
@@ -2128,19 +2148,15 @@ export default function AgentDetailPage() {
     const [sessionsLoading, setSessionsLoading] = useState(false);
     const [allSessionsLoading, setAllSessionsLoading] = useState(false);
     const [agentExpired, setAgentExpired] = useState(false);
+    const [modelSelectionSaving, setModelSelectionSaving] = useState(false);
     // Websocket chat state (for 'me' conversation)
     const token = useAuthStore((s) => s.token);
     const currentUser = useAuthStore((s) => s.user);
-    const isAgentOwner =
-        currentUser?.id != null &&
-        (agent as any)?.creator_id != null &&
-        String((agent as any).creator_id) === String(currentUser.id);
     /** Chat sidebar: who may list all sessions & read others' threads (matches backend scope=all). */
     const canViewAllAgentChatSessions =
         currentUser?.role === 'platform_admin' ||
         currentUser?.role === 'org_admin' ||
-        currentUser?.role === 'agent_admin' ||
-        isAgentOwner;
+        currentUser?.role === 'agent_admin';
     type SessionRuntimeKey = string;
     const wsMapRef = useRef<Record<SessionRuntimeKey, WebSocket>>({});
     const reconnectTimerRef = useRef<Record<SessionRuntimeKey, ReturnType<typeof setTimeout> | null>>({});
@@ -2150,6 +2166,7 @@ export default function AgentDetailPage() {
     const currentAgentIdRef = useRef<string | undefined>(id);
     const sessionMsgAbortRef = useRef<AbortController | null>(null);
     const sessionLoadSeqRef = useRef(0);
+    const modelSelectionSaveSeqRef = useRef(0);
 
     const buildSessionRuntimeKey = (agentId: string, sessionId: string) => `${agentId}:${sessionId}`;
 
@@ -2204,6 +2221,14 @@ export default function AgentDetailPage() {
                     ? sess.participant_type
                     : 'user',
             is_group: Boolean(sess.is_group),
+            model_tier:
+                typeof sess.model_tier === 'string' && sess.model_tier.trim()
+                    ? sess.model_tier.trim().toLowerCase()
+                    : null,
+            model_modality:
+                typeof sess.model_modality === 'string' && sess.model_modality.trim()
+                    ? sess.model_modality.trim().toLowerCase()
+                    : null,
         };
     };
 
@@ -2229,6 +2254,79 @@ export default function AgentDetailPage() {
     };
 
     const isViewingOtherUsersSessions = canViewAllAgentChatSessions && chatScope === 'all';
+
+    useEffect(() => {
+        const nextTier = resolveChatSessionTier(
+            activeSession?.model_tier,
+            agent?.preferred_tier,
+            allowedTiers,
+        );
+        const nextModality = resolveChatSessionModality(
+            activeSession?.model_modality,
+            agent?.preferred_modality,
+        );
+        setChatTier(prev => prev === nextTier ? prev : nextTier);
+        setChatModality(prev => prev === nextModality ? prev : nextModality);
+    }, [
+        activeSession?.id,
+        activeSession?.model_tier,
+        activeSession?.model_modality,
+        agent?.preferred_tier,
+        agent?.preferred_modality,
+        allowedTiers,
+    ]);
+
+    const handleTierChange = async (newTier: SaasTier) => {
+        const sessionId = activeSession?.id ? String(activeSession.id) : null;
+        if (!id || !sessionId || !isWritableSession(activeSession)) return;
+
+        const previousTier = activeSession.model_tier ?? null;
+        const previousModality = activeSession.model_modality ?? null;
+        const sequence = ++modelSelectionSaveSeqRef.current;
+        const optimistic = { model_tier: newTier };
+        setChatTier(newTier);
+        setActiveSession((prev: any) => prev && String(prev.id) === sessionId ? { ...prev, ...optimistic } : prev);
+        setSessions(prev => prev.map((item: any) => String(item.id) === sessionId ? { ...item, ...optimistic } : item));
+        setAllSessions(prev => prev.map((item: any) => String(item.id) === sessionId ? { ...item, ...optimistic } : item));
+        setModelSelectionSaving(true);
+
+        try {
+            const tkn = localStorage.getItem('token');
+            const res = await fetch(`/api/agents/${id}/sessions/${sessionId}`, {
+                method: 'PATCH',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${tkn}`,
+                },
+                body: JSON.stringify({ model_tier: newTier }),
+            });
+            if (!res.ok) {
+                const error = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }));
+                throw new Error(String(error.detail || `HTTP ${res.status}`));
+            }
+            const saved = await res.json();
+            if (sequence !== modelSelectionSaveSeqRef.current || activeSessionIdRef.current !== sessionId) return;
+            const persisted = {
+                model_tier: saved.model_tier,
+                model_modality: saved.model_modality,
+            };
+            setActiveSession((prev: any) => prev && String(prev.id) === sessionId ? normalizeChatSession({ ...prev, ...persisted }) : prev);
+            setSessions(prev => prev.map((item: any) => String(item.id) === sessionId ? normalizeChatSession({ ...item, ...persisted }) : item));
+            setAllSessions(prev => prev.map((item: any) => String(item.id) === sessionId ? normalizeChatSession({ ...item, ...persisted }) : item));
+        } catch (err: any) {
+            if (sequence !== modelSelectionSaveSeqRef.current || activeSessionIdRef.current !== sessionId) return;
+            const rollback = { model_tier: previousTier, model_modality: previousModality };
+            setActiveSession((prev: any) => prev && String(prev.id) === sessionId ? { ...prev, ...rollback } : prev);
+            setSessions(prev => prev.map((item: any) => String(item.id) === sessionId ? { ...item, ...rollback } : item));
+            setAllSessions(prev => prev.map((item: any) => String(item.id) === sessionId ? { ...item, ...rollback } : item));
+            setChatTier(resolveChatSessionTier(previousTier, agent?.preferred_tier, allowedTiers));
+            toast.error(t('agent.chat.modelSelectionSaveFailed', '模型档位保存失败'), {
+                details: String(err?.message || err),
+            });
+        } finally {
+            if (sequence === modelSelectionSaveSeqRef.current) setModelSelectionSaving(false);
+        }
+    };
 
     /** Sessions in scope=all that are not the current viewer's own P2P rows (for admin「其他用户」tab).
      *  Agent-to-agent sessions (source_channel === 'agent') store the creator's user_id, so we must
@@ -2326,7 +2424,7 @@ export default function AgentDetailPage() {
             } else {
                 setAllSessions([]);
                 if (res.status === 403) {
-                    console.warn('[chat] scope=all sessions forbidden (need org/platform/agent admin)');
+                    console.warn('[chat] scope=all sessions forbidden (administrator role required)');
                 }
             }
         } catch {
@@ -2444,7 +2542,11 @@ export default function AgentDetailPage() {
         if (!ok) return;
         const tkn = localStorage.getItem('token');
         try {
-            await fetch(`/api/agents/${id}/sessions/${sessionId}`, { method: 'DELETE', headers: { Authorization: `Bearer ${tkn}` } });
+            const res = await fetch(`/api/agents/${id}/sessions/${sessionId}`, { method: 'DELETE', headers: { Authorization: `Bearer ${tkn}` } });
+            if (!res.ok) {
+                const error = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }));
+                throw new Error(String(error.detail || `HTTP ${res.status}`));
+            }
             if (id) closeSessionSocket(buildSessionRuntimeKey(id, sessionId), true);
             // If deleted the active session, clear it
             if (activeSession?.id === sessionId) {
@@ -2502,7 +2604,7 @@ export default function AgentDetailPage() {
         } catch (e: any) { toast.error(t('common.error.saveFailed', '保存失败'), { details: String(e?.message || e) }); }
         setExpirySaving(false);
     };
-    interface ChatMsg { role: 'user' | 'assistant' | 'tool_call'; content: string; fileName?: string; toolName?: string; toolCallId?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; toolThinking?: string; thinking?: string; imageUrl?: string; timestamp?: string; }
+    interface ChatMsg { role: 'user' | 'assistant' | 'tool_call'; content: string; fileName?: string; toolName?: string; toolCallId?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; toolThinking?: string; thinking?: string; imageUrl?: string; timestamp?: string; quotaError?: { quota_type?: string; action?: string; details?: { upgrade_url?: string } }; }
     const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
     const getToolTargetKey = (args: any): string => {
         if (!args) return '';
@@ -2583,7 +2685,8 @@ export default function AgentDetailPage() {
         userMsg: string;
         fileName: string;
         imageUrl?: string;
-        modelId?: string | null;
+        tier?: SaasTier | null;
+        modality?: string;
     };
     const [attachedFiles, setAttachedFiles] = useState<AttachedFileRef[]>([]);
     const dismissedWorkspaceRefPath = useRef<string | null>(null);
@@ -2594,7 +2697,24 @@ export default function AgentDetailPage() {
     const chatContainerRef = useRef<HTMLDivElement>(null);
     const chatInputRef = useRef<HTMLTextAreaElement>(null);
     const chatInputAreaRef = useRef<HTMLDivElement>(null);
+    const chatInputResizeFrameRef = useRef<number | null>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
+
+    const scheduleChatInputResize = useCallback((element: HTMLTextAreaElement) => {
+        if (chatInputResizeFrameRef.current !== null) {
+            cancelAnimationFrame(chatInputResizeFrameRef.current);
+        }
+        chatInputResizeFrameRef.current = requestAnimationFrame(() => {
+            element.style.height = 'auto';
+            element.style.height = `${element.scrollHeight}px`;
+            chatInputResizeFrameRef.current = null;
+        });
+    }, []);
+    useEffect(() => () => {
+        if (chatInputResizeFrameRef.current !== null) {
+            cancelAnimationFrame(chatInputResizeFrameRef.current);
+        }
+    }, []);
 
     const workspacePreviewLocked = !!workspaceLockedPath;
     useEffect(() => {
@@ -2651,8 +2771,8 @@ export default function AgentDetailPage() {
 
     // Settings form local state
     const [settingsForm, setSettingsForm] = useState({
-        primary_model_id: '',
-        fallback_model_id: '',
+        preferred_tier: '',
+        preferred_modality: 'text',
         context_window_size: 100,
         max_tool_rounds: 50,
         max_tokens_per_day: '' as string | number,
@@ -2670,8 +2790,8 @@ export default function AgentDetailPage() {
     useEffect(() => {
         if (agent && !settingsInitRef.current) {
             setSettingsForm({
-                primary_model_id: agent.primary_model_id || '',
-                fallback_model_id: agent.fallback_model_id || '',
+                preferred_tier: resolveAllowedTier(agent.preferred_tier, allowedTiers) || '',
+                preferred_modality: agent.preferred_modality || 'text',
                 context_window_size: agent.context_window_size ?? 100,
                 max_tool_rounds: (agent as any).max_tool_rounds ?? 50,
                 max_tokens_per_day: agent.max_tokens_per_day || '',
@@ -2682,7 +2802,15 @@ export default function AgentDetailPage() {
             });
             settingsInitRef.current = true;
         }
-    }, [agent]);
+    }, [agent, allowedTiers]);
+
+    useEffect(() => {
+        if (!allowedTiers.length) return;
+        setSettingsForm((form) => {
+            const tier = resolveAllowedTier(form.preferred_tier || agent?.preferred_tier, allowedTiers);
+            return tier && tier !== form.preferred_tier ? { ...form, preferred_tier: tier } : form;
+        });
+    }, [agent?.preferred_tier, allowedTiers]);
 
     // Welcome message editor state (must be at top level -- not inside IIFE)
     const [wmDraft, setWmDraft] = useState('');
@@ -2690,8 +2818,8 @@ export default function AgentDetailPage() {
     useEffect(() => { setWmDraft((agent as any)?.welcome_message || ''); }, [(agent as any)?.welcome_message]);
 
     const hasSettingsChanges = (
-        settingsForm.primary_model_id !== (agent?.primary_model_id || '') ||
-        settingsForm.fallback_model_id !== (agent?.fallback_model_id || '') ||
+        settingsForm.preferred_tier !== (agent?.preferred_tier || 'pro') ||
+        settingsForm.preferred_modality !== (agent?.preferred_modality || 'text') ||
         settingsForm.context_window_size !== (agent?.context_window_size ?? 100) ||
         settingsForm.max_tool_rounds !== ((agent as any)?.max_tool_rounds ?? 50) ||
         String(settingsForm.max_tokens_per_day) !== String(agent?.max_tokens_per_day || '') ||
@@ -2706,8 +2834,8 @@ export default function AgentDetailPage() {
         setSettingsError('');
         try {
             const result: any = await agentApi.update(id!, {
-                primary_model_id: settingsForm.primary_model_id || null,
-                fallback_model_id: settingsForm.fallback_model_id || null,
+                preferred_tier: settingsForm.preferred_tier || null,
+                preferred_modality: settingsForm.preferred_modality || 'text',
                 context_window_size: settingsForm.context_window_size,
                 max_tool_rounds: settingsForm.max_tool_rounds,
                 max_tokens_per_day: settingsForm.max_tokens_per_day ? Number(settingsForm.max_tokens_per_day) : null,
@@ -2796,7 +2924,7 @@ export default function AgentDetailPage() {
         if (parsed.fileName && !parsed.imageUrl && id) {
             const ext = parsed.fileName.split('.').pop()?.toLowerCase() || '';
             if (IMAGE_EXTS.includes(ext)) {
-                parsed.imageUrl = `/api/agents/${id}/files/download?path=workspace/uploads/${encodeURIComponent(parsed.fileName)}&token=${token}`;
+                parsed.imageUrl = fileApi.downloadUrl(id, `workspace/uploads/${parsed.fileName}`, { inline: true });
             }
         }
         return parsed;
@@ -2880,7 +3008,7 @@ export default function AgentDetailPage() {
         if (existing && (existing.readyState === WebSocket.OPEN || existing.readyState === WebSocket.CONNECTING)) return;
         reconnectDisabledRef.current[key] = false;
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const sessionParam = `&session_id=${sessionId}`;
+        const sessionParam = `session_id=${encodeURIComponent(sessionId)}`;
 
         const scheduleReconnect = () => {
             if (reconnectDisabledRef.current[key]) return;
@@ -2892,7 +3020,8 @@ export default function AgentDetailPage() {
         };
 
         const lang = (i18n.language || 'en').toLowerCase().startsWith('zh') ? 'zh' : 'en';
-        const ws = new WebSocket(`${protocol}//${window.location.host}/ws/chat/${agentId}?token=${authToken}${sessionParam}&lang=${lang}`);
+        const wsUrl = `${protocol}//${window.location.host}/ws/chat/${agentId}?${sessionParam}&lang=${lang}`;
+        const ws = new WebSocket(wsUrl, websocketAuthProtocols(authToken));
         wsMapRef.current[key] = ws;
         ws.onopen = () => {
             if (reconnectDisabledRef.current[key]) {
@@ -2926,11 +3055,27 @@ export default function AgentDetailPage() {
                 if (isActiveRuntime && e.code === 4003) setAgentExpired(true);
                 return;
             }
+            if (e.code !== 1000 && e.code !== 1001) {
+                reportClientIssue({
+                    category: 'websocket',
+                    error_code: `close_${e.code}`,
+                    route: '/ws/chat/{agent_id}',
+                    operation: 'chat',
+                    metadata: { close_code: e.code, component: 'AgentDetailPage' },
+                });
+            }
             scheduleReconnect();
         };
         ws.onerror = (error) => {
             const isActiveRuntime = currentAgentIdRef.current === agentId && activeSessionIdRef.current === sessionId;
             if (isActiveRuntime) setWsConnected(false);
+            reportClientIssue({
+                category: 'websocket',
+                error_code: 'WebSocketError',
+                route: '/ws/chat/{agent_id}',
+                operation: 'chat',
+                metadata: { component: 'AgentDetailPage' },
+            });
             console.warn(`WebSocket error for session ${sessionId}:`, error);
             // Error automatically triggers onclose with abnormal code, which handles reconnect
         };
@@ -3146,8 +3291,8 @@ export default function AgentDetailPage() {
                 setChatMessages(prev => {
                     const last = prev[prev.length - 1];
                     const thinking = (last && last.role === 'assistant' && (last as any)._streaming) ? last.thinking : undefined;
-                    if (last && last.role === 'assistant' && (last as any)._streaming) return [...prev.slice(0, -1), parseChatMsg({ role: 'assistant', content: d.content, thinking, timestamp: new Date().toISOString() })];
-                    return [...prev, parseChatMsg({ role: d.role, content: d.content, timestamp: new Date().toISOString() })];
+                    if (last && last.role === 'assistant' && (last as any)._streaming) return [...prev.slice(0, -1), parseChatMsg({ role: 'assistant', content: d.content, thinking, timestamp: new Date().toISOString(), quotaError: d.quota_error })];
+                    return [...prev, parseChatMsg({ role: d.role, content: d.content, timestamp: new Date().toISOString(), quotaError: d.quota_error })];
                 });
                 const currentSessionId = activeSessionIdRef.current ? String(activeSessionIdRef.current) : '';
                 if (currentSessionId) clearUnreadForSession(currentSessionId);
@@ -3167,7 +3312,7 @@ export default function AgentDetailPage() {
                     const last = prev[prev.length - 1];
                     const warningText = `Warning: ${msg}`;
                     if (last && last.role === 'assistant' && last.content === warningText) return prev;
-                    return [...prev, parseChatMsg({ role: 'assistant', content: warningText })];
+                    return [...prev, parseChatMsg({ role: 'assistant', content: warningText, quotaError: d.quota_error })];
                 });
                 if (msg.includes('expired') || msg.includes('Setup failed')) {
                     reconnectDisabledRef.current[key] = true;
@@ -3236,7 +3381,8 @@ export default function AgentDetailPage() {
             content: payload.contentForLLM,
             display_content: payload.userMsg,
             file_name: payload.fileName,
-            model_id: payload.modelId,
+            tier: payload.tier,
+            modality: payload.modality,
         }));
     };
 
@@ -3546,6 +3692,11 @@ export default function AgentDetailPage() {
                 return ''; // always strip the marker from displayed text
             }).trim();
         }
+        const isSubscriptionQuotaError = !!msg.quotaError
+            || displayContent.includes('套餐详情')
+            || displayContent.includes('Credits 不足')
+            || displayContent.includes('Insufficient credits')
+            || displayContent.includes('Agent 已停止');
 
         const timestampHtml = msg.timestamp ? (() => {
             const d = new Date(msg.timestamp);
@@ -3607,13 +3758,23 @@ export default function AgentDetailPage() {
                                     </div>
                                 ) : <MarkdownRenderer content={displayContent} />
                             ) : <MarkdownRenderer content={displayContent} />}
+                            {msg.role === 'assistant' && isSubscriptionQuotaError && (
+                                <button
+                                    type="button"
+                                    className="btn btn-primary"
+                                    style={{ marginTop: 10, padding: '6px 12px', fontSize: 12 }}
+                                    onClick={() => navigate(msg.quotaError?.details?.upgrade_url || SUBSCRIPTION_UPGRADE_PATH)}
+                                >
+                                    {t('subscription.goToDetail', i18n.language?.startsWith('zh') ? '去套餐详情' : 'Go to subscription')}
+                                </button>
+                            )}
                         </div>
                     </div>
                     {timestampHtml}
                 </div>
             </div>
         );
-    }), [t]);
+    }), [i18n.language, navigate, t]);
 
     const handleChatScroll = () => {
         const el = chatContainerRef.current;
@@ -3720,6 +3881,17 @@ export default function AgentDetailPage() {
     const sendChatMsg = () => {
         if (!id || !activeSession?.id) return;
         if (showNoModelState) return;
+        if (agent?.status === 'stopped') {
+            setChatMessages(prev => [...prev, parseChatMsg({
+                role: 'assistant',
+                content: i18n.language?.startsWith('zh')
+                    ? '该 Agent 已停止，当前套餐数量不足或订阅已降级。请前往「套餐详情」升级套餐后继续。'
+                    : 'This Agent is stopped because the current plan does not include enough seats. Go to subscription details to upgrade.',
+                quotaError: { quota_type: 'agent_stopped', action: 'upgrade' },
+                timestamp: new Date().toISOString(),
+            })]);
+            return;
+        }
         const activeRuntimeKey = buildSessionRuntimeKey(id, String(activeSession.id));
         const activeSocket = wsMapRef.current[activeRuntimeKey];
         if (!chatInput.trim() && attachedFiles.length === 0) return;
@@ -3775,7 +3947,8 @@ export default function AgentDetailPage() {
             userMsg,
             fileName: attachedFiles.map(f => f.name).join(', '),
             imageUrl: attachedFiles.length === 1 ? attachedFiles[0].imageUrl : undefined,
-            modelId: effectiveChatModelId,
+            tier: effectiveChatTier,
+            modality: effectiveChatModality,
         };
 
         setChatInput('');
@@ -4048,45 +4221,76 @@ export default function AgentDetailPage() {
         enabled: !!id && activeTab === 'status',
         retry: false,
     });
-
-
-
-    const { data: llmModels = [], isLoading: llmModelsLoading } = useQuery({
-        queryKey: ['llm-models'],
-        queryFn: () => enterpriseApi.llmModels(),
-        enabled: activeTab === 'settings' || activeTab === 'status' || activeTab === 'chat',
-        refetchOnMount: 'always',
+    const recoverAgentMut = useMutation({
+        mutationFn: () => agentApi.recover(id!),
+        onSuccess: async () => {
+            await queryClient.invalidateQueries({ queryKey: ['agent', id] });
+            toast.success(t('agent.status.recoverySucceeded', 'Agent recovered'));
+        },
+        onError: (err: any) => {
+            const message = err?.detail || err?.message || String(err);
+            toast.error(t('agent.status.recoveryFailed', 'Agent recovery failed'), {
+                details: String(message),
+            });
+        },
     });
-
     useEffect(() => {
         if (activeTab !== 'chat') return;
-        queryClient.refetchQueries({ queryKey: ['llm-models'] });
-        queryClient.refetchQueries({ queryKey: ['tenant', 'me'] });
+        queryClient.refetchQueries({ queryKey: ['subscription-entitlements'] });
     }, [activeTab, location.key, queryClient]);
 
-    const enabledLlmModels = useMemo(
-        () => (llmModels as any[]).filter((m: any) => m.enabled),
-        [llmModels],
+    const effectiveChatTier = resolveChatSessionTier(
+        activeSession ? activeSession.model_tier : chatTier,
+        agent?.preferred_tier,
+        allowedTiers,
     );
-    const effectiveChatModelId = overrideModelId
-        || agent?.primary_model_id
-        || myTenant?.default_model_id
-        || enabledLlmModels[0]?.id
-        || null;
-
-    const supportsVision = !!effectiveChatModelId && llmModels.some(
-        (m: any) => m.id === effectiveChatModelId && m.supports_vision
+    const effectiveChatModality = resolveChatSessionModality(
+        activeSession ? activeSession.model_modality : chatModality,
+        agent?.preferred_modality,
     );
-    const enabledModelCount = enabledLlmModels.length;
-    const effectiveModelReady = !!effectiveChatModelId && enabledLlmModels.some((m: any) => m.id === effectiveChatModelId);
+    const effectiveTierReady = !!effectiveChatTier;
+    const supportsVision = effectiveChatModality === 'image';
+    const { data: mediaCapabilitiesData, isLoading: mediaCapabilitiesLoading } = useQuery({
+        queryKey: ['agent-media-capabilities', id, effectiveChatTier],
+        queryFn: () => fetchAuth<MediaCapabilitiesResponse>(
+            `/agents/${id}/media-capabilities?tier=${encodeURIComponent(effectiveChatTier!)}`,
+        ),
+        enabled: !!id && !!effectiveChatTier && activeTab === 'chat' && (agent as any)?.agent_type !== 'openclaw',
+        retry: false,
+    });
 
-    // Onboarding kickoff: wait until a usable model is available before
-    // sending the invisible trigger. Otherwise the empty session would be
-    // marked as already kicked off while the user is still configuring models.
+    const handleMediaCapabilityClick = (capability: MediaCapability) => {
+        const language = i18n.language?.startsWith('zh') ? 'zh' : 'en';
+        const state = mediaCapabilityState(capability, language);
+        if (capability.available) {
+            const draft = buildMediaPrompt(capability.modality, language);
+            setChatInput((current) => current.trim() ? `${current.trimEnd()}\n${draft}` : draft);
+            requestAnimationFrame(() => {
+                const input = chatInputRef.current;
+                if (!input) return;
+                input.focus();
+                input.style.height = 'auto';
+                input.style.height = `${Math.min(input.scrollHeight, 180)}px`;
+            });
+            return;
+        }
+        if (state.action === 'upgrade') {
+            navigate(SUBSCRIPTION_UPGRADE_PATH);
+        } else if (state.action === 'open_tools') {
+            setActiveTab('tools');
+        } else if (state.action === 'contact_admin' && canAccessSaasAdmin(currentUser)) {
+            navigate('/admin/saas?tab=accounts');
+        } else {
+            toast.info(state.label);
+        }
+    };
+
+    // Onboarding kickoff: wait until a tier is available before sending the
+    // invisible trigger. The backend resolves tier+modality to a real model.
     useEffect(() => {
         if (!wsConnected || !id || !activeSession?.id) return;
         if (!agent || agent.onboarded_for_me !== false) return;
-        if (llmModelsLoading || !effectiveModelReady || !effectiveChatModelId) return;
+        if (!effectiveTierReady || !effectiveChatTier) return;
         if (chatMessages.length > 0) return;
         const runtimeKey = buildSessionRuntimeKey(id, String(activeSession.id));
         if (onboardingKickoffRef.current.has(runtimeKey)) return;
@@ -4098,9 +4302,10 @@ export default function AgentDetailPage() {
         socket.send(JSON.stringify({
             content: '',
             kind: 'onboarding_trigger',
-            model_id: effectiveChatModelId,
+            tier: effectiveChatTier,
+            modality: effectiveChatModality,
         }));
-    }, [wsConnected, id, activeSession?.id, agent?.onboarded_for_me, llmModelsLoading, effectiveModelReady, effectiveChatModelId, chatMessages.length]);
+    }, [wsConnected, id, activeSession?.id, agent?.onboarded_for_me, effectiveTierReady, effectiveChatTier, effectiveChatModality, chatMessages.length]);
 
     const { data: permData } = useQuery({
         queryKey: ['agent-permissions', id],
@@ -4173,32 +4378,39 @@ export default function AgentDetailPage() {
     };
     const statusKey = computeStatusKey();
     const canManage = (agent as any).access_level === 'manage';
+    const agentNameText = String((agent as any)?.name || '').toLowerCase();
+    const agentRoleText = String((agent as any)?.role_description || '').toLowerCase();
+    const isDouyinAgent = agentNameText.includes('douyin')
+        || agentNameText.includes('抖音')
+        || agentRoleText.includes('douyin')
+        || agentRoleText.includes('抖音');
     const formatAgentDate = (d?: string | null) => {
         if (!d) return '—';
         try { return new Date(d).toLocaleDateString(tsLocale, { year: 'numeric', month: 'short', day: 'numeric' }); } catch { return d; }
     };
-    const primaryModel = llmModels.find((m: any) => m.id === agent.primary_model_id);
-    const showNoModelState = !llmModelsLoading && (agent as any).agent_type !== 'openclaw' && (enabledModelCount === 0 || !effectiveModelReady);
-    const canConfigureModels = currentUser?.role === 'platform_admin' || currentUser?.role === 'org_admin' || !!(currentUser as any)?.is_platform_admin;
+    const showNoModelState = (agent as any).agent_type !== 'openclaw' && !effectiveTierReady;
+    const agentStoppedByPlan = agent.status === 'stopped' && !(agent as any).is_expired;
+    const chatInputDisabled = showNoModelState || agentStoppedByPlan;
+    const canConfigureModels = canAccessSaasAdmin(currentUser);
     const renderNoModelGuide = (variant: 'empty' | 'floating' = 'empty') => (
         <div className={`chat-no-model-state${variant === 'floating' ? ' chat-no-model-state--floating' : ''}`}>
             <div className="chat-no-model-state__icon"><IconAlertTriangle size={20} stroke={1.8} /></div>
-            <div className="chat-no-model-state__title">{t('agent.chat.noModelTitle', 'No company model configured')}</div>
+            <div className="chat-no-model-state__title">{t('agent.chat.noModelTitle', 'No model tier available')}</div>
             <div className="chat-no-model-state__text">
                 {canConfigureModels
-                    ? t('agent.chat.noModelAdmin', 'Configure a company model before chatting with this assistant.')
-                    : t('agent.chat.noModelMember', 'This company has not configured a model yet. Please contact an administrator.')}
+                    ? t('agent.chat.noModelAdmin', 'Configure model routes in SaaS admin before chatting with this assistant.')
+                    : t('agent.chat.noModelMember', 'This company has not configured a model tier yet. Please contact an administrator.')}
             </div>
             {canConfigureModels && (
-                <button className="btn btn-primary" onClick={() => navigate('/enterprise#llm')}>
+                <button className="btn btn-primary" onClick={() => navigate('/admin/saas?tab=model-routes')}>
                     <IconSettings size={15} stroke={1.75} />
-                    {t('agent.chat.goModelSettings', 'Go to model management')}
+                    {t('agent.chat.goModelSettings', 'Go to model routes')}
                 </button>
             )}
         </div>
     );
-    const modelLabel = primaryModel ? (primaryModel.label || primaryModel.model) : '—';
-    const modelProvider = primaryModel ? primaryModel.provider : '—';
+    const tierLabel = effectiveChatTier ? t(`tier.${effectiveChatTier}`, effectiveChatTier) : '—';
+    const modalityLabel = agent?.preferred_modality || '—';
     const todayParts = formatTokensParts(agent.tokens_used_today || 0);
     const monthParts = formatTokensParts(agent.tokens_used_month || 0);
     const totalParts = formatTokensParts((agent as any).tokens_used_total || 0);
@@ -4276,14 +4488,14 @@ export default function AgentDetailPage() {
                             <div className="agent-info-card-body agent-info-card-body--compact">
                                 <div className="agent-info-model-card">
                                     <div className="agent-info-model-card-text">
-                                        <span className="agent-info-model-card-label">{t('agent.modelConfig.model')}</span>
-                                        <span className="agent-info-model-card-name" title={modelLabel}>{modelLabel}</span>
+                                        <span className="agent-info-model-card-label">{t('agent.modelConfig.tier', 'Tier')}</span>
+                                        <span className="agent-info-model-card-name" title={tierLabel}>{tierLabel}</span>
                                     </div>
                                 </div>
                                 <div className="agent-info-meta-list">
                                     <div className="agent-info-meta-row">
-                                        <span>{t('agent.modelConfig.provider', 'Provider')}</span>
-                                        <span>{modelProvider}</span>
+                                        <span>{t('agent.modelConfig.modality', 'Modality')}</span>
+                                        <span>{modalityLabel}</span>
                                     </div>
                                 </div>
                             </div>
@@ -4338,6 +4550,7 @@ export default function AgentDetailPage() {
     );
     const renderAwarePreview = () => {
         const focusItems = focusRecords.map(focusItemFromApi);
+        const displayFocusItems = appendSyntheticTriggerFocusItems(focusItems, awareTriggers as any[]);
         const isZh = i18n.language?.startsWith('zh');
         const formatTrigger = (trig: any) => {
             if (trig.type === 'cron' && trig.config?.expr) return `Cron ${trig.config.expr}`;
@@ -4360,7 +4573,7 @@ export default function AgentDetailPage() {
             return Array.from(new Set(parts.filter(Boolean))).join('\n');
         };
         const triggersByFocus: Record<string, any[]> = {};
-        const focusNames = new Set(focusItems.map((item) => item.name));
+        const focusNames = new Set(displayFocusItems.map((item) => item.name));
         for (const trig of awareTriggers as any[]) {
             if (trig.focus_ref && focusNames.has(trig.focus_ref)) {
                 if (!triggersByFocus[trig.focus_ref]) triggersByFocus[trig.focus_ref] = [];
@@ -4371,7 +4584,6 @@ export default function AgentDetailPage() {
                 triggersByFocus[synthetic.name].push(trig);
             }
         }
-        const displayFocusItems = focusItems;
         const activeFocusItems = displayFocusItems.filter(item => !item.done && !item.system);
         const systemFocusItems = displayFocusItems.filter(item => !item.done && item.system);
         const completedFocusItems = displayFocusItems.filter(item => item.done);
@@ -4453,6 +4665,34 @@ export default function AgentDetailPage() {
                                             <div className="aware-side-item-title">{triggerTitle(trig)}</div>
                                             <div className="aware-side-item-meta">{triggerMeta(trig)}</div>
                                         </div>
+                                        {canManage && (
+                                            <button
+                                                type="button"
+                                                className="btn btn-ghost"
+                                                style={{ padding: '2px 6px', fontSize: '11px', flexShrink: 0 }}
+                                                aria-label={trig.is_enabled
+                                                    ? t('agent.aware.disableTrigger', '停用触发器')
+                                                    : t('agent.aware.enableTrigger', '启用触发器')}
+                                                onClick={async (event) => {
+                                                    event.stopPropagation();
+                                                    try {
+                                                        await triggerApi.update(id!, trig.id, { is_enabled: !trig.is_enabled });
+                                                        await refetchTriggers();
+                                                        toast.success(trig.is_enabled
+                                                            ? t('agent.aware.triggerDisabled', '触发器已停用')
+                                                            : t('agent.aware.triggerEnabled', '触发器已启用'));
+                                                    } catch (error: any) {
+                                                        toast.error(t('agent.aware.triggerUpdateFailed', '触发器状态更新失败'), {
+                                                            details: String(error?.message || error),
+                                                        });
+                                                    }
+                                                }}
+                                            >
+                                                {trig.is_enabled
+                                                    ? t('common.disable', '停用')
+                                                    : t('common.enable', '启用')}
+                                            </button>
+                                        )}
                                     </div>
                                 ))}
                             </div>
@@ -4876,6 +5116,17 @@ export default function AgentDetailPage() {
                             </>
                             {(agent as any)?.agent_type !== 'openclaw' && (
                                 <>
+                                    {canManage && agent.status === 'error' && (
+                                        <button
+                                            className="btn btn-secondary"
+                                            disabled={recoverAgentMut.isPending}
+                                            onClick={() => recoverAgentMut.mutate()}
+                                        >
+                                            {recoverAgentMut.isPending
+                                                ? t('agent.status.recovering', 'Recovering…')
+                                                : t('agent.status.recover', 'Recover')}
+                                        </button>
+                                    )}
                                     {canManage && agent.status === 'stopped' && (
                                         <button className="btn btn-secondary" onClick={async () => { await agentApi.start(id!); queryClient.invalidateQueries({ queryKey: ['agent', id] }); }}>{t('agent.actions.start')}</button>
                                     )}
@@ -4892,6 +5143,7 @@ export default function AgentDetailPage() {
                 {activeTab !== 'chat' && <div className="tabs">
                     {AGENT_DETAIL_TABS.filter(tab => {
                         if (['aware', 'workspace', 'chat'].includes(tab)) return false;
+                        if (tab === 'douyin' && !isDouyinAgent) return false;
                         // 'use' access keeps the existing tab bar unchanged; settings remains available via its own entry.
                         if ((agent as any)?.access_level === 'use') {
                             if (tab === 'settings' || tab === 'approvals') return false;
@@ -4918,10 +5170,8 @@ export default function AgentDetailPage() {
                     const formatDate = (d: string) => {
                         try { return new Date(d).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }); } catch { return d; }
                     };
-                    // Get model label
-                    const primaryModel = llmModels.find((m: any) => m.id === agent.primary_model_id);
-                    const modelLabel = primaryModel ? (primaryModel.label || primaryModel.model) : '—';
-                    const modelProvider = primaryModel ? primaryModel.provider : '—';
+                    const tierLabel = (effectiveChatTier || '—').toUpperCase();
+                    const modalityLabel = agent?.preferred_modality || 'text';
 
                     return (
                         <div>
@@ -4999,6 +5249,29 @@ export default function AgentDetailPage() {
                                 )}
                             </div>
 
+                            {canManage && statusKey === 'error' && (
+                                <div
+                                    className="card"
+                                    role="alert"
+                                    style={{
+                                        borderColor: 'var(--error)',
+                                        marginBottom: '24px',
+                                    }}
+                                >
+                                    <h3 style={{ color: 'var(--error)', fontSize: '14px', fontWeight: 600, marginBottom: '8px' }}>
+                                        {t('agent.status.errorReason')}
+                                    </h3>
+                                    <div style={{ fontFamily: 'var(--font-mono)', fontSize: '12px', lineHeight: 1.6, overflowWrap: 'anywhere', whiteSpace: 'pre-wrap' }}>
+                                        {agent.last_error || t('agent.status.errorReasonUnavailable')}
+                                    </div>
+                                    {agent.last_error_at && (
+                                        <div style={{ color: 'var(--text-tertiary)', fontSize: '11px', marginTop: '8px' }}>
+                                            {t('agent.status.errorSince', { time: formatDate(agent.last_error_at) })}
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+
                             {/* Agent Profile & Model Info */}
                             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', marginBottom: '24px' }}>
                                 <div className="card">
@@ -5033,12 +5306,12 @@ export default function AgentDetailPage() {
                                         <h3 style={{ fontSize: '14px', fontWeight: 600, marginBottom: '12px' }}>{t('agent.modelConfig.title')}</h3>
                                         <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
                                             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '13px' }}>
-                                                <span style={{ color: 'var(--text-tertiary)' }}>{t('agent.modelConfig.model')}</span>
-                                                <span style={{ fontFamily: 'var(--font-mono)', fontSize: '12px' }}>{modelLabel}</span>
+                                                <span style={{ color: 'var(--text-tertiary)' }}>{t('agent.modelConfig.tier', 'Tier')}</span>
+                                                <span style={{ fontFamily: 'var(--font-mono)', fontSize: '12px' }}>{tierLabel}</span>
                                             </div>
                                             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '13px' }}>
-                                                <span style={{ color: 'var(--text-tertiary)' }}>{t('agent.modelConfig.provider')}</span>
-                                                <span style={{ textTransform: 'capitalize' }}>{modelProvider}</span>
+                                                <span style={{ color: 'var(--text-tertiary)' }}>{t('agent.modelConfig.modality', 'Modality')}</span>
+                                                <span style={{ textTransform: 'capitalize' }}>{modalityLabel}</span>
                                             </div>
                                             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '13px' }}>
                                                 <span style={{ color: 'var(--text-tertiary)' }}>{t('agent.modelConfig.contextRounds')}</span>
@@ -5181,7 +5454,8 @@ export default function AgentDetailPage() {
 
                     // Group triggers by focus_ref
                     const triggersByFocus: Record<string, any[]> = {};
-                    const focusNames = new Set(focusItems.map((item) => item.name));
+                    const displayFocusItems = appendSyntheticTriggerFocusItems(focusItems, awareTriggers as any[]);
+                    const focusNames = new Set(displayFocusItems.map((item) => item.name));
                     for (const trig of awareTriggers) {
                         if (trig.focus_ref && focusNames.has(trig.focus_ref)) {
                             if (!triggersByFocus[trig.focus_ref]) triggersByFocus[trig.focus_ref] = [];
@@ -5192,8 +5466,6 @@ export default function AgentDetailPage() {
                             triggersByFocus[synthetic.name].push(trig);
                         }
                     }
-                    const displayFocusItems = focusItems;
-
                     // Group activity logs by trigger name -> focus_ref
                     const triggerLogsByFocus: Record<string, any[]> = {};
                     const triggerNameToFocus: Record<string, string> = {};
@@ -5344,6 +5616,31 @@ export default function AgentDetailPage() {
                                                             {trig.is_enabled ? t('agent.aware.inProgress') : t('agent.aware.completed')}
                                                         </span>
                                                         <div style={{ display: 'flex', gap: '4px' }}>
+                                                            {canManage && <button
+                                                                className="btn btn-ghost"
+                                                                style={{ padding: '2px 6px', fontSize: '11px' }}
+                                                                aria-label={trig.is_enabled
+                                                                    ? t('agent.aware.disableTrigger', '停用触发器')
+                                                                    : t('agent.aware.enableTrigger', '启用触发器')}
+                                                                onClick={async (e) => {
+                                                                    e.stopPropagation();
+                                                                    try {
+                                                                        await triggerApi.update(id!, trig.id, { is_enabled: !trig.is_enabled });
+                                                                        await refetchTriggers();
+                                                                        toast.success(trig.is_enabled
+                                                                            ? t('agent.aware.triggerDisabled', '触发器已停用')
+                                                                            : t('agent.aware.triggerEnabled', '触发器已启用'));
+                                                                    } catch (err: any) {
+                                                                        toast.error(t('agent.aware.triggerUpdateFailed', '触发器状态更新失败'), {
+                                                                            details: String(err?.message || err),
+                                                                        });
+                                                                    }
+                                                                }}
+                                                            >
+                                                                {trig.is_enabled
+                                                                    ? t('common.disable', '停用')
+                                                                    : t('common.enable', '启用')}
+                                                            </button>}
                                                             {canManage && !trig.is_system && <button className="btn btn-ghost" style={{ padding: '2px 6px', fontSize: '11px', color: 'var(--error)' }}
                                                                 onClick={async (e) => {
                                                                     e.stopPropagation();
@@ -5719,6 +6016,13 @@ export default function AgentDetailPage() {
                     )
                 }
 
+                {/* ── Douyin Operations Tab ── */}
+                {
+                    activeTab === 'douyin' && id && isDouyinAgent && (
+                        <DouyinTab agentId={id} canManage={canManage} />
+                    )
+                }
+
                 {/* ── Tools Tab ── */}
                 {
                     activeTab === 'tools' && id && <ToolsTab agentId={id} canManage={canManage} />
@@ -5891,7 +6195,7 @@ export default function AgentDetailPage() {
                                                             onMouseLeave={e => { if (!isActive) e.currentTarget.style.background = 'transparent'; }}>
                                                             <div style={{ flex: 1, minWidth: 0 }}>
                                                                 <div style={{ display: 'flex', alignItems: 'center', gap: '5px', marginBottom: '2px' }}>
-                                                                    <div style={{ fontSize: '12px', fontWeight: isActive ? 600 : 400, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }}>{s.title}</div>
+                                                                    <div style={{ fontSize: '12px', fontWeight: isActive ? 600 : 400, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }}>{displaySessionTitle(s.title, s.created_at, tsLocale)}</div>
                                                                     {s.is_primary && (
                                                                         <span style={{
                                                                             fontSize: '9px',
@@ -6072,20 +6376,13 @@ export default function AgentDetailPage() {
                                                     </div>
                                                 )}
                                                 {(() => {
-                                                    // For A2A sessions, determine which participant is "this agent" (left side)
-                                                    // Use agent.name matching against sender_name from messages
+                                                    // A2A alignment uses the stable sender Agent id returned by the
+                                                    // API.  Display names are mutable and can collide.
                                                     const isA2A = activeSession.source_channel === 'agent' || activeSession.participant_type === 'agent';
                                                     const isHumanReadonly = !isA2A && !activeSession.is_group;
-                                                    const thisAgentName = (agent as any)?.name;
-                                                    // Find this agent's participant_id from loaded messages
-                                                    const thisAgentPid = isA2A && thisAgentName
-                                                        ? historyMsgs.find((m: any) => m.sender_name === thisAgentName)?.participant_id
-                                                        : null;
                                                     return historyMsgs.map((m: any, i: number) => {
-                                                        // Determine if this message is from "this agent" (left) or peer (right)
-                                                        // Actually, "this agent" should be on the RIGHT (like 'me'), and peer on the LEFT
-                                                        const isLeft = isA2A && thisAgentPid
-                                                            ? m.participant_id !== thisAgentPid
+                                                        const isLeft = isA2A
+                                                            ? isA2AMessageLeft(m, agent.id, agent.name)
                                                             : m.role === 'assistant';
                                                         if (m.role === 'tool_call') {
                                                             const tName = m.toolName || (() => { try { return JSON.parse(m.content || '{}').name; } catch { return 'tool'; } })();
@@ -6169,7 +6466,11 @@ export default function AgentDetailPage() {
                                                 )}
                                                 {chatMessages.length === 0 && !showNoModelState && (
                                                     <div className="chat-empty-state">
-                                                        <div className="chat-empty-state__title">{activeSession?.title || t('agent.chat.startChat')}</div>
+                                                        <div className="chat-empty-state__title">
+                                                            {activeSession
+                                                                ? displaySessionTitle(activeSession.title, activeSession.created_at, tsLocale)
+                                                                : t('agent.chat.startChat')}
+                                                        </div>
                                                         <div className="chat-empty-state__subtitle">{t('agent.chat.startConversation', { name: agent.name })}</div>
                                                         <div className="chat-empty-state__hint">{t('agent.chat.fileSupport')}</div>
                                                     </div>
@@ -6377,14 +6678,6 @@ export default function AgentDetailPage() {
                                             )}
                                             {/* Transient info banner — e.g. fallback model switch */}
                                             {chatInfoMsg && (
-                                                <div style={{ padding: '6px 14px', borderTop: '1px solid var(--border-subtle)', background: 'var(--bg-secondary)', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', color: 'var(--text-secondary)', animation: 'fadeIn 0.2s ease' }}>
-                                                    <span style={{ opacity: 0.7 }}>ℹ️</span>
-                                                    <span style={{ flex: 1 }}>{chatInfoMsg}</span>
-                                                    <button onClick={() => setChatInfoMsg(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-tertiary)', fontSize: '14px', lineHeight: 1, padding: '0 2px' }}>✕</button>
-                                                </div>
-                                            )}
-                                            {/* Transient info banner — e.g. fallback model switch */}
-                                            {chatInfoMsg && (
                                                 <div style={{ padding: '6px 14px', borderTop: '1px solid rgba(99,102,241,0.25)', background: 'rgba(99,102,241,0.07)', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', color: 'var(--text-secondary)', animation: 'fadeIn 0.2s ease' }}>
                                                     <span style={{ opacity: 0.7 }}>ℹ️</span>
                                                     <span style={{ flex: 1 }}>{chatInfoMsg}</span>
@@ -6395,6 +6688,14 @@ export default function AgentDetailPage() {
                                                 <div style={{ padding: '7px 16px', borderTop: '1px solid rgba(245,158,11,0.3)', background: 'rgba(245,158,11,0.08)', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', color: 'rgb(180,100,0)' }}>
                                                     <span>⏸</span>
                                                     <span>This Agent has <strong>expired</strong> and is off duty. Contact your admin to extend its service.</span>
+                                                </div>
+                                            ) : agentStoppedByPlan ? (
+                                                <div style={{ padding: '8px 16px', borderTop: '1px solid rgba(245,158,11,0.3)', background: 'rgba(245,158,11,0.08)', display: 'flex', alignItems: 'center', gap: '10px', fontSize: '12px', color: 'rgb(180,100,0)' }}>
+                                                    <span>⏸</span>
+                                                    <span style={{ flex: 1 }}>{t('subscription.agentStoppedHint', '该 Agent 已停止，当前套餐数量不足。请升级套餐后继续使用。')}</span>
+                                                    <button type="button" className="btn btn-secondary" style={{ padding: '5px 10px', fontSize: 12 }} onClick={() => navigate(SUBSCRIPTION_UPGRADE_PATH)}>
+                                                        {t('subscription.goToDetail', '去套餐详情')}
+                                                    </button>
                                                 </div>
                                             ) : !wsConnected && !!currentUser && sessionUserIdStr(activeSession) === viewerUserIdStr() ? (
                                                 <div style={{ padding: '3px 16px', display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px', color: 'var(--text-tertiary)' }}>
@@ -6472,14 +6773,11 @@ export default function AgentDetailPage() {
                                                         <textarea
                                                             ref={chatInputRef}
                                                             className="chat-input"
-                                                            disabled={showNoModelState}
+                                                            disabled={chatInputDisabled}
                                                             value={chatInput}
                                                             onChange={e => {
                                                                 setChatInput(e.target.value);
-                                                                // Auto-grow: reset height then expand to scrollHeight
-                                                                const el = e.target;
-                                                                el.style.height = 'auto';
-                                                                el.style.height = el.scrollHeight + 'px';
+                                                                scheduleChatInputResize(e.target);
                                                             }}
                                                             onKeyDown={e => {
                                                                 // Enter sends the message; Shift+Enter inserts a newline
@@ -6489,7 +6787,7 @@ export default function AgentDetailPage() {
                                                                 }
                                                             }}
                                                             onPaste={handlePaste}
-                                                            placeholder={showNoModelState ? t('agent.chat.noModelPlaceholder', 'Configure a company model to start chatting') : (!wsConnected && !!currentUser && sessionUserIdStr(activeSession) === viewerUserIdStr() ? 'Connecting...' : t('chat.placeholder'))}
+                                                            placeholder={showNoModelState ? t('agent.chat.noModelPlaceholder', 'Configure model routes to start chatting') : (agentStoppedByPlan ? t('subscription.agentStoppedPlaceholder', '升级套餐后可继续聊天') : (!wsConnected && !!currentUser && sessionUserIdStr(activeSession) === viewerUserIdStr() ? 'Connecting...' : t('chat.placeholder')))}
                                                             rows={1}
                                                         />
                                                     </div>
@@ -6499,16 +6797,42 @@ export default function AgentDetailPage() {
                                                             type="button"
                                                             className="chat-composer-btn"
                                                             onClick={() => fileInputRef.current?.click()}
-                                                            disabled={showNoModelState || !wsConnected || chatUploadDrafts.length > 0 || isWaiting || isStreaming || attachedFiles.length >= 10}
+                                                            disabled={chatInputDisabled || !wsConnected || chatUploadDrafts.length > 0 || isWaiting || isStreaming || attachedFiles.length >= 10}
                                                             title={t('agent.workspace.uploadFile')}
                                                         >
                                                             <IconPaperclip size={16} stroke={1.75} />
                                                         </button>
-                                                        <ModelSwitcher
-                                                            value={overrideModelId}
-                                                            onChange={handleModelChange}
-                                                            tenantDefaultId={myTenant?.default_model_id || null}
-                                                            disabled={showNoModelState || !wsConnected}
+                                                        {(mediaCapabilitiesData?.capabilities || []).map((capability) => {
+                                                            const language = i18n.language?.startsWith('zh') ? 'zh' : 'en';
+                                                            const state = mediaCapabilityState(capability, language);
+                                                            const mediaIcons: Record<MediaModality, React.ReactNode> = {
+                                                                image: <IconPhoto size={16} stroke={1.75} />,
+                                                                audio: <IconVolume size={16} stroke={1.75} />,
+                                                                music: <IconMusic size={16} stroke={1.75} />,
+                                                                video: <IconVideo size={16} stroke={1.75} />,
+                                                            };
+                                                            return (
+                                                                <button
+                                                                    key={capability.modality}
+                                                                    type="button"
+                                                                    className="chat-composer-btn"
+                                                                    onClick={() => handleMediaCapabilityClick(capability)}
+                                                                    disabled={chatInputDisabled || !wsConnected || mediaCapabilitiesLoading}
+                                                                    aria-label={state.label}
+                                                                    data-capability-state={state.disabled ? 'unavailable' : 'available'}
+                                                                    title={state.label}
+                                                                    style={state.disabled ? { opacity: 0.48 } : undefined}
+                                                                >
+                                                                    {mediaIcons[capability.modality]}
+                                                                </button>
+                                                            );
+                                                        })}
+                                                        <TierSelector
+                                                            value={effectiveChatTier}
+                                                            onChange={handleTierChange}
+                                                            allowedTiers={allowedTiers}
+                                                            disabled={chatInputDisabled || !wsConnected || modelSelectionSaving}
+                                                            size="sm"
                                                         />
                                                         <div style={{ flex: 1 }} />
                                                         {(isStreaming || isWaiting) ? (
@@ -6535,7 +6859,7 @@ export default function AgentDetailPage() {
                                                                 type="button"
                                                                 className="btn btn-primary chat-composer-send"
                                                                 onClick={sendChatMsg}
-                                                                disabled={showNoModelState || !wsConnected || (!chatInput.trim() && attachedFiles.length === 0)}
+                                                                disabled={chatInputDisabled || !wsConnected || (!chatInput.trim() && attachedFiles.length === 0)}
                                                                 title={t('chat.send')}
                                                             >
                                                                 <IconSend size={16} stroke={1.75} />
@@ -6729,7 +7053,6 @@ export default function AgentDetailPage() {
                             agent={agent}
                             agentId={id}
                             canManage={canManage}
-                            llmModels={llmModels}
                             settingsForm={settingsForm}
                             setSettingsForm={setSettingsForm}
                             settingsSaved={settingsSaved}

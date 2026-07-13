@@ -53,6 +53,8 @@ services:
         CLAWITH_PIP_INDEX_URL: ${CLAWITH_PIP_INDEX_URL:-}
         CLAWITH_PIP_TRUSTED_HOST: ${CLAWITH_PIP_TRUSTED_HOST:-}
     restart: unless-stopped
+    stop_grace_period: 30s
+    shm_size: "1gb"
     command: ["/bin/bash", "/app/entrypoint.sh"]
     environment:
       DATABASE_URL: postgresql+asyncpg://clawith:clawith@postgres:5432/clawith
@@ -71,7 +73,7 @@ services:
       SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-me-jwt-secret}
       PROCESS_ROLE: api
-      CORS_ORIGINS: '["*"]'
+      CORS_ORIGINS: '${CORS_ORIGINS:-[]}'
       FEISHU_APP_ID: ${FEISHU_APP_ID:-}
       FEISHU_APP_SECRET: ${FEISHU_APP_SECRET:-}
       DOCKER_NETWORK: clawith_yaojin_network
@@ -112,6 +114,8 @@ services:
         CLAWITH_PIP_INDEX_URL: ${CLAWITH_PIP_INDEX_URL:-}
         CLAWITH_PIP_TRUSTED_HOST: ${CLAWITH_PIP_TRUSTED_HOST:-}
     restart: unless-stopped
+    stop_grace_period: 30s
+    shm_size: "1gb"
     command: ["/bin/bash", "/app/entrypoint.sh"]
     environment:
       DATABASE_URL: postgresql+asyncpg://clawith:clawith@postgres:5432/clawith
@@ -130,7 +134,12 @@ services:
       SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-me-jwt-secret}
       PROCESS_ROLE: bootstrap,worker,connector
-      CORS_ORIGINS: '["*"]'
+      HEARTBEAT_ENABLED: ${HEARTBEAT_ENABLED:-false}
+      MEDIA_GENERATION_POLL_INTERVAL_SECONDS: ${MEDIA_GENERATION_POLL_INTERVAL_SECONDS:-15}
+      MEDIA_GENERATION_BATCH_SIZE: ${MEDIA_GENERATION_BATCH_SIZE:-20}
+      MEDIA_GENERATION_SUBMISSION_TIMEOUT_SECONDS: ${MEDIA_GENERATION_SUBMISSION_TIMEOUT_SECONDS:-600}
+      MEDIA_GENERATION_MAX_AGE_SECONDS: ${MEDIA_GENERATION_MAX_AGE_SECONDS:-172800}
+      CORS_ORIGINS: '${CORS_ORIGINS:-[]}'
       FEISHU_APP_ID: ${FEISHU_APP_ID:-}
       FEISHU_APP_SECRET: ${FEISHU_APP_SECRET:-}
       DOCKER_NETWORK: clawith_yaojin_network
@@ -176,7 +185,8 @@ services:
     networks:
       - default
     depends_on:
-      - backend-api
+      backend-api:
+        condition: service_healthy
 
 volumes:
   pgdata:

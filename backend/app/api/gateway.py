@@ -9,7 +9,7 @@ import hashlib
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Header, HTTPException, Depends
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -297,7 +297,6 @@ async def _send_to_agent_background(
     source_agent_name: str,
     target_agent_id: str,
     target_agent_name: str,
-    target_primary_model_id: str,
     target_role_description: str,
     target_creator_id: str,
     content: str,
@@ -309,19 +308,24 @@ async def _send_to_agent_background(
     """
     logger.info(f"[Gateway] _send_to_agent_background started: {source_agent_name} -> {target_agent_name}")
     try:
-        from app.services.llm import call_llm
-        from app.models.llm import LLMModel
+        from app.services.llm import call_llm, resolve_agent_model
+        from app.models.agent import Agent
         from app.models.audit import ChatMessage
         from app.models.chat_session import ChatSession
 
         async with async_session() as db:
-            # Load target agent's LLM model
-            if not target_primary_model_id:
-                logger.warning(f"Target agent {target_agent_name} has no LLM model")
+            target_agent_result = await db.execute(
+                select(Agent).where(Agent.id == uuid.UUID(str(target_agent_id)))
+            )
+            target_agent = target_agent_result.scalar_one_or_none()
+            if not target_agent:
+                logger.warning(f"Target agent {target_agent_name} no longer exists")
                 return
-            result = await db.execute(select(LLMModel).where(LLMModel.id == target_primary_model_id))
-            model = result.scalar_one_or_none()
+
+            model, fallback_model, route_meta = await resolve_agent_model(target_agent)
+            model = model or fallback_model
             if not model:
+                logger.warning(f"Target agent {target_agent_name} has no LLM model")
                 return
             # Skip if model is disabled by admin
             if not model.enabled:
@@ -432,6 +436,7 @@ async def _send_to_agent_background(
             user_id=target_creator_id,
             session_id=conv_id,
             on_chunk=on_chunk,
+            route_meta=route_meta,
         )
         final_reply = reply or "".join(collected)
 
@@ -538,13 +543,12 @@ async def send_message(
             _src_name = agent.name
             _tgt_id = str(target_agent.id)
             _tgt_name = target_agent.name
-            _tgt_model = str(target_agent.primary_model_id) if target_agent.primary_model_id else ""
             _tgt_role = target_agent.role_description or ""
             _tgt_creator = str(target_agent.creator_id) if target_agent.creator_id else ""
             await db.commit()
             task = asyncio.create_task(_send_to_agent_background(
                 _src_id, _src_name, _tgt_id, _tgt_name,
-                _tgt_model, _tgt_role, _tgt_creator, content,
+                _tgt_role, _tgt_creator, content,
             ))
             _background_tasks.add(task)
             task.add_done_callback(_background_tasks.discard)
@@ -658,6 +662,7 @@ async def send_message(
 @router.get("/setup-guide/{agent_id}")
 async def get_setup_guide(
     agent_id: uuid.UUID,
+    request: Request,
     x_api_key: str = Header(..., alias="X-Api-Key"),
     db: AsyncSession = Depends(get_db),
 ):
@@ -666,18 +671,20 @@ async def get_setup_guide(
     if agent.id != agent_id:
         raise HTTPException(status_code=403, detail="Key does not match this agent")
 
-    # Note: we use the raw key from the header since the agent already authenticated
-    base_url = "https://try.clawith.ai"
+    # Note: we use the raw key from the header since the agent already authenticated.
+    from app.services.platform_service import platform_service
+
+    base_url = await platform_service.get_public_base_url(db, request)
 
     skill_content = f"""---
 name: clawith_sync
-description: Sync with Clawith platform — check inbox, submit results, and send messages.
+description: Sync with Astra platform — check inbox, submit results, and send messages.
 ---
 
-# Clawith Sync
+# Astra Sync
 
 ## When to use
-Check for new messages from the Clawith platform during every heartbeat cycle.
+Check for new messages from the Astra platform during every heartbeat cycle.
 You can also proactively send messages to people and agents in your relationships.
 
 ## Instructions
@@ -690,7 +697,7 @@ Make an HTTP GET request:
 The response contains a `messages` array. Each message includes:
 - `id` — unique message ID (use this for reporting)
 - `content` — the message text
-- `sender_user_name` — name of the Clawith user who sent it
+- `sender_user_name` — name of the Astra user who sent it
 - `sender_user_id` — unique ID of the sender
 - `conversation_id` — the conversation this message belongs to
 - `history` — array of previous messages in this conversation for context
@@ -722,7 +729,7 @@ The system auto-detects the best channel. For agents, the reply appears in your 
 For humans, the message is delivered via their available channel (e.g. Feishu).
 """
 
-    heartbeat_line = "- Check Clawith inbox using the clawith_sync skill and process any pending messages"
+    heartbeat_line = "- Check Astra inbox using the clawith_sync skill and process any pending messages"
 
     return {
         "skill_filename": "clawith_sync.md",

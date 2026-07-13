@@ -13,7 +13,7 @@ from app.core.security import verify_password, hash_password
 from app.models.user import User
 from app.schemas.schemas import ForgotPasswordRequest, ResetPasswordRequest
 from app.services import password_reset_service, system_email_service
-from app.database import _session_ctx, transaction
+from app.database import transaction
 
 
 async def run_with_db(db, func, *args, **kwargs):
@@ -146,8 +146,6 @@ async def test_create_password_reset_token_invalidates_older_tokens(monkeypatch)
     async def fake_get_redis(): return mock_redis
     monkeypatch.setattr(password_reset_service, "get_redis", fake_get_redis)
 
-    db = RecordingDB()
-
     raw_token, expires_at = await password_reset_service.create_password_reset_token(user_id)
 
     # Verify old token invalidation
@@ -170,6 +168,29 @@ async def test_build_password_reset_url_uses_env_public_base_url(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_build_password_reset_url_uses_persisted_platform_setting(monkeypatch):
+    monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
+    setting = SimpleNamespace(value={"public_base_url": "https://stored.example.com/"})
+
+    class FakeSession:
+        async def execute(self, _statement):
+            return DummyResult(value=setting)
+
+    class FakeSessionContext:
+        async def __aenter__(self):
+            return FakeSession()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(password_reset_service, "async_session", FakeSessionContext)
+
+    url = await password_reset_service.build_password_reset_url("abc123")
+
+    assert url == "https://stored.example.com/reset-password?token=abc123"
+
+
+@pytest.mark.asyncio
 async def test_consume_password_reset_token_works_correctly(monkeypatch):
     user_id = uuid.uuid4()
     raw_token = "raw-token"
@@ -183,7 +204,6 @@ async def test_consume_password_reset_token_works_correctly(monkeypatch):
     async def fake_get_redis(): return mock_redis
     monkeypatch.setattr(password_reset_service, "get_redis", fake_get_redis)
 
-    db = RecordingDB()
     result = await password_reset_service.consume_password_reset_token(raw_token)
 
     assert result is not None
@@ -198,7 +218,7 @@ async def test_forgot_password_returns_generic_response_for_unknown_email(monkey
     async def fake_resolve_email_config_async():
         return system_email_service.SystemEmailConfig(
             from_address="bot@example.com",
-            from_name="Clawith",
+            from_name="Astra",
             smtp_host="smtp.example.com",
             smtp_port=465,
             smtp_username="bot@example.com",
@@ -240,7 +260,7 @@ async def test_forgot_password_queues_background_email(monkeypatch):
     async def fake_resolve_email_config_async():
         return system_email_service.SystemEmailConfig(
             from_address="bot@example.com",
-            from_name="Clawith",
+            from_name="Astra",
             smtp_host="smtp.example.com",
             smtp_port=465,
             smtp_username="bot@example.com",
@@ -308,7 +328,7 @@ def test_send_system_email_uses_configured_timeout(monkeypatch):
 
     config = system_email_service.SystemEmailConfig(
         from_address="bot@example.com",
-        from_name="Clawith",
+        from_name="Astra",
         smtp_host="smtp.example.com",
         smtp_port=465,
         smtp_username="bot@example.com",
@@ -383,7 +403,7 @@ async def test_broadcast_notification_queues_email_delivery(monkeypatch):
     async def fake_resolve_email_config_async(db):
         return system_email_service.SystemEmailConfig(
             from_address="bot@example.com",
-            from_name="Clawith",
+            from_name="Astra",
             smtp_host="smtp.example.com",
             smtp_port=465,
             smtp_username="bot@example.com",

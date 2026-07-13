@@ -12,8 +12,10 @@ All paths now support:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -21,18 +23,19 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
+from app.core.logging_config import get_trace_id
 from app.database import async_session
+from app.services.credit_service import charge_credits, check_credit_balance
+from app.services.provider_pricing import provider_text_credits
+from app.services.model_router import resolve_route
+from app.services.quota_guard import (
+    QuotaExceeded,
+    check_agent_llm_quota,
+    check_plan_inference_entitlement,
+    check_tenant_token_credits,
+    consume_agent_llm_quota,
+)
 
-# NOTE: agent_tools imports are deferred to function bodies to avoid circular
-# import: agent_tools → llm.finish → llm/__init__ → caller → agent_tools
-
-async def get_agent_tools_for_llm(*args, **kwargs):
-    from app.services.agent_tools import get_agent_tools_for_llm as _impl
-    return await _impl(*args, **kwargs)
-
-async def execute_tool(*args, **kwargs):
-    from app.services.agent_tools import execute_tool as _impl
-    return await _impl(*args, **kwargs)
 from app.services.token_tracker import (
     TokenUsage,
     record_token_usage,
@@ -41,19 +44,139 @@ from app.services.token_tracker import (
 )
 
 from .client import LLMError
-from .failover import classify_error, FailoverErrorType
+from .failover import (
+    CredentialFailureAction,
+    FailoverErrorType,
+    classify_error,
+    credential_failure_action,
+    extract_minimax_code,
+    is_rate_limit_error,
+)
 from .finish import FINISH_PROTOCOL_REMINDER, FINISH_TOOL_DEFINITION, find_finish_call, parse_tool_arguments
-from .utils import LLMMessage, create_llm_client, get_max_tokens, get_model_api_key
+from .utils import (
+    LLMMessage,
+    create_llm_client,
+    get_credential_api_key,
+    get_max_tokens,
+    get_model_api_key,
+    get_provider_spec,
+)
+from .load_balancer import (
+    NoCredentialAvailable,
+    no_credential_user_message,
+    record_credential_call,
+    mark_credential_degraded,
+    mark_credential_quota_exceeded,
+    pick_credential,
+)
+# Backward compat alias (record_credential_call supersedes increment_credential_usage)
+increment_credential_usage = record_credential_call
+
+
+async def _record_llm_product_issue(
+    *,
+    category: str,
+    error_code: str,
+    model,
+    agent_id: uuid.UUID | None,
+    user_id: uuid.UUID | None,
+    tenant_id: uuid.UUID | None,
+    route_meta: "RouteMeta | None",
+    severity: str = "error",
+) -> None:
+    from app.services.production_issue_monitor import record_production_issue
+
+    await record_production_issue(
+        source="llm_runtime",
+        category=category,
+        summary=(
+            "Platform model credential route was unavailable"
+            if category == "credential"
+            else "Model provider operation failed"
+        ),
+        severity=severity,
+        error_code=error_code,
+        operation=getattr(route_meta, "action", None) or "chat",
+        tenant_id=tenant_id,
+        user_id=user_id,
+        agent_id=agent_id,
+        trace_id=get_trace_id(),
+        metadata={
+            "provider": getattr(model, "provider", None),
+            "model": getattr(model, "model", None),
+            "modality": getattr(route_meta, "modality", None),
+            "saas_tier": getattr(route_meta, "saas_tier", None),
+            "reason_code": error_code if category == "credential" else None,
+        },
+    )
+
+
+async def _apply_credential_failure_policy(
+    credential_id: uuid.UUID,
+    error: Exception,
+    *,
+    log_context: str,
+) -> None:
+    """Apply the shared-pool circuit-breaker policy in every LLM path."""
+
+    action = credential_failure_action(error)
+    if action is CredentialFailureAction.DEGRADE:
+        await mark_credential_degraded(credential_id, immediate=True)
+    elif action is CredentialFailureAction.QUOTA_EXCEEDED:
+        await mark_credential_quota_exceeded(credential_id)
+    elif is_rate_limit_error(error):
+        logger.warning(f"[{log_context}] Rate limit on credential {credential_id}")
+        await asyncio.sleep(1.0)
+
+# NOTE: agent_tools imports are deferred to function bodies to avoid circular
+# import: agent_tools → llm.finish → llm/__init__ → caller → agent_tools
+
+
+async def get_agent_tools_for_llm(*args, **kwargs):
+    from app.services.agent_tools import get_agent_tools_for_llm as _impl
+
+    return await _impl(*args, **kwargs)
+
+
+async def execute_tool(*args, **kwargs):
+    from app.services.agent_tools import execute_tool as _impl
+
+    return await _impl(*args, **kwargs)
 
 if TYPE_CHECKING:
     from app.models.agent import Agent
     from app.models.llm import LLMModel
 
 
+@dataclass
+class RouteMeta:
+    """SaaS route metadata for a single LLM invocation."""
+
+    saas_tier: str
+    modality: str
+    action: str = "chat"
+
+
+@dataclass
+class AgentLLMInvocation:
+    """Resolved model, billing, and credential context for a background run."""
+
+    model: "LLMModel"
+    fallback_model: "LLMModel | None"
+    route_meta: RouteMeta | None
+    tenant_id: uuid.UUID | None
+    api_key: str
+    base_url: str | None
+    credential_id: uuid.UUID | None
+
+
 TOOLS_REQUIRING_ARGS = frozenset({
     "write_file", "read_file", "move_file", "delete_file", "read_document",
-    "send_message_to_agent", "send_feishu_message", "send_email"
+    "send_message_to_agent", "send_feishu_message", "send_email",
+    "execute_code", "execute_code_e2b",
 })
+
+MAX_CONSECUTIVE_INVALID_TOOL_CALLS = 3
 
 
 def _sanitize_tool_calls_for_context(tool_calls: list[dict]) -> tuple[list[dict] | None, str | None]:
@@ -108,6 +231,39 @@ def _sanitize_tool_calls_for_context(tool_calls: list[dict]) -> tuple[list[dict]
     return sanitized, None
 
 
+def _build_ordered_api_messages(
+    static_prompt: str,
+    dynamic_prompt: str,
+    messages: list[dict],
+) -> list[LLMMessage]:
+    """Build one leading system message and preserve all non-system order."""
+    system_parts = [static_prompt] if static_prompt else []
+    non_system_messages: list[LLMMessage] = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        if role == "system":
+            content = msg.get("content")
+            if isinstance(content, str) and content.strip():
+                system_parts.append(content.strip())
+            continue
+        non_system_messages.append(LLMMessage(
+            role=role,
+            content=msg.get("content"),
+            tool_calls=msg.get("tool_calls"),
+            tool_call_id=msg.get("tool_call_id"),
+            reasoning_content=msg.get("reasoning_content"),
+        ))
+
+    return [
+        LLMMessage(
+            role="system",
+            content="\n\n".join(system_parts),
+            dynamic_content=dynamic_prompt,
+        ),
+        *non_system_messages,
+    ]
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Failover Guard
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -154,6 +310,11 @@ def is_retryable_error(result: str) -> bool:
     return classify_error(Exception(result)) != FailoverErrorType.NON_RETRYABLE
 
 
+def _is_llm_error_result(result: str) -> bool:
+    """Return whether a model result represents an error rather than content."""
+    return result.startswith(("[LLM Error]", "[LLM call error]", "[Error]", "⚠️"))
+
+
 def _get_model_timeout(model: "LLMModel") -> float:
     """Return the effective request timeout for a model."""
     return float(getattr(model, "request_timeout", None) or 120.0)
@@ -166,6 +327,11 @@ def _usage_from_response_or_estimate(response, api_messages: list[LLMMessage]) -
     round_chars = sum(len(m.content or '') if isinstance(m.content, str) else 0 for m in api_messages)
     round_chars += len(response.content or '')
     return estimate_token_usage_from_chars(round_chars)
+
+
+def _is_persisted_model(model: object) -> bool:
+    """Return true for real DB-backed LLMModel objects, false for unit-test fakes."""
+    return isinstance(getattr(model, "id", None), uuid.UUID)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -273,6 +439,13 @@ def _check_tool_requires_args(tool_name: str, args: dict) -> tuple[bool, str]:
     """Check if tool requires arguments and return (should_execute, result_or_error)."""
     if not args and tool_name in TOOLS_REQUIRING_ARGS:
         return False, f"Error: {tool_name} was called with empty arguments. You must provide the required parameters. Please retry with the correct arguments."
+    if tool_name in {"execute_code", "execute_code_e2b"}:
+        code = args.get("code")
+        if not isinstance(code, str) or not code.strip():
+            return False, (
+                f"Error: {tool_name} requires a non-empty string `code` parameter. "
+                "Retry the tool call with both `language` and `code`; do not call it again with the same arguments."
+            )
     return True, ""
 
 
@@ -283,6 +456,29 @@ def _allowed_tool_names(tools_for_llm: list[dict] | None) -> set[str]:
         if name:
             names.add(name)
     return names
+
+
+def _build_runtime_capability_manifest(
+    tools_for_llm: list[dict] | None,
+    *,
+    supports_vision: bool = False,
+) -> str:
+    """Describe the exact runtime tool surface as an authoritative prompt fact."""
+    names = sorted(_allowed_tool_names(tools_for_llm))
+    return (
+        "\n\n## Runtime tool capabilities (authoritative)\n"
+        "The following JSON array is the complete set of tools enabled for this "
+        "turn. Check it before claiming that a capability exists or is missing. "
+        "Never invent, rename, or assume tools outside this list:\n"
+        f"{json.dumps(names, ensure_ascii=False)}\n"
+        f"Native vision input for this turn: {str(bool(supports_vision)).lower()}.\n"
+        "A generic file-reading tool does not inspect pixels in an image. If native "
+        "vision is false and no enabled tool explicitly understands or edits images, "
+        "state that limitation and never claim to have seen or used a reference image.\n"
+        "Only report an external action or generated file after a successful tool result. "
+        "Reuse artifact paths and URLs exactly as returned; never invent or rename them. "
+        "For PowerPoint conversion, use convert_html_to_pptx only when that exact tool name is listed."
+    )
 
 
 def _tool_not_enabled_message(tool_name: str) -> str:
@@ -303,6 +499,7 @@ async def _process_tool_call(
     on_tool_call,
     full_reasoning_content: str,
     allowed_tool_names: set[str],
+    route_meta: RouteMeta | None = None,
     on_code_output=None,
 ) -> str:
     """Process a single tool call and return result."""
@@ -321,27 +518,27 @@ async def _process_tool_call(
     if not should_execute:
         return error_msg
 
-    # if tool_name not in allowed_tool_names:
-    #     result = _tool_not_enabled_message(tool_name)
-    #     logger.warning(f"[LLM] Blocked disabled tool call: {tool_name} agent_id={agent_id}")
-    #     if on_tool_call:
-    #         try:
-    #             await on_tool_call({
-    #                 "name": tool_name,
-    #                 "call_id": tc.get("id", ""),
-    #                 "args": args,
-    #                 "status": "done",
-    #                 "result": result,
-    #                 "reasoning_content": full_reasoning_content
-    #             })
-    #         except Exception:
-    #             pass
-    #     api_messages.append(LLMMessage(
-    #         role="tool",
-    #         tool_call_id=tc["id"],
-    #         content=result,
-    #     ))
-    #     return ""
+    if tool_name not in allowed_tool_names:
+        result = _tool_not_enabled_message(tool_name)
+        logger.warning(f"[LLM] Blocked disabled tool call: {tool_name} agent_id={agent_id}")
+        if on_tool_call:
+            try:
+                await on_tool_call({
+                    "name": tool_name,
+                    "call_id": tc.get("id", ""),
+                    "args": args,
+                    "status": "done",
+                    "result": result,
+                    "reasoning_content": full_reasoning_content
+                })
+            except Exception:
+                pass
+        api_messages.append(LLMMessage(
+            role="tool",
+            tool_call_id=tc["id"],
+            content=result,
+        ))
+        return ""
 
     # Notify client about tool call (in-progress)
     if on_tool_call:
@@ -363,6 +560,7 @@ async def _process_tool_call(
         agent_id=agent_id,
         user_id=user_id or agent_id,
         session_id=session_id,
+        saas_tier=route_meta.saas_tier if route_meta else None,
         on_output=_on_output,
     )
     logger.debug(f"[LLM] Tool result: {result[:100]}")
@@ -408,6 +606,156 @@ async def _process_tool_call(
 # Core LLM Call Functions
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
+async def resolve_model_key(model: "LLMModel") -> tuple[str, str | None, uuid.UUID | None]:
+    """Resolve (api_key, base_url, credential_id) for a model.
+
+    Platform model (tenant_id=null): pick from the credential pool (load balanced).
+    Tenant model (tenant_id set): use the model's own api_key_encrypted (single key).
+    Raises NoCredentialAvailable if the platform pool has no healthy credential.
+    """
+    if not _is_persisted_model(model):
+        return get_model_api_key(model) or "test-key", getattr(model, "base_url", None), None
+    if getattr(model, "tenant_id", None) is None:
+        try:
+            cred = await pick_credential(model.provider, model.modality)
+        except NoCredentialAvailable:
+            spec = get_provider_spec(model.provider)
+            if spec and not spec.requires_api_key:
+                return "", model.base_url, None
+            raise
+        return get_credential_api_key(cred), cred.base_url or model.base_url, cred.id
+    return get_model_api_key(model), model.base_url, None
+
+
+async def ensure_agent_billing_route(
+    agent_id: uuid.UUID | str | None,
+    model: "LLMModel",
+    route_meta: RouteMeta | None,
+) -> tuple["LLMModel", RouteMeta | None]:
+    """Recover the SaaS route when a caller omitted billing metadata.
+
+    Older background/channel entry points passed a tenant-scoped concrete model
+    directly to ``call_llm``.  For subscribed agents that silently bypassed the
+    platform account pool and Credits settlement.  Keep legacy deployments
+    working, but automatically route any agent for which ``resolve_agent_model``
+    returns SaaS metadata.
+    """
+    if route_meta is not None or not agent_id or not _is_persisted_model(model):
+        return model, route_meta
+
+    from app.models.agent import Agent
+
+    try:
+        normalized_agent_id = agent_id if isinstance(agent_id, uuid.UUID) else uuid.UUID(str(agent_id))
+    except (TypeError, ValueError, AttributeError):
+        return model, route_meta
+
+    async with async_session() as db:
+        result = await db.execute(select(Agent).where(Agent.id == normalized_agent_id))
+        agent = result.scalar_one_or_none()
+
+    if not agent:
+        return model, route_meta
+
+    primary_model, fallback_model, resolved_meta = await resolve_agent_model(agent)
+    routed_model = primary_model or fallback_model
+    if not routed_model or not resolved_meta:
+        return model, route_meta
+
+    logger.warning(
+        "[LLM Billing] Recovered missing route metadata for agent {}: {}/{} -> {}",
+        normalized_agent_id,
+        resolved_meta.saas_tier,
+        resolved_meta.modality,
+        getattr(routed_model, "model", "unknown"),
+    )
+    return routed_model, resolved_meta
+
+
+async def _prepare_llm_billing_context(
+    agent_id: uuid.UUID | str | None,
+    model: "LLMModel",
+    route_meta: RouteMeta | None,
+) -> uuid.UUID | None:
+    """Validate entitlements/credits and return the tenant to settle."""
+    persisted_model = _is_persisted_model(model)
+    if persisted_model:
+        await check_plan_inference_entitlement(
+            agent_id,
+            modality=(
+                route_meta.modality
+                if route_meta is not None
+                else getattr(model, "modality", None)
+            ),
+            saas_tier=route_meta.saas_tier if route_meta is not None else None,
+        )
+
+    if not (agent_id and route_meta and persisted_model):
+        return None
+
+    from app.models.agent import Agent
+
+    try:
+        normalized_agent_id = agent_id if isinstance(agent_id, uuid.UUID) else uuid.UUID(str(agent_id))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise QuotaExceeded(
+            "Agent billing context is invalid.",
+            quota_type="billing_context",
+        ) from exc
+
+    async with async_session() as db:
+        result = await db.execute(select(Agent.tenant_id).where(Agent.id == normalized_agent_id))
+        tenant_id = result.scalar_one_or_none()
+
+    if tenant_id is None:
+        raise QuotaExceeded(
+            "Agent billing context is unavailable.",
+            quota_type="billing_context",
+        )
+
+    await check_tenant_token_credits(tenant_id)
+    await check_credit_balance(
+        tenant_id,
+        route_meta.action,
+        route_meta.modality,
+        route_meta.saas_tier,
+    )
+    await check_agent_llm_quota(normalized_agent_id, model_tier=route_meta.saas_tier)
+    return tenant_id
+
+
+async def _record_llm_usage_and_charge(
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID | None,
+    tenant_id: uuid.UUID | None,
+    model: "LLMModel",
+    usage: TokenUsage,
+    route_meta: RouteMeta | None,
+) -> None:
+    """Record completed provider usage and charge tenant Credits."""
+    if not agent_id or not tenant_id:
+        return
+
+    saas_tier = route_meta.saas_tier if route_meta else getattr(model, "tier", None)
+    modality = route_meta.modality if route_meta else getattr(model, "modality", None)
+    credit_delta = provider_text_credits(model.provider, model.model, usage) if route_meta else None
+
+    await consume_agent_llm_quota(agent_id, model_tier=saas_tier)
+    if route_meta:
+        await charge_credits(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            agent_id=agent_id,
+            action=route_meta.action,
+            modality=modality,
+            saas_tier=saas_tier,
+            provider=model.provider,
+            model=model.model,
+            delta=credit_delta,
+        )
+
+
 async def call_llm(
     model: LLMModel,
     messages: list[dict],
@@ -426,12 +774,24 @@ async def call_llm(
     on_code_output=None,
     current_user_name_override: str | None = None,
     system_prompt_suffix: str | None = None,
+    route_meta: RouteMeta | None = None,
 ) -> str:
     """Call LLM via unified client with function-calling tool loop."""
     # Get agent config for tool rounds
     _max_tool_rounds, _token_limit_msg = await _get_agent_config(agent_id)
     if _token_limit_msg:
         return _token_limit_msg
+
+    # Subscription inference-capability gate (模块四 7.4): reject if the
+    # tenant's plan disallows the routed SaaS tier/modality. Concrete model rows
+    # remain platform routing details. Returns a user-facing string
+    # (call_llm's contract); "⚠️" is non-retryable so failover won't engage.
+    try:
+        model, route_meta = await ensure_agent_billing_route(agent_id, model, route_meta)
+        _tenant_id = await _prepare_llm_billing_context(agent_id, model, route_meta)
+    except QuotaExceeded as _ent_err:
+        return f"⚠️ {_ent_err.message}"
+
     if max_tool_rounds_override and max_tool_rounds_override < _max_tool_rounds:
         _max_tool_rounds = max_tool_rounds_override
 
@@ -474,28 +834,43 @@ async def call_llm(
     else:
         from app.services.agent_tools import AGENT_TOOLS
         tools_for_llm = await get_agent_tools_for_llm(agent_id) if agent_id else AGENT_TOOLS
+    dynamic_prompt += _build_runtime_capability_manifest(
+        tools_for_llm,
+        supports_vision=supports_vision,
+    )
     allowed_tool_names = _allowed_tool_names(tools_for_llm)
 
     # Convert messages to LLMMessage format
-    api_messages = [LLMMessage(role="system", content=static_prompt, dynamic_content=dynamic_prompt)]
-    for msg in messages:
-        api_messages.append(LLMMessage(
-            role=msg.get("role", "user"),
-            content=msg.get("content"),
-            tool_calls=msg.get("tool_calls"),
-            tool_call_id=msg.get("tool_call_id"),
-        ))
+    api_messages = _build_ordered_api_messages(static_prompt, dynamic_prompt, messages)
 
     # Vision format conversion
     api_messages = _convert_messages_for_vision(api_messages, supports_vision)
 
     # Create the unified LLM client
+    # Resolve API key: platform model → credential pool; tenant model → its own key.
+    try:
+        _api_key, _base_url, _cred_id = await resolve_model_key(model)
+    except NoCredentialAvailable as exc:
+        await _record_llm_product_issue(
+            category="credential",
+            error_code=exc.reason_code.value,
+            model=model,
+            agent_id=agent_id,
+            user_id=user_id,
+            tenant_id=_tenant_id,
+            route_meta=route_meta,
+            severity=("critical" if exc.reason_code.value == "all_unhealthy" else "error"),
+        )
+        return f"⚠️ {no_credential_user_message(exc)}"
+    provider_spec = get_provider_spec(model.provider)
+    if not _api_key and (provider_spec is None or provider_spec.requires_api_key):
+        return "⚠️ 未配置 API key"
     try:
         client = create_llm_client(
             provider=model.provider,
-            api_key=get_model_api_key(model),
+            api_key=_api_key,
             model=model.model,
-            base_url=model.base_url,
+            base_url=_base_url,
             timeout=_get_model_timeout(model),
         )
     except Exception as e:
@@ -504,8 +879,35 @@ async def call_llm(
     max_tokens = get_max_tokens(model.provider, model.model, getattr(model, 'max_output_tokens', None))
     _accumulated_usage = TokenUsage()
     _unsaved_usage = TokenUsage()
+    _usage_finalized = False
+
+    async def _finalize_llm_usage(*, billable: bool) -> None:
+        nonlocal _unsaved_usage, _usage_finalized
+        if _usage_finalized:
+            return
+        _usage_finalized = True
+        if agent_id and _unsaved_usage.total_tokens > 0:
+            await record_token_usage(agent_id, _unsaved_usage)
+            _unsaved_usage = TokenUsage()
+        if _accumulated_usage.total_tokens <= 0:
+            return
+        if _cred_id:
+            await record_credential_call(
+                _cred_id,
+                tokens_used=_accumulated_usage.total_tokens,
+            )
+        if billable:
+            await _record_llm_usage_and_charge(
+                agent_id=agent_id,
+                user_id=user_id,
+                tenant_id=_tenant_id,
+                model=model,
+                usage=_accumulated_usage,
+                route_meta=route_meta,
+            )
 
     # Tool-calling loop
+    consecutive_invalid_tool_calls = 0
     for round_i in range(_max_tool_rounds):
         # Dynamic tool-call limit warning
         _warn_threshold_80 = int(_max_tool_rounds * 0.8)
@@ -533,6 +935,7 @@ async def call_llm(
                 _, _token_limit_msg = await _get_agent_config(agent_id)
                 if _token_limit_msg:
                     logger.warning(f"[LLM] Token limit exceeded mid-loop: {_token_limit_msg}")
+                    await _finalize_llm_usage(billable=False)
                     await client.close()
                     return _token_limit_msg
 
@@ -551,16 +954,60 @@ async def call_llm(
                 on_tool_delta=on_tool_delta,
                 on_thinking=on_thinking,
             )
+        except asyncio.CancelledError:
+            await _finalize_llm_usage(billable=False)
+            await client.close()
+            raise
         except LLMError as e:
-            logger.error(f"[LLM] LLMError: provider={getattr(model, 'provider', '?')} model={getattr(model, 'model', '?')} {e}")
-            if agent_id and _unsaved_usage.total_tokens > 0:
-                await record_token_usage(agent_id, _unsaved_usage)
+            logger.error(
+                "[LLM] provider operation failed provider={} model={} error_type={} error_code={}",
+                getattr(model, "provider", "?"),
+                getattr(model, "model", "?"),
+                type(e).__name__,
+                extract_minimax_code(str(e)) or "unknown",
+            )
+            await _record_llm_product_issue(
+                category="llm_provider",
+                error_code=extract_minimax_code(str(e)) or type(e).__name__,
+                model=model,
+                agent_id=agent_id,
+                user_id=user_id,
+                tenant_id=_tenant_id,
+                route_meta=route_meta,
+            )
+            if _cred_id:
+                await _apply_credential_failure_policy(
+                    _cred_id,
+                    e,
+                    log_context="LLM",
+                )
+            await _finalize_llm_usage(billable=False)
             await client.close()
             return f"[LLM Error] {e}"
         except Exception as e:
-            logger.exception(f"[LLM] Unexpected error: {type(e).__name__}: {str(e)[:300]}")
-            if agent_id and _unsaved_usage.total_tokens > 0:
-                await record_token_usage(agent_id, _unsaved_usage)
+            logger.error(
+                "[LLM] unexpected provider failure provider={} model={} error_type={} error_code={}",
+                getattr(model, "provider", "?"),
+                getattr(model, "model", "?"),
+                type(e).__name__,
+                extract_minimax_code(str(e)) or "unknown",
+            )
+            await _record_llm_product_issue(
+                category="llm_provider",
+                error_code=extract_minimax_code(str(e)) or type(e).__name__,
+                model=model,
+                agent_id=agent_id,
+                user_id=user_id,
+                tenant_id=_tenant_id,
+                route_meta=route_meta,
+            )
+            if _cred_id:
+                await _apply_credential_failure_policy(
+                    _cred_id,
+                    e,
+                    log_context="LLM",
+                )
+            await _finalize_llm_usage(billable=False)
             await client.close()
             return f"[LLM call error] {type(e).__name__}: {str(e)[:200]}"
 
@@ -569,9 +1016,20 @@ async def call_llm(
         _accumulated_usage.add(_usage_this_round)
         _unsaved_usage.add(_usage_this_round)
 
-        # Plain assistant text is not a stop condition. The model must finish
-        # explicitly via finish(content=...).
+        # Most hosted providers must finish explicitly via finish(content=...).
+        # Ollama also serves models without reliable function calling; its
+        # provider capability permits a non-empty plain-text final response so
+        # a simple greeting cannot spin until the tool-round limit is reached.
         if not response.tool_calls:
+            provider_spec = get_provider_spec(getattr(model, "provider", ""))
+            if (
+                response.content
+                and provider_spec
+                and provider_spec.accepts_plain_text_final
+            ):
+                await _finalize_llm_usage(billable=True)
+                await client.close()
+                return response.content
             if response.content:
                 api_messages.append(LLMMessage(role="assistant", content=response.content))
             api_messages.append(LLMMessage(role="user", content=FINISH_PROTOCOL_REMINDER))
@@ -581,14 +1039,26 @@ async def call_llm(
         logger.info(f"[LLM] Round {round_i+1}: {len(response.tool_calls)} tool call(s)")
         sanitized_tool_calls, retry_instruction = _sanitize_tool_calls_for_context(response.tool_calls)
         if retry_instruction:
+            consecutive_invalid_tool_calls += 1
+            if consecutive_invalid_tool_calls >= MAX_CONSECUTIVE_INVALID_TOOL_CALLS:
+                logger.error(
+                    "[LLM] Circuit breaker stopped {} consecutive invalid tool calls",
+                    consecutive_invalid_tool_calls,
+                )
+                await _finalize_llm_usage(billable=False)
+                await client.close()
+                return (
+                    "⚠️ 工具参数连续 3 次无效，本次执行已自动停止且不会扣除对话 Credits。"
+                    "请缩短单次写入内容或重新发起任务。"
+                )
             api_messages.append(LLMMessage(role="user", content=retry_instruction))
             continue
+        consecutive_invalid_tool_calls = 0
 
         finish_call = find_finish_call(sanitized_tool_calls)
         if finish_call:
             if finish_call.valid:
-                if agent_id and _unsaved_usage.total_tokens > 0:
-                    await record_token_usage(agent_id, _unsaved_usage)
+                await _finalize_llm_usage(billable=True)
                 await client.close()
                 return finish_call.content
 
@@ -616,18 +1086,33 @@ async def call_llm(
         full_reasoning_content = response.reasoning_content or ""
 
         for tc in sanitized_tool_calls or []:
-            tool_error = await _process_tool_call(
-                tc=tc,
-                api_messages=api_messages,
-                agent_id=agent_id,
-                user_id=user_id,
-                session_id=session_id,
-                supports_vision=supports_vision,
-                on_tool_call=on_tool_call,
-                on_code_output=on_code_output,
-                full_reasoning_content=full_reasoning_content,
-                allowed_tool_names=allowed_tool_names,
-            )
+            try:
+                tool_error = await _process_tool_call(
+                    tc=tc,
+                    api_messages=api_messages,
+                    agent_id=agent_id,
+                    user_id=user_id,
+                    session_id=session_id,
+                    supports_vision=supports_vision,
+                    on_tool_call=on_tool_call,
+                    on_code_output=on_code_output,
+                    full_reasoning_content=full_reasoning_content,
+                    allowed_tool_names=allowed_tool_names,
+                    route_meta=route_meta,
+                )
+            except asyncio.CancelledError:
+                await _finalize_llm_usage(billable=False)
+                await client.close()
+                raise
+            except Exception as e:
+                logger.exception(
+                    "[LLM] Tool execution failed after provider usage: {}: {}",
+                    type(e).__name__,
+                    str(e)[:300],
+                )
+                await _finalize_llm_usage(billable=False)
+                await client.close()
+                return f"[Error] Tool execution failed: {type(e).__name__}: {str(e)[:200]}"
             if tool_error:
                 api_messages.append(LLMMessage(
                     role="tool",
@@ -635,9 +1120,8 @@ async def call_llm(
                     tool_call_id=tc.get("id", ""),
                 ))
 
-    # Record tokens even on "too many rounds" exit
-    if agent_id and _unsaved_usage.total_tokens > 0:
-        await record_token_usage(agent_id, _unsaved_usage)
+    # Settle provider usage even when the model never emits a valid finish call.
+    await _finalize_llm_usage(billable=False)
     await client.close()
     return "[Error] Too many tool call rounds"
 
@@ -661,6 +1145,7 @@ async def call_llm_with_failover(
     on_code_output=None,
     current_user_name_override: str | None = None,
     system_prompt_suffix: str | None = None,
+    route_meta: RouteMeta | None = None,
 ) -> str:
     """Call LLM with automatic failover support."""
     guard = FailoverGuard()
@@ -704,11 +1189,18 @@ async def call_llm_with_failover(
         on_code_output=on_code_output,
         current_user_name_override=current_user_name_override,
         system_prompt_suffix=system_prompt_suffix,
+        route_meta=route_meta,
     )
 
     # Check if we need to failover
     if not is_retryable_error(primary_result):
-        logger.warning(f"[Failover] Canceled: Primary model returned a non-retryable error: {primary_result[:150]}")
+        if _is_llm_error_result(primary_result):
+            logger.warning(
+                "[Failover] Skipped: primary model returned a non-retryable error: {}",
+                primary_result[:150],
+            )
+        else:
+            logger.debug("[Failover] Primary model completed successfully; no failover needed")
         return primary_result
 
     # Check guard conditions
@@ -769,10 +1261,11 @@ async def call_llm_with_failover(
         on_code_output=on_code_output,
         current_user_name_override=current_user_name_override,
         system_prompt_suffix=system_prompt_suffix,
+        route_meta=route_meta,
     )
 
     # Combine error messages if fallback also failed
-    if is_retryable_error(fallback_result) or fallback_result.startswith("⚠️") or fallback_result.startswith("[Error]"):
+    if _is_llm_error_result(fallback_result):
         return f"⚠️ 调用模型出错: Primary: {primary_result[:80]} | Fallback: {fallback_result[:80]}"
 
     return fallback_result
@@ -781,6 +1274,136 @@ async def call_llm_with_failover(
 # ═══════════════════════════════════════════════════════════════════════════════
 # High-level Agent Call Functions
 # ═══════════════════════════════════════════════════════════════════════════════
+
+async def resolve_agent_model(
+    agent: "Agent",
+    tier: str | None = None,
+    modality: str | None = None,
+) -> tuple["LLMModel | None", "LLMModel | None", RouteMeta | None]:
+    """Resolve the concrete LLM model(s) for an agent.
+
+    If a SaaS tier is provided (or the agent has preferred_tier), use the
+    model_routes table. Otherwise fall back to legacy primary_model_id /
+    fallback_model_id.
+    """
+    from app.models.llm import LLMModel
+
+    effective_tier = tier
+    effective_modality = modality
+
+    # Explicit per-chat selections remain strict and are checked by
+    # resolve_route. Persisted preferences may predate the active plan, so only
+    # that stored default is normalized to keep background channels usable
+    # after a downgrade without granting a disallowed tier.
+    if effective_tier is None:
+        from app.services.agent_plan_selection import (
+            InvalidAgentPlanSelection,
+            resolve_agent_plan_selection,
+        )
+        from app.services.entitlements import get_tenant_entitlements
+
+        entitlements = await get_tenant_entitlements(agent.tenant_id) if agent.tenant_id else None
+        if entitlements:
+            try:
+                effective_tier, stored_modality = resolve_agent_plan_selection(
+                    entitlements,
+                    agent.preferred_tier,
+                    agent.preferred_modality,
+                    strict=False,
+                )
+            except InvalidAgentPlanSelection as exc:
+                raise QuotaExceeded(str(exc), quota_type=exc.quota_type) from exc
+            effective_modality = effective_modality or stored_modality
+        else:
+            # Preserve the legacy concrete-model path for deployments that
+            # have not enabled subscriptions/model routes yet.
+            effective_tier = agent.preferred_tier
+            effective_modality = effective_modality or agent.preferred_modality or "text"
+    else:
+        effective_modality = effective_modality or agent.preferred_modality or "text"
+
+    if effective_tier:
+        route = await resolve_route(
+            agent.tenant_id,
+            effective_tier,
+            effective_modality,
+            allow_fallback=True,
+        )
+        return (
+            route.model,
+            route.fallback_model,
+            RouteMeta(saas_tier=route.saas_tier, modality=route.modality, action="chat"),
+        )
+
+    # Legacy path
+    primary_model: LLMModel | None = None
+    if agent.primary_model_id:
+        async with async_session() as db:
+            result = await db.execute(select(LLMModel).where(LLMModel.id == agent.primary_model_id))
+            primary_model = result.scalar_one_or_none()
+
+    fallback_model: LLMModel | None = None
+    if agent.fallback_model_id:
+        async with async_session() as db:
+            result = await db.execute(select(LLMModel).where(LLMModel.id == agent.fallback_model_id))
+            fallback_model = result.scalar_one_or_none()
+
+    return primary_model, fallback_model, None
+
+
+async def prepare_agent_llm_invocation(
+    agent: "Agent",
+    *,
+    action: str = "chat",
+) -> AgentLLMInvocation | None:
+    """Resolve and preflight a background LLM run through the SaaS route."""
+    primary_model, fallback_model, route_meta = await resolve_agent_model(agent)
+    if primary_model is None and fallback_model is not None:
+        primary_model = fallback_model
+        fallback_model = None
+    if primary_model is None:
+        return None
+
+    if route_meta is not None:
+        route_meta = replace(route_meta, action=action)
+
+    tenant_id = await _prepare_llm_billing_context(agent.id, primary_model, route_meta)
+    api_key, base_url, credential_id = await resolve_model_key(primary_model)
+    return AgentLLMInvocation(
+        model=primary_model,
+        fallback_model=fallback_model,
+        route_meta=route_meta,
+        tenant_id=tenant_id,
+        api_key=api_key,
+        base_url=base_url,
+        credential_id=credential_id,
+    )
+
+
+async def settle_agent_llm_invocation(
+    invocation: AgentLLMInvocation,
+    *,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID | None,
+    usage: TokenUsage,
+) -> None:
+    """Record account-pool usage and settle Credits for a background run."""
+    if usage.total_tokens <= 0:
+        return
+    if invocation.credential_id:
+        await record_credential_call(
+            invocation.credential_id,
+            tokens_used=usage.total_tokens,
+        )
+    await _record_llm_usage_and_charge(
+        agent_id=agent_id,
+        user_id=user_id,
+        tenant_id=invocation.tenant_id,
+        model=invocation.model,
+        usage=usage,
+        route_meta=invocation.route_meta,
+    )
+
 
 async def call_agent_llm(
     db: AsyncSession,
@@ -795,7 +1418,6 @@ async def call_agent_llm(
 ) -> str:
     """Call the agent's LLM with automatic failover support."""
     from app.models.agent import Agent
-    from app.models.llm import LLMModel
     from app.core.permissions import is_agent_expired
 
     # Load agent
@@ -807,23 +1429,17 @@ async def call_agent_llm(
     if is_agent_expired(agent):
         return "This Agent has expired and is off duty. Please contact your admin to extend its service."
 
-    # Load primary model
-    primary_model: LLMModel | None = None
-    if agent.primary_model_id:
-        model_result = await db.execute(select(LLMModel).where(LLMModel.id == agent.primary_model_id))
-        primary_model = model_result.scalar_one_or_none()
-
-    # Load fallback model
-    fallback_model: LLMModel | None = None
-    if agent.fallback_model_id:
-        fb_result = await db.execute(select(LLMModel).where(LLMModel.id == agent.fallback_model_id))
-        fallback_model = fb_result.scalar_one_or_none()
+    # Resolve primary/fallback model via SaaS tier route or legacy model IDs
+    try:
+        primary_model, fallback_model, route_meta = await resolve_agent_model(agent)
+    except QuotaExceeded as e:
+        return f"⚠️ {e.message}"
 
     # Config-level fallback: primary missing -> use fallback
     if not primary_model and fallback_model:
         primary_model = fallback_model
         fallback_model = None
-        logger.warning(f"[call_agent_llm] Primary model unavailable, using fallback: {primary_model.model}")
+        logger.warning(f"[call_agent_llm] Primary model unavailable, using fallback: {getattr(primary_model, 'model', '?')}")
 
     if not primary_model:
         return f"⚠️ {agent.name} 未配置 LLM 模型，请在管理后台设置。"
@@ -848,6 +1464,7 @@ async def call_agent_llm(
             on_chunk=on_chunk,
             on_thinking=on_thinking,
             supports_vision=supports_vision or getattr(primary_model, 'supports_vision', False),
+            route_meta=route_meta,
         )
         return reply
     except Exception as e:
@@ -866,7 +1483,6 @@ async def call_agent_llm_with_tools(
 ) -> str:
     """Call agent LLM with tool-calling loop (for background services)."""
     from app.models.agent import Agent
-    from app.models.llm import LLMModel
 
     # Load agent and models
     agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
@@ -874,16 +1490,11 @@ async def call_agent_llm_with_tools(
     if not agent:
         return "⚠️ Agent not found"
 
-    # Load models
-    primary_model: LLMModel | None = None
-    if agent.primary_model_id:
-        model_result = await db.execute(select(LLMModel).where(LLMModel.id == agent.primary_model_id))
-        primary_model = model_result.scalar_one_or_none()
-
-    fallback_model: LLMModel | None = None
-    if agent.fallback_model_id:
-        fb_result = await db.execute(select(LLMModel).where(LLMModel.id == agent.fallback_model_id))
-        fallback_model = fb_result.scalar_one_or_none()
+    # Resolve models via SaaS tier route or legacy model IDs
+    try:
+        primary_model, fallback_model, route_meta = await resolve_agent_model(agent)
+    except QuotaExceeded as e:
+        return f"⚠️ {e.message}"
 
     # Config-level fallback
     if not primary_model and fallback_model:
@@ -906,13 +1517,53 @@ async def call_agent_llm_with_tools(
         """Try to complete with a model. Returns (response, success, tool_executed)."""
         _accumulated_usage = TokenUsage()
         _unsaved_usage = TokenUsage()
+        _usage_finalized = False
+        _cred_id = None
+        client = None
         tool_executed = False
+        tenant_id = await _prepare_llm_billing_context(agent_id, model, route_meta)
+
+        async def _finalize_background_usage() -> None:
+            nonlocal _unsaved_usage, _usage_finalized
+            if _usage_finalized:
+                return
+            _usage_finalized = True
+            if agent_id and _unsaved_usage.total_tokens > 0:
+                await record_token_usage(agent_id, _unsaved_usage)
+                _unsaved_usage = TokenUsage()
+            if _accumulated_usage.total_tokens <= 0:
+                return
+            if _cred_id:
+                await record_credential_call(_cred_id, tokens_used=_accumulated_usage.total_tokens)
+            await _record_llm_usage_and_charge(
+                agent_id=agent_id,
+                user_id=agent.creator_id,
+                tenant_id=tenant_id,
+                model=model,
+                usage=_accumulated_usage,
+                route_meta=route_meta,
+            )
+
+        try:
+            _api_key, _base_url, _cred_id = await resolve_model_key(model)
+        except NoCredentialAvailable as exc:
+            await _record_llm_product_issue(
+                category="credential",
+                error_code=exc.reason_code.value,
+                model=model,
+                agent_id=agent_id,
+                user_id=agent.creator_id,
+                tenant_id=tenant_id,
+                route_meta=route_meta,
+                severity=("critical" if exc.reason_code.value == "all_unhealthy" else "error"),
+            )
+            return f"⚠️ {no_credential_user_message(exc)}", False, tool_executed
         try:
             client = create_llm_client(
                 provider=model.provider,
-                api_key=get_model_api_key(model),
+                api_key=_api_key,
                 model=model.model,
-                base_url=model.base_url,
+                base_url=_base_url,
                 timeout=_get_model_timeout(model),
             )
 
@@ -932,6 +1583,7 @@ async def call_agent_llm_with_tools(
                         _, _token_limit_msg = await _get_agent_config(agent_id)
                         if _token_limit_msg:
                             logger.warning(f"[call_agent_llm_with_tools] Token limit exceeded mid-loop: {_token_limit_msg}")
+                            await _finalize_background_usage()
                             await client.close()
                             return _token_limit_msg, False, tool_executed
 
@@ -943,10 +1595,30 @@ async def call_agent_llm_with_tools(
                         max_tokens=max_tokens,
                     )
                 except Exception as e:
-                    logger.error(f"[call_agent_llm_with_tools] Agent {agent_id}: LLM call error: {e}")
-                    await client.close()
-                    if agent_id and _unsaved_usage.total_tokens > 0:
-                        await record_token_usage(agent_id, _unsaved_usage)
+                    logger.error(
+                        "[call_agent_llm_with_tools] agent={} provider={} model={} "
+                        "error_type={} error_code={}",
+                        agent_id,
+                        getattr(model, "provider", "?"),
+                        getattr(model, "model", "?"),
+                        type(e).__name__,
+                        extract_minimax_code(str(e)) or "unknown",
+                    )
+                    await _record_llm_product_issue(
+                        category="llm_provider",
+                        error_code=extract_minimax_code(str(e)) or type(e).__name__,
+                        model=model,
+                        agent_id=agent_id,
+                        user_id=agent.creator_id,
+                        tenant_id=tenant_id,
+                        route_meta=route_meta,
+                    )
+                    if _cred_id:
+                        await _apply_credential_failure_policy(
+                            _cred_id,
+                            e,
+                            log_context="call_agent_llm_with_tools",
+                        )
                     raise
 
                 # Track tokens for this round
@@ -969,8 +1641,7 @@ async def call_agent_llm_with_tools(
                 finish_call = find_finish_call(sanitized_tool_calls)
                 if finish_call:
                     if finish_call.valid:
-                        if agent_id and _unsaved_usage.total_tokens > 0:
-                            await record_token_usage(agent_id, _unsaved_usage)
+                        await _finalize_background_usage()
                         await client.close()
                         return finish_call.content, True, tool_executed
                     api_messages.append(LLMMessage(
@@ -1007,30 +1678,43 @@ async def call_agent_llm_with_tools(
                         logger.warning(f"[call_agent_llm_with_tools] Blocked disabled tool call: {tool_name} agent_id={agent_id}")
                         result = _tool_not_enabled_message(tool_name)
                     else:
-                        result = await execute_tool(
-                            tool_name, args,
-                            agent_id=agent_id,
-                            user_id=agent.creator_id,
-                            session_id=session_id,
-                        )
+                        should_execute, argument_error = _check_tool_requires_args(tool_name, args)
+                        if not should_execute:
+                            result = argument_error
+                        else:
+                            result = await execute_tool(
+                                tool_name, args,
+                                agent_id=agent_id,
+                                user_id=agent.creator_id,
+                                session_id=session_id,
+                                saas_tier=route_meta.saas_tier if route_meta else None,
+                            )
                     api_messages.append(LLMMessage(
                         role="tool",
                         tool_call_id=tc["id"],
                         content=str(result),
                     ))
 
-            if agent_id and _unsaved_usage.total_tokens > 0:
-                await record_token_usage(agent_id, _unsaved_usage)
+            await _finalize_background_usage()
             await client.close()
             return "[Error] Too many tool call rounds", False, tool_executed
 
+        except asyncio.CancelledError:
+            await _finalize_background_usage()
+            if client is not None:
+                await client.close()
+            raise
         except Exception as e:
-            if agent_id and _unsaved_usage.total_tokens > 0:
-                await record_token_usage(agent_id, _unsaved_usage)
+            await _finalize_background_usage()
+            if client is not None:
+                await client.close()
             return f"[Error] {e}", False, tool_executed
 
     # Try primary model
-    reply, success, primary_tool_executed = await _try_model(primary_model)
+    try:
+        reply, success, primary_tool_executed = await _try_model(primary_model)
+    except QuotaExceeded as e:
+        return f"⚠️ {e.message}"
     if success:
         return reply
 
@@ -1045,7 +1729,10 @@ async def call_agent_llm_with_tools(
 
     # Try fallback model
     logger.info(f"[call_agent_llm_with_tools] Retrying with fallback: {fallback_model.model}")
-    reply2, success2, _fallback_tool_executed = await _try_model(fallback_model)
+    try:
+        reply2, success2, _fallback_tool_executed = await _try_model(fallback_model)
+    except QuotaExceeded as e:
+        return f"⚠️ {e.message}"
     if success2:
         return reply2
 
@@ -1057,6 +1744,12 @@ __all__ = [
     "call_llm_with_failover",
     "call_agent_llm",
     "call_agent_llm_with_tools",
+    "resolve_agent_model",
+    "ensure_agent_billing_route",
+    "prepare_agent_llm_invocation",
+    "settle_agent_llm_invocation",
+    "AgentLLMInvocation",
+    "RouteMeta",
     "FailoverGuard",
     "is_retryable_error",
 ]

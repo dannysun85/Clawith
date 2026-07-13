@@ -14,11 +14,15 @@ from datetime import datetime, timezone, timedelta
 
 from loguru import logger
 
+from app.config import get_settings
 from app.core.logging_config import new_trace_id
 from sqlalchemy import select, update, or_
 from app.services.storage import agent_storage_key, get_storage_backend
+from app.services.quota_guard import QuotaExceeded
 
 from app.services.llm.finish import FINISH_PROTOCOL_REMINDER, find_finish_call, parse_tool_arguments
+
+settings = get_settings()
 
 _HEARTBEAT_SEMAPHORE = asyncio.Semaphore(10)
 
@@ -135,19 +139,23 @@ def _is_in_active_hours(active_hours: str, tz_name: str = "UTC") -> bool:
 async def _execute_heartbeat(agent_id: uuid.UUID):
     """Execute a single heartbeat for an agent.
 
-    Uses three short DB transactions to avoid holding connections
+    Uses short DB transactions to avoid holding connections
     during long-running LLM calls:
       Phase 1: Read agent, model, context, notifications → commit
       Phase 2: LLM tool loop (no DB connection held)
-      Phase 3: Write token usage → commit
+      Finalizer: record token usage and settle Credits on every exit path
     """
     new_trace_id()
     await _HEARTBEAT_SEMAPHORE.acquire()
+    client = None
+    llm_invocation = None
+    agent_creator_id = None
+    _hb_accumulated_usage = None
+    _hb_unsaved_usage = None
     try:
         from app.database import async_session
         from app.models.agent import Agent
-        from app.models.llm import LLMModel
-        from app.services.llm import get_model_api_key
+        from app.services.llm import prepare_agent_llm_invocation
 
         # ── Phase 1: Read all context from DB (short transaction) ──
         agent_name = ""
@@ -160,6 +168,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
         model_base_url = None
         model_temperature = None
         model_max_output_tokens = None
+        model_request_timeout = None
         heartbeat_instruction = DEFAULT_HEARTBEAT_INSTRUCTION
 
         async with async_session() as db:
@@ -168,14 +177,10 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
             if not agent:
                 return
 
-            model_id = agent.primary_model_id or agent.fallback_model_id
-            if not model_id:
+            llm_invocation = await prepare_agent_llm_invocation(agent, action="heartbeat")
+            if llm_invocation is None:
                 return
-
-            model_result = await db.execute(select(LLMModel).where(LLMModel.id == model_id))
-            model = model_result.scalar_one_or_none()
-            if not model:
-                return
+            model = llm_invocation.model
 
             # Cache values we need for Phase 2 (after DB session closes)
             agent_name = agent.name
@@ -183,9 +188,9 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
             agent_creator_id = agent.creator_id
             agent_is_private = (getattr(agent, "access_mode", None) or "company") != "company"
             model_provider = model.provider
-            model_api_key = get_model_api_key(model)
+            model_api_key = llm_invocation.api_key
             model_model = model.model
-            model_base_url = model.base_url
+            model_base_url = llm_invocation.base_url
             model_temperature = model.temperature
             model_max_output_tokens = getattr(model, 'max_output_tokens', None)
             model_request_timeout = getattr(model, 'request_timeout', None)
@@ -251,7 +256,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                 notif_result = await db.execute(
                     select(Notification).where(
                         Notification.agent_id == agent_id,
-                        Notification.is_read == False,
+                        Notification.is_read.is_(False),
                     ).order_by(Notification.created_at).limit(10)
                 )
                 unread = notif_result.scalars().all()
@@ -274,7 +279,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
         full_instruction = heartbeat_instruction + recent_context + inbox_context
 
         # Call LLM with tools using unified client
-        from app.services.llm import create_llm_client, get_max_tokens, LLMMessage, LLMError, get_model_api_key
+        from app.services.llm import create_llm_client, get_max_tokens, LLMMessage, LLMError
         from app.services.agent_tools import execute_tool, get_agent_tools_for_llm
 
         try:
@@ -294,9 +299,6 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
         reply = ""
         plaza_posts_made = 0       # hard limit: 1 new post per heartbeat
         plaza_comments_made = 0    # hard limit: 2 comments per heartbeat
-        _hb_accumulated_usage = None
-        _hb_unsaved_usage = None
-
         # Token tracking helpers
         from app.services.token_tracker import (
             TokenUsage,
@@ -325,7 +327,6 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                     _, _token_limit_msg = await _get_agent_config(agent_id)
                     if _token_limit_msg:
                         logger.warning(f"[Heartbeat] Token limit exceeded mid-loop: {_token_limit_msg}")
-                        await client.close()
                         reply = _token_limit_msg
                         break
 
@@ -435,15 +436,6 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                 llm_messages.append(LLMMessage(role="user", content=FINISH_PROTOCOL_REMINDER))
                 continue
 
-        await client.close()
-
-        # ── Phase 3: Write results back to DB (short transaction) ──
-        async with async_session() as db:
-            # Record accumulated heartbeat token usage
-            if _hb_unsaved_usage and _hb_unsaved_usage.total_tokens > 0:
-                await record_token_usage(agent_id, _hb_unsaved_usage)
-            await db.commit()
-
         # Log activity if not empty
         is_ok = "HEARTBEAT_OK" in reply.upper().replace(" ", "_") if reply else False
         if not is_ok and reply:
@@ -456,14 +448,46 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
 
         logger.info(f"💓 Heartbeat for {agent_name}: {'OK' if is_ok else reply[:60]}")
 
+    except QuotaExceeded as e:
+        logger.warning(f"Heartbeat skipped for agent {agent_id}: {e.message}")
     except Exception as e:
         logger.exception(f"Heartbeat error for agent {agent_id}: {e}")
     finally:
+        if client is not None:
+            try:
+                await client.close()
+            except Exception as e:
+                logger.warning(f"Failed to close heartbeat LLM client for agent {agent_id}: {e}")
+
+        if _hb_unsaved_usage and _hb_unsaved_usage.total_tokens > 0:
+            try:
+                from app.services.token_tracker import record_token_usage
+
+                await record_token_usage(agent_id, _hb_unsaved_usage)
+            except Exception as e:
+                logger.exception(f"Failed to record heartbeat tokens for agent {agent_id}: {e}")
+
+        if _hb_accumulated_usage and _hb_accumulated_usage.total_tokens > 0 and llm_invocation:
+            try:
+                from app.services.llm import settle_agent_llm_invocation
+
+                await settle_agent_llm_invocation(
+                    llm_invocation,
+                    agent_id=agent_id,
+                    user_id=agent_creator_id,
+                    usage=_hb_accumulated_usage,
+                )
+            except Exception as e:
+                logger.exception(f"Failed to settle heartbeat Credits for agent {agent_id}: {e}")
+
         _HEARTBEAT_SEMAPHORE.release()
 
 
 async def _heartbeat_tick():
     """One heartbeat tick: find agents due for heartbeat."""
+    if not settings.HEARTBEAT_ENABLED:
+        return
+
     from app.database import async_session
     from app.models.agent import Agent
     from app.services.audit_logger import write_audit_log
@@ -477,7 +501,7 @@ async def _heartbeat_tick():
         async with async_session() as db:
             result = await db.execute(
                 select(Agent).where(
-                    Agent.heartbeat_enabled == True,
+                    Agent.heartbeat_enabled.is_(True),
                     Agent.status.in_(["running", "idle"]),
                 )
             )
@@ -519,7 +543,7 @@ async def _heartbeat_tick():
                     update(Agent)
                     .where(
                         Agent.id == agent.id,
-                        Agent.heartbeat_enabled == True,
+                        Agent.heartbeat_enabled.is_(True),
                         Agent.status.in_(["running", "idle"]),
                         or_(
                             Agent.last_heartbeat_at.is_(None),
@@ -609,11 +633,15 @@ async def run_agent_oneshot(
     Returns the final reply string (for logging purposes).
     """
     new_trace_id()
+    client = None
+    llm_invocation = None
+    agent_creator_id = None
+    accumulated_usage = None
+    unsaved_usage = None
     try:
         from app.database import async_session
         from app.models.agent import Agent
-        from app.models.llm import LLMModel
-        from app.services.llm import get_model_api_key
+        from app.services.llm import prepare_agent_llm_invocation
 
         # ── Phase 1: Read agent + model config (short DB transaction) ──────────
         agent_name = ""
@@ -626,7 +654,6 @@ async def run_agent_oneshot(
         model_temperature = None
         model_max_output_tokens = None
         model_request_timeout = None
-
         async with async_session() as db:
             result = await db.execute(select(Agent).where(Agent.id == agent_id))
             agent = result.scalar_one_or_none()
@@ -634,28 +661,20 @@ async def run_agent_oneshot(
                 logger.warning(f"[Oneshot] Agent {agent_id} not found — aborting")
                 return ""
 
-            model_id = agent.primary_model_id or agent.fallback_model_id
-            if not model_id:
-                msg = "Agent has no LLM model configured. Please assign a model in Agent Settings."
-                logger.warning(f"[Oneshot] Agent {agent_id} has no model configured — aborting")
-                await _notify_oneshot_error(triggered_by_user_id, agent_id, agent_name or str(agent_id), msg)
-                return ""
-
-            model_result = await db.execute(select(LLMModel).where(LLMModel.id == model_id))
-            model = model_result.scalar_one_or_none()
-            if not model:
-                msg = f"The configured LLM model ({model_id}) was not found. Please check Agent Settings."
-                logger.warning(f"[Oneshot] Model {model_id} not found — aborting")
-                await _notify_oneshot_error(triggered_by_user_id, agent_id, agent_name or str(agent_id), msg)
-                return ""
-
             agent_name = agent.name
             agent_role = agent.role_description or ""
             agent_creator_id = agent.creator_id
+            llm_invocation = await prepare_agent_llm_invocation(agent, action="chat")
+            if llm_invocation is None:
+                msg = "Agent has no LLM model configured. Please assign a model in Agent Settings."
+                logger.warning(f"[Oneshot] Agent {agent_id} has no model configured — aborting")
+                await _notify_oneshot_error(triggered_by_user_id, agent_id, agent_name, msg)
+                return ""
+            model = llm_invocation.model
             model_provider = model.provider
-            model_api_key = get_model_api_key(model)
+            model_api_key = llm_invocation.api_key
             model_model = model.model
-            model_base_url = model.base_url
+            model_base_url = llm_invocation.base_url
             model_temperature = model.temperature
             model_max_output_tokens = getattr(model, "max_output_tokens", None)
             model_request_timeout = getattr(model, "request_timeout", None)
@@ -714,12 +733,12 @@ async def run_agent_oneshot(
                         await record_token_usage(agent_id, unsaved_usage)
                     except Exception as e:
                         logger.warning(f"[Oneshot] Failed to record token usage mid-loop: {e}")
-                    unsaved_usage = TokenUsage()
+                    else:
+                        unsaved_usage = TokenUsage()
                     from app.services.llm.caller import _get_agent_config
                     _, _token_limit_msg = await _get_agent_config(agent_id)
                     if _token_limit_msg:
                         logger.warning(f"[Oneshot] Token limit exceeded mid-loop: {_token_limit_msg}")
-                        await client.close()
                         reply = _token_limit_msg
                         break
 
@@ -800,15 +819,10 @@ async def run_agent_oneshot(
                 llm_messages.append(LLMMessage(role="user", content=FINISH_PROTOCOL_REMINDER))
                 continue
 
-        await client.close()
+        # Client close and all usage settlement run in the function-level
+        # ``finally`` block so cancellation/tool failures cannot bypass billing.
 
         # ── Phase 3: Record token usage (best-effort) ───────────────────────────
-        if unsaved_usage.total_tokens > 0:
-            try:
-                await record_token_usage(agent_id, unsaved_usage)
-            except Exception as e:
-                logger.warning(f"[Oneshot] Failed to record token usage: {e}")
-
         # Log activity
         if reply:
             try:
@@ -842,6 +856,37 @@ async def run_agent_oneshot(
         logger.info(f"[Oneshot] {agent_name} completed ({round_i + 1} rounds, {accumulated_usage.total_tokens} tokens)")
         return reply
 
+    except QuotaExceeded as e:
+        logger.warning(f"[Oneshot] Skipped agent {agent_id}: {e.message}")
+        await _notify_oneshot_error(triggered_by_user_id, agent_id, str(agent_id), e.message)
+        return ""
     except Exception as e:
         logger.exception(f"[Oneshot] Unexpected error for agent {agent_id}: {e}")
         return ""
+    finally:
+        if client is not None:
+            try:
+                await client.close()
+            except Exception as e:
+                logger.warning(f"[Oneshot] Failed to close LLM client for agent {agent_id}: {e}")
+
+        if unsaved_usage and unsaved_usage.total_tokens > 0:
+            try:
+                from app.services.token_tracker import record_token_usage
+
+                await record_token_usage(agent_id, unsaved_usage)
+            except Exception as e:
+                logger.exception(f"[Oneshot] Failed to record token usage for agent {agent_id}: {e}")
+
+        if accumulated_usage and accumulated_usage.total_tokens > 0 and llm_invocation:
+            try:
+                from app.services.llm import settle_agent_llm_invocation
+
+                await settle_agent_llm_invocation(
+                    llm_invocation,
+                    agent_id=agent_id,
+                    user_id=agent_creator_id,
+                    usage=accumulated_usage,
+                )
+            except Exception as e:
+                logger.exception(f"[Oneshot] Failed to settle Credits for agent {agent_id}: {e}")

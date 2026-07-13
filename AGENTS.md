@@ -1,36 +1,18 @@
-# Clawith Project Instructions
+# Astra — Agent Instructions
 
-This file is the project-level entry point for agent instructions.
+This file is a **redirector only**. It contains no substantive project knowledge.
 
-## Primary Source of Project Rules
+Canonical project guidance lives in **[`SKILL.md`](./SKILL.md)**.
 
-For this repository, the canonical project instructions live under:
+**Before starting any work in this repository, read `SKILL.md` in full.**
 
-- `.agents/rules/`
-- `.agents/workflows/`
+Topic-specific files (when they exist):
 
-When working in this project, read and follow those files first. If this file and a file under `.agents/` ever conflict, prefer the more specific file under `.agents/`.
+- `.agents/rules/` — behavioral rules ("must / must not")
+- `.agents/workflows/` — step-by-step task workflows
+- `.agents/reference/` — factual reference material
+- `ARCHITECTURE_SPEC_EN.md` — deep architecture spec (if later added)
 
-## Required Read Order
+## Anti-drift rule
 
-At the start of work on Clawith, use this order:
-
-1. `.agents/workflows/read_architecture.md`
-2. Relevant files under `.agents/rules/`
-
-In practice:
-
-- For general design, implementation, or feature questions, read `.agents/rules/design_and_dev.md`
-- For deployment and environment updates, read `.agents/rules/deploy.md`
-- For GitHub-related work, read `.agents/rules/github.md`
-- For versioning and release work, read `.agents/rules/release.md`
-
-## Notes
-
-- The architecture document currently present in this repository is `ARCHITECTURE_SPEC_EN.md`
-- Do not invent alternative instruction filenames when the real rules already exist under `.agents/`
-
-## Local Collaboration Preference
-
-- At the end of each completed task, play a short local completion sound on the user's machine (for example with `afplay` on macOS) so the user notices work has finished even when reading or working in another window.
-- This reminder should be treated as a default behavior for this repository across sessions unless the user explicitly asks to skip it for a specific task.
+Do not add commands, architecture descriptions, data-model details, code snippets, or other project facts to this file. If project guidance needs to change, edit `SKILL.md` (or a file under `.agents/` and register it in SKILL.md's index). If this file and `SKILL.md` ever conflict, **`SKILL.md` wins**.

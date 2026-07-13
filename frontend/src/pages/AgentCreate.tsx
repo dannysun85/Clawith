@@ -3,19 +3,27 @@ import { useLocation, useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { IconEye, IconSettings, IconTools } from '@tabler/icons-react';
-import { agentApi, channelApi, enterpriseApi, skillApi, tenantApi } from '../services/api';
+import { agentApi, channelApi, skillApi, tenantApi } from '../services/api';
+import { useAllowedTiers } from '../hooks/useLlmModels';
+import {
+    SUBSCRIPTION_UPGRADE_PATH,
+    agentLimitMessage,
+    useAgentCreationLimit,
+} from '../hooks/useAgentCreationLimit';
+import TierSelector, { type SaasTier } from '../components/TierSelector';
 import ChannelConfig from '../components/ChannelConfig';
 import LinearCopyButton from '../components/LinearCopyButton';
 const STEPS = ['basicInfo', 'personality', 'skills', 'permissions', 'channel'] as const;
 const OPENCLAW_STEPS = ['basicInfo', 'permissions'] as const;
 
 export default function AgentCreate() {
-    const { t } = useTranslation();
+    const { t, i18n } = useTranslation();
     const navigate = useNavigate();
     const location = useLocation();
     const queryClient = useQueryClient();
     const [step, setStep] = useState(0);
     const [error, setError] = useState('');
+    const [upgradeUrl, setUpgradeUrl] = useState('');
     const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
     const [agentType, setAgentType] = useState<'native' | 'openclaw'>(() => {
         const params = new URLSearchParams(location.search);
@@ -32,8 +40,8 @@ export default function AgentCreate() {
         role_description: '',
         personality: '',
         boundaries: '',
-        primary_model_id: '' as string,
-        fallback_model_id: '' as string,
+        preferred_tier: 'lite' as SaasTier,
+        preferred_modality: 'text',
         permission_scope_type: 'company',
         permission_access_level: 'use',
         max_tokens_per_day: '',
@@ -42,27 +50,20 @@ export default function AgentCreate() {
     });
     const [channelValues, setChannelValues] = useState<Record<string, string>>({});
 
-    // Fetch LLM models for step 1
-    const { data: models = [] } = useQuery({
-        queryKey: ['llm-models'],
-        queryFn: enterpriseApi.llmModels,
-    });
+    // Allowed tiers from tenant subscription entitlements
+    const allowedTiers = useAllowedTiers();
+    const agentCreationLimit = useAgentCreationLimit();
+    const isChinese = i18n.language?.startsWith('zh') || false;
 
-    // Tenant default model — used to preselect the model step so the open-source
-    // default ("hire and go") path needs no clicks. User can override.
-    const { data: myTenant } = useQuery({
-        queryKey: ['tenant', 'me'],
-        queryFn: () => tenantApi.me(),
-        staleTime: 5 * 60 * 1000,
-    });
     useEffect(() => {
-        if (!myTenant?.default_model_id) return;
-        const enabledModels = (models as any[]).filter((m: any) => m.enabled);
-        const exists = enabledModels.some((m: any) => m.id === myTenant.default_model_id);
-        if (exists) {
-            setForm(prev => prev.primary_model_id ? prev : { ...prev, primary_model_id: myTenant.default_model_id! });
+        if (!allowedTiers.length) return;
+        if (!allowedTiers.includes(form.preferred_tier)) {
+            setForm(prev => ({
+                ...prev,
+                preferred_tier: (allowedTiers[0] || 'lite') as SaasTier,
+            }));
         }
-    }, [myTenant?.default_model_id, models]);
+    }, [allowedTiers, form.preferred_tier]);
 
     // Fetch global skills for step 3
     const { data: globalSkills = [] } = useQuery({
@@ -90,6 +91,7 @@ export default function AgentCreate() {
         },
         onSuccess: async (agent) => {
             queryClient.invalidateQueries({ queryKey: ['agents'] });
+            queryClient.invalidateQueries({ queryKey: ['subscription-seats'] });
 
             // Automatically bind channels if configured in wizard
             // Feishu
@@ -101,7 +103,8 @@ export default function AgentCreate() {
                         app_secret: channelValues.feishu_app_secret,
                         encrypt_key: channelValues.feishu_encrypt_key || undefined,
                         extra_config: {
-                            connection_mode: channelValues.feishu_connection_mode || 'websocket'
+                            connection_mode: channelValues.feishu_connection_mode || 'websocket',
+                            activation_mode: channelValues.feishu_activation_mode || 'mention',
                         }
                     });
                 } catch (err) {
@@ -173,7 +176,10 @@ export default function AgentCreate() {
                 navigate(`/agents/${agent.id}`);
             }
         },
-        onError: (err: any) => setError(err.message),
+        onError: (err: any) => {
+            setError(err.message);
+            setUpgradeUrl(err?.detail?.details?.upgrade_url || err?.detail?.upgrade_url || (err?.status === 402 ? SUBSCRIPTION_UPGRADE_PATH : ''));
+        },
     });
 
     const validateStep0 = (): boolean => {
@@ -195,9 +201,8 @@ export default function AgentCreate() {
         if (form.max_tokens_per_month && (isNaN(Number(form.max_tokens_per_month)) || Number(form.max_tokens_per_month) <= 0)) {
             errors.max_tokens_per_month = t('wizard.errors.tokenLimitInvalid', '请输入有效的正整数');
         }
-        const enabledModels = (models as any[]).filter((m: any) => m.enabled);
-        if (agentType === 'native' && enabledModels.length > 0 && !form.primary_model_id) {
-            errors.primary_model_id = t('wizard.errors.modelRequired', '请选择一个主模型');
+        if (agentType === 'native' && !form.preferred_tier) {
+            errors.preferred_tier = t('wizard.errors.tierRequired', '请选择一个模型档位');
         }
         setFieldErrors(errors);
         return Object.keys(errors).length === 0;
@@ -205,12 +210,14 @@ export default function AgentCreate() {
 
     const handleNext = () => {
         setError('');
+        setUpgradeUrl('');
         if (step === 0 && !validateStep0()) return;
         setStep(step + 1);
     };
 
     const handleFinish = () => {
         setError('');
+        setUpgradeUrl('');
         if (step === 0 || agentType === 'openclaw') {
             if (!validateStep0()) return;
         }
@@ -220,8 +227,8 @@ export default function AgentCreate() {
             role_description: form.role_description,
             personality: agentType === 'native' ? form.personality : undefined,
             boundaries: agentType === 'native' ? form.boundaries : undefined,
-            primary_model_id: agentType === 'native' ? (form.primary_model_id || undefined) : undefined,
-            fallback_model_id: agentType === 'native' ? (form.fallback_model_id || undefined) : undefined,
+            preferred_tier: agentType === 'native' ? form.preferred_tier : undefined,
+            preferred_modality: agentType === 'native' ? form.preferred_modality : undefined,
             permission_scope_type: form.permission_scope_type,
             max_tokens_per_day: form.max_tokens_per_day ? Number(form.max_tokens_per_day) : undefined,
             max_tokens_per_month: form.max_tokens_per_month ? Number(form.max_tokens_per_month) : undefined,
@@ -231,8 +238,18 @@ export default function AgentCreate() {
         });
     };
 
-    const selectedModel = models.find((m: any) => m.id === form.primary_model_id);
     const activeSteps = agentType === 'openclaw' ? OPENCLAW_STEPS : STEPS;
+
+    const upgradeButton = upgradeUrl ? (
+        <button
+            type="button"
+            className="btn btn-secondary"
+            style={{ marginTop: '10px' }}
+            onClick={() => navigate(upgradeUrl)}
+        >
+            {t('subscription.goToDetail', isChinese ? '去套餐详情' : 'Go to subscription')}
+        </button>
+    ) : null;
 
     // If OpenClaw agent just created, show success page with API key
     if (createdApiKey && createMutation.data) {
@@ -264,17 +281,17 @@ export default function AgentCreate() {
                                 padding: '12px', background: 'var(--bg-secondary)', borderRadius: '6px',
                                 fontSize: '11px', lineHeight: 1.6, overflow: 'auto', maxHeight: '280px',
                                 border: '1px solid var(--border-default)', whiteSpace: 'pre-wrap',
-                            }}>{`Please create a skill file at skills/clawith_sync.md with the following content, then add "Check Clawith inbox using the clawith_sync skill and process any pending messages" to your HEARTBEAT.md:
+                            }}>{`Please create a skill file at skills/clawith_sync.md with the following content, then add "Check Astra inbox using the clawith_sync skill and process any pending messages" to your HEARTBEAT.md:
 
 ---
 name: clawith_sync
-description: Sync with Clawith platform — check inbox, submit results, and send messages.
+description: Sync with Astra platform — check inbox, submit results, and send messages.
 ---
 
-# Clawith Sync
+# Astra Sync
 
 ## When to use
-Check for new messages from the Clawith platform during every heartbeat cycle.
+Check for new messages from the Astra platform during every heartbeat cycle.
 You can also proactively send messages to people and agents in your relationships.
 
 ## Instructions
@@ -287,7 +304,7 @@ Make an HTTP GET request:
 The response contains a \`messages\` array. Each message includes:
 - \`id\` — unique message ID (use this for reporting)
 - \`content\` — the message text
-- \`sender_user_name\` — name of the Clawith user who sent it
+- \`sender_user_name\` — name of the Astra user who sent it
 - \`sender_user_id\` — unique ID of the sender
 - \`conversation_id\` — the conversation this message belongs to
 - \`history\` — array of previous messages in this conversation for context
@@ -320,7 +337,7 @@ For humans, the message is delivered via their available channel (e.g. Feishu).`
                                     <LinearCopyButton
                                         className="btn btn-ghost"
                                         style={{ position: 'absolute', top: '4px', right: '4px', fontSize: '11px', minWidth: '60px' }}
-                                        textToCopy={`Please create a skill file at skills/clawith_sync.md with the following content, then add "Check Clawith inbox using the clawith_sync skill and process any pending messages" to your HEARTBEAT.md:\n\n---\nname: clawith_sync\ndescription: Sync with Clawith platform — check inbox, submit results, and send messages.\n---\n\n# Clawith Sync\n\n## When to use\nCheck for new messages from the Clawith platform during every heartbeat cycle.\nYou can also proactively send messages to people and agents in your relationships.\n\n## Instructions\n\n### 1. Check inbox\nMake an HTTP GET request:\n- URL: ${window.location.origin}/api/gateway/poll\n- Header: X-Api-Key: ${createdApiKey}\n\nThe response contains a \`messages\` array. Each message includes:\n- \`id\` — unique message ID (use this for reporting)\n- \`content\` — the message text\n- \`sender_user_name\` — name of the Clawith user who sent it\n- \`sender_user_id\` — unique ID of the sender\n- \`conversation_id\` — the conversation this message belongs to\n- \`history\` — array of previous messages in this conversation for context\n\nThe response also contains a \`relationships\` array describing your colleagues:\n- \`name\` — the person or agent name\n- \`type\` — "human" or "agent"\n- \`role\` — relationship type (e.g. collaborator, supervisor)\n- \`channels\` — available communication channels (e.g. ["feishu"], ["agent"])\n\n**IMPORTANT**: Use the \`history\` array to understand conversation context before replying.\nDifferent \`sender_user_name\` values mean different people — address them accordingly.\n\n### 2. Report results\nFor each completed message, make an HTTP POST request:\n- URL: ${window.location.origin}/api/gateway/report\n- Header: X-Api-Key: ${createdApiKey}\n- Header: Content-Type: application/json\n- Body: {"message_id": "<id from the message>", "result": "<your response>"}\n\n### 3. Send a message to someone\nTo proactively contact a person or agent, make an HTTP POST request:\n- URL: ${window.location.origin}/api/gateway/send-message\n- Header: X-Api-Key: ${createdApiKey}\n- Header: Content-Type: application/json\n- Body: {"target": "<name of person or agent>", "content": "<your message>"}\n\nThe system auto-detects the best channel. For agents, the reply appears in your next poll.\nFor humans, the message is delivered via their available channel (e.g. Feishu).`}
+                                        textToCopy={`Please create a skill file at skills/clawith_sync.md with the following content, then add "Check Astra inbox using the clawith_sync skill and process any pending messages" to your HEARTBEAT.md:\n\n---\nname: clawith_sync\ndescription: Sync with Astra platform — check inbox, submit results, and send messages.\n---\n\n# Astra Sync\n\n## When to use\nCheck for new messages from the Astra platform during every heartbeat cycle.\nYou can also proactively send messages to people and agents in your relationships.\n\n## Instructions\n\n### 1. Check inbox\nMake an HTTP GET request:\n- URL: ${window.location.origin}/api/gateway/poll\n- Header: X-Api-Key: ${createdApiKey}\n\nThe response contains a \`messages\` array. Each message includes:\n- \`id\` — unique message ID (use this for reporting)\n- \`content\` — the message text\n- \`sender_user_name\` — name of the Astra user who sent it\n- \`sender_user_id\` — unique ID of the sender\n- \`conversation_id\` — the conversation this message belongs to\n- \`history\` — array of previous messages in this conversation for context\n\nThe response also contains a \`relationships\` array describing your colleagues:\n- \`name\` — the person or agent name\n- \`type\` — "human" or "agent"\n- \`role\` — relationship type (e.g. collaborator, supervisor)\n- \`channels\` — available communication channels (e.g. ["feishu"], ["agent"])\n\n**IMPORTANT**: Use the \`history\` array to understand conversation context before replying.\nDifferent \`sender_user_name\` values mean different people — address them accordingly.\n\n### 2. Report results\nFor each completed message, make an HTTP POST request:\n- URL: ${window.location.origin}/api/gateway/report\n- Header: X-Api-Key: ${createdApiKey}\n- Header: Content-Type: application/json\n- Body: {"message_id": "<id from the message>", "result": "<your response>"}\n\n### 3. Send a message to someone\nTo proactively contact a person or agent, make an HTTP POST request:\n- URL: ${window.location.origin}/api/gateway/send-message\n- Header: X-Api-Key: ${createdApiKey}\n- Header: Content-Type: application/json\n- Body: {"target": "<name of person or agent>", "content": "<your message>"}\n\nThe system auto-detects the best channel. For agents, the reply appears in your next poll.\nFor humans, the message is delivered via their available channel (e.g. Feishu).`}
                                         label={t('common.copy', 'Copy')}
                                         copiedLabel="Copied"
                                     />
@@ -361,6 +378,36 @@ For humans, the message is delivered via their available channel (e.g. Feishu).`
         );
     }
 
+    if (!agentCreationLimit.isLoading && agentCreationLimit.isLimited) {
+        const limitText = agentLimitMessage(
+            isChinese,
+            agentCreationLimit.activeCount,
+            agentCreationLimit.maxAgents,
+        );
+        return (
+            <div>
+                <div className="page-header">
+                    <h1 className="page-title">{t('nav.newAgent')}</h1>
+                </div>
+                <div className="card" style={{ maxWidth: '640px' }}>
+                    <h3 style={{ margin: '0 0 8px', fontWeight: 600, fontSize: '16px' }}>
+                        {t('agent.limit.title', isChinese ? '智能体数量已达上限' : 'Agent limit reached')}
+                    </h3>
+                    <p style={{ fontSize: '13px', color: 'var(--text-secondary)', lineHeight: 1.6, margin: '0 0 20px' }}>
+                        {limitText}
+                    </p>
+                    <button
+                        type="button"
+                        className="btn btn-primary"
+                        onClick={() => navigate(SUBSCRIPTION_UPGRADE_PATH)}
+                    >
+                        {t('subscription.goToDetail', isChinese ? '去套餐详情' : 'Go to subscription')}
+                    </button>
+                </div>
+            </div>
+        );
+    }
+
     // ── Type Selector (shared between both modes) ──
     const typeSelector = (
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', maxWidth: '640px', marginBottom: '24px' }}>
@@ -373,7 +420,7 @@ For humans, the message is delivered via their available channel (e.g. Feishu).`
                 }}
             >
                 <div style={{ fontWeight: 600, fontSize: '14px', marginBottom: '4px' }}>{t('openclaw.nativeTitle', 'Platform Hosted')}</div>
-                <div style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>{t('openclaw.nativeDesc', 'Full agent running on Clawith platform')}</div>
+                <div style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>{t('openclaw.nativeDesc', 'Full agent running on Astra platform')}</div>
             </div>
             <div
                 onClick={() => { setAgentType('openclaw'); setStep(0); }}
@@ -408,6 +455,7 @@ For humans, the message is delivered via their available channel (e.g. Feishu).`
                 {error && (
                     <div style={{ background: 'var(--error-subtle)', color: 'var(--error)', padding: '8px 12px', borderRadius: '6px', fontSize: '13px', marginBottom: '16px', maxWidth: '640px' }}>
                         {error}
+                        {upgradeButton}
                     </div>
                 )}
 
@@ -504,6 +552,7 @@ For humans, the message is delivered via their available channel (e.g. Feishu).`
             {error && (
                 <div style={{ background: 'var(--error-subtle)', color: 'var(--error)', padding: '8px 12px', borderRadius: '6px', fontSize: '13px', marginBottom: '16px' }}>
                     {error}
+                    {upgradeButton}
                 </div>
             )}
 
@@ -528,32 +577,15 @@ For humans, the message is delivered via their available channel (e.g. Feishu).`
                             {fieldErrors.role_description && <div style={{ color: 'var(--error)', fontSize: '12px', marginTop: '4px' }}>{fieldErrors.role_description}</div>}
                         </div>
 
-                        {/* Model Selection */}
+                        {/* Model Tier Selection */}
                         <div className="form-group">
-                            <label className="form-label">{t('wizard.step1.primaryModel')} <span style={{ color: 'var(--error)' }}>*</span></label>
-                            {models.length > 0 ? (
-                                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                                    {models.filter((m: any) => m.enabled).map((m: any) => (
-                                        <label key={m.id} style={{
-                                            display: 'flex', alignItems: 'center', gap: '10px', padding: '10px 12px',
-                                            background: form.primary_model_id === m.id ? 'var(--accent-subtle)' : 'var(--bg-elevated)',
-                                            border: `1px solid ${form.primary_model_id === m.id ? 'var(--accent-primary)' : fieldErrors.primary_model_id ? 'var(--error)' : 'var(--border-default)'}`,
-                                            borderRadius: '8px', cursor: 'pointer',
-                                        }}>
-                                            <input type="radio" name="model" checked={form.primary_model_id === m.id}
-                                                onChange={() => { setForm({ ...form, primary_model_id: m.id }); clearFieldError('primary_model_id'); }} />
-                                            <div>
-                                                <div style={{ fontWeight: 500, fontSize: '13px' }}>{m.label}</div>
-                                            </div>
-                                        </label>
-                                    ))}
-                                    {fieldErrors.primary_model_id && <div style={{ color: 'var(--error)', fontSize: '12px', marginTop: '2px' }}>{fieldErrors.primary_model_id}</div>}
-                                </div>
-                            ) : (
-                                <div style={{ padding: '16px', background: 'var(--bg-elevated)', borderRadius: '8px', fontSize: '13px', color: 'var(--text-tertiary)', textAlign: 'center' }}>
-                                    {t('wizard.step1.noModels')} <span style={{ color: 'var(--accent-primary)', cursor: 'pointer' }} onClick={() => navigate('/enterprise')}>{t('wizard.step1.enterpriseSettings')}</span> {t('wizard.step1.addModels')}
-                                </div>
-                            )}
+                            <label className="form-label">{t('wizard.step1.modelTier', '模型档位')} <span style={{ color: 'var(--error)' }}>*</span></label>
+                            <TierSelector
+                                value={form.preferred_tier}
+                                onChange={(tier) => { setForm({ ...form, preferred_tier: tier }); clearFieldError('preferred_tier'); }}
+                                allowedTiers={allowedTiers}
+                            />
+                            {fieldErrors.preferred_tier && <div style={{ color: 'var(--error)', fontSize: '12px', marginTop: '6px' }}>{fieldErrors.preferred_tier}</div>}
                         </div>
 
                         {/* Token limits */}
@@ -727,13 +759,16 @@ For humans, the message is delivered via their available channel (e.g. Feishu).`
             </div>
 
             {/* Summary sidebar */}
-            {selectedModel && (
-                <div style={{ marginTop: '16px', padding: '12px', background: 'var(--bg-elevated)', borderRadius: '8px', fontSize: '12px', color: 'var(--text-secondary)', maxWidth: '640px', marginBottom: '80px' }}>
-                    <strong>{form.name || t('wizard.summary.unnamed')}</strong> · {t('wizard.summary.model')}: {selectedModel.label}
-                    {form.max_tokens_per_day && ` · ${t('wizard.summary.dailyLimit')}: ${Number(form.max_tokens_per_day).toLocaleString()}`}
-                </div>
-            )}
-            {!selectedModel && <div style={{ marginBottom: '80px' }}></div>}
+            <div style={{ marginTop: '16px', padding: '12px', background: 'var(--bg-elevated)', borderRadius: '8px', fontSize: '12px', color: 'var(--text-secondary)', maxWidth: '640px', marginBottom: '80px' }}>
+                <strong>{form.name || t('wizard.summary.unnamed')}</strong>
+                {agentType === 'native' && (
+                    <>
+                        {' · '}
+                        {t('wizard.summary.tier', '档位')}: {t(`tier.${form.preferred_tier}`, form.preferred_tier)}
+                    </>
+                )}
+                {form.max_tokens_per_day && ` · ${t('wizard.summary.dailyLimit')}: ${Number(form.max_tokens_per_day).toLocaleString()}`}
+            </div>
 
             {/* Navigation — sticky footer at the bottom */}
             <div style={{

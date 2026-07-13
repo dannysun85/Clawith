@@ -7,6 +7,7 @@ and control platform-level settings.
 import secrets
 import uuid
 from datetime import datetime
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -14,12 +15,14 @@ from sqlalchemy import func as sqla_func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import require_role
+from app.core.secret_detection import looks_like_secret
 from app.database import get_db
 from app.models.agent import Agent
 from app.models.invitation_code import InvitationCode
 from app.models.system_settings import SystemSetting
 from app.models.tenant import Tenant
 from app.models.user import User, Identity
+from app.services.subscription_lifecycle import ensure_free_subscription_for_tenant
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -53,7 +56,7 @@ class CompanyCreateResponse(BaseModel):
 
 class PlatformSettingsOut(BaseModel):
     allow_self_create_company: bool = True
-    invitation_code_enabled: bool = False
+    invitation_code_enabled: bool = True
     sso_custom_domain_redirect_enabled: bool = True
 
 
@@ -61,6 +64,32 @@ class PlatformSettingsUpdate(BaseModel):
     allow_self_create_company: bool | None = None
     invitation_code_enabled: bool | None = None
     sso_custom_domain_redirect_enabled: bool | None = None
+
+
+class RegistrationCodeCreateRequest(BaseModel):
+    count: int = Field(default=5, ge=1, le=100)
+    max_uses: int = Field(default=1, ge=1, le=10000)
+
+
+class RegistrationCodeOut(BaseModel):
+    id: uuid.UUID
+    code: str
+    max_uses: int
+    used_count: int
+    is_active: bool
+    created_at: datetime | None = None
+
+
+class RegistrationCodeListOut(BaseModel):
+    items: list[RegistrationCodeOut]
+    total: int
+    page: int
+    page_size: int
+
+
+class RegistrationCodeCreateResponse(BaseModel):
+    created: int
+    codes: list[str]
 
 
 # ─── Company Management ────────────────────────────────
@@ -146,14 +175,26 @@ async def create_company(
     """Create a new company and generate an admin invitation code (max_uses=1)."""
     import re
 
-    slug = re.sub(r"[^a-z0-9]+", "-", data.name.lower().strip()).strip("-")[:40]
+    company_name = data.name.strip()
+    if looks_like_secret(company_name):
+        raise HTTPException(
+            status_code=400,
+            detail="Company name looks like a credential. Rotate the credential if it was pasted here, then enter a public company name.",
+        )
+
+    slug = re.sub(r"[^a-z0-9]+", "-", company_name.lower()).strip("-")[:40]
     if not slug:
         slug = "company"
     slug = f"{slug}-{secrets.token_hex(3)}"
 
-    tenant = Tenant(name=data.name, slug=slug, im_provider="web_only")
+    tenant = Tenant(name=company_name, slug=slug, im_provider="web_only")
     db.add(tenant)
     await db.flush()
+    await ensure_free_subscription_for_tenant(
+        db,
+        tenant.id,
+        granted_by=current_user.id,
+    )
 
     # Generate admin invitation code (single-use)
     code_str = secrets.token_urlsafe(12)[:16].upper()
@@ -206,9 +247,6 @@ async def toggle_company(
 
 
 # ─── Platform Metrics Dashboard ─────────────────────────
-
-from typing import Any
-from fastapi import Query
 
 @router.get("/metrics/timeseries", response_model=list[dict[str, Any]])
 async def get_platform_timeseries(
@@ -590,7 +628,7 @@ async def get_platform_settings(
 
     for key, default in [
         ("allow_self_create_company", True),
-        ("invitation_code_enabled", False),
+        ("invitation_code_enabled", True),
         ("sso_custom_domain_redirect_enabled", True),
     ]:
         r = await db.execute(select(SystemSetting).where(SystemSetting.key == key))
@@ -619,3 +657,133 @@ async def update_platform_settings(
 
     await db.flush()
     return await get_platform_settings(current_user=current_user, db=db)
+
+
+# ─── Platform Registration Codes ───────────────────────
+
+async def _generate_unique_registration_code(db: AsyncSession) -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    for _ in range(20):
+        code = "".join(secrets.choice(alphabet) for _ in range(10))
+        existing = await db.execute(select(InvitationCode.id).where(InvitationCode.code == code))
+        if existing.scalar_one_or_none() is None:
+            return code
+    raise HTTPException(status_code=500, detail="Failed to generate unique registration code")
+
+
+@router.get("/registration-codes", response_model=RegistrationCodeListOut)
+async def list_registration_codes(
+    page: int = 1,
+    page_size: int = 20,
+    search: str = "",
+    current_user: User = Depends(require_role("platform_admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    """List platform-level registration codes used by the signup gate."""
+    page = max(page, 1)
+    page_size = min(max(page_size, 1), 100)
+    base_filter = InvitationCode.tenant_id.is_(None)
+    stmt = select(InvitationCode).where(base_filter)
+    count_stmt = select(sqla_func.count()).select_from(InvitationCode).where(base_filter)
+
+    if search:
+        normalized = search.strip().upper()
+        stmt = stmt.where(InvitationCode.code.ilike(f"%{normalized}%"))
+        count_stmt = count_stmt.where(InvitationCode.code.ilike(f"%{normalized}%"))
+
+    total_result = await db.execute(count_stmt)
+    total = total_result.scalar() or 0
+    result = await db.execute(
+        stmt.order_by(InvitationCode.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+
+    return RegistrationCodeListOut(
+        items=[RegistrationCodeOut.model_validate(c, from_attributes=True) for c in result.scalars().all()],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.post("/registration-codes", response_model=RegistrationCodeCreateResponse, status_code=201)
+async def create_registration_codes(
+    data: RegistrationCodeCreateRequest,
+    current_user: User = Depends(require_role("platform_admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Batch-create platform-level registration codes."""
+    created: list[str] = []
+    for _ in range(data.count):
+        code_str = await _generate_unique_registration_code(db)
+        db.add(
+            InvitationCode(
+                code=code_str,
+                tenant_id=None,
+                max_uses=data.max_uses,
+                created_by=current_user.id,
+            )
+        )
+        created.append(code_str)
+
+    await db.flush()
+    return RegistrationCodeCreateResponse(created=len(created), codes=created)
+
+
+@router.get("/registration-codes/export")
+async def export_registration_codes_csv(
+    current_user: User = Depends(require_role("platform_admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Export platform registration codes as CSV."""
+    import csv
+    import io
+    from fastapi.responses import StreamingResponse
+
+    result = await db.execute(
+        select(InvitationCode)
+        .where(InvitationCode.tenant_id.is_(None))
+        .order_by(InvitationCode.created_at.asc())
+    )
+    codes = result.scalars().all()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Code", "Max Uses", "Used Count", "Active", "Created At"])
+    for code in codes:
+        writer.writerow([
+            code.code,
+            code.max_uses,
+            code.used_count,
+            "Yes" if code.is_active else "No",
+            code.created_at.strftime("%Y-%m-%d %H:%M:%S") if code.created_at else "",
+        ])
+
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=registration_codes.csv"},
+    )
+
+
+@router.delete("/registration-codes/{code_id}")
+async def deactivate_registration_code(
+    code_id: uuid.UUID,
+    current_user: User = Depends(require_role("platform_admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Deactivate a platform registration code."""
+    result = await db.execute(
+        select(InvitationCode).where(
+            InvitationCode.id == code_id,
+            InvitationCode.tenant_id.is_(None),
+        )
+    )
+    code = result.scalar_one_or_none()
+    if not code:
+        raise HTTPException(status_code=404, detail="Registration code not found")
+    code.is_active = False
+    await db.flush()
+    return {"status": "deactivated"}

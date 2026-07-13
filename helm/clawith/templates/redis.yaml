@@ -43,7 +43,7 @@ spec:
     spec:
       containers:
       - name: redis
-        image: "{{ .Values.redis.image.registry }}/{{ .Values.redis.image.repository }}:{{ .Values.redis.image.tag }}"
+        image: {{ include "clawith.image" (dict "registry" .Values.redis.image.registry "repository" .Values.redis.image.repository "tag" .Values.redis.image.tag) | quote }}
         imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
         ports:
         - name: redis
@@ -90,4 +90,3 @@ spec:
     port: {{ .Values.redis.service.port }}
     targetPort: redis
 {{- end }}
-

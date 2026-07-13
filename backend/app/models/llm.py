@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, func
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -28,6 +28,56 @@ class LLMModel(Base):
     temperature: Mapped[float | None] = mapped_column(Float, nullable=True)
     request_timeout: Mapped[int | None] = mapped_column(Integer, nullable=True)  # Request timeout in seconds, default 120
     max_output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)  # Per-model output token limit override
+    # Subscription model routing (模块四 7.2)
+    modality: Mapped[str] = mapped_column(String(20), nullable=False, default="text")  # text/vision/audio/music/video/multimodal
+    modalities: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # ["text","vision"]
+    tier: Mapped[str] = mapped_column(String(20), nullable=False, default="standard")  # premium/standard/basic
+    capabilities: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # {stream, tool_call, ...}
+    verification_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    last_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error_code: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    last_error_message: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class LLMCredential(Base):
+    """API-key account pool entry (账号池, provider-scoped).
+
+    One account serves multiple models/modalities of a provider (e.g. a MiniMax
+    code-plan account can call text/voice/image/video). Load-balanced across the
+    pool per provider+modality. tenant_id=null = platform pool (shared by all
+    tenants); set = tenant-owned key (future).
+    """
+
+    __tablename__ = "llm_credentials"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    provider: Mapped[str] = mapped_column(String(50), nullable=False, index=True)  # minimax/openai/...
+    label: Mapped[str] = mapped_column(String(200), nullable=False)  # "MiniMax code plan A"
+    api_key_encrypted: Mapped[str] = mapped_column(String(1024), nullable=False)
+    base_url: Mapped[str | None] = mapped_column(String(500))  # override provider default
+    capabilities: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # ["text","voice","image","video"]
+    daily_quota: Mapped[int | None] = mapped_column(Integer, nullable=True)  # per-account daily cap
+    used_today: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reset_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="unverified")
+    # unverified / healthy / degraded / quota_exceeded / disabled
+    error_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    weight: Mapped[int] = mapped_column(Integer, nullable=False, default=1)  # weighted round-robin
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)  # higher = used first
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Client-side rate limiting (proactive protection against 429s / provider bans).
+    # NULL means "no limit enforced" (provider default or unlimited).
+    rpm_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)  # max requests per minute
+    tpm_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)  # max tokens per minute
+    window_5h_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)  # MiniMax Token Plan 5h window (token units)
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=True, index=True
+    )  # null = platform pool / set = tenant-owned key
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

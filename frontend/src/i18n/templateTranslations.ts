@@ -153,6 +153,16 @@ const ZH: Record<string, TemplateLocale> = {
             '发布节奏 —— 测试计划,边发边学算法奖励什么',
         ],
     },
+    'Douyin Operations Manager': {
+        name: '抖音运营经理',
+        description: '负责抖音账号数据复盘、内容选题、发布任务草稿、评论分诊和运营周报，默认审批后执行。',
+        bullets: [
+            '账号复盘 —— 标清数据时间和关键变化',
+            '内容计划 —— 选题、脚本、标题、发布时间一起给',
+            '审批后执行 —— 发布和回复先生成任务,确认后再做',
+            '评论分诊 —— 负面、高风险、商机评论分开处理',
+        ],
+    },
     'LinkedIn Content Creator': {
         name: 'LinkedIn 内容创作者',
         description: '在 LinkedIn 上打造个人品牌和 B2B 思想领导力 —— 真有人读、真愿意转的帖子。',

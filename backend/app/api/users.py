@@ -73,7 +73,7 @@ async def list_users(
         count_result = await db.execute(
             select(func.count()).select_from(Agent).where(
                 Agent.creator_id == u.id,
-                Agent.is_expired == False,
+                Agent.is_expired.is_(False),
             )
         )
         agents_count = count_result.scalar() or 0
@@ -139,7 +139,7 @@ async def update_user_quota(
     count_result = await db.execute(
         select(func.count()).select_from(Agent).where(
             Agent.creator_id == user.id,
-            Agent.is_expired == False,
+            Agent.is_expired.is_(False),
         )
     )
     agents_count = count_result.scalar() or 0
@@ -201,6 +201,11 @@ async def update_user_role(
     # org_admin can only modify users in the same tenant
     if current_user.role == "org_admin" and target_user.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=403, detail="Cannot modify users outside your organization")
+
+    # Tenant administrators must never be able to change a platform administrator,
+    # even when both user rows happen to be attached to the same tenant.
+    if current_user.role != "platform_admin" and target_user.role == "platform_admin":
+        raise HTTPException(status_code=403, detail="Platform administrators can only be modified by a platform administrator")
 
     # No-op shortcut
     if target_user.role == data.role:

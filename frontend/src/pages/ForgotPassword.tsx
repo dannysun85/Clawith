@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { IconAlertTriangle, IconBulb, IconCheck } from '@tabler/icons-react';
 import { authApi } from '../services/api';
+import { AstraWordmark } from '../components/atlas';
 
 export default function ForgotPassword() {
     const { t } = useTranslation();
@@ -58,8 +59,7 @@ export default function ForgotPassword() {
                 <div className="login-form-wrapper" style={{ maxWidth: '460px' }}>
                     <div className="login-form-header">
                         <div className="login-form-logo">
-                            <img src="/logo-black.png" className="login-logo-img" alt="" style={{ width: 28, height: 28, marginRight: 8, verticalAlign: 'middle' }} />
-                            Clawith
+                            <AstraWordmark height={28} variant="ui" />
                         </div>
                         <h2 className="login-form-title">{t('auth.forgotPasswordTitle', 'Forgot password')}</h2>
                         <p className="login-form-subtitle">

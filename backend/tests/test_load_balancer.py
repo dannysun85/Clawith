@@ -1,0 +1,212 @@
+"""Unit tests for load_balancer (账号池 pick_credential + usage tracking).
+
+Mock-based (no DB). Verifies priority grouping, weighted pick, NoCredentialAvailable,
+increment→quota_exceeded, mark_degraded, reset_daily_usage.
+"""
+
+import uuid
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from app.services.llm import load_balancer
+from app.services.llm.load_balancer import (
+    NoCredentialAvailable,
+    increment_credential_usage,
+    mark_credential_degraded,
+    pick_credential,
+    reset_daily_usage,
+)
+
+
+def _cred(priority=0, weight=1, status="healthy", daily_quota=None, used_today=0, error_count=0, capabilities=None):
+    return SimpleNamespace(
+        id=uuid.uuid4(),
+        provider="minimax",
+        label="c",
+        api_key_encrypted="enc",
+        base_url=None,
+        capabilities=capabilities,
+        daily_quota=daily_quota,
+        used_today=used_today,
+        status=status,
+        error_count=error_count,
+        weight=weight,
+        priority=priority,
+        last_used_at=None,
+        enabled=True,
+    )
+
+
+def _patch_session(execute_result=None, get_value=None):
+    """Fake async_session: db.execute → execute_result (a list-like via scalars().all()), db.get → get_value."""
+    fake_db = MagicMock()
+    fake_result = MagicMock()
+    fake_result.scalars.return_value.all.return_value = execute_result or []
+    fake_db.execute = AsyncMock(return_value=fake_result)
+    fake_db.get = AsyncMock(return_value=get_value)
+    fake_db.commit = AsyncMock()
+    fake_session = MagicMock()
+    fake_session.__aenter__ = AsyncMock(return_value=fake_db)
+    fake_session.__aexit__ = AsyncMock(return_value=None)
+    return patch.object(load_balancer, "async_session", return_value=fake_session), fake_db
+
+
+@pytest.mark.asyncio
+async def test_pick_returns_top_priority_cred():
+    """Among creds of different priority, only the top-priority group is considered."""
+    low = _cred(priority=0, weight=1)
+    high = _cred(priority=10, weight=1)
+    sess, _ = _patch_session(execute_result=[high, low])  # ordered by priority desc
+    with sess:
+        chosen = await pick_credential("minimax", "text")
+    assert chosen.priority == 10
+
+
+@pytest.mark.asyncio
+async def test_pick_uses_only_the_centrally_funded_platform_pool():
+    cred = _cred()
+    sess, fake_db = _patch_session(execute_result=[cred])
+    with sess:
+        await pick_credential("minimax", "text")
+
+    query = str(fake_db.execute.await_args.args[0])
+    assert "llm_credentials.tenant_id IS NULL" in query
+
+
+@pytest.mark.asyncio
+async def test_pick_empty_pool_raises():
+    sess, _ = _patch_session(execute_result=[])
+    with sess:
+        with pytest.raises(NoCredentialAvailable):
+            await pick_credential("minimax", "text")
+
+
+@pytest.mark.asyncio
+async def test_pick_updates_last_used_and_commits():
+    cred = _cred(priority=0, weight=1)
+    sess, fake_db = _patch_session(execute_result=[cred])
+    with sess:
+        await pick_credential("minimax", "text")
+    assert cred.last_used_at is not None
+    fake_db.commit.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_increment_marks_quota_exceeded_at_cap():
+    cred = _cred(daily_quota=10, used_today=9)
+    sess, _ = _patch_session(get_value=cred)
+    with sess:
+        await increment_credential_usage(cred.id, weight=1)
+    assert cred.used_today == 10
+    assert cred.status == "quota_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_increment_no_quota_limit_stays_healthy():
+    cred = _cred(daily_quota=None, used_today=100)
+    sess, _ = _patch_session(get_value=cred)
+    with sess:
+        await increment_credential_usage(cred.id, weight=1)
+    assert cred.status == "healthy"
+
+
+@pytest.mark.asyncio
+async def test_success_resets_prior_error_count():
+    """Health degradation is based on consecutive failures, not lifetime errors."""
+    cred = _cred(error_count=4)
+    sess, _ = _patch_session(get_value=cred)
+    with sess:
+        await increment_credential_usage(cred.id, weight=1)
+    assert cred.error_count == 0
+    assert cred.status == "healthy"
+
+
+@pytest.mark.asyncio
+async def test_success_does_not_re_admit_explicitly_degraded_credential():
+    cred = _cred(status="degraded", error_count=4)
+    sess, _ = _patch_session(get_value=cred)
+    with sess:
+        await increment_credential_usage(cred.id, weight=1)
+    assert cred.error_count == 0
+    assert cred.status == "degraded"
+
+
+@pytest.mark.asyncio
+async def test_inflight_success_at_daily_cap_does_not_reclassify_degraded_credential():
+    cred = _cred(
+        status="degraded",
+        daily_quota=10,
+        used_today=9,
+        error_count=4,
+    )
+    sess, _ = _patch_session(get_value=cred)
+    with sess:
+        await increment_credential_usage(cred.id, weight=1)
+
+    assert cred.used_today == 10
+    assert cred.error_count == 0
+    assert cred.status == "degraded"
+
+
+@pytest.mark.parametrize(
+    ("credentials", "modality", "expected"),
+    [
+        ([], "text", load_balancer.CredentialUnavailableReason.NOT_CONFIGURED),
+        ([_cred(status="degraded")], "text", load_balancer.CredentialUnavailableReason.ALL_UNHEALTHY),
+        ([_cred(status="quota_exceeded")], "text", load_balancer.CredentialUnavailableReason.QUOTA_EXHAUSTED),
+        ([_cred(capabilities=["text"])], "video", load_balancer.CredentialUnavailableReason.CAPABILITY_MISMATCH),
+    ],
+)
+def test_base_filter_failure_has_structured_reason(credentials, modality, expected):
+    assert load_balancer._diagnose_base_filter_failure(credentials, modality) is expected
+
+
+def test_no_credential_user_message_does_not_expose_pool_internals():
+    error = load_balancer.NoCredentialAvailable(
+        "minimax",
+        "video",
+        load_balancer.CredentialUnavailableReason.RATE_SATURATED,
+        "credential-id=secret-internal-detail",
+    )
+    message = load_balancer.no_credential_user_message(error)
+    assert "繁忙" in message
+    assert "credential-id" not in message
+
+
+@pytest.mark.asyncio
+async def test_mark_degraded_past_threshold():
+    cred = _cred()
+    cred.error_count = 4
+    sess, _ = _patch_session(get_value=cred)
+    with sess:
+        await mark_credential_degraded(cred.id, threshold=5)
+    assert cred.error_count == 5
+    assert cred.status == "degraded"
+
+
+@pytest.mark.asyncio
+async def test_reset_daily_resets_all_counters_but_only_restores_local_daily_cap():
+    exhausted = _cred(status="quota_exceeded", daily_quota=100, used_today=100, error_count=3)
+    degraded = _cred(status="degraded", used_today=50, error_count=5)
+    provider_exhausted = _cred(status="quota_exceeded", daily_quota=None, used_today=10, error_count=1)
+    healthy = _cred(status="healthy", daily_quota=100, used_today=40, error_count=0)
+    sess, _ = _patch_session(execute_result=[exhausted, degraded, provider_exhausted, healthy])
+    with sess:
+        count = await reset_daily_usage()
+    assert count == 4
+    assert exhausted.status == "healthy" and exhausted.used_today == 0
+    assert degraded.status == "degraded" and degraded.error_count == 5 and degraded.used_today == 0
+    assert provider_exhausted.status == "quota_exceeded" and provider_exhausted.used_today == 0
+    assert healthy.status == "healthy" and healthy.used_today == 0
+
+
+@pytest.mark.asyncio
+async def test_pick_skips_when_no_modality_filter():
+    """modality=None → no capabilities filter (picks any healthy cred)."""
+    cred = _cred(priority=0, weight=1, capabilities=None)
+    sess, _ = _patch_session(execute_result=[cred])
+    with sess:
+        chosen = await pick_credential("minimax", None)
+    assert chosen.id == cred.id

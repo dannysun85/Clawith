@@ -1,25 +1,24 @@
 """Seed default agents (Morty & Meeseeks) on first platform startup."""
 
 import uuid
-from datetime import datetime, timezone
 
 from loguru import logger
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlalchemy.exc import IntegrityError
 
 from app.database import async_session
 from app.models.agent import Agent, AgentPermission
 from app.models.org import AgentAgentRelationship
-from app.models.skill import Skill, SkillFile
+from app.models.skill import Skill
 from app.models.tool import Tool, AgentTool
 from app.models.trigger import AgentTrigger
 from app.models.user import User
 from app.models.okr import OKRSettings
 from app.config import get_settings
 from app.services.agent_manager import agent_manager
+from app.services.skill_scope import prefer_tenant_skill_overrides, scope_skill_query
 from app.services.storage import get_storage_backend, store_agent_bytes
 
 settings = get_settings()
@@ -202,14 +201,30 @@ MEESEEKS_SKILLS = [
     # defaults (auto-included): skill-creator
 ]
 
+DEFAULT_AGENT_SEED_ORDER = ("Meeseeks", "Morty")
+
+
+def _default_agent_names_for_available_slots(
+    existing_names: set[str],
+    available_slots: int,
+) -> tuple[str, ...]:
+    """Select default Agents without exceeding the tenant's plan capacity."""
+    missing = (name for name in DEFAULT_AGENT_SEED_ORDER if name not in existing_names)
+    return tuple(list(missing)[: max(0, available_slots)])
+
 
 async def seed_default_agents():
-    """Create Morty & Meeseeks if they don't already exist.
+    """Create default Agents up to the tenant's purchased Agent capacity.
 
     Idempotency is guarded by a '.seeded' marker file in AGENT_DATA_DIR rather
     than by agent name, so the seeder does NOT re-run if the user renames or
     deletes the default agents.  Delete the marker manually to re-seed.
     """
+    marker_content = await _read_seed_marker()
+    if "morty=" in marker_content and "meeseeks=" in marker_content:
+        logger.info("[AgentSeeder] Default agents already seeded, preserving user renames")
+        return
+
     async with async_session() as db:
 
         # Get platform admin as creator
@@ -219,6 +234,9 @@ async def seed_default_agents():
         admin = admin_result.scalar_one_or_none()
         if not admin:
             logger.warning("[AgentSeeder] No platform admin found, skipping default agents")
+            return
+        if not admin.tenant_id:
+            logger.warning("[AgentSeeder] Platform admin has no tenant, skipping default agents")
             return
 
         # DB-backed idempotency is the source of truth. The storage marker can
@@ -245,10 +263,28 @@ async def seed_default_agents():
             )
             return
 
+        from app.services.quota_guard import _count_active_tenant_agents, _tenant_max_agents
+
+        max_agents = await _tenant_max_agents(admin.tenant_id)
+        active_agents = await _count_active_tenant_agents(admin.tenant_id, db)
+        available_slots = max(0, max_agents - active_agents)
+        names_to_create = set(
+            _default_agent_names_for_available_slots(
+                set(existing_by_name),
+                available_slots,
+            )
+        )
+        logger.info(
+            "[AgentSeeder] Applying plan capacity to default agents: "
+            f"active={active_agents}, max={max_agents}, creating={sorted(names_to_create)}"
+        )
+
         created_agents: list[Agent] = []
         created_names: set[str] = set()
+        morty = existing_by_name.get("Morty")
+        meeseeks = existing_by_name.get("Meeseeks")
 
-        if "Morty" not in existing_by_name:
+        if morty is None and "Morty" in names_to_create:
             morty = Agent(
                 name="Morty",
                 role_description="Research analyst & knowledge assistant — curious, thorough, great at finding and synthesizing information",
@@ -261,10 +297,8 @@ async def seed_default_agents():
             db.add(morty)
             created_agents.append(morty)
             created_names.add("Morty")
-        else:
-            morty = existing_by_name["Morty"]
 
-        if "Meeseeks" not in existing_by_name:
+        if meeseeks is None and "Meeseeks" in names_to_create:
             meeseeks = Agent(
                 name="Meeseeks",
                 role_description="Task executor & project manager — goal-oriented, systematic planner, strong at breaking down and completing complex tasks",
@@ -277,9 +311,6 @@ async def seed_default_agents():
             db.add(meeseeks)
             created_agents.append(meeseeks)
             created_names.add("Meeseeks")
-        else:
-            meeseeks = existing_by_name["Meeseeks"]
-
         await db.flush()  # get IDs
 
         # ── Participant identities ──
@@ -292,7 +323,12 @@ async def seed_default_agents():
         for agent in created_agents:
             db.add(AgentPermission(agent_id=agent.id, scope_type="company", access_level="manage"))
 
-        for agent, soul_content in [(morty, MORTY_SOUL), (meeseeks, MEESEEKS_SOUL)]:
+        default_agents = [
+            (agent, soul_content)
+            for agent, soul_content in ((morty, MORTY_SOUL), (meeseeks, MEESEEKS_SOUL))
+            if agent is not None
+        ]
+        for agent, soul_content in default_agents:
             if agent.name not in created_names:
                 continue
             await agent_manager.initialize_agent_files(db, agent)
@@ -305,11 +341,25 @@ async def seed_default_agents():
 
         # ── Assign skills ──
         all_skills_result = await db.execute(
-            select(Skill).options(selectinload(Skill.files))
+            scope_skill_query(
+                select(Skill).options(selectinload(Skill.files)),
+                admin.tenant_id,
+            )
         )
-        all_skills = {s.folder_name: s for s in all_skills_result.scalars().all()}
+        all_skills = {
+            skill.folder_name: skill
+            for skill in prefer_tenant_skill_overrides(
+                all_skills_result.scalars().all(),
+                admin.tenant_id,
+            )
+        }
 
-        for agent, skill_folders in [(morty, MORTY_SKILLS), (meeseeks, MEESEEKS_SKILLS)]:
+        default_agent_skills = [
+            (agent, skill_folders)
+            for agent, skill_folders in ((morty, MORTY_SKILLS), (meeseeks, MEESEEKS_SKILLS))
+            if agent is not None
+        ]
+        for agent, skill_folders in default_agent_skills:
             if agent.name not in created_names:
                 continue
             # Always include default skills
@@ -332,7 +382,7 @@ async def seed_default_agents():
 
         # ── Assign all default tools ──
         default_tools_result = await db.execute(
-            select(Tool).where(Tool.is_default == True)
+            select(Tool).where(Tool.is_default)
         )
         default_tools = default_tools_result.scalars().all()
 
@@ -341,18 +391,20 @@ async def seed_default_agents():
                 db.add(AgentTool(agent_id=agent.id, tool_id=tool.id, enabled=True))
 
         # ── Mutual relationships ──
-        relationship_specs = [
-            (
-                morty.id,
-                meeseeks.id,
-                "Expert task executor who breaks down complex tasks into structured plans and executes them systematically. Delegate multi-step tasks to him.",
-            ),
-            (
-                meeseeks.id,
-                morty.id,
-                "Research expert with strong learning ability. Ask him for information retrieval, web research, data analysis, and knowledge synthesis.",
-            ),
-        ]
+        relationship_specs = []
+        if morty is not None and meeseeks is not None:
+            relationship_specs = [
+                (
+                    morty.id,
+                    meeseeks.id,
+                    "Expert task executor who breaks down complex tasks into structured plans and executes them systematically. Delegate multi-step tasks to him.",
+                ),
+                (
+                    meeseeks.id,
+                    morty.id,
+                    "Research expert with strong learning ability. Ask him for information retrieval, web research, data analysis, and knowledge synthesis.",
+                ),
+            ]
         for agent_id, target_agent_id, description in relationship_specs:
             rel_result = await db.execute(
                 select(AgentAgentRelationship).where(
@@ -371,16 +423,17 @@ async def seed_default_agents():
 
 
         await db.commit()
+        morty_marker = str(morty.id) if morty is not None else "skipped-plan-limit"
+        meeseeks_marker = str(meeseeks.id) if meeseeks is not None else "skipped-plan-limit"
         logger.info(
             "[AgentSeeder] Default agent seeding complete: "
-            f"Morty ({morty.id}), Meeseeks ({meeseeks.id}), created={len(created_agents)}"
+            f"Morty ({morty_marker}), Meeseeks ({meeseeks_marker}), created={len(created_agents)}"
         )
 
-    # Write seed marker AFTER a successful commit so a failed seed can be retried
-    await get_storage_backend().write_text(
-        SEED_MARKER_KEY,
-        f"seeded\nmorty={morty.id}\nmeeseeks={meeseeks.id}\n",
-        encoding="utf-8",
+    # Append only after a successful commit so failures can be retried without
+    # erasing marker entries owned by other bootstrap seeders.
+    await _append_seed_marker(
+        f"morty={morty_marker}\nmeeseeks={meeseeks_marker}"
     )
     logger.info(f"[AgentSeeder] Wrote seed marker to {SEED_MARKER_KEY}")
 
@@ -515,7 +568,7 @@ async def seed_okr_agent():
         # ── Assign default tools + OKR-specific tools ──
         # Default tools: all tools where is_default=True
         default_tools_result = await db.execute(
-            select(Tool).where(Tool.is_default == True)
+            select(Tool).where(Tool.is_default)
         )
         default_tools = default_tools_result.scalars().all()
         for tool in default_tools:

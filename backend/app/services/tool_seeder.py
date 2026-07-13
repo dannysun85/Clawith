@@ -16,6 +16,11 @@ SYNC_IS_DEFAULT_TOOL_NAMES = {
     "jina_search",
     "jina_read",
     "update_objective",
+    "generate_image_minimax",
+    "generate_speech_minimax",
+    "generate_music_minimax",
+    "generate_video_minimax",
+    "check_video_minimax",
     # AgentBay tools should NOT be is_default=True. Older seeder versions may
     # have set them to True; include them here so the seeder corrects the DB.
     "agentbay_browser_navigate",
@@ -52,6 +57,10 @@ LEGACY_IMAGE_TOOL_MODEL_DEFAULTS = {
     "generate_image_siliconflow": "black-forest-labs/FLUX.1-schnell",
     "generate_image_openai": "dall-e-3",
     "generate_image_google": "gemini-2.5-flash-image",
+    "generate_image_minimax": "image-01",
+    "generate_speech_minimax": "speech-2.8-turbo",
+    "generate_music_minimax": "music-2.6",
+    "generate_video_minimax": "MiniMax-Hailuo-2.3",
 }
 
 
@@ -332,7 +341,7 @@ BUILTIN_TOOLS = [
     {
         "name": "convert_html_to_pptx",
         "display_name": "HTML to PowerPoint",
-        "description": "Convert an HTML source file into a PowerPoint .pptx file. By default, render_mode='editable' opens the HTML in headless Chrome, samples real element positions/styles, and maps explicit .slide/data-slide nodes or top-level page sections into editable PPT elements. Use render_mode='visual' as a high-fidelity screenshot fallback when exact visual preservation is more important than editability.",
+        "description": "Convert an HTML source file into a PowerPoint .pptx file. By default, render_mode='visual' opens the HTML in headless Chrome and preserves each slide as a high-fidelity screenshot so text, images, tables, and complex CSS are not silently dropped. Use render_mode='editable' when editable PPT elements are more important than exact visual fidelity.",
         "category": "file",
         "icon": "📽️",
         "is_default": True,
@@ -343,7 +352,7 @@ BUILTIN_TOOLS = [
                 "target_path": {"type": "string", "description": "Path for the output PowerPoint file (.pptx)"},
                 "design_width": {"type": "number", "description": "Optional source design width in pixels, default 1280"},
                 "design_height": {"type": "number", "description": "Optional source design height in pixels, default 720"},
-                "render_mode": {"type": "string", "enum": ["editable", "visual"], "description": "editable maps HTML/CSS into editable PPT elements using Chrome layout sampling; visual preserves styling with Chrome-rendered screenshots as a fallback. Default: editable"},
+                "render_mode": {"type": "string", "enum": ["editable", "visual"], "description": "visual preserves styling with Chrome-rendered screenshots; editable maps HTML/CSS into editable PPT elements using browser layout sampling. Default: visual"},
                 "render_scale": {"type": "number", "description": "Optional Chrome raster scale for screenshots and complex CSS captures. Higher values improve sharpness but increase PPTX size. Default: 2, clamped between 1 and 4"},
             },
             "required": ["source_path", "target_path"],
@@ -484,7 +493,7 @@ BUILTIN_TOOLS = [
     {
         "name": "send_platform_message",
         "display_name": "Platform Message",
-        "description": "Send a proactive message to a user on the Clawith first-party platform (web or app). The message appears in their platform chat history and is pushed in real-time if they are online.",
+        "description": "Send a proactive message to a user on the Astra first-party platform (web or app). The message appears in their platform chat history and is pushed in real-time if they are online.",
         "category": "communication",
         "icon": "🌐",
         "is_default": True,
@@ -1282,7 +1291,7 @@ BUILTIN_TOOLS = [
                     "label": "Extra Headers JSON",
                     "type": "textarea",
                     "default": "",
-                    "placeholder": "{\n  \"HTTP-Referer\": \"https://your-app.example\",\n  \"X-Title\": \"Clawith\"\n}",
+                    "placeholder": "{\n  \"HTTP-Referer\": \"https://your-app.example\",\n  \"X-Title\": \"Astra\"\n}",
                     "advanced": True,
                 },
                 {
@@ -1296,6 +1305,155 @@ BUILTIN_TOOLS = [
                 },
             ]
         },
+    },
+    {
+        "name": "generate_image_minimax",
+        "display_name": "Generate Image (MiniMax)",
+        "description": "Generate an image via the MiniMax credential pool. Model quality is selected from the active Lite, Pro, or Ultra product tier.",
+        "category": "media",
+        "icon": "🎨",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "Detailed image description."},
+                "aspect_ratio": {
+                    "type": "string",
+                    "description": "Aspect ratio: '1:1', '16:9', '4:3', '3:4', '9:16', '2:3', '3:2'. Default: '1:1'.",
+                },
+                "reference_image": {
+                    "type": "string",
+                    "description": "Optional workspace image path, public URL, or image data URL. MiniMax subject reference is best for people/characters.",
+                },
+                "overlay_text": {
+                    "type": "string",
+                    "description": "Optional exact Chinese/English copy rendered after generation with a real font.",
+                },
+                "overlay_position": {
+                    "type": "string",
+                    "enum": ["top", "center", "bottom"],
+                    "description": "Position for overlay_text. Default: bottom.",
+                },
+                "save_path": {"type": "string", "description": "Save path in workspace. Default: auto."},
+            },
+            "required": ["prompt"],
+        },
+        "config": {
+            "model": "image-01",
+        },
+        "config_schema": {
+            "fields": []
+        },
+    },
+    {
+        "name": "generate_speech_minimax",
+        "display_name": "Generate Speech (MiniMax)",
+        "description": "Generate speech audio via the MiniMax credential pool using the active Lite, Pro, or Ultra quality profile.",
+        "category": "media",
+        "icon": "🔊",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Text to synthesize."},
+                "voice_id": {"type": "string", "description": "MiniMax voice_id. Default: tool config."},
+                "format": {"type": "string", "description": "Audio format: mp3, wav, flac, or pcm. Default: mp3."},
+                "save_path": {"type": "string", "description": "Save path in workspace. Default: auto."},
+            },
+            "required": ["text"],
+        },
+        "config": {
+            "model": "speech-2.8-turbo",
+            "voice_id": "English_expressive_narrator",
+            "format": "mp3",
+        },
+        "config_schema": {
+            "fields": [
+                {"key": "voice_id", "label": "Voice ID", "type": "text", "default": "English_expressive_narrator"},
+                {"key": "format", "label": "Format", "type": "select", "default": "mp3", "options": ["mp3", "wav", "flac", "pcm"]},
+                {"key": "language_boost", "label": "Language Boost", "type": "text", "default": "auto", "advanced": True},
+            ]
+        },
+    },
+    {
+        "name": "generate_music_minimax",
+        "display_name": "Generate Music (MiniMax)",
+        "description": "Generate music via the MiniMax credential pool using the active Lite, Pro, or Ultra quality profile.",
+        "category": "media",
+        "icon": "🎵",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "Music style and mood prompt."},
+                "lyrics": {"type": "string", "description": "Lyrics for the song."},
+                "format": {"type": "string", "description": "Audio format: mp3 or wav. Default: mp3."},
+                "save_path": {"type": "string", "description": "Save path in workspace. Default: auto."},
+            },
+            "required": ["prompt", "lyrics"],
+        },
+        "config": {
+            "model": "music-2.6",
+            "format": "mp3",
+        },
+        "config_schema": {
+            "fields": [
+                {"key": "format", "label": "Format", "type": "select", "default": "mp3", "options": ["mp3", "wav"]},
+            ]
+        },
+    },
+    {
+        "name": "generate_video_minimax",
+        "display_name": "Generate Video (MiniMax)",
+        "description": "Create a MiniMax text-to-video task with the active Lite, Pro, or Ultra quality profile and save task metadata for later polling.",
+        "category": "media",
+        "icon": "🎬",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "Text description of the video."},
+                "duration": {"type": "integer", "description": "Video duration in seconds. Default: 6."},
+                "resolution": {"type": "string", "description": "Video resolution, e.g. 1080P or 768P. Default: 1080P."},
+                "first_frame_image": {"type": "string", "description": "Optional workspace image path, public URL, or image data URL used as the first frame. Use it to preserve an uploaded product or visual subject."},
+                "last_frame_image": {"type": "string", "description": "Optional workspace image path, public URL, or image data URL used as the last frame. Requires first_frame_image."},
+                "prompt_optimizer": {"type": "boolean", "description": "Whether MiniMax may optimize the motion prompt. Default: true."},
+                "overlay_text": {"type": "string", "description": "Optional exact Chinese/English copy rendered deterministically after download."},
+                "overlay_position": {"type": "string", "enum": ["top", "center", "bottom"], "description": "Position for overlay_text. Default: bottom."},
+                "wait_for_completion": {"type": "boolean", "description": "Poll and download if completed before timeout. Default: false."},
+                "poll_timeout_seconds": {"type": "integer", "description": "Maximum wait time when wait_for_completion=true. Default: 180."},
+                "save_path": {"type": "string", "description": "Save path for the completed video. Default: auto."},
+            },
+            "required": ["prompt"],
+        },
+        "config": {
+            "model": "MiniMax-Hailuo-2.3",
+            "duration": 6,
+            "resolution": "1080P",
+        },
+        "config_schema": {
+            "fields": [
+                {"key": "poll_timeout_seconds", "label": "Poll Timeout Seconds", "type": "number", "default": 180, "advanced": True},
+            ]
+        },
+    },
+    {
+        "name": "check_video_minimax",
+        "display_name": "Check Video (MiniMax)",
+        "description": "Check a MiniMax video task metadata file and download the video when it is ready.",
+        "category": "media",
+        "icon": "▶",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "task_meta_path": {"type": "string", "description": "Workspace path returned by generate_video_minimax."},
+                "save_path": {"type": "string", "description": "Save path for the completed video. Default: auto."},
+            },
+            "required": ["task_meta_path"],
+        },
+        "config": {},
+        "config_schema": {},
     },
     {
         "name": "discover_resources",
@@ -3730,11 +3888,11 @@ async def clean_orphaned_mcp_tools():
         assigned_ids = [row[0] for row in all_assigned_r.fetchall()]
         
         # 2. Delete MCP tools that have NO tenant_id AND are NOT in the assigned list
-        # tenant_id == None ensures we don't delete Global Tools manually added by company admins
+        # tenant_id is None ensures we don't delete Global Tools manually added by company admins
         stmt = delete(Tool).where(
             and_(
                 Tool.type == "mcp",
-                Tool.tenant_id == None,
+                Tool.tenant_id.is_(None),
                 ~Tool.id.in_(assigned_ids) if assigned_ids else True
             )
         )

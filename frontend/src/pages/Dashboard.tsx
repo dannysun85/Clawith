@@ -4,6 +4,12 @@ import { useNavigate, useOutletContext } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { agentApi, taskApi, activityApi, fetchJson, tenantApi } from '../services/api';
 import type { Agent, Task } from '../types';
+import { useToast } from '../components/Toast/ToastProvider';
+import {
+    SUBSCRIPTION_UPGRADE_PATH,
+    agentLimitMessage,
+    useAgentCreationLimit,
+} from '../hooks/useAgentCreationLimit';
 
 type LayoutOutletContext = {
     openTalentMarket?: () => void;
@@ -502,7 +508,8 @@ function ActivityFeed({ activities, agents }: { activities: any[]; agents: Agent
 /* ────── Main Dashboard ────── */
 
 export default function Dashboard() {
-    const { t } = useTranslation();
+    const { t, i18n } = useTranslation();
+    const toast = useToast();
     const navigate = useNavigate();
     const outletContext = useOutletContext<LayoutOutletContext | null>();
     const openTalentMarket = outletContext?.openTalentMarket;
@@ -513,6 +520,7 @@ export default function Dashboard() {
         queryFn: () => agentApi.list(currentTenant || undefined),
         refetchInterval: 15000,
     });
+    const agentCreationLimit = useAgentCreationLimit(agents as any[]);
 
     const { data: tokenUsage } = useQuery({
         queryKey: ['tenant-token-usage', currentTenant],
@@ -601,6 +609,14 @@ export default function Dashboard() {
                         onClick={() => {
                             if (openTalentMarket) {
                                 openTalentMarket();
+                                return;
+                            }
+                            if (agentCreationLimit.isLimited) {
+                                toast.warning(
+                                    agentLimitMessage(i18n.language.startsWith('zh'), agentCreationLimit.activeCount, agentCreationLimit.maxAgents),
+                                    { duration: 5000 },
+                                );
+                                navigate(SUBSCRIPTION_UPGRADE_PATH);
                                 return;
                             }
                             navigate('/agents/new');

@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 import bcrypt
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, Response, WebSocket, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from sqlalchemy import select
@@ -21,6 +21,10 @@ from app.config import get_settings
 from app.database import get_db
 
 settings = get_settings()
+
+BROWSER_SESSION_COOKIE = "astra_session"
+WEBSOCKET_APP_PROTOCOL = "astra-chat"
+WEBSOCKET_TOKEN_PROTOCOL_PREFIX = "astra-token."
 
 # Bearer token scheme
 security = HTTPBearer()
@@ -150,6 +154,69 @@ def decode_access_token(token: str) -> dict:
         )
 
 
+def _request_is_secure(request: Request | None) -> bool:
+    """Return whether browser cookies must be marked Secure."""
+    if settings.ENVIRONMENT.strip().lower() in {"production", "prod"}:
+        return True
+    if request is None:
+        return False
+    forwarded_proto = (request.headers.get("x-forwarded-proto") or "").split(",", 1)[0].strip().lower()
+    return forwarded_proto == "https" or request.url.scheme == "https"
+
+
+def set_browser_session_cookie(response: Response, token: str, request: Request | None = None) -> None:
+    """Set the same-origin, HttpOnly browser credential used by media URLs."""
+    response.set_cookie(
+        key=BROWSER_SESSION_COOKIE,
+        value=token,
+        max_age=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        path="/",
+        secure=_request_is_secure(request),
+        httponly=True,
+        samesite="lax",
+    )
+
+
+def clear_browser_session_cookie(response: Response, request: Request | None = None) -> None:
+    """Delete the browser credential without exposing its value to JavaScript."""
+    response.delete_cookie(
+        key=BROWSER_SESSION_COOKIE,
+        path="/",
+        secure=_request_is_secure(request),
+        httponly=True,
+        samesite="lax",
+    )
+
+
+def _websocket_protocols(websocket: WebSocket) -> list[str]:
+    raw = websocket.headers.get("sec-websocket-protocol") or ""
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def extract_websocket_access_token(websocket: WebSocket, legacy_query_token: str | None = None) -> str | None:
+    """Resolve WebSocket auth without putting bearer credentials in the URL.
+
+    The query-string fallback is temporary compatibility for already-cached
+    frontend bundles. New clients use a dedicated Sec-WebSocket-Protocol
+    value, while the HttpOnly browser cookie is a secondary fallback.
+    """
+    for protocol in _websocket_protocols(websocket):
+        if protocol.startswith(WEBSOCKET_TOKEN_PROTOCOL_PREFIX):
+            token = protocol[len(WEBSOCKET_TOKEN_PROTOCOL_PREFIX):].strip()
+            if token:
+                return token
+    cookie_token = websocket.cookies.get(BROWSER_SESSION_COOKIE)
+    if cookie_token:
+        return cookie_token
+    return (legacy_query_token or "").strip() or None
+
+
+def websocket_response_subprotocol(websocket: WebSocket) -> str | None:
+    """Negotiate only the non-secret application protocol back to the client."""
+    protocols = _websocket_protocols(websocket)
+    return WEBSOCKET_APP_PROTOCOL if WEBSOCKET_APP_PROTOCOL in protocols else None
+
+
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: AsyncSession = Depends(get_db),
@@ -201,6 +268,27 @@ async def get_current_admin(current_user=Depends(get_current_user)):
     identity_is_platform_admin = bool(getattr(getattr(current_user, "identity", None), "is_platform_admin", False))
     if current_user.role not in ("platform_admin", "org_admin") and not identity_is_platform_admin:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+    return current_user
+
+
+async def get_saas_admin(current_user=Depends(get_current_user)):
+    """Require the configured owner of the platform-wide SaaS console.
+
+    Global billing catalogs, cross-tenant subscription assignments, credential
+    pools, and model routes share this boundary. A tenant ``org_admin`` must
+    never be able to mutate those platform-wide resources.
+    """
+    identity_is_platform_admin = bool(
+        getattr(getattr(current_user, "identity", None), "is_platform_admin", False)
+    )
+    is_platform_admin = current_user.role == "platform_admin" or identity_is_platform_admin
+    expected_email = (settings.SAAS_ADMIN_EMAIL or "").strip().lower()
+    user_email = (getattr(current_user, "email", None) or "").strip().lower()
+    if not is_platform_admin or not expected_email or user_email != expected_email:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="SaaS admin access is restricted to the configured owner account.",
+        )
     return current_user
 
 

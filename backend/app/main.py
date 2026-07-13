@@ -1,4 +1,4 @@
-"""Clawith Backend — FastAPI Application Entry Point."""
+"""Astra Backend — FastAPI Application Entry Point."""
 
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -13,6 +13,7 @@ from app.core.events import close_redis
 from app.core.logging_config import configure_logging, intercept_standard_logging
 from app.core.middleware import TraceIdMiddleware
 from app.schemas.schemas import HealthResponse
+from app.services.process_utils import terminate_process_group
 from app.services.realtime import realtime_router
 
 settings = get_settings()
@@ -68,24 +69,27 @@ def _log_bwrap_startup_status() -> None:
         )
 
 
-async def _start_ss_local() -> None:
+async def _start_ss_local() -> tuple[object, str] | None:
     """Start ss-local SOCKS5 proxy for Discord API calls. Tries nodes in priority order."""
-    import asyncio, json, os, shutil, tempfile
+    import asyncio
+    import json
+    import os
+    import tempfile
+
     if not shutil.which("ss-local"):
         logger.info("[Proxy] ss-local not found — Discord proxy disabled")
         return
     # Load proxy nodes from config file (gitignored, mounted as Docker volume)
-    import json as _json
     cfg_file = os.environ.get("SS_CONFIG_FILE", "/data/ss-nodes.json")
     if os.path.isfile(cfg_file):
         # Guard against empty or malformed config file — both produce a clear
         # warning and a clean exit rather than an unhandled JSONDecodeError.
         try:
-            raw = open(cfg_file).read().strip()
+            raw = Path(cfg_file).read_text(encoding="utf-8").strip()
             if not raw:
                 logger.warning(f"[Proxy] {cfg_file} exists but is empty — skipping proxy")
                 return
-            nodes = _json.loads(raw)
+            nodes = json.loads(raw)
         except (json.JSONDecodeError, ValueError) as exc:
             logger.warning(f"[Proxy] Failed to parse {cfg_file}: {exc} — skipping proxy")
             return
@@ -100,21 +104,46 @@ async def _start_ss_local() -> None:
         cfg = {"server": node["server"], "server_port": node["port"], "local_address": "127.0.0.1",
                "local_port": 1080, "password": node["password"], "method": node["method"], "timeout": 10}
         tf = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
-        json.dump(cfg, tf); tf.close()
+        json.dump(cfg, tf)
+        tf.close()
+        proc = None
+        keep_process = False
         try:
             proc = await asyncio.create_subprocess_exec(
                 "ss-local", "-c", tf.name,
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
             await asyncio.sleep(2)
             if proc.returncode is None:
                 os.environ["DISCORD_PROXY"] = "socks5h://127.0.0.1:1080"
                 logger.info(f"[Proxy] ss-local → {node['label']} ({node['server']}:{node['port']})")
-                return
+                keep_process = True
+                return proc, tf.name
+            await proc.wait()
             err = (await proc.stderr.read()).decode()[:120]
             logger.warning(f"[Proxy] {node['label']} failed: {err}")
         except Exception as e:
             logger.error(f"[Proxy] {node['label']} error: {e}")
+        finally:
+            if not keep_process:
+                if proc is not None and proc.returncode is None:
+                    await terminate_process_group(proc)
+                Path(tf.name).unlink(missing_ok=True)
     logger.warning("[Proxy] All SS nodes failed — Discord API calls will run without proxy")
+    return None
+
+
+async def _stop_ss_local(resource: tuple[object, str] | None) -> None:
+    """Stop the managed proxy process and remove its credential file."""
+    if not resource:
+        return
+    proc, config_path = resource
+    try:
+        await terminate_process_group(proc)
+    finally:
+        Path(config_path).unlink(missing_ok=True)
 
 
 @asynccontextmanager
@@ -126,7 +155,9 @@ async def lifespan(app: FastAPI):
     logger.info("[startup] Logging configured")
     _log_bwrap_startup_status()
 
-    # Warn about default JWT secrets in production
+    settings.validate_runtime_secrets()
+
+    # Keep local development convenient while making the unsafe state visible.
     if "change-me" in settings.SECRET_KEY.lower() or "change-me" in settings.JWT_SECRET_KEY.lower():
         logger.warning(
             "[startup] WARNING: SECRET_KEY or JWT_SECRET_KEY contains default 'change-me' value. "
@@ -137,6 +168,13 @@ async def lifespan(app: FastAPI):
     import sys
     import os
     from app.services.trigger_daemon import start_trigger_daemon
+    from app.services.subscription_lifecycle import start_subscription_lifecycle_daemon
+    from app.services.billing_reconciliation import start_billing_reconciliation_daemon
+    from app.services.media_generation import start_media_generation_daemon
+    from app.services.production_issue_monitor import (
+        record_production_issue,
+        start_production_issue_monitor_daemon,
+    )
     from app.services.tool_seeder import seed_builtin_tools
     from app.services.template_seeder import seed_agent_templates
     from app.services.feishu_ws import feishu_ws_manager
@@ -176,6 +214,10 @@ async def lifespan(app: FastAPI):
             import app.models.agent_credential  # noqa
             import app.models.okr            # noqa
             import app.models.onboarding     # noqa
+            import app.models.douyin         # noqa
+            import app.models.subscription   # noqa
+            import app.models.media_generation  # noqa
+            import app.models.production_issue  # noqa
 
             import app.models.identity       # noqa
             async with engine.begin() as conn:
@@ -291,13 +333,36 @@ async def lifespan(app: FastAPI):
             except asyncio.CancelledError:
                 return
             if exc:
-                logger.error(f"[startup] Background task {t.get_name()} CRASHED: {exc}")
+                logger.error(
+                    f"[startup] Background task {t.get_name()} CRASHED "
+                    f"error_type={type(exc).__name__}"
+                )
+                asyncio.create_task(
+                    record_production_issue(
+                        source="background_task",
+                        category="worker",
+                        summary="A production background task crashed",
+                        severity="critical",
+                        error_code=type(exc).__name__,
+                        operation=t.get_name(),
+                        metadata={
+                            "error_type": type(exc).__name__,
+                            "component": t.get_name(),
+                        },
+                    ),
+                    name=f"capture-crash-{t.get_name()}",
+                )
                 import traceback
-                traceback.print_exception(type(exc), exc, exc.__traceback__)
+                traceback.print_tb(exc.__traceback__)
 
         task_specs = []
         if _role_enabled("all", "worker"):
             task_specs.append(("trigger_daemon", start_trigger_daemon()))
+            task_specs.append(("subscription_lifecycle", start_subscription_lifecycle_daemon()))
+            task_specs.append(("media_generation", start_media_generation_daemon()))
+            task_specs.append(("billing_reconciliation", start_billing_reconciliation_daemon()))
+            if settings.PRODUCTION_ISSUE_MONITOR_ENABLED:
+                task_specs.append(("production_issue_monitor", start_production_issue_monitor_daemon()))
         if _role_enabled("all", "connector"):
             task_specs.extend([
                 ("feishu_ws", feishu_ws_manager.start_all()),
@@ -321,11 +386,25 @@ async def lifespan(app: FastAPI):
     ss_task = asyncio.create_task(_start_ss_local(), name="ss-local-proxy")
     ss_task.add_done_callback(_bg_task_error)
 
-    yield
+    try:
+        yield
+    finally:
+        # Shutdown the proxy explicitly.  Returning from _start_ss_local used
+        # to orphan the process and its credential-bearing temp file on every
+        # backend restart.
+        if not ss_task.done():
+            ss_task.cancel()
+        try:
+            ss_resource = await ss_task
+        except asyncio.CancelledError:
+            ss_resource = None
+        except Exception as exc:
+            logger.warning(f"[shutdown] ss-local task failed: {exc}")
+            ss_resource = None
+        await _stop_ss_local(ss_resource)
 
-    # Shutdown
-    await realtime_router.stop()
-    await close_redis()
+        await realtime_router.stop()
+        await close_redis()
 
 
 app = FastAPI(
@@ -388,10 +467,16 @@ from app.api.notification import router as notification_router
 from app.api.gateway import router as gateway_router
 from app.api.admin import router as admin_router
 from app.api.pages import router as pages_router, public_router as pages_public_router
-from app.api.agent_credentials import router as credentials_router
+from app.api.agent_credentials import router as agent_credentials_router
 from app.api.agentbay_control import router as agentbay_control_router
 from app.api.okr import router as okr_router
 from app.api.onboarding import router as onboarding_router
+from app.api.subscription import router as subscription_router
+from app.api.credentials import router as credential_pool_router
+from app.api.saas import router as saas_router
+from app.api.douyin import router as douyin_router
+from app.api.production_issues import admin_router as production_issue_admin_router
+from app.api.production_issues import client_router as production_issue_client_router
 
 app.include_router(auth_router, prefix=settings.API_PREFIX)
 app.include_router(agents_router, prefix=settings.API_PREFIX)
@@ -434,10 +519,16 @@ app.include_router(gateway_router, prefix=settings.API_PREFIX)
 app.include_router(admin_router, prefix=settings.API_PREFIX)
 app.include_router(pages_router, prefix=settings.API_PREFIX)
 app.include_router(pages_public_router)  # Public endpoint for /p/{short_id}, no API prefix
-app.include_router(credentials_router, prefix=settings.API_PREFIX)
+app.include_router(agent_credentials_router, prefix=settings.API_PREFIX)
 app.include_router(agentbay_control_router, prefix=settings.API_PREFIX)
 app.include_router(okr_router)  # OKR — self-prefixed at /api/okr
 app.include_router(onboarding_router, prefix=settings.API_PREFIX)
+app.include_router(subscription_router, prefix=settings.API_PREFIX)
+app.include_router(credential_pool_router, prefix=settings.API_PREFIX)
+app.include_router(saas_router, prefix=settings.API_PREFIX)
+app.include_router(douyin_router, prefix=settings.API_PREFIX)
+app.include_router(production_issue_client_router, prefix=settings.API_PREFIX)
+app.include_router(production_issue_admin_router, prefix=settings.API_PREFIX)
 
 
 @app.get("/api/health", response_model=HealthResponse, tags=["health"])
@@ -448,22 +539,34 @@ async def health_check():
 
 # ── Version endpoint (public, no auth required) ──
 def _load_version_info() -> dict[str, str]:
-    """Read version + commit hash once at startup."""
-    import os, subprocess
-    version = "unknown"
-    for candidate in ["../frontend/VERSION", "frontend/VERSION", "VERSION"]:
-        try:
-            version = open(candidate).read().strip()
-            break
-        except FileNotFoundError:
-            continue
-    commit = ""
-    for commit_file in ["../COMMIT", "COMMIT", "../frontend/COMMIT"]:
-        try:
-            commit = open(commit_file).read().strip()
-            break
-        except FileNotFoundError:
-            continue
+    """Read release metadata once at startup.
+
+    Production images only contain the backend build context, so the release
+    files written beside ``docker-compose.prod.yml`` are not available inside
+    the container.  The deployment environment is therefore authoritative;
+    local files and git remain development fallbacks.
+    """
+    import os
+    import subprocess
+
+    version = os.environ.get("ASTRA_RELEASE_VERSION", "").strip()
+    if not version:
+        version = "unknown"
+        for candidate in ["../frontend/VERSION", "frontend/VERSION", "VERSION"]:
+            try:
+                version = open(candidate).read().strip()
+                break
+            except FileNotFoundError:
+                continue
+
+    commit = os.environ.get("ASTRA_RELEASE_COMMIT", "").strip()
+    if not commit:
+        for commit_file in ["../COMMIT", "COMMIT", "../frontend/COMMIT"]:
+            try:
+                commit = open(commit_file).read().strip()
+                break
+            except FileNotFoundError:
+                continue
     if not commit:
         try:
             commit = subprocess.check_output(
@@ -478,5 +581,5 @@ _version_cache = _load_version_info()
 
 @app.get("/api/version", tags=["system"])
 async def get_version():
-    """Return current Clawith version and commit hash."""
+    """Return current Astra version and commit hash."""
     return _version_cache

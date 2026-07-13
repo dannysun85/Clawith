@@ -49,7 +49,7 @@ async def receive_webhook(token: str, request: Request):
     Public endpoint — no authentication required.
     Security is provided by:
     - Unique, unguessable URL token
-    - Optional HMAC signature verification
+    - Mandatory HMAC-SHA256 signature verification
     - Rate limiting (5 requests/minute per token)
     - Payload size limit (64KB)
     """
@@ -124,15 +124,21 @@ async def receive_webhook(token: str, request: Request):
                 pass
             return JSONResponse({"ok": True}, status_code=429)
 
-        # HMAC signature verification (optional)
-        secret = target_config.get("secret")
-        if secret:
-            sig_header = request.headers.get("x-hub-signature-256", "")
-            expected_sig = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-            if not hmac.compare_digest(sig_header, expected_sig):
-                logger.warning(f"Webhook signature mismatch for trigger {target_name}")
-                # Still return 200 to not leak info
-                return JSONResponse({"ok": True})
+        # URL tokens leak through logs and third-party configuration. Every
+        # delivery therefore requires an independent HMAC secret.
+        secret = str(target_config.get("secret") or "").strip()
+        if not secret:
+            logger.error(f"Blocked legacy unsigned webhook trigger {target_name}")
+            return JSONResponse({"ok": False, "error": "webhook signing is not configured"}, status_code=403)
+
+        sig_header = (
+            request.headers.get("x-hub-signature-256", "")
+            or request.headers.get("x-astra-signature-256", "")
+        )
+        expected_sig = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig_header, expected_sig):
+            logger.warning(f"Webhook signature mismatch for trigger {target_name}")
+            return JSONResponse({"ok": False, "error": "invalid signature"}, status_code=401)
 
         # Parse payload
         try:

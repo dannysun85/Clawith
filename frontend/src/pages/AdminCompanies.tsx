@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef } from 'react';
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { adminApi } from '../services/api';
 import { useAuthStore } from '../stores';
@@ -46,7 +46,7 @@ const PAGE_SIZE = 15;
 export default function AdminCompanies() {
     const { t } = useTranslation();
     const user = useAuthStore((s) => s.user);
-    const [activeTab, setActiveTab] = useState<'dashboard' | 'platform' | 'companies'>('dashboard');
+    const [activeTab, setActiveTab] = useState<'dashboard' | 'platform' | 'registrationCodes' | 'companies'>('dashboard');
 
     const canAccessPlatformSettings = user?.role === 'platform_admin' || !!(user as any)?.is_platform_admin;
 
@@ -62,6 +62,7 @@ export default function AdminCompanies() {
     const tabs = [
         { key: 'dashboard' as const, label: t('admin.tab.dashboard', 'Dashboard') },
         { key: 'platform' as const, label: t('admin.tab.platform', 'Platform') },
+        { key: 'registrationCodes' as const, label: t('admin.tab.registrationCodes', '注册码') },
         { key: 'companies' as const, label: t('admin.tab.companies', 'Companies') },
     ];
 
@@ -91,7 +92,274 @@ export default function AdminCompanies() {
             <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
                 {activeTab === 'dashboard' && <PlatformDashboard />}
                 {activeTab === 'platform' && <PlatformTab />}
+                {activeTab === 'registrationCodes' && <RegistrationCodesTab />}
                 {activeTab === 'companies' && <CompaniesTab />}
+            </div>
+        </div>
+    );
+}
+
+
+// ─── Registration Codes Tab ─────────────────────────
+export function RegistrationCodesTab() {
+    const { t, i18n } = useTranslation();
+    const isZh = i18n.language.startsWith('zh');
+    const [codes, setCodes] = useState<any[]>([]);
+    const [total, setTotal] = useState(0);
+    const [page, setPage] = useState(1);
+    const [search, setSearch] = useState('');
+    const [count, setCount] = useState(10);
+    const [maxUses, setMaxUses] = useState(1);
+    const [loading, setLoading] = useState(false);
+    const [creating, setCreating] = useState(false);
+    const [createdCodes, setCreatedCodes] = useState<string[]>([]);
+    const [toast, setToast] = useState<{ msg: string; type: 'success' | 'error' } | null>(null);
+    const pageSize = 20;
+
+    const showToast = (msg: string, type: 'success' | 'error' = 'success') => {
+        setToast({ msg, type });
+        setTimeout(() => setToast(null), 3000);
+    };
+
+    const loadCodes = useCallback(async (nextPage = page, nextSearch = search) => {
+        setLoading(true);
+        try {
+            const data = await adminApi.listRegistrationCodes({
+                page: nextPage,
+                page_size: pageSize,
+                search: nextSearch.trim(),
+            });
+            setCodes(data.items || []);
+            setTotal(data.total || 0);
+        } catch (e: any) {
+            showToast(e.message || (isZh ? '加载注册码失败' : 'Failed to load registration codes'), 'error');
+        } finally {
+            setLoading(false);
+        }
+    }, [page, search, isZh]);
+
+    useEffect(() => {
+        loadCodes(page, search);
+    }, [page, search, loadCodes]);
+
+    const createCodes = async () => {
+        setCreating(true);
+        setCreatedCodes([]);
+        try {
+            const result = await adminApi.createRegistrationCodes({ count, max_uses: maxUses });
+            setCreatedCodes(result.codes || []);
+            setPage(1);
+            setSearch('');
+            await loadCodes(1, '');
+            showToast(isZh ? '注册码已生成' : 'Registration codes generated');
+        } catch (e: any) {
+            showToast(e.message || (isZh ? '生成注册码失败' : 'Failed to generate registration codes'), 'error');
+        } finally {
+            setCreating(false);
+        }
+    };
+
+    const deactivate = async (id: string) => {
+        try {
+            await adminApi.deactivateRegistrationCode(id);
+            await loadCodes();
+            showToast(isZh ? '注册码已禁用' : 'Registration code disabled');
+        } catch (e: any) {
+            showToast(e.message || (isZh ? '禁用失败' : 'Failed to disable code'), 'error');
+        }
+    };
+
+    const exportCsv = () => {
+        const token = localStorage.getItem('token');
+        const a = document.createElement('a');
+        fetch('/api/admin/registration-codes/export', {
+            headers: token ? { Authorization: `Bearer ${token}` } : {},
+        })
+            .then(r => r.blob())
+            .then(blob => {
+                a.href = URL.createObjectURL(blob);
+                a.download = 'registration_codes.csv';
+                a.click();
+                URL.revokeObjectURL(a.href);
+            })
+            .catch(() => showToast(isZh ? '导出失败' : 'Export failed', 'error'));
+    };
+
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const codeStatus = (code: any) => {
+        if (!code.is_active) return { label: isZh ? '已禁用' : 'Disabled', color: 'var(--text-tertiary)', bg: 'rgba(107,114,128,0.12)' };
+        if (code.used_count >= code.max_uses) return { label: isZh ? '已用尽' : 'Exhausted', color: 'var(--warning)', bg: 'rgba(245,158,11,0.12)' };
+        return { label: isZh ? '可用' : 'Active', color: 'var(--success)', bg: 'rgba(34,197,94,0.12)' };
+    };
+
+    return (
+        <div style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: '24px' }}>
+            {toast && (
+                <div style={{
+                    position: 'fixed', top: '20px', right: '20px', padding: '10px 20px',
+                    borderRadius: '8px', background: toast.type === 'success' ? 'var(--success)' : 'var(--error)',
+                    color: '#fff', fontSize: '13px', zIndex: 9999, boxShadow: '0 4px 12px rgba(0,0,0,0.2)',
+                }}>{toast.msg}</div>
+            )}
+
+            <div style={{ maxWidth: '980px', margin: '0 auto' }}>
+                <div className="card" style={{ padding: '16px', marginBottom: '16px' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: '16px', alignItems: 'flex-start', marginBottom: '16px' }}>
+                        <div>
+                            <div style={{ fontSize: '15px', fontWeight: 700 }}>
+                                {isZh ? '平台注册码' : 'Platform Registration Codes'}
+                            </div>
+                            <div style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginTop: '4px', lineHeight: 1.5 }}>
+                                {isZh
+                                    ? '用于限制新账号注册。除首位初始化用户外，新用户注册必须填写这里生成的注册码。'
+                                    : 'Gate new account registration. Except for the bootstrap user, new users must enter one of these codes.'}
+                            </div>
+                        </div>
+                        <button className="btn btn-secondary" onClick={exportCsv} style={{ whiteSpace: 'nowrap' }}>
+                            {isZh ? '导出 CSV' : 'Export CSV'}
+                        </button>
+                    </div>
+
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: '12px', alignItems: 'end' }}>
+                        <div>
+                            <label className="form-label" style={{ fontSize: '12px', marginBottom: '6px' }}>
+                                {isZh ? '生成数量' : 'Number of codes'}
+                            </label>
+                            <input
+                                className="form-input"
+                                type="number"
+                                min={1}
+                                max={100}
+                                value={count}
+                                onChange={e => setCount(Math.max(1, Math.min(100, Number(e.target.value) || 1)))}
+                            />
+                        </div>
+                        <div>
+                            <label className="form-label" style={{ fontSize: '12px', marginBottom: '6px' }}>
+                                {isZh ? '每个注册码最多使用次数' : 'Max uses per code'}
+                            </label>
+                            <input
+                                className="form-input"
+                                type="number"
+                                min={1}
+                                max={10000}
+                                value={maxUses}
+                                onChange={e => setMaxUses(Math.max(1, Math.min(10000, Number(e.target.value) || 1)))}
+                            />
+                        </div>
+                        <button className="btn btn-primary" onClick={createCodes} disabled={creating}>
+                            {creating ? t('common.loading') : (isZh ? '生成注册码' : 'Generate')}
+                        </button>
+                    </div>
+
+                    {createdCodes.length > 0 && (
+                        <div style={{ marginTop: '16px', padding: '12px', borderRadius: '8px', background: 'var(--bg-secondary)', border: '1px solid var(--border-subtle)' }}>
+                            <div style={{ fontSize: '12px', fontWeight: 600, marginBottom: '8px' }}>
+                                {isZh ? '本次生成' : 'Generated now'}
+                            </div>
+                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+                                {createdCodes.map(code => (
+                                    <code key={code} style={{ padding: '6px 8px', borderRadius: '6px', background: 'var(--bg-primary)', border: '1px solid var(--border-subtle)', fontSize: '12px', letterSpacing: '0.08em' }}>
+                                        {code}
+                                    </code>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+                </div>
+
+                <div className="card" style={{ padding: '16px' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px', marginBottom: '12px' }}>
+                        <div style={{ fontSize: '13px', fontWeight: 600 }}>
+                            {isZh ? '注册码列表' : 'Registration codes'} ({total})
+                        </div>
+                        <input
+                            className="form-input"
+                            value={search}
+                            onChange={e => { setSearch(e.target.value); setPage(1); }}
+                            placeholder={isZh ? '搜索注册码' : 'Search code'}
+                            style={{ width: '220px', height: '32px', fontSize: '12px' }}
+                        />
+                    </div>
+
+                    <div style={{
+                        display: 'grid', gridTemplateColumns: '2fr 1fr 1fr 1fr 140px',
+                        gap: '12px', padding: '8px 12px', fontSize: '11px', fontWeight: 600,
+                        color: 'var(--text-tertiary)', textTransform: 'uppercase',
+                        borderBottom: '1px solid var(--border-subtle)',
+                    }}>
+                        <div>{isZh ? '注册码' : 'Code'}</div>
+                        <div>{isZh ? '用量' : 'Usage'}</div>
+                        <div>{isZh ? '状态' : 'Status'}</div>
+                        <div>{isZh ? '创建时间' : 'Created'}</div>
+                        <div />
+                    </div>
+
+                    {loading && (
+                        <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-tertiary)', fontSize: '13px' }}>
+                            {t('common.loading')}
+                        </div>
+                    )}
+                    {!loading && codes.length === 0 && (
+                        <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-tertiary)', fontSize: '13px' }}>
+                            {t('common.noData')}
+                        </div>
+                    )}
+
+                    {!loading && codes.map(code => {
+                        const status = codeStatus(code);
+                        const active = code.is_active && code.used_count < code.max_uses;
+                        return (
+                            <div key={code.id} style={{
+                                display: 'grid', gridTemplateColumns: '2fr 1fr 1fr 1fr 140px',
+                                gap: '12px', padding: '10px 12px', alignItems: 'center',
+                                borderBottom: '1px solid var(--border-subtle)', fontSize: '13px',
+                            }}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
+                                    <code style={{ fontWeight: 700, letterSpacing: '0.1em', overflowWrap: 'anywhere' }}>{code.code}</code>
+                                    <LinearCopyButton
+                                        className="btn btn-ghost"
+                                        style={{ padding: '2px 6px', fontSize: '10px', flexShrink: 0 }}
+                                        textToCopy={code.code}
+                                        label={isZh ? '复制' : 'Copy'}
+                                        copiedLabel={isZh ? '已复制' : 'Copied'}
+                                    />
+                                </div>
+                                <div>
+                                    <span style={{ fontWeight: 600 }}>{code.used_count}</span>
+                                    <span style={{ color: 'var(--text-tertiary)' }}> / {code.max_uses}</span>
+                                </div>
+                                <div>
+                                    <span style={{ display: 'inline-flex', padding: '3px 8px', borderRadius: '999px', fontSize: '11px', fontWeight: 600, color: status.color, background: status.bg }}>
+                                        {status.label}
+                                    </span>
+                                </div>
+                                <div style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>
+                                    {code.created_at ? formatDate(code.created_at) : '-'}
+                                </div>
+                                <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                                    {active && (
+                                        <button className="btn btn-secondary" onClick={() => deactivate(code.id)} style={{ padding: '4px 10px', fontSize: '11px' }}>
+                                            {isZh ? '禁用' : 'Disable'}
+                                        </button>
+                                    )}
+                                </div>
+                            </div>
+                        );
+                    })}
+
+                    {totalPages > 1 && (
+                        <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '8px', paddingTop: '16px', fontSize: '13px' }}>
+                            <button className="btn btn-secondary" disabled={page <= 1} onClick={() => setPage(p => Math.max(1, p - 1))}>
+                                {isZh ? '上一页' : 'Previous'}
+                            </button>
+                            <span style={{ color: 'var(--text-secondary)' }}>{page} / {totalPages}</span>
+                            <button className="btn btn-secondary" disabled={page >= totalPages} onClick={() => setPage(p => Math.min(totalPages, p + 1))}>
+                                {isZh ? '下一页' : 'Next'}
+                            </button>
+                        </div>
+                    )}
+                </div>
             </div>
         </div>
     );
@@ -129,7 +397,7 @@ function PlatformTab() {
     const [systemEmailConfig, setSystemEmailConfig] = useState({
         SYSTEM_EMAIL_ENABLED: false,
         SYSTEM_EMAIL_FROM_ADDRESS: '',
-        SYSTEM_EMAIL_FROM_NAME: 'Clawith',
+        SYSTEM_EMAIL_FROM_NAME: 'Astra',
         SYSTEM_SMTP_HOST: '',
         SYSTEM_SMTP_PORT: 465,
         SYSTEM_SMTP_USERNAME: '',
@@ -190,7 +458,7 @@ function PlatformTab() {
                             ? !!d.value.SYSTEM_EMAIL_ENABLED
                             : !!(d.value.SYSTEM_EMAIL_FROM_ADDRESS && d.value.SYSTEM_SMTP_HOST),
                         SYSTEM_EMAIL_FROM_ADDRESS: d.value.SYSTEM_EMAIL_FROM_ADDRESS || '',
-                        SYSTEM_EMAIL_FROM_NAME: d.value.SYSTEM_EMAIL_FROM_NAME || 'Clawith',
+                        SYSTEM_EMAIL_FROM_NAME: d.value.SYSTEM_EMAIL_FROM_NAME || 'Astra',
                         SYSTEM_SMTP_HOST: d.value.SYSTEM_SMTP_HOST || '',
                         SYSTEM_SMTP_PORT: d.value.SYSTEM_SMTP_PORT || 465,
                         SYSTEM_SMTP_USERNAME: d.value.SYSTEM_SMTP_USERNAME || '',
@@ -676,7 +944,7 @@ function PlatformTab() {
                             className="form-input"
                             value={systemEmailConfig.SYSTEM_EMAIL_FROM_NAME}
                             onChange={e => setSystemEmailConfig({ ...systemEmailConfig, SYSTEM_EMAIL_FROM_NAME: e.target.value })}
-                            placeholder="Clawith"
+                            placeholder="Astra"
                             style={{ fontSize: '13px' }}
                         />
                     </div>
@@ -1425,7 +1693,7 @@ function EditCompanyModal({ company, onClose, onUpdated }: { company: any, onClo
                             className="form-input"
                             value={ssoDomain}
                             onChange={e => setSsoDomain(e.target.value)}
-                            placeholder={t('admin.ssoDomainPlaceholder', 'e.g. acme.clawith.com')}
+                            placeholder={t('admin.ssoDomainPlaceholder', 'e.g. acme.astra.ai')}
                             style={{ fontSize: '13px' }}
                         />
                     </div>

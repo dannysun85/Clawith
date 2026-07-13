@@ -41,6 +41,29 @@ class AgentManager:
     def _template_dir(self) -> Path:
         return Path(settings.AGENT_TEMPLATE_DIR)
 
+    @staticmethod
+    def mark_error(agent: Agent, reason: str) -> None:
+        agent.status = "error"
+        agent.last_error = reason[:2000]
+        agent.last_error_at = datetime.now(timezone.utc)
+
+    @staticmethod
+    def clear_error(agent: Agent) -> None:
+        agent.last_error = None
+        agent.last_error_at = None
+
+    def reconcile_error_status(self, agent: Agent) -> bool:
+        """Clear a stale error when Docker already restarted the container."""
+        if agent.status != "error" or not agent.container_id:
+            return False
+        runtime = self.get_container_status(agent)
+        if runtime.get("running"):
+            agent.status = "running"
+            agent.last_active_at = datetime.now(timezone.utc)
+            self.clear_error(agent)
+            return True
+        return False
+
     async def _materialize_agent_dir(self, agent_id: uuid.UUID) -> Path:
         """Create a local working tree from shared storage for container mounting."""
         agent_dir = self._agent_dir(agent_id)
@@ -72,9 +95,9 @@ class AgentManager:
         storage = get_storage_backend()
         agent_prefix = self._agent_storage_prefix(agent.id)
 
-        if await storage.exists(agent_prefix) or await storage.is_dir(agent_prefix):
-            logger.warning(f"Agent dir already exists: {agent_dir}")
-            return
+        repairing_existing = await storage.exists(agent_prefix) or await storage.is_dir(agent_prefix)
+        if repairing_existing:
+            logger.info(f"Repairing existing agent directory if needed: {agent_dir}")
 
         if template_dir.exists():
             import asyncio
@@ -87,26 +110,26 @@ class AgentManager:
                 rel = src.relative_to(template_dir).as_posix()
                 if rel == "tasks.json" or rel == "todo.json" or rel.startswith("enterprise_info/"):
                     continue
-                tasks.append(
-                    storage.write_bytes(
-                        f"{agent_prefix}/{rel}",
-                        src.read_bytes(),
-                    )
-                )
+                target_key = f"{agent_prefix}/{rel}"
+                if not await storage.exists(target_key):
+                    tasks.append(storage.write_bytes(target_key, src.read_bytes()))
             if tasks:
                 await asyncio.gather(*tasks)
             logger.info(f"[AgentManager] Uploaded {len(tasks)} template files concurrently in {time.perf_counter() - t_start_files:.2f}s for agent {agent.id}")
         else:
             logger.info(f"Template dir not found ({template_dir}), creating minimal workspace")
-            await storage.write_text(f"{agent_prefix}/tasks.json", "[]", encoding="utf-8")
-            await storage.write_text(f"{agent_prefix}/tasks.json", "[]", encoding="utf-8")
+            tasks_key = f"{agent_prefix}/tasks.json"
+            if not await storage.exists(tasks_key):
+                await storage.write_text(tasks_key, "[]", encoding="utf-8")
             for placeholder in (
                 "workspace/.gitkeep",
                 "workspace/knowledge_base/.gitkeep",
                 "memory/.gitkeep",
                 "skills/.gitkeep",
             ):
-                await storage.write_text(f"{agent_prefix}/{placeholder}", "", encoding="utf-8")
+                placeholder_key = f"{agent_prefix}/{placeholder}"
+                if not await storage.exists(placeholder_key):
+                    await storage.write_text(placeholder_key, "", encoding="utf-8")
 
         # Customize soul.md
         # Get creator name
@@ -120,7 +143,7 @@ class AgentManager:
         if await storage.exists(soul_key):
             template_content = await storage.read_text(soul_key, encoding="utf-8", errors="replace")
             soul_content = template_content.replace("{{agent_name}}", agent.name)
-            soul_content = soul_content.replace("{{role_description}}", agent.role_description or "通用助手")
+            soul_content = soul_content.replace("{{role_description}}", agent.role_description or "General assistant")
             soul_content = soul_content.replace("{{creator_name}}", creator_name)
             soul_content = soul_content.replace("{{created_at}}", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
 
@@ -214,10 +237,21 @@ class AgentManager:
 
         Returns container_id or None if Docker not available.
         """
+        # Native agents run in the platform backend and must never depend on an
+        # OpenClaw image or Docker socket. This guard belongs at the lifecycle
+        # boundary so creation, onboarding, start, and recovery callers cannot
+        # accidentally regress into the container path.
+        if getattr(agent, "agent_type", "native") == "native":
+            agent.status = "idle"
+            agent.last_active_at = datetime.now(timezone.utc)
+            self.clear_error(agent)
+            return None
+
         if not self.docker_client:
             logger.info("Docker not available, skipping container start")
             agent.status = "idle"
             agent.last_active_at = datetime.now(timezone.utc)
+            self.clear_error(agent)
             return None
 
         agent_dir = await self._materialize_agent_dir(agent.id)
@@ -266,13 +300,14 @@ class AgentManager:
             agent.container_port = container_port
             agent.status = "running"
             agent.last_active_at = datetime.now(timezone.utc)
+            self.clear_error(agent)
 
             logger.info(f"Started container {container.id[:12]} for agent {agent.name} on port {container_port}")
             return container.id
 
         except DockerException as e:
             logger.error(f"Failed to start container for agent {agent.name}: {e}")
-            agent.status = "error"
+            self.mark_error(agent, f"container_start: {type(e).__name__}: {str(e)[:1500]}")
             return None
 
     async def stop_container(self, agent: Agent) -> bool:

@@ -1,4 +1,5 @@
 {{- if .Values.postgresql.enabled }}
+{{- $postgresPassword := required "postgresql.auth.password must be set to a strong deployment-specific value when PostgreSQL is enabled" .Values.postgresql.auth.password }}
 apiVersion: v1
 kind: Secret
 metadata:
@@ -9,7 +10,7 @@ metadata:
     app.kubernetes.io/component: postgresql
 type: Opaque
 data:
-  postgres-password: {{ .Values.postgresql.auth.password | b64enc | quote }}
+  postgres-password: {{ $postgresPassword | b64enc | quote }}
 ---
 {{- if and .Values.postgresql.primary.persistence.enabled (not .Values.postgresql.primary.persistence.existingClaim) }}
 apiVersion: v1
@@ -58,21 +59,17 @@ spec:
       {{- end }}
       containers:
       - name: postgresql
-        image: "{{ .Values.postgresql.image.registry }}/{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
+        image: {{ include "clawith.image" (dict "registry" .Values.postgresql.image.registry "repository" .Values.postgresql.image.repository "tag" .Values.postgresql.image.tag) | quote }}
         imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
         {{- with .Values.postgresql.primary.containerSecurityContext }}
         securityContext:
           {{- toYaml . | nindent 10 }}
         {{- end }}
         env:
-        - name: BITNAMI_DEBUG
-          value: "false"
-        - name: POSTGRESQL_PORT_NUMBER
-          value: "{{ .Values.postgresql.primary.service.port }}"
-        - name: POSTGRESQL_VOLUME_DIR
-          value: /bitnami/postgresql
         - name: PGDATA
-          value: /bitnami/postgresql/data
+          value: /var/lib/postgresql/data/pgdata
+        - name: POSTGRES_USER
+          value: {{ .Values.postgresql.auth.username | quote }}
         - name: POSTGRES_PASSWORD
           valueFrom:
             secretKeyRef:
@@ -80,22 +77,6 @@ spec:
               key: postgres-password
         - name: POSTGRES_DB
           value: {{ .Values.postgresql.auth.database | quote }}
-        - name: POSTGRESQL_ENABLE_LDAP
-          value: "no"
-        - name: POSTGRESQL_ENABLE_TLS
-          value: "no"
-        - name: POSTGRESQL_LOG_HOSTNAME
-          value: "false"
-        - name: POSTGRESQL_LOG_CONNECTIONS
-          value: "false"
-        - name: POSTGRESQL_LOG_DISCONNECTIONS
-          value: "false"
-        - name: POSTGRESQL_PGAUDIT_LOG_CATALOG
-          value: "off"
-        - name: POSTGRESQL_CLIENT_MIN_MESSAGES
-          value: error
-        - name: POSTGRESQL_SHARED_PRELOAD_LIBRARIES
-          value: pgaudit
         ports:
         - name: tcp-postgresql
           containerPort: {{ .Values.postgresql.primary.service.port }}
@@ -114,10 +95,7 @@ spec:
             command:
               - /bin/sh
               - '-c'
-              - '-e'
-              - |
-                exec pg_isready -U "{{ .Values.postgresql.auth.username }}" -d "dbname={{ .Values.postgresql.auth.database }}" -h 127.0.0.1 -p {{ .Values.postgresql.primary.service.port }}
-                [ -f /opt/bitnami/postgresql/tmp/.initialized ] || [ -f /bitnami/postgresql/.initialized ]
+              - exec pg_isready -U "{{ .Values.postgresql.auth.username }}" -d "dbname={{ .Values.postgresql.auth.database }}" -h 127.0.0.1 -p {{ .Values.postgresql.primary.service.port }}
           initialDelaySeconds: 5
           periodSeconds: 10
           timeoutSeconds: 5
@@ -131,7 +109,7 @@ spec:
           mountPath: /dev/shm
         {{- if .Values.postgresql.primary.persistence.enabled }}
         - name: data
-          mountPath: /bitnami/postgresql
+          mountPath: /var/lib/postgresql/data
         {{- end }}
       volumes:
       - name: dshm
@@ -180,4 +158,3 @@ spec:
     port: {{ .Values.postgresql.primary.service.port }}
     targetPort: tcp-postgresql
 {{- end }}
-

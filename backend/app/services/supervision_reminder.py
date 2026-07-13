@@ -9,6 +9,7 @@ Runs as a background task inside the FastAPI process.
 """
 
 import asyncio
+import json
 from datetime import datetime, timezone, timedelta
 
 from loguru import logger
@@ -17,6 +18,7 @@ from sqlalchemy import select
 from app.database import async_session
 from app.models.task import Task, TaskLog
 from app.models.agent import Agent
+from app.services.llm import LLMError
 
 # Schedule JSON format:
 # {"freq": "daily"|"weekly", "interval": N, "time": "HH:MM", "weekdays": [0-6]}
@@ -25,7 +27,6 @@ from app.models.agent import Agent
 
 def _parse_schedule(remind_schedule: str) -> dict | None:
     """Parse remind_schedule — supports JSON format or legacy simple presets."""
-    import json
     if not remind_schedule:
         return None
     try:
@@ -103,28 +104,28 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
 
     Returns the reply text, or None if the agent can't respond.
     """
-    from app.models.llm import LLMModel
     from app.services.agent_context import build_agent_context
     from app.services.llm import (
-        get_provider_base_url,
         create_llm_client,
         LLMMessage,
-        get_model_api_key,
+        prepare_agent_llm_invocation,
+        settle_agent_llm_invocation,
+    )
+    from app.services.quota_guard import QuotaExceeded
+    from app.services.token_tracker import (
+        estimate_token_usage_from_chars,
+        extract_token_usage,
+        record_token_usage,
     )
 
-    model_id = target_agent.primary_model_id or target_agent.fallback_model_id
-    if not model_id:
+    try:
+        invocation = await prepare_agent_llm_invocation(target_agent, action="chat")
+    except QuotaExceeded as exc:
+        logger.warning(f"Supervision reply skipped for agent {target_agent.id}: {exc.message}")
         return None
-
-    from sqlalchemy import select as _select
-    model_result = await db.execute(_select(LLMModel).where(LLMModel.id == model_id))
-    model = model_result.scalar_one_or_none()
-    if not model:
+    if invocation is None:
         return None
-
-    base_url = get_provider_base_url(model.provider, model.base_url)
-    if not base_url:
-        return None
+    model = invocation.model
 
     static_prompt, dynamic_prompt = await build_agent_context(
         target_agent.id, target_agent.name, target_agent.role_description or ""
@@ -137,11 +138,12 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
 
     client = create_llm_client(
         provider=model.provider,
-        api_key=get_model_api_key(model),
+        api_key=invocation.api_key,
         model=model.model,
-        base_url=base_url,
+        base_url=invocation.base_url,
         timeout=float(getattr(model, 'request_timeout', None) or 60.0),
     )
+    usage = None
     try:
         response = await client.complete(
             messages=messages,
@@ -149,13 +151,35 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
             max_tokens=512,
         )
         content = (response.content or "").strip()
+        usage = extract_token_usage(response.usage)
+        if usage is None:
+            usage = estimate_token_usage_from_chars(
+                len(static_prompt) + len(dynamic_prompt) + len(message) + len(content)
+            )
         return content if content else None
     except LLMError as e:
         logger.error(f"_get_agent_reply LLM error: {e}")
     except Exception as e:
         logger.error(f"_get_agent_reply LLM call failed: {e}")
     finally:
-        await client.close()
+        try:
+            await client.close()
+        except Exception as e:
+            logger.warning(f"Failed to close supervision LLM client: {e}")
+        if usage is not None and usage.total_tokens > 0:
+            try:
+                await record_token_usage(target_agent.id, usage)
+            except Exception as e:
+                logger.exception(f"Failed to record supervision LLM tokens: {e}")
+            try:
+                await settle_agent_llm_invocation(
+                    invocation,
+                    agent_id=target_agent.id,
+                    user_id=target_agent.creator_id,
+                    usage=usage,
+                )
+            except Exception as e:
+                logger.exception(f"Failed to settle supervision LLM Credits: {e}")
     return None
 
 
@@ -185,7 +209,7 @@ async def _send_supervision_reminder(task: Task, agent_name: str):
         reminder_msg += f"创建于：{days_since} 天前\n"
         if task.due_date:
             reminder_msg += f"截止日期：{task.due_date.strftime('%Y-%m-%d')}\n"
-        reminder_msg += f"\n请及时处理，谢谢！"
+        reminder_msg += "\n请及时处理，谢谢！"
 
         async with async_session() as db:
             sent = False

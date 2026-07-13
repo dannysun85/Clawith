@@ -1,0 +1,185 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-astra}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-astra}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-astra} -d ${POSTGRES_DB:-astra}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - default
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - default
+
+  backend: &backend-service
+    image: ${BACKEND_IMAGE:-astra-backend}:${ASTRA_RELEASE_ID:-local}
+    build:
+      context: ./backend
+      args:
+        ASTRA_PIP_INDEX_URL: ${ASTRA_PIP_INDEX_URL:-}
+        ASTRA_PIP_TRUSTED_HOST: ${ASTRA_PIP_TRUSTED_HOST:-}
+        CLAWITH_PIP_INDEX_URL: ${CLAWITH_PIP_INDEX_URL:-}
+        CLAWITH_PIP_TRUSTED_HOST: ${CLAWITH_PIP_TRUSTED_HOST:-}
+    restart: unless-stopped
+    stop_grace_period: 30s
+    shm_size: "1gb"
+    # Required by the local bubblewrap execute_code backend. The application
+    # still drops to the non-root clawith user before serving requests.
+    privileged: true
+    environment: &backend-environment
+      APP_NAME: astra
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-astra}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-astra}
+      REDIS_URL: redis://redis:6379/0
+      AGENT_DATA_DIR: /data/agents
+      AGENT_TEMPLATE_DIR: /app/agent_template
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY is required}
+      ENVIRONMENT: production
+      CORS_ORIGINS: ${CORS_ORIGINS:?CORS_ORIGINS is required}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?PUBLIC_BASE_URL is required}
+      ASTRA_RELEASE_VERSION: ${ASTRA_RELEASE_VERSION:-}
+      ASTRA_RELEASE_COMMIT: ${ASTRA_RELEASE_COMMIT:-}
+      ASTRA_RELEASE_ID: ${ASTRA_RELEASE_ID:-}
+      PROCESS_ROLE: ${API_PROCESS_ROLE:-api,bootstrap}
+      ALLOW_MIGRATION_FAILURE: ${ALLOW_MIGRATION_FAILURE:-false}
+      PASSWORD_RESET_TOKEN_EXPIRE_MINUTES: ${PASSWORD_RESET_TOKEN_EXPIRE_MINUTES:-30}
+      FEISHU_APP_ID: ${FEISHU_APP_ID:-}
+      FEISHU_APP_SECRET: ${FEISHU_APP_SECRET:-}
+      FEISHU_REDIRECT_URI: ${FEISHU_REDIRECT_URI:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      KIMI_API_KEY: ${KIMI_API_KEY:-}
+      MOONSHOT_API_KEY: ${MOONSHOT_API_KEY:-}
+      JINA_API_KEY: ${JINA_API_KEY:-}
+      EXA_API_KEY: ${EXA_API_KEY:-}
+      AGENTBAY_API_KEY: ${AGENTBAY_API_KEY:-}
+      AGENTBAY_ACCESS_KEY_ID: ${AGENTBAY_ACCESS_KEY_ID:-}
+      DOCKER_NETWORK: ${DOCKER_NETWORK:-astra_network}
+      DOUYIN_CLIENT_KEY: ${DOUYIN_CLIENT_KEY:-}
+      DOUYIN_CLIENT_SECRET: ${DOUYIN_CLIENT_SECRET:-}
+      DOUYIN_REDIRECT_URI: ${DOUYIN_REDIRECT_URI:-}
+      DOUYIN_SCOPES: ${DOUYIN_SCOPES:-user_info,h5.share,aweme.share,aweme.forward,open.get.ticket,video.comment,data.external.user,data.external.item}
+      DOUYIN_DIRECT_PUBLISH_ENABLED: ${DOUYIN_DIRECT_PUBLISH_ENABLED:-false}
+      BILLING_PROVIDER: ${BILLING_PROVIDER:-manual}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      STRIPE_API_BASE_URL: ${STRIPE_API_BASE_URL:-https://api.stripe.com}
+      STRIPE_SUCCESS_URL: ${STRIPE_SUCCESS_URL:-}
+      STRIPE_CANCEL_URL: ${STRIPE_CANCEL_URL:-}
+      BILLING_SUCCESS_URL: ${BILLING_SUCCESS_URL:-}
+      BILLING_CANCEL_URL: ${BILLING_CANCEL_URL:-}
+      BILLING_RECONCILIATION_INTERVAL_SECONDS: ${BILLING_RECONCILIATION_INTERVAL_SECONDS:-86400}
+      BILLING_RESERVATION_EXPIRY_SWEEP_SECONDS: ${BILLING_RESERVATION_EXPIRY_SWEEP_SECONDS:-600}
+      MEDIA_GENERATION_POLL_INTERVAL_SECONDS: ${MEDIA_GENERATION_POLL_INTERVAL_SECONDS:-15}
+      MEDIA_GENERATION_BATCH_SIZE: ${MEDIA_GENERATION_BATCH_SIZE:-20}
+      MEDIA_GENERATION_SUBMISSION_TIMEOUT_SECONDS: ${MEDIA_GENERATION_SUBMISSION_TIMEOUT_SECONDS:-600}
+      MEDIA_GENERATION_MAX_AGE_SECONDS: ${MEDIA_GENERATION_MAX_AGE_SECONDS:-172800}
+      MEDIA_GENERATION_MAX_CONSECUTIVE_ERRORS: ${MEDIA_GENERATION_MAX_CONSECUTIVE_ERRORS:-12}
+      PRODUCTION_ISSUE_MONITOR_ENABLED: ${PRODUCTION_ISSUE_MONITOR_ENABLED:-true}
+      PRODUCTION_ISSUE_MONITOR_INTERVAL_SECONDS: ${PRODUCTION_ISSUE_MONITOR_INTERVAL_SECONDS:-30}
+      PRODUCTION_ISSUE_ALERT_THRESHOLD: ${PRODUCTION_ISSUE_ALERT_THRESHOLD:-1}
+      PRODUCTION_ISSUE_RETENTION_DAYS: ${PRODUCTION_ISSUE_RETENTION_DAYS:-30}
+      PRODUCTION_ISSUE_ALERT_WEBHOOK_URL: ${PRODUCTION_ISSUE_ALERT_WEBHOOK_URL:-}
+      HEARTBEAT_ENABLED: ${HEARTBEAT_ENABLED:-false}
+      SAAS_ADMIN_EMAIL: ${SAAS_ADMIN_EMAIL:-admin@reeftotem.ai}
+      COMPANY_ASSIGNMENT_RUNNER_ENABLED: ${COMPANY_ASSIGNMENT_RUNNER_ENABLED:-false}
+      COMPANY_ASSIGNMENT_RUNNER_INTERVAL_SECONDS: ${COMPANY_ASSIGNMENT_RUNNER_INTERVAL_SECONDS:-120}
+      COMPANY_ASSIGNMENT_RUNNER_BATCH_SIZE: ${COMPANY_ASSIGNMENT_RUNNER_BATCH_SIZE:-10}
+      COMPANY_ASSIGNMENT_RUNNER_TENANT_IDS: ${COMPANY_ASSIGNMENT_RUNNER_TENANT_IDS:-}
+      COMPANY_ASSIGNMENT_RUNNER_PROJECT_IDS: ${COMPANY_ASSIGNMENT_RUNNER_PROJECT_IDS:-}
+      COMPANY_ASSIGNMENT_WAITING_REPLY_ESCALATION_MINUTES: ${COMPANY_ASSIGNMENT_WAITING_REPLY_ESCALATION_MINUTES:-60}
+      COMPANY_WORK_ORDER_REVIEW_ESCALATION_MINUTES: ${COMPANY_WORK_ORDER_REVIEW_ESCALATION_MINUTES:-15}
+      SOCIAL_SIDECAR_BASE_URLS: ${SOCIAL_SIDECAR_BASE_URLS:-}
+    volumes:
+      - agentdata:/data/agents
+      - /var/run/docker.sock:/var/run/docker.sock
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    networks:
+      default:
+        aliases:
+          - ${BACKEND_NETWORK_ALIAS:-backend}
+
+  worker:
+    <<: *backend-service
+    stop_grace_period: 120s
+    environment:
+      <<: *backend-environment
+      PROCESS_ROLE: ${WORKER_PROCESS_ROLE:-worker,connector}
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - default
+
+  frontend:
+    build:
+      context: ./frontend
+    restart: unless-stopped
+    environment:
+      API_UPSTREAM: ${API_UPSTREAM:-backend:8000}
+      MINIO_UPSTREAM: ${MINIO_UPSTREAM:-minio:9000}
+    ports:
+      - "${FRONTEND_BIND:-127.0.0.1}:${FRONTEND_PORT:-3008}:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/ >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    networks:
+      - default
+
+volumes:
+  pgdata:
+    name: ${POSTGRES_VOLUME:-astra-poc_pgdata}
+  redisdata:
+    name: ${REDIS_VOLUME:-astra-poc_redisdata}
+  agentdata:
+    name: ${AGENT_DATA_VOLUME:-astra-poc_agentdata}
+
+networks:
+  default:
+    name: ${DOCKER_NETWORK:-astra_network}

@@ -15,7 +15,7 @@ export default function Login() {
     const { t, i18n } = useTranslation();
     const navigate = useNavigate();
     const [searchParams] = useSearchParams();
-    const invitationCode = searchParams.get('code');
+    const invitationCode = searchParams.get('code') || '';
     const invitedEmail = searchParams.get('email') || '';
     const setAuth = useAuthStore((s) => s.setAuth);
     // Default to register if there's an invitation code — will be overridden after email check
@@ -37,6 +37,8 @@ export default function Login() {
     const [verificationEmail, setVerificationEmail] = useState('');
     const [verificationCode, setVerificationCode] = useState('');
     const [verificationEntryMode, setVerificationEntryMode] = useState<'create' | 'join' | 'home'>('home');
+    const [registrationCodeRequired, setRegistrationCodeRequired] = useState(true);
+    const [registrationCode, setRegistrationCode] = useState(invitationCode);
 
     const [form, setForm] = useState({
         login_identifier: invitedEmail,  // Pre-fill invited email if present
@@ -46,6 +48,10 @@ export default function Login() {
 
     useEffect(() => {
         document.documentElement.setAttribute('data-theme', localStorage.getItem('theme') || 'light');
+
+        authApi.registrationConfig()
+            .then(config => setRegistrationCodeRequired(!!config.invitation_code_required))
+            .catch(() => setRegistrationCodeRequired(true));
 
         // If arriving via invitation link with email, check whether the email is already registered
         // to decide whether to show login or register form.
@@ -222,12 +228,18 @@ export default function Login() {
 
         try {
             if (isRegister) {
+                const code = registrationCode.trim();
+                if (registrationCodeRequired && !code) {
+                    setError(isZh ? '请输入注册码' : 'Registration code is required.');
+                    setLoading(false);
+                    return;
+                }
                 const regRes = await authApi.register({
                     username: form.login_identifier.split('@')[0],
                     email: form.login_identifier,
                     password: form.password,
                     display_name: form.login_identifier.split('@')[0],
-                    ...(invitationCode ? { invitation_code: invitationCode } : {})
+                    ...(code ? { invitation_code: code } : {})
                 });
                 // Save authentication state for company selection (user not active yet)
                 if (regRes.access_token && regRes.user) {
@@ -299,7 +311,9 @@ export default function Login() {
                     }
                 }
 
-                if (tokenRes.user && !tokenRes.user.tenant_id) {
+                if (tokenRes.user?.role === 'platform_admin' || tokenRes.user?.is_platform_admin) {
+                    navigate('/admin/platform-settings');
+                } else if (tokenRes.user && !tokenRes.user.tenant_id) {
                     navigate('/setup-company');
                 } else {
                     navigate('/');
@@ -364,7 +378,9 @@ export default function Login() {
 
             const tokenRes = res as TokenResponse;
             setAuth(tokenRes.user, tokenRes.access_token);
-            if (tokenRes.user && !tokenRes.user.tenant_id) {
+            if (tokenRes.user?.role === 'platform_admin' || tokenRes.user?.is_platform_admin) {
+                navigate('/admin/platform-settings');
+            } else if (tokenRes.user && !tokenRes.user.tenant_id) {
                 navigate('/setup-company');
             } else {
                 navigate('/');
@@ -663,6 +679,7 @@ export default function Login() {
                                     onChange={(e) => setForm({ ...form, login_identifier: e.target.value })}
                                     required
                                     autoFocus
+                                    autoComplete="email"
                                     placeholder={t('auth.emailPlaceholder')}
                                 />
                             </div>
@@ -674,9 +691,27 @@ export default function Login() {
                                     value={form.password}
                                     onChange={(e) => setForm({ ...form, password: e.target.value })}
                                     required
+                                    autoComplete={isRegister ? 'new-password' : 'current-password'}
                                     placeholder={t('auth.passwordPlaceholder')}
                                 />
                             </div>
+
+                            {isRegister && registrationCodeRequired && (
+                                <div className="login-field">
+                                    <label>{t('auth.invitationCode', isZh ? '注册码' : 'Registration Code')}</label>
+                                    <input
+                                        type="text"
+                                        value={registrationCode}
+                                        onChange={(e) => setRegistrationCode(e.target.value.toUpperCase())}
+                                        required
+                                        placeholder={t('auth.invitationCodePlaceholder', isZh ? '请输入注册码' : 'Enter registration code')}
+                                        autoComplete="off"
+                                    />
+                                    <div style={{ marginTop: '6px', fontSize: '12px', color: 'var(--text-tertiary)', lineHeight: 1.5 }}>
+                                        {t('auth.invitationHint')}
+                                    </div>
+                                </div>
+                            )}
 
                             {!isRegister && (
                                 <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '-4px', marginBottom: '8px' }}>

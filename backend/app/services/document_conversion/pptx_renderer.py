@@ -10,6 +10,7 @@ from app.services.document_conversion.chrome_renderer import collect_browser_lay
 
 
 async def render_html_to_pptx(src_file: Path, tgt_file: Path, target_path: str, ws: Path, arguments: dict[str, Any]) -> str:
+    temporary_render_files: set[Path] = set()
     try:
         from bs4 import BeautifulSoup
         from bs4.element import Tag
@@ -519,6 +520,16 @@ async def render_html_to_pptx(src_file: Path, tgt_file: Path, target_path: str, 
             return True
 
         browser_layout = await collect_browser_layout(src_file, design_w_px, design_h_px, render_mode, render_scale)
+        if browser_layout:
+            for value in browser_layout.get("screenshots") or []:
+                if value:
+                    temporary_render_files.add(Path(value))
+            for value in browser_layout.get("backgroundScreenshots") or []:
+                if value:
+                    temporary_render_files.add(Path(value))
+            for value in (browser_layout.get("shapeScreenshots") or {}).values():
+                if value:
+                    temporary_render_files.add(Path(value))
         if browser_layout and render_mode in ("visual", "screenshot", "image", "hybrid") and render_browser_screenshots(browser_layout):
             tgt_file.parent.mkdir(parents=True, exist_ok=True)
             prs.save(str(tgt_file))
@@ -571,3 +582,6 @@ async def render_html_to_pptx(src_file: Path, tgt_file: Path, target_path: str, 
     except Exception as e:
         logger.exception(f"Convert HTML to PPTX failed: {e}")
         return f"❌ Conversion failed: {e}"
+    finally:
+        for temporary_file in temporary_render_files:
+            temporary_file.unlink(missing_ok=True)

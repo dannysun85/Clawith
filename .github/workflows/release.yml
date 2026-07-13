@@ -242,6 +242,19 @@ jobs:
           printf '%s\n' "$TARGET_VERSION" > backend/VERSION
           printf '%s\n' "$TARGET_VERSION" > frontend/VERSION
 
+          python <<'PY'
+          from pathlib import Path
+          import os
+          import re
+
+          version = os.environ["TARGET_VERSION"]
+          chart_path = Path("helm/clawith/Chart.yaml")
+          chart = chart_path.read_text(encoding="utf-8")
+          chart = re.sub(r"(?m)^version:\s*.*$", f"version: {version}", chart, count=1)
+          chart = re.sub(r"(?m)^appVersion:\s*.*$", f'appVersion: "{version}"', chart, count=1)
+          chart_path.write_text(chart, encoding="utf-8")
+          PY
+
       - name: Draft release notes with GitHub Models
         if: ${{ inputs.use_ai_notes }}
         shell: bash
@@ -424,7 +437,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          git add backend/VERSION frontend/VERSION RELEASE_NOTES.md
+          git add backend/VERSION frontend/VERSION helm/clawith/Chart.yaml RELEASE_NOTES.md
 
           if git diff --cached --quiet; then
             echo "No release metadata changes to commit."
@@ -440,26 +453,28 @@ jobs:
         env:
           TARGET_TAG: ${{ steps.version.outputs.tag }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_BRANCH: ${{ github.ref_name }}
         run: |
           set -euo pipefail
 
-          release_notes=""
-          if [ -s .github/release-artifacts/release-notes.generated.md ]; then
-            release_notes="$(cat .github/release-artifacts/release-notes.generated.md)"
-          fi
+          python <<'PY'
+          from pathlib import Path
+
+          notes_path = Path(".github/release-artifacts/release-notes.generated.md")
+          release_notes = notes_path.read_text(encoding="utf-8").strip() if notes_path.exists() else ""
+          body = (
+              "Automated release PR. Merging this PR will automatically tag "
+              "and publish the release.\n\n---\n\n"
+              f"{release_notes}\n"
+          )
+          Path(".github/release-artifacts/pr-body.md").write_text(body, encoding="utf-8")
+          PY
 
           gh pr create \
             --title "chore(release): cut ${TARGET_TAG}" \
-            --body "$(cat <<EOF
-          Automated release PR for ${TARGET_TAG}. Merging this PR will automatically tag the release and publish it.
-
-          ---
-
-          ${release_notes}
-          EOF
-          )" \
+            --body-file .github/release-artifacts/pr-body.md \
             --head "release/${TARGET_TAG}" \
-            --base "${{ github.ref_name }}"
+            --base "$BASE_BRANCH"
 
   publish_release:
     name: Publish release
@@ -480,10 +495,12 @@ jobs:
       - name: Extract Release Info
         id: release_info
         shell: bash
+        env:
+          RELEASE_HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
           set -euo pipefail
 
-          branch_name="${{ github.event.pull_request.head.ref }}"
+          branch_name="$RELEASE_HEAD_REF"
           tag_name="${branch_name#release/}"
 
           python - "$tag_name" <<'PY'

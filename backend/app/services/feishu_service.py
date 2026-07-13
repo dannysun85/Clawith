@@ -12,11 +12,11 @@ try:
 except ImportError:
     lark = None  # type: ignore
     _HAS_LARK = False
-from sqlalchemy import select, or_
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.core.security import create_access_token, hash_password
+from app.core.security import create_access_token
 from app.models.user import User, Identity
 from app.models.identity import IdentityProvider
 
@@ -26,6 +26,20 @@ FEISHU_TOKEN_URL = "https://open.feishu.cn/open-apis/authen/v1/oidc/access_token
 FEISHU_USER_INFO_URL = "https://open.feishu.cn/open-apis/authen/v1/user_info"
 FEISHU_APP_TOKEN_URL = "https://open.feishu.cn/open-apis/auth/v3/app_access_token/internal"
 FEISHU_SEND_MSG_URL = "https://open.feishu.cn/open-apis/im/v1/messages"
+FEISHU_MAX_FILE_BYTES = 25 * 1024 * 1024
+FEISHU_MAX_IMAGE_BYTES = 10 * 1024 * 1024
+
+
+class FeishuResourceTooLargeError(RuntimeError):
+    """Raised before an oversized Feishu resource is buffered in memory."""
+
+    def __init__(self, *, limit: int, actual: int | None = None):
+        self.limit = limit
+        self.actual = actual
+        detail = f"resource exceeds the {limit // 1024 // 1024}MB limit"
+        if actual is not None:
+            detail += f" ({actual} bytes)"
+        super().__init__(detail)
 
 class FeishuAPIError(RuntimeError):
     """Structured Feishu API error that preserves provider-returned details."""
@@ -201,7 +215,6 @@ class FeishuService:
 
         open_id = feishu_user["open_id"]
         user_id = feishu_user.get("user_id", "")
-        union_id = feishu_user.get("union_id")
         fs_email = feishu_user.get("email", "")
         fs_name = feishu_user.get("name", "")
         fs_avatar = feishu_user.get("avatar_url", "")
@@ -476,46 +489,63 @@ class FeishuService:
                                   action_type: str, details: str, approval_id: str) -> dict:
         """Send an interactive approval card to the agent creator via Feishu."""
         import json
-        card_content = json.dumps({
-            "type": "template",
-            "data": {
-                "template_id": "",  # Use custom card
-                "template_variable": {
-                    "agent_name": agent_name,
-                    "action_type": action_type,
-                    "details": details,
-                    "approval_id": approval_id,
-                }
-            }
-        })
         # Simplified — in production, use Feishu interactive card JSON
         text_content = json.dumps({
-            "text": f"🔴 [{agent_name}] 请求审批\n操作: {action_type}\n详情: {details}\n\n请在 Clawith 平台审批。"
+            "text": f"🔴 [{agent_name}] 请求审批\n操作: {action_type}\n详情: {details}\n\n请在 Astra 平台审批。"
         })
         return await self.send_message(app_id, app_secret, creator_open_id, "text", text_content)
 
-    async def download_message_resource(self, app_id: str, app_secret: str,
-                                         message_id: str, file_key: str,
-                                         resource_type: str = "file") -> bytes:
+    async def download_message_resource(
+        self,
+        app_id: str,
+        app_secret: str,
+        message_id: str,
+        file_key: str,
+        resource_type: str = "file",
+        max_bytes: int | None = None,
+    ) -> bytes:
         """Download a file or image from a Feishu message.
 
         Args:
             resource_type: "file" or "image"
+            max_bytes: Maximum bytes buffered in memory. Defaults to 10MB for
+                images and 25MB for other files.
         Returns raw file bytes.
         """
+        limit = max_bytes
+        if limit is None:
+            limit = FEISHU_MAX_IMAGE_BYTES if resource_type == "image" else FEISHU_MAX_FILE_BYTES
+
         async with httpx.AsyncClient(timeout=30) as client:
             token_resp = await client.post(FEISHU_APP_TOKEN_URL, json={
                 "app_id": app_id,
                 "app_secret": app_secret,
             })
-            app_token = token_resp.json().get("app_access_token", "")
-            resp = await client.get(
+            token_resp.raise_for_status()
+            token_data = self._parse_api_response(token_resp, stage="download_resource_token")
+            app_token = token_data.get("tenant_access_token") or token_data.get("app_access_token", "")
+            if not app_token:
+                raise FeishuAPIError(stage="download_resource_token", msg="missing access token")
+
+            async with client.stream(
+                "GET",
                 f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{file_key}",
                 params={"type": resource_type},
                 headers={"Authorization": f"Bearer {app_token}"},
-            )
-            resp.raise_for_status()
-            return resp.content
+            ) as resp:
+                resp.raise_for_status()
+                content_length = resp.headers.get("content-length")
+                if content_length and content_length.isdigit() and int(content_length) > limit:
+                    raise FeishuResourceTooLargeError(limit=limit, actual=int(content_length))
+
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in resp.aiter_bytes():
+                    total += len(chunk)
+                    if total > limit:
+                        raise FeishuResourceTooLargeError(limit=limit, actual=total)
+                    chunks.append(chunk)
+                return b"".join(chunks)
 
     async def upload_and_send_file(self, app_id: str, app_secret: str,
                                     receive_id: str, file_path,

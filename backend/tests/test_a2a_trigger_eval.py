@@ -33,10 +33,12 @@ class RecordingDB:
     def __init__(self, responses=None):
         self.responses = list(responses or [])
         self.added = []
+        self.statements = []
         self.committed = False
         self.flushed = False
 
     async def execute(self, _statement, _params=None):
+        self.statements.append(_statement)
         if not self.responses:
             raise AssertionError("unexpected execute() call")
         return self.responses.pop(0)
@@ -57,14 +59,18 @@ async def test_check_new_agent_messages_matches_user_role():
     agent_id = uuid.uuid4()
     source_agent_id = uuid.uuid4()
     participant_id = uuid.uuid4()
+    conversation_id = str(uuid.uuid4())
+    tenant_id = uuid.uuid4()
     
     # Mock source agent
     source_agent = MagicMock()
     source_agent.id = source_agent_id
     source_agent.name = "Ray"
+    source_agent.tenant_id = tenant_id
 
     # Mock chat message
     chat_message = MagicMock()
+    chat_message.id = uuid.uuid4()
     chat_message.content = "Designed the logo"
     chat_message.role = "user"  # Role is user
 
@@ -73,14 +79,19 @@ async def test_check_new_agent_messages_matches_user_role():
         agent_id=agent_id,
         name="test_trigger",
         type="on_message",
-        config={"from_agent_name": "Ray"},
+        config={
+            "from_agent_name": "Ray",
+            "from_agent_id": str(source_agent_id),
+            "expected_conversation_id": conversation_id,
+        },
         is_enabled=True,
         created_at=datetime.now(UTC),
         fire_count=0,
     )
 
     db = RecordingDB(responses=[
-        DummyResult(scalars_list=[source_agent]),  # AgentModel lookup
+        DummyResult(scalar_value=tenant_id),  # Target tenant lookup
+        DummyResult(scalar_value=source_agent),  # AgentModel lookup by stable id
         DummyResult(scalar_value=participant_id),  # Participant lookup
         DummyResult(scalar_value=chat_message),    # ChatMessage lookup
     ])
@@ -94,3 +105,7 @@ async def test_check_new_agent_messages_matches_user_role():
     assert result is True
     assert trigger.config["_matched_message"] == "Designed the logo"
     assert trigger.config["_matched_from"] == "Ray"
+    assert trigger.config["_matched_from_agent_id"] == str(source_agent_id)
+    assert trigger.config["_matched_message_id"] == str(chat_message.id)
+    assert tenant_id in db.statements[1].compile().params.values()
+    assert conversation_id in db.statements[-1].compile().params.values()

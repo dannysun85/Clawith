@@ -1,12 +1,12 @@
 {
   "app": {
-    "name": "Clawith",
+    "name": "Astra",
     "tagline": "Enterprise Digital Employee Platform"
   },
   "login": {
     "hero": {
       "badge": "Open Source · Multi-Agent Collaboration",
-      "title": "Clawith",
+      "title": "Astra",
       "subtitle": "Your Agent Company.",
       "welcome": "Welcome,",
       "founder": "Founder",
@@ -89,9 +89,9 @@
     "loginFailed": "Login failed",
     "subtitleLogin": "Welcome back. Sign in to continue.",
     "subtitleRegister": "Create your account to get started.",
-    "invitationCode": "Invitation Code",
-    "invitationCodePlaceholder": "Enter invitation code",
-    "invitationHint": "Token consumption is significant, so invitation codes are required. We recommend deploying your own instance and configuring leading models for the best experience.",
+    "invitationCode": "Registration Code",
+    "invitationCodePlaceholder": "Enter registration code",
+    "invitationHint": "Registration requires a platform registration code. Contact your platform administrator.",
     "usernamePlaceholder": "Enter username",
     "passwordPlaceholder": "Enter password",
     "emailPlaceholder": "you@example.com",
@@ -208,13 +208,21 @@
       "llmCallsToday": "LLM Calls Today",
       "max": "Max",
       "totalToken": "Total Token",
-      "pending": "Pending"
+      "pending": "Pending",
+      "errorReason": "Failure details",
+      "errorReasonUnavailable": "No diagnostic details were recorded for this failure.",
+      "errorSince": "Recorded at {{time}}",
+      "recover": "Recover",
+      "recovering": "Recovering…",
+      "recoverySucceeded": "Agent recovered",
+      "recoveryFailed": "Agent recovery failed"
     },
     "tabs": {
       "status": "Status",
       "tasks": "Tasks",
       "aware": "Aware",
       "mind": "Mind",
+      "douyin": "Douyin",
       "tools": "Tools",
       "skills": "Skills",
       "relationships": "Relationships",
@@ -242,9 +250,9 @@
       "timezone": "Timezone"
     },
     "modelConfig": {
-      "title": "Model Config",
-      "model": "Model",
-      "provider": "Provider",
+      "title": "Model Route",
+      "model": "Tier",
+      "provider": "Modality",
       "contextRounds": "Context Window"
     },
     "actions": {
@@ -459,9 +467,9 @@
     },
     "settings": {
       "title": "Agent Settings",
-      "modelConfig": "Model Config",
-      "primaryModel": "Primary Model",
-      "fallbackModel": "Fallback Model",
+      "modelConfig": "Model Tier & Route",
+      "primaryModel": "Model Tier",
+      "fallbackModel": "Fallback Route",
       "noFallback": "No fallback",
       "conversationContext": "Context Window",
       "maxRounds": "Context Window Size",
@@ -776,11 +784,12 @@
     "nameHint": "Name your digital employee",
     "roleHint": "Describe its role",
     "step1": {
-      "title": "Basic Info & Model Selection",
+      "title": "Basic Info & Model Tier",
       "selectTemplate": "Select template (optional)",
       "custom": "Custom",
-      "primaryModel": "Primary Model",
-      "noModels": "No available models. Please add LLM models in",
+      "primaryModel": "Model Tier",
+      "modelTier": "Model Tier",
+      "noModels": "No available model tiers. Configure SaaS model routes in",
       "enterpriseSettings": "Company Settings",
       "addModels": "first",
       "dailyTokenLimit": "Daily Token Limit",
@@ -886,7 +895,8 @@
       "nameTooLong": "Name cannot exceed 100 characters",
       "roleDescTooLong": "Role description cannot exceed 500 characters (current: {{count}})",
       "tokenLimitInvalid": "Please enter a valid positive integer",
-      "modelRequired": "Please select a primary model"
+      "modelRequired": "Please select a model tier",
+      "tierRequired": "Please select a model tier"
     },
     "templates": {
       "Project Manager": "Project Manager",
@@ -948,6 +958,7 @@
     "title": "Company Settings",
     "tabs": {
       "llm": "Models",
+      "douyin": "Douyin Account",
       "tools": "Tools",
       "org": "Org Structure",
       "info": "Company Info",
@@ -960,6 +971,25 @@
       "users": "Users",
       "invites": "Invitation Codes",
       "identity": "OA Management"
+    },
+    "douyin": {
+      "title": "Douyin Account",
+      "notConnected": "Not connected",
+      "description": "Each company connects its own official Douyin account. Before authorization, the Douyin Operations Manager will not read data, reply to comments, or create publish packages.",
+      "createAgent": "Create Douyin Manager",
+      "connectAccount": "Connect Douyin Account",
+      "oauthPendingTitle": "Enabled after official OAuth integration is ready",
+      "authStatus": "Authorization Status",
+      "executionMode": "Execution Mode",
+      "dataRead": "Data read",
+      "publishApproval": "Collaborative publishing",
+      "replyApproval": "Comment reply approval",
+      "pendingAuth": "Pending auth",
+      "publishWork": "Publish video",
+      "replyComment": "Reply comment",
+      "sensitiveAction": "Sensitive action",
+      "approvalTask": "Create package, user confirms",
+      "humanConfirm": "Human confirmation"
     },
     "a2aAsync": {
       "title": "Agent-to-Agent Async Communication",
@@ -1222,7 +1252,7 @@
         "list_triggers": "List all your active triggers with details.",
         "send_file_to_agent": "Send a file to a specific person or back to the current conversation.",
         "send_feishu_message": "Send a message to a Feishu user or group.",
-        "send_platform_message": "Send a proactive message to a user on the Clawith platform (web or app).",
+        "send_platform_message": "Send a proactive message to a user on the Astra platform (web or app).",
         "send_message_to_agent": "Send a message to a digital employee colleague and receive a reply.",
         "web_search": "Search the internet using a configurable search engine.",
         "jina_search": "Search the internet using Jina AI.",
@@ -1325,7 +1355,7 @@
           "step2": "Add the same Redirect URL shown below to the Authorized redirect URIs in Google Cloud Console.",
           "step3": "SSO login will use this same OAuth configuration directly.",
           "step4": "For organization sync, click Authorize below using a Google Workspace admin account that has Directory read permission.",
-          "step5": "Clawith will encrypt and store the admin refresh token. Subsequent scheduled syncs will automatically refresh the access token."
+          "step5": "Astra will encrypt and store the admin refresh token. Subsequent scheduled syncs will automatically refresh the access token."
         }
       }
     },
@@ -1449,7 +1479,7 @@
         "syncTitle": "1. User Directory Sync",
         "syncDesc": "Directory sync via the contacts secret works for fetching user IDs. However, fetching full user details (name, avatar, email) requires the self-built app's IP to be whitelisted in WeCom — a setting that must be configured by the WeCom enterprise admin.",
         "ssoTitle": "2. SSO Login (Single Sign-On)",
-        "ssoDesc": "WeCom OAuth requires the callback domain to be ICP-filed with a business entity matching the WeCom enterprise's registration. The platform domain (clawith.ai) is a .ai TLD which cannot be ICP-filed in mainland China, making SSO unavailable on the current domain. Requires either an ICP-filed .com/.cn domain or WeCom ISV (service provider) registration.",
+        "ssoDesc": "WeCom OAuth requires the callback domain to be ICP-filed with a business entity matching the WeCom enterprise's registration. The platform domain (astra.ai) is a .ai TLD which cannot be ICP-filed in mainland China, making SSO unavailable on the current domain. Requires either an ICP-filed .com/.cn domain or WeCom ISV (service provider) registration.",
         "messagingTitle": "3. Proactive 1-to-1 Messaging (AI-initiated)",
         "messagingDesc": "Sending messages to individual users requires a valid WeCom API access token, which can only be obtained from a server IP that has been whitelisted in the self-built app's settings. Unlike Feishu, WeCom mandates IP-level restrictions on all API calls — there is no token-only authentication option.",
         "footerText": "Due to the above constraints, WeCom integration currently cannot be easily set up by most users. We are actively exploring alternative approaches — including WeCom ISV (service provider) registration and lower-friction API options — or we may advocate for WeCom to relax these restrictions for SaaS platforms. Configuration will be re-enabled once a viable path is available."
@@ -1472,16 +1502,16 @@
       "saved": "Email templates saved",
       "emailVerification": "Email Verification Code",
       "emailVerificationDesc": "Sent when a user registers and needs to verify their email address.",
-      "emailVerificationSubject": "Verify your Clawith email address",
-      "emailVerificationBody": "Hello {{display_name}},\n\nWelcome to Clawith! Please use the following 6-digit code to verify your email address:\n\nVerification code: {{verification_code}}\n\nThis code expires in {{expiry_minutes}} minutes. If you did not create an account, you can ignore this email.",
+      "emailVerificationSubject": "Verify your Astra email address",
+      "emailVerificationBody": "Hello {{display_name}},\n\nWelcome to Astra! Please use the following 6-digit code to verify your email address:\n\nVerification code: {{verification_code}}\n\nThis code expires in {{expiry_minutes}} minutes. If you did not create an account, you can ignore this email.",
       "passwordReset": "Password Reset",
       "passwordResetDesc": "Sent when a user requests to reset their password.",
-      "passwordResetSubject": "Reset your Clawith password",
-      "passwordResetBody": "Hello {{display_name}},\n\nWe received a request to reset your Clawith password.\n\nReset link: {{reset_url}}\n\nThis link expires in {{expiry_minutes}} minutes. If you did not request this, you can ignore this email.",
+      "passwordResetSubject": "Reset your Astra password",
+      "passwordResetBody": "Hello {{display_name}},\n\nWe received a request to reset your Astra password.\n\nReset link: {{reset_url}}\n\nThis link expires in {{expiry_minutes}} minutes. If you did not request this, you can ignore this email.",
       "companyInvitation": "Company Invitation",
       "companyInvitationDesc": "Sent when an admin invites a user to join their company.",
-      "companyInvitationSubject": "{{inviter_name}} invited you to join {{company_name}} on Clawith",
-      "companyInvitationBody": "Hello,\n\n{{inviter_name}} has invited you to join their team '{{company_name}}' on Clawith.\n\nTo accept the invitation and create your account, please click the link below:\n\n{{invite_url}}\n\nIf you don't want to join this team or didn't expect this invitation, you can ignore this email."
+      "companyInvitationSubject": "{{inviter_name}} invited you to join {{company_name}} on Astra",
+      "companyInvitationBody": "Hello,\n\n{{inviter_name}} has invited you to join their team '{{company_name}}' on Astra.\n\nTo accept the invitation and create your account, please click the link below:\n\n{{invite_url}}\n\nIf you don't want to join this team or didn't expect this invitation, you can ignore this email."
     },
     "timezone": {
       "title": "Company Timezone",
@@ -1788,7 +1818,7 @@
     "wechat": {
       "step1": "Click Generate QR Code below to request a fresh WeChat iLink login QR.",
       "step2": "Open WeChat on your phone and scan the QR code, then confirm the bot login on the device.",
-      "step3": "After confirmation, Clawith stores the returned bot token and starts the getupdates long-poll worker automatically.",
+      "step3": "After confirmation, Astra stores the returned bot token and starts the getupdates long-poll worker automatically.",
       "step4": "Send a direct message to the linked WeChat iLink bot to verify inbound polling and outbound replies.",
       "note": "This channel follows the iLink Bot protocol: QR login, token-based long polling, and replies bound to the incoming context_token."
     },
@@ -1941,7 +1971,7 @@
     "ssoConfigDesc": "Configure SSO and custom domain for this company.",
     "ssoEnabled": "Enable SSO",
     "ssoDomain": "Custom Access Domain",
-    "ssoDomainPlaceholder": "e.g. acme.clawith.com"
+    "ssoDomainPlaceholder": "e.g. acme.astra.ai"
   },
   "postHire": {
     "title": "Configure new teammate",
@@ -1952,18 +1982,18 @@
     "visibilityOnlyMeHint": "Only you can use it; you can share later in Settings",
     "visibilityCustomTitle": "Custom",
     "visibilityCustomHint": "Start with creator access, then choose platform users in Settings",
-    "model": "Preferred model",
+    "model": "Model tier",
     "defaultSuffix": "default",
     "createOnly": "Just create",
     "chatNow": "Chat now",
     "creating": "Creating...",
-    "noModelButtonHint": "Enable at least one model in company settings before creating a teammate from a template.",
-    "noModelError": "No company model is enabled yet. Configure a model before creating a teammate from a template.",
-    "modelRequired": "Choose a model",
-    "noModelsTitle": "No enabled model yet",
-    "noModelsAdminHint": "Enable at least one company model before creating a teammate from a template.",
-    "noModelsMemberHint": "Ask a company admin to enable a model first.",
-    "configureModels": "Configure models",
+    "noModelButtonHint": "Configure at least one SaaS model route before creating a teammate from a template.",
+    "noModelError": "No company model route is available yet. Configure SaaS model routes before creating a teammate from a template.",
+    "modelRequired": "Choose a model tier",
+    "noModelsTitle": "No model tier available yet",
+    "noModelsAdminHint": "Configure at least one SaaS model route before creating a teammate from a template.",
+    "noModelsMemberHint": "Ask a company admin to configure model routes first.",
+    "configureModels": "Configure model routes",
     "createFailed": "Failed to create agent"
   },
   "agentDetail": {
@@ -2013,14 +2043,14 @@
     "sendText": "Send text"
   },
   "customAgentModal": {
-    "noModelButtonHint": "Enable at least one model in company settings before creating a platform-hosted teammate.",
+    "noModelButtonHint": "Configure at least one SaaS model route before creating a platform-hosted teammate.",
     "nameRequired": "Name is required",
-    "noModelError": "No company model is enabled yet. Configure a model or switch to External agent.",
-    "modelRequired": "Choose a model",
+    "noModelError": "No company model route is available yet. Configure model routes or switch to External agent.",
+    "modelRequired": "Choose a model tier",
     "nativeTitle": "Create custom teammate",
     "externalTitle": "Link external agent",
     "nativeSubtitle": "Start with the essentials; tune the rest in settings later.",
-    "externalSubtitle": "Create a Clawith connection for an externally running agent.",
+    "externalSubtitle": "Create an Astra connection for an externally running agent.",
     "nativeMode": "Platform hosted",
     "externalMode": "External agent",
     "name": "Name",
@@ -2035,21 +2065,21 @@
     "visibilityOnlyMeHint": "Only you can use it; you can share it later",
     "visibilityCustom": "Custom",
     "visibilityCustomHint": "Start private, then choose members in settings",
-    "model": "Preferred model",
-    "modelFallback": "Model",
+    "model": "Model tier",
+    "modelFallback": "Model tier",
     "defaultModel": "default",
     "createOnly": "Just create",
     "creating": "Creating...",
     "chatNow": "Chat now",
     "createConnection": "Create connection",
-    "noModelsTitle": "No enabled model yet",
-    "noModelsAdminHint": "Enable at least one company model before creating a platform-hosted teammate.",
-    "noModelsMemberHint": "Ask a company admin to enable a model first.",
+    "noModelsTitle": "No model tier available yet",
+    "noModelsAdminHint": "Configure at least one SaaS model route before creating a platform-hosted teammate.",
+    "noModelsMemberHint": "Ask a company admin to configure model routes first.",
     "noModelsExternalHint": "If you are linking an externally running agent, switch to External agent.",
-    "configureModels": "Configure models",
+    "configureModels": "Configure model routes",
     "creationFailed": "Creation failed",
     "externalCreated": "Connection created",
-    "externalCreatedDesc": "Send the setup instruction below to the external agent so it can sync with Clawith through the gateway.",
+    "externalCreatedDesc": "Send the setup instruction below to the external agent so it can sync with Astra through the gateway.",
     "gatewayKeyEmbedded": "The API key is included in the setup instruction",
     "copyKey": "Copy key",
     "noKeyReturned": "No API key was returned. Open the agent page and generate one there.",
@@ -2068,7 +2098,7 @@
     "redirectingToLogin": "Redirecting to secure login...",
     "error": "Error",
     "completingLogin": "Completing login...",
-    "loginTitle": "Login to Clawith",
+    "loginTitle": "Login to Astra",
     "selectLoginMethod": "Select your login method",
     "loginWith": "Login with {{provider}}",
     "noProviders": "No SSO providers configured."

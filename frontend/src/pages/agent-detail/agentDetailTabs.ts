@@ -2,6 +2,7 @@ export const AGENT_DETAIL_TABS = [
     'status',
     'aware',
     'mind',
+    'douyin',
     'tools',
     'skills',
     'relationships',

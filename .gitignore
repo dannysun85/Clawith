@@ -3,7 +3,6 @@
 node_modules/
 dist/
 *.zip
-uv.lock
 .vite/
 *.log
 pnpm-lock.yaml
@@ -22,11 +21,15 @@ venv/
 *.db
 .DS_Store
 .gstack/
+.deepseek/
+.playwright-cli/
+output/
 # Runtime agent data
 backend/data/
 backend/agent_data/
 ss-nodes.json
 .data/
+.tmp/
 
 # Ignore Antigravity / Claude Code agent configurations
 .agent/

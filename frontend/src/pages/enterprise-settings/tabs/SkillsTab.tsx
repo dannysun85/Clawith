@@ -120,14 +120,14 @@ export default function SkillsTab() {
 
     return (
         <div>
-            <div style={{ marginBottom: '12px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+            <div className="skill-registry-header" style={{ marginBottom: '12px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
                 <div>
                     <h3>{t('enterprise.tabs.skills', 'Skill Registry')}</h3>
                     <p style={{ fontSize: '13px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
                         {t('enterprise.tools.manageGlobalSkills')}
                     </p>
                 </div>
-                <div style={{ display: 'flex', gap: '8px', flexShrink: 0 }}>
+                <div className="skill-registry-actions" style={{ display: 'flex', gap: '8px', flexShrink: 0 }}>
                     <button
                         className="btn btn-secondary"
                         style={{ fontSize: '13px', padding: '6px 10px', minWidth: 'auto' }}

@@ -18,7 +18,7 @@ from app.database import async_session as _async_session, get_db
 from app.models.channel_config import ChannelConfig
 from app.models.user import User
 from app.schemas.schemas import ChannelConfigCreate, ChannelConfigOut, TokenResponse, UserOut
-from app.services.feishu_service import feishu_service
+from app.services.feishu_service import FeishuResourceTooLargeError, feishu_service
 from app.services.llm.utils import convert_chat_messages_to_llm_format, truncate_messages_with_pair_integrity
 from app.services.storage import agent_upload_key, get_storage_backend, store_agent_upload
 
@@ -36,6 +36,92 @@ _USER_RESOLUTION_ERROR_TIP = (
     "抱歉，我暂时无法稳定识别你的飞书账号，已停止本次处理以避免重复创建账号。"
     "请稍后重试，或联系管理员检查飞书 Contact API 权限。"
 )
+
+_FEISHU_GROUP_ACTIVATION_MODES = frozenset({"mention", "always", "silent"})
+_FEISHU_BOT_IDENTITY_TTL_SECONDS = 600.0
+_feishu_bot_identity_cache: dict[str, tuple[float, str]] = {}
+
+
+def _feishu_group_activation_mode(config: ChannelConfig) -> str:
+    """Return a validated group activation mode; legacy configs default safe."""
+    raw_mode = str((config.extra_config or {}).get("activation_mode", "mention")).strip().lower()
+    return raw_mode if raw_mode in _FEISHU_GROUP_ACTIVATION_MODES else "mention"
+
+
+def _feishu_mentioned_open_ids(message: dict) -> set[str]:
+    """Extract mentioned identities from a Feishu message event."""
+    mentioned: set[str] = set()
+    for mention in message.get("mentions") or []:
+        if not isinstance(mention, dict):
+            continue
+        identity = mention.get("id") or mention.get("mention_id") or {}
+        if not isinstance(identity, dict):
+            continue
+        open_id = identity.get("open_id")
+        if isinstance(open_id, str) and open_id:
+            mentioned.add(open_id)
+    return mentioned
+
+
+async def _get_feishu_bot_open_id(config: ChannelConfig) -> str | None:
+    """Resolve and briefly cache the configured application's bot open_id."""
+    app_id = config.app_id or ""
+    app_secret = config.app_secret or ""
+    if not app_id or not app_secret:
+        return None
+
+    cached = _feishu_bot_identity_cache.get(app_id)
+    now = time.monotonic()
+    if cached and cached[0] > now:
+        return cached[1]
+
+    try:
+        import httpx
+
+        tenant_token = await feishu_service.get_tenant_access_token(app_id, app_secret)
+        if not tenant_token:
+            logger.warning(f"[Feishu] Cannot resolve bot identity for app_id={app_id}: no tenant token")
+            return None
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(
+                "https://open.feishu.cn/open-apis/bot/v3/info",
+                headers={"Authorization": f"Bearer {tenant_token}"},
+            )
+        data = response.json()
+        if response.status_code >= 400 or data.get("code", 0) != 0:
+            logger.warning(
+                f"[Feishu] Cannot resolve bot identity for app_id={app_id}: "
+                f"HTTP {response.status_code}, code={data.get('code')}, msg={data.get('msg', '')}"
+            )
+            return None
+        bot = data.get("bot") or (data.get("data") or {}).get("bot") or {}
+        bot_open_id = bot.get("open_id") if isinstance(bot, dict) else None
+        if not isinstance(bot_open_id, str) or not bot_open_id:
+            logger.warning(f"[Feishu] Bot identity response has no open_id for app_id={app_id}")
+            return None
+        _feishu_bot_identity_cache[app_id] = (
+            now + _FEISHU_BOT_IDENTITY_TTL_SECONDS,
+            bot_open_id,
+        )
+        return bot_open_id
+    except Exception as exc:
+        logger.warning(f"[Feishu] Bot identity lookup failed for app_id={app_id}: {exc}")
+        return None
+
+
+async def _should_process_feishu_message(config: ChannelConfig, message: dict) -> bool:
+    """Apply the configured group-chat activation gate before any side effects."""
+    if message.get("chat_type", "p2p") != "group":
+        return True
+
+    activation_mode = _feishu_group_activation_mode(config)
+    if activation_mode == "always":
+        return True
+    if activation_mode == "silent":
+        return False
+
+    bot_open_id = await _get_feishu_bot_open_id(config)
+    return bool(bot_open_id and bot_open_id in _feishu_mentioned_open_ids(message))
 
 
 def _storage_mtime(entry) -> float:
@@ -383,7 +469,10 @@ async def configure_channel(
         existing.app_secret = data.app_secret
         existing.encrypt_key = data.encrypt_key
         existing.verification_token = data.verification_token
-        existing.extra_config = data.extra_config or {}
+        merged_extra_config = dict(existing.extra_config or {})
+        if data.extra_config is not None:
+            merged_extra_config.update(data.extra_config)
+        existing.extra_config = merged_extra_config
         existing.is_configured = True
         await db.flush()
         
@@ -421,9 +510,10 @@ async def configure_channel(
     return ChannelConfigOut.model_validate(config)
 
 
-@router.get("/agents/{agent_id}/channel", response_model=ChannelConfigOut)
+@router.get("/agents/{agent_id}/channel", response_model=ChannelConfigOut | None)
 async def get_channel_config(
     agent_id: uuid.UUID,
+    missing_ok: bool = False,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -435,6 +525,8 @@ async def get_channel_config(
     ))
     config = result.scalar_one_or_none()
     if not config:
+        if missing_ok:
+            return None
         raise HTTPException(status_code=404, detail="Channel not configured")
     return ChannelConfigOut.model_validate(config)
 
@@ -514,7 +606,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
         )
         config = result.scalar_one_or_none()
         # Pre-load agent and model configs for LLM call (avoids extra session later)
-        _agent_model, _llm_model, _fallback_model = await _load_agent_and_model(db, agent_id)
+        _agent_model, _llm_model, _fallback_model, _route_meta = await _load_agent_and_model(db, agent_id)
     # Objects are now detached but their column attributes are already loaded.
     if not config:
         return {"code": 1, "msg": "Channel not found"}
@@ -540,6 +632,17 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
         chat_id = message.get("chat_id", "")
 
         logger.info(f"[Feishu] Received {msg_type} message, chat_type={chat_type}, open_id={sender_open_id!r}, user_id_from_event={sender_user_id_from_event!r}")
+
+        # Group messages are gated before parsing files, downloading images,
+        # resolving users, loading history, or spending LLM Credits. Existing
+        # configs default to mention-only; inability to verify bot identity is
+        # intentionally fail-closed.
+        if not await _should_process_feishu_message(config, message):
+            logger.info(
+                f"[Feishu] Ignored group message under activation_mode="
+                f"{_feishu_group_activation_mode(config)}"
+            )
+            return {"code": 0, "msg": "group message ignored by activation policy"}
 
         # ── Normalize post (rich text) → extract text + schedule image downloads ──
         if msg_type == "post":
@@ -1056,7 +1159,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
             # Call LLM with history and streaming callback (no DB session needed)
             try:
                 reply_text = await _call_llm_with_config(
-                    _agent_model, _llm_model, _fallback_model,
+                    _agent_model, _llm_model, _fallback_model, _route_meta,
                     agent_id,
                     llm_user_text,
                     history=history,
@@ -1264,7 +1367,10 @@ async def _handle_feishu_file(
         logger.info(f"[Feishu] Saved {msg_type} to {workspace_path} ({len(file_bytes)} bytes)")
     except Exception as e:
         logger.error(f"[Feishu] Failed to download {msg_type}: {e}")
-        err_tip = "抱歉，文件下载失败。可能原因：机器人缺少 `im:resource` 权限（文件读取）。\n请在飞书开放平台 → 权限管理 → 批量导入权限 JSON → 重新发布机器人版本后重试。"
+        if isinstance(e, FeishuResourceTooLargeError):
+            err_tip = f"抱歉，文件过大，当前最多支持 {e.limit // 1024 // 1024}MB。请压缩或拆分后重试。"
+        else:
+            err_tip = "抱歉，文件下载失败。可能原因：机器人缺少 `im:resource` 权限（文件读取）。\n请在飞书开放平台 → 权限管理 → 批量导入权限 JSON → 重新发布机器人版本后重试。"
         try:
             import json as _j
             if chat_type == "group" and chat_id:
@@ -1406,7 +1512,11 @@ async def _handle_feishu_file(
         _history = convert_chat_messages_to_llm_format(reversed(_hist_r.scalars().all()))
 
         # Pre-load agent/model for LLM call before releasing DB connection
-        _agent_model_img, _llm_model_img, _fallback_model_img = await _load_agent_and_model(db, agent_id)
+        _agent_model_img, _llm_model_img, _fallback_model_img, _route_meta_img = await _load_agent_and_model(
+            db,
+            agent_id,
+            modality="image",
+        )
 
         await db.commit()
         # ── Phase 1 complete: release connection before slow LLM/HTTP work ──
@@ -1504,7 +1614,7 @@ async def _handle_feishu_file(
         # Call LLM with image marker — vision models will parse it
         try:
             reply_text = await _call_llm_with_config(
-                _agent_model_img, _llm_model_img, _fallback_model_img,
+                _agent_model_img, _llm_model_img, _fallback_model_img, _route_meta_img,
                 agent_id, user_msg_content, history=_history,
                 user_id=platform_user_id, session_id=session_conv_id, on_chunk=_img_on_chunk,
             )
@@ -1599,49 +1709,46 @@ async def _download_post_images(agent_id, config, message_id, image_keys):
 
 
 async def _load_agent_and_model(
-    db: AsyncSession, agent_id: uuid.UUID
+    db: AsyncSession,
+    agent_id: uuid.UUID,
+    *,
+    modality: str | None = None,
 ):
-    """Load agent and LLM model configs in a short DB transaction.
+    """Load an agent and resolve its subscription-backed LLM route.
 
-    Returns (agent, model, fallback_model). Caller should extract all needed
-    scalar values before closing the session to avoid detached-instance errors.
+    Returns (agent, model, fallback_model, route_meta). Caller should extract
+    all needed scalar values before closing the session to avoid detached-
+    instance errors.
     """
     from app.models.agent import Agent
-    from app.models.llm import LLMModel
+    from app.services.llm import resolve_agent_model
 
     agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
     agent = agent_result.scalar_one_or_none()
     if not agent:
-        return None, None, None
+        return None, None, None, None
 
-    model = None
-    if agent.primary_model_id:
-        model_result = await db.execute(select(LLMModel).where(LLMModel.id == agent.primary_model_id))
-        model = model_result.scalar_one_or_none()
-        if model and not model.enabled:
-            logger.info(f"[Channel] Primary model {model.model} is disabled, skipping")
-            model = None
-
-    fallback_model = None
-    if agent.fallback_model_id:
-        fb_result = await db.execute(select(LLMModel).where(LLMModel.id == agent.fallback_model_id))
-        fallback_model = fb_result.scalar_one_or_none()
-        if fallback_model and not fallback_model.enabled:
-            logger.info(f"[Channel] Fallback model {fallback_model.model} is disabled, skipping")
-            fallback_model = None
+    model, fallback_model, route_meta = await resolve_agent_model(agent, modality=modality)
+    if model and not model.enabled:
+        logger.info(f"[Channel] Primary model {model.model} is disabled, skipping")
+        model = None
+    if fallback_model and not fallback_model.enabled:
+        logger.info(f"[Channel] Fallback model {fallback_model.model} is disabled, skipping")
+        fallback_model = None
 
     if not model and fallback_model:
         model = fallback_model
         fallback_model = None
         logger.warning(f"[Channel] Primary model unavailable, using fallback: {model.model}")
 
-    return agent, model, fallback_model
+    return agent, model, fallback_model, route_meta
 
 
 async def _call_llm_with_config(
     agent,
     model,
     fallback_model,
+    route_meta,
     agent_id: uuid.UUID,
     user_text: str,
     history: list[dict] | None = None,
@@ -1688,6 +1795,7 @@ async def _call_llm_with_config(
                 on_chunk=on_chunk,
                 on_thinking=on_thinking,
                 on_tool_call=on_tool_call,
+                route_meta=route_meta,
             ),
             timeout=_timeout,
         )
@@ -1714,6 +1822,7 @@ async def _call_llm_with_config(
                         on_chunk=on_chunk,
                         on_thinking=on_thinking,
                         on_tool_call=on_tool_call,
+                        route_meta=route_meta,
                     ),
                     timeout=_fb_timeout,
                 )
@@ -1751,6 +1860,7 @@ async def _call_llm_with_config(
                         on_chunk=on_chunk,
                         on_thinking=on_thinking,
                         on_tool_call=on_tool_call,
+                        route_meta=route_meta,
                     ),
                     timeout=_fb_timeout,
                 )
@@ -1783,11 +1893,11 @@ async def _call_agent_llm(
     Prefer _load_agent_and_model + _call_llm_with_config for short-transaction
     patterns where the session should be closed before the LLM call.
     """
-    agent, model, fallback_model = await _load_agent_and_model(db, agent_id)
+    agent, model, fallback_model, route_meta = await _load_agent_and_model(db, agent_id)
     if not agent:
         return "⚠️ 数字员工未找到"
     return await _call_llm_with_config(
-        agent, model, fallback_model, agent_id, user_text,
+        agent, model, fallback_model, route_meta, agent_id, user_text,
         history=history, user_id=user_id, session_id=session_id,
         on_chunk=on_chunk, on_thinking=on_thinking, on_tool_call=on_tool_call,
     )

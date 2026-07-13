@@ -137,7 +137,7 @@ async def test_notify_returns_immediately():
     ):
         mock_session_ctx.return_value.__aenter__ = AsyncMock(return_value=db)
         mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
-
+        mock_wake.return_value = True
         result = await _send_message_to_agent(
             from_agent_id,
             {
@@ -190,6 +190,7 @@ async def test_task_delegate_creates_focus_and_trigger():
     ):
         mock_session_ctx.return_value.__aenter__ = AsyncMock(return_value=db)
         mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_wake.return_value = True
 
         result = await _send_message_to_agent(
             from_agent_id,
@@ -207,12 +208,15 @@ async def test_task_delegate_creates_focus_and_trigger():
     mock_wake.assert_awaited_once()
 
     focus_call = mock_focus.call_args
-    assert "wait_bob_task" in focus_call[0][1]
+    assert focus_call[0][1].startswith("wait_bob_")
     assert "Bob" in focus_call[0][2]
 
     trigger_call = mock_trigger.call_args
     assert trigger_call[1]["from_agent_name"] == "Bob"
+    assert trigger_call[1]["from_agent_id"] == target_id
+    assert trigger_call[1]["expected_conversation_id"] == str(session_id)
     assert trigger_call[1]["focus_ref"] == focus_call[0][1]
+    assert trigger_call[1]["trigger_name"].endswith(focus_call[0][1].removeprefix("wait_"))
 
 
 @pytest.mark.asyncio
@@ -359,6 +363,7 @@ async def test_default_msg_type_is_notify():
     ):
         mock_session_ctx.return_value.__aenter__ = AsyncMock(return_value=db)
         mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_wake.return_value = True
 
         result = await _send_message_to_agent(
             from_agent_id,
@@ -476,6 +481,8 @@ async def test_create_on_message_trigger():
             agent_id=agent_id,
             trigger_name="test_trigger",
             from_agent_name="Bob",
+            from_agent_id=uuid.UUID("00000000-0000-0000-0000-000000000002"),
+            expected_conversation_id="00000000-0000-0000-0000-000000000003",
             reason="Test reason",
             focus_ref="test_focus",
         )
@@ -487,6 +494,8 @@ async def test_create_on_message_trigger():
     assert trigger.name == "test_trigger"
     assert trigger.type == "on_message"
     assert trigger.config["from_agent_name"] == "Bob"
+    assert trigger.config["from_agent_id"] == "00000000-0000-0000-0000-000000000002"
+    assert trigger.config["expected_conversation_id"] == "00000000-0000-0000-0000-000000000003"
     assert trigger.reason == "Test reason"
     assert trigger.focus_ref == "test_focus"
 
@@ -564,7 +573,15 @@ async def test_wake_agent_async_calls_trigger_daemon():
 
     with patch("app.services.trigger_daemon.wake_agent_with_context", new_callable=AsyncMock) as mock_wake:
         await _wake_agent_async(agent_id, context)
-        mock_wake.assert_awaited_once_with(agent_id, context, from_agent_id=None, skip_dedup=False)
+        mock_wake.assert_awaited_once_with(
+            agent_id,
+            context,
+            from_agent_id=None,
+            skip_dedup=False,
+            message_kind="notify",
+            idempotency_key=None,
+            source_message_id=None,
+        )
 
 
 @pytest.mark.asyncio
@@ -752,6 +769,7 @@ async def test_feature_flag_on_uses_notify():
     ):
         mock_session_ctx.return_value.__aenter__ = AsyncMock(return_value=db)
         mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_wake.return_value = True
 
         result = await _send_message_to_agent(
             from_agent_id,
@@ -807,7 +825,7 @@ async def test_handle_set_trigger_resets_fire_count():
         arguments = {
             "name": "test_trigger",
             "type": "once",
-            "config": {"at": "2026-03-10T09:00:00+08:00"},
+            "config": '{"at": "2026-03-10T09:00:00+08:00"}',
             "reason": "New reason",
             "focus_ref": "new_focus",
         }
@@ -818,6 +836,24 @@ async def test_handle_set_trigger_resets_fire_count():
     assert existing_trigger.is_enabled is True
     assert existing_trigger.fire_count == 0
     assert existing_trigger.reason == "New reason"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("config", ["not-json", "[]", 42])
+async def test_handle_set_trigger_rejects_non_object_config(config):
+    from app.services.agent_tools import _handle_set_trigger
+
+    result = await _handle_set_trigger(
+        uuid.uuid4(),
+        {
+            "name": "test_trigger",
+            "type": "once",
+            "config": config,
+            "reason": "Test invalid input",
+        },
+    )
+
+    assert result == "❌ Invalid trigger config: expected a JSON object"
 
 
 @pytest.mark.asyncio

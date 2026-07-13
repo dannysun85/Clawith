@@ -47,8 +47,8 @@ export function applyAccentColor(hex: string) {
     root.style.setProperty('--accent-subtle', `rgba(${rgb.join(',')}, 0.15)`);
     root.style.setProperty('--accent-text', rgbToHex(lum > 0.6 ? rgb : lighten(rgb, 0.3)));
 
-    // For buttons: ensure text is readable
-    root.style.setProperty('--accent-btn-text', lum > 0.5 ? '#0a0a0f' : '#ffffff');
+    // For buttons: ensure text is readable against the accent button bg
+    root.style.setProperty('--accent-btn-text', lum > 0.5 ? '#07070F' : '#ffffff');
 }
 
 /** Save accent color to localStorage */
@@ -81,16 +81,16 @@ export function resetAccentColor() {
     root.style.removeProperty('--accent-btn-text');
 }
 
-/** Preset accent colors */
+/** Preset accent colors — cosmic-themed */
 export const PRESET_COLORS = [
-    { name: 'Indigo', hex: '#5e6ad2' },
-    { name: 'Teal', hex: '#0abab5' },
-    { name: 'Blue', hex: '#3b82f6' },
-    { name: 'Cyan', hex: '#06b6d4' },
-    { name: 'Emerald', hex: '#10b981' },
-    { name: 'Rose', hex: '#f3217c' },
-    { name: 'Amber', hex: '#f59e0b' },
-    { name: 'Orange', hex: '#f97316' },
-    { name: 'Violet', hex: '#8b5cf6' },
-    { name: 'Slate', hex: '#64748b' },
+    { name: 'Cosmic Violet', hex: '#8B7CFF' },
+    { name: 'Nebula Blue', hex: '#5B8DEF' },
+    { name: 'Stellar Teal', hex: '#3EC7C1' },
+    { name: 'Aurora Pink', hex: '#EA6AA2' },
+    { name: 'Solar Amber', hex: '#F0A754' },
+    { name: 'Supernova Orange', hex: '#FF7A45' },
+    { name: 'Meteor Emerald', hex: '#4CC988' },
+    { name: 'Nebula Rose', hex: '#E26B8C' },
+    { name: 'Galactic Indigo', hex: '#4F46A4' },
+    { name: 'Deep Space', hex: '#565A7D' },
 ];

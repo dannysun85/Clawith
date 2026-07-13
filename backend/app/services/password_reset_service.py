@@ -9,6 +9,8 @@ from datetime import datetime, timedelta, timezone
 
 from app.config import get_settings
 from app.core.events import get_redis
+from app.database import async_session
+from app.services.platform_service import platform_service
 
 # Key prefixes for Redis
 TOKEN_PREFIX = "pwd_reset:token:"
@@ -51,8 +53,8 @@ async def create_password_reset_token(identity_id: uuid.UUID) -> tuple[str, date
 
 async def get_public_base_url() -> str:
     """Resolve the public base URL used for user-facing links."""
-    from app.services.platform_service import platform_service
-    return await platform_service.get_public_base_url()
+    async with async_session() as db:
+        return await platform_service.get_public_base_url(db)
 
 
 async def build_password_reset_url(raw_token: str) -> str:

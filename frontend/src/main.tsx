@@ -10,7 +10,11 @@ import ErrorBoundary from './components/ErrorBoundary';
 import { DialogProvider } from './components/Dialog/DialogProvider';
 import { ToastProvider } from './components/Toast/ToastProvider';
 import { loadSavedAccentColor } from './utils/theme';
+import { installChunkRecovery } from './utils/chunkRecovery';
+import { installClientIssueReporting } from './services/productionIssueReporter';
 
+installChunkRecovery();
+installClientIssueReporting();
 // Apply saved theme color before first paint
 loadSavedAccentColor();
 

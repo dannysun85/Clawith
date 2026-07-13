@@ -2,12 +2,13 @@
 
 import hashlib
 import json
+import re
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from loguru import logger
 from sqlalchemy import cast, func, select, String
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,16 +26,62 @@ from app.models.user import User
 from app.schemas.schemas import AgentCreate, AgentOut, AgentUpdate
 from app.services.storage import get_storage_backend
 from app.services.access_relationships import ensure_access_granted_platform_relationships
-from app.services.quota_guard import check_agent_creation_quota, QuotaExceeded
+from app.services.quota_guard import check_agent_creation_quota, QuotaExceeded, quota_error_payload
+from app.services.entitlements import get_tenant_entitlements
+from app.services.agent_plan_selection import (
+    InvalidAgentPlanSelection,
+    resolve_agent_plan_selection,
+)
 from app.models.tenant import Tenant
 from app.models.participant import Participant
 from app.services.okr_agent_hook import hook_new_agent
 from app.services.agent_manager import agent_manager
 from app.models.skill import Skill
 from app.services.resource_discovery import import_mcp_from_smithery
+from app.services.skill_scope import resolve_agent_skills, scope_skill_query
 
 router = APIRouter(prefix="/agents", tags=["agents"])
 settings = get_settings()
+
+def _resolve_agent_plan_selection(ent, requested_tier: str | None, requested_modality: str | None) -> tuple[str | None, str | None]:
+    """Resolve and validate the Agent's SaaS tier/modality selection."""
+    try:
+        return resolve_agent_plan_selection(ent, requested_tier, requested_modality)
+    except InvalidAgentPlanSelection as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
+        ) from exc
+
+
+def _is_platform_admin(current_user: User) -> bool:
+    identity = getattr(current_user, "identity", None)
+    return current_user.role == "platform_admin" or bool(
+        getattr(identity, "is_platform_admin", False)
+    )
+
+
+async def _validate_agent_skill_selection(
+    db: AsyncSession,
+    skill_ids: list[uuid.UUID],
+    tenant_id: uuid.UUID | None,
+) -> None:
+    """Reject selected skills that are outside the target tenant's view."""
+    requested = set(skill_ids)
+    if not requested:
+        return
+    result = await db.execute(
+        scope_skill_query(
+            select(Skill.id).where(Skill.id.in_(requested)),
+            tenant_id,
+        )
+    )
+    visible = set(result.scalars().all())
+    if visible != requested:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="One or more selected skills are unavailable to the target tenant",
+        )
 
 
 async def _get_active_admin_users(db: AsyncSession, tenant_id: uuid.UUID | None) -> list[User]:
@@ -242,6 +289,36 @@ async def _agents_to_out(
     return out
 
 
+def _format_agent_setup_error(stage: str, exc: Exception) -> str:
+    message = str(exc).strip() or type(exc).__name__
+    message = re.sub(
+        r"(?i)(password|secret|token|api[_-]?key)(\s*[:=]\s*)[^\s,;]+",
+        r"\1\2***",
+        message,
+    )
+    message = re.sub(r"://([^:/\s]+):([^@\s]+)@", r"://\1:***@", message)
+    return f"{stage}: {type(exc).__name__}: {message[:1500]}"
+
+
+async def _record_agent_setup_error(
+    agent_id: uuid.UUID,
+    stage: str,
+    exc: Exception,
+) -> None:
+    """Persist a manager-visible failure reason without leaking credentials."""
+    try:
+        async with async_session() as db:
+            result = await db.execute(select(Agent).where(Agent.id == agent_id))
+            agent = result.scalar_one_or_none()
+            if agent:
+                agent_manager.mark_error(agent, _format_agent_setup_error(stage, exc))
+                await db.commit()
+    except Exception as persist_exc:
+        logger.exception(
+            f"Failed to persist setup error for agent {agent_id}: {persist_exc}"
+        )
+
+
 @router.get("/", response_model=list[AgentOut])
 async def list_agents(
     tenant_id: uuid.UUID | None = None,
@@ -292,6 +369,7 @@ async def _background_agent_setup(
     template_mcp_servers: list[str],
 ) -> None:
     """Run all creation tasks asynchronously with small, short-lived transactions."""
+    agent_tenant_id: uuid.UUID | None = None
     # 1. Initialize agent file system from template
     try:
         async with async_session() as db:
@@ -300,6 +378,7 @@ async def _background_agent_setup(
             if not agent:
                 logger.error(f"[background_agent_setup] Agent {agent_id} not found")
                 return
+            agent_tenant_id = agent.tenant_id
             await agent_manager.initialize_agent_files(
                 db,
                 agent,
@@ -309,33 +388,27 @@ async def _background_agent_setup(
             await db.commit()
     except Exception as e:
         logger.exception(f"Error during agent file initialization for {agent_id}: {e}")
-        async with async_session() as db:
-            agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
-            agent = agent_result.scalar_one_or_none()
-            if agent:
-                agent.status = "error"
-                await db.commit()
+        await _record_agent_setup_error(agent_id, "file_initialization", e)
         return
 
     # 2. Skill resolution (reads from DB)
     skill_files_to_write = []
     try:
         async with async_session() as db:
-            default_result = await db.execute(select(Skill).where(Skill.is_default))
-            default_ids = {s.id for s in default_result.scalars().all()}
-
-            template_skill_ids = set()
-            if template_skill_folder_names:
-                tpl_skills_r = await db.execute(select(Skill).where(Skill.folder_name.in_(template_skill_folder_names)))
-                template_skill_ids = {s.id for s in tpl_skills_r.scalars().all()}
-
-            all_skill_ids = set(skill_ids) | default_ids | template_skill_ids
-
-            if all_skill_ids:
-                skills_result = await db.execute(
-                    select(Skill).where(Skill.id.in_(all_skill_ids)).options(selectinload(Skill.files))
+            skills_result = await db.execute(
+                scope_skill_query(
+                    select(Skill).options(selectinload(Skill.files)),
+                    agent_tenant_id,
                 )
-                skills = skills_result.scalars().all()
+            )
+            visible_skills = skills_result.scalars().all()
+            skills = resolve_agent_skills(
+                visible_skills,
+                agent_tenant_id,
+                selected_ids=skill_ids,
+                template_folders=template_skill_folder_names,
+            )
+            if skills:
                 agent_prefix = agent_manager._agent_storage_prefix(agent_id)
                 for skill in skills:
                     for sf in skill.files:
@@ -344,12 +417,7 @@ async def _background_agent_setup(
                         )
     except Exception as e:
         logger.exception(f"Error resolving skills for agent {agent_id}: {e}")
-        async with async_session() as db:
-            agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
-            agent = agent_result.scalar_one_or_none()
-            if agent:
-                agent.status = "error"
-                await db.commit()
+        await _record_agent_setup_error(agent_id, "skill_resolution", e)
         return
 
     # 3. Skills Copying (I/O only, NO db connection held!)
@@ -364,12 +432,7 @@ async def _background_agent_setup(
             logger.info(f"[_skills_copy] background agent={agent_id} files={len(skill_files_to_write)} completed")
         except Exception as e:
             logger.exception(f"Error copying skills files for agent {agent_id}: {e}")
-            async with async_session() as db:
-                agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
-                agent = agent_result.scalar_one_or_none()
-                if agent:
-                    agent.status = "error"
-                    await db.commit()
+            await _record_agent_setup_error(agent_id, "skill_copy", e)
             return
 
     # 4. Install template MCP servers
@@ -406,18 +469,17 @@ async def _background_agent_setup(
 
             await agent_manager.start_container(db, agent)
 
+            if agent.status == "error":
+                await db.commit()
+                return
+
             if agent.tenant_id:
                 await hook_new_agent(db, agent.id, agent.tenant_id)
 
             await db.commit()
     except Exception as e:
         logger.exception(f"Error starting container for agent {agent_id}: {e}")
-        async with async_session() as db:
-            agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
-            agent = agent_result.scalar_one_or_none()
-            if agent:
-                agent.status = "error"
-                await db.commit()
+        await _record_agent_setup_error(agent_id, "container_start", e)
 
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
@@ -428,34 +490,50 @@ async def create_agent(
     db: AsyncSession = Depends(get_db),
 ):
     """Create a new digital employee (any authenticated user)."""
-    # Check agent creation quota
-    try:
-        await check_agent_creation_quota(current_user.id)
-    except QuotaExceeded as e:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=e.message)
-
     # A TTL of 0 or less means the agent never expires.
     ttl_hours = current_user.quota_agent_ttl_hours
 
-    # Determine target tenant: normally user's tenant; admins can override via payload
+    # Determine target tenant: only platform admins may cross tenant boundaries.
     target_tenant_id = current_user.tenant_id
-    if current_user.role in ("platform_admin", "org_admin") and data.tenant_id:
+    if data.tenant_id:
+        if data.tenant_id != current_user.tenant_id and not _is_platform_admin(current_user):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Cannot create an agent in another tenant",
+            )
         target_tenant_id = data.tenant_id
 
-    # Get default limits from target tenant
+    await _validate_agent_skill_selection(
+        db,
+        list(data.skill_ids or []),
+        target_tenant_id,
+    )
+
+    # Plan max_agents is a tenant-level commercial limit. Enforce it after the
+    # final target tenant is known so org/platform admins cannot bypass it.
+    try:
+        await check_agent_creation_quota(current_user.id, tenant_id=target_tenant_id, db=db)
+    except QuotaExceeded as e:
+        if e.quota_type == "max_agents":
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail=quota_error_payload(e),
+            )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=quota_error_payload(e))
+
+    # Get default limits from subscription entitlements, falling back to tenant defaults
     max_llm_calls = 1000
     default_max_triggers = 20
     default_min_poll = 5
     default_webhook_rate = 5
     default_heartbeat_interval = 240  # model default
     tenant_default_model_id = None
+    tenant = None
     if target_tenant_id:
         tenant_result = await db.execute(select(Tenant).where(Tenant.id == target_tenant_id))
         tenant = tenant_result.scalar_one_or_none()
         if tenant:
             ttl_hours = tenant.default_agent_ttl_hours
-            max_llm_calls = tenant.default_max_llm_calls_per_day or 1000
-            default_max_triggers = tenant.default_max_triggers or 20
             default_min_poll = tenant.min_poll_interval_floor or 5
             default_webhook_rate = tenant.max_webhook_rate_ceiling or 5
             tenant_default_model_id = tenant.default_model_id
@@ -465,6 +543,23 @@ async def create_agent(
                 and tenant.min_heartbeat_interval_minutes > default_heartbeat_interval
             ):
                 default_heartbeat_interval = tenant.min_heartbeat_interval_minutes
+
+        ent = await get_tenant_entitlements(target_tenant_id)
+        if ent:
+            max_llm_calls = ent.max_llm_calls_per_day
+            default_max_triggers = ent.max_triggers
+        elif tenant:
+            max_llm_calls = tenant.default_max_llm_calls_per_day or 1000
+            default_max_triggers = tenant.default_max_triggers or 20
+
+    effective_preferred_tier = data.preferred_tier
+    effective_preferred_modality = data.preferred_modality or "text"
+    if (data.agent_type or "native") == "native":
+        effective_preferred_tier, effective_preferred_modality = _resolve_agent_plan_selection(
+            ent if target_tenant_id else None,
+            data.preferred_tier,
+            data.preferred_modality,
+        )
 
     # If the caller didn't pick a model, fall back to the tenant's default.
     effective_primary_model_id = data.primary_model_id or tenant_default_model_id
@@ -480,6 +575,8 @@ async def create_agent(
         agent_type=data.agent_type or "native",
         primary_model_id=effective_primary_model_id,
         fallback_model_id=data.fallback_model_id,
+        preferred_tier=effective_preferred_tier,
+        preferred_modality=effective_preferred_modality,
         max_tokens_per_day=data.max_tokens_per_day,
         max_tokens_per_month=data.max_tokens_per_month,
         template_id=data.template_id,
@@ -591,12 +688,17 @@ async def get_agent(
 ):
     """Get agent details."""
     agent, access_level = await check_agent_access(db, current_user, agent_id)
+    if agent_manager.reconcile_error_status(agent):
+        await db.flush()
     # Lazy reset token counters
     if await _lazy_reset_token_counters(agent, db):
         await db.commit()
     out_model = await _agent_to_out(db, agent, current_user.id)
     out = out_model.model_dump()
     out["access_level"] = access_level
+    if access_level == "manage":
+        out["last_error"] = agent.last_error
+        out["last_error_at"] = agent.last_error_at
 
     # Resolve creator username (one extra query, only on detail page).
     # IMPORTANT: User.username is an association_proxy to User.identity.username.
@@ -624,6 +726,31 @@ async def get_agent(
     out["effective_timezone"] = effective_tz or "UTC"
 
     return out
+
+
+@router.get("/{agent_id}/media-capabilities")
+async def get_media_capabilities(
+    agent_id: uuid.UUID,
+    tier: str | None = Query(default=None),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return safe, user-facing media generation readiness for an Agent."""
+    agent, _access_level = await check_agent_access(db, current_user, agent_id)
+    entitlements = await get_tenant_entitlements(agent.tenant_id) if agent.tenant_id else None
+    selected_tier = str(tier or agent.preferred_tier or "lite").strip().lower()
+    if selected_tier not in {"lite", "pro", "ultra"}:
+        selected_tier = "lite"
+
+    from app.services.media_capabilities import get_agent_media_capabilities
+
+    capabilities = await get_agent_media_capabilities(
+        db,
+        agent_id=agent.id,
+        entitlements=entitlements,
+        tier=selected_tier,
+    )
+    return {"tier": selected_tier, "capabilities": capabilities}
 
 
 @router.get("/{agent_id}/permissions")
@@ -922,6 +1049,33 @@ async def update_agent(
 
     update_data = data.model_dump(exclude_unset=True)
 
+    # These fields select a subscription tier in the shared model pool; they
+    # never grant direct access to a tenant-owned model object. Validate any
+    # explicit change against the Agent's tenant and repair a stale counterpart
+    # left by an earlier plan before persisting the pair.
+    plan_fields = {"preferred_tier", "preferred_modality"}
+    if agent.agent_type == "native" and plan_fields & set(update_data):
+        ent = await get_tenant_entitlements(agent.tenant_id) if agent.tenant_id else None
+        try:
+            current_tier, current_modality = resolve_agent_plan_selection(
+                ent,
+                agent.preferred_tier,
+                agent.preferred_modality,
+                strict=False,
+            )
+            preferred_tier, preferred_modality = resolve_agent_plan_selection(
+                ent,
+                update_data.get("preferred_tier", current_tier),
+                update_data.get("preferred_modality", current_modality),
+            )
+        except InvalidAgentPlanSelection as exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=str(exc),
+            ) from exc
+        update_data["preferred_tier"] = preferred_tier
+        update_data["preferred_modality"] = preferred_modality
+
     # expires_at: admin only
     if "expires_at" in update_data:
         if not is_admin:
@@ -1142,6 +1296,39 @@ async def start_agent(
 
     await agent_manager.start_container(db, agent)
     await db.flush()
+    return await _agent_to_out(db, agent, current_user.id)
+
+
+@router.post("/{agent_id}/recover", response_model=AgentOut)
+async def recover_agent(
+    agent_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Repair an incomplete workspace and restart an agent after an error."""
+    agent, access_level = await check_agent_access(db, current_user, agent_id)
+    if access_level != "manage":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only manager can recover agent",
+        )
+
+    try:
+        if agent.container_id:
+            await agent_manager.remove_container(agent)
+        await agent_manager.initialize_agent_files(db, agent)
+        await agent_manager.start_container(db, agent)
+        if agent.status == "error":
+            raise RuntimeError(agent.last_error or "Agent recovery failed")
+        await db.flush()
+    except Exception as exc:
+        agent_manager.mark_error(agent, _format_agent_setup_error("recovery", exc))
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=agent.last_error,
+        ) from exc
+
     return await _agent_to_out(db, agent, current_user.id)
 
 

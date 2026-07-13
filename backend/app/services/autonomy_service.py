@@ -21,6 +21,13 @@ from app.models.user import User
 from app.services.feishu_service import feishu_service
 
 
+HIGH_RISK_DEFAULT_L3_ACTIONS = {
+    "douyin_publish_job",
+    "douyin_reply_comment",
+    "douyin_external_write",
+}
+
+
 class AutonomyService:
     """Enforce autonomy boundaries for agent operations."""
 
@@ -38,7 +45,8 @@ class AutonomyService:
             }
         """
         policy = agent.autonomy_policy or {}
-        level = policy.get(action_type, "L2")  # Default to L2
+        default_level = "L3" if action_type in HIGH_RISK_DEFAULT_L3_ACTIONS else "L2"
+        level = policy.get(action_type, default_level)
 
         # Log the action regardless of level
         audit = AuditLog(
@@ -106,7 +114,14 @@ class AutonomyService:
         # Permission check: only agent creator or platform admin can resolve
         agent_result = await db.execute(select(Agent).where(Agent.id == approval.agent_id))
         agent = agent_result.scalar_one_or_none()
-        if agent and agent.creator_id != user.id and user.role != "platform_admin":
+        same_tenant_org_admin = bool(
+            agent
+            and user.role == "org_admin"
+            and user.tenant_id
+            and agent.tenant_id == user.tenant_id
+        )
+        identity_is_platform_admin = bool(getattr(getattr(user, "identity", None), "is_platform_admin", False))
+        if agent and agent.creator_id != user.id and user.role != "platform_admin" and not identity_is_platform_admin and not same_tenant_org_admin:
             raise ValueError("Only the agent creator or platform admin can resolve approvals")
 
         approval.status = "approved" if action == "approve" else "rejected"

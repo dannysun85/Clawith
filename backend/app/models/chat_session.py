@@ -50,6 +50,10 @@ class ChatSession(Base):
     # Primary platform session: the long-lived first-party conversation that agent-initiated
     # messages should land in. User-created side-topic sessions remain temporary (`is_primary=false`).
     is_primary: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False, index=True)
+    # First-party web chats keep their own SaaS routing selection. Agent-level
+    # preferences remain the default for automations and newly-created chats.
+    model_tier: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    model_modality: Mapped[str | None] = mapped_column(String(20), nullable=True)
     # Tracks when the owning platform user last opened/read this session. Unread badges are derived
     # from non-user messages created after this timestamp.
     last_read_at_by_user: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

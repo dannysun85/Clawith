@@ -466,7 +466,7 @@ class DingTalkStreamManager:
         manager_self = self
 
         class ClawithChatbotHandler(dingtalk_stream.ChatbotHandler):
-            """Custom handler that dispatches messages to the Clawith LLM pipeline."""
+            """Custom handler that dispatches messages to the Astra LLM pipeline."""
 
             async def process(self, callback: dingtalk_stream.CallbackMessage):
                 """Handle incoming bot message from DingTalk Stream.

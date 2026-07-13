@@ -26,6 +26,7 @@ class RegisterInitRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=6, max_length=128)
     display_name: str | None = None
+    invitation_code: str | None = None
     target_tenant_id: uuid.UUID | None = None
 
 
@@ -225,6 +226,9 @@ class AgentCreate(BaseModel):
     # Model
     primary_model_id: uuid.UUID | None = None
     fallback_model_id: uuid.UUID | None = None
+    # SaaS tier selection (Lite/Pro/Ultra); preferred over legacy model IDs
+    preferred_tier: str | None = None
+    preferred_modality: str | None = "text"
     # Permissions
     permission_scope_type: str = "company"  # company | user | custom
     permission_scope_ids: list[uuid.UUID] = []
@@ -254,6 +258,8 @@ class AgentOut(BaseModel):
     creator_username: str | None = None  # Populated by API layer; not in ORM model directly
     primary_model_id: uuid.UUID | None = None
     fallback_model_id: uuid.UUID | None = None
+    preferred_tier: str | None = None
+    preferred_modality: str | None = None
     autonomy_policy: dict
     tokens_used_today: int
     tokens_used_month: int
@@ -271,7 +277,7 @@ class AgentOut(BaseModel):
     max_triggers: int = 20
     min_poll_interval_min: int = 5
     webhook_rate_limit: int = 5
-    heartbeat_enabled: bool = True
+    heartbeat_enabled: bool = False
     heartbeat_interval_minutes: int = 240
     heartbeat_active_hours: str = "09:00-18:00"
     last_heartbeat_at: datetime | None = None
@@ -309,6 +315,8 @@ class AgentUpdate(BaseModel):
     autonomy_policy: dict | None = None
     primary_model_id: uuid.UUID | None = None
     fallback_model_id: uuid.UUID | None = None
+    preferred_tier: str | None = None
+    preferred_modality: str | None = None
     context_window_size: int | None = Field(default=None, ge=1, le=500)
     max_tokens_per_day: int | None = None
     max_tokens_per_month: int | None = None
@@ -398,15 +406,17 @@ class TaskLogOut(BaseModel):
 class LLMModelCreate(BaseModel):
     provider: str
     model: str
-    api_key: str
+    api_key: str = ""  # empty for platform models (key lives in the credential pool)
     base_url: str | None = None
     label: str
     temperature: float | None = Field(None, ge=0.0, le=2.0)
     max_tokens_per_day: int | None = None
     enabled: bool = True
     supports_vision: bool = False
-    max_output_tokens: int | None = None
+    max_output_tokens: int | None = Field(None, ge=1, le=1_000_000)
     request_timeout: int | None = None
+    modality: str = "text"
+    tier: str = "standard"
 
 class LLMModelUpdate(BaseModel):
     provider: str | None = None
@@ -418,8 +428,10 @@ class LLMModelUpdate(BaseModel):
     max_tokens_per_day: int | None = None
     enabled: bool | None = None
     supports_vision: bool | None = None
-    max_output_tokens: int | None = None
+    max_output_tokens: int | None = Field(None, ge=1, le=1_000_000)
     request_timeout: int | None = None
+    modality: str | None = None
+    tier: str | None = None
 
 
 class LLMModelOut(BaseModel):
@@ -435,6 +447,8 @@ class LLMModelOut(BaseModel):
     supports_vision: bool = False
     max_output_tokens: int | None = None
     request_timeout: int | None = None
+    modality: str = "text"
+    tier: str = "standard"
     created_at: datetime
 
     model_config = {"from_attributes": True}

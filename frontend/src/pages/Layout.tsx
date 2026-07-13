@@ -4,8 +4,14 @@ import { Outlet, NavLink, useNavigate, useMatch, useLocation } from 'react-route
 import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useAuthStore } from '../stores';
+import { canAccessSaasAdmin } from '../utils/saasAdmin';
 import { agentApi, tenantApi, authApi, onboardingApi } from '../services/api';
 import { useToast } from '../components/Toast/ToastProvider';
+import {
+    SUBSCRIPTION_UPGRADE_PATH,
+    agentLimitMessage,
+    useAgentCreationLimit,
+} from '../hooks/useAgentCreationLimit';
 
 import {
     IconHome,
@@ -30,9 +36,15 @@ import {
     IconChevronRight,
     IconCheck,
     IconChevronDown,
+    IconKey,
+    IconReceipt,
+    IconMenu2,
 } from '@tabler/icons-react';
 import { useAppStore } from '../stores';
 import TalentMarketModal from '../components/TalentMarketModal';
+import { AstraWordmark } from '../components/atlas';
+
+const MOBILE_NAV_MEDIA_QUERY = '(max-width: 768px)';
 
 /* ────── Tabler Icons ────── */
 const SidebarIcons = {
@@ -430,6 +442,7 @@ export default function Layout() {
     const activeAgentRootMatch = useMatch('/agents/:id');
     const activeAgentId = activeAgentNestedMatch?.params.id || activeAgentRootMatch?.params.id;
     const canAccessPlatformSettings = user?.role === 'platform_admin' || !!(user as any)?.is_platform_admin;
+    const canAccessSaas = canAccessSaasAdmin(user);
     const canAccessCompanySettings = user?.role === 'platform_admin' || user?.role === 'org_admin' || !!(user as any)?.is_platform_admin;
     const routeParams = new URLSearchParams(location.search);
     const showCompanyTour = routeParams.get('tour') === 'company';
@@ -445,6 +458,7 @@ export default function Layout() {
     const langHoverCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const [showNotifications, setShowNotifications] = useState(false);
     const [showTalentMarket, setShowTalentMarket] = useState(false);
+    const [talentMarketInitialSearch, setTalentMarketInitialSearch] = useState('');
     const [notifCategory, setNotifCategory] = useState<string>('all');
     const [selectedNotification, setSelectedNotification] = useState<any | null>(null);
     const [showTenantMenu, setShowTenantMenu] = useState(false);
@@ -609,9 +623,62 @@ export default function Layout() {
 
     const toggleTheme = () => setTheme(prev => prev === 'dark' ? 'light' : 'dark');
 
-    // Sidebar collapse state
-    const isSidebarCollapsed = useAppStore(s => s.sidebarCollapsed);
+    // Sidebar state. On narrow screens the desktop collapse preference is
+    // ignored while the full sidebar is used as an off-canvas navigation
+    // drawer, so every destination and account action remains reachable.
+    const storedSidebarCollapsed = useAppStore(s => s.sidebarCollapsed);
     const toggleSidebar = useAppStore(s => s.toggleSidebar);
+    const [isMobileViewport, setIsMobileViewport] = useState(() => (
+        typeof window !== 'undefined' && window.matchMedia(MOBILE_NAV_MEDIA_QUERY).matches
+    ));
+    const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+    const isSidebarCollapsed = storedSidebarCollapsed && !isMobileViewport;
+
+    useEffect(() => {
+        const mediaQuery = window.matchMedia(MOBILE_NAV_MEDIA_QUERY);
+        const syncViewport = (matches: boolean) => {
+            setIsMobileViewport(matches);
+            if (!matches) setMobileSidebarOpen(false);
+        };
+        const handleChange = (event: MediaQueryListEvent) => syncViewport(event.matches);
+
+        syncViewport(mediaQuery.matches);
+        if (mediaQuery.addEventListener) mediaQuery.addEventListener('change', handleChange);
+        else mediaQuery.addListener(handleChange);
+
+        return () => {
+            if (mediaQuery.removeEventListener) mediaQuery.removeEventListener('change', handleChange);
+            else mediaQuery.removeListener(handleChange);
+        };
+    }, []);
+
+    useEffect(() => {
+        setMobileSidebarOpen(false);
+    }, [location.pathname, location.search, location.hash]);
+
+    useEffect(() => {
+        if (!mobileSidebarOpen) return;
+        const closeOnEscape = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') setMobileSidebarOpen(false);
+        };
+        document.addEventListener('keydown', closeOnEscape);
+        return () => document.removeEventListener('keydown', closeOnEscape);
+    }, [mobileSidebarOpen]);
+
+    useEffect(() => {
+        if (
+            isMobileViewport
+            && (showAccountSettings || showNotifications || showTenantSetupModal || showTalentMarket)
+        ) {
+            setMobileSidebarOpen(false);
+        }
+    }, [
+        isMobileViewport,
+        showAccountSettings,
+        showNotifications,
+        showTalentMarket,
+        showTenantSetupModal,
+    ]);
 
     // Sidebar agent search & pin
     const [sidebarSearch, setSidebarSearch] = useState('');
@@ -663,6 +730,26 @@ export default function Layout() {
         queryFn: () => agentApi.list(currentTenant || undefined),
         refetchInterval: 30000,
     });
+    const agentCreationLimit = useAgentCreationLimit(agents as any[]);
+
+    const handleAgentLimitReached = useCallback(() => {
+        toast.warning(
+            agentLimitMessage(!!isChinese, agentCreationLimit.activeCount, agentCreationLimit.maxAgents),
+            { duration: 5000 },
+        );
+        setAgentDrawerOpen(false);
+        setShowTalentMarket(false);
+        navigate(SUBSCRIPTION_UPGRADE_PATH);
+    }, [agentCreationLimit.activeCount, agentCreationLimit.maxAgents, isChinese, navigate, toast]);
+
+    const handleOpenTalentMarket = useCallback((options?: { initialSearchQuery?: string }) => {
+        if (agentCreationLimit.isLimited) {
+            handleAgentLimitReached();
+            return;
+        }
+        setTalentMarketInitialSearch(options?.initialSearchQuery || '');
+        setShowTalentMarket(true);
+    }, [agentCreationLimit.isLimited, handleAgentLimitReached]);
 
     const openAgentDrawer = useCallback(() => {
         if (!isSidebarCollapsed) return;
@@ -995,10 +1082,12 @@ export default function Layout() {
                 <button
                     type="button"
                     onClick={() => {
-                        setShowTalentMarket(true);
+                        handleOpenTalentMarket();
                         setAgentDrawerOpen(false);
                     }}
-                    title={t('nav.hire', t('nav.newAgent'))}
+                    title={agentCreationLimit.isLimited
+                        ? agentLimitMessage(!!isChinese, agentCreationLimit.activeCount, agentCreationLimit.maxAgents)
+                        : t('nav.hire', t('nav.newAgent'))}
                 >
                     <IconPlus size={16} stroke={1.7} />
                 </button>
@@ -1012,9 +1101,42 @@ export default function Layout() {
     );
 
     return (
-        <div className={`app-layout ${isSidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
-            <nav className={`sidebar ${isSidebarCollapsed ? 'collapsed' : ''}`}>
+        <div className={`app-layout ${isSidebarCollapsed ? 'sidebar-collapsed' : ''}${mobileSidebarOpen ? ' mobile-sidebar-open' : ''}`}>
+            <header className="mobile-app-bar">
+                <button
+                    type="button"
+                    className="mobile-navigation-toggle"
+                    aria-label={isChinese ? '打开导航' : 'Open navigation'}
+                    aria-controls="primary-sidebar"
+                    aria-expanded={mobileSidebarOpen}
+                    onClick={() => setMobileSidebarOpen(true)}
+                >
+                    <IconMenu2 size={21} stroke={1.7} />
+                </button>
+                <AstraWordmark height={20} variant="ui" />
+                <span className="mobile-workspace-name">{currentTenantName}</span>
+            </header>
+            {mobileSidebarOpen && (
+                <button
+                    type="button"
+                    className="mobile-sidebar-backdrop"
+                    aria-label={isChinese ? '关闭导航' : 'Close navigation'}
+                    onClick={() => setMobileSidebarOpen(false)}
+                />
+            )}
+            <nav id="primary-sidebar" className={`sidebar ${isSidebarCollapsed ? 'collapsed' : ''}`} aria-label={isChinese ? '主导航' : 'Primary navigation'}>
                 <div className="sidebar-top">
+                    <div className="sidebar-logo">
+                        <AstraWordmark height={22} variant="ui" glyphOnly={isSidebarCollapsed} />
+                        <button
+                            type="button"
+                            className="mobile-sidebar-close"
+                            aria-label={isChinese ? '关闭导航' : 'Close navigation'}
+                            onClick={() => setMobileSidebarOpen(false)}
+                        >
+                            <IconX size={18} stroke={1.8} />
+                        </button>
+                    </div>
                     <div className="sidebar-workspace-row" ref={tenantSwitcherRef} data-tour-target="company-switcher">
                         <button
                             type="button"
@@ -1078,8 +1200,10 @@ export default function Layout() {
                             <button
                                 type="button"
                                 data-tour-target="hire-agent"
-                                onClick={() => setShowTalentMarket(true)}
-                                title={t('nav.hire', t('nav.newAgent'))}
+                                onClick={() => handleOpenTalentMarket()}
+                                title={agentCreationLimit.isLimited
+                                    ? agentLimitMessage(!!isChinese, agentCreationLimit.activeCount, agentCreationLimit.maxAgents)
+                                    : t('nav.hire', t('nav.newAgent'))}
                             >
                                 <IconPlus size={15} stroke={1.7} />
                             </button>
@@ -1154,10 +1278,20 @@ export default function Layout() {
                                         <IconUser size={15} stroke={1.5} />
                                         <span>{isChinese ? '账户设置' : 'Account Settings'}</span>
                                     </button>
+                                    <button className="account-dropdown-item" onClick={() => { navigate('/account/subscription'); setShowAccountMenu(false); }}>
+                                        <IconReceipt size={15} stroke={1.5} />
+                                        <span>{t('nav.subscriptionDetail', '套餐详情')}</span>
+                                    </button>
                                     {canAccessPlatformSettings && (
                                         <button className="account-dropdown-item" onClick={() => { navigate('/admin/platform-settings'); setShowAccountMenu(false); }}>
                                             <IconSettings size={15} stroke={1.5} />
                                             <span>{t('nav.platformSettings', 'Platform Settings')}</span>
+                                        </button>
+                                    )}
+                                    {canAccessSaas && (
+                                        <button className="account-dropdown-item" onClick={() => { navigate('/admin/saas'); setShowAccountMenu(false); }}>
+                                            <IconKey size={15} stroke={1.5} />
+                                            <span>{t('nav.saasAdmin', 'SaaS 后台')}</span>
                                         </button>
                                     )}
                                     <div style={{ height: '1px', background: 'var(--border-subtle)', margin: '4px 0' }} />
@@ -1366,7 +1500,7 @@ export default function Layout() {
             )}
 
             <main className={`main-content${isChatPage ? ' chat-page' : ''}${isAgentSettingsPage ? ' agent-settings-page' : ''}`}>
-                <Outlet context={{ openTalentMarket: () => setShowTalentMarket(true) }} />
+                <Outlet context={{ openTalentMarket: handleOpenTalentMarket }} />
             </main>
 
             {showAccountSettings && (
@@ -1379,7 +1513,14 @@ export default function Layout() {
 
             <TalentMarketModal
                 open={showTalentMarket}
-                onClose={() => setShowTalentMarket(false)}
+                onClose={() => {
+                    setShowTalentMarket(false);
+                    setTalentMarketInitialSearch('');
+                }}
+                initialSearchQuery={talentMarketInitialSearch}
+                agentLimitReached={agentCreationLimit.isLimited}
+                agentLimitMessage={agentLimitMessage(!!isChinese, agentCreationLimit.activeCount, agentCreationLimit.maxAgents)}
+                onAgentLimitReached={handleAgentLimitReached}
             />
             {showCompanyTour && (
                 <CompanyTourOverlay

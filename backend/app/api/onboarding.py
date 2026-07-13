@@ -18,6 +18,12 @@ from app.models.participant import Participant
 from app.models.tenant import Tenant
 from app.models.user import User
 from app.services.access_relationships import ensure_access_granted_platform_relationships
+from app.services.agent_plan_selection import (
+    InvalidAgentPlanSelection,
+    resolve_agent_plan_selection,
+)
+from app.services.entitlements import get_tenant_entitlements
+from app.services.quota_guard import QuotaExceeded, check_agent_creation_quota
 
 router = APIRouter(prefix="/onboarding", tags=["onboarding"])
 
@@ -107,6 +113,14 @@ async def _tenant_default_model_id(db: AsyncSession, tenant_id: uuid.UUID | None
     return model_result.scalar_one_or_none()
 
 
+async def _tenant_plan_selection(tenant_id: uuid.UUID) -> tuple[str, str]:
+    entitlements = await get_tenant_entitlements(tenant_id)
+    try:
+        return resolve_agent_plan_selection(entitlements, None, "text")
+    except InvalidAgentPlanSelection as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
 async def _create_personal_assistant(
     db: AsyncSession,
     user: User,
@@ -120,6 +134,7 @@ async def _create_personal_assistant(
     )
     template = template_result.scalar_one_or_none()
     primary_model_id = await _tenant_default_model_id(db, user.tenant_id)
+    preferred_tier, preferred_modality = await _tenant_plan_selection(user.tenant_id)
     personality_note = f"Personality: {data.personality}. Work style: {data.work_style}."
     boundaries = data.boundaries.strip()
     bio = (
@@ -136,6 +151,8 @@ async def _create_personal_assistant(
         tenant_id=user.tenant_id,
         agent_type="native",
         primary_model_id=primary_model_id,
+        preferred_tier=preferred_tier,
+        preferred_modality=preferred_modality,
         template_id=template.id if template else None,
         status="creating",
         access_mode="private",
@@ -208,6 +225,18 @@ async def create_personal_assistant(
             row.current_step = "opening"
             await db.commit()
             return {"agent": {"id": str(existing.id), "name": existing.name}, "onboarding": _status_payload(row)}
+
+    try:
+        await check_agent_creation_quota(current_user.id, tenant_id=current_user.tenant_id, db=db)
+    except QuotaExceeded as e:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={
+                "code": e.quota_type,
+                "message": e.message,
+                "upgrade_url": "/account/subscription",
+            },
+        )
 
     agent = await _create_personal_assistant(db, current_user, data)
     row.personal_assistant_agent_id = agent.id

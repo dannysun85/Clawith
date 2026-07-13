@@ -1,11 +1,12 @@
 """Chat session management API endpoints."""
 
 import uuid
+import re
 from datetime import datetime, timezone as tz
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, ConfigDict, model_validator
 from sqlalchemy import cast, select, func, String
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,19 +17,33 @@ from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.agent import Agent
 from app.models.user import User
+from app.services.agent_plan_selection import (
+    InvalidAgentPlanSelection,
+    resolve_agent_plan_selection,
+)
+from app.services.entitlements import get_tenant_entitlements
 
 router = APIRouter(prefix="/api/agents", tags=["chat-sessions"])
 
+# Session counters represent user-visible conversation turns. Internal system
+# events and tool execution records must not make the counter climb while an
+# agent is working in the background.
+VISIBLE_MESSAGE_ROLES = ("user", "assistant")
 
-def _can_view_all_agent_chat_sessions(user: User, agent: Agent) -> bool:
-    """Admins and the agent creator may list/view/delete other users' chat sessions."""
-    return (
-        user.role in ("platform_admin", "org_admin", "agent_admin")
-        or str(agent.creator_id) == str(user.id)
-    )
+
+def _can_view_all_agent_chat_sessions(user: User) -> bool:
+    """Return whether a user may audit other users' chat sessions.
+
+    Agent ownership grants management of the shared Agent configuration, not
+    ownership of every user's private conversation with that Agent.  Only
+    explicit administrative roles may cross the session-owner boundary.
+    """
+    return user.role in ("platform_admin", "org_admin", "agent_admin")
 
 
 class SessionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
     agent_id: str
     user_id: str
@@ -40,6 +55,8 @@ class SessionOut(BaseModel):
     message_count: int = 0
     unread_count: int = 0
     is_primary: bool = False
+    model_tier: Optional[str] = None
+    model_modality: Optional[str] = None
     # Agent-to-agent session fields
     peer_agent_id: Optional[str] = None
     peer_agent_name: Optional[str] = None
@@ -48,16 +65,41 @@ class SessionOut(BaseModel):
     is_group: bool = False
     group_name: Optional[str] = None
 
-    class Config:
-        from_attributes = True
-
-
 class CreateSessionIn(BaseModel):
     title: Optional[str] = None
+    model_tier: Optional[str] = None
+    model_modality: Optional[str] = None
 
 
 class PatchSessionIn(BaseModel):
-    title: str
+    title: Optional[str] = None
+    model_tier: Optional[str] = None
+    model_modality: Optional[str] = None
+
+    @model_validator(mode="after")
+    def require_update(self):
+        if not self.model_fields_set:
+            raise ValueError("At least one session field must be provided")
+        if "title" in self.model_fields_set and self.title is None:
+            raise ValueError("Session title cannot be null")
+        return self
+
+
+async def _resolve_session_model_selection(
+    agent: Agent,
+    requested_tier: str | None,
+    requested_modality: str | None,
+    *,
+    strict: bool,
+) -> tuple[str, str]:
+    tenant_id = getattr(agent, "tenant_id", None)
+    entitlements = await get_tenant_entitlements(tenant_id) if tenant_id else None
+    return resolve_agent_plan_selection(
+        entitlements,
+        requested_tier,
+        requested_modality,
+        strict=strict,
+    )
 
 
 @router.get("/{agent_id}/sessions")
@@ -76,7 +118,7 @@ async def list_sessions(
     await check_agent_access(db, current_user, agent_id)
 
     if scope == "all":
-        if not _can_view_all_agent_chat_sessions(current_user, agent):
+        if not _can_view_all_agent_chat_sessions(current_user):
             raise HTTPException(status_code=403, detail="Not authorized to view all sessions")
 
         # Fetch all sessions (including agent-to-agent where this agent is peer)
@@ -100,30 +142,34 @@ async def list_sessions(
         if session_ids:
             count_res = await db.execute(
                 select(ChatMessage.conversation_id, func.count(ChatMessage.id))
-                .where(ChatMessage.conversation_id.in_(session_ids))
+                .where(
+                    ChatMessage.conversation_id.in_(session_ids),
+                    ChatMessage.role.in_(VISIBLE_MESSAGE_ROLES),
+                )
                 .group_by(ChatMessage.conversation_id)
             )
             for row in count_res.all():
                 message_counts[row[0]] = row[1]
 
-            unread_res = await db.execute(
-                select(ChatSession.id, func.count(ChatMessage.id))
-                .join(ChatMessage, ChatMessage.conversation_id == cast(ChatSession.id, String))
-                .where(
-                    ChatSession.id.in_(session_uuid_ids),
-                    ChatSession.user_id == current_user.id,
-                    ChatSession.source_channel.notin_(["agent", "trigger"]),
-                    ChatSession.is_group == False,
-                    ChatMessage.role.in_(["assistant", "system", "tool_call"]),
-                    ChatMessage.created_at > func.coalesce(
-                        ChatSession.last_read_at_by_user,
-                        datetime(1970, 1, 1, tzinfo=tz.utc),
-                    ),
+            own_session_ids = [s.id for s in sessions if str(s.user_id) == str(current_user.id)]
+            if own_session_ids:
+                unread_res = await db.execute(
+                    select(ChatSession.id, func.count(ChatMessage.id))
+                    .join(ChatMessage, ChatMessage.conversation_id == cast(ChatSession.id, String))
+                    .where(
+                        ChatSession.id.in_(own_session_ids),
+                        ChatSession.source_channel.notin_(["agent", "trigger"]),
+                        ChatSession.is_group.is_(False),
+                        ChatMessage.role == "assistant",
+                        ChatMessage.created_at > func.coalesce(
+                            ChatSession.last_read_at_by_user,
+                            datetime(1970, 1, 1, tzinfo=tz.utc),
+                        ),
+                    )
+                    .group_by(ChatSession.id)
                 )
-                .group_by(ChatSession.id)
-            )
-            for row in unread_res.all():
-                unread_counts[str(row[0])] = int(row[1] or 0)
+                for row in unread_res.all():
+                    unread_counts[str(row[0])] = int(row[1] or 0)
 
         # Collect IDs to resolve in bulk
         from app.models.user import Identity
@@ -185,7 +231,9 @@ async def list_sessions(
                 last_message_at=session.last_message_at.isoformat() if session.last_message_at else None,
                 message_count=count,
                 unread_count=unread_counts.get(str(session.id), 0),
-                is_primary=bool(session.is_primary),
+                is_primary=bool(getattr(session, "is_primary", False)),
+                model_tier=getattr(session, "model_tier", None),
+                model_modality=getattr(session, "model_modality", None),
                 peer_agent_id=peer_agent_id,
                 peer_agent_name=peer_agent_name,
                 participant_type="group" if session.is_group else participant_type,
@@ -200,7 +248,7 @@ async def list_sessions(
             .where(
                 ChatSession.agent_id == agent_id,
                 ChatSession.user_id == current_user.id,
-                ChatSession.is_group == False,  # Group sessions are not "mine"
+                ChatSession.is_group.is_(False),  # Group sessions are not "mine"
                 ChatSession.source_channel.notin_(["agent", "trigger"]),  # Exclude agent-to-agent and reflection sessions
             )
             .order_by(ChatSession.last_message_at.desc().nulls_last(), ChatSession.created_at.desc())
@@ -221,7 +269,8 @@ async def list_sessions(
                     func.count(ChatMessage.id)
                 ).where(
                     ChatMessage.conversation_id.in_(session_ids),
-                    ChatMessage.agent_id == agent_id
+                    ChatMessage.agent_id == agent_id,
+                    ChatMessage.role.in_(VISIBLE_MESSAGE_ROLES),
                 ).group_by(ChatMessage.conversation_id)
             )
             for row in counts_res.all():
@@ -232,7 +281,7 @@ async def list_sessions(
                 .join(ChatMessage, ChatMessage.conversation_id == cast(ChatSession.id, String))
                 .where(
                     ChatSession.id.in_(session_uuid_ids),
-                    ChatMessage.role.in_(["assistant", "system", "tool_call"]),
+                    ChatMessage.role == "assistant",
                     ChatMessage.created_at > func.coalesce(
                         ChatSession.last_read_at_by_user,
                         datetime(1970, 1, 1, tzinfo=tz.utc),
@@ -261,6 +310,8 @@ async def list_sessions(
                 message_count=count,
                 unread_count=unread_counts.get(str(session.id), 0),
                 is_primary=bool(session.is_primary),
+                model_tier=getattr(session, "model_tier", None),
+                model_modality=getattr(session, "model_modality", None),
             ))
         return out
 
@@ -273,7 +324,23 @@ async def create_session(
     db: AsyncSession = Depends(get_db),
 ):
     """Create a new chat session for the current user."""
-    await check_agent_access(db, current_user, agent_id)
+    agent, _ = await check_agent_access(db, current_user, agent_id)
+
+    explicit_selection = bool({"model_tier", "model_modality"} & body.model_fields_set)
+    default_tier = getattr(agent, "preferred_tier", None)
+    default_modality = getattr(agent, "preferred_modality", None)
+    model_tier: str | None = None
+    model_modality: str | None = None
+    if explicit_selection or default_tier:
+        try:
+            model_tier, model_modality = await _resolve_session_model_selection(
+                agent,
+                body.model_tier if body.model_tier is not None else default_tier,
+                body.model_modality if body.model_modality is not None else default_modality,
+                strict=explicit_selection,
+            )
+        except InvalidAgentPlanSelection as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
 
     now = datetime.now(tz.utc)
     new_id = uuid.uuid4()
@@ -284,6 +351,8 @@ async def create_session(
         title=body.title or f"Session {now.strftime('%m-%d %H:%M')}",
         source_channel="web",
         is_primary=False,
+        model_tier=model_tier,
+        model_modality=model_modality,
         created_at=now,
     )
     db.add(session)
@@ -300,6 +369,8 @@ async def create_session(
         message_count=0,
         unread_count=0,
         is_primary=False,
+        model_tier=getattr(session, "model_tier", None),
+        model_modality=getattr(session, "model_modality", None),
         participant_type="user",
         is_group=False,
     )
@@ -313,21 +384,56 @@ async def rename_session(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Rename a session. Owner, agent creator, or admin may rename others' sessions."""
+    """Update a session title or its first-party chat model selection."""
     agent, _ = await check_agent_access(db, current_user, agent_id)
     result = await db.execute(
-        select(ChatSession).where(ChatSession.id == session_id, ChatSession.agent_id == agent_id)
+        select(ChatSession).where(
+            ChatSession.id == session_id,
+            (ChatSession.agent_id == agent_id) | (ChatSession.peer_agent_id == agent_id),
+        )
     )
     session = result.scalar_one_or_none()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    if str(session.user_id) != str(current_user.id) and not _can_view_all_agent_chat_sessions(current_user, agent):
+    if str(session.user_id) != str(current_user.id) and not _can_view_all_agent_chat_sessions(current_user):
         raise HTTPException(status_code=403, detail="Not authorized")
 
-    session.title = body.title
+    selection_fields = {"model_tier", "model_modality"} & body.model_fields_set
+    if selection_fields:
+        if str(session.user_id) != str(current_user.id):
+            raise HTTPException(status_code=403, detail="Only the session owner can change its model selection")
+        if session.source_channel != "web" or bool(getattr(session, "is_group", False)):
+            raise HTTPException(status_code=400, detail="Model selection is only available for first-party web chats")
+
+        try:
+            current_tier, current_modality = await _resolve_session_model_selection(
+                agent,
+                getattr(session, "model_tier", None) or getattr(agent, "preferred_tier", None),
+                getattr(session, "model_modality", None) or getattr(agent, "preferred_modality", None),
+                strict=False,
+            )
+            model_tier, model_modality = await _resolve_session_model_selection(
+                agent,
+                body.model_tier if "model_tier" in body.model_fields_set else current_tier,
+                body.model_modality if "model_modality" in body.model_fields_set else current_modality,
+                strict=True,
+            )
+        except InvalidAgentPlanSelection as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        session.model_tier = model_tier
+        session.model_modality = model_modality
+
+    if "title" in body.model_fields_set:
+        session.title = body.title
     await db.commit()
-    return {"id": str(session.id), "title": session.title}
+    response = {"id": str(session.id), "title": session.title}
+    if selection_fields:
+        response.update({
+            "model_tier": session.model_tier,
+            "model_modality": session.model_modality,
+        })
+    return response
 
 
 @router.delete("/{agent_id}/sessions/{session_id}", status_code=204)
@@ -337,16 +443,19 @@ async def delete_session(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Delete a chat session and its messages. Owner, agent creator, or admin may delete others' sessions."""
-    agent, _ = await check_agent_access(db, current_user, agent_id)
+    """Delete a chat session and its messages as its owner or an administrator."""
+    await check_agent_access(db, current_user, agent_id)
     result = await db.execute(
-        select(ChatSession).where(ChatSession.id == session_id, ChatSession.agent_id == agent_id)
+        select(ChatSession).where(
+            ChatSession.id == session_id,
+            (ChatSession.agent_id == agent_id) | (ChatSession.peer_agent_id == agent_id),
+        )
     )
     session = result.scalar_one_or_none()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    if str(session.user_id) != str(current_user.id) and not _can_view_all_agent_chat_sessions(current_user, agent):
+    if str(session.user_id) != str(current_user.id) and not _can_view_all_agent_chat_sessions(current_user):
         raise HTTPException(status_code=403, detail="Not authorized")
 
     # Delete associated messages first
@@ -367,7 +476,11 @@ async def get_session_messages(
     db: AsyncSession = Depends(get_db),
 ):
     """Get chat messages for a specific session."""
-    agent, _ = await check_agent_access(db, current_user, agent_id)
+    if not isinstance(limit, int):
+        limit = 20
+    if not isinstance(before, str):
+        before = None
+    await check_agent_access(db, current_user, agent_id)
     # Allow looking up sessions where agent_id OR peer_agent_id matches
     result = await db.execute(
         select(ChatSession).where(
@@ -379,8 +492,9 @@ async def get_session_messages(
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # Permission: session owner, agent creator, or admin.
-    if str(session.user_id) != str(current_user.id) and not _can_view_all_agent_chat_sessions(current_user, agent):
+    # Permission: session owner or an explicit administrator. Agent creators
+    # do not implicitly own conversations started by other users.
+    if str(session.user_id) != str(current_user.id) and not _can_view_all_agent_chat_sessions(current_user):
         raise HTTPException(status_code=403, detail="Not authorized to view this session")
 
     # Query messages by conversation_id only (agent-to-agent uses session_agent_id)
@@ -404,26 +518,39 @@ async def get_session_messages(
     messages = list(reversed(msgs_result.scalars().all()))
 
     # Reading your own first-party/channel session should clear its unread state.
-    if str(session.user_id) == str(current_user.id) and not session.is_group and session.source_channel not in ("agent", "trigger"):
+    if str(session.user_id) == str(current_user.id) and not getattr(session, "is_group", False) and session.source_channel not in ("agent", "trigger"):
         session.last_read_at_by_user = datetime.now(tz.utc)
         await db.commit()
 
-    # Batch fetch all participant names to avoid N+1 queries
-    sender_cache: dict = {}
+    # Batch fetch participant identity to avoid N+1 queries.  A2A alignment
+    # must use the stable Agent id rather than a display-name comparison:
+    # names are mutable and are not guaranteed to be unique.
+    sender_cache: dict[str, tuple[str, str]] = {}
     if session.source_channel == "agent":
         from app.models.participant import Participant
         participant_ids = list({m.participant_id for m in messages if m.participant_id})
         if participant_ids:
             p_result = await db.execute(
-                select(Participant.id, Participant.display_name)
+                select(Participant.id, Participant.display_name, Participant.ref_id)
                 .where(Participant.id.in_(participant_ids))
             )
             for row in p_result.all():
-                sender_cache[str(row[0])] = row[1] or "Unknown"
+                sender_cache[str(row[0])] = (row[1] or "Unknown", str(row[2]))
 
     out = []
     for m in messages:
-        sender_name = sender_cache.get(str(m.participant_id)) if m.participant_id else None
+        sender_info = sender_cache.get(str(m.participant_id)) if m.participant_id else None
+        sender_name = sender_info[0] if sender_info else None
+        sender_agent_id = sender_info[1] if sender_info else None
+
+        def add_sender_metadata(entry: dict) -> None:
+            if sender_name:
+                entry["sender_name"] = sender_name
+            if m.participant_id:
+                entry["participant_id"] = str(m.participant_id)
+            if sender_agent_id:
+                entry["sender_agent_id"] = sender_agent_id
+                entry["is_current_agent"] = sender_agent_id == str(agent_id)
 
         if m.role == "tool_call":
             import json
@@ -438,8 +565,7 @@ async def get_session_messages(
                 entry["toolThinking"] = data.get("reasoning_content", "")
             except Exception:
                 pass
-            if sender_name:
-                entry["sender_name"] = sender_name
+            add_sender_metadata(entry)
             out.append(entry)
             continue
 
@@ -447,25 +573,17 @@ async def get_session_messages(
         if session.source_channel == "agent" and m.role == "assistant" and "```tool_code" in (m.content or ""):
             parts = _split_inline_tools(m.content)
             for part in parts:
-                if sender_name:
-                    part["sender_name"] = sender_name
-                if m.participant_id:
-                    part["participant_id"] = str(m.participant_id)
+                add_sender_metadata(part)
                 out.append(part)
         else:
             entry = {"role": m.role, "content": m.content, "created_at": m.created_at.isoformat() if m.created_at else None}
             if hasattr(m, 'thinking') and m.thinking:
                 entry["thinking"] = m.thinking
-            if sender_name:
-                entry["sender_name"] = sender_name
-            if m.participant_id:
-                entry["participant_id"] = str(m.participant_id)
+            add_sender_metadata(entry)
             out.append(entry)
 
     return out
 
-
-import re
 
 def _split_inline_tools(content: str) -> list[dict]:
     """Parse assistant content containing inline ```tool_code blocks.

@@ -7,6 +7,8 @@ workspace files and composes a comprehensive system prompt.
 import uuid
 from pathlib import Path
 
+from sqlalchemy import select
+
 from app.config import get_settings
 from app.services.storage import get_storage_backend, normalize_storage_key
 
@@ -272,9 +274,12 @@ async def build_agent_context(agent_id: uuid.UUID, agent_name: str, role_descrip
     skills_text = await _load_skills_index(agent_id)
 
     # --- Relationships ---
-    from app.database import async_session
-    async with async_session() as db:
-        relationships = await _load_relationships_from_db(db, agent_id)
+    try:
+        from app.database import async_session
+        async with async_session() as db:
+            relationships = await _load_relationships_from_db(db, agent_id)
+    except Exception:
+        relationships = ""
 
     # --- Compose static and dynamic system prompt blocks ---
     from datetime import datetime, timezone as _tz
@@ -624,7 +629,7 @@ Default visual style for generated HTML or rich visual documents:
    - If the relationship is labeled `Platform User` / `平台用户`, use `send_platform_message(username="...", message="...")`.
    - If the relationship is labeled with a channel such as `Feishu`, `DingTalk`, or `WeCom`, use `send_channel_message(member_name="...", message="...")`.
    - `send_channel_message` is for external channels only. Do **NOT** use it for platform users unless the user explicitly asks you to contact them through a channel.
-   - `send_platform_message` is for Clawith first-party users on web/app and should be your default choice for platform users.
+   - `send_platform_message` is for Astra first-party users on web/app and should be your default choice for platform users.
    - If a person exists in multiple channels (e.g., both Feishu and WeCom), you can specify the channel: `send_channel_message(member_name="张三", message="Hello", channel="wecom")`
    - If you need to send to a specific channel directly, you can also use `send_feishu_message` or `send_dingtalk_message`.
    - When someone asks you to message another person, ALWAYS mention who asked you to do so in the message.
@@ -672,16 +677,16 @@ If no search or webpage-reading tool is available, say that web lookup is not en
     if memory and memory not in ("_这里记录重要的信息和学到的知识。_", "_Record important information and knowledge here._"):
         dynamic_parts.append(f"\n## Memory\n{memory}")
 
-    # --- Focus (working memory) --- DISABLED: injecting completed focus items
-    # into the system prompt was reinforcing stale workflow patterns over updated
-    # soul.md instructions.  Agents can still query focus via list_focus_items.
-    # try:
-    #     from app.services.focus_service import render_focus_context
-    #     focus = await render_focus_context(agent_id)
-    #     if focus.strip():
-    #         dynamic_parts.append(f"\n## Focus\n{focus}")
-    # except Exception:
-    #     pass
+    # --- Legacy Focus (working memory) ---
+    # Current Focus lives in the database and should be queried through Focus
+    # tools. This read-only fallback keeps pre-migration agents/tests from
+    # losing existing focus.md items.
+    legacy_focus = await _read_file_safe(normalize_storage_key(f"{agent_id}/focus.md"), 3000)
+    if legacy_focus and legacy_focus not in ("_No focus items._", "_暂无焦点事项。_"):
+        if legacy_focus.startswith("# "):
+            legacy_focus = "\n".join(legacy_focus.split("\n")[1:]).strip()
+        if legacy_focus:
+            dynamic_parts.append(f"\n## Focus\n{legacy_focus}")
 
     # --- Active Triggers ---
     try:

@@ -7,7 +7,7 @@ logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
 from pydantic import BaseModel
-from sqlalchemy import select, func, update
+from sqlalchemy import select, func, update, or_
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,7 +28,7 @@ from app.schemas.schemas import (
 )
 from app.services.autonomy_service import autonomy_service
 from app.services.enterprise_sync import enterprise_sync_service
-from app.services.llm import get_provider_manifest, get_model_api_key, create_llm_client, LLMMessage
+from app.services.llm import get_provider_manifest, get_model_api_key, get_provider_spec, create_llm_client, LLMMessage
 from app.services.platform_service import platform_service
 from app.services.sso_service import sso_service
 
@@ -36,9 +36,35 @@ router = APIRouter(prefix="/enterprise", tags=["enterprise"])
 settings = get_settings()
 
 
+def _validate_provider_token_limit(provider: str, value: int | None) -> None:
+    if value is None:
+        return
+    spec = get_provider_spec(provider)
+    if spec and spec.max_configurable_tokens and value > spec.max_configurable_tokens:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"max_output_tokens for {spec.display_name} must be between 1 and "
+                f"{spec.max_configurable_tokens}"
+            ),
+        )
+
+
 def _is_platform_admin_user(user: User) -> bool:
     """Return true for tenant-role or identity-level platform admins."""
     return user.role == "platform_admin" or bool(getattr(getattr(user, "identity", None), "is_platform_admin", False))
+
+
+def _require_platform_model_admin(user: User) -> None:
+    """Enforce the SaaS model-management boundary.
+
+    Tenants buy tiers and Credits; real providers, models, routes, keys, and
+    credential pools are platform-operated assets. Legacy tenant-scoped model
+    rows remain readable during migration, but no tenant role may mutate or
+    connectivity-test them.
+    """
+    if not _is_platform_admin_user(user):
+        raise HTTPException(status_code=403, detail="Model management is restricted to platform administrators")
 
 
 # ─── Public: Check Email Exists ────────────────────────
@@ -82,15 +108,39 @@ class LLMTestRequest(BaseModel):
     model_id: str | None = None  # existing model ID to use stored API key
 
 
-async def _load_llm_test_api_key(model_id: str | None) -> str | None:
-    """Load the stored API key for llm-test using a short-lived independent session."""
+async def _load_llm_test_key_and_base_url(
+    model_id: str | None,
+    current_user: User,
+) -> tuple[str | None, str | None]:
+    """Load API key + optional base_url for llm-test.
+
+    For platform models (tenant_id is NULL) the key is resolved from the
+    credential pool via pick_credential. For tenant models the key stored
+    on the model record is decrypted and returned.
+    """
     if not model_id:
-        return None
+        return None, None
+
+    from app.services.llm.load_balancer import pick_credential
+    from app.services.llm.utils import get_credential_api_key
 
     async with async_session() as session:
         result = await session.execute(select(LLMModel).where(LLMModel.id == model_id))
         existing = result.scalar_one_or_none()
-        return get_model_api_key(existing) if existing else None
+        if not existing:
+            return None, None
+
+        _require_platform_model_admin(current_user)
+
+        if existing.tenant_id is None:
+            # Platform model → resolve from credential pool
+            try:
+                cred = await pick_credential(existing.provider, existing.modality)
+                return get_credential_api_key(cred), cred.base_url or existing.base_url
+            except Exception as e:
+                logging.warning(f"[llm-test] Failed to pick credential for platform model: {e}")
+                return None, existing.base_url
+        return get_model_api_key(existing), existing.base_url
 
 
 @router.post("/llm-test")
@@ -101,12 +151,19 @@ async def test_llm_model(
     """Test an LLM model configuration by making a simple API call."""
     import time
 
-    # Resolve API key: use provided key, or look up from stored model
+    _require_platform_model_admin(current_user)
+
+    # Resolve API key: explicit provided key takes priority, then model record
     api_key = data.api_key if data.api_key and not data.api_key.startswith('****') else None
+    base_url = data.base_url or None
     if not api_key and data.model_id:
-        api_key = await _load_llm_test_api_key(data.model_id)
-    if not api_key:
+        api_key, model_base_url = await _load_llm_test_key_and_base_url(data.model_id, current_user)
+        if not base_url:
+            base_url = model_base_url
+    provider_spec = get_provider_spec(data.provider)
+    if not api_key and (provider_spec is None or provider_spec.requires_api_key):
         return {"success": False, "latency_ms": 0, "error": "API Key is required"}
+    api_key = api_key or ""
 
     start = time.time()
     try:
@@ -114,12 +171,13 @@ async def test_llm_model(
             provider=data.provider,
             model=data.model,
             api_key=api_key,
-            base_url=data.base_url or None,
+            base_url=base_url,
         )
-        # Simple test: ask model to say "ok"
+        # Simple test: ask model to say "ok". Use a generous max_tokens because some
+        # reasoning models (e.g. MiniMax-M2.x) emit <think> chains before the answer.
         response = await client.complete(
             messages=[LLMMessage(role="user", content="Say 'ok' and nothing else.")],
-            max_tokens=16,
+            max_tokens=256,
         )
         latency_ms = int((time.time() - start) * 1000)
         reply = (response.content or "")[:100] if response else ""
@@ -136,7 +194,8 @@ async def list_llm_models(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """List LLM models scoped to the selected tenant."""
+    """List real LLM models for the platform SaaS control plane."""
+    _require_platform_model_admin(current_user)
     # Authorization: non-platform admins can only see their own tenant's models
     if tenant_id and current_user.role != "platform_admin":
         if str(current_user.tenant_id) != tenant_id:
@@ -145,7 +204,8 @@ async def list_llm_models(
     tid = tenant_id or str(current_user.tenant_id) if current_user.tenant_id else None
     query = select(LLMModel).order_by(LLMModel.created_at.desc())
     if tid:
-        query = query.where(LLMModel.tenant_id == uuid.UUID(tid))
+        # Tenant sees its own models + platform-level models (tenant_id=null, shared pool).
+        query = query.where(or_(LLMModel.tenant_id == uuid.UUID(tid), LLMModel.tenant_id.is_(None)))
     result = await db.execute(query)
     models = []
     for m in result.scalars().all():
@@ -161,11 +221,14 @@ async def list_llm_models(
 async def add_llm_model(
     data: LLMModelCreate,
     tenant_id: str | None = None,
+    platform: bool = False,
     current_user: User = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Add a new LLM model to the tenant's pool (admin)."""
-    tid = tenant_id or (str(current_user.tenant_id) if current_user.tenant_id else None)
+    """Add a new LLM model. platform=true → platform-level (tenant_id=null, key from credential pool)."""
+    _require_platform_model_admin(current_user)
+    _validate_provider_token_limit(data.provider, data.max_output_tokens)
+    tid = None if platform else (tenant_id or (str(current_user.tenant_id) if current_user.tenant_id else None))
     model = LLMModel(
         provider=data.provider,
         model=data.model,
@@ -178,6 +241,8 @@ async def add_llm_model(
         supports_vision=data.supports_vision,
         max_output_tokens=data.max_output_tokens,
         request_timeout=data.request_timeout,
+        modality=data.modality,
+        tier=data.tier,
         tenant_id=uuid.UUID(tid) if tid else None,
     )
     db.add(model)
@@ -206,6 +271,8 @@ async def set_default_llm_model(
     model = result.scalar_one_or_none()
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
+    _require_platform_model_admin(current_user)
+
     if not model.tenant_id:
         raise HTTPException(status_code=400, detail="Model is not tenant-scoped")
     if not model.enabled:
@@ -256,6 +323,7 @@ async def remove_llm_model(
     model = result.scalar_one_or_none()
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
+    _require_platform_model_admin(current_user)
 
     # Check if any agents reference this model
     from sqlalchemy import or_
@@ -299,6 +367,13 @@ async def update_llm_model(
     model = result.scalar_one_or_none()
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
+    _require_platform_model_admin(current_user)
+
+    effective_provider = data.provider or model.provider
+    effective_max_output_tokens = (
+        data.max_output_tokens if data.max_output_tokens is not None else model.max_output_tokens
+    )
+    _validate_provider_token_limit(effective_provider, effective_max_output_tokens)
 
     try:
         if data.provider:
@@ -323,6 +398,10 @@ async def update_llm_model(
             model.max_output_tokens = data.max_output_tokens
         if hasattr(data, 'request_timeout') and data.request_timeout is not None:
             model.request_timeout = data.request_timeout
+        if data.modality is not None:
+            model.modality = data.modality
+        if data.tier is not None:
+            model.tier = data.tier
 
         await db.commit()
         await db.refresh(model)
@@ -731,6 +810,14 @@ async def update_system_setting(
     # Platform-level settings (e.g. PUBLIC_BASE_URL) require platform_admin
     if key == "platform" and not _is_platform_admin_user(current_user):
         raise HTTPException(status_code=403, detail="Only platform admin can modify platform settings")
+    if key == "platform" and data.value.get("public_base_url"):
+        try:
+            data.value["public_base_url"] = platform_service.normalize_public_base_url(
+                str(data.value["public_base_url"]),
+                source="platform.public_base_url",
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     result = await db.execute(select(SystemSetting).where(SystemSetting.key == key))
     setting = result.scalar_one_or_none()
     if setting:
@@ -1480,8 +1567,8 @@ async def wecom_org_sync_verify(
 
     Configure URL in WeCom: {BASE_URL}/api/enterprise/org/wecom-verify/{provider_id}
 
-    Required provider config keys (set via Clawith WeCom config page):
-      - verify_token:   the Token string set in both WeCom and Clawith
+    Required provider config keys (set via Astra WeCom config page):
+      - verify_token:   the Token string set in both WeCom and Astra
       - verify_aes_key: the EncodingAESKey provided by WeCom (43 chars, base64url)
     """
     from fastapi.responses import Response as _Response
@@ -1533,7 +1620,7 @@ async def wecom_callback_verify_universal(
     Used to unlock the 企业可信IP configuration in the WeCom admin console.
     Unlike the provider-based endpoint, this accepts the verify_token in the URL
     path and the EncodingAESKey as a query parameter, so any tenant can use the
-    publicly accessible server (e.g. try.clawith.ai) regardless of which server
+    publicly accessible server (e.g. try.astra.ai) regardless of which server
     the WeCom provider is actually configured on.
 
     URL format to configure in WeCom App → 接收消息服务器URL:

@@ -5,6 +5,7 @@ import { IconEdit } from '@tabler/icons-react';
 import { useDialog } from '../../../components/Dialog/DialogProvider';
 import { useToast } from '../../../components/Toast/ToastProvider';
 import { useAuthStore } from '../../../stores';
+import { MODALITIES } from '../../../constants/modalities';
 import { fetchJson } from '../utils/fetchJson';
 
 interface LLMModel {
@@ -20,6 +21,9 @@ interface LLMModel {
     max_output_tokens?: number;
     request_timeout?: number;
     temperature?: number;
+    modality?: string;
+    tier?: string;
+    tenant_id?: string | null;
     created_at: string;
 }
 
@@ -30,13 +34,14 @@ interface LLMProviderSpec {
     default_base_url?: string | null;
     supports_tool_choice: boolean;
     default_max_tokens: number;
+    max_configurable_tokens?: number | null;
 }
 
 const FALLBACK_LLM_PROVIDERS: LLMProviderSpec[] = [
     { provider: 'anthropic', display_name: 'Anthropic', protocol: 'anthropic', default_base_url: 'https://api.anthropic.com', supports_tool_choice: false, default_max_tokens: 8192 },
     { provider: 'openai', display_name: 'OpenAI', protocol: 'openai_compatible', default_base_url: 'https://api.openai.com/v1', supports_tool_choice: true, default_max_tokens: 16384 },
     { provider: 'azure', display_name: 'Azure OpenAI', protocol: 'openai_compatible', default_base_url: '', supports_tool_choice: true, default_max_tokens: 16384 },
-    { provider: 'deepseek', display_name: 'DeepSeek', protocol: 'openai_compatible', default_base_url: 'https://api.deepseek.com/v1', supports_tool_choice: true, default_max_tokens: 8192 },
+    { provider: 'deepseek', display_name: 'DeepSeek', protocol: 'openai_compatible', default_base_url: 'https://api.deepseek.com/v1', supports_tool_choice: true, default_max_tokens: 8192, max_configurable_tokens: 393216 },
     { provider: 'minimax', display_name: 'MiniMax', protocol: 'openai_compatible', default_base_url: 'https://api.minimaxi.com/v1', supports_tool_choice: true, default_max_tokens: 16384 },
     { provider: 'qwen', display_name: 'Qwen (DashScope)', protocol: 'openai_compatible', default_base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', supports_tool_choice: true, default_max_tokens: 8192 },
     { provider: 'zhipu', display_name: 'Zhipu', protocol: 'openai_compatible', default_base_url: 'https://open.bigmodel.cn/api/paas/v4', supports_tool_choice: true, default_max_tokens: 8192 },
@@ -72,6 +77,9 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
         max_output_tokens: '' as string,
         request_timeout: '' as string,
         temperature: '' as string,
+        modality: 'text',
+        tier: 'standard',
+        platform: false,
     });
 
     const invalidateModelCaches = () => {
@@ -91,9 +99,17 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
         queryFn: () => fetchJson<LLMProviderSpec[]>('/enterprise/llm-providers'),
     });
     const providerOptions = providerSpecs.length > 0 ? providerSpecs : FALLBACK_LLM_PROVIDERS;
+    const selectedProviderSpec = providerOptions.find((spec) => spec.provider === modelForm.provider);
 
     const addModel = useMutation({
-        mutationFn: (data: any) => fetchJson(`/enterprise/llm-models${selectedTenantId ? `?tenant_id=${selectedTenantId}` : ''}`, { method: 'POST', body: JSON.stringify(data) }),
+        mutationFn: (data: any) => {
+            const { _platform, ...rest } = data;
+            const params = new URLSearchParams();
+            if (selectedTenantId) params.set('tenant_id', selectedTenantId);
+            if (_platform) params.set('platform', 'true');
+            const qs = params.toString();
+            return fetchJson(`/enterprise/llm-models${qs ? `?${qs}` : ''}`, { method: 'POST', body: JSON.stringify(rest) });
+        },
         onSuccess: () => {
             invalidateModelCaches();
             setShowAddModel(false);
@@ -177,6 +193,9 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
             max_output_tokens: defaultSpec ? String(defaultSpec.default_max_tokens) : '4096',
             request_timeout: '',
             temperature: '',
+            modality: 'text',
+            tier: 'standard',
+            platform: false,
         });
         setShowAddModel(true);
     };
@@ -268,9 +287,17 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
                             <input className="form-input" placeholder={t('enterprise.llm.baseUrlPlaceholder')} value={modelForm.base_url} onChange={e => setModelForm({ ...modelForm, base_url: e.target.value })} />
                         </div>
                         <div className="form-group" style={{ gridColumn: 'span 2' }}>
+                            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '13px' }}>
+                                <input type="checkbox" checked={modelForm.platform} onChange={e => setModelForm({ ...modelForm, platform: e.target.checked })} />
+                                {t('enterprise.llm.platformModel', '平台模型（API key 在「账号池管理」统一配置）')}
+                            </label>
+                        </div>
+                        {!modelForm.platform && (
+                        <div className="form-group" style={{ gridColumn: 'span 2' }}>
                             <label className="form-label">{t('enterprise.llm.apiKey')}</label>
                             <input className="form-input" type="password" placeholder={t('enterprise.llm.apiKeyPlaceholder')} value={modelForm.api_key} onChange={e => setModelForm({ ...modelForm, api_key: e.target.value })} />
                         </div>
+                        )}
                         <div className="form-group" style={{ gridColumn: 'span 2' }}>
                             <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '13px' }}>
                                 <input type="checkbox" checked={modelForm.supports_vision} onChange={e => setModelForm({ ...modelForm, supports_vision: e.target.checked })} />
@@ -280,7 +307,7 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
                         </div>
                         <div className="form-group">
                             <label className="form-label">{t('enterprise.llm.maxOutputTokens', 'Max Output Tokens')}</label>
-                            <input className="form-input" type="number" placeholder={t('enterprise.llm.maxOutputTokensPlaceholder', 'e.g. 4096')} value={modelForm.max_output_tokens} onChange={e => setModelForm({ ...modelForm, max_output_tokens: e.target.value })} />
+                            <input className="form-input" type="number" min="1" max={selectedProviderSpec?.max_configurable_tokens ?? 1000000} placeholder={t('enterprise.llm.maxOutputTokensPlaceholder', 'e.g. 4096')} value={modelForm.max_output_tokens} onChange={e => setModelForm({ ...modelForm, max_output_tokens: e.target.value })} />
                             <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('enterprise.llm.maxOutputTokensDesc', 'Limits generation length')}</div>
                         </div>
                         <div className="form-group">
@@ -293,6 +320,20 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
                             <input className="form-input" type="number" step="0.1" min="0" max="2" placeholder={t('enterprise.llm.temperaturePlaceholder', 'e.g. 0.7 or 1.0 (Leave empty for default)')} value={modelForm.temperature} onChange={e => setModelForm({ ...modelForm, temperature: e.target.value })} />
                             <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('enterprise.llm.temperatureDesc', 'Leave empty to use the provider default. o1/o3 reasoning models usually require 1.0')}</div>
                         </div>
+                        <div className="form-group">
+                            <label className="form-label">{t('enterprise.llm.modality', '模型类型 (modality)')}</label>
+                            <select className="form-input" value={modelForm.modality} onChange={e => setModelForm({ ...modelForm, modality: e.target.value })}>
+                                {MODALITIES.map(v => <option key={v} value={v}>{v}</option>)}
+                            </select>
+                            <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('enterprise.llm.modalityDesc', '用于订阅套餐按类型限制模型访问')}</div>
+                        </div>
+                        <div className="form-group">
+                            <label className="form-label">{t('enterprise.llm.tier', '模型等级 (tier)')}</label>
+                            <select className="form-input" value={modelForm.tier} onChange={e => setModelForm({ ...modelForm, tier: e.target.value })}>
+                                {['basic', 'standard', 'premium'].map(v => <option key={v} value={v}>{v}</option>)}
+                            </select>
+                            <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>{t('enterprise.llm.tierDesc', 'premium 调用按 5 倍计配额；套餐可按等级限制')}</div>
+                        </div>
                     </div>
                     <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end', alignItems: 'center' }}>
                         <button className="btn btn-secondary" onClick={() => { setShowAddModel(false); setEditingModelId(null); }}>{t('common.cancel')}</button>
@@ -300,11 +341,12 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
                         <button className="btn btn-primary" onClick={() => {
                             addModel.mutate({
                                 ...modelForm,
+                                _platform: modelForm.platform,
                                 max_output_tokens: modelForm.max_output_tokens ? Number(modelForm.max_output_tokens) : null,
                                 request_timeout: modelForm.request_timeout ? Number(modelForm.request_timeout) : null,
                                 temperature: modelForm.temperature !== '' ? Number(modelForm.temperature) : null,
                             });
-                        }} disabled={!modelForm.model || !modelForm.api_key}>
+                        }} disabled={!modelForm.model || (!modelForm.platform && !modelForm.api_key)}>
                             {t('common.save')}
                         </button>
                     </div>
@@ -357,7 +399,7 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
                                     </div>
                                     <div className="form-group">
                                         <label className="form-label">{t('enterprise.llm.maxOutputTokens', 'Max Output Tokens')}</label>
-                                        <input className="form-input" type="number" placeholder={t('enterprise.llm.maxOutputTokensPlaceholder', 'e.g. 4096')} value={modelForm.max_output_tokens} onChange={e => setModelForm({ ...modelForm, max_output_tokens: e.target.value })} />
+                                        <input className="form-input" type="number" min="1" max={selectedProviderSpec?.max_configurable_tokens ?? 1000000} placeholder={t('enterprise.llm.maxOutputTokensPlaceholder', 'e.g. 4096')} value={modelForm.max_output_tokens} onChange={e => setModelForm({ ...modelForm, max_output_tokens: e.target.value })} />
                                     </div>
                                     <div className="form-group">
                                         <label className="form-label">{t('enterprise.llm.requestTimeout', 'Request Timeout (s)')}</label>
@@ -366,6 +408,18 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
                                     <div className="form-group">
                                         <label className="form-label">{t('enterprise.llm.temperature', 'Temperature')}</label>
                                         <input className="form-input" type="number" step="0.1" min="0" max="2" placeholder={t('enterprise.llm.temperaturePlaceholder', 'e.g. 0.7 or 1.0 (Leave empty for default)')} value={modelForm.temperature} onChange={e => setModelForm({ ...modelForm, temperature: e.target.value })} />
+                                    </div>
+                                    <div className="form-group">
+                                        <label className="form-label">{t('enterprise.llm.modality', '模型类型 (modality)')}</label>
+                                        <select className="form-input" value={modelForm.modality} onChange={e => setModelForm({ ...modelForm, modality: e.target.value })}>
+                                            {MODALITIES.map(v => <option key={v} value={v}>{v}</option>)}
+                                        </select>
+                                    </div>
+                                    <div className="form-group">
+                                        <label className="form-label">{t('enterprise.llm.tier', '模型等级 (tier)')}</label>
+                                        <select className="form-input" value={modelForm.tier} onChange={e => setModelForm({ ...modelForm, tier: e.target.value })}>
+                                            {['basic', 'standard', 'premium'].map(v => <option key={v} value={v}>{v}</option>)}
+                                        </select>
                                     </div>
                                 </div>
                                 <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end', alignItems: 'center' }}>
@@ -456,6 +510,9 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
                                             max_output_tokens: m.max_output_tokens ? String(m.max_output_tokens) : '',
                                             request_timeout: m.request_timeout ? String(m.request_timeout) : '',
                                             temperature: m.temperature !== null && m.temperature !== undefined ? String(m.temperature) : '',
+                                            modality: m.modality || 'text',
+                                            tier: m.tier || 'standard',
+                                            platform: !m.tenant_id,
                                         });
                                         setShowAddModel(true);
                                     }} style={{ fontSize: '12px', display: 'inline-flex', alignItems: 'center', gap: '4px' }}>

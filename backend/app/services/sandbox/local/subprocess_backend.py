@@ -3,7 +3,6 @@
 import asyncio
 import os
 import shutil
-import signal
 import time
 from pathlib import Path
 
@@ -11,10 +10,37 @@ from loguru import logger
 
 from app.services.sandbox.base import BaseSandboxBackend, ExecutionResult, SandboxCapabilities
 from app.services.sandbox.config import SandboxConfig
+from app.services.process_utils import settle_tasks, terminate_process_group
 from app.services.workspace_paths import WorkspacePathError, resolve_path_within_root
 
 MAX_STDOUT_CAPTURE_BYTES = 1_000_000
 MAX_STDERR_CAPTURE_BYTES = 500_000
+
+_BWRAP_NAMESPACE_FAILURE_MARKERS = (
+    "no permissions to create new namespace",
+    "creating new namespace failed",
+    "failed to unshare",
+    "unshare failed",
+    "namespace creation failed",
+)
+
+
+def _bwrap_failure_error(stderr: str) -> str | None:
+    """Turn common namespace failures into a deployer-actionable error."""
+    normalized = (stderr or "").lower()
+    namespace_failure = any(marker in normalized for marker in _BWRAP_NAMESPACE_FAILURE_MARKERS)
+    namespace_failure = namespace_failure or (
+        "namespace" in normalized and "operation not permitted" in normalized
+    )
+    if not namespace_failure:
+        return None
+    return (
+        "bubblewrap sandbox is installed but the runtime cannot create the required "
+        "Linux namespaces. Enable user namespaces/capabilities for the backend "
+        "runtime (or use the repository's supported Docker security settings). "
+        "Execution remains fail-closed; the unsafe fallback is for explicit local "
+        "development only."
+    )
 
 
 # Security patterns - reused from agent_tools.py
@@ -390,6 +416,8 @@ class SubprocessBackend(BaseSandboxBackend):
         
         # Write code to temp file
         script_path = work_path / f"_exec_tmp{ext}"
+        proc = None
+        reader_tasks: list[asyncio.Task] = []
 
         try:
             self._ensure_workspace_venv(venv_path)
@@ -449,20 +477,19 @@ class SubprocessBackend(BaseSandboxBackend):
                         except Exception:
                             pass
 
-            task1 = asyncio.create_task(read_stream(proc.stdout, stdout_data, "stdout"))
-            task2 = asyncio.create_task(read_stream(proc.stderr, stderr_data, "stderr"))
+            reader_tasks = [
+                asyncio.create_task(read_stream(proc.stdout, stdout_data, "stdout")),
+                asyncio.create_task(read_stream(proc.stderr, stderr_data, "stderr")),
+            ]
 
             is_timeout = False
             try:
                 await asyncio.wait_for(proc.wait(), timeout=timeout)
             except asyncio.TimeoutError:
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                except Exception:
-                    proc.kill()
                 is_timeout = True
+                await terminate_process_group(proc)
 
-            await asyncio.gather(task1, task2)
+            await settle_tasks(reader_tasks)
             stdout = bytes(stdout_data)
             stderr = bytes(stderr_data)
 
@@ -481,13 +508,14 @@ class SubprocessBackend(BaseSandboxBackend):
                     error=f"Code execution timed out after {timeout}s. If you expect this code to take longer, try calling the tool again with a higher 'timeout' parameter (up to 3600s)."
                 )
 
+            bwrap_error = _bwrap_failure_error(stderr_str) if bwrap_command else None
             return ExecutionResult(
                 success=proc.returncode == 0,
                 stdout=stdout_str,
                 stderr=stderr_str,
                 exit_code=proc.returncode,
                 duration_ms=duration_ms,
-                error=None if proc.returncode == 0 else f"Exit code: {proc.returncode}"
+                error=None if proc.returncode == 0 else (bwrap_error or f"Exit code: {proc.returncode}")
             )
 
         except Exception as e:
@@ -503,6 +531,9 @@ class SubprocessBackend(BaseSandboxBackend):
             )
 
         finally:
+            if proc is not None and proc.returncode is None:
+                await terminate_process_group(proc)
+            await settle_tasks(reader_tasks)
             # Clean up temp script
             try:
                 script_path.unlink(missing_ok=True)

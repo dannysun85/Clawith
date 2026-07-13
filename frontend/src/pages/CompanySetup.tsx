@@ -138,14 +138,22 @@ export default function CompanySetup() {
             <div className="atlas-screen-center atlas-screen-pad">
                 <div className="atlas-name-stack">
                     <h1 className="atlas-display atlas-display--centered">
-                        {isZh ? (
+                        {!allowCreate ? (
+                            isZh
+                                ? <><span>加入你的公司。</span><br /><span>输入管理员提供的邀请码。</span></>
+                                : <><span>Join your Company.</span><br /><span>Enter your invitation code.</span></>
+                        ) : isZh ? (
                             <><span>开始吧。</span><br /><span>给你的公司起个名字。</span></>
                         ) : (
                             <><span>Let's begin.</span><br /><span>Name your Company.</span></>
                         )}
                     </h1>
                     <p className="atlas-body atlas-body--muted atlas-name-sub">
-                        {isZh
+                        {!allowCreate
+                            ? (isZh
+                                ? '当前平台由管理员创建公司。邀请码将把你的账号安全地加入对应团队。'
+                                : 'Companies are created by administrators. Your invitation code securely joins the correct team.')
+                            : isZh
                             ? '每个宇宙都从一个名字开始。让它具体、属于你 —— 之后随时能改。'
                             : 'Every universe begins with a name. Make it specific, make it yours — it can change later.'}
                     </p>

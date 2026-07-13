@@ -3,16 +3,26 @@ import { useTranslation } from 'react-i18next';
 
 import { fetchAuth } from '../utils/fetchAuth';
 
+export function normalizeApprovals(value: unknown): any[] {
+    if (Array.isArray(value)) return value;
+    if (value && typeof value === 'object' && 'items' in value) {
+        const items = (value as { items?: unknown }).items;
+        return Array.isArray(items) ? items : [];
+    }
+    return [];
+}
+
 export default function ApprovalsTab({ agentId, canManage }: { agentId: string; canManage: boolean }) {
     const { i18n } = useTranslation();
     const queryClient = useQueryClient();
     const isChinese = i18n.language?.startsWith('zh');
-    const { data: approvals = [], refetch: refetchApprovals } = useQuery({
+    const { data: approvalData, isError, refetch: refetchApprovals } = useQuery({
         queryKey: ['agent-approvals', agentId],
-        queryFn: () => fetchAuth<any[]>(`/agents/${agentId}/approvals`),
+        queryFn: () => fetchAuth<unknown>(`/agents/${agentId}/approvals`),
         enabled: !!agentId,
         refetchInterval: 15000,
     });
+    const approvals = normalizeApprovals(approvalData);
 
     const resolveMut = useMutation({
         mutationFn: async ({ approvalId, action }: { approvalId: string; action: string }) => {
@@ -51,6 +61,11 @@ export default function ApprovalsTab({ agentId, canManage }: { agentId: string; 
 
     return (
         <div style={{ padding: '20px 24px' }}>
+            {isError && (
+                <div style={{ marginBottom: '12px', color: 'var(--error)', fontSize: '13px' }}>
+                    {isChinese ? '审批记录加载失败，请稍后重试。' : 'Failed to load approvals. Please try again.'}
+                </div>
+            )}
             {pending.length > 0 && (
                 <>
                     <h4 style={{ margin: '0 0 12px', fontSize: '13px', color: 'var(--warning)' }}>

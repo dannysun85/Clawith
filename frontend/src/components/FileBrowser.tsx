@@ -65,6 +65,19 @@ function isImage(name: string): boolean {
     return IMAGE_EXTS.some(ext => n.endsWith(ext));
 }
 
+const VIDEO_EXTS = ['.mp4', '.webm', '.mov', '.m4v'];
+const AUDIO_EXTS = ['.mp3', '.wav', '.ogg', '.m4a', '.aac', '.flac', '.opus'];
+
+function isVideo(name: string): boolean {
+    const n = name.toLowerCase();
+    return VIDEO_EXTS.some(ext => n.endsWith(ext));
+}
+
+function isAudio(name: string): boolean {
+    const n = name.toLowerCase();
+    return AUDIO_EXTS.some(ext => n.endsWith(ext));
+}
+
 // ─── Component ─────────────────────────────────────────
 
 export default function FileBrowser({
@@ -473,6 +486,28 @@ export default function FileBrowser({
                                 />
                             ) : (
                                 <div style={{ padding: '20px', color: 'var(--text-tertiary)' }}>Cannot preview image without download URL</div>
+                            )}
+                        </div>
+                    ) : isVideo(viewing) ? (
+                        <div style={{ textAlign: 'center', padding: '20px', background: 'var(--bg-tertiary)', borderRadius: '8px' }}>
+                            {api.downloadUrl ? (
+                                <video
+                                    src={api.downloadUrl(viewing)}
+                                    controls
+                                    playsInline
+                                    preload="metadata"
+                                    style={{ maxWidth: '100%', maxHeight: '600px', borderRadius: '6px' }}
+                                />
+                            ) : (
+                                <div style={{ padding: '20px', color: 'var(--text-tertiary)' }}>Cannot preview video without download URL</div>
+                            )}
+                        </div>
+                    ) : isAudio(viewing) ? (
+                        <div style={{ padding: '28px', background: 'var(--bg-tertiary)', borderRadius: '8px' }}>
+                            {api.downloadUrl ? (
+                                <audio src={api.downloadUrl(viewing)} controls preload="metadata" style={{ width: '100%' }} />
+                            ) : (
+                                <div style={{ color: 'var(--text-tertiary)' }}>Cannot preview audio without download URL</div>
                             )}
                         </div>
                     ) : (

@@ -31,8 +31,8 @@ class SystemSettingDAO(BaseDAO[SystemSetting]):
 
     async def is_invitation_code_enabled(self) -> bool:
         """Return whether invitation-code enforcement is active."""
-        value = await self.get_value("invitation_code_enabled", {})
-        return bool(value.get("enabled", False))
+        value = await self.get_value("invitation_code_enabled", {"enabled": True})
+        return bool(value.get("enabled", True))
 
     async def is_sso_custom_domain_redirect_enabled(self) -> bool:
         """Return whether cross-domain SSO redirect is globally enabled."""

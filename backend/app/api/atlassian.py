@@ -88,6 +88,7 @@ async def configure_atlassian_channel(
 @router.get("/agents/{agent_id}/atlassian-channel")
 async def get_atlassian_channel(
     agent_id: uuid.UUID,
+    missing_ok: bool = False,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -100,6 +101,8 @@ async def get_atlassian_channel(
     )
     config = result.scalar_one_or_none()
     if not config:
+        if missing_ok:
+            return None
         raise HTTPException(status_code=404, detail="Atlassian not configured")
     return _serialize(config)
 

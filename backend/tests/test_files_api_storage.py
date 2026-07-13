@@ -1,5 +1,6 @@
 import uuid
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -73,6 +74,38 @@ class PrefixOnlyStorage(StorageBackend):
         )
 
 
+def test_file_kind_recognizes_browser_playable_media():
+    assert files._file_kind("workspace/videos/demo.mp4") == "video"
+    assert files._file_kind("workspace/videos/demo.webm") == "video"
+    assert files._file_kind("workspace/audio/demo.mp3") == "audio"
+    assert files._file_kind("workspace/audio/demo.wav") == "audio"
+
+
+@pytest.mark.asyncio
+async def test_preview_video_returns_stream_url_without_embedding_binary(monkeypatch):
+    agent_id = uuid.uuid4()
+    storage = PrefixOnlyStorage({f"{agent_id}/workspace/videos/demo.mp4": b"\x00\x00\x00\x18ftypmp42video"})
+    monkeypatch.setattr(files, "get_storage_backend", lambda: storage)
+
+    async def allow_access(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(files, "check_agent_access", allow_access)
+    user = SimpleNamespace(tenant_id=None)
+
+    result = await files.preview_file(
+        agent_id,
+        path="workspace/videos/demo.mp4",
+        current_user=user,
+        db=None,
+    )
+
+    assert result["kind"] == "video"
+    assert result["mime_type"] == "video/mp4"
+    assert result["url"].endswith("path=workspace/videos/demo.mp4")
+    assert "base64_sample" not in result
+
+
 @pytest.mark.asyncio
 async def test_list_files_accepts_s3_prefix_directory(monkeypatch):
     agent_id = uuid.uuid4()
@@ -124,18 +157,32 @@ async def test_read_file_returns_version_token(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_agent_manager_does_not_reinitialize_s3_prefix_directory(monkeypatch, tmp_path):
+async def test_agent_manager_repairs_partial_s3_prefix_without_overwriting(monkeypatch, tmp_path):
     agent_id = uuid.uuid4()
     storage = PrefixOnlyStorage({f"{agent_id}/soul.md": b"existing"})
+    template_dir = tmp_path / "templates"
+    template_dir.mkdir()
+    (template_dir / "soul.md").write_text("template", encoding="utf-8")
+    (template_dir / "instructions.md").write_text("# Instructions\n", encoding="utf-8")
     monkeypatch.setattr("app.services.agent_manager.get_storage_backend", lambda: storage)
     monkeypatch.setattr("app.services.agent_manager.settings.STORAGE_LOCAL_ROOT", str(tmp_path))
+    monkeypatch.setattr("app.services.agent_manager.settings.AGENT_TEMPLATE_DIR", str(template_dir))
 
     manager = AgentManager()
-    agent = SimpleNamespace(id=agent_id)
+    agent = SimpleNamespace(
+        id=agent_id,
+        creator_id=uuid.uuid4(),
+        name="Repairable Agent",
+        role_description="",
+    )
+    db = SimpleNamespace(
+        execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: None)),
+    )
 
-    await manager.initialize_agent_files(db=None, agent=agent)
+    await manager.initialize_agent_files(db=db, agent=agent)
 
     assert storage.objects[f"{agent_id}/soul.md"] == b"existing"
+    assert storage.objects[f"{agent_id}/instructions.md"] == b"# Instructions\n"
 
 
 @pytest.mark.asyncio
@@ -154,3 +201,36 @@ async def test_agent_manager_materializes_s3_prefix_directory(monkeypatch, tmp_p
 
     assert (agent_dir / "soul.md").read_text(encoding="utf-8") == "# Soul\n"
     assert (agent_dir / "memory" / "memory.md").read_text(encoding="utf-8") == "# Memory\n"
+
+
+@pytest.mark.asyncio
+async def test_agent_manager_uses_english_default_role_in_soul(monkeypatch, tmp_path):
+    agent_id = uuid.uuid4()
+    creator_id = uuid.uuid4()
+    storage = PrefixOnlyStorage()
+    template_dir = tmp_path / "templates"
+    template_dir.mkdir()
+    (template_dir / "soul.md").write_text(
+        "# {{agent_name}}\n\nRole: {{role_description}}\nCreator: {{creator_name}}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("app.services.agent_manager.get_storage_backend", lambda: storage)
+    monkeypatch.setattr("app.services.agent_manager.settings.STORAGE_LOCAL_ROOT", str(tmp_path / "agents"))
+    monkeypatch.setattr("app.services.agent_manager.settings.AGENT_TEMPLATE_DIR", str(template_dir))
+
+    creator = SimpleNamespace(display_name="Owner")
+    db = SimpleNamespace(
+        execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: creator)),
+    )
+    agent = SimpleNamespace(
+        id=agent_id,
+        creator_id=creator_id,
+        name="Writer",
+        role_description="",
+    )
+
+    await AgentManager().initialize_agent_files(db, agent)
+
+    soul = (await storage.read_bytes(f"{agent_id}/soul.md")).decode()
+    assert "Role: General assistant" in soul
+    assert "通用助手" not in soul

@@ -1,4 +1,4 @@
-# Contributing to Clawith 🦞
+# Contributing to Astra 🦞
 
 Thanks for your interest in contributing! Whether it's a bug fix, new feature, translation, or documentation improvement — every contribution matters.
 

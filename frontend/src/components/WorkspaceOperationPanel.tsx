@@ -6,6 +6,7 @@ import MarkdownRenderer from './MarkdownRenderer';
 import PromptModal from './PromptModal';
 import { useDialog } from './Dialog/DialogProvider';
 import { fileApi, uploadFileWithProgress } from '../services/api';
+import { loadExpandedFileTree, type WorkspaceFileNode } from '../utils/workspaceTree';
 
 export interface WorkspaceActivity {
     action: 'write' | 'edit' | 'move' | 'convert' | 'delete';
@@ -22,13 +23,6 @@ export interface WorkspaceLiveDraft {
     path?: string;
     content?: string;
     status: 'drafting' | 'running';
-}
-
-interface WorkspaceFileNode {
-    name: string;
-    path: string;
-    is_dir: boolean;
-    children?: WorkspaceFileNode[];
 }
 
 interface UploadItem {
@@ -66,7 +60,9 @@ const DEFAULT_UPLOAD_DIR = 'workspace/uploads';
 type TreeScope = 'workspace' | 'all';
 const EDITABLE_EXTS = new Set(['.md', '.markdown', '.csv']);
 const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg']);
-const PREVIEW_EXTS = new Set(['.md', '.markdown', '.csv', '.html', '.htm', '.pdf', '.xlsx', '.xls', '.docx', '.doc', '.pptx', '.ppt', '.txt', '.log', '.json', ...IMAGE_EXTS]);
+const VIDEO_EXTS = new Set(['.mp4', '.webm', '.mov', '.m4v']);
+const AUDIO_EXTS = new Set(['.mp3', '.wav', '.ogg', '.m4a', '.aac', '.flac', '.opus']);
+const PREVIEW_EXTS = new Set(['.md', '.markdown', '.csv', '.html', '.htm', '.pdf', '.xlsx', '.xls', '.docx', '.doc', '.pptx', '.ppt', '.txt', '.log', '.json', ...IMAGE_EXTS, ...VIDEO_EXTS, ...AUDIO_EXTS]);
 const MIN_SAVING_VISIBLE_MS = 650;
 const SAVED_VISIBLE_MS = 1600;
 const DEFAULT_TREE_WIDTH = 240;
@@ -493,23 +489,12 @@ export default function WorkspaceOperationPanel({
     };
 
     const loadFileTree = async () => {
-        const loadDir = async (path: string, depth: number): Promise<WorkspaceFileNode[]> => {
-            if (depth > 8) return [];
-            const isRoot = path === (treeScope === 'workspace' ? WORKSPACE_ROOT : '');
-            const isExpanded = expandedDirs.has(path);
-            if (!isRoot && !isExpanded) {
-                return [];
-            }
-            const items = await fileApi.list(agentId, path).catch(() => []);
-            return Promise.all(items.map(async (item: WorkspaceFileNode) => {
-                if (!item.is_dir) return item;
-                const children = expandedDirs.has(item.path)
-                    ? await loadDir(item.path, depth + 1)
-                    : [];
-                return { ...item, children };
-            }));
-        };
-        const roots = await loadDir(treeScope === 'workspace' ? WORKSPACE_ROOT : '', 0);
+        const rootPath = treeScope === 'workspace' ? WORKSPACE_ROOT : '';
+        const roots = await loadExpandedFileTree(
+            (path) => fileApi.list(agentId, path),
+            rootPath,
+            expandedDirs,
+        );
         setFileTree(roots);
     };
 
@@ -1077,6 +1062,35 @@ export default function WorkspaceOperationPanel({
                         alt={fileName(activePath)}
                         className="workspace-op-image"
                     />
+                </div>
+            );
+        }
+        if (previewType === 'video') {
+            return (
+                <div className="workspace-op-media-preview">
+                    <video
+                        src={fileApi.downloadUrl(agentId, activePath, { inline: true })}
+                        className="workspace-op-video"
+                        controls
+                        playsInline
+                        preload="metadata"
+                    >
+                        Your browser does not support video playback.
+                    </video>
+                </div>
+            );
+        }
+        if (previewType === 'audio') {
+            return (
+                <div className="workspace-op-media-preview">
+                    <audio
+                        src={fileApi.downloadUrl(agentId, activePath, { inline: true })}
+                        className="workspace-op-audio"
+                        controls
+                        preload="metadata"
+                    >
+                        Your browser does not support audio playback.
+                    </audio>
                 </div>
             );
         }

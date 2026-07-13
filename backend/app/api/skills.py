@@ -5,20 +5,25 @@ import base64
 import io
 import os
 import re
+import uuid
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
+from app.core.security import get_current_admin, get_current_user, require_role
 from app.database import async_session
 from app.models.skill import Skill, SkillFile
-from app.core.security import get_current_admin, get_current_user, require_role
 from app.models.user import User
-from loguru import logger
+from app.services.skill_scope import (
+    prefer_tenant_skill_overrides,
+    scope_skill_query,
+)
 
 router = APIRouter(prefix="/skills", tags=["skills"])
 
@@ -318,27 +323,134 @@ def _parse_github_url(url: str) -> dict | None:
 
 
 def _apply_skill_scope(query, current_user: User):
-    """Scope skill queries for tenant admins while leaving platform admins unrestricted."""
-    from sqlalchemy import or_ as _or
+    """Scope generic skill APIs to global + the caller's current tenant."""
+    return scope_skill_query(query, current_user.tenant_id)
 
-    if current_user.role == "platform_admin" or not current_user.tenant_id:
-        return query
-    return query.where(_or(Skill.tenant_id.is_(None), Skill.tenant_id == current_user.tenant_id))
+
+def _is_platform_skill_admin(current_user: User) -> bool:
+    identity = getattr(current_user, "identity", None)
+    return current_user.role == "platform_admin" or bool(
+        getattr(identity, "is_platform_admin", False)
+    )
 
 
 def _ensure_skill_write_access(skill: Skill, current_user: User):
-    """Allow platform admins to edit everything; tenant admins can edit
-    tenant-owned skills AND builtin (preset) skills visible to their tenant.
-    Builtin skills are treated as presets -- placed during company init,
-    but fully manageable by org_admin afterwards.
-    """
-    if current_user.role == "platform_admin":
+    """Reject cross-tenant writes and tenant writes to global definitions."""
+    if _is_platform_skill_admin(current_user):
         return
     if not current_user.tenant_id:
         raise HTTPException(403, "Cannot modify skills without a tenant")
-    # Allow org_admin to manage: their own tenant skills OR builtin (preset) skills
-    if skill.tenant_id is not None and skill.tenant_id != current_user.tenant_id:
+    if skill.tenant_id is None:
+        raise HTTPException(403, "Global skills cannot be modified by tenant admins")
+    if skill.tenant_id != current_user.tenant_id:
         raise HTTPException(403, "Cannot modify other-tenant skills")
+
+
+def _validate_skill_folder(folder_name: str) -> str:
+    folder = folder_name.strip()
+    if (
+        not folder
+        or len(folder) > 100
+        or folder in {".", ".."}
+        or "/" in folder
+        or "\\" in folder
+        or "\x00" in folder
+    ):
+        raise HTTPException(400, "Invalid skill folder name")
+    return folder
+
+
+def _validate_skill_file_path(file_path: str) -> str:
+    path = file_path.strip()
+    parsed = PurePosixPath(path)
+    if (
+        not path
+        or len(path) > 500
+        or parsed.is_absolute()
+        or any(part in {"", ".", ".."} for part in parsed.parts)
+        or "\\" in path
+        or "\x00" in path
+    ):
+        raise HTTPException(400, "Invalid skill file path")
+    return path
+
+
+def _exact_owner_clause(tenant_id: uuid.UUID | None):
+    if tenant_id is None:
+        return Skill.tenant_id.is_(None)
+    return Skill.tenant_id == tenant_id
+
+
+async def _find_skill_conflict(
+    db,
+    *,
+    tenant_id: uuid.UUID | None,
+    name: str,
+    folder_name: str,
+    exclude_id: uuid.UUID | None = None,
+) -> Skill | None:
+    query = select(Skill).where(
+        _exact_owner_clause(tenant_id),
+        or_(Skill.name == name, Skill.folder_name == folder_name),
+    )
+    if exclude_id is not None:
+        query = query.where(Skill.id != exclude_id)
+    result = await db.execute(query)
+    return result.scalars().first()
+
+
+async def _resolve_skill_folder(
+    db,
+    folder_name: str,
+    tenant_id: uuid.UUID | None,
+) -> Skill | None:
+    query = scope_skill_query(
+        select(Skill)
+        .where(Skill.folder_name == folder_name)
+        .options(selectinload(Skill.files)),
+        tenant_id,
+    )
+    result = await db.execute(query)
+    effective = prefer_tenant_skill_overrides(result.scalars().all(), tenant_id)
+    return effective[0] if effective else None
+
+
+async def _clone_global_skill_for_tenant(
+    db,
+    skill: Skill,
+    tenant_id: uuid.UUID,
+) -> Skill:
+    """Create or return the tenant-local copy used for safe customization."""
+    result = await db.execute(
+        select(Skill)
+        .where(
+            Skill.tenant_id == tenant_id,
+            Skill.folder_name == skill.folder_name,
+        )
+        .options(selectinload(Skill.files))
+    )
+    existing = result.scalars().first()
+    if existing:
+        return existing
+
+    clone = Skill(
+        tenant_id=tenant_id,
+        name=skill.name,
+        description=skill.description,
+        category=skill.category,
+        icon=skill.icon,
+        folder_name=skill.folder_name,
+        is_builtin=False,
+        is_default=skill.is_default,
+        files=[SkillFile(path=file.path, content=file.content) for file in skill.files],
+    )
+    db.add(clone)
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(409, "A tenant skill override already exists") from exc
+    return clone
 
 
 async def _fetch_github_directory(
@@ -423,34 +535,49 @@ async def _save_skill_to_db(
     tenant_id: str | None = None,
 ) -> dict:
     """Create a Skill + SkillFile records in the database."""
-    import uuid as _uuid
+    folder_name = _validate_skill_folder(folder_name)
+    normalized_name = name.strip()
+    if not normalized_name:
+        raise HTTPException(400, "Skill name is required")
+    owner_id = uuid.UUID(tenant_id) if tenant_id else None
+    normalized_files = [
+        {"path": _validate_skill_file_path(file["path"]), "content": file.get("content", "")}
+        for file in files
+    ]
+
     async with async_session() as db:
-        # Check for folder_name conflict (scoped by tenant)
-        conflict_q = select(Skill).where(Skill.folder_name == folder_name)
-        if tenant_id:
-            conflict_q = conflict_q.where(Skill.tenant_id == _uuid.UUID(tenant_id))
-        else:
-            conflict_q = conflict_q.where(Skill.tenant_id.is_(None))
-        existing = await db.execute(conflict_q)
-        if existing.scalar_one_or_none():
+        existing = await _find_skill_conflict(
+            db,
+            tenant_id=owner_id,
+            name=normalized_name,
+            folder_name=folder_name,
+        )
+        if existing:
             raise HTTPException(
-                409, f"A skill with folder name '{folder_name}' already exists. "
-                     "Delete it first or use a different name."
+                409,
+                "A skill with the same name or folder already exists in this tenant.",
             )
 
         skill = Skill(
-            name=name,
+            name=normalized_name,
             description=description,
             category=category,
             icon=icon,
             folder_name=folder_name,
             is_builtin=False,
-            tenant_id=_uuid.UUID(tenant_id) if tenant_id else None,
+            tenant_id=owner_id,
         )
         db.add(skill)
-        await db.flush()
+        try:
+            await db.flush()
+        except IntegrityError as exc:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "A skill with the same name or folder already exists in this tenant.",
+            ) from exc
 
-        for f in files:
+        for f in normalized_files:
             # PostgreSQL text columns cannot store null bytes
             content = f["content"].replace("\x00", "") if f.get("content") else ""
             db.add(SkillFile(skill_id=skill.id, path=f["path"], content=content))
@@ -662,16 +789,13 @@ async def preview_url_import(body: UrlImportIn, current_user: User = Depends(get
 @router.get("/")
 async def list_skills(current_user: User = Depends(get_current_user)):
     """List global skills scoped by tenant (builtin + tenant-specific)."""
-    import uuid as _uuid
-    from sqlalchemy import or_ as _or
-    tenant_id = str(current_user.tenant_id) if current_user.tenant_id else None
     async with async_session() as db:
-        query = select(Skill).order_by(Skill.name)
-        # Scope by tenant: show builtin (tenant_id is NULL) + tenant-specific skills
-        if tenant_id:
-            query = query.where(_or(Skill.tenant_id.is_(None), Skill.tenant_id == _uuid.UUID(tenant_id)))
+        query = scope_skill_query(select(Skill), current_user.tenant_id)
         result = await db.execute(query)
-        skills = result.scalars().all()
+        skills = prefer_tenant_skill_overrides(
+            result.scalars().all(),
+            current_user.tenant_id,
+        )
         return [
             {
                 "id": str(s.id),
@@ -715,29 +839,63 @@ async def get_skill(skill_id: str, current_user: User = Depends(get_current_user
 @router.post("/")
 async def create_skill(body: SkillCreateIn, current_user: User = Depends(get_current_admin)):
     """Create a custom skill."""
+    folder_name = _validate_skill_folder(body.folder_name)
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(400, "Skill name is required")
+    files = [
+        SkillFileIn(path=_validate_skill_file_path(file.path), content=file.content)
+        for file in body.files
+    ]
+
     async with async_session() as db:
+        conflict = await _find_skill_conflict(
+            db,
+            tenant_id=current_user.tenant_id,
+            name=name,
+            folder_name=folder_name,
+        )
+        if conflict:
+            raise HTTPException(
+                409,
+                "A skill with the same name or folder already exists in this tenant.",
+            )
+
         skill = Skill(
-            name=body.name,
+            name=name,
             description=body.description,
             category=body.category,
             icon=body.icon,
-            folder_name=body.folder_name,
+            folder_name=folder_name,
             is_builtin=False,
             tenant_id=current_user.tenant_id,
         )
         db.add(skill)
-        await db.flush()
+        try:
+            await db.flush()
+        except IntegrityError as exc:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "A skill with the same name or folder already exists in this tenant.",
+            ) from exc
 
-        if not body.files:
+        if not files:
             # Auto-create a SKILL.md template
             db.add(SkillFile(
                 skill_id=skill.id,
                 path="SKILL.md",
-                content=f"---\nname: {body.name}\ndescription: {body.description}\n---\n\n# {body.name}\n\n## Overview\n{body.description}\n",
+                content=f"---\nname: {name}\ndescription: {body.description}\n---\n\n# {name}\n\n## Overview\n{body.description}\n",
             ))
         else:
-            for f in body.files:
-                db.add(SkillFile(skill_id=skill.id, path=f.path, content=f.content))
+            for file in files:
+                db.add(
+                    SkillFile(
+                        skill_id=skill.id,
+                        path=file.path,
+                        content=file.content.replace("\x00", ""),
+                    )
+                )
 
         await db.commit()
         return {"id": str(skill.id), "name": skill.name}
@@ -760,10 +918,37 @@ async def update_skill(skill_id: str, body: SkillUpdateIn, current_user: User = 
         skill = result.scalar_one_or_none()
         if not skill:
             raise HTTPException(404, "Skill not found")
-        _ensure_skill_write_access(skill, current_user)
+
+        if (
+            skill.tenant_id is None
+            and not _is_platform_skill_admin(current_user)
+            and current_user.tenant_id is not None
+        ):
+            skill = await _clone_global_skill_for_tenant(
+                db,
+                skill,
+                current_user.tenant_id,
+            )
+        else:
+            _ensure_skill_write_access(skill, current_user)
 
         if body.name is not None:
-            skill.name = body.name
+            name = body.name.strip()
+            if not name:
+                raise HTTPException(400, "Skill name is required")
+            conflict = await _find_skill_conflict(
+                db,
+                tenant_id=skill.tenant_id,
+                name=name,
+                folder_name=skill.folder_name,
+                exclude_id=skill.id,
+            )
+            if conflict:
+                raise HTTPException(
+                    409,
+                    "A skill with the same name or folder already exists in this tenant.",
+                )
+            skill.name = name
         if body.description is not None:
             skill.description = body.description
         if body.category is not None:
@@ -773,13 +958,27 @@ async def update_skill(skill_id: str, body: SkillUpdateIn, current_user: User = 
 
         # Replace files if provided
         if body.files is not None:
+            replacement_files = [
+                SkillFileIn(
+                    path=_validate_skill_file_path(file.path),
+                    content=file.content.replace("\x00", ""),
+                )
+                for file in body.files
+            ]
             for f in skill.files:
                 await db.delete(f)
             await db.flush()
-            for f in body.files:
+            for f in replacement_files:
                 db.add(SkillFile(skill_id=skill.id, path=f.path, content=f.content))
 
-        await db.commit()
+        try:
+            await db.commit()
+        except IntegrityError as exc:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "A skill with the same name or folder already exists in this tenant.",
+            ) from exc
         return {"id": str(skill.id), "name": skill.name}
 
 
@@ -793,6 +992,8 @@ async def delete_skill(skill_id: str, current_user: User = Depends(get_current_a
         if not skill:
             raise HTTPException(404, "Skill not found")
         _ensure_skill_write_access(skill, current_user)
+        if skill.is_builtin:
+            raise HTTPException(409, "Builtin skills cannot be deleted")
         await db.delete(skill)
         await db.commit()
         return {"ok": True}
@@ -878,17 +1079,15 @@ async def set_skill_token(
 @router.get("/browse/list")
 async def browse_list(path: str = "", current_user: User = Depends(get_current_user)):
     """List skill folders (root) or files/subdirs within a skill folder."""
-    import uuid as _uuid
-    from sqlalchemy import or_ as _or
-    tenant_id = str(current_user.tenant_id) if current_user.tenant_id else None
     async with async_session() as db:
         if not path or path == "/":
             # Root: list all skill folders (scoped by tenant)
-            query = select(Skill).order_by(Skill.name)
-            if tenant_id:
-                query = query.where(_or(Skill.tenant_id.is_(None), Skill.tenant_id == _uuid.UUID(tenant_id)))
+            query = scope_skill_query(select(Skill), current_user.tenant_id)
             result = await db.execute(query)
-            skills = result.scalars().all()
+            skills = prefer_tenant_skill_overrides(
+                result.scalars().all(),
+                current_user.tenant_id,
+            )
             return [
                 {"name": s.folder_name, "path": s.folder_name, "is_dir": True, "size": 0}
                 for s in skills
@@ -896,13 +1095,8 @@ async def browse_list(path: str = "", current_user: User = Depends(get_current_u
 
         # Inside a skill folder — resolve the skill and relative subpath
         clean = path.strip("/")
-        folder = clean.split("/")[0]
-        # Resolve skill folder scoped by tenant
-        skill_q = select(Skill).where(Skill.folder_name == folder).options(selectinload(Skill.files))
-        if tenant_id:
-            skill_q = skill_q.where(_or(Skill.tenant_id.is_(None), Skill.tenant_id == _uuid.UUID(tenant_id)))
-        result = await db.execute(skill_q)
-        skill = result.scalar_one_or_none()
+        folder = _validate_skill_folder(clean.split("/")[0])
+        skill = await _resolve_skill_folder(db, folder, current_user.tenant_id)
         if not skill:
             return []
 
@@ -938,19 +1132,13 @@ async def browse_list(path: str = "", current_user: User = Depends(get_current_u
 @router.get("/browse/read")
 async def browse_read(path: str, current_user: User = Depends(get_current_user)):
     """Read a file from a skill folder."""
-    import uuid as _uuid
-    from sqlalchemy import or_ as _or
-    tenant_id = str(current_user.tenant_id) if current_user.tenant_id else None
     parts = path.strip("/").split("/", 1)
     if len(parts) < 2:
         raise HTTPException(400, "Path must include folder and file")
-    folder, file_path = parts
+    folder = _validate_skill_folder(parts[0])
+    file_path = _validate_skill_file_path(parts[1])
     async with async_session() as db:
-        skill_q = select(Skill).where(Skill.folder_name == folder).options(selectinload(Skill.files))
-        if tenant_id:
-            skill_q = skill_q.where(_or(Skill.tenant_id.is_(None), Skill.tenant_id == _uuid.UUID(tenant_id)))
-        result = await db.execute(skill_q)
-        skill = result.scalar_one_or_none()
+        skill = await _resolve_skill_folder(db, folder, current_user.tenant_id)
         if not skill:
             raise HTTPException(404, "Skill not found")
         for f in skill.files:
@@ -970,16 +1158,27 @@ async def browse_write(body: BrowseWriteIn, current_user: User = Depends(get_cur
     parts = body.path.strip("/").split("/", 1)
     if len(parts) < 2:
         raise HTTPException(400, "Path must include folder and file")
-    folder, file_path = parts
+    folder = _validate_skill_folder(parts[0])
+    file_path = _validate_skill_file_path(parts[1])
     async with async_session() as db:
-        skill_q = select(Skill).where(Skill.folder_name == folder).options(selectinload(Skill.files))
-        result = await db.execute(_apply_skill_scope(skill_q, current_user))
-        skill = result.scalar_one_or_none()
+        skill = await _resolve_skill_folder(db, folder, current_user.tenant_id)
         created_new_skill = False
         if not skill:
             # Auto-create skill from folder name, scoped to tenant
+            generated_name = folder.replace("-", " ").title()
+            conflict = await _find_skill_conflict(
+                db,
+                tenant_id=current_user.tenant_id,
+                name=generated_name,
+                folder_name=folder,
+            )
+            if conflict:
+                raise HTTPException(
+                    409,
+                    "A skill with the same name or folder already exists in this tenant.",
+                )
             skill = Skill(
-                name=folder.replace("-", " ").title(),
+                name=generated_name,
                 description="",
                 category="custom",
                 icon="--",
@@ -988,8 +1187,25 @@ async def browse_write(body: BrowseWriteIn, current_user: User = Depends(get_cur
                 tenant_id=current_user.tenant_id,
             )
             db.add(skill)
-            await db.flush()
+            try:
+                await db.flush()
+            except IntegrityError as exc:
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    "A skill with the same name or folder already exists in this tenant.",
+                ) from exc
             created_new_skill = True
+        elif (
+            skill.tenant_id is None
+            and not _is_platform_skill_admin(current_user)
+            and current_user.tenant_id is not None
+        ):
+            skill = await _clone_global_skill_for_tenant(
+                db,
+                skill,
+                current_user.tenant_id,
+            )
         else:
             _ensure_skill_write_access(skill, current_user)
 
@@ -1001,10 +1217,23 @@ async def browse_write(body: BrowseWriteIn, current_user: User = Depends(get_cur
                     existing = f
                     break
         if existing:
-            existing.content = body.content
+            existing.content = body.content.replace("\x00", "")
         else:
-            db.add(SkillFile(skill_id=skill.id, path=file_path, content=body.content))
-        await db.commit()
+            db.add(
+                SkillFile(
+                    skill_id=skill.id,
+                    path=file_path,
+                    content=body.content.replace("\x00", ""),
+                )
+            )
+        try:
+            await db.commit()
+        except IntegrityError as exc:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "A skill with the same name or folder already exists in this tenant.",
+            ) from exc
         return {"ok": True}
 
 
@@ -1012,17 +1241,19 @@ async def browse_write(body: BrowseWriteIn, current_user: User = Depends(get_cur
 async def browse_delete(path: str, current_user: User = Depends(get_current_admin)):
     """Delete a file or an entire skill folder."""
     parts = path.strip("/").split("/", 1)
-    folder = parts[0]
+    folder = _validate_skill_folder(parts[0])
+    if len(parts) > 1:
+        _validate_skill_file_path(parts[1])
     async with async_session() as db:
-        skill_q = select(Skill).where(Skill.folder_name == folder).options(selectinload(Skill.files))
-        result = await db.execute(_apply_skill_scope(skill_q, current_user))
-        skill = result.scalar_one_or_none()
+        skill = await _resolve_skill_folder(db, folder, current_user.tenant_id)
         if not skill:
             raise HTTPException(404, "Skill not found")
         _ensure_skill_write_access(skill, current_user)
 
         if len(parts) == 1:
             # Delete entire skill
+            if skill.is_builtin:
+                raise HTTPException(409, "Builtin skills cannot be deleted")
             await db.delete(skill)
         else:
             # Delete specific file

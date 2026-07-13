@@ -38,6 +38,7 @@ from app.models.okr import (
     OKRSettings,
     WorkReport,
 )
+from app.models.user import User
 
 router = APIRouter(prefix="/api/okr", tags=["okr"])
 
