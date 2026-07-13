@@ -136,7 +136,7 @@ def _require_bulk_confirm(item_count: int, confirmed: bool, operation: str) -> N
 
 def _validate_model_route(model: LLMModel, modality: str) -> str:
     canonical = canonicalize_modality(modality) or ""
-    if canonical in {"audio", "music", "video"}:
+    if canonical in {"audio", "music"}:
         raise HTTPException(
             status_code=400,
             detail=f"{canonical} generation must be configured in SaaS media routes, not LLM model routes.",

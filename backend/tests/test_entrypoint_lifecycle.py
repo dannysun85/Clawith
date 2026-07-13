@@ -6,6 +6,7 @@ def test_start_command_replaces_shell_so_app_receives_container_signals():
 
     assert 'exec /bin/bash -c "exec $START_COMMAND"' in entrypoint
     assert 'exec /bin/bash -lc "exec $START_COMMAND"' not in entrypoint
+    assert "--ws-max-size 67108864" in entrypoint
 
 
 def test_compose_backends_do_not_insert_signal_intercepting_init_process():

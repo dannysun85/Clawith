@@ -24,11 +24,14 @@ TEXT_EXTENSIONS = {
 }
 OFFICE_EXTENSIONS = {".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
 EXTRACTABLE = TEXT_EXTENSIONS | OFFICE_EXTENSIONS
 
 MIME_MAP = {
     ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
     ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+    ".mp4": "video/mp4", ".avi": "video/x-msvideo", ".mov": "video/quicktime",
+    ".mkv": "video/x-matroska",
 }
 
 MAX_CHAT_UPLOAD_BYTES = 25 * 1024 * 1024
@@ -110,6 +113,7 @@ async def upload_file(
 
     content = await _read_upload_with_limit(file)
     is_image = ext in IMAGE_EXTENSIONS
+    is_video = ext in VIDEO_EXTENSIONS
     if is_image and len(content) > 10 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Image too large (max 10MB)")
 
@@ -144,12 +148,18 @@ async def upload_file(
 
     # Extract text (only for known formats)
     image_data_url = ""
+    video_data_url = ""
     if is_image:
         # For images: generate base64 data URL for vision models
         mime = MIME_MAP.get(ext, "image/png")
         b64 = base64.b64encode(content).decode("ascii")
         image_data_url = f"data:{mime};base64,{b64}"
         extracted = f"[图片文件: {file.filename}，需要视觉模型分析]"
+    elif is_video:
+        mime = MIME_MAP.get(ext, "video/mp4")
+        b64 = base64.b64encode(content).decode("ascii")
+        video_data_url = f"data:{mime};base64,{b64}"
+        extracted = f"[视频文件: {file.filename}，需要视频理解模型分析]"
     elif ext in EXTRACTABLE:
         extracted = extract_text(save_path, ext)
     else:
@@ -166,5 +176,7 @@ async def upload_file(
         "extracted_text": extracted,
         "workspace_path": workspace_path,
         "is_image": is_image,
+        "is_video": is_video,
         "image_data_url": image_data_url,
+        "video_data_url": video_data_url,
     }

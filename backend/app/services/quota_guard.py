@@ -34,6 +34,7 @@ QUOTA_ACTIONS = {
     "max_triggers": "upgrade",
     "agent_stopped": "manage_subscription",
     "no_route": "contact_admin",
+    "media_payload": "reduce_attachments",
 }
 
 

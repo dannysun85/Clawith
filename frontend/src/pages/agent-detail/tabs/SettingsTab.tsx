@@ -144,7 +144,7 @@ export default function SettingsTab(props: Props) {
                             ))}
                         </select>
                         <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
-                            {t('agent.settings.conversationModalityHint', '这里只控制对话输入；图片、语音、音乐和视频输出请从聊天框的生成入口使用。')}
+                            {t('agent.settings.conversationModalityHint', '这里只控制对话输入理解；语音、音乐以及图片/视频生成请从聊天框的生成入口使用。')}
                         </div>
                     </div>
                 </div>

@@ -2033,9 +2033,9 @@ PROVIDER_REGISTRY: dict[str, ProviderSpec] = {
             "MiniMax-M2.7-highspeed": 65536,
             "MiniMax-M2.7": 65536,
         },
-        # MiniMax's OpenAI-compatible endpoint does not document either the
-        # OpenAI `parallel_tool_calls` extension or a top-level `thinking`
-        # object. Sending them causes business error 2013 on some models.
+        # MiniMax does not document OpenAI's parallel_tool_calls extension.
+        # M3-specific thinking/service-tier options are supplied per model by
+        # caller.py; sending them to M2.x can still cause business error 2013.
         supports_parallel_tool_calls=False,
         max_tokens_param="max_completion_tokens",
     ),

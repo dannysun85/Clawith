@@ -1,7 +1,10 @@
 """Tests for MiniMax-specific error classification and credential failover."""
 
+from types import SimpleNamespace
+
 import pytest
 
+from app.services.llm.caller import _minimax_m3_request_options
 from app.services.llm.client import LLMError
 from app.services.llm.utils import LLMMessage, create_llm_client
 from app.services.llm.failover import (
@@ -115,6 +118,37 @@ def test_minimax_payload_uses_only_documented_chat_parameters():
     assert "parallel_tool_calls" not in payload
     assert "thinking" not in payload
     assert [message["role"] for message in payload["messages"]] == ["system", "user"]
+
+
+@pytest.mark.parametrize(
+    ("thinking", "service_tier"),
+    [("disabled", "standard"), ("adaptive", "standard"), ("adaptive", "priority")],
+)
+def test_minimax_m3_payload_uses_tier_request_policy(thinking, service_tier):
+    model = SimpleNamespace(
+        provider="minimax",
+        model="MiniMax-M3",
+        capabilities={"thinking": thinking, "service_tier": service_tier},
+    )
+    client = create_llm_client(provider="minimax", api_key="test-key", model=model.model)
+
+    payload = client._build_payload(
+        messages=[LLMMessage(role="user", content="hello")],
+        tools=None,
+        temperature=1,
+        max_tokens=321,
+        **_minimax_m3_request_options(model),
+    )
+
+    assert payload["thinking"] == {"type": thinking}
+    assert payload["service_tier"] == service_tier
+    assert payload["reasoning_split"] is True
+
+
+def test_minimax_m2_does_not_receive_m3_request_policy():
+    model = SimpleNamespace(provider="minimax", model="MiniMax-M2.7", capabilities={})
+
+    assert _minimax_m3_request_options(model) == {}
 
 
 # --- is_auth_error / is_billing_or_quota_error ---

@@ -261,7 +261,7 @@ start_backend() {
         env PYTHONUNBUFFERED=1 \
             PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-}" \
             DATABASE_URL="$DATABASE_URL" \
-            .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port $BACKEND_PORT
+            .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port $BACKEND_PORT --ws-max-size 67108864
     wait_for_port $BACKEND_PORT "Backend" 30 "$BACKEND_PID" "$BACKEND_LOG"
 }
 

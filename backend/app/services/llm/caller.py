@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -71,6 +72,46 @@ from .load_balancer import (
 )
 # Backward compat alias (record_credential_call supersedes increment_credential_usage)
 increment_credential_usage = record_credential_call
+
+
+MAX_INLINE_MEDIA_BASE64_CHARS = 60 * 1024 * 1024
+_INLINE_MEDIA_BASE64_PATTERN = re.compile(
+    r"\[(?:image|video)_data:data:(?:image|video)/[^;]+;base64,([A-Za-z0-9+/=]+)\]"
+)
+
+
+def validate_inline_media_payload(content: str) -> None:
+    """Keep inline multimodal requests below MiniMax's 64 MB body limit."""
+
+    encoded_chars = sum(len(match) for match in _INLINE_MEDIA_BASE64_PATTERN.findall(content or ""))
+    if encoded_chars > MAX_INLINE_MEDIA_BASE64_CHARS:
+        raise QuotaExceeded(
+            "图片和视频合计内容过大，请减少附件后重试。单次多模态请求最多约 45MB 原始媒体。",
+            quota_type="media_payload",
+        )
+
+
+def _minimax_m3_request_options(model) -> dict:
+    """Resolve documented MiniMax-M3 request policy from platform model metadata."""
+
+    if str(getattr(model, "provider", "")).lower() != "minimax":
+        return {}
+    if str(getattr(model, "model", "")) != "MiniMax-M3":
+        return {}
+
+    capabilities = getattr(model, "capabilities", None)
+    capabilities = capabilities if isinstance(capabilities, dict) else {}
+    thinking = str(capabilities.get("thinking") or "adaptive").lower()
+    if thinking not in {"disabled", "adaptive"}:
+        thinking = "adaptive"
+    service_tier = str(capabilities.get("service_tier") or "standard").lower()
+    if service_tier not in {"standard", "priority"}:
+        service_tier = "standard"
+    return {
+        "thinking": {"type": thinking},
+        "service_tier": service_tier,
+        "reasoning_split": True,
+    }
 
 
 async def _record_llm_product_issue(
@@ -395,7 +436,7 @@ async def _get_user_name(user_id) -> str | None:
 def _convert_messages_for_vision(
     api_messages: list, supports_vision: bool
 ) -> list:
-    """Convert image markers to vision format if supported, or strip them."""
+    """Convert image/video markers to multimodal format if supported, or strip them."""
     import re as _re_v
     import copy
 
@@ -403,28 +444,33 @@ def _convert_messages_for_vision(
     new_messages = copy.deepcopy(api_messages)
 
     if supports_vision:
-        # Vision format: convert image markers in strings to OpenAI Vision API list format
+        # Multimodal format: convert media markers in strings to OpenAI-compatible content parts.
         for i, msg in enumerate(new_messages):
             if msg.role != "user" or not msg.content or not isinstance(msg.content, str):
                 continue
             
             content_str = msg.content
-            pattern = r'\[image_data:(data:image/[^;]+;base64,[A-Za-z0-9+/=]+)\]'
-            images = _re_v.findall(pattern, content_str)
+            image_pattern = r'\[image_data:(data:image/[^;]+;base64,[A-Za-z0-9+/=]+)\]'
+            video_pattern = r'\[video_data:(data:video/[^;]+;base64,[A-Za-z0-9+/=]+)\]'
+            images = _re_v.findall(image_pattern, content_str)
+            videos = _re_v.findall(video_pattern, content_str)
             
-            if not images:
+            if not images and not videos:
                 continue
 
-            text = _re_v.sub(pattern, '', content_str).strip()
+            text = _re_v.sub(image_pattern, '', content_str)
+            text = _re_v.sub(video_pattern, '', text).strip()
             parts = [{"type": "image_url", "image_url": {"url": img}} for img in images]
+            parts.extend({"type": "video_url", "video_url": {"url": video}} for video in videos)
             if text:
-                # Per OpenAI spec, text part should come after image parts
+                # Put text after media parts so the user's instruction is read with the media context.
                 parts.append({"type": "text", "text": text})
             
             new_messages[i] = type(msg)(role=msg.role, content=parts, tool_calls=msg.tool_calls, tool_call_id=msg.tool_call_id)
     else:
-        # Non-vision format: ensure content is a string for all roles, stripping image data.
+        # Non-multimodal format: ensure content is a string for all roles, stripping media data.
         _img_marker_pattern = r'\[image_data:data:image/[^;]+;base64,[A-Za-z0-9+/=]+\]'
+        _video_marker_pattern = r'\[video_data:data:video/[^;]+;base64,[A-Za-z0-9+/=]+\]'
         for i, msg in enumerate(new_messages):
             
             if isinstance(msg.content, list):
@@ -437,9 +483,22 @@ def _convert_messages_for_vision(
             elif isinstance(msg.content, str) and "[image_data:" in msg.content:
                 # It's a string with image markers, strip them
                 _n_imgs = len(_re_v.findall(_img_marker_pattern, msg.content))
-                cleaned = _re_v.sub(_img_marker_pattern, '', msg.content).strip()
-                if _n_imgs > 0:
-                    cleaned += f"\n[用户发送了 {_n_imgs} 张图片，但当前模型不支持视觉，无法查看图片内容]"
+                _n_videos = len(_re_v.findall(_video_marker_pattern, msg.content))
+                cleaned = _re_v.sub(_img_marker_pattern, '', msg.content)
+                cleaned = _re_v.sub(_video_marker_pattern, '', cleaned).strip()
+                if _n_imgs > 0 or _n_videos > 0:
+                    fragments = []
+                    if _n_imgs:
+                        fragments.append(f"{_n_imgs} 张图片")
+                    if _n_videos:
+                        fragments.append(f"{_n_videos} 个视频")
+                    cleaned += f"\n[用户发送了 {'、'.join(fragments)}，但当前模型不支持多模态理解，无法查看媒体内容]"
+                new_messages[i] = type(msg)(role=msg.role, content=cleaned, tool_calls=msg.tool_calls, tool_call_id=msg.tool_call_id)
+            elif isinstance(msg.content, str) and "[video_data:" in msg.content:
+                _n_videos = len(_re_v.findall(_video_marker_pattern, msg.content))
+                cleaned = _re_v.sub(_video_marker_pattern, '', msg.content).strip()
+                if _n_videos > 0:
+                    cleaned += f"\n[用户发送了 {_n_videos} 个视频，但当前模型不支持多模态理解，无法查看视频内容]"
                 new_messages[i] = type(msg)(role=msg.role, content=cleaned, tool_calls=msg.tool_calls, tool_call_id=msg.tool_call_id)
 
     return new_messages
@@ -891,6 +950,7 @@ async def call_llm(
         return f"[Error] Failed to create LLM client: {e}"
 
     max_tokens = get_max_tokens(model.provider, model.model, getattr(model, 'max_output_tokens', None))
+    request_options = _minimax_m3_request_options(model)
     _accumulated_usage = TokenUsage()
     _unsaved_usage = TokenUsage()
     _usage_finalized = False
@@ -967,6 +1027,7 @@ async def call_llm(
                 on_chunk=_buffer_chunk,
                 on_tool_delta=on_tool_delta,
                 on_thinking=on_thinking,
+                **request_options,
             )
         except asyncio.CancelledError:
             await _finalize_llm_usage(billable=False)
@@ -1587,6 +1648,7 @@ async def call_agent_llm_with_tools(
                 model.provider, model.model,
                 getattr(model, 'max_output_tokens', None)
             )
+            request_options = _minimax_m3_request_options(model)
 
             # Tool-calling loop
             api_messages = list(messages)
@@ -1611,6 +1673,7 @@ async def call_agent_llm_with_tools(
                         tools=tools_for_llm if tools_for_llm else None,
                         temperature=model.temperature,
                         max_tokens=max_tokens,
+                        **request_options,
                     )
                 except Exception as e:
                     logger.error(

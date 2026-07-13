@@ -274,12 +274,24 @@ def test_text_model_route_cannot_claim_media_generation_capability():
         modalities=["text"],
         supports_vision=False,
     )
+    multimodal_model = SimpleNamespace(
+        label="MiniMax-M3 Pro (Platform)",
+        modality="multimodal",
+        modalities=["text", "image", "video"],
+        supports_vision=True,
+    )
 
     assert saas_api._validate_model_route(model, "text") == "text"
-    with pytest.raises(HTTPException, match="media routes"):
-        saas_api._validate_model_route(model, "video")
     with pytest.raises(HTTPException, match="does not support"):
         saas_api._validate_model_route(model, "image")
+    with pytest.raises(HTTPException, match="does not support"):
+        saas_api._validate_model_route(model, "video")
+    assert saas_api._validate_model_route(multimodal_model, "image") == "image"
+    assert saas_api._validate_model_route(multimodal_model, "video") == "video"
+    with pytest.raises(HTTPException, match="media routes"):
+        saas_api._validate_model_route(multimodal_model, "audio")
+    with pytest.raises(HTTPException, match="media routes"):
+        saas_api._validate_model_route(multimodal_model, "music")
 
 
 def test_media_route_migration_seeds_explicit_matrix_and_disables_legacy_tts():

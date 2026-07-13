@@ -5,7 +5,7 @@ set -e
 
 PROCESS_ROLE="${PROCESS_ROLE:-all}"
 ALLOW_MIGRATION_FAILURE="${ALLOW_MIGRATION_FAILURE:-false}"
-START_COMMAND="${START_COMMAND:-uvicorn app.main:app --host 0.0.0.0 --port 8000}"
+START_COMMAND="${START_COMMAND:-uvicorn app.main:app --host 0.0.0.0 --port 8000 --ws-max-size 67108864}"
 
 role_contains() {
     case ",${PROCESS_ROLE}," in

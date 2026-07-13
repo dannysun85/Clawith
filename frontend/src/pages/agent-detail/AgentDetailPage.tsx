@@ -100,6 +100,8 @@ const WORKSPACE_TOOLS = new Set([
     'convert_html_to_pptx',
 ]);
 
+const MAX_INLINE_MEDIA_BYTES = 45 * 1024 * 1024;
+
 const AWARE_TOOLS = new Set(['set_trigger', 'update_trigger', 'cancel_trigger', 'list_triggers', 'list_focus_items', 'upsert_focus_item', 'complete_focus_item']);
 const EMOJI_RE = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]/u;
 const trimLeadingPictograph = (value: string) => value.replace(/^\p{Extended_Pictographic}\s*/u, '');
@@ -2761,7 +2763,15 @@ export default function AgentDetailPage() {
     const [isStreaming, setIsStreaming] = useState(false);
     const [chatUploadDrafts, setChatUploadDrafts] = useState<{ id: string; name: string; percent: number; previewUrl?: string; sizeBytes: number }[]>([]);
     const chatUploadAbortRef = useRef<Map<string, () => void>>(new Map());
-    type AttachedFileRef = { name: string; text: string; path?: string; imageUrl?: string; source?: 'upload' | 'workspace_auto' };
+    type AttachedFileRef = {
+        name: string;
+        text: string;
+        path?: string;
+        imageUrl?: string;
+        videoUrl?: string;
+        sizeBytes?: number;
+        source?: 'upload' | 'workspace_auto';
+    };
     type PendingChatMessage = {
         runtimeKey: SessionRuntimeKey;
         contentForLLM: string;
@@ -4000,6 +4010,27 @@ export default function AgentDetailPage() {
         let userMsg = chatInput.trim();
         let contentForLLM = userMsg;
         let displayFiles = '';
+        const hasImageAttachment = attachedFiles.some((file) => !!file.imageUrl);
+        const hasVideoAttachment = attachedFiles.some((file) => !!file.videoUrl);
+        const inlineMediaBytes = attachedFiles.reduce(
+            (total, file) => total + (file.imageUrl || file.videoUrl ? file.sizeBytes || 0 : 0),
+            0,
+        );
+        if (inlineMediaBytes > MAX_INLINE_MEDIA_BYTES) {
+            toast.warning(t(
+                'common.file.multimodalPayloadTooLarge',
+                '图片和视频合计超过 45MB，请减少附件后重试。',
+            ));
+            return;
+        }
+        const outboundChatModality = hasVideoAttachment
+            ? 'video'
+            : hasImageAttachment
+                ? 'image'
+                : effectiveChatModality;
+        const supportsImageInput = ['image', 'video', 'multimodal'].includes(outboundChatModality);
+        const supportsVideoInput = ['video', 'multimodal'].includes(outboundChatModality);
+        const supportsNativeMediaInput = supportsImageInput || supportsVideoInput;
 
         if (attachedFiles.length > 0) {
             let filesPrompt = '';
@@ -4011,13 +4042,25 @@ export default function AgentDetailPage() {
                 const codePath = wsPath.replace(/^workspace\//, '');
                 const fileLoc = wsPath ? `\nFile location: ${wsPath} (for read_file/read_document/send_email tools)\nIn execute_code, use relative path: "${codePath}" (working directory is workspace/)\n` : '';
 
-                if (file.imageUrl && supportsVision) {
+                if (file.imageUrl && supportsImageInput) {
                     filesPrompt += `[image_data:${file.imageUrl}]\n`;
                     if (fileLoc) {
                         filesPrompt += `[Image File Path Reference]${fileLoc}\n`;
                     }
+                } else if (file.videoUrl && supportsVideoInput) {
+                    filesPrompt += `[video_data:${file.videoUrl}]\n`;
+                    if (fileLoc) {
+                        filesPrompt += `[Video File Path Reference]${fileLoc}\n`;
+                    }
                 } else if (file.imageUrl) {
                     filesPrompt += t('common.file.imageUploaded', '[图片文件已上传: {{name}}...]', { name: file.name });
+                    if (fileLoc) {
+                        filesPrompt += `${fileLoc}\n`;
+                    } else {
+                        filesPrompt += '\n';
+                    }
+                } else if (file.videoUrl) {
+                    filesPrompt += `[视频文件已上传: ${file.name}]`;
                     if (fileLoc) {
                         filesPrompt += `${fileLoc}\n`;
                     } else {
@@ -4032,7 +4075,7 @@ export default function AgentDetailPage() {
                 }
             });
 
-            if (supportsVision && attachedFiles.some(f => f.imageUrl)) {
+            if (supportsNativeMediaInput && attachedFiles.some(f => f.imageUrl || f.videoUrl)) {
                 contentForLLM = userMsg ? `${filesPrompt}\n${userMsg}` : `${filesPrompt}\n${t('common.file.analyzeFiles', '请分析这些文件')}`;
             } else {
                 contentForLLM = userMsg ? `${filesPrompt}\nQuestion: ${userMsg}` : `Please analyze these files:\n\n${filesPrompt}`;
@@ -4049,7 +4092,7 @@ export default function AgentDetailPage() {
             fileName: attachedFiles.map(f => f.name).join(', '),
             imageUrl: attachedFiles.length === 1 ? attachedFiles[0].imageUrl : undefined,
             tier: effectiveChatTier,
-            modality: effectiveChatModality,
+            modality: outboundChatModality,
         };
 
         setChatInput('');
@@ -4116,6 +4159,8 @@ export default function AgentDetailPage() {
                         text: data.extracted_text,
                         path: data.workspace_path,
                         imageUrl: data.image_data_url || undefined,
+                        videoUrl: data.video_data_url || undefined,
+                        sizeBytes: data.size,
                     }].slice(0, 10),
                 );
             } catch (err: any) {
@@ -4188,6 +4233,8 @@ export default function AgentDetailPage() {
                         text: data.extracted_text,
                         path: data.workspace_path,
                         imageUrl: data.image_data_url || undefined,
+                        videoUrl: data.video_data_url || undefined,
+                        sizeBytes: data.size,
                     }].slice(0, 10),
                 );
             } catch (err: any) {
@@ -4222,7 +4269,14 @@ export default function AgentDetailPage() {
                     id ? { agent_id: id } : undefined,
                 );
                 const data = await promise;
-                setAttachedFiles(prev => [...prev, { name: data.filename, text: data.extracted_text, path: data.workspace_path, imageUrl: data.image_data_url || undefined }]);
+                setAttachedFiles(prev => [...prev, {
+                    name: data.filename,
+                    text: data.extracted_text,
+                    path: data.workspace_path,
+                    imageUrl: data.image_data_url || undefined,
+                    videoUrl: data.video_data_url || undefined,
+                    sizeBytes: data.size,
+                }]);
             } catch (err: any) {
                 if (err?.message !== 'Upload cancelled') {
                     toast.error(t('agent.upload.failed'), { details: String(err?.message || '') });
@@ -4354,7 +4408,6 @@ export default function AgentDetailPage() {
         agent?.preferred_modality,
     );
     const effectiveTierReady = !!effectiveChatTier;
-    const supportsVision = effectiveChatModality === 'image';
     const { data: mediaCapabilitiesData, isLoading: mediaCapabilitiesLoading } = useQuery({
         queryKey: ['agent-media-capabilities', id, effectiveChatTier],
         queryFn: () => fetchAuth<MediaCapabilitiesResponse>(

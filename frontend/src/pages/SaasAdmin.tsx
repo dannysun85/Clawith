@@ -10,7 +10,7 @@ import AccountManagement from './AccountManagement';
 import { RegistrationCodesTab } from './AdminCompanies';
 
 const SAAS_TIERS = ['lite', 'pro', 'ultra'];
-const LLM_ROUTE_MODALITIES = ['text', 'image', 'multimodal'];
+const LLM_ROUTE_MODALITIES = ['text', 'image', 'video'];
 
 type SaasTab = 'plans' | 'packs' | 'rules' | 'model-routes' | 'media-routes' | 'tenants' | 'registration-codes' | 'accounts' | 'production-issues';
 
@@ -119,7 +119,7 @@ const tabMeta: { key: SaasTab; label: string; icon: ReactNode }[] = [
     { key: 'plans', label: '套餐', icon: <IconStack2 size={15} stroke={1.7} /> },
     { key: 'packs', label: '额度包', icon: <IconWallet size={15} stroke={1.7} /> },
     { key: 'rules', label: '计费规则', icon: <IconReceipt size={15} stroke={1.7} /> },
-    { key: 'model-routes', label: '文本模型', icon: <IconRoute size={15} stroke={1.7} /> },
+    { key: 'model-routes', label: '理解模型', icon: <IconRoute size={15} stroke={1.7} /> },
     { key: 'media-routes', label: '媒体路由', icon: <IconPhotoVideo size={15} stroke={1.7} /> },
     { key: 'tenants', label: '租户订阅', icon: <IconUsers size={15} stroke={1.7} /> },
     { key: 'registration-codes', label: '注册码', icon: <IconKey size={15} stroke={1.7} /> },
@@ -139,7 +139,7 @@ export default function SaasAdmin() {
                 <div>
                     <h1 className="page-title">{t('saas.title', 'SaaS 后台')}</h1>
                     <p style={{ margin: '6px 0 0', color: 'var(--text-tertiary)', fontSize: 13 }}>
-                        {t('saas.desc', '统一配置套餐、额度、文本模型、媒体生成路由、账号池和租户订阅。')}
+                        {t('saas.desc', '统一配置套餐、额度、理解模型、媒体生成路由、账号池和租户订阅。')}
                     </p>
                 </div>
             </div>
@@ -200,7 +200,7 @@ function ModelRoutesTab() {
     return (
         <div>
             <div className="card" style={{ marginBottom: 16, padding: 14, color: 'var(--text-secondary)', fontSize: 12, lineHeight: 1.7 }}>
-                这里仅配置对话/理解模型。图片、语音、音乐、视频的“生成模型”请到“媒体路由”配置；系统会拒绝把 text-only 模型错误绑定到媒体能力。
+                这里配置对话输入理解路由：text、image、video。语音、音乐以及图片/视频“生成模型”请到“媒体路由”配置；系统会拒绝把不支持该输入类型的模型绑定到对应路由。
             </div>
             <div className="card" style={{ marginBottom: 16, display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 10, alignItems: 'end' }}>
                 <Field label="Tier">

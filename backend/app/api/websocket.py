@@ -33,7 +33,7 @@ from app.services.artifact_contract import append_authoritative_artifacts, verif
 from app.services.agentbay_live import detect_agentbay_env, get_browser_snapshot, get_desktop_screenshot
 from app.services.chat_session_service import ensure_primary_platform_session
 from app.services.llm import call_llm_with_failover
-from app.services.llm.caller import RouteMeta
+from app.services.llm.caller import RouteMeta, validate_inline_media_payload
 from app.services.llm.utils import convert_chat_messages_to_llm_format, truncate_messages_with_pair_integrity
 from app.services.onboarding import is_onboarded, mark_onboarding_phase, resolve_onboarding_prompt
 from app.services.quota_guard import (
@@ -524,6 +524,17 @@ class WebSocketChatHandler:
                 if await self._handle_onboarding_trigger_guard():
                     continue
                 content = "Please begin the onboarding."
+
+            try:
+                validate_inline_media_payload(content)
+            except QuotaExceeded as qe:
+                await self.websocket.send_json({
+                    "type": "done",
+                    "role": "assistant",
+                    "content": f"⚠️ {qe.message}",
+                    "quota_error": quota_error_payload(qe),
+                })
+                continue
 
             self.current_user_text = content
 

@@ -123,7 +123,7 @@ INSERT INTO billing_rules (
 SQL
 
 .venv/bin/alembic upgrade head
-.venv/bin/alembic current | grep -F "add_user_chat_tier_preference (head)"
+.venv/bin/alembic current | grep -F "seed_minimax_m3_understanding (head)"
 PYTHONPATH=. .venv/bin/python ../scripts/plan-update-postgres-smoke.py
 
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
@@ -252,37 +252,32 @@ BEGIN
   IF NOT EXISTS (
     SELECT 1 FROM plans
     WHERE code = 'free'
-      AND allowed_modalities::jsonb = '["text"]'::jsonb
+      AND allowed_modalities::jsonb = '["text","image","video"]'::jsonb
       AND features::jsonb @> '{"generation_modalities":["image","audio","music","video"],"generation_tiers":["lite"]}'::jsonb
   ) THEN
-    RAISE EXCEPTION 'missing free-plan media generation entitlement without chat widening';
+    RAISE EXCEPTION 'missing free-plan media generation entitlement and M3 understanding inputs';
   END IF;
   IF (
     SELECT count(*) FROM plans
     WHERE code IN ('starter', 'pro', 'scale')
-      AND allowed_modalities::jsonb = '["text"]'::jsonb
+      AND allowed_modalities::jsonb = '["text","image","video"]'::jsonb
       AND features::jsonb ? 'generation_modalities'
       AND features::jsonb ? 'generation_tiers'
   ) <> 3 THEN
-    RAISE EXCEPTION 'missing paid-plan media generation entitlements';
+    RAISE EXCEPTION 'missing paid-plan media generation entitlements and M3 understanding inputs';
   END IF;
   IF (
     SELECT count(*)
     FROM model_routes mr
     JOIN llm_models lm ON lm.id = mr.llm_model_id
-    WHERE mr.modality = 'text'
+    WHERE mr.modality IN ('text', 'image', 'video')
       AND mr.enabled = true
-      AND (
-        (mr.saas_tier = 'lite' AND lm.model = 'MiniMax-M2.5' AND lm.max_output_tokens = 2048)
-        OR (mr.saas_tier = 'pro' AND lm.model = 'MiniMax-M2.7' AND lm.max_output_tokens = 4096)
-        OR (
-          mr.saas_tier = 'ultra'
-          AND lm.model = 'MiniMax-M2.7-highspeed'
-          AND lm.max_output_tokens = 8192
-        )
-      )
-  ) <> 3 THEN
-    RAISE EXCEPTION 'MiniMax Lite/Pro/Ultra text routes were not differentiated';
+      AND mr.saas_tier IN ('lite', 'pro', 'ultra')
+      AND lm.model = 'MiniMax-M3'
+      AND lm.supports_vision = true
+      AND lm.modalities::jsonb @> '["text","image","video"]'::jsonb
+  ) <> 9 THEN
+    RAISE EXCEPTION 'MiniMax-M3 text/image/video understanding routes were not seeded';
   END IF;
   IF (
     SELECT count(*) FROM pg_indexes
@@ -385,6 +380,52 @@ WHERE id IN (
 );
 SQL
 
+# The M3 data migration must be independently reversible: existing M2.x
+# routes and administrator-owned catalog rows must survive a one-step rollback.
+.venv/bin/alembic downgrade add_user_chat_tier_preference
+.venv/bin/alembic current | grep -F "add_user_chat_tier_preference"
+psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM llm_models
+    WHERE provider = 'minimax'
+      AND model = 'MiniMax-M3'
+      AND capabilities::jsonb @> '{"seed_revision":"seed_minimax_m3_understanding"}'::jsonb
+  ) THEN
+    RAISE EXCEPTION 'M3 seeded models survived migration downgrade';
+  END IF;
+  IF (
+    SELECT count(*)
+    FROM model_routes mr
+    JOIN llm_models lm ON lm.id = mr.llm_model_id
+    WHERE mr.modality = 'text'
+      AND mr.enabled = true
+      AND (
+        (mr.saas_tier = 'lite' AND lm.model = 'MiniMax-M2.5')
+        OR (mr.saas_tier = 'pro' AND lm.model = 'MiniMax-M2.7')
+        OR (mr.saas_tier = 'ultra' AND lm.model = 'MiniMax-M2.7-highspeed')
+      )
+  ) <> 3 THEN
+    RAISE EXCEPTION 'legacy MiniMax text routes were not restored by downgrade';
+  END IF;
+  IF (
+    SELECT count(*) FROM plans
+    WHERE code IN ('free', 'starter', 'pro', 'scale')
+      AND allowed_modalities::jsonb = '["text"]'::jsonb
+  ) <> 4 THEN
+    RAISE EXCEPTION 'plan understanding modalities were not restored by downgrade';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM billing_rules WHERE priority = 93
+  ) THEN
+    RAISE EXCEPTION 'M3 seeded billing rules survived migration downgrade';
+  END IF;
+END $$;
+SQL
+.venv/bin/alembic upgrade head
+.venv/bin/alembic current | grep -F "seed_minimax_m3_understanding (head)"
+
 PYTHONPATH=. .venv/bin/python ../scripts/a2a-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/media-generation-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/production-issue-postgres-smoke.py
@@ -412,7 +453,7 @@ FROM users
 WHERE id = '07500000-0000-4000-8000-000000000070';
 SQL
 .venv/bin/alembic upgrade head
-.venv/bin/alembic current | grep -F "add_user_chat_tier_preference (head)"
+.venv/bin/alembic current | grep -F "seed_minimax_m3_understanding (head)"
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 --tuples-only --no-align <<'SQL' | grep -Fx 'ultra|7'
 SELECT preferred_chat_tier || '|' || preferred_chat_tier_revision
 FROM users
