@@ -737,7 +737,9 @@ wait_for_worker_release() {
 
 managed_worker_ids() {
     local project="$1"
-    docker ps -q \
+    # `docker compose ps -q` returns a full container ID. Keep the same form so
+    # the exactly-one-worker comparison cannot reject a healthy matching worker.
+    docker ps --no-trunc -q \
         --filter "label=com.docker.compose.project=$project" \
         --filter "label=com.docker.compose.service=worker"
 }

@@ -730,6 +730,65 @@ def test_production_deploy_verifies_public_release_identity_before_stopping_old_
     ]
 
 
+def test_single_worker_assertion_compares_full_container_ids(tmp_path):
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    worker_helpers = _shell_function_source(
+        script,
+        "managed_worker_ids",
+        "remaining_old_nginx_workers",
+    )
+    full_id = "a" * 64
+    short_id = full_id[:12]
+    call_log = tmp_path / "docker-calls.log"
+    harness = f"""set +e
+COMPOSE_PROJECT=astra-poc
+CALL_LOG={shlex.quote(str(call_log))}
+compose_project() {{
+    printf '%s\n' {full_id}
+}}
+wait_for_worker_release() {{
+    return 0
+}}
+docker() {{
+    if [ "$1" = ps ]; then
+        printf '%s\n' "$*" >> "$CALL_LOG"
+        case "$*" in
+            *com.docker.compose.project=astra-poc-app-a*)
+                case " $* " in
+                    *" --no-trunc "*) printf '%s\n' {full_id} ;;
+                    *) printf '%s\n' {short_id} ;;
+                esac
+                ;;
+        esac
+        return 0
+    fi
+    if [ "$1" = inspect ]; then
+        printf '%s\n' astra-poc-app-a
+        return 0
+    fi
+    return 1
+}}
+{worker_helpers}
+assert_single_active_worker astra-poc-app-a env compose release-a
+status=$?
+echo "status=$status"
+exit "$status"
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "status=0" in result.stdout
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert len(calls) == 3
+    assert all("ps --no-trunc -q" in call for call in calls)
+
+
 @pytest.mark.parametrize("runtime_slot", ["b", "a"], ids=["pre_reload", "post_reload"])
 def test_production_deploy_recovers_interrupted_cutover_before_cleanup(
     tmp_path,
