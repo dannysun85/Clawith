@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 import shutil
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
@@ -17,6 +17,11 @@ from app.services.process_utils import terminate_process_group
 from app.services.realtime import realtime_router
 
 settings = get_settings()
+
+_worker_runtime_tracking_started = False
+_worker_runtime_ready = False
+_worker_runtime_failed = False
+_critical_background_task_names: set[str] = set()
 
 
 def _process_roles() -> set[str]:
@@ -32,6 +37,51 @@ def _role_enabled(*required: str) -> bool:
     if "all" in roles:
         return True
     return any(role in roles for role in required)
+
+
+def _worker_health_required() -> bool:
+    """Return whether this process is the dedicated production worker role."""
+
+    return "worker" in _process_roles()
+
+
+def _begin_worker_runtime_tracking(task_names: set[str]) -> None:
+    global _worker_runtime_tracking_started
+    global _worker_runtime_ready
+    global _worker_runtime_failed
+    global _critical_background_task_names
+
+    _worker_runtime_tracking_started = True
+    _worker_runtime_ready = False
+    _worker_runtime_failed = False
+    _critical_background_task_names = set(task_names)
+
+
+def _mark_worker_runtime_ready() -> None:
+    global _worker_runtime_ready
+
+    if _worker_runtime_tracking_started and not _worker_runtime_failed:
+        _worker_runtime_ready = True
+
+
+def _mark_worker_runtime_failed(task_name: str) -> None:
+    global _worker_runtime_ready
+    global _worker_runtime_failed
+
+    if (
+        _worker_runtime_tracking_started
+        and task_name in _critical_background_task_names
+    ):
+        _worker_runtime_ready = False
+        _worker_runtime_failed = True
+
+
+def _stop_worker_runtime_tracking() -> None:
+    global _worker_runtime_tracking_started
+    global _worker_runtime_ready
+
+    _worker_runtime_tracking_started = False
+    _worker_runtime_ready = False
 
 
 def _log_bwrap_startup_status() -> None:
@@ -323,50 +373,65 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"[startup] realtime router start failed: {e}")
 
+    background_tasks: list[asyncio.Task] = []
+    critical_task_names: set[str] = set()
+
+    def _bg_task_error(task: asyncio.Task) -> None:
+        """Surface unexpected task exits and fail dedicated worker health."""
+
+        task_name = task.get_name()
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if (
+            task_name in _critical_background_task_names
+            and not _worker_runtime_tracking_started
+        ):
+            return
+        if exc is None and task_name not in _critical_background_task_names:
+            return
+        _mark_worker_runtime_failed(task_name)
+        error_type = type(exc).__name__ if exc else "UnexpectedTaskExit"
+        logger.error(
+            f"[startup] Background task {task_name} STOPPED "
+            f"error_type={error_type}"
+        )
+        asyncio.create_task(
+            record_production_issue(
+                source="background_task",
+                category="worker",
+                summary="A production background task stopped unexpectedly",
+                severity="critical",
+                error_code=error_type,
+                operation=task_name,
+                metadata={
+                    "error_type": error_type,
+                    "component": task_name,
+                },
+            ),
+            name=f"capture-crash-{task_name}",
+        )
+
     try:
         logger.info("[startup] starting background tasks...")
         from app.services.audit_logger import write_audit_log
         await write_audit_log("server_startup", {"pid": os.getpid()})
 
-        def _bg_task_error(t):
-            """Callback to surface background task exceptions."""
-            try:
-                exc = t.exception()
-            except asyncio.CancelledError:
-                return
-            if exc:
-                logger.error(
-                    f"[startup] Background task {t.get_name()} CRASHED "
-                    f"error_type={type(exc).__name__}"
-                )
-                asyncio.create_task(
-                    record_production_issue(
-                        source="background_task",
-                        category="worker",
-                        summary="A production background task crashed",
-                        severity="critical",
-                        error_code=type(exc).__name__,
-                        operation=t.get_name(),
-                        metadata={
-                            "error_type": type(exc).__name__,
-                            "component": t.get_name(),
-                        },
-                    ),
-                    name=f"capture-crash-{t.get_name()}",
-                )
         task_specs = []
         if _role_enabled("all", "worker"):
-            if settings.TRIGGER_DAEMON_ENABLED:
-                task_specs.append(("trigger_daemon", start_trigger_daemon()))
-            else:
-                logger.warning(
-                    "[startup] Trigger daemon disabled by TRIGGER_DAEMON_ENABLED=false"
-                )
-            task_specs.append(("subscription_lifecycle", start_subscription_lifecycle_daemon()))
-            task_specs.append(("media_generation", start_media_generation_daemon()))
-            task_specs.append(("billing_reconciliation", start_billing_reconciliation_daemon()))
+            worker_task_specs = [
+                ("trigger_daemon", start_trigger_daemon()),
+                ("subscription_lifecycle", start_subscription_lifecycle_daemon()),
+                ("media_generation", start_media_generation_daemon()),
+                ("billing_reconciliation", start_billing_reconciliation_daemon()),
+            ]
             if settings.PRODUCTION_ISSUE_MONITOR_ENABLED:
-                task_specs.append(("production_issue_monitor", start_production_issue_monitor_daemon()))
+                worker_task_specs.append(
+                    ("production_issue_monitor", start_production_issue_monitor_daemon())
+                )
+            task_specs.extend(worker_task_specs)
+            critical_task_names = {name for name, _ in worker_task_specs}
         if _role_enabled("all", "connector"):
             task_specs.extend([
                 ("feishu_ws", feishu_ws_manager.start_all()),
@@ -376,13 +441,37 @@ async def lifespan(app: FastAPI):
                 ("discord_gw", discord_gateway_manager.start_all()),
             ])
 
+        if _worker_health_required():
+            _begin_worker_runtime_tracking(critical_task_names)
         for name, coro in task_specs:
             task = asyncio.create_task(coro, name=name)
             task.add_done_callback(_bg_task_error)
+            background_tasks.append(task)
             logger.info(f"[startup] created bg task: {name}")
+
+        # Give freshly scheduled daemons one event-loop turn. A coroutine that
+        # raises or returns immediately is not a healthy worker runtime.
+        await asyncio.sleep(0)
+        if _worker_health_required():
+            critical_tasks = [
+                task
+                for task in background_tasks
+                if task.get_name() in critical_task_names
+            ]
+            if not critical_tasks or any(task.done() for task in critical_tasks):
+                for task in critical_tasks:
+                    if task.done():
+                        _mark_worker_runtime_failed(task.get_name())
+                raise RuntimeError("critical worker background task did not stay running")
+            _mark_worker_runtime_ready()
         logger.info("[startup] all background tasks created!")
     except Exception as e:
-        logger.error(f"[startup] Background tasks failed: {e}")
+        if _worker_health_required():
+            for task_name in critical_task_names:
+                _mark_worker_runtime_failed(task_name)
+        logger.error(
+            f"[startup] Background tasks failed error_type={type(e).__name__}"
+        )
 
     # Start ss-local SOCKS5 proxy for Discord API calls (non-fatal)
     ss_task = asyncio.create_task(_start_ss_local(), name="ss-local-proxy")
@@ -391,6 +480,13 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        _stop_worker_runtime_tracking()
+        for task in background_tasks:
+            if not task.done():
+                task.cancel()
+        if background_tasks:
+            await asyncio.gather(*background_tasks, return_exceptions=True)
+
         # Shutdown the proxy explicitly.  Returning from _start_ss_local used
         # to orphan the process and its credential-bearing temp file on every
         # backend restart.
@@ -536,6 +632,12 @@ app.include_router(production_issue_admin_router, prefix=settings.API_PREFIX)
 @app.get("/api/health", response_model=HealthResponse, tags=["health"])
 async def health_check():
     """Health check endpoint."""
+    if _worker_health_required() and (
+        not _worker_runtime_tracking_started
+        or not _worker_runtime_ready
+        or _worker_runtime_failed
+    ):
+        raise HTTPException(status_code=503, detail="worker runtime unavailable")
     return HealthResponse(status="ok", version=settings.APP_VERSION)
 
 
