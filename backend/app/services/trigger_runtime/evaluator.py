@@ -11,11 +11,20 @@ from croniter import croniter
 from loguru import logger
 from sqlalchemy import select
 
+from app.config import get_settings
 from app.database import async_session
 from app.models.agent import Agent
 from app.models.trigger import AgentTrigger
 
 MIN_POLL_INTERVAL_MINUTES = 5
+OKR_AUTOMATION_TRIGGER_NAMES = frozenset({
+    "daily_okr_collection",
+    "daily_okr_report",
+    "weekly_okr_report",
+    "biweekly_okr_checkin",
+    "monthly_okr_report",
+})
+runtime_settings = get_settings()
 
 
 async def should_skip_non_workday(trigger: AgentTrigger, local_now: datetime) -> bool:
@@ -81,6 +90,8 @@ async def mark_trigger_fired(trigger_id: uuid.UUID, now: datetime) -> None:
 async def handle_okr_report_trigger(trigger: AgentTrigger, now: datetime) -> bool:
     if trigger.name not in {"daily_okr_report", "weekly_okr_report", "monthly_okr_report"}:
         return False
+    if not runtime_settings.OKR_AUTOMATION_ENABLED:
+        return True
 
     from zoneinfo import ZoneInfo
     from app.models.okr import OKRSettings
@@ -127,6 +138,8 @@ async def handle_okr_report_trigger(trigger: AgentTrigger, now: datetime) -> boo
 async def handle_okr_collection_trigger(trigger: AgentTrigger, now: datetime) -> bool:
     if trigger.name != "daily_okr_collection":
         return False
+    if not runtime_settings.OKR_AUTOMATION_ENABLED:
+        return True
 
     from app.models.okr import OKRSettings
     from app.services.okr_daily_collection import trigger_daily_collection_for_tenant
@@ -172,6 +185,11 @@ def is_private_url(url: str) -> bool:
 
 async def evaluate_trigger(trigger: AgentTrigger, now: datetime) -> bool:
     if not trigger.is_enabled:
+        return False
+    if (
+        trigger.name in OKR_AUTOMATION_TRIGGER_NAMES
+        and not runtime_settings.OKR_AUTOMATION_ENABLED
+    ):
         return False
     if trigger.expires_at and now >= trigger.expires_at:
         return False

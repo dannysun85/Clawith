@@ -26,6 +26,7 @@ from pydantic import BaseModel
 from sqlalchemy import select, delete
 
 from app.api.auth import get_current_user
+from app.config import get_settings
 from app.database import async_session
 from app.models.identity import IdentityProvider
 from app.models.okr import (
@@ -41,6 +42,7 @@ from app.models.okr import (
 from app.models.user import User
 
 router = APIRouter(prefix="/api/okr", tags=["okr"])
+runtime_settings = get_settings()
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -190,10 +192,16 @@ async def _sync_okr_report_triggers(db, settings: OKRSettings) -> None:
         trigger.focus_ref = trigger.focus_ref or system_focus_ref
         return trigger
 
+    automation_enabled = runtime_settings.OKR_AUTOMATION_ENABLED
+
     _ensure_trigger(
         "daily_okr_collection",
         config={"expr": f"{daily_minute} {daily_hour} * * *"},
-        is_enabled=bool(settings.enabled and settings.daily_report_enabled),
+        is_enabled=bool(
+            automation_enabled
+            and settings.enabled
+            and settings.daily_report_enabled
+        ),
         reason=(
             "System trigger: daily OKR collection. When daily reporting is enabled, "
             "the OKR Agent should collect today's final daily update only from members "
@@ -204,7 +212,7 @@ async def _sync_okr_report_triggers(db, settings: OKRSettings) -> None:
     _ensure_trigger(
         "daily_okr_report",
         config={"expr": "0 9 * * *"},
-        is_enabled=bool(settings.enabled),
+        is_enabled=bool(automation_enabled and settings.enabled),
         reason=(
             "System trigger: generate the company daily report at 09:00 for the previous day."
         ),
@@ -213,7 +221,7 @@ async def _sync_okr_report_triggers(db, settings: OKRSettings) -> None:
     _ensure_trigger(
         "weekly_okr_report",
         config={"expr": "0 9 * * 1"},
-        is_enabled=bool(settings.enabled),
+        is_enabled=bool(automation_enabled and settings.enabled),
         reason=(
             "System trigger: generate the company weekly report at 09:00 every Monday "
             "for the previous week."
@@ -222,7 +230,7 @@ async def _sync_okr_report_triggers(db, settings: OKRSettings) -> None:
 
     biweekly = triggers.get("biweekly_okr_checkin")
     if biweekly:
-        biweekly.is_enabled = bool(settings.enabled)
+        biweekly.is_enabled = bool(automation_enabled and settings.enabled)
         biweekly.reason = (
             "System trigger: fires on the 1st and 15th of every month at 10:00 "
             "to perform the mandatory bi-weekly OKR check-in."
@@ -231,7 +239,7 @@ async def _sync_okr_report_triggers(db, settings: OKRSettings) -> None:
     _ensure_trigger(
         "monthly_okr_report",
         config={"expr": "0 9 1 * *"},
-        is_enabled=bool(settings.enabled),
+        is_enabled=bool(automation_enabled and settings.enabled),
         reason=(
             "System trigger: generate the company monthly report at 09:00 on the 1st "
             "for the previous month."

@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime, timezone, timedelta
 from loguru import logger
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from app.config import get_settings
 from app.core.logging_config import new_trace_id
@@ -41,6 +41,7 @@ _ON_MSG_RATE_LIMIT = 30     # max on_message fires per agent per hour
 _on_msg_fire_log: dict[uuid.UUID, list[datetime]] = {}  # agent_id -> list of fire timestamps
 
 _last_invoke: dict[uuid.UUID, datetime] = {}
+_invocation_tasks: set[asyncio.Task[None]] = set()
 
 _A2A_WAKE_TRIGGER_NAME = "__a2a_wake__"
 
@@ -80,8 +81,10 @@ async def _handle_okr_report_trigger(trigger: AgentTrigger, now: datetime) -> bo
 async def _handle_okr_collection_trigger(trigger: AgentTrigger, now: datetime) -> bool:
     return await handle_okr_collection_trigger_runtime(trigger, now)
 
+
 async def _evaluate_trigger(trigger: AgentTrigger, now: datetime) -> bool:
     return await evaluate_trigger_runtime(trigger, now)
+
 
 async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTrigger]):
     new_trace_id()
@@ -111,6 +114,88 @@ async def _invoke_agent_batches(agent_id: uuid.UUID, batches: list[list[AgentTri
         await _invoke_agent_for_triggers(agent_id, triggers)
 
 
+def _max_invocation_concurrency() -> int:
+    return max(1, int(settings.TRIGGER_MAX_CONCURRENCY))
+
+
+def _claim_batch_size() -> int:
+    return max(1, int(settings.TRIGGER_CLAIM_BATCH_SIZE))
+
+
+def _available_invocation_slots() -> int:
+    return max(0, _max_invocation_concurrency() - _active_invocation_count())
+
+
+def _active_invocation_count() -> int:
+    return sum(not task.done() for task in _invocation_tasks)
+
+
+async def _capture_trigger_runtime_issue(
+    error: BaseException,
+    *,
+    operation: str,
+    agent_id: uuid.UUID | None = None,
+) -> None:
+    """Persist a privacy-safe trigger failure without breaking the worker."""
+    from app.services.production_issue_monitor import record_production_issue
+
+    category = "database" if isinstance(error, (SQLAlchemyError, TimeoutError)) else "trigger"
+    await record_production_issue(
+        source="trigger_runtime",
+        category=category,
+        summary="Trigger runtime operation failed",
+        severity="error",
+        error_code=type(error).__name__,
+        operation=operation,
+        agent_id=agent_id,
+        metadata={
+            "component": "trigger_daemon",
+            "error_type": type(error).__name__,
+        },
+    )
+
+
+async def _run_invocation_task(
+    agent_id: uuid.UUID,
+    batches: list[list[AgentTrigger]],
+) -> None:
+    try:
+        await _invoke_agent_batches(agent_id, batches)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.error(
+            "Trigger invocation task crashed agent_id={} error_type={}",
+            agent_id,
+            type(exc).__name__,
+        )
+        await _capture_trigger_runtime_issue(
+            exc,
+            operation="invoke_agent_batches",
+            agent_id=agent_id,
+        )
+
+
+def _invocation_task_done(task: asyncio.Task[None]) -> None:
+    _invocation_tasks.discard(task)
+    try:
+        _ = task.exception()
+    except asyncio.CancelledError:
+        return
+
+
+def _schedule_invocation_task(
+    agent_id: uuid.UUID,
+    batches: list[list[AgentTrigger]],
+) -> None:
+    task = asyncio.create_task(
+        _run_invocation_task(agent_id, batches),
+        name=f"trigger-invoke-{agent_id}",
+    )
+    _invocation_tasks.add(task)
+    task.add_done_callback(_invocation_task_done)
+
+
 # ── Main Tick Loop ──────────────────────────────────────────────────
 
 async def _tick():
@@ -129,10 +214,6 @@ async def _tick():
         # attributes remain readable outside the session context.
         for _t in all_triggers:
             db.expunge(_t)
-
-    if not all_triggers:
-        return
-
 
     # Evaluate and enqueue due triggers. Agent invocation happens only after
     # executions are claimed through the distributed execution queue.
@@ -177,13 +258,39 @@ async def _tick():
                         _on_msg_fire_log[trigger.agent_id] = recent
                     await enqueue_due_trigger(trigger, now)
         except Exception as e:
-            logger.warning(f"Error evaluating trigger {trigger.id}: {e}")
+            logger.warning(
+                "Error evaluating trigger {} error_type={}",
+                trigger.id,
+                type(e).__name__,
+            )
+            await _capture_trigger_runtime_issue(
+                e,
+                operation="evaluate_trigger",
+                agent_id=trigger.agent_id,
+            )
+
+    available_slots = _available_invocation_slots()
+    if available_slots <= 0:
+        logger.warning(
+            "Trigger invocation capacity exhausted active={} limit={}",
+            _active_invocation_count(),
+            _max_invocation_concurrency(),
+        )
+        return
 
     # Claim queued executions with a DB lease so only one worker handles each event.
     try:
-        fired_by_agent, force_invoke_agents = await claim_ready_trigger_invocations(now)
+        claim_limit = min(_claim_batch_size(), available_slots)
+        fired_by_agent, force_invoke_agents = await claim_ready_trigger_invocations(
+            now,
+            limit=claim_limit,
+        )
     except Exception as e:
-        logger.warning(f"Failed to claim trigger executions: {e}")
+        logger.warning(
+            "Failed to claim trigger executions error_type={}",
+            type(e).__name__,
+        )
+        await _capture_trigger_runtime_issue(e, operation="claim_trigger_executions")
         fired_by_agent = {}
         force_invoke_agents = set()
 
@@ -225,9 +332,21 @@ async def _tick():
                             trigger.is_enabled = False
                 await db.commit()
         except Exception as e:
-            logger.warning(f"Failed to pre-update trigger state: {e}")
+            logger.warning(
+                "Failed to pre-update trigger state agent_id={} error_type={}",
+                agent_id,
+                type(e).__name__,
+            )
+            await _capture_trigger_runtime_issue(
+                e,
+                operation="update_trigger_state",
+                agent_id=agent_id,
+            )
 
-        asyncio.create_task(_invoke_agent_batches(agent_id, _build_invocation_batches(agent_triggers)))
+        _schedule_invocation_task(
+            agent_id,
+            _build_invocation_batches(agent_triggers),
+        )
 
 
 async def wake_agent_with_context(
@@ -346,14 +465,24 @@ async def wake_agent_with_context(
 
 async def start_trigger_daemon():
     """Start the background trigger daemon loop. Called from FastAPI startup."""
+    if not settings.TRIGGER_DAEMON_ENABLED:
+        logger.warning("Trigger Daemon disabled by TRIGGER_DAEMON_ENABLED=false")
+        return
     heartbeat_state = "enabled (~60s check)" if settings.HEARTBEAT_ENABLED else "disabled"
-    logger.info(f"⚡ Trigger Daemon started (15s tick, heartbeat {heartbeat_state})")
+    logger.info(
+        "⚡ Trigger Daemon started ({}s tick, heartbeat {}, max_concurrency={}, claim_batch={})",
+        TICK_INTERVAL,
+        heartbeat_state,
+        _max_invocation_concurrency(),
+        _claim_batch_size(),
+    )
     _heartbeat_counter = 0
     while True:
         try:
             await _tick()
         except Exception as e:
-            logger.error(f"Trigger Daemon error: {e}")
+            logger.error("Trigger Daemon error_type={}", type(e).__name__)
+            await _capture_trigger_runtime_issue(e, operation="trigger_daemon_tick")
 
         # Run heartbeat check every 4th tick (~60 seconds) only when the
         # independent global kill switch is enabled. Explicit triggers above
@@ -367,6 +496,7 @@ async def start_trigger_daemon():
                 from app.services.heartbeat import _heartbeat_tick
                 await _heartbeat_tick()
             except Exception as e:
-                logger.error(f"Heartbeat tick error: {e}")
+                logger.error("Heartbeat tick error_type={}", type(e).__name__)
+                await _capture_trigger_runtime_issue(e, operation="heartbeat_tick")
 
         await asyncio.sleep(TICK_INTERVAL)

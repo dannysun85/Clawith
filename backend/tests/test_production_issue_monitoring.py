@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from pydantic import ValidationError
@@ -320,3 +321,72 @@ def test_warning_alert_notification_is_not_labeled_as_error():
     notification = production_issue_monitor._production_issue_notification(issue, uuid.uuid4())
 
     assert notification.title == "[警告] 生产问题告警"
+
+
+@pytest.mark.asyncio
+async def test_database_outage_queues_only_sanitized_issue_data(monkeypatch):
+    class BrokenSession:
+        async def __aenter__(self):
+            raise TimeoutError("Bearer private-token prompt=customer-secret")
+
+        async def __aexit__(self, *_args):
+            return None
+
+    production_issue_monitor._failed_capture_queue.clear()
+    monkeypatch.setattr(
+        production_issue_monitor,
+        "async_session",
+        lambda: BrokenSession(),
+    )
+
+    issue_id = await production_issue_monitor.record_production_issue(
+        source="trigger_runtime",
+        category="database",
+        summary="Trigger runtime operation failed",
+        error_code="TimeoutError",
+        operation="claim_trigger_executions",
+        metadata={
+            "component": "trigger_daemon",
+            "prompt": "customer-secret",
+            "api_key": "private-token",
+        },
+    )
+
+    assert issue_id is None
+    assert len(production_issue_monitor._failed_capture_queue) == 1
+    queued = production_issue_monitor._failed_capture_queue[0]
+    assert queued["metadata"] == {"component": "trigger_daemon"}
+    assert "customer-secret" not in str(queued)
+    assert "private-token" not in str(queued)
+
+
+@pytest.mark.asyncio
+async def test_monitor_flushes_transient_capture_queue(monkeypatch):
+    queued = {
+        "source": "trigger_runtime",
+        "category": "database",
+        "summary": "Trigger runtime operation failed",
+        "severity": "error",
+        "error_code": "TimeoutError",
+        "route": None,
+        "operation": "claim_trigger_executions",
+        "tenant_id": None,
+        "user_id": None,
+        "agent_id": None,
+        "trace_id": None,
+        "metadata": {"component": "trigger_daemon"},
+    }
+    production_issue_monitor._failed_capture_queue.clear()
+    production_issue_monitor._failed_capture_queue.append(queued)
+    persist = AsyncMock(return_value=uuid.uuid4())
+    monkeypatch.setattr(
+        production_issue_monitor,
+        "record_production_issue",
+        persist,
+    )
+
+    flushed = await production_issue_monitor.flush_failed_production_issue_captures()
+
+    assert flushed == 1
+    assert not production_issue_monitor._failed_capture_queue
+    persist.assert_awaited_once_with(**queued)

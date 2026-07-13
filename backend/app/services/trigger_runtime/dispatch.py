@@ -52,11 +52,15 @@ async def enqueue_due_trigger(trigger: AgentTrigger, now: datetime) -> None:
         )
 
 
-async def claim_ready_trigger_invocations(now: datetime) -> tuple[dict[uuid.UUID, list[AgentTrigger]], set[uuid.UUID]]:
+async def claim_ready_trigger_invocations(
+    now: datetime,
+    *,
+    limit: int,
+) -> tuple[dict[uuid.UUID, list[AgentTrigger]], set[uuid.UUID]]:
     fired_by_agent: dict[uuid.UUID, list[AgentTrigger]] = {}
     force_invoke_agents: set[uuid.UUID] = set()
 
-    claimed_executions = await claim_pending_trigger_executions()
+    claimed_executions = await claim_pending_trigger_executions(limit=max(1, limit))
     if claimed_executions:
         await mark_base_triggers_fired([trigger.id for _execution, trigger in claimed_executions], now)
 

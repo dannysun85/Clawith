@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 from loguru import logger
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.database import async_session
 from app.models.agent import Agent
@@ -16,6 +17,29 @@ from app.services.trigger_runtime import (
     mark_trigger_executions_completed,
     mark_trigger_executions_failed,
 )
+
+
+async def _capture_invocation_failure(
+    agent_id: uuid.UUID,
+    error: BaseException,
+) -> None:
+    """Record a sanitized issue rollup for failures consumed by this invoker."""
+    from app.services.production_issue_monitor import record_production_issue
+
+    category = "database" if isinstance(error, (SQLAlchemyError, TimeoutError)) else "trigger"
+    await record_production_issue(
+        source="trigger_runtime",
+        category=category,
+        summary="Trigger agent invocation failed",
+        severity="error",
+        error_code=type(error).__name__,
+        operation="invoke_agent",
+        agent_id=agent_id,
+        metadata={
+            "component": "trigger_invoker",
+            "error_type": type(error).__name__,
+        },
+    )
 
 
 async def resolve_trigger_delivery_target(agent: Agent, triggers: list[AgentTrigger]) -> dict | None:
@@ -413,11 +437,22 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
         if execution_ids:
             await mark_trigger_executions_completed(execution_ids)
     except Exception as e:
-        logger.error(f"Failed to invoke agent {agent_id} for triggers: {e}")
+        logger.error(
+            "Failed to invoke agent {} for triggers error_type={}",
+            agent_id,
+            type(e).__name__,
+        )
         execution_ids = [
             uuid.UUID(str((t.config or {}).get("_execution_id")))
             for t in triggers
             if (t.config or {}).get("_execution_id")
         ]
         if execution_ids:
-            await mark_trigger_executions_failed(execution_ids, str(e)[:2000])
+            try:
+                await mark_trigger_executions_failed(execution_ids, str(e)[:2000])
+            except Exception as mark_error:
+                logger.error(
+                    "Failed to mark trigger executions failed error_type={}",
+                    type(mark_error).__name__,
+                )
+        await _capture_invocation_failure(agent_id, e)

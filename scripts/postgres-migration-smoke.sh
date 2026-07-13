@@ -123,7 +123,7 @@ INSERT INTO billing_rules (
 SQL
 
 .venv/bin/alembic upgrade head
-.venv/bin/alembic current | grep -F "seed_minimax_m3_understanding (head)"
+.venv/bin/alembic current | grep -F "disable_system_okr_automation (head)"
 PYTHONPATH=. .venv/bin/python ../scripts/plan-update-postgres-smoke.py
 
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
@@ -424,7 +424,7 @@ BEGIN
 END $$;
 SQL
 .venv/bin/alembic upgrade head
-.venv/bin/alembic current | grep -F "seed_minimax_m3_understanding (head)"
+.venv/bin/alembic current | grep -F "disable_system_okr_automation (head)"
 
 PYTHONPATH=. .venv/bin/python ../scripts/a2a-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/media-generation-postgres-smoke.py
@@ -453,7 +453,7 @@ FROM users
 WHERE id = '07500000-0000-4000-8000-000000000070';
 SQL
 .venv/bin/alembic upgrade head
-.venv/bin/alembic current | grep -F "seed_minimax_m3_understanding (head)"
+.venv/bin/alembic current | grep -F "disable_system_okr_automation (head)"
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 --tuples-only --no-align <<'SQL' | grep -Fx 'ultra|7'
 SELECT preferred_chat_tier || '|' || preferred_chat_tier_revision
 FROM users

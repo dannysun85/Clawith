@@ -123,6 +123,15 @@ class Settings(BaseSettings):
     # cron/interval/webhook/on_message triggers remain independent.
     HEARTBEAT_ENABLED: bool = False
 
+    # Trigger runtime controls. The daemon stays available for explicit user
+    # workflows, while the costly platform-seeded OKR automation is opt-in.
+    # Claim and concurrency limits are process-local safety bounds; durable
+    # executions remain queued until a worker slot is available.
+    TRIGGER_DAEMON_ENABLED: bool = True
+    OKR_AUTOMATION_ENABLED: bool = False
+    TRIGGER_MAX_CONCURRENCY: int = 8
+    TRIGGER_CLAIM_BATCH_SIZE: int = 16
+
     # Docker (for Agent containers)
     DOCKER_NETWORK: str = "clawith_network"
     OPENCLAW_IMAGE: str = "openclaw:local"

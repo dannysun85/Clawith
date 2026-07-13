@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import re
 import uuid
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -26,6 +27,10 @@ _UUID_RE = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89a
 _LONG_NUMBER_RE = re.compile(r"(?<![A-Za-z])\d{6,}(?![A-Za-z])")
 _SECRETISH_RE = re.compile(r"(?i)(bearer\s+\S+|sk-[A-Za-z0-9_-]{8,}|api[_ -]?key\s*[:=]\s*\S+)")
 _ALLOWED_SEVERITIES = {"warning", "error", "critical"}
+_FAILED_CAPTURE_QUEUE_LIMIT = 1000
+_failed_capture_queue: deque[dict[str, Any]] = deque(
+    maxlen=_FAILED_CAPTURE_QUEUE_LIMIT
+)
 _ALLOWED_METADATA_KEYS = {
     "status_code",
     "error_type",
@@ -114,6 +119,43 @@ def issue_fingerprint(
 def _safe_summary(summary: str) -> str:
     value = _safe_operational_text(summary, 500)
     return (value or "Production operation failed")[:500]
+
+
+def _queue_failed_capture(
+    *,
+    source: str,
+    category: str,
+    summary: str,
+    severity: str,
+    error_code: str | None,
+    route: str | None,
+    operation: str | None,
+    tenant_id: uuid.UUID | None,
+    user_id: uuid.UUID | None,
+    agent_id: uuid.UUID | None,
+    trace_id: str | None,
+    metadata: dict[str, Any] | None,
+) -> None:
+    """Retain only sanitized diagnostics while the primary DB is unavailable."""
+    if len(_failed_capture_queue) >= _FAILED_CAPTURE_QUEUE_LIMIT:
+        logger.error(
+            "[production-issues] fallback queue full capacity={}",
+            _FAILED_CAPTURE_QUEUE_LIMIT,
+        )
+    _failed_capture_queue.append({
+        "source": _safe_operational_text(source, 64).lower() or "unknown",
+        "category": _safe_operational_text(category, 64).lower() or "unknown",
+        "summary": _safe_summary(summary),
+        "severity": severity if severity in _ALLOWED_SEVERITIES else "error",
+        "error_code": _safe_operational_text(error_code, 100) if error_code else None,
+        "route": normalize_issue_route(route),
+        "operation": _safe_operational_text(operation, 100) if operation else None,
+        "tenant_id": tenant_id,
+        "user_id": user_id,
+        "agent_id": agent_id,
+        "trace_id": _safe_operational_text(trace_id, 64) if trace_id else None,
+        "metadata": sanitize_issue_metadata(metadata),
+    })
 
 
 async def record_production_issue(
@@ -233,7 +275,36 @@ async def record_production_issue(
         return issue_id
     except Exception as exc:
         logger.error("[production-issues] capture failed error_type={}", type(exc).__name__)
+        _queue_failed_capture(
+            source=source,
+            category=category,
+            summary=summary,
+            severity=severity,
+            error_code=error_code,
+            route=route,
+            operation=operation,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            agent_id=agent_id,
+            trace_id=trace_id,
+            metadata=metadata,
+        )
         return None
+
+
+async def flush_failed_production_issue_captures() -> int:
+    """Replay transiently failed captures after database capacity recovers."""
+    flushed = 0
+    pending = len(_failed_capture_queue)
+    for _ in range(pending):
+        payload = _failed_capture_queue.popleft()
+        issue_id = await record_production_issue(**payload)
+        if issue_id is None:
+            # record_production_issue re-queued the sanitized payload. Stop so
+            # an unavailable database cannot create a tight retry loop.
+            break
+        flushed += 1
+    return flushed
 
 
 def issue_requires_alert(issue: ProductionIssue, threshold: int) -> bool:
@@ -367,6 +438,7 @@ async def start_production_issue_monitor_daemon() -> None:
     purge_counter = 0
     while True:
         try:
+            await flush_failed_production_issue_captures()
             await dispatch_production_issue_alerts()
             purge_counter += 1
             if purge_counter >= max(3600 // interval, 1):
@@ -374,6 +446,9 @@ async def start_production_issue_monitor_daemon() -> None:
                 purge_counter = 0
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.exception("[production-issues] monitor iteration failed")
+        except Exception as exc:
+            logger.error(
+                "[production-issues] monitor iteration failed error_type={}",
+                type(exc).__name__,
+            )
         await asyncio.sleep(interval)

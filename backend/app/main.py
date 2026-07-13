@@ -354,7 +354,12 @@ async def lifespan(app: FastAPI):
                 )
         task_specs = []
         if _role_enabled("all", "worker"):
-            task_specs.append(("trigger_daemon", start_trigger_daemon()))
+            if settings.TRIGGER_DAEMON_ENABLED:
+                task_specs.append(("trigger_daemon", start_trigger_daemon()))
+            else:
+                logger.warning(
+                    "[startup] Trigger daemon disabled by TRIGGER_DAEMON_ENABLED=false"
+                )
             task_specs.append(("subscription_lifecycle", start_subscription_lifecycle_daemon()))
             task_specs.append(("media_generation", start_media_generation_daemon()))
             task_specs.append(("billing_reconciliation", start_billing_reconciliation_daemon()))

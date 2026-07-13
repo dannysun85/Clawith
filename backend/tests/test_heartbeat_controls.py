@@ -20,6 +20,15 @@ def test_heartbeat_can_be_explicitly_enabled_by_operator():
     assert settings.HEARTBEAT_ENABLED is True
 
 
+def test_trigger_runtime_defaults_keep_explicit_work_bounded_and_okr_off():
+    settings = Settings(_env_file=None)
+
+    assert settings.TRIGGER_DAEMON_ENABLED is True
+    assert settings.OKR_AUTOMATION_ENABLED is False
+    assert settings.TRIGGER_MAX_CONCURRENCY == 8
+    assert settings.TRIGGER_CLAIM_BATCH_SIZE == 16
+
+
 def test_new_agents_and_agent_responses_default_heartbeat_off():
     column_default = Agent.__table__.c.heartbeat_enabled.default
 
@@ -52,6 +61,7 @@ async def test_explicit_trigger_tick_still_runs_when_heartbeat_is_disabled(monke
         raise StopLoop
 
     monkeypatch.setattr(trigger_daemon.settings, "HEARTBEAT_ENABLED", False)
+    monkeypatch.setattr(trigger_daemon.settings, "TRIGGER_DAEMON_ENABLED", True)
     monkeypatch.setattr(trigger_daemon, "_tick", trigger_tick)
     monkeypatch.setattr(trigger_daemon.asyncio, "sleep", stop_after_first_tick)
 
@@ -61,11 +71,28 @@ async def test_explicit_trigger_tick_still_runs_when_heartbeat_is_disabled(monke
     trigger_tick.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_trigger_daemon_kill_switch_returns_without_ticking(monkeypatch):
+    from app.services import trigger_daemon
+
+    trigger_tick = AsyncMock()
+    monkeypatch.setattr(trigger_daemon.settings, "TRIGGER_DAEMON_ENABLED", False)
+    monkeypatch.setattr(trigger_daemon, "_tick", trigger_tick)
+
+    await trigger_daemon.start_trigger_daemon()
+
+    trigger_tick.assert_not_awaited()
+
+
 def test_production_compose_exposes_disabled_heartbeat_kill_switch():
     repository_root = Path(__file__).parents[2]
     compose = (repository_root / "deploy/astra-poc/docker-compose.prod.yml").read_text(encoding="utf-8")
 
     assert "HEARTBEAT_ENABLED: ${HEARTBEAT_ENABLED:-false}" in compose
+    assert "TRIGGER_DAEMON_ENABLED: ${TRIGGER_DAEMON_ENABLED:-true}" in compose
+    assert "OKR_AUTOMATION_ENABLED: ${OKR_AUTOMATION_ENABLED:-false}" in compose
+    assert "TRIGGER_MAX_CONCURRENCY: ${TRIGGER_MAX_CONCURRENCY:-8}" in compose
+    assert "TRIGGER_CLAIM_BATCH_SIZE: ${TRIGGER_CLAIM_BATCH_SIZE:-16}" in compose
 
 
 def test_production_deploy_pins_autonomous_runners_off():
@@ -73,6 +100,10 @@ def test_production_deploy_pins_autonomous_runners_off():
     deploy_script = (repository_root / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
 
     assert '"HEARTBEAT_ENABLED": "false"' in deploy_script
+    assert '"TRIGGER_DAEMON_ENABLED": "true"' in deploy_script
+    assert '"OKR_AUTOMATION_ENABLED": "false"' in deploy_script
+    assert '"TRIGGER_MAX_CONCURRENCY": "8"' in deploy_script
+    assert '"TRIGGER_CLAIM_BATCH_SIZE": "16"' in deploy_script
     assert '"COMPANY_ASSIGNMENT_RUNNER_ENABLED": "false"' in deploy_script
     assert "--exclude .omx" in deploy_script
     assert "--exclude '*/__pycache__'" in deploy_script
