@@ -1,6 +1,6 @@
 import asyncio
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -139,6 +139,46 @@ async def test_okr_automation_kill_switch_avoids_database_and_llm_work(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("handler_name", "trigger_name"),
+    [
+        ("handle_okr_collection_trigger", "daily_okr_collection"),
+        ("handle_okr_report_trigger", "daily_okr_report"),
+    ],
+)
+async def test_user_trigger_name_collision_is_not_disabled_as_system_okr(
+    monkeypatch,
+    handler_name,
+    trigger_name,
+):
+    from app.services.trigger_runtime import evaluator
+
+    now = datetime.now(timezone.utc)
+    trigger = AgentTrigger(
+        id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        name=trigger_name,
+        type="interval",
+        config={"minutes": 30},
+        reason="user-authored automation with a colliding name",
+        is_enabled=True,
+        fire_count=0,
+        cooldown_seconds=60,
+        is_system=False,
+        created_at=now - timedelta(hours=1),
+    )
+    monkeypatch.setattr(evaluator.runtime_settings, "OKR_AUTOMATION_ENABLED", False)
+    handler = getattr(evaluator, handler_name)
+
+    with patch("app.services.trigger_runtime.evaluator.async_session") as session:
+        handled = await handler(trigger, now)
+
+    assert handled is False
+    session.assert_not_called()
+    assert await evaluator.evaluate_trigger(trigger, now) is True
+
+
+@pytest.mark.asyncio
 async def test_trigger_database_failure_enters_privacy_safe_issue_ledger(monkeypatch):
     from app.services.trigger_runtime import invoker
 
@@ -173,3 +213,16 @@ def test_okr_shutdown_migration_preserves_tenant_settings_and_never_auto_restart
     assert "UPDATE trigger_executions" in migration
     assert "UPDATE okr_settings" not in migration
     assert "Never restart token-consuming automation" in migration
+
+
+def test_execution_completion_cannot_overwrite_migration_or_operator_terminal_state():
+    from inspect import getsource
+
+    from app.services.trigger_runtime import executions
+
+    completed = getsource(executions.mark_trigger_executions_completed)
+    failed = getsource(executions.mark_trigger_executions_failed)
+    assert 'TriggerExecution.status == "processing"' in completed
+    assert 'TriggerExecution.status == "processing"' in failed
+    assert "update(TriggerExecution)" in completed
+    assert "update(TriggerExecution)" in failed

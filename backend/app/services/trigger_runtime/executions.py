@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import and_, exists, or_, select
+from sqlalchemy import and_, exists, or_, select, update
 from sqlalchemy.orm import aliased
 
 from app.config import get_settings
@@ -20,15 +20,20 @@ async def mark_trigger_executions_completed(execution_ids: list[uuid.UUID]) -> N
     if not execution_ids:
         return
     async with async_session() as db:
-        result = await db.execute(
-            select(TriggerExecution).where(TriggerExecution.id.in_(execution_ids))
+        await db.execute(
+            update(TriggerExecution)
+            .where(
+                TriggerExecution.id.in_(execution_ids),
+                TriggerExecution.status == "processing",
+            )
+            .values(
+                status="completed",
+                finished_at=datetime.now(timezone.utc),
+                lease_owner=None,
+                lease_expires_at=None,
+                last_error=None,
+            )
         )
-        for execution in result.scalars().all():
-            execution.status = "completed"
-            execution.finished_at = datetime.now(timezone.utc)
-            execution.lease_owner = None
-            execution.lease_expires_at = None
-            execution.last_error = None
         await db.commit()
 
 
@@ -36,15 +41,20 @@ async def mark_trigger_executions_failed(execution_ids: list[uuid.UUID], error_t
     if not execution_ids:
         return
     async with async_session() as db:
-        result = await db.execute(
-            select(TriggerExecution).where(TriggerExecution.id.in_(execution_ids))
+        await db.execute(
+            update(TriggerExecution)
+            .where(
+                TriggerExecution.id.in_(execution_ids),
+                TriggerExecution.status == "processing",
+            )
+            .values(
+                status="failed",
+                finished_at=datetime.now(timezone.utc),
+                lease_owner=None,
+                lease_expires_at=None,
+                last_error=error_text[:2000],
+            )
         )
-        for execution in result.scalars().all():
-            execution.status = "failed"
-            execution.finished_at = datetime.now(timezone.utc)
-            execution.lease_owner = None
-            execution.lease_expires_at = None
-            execution.last_error = error_text
         await db.commit()
 
 

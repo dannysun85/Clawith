@@ -508,6 +508,7 @@ class WebSocketChatHandler:
             file_name = data.get("file_name", "")
             chat_tier = data.get("tier") or self.session_model_tier
             chat_modality = data.get("modality") or self.session_model_modality
+            ephemeral_modality = data.get("ephemeral_modality") is True
             is_onboarding_trigger = data.get("kind") == "onboarding_trigger"
             logger.info(
                 "[WS] Received message content_chars={} display_chars={} file_attached={} kind={}",
@@ -557,7 +558,10 @@ class WebSocketChatHandler:
             if self.current_route_meta is not None:
                 chat_tier = self.current_route_meta.saas_tier
                 chat_modality = self.current_route_meta.modality
-                await self._persist_session_model_selection(chat_tier, chat_modality)
+                await self._persist_session_model_selection(
+                    chat_tier,
+                    None if ephemeral_modality else chat_modality,
+                )
 
             # Quota Checks (use resolved SaaS tier for weighting)
             if not await self._check_quotas(saas_tier=chat_tier):
@@ -671,11 +675,18 @@ class WebSocketChatHandler:
             self.current_route_meta = route_meta
             return primary, fallback
 
-    async def _persist_session_model_selection(self, tier: str, modality: str) -> None:
-        """Persist the resolved route on the owning first-party web session."""
+    async def _persist_session_model_selection(
+        self,
+        tier: str,
+        modality: str | None,
+    ) -> None:
+        """Persist an explicit route selection, never an attachment-only modality."""
         if not self.conv_id or not self.user:
             return
-        if self.session_model_tier == tier and self.session_model_modality == modality:
+        if (
+            self.session_model_tier == tier
+            and (modality is None or self.session_model_modality == modality)
+        ):
             return
         try:
             session_uuid = uuid.UUID(self.conv_id)
@@ -697,10 +708,12 @@ class WebSocketChatHandler:
                 if not session:
                     return
                 session.model_tier = tier
-                session.model_modality = modality
+                if modality is not None:
+                    session.model_modality = modality
                 await db.commit()
             self.session_model_tier = tier
-            self.session_model_modality = modality
+            if modality is not None:
+                self.session_model_modality = modality
         except Exception as exc:
             # A persistence outage must not discard a valid chat response. The
             # frontend PATCH path will retry on the next explicit selection.

@@ -19,6 +19,7 @@ from app.services.agent_tools import (
     _generate_video_minimax,
     _json_path_get,
     _minimax_create_video_task,
+    _record_minimax_tool_success,
     _render_json_template,
 )
 from app.services.quota_guard import QuotaExceeded
@@ -30,6 +31,38 @@ def _valid_png_bytes() -> bytes:
     output = BytesIO()
     Image.new("RGB", (512, 512), (24, 96, 160)).save(output, format="PNG")
     return output.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_minimax_tool_success_survives_secondary_accounting_failures():
+    agent_id = uuid.uuid4()
+    credential_id = uuid.uuid4()
+    record_issue = AsyncMock()
+
+    with (
+        patch(
+            "app.services.llm.load_balancer.record_credential_call",
+            AsyncMock(side_effect=RuntimeError("credential counter unavailable")),
+        ),
+        patch(
+            "app.services.quota_guard.consume_agent_llm_quota",
+            AsyncMock(side_effect=RuntimeError("agent counter unavailable")),
+        ),
+        patch(
+            "app.services.agent_tools._record_minimax_tool_product_issue",
+            record_issue,
+        ),
+    ):
+        await _record_minimax_tool_success(
+            agent_id,
+            credential_id,
+            tier="pro",
+            modality="image",
+            model="image-01",
+        )
+
+    assert record_issue.await_count == 2
+    assert all(call.kwargs["category"] == "usage_accounting" for call in record_issue.await_args_list)
 
 
 class _FakeHTTPResponse:
@@ -197,7 +230,9 @@ async def test_generate_image_minimax_records_success(tmp_path):
     agent_id = uuid.uuid4()
     tenant_id = uuid.uuid4()
     cred_id = uuid.uuid4()
+    reservation_id = uuid.uuid4()
     cred = SimpleNamespace(id=cred_id, base_url=None)
+    reservation = SimpleNamespace(id=reservation_id)
     generated = _valid_png_bytes()
 
     with (
@@ -205,7 +240,9 @@ async def test_generate_image_minimax_records_success(tmp_path):
         patch("app.services.agent_tools._get_agent_tenant_id", AsyncMock(return_value=str(tenant_id))),
         patch("app.services.agent_tools._resolve_minimax_tool_tier", AsyncMock(return_value="pro")),
         patch("app.services.agent_tools._check_minimax_credit_amount", AsyncMock()) as check_credits,
-        patch("app.services.agent_tools._charge_minimax_tool_credits", AsyncMock()) as charge_credits,
+        patch("app.services.agent_tools._reserve_minimax_tool_credits", AsyncMock(return_value=reservation)) as reserve_credits,
+        patch("app.services.agent_tools._finalize_minimax_tool_reservation", AsyncMock()) as finalize_credits,
+        patch("app.services.agent_tools._release_minimax_tool_reservation", AsyncMock()) as release_credits,
         patch("app.services.quota_guard.check_plan_generation_entitlement", AsyncMock()),
         patch("app.services.quota_guard.check_agent_llm_quota", AsyncMock()),
         patch("app.services.llm.load_balancer.pick_credential", AsyncMock(return_value=cred)),
@@ -231,20 +268,24 @@ async def test_generate_image_minimax_records_success(tmp_path):
     record_call.assert_awaited_once_with(cred_id, tokens_used=0)
     consume_quota.assert_awaited_once_with(agent_id, model_tier="pro")
     check_credits.assert_awaited_once_with(tenant_id, 4)
-    charge_credits.assert_awaited_once()
-    assert charge_credits.await_args.kwargs["tenant_id"] == tenant_id
-    assert charge_credits.await_args.kwargs["action"] == "image"
-    assert charge_credits.await_args.kwargs["modality"] == "image"
-    assert charge_credits.await_args.kwargs["tier"] == "pro"
-    assert charge_credits.await_args.kwargs["model"] == "image-01"
-    assert charge_credits.await_args.kwargs["credits"] == 4
+    reserve_credits.assert_awaited_once()
+    assert reserve_credits.await_args.kwargs["tenant_id"] == tenant_id
+    assert reserve_credits.await_args.kwargs["action"] == "image"
+    assert reserve_credits.await_args.kwargs["modality"] == "image"
+    assert reserve_credits.await_args.kwargs["tier"] == "pro"
+    assert reserve_credits.await_args.kwargs["model"] == "image-01"
+    assert reserve_credits.await_args.kwargs["credits"] == 4
+    finalize_credits.assert_awaited_once_with(reservation_id)
+    release_credits.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_generate_image_storage_failure_does_not_settle_credits(tmp_path):
     agent_id = uuid.uuid4()
     tenant_id = uuid.uuid4()
+    reservation_id = uuid.uuid4()
     cred = SimpleNamespace(id=uuid.uuid4(), base_url=None)
+    reservation = SimpleNamespace(id=reservation_id)
 
     with (
         patch("app.services.agent_tools._get_tool_config", AsyncMock(return_value={})),
@@ -255,7 +296,9 @@ async def test_generate_image_storage_failure_does_not_settle_credits(tmp_path):
             AsyncMock(return_value=resolve_minimax_media_profile("image", "pro")),
         ),
         patch("app.services.agent_tools._check_minimax_credit_amount", AsyncMock()),
-        patch("app.services.agent_tools._charge_minimax_tool_credits", AsyncMock()) as charge_credits,
+        patch("app.services.agent_tools._reserve_minimax_tool_credits", AsyncMock(return_value=reservation)),
+        patch("app.services.agent_tools._finalize_minimax_tool_reservation", AsyncMock()) as finalize_credits,
+        patch("app.services.agent_tools._release_minimax_tool_reservation", AsyncMock()) as release_credits,
         patch("app.services.quota_guard.check_plan_generation_entitlement", AsyncMock()),
         patch("app.services.quota_guard.check_agent_llm_quota", AsyncMock()),
         patch("app.services.llm.load_balancer.pick_credential", AsyncMock(return_value=cred)),
@@ -268,7 +311,8 @@ async def test_generate_image_storage_failure_does_not_settle_credits(tmp_path):
         result = await _generate_image(agent_id, tmp_path, {"prompt": "cat"}, "minimax")
 
     assert "disk full" in result
-    charge_credits.assert_not_awaited()
+    finalize_credits.assert_not_awaited()
+    release_credits.assert_awaited_once_with(reservation_id)
     record_call.assert_not_awaited()
     consume_quota.assert_not_awaited()
 
@@ -363,7 +407,9 @@ async def test_generate_speech_minimax_records_success(tmp_path):
     agent_id = uuid.uuid4()
     tenant_id = uuid.uuid4()
     cred_id = uuid.uuid4()
+    reservation_id = uuid.uuid4()
     cred = SimpleNamespace(id=cred_id, base_url=None)
+    reservation = SimpleNamespace(id=reservation_id)
 
     with (
         patch(
@@ -377,7 +423,9 @@ async def test_generate_speech_minimax_records_success(tmp_path):
             AsyncMock(return_value=resolve_minimax_media_profile("audio", "pro")),
         ),
         patch("app.services.agent_tools._check_minimax_credit_amount", AsyncMock()) as check_credits,
-        patch("app.services.agent_tools._charge_minimax_tool_credits", AsyncMock()) as charge_credits,
+        patch("app.services.agent_tools._reserve_minimax_tool_credits", AsyncMock(return_value=reservation)) as reserve_credits,
+        patch("app.services.agent_tools._finalize_minimax_tool_reservation", AsyncMock()) as finalize_credits,
+        patch("app.services.agent_tools._release_minimax_tool_reservation", AsyncMock()) as release_credits,
         patch("app.services.quota_guard.check_plan_generation_entitlement", AsyncMock()),
         patch("app.services.quota_guard.check_agent_llm_quota", AsyncMock()),
         patch("app.services.llm.load_balancer.pick_credential", AsyncMock(return_value=cred)),
@@ -397,13 +445,15 @@ async def test_generate_speech_minimax_records_success(tmp_path):
     record_call.assert_awaited_once_with(cred_id, tokens_used=0)
     consume_quota.assert_awaited_once_with(agent_id, model_tier="pro")
     check_credits.assert_awaited_once_with(tenant_id, 1)
-    charge_credits.assert_awaited_once()
-    assert charge_credits.await_args.kwargs["tenant_id"] == tenant_id
-    assert charge_credits.await_args.kwargs["action"] == "audio"
-    assert charge_credits.await_args.kwargs["modality"] == "audio"
-    assert charge_credits.await_args.kwargs["tier"] == "pro"
-    assert charge_credits.await_args.kwargs["model"] == "speech-2.8-turbo"
-    assert charge_credits.await_args.kwargs["credits"] == 1
+    reserve_credits.assert_awaited_once()
+    assert reserve_credits.await_args.kwargs["tenant_id"] == tenant_id
+    assert reserve_credits.await_args.kwargs["action"] == "audio"
+    assert reserve_credits.await_args.kwargs["modality"] == "audio"
+    assert reserve_credits.await_args.kwargs["tier"] == "pro"
+    assert reserve_credits.await_args.kwargs["model"] == "speech-2.8-turbo"
+    assert reserve_credits.await_args.kwargs["credits"] == 1
+    finalize_credits.assert_awaited_once_with(reservation_id)
+    release_credits.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -411,7 +461,9 @@ async def test_generate_music_minimax_records_success(tmp_path):
     agent_id = uuid.uuid4()
     tenant_id = uuid.uuid4()
     cred_id = uuid.uuid4()
+    reservation_id = uuid.uuid4()
     cred = SimpleNamespace(id=cred_id, base_url="https://minimax.example")
+    reservation = SimpleNamespace(id=reservation_id)
 
     with (
         patch(
@@ -425,7 +477,9 @@ async def test_generate_music_minimax_records_success(tmp_path):
             AsyncMock(return_value=resolve_minimax_media_profile("music", "pro")),
         ),
         patch("app.services.agent_tools._check_minimax_credit_amount", AsyncMock()) as check_credits,
-        patch("app.services.agent_tools._charge_minimax_tool_credits", AsyncMock()) as charge_credits,
+        patch("app.services.agent_tools._reserve_minimax_tool_credits", AsyncMock(return_value=reservation)) as reserve_credits,
+        patch("app.services.agent_tools._finalize_minimax_tool_reservation", AsyncMock()) as finalize_credits,
+        patch("app.services.agent_tools._release_minimax_tool_reservation", AsyncMock()) as release_credits,
         patch("app.services.quota_guard.check_plan_generation_entitlement", AsyncMock()),
         patch("app.services.quota_guard.check_agent_llm_quota", AsyncMock()),
         patch("app.services.llm.load_balancer.pick_credential", AsyncMock(return_value=cred)),
@@ -449,13 +503,15 @@ async def test_generate_music_minimax_records_success(tmp_path):
     record_call.assert_awaited_once_with(cred_id, tokens_used=0)
     consume_quota.assert_awaited_once_with(agent_id, model_tier="pro")
     check_credits.assert_awaited_once_with(tenant_id, 150)
-    charge_credits.assert_awaited_once()
-    assert charge_credits.await_args.kwargs["tenant_id"] == tenant_id
-    assert charge_credits.await_args.kwargs["action"] == "music"
-    assert charge_credits.await_args.kwargs["modality"] == "music"
-    assert charge_credits.await_args.kwargs["tier"] == "pro"
-    assert charge_credits.await_args.kwargs["model"] == "music-2.6"
-    assert charge_credits.await_args.kwargs["credits"] == 150
+    reserve_credits.assert_awaited_once()
+    assert reserve_credits.await_args.kwargs["tenant_id"] == tenant_id
+    assert reserve_credits.await_args.kwargs["action"] == "music"
+    assert reserve_credits.await_args.kwargs["modality"] == "music"
+    assert reserve_credits.await_args.kwargs["tier"] == "pro"
+    assert reserve_credits.await_args.kwargs["model"] == "music-2.6"
+    assert reserve_credits.await_args.kwargs["credits"] == 150
+    finalize_credits.assert_awaited_once_with(reservation_id)
+    release_credits.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -495,7 +551,6 @@ async def test_generate_video_minimax_creates_task_metadata(tmp_path):
         ),
         patch("app.services.agent_tools._check_minimax_credit_amount", AsyncMock()) as check_credits,
         patch("app.services.agent_tools._reserve_minimax_tool_credits", AsyncMock(return_value=reservation)) as reserve_credits,
-        patch("app.services.agent_tools._charge_minimax_tool_credits", AsyncMock()) as charge_credits,
         patch("app.services.quota_guard.check_plan_generation_entitlement", AsyncMock()),
         patch("app.services.quota_guard.check_agent_llm_quota", AsyncMock()),
         patch("app.services.llm.load_balancer.pick_credential", AsyncMock(return_value=cred)),
@@ -542,7 +597,6 @@ async def test_generate_video_minimax_creates_task_metadata(tmp_path):
     assert reserve_credits.await_args.kwargs["tier"] == "pro"
     assert reserve_credits.await_args.kwargs["model"] == "MiniMax-Hailuo-2.3"
     assert reserve_credits.await_args.kwargs["credits"] == 280
-    charge_credits.assert_not_awaited()
 
 
 @pytest.mark.asyncio

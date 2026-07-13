@@ -229,6 +229,64 @@ async def test_reconciliation_stores_valid_mp4_before_settlement_and_is_idempote
 
 
 @pytest.mark.asyncio
+async def test_reconciliation_scopes_quota_failure_to_exact_video_model(monkeypatch):
+    from app.services import agent_tools
+
+    provider_error = RuntimeError("MiniMax API error (2056): resource limit")
+    task = SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+        credential_id=uuid.uuid4(),
+        reservation_id=uuid.uuid4(),
+        provider="minimax",
+        modality="video",
+        model="MiniMax-Hailuo-2.3",
+        provider_task_id="provider-task-quota",
+        status="submitted",
+        metadata_path="workspace/videos/task.json",
+        output_path="workspace/videos/result.mp4",
+        request_metadata={},
+        last_response=None,
+        last_error=None,
+        created_at=datetime.now(timezone.utc),
+        completed_at=None,
+    )
+
+    class Storage:
+        async def exists(self, _key):
+            return False
+
+    mark_failure = AsyncMock()
+    monkeypatch.setattr(media_generation, "_load_task", AsyncMock(return_value=task))
+    monkeypatch.setattr(media_generation, "get_storage_backend", lambda: Storage())
+    monkeypatch.setattr(media_generation, "_finalize_failure", AsyncMock(return_value=task))
+    monkeypatch.setattr(media_generation, "_write_task_metadata", AsyncMock())
+    monkeypatch.setattr(
+        agent_tools,
+        "_load_minimax_tool_credential_by_id",
+        AsyncMock(return_value=SimpleNamespace(api_key="key", base_url="https://minimax.test")),
+    )
+    monkeypatch.setattr(
+        agent_tools,
+        "_minimax_query_video_task",
+        AsyncMock(side_effect=provider_error),
+    )
+    monkeypatch.setattr(agent_tools, "_mark_minimax_tool_credential_failure", mark_failure)
+
+    result = await media_generation.reconcile_minimax_video_task(task.id)
+
+    assert result.status == "failed"
+    mark_failure.assert_awaited_once_with(
+        task.credential_id,
+        provider_error,
+        modality="video",
+        model=task.model,
+    )
+
+
+@pytest.mark.asyncio
 async def test_transient_recovery_errors_are_bounded_and_release_once(monkeypatch):
     task = SimpleNamespace(
         id=uuid.uuid4(),

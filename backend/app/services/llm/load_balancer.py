@@ -526,14 +526,10 @@ async def record_credential_call(
         # so old transient errors must not accumulate forever and eventually
         # remove an otherwise healthy shared account from every modality.
         cred.error_count = 0
-        if str(getattr(cred, "provider", "")).lower() == "minimax":
-            # Any successful covered call proves the shared Token Plan pool is
-            # currently usable. Model-specific caps remain independent.
-            statuses = dict(getattr(cred, "modality_status", None) or {})
-            for key in list(statuses):
-                if _normalize_quota_resource(str(key)) == PLAN_QUOTA_RESOURCE:
-                    statuses.pop(key, None)
-            cred.modality_status = statuses
+        # Do not clear provider quota circuits from an ordinary success. A
+        # request selected just before another request observes exhaustion may
+        # complete afterwards and would otherwise race the newer circuit open.
+        # Only the authoritative quota poller closes provider-evidence circuits.
         if was_healthy and cred.daily_quota and cred.used_today >= cred.daily_quota:
             cred.status = "quota_exceeded"
         await db.commit()

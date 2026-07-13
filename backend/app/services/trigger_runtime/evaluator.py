@@ -88,7 +88,11 @@ async def mark_trigger_fired(trigger_id: uuid.UUID, now: datetime) -> None:
 
 
 async def handle_okr_report_trigger(trigger: AgentTrigger, now: datetime) -> bool:
-    if trigger.name not in {"daily_okr_report", "weekly_okr_report", "monthly_okr_report"}:
+    if not trigger.is_system or trigger.name not in {
+        "daily_okr_report",
+        "weekly_okr_report",
+        "monthly_okr_report",
+    }:
         return False
     if not runtime_settings.OKR_AUTOMATION_ENABLED:
         return True
@@ -136,7 +140,7 @@ async def handle_okr_report_trigger(trigger: AgentTrigger, now: datetime) -> boo
 
 
 async def handle_okr_collection_trigger(trigger: AgentTrigger, now: datetime) -> bool:
-    if trigger.name != "daily_okr_collection":
+    if not trigger.is_system or trigger.name != "daily_okr_collection":
         return False
     if not runtime_settings.OKR_AUTOMATION_ENABLED:
         return True
@@ -187,7 +191,8 @@ async def evaluate_trigger(trigger: AgentTrigger, now: datetime) -> bool:
     if not trigger.is_enabled:
         return False
     if (
-        trigger.name in OKR_AUTOMATION_TRIGGER_NAMES
+        trigger.is_system
+        and trigger.name in OKR_AUTOMATION_TRIGGER_NAMES
         and not runtime_settings.OKR_AUTOMATION_ENABLED
     ):
         return False

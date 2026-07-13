@@ -147,19 +147,23 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
             trigger_names = []
             for t in triggers:
                 part = f"触发器：{t.name} ({t.type})\n原因：{t.reason}"
-                if t.name == "daily_okr_collection":
+                if t.is_system and t.name == "daily_okr_collection":
                     part += (
                         "\n执行要求：先调用 get_okr_settings 确认日报收集是否开启。"
                         "如果开启，只能联系你关系网络中的成员和数字员工来收集今天的最终日报，"
                         "并整理成不超过 2000 字的正式日报；"
                         "如果未开启，则说明本次无需执行并停止。"
                     )
-                elif t.name in ("daily_okr_report", "weekly_okr_report", "monthly_okr_report"):
+                elif t.is_system and t.name in (
+                    "daily_okr_report",
+                    "weekly_okr_report",
+                    "monthly_okr_report",
+                ):
                     part += (
                         "\n执行要求：本次公司级报表由系统自动汇总生成。"
                         "如果你被唤醒，仅补充必要说明，不要再次向成员发起收集。"
                     )
-                elif t.name == "biweekly_okr_checkin":
+                elif t.is_system and t.name == "biweekly_okr_checkin":
                     part += (
                         "\n执行要求：先调用 get_okr_settings 确认 OKR 是否开启。"
                         "如果开启，检查当前周期公司和成员 OKR，主动提醒尚未设置或进展滞后的相关成员；"

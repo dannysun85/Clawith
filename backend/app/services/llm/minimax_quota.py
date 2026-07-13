@@ -88,25 +88,41 @@ def _quota_identity(model_name: Any) -> tuple[str, str | None] | None:
 
 
 def _row_depleted(row: dict[str, Any]) -> bool | None:
-    """Interpret documented status/percentage fields without guessing.
+    """Interpret only MiniMax's documented status, count and percentage fields.
 
-    Current MiniMax semantics use status 1 for active, 2 for exhausted, and 3
-    for not subscribed. A legacy/unknown status value alone is insufficient
-    evidence; a reported zero percentage is always explicit depletion.
+    MiniMax defines status ``1`` as a normal limited bucket, ``2`` as
+    exhausted and ``3`` as unlimited.  Count fields are authoritative for a
+    limited bucket even when the optional percentage is absent.  ``daily`` is
+    retained as a backward-compatible provider shape, using the same status
+    semantics; unknown status values never become recovery/depletion evidence.
     """
 
     observed = False
     depleted = False
     for scope in ("current_interval", "current_daily", "current_weekly"):
+        status = _optional_int(row.get(f"{scope}_status"))
+        if status == 2:
+            observed = True
+            depleted = True
+            continue
+        elif status == 3:
+            # Unlimited is explicit usable evidence for this bucket.
+            observed = True
+            continue
+        elif status == 1:
+            observed = True
+
+        total = _optional_int(row.get(f"{scope}_total_count"))
+        usage = _optional_int(row.get(f"{scope}_usage_count"))
+        if total is not None and usage is not None and total >= 0 and usage >= 0:
+            observed = True
+            if total > 0:
+                depleted = depleted or usage >= total
+
         remaining = _optional_int(row.get(f"{scope}_remaining_percent"))
         if remaining is not None:
             observed = True
             depleted = depleted or remaining <= 0
-
-        status = _optional_int(row.get(f"{scope}_status"))
-        if status in {1, 2, 3}:
-            observed = True
-            depleted = depleted or status in {2, 3}
 
     return depleted if observed else None
 

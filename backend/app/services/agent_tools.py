@@ -9462,6 +9462,8 @@ async def _generate_image(
     minimax_tier: str | None = None
     minimax_tenant_id: uuid.UUID | None = None
     minimax_credit_cost = 0
+    minimax_reservation_id: uuid.UUID | None = None
+    minimax_reservation_finalized = False
 
     # MiniMax uses the central credential pool (账号池) instead of per-tool config
     if provider == "minimax":
@@ -9538,6 +9540,19 @@ async def _generate_image(
     full_save_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
+        if provider == "minimax" and minimax_tenant_id and minimax_credit_cost > 0:
+            reservation = await _reserve_minimax_tool_credits(
+                tenant_id=minimax_tenant_id,
+                user_id=user_id,
+                agent_id=agent_id,
+                action="image",
+                modality="image",
+                tier=minimax_tier or "lite",
+                model=model or "image-01",
+                credits=minimax_credit_cost,
+            )
+            minimax_reservation_id = reservation.id
+
         if provider == "siliconflow":
             image_bytes = await _generate_image_siliconflow(
                 api_key,
@@ -9628,6 +9643,16 @@ async def _generate_image(
         # Settle only after provider validation, deterministic post-process,
         # and local workspace persistence have all succeeded.
         if provider == "minimax":
+            if minimax_reservation_id:
+                await _finalize_minimax_tool_reservation_for_delivery(
+                    minimax_reservation_id,
+                    agent_id=agent_id,
+                    modality="image",
+                    model=model,
+                    tier=minimax_tier,
+                    user_id=user_id,
+                )
+                minimax_reservation_finalized = True
             if minimax_cred_id:
                 await _record_minimax_tool_success(
                     agent_id,
@@ -9635,17 +9660,6 @@ async def _generate_image(
                     tier=minimax_tier or "lite",
                     modality="image",
                     model=model,
-                )
-            if minimax_tenant_id and minimax_credit_cost > 0:
-                await _charge_minimax_tool_credits(
-                    tenant_id=minimax_tenant_id,
-                    user_id=user_id,
-                    agent_id=agent_id,
-                    action="image",
-                    modality="image",
-                    tier=minimax_tier or "lite",
-                    model=model or "image-01",
-                    credits=minimax_credit_cost,
                 )
 
         size_kb = len(image_bytes) / 1024
@@ -9688,6 +9702,16 @@ async def _generate_image(
         err_msg = str(e) or type(e).__name__
         logger.error(f"[GenerateImage] Error ({provider}): {err_msg}")
         return f"❌ Image generation failed ({provider}): {err_msg[:400]}"
+    finally:
+        if minimax_reservation_id and not minimax_reservation_finalized:
+            await _release_minimax_tool_reservation_safely(
+                minimax_reservation_id,
+                agent_id=agent_id,
+                modality="image",
+                model=model,
+                tier=minimax_tier,
+                user_id=user_id,
+            )
 
 
 async def _check_minimax_tool_allowed(agent_id: uuid.UUID, modality: str, tier: str) -> str | None:
@@ -9777,32 +9801,6 @@ async def _check_minimax_credit_amount(tenant_id: uuid.UUID, credits: int) -> No
     await check_credit_amount(tenant_id, credits)
 
 
-async def _charge_minimax_tool_credits(
-    *,
-    tenant_id: uuid.UUID,
-    user_id: uuid.UUID | None,
-    agent_id: uuid.UUID,
-    action: str,
-    modality: str,
-    tier: str,
-    model: str,
-    credits: int,
-) -> None:
-    from app.services.credit_service import charge_credits
-
-    await charge_credits(
-        tenant_id=tenant_id,
-        user_id=user_id,
-        agent_id=agent_id,
-        action=action,
-        modality=modality,
-        saas_tier=tier,
-        provider="minimax",
-        model=model,
-        delta=credits,
-    )
-
-
 async def _reserve_minimax_tool_credits(
     *,
     tenant_id: uuid.UUID,
@@ -9842,6 +9840,72 @@ async def _release_minimax_tool_reservation(reservation_id: uuid.UUID) -> None:
     await release_reserved_credits(reservation_id)
 
 
+async def _finalize_minimax_tool_reservation_for_delivery(
+    reservation_id: uuid.UUID,
+    *,
+    agent_id: uuid.UUID,
+    modality: str,
+    model: str | None,
+    tier: str | None,
+    user_id: uuid.UUID | None,
+) -> None:
+    """Finalize Credits before returning a synchronously generated asset."""
+    try:
+        await _finalize_minimax_tool_reservation(reservation_id)
+    except Exception as exc:
+        logger.error(
+            "[MiniMaxTool] Credit reservation finalization failed error_type={}",
+            type(exc).__name__,
+        )
+        try:
+            await _record_minimax_tool_product_issue(
+                agent_id,
+                modality,
+                error=exc,
+                model=model,
+                tier=tier,
+                user_id=user_id,
+                category="billing_settlement",
+                severity="critical",
+            )
+        except Exception:
+            pass
+        raise
+
+
+async def _release_minimax_tool_reservation_safely(
+    reservation_id: uuid.UUID,
+    *,
+    agent_id: uuid.UUID,
+    modality: str,
+    model: str | None,
+    tier: str | None,
+    user_id: uuid.UUID | None,
+) -> None:
+    """Release an unfinished reservation without hiding the original result."""
+    try:
+        await _release_minimax_tool_reservation(reservation_id)
+    except Exception as exc:
+        logger.error(
+            "[MiniMaxTool] Credit reservation release failed error_type={}",
+            type(exc).__name__,
+        )
+        try:
+            await _record_minimax_tool_product_issue(
+                agent_id,
+                modality,
+                error=exc,
+                model=model,
+                tier=tier,
+                user_id=user_id,
+                category="billing_settlement",
+                severity="critical",
+            )
+        except Exception:
+            # Monitoring must never replace the original provider/product result.
+            pass
+
+
 async def _record_minimax_tool_success(
     agent_id: uuid.UUID,
     credential_id: uuid.UUID,
@@ -9851,23 +9915,50 @@ async def _record_minimax_tool_success(
     model: str | None = None,
 ) -> None:
     """Record successful MiniMax tool usage without failing the user result path."""
-    from app.services.llm.load_balancer import clear_credential_modality_quota, record_credential_call
+    from app.services.llm.load_balancer import record_credential_call
     from app.services.quota_guard import consume_agent_llm_quota
 
     try:
         await record_credential_call(credential_id, tokens_used=0)
-    except Exception as e:
-        logger.warning(f"[MiniMaxTool] Failed to record MiniMax credential usage: {e}")
-    try:
-        model_kwargs = {"model": model} if model else {}
-        await clear_credential_modality_quota(
-            credential_id,
-            modality,
-            **model_kwargs,
+    except Exception as exc:
+        logger.warning(
+            "[MiniMaxTool] Credential usage accounting failed error_type={}",
+            type(exc).__name__,
         )
-    except Exception as e:
-        logger.warning(f"[MiniMaxTool] Failed to clear recovered {modality} quota state: {e}")
-    await consume_agent_llm_quota(agent_id, model_tier=tier)
+        try:
+            await _record_minimax_tool_product_issue(
+                agent_id,
+                modality,
+                error=exc,
+                model=model,
+                tier=tier,
+                category="usage_accounting",
+                severity="critical",
+            )
+        except Exception:
+            pass
+    # A normal success can race a newer quota failure from another in-flight
+    # request. Quota circuits are therefore closed only by named provider
+    # evidence from /v1/token_plan/remains, never by completion order.
+    try:
+        await consume_agent_llm_quota(agent_id, model_tier=tier)
+    except Exception as exc:
+        logger.warning(
+            "[MiniMaxTool] Agent quota accounting failed error_type={}",
+            type(exc).__name__,
+        )
+        try:
+            await _record_minimax_tool_product_issue(
+                agent_id,
+                modality,
+                error=exc,
+                model=model,
+                tier=tier,
+                category="usage_accounting",
+                severity="critical",
+            )
+        except Exception:
+            pass
 
 
 async def _mark_minimax_tool_credential_failure(
@@ -9880,7 +9971,9 @@ async def _mark_minimax_tool_credential_failure(
     """Apply the same credential health policy used by MiniMax text calls."""
     from app.services.llm.failover import (
         CredentialFailureAction,
+        MINIMAX_QUOTA_CODES,
         credential_failure_action,
+        extract_minimax_code,
     )
     from app.services.llm.load_balancer import (
         mark_credential_degraded,
@@ -9888,20 +9981,24 @@ async def _mark_minimax_tool_credential_failure(
         mark_credential_quota_exceeded,
     )
 
-    action = credential_failure_action(error, modality=modality)
+    # A bare provider 2056 does not prove which concrete media allowance was
+    # exhausted. Current MiniMax Token Plan calls share the plan resource;
+    # exact model circuits are created only by the quota poller's named rows.
+    quota_resource = (
+        "plan"
+        if extract_minimax_code(str(error)) in MINIMAX_QUOTA_CODES
+        else modality
+    )
+    action = credential_failure_action(error, modality=quota_resource)
     if action is CredentialFailureAction.DEGRADE:
         await mark_credential_degraded(credential_id, immediate=True)
     elif action is CredentialFailureAction.QUOTA_EXCEEDED:
         await mark_credential_quota_exceeded(credential_id)
     elif action is CredentialFailureAction.MODALITY_QUOTA_EXCEEDED:
-        from app.services.llm.failover import extract_minimax_code
-
-        model_kwargs = {"model": model} if model else {}
         await mark_credential_modality_quota_exceeded(
             credential_id,
-            modality,
+            quota_resource,
             error_code=extract_minimax_code(str(error)) or "2056",
-            **model_kwargs,
         )
 
 
@@ -9935,13 +10032,17 @@ async def _record_minimax_tool_product_issue(
         if severity == "error" and resolved_error_code in MINIMAX_QUOTA_CODES
         else severity
     )
+    summary_by_category = {
+        "credential": "Platform media credential route was unavailable",
+        "billing_settlement": "Media Credits reservation settlement failed",
+        "usage_accounting": "Media usage accounting failed after provider completion",
+    }
     await record_production_issue(
         source="minimax_media_tool",
         category=category,
-        summary=(
-            "Platform media credential route was unavailable"
-            if category == "credential"
-            else "Media generation operation failed before a usable asset was delivered"
+        summary=summary_by_category.get(
+            category,
+            "Media generation operation failed before a usable asset was delivered",
         ),
         severity=effective_severity,
         error_code=resolved_error_code,
@@ -10180,12 +10281,26 @@ async def _generate_speech_minimax(
     if audio_format not in {"mp3", "wav", "flac", "pcm"}:
         return "❌ Unsupported audio format. Use mp3, wav, flac, or pcm."
 
+    reservation_id: uuid.UUID | None = None
+    reservation_finalized = False
     try:
         from app.services.provider_pricing import minimax_tts_credits
         credit_cost = minimax_tts_credits(model, characters=len(text))
         tenant_id = await _get_minimax_tenant_uuid(agent_id)
         if tenant_id:
             await _check_minimax_credit_amount(tenant_id, credit_cost)
+        if tenant_id and credit_cost > 0:
+            reservation = await _reserve_minimax_tool_credits(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                agent_id=agent_id,
+                action="audio",
+                modality="audio",
+                tier=tier,
+                model=model,
+                credits=credit_cost,
+            )
+            reservation_id = reservation.id
         save_path, full_save_path = _resolve_workspace_output_path(
             ws,
             arguments.get("save_path"),
@@ -10209,6 +10324,16 @@ async def _generate_speech_minimax(
             language_boost=config.get("language_boost") or "auto",
         )
         full_save_path.write_bytes(audio_bytes)
+        if reservation_id:
+            await _finalize_minimax_tool_reservation_for_delivery(
+                reservation_id,
+                agent_id=agent_id,
+                modality="audio",
+                model=model,
+                tier=tier,
+                user_id=user_id,
+            )
+            reservation_finalized = True
         await _record_minimax_tool_success(
             agent_id,
             credential.id,
@@ -10216,17 +10341,6 @@ async def _generate_speech_minimax(
             modality="audio",
             model=model,
         )
-        if tenant_id and credit_cost > 0:
-            await _charge_minimax_tool_credits(
-                tenant_id=tenant_id,
-                user_id=user_id,
-                agent_id=agent_id,
-                action="audio",
-                modality="audio",
-                tier=tier,
-                model=model,
-                credits=credit_cost,
-            )
     except Exception as exc:
         from app.services.quota_guard import QuotaExceeded
         if isinstance(exc, QuotaExceeded):
@@ -10247,6 +10361,16 @@ async def _generate_speech_minimax(
         )
         _log_minimax_operation_failure("MiniMaxSpeech", exc)
         return f"❌ Speech generation failed (minimax): {str(exc)[:400]}"
+    finally:
+        if reservation_id and not reservation_finalized:
+            await _release_minimax_tool_reservation_safely(
+                reservation_id,
+                agent_id=agent_id,
+                modality="audio",
+                model=model,
+                tier=tier,
+                user_id=user_id,
+            )
 
     size_kb = len(audio_bytes) / 1024
     return (
@@ -10291,12 +10415,26 @@ async def _generate_music_minimax(
     if audio_format not in {"mp3", "wav"}:
         return "❌ Unsupported music format. Use mp3 or wav."
 
+    reservation_id: uuid.UUID | None = None
+    reservation_finalized = False
     try:
         from app.services.provider_pricing import minimax_music_credits
         credit_cost = minimax_music_credits(model)
         tenant_id = await _get_minimax_tenant_uuid(agent_id)
         if tenant_id:
             await _check_minimax_credit_amount(tenant_id, credit_cost)
+        if tenant_id and credit_cost > 0:
+            reservation = await _reserve_minimax_tool_credits(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                agent_id=agent_id,
+                action="music",
+                modality="music",
+                tier=tier,
+                model=model,
+                credits=credit_cost,
+            )
+            reservation_id = reservation.id
         save_path, full_save_path = _resolve_workspace_output_path(
             ws,
             arguments.get("save_path"),
@@ -10316,6 +10454,16 @@ async def _generate_music_minimax(
             bitrate=int(profile.bitrate or 256000),
         )
         full_save_path.write_bytes(audio_bytes)
+        if reservation_id:
+            await _finalize_minimax_tool_reservation_for_delivery(
+                reservation_id,
+                agent_id=agent_id,
+                modality="music",
+                model=model,
+                tier=tier,
+                user_id=user_id,
+            )
+            reservation_finalized = True
         await _record_minimax_tool_success(
             agent_id,
             credential.id,
@@ -10323,17 +10471,6 @@ async def _generate_music_minimax(
             modality="music",
             model=model,
         )
-        if tenant_id and credit_cost > 0:
-            await _charge_minimax_tool_credits(
-                tenant_id=tenant_id,
-                user_id=user_id,
-                agent_id=agent_id,
-                action="music",
-                modality="music",
-                tier=tier,
-                model=model,
-                credits=credit_cost,
-            )
     except Exception as exc:
         from app.services.quota_guard import QuotaExceeded
         if isinstance(exc, QuotaExceeded):
@@ -10354,6 +10491,16 @@ async def _generate_music_minimax(
         )
         _log_minimax_operation_failure("MiniMaxMusic", exc)
         return f"❌ Music generation failed (minimax): {str(exc)[:400]}"
+    finally:
+        if reservation_id and not reservation_finalized:
+            await _release_minimax_tool_reservation_safely(
+                reservation_id,
+                agent_id=agent_id,
+                modality="music",
+                model=model,
+                tier=tier,
+                user_id=user_id,
+            )
 
     size_kb = len(audio_bytes) / 1024
     return (

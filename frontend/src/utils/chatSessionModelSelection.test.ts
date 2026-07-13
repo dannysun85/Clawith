@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
     resolveChatSessionModality,
     resolveChatSessionTier,
+    resolveOutboundChatRoute,
     shouldApplyChatTierPreferenceResponse,
 } from './chatSessionModelSelection';
 
@@ -24,6 +25,21 @@ describe('chat session model selection', () => {
         expect(resolveChatSessionModality('VOICE', 'text')).toBe('audio');
         expect(resolveChatSessionTier('ultra', 'lite', ['lite'])).toBe('lite');
         expect(resolveChatSessionTier('lite', 'lite', ['lite'], 'ultra')).toBe('lite');
+    });
+
+    it('keeps attachment media routing request-scoped', () => {
+        expect(resolveOutboundChatRoute('text', true, false)).toEqual({
+            modality: 'image',
+            ephemeral: true,
+        });
+        expect(resolveOutboundChatRoute('text', true, true)).toEqual({
+            modality: 'video',
+            ephemeral: true,
+        });
+        expect(resolveOutboundChatRoute('TEXT', false, false)).toEqual({
+            modality: 'text',
+            ephemeral: false,
+        });
     });
 
     it('rejects delayed or older preference responses', () => {

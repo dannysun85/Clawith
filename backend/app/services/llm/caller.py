@@ -152,6 +152,41 @@ async def _record_llm_product_issue(
     )
 
 
+async def _record_llm_settlement_failure(
+    *,
+    stage: str,
+    error: Exception,
+    model,
+    agent_id: uuid.UUID | None,
+    user_id: uuid.UUID | None,
+    tenant_id: uuid.UUID | None,
+    route_meta: "RouteMeta | None",
+) -> None:
+    """Report accounting failures without discarding a completed response."""
+
+    logger.error(
+        "[LLM Billing] settlement stage failed stage={} error_type={}",
+        stage,
+        type(error).__name__,
+    )
+    try:
+        await _record_llm_product_issue(
+            category="billing_settlement",
+            error_code=f"{stage}_{type(error).__name__}"[:100],
+            model=model,
+            agent_id=agent_id,
+            user_id=user_id,
+            tenant_id=tenant_id,
+            route_meta=route_meta,
+            severity="critical",
+        )
+    except Exception as monitor_error:
+        logger.error(
+            "[LLM Billing] settlement failure monitoring failed error_type={}",
+            type(monitor_error).__name__,
+        )
+
+
 async def _apply_credential_failure_policy(
     credential_id: uuid.UUID,
     error: Exception,
@@ -849,7 +884,9 @@ async def _record_llm_usage_and_charge(
     modality = route_meta.modality if route_meta else getattr(model, "modality", None)
     credit_delta = provider_text_credits(model.provider, model.model, usage) if route_meta else None
 
-    await consume_agent_llm_quota(agent_id, model_tier=saas_tier)
+    # Credits are the financial source of truth. Charge first so a secondary
+    # daily-usage counter failure cannot turn a successful provider call into
+    # unbilled usage.
     if route_meta:
         await charge_credits(
             tenant_id=tenant_id,
@@ -862,6 +899,7 @@ async def _record_llm_usage_and_charge(
             model=model.model,
             delta=credit_delta,
         )
+    await consume_agent_llm_quota(agent_id, model_tier=saas_tier)
 
 
 async def call_llm(
@@ -997,26 +1035,62 @@ async def call_llm(
         nonlocal _unsaved_usage, _usage_finalized
         if _usage_finalized:
             return
-        _usage_finalized = True
-        if agent_id and _unsaved_usage.total_tokens > 0:
-            await record_token_usage(agent_id, _unsaved_usage)
-            _unsaved_usage = TokenUsage()
-        if _accumulated_usage.total_tokens <= 0:
-            return
-        if _cred_id:
-            await record_credential_call(
-                _cred_id,
-                tokens_used=_accumulated_usage.total_tokens,
-            )
-        if billable:
-            await _record_llm_usage_and_charge(
-                agent_id=agent_id,
-                user_id=user_id,
-                tenant_id=_tenant_id,
-                model=model,
-                usage=_accumulated_usage,
-                route_meta=route_meta,
-            )
+        try:
+            if agent_id and _unsaved_usage.total_tokens > 0:
+                try:
+                    await record_token_usage(agent_id, _unsaved_usage)
+                except Exception as exc:
+                    await _record_llm_settlement_failure(
+                        stage="token_usage",
+                        error=exc,
+                        model=model,
+                        agent_id=agent_id,
+                        user_id=user_id,
+                        tenant_id=_tenant_id,
+                        route_meta=route_meta,
+                    )
+                finally:
+                    _unsaved_usage = TokenUsage()
+            if _accumulated_usage.total_tokens <= 0:
+                return
+            if _cred_id:
+                try:
+                    await record_credential_call(
+                        _cred_id,
+                        tokens_used=_accumulated_usage.total_tokens,
+                    )
+                except Exception as exc:
+                    await _record_llm_settlement_failure(
+                        stage="credential_usage",
+                        error=exc,
+                        model=model,
+                        agent_id=agent_id,
+                        user_id=user_id,
+                        tenant_id=_tenant_id,
+                        route_meta=route_meta,
+                    )
+            if billable:
+                try:
+                    await _record_llm_usage_and_charge(
+                        agent_id=agent_id,
+                        user_id=user_id,
+                        tenant_id=_tenant_id,
+                        model=model,
+                        usage=_accumulated_usage,
+                        route_meta=route_meta,
+                    )
+                except Exception as exc:
+                    await _record_llm_settlement_failure(
+                        stage="credits",
+                        error=exc,
+                        model=model,
+                        agent_id=agent_id,
+                        user_id=user_id,
+                        tenant_id=_tenant_id,
+                        route_meta=route_meta,
+                    )
+        finally:
+            _usage_finalized = True
 
     # Tool-calling loop
     consecutive_invalid_tool_calls = 0
@@ -1042,8 +1116,20 @@ async def call_llm(
         # Check token usage limit mid-loop (every 3 rounds)
         if round_i > 0 and round_i % 3 == 0:
             if agent_id and _unsaved_usage.total_tokens > 0:
-                await record_token_usage(agent_id, _unsaved_usage)
-                _unsaved_usage = TokenUsage()
+                try:
+                    await record_token_usage(agent_id, _unsaved_usage)
+                except Exception as exc:
+                    await _record_llm_settlement_failure(
+                        stage="token_usage",
+                        error=exc,
+                        model=model,
+                        agent_id=agent_id,
+                        user_id=user_id,
+                        tenant_id=_tenant_id,
+                        route_meta=route_meta,
+                    )
+                finally:
+                    _unsaved_usage = TokenUsage()
                 _, _token_limit_msg = await _get_agent_config(agent_id)
                 if _token_limit_msg:
                     logger.warning(f"[LLM] Token limit exceeded mid-loop agent={agent_id}")
@@ -1515,18 +1601,40 @@ async def settle_agent_llm_invocation(
     if usage.total_tokens <= 0:
         return
     if invocation.credential_id:
-        await record_credential_call(
-            invocation.credential_id,
-            tokens_used=usage.total_tokens,
+        try:
+            await record_credential_call(
+                invocation.credential_id,
+                tokens_used=usage.total_tokens,
+            )
+        except Exception as exc:
+            await _record_llm_settlement_failure(
+                stage="credential_usage",
+                error=exc,
+                model=invocation.model,
+                agent_id=agent_id,
+                user_id=user_id,
+                tenant_id=invocation.tenant_id,
+                route_meta=invocation.route_meta,
+            )
+    try:
+        await _record_llm_usage_and_charge(
+            agent_id=agent_id,
+            user_id=user_id,
+            tenant_id=invocation.tenant_id,
+            model=invocation.model,
+            usage=usage,
+            route_meta=invocation.route_meta,
         )
-    await _record_llm_usage_and_charge(
-        agent_id=agent_id,
-        user_id=user_id,
-        tenant_id=invocation.tenant_id,
-        model=invocation.model,
-        usage=usage,
-        route_meta=invocation.route_meta,
-    )
+    except Exception as exc:
+        await _record_llm_settlement_failure(
+            stage="credits",
+            error=exc,
+            model=invocation.model,
+            agent_id=agent_id,
+            user_id=user_id,
+            tenant_id=invocation.tenant_id,
+            route_meta=invocation.route_meta,
+        )
 
 
 async def call_agent_llm(
@@ -1651,22 +1759,61 @@ async def call_agent_llm_with_tools(
             nonlocal _unsaved_usage, _usage_finalized
             if _usage_finalized:
                 return
-            _usage_finalized = True
-            if agent_id and _unsaved_usage.total_tokens > 0:
-                await record_token_usage(agent_id, _unsaved_usage)
-                _unsaved_usage = TokenUsage()
-            if _accumulated_usage.total_tokens <= 0:
-                return
-            if _cred_id:
-                await record_credential_call(_cred_id, tokens_used=_accumulated_usage.total_tokens)
-            await _record_llm_usage_and_charge(
-                agent_id=agent_id,
-                user_id=agent.creator_id,
-                tenant_id=tenant_id,
-                model=model,
-                usage=_accumulated_usage,
-                route_meta=route_meta,
-            )
+            try:
+                if agent_id and _unsaved_usage.total_tokens > 0:
+                    try:
+                        await record_token_usage(agent_id, _unsaved_usage)
+                    except Exception as exc:
+                        await _record_llm_settlement_failure(
+                            stage="token_usage",
+                            error=exc,
+                            model=model,
+                            agent_id=agent_id,
+                            user_id=agent.creator_id,
+                            tenant_id=tenant_id,
+                            route_meta=route_meta,
+                        )
+                    finally:
+                        _unsaved_usage = TokenUsage()
+                if _accumulated_usage.total_tokens <= 0:
+                    return
+                if _cred_id:
+                    try:
+                        await record_credential_call(
+                            _cred_id,
+                            tokens_used=_accumulated_usage.total_tokens,
+                        )
+                    except Exception as exc:
+                        await _record_llm_settlement_failure(
+                            stage="credential_usage",
+                            error=exc,
+                            model=model,
+                            agent_id=agent_id,
+                            user_id=agent.creator_id,
+                            tenant_id=tenant_id,
+                            route_meta=route_meta,
+                        )
+                try:
+                    await _record_llm_usage_and_charge(
+                        agent_id=agent_id,
+                        user_id=agent.creator_id,
+                        tenant_id=tenant_id,
+                        model=model,
+                        usage=_accumulated_usage,
+                        route_meta=route_meta,
+                    )
+                except Exception as exc:
+                    await _record_llm_settlement_failure(
+                        stage="credits",
+                        error=exc,
+                        model=model,
+                        agent_id=agent_id,
+                        user_id=agent.creator_id,
+                        tenant_id=tenant_id,
+                        route_meta=route_meta,
+                    )
+            finally:
+                _usage_finalized = True
 
         try:
             _api_key, _base_url, _cred_id = await resolve_model_key(
@@ -1706,8 +1853,20 @@ async def call_agent_llm_with_tools(
                 # Check token usage limit mid-loop (every 3 rounds)
                 if round_i > 0 and round_i % 3 == 0:
                     if agent_id and _unsaved_usage.total_tokens > 0:
-                        await record_token_usage(agent_id, _unsaved_usage)
-                        _unsaved_usage = TokenUsage()
+                        try:
+                            await record_token_usage(agent_id, _unsaved_usage)
+                        except Exception as exc:
+                            await _record_llm_settlement_failure(
+                                stage="token_usage",
+                                error=exc,
+                                model=model,
+                                agent_id=agent_id,
+                                user_id=agent.creator_id,
+                                tenant_id=tenant_id,
+                                route_meta=route_meta,
+                            )
+                        finally:
+                            _unsaved_usage = TokenUsage()
                         _, _token_limit_msg = await _get_agent_config(agent_id)
                         if _token_limit_msg:
                             logger.warning(

@@ -30,6 +30,7 @@ import { displaySessionTitle } from '../../utils/sessionDisplay';
 import {
     resolveChatSessionModality,
     resolveChatSessionTier,
+    resolveOutboundChatRoute,
     shouldApplyChatTierPreferenceResponse,
 } from '../../utils/chatSessionModelSelection';
 import {
@@ -2780,6 +2781,7 @@ export default function AgentDetailPage() {
         imageUrl?: string;
         tier?: SaasTier | null;
         modality?: string;
+        ephemeralModality?: boolean;
     };
     const [attachedFiles, setAttachedFiles] = useState<AttachedFileRef[]>([]);
     const dismissedWorkspaceRefPath = useRef<string | null>(null);
@@ -3494,6 +3496,7 @@ export default function AgentDetailPage() {
             file_name: payload.fileName,
             tier: payload.tier,
             modality: payload.modality,
+            ephemeral_modality: payload.ephemeralModality === true,
         }));
     };
 
@@ -4023,11 +4026,12 @@ export default function AgentDetailPage() {
             ));
             return;
         }
-        const outboundChatModality = hasVideoAttachment
-            ? 'video'
-            : hasImageAttachment
-                ? 'image'
-                : effectiveChatModality;
+        const outboundRoute = resolveOutboundChatRoute(
+            effectiveChatModality,
+            hasImageAttachment,
+            hasVideoAttachment,
+        );
+        const outboundChatModality = outboundRoute.modality;
         const supportsImageInput = ['image', 'video', 'multimodal'].includes(outboundChatModality);
         const supportsVideoInput = ['video', 'multimodal'].includes(outboundChatModality);
         const supportsNativeMediaInput = supportsImageInput || supportsVideoInput;
@@ -4093,6 +4097,7 @@ export default function AgentDetailPage() {
             imageUrl: attachedFiles.length === 1 ? attachedFiles[0].imageUrl : undefined,
             tier: effectiveChatTier,
             modality: outboundChatModality,
+            ephemeralModality: outboundRoute.ephemeral,
         };
 
         setChatInput('');

@@ -57,7 +57,7 @@ def test_parse_quota_observations_separates_general_and_media_models():
         ("image", "image-01"): False,
         ("video", "MiniMax-Hailuo-02"): True,
         ("audio", "speech-2.8-hd"): False,
-        ("music", "music-2.0"): True,
+        ("music", "music-2.0"): False,
     }
 
 
@@ -71,6 +71,51 @@ def test_parse_quota_observations_does_not_treat_unknown_legacy_status_as_deplet
         ])
     )
     assert observations == []
+
+
+def test_parse_quota_observations_uses_official_count_and_unlimited_contract():
+    observations = minimax_quota._parse_quota_observations(
+        _payload([
+            {
+                "model_name": "general",
+                "current_interval_status": 1,
+                "current_interval_total_count": 100,
+                "current_interval_usage_count": 100,
+                "current_weekly_status": 1,
+                "current_weekly_total_count": 1000,
+                "current_weekly_usage_count": 200,
+            },
+            {
+                "model_name": "MiniMax-M3",
+                "current_interval_status": 3,
+                "current_interval_total_count": 0,
+                "current_interval_usage_count": 0,
+                "current_weekly_status": 3,
+            },
+        ])
+    )
+
+    # Duplicate rows fail closed for the shared plan: an exhausted limited row
+    # cannot be hidden by a separate unlimited row.
+    assert observations == [
+        minimax_quota.MiniMaxQuotaObservation("plan", None, True),
+    ]
+
+
+def test_status_three_is_unlimited_not_exhausted():
+    observations = minimax_quota._parse_quota_observations(
+        _payload([
+            {
+                "model_name": "general",
+                "current_interval_status": 3,
+                "current_weekly_status": 3,
+            },
+        ])
+    )
+
+    assert observations == [
+        minimax_quota.MiniMaxQuotaObservation("plan", None, False),
+    ]
 
 
 @pytest.mark.parametrize("status_code", [1004, 2049])

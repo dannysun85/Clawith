@@ -9,14 +9,61 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 
+SAFE_DIAGNOSTIC_IDENTIFIER = r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+SAFE_DIAGNOSTIC_ROUTE = r"^/[A-Za-z0-9_./:{}@%+-]*$"
+
+
+class ClientIssueMetadata(BaseModel):
+    """Strict browser-generated diagnostic shape with no free-form text."""
+
+    component: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        pattern=SAFE_DIAGNOSTIC_IDENTIFIER,
+    )
+    file: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=120,
+        pattern=SAFE_DIAGNOSTIC_IDENTIFIER,
+    )
+    status_code: int | None = Field(default=None, ge=100, le=599)
+    close_code: int | None = Field(default=None, ge=0, le=4999)
+    line: int | None = Field(default=None, ge=0, le=10_000_000)
+    column: int | None = Field(default=None, ge=0, le=10_000_000)
+    release_version: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=50,
+        pattern=SAFE_DIAGNOSTIC_IDENTIFIER,
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class ClientIssueReportIn(BaseModel):
     category: Literal["api", "runtime", "websocket"]
     severity: Literal["warning", "error"] = "error"
-    error_code: str = Field(min_length=1, max_length=100)
-    route: str | None = Field(default=None, max_length=500)
-    operation: str | None = Field(default=None, max_length=100)
+    error_code: str = Field(
+        min_length=1,
+        max_length=100,
+        pattern=SAFE_DIAGNOSTIC_IDENTIFIER,
+    )
+    route: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=500,
+        pattern=SAFE_DIAGNOSTIC_ROUTE,
+    )
+    operation: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        pattern=SAFE_DIAGNOSTIC_IDENTIFIER,
+    )
     agent_id: uuid.UUID | None = None
-    metadata: dict = Field(default_factory=dict)
+    metadata: ClientIssueMetadata = Field(default_factory=ClientIssueMetadata)
 
     model_config = ConfigDict(extra="forbid")
 

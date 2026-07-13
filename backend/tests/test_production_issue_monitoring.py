@@ -68,6 +68,37 @@ def test_client_report_contract_rejects_message_and_identity_fields():
         })
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"category": "api", "error_code": "customer private sentence"},
+        {
+            "category": "runtime",
+            "error_code": "WindowError",
+            "operation": "render private customer content",
+        },
+        {
+            "category": "runtime",
+            "error_code": "WindowError",
+            "metadata": {"component": "customer private prompt"},
+        },
+        {
+            "category": "runtime",
+            "error_code": "WindowError",
+            "metadata": {"prompt": "must never be accepted"},
+        },
+        {
+            "category": "api",
+            "error_code": "http_500",
+            "route": "/api/customer private prompt",
+        },
+    ],
+)
+def test_client_report_contract_rejects_free_form_diagnostic_text(payload):
+    with pytest.raises(ValidationError):
+        ClientIssueReportIn.model_validate(payload)
+
+
 def test_client_report_contract_accepts_agent_context_but_not_tenant_override():
     agent_id = uuid.uuid4()
 

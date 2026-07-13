@@ -3,6 +3,7 @@
 ## Model Routing and Multimodal Understanding
 
 - Lite, Pro, and Ultra understanding routes are seeded through the centrally managed `MiniMax-M3` pool for `text`, `image`, and `video` inputs. Chat uploads select the concrete attachment route, and the OpenAI-compatible caller converts image/video markers into structured content parts instead of sending them as plain text.
+- Attachment-driven `image`/`video` understanding is request-scoped. It no longer overwrites the session's persistent modality, so a later text-only turn or page refresh cannot silently keep using the previous attachment route; the user's Lite/Pro/Ultra tier remains persistent.
 - `audio` and `music` remain generation-tool capabilities rather than chat-understanding routes. Image, speech, music, and video generation continue through the explicit media tools, plan entitlements, reservation, and exactly-once Credits settlement paths.
 - Fixed a production-facing account-pool regression where a routed M3 model declared the abstract `multimodal` model type while credentials advertised concrete `text/image/video` capabilities. The selector now separates request capability from provider quota scope, so a healthy platform credential is no longer rejected as “平台账号池暂无可用 API key.”
 - The model selector remains a centrally funded shared-pool policy. This release does **not** add tenant-level or LLM-model-object-level authorization.
@@ -12,13 +13,15 @@
 - MiniMax Token Plan capacity is treated as one provider `plan` circuit shared by text, image, audio, music, and video, matching the current provider contract. An exhausted shared plan can no longer leave another capability incorrectly routable.
 - Provider-specific media allowances are tracked with an exact model scope when MiniMax reports a separate or legacy model cap. Exhausting one concrete video model therefore does not automatically poison unrelated media models.
 - Removed the local `window_5h_limit` raw-token gate. MiniMax applies resource-weighted, cross-modal five-hour and weekly allowances, so a local raw-token counter could falsely reject a valid Code Plan before the provider had exhausted it. The stored field remains for schema compatibility but is no longer enforced or editable in the SaaS console.
-- The account-pool monitor periodically reads MiniMax `/v1/token_plan/remains` evidence. Unknown status values and authentication/probe failures never masquerade as quota depletion or recovery; provider success clears only the quota circuits it actually proves usable.
+- The account-pool monitor periodically reads MiniMax `/v1/token_plan/remains` evidence, including official status and count fields (`1=limited`, `2=exhausted`, `3=unlimited`). Unknown status values and authentication/probe failures never masquerade as quota depletion or recovery; ordinary request success cannot race and clear a newer provider quota circuit.
 - Read-only credential verification no longer clears every scoped quota state. Replacing an API key resets the old state, while relabeling a credential or changing its endpoint cannot silently re-enable exhausted capacity.
 
 ## Automation and Production Safety
 
 - Platform-seeded OKR/CEO automation is disabled by default through migration `094_disable_system_okr_automation.py` and `OKR_AUTOMATION_ENABLED=false`. Explicit user-triggered work, user-managed schedules, durable A2A delivery, and media reconciliation remain available.
+- The OKR safety switch now checks `is_system` as well as the reserved trigger name. A user-created trigger that happens to use an OKR-like name is no longer suppressed or given system-only execution instructions.
 - Trigger claiming and execution are bounded by `TRIGGER_MAX_CONCURRENCY` and `TRIGGER_CLAIM_BATCH_SIZE`, preventing a backlog from starting an unbounded number of Agent runs at once.
+- Production deployment now quiesces the previous worker before running schema migrations, and trigger completion/failure updates only rows that are still `processing`. A late result from an old worker can no longer overwrite a migration- or operator-forced terminal state.
 - Production issue ingestion has a bounded fallback queue, so a temporary persistence outage cannot create unlimited in-memory growth while the monitor continues collecting privacy-safe operational evidence.
 
 ## Privacy-Safe Diagnostics
@@ -26,18 +29,23 @@
 - Audited runtime paths no longer put prompts, response previews, tool payloads, channel messages, provider bodies, credential prefixes, external message identifiers, or user-controlled paths into operational logs. Server-generated Trace IDs and bounded code-owned diagnostic shapes remain available for correlation.
 - Central exception formatting excludes exception values and local variables. HTTP responses expose a server-generated `X-Trace-Id` and ignore client-supplied trace content, preventing customer data from entering log correlation fields.
 - The privacy contract covers HTTP, WebSocket, LLM/tool execution, automation, AgentBay, OAuth, and the supported enterprise channel adapters. Source-level tests reject known payload/preview logging patterns.
+- Managed proxy startup diagnostics no longer expose configuration paths, node labels, server addresses, ports, or provider stderr content.
+- Browser incident intake now accepts only a typed, bounded diagnostic schema. Free-form prompts, messages, provider bodies, and arbitrary metadata cannot be smuggled into production-issue storage through diagnostic fields.
 
 ## Credits and Failure Isolation
 
 - Provider failures continue to release media reservations without creating consumption transactions. Quota state is kept separate from credential authentication health, and unknown, transport, persistence, validation, and code failures do not falsely disable the shared account pool.
 - MiniMax `2056` capacity failures remain recorded production issues but are treated as expected provider-capacity warnings. Exact media-task settlement and release remain idempotent under concurrent reconciliation.
+- Asynchronous video reconciliation forwards the task's concrete provider model for correlation. A bare MiniMax `2056` still opens the shared plan circuit; only provider evidence naming a concrete model opens an exact-model circuit.
+- A completed LLM response is no longer discarded when secondary usage accounting or Credits settlement persistence fails. Credits settlement runs before the secondary Agent quota counter, failures emit a critical privacy-safe production issue, and each settlement stage remains independently observable.
+- Synchronous MiniMax image, speech, and music generation now reserve Credits before the provider call, finalize the reservation only after a usable workspace artifact exists, and release unfinished reservations on every failure path. Concurrent requests can no longer all pass a read-only balance check and overspend the same available Credits.
 
 ## Validation
 
-- The complete backend suite passes: **682 tests**.
-- The complete frontend suite passes: **57 tests**, followed by a production frontend build covering 6,994 modules.
-- PostgreSQL release smoke passes full historical upgrade, targeted downgrade/re-upgrade, a single Alembic head, Credits/media exactly-once settlement, durable trigger delivery, production-issue aggregation/alerting, and chat-tier compare-and-swap checks.
-- Changed-file Ruff checks, Python bytecode compilation, Compose configuration validation, and `git diff --check` are release gates for the local candidate. Production cutover and post-release observation remain separate gates and are not claimed by this local release candidate.
+- The complete backend suite passes: **697 tests**.
+- The complete frontend suite passes: **58 tests**, followed by a production frontend build covering 6,994 modules.
+- PostgreSQL release smoke passes full historical upgrade, targeted downgrade/re-upgrade, a single Alembic head, Credits/media exactly-once settlement, durable trigger delivery, production-issue aggregation/alerting, and chat-tier compare-and-swap checks. Migration `093` uses revision-owned IDs and distinct M3 understanding rows; collision tests prove that administrator-owned models, billing rules, and post-upgrade plan edits survive rollback unchanged.
+- Release-scope Ruff checks (with the repository's pre-existing `main.py` / `agent_tools.py` baseline reported separately), Python bytecode compilation, Compose configuration validation, and `git diff --check` are release gates for the local candidate. Production cutover and post-release observation remain separate gates and are not claimed by this local release candidate.
 
 ## Upgrade Notes
 

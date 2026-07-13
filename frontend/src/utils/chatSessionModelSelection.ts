@@ -17,6 +17,16 @@ export function resolveChatSessionModality(
     return canonicalizeModality(sessionModality || agentDefaultModality || 'text');
 }
 
+export function resolveOutboundChatRoute(
+    persistentModality: string,
+    hasImageAttachment: boolean,
+    hasVideoAttachment: boolean,
+): { modality: string; ephemeral: boolean } {
+    if (hasVideoAttachment) return { modality: 'video', ephemeral: true };
+    if (hasImageAttachment) return { modality: 'image', ephemeral: true };
+    return { modality: canonicalizeModality(persistentModality), ephemeral: false };
+}
+
 export function shouldApplyChatTierPreferenceResponse(
     responseSequence: number,
     latestSequence: number,

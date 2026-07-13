@@ -345,7 +345,7 @@ rollback() {
         compose_project "$OLD_PROJECT" "$PREVIOUS/.env" "$PREVIOUS/$COMPOSE_FILE" up -d --no-deps backend
         compose_project "$OLD_PROJECT" "$PREVIOUS/.env" "$PREVIOUS/$COMPOSE_FILE" up -d --no-deps frontend
     fi
-    if [ "$OLD_WORKER_STOPPED" = "1" ] && [ "$ACTIVE_SLOT" != "legacy" ]; then
+    if [ "$OLD_WORKER_STOPPED" = "1" ]; then
         compose_project "$OLD_PROJECT" "$PREVIOUS/.env" "$PREVIOUS/$COMPOSE_FILE" up -d --no-deps worker
     fi
 }
@@ -356,6 +356,10 @@ compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" rm
 
 echo "[remote] building candidate slot $CANDIDATE_SLOT"
 compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" build backend frontend
+
+echo "[remote] quiescing old worker before automation-state migrations"
+compose_project "$OLD_PROJECT" "$PREVIOUS/.env" "$PREVIOUS/$COMPOSE_FILE" stop --timeout 90 worker
+OLD_WORKER_STOPPED=1
 
 echo "[remote] applying migrations before candidate startup"
 compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" \
@@ -453,11 +457,7 @@ fi
 printf '%s\n' "$PUBLIC_HEALTH" > "$BACKUP/health.public.json"
 printf '%s\n' "$PUBLIC_VERSION" > "$BACKUP/version.public.json"
 
-if [ "$ACTIVE_SLOT" != "legacy" ]; then
-    compose_project "$OLD_PROJECT" "$PREVIOUS/.env" "$PREVIOUS/$COMPOSE_FILE" stop worker
-    OLD_WORKER_STOPPED=1
-    compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" up -d --no-deps worker
-fi
+compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" up -d --no-deps worker
 
 echo "[remote] draining old application connections on port $OLD_PORT"
 DRAINED=0
@@ -475,9 +475,6 @@ done
 if [ "$DRAINED" = "1" ]; then
     compose_project "$OLD_PROJECT" "$PREVIOUS/.env" "$PREVIOUS/$COMPOSE_FILE" stop frontend backend
     OLD_APP_STOPPED=1
-    if [ "$ACTIVE_SLOT" = "legacy" ]; then
-        compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" up -d --no-deps worker
-    fi
     rm -f "$APP_ROOT/pending-drain"
 else
     printf '%s\n' "$OLD_PROJECT $OLD_PORT $PREVIOUS" > "$APP_ROOT/pending-drain"

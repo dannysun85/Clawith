@@ -459,6 +459,14 @@ async def reconcile_minimax_video_task(
                     task.credential_id,
                     exc,
                     modality="video",
+                    model=(
+                        str(
+                            task.model
+                            or (task.request_metadata or {}).get("model")
+                            or ""
+                        ).strip()
+                        or None
+                    ),
                 )
         except Exception:
             logger.exception("[media] failed to update credential health task_id={}", record_id)

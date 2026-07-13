@@ -174,6 +174,39 @@ async def test_websocket_persists_session_route_without_overwriting_user_prefere
 
 
 @pytest.mark.asyncio
+async def test_attachment_route_persists_tier_but_not_ephemeral_media_modality(monkeypatch):
+    websocket = FakeWebSocket()
+    agent_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    session_id = uuid.uuid4()
+    session = SimpleNamespace(
+        id=session_id,
+        agent_id=agent_id,
+        user_id=user_id,
+        source_channel="web",
+        is_group=False,
+        model_tier="pro",
+        model_modality="text",
+    )
+    db = RecordingDB([session])
+    monkeypatch.setattr("app.api.websocket.async_session", lambda: RecordingDBContext(db))
+
+    handler = WebSocketChatHandler(websocket, agent_id, "token", str(session_id))
+    handler.user = SimpleNamespace(id=user_id, preferred_chat_tier=None)
+    handler.conv_id = str(session_id)
+    handler.session_model_tier = "lite"
+    handler.session_model_modality = "text"
+
+    await handler._persist_session_model_selection("pro", None)
+
+    assert session.model_tier == "pro"
+    assert session.model_modality == "text"
+    assert handler.session_model_tier == "pro"
+    assert handler.session_model_modality == "text"
+    assert db.committed is True
+
+
+@pytest.mark.asyncio
 async def test_route_resolution_reloads_current_agent_for_existing_session(monkeypatch):
     websocket = FakeWebSocket()
     agent_id = uuid.uuid4()

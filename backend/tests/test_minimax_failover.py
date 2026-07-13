@@ -195,11 +195,11 @@ class TestCredentialFailurePolicy:
             is CredentialFailureAction.QUOTA_EXCEEDED
         )
 
-    def test_provider_model_limit_is_scoped_when_modality_is_known(self):
+    def test_provider_quota_limit_uses_the_explicit_allowance_resource(self):
         assert (
             credential_failure_action(
                 LLMError("token plan resource limit (2056)"),
-                modality="video",
+                modality="plan",
             )
             is CredentialFailureAction.MODALITY_QUOTA_EXCEEDED
         )
@@ -226,7 +226,7 @@ class TestCredentialFailurePolicy:
         quota.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_media_2056_marks_only_the_requested_modality(self, monkeypatch):
+    async def test_media_2056_opens_shared_plan_until_named_evidence_arrives(self, monkeypatch):
         from unittest.mock import AsyncMock
 
         from app.services import agent_tools
@@ -247,7 +247,7 @@ class TestCredentialFailurePolicy:
 
         scoped_quota.assert_awaited_once_with(
             "credential-id",
-            "video",
+            "plan",
             error_code="2056",
         )
         degrade.assert_not_awaited()

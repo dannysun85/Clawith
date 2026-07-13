@@ -213,9 +213,11 @@ def credential_failure_action(
 
     if is_auth_error(error):
         return CredentialFailureAction.DEGRADE
-    # MiniMax documents 2056 as a model-resource limit. Text has its own
-    # rolling window and every non-text model family has an independent daily
-    # quota, so a scoped call must only open that modality's circuit.
+    # MiniMax 2056 identifies provider capacity exhaustion, but the response
+    # itself does not identify a concrete model bucket. Callers must pass the
+    # allowance resource they actually consumed (normally the shared ``plan``
+    # resource). Exact media-model circuits are opened only from the remains
+    # endpoint, which names the affected model explicitly.
     if extract_minimax_code(str(error).lower()) in MINIMAX_QUOTA_CODES and modality:
         return CredentialFailureAction.MODALITY_QUOTA_EXCEEDED
     if is_billing_or_quota_error(error):

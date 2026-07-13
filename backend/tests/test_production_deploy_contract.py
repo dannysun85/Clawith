@@ -28,17 +28,23 @@ def test_production_deploy_health_checks_candidate_before_nginx_cutover():
     assert "run --rm --no-deps -T --entrypoint alembic backend upgrade head < /dev/null" in script
 
 
-def test_production_deploy_verifies_public_release_identity_before_stopping_old_slot():
+def test_production_deploy_quiesces_worker_before_migrations_and_keeps_app_until_public_gate():
     script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
 
+    worker_quiesce = script.index('echo "[remote] quiescing old worker')
+    migration = script.index("--entrypoint alembic backend upgrade head", worker_quiesce)
     public_gate = script.index('echo "[remote] verifying public cutover identity"')
-    old_worker_stop = script.index('compose_project "$OLD_PROJECT"', public_gate)
-    assert public_gate < old_worker_stop
-    assert "'Cache-Control: no-cache'" in script[public_gate:old_worker_stop]
-    assert 'health.get("version") != expected_version' in script[public_gate:old_worker_stop]
-    assert 'version.get("commit") != expected_commit' in script[public_gate:old_worker_stop]
-    assert 'if [ "$PUBLIC_READY" != "1" ]' in script[public_gate:old_worker_stop]
-    assert 'exit 1' in script[public_gate:old_worker_stop]
+    old_app_stop = script.index('stop frontend backend', public_gate)
+    assert worker_quiesce < migration < public_gate < old_app_stop
+    assert "stop --timeout 90 worker" in script[worker_quiesce:migration]
+    assert "'Cache-Control: no-cache'" in script[public_gate:old_app_stop]
+    assert 'health.get("version") != expected_version' in script[public_gate:old_app_stop]
+    assert 'version.get("commit") != expected_commit' in script[public_gate:old_app_stop]
+    assert 'if [ "$PUBLIC_READY" != "1" ]' in script[public_gate:old_app_stop]
+    assert 'exit 1' in script[public_gate:old_app_stop]
+    rollback = script[script.index("rollback()") : worker_quiesce]
+    assert 'if [ "$OLD_WORKER_STOPPED" = "1" ]' in rollback
+    assert 'up -d --no-deps worker' in rollback
 
 
 def test_production_deploy_does_not_rebuild_the_live_project_in_place():

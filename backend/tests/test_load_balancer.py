@@ -221,7 +221,7 @@ async def test_success_resets_prior_error_count():
 
 
 @pytest.mark.asyncio
-async def test_success_closes_only_the_shared_plan_circuit():
+async def test_success_does_not_race_authoritative_quota_circuits():
     cred = _cred(
         modality_status={
             "plan": {"status": "quota_exceeded"},
@@ -231,7 +231,7 @@ async def test_success_closes_only_the_shared_plan_circuit():
     sess, _ = _patch_session(get_value=cred)
     with sess:
         await increment_credential_usage(cred.id, weight=1)
-    assert set(cred.modality_status) == {"video:minimax-hailuo-02"}
+    assert set(cred.modality_status) == {"plan", "video:minimax-hailuo-02"}
 
 
 @pytest.mark.asyncio

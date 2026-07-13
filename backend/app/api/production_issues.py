@@ -72,7 +72,7 @@ async def report_client_issue(
         user_id=current_user.id,
         agent_id=agent_id,
         trace_id=getattr(request.state, "trace_id", None),
-        metadata=data.metadata,
+        metadata=data.metadata.model_dump(exclude_none=True),
     )
     return {"accepted": True}
 

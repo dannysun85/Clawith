@@ -87,18 +87,21 @@ async def _start_ss_local() -> tuple[object, str] | None:
         try:
             raw = Path(cfg_file).read_text(encoding="utf-8").strip()
             if not raw:
-                logger.warning(f"[Proxy] {cfg_file} exists but is empty — skipping proxy")
+                logger.warning("[Proxy] Config file is empty — skipping proxy")
                 return
             nodes = json.loads(raw)
         except (json.JSONDecodeError, ValueError) as exc:
-            logger.warning(f"[Proxy] Failed to parse {cfg_file}: {exc} — skipping proxy")
+            logger.warning(
+                "[Proxy] Failed to parse config — skipping proxy error_type={}",
+                type(exc).__name__,
+            )
             return
-        logger.info(f"[Proxy] Loaded {len(nodes)} node(s) from {cfg_file}")
+        logger.info("[Proxy] Loaded {} node(s)", len(nodes))
     elif os.environ.get("SS_SERVER") and os.environ.get("SS_PASSWORD"):
         nodes = [{"server": os.environ["SS_SERVER"], "port": int(os.environ.get("SS_PORT", "1080")),
                   "password": os.environ["SS_PASSWORD"], "method": os.environ.get("SS_METHOD", "chacha20-ietf-poly1305"), "label": "env"}]
     else:
-        logger.info(f"[Proxy] {cfg_file} not found and SS_SERVER not set — skipping proxy")
+        logger.info("[Proxy] No proxy configuration available — skipping proxy")
         return
     for node in nodes:
         cfg = {"server": node["server"], "server_port": node["port"], "local_address": "127.0.0.1",
@@ -118,14 +121,14 @@ async def _start_ss_local() -> tuple[object, str] | None:
             await asyncio.sleep(2)
             if proc.returncode is None:
                 os.environ["DISCORD_PROXY"] = "socks5h://127.0.0.1:1080"
-                logger.info(f"[Proxy] ss-local → {node['label']} ({node['server']}:{node['port']})")
+                logger.info("[Proxy] ss-local connected")
                 keep_process = True
                 return proc, tf.name
             await proc.wait()
             err = (await proc.stderr.read()).decode()[:120]
-            logger.warning(f"[Proxy] {node['label']} failed: {err}")
+            logger.warning("[Proxy] ss-local node failed stderr_chars={}", len(err))
         except Exception as e:
-            logger.error(f"[Proxy] {node['label']} error: {e}")
+            logger.error("[Proxy] ss-local node error error_type={}", type(e).__name__)
         finally:
             if not keep_process:
                 if proc is not None and proc.returncode is None:
@@ -165,7 +168,6 @@ async def lifespan(app: FastAPI):
         )
 
     import asyncio
-    import sys
     import os
     from app.services.trigger_daemon import start_trigger_daemon
     from app.services.subscription_lifecycle import start_subscription_lifecycle_daemon
@@ -230,7 +232,7 @@ async def lifespan(app: FastAPI):
         try:
             from app.models.tenant import Tenant
             from app.database import async_session as _session
-            from sqlalchemy import select as _select, update as _update
+            from sqlalchemy import select as _select
             async with _session() as _db:
                 _existing = await _db.execute(_select(Tenant).where(Tenant.slug == "default"))
                 if not _existing.scalar_one_or_none():

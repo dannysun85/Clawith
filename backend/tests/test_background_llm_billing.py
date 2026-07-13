@@ -348,6 +348,100 @@ async def test_call_llm_records_provider_usage_but_does_not_charge_when_tool_loo
 
 
 @pytest.mark.asyncio
+async def test_completed_response_survives_credits_settlement_failure_and_is_monitored():
+    agent_id = uuid.uuid4()
+    tenant_id = uuid.uuid4()
+    credential_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    model = SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=None,
+        provider="minimax",
+        model="MiniMax-M3",
+        modality="text",
+        tier="basic",
+        temperature=0.2,
+        max_output_tokens=256,
+    )
+    route_meta = llm_caller.RouteMeta(saas_tier="lite", modality="text")
+    response = SimpleNamespace(
+        content="completed answer",
+        tool_calls=[],
+        reasoning_content=None,
+        usage={"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
+    )
+    client = FakeLLMClient(response)
+
+    with (
+        patch.object(llm_caller, "_get_agent_config", AsyncMock(return_value=(1, None))),
+        patch.object(llm_caller, "_get_user_name", AsyncMock(return_value=None)),
+        patch.object(llm_caller, "_prepare_llm_billing_context", AsyncMock(return_value=tenant_id)),
+        patch.object(llm_caller, "resolve_model_key", AsyncMock(return_value=("key", None, credential_id))),
+        patch.object(llm_caller, "create_llm_client", return_value=client),
+        patch.object(llm_caller, "get_agent_tools_for_llm", AsyncMock(return_value=[])),
+        patch.object(
+            llm_caller,
+            "get_provider_spec",
+            return_value=SimpleNamespace(accepts_plain_text_final=True, requires_api_key=True),
+        ),
+        patch("app.services.agent_context.build_agent_context", AsyncMock(return_value=("system", "dynamic"))),
+        patch.object(llm_caller, "record_token_usage", AsyncMock()),
+        patch.object(llm_caller, "record_credential_call", AsyncMock()),
+        patch.object(
+            llm_caller,
+            "_record_llm_usage_and_charge",
+            AsyncMock(side_effect=RuntimeError("database unavailable")),
+        ),
+        patch.object(llm_caller, "_record_llm_settlement_failure", AsyncMock()) as monitor,
+    ):
+        result = await llm_caller.call_llm(
+            model=model,
+            messages=[{"role": "user", "content": "run"}],
+            agent_name="Autonomous agent",
+            role_description="worker",
+            agent_id=agent_id,
+            user_id=user_id,
+            route_meta=route_meta,
+        )
+
+    assert result == "completed answer"
+    client.close.assert_awaited_once()
+    monitor.assert_awaited_once()
+    assert monitor.await_args.kwargs["stage"] == "credits"
+
+
+@pytest.mark.asyncio
+async def test_financial_charge_precedes_secondary_agent_usage_counter():
+    events: list[str] = []
+    agent_id = uuid.uuid4()
+    tenant_id = uuid.uuid4()
+    route_meta = llm_caller.RouteMeta(saas_tier="lite", modality="text")
+    model = SimpleNamespace(provider="minimax", model="MiniMax-M3", tier="basic")
+    usage = TokenUsage(total_tokens=100, input_tokens=80, output_tokens=20)
+
+    async def charge(**_kwargs):
+        events.append("credits")
+
+    async def consume(*_args, **_kwargs):
+        events.append("agent_quota")
+
+    with (
+        patch.object(llm_caller, "charge_credits", charge),
+        patch.object(llm_caller, "consume_agent_llm_quota", consume),
+    ):
+        await llm_caller._record_llm_usage_and_charge(
+            agent_id=agent_id,
+            user_id=uuid.uuid4(),
+            tenant_id=tenant_id,
+            model=model,
+            usage=usage,
+            route_meta=route_meta,
+        )
+
+    assert events == ["credits", "agent_quota"]
+
+
+@pytest.mark.asyncio
 async def test_call_llm_settles_completed_rounds_when_cancelled():
     agent_id = uuid.uuid4()
     tenant_id = uuid.uuid4()

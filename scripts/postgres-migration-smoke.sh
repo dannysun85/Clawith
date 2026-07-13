@@ -122,6 +122,28 @@ INSERT INTO billing_rules (
 );
 SQL
 
+.venv/bin/alembic upgrade add_user_chat_tier_preference
+
+# Reproduce administrator-owned catalog and billing data created immediately
+# before 093. The M3 migration must neither adopt nor delete these rows, even
+# when a label or priority happens to match its historical seed convention.
+psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+INSERT INTO llm_models (
+  id, provider, model, api_key_encrypted, label, enabled, supports_vision,
+  modality, modalities, tier, capabilities, max_output_tokens
+) VALUES (
+  '07500000-0000-4000-8000-000000000023', 'minimax', 'MiniMax-M3',
+  'administrator-placeholder', 'MiniMax-M3 Lite (Platform)', true, false,
+  'text', '["text"]'::json, 'lite', '{"administrator_owned":true}'::json, 777
+);
+INSERT INTO billing_rules (
+  id, action, modality, tier, unit, credit_cost, enabled, priority
+) VALUES (
+  '07500000-0000-4000-8000-000000000024',
+  'chat', 'video', 'ultra', 'call', 77, true, 93
+);
+SQL
+
 .venv/bin/alembic upgrade head
 .venv/bin/alembic current | grep -F "disable_system_okr_automation (head)"
 PYTHONPATH=. .venv/bin/python ../scripts/plan-update-postgres-smoke.py
@@ -382,6 +404,11 @@ SQL
 
 # The M3 data migration must be independently reversible: existing M2.x
 # routes and administrator-owned catalog rows must survive a one-step rollback.
+psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+UPDATE plans
+SET allowed_modalities = '["text","image","video","audio"]'::jsonb
+WHERE code = 'scale';
+SQL
 .venv/bin/alembic downgrade add_user_chat_tier_preference
 .venv/bin/alembic current | grep -F "add_user_chat_tier_preference"
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
@@ -394,6 +421,20 @@ BEGIN
       AND capabilities::jsonb @> '{"seed_revision":"seed_minimax_m3_understanding"}'::jsonb
   ) THEN
     RAISE EXCEPTION 'M3 seeded models survived migration downgrade';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM llm_models
+    WHERE id = '07500000-0000-4000-8000-000000000023'
+      AND provider = 'minimax'
+      AND model = 'MiniMax-M3'
+      AND label = 'MiniMax-M3 Lite (Platform)'
+      AND supports_vision = false
+      AND modality = 'text'
+      AND modalities::jsonb = '["text"]'::jsonb
+      AND max_output_tokens = 777
+      AND capabilities::jsonb = '{"administrator_owned":true}'::jsonb
+  ) THEN
+    RAISE EXCEPTION 'administrator-owned M3 catalog row changed during migration rollback';
   END IF;
   IF (
     SELECT count(*)
@@ -411,15 +452,35 @@ BEGIN
   END IF;
   IF (
     SELECT count(*) FROM plans
-    WHERE code IN ('free', 'starter', 'pro', 'scale')
+    WHERE code IN ('free', 'starter', 'pro')
       AND allowed_modalities::jsonb = '["text"]'::jsonb
-  ) <> 4 THEN
+  ) <> 3 THEN
     RAISE EXCEPTION 'plan understanding modalities were not restored by downgrade';
   END IF;
-  IF EXISTS (
-    SELECT 1 FROM billing_rules WHERE priority = 93
+  IF NOT EXISTS (
+    SELECT 1 FROM plans
+    WHERE code = 'scale'
+      AND allowed_modalities::jsonb = '["text","image","video","audio"]'::jsonb
   ) THEN
-    RAISE EXCEPTION 'M3 seeded billing rules survived migration downgrade';
+    RAISE EXCEPTION 'post-upgrade administrator plan edit was overwritten by downgrade';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM billing_rules
+    WHERE id::text LIKE '09300000-0000-4000-8000-0000000002%'
+  ) THEN
+    RAISE EXCEPTION 'revision-owned M3 billing rules survived migration downgrade';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM billing_rules
+    WHERE id = '07500000-0000-4000-8000-000000000024'
+      AND action = 'chat'
+      AND modality = 'video'
+      AND tier = 'ultra'
+      AND unit = 'call'
+      AND credit_cost = 77
+      AND priority = 93
+  ) THEN
+    RAISE EXCEPTION 'administrator-owned billing rule was deleted by migration rollback';
   END IF;
 END $$;
 SQL
