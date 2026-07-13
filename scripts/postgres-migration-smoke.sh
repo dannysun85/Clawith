@@ -408,19 +408,49 @@ psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_nam
 UPDATE plans
 SET allowed_modalities = '["text","image","video","audio"]'::jsonb
 WHERE code = 'scale';
+
+-- Reproduce legitimate post-deploy dependencies on revision-owned rows. The
+-- downgrade must detach a custom fallback edge, preserve a still-referenced
+-- model, and allow the same migration to be upgraded again afterwards.
+INSERT INTO model_routes (
+  id, saas_tier, modality, llm_model_id, priority, fallback_route_id, enabled
+) VALUES (
+  '07500000-0000-4000-8000-000000000025', 'lite', 'custom-understanding',
+  '07500000-0000-4000-8000-000000000023', 77,
+  '09300000-0000-4000-8000-000000000101', true
+);
+UPDATE tenants
+SET default_model_id = '09300000-0000-4000-8000-000000000001'
+WHERE id = '07500000-0000-4000-8000-000000000002';
 SQL
 .venv/bin/alembic downgrade add_user_chat_tier_preference
 .venv/bin/alembic current | grep -F "add_user_chat_tier_preference"
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
 DO $$
 BEGIN
-  IF EXISTS (
+  IF (
+    SELECT count(*) FROM llm_models
+    WHERE capabilities::jsonb @> '{"seed_revision":"seed_minimax_m3_understanding"}'::jsonb
+  ) <> 1 OR NOT EXISTS (
     SELECT 1 FROM llm_models
-    WHERE provider = 'minimax'
-      AND model = 'MiniMax-M3'
+    WHERE id = '09300000-0000-4000-8000-000000000001'
       AND capabilities::jsonb @> '{"seed_revision":"seed_minimax_m3_understanding"}'::jsonb
   ) THEN
-    RAISE EXCEPTION 'M3 seeded models survived migration downgrade';
+    RAISE EXCEPTION 'downgrade did not preserve exactly the referenced M3 seed model';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM model_routes
+    WHERE id = '07500000-0000-4000-8000-000000000025'
+      AND fallback_route_id IS NULL
+  ) THEN
+    RAISE EXCEPTION 'administrator fallback route was not safely detached';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM tenants
+    WHERE id = '07500000-0000-4000-8000-000000000002'
+      AND default_model_id = '09300000-0000-4000-8000-000000000001'
+  ) THEN
+    RAISE EXCEPTION 'referenced M3 seed model dependency was not preserved';
   END IF;
   IF NOT EXISTS (
     SELECT 1 FROM llm_models

@@ -45,6 +45,39 @@ def test_production_deploy_quiesces_worker_before_migrations_and_keeps_app_until
     rollback = script[script.index("rollback()") : worker_quiesce]
     assert 'if [ "$OLD_WORKER_STOPPED" = "1" ]' in rollback
     assert 'up -d --no-deps worker' in rollback
+    assert 'if [ "$MIGRATION_APPLIED" = "1" ]' in rollback
+    assert 'backend downgrade "$PRE_MIGRATION_REVISION"' in rollback
+    candidate_database_stop = rollback.index('stop worker backend')
+    database_restore = rollback.index('backend downgrade "$PRE_MIGRATION_REVISION"')
+    nginx_restore = rollback.index('sudo cp "$NGINX_BACKUP" "$NGINX_SITE"')
+    candidate_cleanup = rollback.index('stop worker frontend backend')
+    assert candidate_database_stop < database_restore < nginx_restore < candidate_cleanup
+    assert 'candidate API is stopped and workers remain quiesced' in rollback
+
+
+def test_m3_seed_remains_compatible_with_the_pre_release_api_during_migration_window():
+    migration = (
+        ROOT / "backend/alembic/versions/093_seed_minimax_m3_understanding_routes.py"
+    ).read_text(encoding="utf-8")
+
+    # The old API resolves account-pool capability from llm_models.modality.
+    # Keep the primary modality concrete while the new API uses modalities for
+    # image/video understanding. This prevents a temporary no-credential outage
+    # while the old blue/green slot is still serving after migrations.
+    assert "'text', '[\"text\",\"image\",\"video\"]'::jsonb" in migration
+    assert "'multimodal', '[\"text\",\"image\",\"video\"]'::jsonb" not in migration
+
+
+def test_m3_downgrade_detaches_fallbacks_and_preserves_referenced_models():
+    migration = (
+        ROOT / "backend/alembic/versions/093_seed_minimax_m3_understanding_routes.py"
+    ).read_text(encoding="utf-8")
+
+    assert "SET fallback_route_id = NULL" in migration
+    assert "primary_model_id = model.id OR fallback_model_id = model.id" in migration
+    assert "SELECT 1 FROM tenants WHERE default_model_id = model.id" in migration
+    assert "ON CONFLICT (id) DO NOTHING" in migration
+    assert "reserved MiniMax-M3 model id" in migration
 
 
 def test_production_deploy_does_not_rebuild_the_live_project_in_place():

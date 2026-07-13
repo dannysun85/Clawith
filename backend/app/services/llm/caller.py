@@ -26,7 +26,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.core.logging_config import get_trace_id, privacy_safe_shape
 from app.database import async_session
-from app.services.credit_service import charge_credits, check_credit_balance
+from app.services.credit_service import (
+    charge_credits,
+    finalize_reserved_credits,
+    get_credit_cost,
+    mark_credit_reservation_settlement_ready,
+    release_reserved_credits,
+    reserve_credits,
+)
 from app.services.provider_pricing import provider_text_credits
 from app.services.model_router import resolve_route
 from app.services.quota_guard import (
@@ -77,6 +84,9 @@ increment_credential_usage = record_credential_call
 MAX_INLINE_MEDIA_BASE64_CHARS = 60 * 1024 * 1024
 _INLINE_MEDIA_BASE64_PATTERN = re.compile(
     r"\[(?:image|video)_data:data:(?:image|video)/[^;]+;base64,([A-Za-z0-9+/=]+)\]"
+)
+_DATA_URL_FOR_ESTIMATE_PATTERN = re.compile(
+    r"data:(?:image|video)/[^;,\"']+;base64,[A-Za-z0-9+/=]+"
 )
 
 
@@ -858,14 +868,169 @@ async def _prepare_llm_billing_context(
         )
 
     await check_tenant_token_credits(tenant_id)
-    await check_credit_balance(
-        tenant_id,
+    await check_agent_llm_quota(normalized_agent_id, model_tier=route_meta.saas_tier)
+    return tenant_id
+
+
+def _estimate_llm_request_input_tokens(
+    messages: list[LLMMessage],
+    tools: list[dict] | None,
+) -> int:
+    """Estimate billable text without treating inline media bytes as tokens."""
+    payload = {
+        "messages": [message.to_openai_format() for message in messages],
+        "tools": tools or [],
+    }
+    serialized = json.dumps(payload, ensure_ascii=False, default=str)
+    serialized = _DATA_URL_FOR_ESTIMATE_PATTERN.sub("data:media;base64,[omitted]", serialized)
+    serialized = _INLINE_MEDIA_BASE64_PATTERN.sub("[media_data:omitted]", serialized)
+    return max(len(serialized) // 3, 1)
+
+
+async def _estimate_llm_round_credit_hold(
+    *,
+    model: "LLMModel",
+    route_meta: RouteMeta,
+    messages: list[LLMMessage],
+    tools: list[dict] | None,
+    max_tokens: int,
+) -> int:
+    configured = await get_credit_cost(
         route_meta.action,
         route_meta.modality,
         route_meta.saas_tier,
     )
-    await check_agent_llm_quota(normalized_agent_id, model_tier=route_meta.saas_tier)
-    return tenant_id
+    estimated_input_tokens = _estimate_llm_request_input_tokens(messages, tools)
+    estimated_output_tokens = max(int(max_tokens or 0), 0)
+    estimate = provider_text_credits(
+        model.provider,
+        model.model,
+        TokenUsage(
+            input_tokens=estimated_input_tokens,
+            output_tokens=estimated_output_tokens,
+            total_tokens=estimated_input_tokens + estimated_output_tokens,
+        ),
+    )
+    return max(configured, estimate or 0)
+
+
+async def reserve_llm_round_credits(
+    *,
+    tenant_id: uuid.UUID | None,
+    user_id: uuid.UUID | None,
+    agent_id: uuid.UUID | None,
+    model: "LLMModel",
+    route_meta: RouteMeta | None,
+    messages: list[LLMMessage],
+    tools: list[dict] | None,
+    max_tokens: int,
+) -> uuid.UUID | None:
+    """Atomically hold the conservative cost of one provider request."""
+    if not (tenant_id and agent_id and route_meta):
+        return None
+    amount = await _estimate_llm_round_credit_hold(
+        model=model,
+        route_meta=route_meta,
+        messages=messages,
+        tools=tools,
+        max_tokens=max_tokens,
+    )
+    reservation = await reserve_credits(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        agent_id=agent_id,
+        action=route_meta.action,
+        modality=route_meta.modality,
+        saas_tier=route_meta.saas_tier,
+        provider=model.provider,
+        model=model.model,
+        amount=amount,
+        ref_type="llm_round",
+    )
+    return reservation.id
+
+
+async def settle_llm_round_credits(
+    reservation_id: uuid.UUID | None,
+    *,
+    usage: TokenUsage,
+    model: "LLMModel",
+    route_meta: RouteMeta | None,
+    agent_id: uuid.UUID | None,
+    user_id: uuid.UUID | None,
+    tenant_id: uuid.UUID | None,
+) -> None:
+    """Persist exact provider debt before tools/results, then finalize it."""
+    if reservation_id is None or route_meta is None:
+        return
+    configured_amount = await get_credit_cost(
+        route_meta.action,
+        route_meta.modality,
+        route_meta.saas_tier,
+    )
+    provider_amount = provider_text_credits(model.provider, model.model, usage)
+    # The billing rule is the product contract; dynamic provider pricing may
+    # raise the charge for unusually expensive/long-context rounds but must not
+    # silently discount Pro/Ultra below their configured tier price.
+    exact_amount = max(configured_amount, provider_amount or 0)
+    try:
+        await mark_credit_reservation_settlement_ready(
+            reservation_id,
+            amount=exact_amount,
+        )
+    except Exception as exc:
+        await _record_llm_settlement_failure(
+            stage="credits_outbox",
+            error=exc,
+            model=model,
+            agent_id=agent_id,
+            user_id=user_id,
+            tenant_id=tenant_id,
+            route_meta=route_meta,
+        )
+        raise
+
+    try:
+        await finalize_reserved_credits(reservation_id)
+    except Exception as exc:
+        # ``settlement_ready`` is durable and cannot be released.  The
+        # reconciliation daemon will retry, so the completed result is safe to
+        # continue even during a transient final-ledger failure.
+        await _record_llm_settlement_failure(
+            stage="credits_finalize",
+            error=exc,
+            model=model,
+            agent_id=agent_id,
+            user_id=user_id,
+            tenant_id=tenant_id,
+            route_meta=route_meta,
+        )
+
+
+async def release_llm_round_credits(
+    reservation_id: uuid.UUID | None,
+    *,
+    model: "LLMModel",
+    route_meta: RouteMeta | None,
+    agent_id: uuid.UUID | None,
+    user_id: uuid.UUID | None,
+    tenant_id: uuid.UUID | None,
+) -> None:
+    """Release a pre-provider hold without masking the original exception."""
+    if reservation_id is None:
+        return
+    try:
+        await release_reserved_credits(reservation_id)
+    except Exception as exc:
+        await _record_llm_settlement_failure(
+            stage="credits_release",
+            error=exc,
+            model=model,
+            agent_id=agent_id,
+            user_id=user_id,
+            tenant_id=tenant_id,
+            route_meta=route_meta,
+        )
 
 
 async def _record_llm_usage_and_charge(
@@ -875,6 +1040,8 @@ async def _record_llm_usage_and_charge(
     model: "LLMModel",
     usage: TokenUsage,
     route_meta: RouteMeta | None,
+    *,
+    charge_credits_enabled: bool = True,
 ) -> None:
     """Record completed provider usage and charge tenant Credits."""
     if not agent_id or not tenant_id:
@@ -887,7 +1054,7 @@ async def _record_llm_usage_and_charge(
     # Credits are the financial source of truth. Charge first so a secondary
     # daily-usage counter failure cannot turn a successful provider call into
     # unbilled usage.
-    if route_meta:
+    if route_meta and charge_credits_enabled:
         await charge_credits(
             tenant_id=tenant_id,
             user_id=user_id,
@@ -1031,7 +1198,7 @@ async def call_llm(
     _unsaved_usage = TokenUsage()
     _usage_finalized = False
 
-    async def _finalize_llm_usage(*, billable: bool) -> None:
+    async def _finalize_llm_usage() -> None:
         nonlocal _unsaved_usage, _usage_finalized
         if _usage_finalized:
             return
@@ -1069,26 +1236,26 @@ async def call_llm(
                         tenant_id=_tenant_id,
                         route_meta=route_meta,
                     )
-            if billable:
-                try:
-                    await _record_llm_usage_and_charge(
-                        agent_id=agent_id,
-                        user_id=user_id,
-                        tenant_id=_tenant_id,
-                        model=model,
-                        usage=_accumulated_usage,
-                        route_meta=route_meta,
-                    )
-                except Exception as exc:
-                    await _record_llm_settlement_failure(
-                        stage="credits",
-                        error=exc,
-                        model=model,
-                        agent_id=agent_id,
-                        user_id=user_id,
-                        tenant_id=_tenant_id,
-                        route_meta=route_meta,
-                    )
+            try:
+                await _record_llm_usage_and_charge(
+                    agent_id=agent_id,
+                    user_id=user_id,
+                    tenant_id=_tenant_id,
+                    model=model,
+                    usage=_accumulated_usage,
+                    route_meta=route_meta,
+                    charge_credits_enabled=False,
+                )
+            except Exception as exc:
+                await _record_llm_settlement_failure(
+                    stage="agent_quota",
+                    error=exc,
+                    model=model,
+                    agent_id=agent_id,
+                    user_id=user_id,
+                    tenant_id=_tenant_id,
+                    route_meta=route_meta,
+                )
         finally:
             _usage_finalized = True
 
@@ -1133,9 +1300,43 @@ async def call_llm(
                 _, _token_limit_msg = await _get_agent_config(agent_id)
                 if _token_limit_msg:
                     logger.warning(f"[LLM] Token limit exceeded mid-loop agent={agent_id}")
-                    await _finalize_llm_usage(billable=False)
+                    await _finalize_llm_usage()
                     await client.close()
                     return _token_limit_msg
+
+        _round_reservation_id = None
+        try:
+            _round_reservation_id = await reserve_llm_round_credits(
+                tenant_id=_tenant_id,
+                user_id=user_id,
+                agent_id=agent_id,
+                model=model,
+                route_meta=route_meta,
+                messages=api_messages,
+                tools=tools_for_llm if tools_for_llm else None,
+                max_tokens=max_tokens,
+            )
+        except asyncio.CancelledError:
+            await _finalize_llm_usage()
+            await client.close()
+            raise
+        except QuotaExceeded as e:
+            await _finalize_llm_usage()
+            await client.close()
+            return f"⚠️ {e.message}"
+        except Exception as e:
+            await _record_llm_settlement_failure(
+                stage="credits_reserve",
+                error=e,
+                model=model,
+                agent_id=agent_id,
+                user_id=user_id,
+                tenant_id=_tenant_id,
+                route_meta=route_meta,
+            )
+            await _finalize_llm_usage()
+            await client.close()
+            return "⚠️ Credits 预留暂时不可用，模型尚未调用，请稍后重试。"
 
         try:
             # Use streaming API for real-time responses
@@ -1154,10 +1355,38 @@ async def call_llm(
                 **request_options,
             )
         except asyncio.CancelledError:
-            await _finalize_llm_usage(billable=False)
+            await release_llm_round_credits(
+                _round_reservation_id,
+                model=model,
+                route_meta=route_meta,
+                agent_id=agent_id,
+                user_id=user_id,
+                tenant_id=_tenant_id,
+            )
+            await _finalize_llm_usage()
             await client.close()
             raise
+        except QuotaExceeded as e:
+            await release_llm_round_credits(
+                _round_reservation_id,
+                model=model,
+                route_meta=route_meta,
+                agent_id=agent_id,
+                user_id=user_id,
+                tenant_id=_tenant_id,
+            )
+            await _finalize_llm_usage()
+            await client.close()
+            return f"⚠️ {e.message}"
         except LLMError as e:
+            await release_llm_round_credits(
+                _round_reservation_id,
+                model=model,
+                route_meta=route_meta,
+                agent_id=agent_id,
+                user_id=user_id,
+                tenant_id=_tenant_id,
+            )
             logger.error(
                 "[LLM] provider operation failed provider={} model={} error_type={} error_code={}",
                 getattr(model, "provider", "?"),
@@ -1184,10 +1413,18 @@ async def call_llm(
                         _llm_capability_modality(model, route_meta),
                     ),
                 )
-            await _finalize_llm_usage(billable=False)
+            await _finalize_llm_usage()
             await client.close()
             return f"[LLM Error] {e}"
         except Exception as e:
+            await release_llm_round_credits(
+                _round_reservation_id,
+                model=model,
+                route_meta=route_meta,
+                agent_id=agent_id,
+                user_id=user_id,
+                tenant_id=_tenant_id,
+            )
             logger.error(
                 "[LLM] unexpected provider failure provider={} model={} error_type={} error_code={}",
                 getattr(model, "provider", "?"),
@@ -1214,7 +1451,7 @@ async def call_llm(
                         _llm_capability_modality(model, route_meta),
                     ),
                 )
-            await _finalize_llm_usage(billable=False)
+            await _finalize_llm_usage()
             await client.close()
             return f"[LLM call error] {type(e).__name__}: {str(e)[:200]}"
 
@@ -1222,6 +1459,28 @@ async def call_llm(
         _usage_this_round = _usage_from_response_or_estimate(response, api_messages)
         _accumulated_usage.add(_usage_this_round)
         _unsaved_usage.add(_usage_this_round)
+        try:
+            await settle_llm_round_credits(
+                _round_reservation_id,
+                usage=_usage_this_round,
+                model=model,
+                route_meta=route_meta,
+                agent_id=agent_id,
+                user_id=user_id,
+                tenant_id=_tenant_id,
+            )
+        except Exception:
+            await release_llm_round_credits(
+                _round_reservation_id,
+                model=model,
+                route_meta=route_meta,
+                agent_id=agent_id,
+                user_id=user_id,
+                tenant_id=_tenant_id,
+            )
+            await _finalize_llm_usage()
+            await client.close()
+            return "⚠️ Credits 结算暂时不可用，本轮结果未执行，请稍后重试。"
 
         # Most hosted providers must finish explicitly via finish(content=...).
         # Ollama also serves models without reliable function calling; its
@@ -1234,7 +1493,7 @@ async def call_llm(
                 and provider_spec
                 and provider_spec.accepts_plain_text_final
             ):
-                await _finalize_llm_usage(billable=True)
+                await _finalize_llm_usage()
                 await client.close()
                 return response.content
             if response.content:
@@ -1252,10 +1511,10 @@ async def call_llm(
                     "[LLM] Circuit breaker stopped {} consecutive invalid tool calls",
                     consecutive_invalid_tool_calls,
                 )
-                await _finalize_llm_usage(billable=False)
+                await _finalize_llm_usage()
                 await client.close()
                 return (
-                    "⚠️ 工具参数连续 3 次无效，本次执行已自动停止且不会扣除对话 Credits。"
+                    "⚠️ 工具参数连续 3 次无效，本次执行已自动停止；已发生的模型调用已正常结算。"
                     "请缩短单次写入内容或重新发起任务。"
                 )
             api_messages.append(LLMMessage(role="user", content=retry_instruction))
@@ -1265,7 +1524,7 @@ async def call_llm(
         finish_call = find_finish_call(sanitized_tool_calls)
         if finish_call:
             if finish_call.valid:
-                await _finalize_llm_usage(billable=True)
+                await _finalize_llm_usage()
                 await client.close()
                 return finish_call.content
 
@@ -1308,7 +1567,7 @@ async def call_llm(
                     route_meta=route_meta,
                 )
             except asyncio.CancelledError:
-                await _finalize_llm_usage(billable=False)
+                await _finalize_llm_usage()
                 await client.close()
                 raise
             except Exception as e:
@@ -1316,7 +1575,7 @@ async def call_llm(
                     "[LLM] Tool execution failed after provider usage error_type={}",
                     type(e).__name__,
                 )
-                await _finalize_llm_usage(billable=False)
+                await _finalize_llm_usage()
                 await client.close()
                 return f"[Error] Tool execution failed: {type(e).__name__}: {str(e)[:200]}"
             if tool_error:
@@ -1327,7 +1586,7 @@ async def call_llm(
                 ))
 
     # Settle provider usage even when the model never emits a valid finish call.
-    await _finalize_llm_usage(billable=False)
+    await _finalize_llm_usage()
     await client.close()
     return "[Error] Too many tool call rounds"
 
@@ -1597,7 +1856,11 @@ async def settle_agent_llm_invocation(
     user_id: uuid.UUID | None,
     usage: TokenUsage,
 ) -> None:
-    """Record account-pool usage and settle Credits for a background run."""
+    """Record account-pool and agent-quota usage for a background run.
+
+    Credits are settled per completed provider round before any tool or result
+    is released; this aggregate finalizer must never charge them a second time.
+    """
     if usage.total_tokens <= 0:
         return
     if invocation.credential_id:
@@ -1624,10 +1887,11 @@ async def settle_agent_llm_invocation(
             model=invocation.model,
             usage=usage,
             route_meta=invocation.route_meta,
+            charge_credits_enabled=False,
         )
     except Exception as exc:
         await _record_llm_settlement_failure(
-            stage="credits",
+            stage="agent_quota",
             error=exc,
             model=invocation.model,
             agent_id=agent_id,
@@ -1801,10 +2065,11 @@ async def call_agent_llm_with_tools(
                         model=model,
                         usage=_accumulated_usage,
                         route_meta=route_meta,
+                        charge_credits_enabled=False,
                     )
                 except Exception as exc:
                     await _record_llm_settlement_failure(
-                        stage="credits",
+                        stage="agent_quota",
                         error=exc,
                         model=model,
                         agent_id=agent_id,
@@ -1876,6 +2141,40 @@ async def call_agent_llm_with_tools(
                             await client.close()
                             return _token_limit_msg, False, tool_executed
 
+                _round_reservation_id = None
+                try:
+                    _round_reservation_id = await reserve_llm_round_credits(
+                        tenant_id=tenant_id,
+                        user_id=agent.creator_id,
+                        agent_id=agent_id,
+                        model=model,
+                        route_meta=route_meta,
+                        messages=api_messages,
+                        tools=tools_for_llm if tools_for_llm else None,
+                        max_tokens=max_tokens,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except QuotaExceeded:
+                    raise
+                except Exception as e:
+                    await _record_llm_settlement_failure(
+                        stage="credits_reserve",
+                        error=e,
+                        model=model,
+                        agent_id=agent_id,
+                        user_id=agent.creator_id,
+                        tenant_id=tenant_id,
+                        route_meta=route_meta,
+                    )
+                    await _finalize_background_usage()
+                    await client.close()
+                    return (
+                        "⚠️ Credits 预留暂时不可用，模型尚未调用，请稍后重试。",
+                        False,
+                        tool_executed,
+                    )
+
                 try:
                     response = await client.complete(
                         messages=api_messages,
@@ -1884,7 +2183,25 @@ async def call_agent_llm_with_tools(
                         max_tokens=max_tokens,
                         **request_options,
                     )
+                except QuotaExceeded:
+                    await release_llm_round_credits(
+                        _round_reservation_id,
+                        model=model,
+                        route_meta=route_meta,
+                        agent_id=agent_id,
+                        user_id=agent.creator_id,
+                        tenant_id=tenant_id,
+                    )
+                    raise
                 except Exception as e:
+                    await release_llm_round_credits(
+                        _round_reservation_id,
+                        model=model,
+                        route_meta=route_meta,
+                        agent_id=agent_id,
+                        user_id=agent.creator_id,
+                        tenant_id=tenant_id,
+                    )
                     logger.error(
                         "[call_agent_llm_with_tools] agent={} provider={} model={} "
                         "error_type={} error_code={}",
@@ -1919,6 +2236,33 @@ async def call_agent_llm_with_tools(
                 _usage_this_round = _usage_from_response_or_estimate(response, api_messages)
                 _accumulated_usage.add(_usage_this_round)
                 _unsaved_usage.add(_usage_this_round)
+                try:
+                    await settle_llm_round_credits(
+                        _round_reservation_id,
+                        usage=_usage_this_round,
+                        model=model,
+                        route_meta=route_meta,
+                        agent_id=agent_id,
+                        user_id=agent.creator_id,
+                        tenant_id=tenant_id,
+                    )
+                    _round_reservation_id = None
+                except Exception:
+                    await release_llm_round_credits(
+                        _round_reservation_id,
+                        model=model,
+                        route_meta=route_meta,
+                        agent_id=agent_id,
+                        user_id=agent.creator_id,
+                        tenant_id=tenant_id,
+                    )
+                    await _finalize_background_usage()
+                    await client.close()
+                    return (
+                        "⚠️ Credits 结算暂时不可用，本轮结果未执行，请稍后重试。",
+                        False,
+                        tool_executed,
+                    )
 
                 if not response.tool_calls:
                     if response.content:

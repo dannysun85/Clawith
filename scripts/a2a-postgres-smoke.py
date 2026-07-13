@@ -100,6 +100,9 @@ async def main() -> None:
     assert expected_execution_id in claimed_ids
     assert second_execution_id not in claimed_ids
     execution_id = expected_execution_id
+    first_execution = next(item[0] for item in first_claim if item[0].id == execution_id)
+    first_lease_token = first_execution.lease_owner
+    assert first_lease_token
 
     # Simulate a worker crash after claiming the row. An expired lease must be
     # reclaimable by the next daemon instance.
@@ -112,11 +115,28 @@ async def main() -> None:
     second_claim = await claim_pending_trigger_executions(sources=["a2a"])
     assert execution_id in [item[0].id for item in second_claim]
     assert second_execution_id not in [item[0].id for item in second_claim]
-    await mark_trigger_executions_completed([execution_id])
+    reclaimed_execution = next(item[0] for item in second_claim if item[0].id == execution_id)
+    second_lease_token = reclaimed_execution.lease_owner
+    assert second_lease_token and second_lease_token != first_lease_token
+
+    # A coroutine from the expired claim generation must not overwrite the
+    # result owned by the reclaimed generation.
+    assert await mark_trigger_executions_completed(
+        [(execution_id, first_lease_token)]
+    ) == 0
+    assert await mark_trigger_executions_completed(
+        [(execution_id, second_lease_token)]
+    ) == 1
 
     third_claim = await claim_pending_trigger_executions(sources=["a2a"])
     assert second_execution_id in [item[0].id for item in third_claim]
-    await mark_trigger_executions_completed([second_execution_id])
+    third_execution = next(
+        item[0] for item in third_claim if item[0].id == second_execution_id
+    )
+    assert third_execution.lease_owner
+    assert await mark_trigger_executions_completed(
+        [(second_execution_id, third_execution.lease_owner)]
+    ) == 1
 
     async with async_session() as db:
         execution = await db.get(TriggerExecution, execution_id)

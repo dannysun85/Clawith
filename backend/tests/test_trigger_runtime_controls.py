@@ -1,7 +1,7 @@
 import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
@@ -218,11 +218,81 @@ def test_okr_shutdown_migration_preserves_tenant_settings_and_never_auto_restart
 def test_execution_completion_cannot_overwrite_migration_or_operator_terminal_state():
     from inspect import getsource
 
-    from app.services.trigger_runtime import executions
+    from app.services.trigger_runtime import executions, invoker
 
     completed = getsource(executions.mark_trigger_executions_completed)
     failed = getsource(executions.mark_trigger_executions_failed)
+    renewed = getsource(executions.renew_trigger_execution_leases)
     assert 'TriggerExecution.status == "processing"' in completed
     assert 'TriggerExecution.status == "processing"' in failed
+    assert 'TriggerExecution.status == "processing"' in renewed
+    assert "TriggerExecution.lease_owner == lease_token" in getsource(
+        executions._claim_fence
+    )
     assert "update(TriggerExecution)" in completed
     assert "update(TriggerExecution)" in failed
+
+    invocation = getsource(invoker.invoke_agent_for_triggers)
+    assert invocation.index("await _stop_lease_renewal()\n            completed =") < invocation.index(
+        "await mark_trigger_executions_completed(execution_claims)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_execution_terminal_update_is_fenced_by_claim_generation(monkeypatch):
+    from app.services.trigger_runtime import executions
+
+    execution_id = uuid.uuid4()
+    lease_token = "worker-a:generation-2"
+    result = MagicMock(rowcount=1)
+    db = MagicMock()
+    db.execute = AsyncMock(return_value=result)
+    db.commit = AsyncMock()
+    session = MagicMock()
+    session.__aenter__ = AsyncMock(return_value=db)
+    session.__aexit__ = AsyncMock(return_value=None)
+    monkeypatch.setattr(executions, "async_session", lambda: session)
+
+    updated = await executions.mark_trigger_executions_completed(
+        [(execution_id, lease_token)]
+    )
+
+    statement = db.execute.await_args.args[0]
+    params = statement.compile().params
+    assert updated == 1
+    assert execution_id in params.values()
+    assert lease_token in params.values()
+    db.commit.assert_awaited_once()
+
+
+def test_runtime_trigger_carries_the_claim_generation_token():
+    from app.models.trigger_execution import TriggerExecution
+    from app.services.trigger_runtime.executions import build_execution_runtime_trigger
+
+    agent_id = uuid.uuid4()
+    trigger = AgentTrigger(
+        id=uuid.uuid4(),
+        agent_id=agent_id,
+        name="fenced",
+        type="once",
+        config={},
+        reason="test",
+        is_enabled=True,
+        fire_count=0,
+        cooldown_seconds=60,
+        is_system=False,
+    )
+    execution = TriggerExecution(
+        id=uuid.uuid4(),
+        trigger_id=trigger.id,
+        agent_id=agent_id,
+        source="once",
+        status="processing",
+        idempotency_key="fenced-generation",
+        lease_owner="worker-a:generation-7",
+    )
+
+    runtime_trigger = build_execution_runtime_trigger(trigger, execution)
+
+    assert runtime_trigger.config["_execution_id"] == str(execution.id)
+    assert runtime_trigger.config["_execution_lease_token"] == execution.lease_owner

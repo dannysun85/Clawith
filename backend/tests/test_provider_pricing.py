@@ -39,6 +39,24 @@ def test_minimax_highspeed_text_uses_highspeed_input_output_prices():
     assert minimax_text_credits("MiniMax-M2.7-highspeed", usage) == 3000
 
 
+def test_minimax_m3_uses_long_context_band_only_above_512k_input_tokens():
+    boundary = TokenUsage(
+        input_tokens=512_000,
+        output_tokens=1_000,
+        cache_read_tokens=500_000,
+        total_tokens=513_000,
+    )
+    long_context = TokenUsage(
+        input_tokens=512_001,
+        output_tokens=1_000,
+        cache_read_tokens=500_000,
+        total_tokens=513_001,
+    )
+
+    assert minimax_text_credits("MiniMax-M3", boundary) == 35
+    assert minimax_text_credits("MiniMax-M3", long_context) == 70
+
+
 def test_minimax_image_credits_rounds_official_image_01_price():
     assert minimax_image_credits("image-01", images=1) == 4
     assert minimax_image_credits("image-01", images=2) == 7

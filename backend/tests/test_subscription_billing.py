@@ -804,6 +804,112 @@ async def test_release_reserved_credits_in_session_releases_without_ledger():
 
 
 @pytest.mark.asyncio
+async def test_mark_credit_reservation_settlement_ready_resizes_durable_hold():
+    tenant_id = uuid.uuid4()
+    reservation = CreditReservation(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        amount=3,
+        status="reserved",
+        action="chat",
+        modality="text",
+        tier="lite",
+    )
+    balance = CreditBalance(tenant_id=tenant_id, balance=100, reserved=8)
+    db = MockDB(
+        get_map={(CreditReservation, reservation.id): reservation},
+        execute_results=[DummyResult(balance)],
+    )
+
+    out = await credit_service.mark_credit_reservation_settlement_ready_in_session(
+        db,
+        reservation.id,
+        amount=5,
+    )
+
+    assert out is reservation
+    assert reservation.status == "settlement_ready"
+    assert reservation.amount == 5
+    assert balance.reserved == 10
+
+
+@pytest.mark.asyncio
+async def test_settlement_ready_reservation_cannot_be_released_and_finalizes_once():
+    tenant_id = uuid.uuid4()
+    reservation = CreditReservation(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        amount=5,
+        status="settlement_ready",
+        action="chat",
+        modality="text",
+        tier="lite",
+    )
+    balance = CreditBalance(tenant_id=tenant_id, balance=100, reserved=5)
+    db = MockDB(
+        get_map={(CreditReservation, reservation.id): reservation},
+        execute_results=[DummyResult(None), DummyResult(balance)],
+    )
+
+    released = await credit_service.release_reserved_credits_in_session(db, reservation.id)
+    assert released.status == "settlement_ready"
+    assert balance.reserved == 5
+
+    tx = await credit_service.finalize_reserved_credits_in_session(db, reservation.id)
+    assert reservation.status == "finalized"
+    assert balance.balance == 95
+    assert balance.reserved == 0
+    assert tx.delta == -5
+
+    db.execute_results = [DummyResult(tx)]
+    duplicate = await credit_service.finalize_reserved_credits_in_session(db, reservation.id)
+    assert duplicate is tx
+    assert balance.balance == 95
+
+
+@pytest.mark.asyncio
+async def test_stale_sweep_finalizes_provider_debt_and_releases_plain_hold():
+    from app.services import billing_reconciliation
+
+    now = datetime.now(timezone.utc)
+    settlement = CreditReservation(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        amount=5,
+        status="settlement_ready",
+        action="chat",
+        expires_at=now,
+    )
+    plain = CreditReservation(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        amount=5,
+        status="reserved",
+        action="chat",
+        expires_at=now,
+    )
+    db = MockDB(execute_results=[DummyManyResult([settlement, plain])])
+
+    with (
+        patch.object(
+            billing_reconciliation,
+            "finalize_reserved_credits_in_session",
+            AsyncMock(),
+        ) as finalize,
+        patch.object(
+            billing_reconciliation,
+            "release_reserved_credits_in_session",
+            AsyncMock(),
+        ) as release,
+    ):
+        recovered = await billing_reconciliation.expire_stale_credit_reservations(db, now=now)
+
+    assert recovered == 2
+    finalize.assert_awaited_once_with(db, settlement.id)
+    release.assert_awaited_once_with(db, plain.id, status="expired")
+
+
+@pytest.mark.asyncio
 async def test_get_my_orders_returns_current_tenant_orders_for_client_history():
     tenant_id = uuid.uuid4()
     plan_id = uuid.uuid4()

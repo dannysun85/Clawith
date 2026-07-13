@@ -36,13 +36,16 @@ def minimax_text_credits(model: str | None, usage: TokenUsage) -> int:
     input to avoid double-charging prompt cache hits/writes.
     """
     model_name = (model or "").lower()
-    if "highspeed" in model_name:
+    # MiniMax-M3 switches to the documented long-context band once the whole
+    # request input (including cache hits) exceeds 512K tokens.
+    is_m3_long_context = "minimax-m3" in model_name and usage.input_tokens > 512_000
+    if "highspeed" in model_name or is_m3_long_context:
         input_per_m = Decimal("0.6")
         output_per_m = Decimal("2.4")
     else:
         input_per_m = Decimal("0.3")
         output_per_m = Decimal("1.2")
-    cache_read_per_m = Decimal("0.06")
+    cache_read_per_m = Decimal("0.12") if is_m3_long_context else Decimal("0.06")
     cache_write_per_m = Decimal("0.375")
 
     cache_read = max(usage.cache_read_tokens, 0)

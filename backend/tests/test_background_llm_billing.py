@@ -112,7 +112,7 @@ async def test_prepare_agent_llm_invocation_uses_platform_route_and_billing_pref
         tier="basic",
         enabled=True,
     )
-    route_meta = llm_caller.RouteMeta(saas_tier="lite", modality="text")
+    route_meta = llm_caller.RouteMeta(saas_tier="ultra", modality="text")
 
     with (
         patch.object(
@@ -149,7 +149,7 @@ async def test_prepare_agent_llm_invocation_uses_platform_route_and_billing_pref
 
 
 @pytest.mark.asyncio
-async def test_settle_agent_llm_invocation_records_pool_usage_and_charges_credits():
+async def test_settle_agent_llm_invocation_records_pool_usage_without_double_charging():
     agent_id = uuid.uuid4()
     user_id = uuid.uuid4()
     tenant_id = uuid.uuid4()
@@ -186,11 +186,12 @@ async def test_settle_agent_llm_invocation_records_pool_usage_and_charges_credit
         model=model,
         usage=usage,
         route_meta=route_meta,
+        charge_credits_enabled=False,
     )
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_settlement_writes_heartbeat_credit_charge_metadata():
+async def test_heartbeat_aggregate_settlement_only_consumes_agent_quota():
     agent_id = uuid.uuid4()
     user_id = uuid.uuid4()
     tenant_id = uuid.uuid4()
@@ -228,18 +229,98 @@ async def test_heartbeat_settlement_writes_heartbeat_credit_charge_metadata():
         )
 
     consume_quota.assert_awaited_once_with(agent_id, model_tier="lite")
-    charge_credits.assert_awaited_once()
-    assert charge_credits.await_args.kwargs == {
-        "tenant_id": tenant_id,
-        "user_id": user_id,
-        "agent_id": agent_id,
-        "action": "heartbeat",
-        "modality": "text",
-        "saas_tier": "lite",
-        "provider": "minimax",
-        "model": "MiniMax-M3",
-        "delta": 1,
-    }
+    charge_credits.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_llm_round_reserves_conservative_max_output_cost_before_provider_call():
+    reservation_id = uuid.uuid4()
+    tenant_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    model = SimpleNamespace(provider="minimax", model="MiniMax-M3")
+    route_meta = llm_caller.RouteMeta(saas_tier="ultra", modality="text")
+
+    with (
+        patch.object(llm_caller, "get_credit_cost", AsyncMock(return_value=1)),
+        patch.object(
+            llm_caller,
+            "reserve_credits",
+            AsyncMock(return_value=SimpleNamespace(id=reservation_id)),
+        ) as reserve,
+    ):
+        result = await llm_caller.reserve_llm_round_credits(
+            tenant_id=tenant_id,
+            user_id=None,
+            agent_id=agent_id,
+            model=model,
+            route_meta=route_meta,
+            messages=[llm_caller.LLMMessage(role="user", content="hello")],
+            tools=None,
+            max_tokens=8192,
+        )
+
+    assert result == reservation_id
+    assert reserve.await_args.kwargs["amount"] >= 10
+    assert reserve.await_args.kwargs["action"] == "chat"
+    assert reserve.await_args.kwargs["ref_type"] == "llm_round"
+
+
+@pytest.mark.asyncio
+async def test_llm_round_persists_exact_debt_before_final_ledger_charge():
+    events: list[str] = []
+    reservation_id = uuid.uuid4()
+    route_meta = llm_caller.RouteMeta(saas_tier="ultra", modality="text")
+    model = SimpleNamespace(provider="minimax", model="MiniMax-M3")
+    usage = TokenUsage(total_tokens=120, input_tokens=100, output_tokens=20)
+
+    async def mark_ready(*_args, **kwargs):
+        events.append(f"ready:{kwargs['amount']}")
+
+    async def finalize(*_args, **_kwargs):
+        events.append("finalize")
+
+    with (
+        patch.object(llm_caller, "get_credit_cost", AsyncMock(return_value=5)),
+        patch.object(llm_caller, "mark_credit_reservation_settlement_ready", mark_ready),
+        patch.object(llm_caller, "finalize_reserved_credits", finalize),
+    ):
+        await llm_caller.settle_llm_round_credits(
+            reservation_id,
+            usage=usage,
+            model=model,
+            route_meta=route_meta,
+            agent_id=uuid.uuid4(),
+            user_id=None,
+            tenant_id=uuid.uuid4(),
+        )
+
+    assert events == ["ready:5", "finalize"]
+
+
+@pytest.mark.asyncio
+async def test_llm_round_uses_dynamic_cost_when_it_exceeds_tier_minimum():
+    reservation_id = uuid.uuid4()
+    route_meta = llm_caller.RouteMeta(saas_tier="ultra", modality="text")
+    model = SimpleNamespace(provider="minimax", model="MiniMax-M3")
+    mark_ready = AsyncMock()
+
+    with (
+        patch.object(llm_caller, "get_credit_cost", AsyncMock(return_value=5)),
+        patch.object(llm_caller, "provider_text_credits", return_value=9),
+        patch.object(llm_caller, "mark_credit_reservation_settlement_ready", mark_ready),
+        patch.object(llm_caller, "finalize_reserved_credits", AsyncMock()),
+    ):
+        await llm_caller.settle_llm_round_credits(
+            reservation_id,
+            usage=TokenUsage(total_tokens=9000, input_tokens=8000, output_tokens=1000),
+            model=model,
+            route_meta=route_meta,
+            agent_id=uuid.uuid4(),
+            user_id=None,
+            tenant_id=uuid.uuid4(),
+        )
+
+    mark_ready.assert_awaited_once_with(reservation_id, amount=9)
 
 
 @pytest.mark.asyncio
@@ -290,7 +371,7 @@ async def test_call_llm_auto_resolves_missing_route_metadata_before_provider_use
 
 
 @pytest.mark.asyncio
-async def test_call_llm_records_provider_usage_but_does_not_charge_when_tool_loop_reaches_round_limit():
+async def test_call_llm_settles_each_provider_round_even_at_tool_round_limit():
     agent_id = uuid.uuid4()
     tenant_id = uuid.uuid4()
     credential_id = uuid.uuid4()
@@ -312,6 +393,7 @@ async def test_call_llm_records_provider_usage_but_does_not_charge_when_tool_loo
         usage={"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
     )
     client = FakeLLMClient(response)
+    reservation_id = uuid.uuid4()
 
     with (
         patch.object(llm_caller, "_get_agent_config", AsyncMock(return_value=(1, None))),
@@ -328,7 +410,13 @@ async def test_call_llm_records_provider_usage_but_does_not_charge_when_tool_loo
         patch("app.services.agent_context.build_agent_context", AsyncMock(return_value=("system", "dynamic"))),
         patch.object(llm_caller, "record_token_usage", AsyncMock()) as record_tokens,
         patch.object(llm_caller, "record_credential_call", AsyncMock()) as record_pool_usage,
-        patch.object(llm_caller, "_record_llm_usage_and_charge", AsyncMock()) as settle_credits,
+        patch.object(
+            llm_caller,
+            "reserve_llm_round_credits",
+            AsyncMock(return_value=reservation_id),
+        ) as reserve_round,
+        patch.object(llm_caller, "settle_llm_round_credits", AsyncMock()) as settle_round,
+        patch.object(llm_caller, "_record_llm_usage_and_charge", AsyncMock()) as settle_quota,
     ):
         result = await llm_caller.call_llm(
             model=model,
@@ -343,8 +431,66 @@ async def test_call_llm_records_provider_usage_but_does_not_charge_when_tool_loo
     assert result == "[Error] Too many tool call rounds"
     record_tokens.assert_awaited_once()
     record_pool_usage.assert_awaited_once_with(credential_id, tokens_used=120)
-    settle_credits.assert_not_awaited()
+    reserve_round.assert_awaited_once()
+    settle_round.assert_awaited_once()
+    assert settle_round.await_args.args == (reservation_id,)
+    assert settle_round.await_args.kwargs["usage"].total_tokens == 120
+    settle_quota.assert_awaited_once()
+    assert settle_quota.await_args.kwargs["charge_credits_enabled"] is False
     client.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_credit_reservation_failure_never_calls_or_degrades_provider():
+    agent_id = uuid.uuid4()
+    tenant_id = uuid.uuid4()
+    credential_id = uuid.uuid4()
+    model = SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=None,
+        provider="minimax",
+        model="MiniMax-M3",
+        modality="text",
+        tier="basic",
+        temperature=0.2,
+        max_output_tokens=256,
+    )
+    route_meta = llm_caller.RouteMeta(saas_tier="lite", modality="text")
+    client = SimpleNamespace(stream=AsyncMock(), close=AsyncMock())
+
+    with (
+        patch.object(llm_caller, "_get_agent_config", AsyncMock(return_value=(1, None))),
+        patch.object(llm_caller, "_get_user_name", AsyncMock(return_value=None)),
+        patch.object(llm_caller, "_prepare_llm_billing_context", AsyncMock(return_value=tenant_id)),
+        patch.object(llm_caller, "resolve_model_key", AsyncMock(return_value=("key", None, credential_id))),
+        patch.object(llm_caller, "create_llm_client", return_value=client),
+        patch.object(llm_caller, "get_agent_tools_for_llm", AsyncMock(return_value=[])),
+        patch("app.services.agent_context.build_agent_context", AsyncMock(return_value=("system", "dynamic"))),
+        patch.object(
+            llm_caller,
+            "reserve_llm_round_credits",
+            AsyncMock(side_effect=RuntimeError("database unavailable")),
+        ),
+        patch.object(llm_caller, "_record_llm_settlement_failure", AsyncMock()) as monitor,
+        patch.object(llm_caller, "_apply_credential_failure_policy", AsyncMock()) as degrade,
+        patch.object(llm_caller, "_record_llm_product_issue", AsyncMock()) as provider_issue,
+    ):
+        result = await llm_caller.call_llm(
+            model=model,
+            messages=[{"role": "user", "content": "run"}],
+            agent_name="Autonomous agent",
+            role_description="worker",
+            agent_id=agent_id,
+            user_id=uuid.uuid4(),
+            route_meta=route_meta,
+        )
+
+    assert result == "⚠️ Credits 预留暂时不可用，模型尚未调用，请稍后重试。"
+    client.stream.assert_not_awaited()
+    client.close.assert_awaited_once()
+    degrade.assert_not_awaited()
+    provider_issue.assert_not_awaited()
+    assert monitor.await_args.kwargs["stage"] == "credits_reserve"
 
 
 @pytest.mark.asyncio
@@ -371,6 +517,7 @@ async def test_completed_response_survives_credits_settlement_failure_and_is_mon
         usage={"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
     )
     client = FakeLLMClient(response)
+    reservation_id = uuid.uuid4()
 
     with (
         patch.object(llm_caller, "_get_agent_config", AsyncMock(return_value=(1, None))),
@@ -389,8 +536,24 @@ async def test_completed_response_survives_credits_settlement_failure_and_is_mon
         patch.object(llm_caller, "record_credential_call", AsyncMock()),
         patch.object(
             llm_caller,
-            "_record_llm_usage_and_charge",
+            "reserve_llm_round_credits",
+            AsyncMock(return_value=reservation_id),
+        ),
+        patch.object(llm_caller, "get_credit_cost", AsyncMock(return_value=1)),
+        patch.object(
+            llm_caller,
+            "mark_credit_reservation_settlement_ready",
+            AsyncMock(),
+        ) as mark_ready,
+        patch.object(
+            llm_caller,
+            "finalize_reserved_credits",
             AsyncMock(side_effect=RuntimeError("database unavailable")),
+        ),
+        patch.object(
+            llm_caller,
+            "_record_llm_usage_and_charge",
+            AsyncMock(),
         ),
         patch.object(llm_caller, "_record_llm_settlement_failure", AsyncMock()) as monitor,
     ):
@@ -406,8 +569,9 @@ async def test_completed_response_survives_credits_settlement_failure_and_is_mon
 
     assert result == "completed answer"
     client.close.assert_awaited_once()
+    mark_ready.assert_awaited_once_with(reservation_id, amount=1)
     monitor.assert_awaited_once()
-    assert monitor.await_args.kwargs["stage"] == "credits"
+    assert monitor.await_args.kwargs["stage"] == "credits_finalize"
 
 
 @pytest.mark.asyncio
@@ -463,6 +627,8 @@ async def test_call_llm_settles_completed_rounds_when_cancelled():
         usage={"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60},
     )
     client = FakeLLMClient(response, asyncio.CancelledError())
+    first_reservation_id = uuid.uuid4()
+    second_reservation_id = uuid.uuid4()
 
     with (
         patch.object(llm_caller, "_get_agent_config", AsyncMock(return_value=(2, None))),
@@ -478,7 +644,14 @@ async def test_call_llm_settles_completed_rounds_when_cancelled():
         ),
         patch("app.services.agent_context.build_agent_context", AsyncMock(return_value=("system", "dynamic"))),
         patch.object(llm_caller, "record_token_usage", AsyncMock()),
-        patch.object(llm_caller, "_record_llm_usage_and_charge", AsyncMock()) as settle_credits,
+        patch.object(
+            llm_caller,
+            "reserve_llm_round_credits",
+            AsyncMock(side_effect=[first_reservation_id, second_reservation_id]),
+        ),
+        patch.object(llm_caller, "settle_llm_round_credits", AsyncMock()) as settle_round,
+        patch.object(llm_caller, "release_llm_round_credits", AsyncMock()) as release_round,
+        patch.object(llm_caller, "_record_llm_usage_and_charge", AsyncMock()) as settle_quota,
     ):
         with pytest.raises(asyncio.CancelledError):
             await llm_caller.call_llm(
@@ -491,7 +664,12 @@ async def test_call_llm_settles_completed_rounds_when_cancelled():
                 route_meta=route_meta,
             )
 
-    settle_credits.assert_not_awaited()
+    settle_round.assert_awaited_once()
+    assert settle_round.await_args.args == (first_reservation_id,)
+    release_round.assert_awaited_once()
+    assert release_round.await_args.args == (second_reservation_id,)
+    settle_quota.assert_awaited_once()
+    assert settle_quota.await_args.kwargs["charge_credits_enabled"] is False
     client.close.assert_awaited_once()
 
 
@@ -521,6 +699,7 @@ async def test_call_llm_settles_completed_round_when_tool_execution_is_cancelled
         usage={"prompt_tokens": 80, "completion_tokens": 20, "total_tokens": 100},
     )
     client = FakeLLMClient(response)
+    reservation_id = uuid.uuid4()
     tools = [{
         "type": "function",
         "function": {
@@ -545,7 +724,13 @@ async def test_call_llm_settles_completed_round_when_tool_execution_is_cancelled
         patch("app.services.agent_context.build_agent_context", AsyncMock(return_value=("system", "dynamic"))),
         patch.object(llm_caller, "record_token_usage", AsyncMock()),
         patch.object(llm_caller, "execute_tool", AsyncMock(side_effect=asyncio.CancelledError())),
-        patch.object(llm_caller, "_record_llm_usage_and_charge", AsyncMock()) as settle_credits,
+        patch.object(
+            llm_caller,
+            "reserve_llm_round_credits",
+            AsyncMock(return_value=reservation_id),
+        ),
+        patch.object(llm_caller, "settle_llm_round_credits", AsyncMock()) as settle_round,
+        patch.object(llm_caller, "_record_llm_usage_and_charge", AsyncMock()) as settle_quota,
     ):
         with pytest.raises(asyncio.CancelledError):
             await llm_caller.call_llm(
@@ -558,7 +743,10 @@ async def test_call_llm_settles_completed_round_when_tool_execution_is_cancelled
                 route_meta=route_meta,
             )
 
-    settle_credits.assert_not_awaited()
+    settle_round.assert_awaited_once()
+    assert settle_round.await_args.args == (reservation_id,)
+    settle_quota.assert_awaited_once()
+    assert settle_quota.await_args.kwargs["charge_credits_enabled"] is False
     client.close.assert_awaited_once()
 
 
@@ -619,6 +807,14 @@ async def test_oneshot_finally_settles_usage_when_tool_execution_is_cancelled():
         ),
         patch("app.services.llm.create_llm_client", return_value=client),
         patch(
+            "app.services.llm.reserve_llm_round_credits",
+            AsyncMock(return_value=uuid.uuid4()),
+        ),
+        patch(
+            "app.services.llm.settle_llm_round_credits",
+            AsyncMock(),
+        ) as settle_round,
+        patch(
             "app.services.agent_tools.get_agent_tools_for_llm",
             AsyncMock(return_value=[]),
         ),
@@ -644,6 +840,7 @@ async def test_oneshot_finally_settles_usage_when_tool_execution_is_cancelled():
         usage=settle_credits.await_args.kwargs["usage"],
     )
     assert settle_credits.await_args.kwargs["usage"].total_tokens == 100
+    settle_round.assert_awaited_once()
     client.close.assert_awaited_once()
 
 
@@ -712,6 +909,14 @@ async def test_heartbeat_finally_settles_usage_when_tool_execution_is_cancelled(
         ),
         patch("app.services.llm.create_llm_client", return_value=client),
         patch(
+            "app.services.llm.reserve_llm_round_credits",
+            AsyncMock(return_value=uuid.uuid4()),
+        ),
+        patch(
+            "app.services.llm.settle_llm_round_credits",
+            AsyncMock(),
+        ) as settle_round,
+        patch(
             "app.services.agent_tools.get_agent_tools_for_llm",
             AsyncMock(return_value=[]),
         ),
@@ -734,6 +939,7 @@ async def test_heartbeat_finally_settles_usage_when_tool_execution_is_cancelled(
     assert settle_credits.await_args.kwargs["agent_id"] == agent_id
     assert settle_credits.await_args.kwargs["user_id"] == creator_id
     assert settle_credits.await_args.kwargs["usage"].total_tokens == 100
+    settle_round.assert_awaited_once()
     client.close.assert_awaited_once()
 
 

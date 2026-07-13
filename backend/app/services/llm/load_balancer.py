@@ -604,7 +604,10 @@ async def mark_credential_modality_quota_exceeded(
     normalized = _canonical_modality(modality)
     resource = credential_quota_resource_key(normalized, model)
     async with async_session() as db:
-        cred = await db.get(LLMCredential, credential_id)
+        # ``modality_status`` is one shared JSON document.  Serialize every
+        # read/modify/write operation on the credential row so two concurrent
+        # provider observations cannot silently overwrite each other.
+        cred = await db.get(LLMCredential, credential_id, with_for_update=True)
         if not cred:
             return
         statuses = dict(getattr(cred, "modality_status", None) or {})
@@ -645,7 +648,7 @@ async def clear_credential_modality_quota(
     normalized = _canonical_modality(modality)
     resource = credential_quota_resource_key(normalized, model)
     async with async_session() as db:
-        cred = await db.get(LLMCredential, credential_id)
+        cred = await db.get(LLMCredential, credential_id, with_for_update=True)
         if not cred:
             return False
         statuses = dict(getattr(cred, "modality_status", None) or {})

@@ -290,7 +290,7 @@ async def test_invalid_finish_does_not_stop_and_is_returned_as_tool_error(monkey
 
 
 @pytest.mark.asyncio
-async def test_repeated_malformed_tool_json_trips_non_billable_circuit_breaker(monkeypatch):
+async def test_repeated_malformed_tool_json_trips_billable_circuit_breaker(monkeypatch):
     from app.services.llm import caller
 
     malformed = _finish_response_with_arguments('{"content":"unterminated')
@@ -316,7 +316,7 @@ async def test_repeated_malformed_tool_json_trips_non_billable_circuit_breaker(m
     )
 
     assert "连续 3 次无效" in result
-    assert "不会扣除" in result
+    assert "已发生的模型调用已正常结算" in result
     assert len(fake_client.messages_seen) == 3
     assert fake_client.closed is True
 

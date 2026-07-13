@@ -14,16 +14,33 @@ from app.models.trigger import AgentTrigger
 from app.models.trigger_execution import TriggerExecution
 
 settings = get_settings()
+TRIGGER_EXECUTION_LEASE_SECONDS = 300
 
 
-async def mark_trigger_executions_completed(execution_ids: list[uuid.UUID]) -> None:
-    if not execution_ids:
-        return
+ExecutionClaim = tuple[uuid.UUID, str]
+
+
+def _claim_fence(claims: list[ExecutionClaim]):
+    return or_(
+        *(
+            and_(
+                TriggerExecution.id == execution_id,
+                TriggerExecution.lease_owner == lease_token,
+            )
+            for execution_id, lease_token in claims
+        )
+    )
+
+
+async def mark_trigger_executions_completed(claims: list[ExecutionClaim]) -> int:
+    """Complete only executions still owned by the exact claim generation."""
+    if not claims:
+        return 0
     async with async_session() as db:
-        await db.execute(
+        result = await db.execute(
             update(TriggerExecution)
             .where(
-                TriggerExecution.id.in_(execution_ids),
+                _claim_fence(claims),
                 TriggerExecution.status == "processing",
             )
             .values(
@@ -35,16 +52,21 @@ async def mark_trigger_executions_completed(execution_ids: list[uuid.UUID]) -> N
             )
         )
         await db.commit()
+        return result.rowcount or 0
 
 
-async def mark_trigger_executions_failed(execution_ids: list[uuid.UUID], error_text: str) -> None:
-    if not execution_ids:
-        return
+async def mark_trigger_executions_failed(
+    claims: list[ExecutionClaim],
+    error_text: str,
+) -> int:
+    """Fail only executions still owned by the exact claim generation."""
+    if not claims:
+        return 0
     async with async_session() as db:
-        await db.execute(
+        result = await db.execute(
             update(TriggerExecution)
             .where(
-                TriggerExecution.id.in_(execution_ids),
+                _claim_fence(claims),
                 TriggerExecution.status == "processing",
             )
             .values(
@@ -56,6 +78,29 @@ async def mark_trigger_executions_failed(execution_ids: list[uuid.UUID], error_t
             )
         )
         await db.commit()
+        return result.rowcount or 0
+
+
+async def renew_trigger_execution_leases(
+    claims: list[ExecutionClaim],
+    *,
+    lease_seconds: int = TRIGGER_EXECUTION_LEASE_SECONDS,
+) -> int:
+    """Extend live claims; a short count is a fencing failure for the caller."""
+    if not claims:
+        return 0
+    lease_until = datetime.now(timezone.utc) + timedelta(seconds=max(lease_seconds, 30))
+    async with async_session() as db:
+        result = await db.execute(
+            update(TriggerExecution)
+            .where(
+                _claim_fence(claims),
+                TriggerExecution.status == "processing",
+            )
+            .values(lease_expires_at=lease_until)
+        )
+        await db.commit()
+        return result.rowcount or 0
 
 
 async def claim_pending_trigger_executions(
@@ -64,7 +109,7 @@ async def claim_pending_trigger_executions(
     limit: int = 100,
 ) -> list[tuple[TriggerExecution, AgentTrigger]]:
     now = datetime.now(timezone.utc)
-    lease_until = now + timedelta(minutes=5)
+    lease_until = now + timedelta(seconds=TRIGGER_EXECUTION_LEASE_SECONDS)
     claimed_pairs: list[tuple[TriggerExecution, AgentTrigger]] = []
     sources = sources or ["webhook", "cron", "once", "interval", "poll", "on_message", "a2a"]
     eligible_execution = or_(
@@ -124,7 +169,9 @@ async def claim_pending_trigger_executions(
             execution.status = "processing"
             execution.started_at = execution.started_at or now
             execution.finished_at = None
-            execution.lease_owner = settings.INSTANCE_ID
+            # Every claim/reclaim gets a unique generation token.  INSTANCE_ID
+            # alone cannot fence an older coroutine in the same process.
+            execution.lease_owner = f"{settings.INSTANCE_ID}:{uuid.uuid4().hex}"
             execution.lease_expires_at = lease_until
             claimed_pairs.append((execution, trigger))
         await db.commit()
@@ -140,6 +187,7 @@ def build_execution_runtime_trigger(trigger: AgentTrigger, execution: TriggerExe
     runtime_cfg = {
         **(trigger.config or {}),
         "_execution_id": str(execution.id),
+        "_execution_lease_token": execution.lease_owner,
     }
     if execution.payload:
         runtime_cfg.update(execution.payload)

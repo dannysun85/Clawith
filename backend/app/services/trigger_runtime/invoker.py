@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json as _json
 import uuid
 from datetime import datetime, timezone
@@ -16,6 +17,7 @@ from app.models.trigger import AgentTrigger
 from app.services.trigger_runtime import (
     mark_trigger_executions_completed,
     mark_trigger_executions_failed,
+    renew_trigger_execution_leases,
 )
 
 
@@ -116,31 +118,94 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
     from app.services.audit_logger import write_audit_log
     from app.services.llm import call_llm, resolve_agent_model
 
+    execution_claims = [
+        (
+            uuid.UUID(str((t.config or {}).get("_execution_id"))),
+            str((t.config or {}).get("_execution_lease_token")),
+        )
+        for t in triggers
+        if (t.config or {}).get("_execution_id")
+        and (t.config or {}).get("_execution_lease_token")
+    ]
+    invocation_task = asyncio.current_task()
+    lease_renewal_task = None
+
+    async def _renew_execution_claims() -> None:
+        while True:
+            await asyncio.sleep(60)
+            try:
+                renewed = await renew_trigger_execution_leases(execution_claims)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "Trigger lease renewal failed agent_id={} error_type={}",
+                    agent_id,
+                    type(exc).__name__,
+                )
+                renewed = 0
+            if renewed != len(execution_claims):
+                logger.error(
+                    "Trigger lease fence lost agent_id={} expected={} renewed={}",
+                    agent_id,
+                    len(execution_claims),
+                    renewed,
+                )
+                if invocation_task is not None:
+                    invocation_task.cancel()
+                return
+
+    if execution_claims:
+        lease_renewal_task = asyncio.create_task(_renew_execution_claims())
+
+    async def _stop_lease_renewal() -> None:
+        nonlocal lease_renewal_task
+        if lease_renewal_task is None:
+            return
+        lease_renewal_task.cancel()
+        await asyncio.gather(lease_renewal_task, return_exceptions=True)
+        lease_renewal_task = None
+
     try:
-        execution_ids = [
+        legacy_unfenced_execution_ids = [
             uuid.UUID(str((t.config or {}).get("_execution_id")))
             for t in triggers
             if (t.config or {}).get("_execution_id")
+            and not (t.config or {}).get("_execution_lease_token")
         ]
+        if legacy_unfenced_execution_ids:
+            raise RuntimeError("Trigger execution is missing its claim-generation fence")
         async with async_session() as db:
             result = await db.execute(select(Agent).where(Agent.id == agent_id))
             agent = result.scalar_one_or_none()
             if not agent or agent.is_expired:
-                if execution_ids:
-                    await mark_trigger_executions_failed(execution_ids, "Agent not found or is expired")
+                if execution_claims:
+                    await _stop_lease_renewal()
+                    await mark_trigger_executions_failed(
+                        execution_claims,
+                        "Agent not found or is expired",
+                    )
                 return
 
             primary_model, fallback_model, route_meta = await resolve_agent_model(agent)
             model = primary_model or fallback_model
             if not model:
                 logger.warning(f"Agent {agent.id} has no LLM model, skipping trigger invocation")
-                if execution_ids:
-                    await mark_trigger_executions_failed(execution_ids, "Agent has no LLM model configured")
+                if execution_claims:
+                    await _stop_lease_renewal()
+                    await mark_trigger_executions_failed(
+                        execution_claims,
+                        "Agent has no LLM model configured",
+                    )
                 return
             if not model.enabled:
                 logger.warning(f"Agent {agent.id} model is unavailable, skipping trigger invocation")
-                if execution_ids:
-                    await mark_trigger_executions_failed(execution_ids, "Agent model is unavailable or disabled")
+                if execution_claims:
+                    await _stop_lease_renewal()
+                    await mark_trigger_executions_failed(
+                        execution_claims,
+                        "Agent model is unavailable or disabled",
+                    )
                 return
 
             context_parts = []
@@ -438,25 +503,40 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
             agent_id=agent_id,
         )
 
-        if execution_ids:
-            await mark_trigger_executions_completed(execution_ids)
+        if execution_claims:
+            await _stop_lease_renewal()
+            completed = await mark_trigger_executions_completed(execution_claims)
+            if completed != len(execution_claims):
+                raise RuntimeError("Trigger execution lease was lost before completion")
+    except asyncio.CancelledError:
+        if execution_claims:
+            try:
+                await _stop_lease_renewal()
+                await mark_trigger_executions_failed(
+                    execution_claims,
+                    "Trigger invocation cancelled or lease fence lost",
+                )
+            except Exception as mark_error:
+                logger.error(
+                    "Failed to fence cancelled trigger executions error_type={}",
+                    type(mark_error).__name__,
+                )
+        raise
     except Exception as e:
         logger.error(
             "Failed to invoke agent {} for triggers error_type={}",
             agent_id,
             type(e).__name__,
         )
-        execution_ids = [
-            uuid.UUID(str((t.config or {}).get("_execution_id")))
-            for t in triggers
-            if (t.config or {}).get("_execution_id")
-        ]
-        if execution_ids:
+        if execution_claims:
             try:
-                await mark_trigger_executions_failed(execution_ids, str(e)[:2000])
+                await _stop_lease_renewal()
+                await mark_trigger_executions_failed(execution_claims, str(e)[:2000])
             except Exception as mark_error:
                 logger.error(
                     "Failed to mark trigger executions failed error_type={}",
                     type(mark_error).__name__,
                 )
         await _capture_invocation_failure(agent_id, e)
+    finally:
+        await _stop_lease_renewal()

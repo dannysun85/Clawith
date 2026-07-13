@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,10 +24,6 @@ from app.models.subscription import (
 )
 from app.services.modalities import canonicalize_modality
 from app.services.quota_guard import QuotaExceeded, subscription_action_message
-
-if TYPE_CHECKING:
-    from app.models.subscription import CreditBalance as CreditBalanceType
-
 
 IDEMPOTENT_GRANT_REASONS = {"subscribe", "topup", "refund", "refund_clawback"}
 
@@ -404,6 +399,74 @@ async def finalize_reserved_credits(reservation_id: uuid.UUID) -> CreditTransact
         return tx
 
 
+async def mark_credit_reservation_settlement_ready(
+    reservation_id: uuid.UUID,
+    *,
+    amount: int,
+) -> CreditReservation:
+    """Persist the exact provider debt before a result or side effect is released.
+
+    The reservation itself is the durable settlement outbox.  ``reserved``
+    means that no provider response has completed yet; ``settlement_ready``
+    means the provider has completed and the exact amount must never be
+    released by an expiry/error path.  The balance hold is resized under the
+    same row locks, so concurrent calls cannot all pass a read-only preflight.
+    """
+    async with async_session() as db:
+        reservation = await mark_credit_reservation_settlement_ready_in_session(
+            db,
+            reservation_id,
+            amount=amount,
+        )
+        await db.commit()
+        return reservation
+
+
+async def mark_credit_reservation_settlement_ready_in_session(
+    db: AsyncSession,
+    reservation_id: uuid.UUID,
+    *,
+    amount: int,
+) -> CreditReservation:
+    """Resize and mark a reservation as an irrevocable provider debt."""
+    exact_amount = max(int(amount or 0), 0)
+    reservation = await db.get(CreditReservation, reservation_id, with_for_update=True)
+    if not reservation:
+        raise ValueError("Credit reservation not found")
+    if reservation.status == "finalized":
+        return reservation
+    if reservation.status == "settlement_ready":
+        if reservation.amount != exact_amount:
+            raise ValueError("Credit reservation already has a different settlement amount")
+        return reservation
+    if reservation.status != "reserved":
+        raise ValueError(
+            f"Credit reservation is not settlement-ready eligible (status={reservation.status})"
+        )
+
+    result = await db.execute(
+        select(CreditBalance)
+        .where(CreditBalance.tenant_id == reservation.tenant_id)
+        .with_for_update()
+    )
+    balance_row = result.scalar_one_or_none()
+    if not balance_row:
+        raise ValueError("Credit balance not found for reservation")
+
+    # A provider response has already incurred this debt.  If the conservative
+    # pre-hold underestimated it, keep the full amount reserved even when it
+    # temporarily exceeds the current balance.  Future calls remain blocked;
+    # reconciliation finalizes after a top-up instead of losing the debt.
+    balance_row.reserved = max(
+        (balance_row.reserved or 0) + exact_amount - reservation.amount,
+        0,
+    )
+    balance_row.updated_at = datetime.now(timezone.utc)
+    reservation.amount = exact_amount
+    reservation.status = "settlement_ready"
+    return reservation
+
+
 async def finalize_reserved_credits_in_session(
     db: AsyncSession,
     reservation_id: uuid.UUID,
@@ -429,7 +492,7 @@ async def finalize_reserved_credits_in_session(
         reservation.finalized_at = reservation.finalized_at or datetime.now(timezone.utc)
         return existing_tx
 
-    if reservation.status != "reserved":
+    if reservation.status not in {"reserved", "settlement_ready"}:
         raise ValueError(f"Credit reservation is not finalizable (status={reservation.status})")
 
     result = await db.execute(

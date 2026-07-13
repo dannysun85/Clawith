@@ -15,7 +15,10 @@ from app.config import get_settings
 from app.database import async_session
 from app.models.subscription import CreditBalance, CreditReservation, CreditTransaction, PaymentOrder
 from app.models.media_generation import MediaGenerationTask
-from app.services.credit_service import release_reserved_credits_in_session
+from app.services.credit_service import (
+    finalize_reserved_credits_in_session,
+    release_reserved_credits_in_session,
+)
 
 
 @dataclass(slots=True)
@@ -71,7 +74,9 @@ async def check_credit_ledger_integrity(
     tx_result = await db.execute(tx_stmt)
     transactions = list(tx_result.scalars().all())
 
-    reservation_stmt = select(CreditReservation).where(CreditReservation.status == "reserved")
+    reservation_stmt = select(CreditReservation).where(
+        CreditReservation.status.in_(("reserved", "settlement_ready"))
+    )
     if tenant_id:
         reservation_stmt = reservation_stmt.where(CreditReservation.tenant_id == tenant_id)
     reservation_result = await db.execute(reservation_stmt)
@@ -117,7 +122,7 @@ async def expire_stale_credit_reservations(
     *,
     now: datetime | None = None,
 ) -> int:
-    """Release reservations whose expiry has passed."""
+    """Recover expired reservations without discarding completed provider debt."""
     if db is None:
         # Import recoverable legacy tasks before an expiry sweep can release
         # their reserved Credits during the first startup after migration.
@@ -136,18 +141,37 @@ async def expire_stale_credit_reservations(
     )
     result = await db.execute(
         select(CreditReservation).where(
-            CreditReservation.status == "reserved",
+            CreditReservation.status.in_(("reserved", "settlement_ready")),
             CreditReservation.expires_at.is_not(None),
             CreditReservation.expires_at <= now,
             CreditReservation.id.not_in(active_media_reservations),
         )
     )
     reservations = list(result.scalars().all())
+    recovered = 0
     for reservation in reservations:
-        await release_reserved_credits_in_session(db, reservation.id, status="expired")
+        if reservation.status == "settlement_ready":
+            try:
+                await finalize_reserved_credits_in_session(db, reservation.id)
+            except Exception as exc:
+                # The durable debt stays held for the next sweep (or a top-up).
+                logger.error(
+                    "[billing] settlement-ready reservation recovery failed "
+                    "reservation_id={} error_type={}",
+                    reservation.id,
+                    type(exc).__name__,
+                )
+                continue
+        else:
+            await release_reserved_credits_in_session(db, reservation.id, status="expired")
+        recovered += 1
     if reservations:
-        logger.info("[billing] expired stale credit reservations count={}", len(reservations))
-    return len(reservations)
+        logger.info(
+            "[billing] stale reservation sweep candidates={} recovered={}",
+            len(reservations),
+            recovered,
+        )
+    return recovered
 
 
 async def reconcile_pending_payment_orders(

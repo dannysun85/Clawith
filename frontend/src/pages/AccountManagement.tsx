@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { fetchJson } from '../services/api';
 import { useAuthStore } from '../stores';
 import { MODALITIES } from '../constants/modalities';
+import { summarizeCredentialQuota } from '../utils/credentialQuotaStatus';
 
 interface Credential {
     id: string;
@@ -245,12 +246,10 @@ export default function AccountManagement() {
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                 {creds.map((c) => {
                     const h = healthMap.get(c.id);
-                    const blockedModalities = Object.entries(c.modality_status || {})
-                        .filter(([, value]) => value?.status === 'quota_exceeded')
-                        .map(([resource, value]) => {
-                            const modality = resource.split(':', 1)[0];
-                            return value.model ? `${modality} (${value.model})` : modality;
-                        });
+                    const {
+                        blockedLabels: blockedModalities,
+                        sharedPlanBlocked,
+                    } = summarizeCredentialQuota(c.modality_status);
                     return (
                         <div key={c.id} className="card" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                             <div style={{ flex: 1 }}>
@@ -271,7 +270,9 @@ export default function AccountManagement() {
                                 </div>
                                 {blockedModalities.length > 0 && (
                                     <div role="status" style={{ fontSize: 11, color: 'var(--warning)', marginTop: 4 }}>
-                                        {t('account.modalityQuotaLimited', '供应商独立配额已达上限')}: {blockedModalities.join(' / ')} · {t('account.otherModalitiesAvailable', '其他能力仍可正常调用')}
+                                        {sharedPlanBlocked
+                                            ? t('account.sharedPlanQuotaLimited', 'MiniMax Token Plan 共享额度已达上限，该账号的所有调用能力均暂停')
+                                            : <>{t('account.modalityQuotaLimited', '供应商独立配额已达上限')}: {blockedModalities.join(' / ')} · {t('account.otherModalitiesAvailable', '其他能力仍可正常调用')}</>}
                                     </div>
                                 )}
                             </div>

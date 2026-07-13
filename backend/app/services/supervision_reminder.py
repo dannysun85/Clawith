@@ -109,7 +109,10 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
         create_llm_client,
         LLMMessage,
         prepare_agent_llm_invocation,
+        release_llm_round_credits,
+        reserve_llm_round_credits,
         settle_agent_llm_invocation,
+        settle_llm_round_credits,
     )
     from app.services.quota_guard import QuotaExceeded
     from app.services.token_tracker import (
@@ -144,7 +147,18 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
         timeout=float(getattr(model, 'request_timeout', None) or 60.0),
     )
     usage = None
+    round_reservation_id = None
     try:
+        round_reservation_id = await reserve_llm_round_credits(
+            tenant_id=invocation.tenant_id,
+            user_id=target_agent.creator_id,
+            agent_id=target_agent.id,
+            model=model,
+            route_meta=invocation.route_meta,
+            messages=messages,
+            tools=None,
+            max_tokens=512,
+        )
         response = await client.complete(
             messages=messages,
             temperature=model.temperature,
@@ -156,10 +170,56 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
             usage = estimate_token_usage_from_chars(
                 len(static_prompt) + len(dynamic_prompt) + len(message) + len(content)
             )
+        try:
+            await settle_llm_round_credits(
+                round_reservation_id,
+                usage=usage,
+                model=model,
+                route_meta=invocation.route_meta,
+                agent_id=target_agent.id,
+                user_id=target_agent.creator_id,
+                tenant_id=invocation.tenant_id,
+            )
+        except Exception:
+            await release_llm_round_credits(
+                round_reservation_id,
+                model=model,
+                route_meta=invocation.route_meta,
+                agent_id=target_agent.id,
+                user_id=target_agent.creator_id,
+                tenant_id=invocation.tenant_id,
+            )
+            return None
         return content if content else None
+    except asyncio.CancelledError:
+        await release_llm_round_credits(
+            round_reservation_id,
+            model=model,
+            route_meta=invocation.route_meta,
+            agent_id=target_agent.id,
+            user_id=target_agent.creator_id,
+            tenant_id=invocation.tenant_id,
+        )
+        raise
     except LLMError as e:
+        await release_llm_round_credits(
+            round_reservation_id,
+            model=model,
+            route_meta=invocation.route_meta,
+            agent_id=target_agent.id,
+            user_id=target_agent.creator_id,
+            tenant_id=invocation.tenant_id,
+        )
         logger.error(f"_get_agent_reply LLM error: {e}")
     except Exception as e:
+        await release_llm_round_credits(
+            round_reservation_id,
+            model=model,
+            route_meta=invocation.route_meta,
+            agent_id=target_agent.id,
+            user_id=target_agent.creator_id,
+            tenant_id=invocation.tenant_id,
+        )
         logger.error(f"_get_agent_reply LLM call failed: {e}")
     finally:
         try:

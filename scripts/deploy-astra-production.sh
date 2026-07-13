@@ -330,11 +330,28 @@ NGINX_BACKUP="$BACKUP/astra-poc.nginx.before.conf"
 NGINX_SWITCHED=0
 OLD_WORKER_STOPPED=0
 OLD_APP_STOPPED=0
+MIGRATION_APPLIED=0
+PRE_MIGRATION_REVISION=""
 
 rollback() {
     echo "[remote] rollback to $PREVIOUS" >&2
     set +e
     rm -f "$SMOKE_ENV_FILE"
+    # Stop every candidate process that can touch the database before schema
+    # rollback. If downgrade fails after cutover, keeping the candidate API
+    # stopped deliberately fails closed instead of serving new code against an
+    # older or partially restored schema.
+    compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" stop worker backend
+    if [ "$MIGRATION_APPLIED" = "1" ]; then
+        echo "[remote] restoring database revision $PRE_MIGRATION_REVISION"
+        if ! compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" \
+            run --rm --no-deps -T --entrypoint alembic backend downgrade "$PRE_MIGRATION_REVISION" < /dev/null; then
+            echo "[remote] CRITICAL: database downgrade failed; candidate API is stopped and workers remain quiesced" >&2
+            echo "[remote] backup available at $BACKUP/db.sql.gz" >&2
+            return
+        fi
+        MIGRATION_APPLIED=0
+    fi
     if [ "$NGINX_SWITCHED" = "1" ] && [ -f "$NGINX_BACKUP" ]; then
         sudo cp "$NGINX_BACKUP" "$NGINX_SITE"
         sudo nginx -t >/dev/null && sudo systemctl reload nginx
@@ -361,9 +378,21 @@ echo "[remote] quiescing old worker before automation-state migrations"
 compose_project "$OLD_PROJECT" "$PREVIOUS/.env" "$PREVIOUS/$COMPOSE_FILE" stop --timeout 90 worker
 OLD_WORKER_STOPPED=1
 
+PRE_MIGRATION_REVISION="$(
+    compose_project "$COMPOSE_PROJECT" "$PREVIOUS/.env" "$PREVIOUS/$COMPOSE_FILE" \
+        exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
+        'SELECT version_num FROM alembic_version ORDER BY version_num' < /dev/null
+)"
+if [ -z "$PRE_MIGRATION_REVISION" ] || printf '%s\n' "$PRE_MIGRATION_REVISION" | grep -q '[[:space:]]'; then
+    echo "expected exactly one pre-migration Alembic revision, got: $PRE_MIGRATION_REVISION" >&2
+    exit 1
+fi
+printf '%s\n' "$PRE_MIGRATION_REVISION" > "$BACKUP/alembic-revision.previous.txt"
+
 echo "[remote] applying migrations before candidate startup"
 compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" \
     run --rm --no-deps -T --entrypoint alembic backend upgrade head < /dev/null
+MIGRATION_APPLIED=1
 
 compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" up -d --no-deps backend
 echo "[remote] waiting for candidate backend health"

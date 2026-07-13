@@ -93,16 +93,31 @@ def _ensure_m3_model(tier: str, *, max_output_tokens: int, thinking: str, servic
     )
     _exec(
         f"""
-        INSERT INTO llm_models (
-            id, provider, model, api_key_encrypted, label, enabled, supports_vision,
-            modality, modalities, tier, capabilities, max_output_tokens
-        )
-        VALUES (
-            '{model_id}'::uuid, 'minimax', 'MiniMax-M3', 'platform-credential-pool',
-            '{label}', true, true,
-            'multimodal', '["text","image","video"]'::jsonb, '{tier}',
-            '{capabilities}'::jsonb, {max_output_tokens}
-        )
+        DO $seed_model$
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                FROM llm_models
+                WHERE id = '{model_id}'::uuid
+                  AND COALESCE(capabilities::jsonb ->> 'seed_revision', '')
+                      <> '{SEED_REVISION}'
+            ) THEN
+                RAISE EXCEPTION
+                    'reserved MiniMax-M3 model id {model_id} is administrator-owned';
+            END IF;
+
+            INSERT INTO llm_models (
+                id, provider, model, api_key_encrypted, label, enabled, supports_vision,
+                modality, modalities, tier, capabilities, max_output_tokens
+            )
+            VALUES (
+                '{model_id}'::uuid, 'minimax', 'MiniMax-M3', 'platform-credential-pool',
+                '{label}', true, true,
+                'text', '["text","image","video"]'::jsonb, '{tier}',
+                '{capabilities}'::jsonb, {max_output_tokens}
+            )
+            ON CONFLICT (id) DO NOTHING;
+        END $seed_model$
         """
     )
 
@@ -216,6 +231,18 @@ def downgrade() -> None:
 
     # Deterministic IDs are the ownership boundary: never infer ownership from
     # a label, priority, provider, or capability that an administrator can use.
+    # Administrator routes may legitimately point at a seeded fallback. Detach
+    # only that edge before removing revision-owned routes so rollback cannot
+    # fail on the self-referential foreign key.
+    _exec(
+        f"""
+        UPDATE model_routes
+        SET fallback_route_id = NULL,
+            updated_at = now()
+        WHERE fallback_route_id IN ({route_ids})
+          AND id NOT IN ({route_ids})
+        """
+    )
     _exec(
         f"""
         DELETE FROM model_routes
@@ -265,6 +292,13 @@ def downgrade() -> None:
         WHERE model.id IN ({model_ids})
           AND NOT EXISTS (
               SELECT 1 FROM model_routes WHERE llm_model_id = model.id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM agents
+              WHERE primary_model_id = model.id OR fallback_model_id = model.id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM tenants WHERE default_model_id = model.id
           )
         """
     )

@@ -322,13 +322,18 @@ async def test_reset_daily_resets_all_counters_but_only_restores_local_daily_cap
 @pytest.mark.asyncio
 async def test_modality_quota_mutators_do_not_poison_global_status():
     cred = _cred()
-    sess, _ = _patch_session(get_value=cred)
+    sess, fake_db = _patch_session(get_value=cred)
     with sess:
         await load_balancer.mark_credential_modality_quota_exceeded(
             cred.id,
             "video",
             error_code="2056",
         )
+    fake_db.get.assert_awaited_once_with(
+        load_balancer.LLMCredential,
+        cred.id,
+        with_for_update=True,
+    )
     assert cred.status == "healthy"
     assert cred.modality_status["video"]["status"] == "quota_exceeded"
     assert cred.error_count == 1
@@ -342,9 +347,14 @@ async def test_modality_quota_mutators_do_not_poison_global_status():
         )
     assert cred.error_count == 1
 
-    sess, _ = _patch_session(get_value=cred)
+    sess, fake_db = _patch_session(get_value=cred)
     with sess:
         assert await load_balancer.clear_credential_modality_quota(cred.id, "video") is True
+    fake_db.get.assert_awaited_once_with(
+        load_balancer.LLMCredential,
+        cred.id,
+        with_for_update=True,
+    )
     assert cred.modality_status == {}
 
 

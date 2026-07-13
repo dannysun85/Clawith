@@ -279,7 +279,15 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
         full_instruction = heartbeat_instruction + recent_context + inbox_context
 
         # Call LLM with tools using unified client
-        from app.services.llm import create_llm_client, get_max_tokens, LLMMessage, LLMError
+        from app.services.llm import (
+            LLMError,
+            LLMMessage,
+            create_llm_client,
+            get_max_tokens,
+            release_llm_round_credits,
+            reserve_llm_round_credits,
+            settle_llm_round_credits,
+        )
         from app.services.agent_tools import execute_tool, get_agent_tools_for_llm
 
         try:
@@ -314,6 +322,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
             LLMMessage(role="system", content=static_prompt, dynamic_content=dynamic_prompt),
             LLMMessage(role="user", content=full_instruction)
         ]
+        max_tokens = get_max_tokens(model_provider, model_model, model_max_output_tokens)
 
         for round_i in range(20):  # More rounds for search + write + plaza
             # Check token usage limit mid-loop (every 3 rounds)
@@ -330,18 +339,65 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                         reply = _token_limit_msg
                         break
 
+            round_reservation_id = None
             try:
+                round_reservation_id = await reserve_llm_round_credits(
+                    tenant_id=llm_invocation.tenant_id,
+                    user_id=agent_creator_id,
+                    agent_id=agent_id,
+                    model=llm_invocation.model,
+                    route_meta=llm_invocation.route_meta,
+                    messages=llm_messages,
+                    tools=tools_for_llm,
+                    max_tokens=max_tokens,
+                )
                 response = await client.complete(
                     messages=llm_messages,
                     tools=tools_for_llm,
                     temperature=model_temperature,
-                    max_tokens=get_max_tokens(model_provider, model_model, model_max_output_tokens),
+                    max_tokens=max_tokens,
                 )
+            except asyncio.CancelledError:
+                await release_llm_round_credits(
+                    round_reservation_id,
+                    model=llm_invocation.model,
+                    route_meta=llm_invocation.route_meta,
+                    agent_id=agent_id,
+                    user_id=agent_creator_id,
+                    tenant_id=llm_invocation.tenant_id,
+                )
+                raise
+            except QuotaExceeded:
+                await release_llm_round_credits(
+                    round_reservation_id,
+                    model=llm_invocation.model,
+                    route_meta=llm_invocation.route_meta,
+                    agent_id=agent_id,
+                    user_id=agent_creator_id,
+                    tenant_id=llm_invocation.tenant_id,
+                )
+                raise
             except LLMError as e:
+                await release_llm_round_credits(
+                    round_reservation_id,
+                    model=llm_invocation.model,
+                    route_meta=llm_invocation.route_meta,
+                    agent_id=agent_id,
+                    user_id=agent_creator_id,
+                    tenant_id=llm_invocation.tenant_id,
+                )
                 logger.error(f"LLM error in heartbeat: {e}")
                 reply = ""
                 break
             except Exception as e:
+                await release_llm_round_credits(
+                    round_reservation_id,
+                    model=llm_invocation.model,
+                    route_meta=llm_invocation.route_meta,
+                    agent_id=agent_id,
+                    user_id=agent_creator_id,
+                    tenant_id=llm_invocation.tenant_id,
+                )
                 logger.error(f"LLM call error in heartbeat: {e}")
                 reply = ""
                 break
@@ -353,6 +409,27 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                 usage = estimate_token_usage_from_chars(round_chars)
             _hb_accumulated_usage.add(usage)
             _hb_unsaved_usage.add(usage)
+            try:
+                await settle_llm_round_credits(
+                    round_reservation_id,
+                    usage=usage,
+                    model=llm_invocation.model,
+                    route_meta=llm_invocation.route_meta,
+                    agent_id=agent_id,
+                    user_id=agent_creator_id,
+                    tenant_id=llm_invocation.tenant_id,
+                )
+            except Exception:
+                await release_llm_round_credits(
+                    round_reservation_id,
+                    model=llm_invocation.model,
+                    route_meta=llm_invocation.route_meta,
+                    agent_id=agent_id,
+                    user_id=agent_creator_id,
+                    tenant_id=llm_invocation.tenant_id,
+                )
+                reply = "⚠️ Credits 结算暂时不可用，本轮结果未执行。"
+                break
 
             if response.tool_calls:
                 # Add assistant message with tool calls
@@ -706,6 +783,9 @@ async def run_agent_oneshot(
             get_max_tokens,
             LLMMessage,
             LLMError,
+            release_llm_round_credits,
+            reserve_llm_round_credits,
+            settle_llm_round_credits,
         )
         from app.services.agent_tools import execute_tool, get_agent_tools_for_llm
         from app.services.token_tracker import (
@@ -738,6 +818,7 @@ async def run_agent_oneshot(
         reply = ""
         accumulated_usage = TokenUsage()
         unsaved_usage = TokenUsage()
+        max_tokens = get_max_tokens(model_provider, model_model, model_max_output_tokens)
 
         for round_i in range(max_rounds):
             # Check token usage limit mid-loop (every 3 rounds)
@@ -756,14 +837,53 @@ async def run_agent_oneshot(
                         reply = _token_limit_msg
                         break
 
+            round_reservation_id = None
             try:
+                round_reservation_id = await reserve_llm_round_credits(
+                    tenant_id=llm_invocation.tenant_id,
+                    user_id=agent_creator_id,
+                    agent_id=agent_id,
+                    model=llm_invocation.model,
+                    route_meta=llm_invocation.route_meta,
+                    messages=llm_messages,
+                    tools=tools_for_llm,
+                    max_tokens=max_tokens,
+                )
                 response = await client.complete(
                     messages=llm_messages,
                     tools=tools_for_llm,
                     temperature=model_temperature,
-                    max_tokens=get_max_tokens(model_provider, model_model, model_max_output_tokens),
+                    max_tokens=max_tokens,
                 )
+            except asyncio.CancelledError:
+                await release_llm_round_credits(
+                    round_reservation_id,
+                    model=llm_invocation.model,
+                    route_meta=llm_invocation.route_meta,
+                    agent_id=agent_id,
+                    user_id=agent_creator_id,
+                    tenant_id=llm_invocation.tenant_id,
+                )
+                raise
+            except QuotaExceeded:
+                await release_llm_round_credits(
+                    round_reservation_id,
+                    model=llm_invocation.model,
+                    route_meta=llm_invocation.route_meta,
+                    agent_id=agent_id,
+                    user_id=agent_creator_id,
+                    tenant_id=llm_invocation.tenant_id,
+                )
+                raise
             except LLMError as e:
+                await release_llm_round_credits(
+                    round_reservation_id,
+                    model=llm_invocation.model,
+                    route_meta=llm_invocation.route_meta,
+                    agent_id=agent_id,
+                    user_id=agent_creator_id,
+                    tenant_id=llm_invocation.tenant_id,
+                )
                 logger.error(f"[Oneshot] LLM error (round {round_i}): {e}")
                 await _notify_oneshot_error(
                     triggered_by_user_id, agent_id, agent_name,
@@ -771,6 +891,14 @@ async def run_agent_oneshot(
                 )
                 break
             except Exception as e:
+                await release_llm_round_credits(
+                    round_reservation_id,
+                    model=llm_invocation.model,
+                    route_meta=llm_invocation.route_meta,
+                    agent_id=agent_id,
+                    user_id=agent_creator_id,
+                    tenant_id=llm_invocation.tenant_id,
+                )
                 logger.error(f"[Oneshot] Unexpected LLM error (round {round_i}): {e}")
                 await _notify_oneshot_error(
                     triggered_by_user_id, agent_id, agent_name,
@@ -785,6 +913,33 @@ async def run_agent_oneshot(
                 usage = estimate_token_usage_from_chars(round_chars)
             accumulated_usage.add(usage)
             unsaved_usage.add(usage)
+            try:
+                await settle_llm_round_credits(
+                    round_reservation_id,
+                    usage=usage,
+                    model=llm_invocation.model,
+                    route_meta=llm_invocation.route_meta,
+                    agent_id=agent_id,
+                    user_id=agent_creator_id,
+                    tenant_id=llm_invocation.tenant_id,
+                )
+            except Exception:
+                await release_llm_round_credits(
+                    round_reservation_id,
+                    model=llm_invocation.model,
+                    route_meta=llm_invocation.route_meta,
+                    agent_id=agent_id,
+                    user_id=agent_creator_id,
+                    tenant_id=llm_invocation.tenant_id,
+                )
+                reply = "⚠️ Credits 结算暂时不可用，本轮结果未执行。"
+                await _notify_oneshot_error(
+                    triggered_by_user_id,
+                    agent_id,
+                    agent_name,
+                    reply,
+                )
+                break
 
             if response.tool_calls:
                 llm_messages.append(LLMMessage(

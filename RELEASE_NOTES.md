@@ -5,7 +5,7 @@
 - Lite, Pro, and Ultra understanding routes are seeded through the centrally managed `MiniMax-M3` pool for `text`, `image`, and `video` inputs. Chat uploads select the concrete attachment route, and the OpenAI-compatible caller converts image/video markers into structured content parts instead of sending them as plain text.
 - Attachment-driven `image`/`video` understanding is request-scoped. It no longer overwrites the session's persistent modality, so a later text-only turn or page refresh cannot silently keep using the previous attachment route; the user's Lite/Pro/Ultra tier remains persistent.
 - `audio` and `music` remain generation-tool capabilities rather than chat-understanding routes. Image, speech, music, and video generation continue through the explicit media tools, plan entitlements, reservation, and exactly-once Credits settlement paths.
-- Fixed a production-facing account-pool regression where a routed M3 model declared the abstract `multimodal` model type while credentials advertised concrete `text/image/video` capabilities. The selector now separates request capability from provider quota scope, so a healthy platform credential is no longer rejected as “平台账号池暂无可用 API key.”
+- Fixed a production-facing account-pool regression where a routed M3 model could declare the abstract `multimodal` model type while credentials advertised concrete `text/image/video` capabilities. The seeded M3 rows retain a legacy-compatible primary `text` modality plus explicit `text/image/video` modalities, and the new selector separates request capability from provider quota scope, so both blue/green slots keep finding the healthy platform pool during migration.
 - The model selector remains a centrally funded shared-pool policy. This release does **not** add tenant-level or LLM-model-object-level authorization.
 
 ## MiniMax Token Plan Correctness
@@ -21,7 +21,7 @@
 - Platform-seeded OKR/CEO automation is disabled by default through migration `094_disable_system_okr_automation.py` and `OKR_AUTOMATION_ENABLED=false`. Explicit user-triggered work, user-managed schedules, durable A2A delivery, and media reconciliation remain available.
 - The OKR safety switch now checks `is_system` as well as the reserved trigger name. A user-created trigger that happens to use an OKR-like name is no longer suppressed or given system-only execution instructions.
 - Trigger claiming and execution are bounded by `TRIGGER_MAX_CONCURRENCY` and `TRIGGER_CLAIM_BATCH_SIZE`, preventing a backlog from starting an unbounded number of Agent runs at once.
-- Production deployment now quiesces the previous worker before running schema migrations, and trigger completion/failure updates only rows that are still `processing`. A late result from an old worker can no longer overwrite a migration- or operator-forced terminal state.
+- Production deployment now quiesces the previous worker before running schema migrations. Every trigger claim gets a unique generation fence, long executions renew their lease, and completion/failure requires both the `processing` state and the exact current fence. A late coroutine from an expired/reclaimed worker can no longer overwrite the new owner, a migration, or an operator-forced terminal state.
 - Production issue ingestion has a bounded fallback queue, so a temporary persistence outage cannot create unlimited in-memory growth while the monitor continues collecting privacy-safe operational evidence.
 
 ## Privacy-Safe Diagnostics
@@ -38,13 +38,15 @@
 - MiniMax `2056` capacity failures remain recorded production issues but are treated as expected provider-capacity warnings. Exact media-task settlement and release remain idempotent under concurrent reconciliation.
 - Asynchronous video reconciliation forwards the task's concrete provider model for correlation. A bare MiniMax `2056` still opens the shared plan circuit; only provider evidence naming a concrete model opens an exact-model circuit.
 - A completed LLM response is no longer discarded when secondary usage accounting or Credits settlement persistence fails. Credits settlement runs before the secondary Agent quota counter, failures emit a critical privacy-safe production issue, and each settlement stage remains independently observable.
+- Every routed LLM provider round now atomically reserves a conservative maximum before the request. Once the provider completes, the exact debt is persisted as a durable `settlement_ready` outbox before tools or results are released; reconciliation retries any final-ledger outage instead of refunding already-incurred usage. Invalid tool output, round limits, and cancellation after a provider response therefore remain billable, while a reservation database failure never calls or degrades the provider.
+- Final LLM Credits use the higher of the configured Lite/Pro/Ultra product price and MiniMax's token-derived cost, including the higher M3 long-context band above 512K input tokens. This preserves tier pricing without undercharging unusually expensive requests.
 - Synchronous MiniMax image, speech, and music generation now reserve Credits before the provider call, finalize the reservation only after a usable workspace artifact exists, and release unfinished reservations on every failure path. Concurrent requests can no longer all pass a read-only balance check and overspend the same available Credits.
 
 ## Validation
 
-- The complete backend suite passes: **697 tests**.
-- The complete frontend suite passes: **58 tests**, followed by a production frontend build covering 6,994 modules.
-- PostgreSQL release smoke passes full historical upgrade, targeted downgrade/re-upgrade, a single Alembic head, Credits/media exactly-once settlement, durable trigger delivery, production-issue aggregation/alerting, and chat-tier compare-and-swap checks. Migration `093` uses revision-owned IDs and distinct M3 understanding rows; collision tests prove that administrator-owned models, billing rules, and post-upgrade plan edits survive rollback unchanged.
+- The complete backend suite passes: **709 tests**.
+- The complete frontend suite passes: **60 tests**, followed by a production frontend build covering 6,995 modules.
+- PostgreSQL release smoke passes full historical upgrade, targeted downgrade/re-upgrade, a single Alembic head, Credits/media exactly-once settlement, fenced trigger reclaim, durable A2A delivery, production-issue aggregation/alerting, and chat-tier compare-and-swap checks. Migration `093` uses revision-owned IDs and distinct M3 understanding rows; dependency/collision tests prove that administrator fallback routes, referenced models, administrator-owned catalog/billing rows, and post-upgrade plan edits survive rollback and re-upgrade unchanged.
 - Release-scope Ruff checks (with the repository's pre-existing `main.py` / `agent_tools.py` baseline reported separately), Python bytecode compilation, Compose configuration validation, and `git diff --check` are release gates for the local candidate. Production cutover and post-release observation remain separate gates and are not claimed by this local release candidate.
 
 ## Upgrade Notes
@@ -52,6 +54,7 @@
 - Review `OKR_AUTOMATION_ENABLED`, `TRIGGER_DAEMON_ENABLED`, `TRIGGER_MAX_CONCURRENCY`, and `TRIGGER_CLAIM_BATCH_SIZE` before cutover. The safe defaults keep the trigger daemon active for explicit/durable work while preventing the platform-seeded CEO/OKR loop from running automatically.
 - MiniMax Token Plan has provider-enforced five-hour and weekly windows shared across modalities. Production high availability still requires pay-as-you-go fallback or a genuinely independent secondary provider credential; increasing `max_output_tokens` does not increase plan allowance.
 - Existing `window_5h_limit` database values are retained but ignored. No tenant balances, subscriptions, Credits ledger rows, model ownership, or model-object permissions are migrated by this release.
+- Rollback stops the candidate API and worker before restoring the exact pre-release Alembic revision. A failed database downgrade leaves candidate database writers stopped and fails closed for operator recovery from the captured database backup; it never starts legacy workers against an unverified schema.
 
 # v1.10.11 — Verified Public Blue/Green Cutover
 
@@ -60,6 +63,7 @@
 - Blue/green deployment now verifies the public health payload, release version, and exact commit after Nginx reload and before stopping the previous application slot.
 - Public verification bypasses intermediary caches with a release-specific query and `Cache-Control: no-cache`, retries boundedly for reload propagation, and records the verified health/version evidence in the rollback backup directory.
 - If the public endpoint does not expose the expected version and commit, deployment exits through the existing rollback trap: Nginx, the `current` symlink, and any stopped previous services are restored instead of accepting a partially switched release.
+- Rollback records the exact pre-release Alembic revision and downgrades to it before returning traffic to the legacy slot. If database downgrade fails, rollback fails closed: it keeps the current traffic slot in place, leaves the legacy worker stopped, and points operators to the pre-migration database backup.
 
 ## Validation
 
