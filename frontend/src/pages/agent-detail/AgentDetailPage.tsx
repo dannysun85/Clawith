@@ -15,7 +15,7 @@ import AgentSidePanel, { SidePanelTab } from '../../components/AgentSidePanel';
 import type { WorkspaceActivity, WorkspaceLiveDraft } from '../../components/WorkspaceOperationPanel';
 import { activityApi, agentApi, channelApi, fileApi, focusApi, scheduleApi, skillApi, taskApi, triggerApi, uploadFileWithProgress } from '../../services/api';
 import { websocketAuthProtocols } from '../../utils/authTransport';
-import { reportClientIssue } from '../../services/productionIssueReporter';
+import { reportClientIssue, shouldReportWebSocketClose } from '../../services/productionIssueReporter';
 import type { FocusApiItem } from '../../services/api';
 import { isA2AMessageLeft } from '../../utils/a2aMessageSide';
 import TierSelector, { resolveAllowedTier, type SaasTier } from '../../components/TierSelector';
@@ -82,6 +82,11 @@ import SkillsTab from './tabs/SkillsTab';
 import ToolsTab from './tabs/ToolsTab';
 import { useAgentDetailRoute } from './hooks/useAgentDetailRoute';
 import { fetchAuth } from './utils/fetchAuth';
+
+const closeWebSocketIntentionally = (ws: WebSocket) => {
+    if (ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED) return;
+    ws.close(1000, 'client_navigation');
+};
 
 const WORKSPACE_TOOLS = new Set([
     'write_file',
@@ -2185,7 +2190,7 @@ export default function AgentDetailPage() {
         if (disableReconnect) reconnectDisabledRef.current[key] = true;
         clearReconnectTimer(key);
         const ws = wsMapRef.current[key];
-        if (ws && ws.readyState !== WebSocket.CLOSED) ws.close();
+        if (ws) closeWebSocketIntentionally(ws);
         delete wsMapRef.current[key];
         delete sessionUiStateRef.current[key];
     };
@@ -3068,7 +3073,7 @@ export default function AgentDetailPage() {
         });
         Object.keys(wsMapRef.current).forEach((k) => {
             const ws = wsMapRef.current[k];
-            if (ws && ws.readyState !== WebSocket.CLOSED) ws.close();
+            if (ws) closeWebSocketIntentionally(ws);
         });
         wsMapRef.current = {};
         wsRef.current = null;
@@ -3112,7 +3117,7 @@ export default function AgentDetailPage() {
         wsMapRef.current[key] = ws;
         ws.onopen = () => {
             if (reconnectDisabledRef.current[key]) {
-                ws.close();
+                closeWebSocketIntentionally(ws);
                 return;
             }
             if (currentAgentIdRef.current === agentId && activeSessionIdRef.current === sessionId) {
@@ -3127,6 +3132,7 @@ export default function AgentDetailPage() {
             }
         };
         ws.onclose = (e) => {
+            const intentionalClose = reconnectDisabledRef.current[key] === true;
             if (wsMapRef.current[key] === ws) delete wsMapRef.current[key];
             setSessionUiState(key, { isWaiting: false, isStreaming: false });
             const isActiveRuntime = currentAgentIdRef.current === agentId && activeSessionIdRef.current === sessionId;
@@ -3136,33 +3142,41 @@ export default function AgentDetailPage() {
                 setIsWaiting(false);
                 setIsStreaming(false);
             }
+            if (shouldReportWebSocketClose(e.code, intentionalClose)) {
+                reportClientIssue({
+                    category: 'websocket',
+                    error_code: `close_${e.code}`,
+                    route: '/ws/chat/{agent_id}',
+                    operation: 'chat',
+                    agent_id: agentId,
+                    metadata: { close_code: e.code, component: 'AgentDetailPage' },
+                });
+            }
+            if (intentionalClose) {
+                clearReconnectTimer(key);
+                return;
+            }
             if (e.code === 4003 || e.code === 4002) {
                 reconnectDisabledRef.current[key] = true;
                 clearReconnectTimer(key);
                 if (isActiveRuntime && e.code === 4003) setAgentExpired(true);
                 return;
             }
-            if (e.code !== 1000 && e.code !== 1001) {
-                reportClientIssue({
-                    category: 'websocket',
-                    error_code: `close_${e.code}`,
-                    route: '/ws/chat/{agent_id}',
-                    operation: 'chat',
-                    metadata: { close_code: e.code, component: 'AgentDetailPage' },
-                });
-            }
             scheduleReconnect();
         };
         ws.onerror = (error) => {
             const isActiveRuntime = currentAgentIdRef.current === agentId && activeSessionIdRef.current === sessionId;
             if (isActiveRuntime) setWsConnected(false);
-            reportClientIssue({
-                category: 'websocket',
-                error_code: 'WebSocketError',
-                route: '/ws/chat/{agent_id}',
-                operation: 'chat',
-                metadata: { component: 'AgentDetailPage' },
-            });
+            if (!reconnectDisabledRef.current[key]) {
+                reportClientIssue({
+                    category: 'websocket',
+                    error_code: 'WebSocketError',
+                    route: '/ws/chat/{agent_id}',
+                    operation: 'chat',
+                    agent_id: agentId,
+                    metadata: { component: 'AgentDetailPage' },
+                });
+            }
             console.warn(`WebSocket error for session ${sessionId}:`, error);
             // Error automatically triggers onclose with abnormal code, which handles reconnect
         };
@@ -3531,7 +3545,7 @@ export default function AgentDetailPage() {
             Object.keys(reconnectDisabledRef.current).forEach((key) => { reconnectDisabledRef.current[key] = true; });
             Object.keys(reconnectTimerRef.current).forEach((key) => clearReconnectTimer(key));
             Object.values(wsMapRef.current).forEach((ws) => {
-                if (ws.readyState !== WebSocket.CLOSED) ws.close();
+                closeWebSocketIntentionally(ws);
             });
             wsMapRef.current = {};
             wsRef.current = null;

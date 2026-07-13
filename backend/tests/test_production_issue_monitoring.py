@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
+from app.api import production_issues
 from app.schemas.production_issue import ClientIssueReportIn
 from app.services import production_issue_monitor
 
@@ -64,6 +65,57 @@ def test_client_report_contract_rejects_message_and_identity_fields():
             "summary": "raw server response",
             "tenant_id": str(uuid.uuid4()),
         })
+
+
+def test_client_report_contract_accepts_agent_context_but_not_tenant_override():
+    agent_id = uuid.uuid4()
+
+    report = ClientIssueReportIn.model_validate({
+        "category": "websocket",
+        "error_code": "close_1006",
+        "agent_id": str(agent_id),
+    })
+    assert report.agent_id == agent_id
+
+    with pytest.raises(ValidationError):
+        ClientIssueReportIn.model_validate({
+            "category": "websocket",
+            "error_code": "close_1006",
+            "agent_id": str(agent_id),
+            "tenant_id": str(uuid.uuid4()),
+        })
+
+
+@pytest.mark.asyncio
+async def test_client_agent_context_uses_the_product_access_policy(monkeypatch):
+    requested_agent_id = uuid.uuid4()
+    tenant_id = uuid.uuid4()
+    user = SimpleNamespace(tenant_id=tenant_id)
+
+    async def allow_agent(db, checked_user, checked_agent_id):
+        assert checked_user is user
+        assert checked_agent_id == requested_agent_id
+        return SimpleNamespace(id=requested_agent_id), "use"
+
+    monkeypatch.setattr(production_issues, "check_agent_access", allow_agent)
+
+    assert await production_issues._authorized_client_agent_id(
+        object(), user, requested_agent_id
+    ) == requested_agent_id
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_client_agent_context_is_dropped(monkeypatch):
+    from fastapi import HTTPException
+
+    async def deny_agent(_db, _user, _agent_id):
+        raise HTTPException(status_code=403, detail="No access to this agent")
+
+    monkeypatch.setattr(production_issues, "check_agent_access", deny_agent)
+
+    assert await production_issues._authorized_client_agent_id(
+        object(), SimpleNamespace(tenant_id=uuid.uuid4()), uuid.uuid4()
+    ) is None
 
 
 def test_issue_fingerprint_groups_same_failure_across_tenants():

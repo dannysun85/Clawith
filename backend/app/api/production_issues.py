@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.permissions import check_agent_access
 from app.core.security import get_current_user, get_saas_admin
 from app.database import get_db
 from app.models.audit import AuditLog
@@ -28,11 +29,28 @@ client_router = APIRouter(prefix="/production-issues", tags=["production-issues"
 admin_router = APIRouter(prefix="/saas/production-issues", tags=["saas-production-issues"])
 
 
+async def _authorized_client_agent_id(
+    db: AsyncSession,
+    current_user: User,
+    requested_agent_id: uuid.UUID | None,
+) -> uuid.UUID | None:
+    """Associate client telemetry only with an Agent in the caller's tenant."""
+
+    if requested_agent_id is None:
+        return None
+    try:
+        agent, _access_level = await check_agent_access(db, current_user, requested_agent_id)
+    except HTTPException:
+        return None
+    return agent.id
+
+
 @client_router.post("/client-report", status_code=status.HTTP_202_ACCEPTED)
 async def report_client_issue(
     data: ClientIssueReportIn,
     request: Request,
     current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """Accept only operational metadata; prompts, bodies and messages are rejected by allowlist."""
 
@@ -41,6 +59,7 @@ async def report_client_issue(
         "runtime": "Client runtime operation failed",
         "websocket": "Client WebSocket operation failed",
     }
+    agent_id = await _authorized_client_agent_id(db, current_user, data.agent_id)
     await record_production_issue(
         source=f"client_{data.category}",
         category=data.category,
@@ -51,6 +70,7 @@ async def report_client_issue(
         operation=data.operation,
         tenant_id=current_user.tenant_id,
         user_id=current_user.id,
+        agent_id=agent_id,
         trace_id=getattr(request.state, "trace_id", None),
         metadata=data.metadata,
     )

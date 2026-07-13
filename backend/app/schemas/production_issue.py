@@ -15,6 +15,7 @@ class ClientIssueReportIn(BaseModel):
     error_code: str = Field(min_length=1, max_length=100)
     route: str | None = Field(default=None, max_length=500)
     operation: str | None = Field(default=None, max_length=100)
+    agent_id: uuid.UUID | None = None
     metadata: dict = Field(default_factory=dict)
 
     model_config = ConfigDict(extra="forbid")

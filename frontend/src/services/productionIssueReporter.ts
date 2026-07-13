@@ -6,6 +6,7 @@ type ClientIssueReport = {
     error_code: string;
     route?: string;
     operation?: string;
+    agent_id?: string;
     metadata?: Record<string, string | number | boolean | null>;
 };
 
@@ -21,7 +22,12 @@ const reportFingerprint = (report: ClientIssueReport) => [
     report.error_code,
     routeWithoutQuery(report.route || ''),
     report.operation || '',
+    report.agent_id || '',
 ].join('|');
+
+export function shouldReportWebSocketClose(code: number, intentional: boolean): boolean {
+    return !intentional && ![1000, 1001, 4002, 4003].includes(code);
+}
 
 function isDuplicateReport(report: ClientIssueReport, now = Date.now()): boolean {
     const fingerprint = reportFingerprint(report);

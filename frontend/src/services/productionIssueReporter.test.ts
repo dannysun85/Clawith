@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { reportClientIssue } from './productionIssueReporter';
+import { reportClientIssue, shouldReportWebSocketClose } from './productionIssueReporter';
 
 
 describe('production issue reporter', () => {
@@ -32,6 +32,7 @@ describe('production issue reporter', () => {
             error_code: 'http_503',
             route: '/api/agents/123?token=must-not-survive',
             operation: 'GET',
+            agent_id: '123',
             metadata: { status_code: 503, component: 'fetch' },
         };
 
@@ -49,5 +50,38 @@ describe('production issue reporter', () => {
         vi.advanceTimersByTime(30_000);
         reportClientIssue(report);
         expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('keeps Agent occurrences distinct inside the client dedupe window', () => {
+        const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+        vi.stubGlobal('fetch', fetchMock);
+
+        reportClientIssue({
+            category: 'websocket',
+            error_code: 'close_1006',
+            route: '/ws/chat/{agent_id}',
+            operation: 'chat',
+            agent_id: 'agent-a',
+        });
+        reportClientIssue({
+            category: 'websocket',
+            error_code: 'close_1006',
+            route: '/ws/chat/{agent_id}',
+            operation: 'chat',
+            agent_id: 'agent-b',
+        });
+
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not classify intentional socket shutdown as a product error', () => {
+        expect(shouldReportWebSocketClose(1005, true)).toBe(false);
+        expect(shouldReportWebSocketClose(1006, true)).toBe(false);
+        expect(shouldReportWebSocketClose(1000, false)).toBe(false);
+        expect(shouldReportWebSocketClose(1001, false)).toBe(false);
+        expect(shouldReportWebSocketClose(4002, false)).toBe(false);
+        expect(shouldReportWebSocketClose(4003, false)).toBe(false);
+        expect(shouldReportWebSocketClose(1005, false)).toBe(true);
+        expect(shouldReportWebSocketClose(1006, false)).toBe(true);
     });
 });

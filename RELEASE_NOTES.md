@@ -1,3 +1,24 @@
+# v1.10.10 — WebSocket Monitoring Signal Integrity
+
+## Bug Fixes
+
+- Agent chat WebSockets now distinguish intentional browser lifecycle shutdowns from unexpected disconnects. Navigation, logout, session teardown, and component cleanup close normally and no longer create `close_1005` false-positive production incidents or reconnect loops.
+- Genuine unexpected `1005` / `1006` disconnects remain observable and retain the existing bounded reconnect behavior. Application terminal codes `4002` / `4003` remain expected control flow rather than infrastructure errors.
+- Client WebSocket reports now include Agent context for faster diagnosis. The backend validates that context through the existing Agent access policy; an unauthorized Agent ID is discarded while the privacy-safe operational report is still accepted.
+- Browser-side incident deduplication now keeps separate Agent occurrences distinct without storing prompts, messages, request bodies, credentials, or tenant-supplied identity.
+
+## Validation
+
+- Focused monitoring regressions pass for intentional versus unexpected WebSocket closes, Agent-level deduplication, schema restrictions, product access-policy reuse, and unauthorized-context removal.
+- Complete backend and frontend unit suites, changed-file Ruff checks, frontend production compilation, and `git diff --check` pass.
+- Fresh PostgreSQL upgrade, downgrade/re-upgrade, Plan CAS, A2A durability, media exactly-once settlement, production-issue aggregation/alerting, and chat-tier CAS smoke tests pass.
+
+## Upgrade Notes
+
+- This release changes only WebSocket lifecycle signaling and production-monitoring attribution. It does not change Credits, reservations, subscriptions, Lite / Pro / Ultra routing, shared credential ownership, plan entitlements, provider calls, media settlement, or autonomous execution.
+- The production observation clock restarts from the v1.10.10 cutover because runtime code changed after the v1.10.9 observation began.
+- The centrally funded shared account pool remains unchanged. This release does **not** add tenant-level or model-object-level authorization.
+
 # v1.10.9 — Explicit SaaS Media Entitlements
 
 - The SaaS plan editor now shows chat-model permissions and media-generation permissions as separate controls. Administrators can directly verify and edit image, audio, music, video, and Lite / Pro / Ultra generation access without interpreting raw `features` JSON.
