@@ -1059,12 +1059,18 @@ def test_autonomous_entrypoints_keep_routing_and_settlement_hooks():
 
     assert "prepare_agent_llm_invocation" in heartbeat_source
     assert "settle_agent_llm_invocation" in heartbeat_source
+    assert "get_llm_request_options" in heartbeat_source
+    assert heartbeat_source.count("**request_options") == 1
     assert "prepare_agent_llm_invocation" in oneshot_source
     assert "settle_agent_llm_invocation" in oneshot_source
+    assert "get_llm_request_options" in oneshot_source
+    assert oneshot_source.count("**request_options") == 1
     assert "resolve_agent_model" in trigger_source
     assert "route_meta=route_meta" in trigger_source
     assert "prepare_agent_llm_invocation" in supervision_source
     assert "settle_agent_llm_invocation" in supervision_source
+    assert "get_llm_request_options" in supervision_source
+    assert supervision_source.count("**request_options") == 1
     assert "resolve_agent_model" in feishu_loader_source
     assert "route_meta=route_meta" in feishu_call_source
     assert "resolve_agent_model" in gateway_source

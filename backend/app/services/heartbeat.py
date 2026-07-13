@@ -283,6 +283,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
             LLMError,
             LLMMessage,
             create_llm_client,
+            get_llm_request_options,
             get_max_tokens,
             release_llm_round_credits,
             reserve_llm_round_credits,
@@ -323,6 +324,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
             LLMMessage(role="user", content=full_instruction)
         ]
         max_tokens = get_max_tokens(model_provider, model_model, model_max_output_tokens)
+        request_options = get_llm_request_options(llm_invocation.model)
 
         for round_i in range(20):  # More rounds for search + write + plaza
             # Check token usage limit mid-loop (every 3 rounds)
@@ -356,6 +358,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                     tools=tools_for_llm,
                     temperature=model_temperature,
                     max_tokens=max_tokens,
+                    **request_options,
                 )
             except asyncio.CancelledError:
                 await release_llm_round_credits(
@@ -778,6 +781,7 @@ async def run_agent_oneshot(
         # ── Phase 2: LLM tool-call loop (no DB connection held) ────────────────
         from app.services.llm import (
             create_llm_client,
+            get_llm_request_options,
             get_max_tokens,
             LLMMessage,
             LLMError,
@@ -817,6 +821,7 @@ async def run_agent_oneshot(
         accumulated_usage = TokenUsage()
         unsaved_usage = TokenUsage()
         max_tokens = get_max_tokens(model_provider, model_model, model_max_output_tokens)
+        request_options = get_llm_request_options(llm_invocation.model)
 
         for round_i in range(max_rounds):
             # Check token usage limit mid-loop (every 3 rounds)
@@ -852,6 +857,7 @@ async def run_agent_oneshot(
                     tools=tools_for_llm,
                     temperature=model_temperature,
                     max_tokens=max_tokens,
+                    **request_options,
                 )
             except asyncio.CancelledError:
                 await release_llm_round_credits(

@@ -101,7 +101,7 @@ def validate_inline_media_payload(content: str) -> None:
         )
 
 
-def _minimax_m3_request_options(model) -> dict:
+def get_llm_request_options(model) -> dict:
     """Resolve documented MiniMax-M3 request policy from platform model metadata."""
 
     if str(getattr(model, "provider", "")).lower() != "minimax":
@@ -124,10 +124,16 @@ def _minimax_m3_request_options(model) -> dict:
     }
 
 
+# Compatibility alias for existing internal imports and focused tests. New
+# callers should use the public helper exported from ``app.services.llm`` so
+# every direct provider entry point sends the same model policy.
+_minimax_m3_request_options = get_llm_request_options
+
+
 def _llm_provider_service_tier(model) -> str:
     """Return the provider delivery tier used by the actual request."""
 
-    return str(_minimax_m3_request_options(model).get("service_tier") or "standard")
+    return str(get_llm_request_options(model).get("service_tier") or "standard")
 
 
 async def _record_llm_product_issue(
@@ -1241,7 +1247,7 @@ async def call_llm(
         return f"[Error] Failed to create LLM client: {e}"
 
     max_tokens = get_max_tokens(model.provider, model.model, getattr(model, 'max_output_tokens', None))
-    request_options = _minimax_m3_request_options(model)
+    request_options = get_llm_request_options(model)
     _accumulated_usage = TokenUsage()
     _unsaved_usage = TokenUsage()
     _usage_finalized = False
@@ -2157,7 +2163,7 @@ async def call_agent_llm_with_tools(
                 model.provider, model.model,
                 getattr(model, 'max_output_tokens', None)
             )
-            request_options = _minimax_m3_request_options(model)
+            request_options = get_llm_request_options(model)
 
             # Tool-calling loop
             api_messages = list(messages)

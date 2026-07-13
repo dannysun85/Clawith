@@ -107,6 +107,7 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
     from app.services.agent_context import build_agent_context
     from app.services.llm import (
         create_llm_client,
+        get_llm_request_options,
         LLMMessage,
         prepare_agent_llm_invocation,
         release_llm_round_credits,
@@ -148,6 +149,7 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
     )
     usage = None
     round_reservation_id = None
+    request_options = get_llm_request_options(model)
     try:
         round_reservation_id = await reserve_llm_round_credits(
             tenant_id=invocation.tenant_id,
@@ -163,6 +165,7 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
             messages=messages,
             temperature=model.temperature,
             max_tokens=512,
+            **request_options,
         )
         content = (response.content or "").strip()
         usage = extract_token_usage(response.usage)
