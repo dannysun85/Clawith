@@ -20,7 +20,10 @@ from sqlalchemy import select
 
 from app.database import async_session
 from app.models.llm import LLMCredential
-from app.services.llm.load_balancer import mark_credential_quota_exceeded
+from app.services.llm.load_balancer import (
+    clear_credential_modality_quota,
+    mark_credential_modality_quota_exceeded,
+)
 from app.services.llm.utils import get_credential_api_key
 
 # MiniMax remains API lives on the www host (not api.minimaxi.com).
@@ -53,12 +56,18 @@ async def poll_minimax_quota() -> int:
             is_depleted = await _check_credential_depleted(api_key)
             checked += 1
             if is_depleted:
-                await mark_credential_quota_exceeded(cred.id)
+                await mark_credential_modality_quota_exceeded(
+                    cred.id,
+                    "text",
+                    error_code="2056",
+                )
                 depleted += 1
                 logger.warning(
                     f"[minimax_quota] credential {cred.id} ({cred.label}) "
                     "Token Plan window depleted -> quota_exceeded"
                 )
+            else:
+                await clear_credential_modality_quota(cred.id, "text")
         except Exception as e:
             logger.debug(f"[minimax_quota] poll failed for {cred.id}: {e}")
 

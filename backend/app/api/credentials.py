@@ -64,6 +64,7 @@ async def credentials_health():
             label=e["label"],
             status=e["status"],
             enabled=e["enabled"],
+            modality_status=e["modality_status"],
             used_today=e["used_today"],
             daily_quota=e["daily_quota"],
             error_count=e["error_count"],
@@ -119,6 +120,7 @@ async def update_credential(credential_id: uuid.UUID, data: CredentialUpdateIn, 
     if base_url_changed or api_key_changed:
         cred.status = "unverified"
         cred.error_count = 0
+        cred.modality_status = {}
     await db.commit()
     await db.refresh(cred)
     return _to_out(cred)
@@ -138,6 +140,9 @@ async def verify_credential(credential_id: uuid.UUID, db: AsyncSession = Depends
         # degraded shared credential. Ordinary successful calls may clear a
         # consecutive counter, but must not silently re-admit an isolated key.
         cred.error_count = 0
+        # An administrator verification is also the explicit recovery
+        # boundary after a provider top-up or plan reset.
+        cred.modality_status = {}
     await db.commit()
     return CredentialVerificationOut(
         ok=result.ok,

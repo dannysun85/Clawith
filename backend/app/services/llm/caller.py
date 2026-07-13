@@ -116,14 +116,24 @@ async def _apply_credential_failure_policy(
     error: Exception,
     *,
     log_context: str,
+    modality: str | None = None,
 ) -> None:
     """Apply the shared-pool circuit-breaker policy in every LLM path."""
 
-    action = credential_failure_action(error)
+    action = credential_failure_action(error, modality=modality)
     if action is CredentialFailureAction.DEGRADE:
         await mark_credential_degraded(credential_id, immediate=True)
     elif action is CredentialFailureAction.QUOTA_EXCEEDED:
         await mark_credential_quota_exceeded(credential_id)
+    elif action is CredentialFailureAction.MODALITY_QUOTA_EXCEEDED:
+        from app.services.llm.load_balancer import mark_credential_modality_quota_exceeded
+
+        assert modality is not None
+        await mark_credential_modality_quota_exceeded(
+            credential_id,
+            modality,
+            error_code=extract_minimax_code(str(error)) or "2056",
+        )
     elif is_rate_limit_error(error):
         logger.warning(f"[{log_context}] Rate limit on credential {credential_id}")
         await asyncio.sleep(1.0)
@@ -980,6 +990,7 @@ async def call_llm(
                     _cred_id,
                     e,
                     log_context="LLM",
+                    modality=getattr(route_meta, "modality", None) or getattr(model, "modality", None),
                 )
             await _finalize_llm_usage(billable=False)
             await client.close()
@@ -1006,6 +1017,7 @@ async def call_llm(
                     _cred_id,
                     e,
                     log_context="LLM",
+                    modality=getattr(route_meta, "modality", None) or getattr(model, "modality", None),
                 )
             await _finalize_llm_usage(billable=False)
             await client.close()
@@ -1618,6 +1630,7 @@ async def call_agent_llm_with_tools(
                             _cred_id,
                             e,
                             log_context="call_agent_llm_with_tools",
+                            modality=getattr(route_meta, "modality", None) or getattr(model, "modality", None),
                         )
                     raise
 

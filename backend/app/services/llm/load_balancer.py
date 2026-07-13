@@ -26,7 +26,7 @@ from sqlalchemy import or_, select, text
 from app.core.events import get_redis
 from app.database import async_session
 from app.models.llm import LLMCredential
-from app.services.modalities import modality_match_values
+from app.services.modalities import canonicalize_modalities, modality_match_values
 
 
 # Redis key prefixes
@@ -90,6 +90,32 @@ def _credential_supports_modality(credential: LLMCredential, modality: str | Non
     return bool(supported.intersection(modality_match_values(modality)))
 
 
+def _canonical_modality(modality: str) -> str:
+    canonical = canonicalize_modalities([modality])
+    return canonical[0] if canonical else str(modality).strip().lower()
+
+
+def credential_blocked_modalities(credential: LLMCredential) -> set[str]:
+    """Return provider-quota-blocked modalities from a backward-safe JSON map."""
+
+    raw = getattr(credential, "modality_status", None)
+    if not isinstance(raw, dict):
+        return set()
+    blocked: set[str] = set()
+    for modality, value in raw.items():
+        status = value.get("status") if isinstance(value, dict) else value
+        if str(status or "").strip().lower() == "quota_exceeded":
+            blocked.add(_canonical_modality(str(modality)))
+    return blocked
+
+
+def credential_modality_is_blocked(credential: LLMCredential, modality: str | None) -> bool:
+    if not modality:
+        return False
+    requested = {_canonical_modality(value) for value in modality_match_values(modality)}
+    return bool(requested.intersection(credential_blocked_modalities(credential)))
+
+
 def _diagnose_base_filter_failure(
     credentials: list[LLMCredential],
     modality: str | None,
@@ -112,6 +138,13 @@ def _diagnose_base_filter_failure(
         )
     ]
     if not quota_available:
+        return CredentialUnavailableReason.QUOTA_EXHAUSTED
+    modality_available = [
+        credential
+        for credential in quota_available
+        if not credential_modality_is_blocked(credential, modality)
+    ]
+    if not modality_available:
         return CredentialUnavailableReason.QUOTA_EXHAUSTED
     return CredentialUnavailableReason.ALL_UNHEALTHY
 
@@ -273,7 +306,11 @@ async def pick_credential(
         )
 
         result = await db.execute(query)
-        all_creds = result.scalars().all()
+        all_creds = [
+            credential
+            for credential in result.scalars().all()
+            if not credential_modality_is_blocked(credential, modality)
+        ]
         if not all_creds:
             diagnostic_result = await db.execute(
                 select(LLMCredential).where(
@@ -506,6 +543,66 @@ async def mark_credential_quota_exceeded(credential_id: uuid.UUID) -> None:
         await db.commit()
 
 
+async def mark_credential_modality_quota_exceeded(
+    credential_id: uuid.UUID,
+    modality: str,
+    *,
+    error_code: str = "2056",
+) -> None:
+    """Open only one provider-model circuit without poisoning the shared key."""
+
+    normalized = _canonical_modality(modality)
+    async with async_session() as db:
+        cred = await db.get(LLMCredential, credential_id)
+        if not cred:
+            return
+        statuses = dict(getattr(cred, "modality_status", None) or {})
+        existing = statuses.get(normalized)
+        if (
+            isinstance(existing, dict)
+            and existing.get("status") == "quota_exceeded"
+            and str(existing.get("error_code") or "") == str(error_code)
+        ):
+            return
+        statuses[normalized] = {
+            "status": "quota_exceeded",
+            "error_code": str(error_code),
+            "detected_at": datetime.now(timezone.utc).isoformat(),
+            "reset_scope": "rolling_5h" if normalized == "text" else "daily",
+        }
+        cred.modality_status = statuses
+        cred.error_count += 1
+        logger.warning(
+            "[load_balancer] credential {} modality={} marked quota_exceeded",
+            credential_id,
+            normalized,
+        )
+        await db.commit()
+
+
+async def clear_credential_modality_quota(
+    credential_id: uuid.UUID,
+    modality: str,
+) -> bool:
+    """Close a scoped quota circuit after explicit provider recovery evidence."""
+
+    normalized = _canonical_modality(modality)
+    async with async_session() as db:
+        cred = await db.get(LLMCredential, credential_id)
+        if not cred:
+            return False
+        statuses = dict(getattr(cred, "modality_status", None) or {})
+        removed = False
+        for key in list(statuses):
+            if _canonical_modality(str(key)) == normalized:
+                statuses.pop(key, None)
+                removed = True
+        if removed:
+            cred.modality_status = statuses
+            await db.commit()
+        return removed
+
+
 async def reset_daily_usage() -> int:
     """Reset the local daily counter without re-admitting broken credentials.
 
@@ -538,6 +635,18 @@ async def reset_daily_usage() -> int:
             if hit_local_daily_cap:
                 c.error_count = 0
                 c.status = "healthy"
+            # MiniMax non-text Token Plan resources reset daily. Text uses a
+            # rolling window and is recovered by the provider quota poller.
+            statuses = dict(getattr(c, "modality_status", None) or {})
+            c.modality_status = {
+                key: value
+                for key, value in statuses.items()
+                if not (
+                    isinstance(value, dict)
+                    and value.get("status") == "quota_exceeded"
+                    and value.get("reset_scope") == "daily"
+                )
+            }
             reset_count += 1
         if creds:
             await db.commit()
@@ -569,6 +678,7 @@ async def get_credential_health() -> list[dict[str, Any]]:
                 "label": c.label,
                 "status": c.status,
                 "enabled": c.enabled,
+                "modality_status": dict(getattr(c, "modality_status", None) or {}),
                 "used_today": c.used_today,
                 "daily_quota": c.daily_quota,
                 "error_count": c.error_count,

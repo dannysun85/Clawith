@@ -33,6 +33,7 @@ class CredentialFailureAction(Enum):
     NONE = "none"
     DEGRADE = "degrade"
     QUOTA_EXCEEDED = "quota_exceeded"
+    MODALITY_QUOTA_EXCEEDED = "modality_quota_exceeded"
 
 
 # MiniMax-specific error codes (from base_resp.status_code)
@@ -197,7 +198,11 @@ def is_rate_limit_error(error: Exception) -> bool:
     return False
 
 
-def credential_failure_action(error: Exception) -> CredentialFailureAction:
+def credential_failure_action(
+    error: Exception,
+    *,
+    modality: str | None = None,
+) -> CredentialFailureAction:
     """Return the only safe persistent pool action for ``error``.
 
     Authentication failures prove that the key is invalid and therefore open
@@ -208,6 +213,11 @@ def credential_failure_action(error: Exception) -> CredentialFailureAction:
 
     if is_auth_error(error):
         return CredentialFailureAction.DEGRADE
+    # MiniMax documents 2056 as a model-resource limit. Text has its own
+    # rolling window and every non-text model family has an independent daily
+    # quota, so a scoped call must only open that modality's circuit.
+    if extract_minimax_code(str(error).lower()) in MINIMAX_QUOTA_CODES and modality:
+        return CredentialFailureAction.MODALITY_QUOTA_EXCEEDED
     if is_billing_or_quota_error(error):
         return CredentialFailureAction.QUOTA_EXCEEDED
     return CredentialFailureAction.NONE

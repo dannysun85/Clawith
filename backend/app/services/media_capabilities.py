@@ -12,6 +12,7 @@ from app.models.llm import LLMCredential
 from app.models.tool import AgentTool, Tool
 from app.services.entitlements import Entitlements
 from app.services.minimax_media_profiles import resolve_minimax_media_profile
+from app.services.llm.load_balancer import credential_modality_is_blocked
 from app.services.modalities import canonicalize_modalities
 
 
@@ -129,10 +130,13 @@ async def get_agent_media_capabilities(
     )
     pool_modalities: set[str] = set()
     for credential in credentials_result.scalars().all():
-        if credential.capabilities is None or "multimodal" in canonicalize_modalities(credential.capabilities):
-            pool_modalities.update(MEDIA_MODALITIES)
-        else:
-            pool_modalities.update(canonicalize_modalities(credential.capabilities))
+        capabilities = canonicalize_modalities(credential.capabilities)
+        supported = set(MEDIA_MODALITIES) if not capabilities or "multimodal" in capabilities else set(capabilities)
+        pool_modalities.update(
+            modality
+            for modality in supported
+            if modality in MEDIA_MODALITIES and not credential_modality_is_blocked(credential, modality)
+        )
 
     return evaluate_media_capabilities(
         entitlements,

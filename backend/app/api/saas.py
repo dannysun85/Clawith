@@ -244,6 +244,8 @@ async def update_model_route(
 
 
 async def _minimax_pool_modalities(db: AsyncSession) -> set[str]:
+    from app.services.llm.load_balancer import credential_modality_is_blocked
+
     result = await db.execute(
         select(LLMCredential).where(
             LLMCredential.provider == "minimax",
@@ -260,9 +262,15 @@ async def _minimax_pool_modalities(db: AsyncSession) -> set[str]:
     for credential in result.scalars().all():
         capabilities = canonicalize_modalities(credential.capabilities)
         if not capabilities or "multimodal" in capabilities:
-            pool_modalities.update(MINIMAX_MEDIA_TOOL_NAMES)
+            supported = set(MINIMAX_MEDIA_TOOL_NAMES)
         else:
-            pool_modalities.update(capabilities)
+            supported = set(capabilities)
+        pool_modalities.update(
+            modality
+            for modality in supported
+            if modality in MINIMAX_MEDIA_TOOL_NAMES
+            and not credential_modality_is_blocked(credential, modality)
+        )
     return pool_modalities
 
 

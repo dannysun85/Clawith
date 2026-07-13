@@ -161,6 +161,15 @@ class TestCredentialFailurePolicy:
             is CredentialFailureAction.QUOTA_EXCEEDED
         )
 
+    def test_provider_model_limit_is_scoped_when_modality_is_known(self):
+        assert (
+            credential_failure_action(
+                LLMError("token plan resource limit (2056)"),
+                modality="video",
+            )
+            is CredentialFailureAction.MODALITY_QUOTA_EXCEEDED
+        )
+
     @pytest.mark.asyncio
     async def test_media_transient_error_does_not_call_pool_mutators(self, monkeypatch):
         from unittest.mock import AsyncMock
@@ -176,10 +185,39 @@ class TestCredentialFailurePolicy:
         await agent_tools._mark_minimax_tool_credential_failure(
             "credential-id",
             LLMError("MiniMax API error (1000): unexpected error"),
+            modality="video",
         )
 
         degrade.assert_not_awaited()
         quota.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_media_2056_marks_only_the_requested_modality(self, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        from app.services import agent_tools
+        from app.services.llm import load_balancer
+
+        degrade = AsyncMock()
+        global_quota = AsyncMock()
+        scoped_quota = AsyncMock()
+        monkeypatch.setattr(load_balancer, "mark_credential_degraded", degrade)
+        monkeypatch.setattr(load_balancer, "mark_credential_quota_exceeded", global_quota)
+        monkeypatch.setattr(load_balancer, "mark_credential_modality_quota_exceeded", scoped_quota)
+
+        await agent_tools._mark_minimax_tool_credential_failure(
+            "credential-id",
+            LLMError("MiniMax API error (2056): resource limit"),
+            modality="video",
+        )
+
+        scoped_quota.assert_awaited_once_with(
+            "credential-id",
+            "video",
+            error_code="2056",
+        )
+        degrade.assert_not_awaited()
+        global_quota.assert_not_awaited()
 
 
 # --- mark_credential_quota_exceeded ---

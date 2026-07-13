@@ -12,6 +12,7 @@ interface Credential {
     base_url?: string | null;
     api_key_masked: string;
     capabilities?: string[] | null;
+    modality_status?: Record<string, { status: string; error_code?: string; reset_scope?: string }> | null;
     daily_quota?: number | null;
     rpm_limit?: number | null;
     tpm_limit?: number | null;
@@ -31,6 +32,7 @@ interface Health {
     label: string;
     status: string;
     enabled: boolean;
+    modality_status?: Record<string, { status: string; error_code?: string; reset_scope?: string }> | null;
     used_today: number;
     daily_quota?: number | null;
     error_count: number;
@@ -60,7 +62,7 @@ const STATUS_COLOR: Record<string, string> = {
 
 const emptyForm = {
     provider: 'minimax', label: '', api_key: '', base_url: '',
-    capabilities: ['text'] as string[],
+    capabilities: [...MODALITIES] as string[],
     daily_quota: '', weight: '1', priority: '0',
     rpm_limit: '', tpm_limit: '', window_5h_limit: '',
 };
@@ -243,6 +245,9 @@ export default function AccountManagement() {
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                 {creds.map((c) => {
                     const h = healthMap.get(c.id);
+                    const blockedModalities = Object.entries(c.modality_status || {})
+                        .filter(([, value]) => value?.status === 'quota_exceeded')
+                        .map(([modality]) => modality);
                     return (
                         <div key={c.id} className="card" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                             <div style={{ flex: 1 }}>
@@ -261,9 +266,14 @@ export default function AccountManagement() {
                                     {c.tpm_limit && h && <span>TPM: {fmtNum(h.tpm_current)}/{fmtNum(c.tpm_limit)}</span>}
                                     {c.last_used_at && <span>{t('account.lastUsed', '最后使用')}: {new Date(c.last_used_at).toLocaleString()}</span>}
                                 </div>
+                                {blockedModalities.length > 0 && (
+                                    <div role="status" style={{ fontSize: 11, color: 'var(--warning)', marginTop: 4 }}>
+                                        {t('account.modalityQuotaLimited', '供应商独立配额已达上限')}: {blockedModalities.join(' / ')} · {t('account.otherModalitiesAvailable', '其他能力仍可正常调用')}
+                                    </div>
+                                )}
                             </div>
                             <div style={{ display: 'flex', gap: 6 }}>
-                                {c.status === 'unverified' && (
+                                {(c.status === 'unverified' || c.status === 'degraded' || c.status === 'quota_exceeded' || blockedModalities.length > 0) && (
                                     <button
                                         className="btn btn-secondary"
                                         style={{ fontSize: 12 }}

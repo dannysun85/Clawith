@@ -60,6 +60,11 @@ class LLMCredential(Base):
     api_key_encrypted: Mapped[str] = mapped_column(String(1024), nullable=False)
     base_url: Mapped[str | None] = mapped_column(String(500))  # override provider default
     capabilities: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # ["text","voice","image","video"]
+    # Provider plans can exhaust one model family while the same key remains
+    # usable for the others (MiniMax non-text quotas are independent).  Keep
+    # those circuit breakers separate from the credential-wide ``status`` so
+    # a video limit cannot take text/image/audio/music out of rotation.
+    modality_status: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=dict)
     daily_quota: Mapped[int | None] = mapped_column(Integer, nullable=True)  # per-account daily cap
     used_today: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     reset_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

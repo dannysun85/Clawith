@@ -449,7 +449,11 @@ async def reconcile_minimax_video_task(
     except Exception as exc:
         try:
             if task.credential_id:
-                await _mark_minimax_tool_credential_failure(task.credential_id, exc)
+                await _mark_minimax_tool_credential_failure(
+                    task.credential_id,
+                    exc,
+                    modality="video",
+                )
         except Exception:
             logger.exception("[media] failed to update credential health task_id={}", record_id)
         expiry_reason = _media_task_expiry_reason(task)

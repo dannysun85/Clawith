@@ -20,7 +20,16 @@ from app.services.llm.load_balancer import (
 )
 
 
-def _cred(priority=0, weight=1, status="healthy", daily_quota=None, used_today=0, error_count=0, capabilities=None):
+def _cred(
+    priority=0,
+    weight=1,
+    status="healthy",
+    daily_quota=None,
+    used_today=0,
+    error_count=0,
+    capabilities=None,
+    modality_status=None,
+):
     return SimpleNamespace(
         id=uuid.uuid4(),
         provider="minimax",
@@ -28,6 +37,7 @@ def _cred(priority=0, weight=1, status="healthy", daily_quota=None, used_today=0
         api_key_encrypted="enc",
         base_url=None,
         capabilities=capabilities,
+        modality_status=modality_status or {},
         daily_quota=daily_quota,
         used_today=used_today,
         status=status,
@@ -62,6 +72,24 @@ async def test_pick_returns_top_priority_cred():
     with sess:
         chosen = await pick_credential("minimax", "text")
     assert chosen.priority == 10
+
+
+@pytest.mark.asyncio
+async def test_pick_skips_only_the_quota_blocked_modality():
+    video_blocked = _cred(
+        priority=10,
+        modality_status={"video": {"status": "quota_exceeded"}},
+    )
+    fallback = _cred(priority=0)
+    sess, _ = _patch_session(execute_result=[video_blocked, fallback])
+    with sess:
+        chosen = await pick_credential("minimax", "video")
+    assert chosen.id == fallback.id
+
+    sess, _ = _patch_session(execute_result=[video_blocked, fallback])
+    with sess:
+        chosen = await pick_credential("minimax", "text")
+    assert chosen.id == video_blocked.id
 
 
 @pytest.mark.asyncio
@@ -156,6 +184,7 @@ async def test_inflight_success_at_daily_cap_does_not_reclassify_degraded_creden
         ([], "text", load_balancer.CredentialUnavailableReason.NOT_CONFIGURED),
         ([_cred(status="degraded")], "text", load_balancer.CredentialUnavailableReason.ALL_UNHEALTHY),
         ([_cred(status="quota_exceeded")], "text", load_balancer.CredentialUnavailableReason.QUOTA_EXHAUSTED),
+        ([_cred(modality_status={"video": {"status": "quota_exceeded"}})], "video", load_balancer.CredentialUnavailableReason.QUOTA_EXHAUSTED),
         ([_cred(capabilities=["text"])], "video", load_balancer.CredentialUnavailableReason.CAPABILITY_MISMATCH),
     ],
 )
@@ -192,6 +221,10 @@ async def test_reset_daily_resets_all_counters_but_only_restores_local_daily_cap
     degraded = _cred(status="degraded", used_today=50, error_count=5)
     provider_exhausted = _cred(status="quota_exceeded", daily_quota=None, used_today=10, error_count=1)
     healthy = _cred(status="healthy", daily_quota=100, used_today=40, error_count=0)
+    healthy.modality_status = {
+        "video": {"status": "quota_exceeded", "reset_scope": "daily"},
+        "text": {"status": "quota_exceeded", "reset_scope": "rolling_5h"},
+    }
     sess, _ = _patch_session(execute_result=[exhausted, degraded, provider_exhausted, healthy])
     with sess:
         count = await reset_daily_usage()
@@ -200,6 +233,36 @@ async def test_reset_daily_resets_all_counters_but_only_restores_local_daily_cap
     assert degraded.status == "degraded" and degraded.error_count == 5 and degraded.used_today == 0
     assert provider_exhausted.status == "quota_exceeded" and provider_exhausted.used_today == 0
     assert healthy.status == "healthy" and healthy.used_today == 0
+    assert set(healthy.modality_status) == {"text"}
+
+
+@pytest.mark.asyncio
+async def test_modality_quota_mutators_do_not_poison_global_status():
+    cred = _cred()
+    sess, _ = _patch_session(get_value=cred)
+    with sess:
+        await load_balancer.mark_credential_modality_quota_exceeded(
+            cred.id,
+            "video",
+            error_code="2056",
+        )
+    assert cred.status == "healthy"
+    assert cred.modality_status["video"]["status"] == "quota_exceeded"
+    assert cred.error_count == 1
+
+    sess, _ = _patch_session(get_value=cred)
+    with sess:
+        await load_balancer.mark_credential_modality_quota_exceeded(
+            cred.id,
+            "video",
+            error_code="2056",
+        )
+    assert cred.error_count == 1
+
+    sess, _ = _patch_session(get_value=cred)
+    with sess:
+        assert await load_balancer.clear_credential_modality_quota(cred.id, "video") is True
+    assert cred.modality_status == {}
 
 
 @pytest.mark.asyncio

@@ -41,6 +41,7 @@ class CredentialOut(BaseModel):
     base_url: str | None = None
     api_key_masked: str = ""
     capabilities: list | None = None
+    modality_status: dict[str, dict[str, str]] | None = None
     daily_quota: int | None = None
     used_today: int = 0
     status: str = "unverified"
@@ -72,6 +73,7 @@ class CredentialHealthOut(BaseModel):
     label: str
     status: str
     enabled: bool
+    modality_status: dict[str, dict[str, str]] | None = None
     used_today: int
     daily_quota: int | None = None
     error_count: int
