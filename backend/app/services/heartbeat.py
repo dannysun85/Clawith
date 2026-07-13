@@ -285,6 +285,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
             create_llm_client,
             get_llm_request_options,
             get_max_tokens,
+            llm_provider_may_have_accepted,
             release_llm_round_credits,
             reserve_llm_round_credits,
             settle_llm_round_credits,
@@ -368,7 +369,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                     agent_id=agent_id,
                     user_id=agent_creator_id,
                     tenant_id=llm_invocation.tenant_id,
-                    provider_failed=True,
+                    provider_failed=not llm_provider_may_have_accepted(client),
                 )
                 raise
             except QuotaExceeded:
@@ -379,7 +380,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                     agent_id=agent_id,
                     user_id=agent_creator_id,
                     tenant_id=llm_invocation.tenant_id,
-                    provider_failed=True,
+                    provider_failed=not llm_provider_may_have_accepted(client),
                 )
                 raise
             except LLMError as e:
@@ -390,7 +391,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                     agent_id=agent_id,
                     user_id=agent_creator_id,
                     tenant_id=llm_invocation.tenant_id,
-                    provider_failed=True,
+                    provider_failed=not llm_provider_may_have_accepted(client),
                 )
                 logger.error(f"LLM error in heartbeat: {e}")
                 reply = ""
@@ -403,7 +404,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                     agent_id=agent_id,
                     user_id=agent_creator_id,
                     tenant_id=llm_invocation.tenant_id,
-                    provider_failed=True,
+                    provider_failed=not llm_provider_may_have_accepted(client),
                 )
                 logger.error(f"LLM call error in heartbeat: {e}")
                 reply = ""
@@ -785,6 +786,7 @@ async def run_agent_oneshot(
             get_max_tokens,
             LLMMessage,
             LLMError,
+            llm_provider_may_have_accepted,
             release_llm_round_credits,
             reserve_llm_round_credits,
             settle_llm_round_credits,
@@ -867,7 +869,7 @@ async def run_agent_oneshot(
                     agent_id=agent_id,
                     user_id=agent_creator_id,
                     tenant_id=llm_invocation.tenant_id,
-                    provider_failed=True,
+                    provider_failed=not llm_provider_may_have_accepted(client),
                 )
                 raise
             except QuotaExceeded:
@@ -878,7 +880,7 @@ async def run_agent_oneshot(
                     agent_id=agent_id,
                     user_id=agent_creator_id,
                     tenant_id=llm_invocation.tenant_id,
-                    provider_failed=True,
+                    provider_failed=not llm_provider_may_have_accepted(client),
                 )
                 raise
             except LLMError as e:
@@ -889,7 +891,7 @@ async def run_agent_oneshot(
                     agent_id=agent_id,
                     user_id=agent_creator_id,
                     tenant_id=llm_invocation.tenant_id,
-                    provider_failed=True,
+                    provider_failed=not llm_provider_may_have_accepted(client),
                 )
                 logger.error(f"[Oneshot] LLM error (round {round_i}): {e}")
                 await _notify_oneshot_error(
@@ -905,7 +907,7 @@ async def run_agent_oneshot(
                     agent_id=agent_id,
                     user_id=agent_creator_id,
                     tenant_id=llm_invocation.tenant_id,
-                    provider_failed=True,
+                    provider_failed=not llm_provider_may_have_accepted(client),
                 )
                 logger.error(f"[Oneshot] Unexpected LLM error (round {round_i}): {e}")
                 await _notify_oneshot_error(

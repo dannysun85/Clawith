@@ -196,6 +196,16 @@ def test_a2a_invocation_batches_never_merge_durable_messages():
     ]
 
 
+def test_a2a_claim_head_includes_live_processing_execution():
+    from inspect import getsource
+
+    from app.services.trigger_runtime.executions import claim_pending_trigger_executions
+
+    source = getsource(claim_pending_trigger_executions)
+    assert 'status.in_(("pending", "processing"))' in source
+    assert "earlier_is_unfinished" in source
+
+
 @pytest.mark.asyncio
 async def test_default_execution_claim_sources_include_a2a():
     from app.services.trigger_runtime.executions import claim_pending_trigger_executions

@@ -16,14 +16,19 @@ from app.services.quota_guard import QuotaExceeded
 
 
 class FakeLLMClient:
-    def __init__(self, *responses):
+    def __init__(self, *responses, failure_may_have_been_accepted=False):
         self._responses = list(responses)
+        self.failure_may_have_been_accepted = failure_may_have_been_accepted
+        self.provider_request_started = False
         self.close = AsyncMock()
 
     async def stream(self, **_kwargs):
+        self.provider_request_started = False
         response = self._responses.pop(0)
         if isinstance(response, BaseException):
+            self.provider_request_started = self.failure_may_have_been_accepted
             raise response
+        self.provider_request_started = True
         return response
 
 
@@ -706,7 +711,14 @@ async def test_financial_charge_precedes_secondary_agent_usage_counter():
 
 
 @pytest.mark.asyncio
-async def test_call_llm_settles_completed_rounds_when_cancelled():
+@pytest.mark.parametrize(
+    ("provider_may_have_accepted", "provider_failed"),
+    [(True, False), (False, True)],
+)
+async def test_call_llm_settles_completed_rounds_when_cancelled(
+    provider_may_have_accepted,
+    provider_failed,
+):
     agent_id = uuid.uuid4()
     tenant_id = uuid.uuid4()
     model = SimpleNamespace(
@@ -726,7 +738,11 @@ async def test_call_llm_settles_completed_rounds_when_cancelled():
         reasoning_content=None,
         usage={"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60},
     )
-    client = FakeLLMClient(response, asyncio.CancelledError())
+    client = FakeLLMClient(
+        response,
+        asyncio.CancelledError(),
+        failure_may_have_been_accepted=provider_may_have_accepted,
+    )
     first_reservation_id = uuid.uuid4()
     second_reservation_id = uuid.uuid4()
 
@@ -768,6 +784,7 @@ async def test_call_llm_settles_completed_rounds_when_cancelled():
     assert settle_round.await_args.args == (first_reservation_id,)
     release_round.assert_awaited_once()
     assert release_round.await_args.args == (second_reservation_id,)
+    assert release_round.await_args.kwargs["provider_failed"] is provider_failed
     settle_quota.assert_awaited_once()
     assert settle_quota.await_args.kwargs["charge_credits_enabled"] is False
     client.close.assert_awaited_once()
@@ -1060,16 +1077,19 @@ def test_autonomous_entrypoints_keep_routing_and_settlement_hooks():
     assert "prepare_agent_llm_invocation" in heartbeat_source
     assert "settle_agent_llm_invocation" in heartbeat_source
     assert "get_llm_request_options" in heartbeat_source
+    assert "llm_provider_may_have_accepted" in heartbeat_source
     assert heartbeat_source.count("**request_options") == 1
     assert "prepare_agent_llm_invocation" in oneshot_source
     assert "settle_agent_llm_invocation" in oneshot_source
     assert "get_llm_request_options" in oneshot_source
+    assert "llm_provider_may_have_accepted" in oneshot_source
     assert oneshot_source.count("**request_options") == 1
     assert "resolve_agent_model" in trigger_source
     assert "route_meta=route_meta" in trigger_source
     assert "prepare_agent_llm_invocation" in supervision_source
     assert "settle_agent_llm_invocation" in supervision_source
     assert "get_llm_request_options" in supervision_source
+    assert "llm_provider_may_have_accepted" in supervision_source
     assert supervision_source.count("**request_options") == 1
     assert "resolve_agent_model" in feishu_loader_source
     assert "route_meta=route_meta" in feishu_call_source
@@ -1077,3 +1097,4 @@ def test_autonomous_entrypoints_keep_routing_and_settlement_hooks():
     assert "route_meta=route_meta" in gateway_source
     assert "_prepare_llm_billing_context" in background_tools_source
     assert "_finalize_background_usage" in background_tools_source
+    assert "llm_provider_may_have_accepted" in background_tools_source

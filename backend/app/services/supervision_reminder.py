@@ -108,6 +108,7 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
     from app.services.llm import (
         create_llm_client,
         get_llm_request_options,
+        llm_provider_may_have_accepted,
         LLMMessage,
         prepare_agent_llm_invocation,
         release_llm_round_credits,
@@ -196,7 +197,7 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
             agent_id=target_agent.id,
             user_id=target_agent.creator_id,
             tenant_id=invocation.tenant_id,
-            provider_failed=True,
+            provider_failed=not llm_provider_may_have_accepted(client),
         )
         raise
     except LLMError as e:
@@ -207,7 +208,7 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
             agent_id=target_agent.id,
             user_id=target_agent.creator_id,
             tenant_id=invocation.tenant_id,
-            provider_failed=True,
+            provider_failed=not llm_provider_may_have_accepted(client),
         )
         logger.error(f"_get_agent_reply LLM error: {e}")
     except Exception as e:
@@ -218,7 +219,7 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
             agent_id=target_agent.id,
             user_id=target_agent.creator_id,
             tenant_id=invocation.tenant_id,
-            provider_failed=True,
+            provider_failed=not llm_provider_may_have_accepted(client),
         )
         logger.error(f"_get_agent_reply LLM call failed: {e}")
     finally:

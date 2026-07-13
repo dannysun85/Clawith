@@ -104,6 +104,11 @@ async def main() -> None:
     first_lease_token = first_execution.lease_owner
     assert first_lease_token
 
+    # The active head owns this Agent's A2A lane until it completes or its
+    # lease expires. A second daemon tick must not claim the next message.
+    active_head_claim = await claim_pending_trigger_executions(sources=["a2a"])
+    assert second_execution_id not in [item[0].id for item in active_head_claim]
+
     # Simulate a worker crash after claiming the row. An expired lease must be
     # reclaimable by the next daemon instance.
     async with async_session() as db:

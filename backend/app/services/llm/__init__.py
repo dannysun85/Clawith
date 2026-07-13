@@ -38,7 +38,13 @@ from .caller import (
     FailoverGuard,
     is_retryable_error,
 )
-from .client import LLMClient, LLMResponse, LLMError, LLMMessage
+from .client import (
+    LLMClient,
+    LLMResponse,
+    LLMError,
+    LLMMessage,
+    llm_provider_may_have_accepted,
+)
 from .failover import classify_error, FailoverErrorType
 from .utils import (
     create_llm_client,
@@ -74,6 +80,7 @@ __all__ = [
     "LLMResponse",
     "LLMError",
     "LLMMessage",
+    "llm_provider_may_have_accepted",
     # Utilities
     "create_llm_client",
     "get_max_tokens",

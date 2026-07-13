@@ -51,7 +51,7 @@ from app.services.token_tracker import (
     estimate_token_usage_from_chars,
 )
 
-from .client import LLMError
+from .client import LLMError, llm_provider_may_have_accepted
 from .failover import (
     CredentialFailureAction,
     FailoverErrorType,
@@ -1052,11 +1052,12 @@ async def release_llm_round_credits(
     tenant_id: uuid.UUID | None,
     provider_failed: bool = False,
 ) -> None:
-    """Release a hold only when the provider did not return a usable result.
+    """Release a hold only when the provider is known not to have accepted it.
 
     LLM reservations enter ``provider_inflight`` atomically before network I/O.
-    Callers must explicitly identify provider failure/cancellation to release
-    that state; settlement failures therefore fail closed with the hold intact.
+    Callers may release that state only after an explicit HTTP rejection or a
+    pre-connection failure.  Cancellation, read interruption, and other
+    ambiguous outcomes fail closed with the hold intact for reconciliation.
     """
     if reservation_id is None:
         return
@@ -1416,7 +1417,7 @@ async def call_llm(
                 agent_id=agent_id,
                 user_id=user_id,
                 tenant_id=_tenant_id,
-                provider_failed=True,
+                provider_failed=not llm_provider_may_have_accepted(client),
             )
             await _finalize_llm_usage()
             await client.close()
@@ -1429,7 +1430,7 @@ async def call_llm(
                 agent_id=agent_id,
                 user_id=user_id,
                 tenant_id=_tenant_id,
-                provider_failed=True,
+                provider_failed=not llm_provider_may_have_accepted(client),
             )
             await _finalize_llm_usage()
             await client.close()
@@ -1442,7 +1443,7 @@ async def call_llm(
                 agent_id=agent_id,
                 user_id=user_id,
                 tenant_id=_tenant_id,
-                provider_failed=True,
+                provider_failed=not llm_provider_may_have_accepted(client),
             )
             logger.error(
                 "[LLM] provider operation failed provider={} model={} error_type={} error_code={}",
@@ -1481,7 +1482,7 @@ async def call_llm(
                 agent_id=agent_id,
                 user_id=user_id,
                 tenant_id=_tenant_id,
-                provider_failed=True,
+                provider_failed=not llm_provider_may_have_accepted(client),
             )
             logger.error(
                 "[LLM] unexpected provider failure provider={} model={} error_type={} error_code={}",
@@ -2244,7 +2245,7 @@ async def call_agent_llm_with_tools(
                         agent_id=agent_id,
                         user_id=agent.creator_id,
                         tenant_id=tenant_id,
-                        provider_failed=True,
+                        provider_failed=not llm_provider_may_have_accepted(client),
                     )
                     raise
                 except Exception as e:
@@ -2255,7 +2256,7 @@ async def call_agent_llm_with_tools(
                         agent_id=agent_id,
                         user_id=agent.creator_id,
                         tenant_id=tenant_id,
-                        provider_failed=True,
+                        provider_failed=not llm_provider_may_have_accepted(client),
                     )
                     logger.error(
                         "[call_agent_llm_with_tools] agent={} provider={} model={} "

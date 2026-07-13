@@ -209,6 +209,39 @@ class LLMClient(ABC):
         self.base_url = base_url
         self.model = model
         self.timeout = timeout
+        # These flags describe the most recent provider operation.  Credit
+        # callers use them conservatively: once network I/O may have reached
+        # the provider, cancellation/read failures must keep the reservation
+        # held for reconciliation instead of guessing that no bill exists.
+        self.provider_request_started = False
+        self.provider_response_started = False
+
+    def _reset_provider_state(self) -> None:
+        self.provider_request_started = False
+        self.provider_response_started = False
+
+    def _mark_provider_request_started(self) -> None:
+        self.provider_request_started = True
+
+    def _mark_provider_response_started(self) -> None:
+        self.provider_request_started = True
+        self.provider_response_started = True
+
+    def _mark_provider_rejected(self) -> None:
+        """Record a failure that is known not to have produced provider debt."""
+
+        self.provider_request_started = False
+        self.provider_response_started = False
+
+    def _mark_provider_http_error(self, status_code: int) -> None:
+        """Release only deterministic client-side rejections.
+
+        Server failures and request timeouts can occur after acceptance, so
+        they deliberately retain the ambiguous provider-request state.
+        """
+
+        if 400 <= status_code < 500 and status_code != 408:
+            self._mark_provider_rejected()
 
     @abstractmethod
     async def complete(
@@ -241,6 +274,21 @@ class LLMClient(ABC):
     def _get_headers(self) -> dict[str, str]:
         """Get request headers."""
         pass
+
+
+def llm_provider_may_have_accepted(client: Any) -> bool:
+    """Return whether the latest request may have reached a billable provider.
+
+    A request is treated as ambiguous from the moment network I/O starts.  A
+    client may clear the flag only for an explicit HTTP rejection or a
+    connection/pool failure that happened before a provider connection was
+    established.  Gemini's legacy OpenAI-compatible adapter is inspected too.
+    """
+
+    if bool(getattr(client, "provider_request_started", False)):
+        return True
+    fallback = getattr(client, "_openai_fallback_client", None)
+    return bool(fallback and getattr(fallback, "provider_request_started", False))
 
 
 # ============================================================================
@@ -556,16 +604,24 @@ class OpenAICompatibleClient(LLMClient):
         **kwargs: Any,
     ) -> LLMResponse:
         """Non-streaming completion."""
+        self._reset_provider_state()
         url = f"{self._normalize_base_url()}/chat/completions"
         payload = self._build_payload(messages, tools, temperature, max_tokens, stream=False, **kwargs)
 
         client = await self._get_client()
-        response = await client.post(url, json=payload, headers=self._get_headers())
+        self._mark_provider_request_started()
+        try:
+            response = await client.post(url, json=payload, headers=self._get_headers())
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
+            self._mark_provider_rejected()
+            raise
 
         if response.status_code >= 400:
+            self._mark_provider_http_error(response.status_code)
             error_text = response.text[:500]
             raise LLMError(f"HTTP {response.status_code}: {error_text}")
 
+        self._mark_provider_response_started()
         data = response.json()
 
         if "error" in data:
@@ -607,6 +663,7 @@ class OpenAICompatibleClient(LLMClient):
         **kwargs: Any,
     ) -> LLMResponse:
         """Streaming completion."""
+        self._reset_provider_state()
         url = f"{self._normalize_base_url()}/chat/completions"
         payload = self._build_payload(messages, tools, temperature, max_tokens, stream=True, **kwargs)
         full_content = ""
@@ -624,13 +681,16 @@ class OpenAICompatibleClient(LLMClient):
 
         for attempt in range(max_retries):
             try:
+                self._mark_provider_request_started()
                 async with client.stream("POST", url, json=payload, headers=self._get_headers()) as resp:
                     if resp.status_code >= 400:
+                        self._mark_provider_http_error(resp.status_code)
                         error_body = ""
                         async for chunk in resp.aiter_bytes():
                             error_body += chunk.decode(errors="replace")
                         raise LLMError(f"HTTP {resp.status_code}: {error_body[:500]}")
 
+                    self._mark_provider_response_started()
                     async for line in resp.aiter_lines():
                         chunk, in_think, tag_buffer, json_buffer = self._parse_stream_line(
                             line, in_think, tag_buffer, json_buffer
@@ -686,7 +746,11 @@ class OpenAICompatibleClient(LLMClient):
 
                 break  # Success
 
-            except (httpx.ConnectError, httpx.ReadError, httpx.ConnectTimeout) as e:
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+                # These failures occur before a provider connection exists, so
+                # retrying cannot duplicate a generation and the Credits hold
+                # is releasable if all attempts fail this way.
+                self._mark_provider_rejected()
                 if attempt < max_retries - 1:
                     wait = (attempt + 1) * 1
                     logger.warning(f"Stream attempt {attempt + 1} failed ({type(e).__name__}), retrying in {wait}s...")
@@ -699,6 +763,10 @@ class OpenAICompatibleClient(LLMClient):
                     json_buffer = ""
                 else:
                     raise LLMError(f"Connection failed after {max_retries} attempts: {e}")
+            except (httpx.ReadError, httpx.ReadTimeout) as e:
+                # A successful response (or even a sent request awaiting its
+                # response) may already be billable.  Never replay it.
+                raise LLMError(f"Provider stream interrupted after request start: {e}") from e
 
         # Clean up any remaining think tags
         full_content = re.sub(r"<think>[\s\S]*?</think>\s*", "", full_content).strip()
@@ -1026,16 +1094,24 @@ class OpenAIResponsesClient(LLMClient):
         **kwargs: Any,
     ) -> LLMResponse:
         """Non-streaming completion."""
+        self._reset_provider_state()
         url = f"{self._normalize_base_url()}/responses"
         payload = self._build_payload(messages, tools, temperature, max_tokens, stream=False, **kwargs)
 
         client = await self._get_client()
-        response = await client.post(url, json=payload, headers=self._get_headers())
+        self._mark_provider_request_started()
+        try:
+            response = await client.post(url, json=payload, headers=self._get_headers())
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
+            self._mark_provider_rejected()
+            raise
 
         if response.status_code >= 400:
+            self._mark_provider_http_error(response.status_code)
             error_text = response.text[:500]
             raise LLMError(f"HTTP {response.status_code}: {error_text}")
 
+        self._mark_provider_response_started()
         data = response.json()
         api_error = self._extract_api_error(data)
         if api_error:
@@ -1432,6 +1508,7 @@ class GeminiClient(LLMClient):
         **kwargs: Any,
     ) -> LLMResponse:
         """Non-streaming completion."""
+        self._reset_provider_state()
         if self._is_openai_compatible_base():
             fallback = await self._get_openai_fallback_client()
             return await fallback.complete(
@@ -1447,12 +1524,19 @@ class GeminiClient(LLMClient):
         payload = self._build_payload(messages, tools, temperature, max_tokens, **kwargs)
 
         client = await self._get_client()
-        response = await client.post(url, json=payload, headers=self._get_headers())
+        self._mark_provider_request_started()
+        try:
+            response = await client.post(url, json=payload, headers=self._get_headers())
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
+            self._mark_provider_rejected()
+            raise
 
         if response.status_code >= 400:
+            self._mark_provider_http_error(response.status_code)
             error_text = response.text[:500]
             raise LLMError(f"HTTP {response.status_code}: {error_text}")
 
+        self._mark_provider_response_started()
         data = response.json()
         if isinstance(data, dict) and data.get("error"):
             raise LLMError(f"API error: {data['error']}")
@@ -1471,6 +1555,7 @@ class GeminiClient(LLMClient):
         **kwargs: Any,
     ) -> LLMResponse:
         """Streaming completion using Gemini SSE endpoint."""
+        self._reset_provider_state()
         if self._is_openai_compatible_base():
             fallback = await self._get_openai_fallback_client()
             return await fallback.stream(
@@ -1497,6 +1582,7 @@ class GeminiClient(LLMClient):
         client = await self._get_client()
 
         try:
+            self._mark_provider_request_started()
             async with client.stream(
                 "POST",
                 url,
@@ -1505,11 +1591,13 @@ class GeminiClient(LLMClient):
                 headers=self._get_headers(),
             ) as resp:
                 if resp.status_code >= 400:
+                    self._mark_provider_http_error(resp.status_code)
                     error_body = ""
                     async for chunk in resp.aiter_bytes():
                         error_body += chunk.decode(errors="replace")
                     raise LLMError(f"HTTP {resp.status_code}: {error_body[:500]}")
 
+                self._mark_provider_response_started()
                 async for line in resp.aiter_lines():
                     if not line.startswith("data:"):
                         continue
@@ -1564,8 +1652,11 @@ class GeminiClient(LLMClient):
                                 "_gemini_extra": extra,
                             })
 
-        except (httpx.ConnectError, httpx.ReadError, httpx.ConnectTimeout) as e:
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+            self._mark_provider_rejected()
             raise LLMError(f"Connection failed: {e}")
+        except (httpx.ReadError, httpx.ReadTimeout) as e:
+            raise LLMError(f"Provider stream interrupted after request start: {e}") from e
 
         return LLMResponse(
             content=full_text,
@@ -1725,16 +1816,24 @@ class AnthropicClient(LLMClient):
         **kwargs: Any,
     ) -> LLMResponse:
         """Non-streaming completion."""
+        self._reset_provider_state()
         url = f"{self._normalize_base_url()}/v1/messages"
         payload = self._build_payload(messages, tools, temperature, max_tokens, stream=False, **kwargs)
 
         client = await self._get_client()
-        response = await client.post(url, json=payload, headers=self._get_headers())
+        self._mark_provider_request_started()
+        try:
+            response = await client.post(url, json=payload, headers=self._get_headers())
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
+            self._mark_provider_rejected()
+            raise
 
         if response.status_code >= 400:
+            self._mark_provider_http_error(response.status_code)
             error_text = response.text[:500]
             raise LLMError(f"HTTP {response.status_code}: {error_text}")
 
+        self._mark_provider_response_started()
         data = response.json()
         if data.get("type") == "error":
             raise LLMError(f"API error: {data.get('error', {})}")
@@ -1791,6 +1890,7 @@ class AnthropicClient(LLMClient):
         **kwargs: Any,
     ) -> LLMResponse:
         """Streaming completion."""
+        self._reset_provider_state()
         url = f"{self._normalize_base_url()}/v1/messages"
         payload = self._build_payload(messages, tools, temperature, max_tokens, stream=True, **kwargs)
 
@@ -1806,13 +1906,16 @@ class AnthropicClient(LLMClient):
         client = await self._get_client()
 
         try:
+            self._mark_provider_request_started()
             async with client.stream("POST", url, json=payload, headers=self._get_headers()) as resp:
                 if resp.status_code >= 400:
+                    self._mark_provider_http_error(resp.status_code)
                     error_body = ""
                     async for chunk in resp.aiter_bytes():
                         error_body += chunk.decode(errors="replace")
                     raise LLMError(f"HTTP {resp.status_code}: {error_body[:500]}")
 
+                self._mark_provider_response_started()
                 current_event = None
 
                 async for line in resp.aiter_lines():
@@ -1912,8 +2015,11 @@ class AnthropicClient(LLMClient):
                     elif current_event == "message_stop":
                         break
 
-        except (httpx.ConnectError, httpx.ReadError, httpx.ConnectTimeout) as e:
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+            self._mark_provider_rejected()
             raise LLMError(f"Connection failed: {e}")
+        except (httpx.ReadError, httpx.ReadTimeout) as e:
+            raise LLMError(f"Provider stream interrupted after request start: {e}") from e
 
         # Normalize stop reason to OpenAI style (optional but helpful for consistency)
         if last_finish_reason == "end_turn":

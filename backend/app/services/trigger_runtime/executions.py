@@ -123,21 +123,17 @@ async def claim_pending_trigger_executions(
     a2a_head_only = True
     if "a2a" in sources:
         earlier_execution = aliased(TriggerExecution)
-        earlier_is_eligible = or_(
-            earlier_execution.status == "pending",
-            (earlier_execution.status == "processing")
-            & (
-                earlier_execution.lease_expires_at.is_(None)
-                | (earlier_execution.lease_expires_at < now)
-            ),
-        )
+        # A live processing head still owns this Agent's A2A lane.  Limiting
+        # the subquery to executions that are eligible for a new claim would
+        # let the second message run concurrently until the first lease ends.
+        earlier_is_unfinished = earlier_execution.status.in_(("pending", "processing"))
         a2a_head_only = or_(
             TriggerExecution.source != "a2a",
             ~exists(
                 select(1).where(
                     earlier_execution.source == "a2a",
                     earlier_execution.agent_id == TriggerExecution.agent_id,
-                    earlier_is_eligible,
+                    earlier_is_unfinished,
                     or_(
                         earlier_execution.scheduled_at
                         < TriggerExecution.scheduled_at,
