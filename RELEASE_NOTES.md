@@ -2,6 +2,15 @@
 
 ## Model Routing and Multimodal Understanding
 
+- Lite, Pro, and Ultra understanding routes are seeded through the centrally managed `MiniMax-M3` pool for `text`, `image`, and `video` inputs. Chat uploads select the concrete attachment route, and the OpenAI-compatible caller converts image/video markers into structured content parts instead of sending them as plain text.
+- Attachment-driven `image`/`video` understanding is request-scoped. It no longer overwrites the session's persistent modality, so a later text-only turn or page refresh cannot silently keep using the previous attachment route; the user's Lite/Pro/Ultra tier remains persistent.
+- `audio` and `music` remain generation-tool capabilities rather than chat-understanding routes. Image, speech, music, and video generation continue through the explicit media tools, plan entitlements, reservation, and exactly-once Credits settlement paths.
+- Routed M3 models retain a legacy-compatible primary `text` modality plus explicit `text/image/video` capabilities. The selector separates request capability from provider quota scope, so both blue/green slots can use the healthy platform pool during migration.
+- Media capability discovery uses the same centrally funded platform-pool boundary as runtime credential selection. A tenant-private MiniMax credential cannot make a shared SaaS media capability appear available to another company.
+- The model selector remains a centrally funded shared-pool policy. This release does **not** add tenant-level or LLM-model-object-level authorization.
+
+## Production Privacy and Cutover Safety
+
 - Audited production runtime paths no longer include chat prompts, assistant response previews, tool arguments/results, channel message text, OAuth/provider response bodies, credential prefixes, external sender/message identifiers, or user-controlled file paths in operational logs. Diagnostics use server-generated Trace IDs plus code-owned operation/type, status/error code, content length, and aggregate counts.
 - Central exception formatting no longer renders exception values or diagnostic local variables. It retains the exception type and a bounded function/line trace shape for investigation without exposing customer or credential data. Standard-library records retain only safe diagnostic shape (`source`, `level`, message length, argument shape, bounded HTTP status, and exception type), while a source-level contract rejects direct logging of sensitive values in application and startup-seeder paths.
 - HTTP request contexts always use a server-generated 12-hex Trace ID; successful and handled-error responses expose it through `X-Trace-Id`. Client-supplied `X-Trace-Id` content is ignored so correlation headers cannot inject customer or credential data into operational logs.
@@ -24,16 +33,9 @@
 - Platform-seeded OKR/CEO automation is disabled by default through migration `094_disable_system_okr_automation.py` and `OKR_AUTOMATION_ENABLED=false`. Explicit user-triggered work, user-managed schedules, durable A2A delivery, and media reconciliation remain available.
 - The OKR safety switch now checks `is_system` as well as the reserved trigger name. A user-created trigger that happens to use an OKR-like name is no longer suppressed or given system-only execution instructions.
 - Trigger claiming and execution are bounded by `TRIGGER_MAX_CONCURRENCY` and `TRIGGER_CLAIM_BATCH_SIZE`, preventing a backlog from starting an unbounded number of Agent runs at once.
-- Production deployment now quiesces the previous worker before running schema migrations. Rollback also quiesces both old and candidate API writers before database downgrade, and every guarded failure exits after cleanup instead of resuming the deployment after `set +e`. Every trigger claim gets a unique generation fence, long executions renew their lease, and completion/failure requires both the `processing` state and the exact current fence. A late coroutine from an expired/reclaimed worker can no longer overwrite the new owner, a migration, or an operator-forced terminal state.
+- Production deployment quiesces the previous worker before the automation-state migration. The blue/green cutover uses a serialized host lock, durable slot/release and cutover journals, exact public/worker identity checks, bounded Nginx drain, and signal-safe rollback. The release migrations are backward-compatible and remain applied during application rollback, preserving the OKR safety switch and operational evidence instead of attempting a risky online schema downgrade.
+- Every trigger claim gets a unique generation fence, long executions renew their lease, and completion/failure requires both the `processing` state and the exact current fence. A late coroutine from an expired/reclaimed worker cannot overwrite the new owner, a migration, or an operator-forced terminal state.
 - Production issue ingestion has a bounded fallback queue, so a temporary persistence outage cannot create unlimited in-memory growth while the monitor continues collecting privacy-safe operational evidence.
-
-## Privacy-Safe Diagnostics
-
-- Audited runtime paths no longer put prompts, response previews, tool payloads, channel messages, provider bodies, credential prefixes, external message identifiers, or user-controlled paths into operational logs. Server-generated Trace IDs and bounded code-owned diagnostic shapes remain available for correlation.
-- Central exception formatting excludes exception values and local variables. HTTP responses expose a server-generated `X-Trace-Id` and ignore client-supplied trace content, preventing customer data from entering log correlation fields.
-- The privacy contract covers HTTP, WebSocket, LLM/tool execution, automation, AgentBay, OAuth, and the supported enterprise channel adapters. Source-level tests reject known payload/preview logging patterns.
-- Managed proxy startup diagnostics no longer expose configuration paths, node labels, server addresses, ports, or provider stderr content.
-- Browser incident intake now accepts only a typed, bounded diagnostic schema. Free-form prompts, messages, provider bodies, and arbitrary metadata cannot be smuggled into production-issue storage through diagnostic fields.
 
 ## Credits and Failure Isolation
 

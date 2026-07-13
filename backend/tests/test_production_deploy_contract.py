@@ -5,7 +5,6 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
-import subprocess
 
 import pytest
 
@@ -1442,6 +1441,162 @@ exit $status
     assert result.returncode == 1
     assert "status=1" in result.stdout
     assert "invalid active state format" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_status"),
+    [
+        ("valid", 0),
+        ("existing_valid_journal", 0),
+        ("release_mismatch", 1),
+        ("nginx_mismatch", 1),
+        ("symlink_journal", 1),
+        ("dangling_symlink_journal", 1),
+        ("invalid_journal", 1),
+        ("multiline_journal", 1),
+        ("empty_journal", 1),
+        ("directory_journal", 1),
+    ],
+)
+def test_legacy_active_pair_slot_journal_is_strictly_migrated(
+    tmp_path,
+    mutation,
+    expected_status,
+):
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    app_root = tmp_path / "app"
+    release_b = _write_test_release(app_root, "release-b")
+    current = app_root / "current"
+    current.symlink_to(release_b)
+    active_slot = app_root / "active-slot"
+    active_slot.write_text("b\n", encoding="utf-8")
+    active_release = app_root / "active-release"
+    active_release.write_text(
+        f"{'wrong-release' if mutation == 'release_mismatch' else 'release-b'}\n",
+        encoding="utf-8",
+    )
+    slot_journal = app_root / "slot-b-release"
+    external_journal = tmp_path / "external-slot-journal"
+    if mutation == "existing_valid_journal":
+        slot_journal.write_text(f"{release_b}\n", encoding="utf-8")
+    elif mutation == "symlink_journal":
+        external_journal.write_text(f"{release_b}\n", encoding="utf-8")
+        slot_journal.symlink_to(external_journal)
+    elif mutation == "dangling_symlink_journal":
+        slot_journal.symlink_to(tmp_path / "missing-slot-journal")
+    elif mutation == "invalid_journal":
+        slot_journal.write_text("not-a-release\n", encoding="utf-8")
+    elif mutation == "multiline_journal":
+        slot_journal.write_text(
+            f"{str(release_b)[:-1]}\n{str(release_b)[-1:]}\n",
+            encoding="utf-8",
+        )
+    elif mutation == "empty_journal":
+        slot_journal.touch()
+    elif mutation == "directory_journal":
+        slot_journal.mkdir()
+    state_helpers = _shell_function_source(
+        script,
+        "write_atomic_line",
+        "write_cutover_state",
+    )
+    port_function = _shell_function_source(
+        script,
+        "port_for_slot",
+        "release_payloads_match",
+    )
+    release_function = _shell_function_source(
+        script,
+        "release_for_slot",
+        "wait_for_worker_release",
+    )
+    validate_function = _shell_function_source(
+        script,
+        "validate_stable_state",
+        "recover_indeterminate_cutover",
+    )
+    nginx_port = "3008" if mutation == "nginx_mismatch" else "3009"
+    harness = f"""set +e
+APP_ROOT={shlex.quote(str(app_root))}
+COMPOSE_FILE=docker-compose.prod.yml
+CURRENT={shlex.quote(str(current))}
+ACTIVE_STATE_FILE={shlex.quote(str(app_root / 'active-state'))}
+ACTIVE_SLOT_FILE={shlex.quote(str(active_slot))}
+ACTIVE_RELEASE_FILE={shlex.quote(str(active_release))}
+CUTOVER_PHASE=
+NGINX_ACTIVE_PORT={nginx_port}
+{state_helpers}
+{port_function}
+{release_function}
+{validate_function}
+load_active_state
+echo "source_before=$ACTIVE_STATE_SOURCE"
+validate_stable_state
+status=$?
+if [ "$status" != 0 ]; then
+    echo "status=$status"
+    exit "$status"
+fi
+PREVIOUS=$(readlink -f "$CURRENT")
+ACTIVE_SLOT=$RECORDED_SLOT
+PREVIOUS_RELEASE_ID=$(basename "$PREVIOUS")
+write_atomic_line "$APP_ROOT/slot-${{ACTIVE_SLOT}}-release" "$PREVIOUS"
+commit_active_state "$ACTIVE_SLOT" "$PREVIOUS_RELEASE_ID"
+load_active_state
+validate_stable_state
+status=$?
+echo "status=$status source_after=$ACTIVE_STATE_SOURCE"
+echo "state=$(tr -d '\n' < "$ACTIVE_STATE_FILE")"
+echo "journal=$(tr -d '\n' < "$APP_ROOT/slot-b-release")"
+exit "$status"
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == expected_status, result.stderr
+    assert f"status={expected_status}" in result.stdout
+    assert "source_before=legacy-pair" in result.stdout
+    if expected_status == 0:
+        assert "source_after=atomic" in result.stdout
+        assert "state=slot=b release=release-b" in result.stdout
+        assert f"journal={release_b}" in result.stdout
+    else:
+        assert not (app_root / "active-state").exists()
+        if mutation == "symlink_journal":
+            assert slot_journal.is_symlink()
+            assert external_journal.read_text(encoding="utf-8") == f"{release_b}\n"
+        elif mutation == "dangling_symlink_journal":
+            assert slot_journal.is_symlink()
+            assert not slot_journal.exists()
+        elif mutation == "invalid_journal":
+            assert slot_journal.read_text(encoding="utf-8") == "not-a-release\n"
+        elif mutation == "multiline_journal":
+            assert slot_journal.read_text(encoding="utf-8") == (
+                f"{str(release_b)[:-1]}\n{str(release_b)[-1:]}\n"
+            )
+        elif mutation == "empty_journal":
+            assert slot_journal.read_bytes() == b""
+        elif mutation == "directory_journal":
+            assert slot_journal.is_dir()
+        else:
+            assert not slot_journal.exists()
+
+    previous_id = script.index('PREVIOUS_RELEASE_ID="$(basename "$PREVIOUS")"')
+    slot_journal = script.index(
+        'write_atomic_line "$APP_ROOT/slot-${ACTIVE_SLOT}-release" "$PREVIOUS"',
+        previous_id,
+    )
+    canonical_commit = script.index(
+        'commit_active_state "$ACTIVE_SLOT" "$PREVIOUS_RELEASE_ID"',
+        slot_journal,
+    )
+    pending_drain = script.index("if ! complete_pending_drain", canonical_commit)
+    assert previous_id < slot_journal < canonical_commit < pending_drain
 
 
 @pytest.mark.parametrize(

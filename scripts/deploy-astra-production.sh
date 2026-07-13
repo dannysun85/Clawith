@@ -603,10 +603,45 @@ release_for_slot() {
     local journal="$APP_ROOT/slot-${slot}-release"
     local release
 
-    if [ ! -s "$journal" ]; then
+    if [ ! -f "$journal" ] || [ -L "$journal" ] || [ ! -s "$journal" ]; then
         return 1
     fi
-    release="$(tr -d '\r\n' < "$journal")"
+    release="$(python3 - "$journal" <<'PY_STRICT_SLOT_JOURNAL'
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+try:
+    descriptor = os.open(path, flags)
+except OSError:
+    raise SystemExit(1)
+try:
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        raise SystemExit(1)
+    payload = os.read(descriptor, 4097)
+finally:
+    os.close(descriptor)
+
+if (
+    not payload
+    or len(payload) > 4096
+    or not payload.endswith(b"\n")
+    or payload.count(b"\n") != 1
+    or b"\r" in payload
+    or b"\x00" in payload
+):
+    raise SystemExit(1)
+try:
+    value = payload[:-1].decode("utf-8")
+except UnicodeDecodeError:
+    raise SystemExit(1)
+if not value or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+    raise SystemExit(1)
+sys.stdout.write(value)
+PY_STRICT_SLOT_JOURNAL
+)" || return 1
     if [ -z "$release" ] || [ ! -d "$release" ]; then
         return 1
     fi
@@ -976,6 +1011,7 @@ validate_stable_state() {
     local recorded_release_id
     local canonical_current
     local expected_port
+    local recorded_journal
 
     if [ "$ACTIVE_STATE_PRESENT" = "0" ]; then
         if [ -n "$CUTOVER_PHASE" ]; then
@@ -989,17 +1025,51 @@ validate_stable_state() {
         return 0
     fi
 
-    if ! recorded_release="$(release_for_slot "$RECORDED_SLOT")"; then
-        echo "committed active slot has no valid release journal" >&2
+    canonical_current="$(readlink -f "$CURRENT")" || return 1
+    if [ ! -L "$CURRENT" ]; then
+        echo "current release is not an atomic symlink" >&2
         return 1
+    fi
+    if ! recorded_release="$(release_for_slot "$RECORDED_SLOT")"; then
+        if [ "$ACTIVE_STATE_SOURCE" != "legacy-pair" ]; then
+            echo "committed active slot has no valid release journal" >&2
+            return 1
+        fi
+        recorded_journal="$APP_ROOT/slot-${RECORDED_SLOT}-release"
+        if [ -e "$recorded_journal" ] || [ -L "$recorded_journal" ]; then
+            echo "legacy active slot has an invalid existing release journal" >&2
+            return 1
+        fi
+        # Pre-v1.10.12 production stored only active-slot/active-release.
+        # Accept that format for one migration only when current is a complete
+        # managed release whose basename and live Nginx slot both agree.
+        recorded_release="$canonical_current"
+        case "$recorded_release" in
+            "$APP_ROOT"/releases/*) ;;
+            *)
+                echo "legacy active release is outside the managed release directory" >&2
+                return 1
+                ;;
+        esac
+        if [ ! -s "$recorded_release/VERSION" ] || \
+            [ ! -s "$recorded_release/COMMIT" ] || \
+            [ ! -s "$recorded_release/.env" ] || \
+            [ ! -s "$recorded_release/$COMPOSE_FILE" ]; then
+            echo "legacy active release is incomplete" >&2
+            return 1
+        fi
+        expected_port="$(port_for_slot "$RECORDED_SLOT")" || return 1
+        if [ "$expected_port" != "$NGINX_ACTIVE_PORT" ]; then
+            echo "legacy active slot does not match the live Nginx upstream" >&2
+            return 1
+        fi
     fi
     recorded_release_id="$(basename "$recorded_release")"
     if [ "$recorded_release_id" != "$ACTIVE_RELEASE_ID" ]; then
         echo "active release does not match the active slot journal" >&2
         return 1
     fi
-    canonical_current="$(readlink -f "$CURRENT")" || return 1
-    if [ ! -L "$CURRENT" ] || [ "$canonical_current" != "$recorded_release" ]; then
+    if [ "$canonical_current" != "$recorded_release" ]; then
         echo "current symlink does not match the committed active release" >&2
         return 1
     fi
@@ -1159,13 +1229,6 @@ if [ "$RECOVERY_REQUIRED" = "1" ]; then
         echo "cutover recovery did not produce a consistent terminal state" >&2
         exit 1
     fi
-elif [ "$ACTIVE_STATE_PRESENT" = "1" ]; then
-    # Heal compatibility mirrors or migrate the pre-v1.10.12 pair only after
-    # the canonical state, current symlink, and live Nginx target agree.
-    commit_active_state "$RECORDED_SLOT" "$ACTIVE_RELEASE_ID" || {
-        echo "cannot persist canonical active release state" >&2
-        exit 1
-    }
 fi
 
 if [ "$RECORDED_SLOT" = "legacy" ]; then
@@ -1201,8 +1264,11 @@ if [ "$ACTIVE_SLOT" = "legacy" ]; then
     PREVIOUS="$CURRENT_TARGET"
 else
     ACTIVE_SLOT_RELEASE_FILE="$APP_ROOT/slot-${ACTIVE_SLOT}-release"
-    if [ -f "$ACTIVE_SLOT_RELEASE_FILE" ]; then
-        PREVIOUS="$(tr -d '\r\n' < "$ACTIVE_SLOT_RELEASE_FILE")"
+    if PREVIOUS="$(release_for_slot "$ACTIVE_SLOT")"; then
+        :
+    elif [ -e "$ACTIVE_SLOT_RELEASE_FILE" ] || [ -L "$ACTIVE_SLOT_RELEASE_FILE" ]; then
+        echo "cannot reconcile live slot $ACTIVE_SLOT from an invalid release journal" >&2
+        exit 1
     elif [ "$ACTIVE_SLOT" = "$RECORDED_SLOT" ] && [ -d "$CURRENT_TARGET" ]; then
         PREVIOUS="$CURRENT_TARGET"
         write_atomic_line "$ACTIVE_SLOT_RELEASE_FILE" "$PREVIOUS"
@@ -1236,14 +1302,17 @@ if [ ! -s "$PREVIOUS/VERSION" ] || [ ! -s "$PREVIOUS/COMMIT" ] || \
 fi
 PREVIOUS_RELEASE_ID="$(basename "$PREVIOUS")"
 write_atomic_line "$APP_ROOT/slot-${ACTIVE_SLOT}-release" "$PREVIOUS"
-if [ "$ACTIVE_STATE_PRESENT" = "0" ]; then
-    commit_active_state "$ACTIVE_SLOT" "$PREVIOUS_RELEASE_ID" || {
-        echo "cannot bootstrap canonical active release state" >&2
-        exit 1
-    }
-    ACTIVE_STATE_PRESENT=1
-    ACTIVE_RELEASE_ID="$PREVIOUS_RELEASE_ID"
-fi
+# The slot journal must be durable before canonical active-state references it.
+# Rewriting an existing atomic state is also intentional: it heals either
+# compatibility mirror after an interrupted prior commit.
+commit_active_state "$ACTIVE_SLOT" "$PREVIOUS_RELEASE_ID" || {
+    echo "cannot persist canonical active release state" >&2
+    exit 1
+}
+ACTIVE_STATE_PRESENT=1
+ACTIVE_STATE_SOURCE="atomic"
+ACTIVE_RELEASE_ID="$PREVIOUS_RELEASE_ID"
+RECORDED_SLOT="$ACTIVE_SLOT"
 if ! complete_pending_drain; then
     echo "cannot safely reuse inactive slot while pending drain is unresolved" >&2
     exit 1
@@ -1556,23 +1625,10 @@ compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" bu
 
 echo "[remote] quiescing old worker before automation-state migrations"
 compose_project "$OLD_PROJECT" "$PREVIOUS/.env" "$PREVIOUS/$COMPOSE_FILE" stop --timeout 90 worker
-OLD_WORKER_STOPPED=1
-
-PRE_MIGRATION_REVISION="$(
-    compose_project "$COMPOSE_PROJECT" "$PREVIOUS/.env" "$PREVIOUS/$COMPOSE_FILE" \
-        exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atc \
-        'SELECT version_num FROM alembic_version ORDER BY version_num' < /dev/null
-)"
-if [ -z "$PRE_MIGRATION_REVISION" ] || printf '%s\n' "$PRE_MIGRATION_REVISION" | grep -q '[[:space:]]'; then
-    echo "expected exactly one pre-migration Alembic revision, got: $PRE_MIGRATION_REVISION" >&2
-    false
-fi
-printf '%s\n' "$PRE_MIGRATION_REVISION" > "$BACKUP/alembic-revision.previous.txt"
 
 echo "[remote] applying migrations before candidate startup"
 compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" \
     run --rm --no-deps -T --entrypoint alembic backend upgrade head < /dev/null
-MIGRATION_APPLIED=1
 
 compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" up -d --no-deps backend
 echo "[remote] waiting for candidate backend health"
