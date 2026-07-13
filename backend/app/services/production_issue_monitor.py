@@ -16,6 +16,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.config import get_settings
 from app.database import async_session
+from app.models.agent import Agent
 from app.models.notification import Notification
 from app.models.production_issue import ProductionIssue, ProductionIssueEvent
 from app.models.user import Identity, User
@@ -211,6 +212,10 @@ async def record_production_issue(
             .returning(ProductionIssue.id)
         )
         async with async_session() as db:
+            if tenant_id is None and agent_id is not None:
+                tenant_id = await db.scalar(
+                    select(Agent.tenant_id).where(Agent.id == agent_id)
+                )
             issue_id = (await db.execute(statement)).scalar_one()
             db.add(ProductionIssueEvent(
                 issue_id=issue_id,

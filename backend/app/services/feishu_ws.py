@@ -1,12 +1,15 @@
 """Feishu WebSocket Long Connection Manager."""
 
 import asyncio
-import json
-import threading
-from typing import Any, Dict
 import uuid
+from typing import Any, Dict
 
 from loguru import logger
+from sqlalchemy import select
+
+from app.database import async_session
+from app.models.channel_config import ChannelConfig
+
 try:
     import lark_oapi as lark
     import lark_oapi.ws as ws
@@ -74,11 +77,6 @@ def _make_no_proxy_connect(orig_connect):
             logger.debug("[Feishu WS] Scoped websockets proxy bypass: restored")
 
     return _scoped_no_proxy
-
-from app.database import async_session
-from app.models.channel_config import ChannelConfig
-from sqlalchemy import select
-
 
 if not _HAS_LARK:
     logger.warning(
@@ -289,6 +287,14 @@ class FeishuWSManager:
                 return
             except Exception as e:
                 logger.exception(f"[Feishu WS] Initial connect failed for agent {agent_id}: {e}")
+                from app.services.channel_issue_reporting import record_channel_issue
+
+                await record_channel_issue(
+                    channel="feishu",
+                    operation="connect",
+                    agent_id=agent_id,
+                    error_code=type(e).__name__,
+                )
 
             # Health-watch: only log status changes for diagnostics.
             # SDK handles reconnect internally via _receive_message_loop → _reconnect.
@@ -368,7 +374,7 @@ class FeishuWSManager:
         async with async_session() as db:
             result = await db.execute(
                 select(ChannelConfig).where(
-                    ChannelConfig.is_configured == True,
+                    ChannelConfig.is_configured.is_(True),
                     ChannelConfig.channel_type == "feishu",
                 )
             )

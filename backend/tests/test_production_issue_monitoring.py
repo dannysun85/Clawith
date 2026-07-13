@@ -164,6 +164,61 @@ async def test_issue_capture_stores_only_sanitized_occurrence_metadata(monkeypat
     assert event.metadata_json == {"component": "fetch", "status_code": 503}
 
 
+@pytest.mark.asyncio
+async def test_issue_capture_derives_tenant_from_agent(monkeypatch):
+    expected_issue_id = uuid.uuid4()
+    expected_tenant_id = uuid.uuid4()
+
+    class Result:
+        def scalar_one(self):
+            return expected_issue_id
+
+    class Session:
+        def __init__(self):
+            self.added = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def scalar(self, _statement):
+            return expected_tenant_id
+
+        async def execute(self, _statement):
+            return Result()
+
+        def add(self, value):
+            self.added.append(value)
+
+        async def commit(self):
+            return None
+
+    session = Session()
+    monkeypatch.setattr(production_issue_monitor, "async_session", lambda: session)
+    monkeypatch.setattr(
+        production_issue_monitor,
+        "get_settings",
+        lambda: SimpleNamespace(APP_VERSION="1.10.8"),
+    )
+    agent_id = uuid.uuid4()
+
+    issue_id = await production_issue_monitor.record_production_issue(
+        source="channel_connector",
+        category="channel",
+        summary="Feishu channel connect failed",
+        error_code="ClientException",
+        operation="feishu.connect",
+        agent_id=agent_id,
+    )
+
+    assert issue_id == expected_issue_id
+    assert len(session.added) == 1
+    assert session.added[0].agent_id == agent_id
+    assert session.added[0].tenant_id == expected_tenant_id
+
+
 def test_worker_and_production_compose_enable_monitoring_contract():
     main_source = (ROOT / "backend/app/main.py").read_text(encoding="utf-8")
     compose = (ROOT / "deploy/astra-poc/docker-compose.prod.yml").read_text(encoding="utf-8")

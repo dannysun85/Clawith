@@ -581,6 +581,18 @@ class DingTalkStreamManager:
                 logger.warning(
                     f"[DingTalk Stream] Connection lost for agent {agent_id}, will retry..."
                 )
+                if main_loop and main_loop.is_running():
+                    from app.services.channel_issue_reporting import record_channel_issue
+
+                    _fire_and_forget(
+                        main_loop,
+                        record_channel_issue(
+                            channel="dingtalk",
+                            operation="connect",
+                            agent_id=agent_id,
+                            error_code="connection_closed",
+                        ),
+                    )
 
             except Exception as e:
                 retries += 1
@@ -588,11 +600,36 @@ class DingTalkStreamManager:
                     f"[DingTalk Stream] Connection error for {agent_id} "
                     f"(attempt {retries}/{MAX_RETRIES + 1}): {e}"
                 )
+                if main_loop and main_loop.is_running():
+                    from app.services.channel_issue_reporting import record_channel_issue
+
+                    _fire_and_forget(
+                        main_loop,
+                        record_channel_issue(
+                            channel="dingtalk",
+                            operation="connect",
+                            agent_id=agent_id,
+                            error_code=type(e).__name__,
+                        ),
+                    )
 
             if retries > MAX_RETRIES:
                 logger.error(
                     f"[DingTalk Stream] Agent {agent_id} exhausted all {MAX_RETRIES} retries, giving up"
                 )
+                if main_loop and main_loop.is_running():
+                    from app.services.channel_issue_reporting import record_channel_issue
+
+                    _fire_and_forget(
+                        main_loop,
+                        record_channel_issue(
+                            channel="dingtalk",
+                            operation="connect",
+                            agent_id=agent_id,
+                            error_code="retry_exhausted",
+                            severity="critical",
+                        ),
+                    )
                 break
 
             delay = RETRY_DELAYS[min(retries - 1, len(RETRY_DELAYS) - 1)]
@@ -665,7 +702,7 @@ class DingTalkStreamManager:
         async with async_session() as db:
             result = await db.execute(
                 select(ChannelConfig).where(
-                    ChannelConfig.is_configured == True,
+                    ChannelConfig.is_configured.is_(True),
                     ChannelConfig.channel_type == "dingtalk",
                 )
             )

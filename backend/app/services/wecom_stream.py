@@ -167,6 +167,14 @@ class WeComStreamManager:
 
                 except Exception as e:
                     logger.error(f"[WeCom Stream] Error handling text message: {e}")
+                    from app.services.channel_issue_reporting import record_channel_issue
+
+                    await record_channel_issue(
+                        channel="wecom",
+                        operation="message",
+                        agent_id=agent_id,
+                        error_code=type(e).__name__,
+                    )
                     import traceback
                     traceback.print_exc()
                     try:
@@ -193,6 +201,14 @@ class WeComStreamManager:
                     )
                 except Exception as e:
                     logger.error(f"[WeCom Stream] Error handling image: {e}")
+                    from app.services.channel_issue_reporting import record_channel_issue
+
+                    await record_channel_issue(
+                        channel="wecom",
+                        operation="image",
+                        agent_id=agent_id,
+                        error_code=type(e).__name__,
+                    )
 
             # ── Message handler: file ──
             async def on_file(frame):
@@ -208,6 +224,14 @@ class WeComStreamManager:
                     )
                 except Exception as e:
                     logger.error(f"[WeCom Stream] Error handling file: {e}")
+                    from app.services.channel_issue_reporting import record_channel_issue
+
+                    await record_channel_issue(
+                        channel="wecom",
+                        operation="file",
+                        agent_id=agent_id,
+                        error_code=type(e).__name__,
+                    )
 
             # ── Enter chat event: send welcome ──
             async def on_enter_chat(frame):
@@ -225,6 +249,14 @@ class WeComStreamManager:
                     logger.info(f"[WeCom Stream] Sent welcome message for agent {agent_id}")
                 except Exception as e:
                     logger.error(f"[WeCom Stream] Error sending welcome: {e}")
+                    from app.services.channel_issue_reporting import record_channel_issue
+
+                    await record_channel_issue(
+                        channel="wecom",
+                        operation="welcome",
+                        agent_id=agent_id,
+                        error_code=type(e).__name__,
+                    )
 
             # Register event handlers
             client.on("message.text", on_text)
@@ -248,11 +280,27 @@ class WeComStreamManager:
 
                     self._connected[agent_id] = False
                     logger.info(f"[WeCom Stream] Client disconnected for agent {agent_id}, reconnecting in {retry_delay}s...")
+                    from app.services.channel_issue_reporting import record_channel_issue
+
+                    await record_channel_issue(
+                        channel="wecom",
+                        operation="connect",
+                        agent_id=agent_id,
+                        error_code="connection_closed",
+                    )
                 except asyncio.CancelledError:
                     raise  # Propagate cancellation
                 except Exception as e:
                     self._connected[agent_id] = False
                     logger.error(f"[WeCom Stream] Connection error for {agent_id}: {e}, retrying in {retry_delay}s...")
+                    from app.services.channel_issue_reporting import record_channel_issue
+
+                    await record_channel_issue(
+                        channel="wecom",
+                        operation="connect",
+                        agent_id=agent_id,
+                        error_code=type(e).__name__,
+                    )
 
                 await asyncio.sleep(retry_delay)
                 retry_delay = min(retry_delay * 2, max_retry_delay)
@@ -267,6 +315,15 @@ class WeComStreamManager:
                     pass
         except Exception as e:
             logger.error(f"[WeCom Stream] Fatal client error for {agent_id}: {e}")
+            from app.services.channel_issue_reporting import record_channel_issue
+
+            await record_channel_issue(
+                channel="wecom",
+                operation="client",
+                agent_id=agent_id,
+                error_code=type(e).__name__,
+                severity="critical",
+            )
             import traceback
             traceback.print_exc()
         finally:
