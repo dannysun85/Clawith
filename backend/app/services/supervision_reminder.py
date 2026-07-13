@@ -181,14 +181,8 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
                 tenant_id=invocation.tenant_id,
             )
         except Exception:
-            await release_llm_round_credits(
-                round_reservation_id,
-                model=model,
-                route_meta=invocation.route_meta,
-                agent_id=target_agent.id,
-                user_id=target_agent.creator_id,
-                tenant_id=invocation.tenant_id,
-            )
+            # The provider completed; keep the hold recoverable when the exact
+            # settlement transition cannot be persisted.
             return None
         return content if content else None
     except asyncio.CancelledError:
@@ -199,6 +193,7 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
             agent_id=target_agent.id,
             user_id=target_agent.creator_id,
             tenant_id=invocation.tenant_id,
+            provider_failed=True,
         )
         raise
     except LLMError as e:
@@ -209,6 +204,7 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
             agent_id=target_agent.id,
             user_id=target_agent.creator_id,
             tenant_id=invocation.tenant_id,
+            provider_failed=True,
         )
         logger.error(f"_get_agent_reply LLM error: {e}")
     except Exception as e:
@@ -219,6 +215,7 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
             agent_id=target_agent.id,
             user_id=target_agent.creator_id,
             tenant_id=invocation.tenant_id,
+            provider_failed=True,
         )
         logger.error(f"_get_agent_reply LLM call failed: {e}")
     finally:

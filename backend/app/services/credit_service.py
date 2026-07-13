@@ -304,6 +304,7 @@ async def reserve_credits(
     ref_type: str | None = None,
     ref_id: uuid.UUID | None = None,
     expires_at: datetime | None = None,
+    initial_status: str = "reserved",
 ) -> CreditReservation:
     """Hold credits for an asynchronous operation."""
     async with async_session() as db:
@@ -321,6 +322,7 @@ async def reserve_credits(
             ref_type=ref_type,
             ref_id=ref_id,
             expires_at=expires_at,
+            initial_status=initial_status,
         )
         await db.commit()
         return reservation
@@ -340,8 +342,11 @@ async def reserve_credits_in_session(
     ref_type: str | None = None,
     ref_id: uuid.UUID | None = None,
     expires_at: datetime | None = None,
+    initial_status: str = "reserved",
 ) -> CreditReservation:
     """Reserve credits using the caller's transaction/session."""
+    if initial_status not in {"reserved", "provider_inflight"}:
+        raise ValueError(f"Unsupported initial credit reservation status: {initial_status}")
     if amount is None:
         amount = await get_credit_cost(action, modality, saas_tier)
     if amount <= 0:
@@ -382,7 +387,7 @@ async def reserve_credits_in_session(
         provider=provider,
         model=model,
         amount=amount,
-        status="reserved",
+        status=initial_status,
         ref_type=ref_type,
         ref_id=ref_id,
         expires_at=expires_at or (datetime.now(timezone.utc) + timedelta(hours=24)),
@@ -406,8 +411,8 @@ async def mark_credit_reservation_settlement_ready(
 ) -> CreditReservation:
     """Persist the exact provider debt before a result or side effect is released.
 
-    The reservation itself is the durable settlement outbox.  ``reserved``
-    means that no provider response has completed yet; ``settlement_ready``
+    The reservation itself is the durable settlement outbox.  LLM requests are
+    created as ``provider_inflight`` before network I/O; ``settlement_ready``
     means the provider has completed and the exact amount must never be
     released by an expiry/error path.  The balance hold is resized under the
     same row locks, so concurrent calls cannot all pass a read-only preflight.
@@ -439,7 +444,7 @@ async def mark_credit_reservation_settlement_ready_in_session(
         if reservation.amount != exact_amount:
             raise ValueError("Credit reservation already has a different settlement amount")
         return reservation
-    if reservation.status != "reserved":
+    if reservation.status not in {"reserved", "provider_inflight"}:
         raise ValueError(
             f"Credit reservation is not settlement-ready eligible (status={reservation.status})"
         )
@@ -534,10 +539,20 @@ async def finalize_reserved_credits_in_session(
     return tx
 
 
-async def release_reserved_credits(reservation_id: uuid.UUID, status: str = "released") -> CreditReservation:
+async def release_reserved_credits(
+    reservation_id: uuid.UUID,
+    status: str = "released",
+    *,
+    release_provider_inflight: bool = False,
+) -> CreditReservation:
     """Release a reservation in its own transaction."""
     async with async_session() as db:
-        reservation = await release_reserved_credits_in_session(db, reservation_id, status=status)
+        reservation = await release_reserved_credits_in_session(
+            db,
+            reservation_id,
+            status=status,
+            release_provider_inflight=release_provider_inflight,
+        )
         await db.commit()
         return reservation
 
@@ -547,12 +562,16 @@ async def release_reserved_credits_in_session(
     reservation_id: uuid.UUID,
     *,
     status: str = "released",
+    release_provider_inflight: bool = False,
 ) -> CreditReservation:
     """Release held credits without writing a consume ledger row."""
     reservation = await db.get(CreditReservation, reservation_id, with_for_update=True)
     if not reservation:
         raise ValueError("Credit reservation not found")
-    if reservation.status != "reserved":
+    releasable_statuses = {"reserved"}
+    if release_provider_inflight:
+        releasable_statuses.add("provider_inflight")
+    if reservation.status not in releasable_statuses:
         return reservation
 
     result = await db.execute(

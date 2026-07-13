@@ -1,7 +1,29 @@
 import uuid
 
+import pytest
+
 from app.services.entitlements import Entitlements
-from app.services.media_capabilities import evaluate_media_capabilities
+from app.services.media_capabilities import (
+    evaluate_media_capabilities,
+    get_agent_media_capabilities,
+)
+
+
+class _EmptyResult:
+    def scalars(self):
+        return self
+
+    def all(self):
+        return []
+
+
+class _RecordingDB:
+    def __init__(self):
+        self.statements = []
+
+    async def execute(self, statement):
+        self.statements.append(statement)
+        return _EmptyResult()
 
 
 def _ent() -> Entitlements:
@@ -51,3 +73,18 @@ def test_media_capabilities_report_tier_and_pool_failures_without_model_ids():
     assert by_modality["image"]["reason"] == "plan_denied"
     assert by_modality["video"]["pool_available"] is False
     assert all("model_id" not in row and "credential_id" not in row for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_media_capability_pool_ignores_tenant_private_credentials():
+    db = _RecordingDB()
+
+    await get_agent_media_capabilities(
+        db,
+        agent_id=uuid.uuid4(),
+        entitlements=_ent(),
+        tier="lite",
+    )
+
+    credential_query = str(db.statements[-1].compile())
+    assert "llm_credentials.tenant_id IS NULL" in credential_query

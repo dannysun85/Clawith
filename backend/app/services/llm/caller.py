@@ -124,6 +124,12 @@ def _minimax_m3_request_options(model) -> dict:
     }
 
 
+def _llm_provider_service_tier(model) -> str:
+    """Return the provider delivery tier used by the actual request."""
+
+    return str(_minimax_m3_request_options(model).get("service_tier") or "standard")
+
+
 async def _record_llm_product_issue(
     *,
     category: str,
@@ -134,6 +140,8 @@ async def _record_llm_product_issue(
     tenant_id: uuid.UUID | None,
     route_meta: "RouteMeta | None",
     severity: str = "error",
+    reservation_id: uuid.UUID | None = None,
+    settlement_credits: int | None = None,
 ) -> None:
     from app.services.production_issue_monitor import record_production_issue
 
@@ -143,7 +151,11 @@ async def _record_llm_product_issue(
         summary=(
             "Platform model credential route was unavailable"
             if category == "credential"
-            else "Model provider operation failed"
+            else (
+                "LLM Credits settlement failed"
+                if category == "billing_settlement"
+                else "Model provider operation failed"
+            )
         ),
         severity=severity,
         error_code=error_code,
@@ -158,6 +170,8 @@ async def _record_llm_product_issue(
             "modality": getattr(route_meta, "modality", None),
             "saas_tier": getattr(route_meta, "saas_tier", None),
             "reason_code": error_code if category == "credential" else None,
+            "reservation_id": str(reservation_id) if reservation_id else None,
+            "settlement_credits": settlement_credits,
         },
     )
 
@@ -171,6 +185,8 @@ async def _record_llm_settlement_failure(
     user_id: uuid.UUID | None,
     tenant_id: uuid.UUID | None,
     route_meta: "RouteMeta | None",
+    reservation_id: uuid.UUID | None = None,
+    settlement_credits: int | None = None,
 ) -> None:
     """Report accounting failures without discarding a completed response."""
 
@@ -189,6 +205,8 @@ async def _record_llm_settlement_failure(
             tenant_id=tenant_id,
             route_meta=route_meta,
             severity="critical",
+            reservation_id=reservation_id,
+            settlement_credits=settlement_credits,
         )
     except Exception as monitor_error:
         logger.error(
@@ -910,6 +928,7 @@ async def _estimate_llm_round_credit_hold(
             output_tokens=estimated_output_tokens,
             total_tokens=estimated_input_tokens + estimated_output_tokens,
         ),
+        service_tier=_llm_provider_service_tier(model),
     )
     return max(configured, estimate or 0)
 
@@ -946,6 +965,7 @@ async def reserve_llm_round_credits(
         model=model.model,
         amount=amount,
         ref_type="llm_round",
+        initial_status="provider_inflight",
     )
     return reservation.id
 
@@ -968,7 +988,12 @@ async def settle_llm_round_credits(
         route_meta.modality,
         route_meta.saas_tier,
     )
-    provider_amount = provider_text_credits(model.provider, model.model, usage)
+    provider_amount = provider_text_credits(
+        model.provider,
+        model.model,
+        usage,
+        service_tier=_llm_provider_service_tier(model),
+    )
     # The billing rule is the product contract; dynamic provider pricing may
     # raise the charge for unusually expensive/long-context rounds but must not
     # silently discount Pro/Ultra below their configured tier price.
@@ -987,6 +1012,8 @@ async def settle_llm_round_credits(
             user_id=user_id,
             tenant_id=tenant_id,
             route_meta=route_meta,
+            reservation_id=reservation_id,
+            settlement_credits=exact_amount,
         )
         raise
 
@@ -1004,6 +1031,8 @@ async def settle_llm_round_credits(
             user_id=user_id,
             tenant_id=tenant_id,
             route_meta=route_meta,
+            reservation_id=reservation_id,
+            settlement_credits=exact_amount,
         )
 
 
@@ -1015,12 +1044,21 @@ async def release_llm_round_credits(
     agent_id: uuid.UUID | None,
     user_id: uuid.UUID | None,
     tenant_id: uuid.UUID | None,
+    provider_failed: bool = False,
 ) -> None:
-    """Release a pre-provider hold without masking the original exception."""
+    """Release a hold only when the provider did not return a usable result.
+
+    LLM reservations enter ``provider_inflight`` atomically before network I/O.
+    Callers must explicitly identify provider failure/cancellation to release
+    that state; settlement failures therefore fail closed with the hold intact.
+    """
     if reservation_id is None:
         return
     try:
-        await release_reserved_credits(reservation_id)
+        await release_reserved_credits(
+            reservation_id,
+            release_provider_inflight=provider_failed,
+        )
     except Exception as exc:
         await _record_llm_settlement_failure(
             stage="credits_release",
@@ -1030,6 +1068,7 @@ async def release_llm_round_credits(
             user_id=user_id,
             tenant_id=tenant_id,
             route_meta=route_meta,
+            reservation_id=reservation_id,
         )
 
 
@@ -1049,7 +1088,16 @@ async def _record_llm_usage_and_charge(
 
     saas_tier = route_meta.saas_tier if route_meta else getattr(model, "tier", None)
     modality = route_meta.modality if route_meta else getattr(model, "modality", None)
-    credit_delta = provider_text_credits(model.provider, model.model, usage) if route_meta else None
+    credit_delta = (
+        provider_text_credits(
+            model.provider,
+            model.model,
+            usage,
+            service_tier=_llm_provider_service_tier(model),
+        )
+        if route_meta
+        else None
+    )
 
     # Credits are the financial source of truth. Charge first so a secondary
     # daily-usage counter failure cannot turn a successful provider call into
@@ -1362,6 +1410,7 @@ async def call_llm(
                 agent_id=agent_id,
                 user_id=user_id,
                 tenant_id=_tenant_id,
+                provider_failed=True,
             )
             await _finalize_llm_usage()
             await client.close()
@@ -1374,6 +1423,7 @@ async def call_llm(
                 agent_id=agent_id,
                 user_id=user_id,
                 tenant_id=_tenant_id,
+                provider_failed=True,
             )
             await _finalize_llm_usage()
             await client.close()
@@ -1386,6 +1436,7 @@ async def call_llm(
                 agent_id=agent_id,
                 user_id=user_id,
                 tenant_id=_tenant_id,
+                provider_failed=True,
             )
             logger.error(
                 "[LLM] provider operation failed provider={} model={} error_type={} error_code={}",
@@ -1424,6 +1475,7 @@ async def call_llm(
                 agent_id=agent_id,
                 user_id=user_id,
                 tenant_id=_tenant_id,
+                provider_failed=True,
             )
             logger.error(
                 "[LLM] unexpected provider failure provider={} model={} error_type={} error_code={}",
@@ -1470,14 +1522,9 @@ async def call_llm(
                 tenant_id=_tenant_id,
             )
         except Exception:
-            await release_llm_round_credits(
-                _round_reservation_id,
-                model=model,
-                route_meta=route_meta,
-                agent_id=agent_id,
-                user_id=user_id,
-                tenant_id=_tenant_id,
-            )
+            # The provider already returned. ``settle_llm_round_credits`` has
+            # recorded a critical incident; keep the provider-inflight hold so
+            # reconciliation cannot turn this completed call into free usage.
             await _finalize_llm_usage()
             await client.close()
             return "⚠️ Credits 结算暂时不可用，本轮结果未执行，请稍后重试。"
@@ -2191,6 +2238,7 @@ async def call_agent_llm_with_tools(
                         agent_id=agent_id,
                         user_id=agent.creator_id,
                         tenant_id=tenant_id,
+                        provider_failed=True,
                     )
                     raise
                 except Exception as e:
@@ -2201,6 +2249,7 @@ async def call_agent_llm_with_tools(
                         agent_id=agent_id,
                         user_id=agent.creator_id,
                         tenant_id=tenant_id,
+                        provider_failed=True,
                     )
                     logger.error(
                         "[call_agent_llm_with_tools] agent={} provider={} model={} "
@@ -2248,14 +2297,8 @@ async def call_agent_llm_with_tools(
                     )
                     _round_reservation_id = None
                 except Exception:
-                    await release_llm_round_credits(
-                        _round_reservation_id,
-                        model=model,
-                        route_meta=route_meta,
-                        agent_id=agent_id,
-                        user_id=agent.creator_id,
-                        tenant_id=tenant_id,
-                    )
+                    # A provider response exists; preserve the in-flight hold
+                    # until the exact settlement outbox can be recovered.
                     await _finalize_background_usage()
                     await client.close()
                     return (

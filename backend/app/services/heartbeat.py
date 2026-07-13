@@ -365,6 +365,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                     agent_id=agent_id,
                     user_id=agent_creator_id,
                     tenant_id=llm_invocation.tenant_id,
+                    provider_failed=True,
                 )
                 raise
             except QuotaExceeded:
@@ -375,6 +376,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                     agent_id=agent_id,
                     user_id=agent_creator_id,
                     tenant_id=llm_invocation.tenant_id,
+                    provider_failed=True,
                 )
                 raise
             except LLMError as e:
@@ -385,6 +387,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                     agent_id=agent_id,
                     user_id=agent_creator_id,
                     tenant_id=llm_invocation.tenant_id,
+                    provider_failed=True,
                 )
                 logger.error(f"LLM error in heartbeat: {e}")
                 reply = ""
@@ -397,6 +400,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                     agent_id=agent_id,
                     user_id=agent_creator_id,
                     tenant_id=llm_invocation.tenant_id,
+                    provider_failed=True,
                 )
                 logger.error(f"LLM call error in heartbeat: {e}")
                 reply = ""
@@ -420,14 +424,8 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                     tenant_id=llm_invocation.tenant_id,
                 )
             except Exception:
-                await release_llm_round_credits(
-                    round_reservation_id,
-                    model=llm_invocation.model,
-                    route_meta=llm_invocation.route_meta,
-                    agent_id=agent_id,
-                    user_id=agent_creator_id,
-                    tenant_id=llm_invocation.tenant_id,
-                )
+                # The provider completed; keep the in-flight hold recoverable
+                # when the durable settlement transition is unavailable.
                 reply = "⚠️ Credits 结算暂时不可用，本轮结果未执行。"
                 break
 
@@ -863,6 +861,7 @@ async def run_agent_oneshot(
                     agent_id=agent_id,
                     user_id=agent_creator_id,
                     tenant_id=llm_invocation.tenant_id,
+                    provider_failed=True,
                 )
                 raise
             except QuotaExceeded:
@@ -873,6 +872,7 @@ async def run_agent_oneshot(
                     agent_id=agent_id,
                     user_id=agent_creator_id,
                     tenant_id=llm_invocation.tenant_id,
+                    provider_failed=True,
                 )
                 raise
             except LLMError as e:
@@ -883,6 +883,7 @@ async def run_agent_oneshot(
                     agent_id=agent_id,
                     user_id=agent_creator_id,
                     tenant_id=llm_invocation.tenant_id,
+                    provider_failed=True,
                 )
                 logger.error(f"[Oneshot] LLM error (round {round_i}): {e}")
                 await _notify_oneshot_error(
@@ -898,6 +899,7 @@ async def run_agent_oneshot(
                     agent_id=agent_id,
                     user_id=agent_creator_id,
                     tenant_id=llm_invocation.tenant_id,
+                    provider_failed=True,
                 )
                 logger.error(f"[Oneshot] Unexpected LLM error (round {round_i}): {e}")
                 await _notify_oneshot_error(
@@ -924,14 +926,7 @@ async def run_agent_oneshot(
                     tenant_id=llm_invocation.tenant_id,
                 )
             except Exception:
-                await release_llm_round_credits(
-                    round_reservation_id,
-                    model=llm_invocation.model,
-                    route_meta=llm_invocation.route_meta,
-                    agent_id=agent_id,
-                    user_id=agent_creator_id,
-                    tenant_id=llm_invocation.tenant_id,
-                )
+                # The provider completed; preserve the hold for reconciliation.
                 reply = "⚠️ Credits 结算暂时不可用，本轮结果未执行。"
                 await _notify_oneshot_error(
                     triggered_by_user_id,

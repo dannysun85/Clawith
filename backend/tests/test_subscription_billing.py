@@ -810,7 +810,7 @@ async def test_mark_credit_reservation_settlement_ready_resizes_durable_hold():
         id=uuid.uuid4(),
         tenant_id=tenant_id,
         amount=3,
-        status="reserved",
+        status="provider_inflight",
         action="chat",
         modality="text",
         tier="lite",
@@ -831,6 +831,37 @@ async def test_mark_credit_reservation_settlement_ready_resizes_durable_hold():
     assert reservation.status == "settlement_ready"
     assert reservation.amount == 5
     assert balance.reserved == 10
+
+
+@pytest.mark.asyncio
+async def test_provider_inflight_hold_requires_explicit_provider_failure_to_release():
+    tenant_id = uuid.uuid4()
+    reservation = CreditReservation(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        amount=5,
+        status="provider_inflight",
+        action="chat",
+        modality="text",
+        tier="lite",
+    )
+    balance = CreditBalance(tenant_id=tenant_id, balance=100, reserved=5)
+    db = MockDB(
+        get_map={(CreditReservation, reservation.id): reservation},
+        execute_results=[DummyResult(balance)],
+    )
+
+    retained = await credit_service.release_reserved_credits_in_session(db, reservation.id)
+    assert retained.status == "provider_inflight"
+    assert balance.reserved == 5
+
+    released = await credit_service.release_reserved_credits_in_session(
+        db,
+        reservation.id,
+        release_provider_inflight=True,
+    )
+    assert released.status == "released"
+    assert balance.reserved == 0
 
 
 @pytest.mark.asyncio
@@ -888,7 +919,15 @@ async def test_stale_sweep_finalizes_provider_debt_and_releases_plain_hold():
         action="chat",
         expires_at=now,
     )
-    db = MockDB(execute_results=[DummyManyResult([settlement, plain])])
+    provider_inflight = CreditReservation(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        amount=8,
+        status="provider_inflight",
+        action="chat",
+        expires_at=now,
+    )
+    db = MockDB(execute_results=[DummyManyResult([settlement, plain, provider_inflight])])
 
     with (
         patch.object(
@@ -901,12 +940,22 @@ async def test_stale_sweep_finalizes_provider_debt_and_releases_plain_hold():
             "release_reserved_credits_in_session",
             AsyncMock(),
         ) as release,
+        patch(
+            "app.services.production_issue_monitor.record_production_issue",
+            AsyncMock(),
+        ) as monitor,
     ):
         recovered = await billing_reconciliation.expire_stale_credit_reservations(db, now=now)
 
     assert recovered == 2
     finalize.assert_awaited_once_with(db, settlement.id)
     release.assert_awaited_once_with(db, plain.id, status="expired")
+    monitor.assert_awaited_once()
+    assert monitor.await_args.kwargs["metadata"] == {
+        "reservation_id": str(provider_inflight.id)
+    }
+    assert provider_inflight.status == "provider_inflight"
+    assert provider_inflight.expires_at > now
 
 
 @pytest.mark.asyncio

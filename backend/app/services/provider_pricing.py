@@ -28,7 +28,12 @@ def _usd_for_units(units: int, price_per_million_units: Decimal) -> Decimal:
     return (Decimal(units) / Decimal("1000000")) * price_per_million_units
 
 
-def minimax_text_credits(model: str | None, usage: TokenUsage) -> int:
+def minimax_text_credits(
+    model: str | None,
+    usage: TokenUsage,
+    *,
+    service_tier: str | None = None,
+) -> int:
     """Return MiniMax LLM credits from token usage.
 
     Standard M2.x and ``-highspeed`` use different provider input/output rates.
@@ -62,6 +67,11 @@ def minimax_text_credits(model: str | None, usage: TokenUsage) -> int:
     )
     if amount <= 0 and usage.total_tokens > 0:
         amount = _usd_for_units(usage.total_tokens, input_per_m)
+    # MiniMax documents Priority delivery at 1.5x Standard PAYG pricing.
+    # Apply the multiplier before integer Credits rounding so both reservation
+    # estimates and exact settlement use the same financial contract.
+    if str(service_tier or "standard").strip().lower() == "priority":
+        amount *= Decimal("1.5")
     return _credits_from_usd(amount)
 
 
@@ -105,8 +115,14 @@ def minimax_video_credits(model: str | None, duration: int, resolution: str) -> 
     return _credits_from_usd(prices[key])
 
 
-def provider_text_credits(provider: str | None, model: str | None, usage: TokenUsage) -> int | None:
+def provider_text_credits(
+    provider: str | None,
+    model: str | None,
+    usage: TokenUsage,
+    *,
+    service_tier: str | None = None,
+) -> int | None:
     """Return provider-native text credits, or None to use configured rules."""
     if (provider or "").lower() == "minimax":
-        return minimax_text_credits(model, usage)
+        return minimax_text_credits(model, usage, service_tier=service_tier)
     return None

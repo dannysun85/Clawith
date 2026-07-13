@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 import asyncio
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from loguru import logger
 from sqlalchemy import select
@@ -75,7 +75,7 @@ async def check_credit_ledger_integrity(
     transactions = list(tx_result.scalars().all())
 
     reservation_stmt = select(CreditReservation).where(
-        CreditReservation.status.in_(("reserved", "settlement_ready"))
+        CreditReservation.status.in_(("reserved", "provider_inflight", "settlement_ready"))
     )
     if tenant_id:
         reservation_stmt = reservation_stmt.where(CreditReservation.tenant_id == tenant_id)
@@ -141,7 +141,7 @@ async def expire_stale_credit_reservations(
     )
     result = await db.execute(
         select(CreditReservation).where(
-            CreditReservation.status.in_(("reserved", "settlement_ready")),
+            CreditReservation.status.in_(("reserved", "provider_inflight", "settlement_ready")),
             CreditReservation.expires_at.is_not(None),
             CreditReservation.expires_at <= now,
             CreditReservation.id.not_in(active_media_reservations),
@@ -162,6 +162,31 @@ async def expire_stale_credit_reservations(
                     type(exc).__name__,
                 )
                 continue
+        elif reservation.status == "provider_inflight":
+            # The process may have lost the exact provider response before it
+            # could durably transition to settlement_ready. Never guess by
+            # charging the conservative hold or releasing possible provider
+            # debt. Escalate it for operator reconciliation and re-alert daily.
+            from app.services.production_issue_monitor import record_production_issue
+
+            await record_production_issue(
+                source="billing_reconciliation",
+                category="billing_settlement",
+                summary="Stale LLM provider-inflight Credits hold requires reconciliation",
+                severity="critical",
+                error_code="stale_provider_inflight",
+                operation=reservation.action,
+                tenant_id=reservation.tenant_id,
+                user_id=reservation.user_id,
+                agent_id=reservation.agent_id,
+                metadata={"reservation_id": str(reservation.id)},
+            )
+            reservation.expires_at = now + timedelta(hours=24)
+            logger.error(
+                "[billing] stale provider-inflight reservation retained reservation_id={}",
+                reservation.id,
+            )
+            continue
         else:
             await release_reserved_credits_in_session(db, reservation.id, status="expired")
         recovered += 1

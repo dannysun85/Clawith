@@ -42,6 +42,7 @@ _ALLOWED_METADATA_KEYS = {
     "task_id",
     "provider_task_id",
     "reservation_id",
+    "settlement_credits",
     "http_method",
     "duration_ms",
     "attempt_count",

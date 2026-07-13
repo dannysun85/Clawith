@@ -8,10 +8,7 @@ Supports both:
 from __future__ import annotations
 
 import asyncio
-import inspect
-import smtplib
-import ssl
-import uuid
+import smtplib  # noqa: F401 - compatibility seam for SMTP transport tests
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
@@ -21,7 +18,7 @@ from email.utils import formataddr, make_msgid
 
 from loguru import logger
 
-from app.core.email import force_ipv4, send_smtp_email
+from app.core.email import force_ipv4, send_smtp_email  # noqa: F401 - compatibility seam
 
 
 @dataclass(slots=True)

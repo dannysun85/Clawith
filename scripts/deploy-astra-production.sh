@@ -330,25 +330,40 @@ NGINX_BACKUP="$BACKUP/astra-poc.nginx.before.conf"
 NGINX_SWITCHED=0
 OLD_WORKER_STOPPED=0
 OLD_APP_STOPPED=0
+OLD_BACKEND_QUIESCED_FOR_ROLLBACK=0
 MIGRATION_APPLIED=0
 PRE_MIGRATION_REVISION=""
 
 rollback() {
     echo "[remote] rollback to $PREVIOUS" >&2
-    set +e
     rm -f "$SMOKE_ENV_FILE"
     # Stop every candidate process that can touch the database before schema
     # rollback. If downgrade fails after cutover, keeping the candidate API
     # stopped deliberately fails closed instead of serving new code against an
     # older or partially restored schema.
-    compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" stop worker backend
+    if ! compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" stop worker backend; then
+        echo "[remote] CRITICAL: could not quiesce candidate database writers" >&2
+        return 1
+    fi
     if [ "$MIGRATION_APPLIED" = "1" ]; then
+        # The pre-release API can write while the new schema is active, but it
+        # must be quiesced before downgrade so no old-slot transaction races
+        # the schema restoration.
+        if [ "$OLD_APP_STOPPED" != "1" ]; then
+            echo "[remote] quiescing old backend before database downgrade"
+            if ! compose_project "$OLD_PROJECT" "$PREVIOUS/.env" "$PREVIOUS/$COMPOSE_FILE" \
+                stop --timeout 90 backend; then
+                echo "[remote] CRITICAL: could not quiesce old backend for downgrade" >&2
+                return 1
+            fi
+            OLD_BACKEND_QUIESCED_FOR_ROLLBACK=1
+        fi
         echo "[remote] restoring database revision $PRE_MIGRATION_REVISION"
         if ! compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" \
             run --rm --no-deps -T --entrypoint alembic backend downgrade "$PRE_MIGRATION_REVISION" < /dev/null; then
-            echo "[remote] CRITICAL: database downgrade failed; candidate API is stopped and workers remain quiesced" >&2
+            echo "[remote] CRITICAL: database downgrade failed; both API writers and workers remain quiesced" >&2
             echo "[remote] backup available at $BACKUP/db.sql.gz" >&2
-            return
+            return 1
         fi
         MIGRATION_APPLIED=0
     fi
@@ -361,12 +376,26 @@ rollback() {
     if [ "$OLD_APP_STOPPED" = "1" ]; then
         compose_project "$OLD_PROJECT" "$PREVIOUS/.env" "$PREVIOUS/$COMPOSE_FILE" up -d --no-deps backend
         compose_project "$OLD_PROJECT" "$PREVIOUS/.env" "$PREVIOUS/$COMPOSE_FILE" up -d --no-deps frontend
+    elif [ "$OLD_BACKEND_QUIESCED_FOR_ROLLBACK" = "1" ]; then
+        compose_project "$OLD_PROJECT" "$PREVIOUS/.env" "$PREVIOUS/$COMPOSE_FILE" up -d --no-deps backend
     fi
     if [ "$OLD_WORKER_STOPPED" = "1" ]; then
         compose_project "$OLD_PROJECT" "$PREVIOUS/.env" "$PREVIOUS/$COMPOSE_FILE" up -d --no-deps worker
     fi
 }
-trap rollback ERR
+
+rollback_and_exit() {
+    local exit_code="${1:-1}"
+    trap - ERR
+    set +e
+    rollback
+    local rollback_code="$?"
+    if [ "$rollback_code" != "0" ]; then
+        echo "[remote] CRITICAL: rollback did not complete cleanly (status=$rollback_code)" >&2
+    fi
+    exit "$exit_code"
+}
+trap 'rollback_and_exit "$?"' ERR
 
 echo "[remote] clearing inactive slot $CANDIDATE_SLOT"
 compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" rm -sf worker frontend backend >/dev/null 2>&1 || true
@@ -385,7 +414,7 @@ PRE_MIGRATION_REVISION="$(
 )"
 if [ -z "$PRE_MIGRATION_REVISION" ] || printf '%s\n' "$PRE_MIGRATION_REVISION" | grep -q '[[:space:]]'; then
     echo "expected exactly one pre-migration Alembic revision, got: $PRE_MIGRATION_REVISION" >&2
-    exit 1
+    false
 fi
 printf '%s\n' "$PRE_MIGRATION_REVISION" > "$BACKUP/alembic-revision.previous.txt"
 
@@ -481,7 +510,7 @@ done
 printf '%s\n%s\n' "$PUBLIC_HEALTH" "$PUBLIC_VERSION"
 if [ "$PUBLIC_READY" != "1" ]; then
     echo "public cutover did not expose expected release $VERSION/$COMMIT" >&2
-    exit 1
+    false
 fi
 printf '%s\n' "$PUBLIC_HEALTH" > "$BACKUP/health.public.json"
 printf '%s\n' "$PUBLIC_VERSION" > "$BACKUP/version.public.json"
@@ -520,7 +549,7 @@ fi
 if [ "$RUN_REMOTE_SMOKE" = "1" ]; then
     if [ ! -f "$SMOKE_ENV_FILE" ]; then
         echo "remote smoke environment file is missing" >&2
-        exit 1
+        false
     fi
     set -a
     # This file is generated locally with bash-escaped values and mode 0600.

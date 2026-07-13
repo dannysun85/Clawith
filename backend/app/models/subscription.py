@@ -159,7 +159,7 @@ class CreditReservation(Base):
     model: Mapped[str | None] = mapped_column(String(100), nullable=True)
     amount: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="reserved")
-    # reserved / settlement_ready / finalized / released / expired
+    # reserved / provider_inflight / settlement_ready / finalized / released / expired
     ref_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
     ref_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

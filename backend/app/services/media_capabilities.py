@@ -120,6 +120,7 @@ async def get_agent_media_capabilities(
     credentials_result = await db.execute(
         select(LLMCredential).where(
             LLMCredential.provider == "minimax",
+            LLMCredential.tenant_id.is_(None),
             LLMCredential.enabled == True,  # noqa: E712
             LLMCredential.status == "healthy",
             or_(
