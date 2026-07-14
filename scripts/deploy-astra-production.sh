@@ -93,6 +93,9 @@ if [ "$RUN_LOCAL_CHECKS" = "1" ]; then
         tests/test_subscription_lifecycle.py \
         tests/test_plan_crud.py \
         tests/test_subscription_billing.py \
+        tests/test_code_execution_security.py \
+        tests/test_tool_tenant_scope.py \
+        tests/test_process_utils.py \
         tests/test_production_deploy_contract.py \
         tests/test_worker_runtime_health.py \
         -q)

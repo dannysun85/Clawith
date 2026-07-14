@@ -25,6 +25,36 @@ _BWRAP_NAMESPACE_FAILURE_MARKERS = (
 )
 
 
+def _parse_memory_limit_bytes(value: str) -> int:
+    """Parse a positive byte limit such as ``256m`` or ``1.5g``."""
+
+    normalized = str(value or "").strip().lower()
+    units = {
+        "": 1,
+        "b": 1,
+        "k": 1024,
+        "kb": 1024,
+        "m": 1024**2,
+        "mb": 1024**2,
+        "g": 1024**3,
+        "gb": 1024**3,
+    }
+    number = normalized
+    suffix = ""
+    for candidate in ("kb", "mb", "gb", "b", "k", "m", "g"):
+        if normalized.endswith(candidate):
+            number = normalized[: -len(candidate)]
+            suffix = candidate
+            break
+    try:
+        parsed = float(number)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid memory limit: {value!r}") from exc
+    if parsed <= 0:
+        raise ValueError("Memory limit must be positive")
+    return int(parsed * units[suffix])
+
+
 def _bwrap_failure_error(stderr: str) -> str | None:
     """Turn common namespace failures into a deployer-actionable error."""
     normalized = (stderr or "").lower()
@@ -200,10 +230,9 @@ class SubprocessBackend(BaseSandboxBackend):
     def _fix_pip_shebangs(self, venv_path: Path) -> None:
         """Replace pip with a bash wrapper that delegates to uv pip for extreme performance."""
         venv_bin = venv_path / "bin"
-        sandbox_python = "/workspace/.venv/bin/python"
-        
-        wrapper_script = f"#!/bin/bash\nexec uv pip \"$@\"\n"
-        
+
+        wrapper_script = "#!/bin/bash\nexec uv pip \"$@\"\n"
+
         for pip_cmd in ["pip", "pip3", "pip3.12"]:
             pip_path = venv_bin / pip_cmd
             if pip_path.parent.exists():
@@ -222,24 +251,28 @@ class SubprocessBackend(BaseSandboxBackend):
         return kwargs
 
     def _build_preexec_fn(self, work_path: Path, timeout: int):
+        # Validate resource configuration in the parent process. A malformed
+        # limit must fail before fork/exec instead of silently producing an
+        # unbounded child process.
+        memory_bytes = _parse_memory_limit_bytes(self.config.memory_limit)
+        cpu_limit = max(1, min(timeout, self.config.max_timeout))
+
         def _preexec():
             os.chdir(work_path)
             os.umask(0o077)
 
-            try:
-                import resource
+            import resource
 
-                memory_bytes = int(self.config.memory_limit.rstrip("mM")) * 1024 * 1024
-                cpu_limit = max(1, min(timeout, self.config.max_timeout))
-                resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit))
-                resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
-                resource.setrlimit(resource.RLIMIT_FSIZE, (10 * 1024 * 1024, 10 * 1024 * 1024))
-                resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
-                resource.setrlimit(resource.RLIMIT_NPROC, (32, 32))
-                if hasattr(resource, "RLIMIT_CORE"):
-                    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-            except Exception as exc:
-                logger.warning(f"[Subprocess] Failed to apply resource limits: {exc}")
+            # These limits cover bwrap and every process it starts. Any
+            # setrlimit failure aborts child creation, preserving fail-closed
+            # execution instead of continuing without bounds.
+            resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit))
+            resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
+            resource.setrlimit(resource.RLIMIT_FSIZE, (10 * 1024 * 1024, 10 * 1024 * 1024))
+            resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
+            resource.setrlimit(resource.RLIMIT_NPROC, (32, 32))
+            if hasattr(resource, "RLIMIT_CORE"):
+                resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
             if hasattr(os, "setgid"):
                 try:
@@ -251,13 +284,6 @@ class SubprocessBackend(BaseSandboxBackend):
                     os.setuid(os.getuid())
                 except Exception:
                     pass
-
-            if hasattr(os, "chroot") and os.geteuid() == 0:
-                try:
-                    os.chroot(work_path)
-                    os.chdir("/")
-                except Exception as exc:
-                    logger.warning(f"[Subprocess] Failed to chroot into workspace: {exc}")
 
         return _preexec
 
@@ -454,7 +480,7 @@ class SubprocessBackend(BaseSandboxBackend):
                 proc = await asyncio.create_subprocess_exec(
                     *bwrap_command,
                     cwd=str(work_path),
-                    **self._build_exec_kwargs(work_path, timeout),
+                    **self._build_exec_kwargs(work_path, timeout, use_preexec=True),
                 )
 
             stdout_data = bytearray()
@@ -520,7 +546,7 @@ class SubprocessBackend(BaseSandboxBackend):
 
         except Exception as e:
             duration_ms = int((time.time() - start_time) * 1000)
-            logger.exception(f"[Subprocess] Execution error")
+            logger.exception("[Subprocess] Execution error")
             return ExecutionResult(
                 success=False,
                 stdout="",

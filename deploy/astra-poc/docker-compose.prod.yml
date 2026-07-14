@@ -41,9 +41,6 @@ services:
     restart: unless-stopped
     stop_grace_period: 30s
     shm_size: "1gb"
-    # Required by the local bubblewrap execute_code backend. The application
-    # still drops to the non-root clawith user before serving requests.
-    privileged: true
     environment: &backend-environment
       APP_NAME: astra
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-astra}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-astra}
@@ -97,6 +94,15 @@ services:
       PRODUCTION_ISSUE_ALERT_THRESHOLD: ${PRODUCTION_ISSUE_ALERT_THRESHOLD:-1}
       PRODUCTION_ISSUE_RETENTION_DAYS: ${PRODUCTION_ISSUE_RETENTION_DAYS:-30}
       PRODUCTION_ISSUE_ALERT_WEBHOOK_URL: ${PRODUCTION_ISSUE_ALERT_WEBHOOK_URL:-}
+      CODE_EXECUTION_ENABLED: ${CODE_EXECUTION_ENABLED:-false}
+      CODE_EXECUTION_ALLOWED_TENANT_IDS: ${CODE_EXECUTION_ALLOWED_TENANT_IDS:-}
+      CODE_EXECUTION_ALLOWED_SANDBOX_TYPES: ${CODE_EXECUTION_ALLOWED_SANDBOX_TYPES:-e2b,aio_sandbox,self_hosted,judge0,codesandbox}
+      CODE_EXECUTION_REQUIRE_APPROVAL: ${CODE_EXECUTION_REQUIRE_APPROVAL:-true}
+      SANDBOX_TYPE: ${SANDBOX_TYPE:-subprocess}
+      SANDBOX_API_KEY: ${SANDBOX_API_KEY:-}
+      SANDBOX_API_URL: ${SANDBOX_API_URL:-}
+      SANDBOX_ALLOW_NETWORK: ${SANDBOX_ALLOW_NETWORK:-false}
+      SANDBOX_ALLOW_UNSAFE_FALLBACK_WHEN_BWRAP_MISSING: "false"
       HEARTBEAT_ENABLED: ${HEARTBEAT_ENABLED:-false}
       TRIGGER_DAEMON_ENABLED: ${TRIGGER_DAEMON_ENABLED:-true}
       OKR_AUTOMATION_ENABLED: ${OKR_AUTOMATION_ENABLED:-false}
@@ -113,12 +119,6 @@ services:
       SOCIAL_SIDECAR_BASE_URLS: ${SOCIAL_SIDECAR_BASE_URLS:-}
     volumes:
       - agentdata:/data/agents
-      - /var/run/docker.sock:/var/run/docker.sock
-    cap_add:
-      - SYS_ADMIN
-    security_opt:
-      - seccomp=unconfined
-      - apparmor=unconfined
     depends_on:
       postgres:
         condition: service_healthy

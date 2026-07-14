@@ -85,18 +85,19 @@ def _statement_name(token: _Token, stack: list[_Block]) -> str:
     that this single-file cutover cannot audit safely.
     """
 
-    try:
-        return _directive_name(token)
-    except ValueError:
-        if not stack or stack[-1].name != "map":
-            raise
+    if stack and stack[-1].name == "map":
         map_context = tuple(block.name for block in stack[:-1])
         if map_context not in {(), ("http",), ("stream",)}:
-            raise ValueError("quoted or escaped Nginx map entry has an invalid context")
+            raise ValueError("Nginx map entry has an invalid context")
+        # Every terminated statement directly inside a map body is table data,
+        # even when its first token happens to be the name of a real directive
+        # such as access_log or proxy_pass. Treating only quoted keys as data
+        # lets those ordinary keys escape the map boundary during rewrite/audit.
         normalized = re.sub(r"['\"\\\\]", "", token.value).casefold()
         if normalized == "include":
-            raise ValueError("quoted or escaped Nginx map include is not allowed")
+            raise ValueError("Nginx map include is not allowed")
         return MAP_ENTRY_NAME
+    return _directive_name(token)
 
 
 def _tokenize_nginx(text: str) -> list[_Token]:
@@ -185,9 +186,16 @@ def _parse_nginx(text: str) -> _ParsedConfig:
         if token.value == "{":
             if not directive_tokens:
                 raise ValueError("Nginx block has no directive name")
+            block_name = _directive_name(directive_tokens[0])
+            if stack and stack[-1].name == "map":
+                raise ValueError("nested Nginx blocks are not allowed inside map")
+            if block_name == "map":
+                map_context = tuple(block.name for block in stack)
+                if map_context not in {(), ("http",), ("stream",)}:
+                    raise ValueError("Nginx map entry has an invalid context")
             block = _Block(
                 identifier=next_block_identifier,
-                name=_directive_name(directive_tokens[0]),
+                name=block_name,
                 opener=token,
                 parents=tuple(parent.identifier for parent in stack),
             )

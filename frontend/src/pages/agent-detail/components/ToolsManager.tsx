@@ -93,12 +93,16 @@ export default function ToolsManager({ agentId, canManage = false }: { agentId: 
         setTools(prev => prev.map(t => t.id === toolId ? { ...t, enabled } : t));
         try {
             const token = localStorage.getItem('token');
-            await fetch(`/api/tools/agents/${agentId}`, {
+            const response = await fetch(`/api/tools/agents/${agentId}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
                 body: JSON.stringify([{ tool_id: toolId, enabled }]),
             });
-        } catch (e) { console.error(e); }
+            if (!response.ok) throw new Error((await response.json().catch(() => ({})))?.detail || 'Tool update failed');
+        } catch (e: any) {
+            setTools(prev => prev.map(t => t.id === toolId ? { ...t, enabled: !enabled } : t));
+            toast.error(t('agent.tools.updateFailed', 'Tool update failed'), { details: String(e?.message || e) });
+        }
     };
 
     // Sensitive field keys that should not be pre-filled from masked global config.
@@ -138,10 +142,20 @@ export default function ToolsManager({ agentId, canManage = false }: { agentId: 
         for (const [k, v] of Object.entries(globalCfg)) {
             if (!sensitiveKeys.has(k)) merged[k] = v;
         }
-        Object.assign(merged, agentCfg);
+        for (const [k, v] of Object.entries(agentCfg)) {
+            // The API returns password fields only as masks. Never pre-fill or
+            // submit those placeholders; an omitted secret means "preserve".
+            if (!sensitiveKeys.has(k)) merged[k] = v;
+        }
         Object.assign(merged, applyConfigDefaults(tool.config_schema?.fields || [], merged));
         setConfigData(merged);
-        setConfigJson(JSON.stringify(agentCfg, null, 2));
+        setConfigJson(JSON.stringify(
+            Object.fromEntries(
+                Object.entries(agentCfg).filter(([key]) => !sensitiveKeys.has(key)),
+            ),
+            null,
+            2,
+        ));
         setFocusedField(null);
     };
 
@@ -172,7 +186,9 @@ export default function ToolsManager({ agentId, canManage = false }: { agentId: 
                     // Non-sensitive global fields (e.g. os_type) pre-fill; sensitive ones don't
                     if (!sensitiveKeys.has(k)) merged[k] = v;
                 }
-                Object.assign(merged, agentCfg);
+                for (const [k, v] of Object.entries(agentCfg)) {
+                    if (!sensitiveKeys.has(k)) merged[k] = v;
+                }
                 setConfigData(merged);
             }
         } catch (e) { console.error(e); }
@@ -196,11 +212,12 @@ export default function ToolsManager({ agentId, canManage = false }: { agentId: 
                     if (sensitiveKeys.has(k) && (v === '' || v === undefined || v === null)) continue;
                     payload[k] = v;
                 }
-                await fetch(`/api/tools/agents/${agentId}/category-config/${configCategory}`, {
+                const response = await fetch(`/api/tools/agents/${agentId}/category-config/${configCategory}`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
                     body: JSON.stringify({ config: payload }),
                 });
+                if (!response.ok) throw new Error((await response.json().catch(() => ({})))?.detail || 'Category configuration update failed');
                 setConfigCategory(null);
             } else {
                 const hasSchema = configTool.config_schema?.fields?.length > 0;
@@ -212,11 +229,12 @@ export default function ToolsManager({ agentId, canManage = false }: { agentId: 
                     if (sensitiveKeys.has(k) && (v === '' || v === undefined || v === null)) continue;
                     payload[k] = v;
                 }
-                await fetch(`/api/tools/agents/${agentId}/tool-config/${configTool.id}`, {
+                const response = await fetch(`/api/tools/agents/${agentId}/tool-config/${configTool.id}`, {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
                     body: JSON.stringify({ config: payload }),
                 });
+                if (!response.ok) throw new Error((await response.json().catch(() => ({})))?.detail || 'Tool configuration update failed');
                 setConfigTool(null);
             }
             loadTools();
@@ -411,10 +429,16 @@ export default function ToolsManager({ agentId, canManage = false }: { agentId: 
                         >{deletingToolId === tool.id ? '...' : '✕'}</button>
                     )}
                     {canManage ? (
-                        <label style={{ position: 'relative', display: 'inline-block', width: '40px', height: '22px', cursor: 'pointer', flexShrink: 0 }}>
+                        <label
+                            title={tool.available === false
+                                ? (tool.availability_reason || t('agent.tools.requiresPlatformAuthorization', 'Requires explicit platform and company authorization'))
+                                : undefined}
+                            style={{ position: 'relative', display: 'inline-block', width: '40px', height: '22px', cursor: tool.available === false ? 'not-allowed' : 'pointer', flexShrink: 0, opacity: tool.available === false ? 0.55 : 1 }}
+                        >
                             <input
                                 type="checkbox"
                                 checked={tool.enabled}
+                                disabled={tool.available === false}
                                 onChange={e => toggleTool(tool.id, e.target.checked)}
                                 style={{ opacity: 0, width: 0, height: 0 }}
                             />
@@ -969,7 +993,11 @@ export default function ToolsManager({ agentId, canManage = false }: { agentId: 
                                 {configTool && configTool.agent_config && Object.keys(configTool.agent_config || {}).length > 0 && (
                                     <button className="btn btn-ghost" style={{ color: 'var(--error)', marginRight: 'auto' }} onClick={async () => {
                                         const token = localStorage.getItem('token');
-                                        await fetch(`/api/tools/agents/${agentId}/tool-config/${configTool.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ config: {} }) });
+                                        const response = await fetch(`/api/tools/agents/${agentId}/tool-config/${configTool.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ config: {} }) });
+                                        if (!response.ok) {
+                                            toast.error(t('common.error.saveFailed'), { details: (await response.json().catch(() => ({})))?.detail || 'Tool configuration reset failed' });
+                                            return;
+                                        }
                                         setConfigTool(null); loadTools();
                                     }}>Reset to Global</button>
                                 )}

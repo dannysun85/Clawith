@@ -158,3 +158,30 @@ def mask_sensitive_fields(config: dict, config_schema: dict | None = None) -> di
             suffix = value[-4:] if len(value) > 4 else value
             masked[key] = f"****{suffix}"
     return masked
+
+
+def merge_config_preserving_sensitive(
+    existing: dict | None,
+    incoming: dict | None,
+    config_schema: dict | None = None,
+) -> dict:
+    """Merge a UI update without replacing secrets with masks or blanks.
+
+    An explicitly empty object still means "reset this override". For a
+    non-empty update, omitted/blank/masked sensitive values preserve the
+    existing secret while ordinary fields follow the submitted document.
+    """
+
+    if not incoming:
+        return {}
+    current = dict(existing or {})
+    merged = dict(incoming)
+    for key in get_sensitive_keys(config_schema):
+        value = incoming.get(key)
+        is_placeholder = isinstance(value, str) and value.startswith("****")
+        if key not in incoming or value in (None, "") or is_placeholder:
+            if key in current:
+                merged[key] = current[key]
+            else:
+                merged.pop(key, None)
+    return meaningful_config(merged)

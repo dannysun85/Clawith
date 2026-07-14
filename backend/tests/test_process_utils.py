@@ -8,7 +8,11 @@ from app.services import agent_tools
 from app.services import process_utils
 from app.services.sandbox.config import SandboxConfig
 from app.services.sandbox.local import subprocess_backend as subprocess_backend_module
-from app.services.sandbox.local.subprocess_backend import SubprocessBackend, _bwrap_failure_error
+from app.services.sandbox.local.subprocess_backend import (
+    SubprocessBackend,
+    _bwrap_failure_error,
+    _parse_memory_limit_bytes,
+)
 
 
 @pytest.mark.parametrize(
@@ -29,6 +33,33 @@ def test_bwrap_namespace_failure_has_actionable_diagnostic(stderr):
 
 def test_non_namespace_bwrap_failure_preserves_generic_error_path():
     assert _bwrap_failure_error("python: syntax error") is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("256m", 256 * 1024**2),
+        ("1g", 1024**3),
+        ("1.5gb", int(1.5 * 1024**3)),
+        ("1024kb", 1024**2),
+    ],
+)
+def test_parse_memory_limit_bytes(value, expected):
+    assert _parse_memory_limit_bytes(value) == expected
+
+
+@pytest.mark.parametrize("value", ["", "0m", "-1g", "nope"])
+def test_parse_memory_limit_bytes_rejects_invalid_values(value):
+    with pytest.raises(ValueError):
+        _parse_memory_limit_bytes(value)
+
+
+def test_bwrap_execution_kwargs_apply_resource_limits(tmp_path):
+    backend = SubprocessBackend(SandboxConfig())
+
+    kwargs = backend._build_exec_kwargs(tmp_path, 30, use_preexec=True)
+
+    assert callable(kwargs["preexec_fn"])
 
 
 class FakeProcess:

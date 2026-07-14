@@ -29,7 +29,7 @@ class SandboxConfig(BaseModel):
     # Local sandbox options
     cpu_limit: str = "0.5"
     memory_limit: str = "256m"
-    allow_network: bool = True
+    allow_network: bool = False
     allow_unsafe_fallback_when_bwrap_missing: bool = False
 
     # API sandbox options

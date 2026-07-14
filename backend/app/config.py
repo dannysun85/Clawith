@@ -178,6 +178,15 @@ class Settings(BaseSettings):
     PRODUCTION_ISSUE_RETENTION_DAYS: int = 30
     PRODUCTION_ISSUE_ALERT_WEBHOOK_URL: str = ""
 
+    # Code execution is a separate high-risk product capability. Production
+    # requires an explicit platform switch, an explicit tenant allowlist, and
+    # an isolated external sandbox backend; it is never inferred from a model
+    # plan or from an AgentTool row alone.
+    CODE_EXECUTION_ENABLED: bool = False
+    CODE_EXECUTION_ALLOWED_TENANT_IDS: str = ""
+    CODE_EXECUTION_ALLOWED_SANDBOX_TYPES: str = "e2b,aio_sandbox,self_hosted,judge0,codesandbox"
+    CODE_EXECUTION_REQUIRE_APPROVAL: bool = True
+
     # SaaS console owner. This is intentionally narrower than platform_admin:
     # production SaaS billing/model/quota configuration belongs to this account.
     SAAS_ADMIN_EMAIL: str = "admin@reeftotem.ai"
@@ -238,7 +247,7 @@ def get_sandbox_config() -> SandboxConfig:
     settings = get_settings()
     return SandboxConfig(
         type=settings.SANDBOX_TYPE,
-        enabled=True,
+        enabled=settings.CODE_EXECUTION_ENABLED,
         api_key=settings.SANDBOX_API_KEY,
         api_url=settings.SANDBOX_API_URL,
         cpu_limit=settings.SANDBOX_CPU_LIMIT,

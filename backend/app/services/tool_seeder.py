@@ -21,6 +21,10 @@ SYNC_IS_DEFAULT_TOOL_NAMES = {
     "generate_music_minimax",
     "generate_video_minimax",
     "check_video_minimax",
+    # Code execution is granted explicitly per tenant and per agent. Older
+    # deployments seeded the local executor as a default tool.
+    "execute_code",
+    "execute_code_e2b",
     # AgentBay tools should NOT be is_default=True. Older seeder versions may
     # have set them to True; include them here so the seeder corrects the DB.
     "agentbay_browser_navigate",
@@ -924,7 +928,7 @@ BUILTIN_TOOLS = [
         "description": "Execute code (Python, Bash, Node.js) in a local sandboxed subprocess within the agent's workspace. Useful for data processing, calculations, file transformations, and automation.",
         "category": "code",
         "icon": "💻",
-        "is_default": True,
+        "is_default": False,
         "parameters_schema": {
             "type": "object",
             "properties": {
@@ -938,7 +942,8 @@ BUILTIN_TOOLS = [
             "sandbox_type": "subprocess",
             "cpu_limit": "0.5",
             "memory_limit": "256m",
-            "allow_network": True,
+            "allow_network": False,
+            "allow_unsafe_fallback_when_bwrap_missing": False,
             "default_timeout": 30,
             "max_timeout": 60,
         },
@@ -962,7 +967,7 @@ BUILTIN_TOOLS = [
                     "key": "allow_network",
                     "label": "Allow Network Access",
                     "type": "checkbox",
-                    "default": True,
+                    "default": False,
                     "read_only_for_roles": ["agent_admin", "member"],
                 },
                 {
@@ -1003,6 +1008,8 @@ BUILTIN_TOOLS = [
         "config": {
             "sandbox_type": "e2b",
             "api_key": "",
+            "allow_network": False,
+            "allow_unsafe_fallback_when_bwrap_missing": False,
             "default_timeout": 30,
             "max_timeout": 60,
         },
@@ -1015,6 +1022,13 @@ BUILTIN_TOOLS = [
                     "default": "",
                     "placeholder": "Get your API key at https://e2b.dev",
                     "required": True,
+                },
+                {
+                    "key": "allow_network",
+                    "label": "Allow Network Access",
+                    "type": "checkbox",
+                    "default": False,
+                    "read_only_for_roles": ["org_admin", "agent_admin", "member"],
                 },
                 {
                     "key": "default_timeout",

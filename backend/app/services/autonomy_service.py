@@ -6,6 +6,8 @@ Implements the three-level autonomy system:
   L3 — Require explicit approval before execution
 """
 
+import hashlib
+import hmac
 import json
 import uuid
 from datetime import datetime, timezone
@@ -26,7 +28,88 @@ HIGH_RISK_DEFAULT_L3_ACTIONS = {
     "douyin_publish_job",
     "douyin_reply_comment",
     "douyin_external_write",
+    "execute_code",
 }
+
+
+def _canonical_tool_arguments(arguments: dict) -> str:
+    return json.dumps(arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _tool_approval_signature(agent_id: uuid.UUID, tool_name: str, arguments: dict) -> str:
+    from app.config import get_settings
+
+    payload = f"v1\n{agent_id}\n{tool_name}\n{_canonical_tool_arguments(arguments)}"
+    return hmac.new(
+        get_settings().SECRET_KEY.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def build_tool_approval_details(
+    agent_id: uuid.UUID,
+    tool_name: str,
+    arguments: dict,
+    requested_by: uuid.UUID,
+) -> dict:
+    """Bind the complete immutable tool payload to an HMAC for approval."""
+
+    from app.config import get_settings
+    from app.core.security import encrypt_data
+
+    canonical_arguments = _canonical_tool_arguments(arguments)
+
+    return {
+        "payload_version": 2,
+        "tool": tool_name,
+        "args_encrypted": encrypt_data(
+            canonical_arguments,
+            get_settings().SECRET_KEY,
+        ),
+        "args_hash": hashlib.sha256(
+            canonical_arguments.encode("utf-8")
+        ).hexdigest(),
+        "args_signature": _tool_approval_signature(agent_id, tool_name, arguments),
+        "request_shape": privacy_safe_shape(arguments),
+        "requested_by": str(requested_by),
+    }
+
+
+def _verified_tool_arguments(agent_id: uuid.UUID, details: dict) -> tuple[str, dict]:
+    from app.config import get_settings
+    from app.core.security import decrypt_data
+
+    tool_name = details.get("tool")
+    encrypted_arguments = details.get("args_encrypted")
+    expected_hash = details.get("args_hash")
+    signature = details.get("args_signature")
+    if not isinstance(tool_name, str) or not tool_name:
+        raise ValueError("Approved tool payload is missing the tool name")
+    if not isinstance(encrypted_arguments, str) or not encrypted_arguments:
+        raise ValueError("Approved tool payload is incomplete; request a new approval")
+    try:
+        canonical_arguments = decrypt_data(
+            encrypted_arguments,
+            get_settings().SECRET_KEY,
+        )
+        arguments = json.loads(canonical_arguments)
+    except Exception as exc:
+        raise ValueError("Approved tool payload cannot be decrypted") from exc
+    if not isinstance(arguments, dict):
+        raise ValueError("Approved tool payload is incomplete; request a new approval")
+    actual_hash = hashlib.sha256(canonical_arguments.encode("utf-8")).hexdigest()
+    if not isinstance(expected_hash, str) or not hmac.compare_digest(
+        expected_hash,
+        actual_hash,
+    ):
+        raise ValueError("Approved tool payload integrity check failed")
+    if not isinstance(signature, str) or not hmac.compare_digest(
+        signature,
+        _tool_approval_signature(agent_id, tool_name, arguments),
+    ):
+        raise ValueError("Approved tool payload integrity check failed")
+    return tool_name, arguments
 
 
 class AutonomyService:
@@ -48,12 +131,17 @@ class AutonomyService:
         policy = agent.autonomy_policy or {}
         default_level = "L3" if action_type in HIGH_RISK_DEFAULT_L3_ACTIONS else "L2"
         level = policy.get(action_type, default_level)
+        if action_type == "execute_code":
+            from app.config import get_settings
+
+            if get_settings().CODE_EXECUTION_REQUIRE_APPROVAL:
+                level = "L3"
 
         # Log the action regardless of level
         audit = AuditLog(
             agent_id=agent.id,
             action=f"autonomy_check:{action_type}",
-            details={"level": level, **details},
+            details={"level": level, "request_shape": privacy_safe_shape(details)},
         )
         db.add(audit)
 
@@ -103,7 +191,9 @@ class AutonomyService:
     ) -> ApprovalRequest:
         """Approve or reject a pending approval request."""
         result = await db.execute(
-            select(ApprovalRequest).where(ApprovalRequest.id == approval_id)
+            select(ApprovalRequest)
+            .where(ApprovalRequest.id == approval_id)
+            .with_for_update()
         )
         approval = result.scalar_one_or_none()
         if not approval:
@@ -115,6 +205,8 @@ class AutonomyService:
         # Permission check: only agent creator or platform admin can resolve
         agent_result = await db.execute(select(Agent).where(Agent.id == approval.agent_id))
         agent = agent_result.scalar_one_or_none()
+        if not agent:
+            raise ValueError("Approval Agent not found")
         same_tenant_org_admin = bool(
             agent
             and user.role == "org_admin"
@@ -124,6 +216,9 @@ class AutonomyService:
         identity_is_platform_admin = bool(getattr(getattr(user, "identity", None), "is_platform_admin", False))
         if agent and agent.creator_id != user.id and user.role != "platform_admin" and not identity_is_platform_admin and not same_tenant_org_admin:
             raise ValueError("Only the agent creator or platform admin can resolve approvals")
+
+        if action == "approve" and approval.details and approval.details.get("tool"):
+            _verified_tool_arguments(approval.agent_id, approval.details)
 
         approval.status = "approved" if action == "approve" else "rejected"
         approval.resolved_at = datetime.now(timezone.utc)
@@ -153,7 +248,10 @@ class AutonomyService:
         if agent:
             from app.services.notification_service import send_notification
             status_label = "approved" if approval.status == "approved" else "rejected"
-            body_text = json.dumps(approval.details, ensure_ascii=False)[:200]
+            body_text = json.dumps(
+                privacy_safe_shape(approval.details),
+                ensure_ascii=False,
+            )[:200]
             if execution_result:
                 body_text = f"Result: {execution_result}"
             await send_notification(
@@ -195,24 +293,9 @@ class AutonomyService:
         Reads the tool name and arguments from the approval details,
         then directly calls the tool executor (bypassing autonomy check).
         """
-        tool_name = details.get("tool")
-        args_raw = details.get("args", "{}")
-        if not tool_name:
-            return None
-
+        tool_name = str(details.get("tool") or "unknown")
         try:
-            # Parse args — stored as str(dict) so we need ast.literal_eval
-            import ast
-            if isinstance(args_raw, str):
-                try:
-                    arguments = ast.literal_eval(args_raw)
-                except (ValueError, SyntaxError):
-                    try:
-                        arguments = json.loads(args_raw)
-                    except json.JSONDecodeError:
-                        arguments = {}
-            else:
-                arguments = args_raw
+            tool_name, arguments = _verified_tool_arguments(agent_id, details)
 
             # Import and call the tool's direct executor (no autonomy re-check)
             from app.services.agent_tools import _execute_tool_direct
@@ -232,7 +315,7 @@ class AutonomyService:
             user_id=agent.creator_id,
             type="autonomy_l2",
             title=f"[{agent.name}] executed: {action_type}",
-            body=json.dumps(details, ensure_ascii=False)[:200],
+            body=json.dumps(privacy_safe_shape(details), ensure_ascii=False)[:200],
             link=f"/agents/{agent.id}#activityLog",
         )
 
@@ -286,7 +369,7 @@ class AutonomyService:
             user_id=agent.creator_id,
             type="approval_pending",
             title=f"[{agent.name}] requests approval: {approval.action_type}",
-            body=json.dumps(approval.details, ensure_ascii=False)[:200],
+            body=json.dumps(privacy_safe_shape(approval.details), ensure_ascii=False)[:200],
             link=f"/agents/{agent.id}#approvals",
             ref_id=approval.id,
         )
@@ -327,7 +410,7 @@ class AutonomyService:
                             channel.app_id, channel.app_secret,
                             receive_id,
                             agent.name, approval.action_type,
-                            json.dumps(approval.details, ensure_ascii=False),
+                            json.dumps(privacy_safe_shape(approval.details), ensure_ascii=False),
                             str(approval.id),
                         )
 

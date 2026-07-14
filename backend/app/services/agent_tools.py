@@ -2445,6 +2445,17 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
     except Exception:
         pass
 
+    from app.config import get_settings
+    from app.services.code_execution_policy import (
+        code_execution_tenant_authorized,
+        is_code_execution_tool,
+    )
+
+    code_execution_authorized = code_execution_tenant_authorized(
+        get_settings(),
+        agent_tenant_id,
+    )
+
     # Read os_type once; used to patch agentbay_file_transfer paths below
     computer_os_type = await _get_computer_os_type(agent_id)
 
@@ -2459,17 +2470,20 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
 
             visible_clauses = [Tool.source == "builtin"]
             # Admin tools: visible if they are global (tenant_id is NULL) or belong to the agent's tenant
-            admin_cond = (Tool.tenant_id == None)
+            admin_cond = Tool.tenant_id.is_(None)
             if agent_tenant_id:
                 admin_cond = admin_cond | (Tool.tenant_id == agent_tenant_id)
             visible_clauses.append((Tool.source == "admin") & admin_cond)
-            # Explicitly assigned tools: always visible regardless of source (builtin, admin, agent)
+            # Agent-installed tools require an explicit assignment. An
+            # assignment must never override an admin tool's tenant boundary.
             if assigned_tool_ids:
-                visible_clauses.append(Tool.id.in_(assigned_tool_ids))
+                visible_clauses.append(
+                    (Tool.source == "agent") & Tool.id.in_(assigned_tool_ids)
+                )
 
             # Get all tools visible within this agent's tenant boundary.
             all_tools_r = await db.execute(
-                select(Tool).where(Tool.enabled == True, or_(*visible_clauses))
+                select(Tool).where(Tool.enabled.is_(True), or_(*visible_clauses))
             )
             all_tools = all_tools_r.scalars().all()
 
@@ -2483,6 +2497,8 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
             default_included_names = []
 
             for t in all_tools:
+                if is_code_execution_tool(t.name) and not code_execution_authorized:
+                    continue
                 tid = str(t.id)
                 at = assignments.get(tid)
 
@@ -2851,8 +2867,52 @@ _TOOL_AUTONOMY_MAP = {
     "web_search": "web_search",
     "execute_code": "execute_code",
     "execute_code_e2b": "execute_code",
+    "agentbay_code_execute": "execute_code",
+    "agentbay_command_exec": "execute_code",
     "douyin_run_publish_job": "douyin_publish_job",
 }
+
+
+async def _code_tool_denial_reason(
+    tool_name: str,
+    agent_id: uuid.UUID | None,
+) -> str | None:
+    """Apply the platform and tenant Code grants before any dispatcher path."""
+
+    from app.config import get_settings
+    from app.services.code_execution_policy import (
+        code_execution_denial_reason,
+        is_code_execution_tool,
+    )
+
+    if not is_code_execution_tool(tool_name):
+        return None
+    tenant_id = await _get_agent_tenant_id(agent_id) if agent_id else None
+    denial = code_execution_denial_reason(get_settings(), tenant_id)
+    if denial:
+        return denial
+    if agent_id is None:
+        return "Code execution requires an Agent authorization"
+
+    # Platform and tenant grants are necessary but not sufficient. Every Agent
+    # must retain an explicit enabled assignment at execution time, so revoking
+    # a grant also invalidates a pending approval before it executes.
+    from app.models.tool import AgentTool, Tool
+
+    async with async_session() as db:
+        assignment = await db.execute(
+            select(AgentTool.id)
+            .join(Tool, Tool.id == AgentTool.tool_id)
+            .where(
+                AgentTool.agent_id == agent_id,
+                AgentTool.enabled.is_(True),
+                Tool.name == tool_name,
+                Tool.enabled.is_(True),
+            )
+        )
+        if assignment.scalar_one_or_none() is None:
+            return "Code execution is not authorized for this Agent"
+    return None
 
 
 def _is_enterprise_info_path(path: str | None) -> bool:
@@ -3063,6 +3123,15 @@ async def _execute_tool_direct(
     has been approved and needs to actually run.
     """
     _agent_tenant_id = await _get_agent_tenant_id(agent_id)
+    denial = await _code_tool_denial_reason(tool_name, agent_id)
+    if denial:
+        return f"❌ {denial}"
+    if tool_name.startswith("agentbay_"):
+        from app.api.agentbay_control import is_session_locked
+
+        session_id = str(arguments.get("_session_id") or "")
+        if is_session_locked(str(agent_id), session_id):
+            return "❌ AgentBay session is under human control; approved execution was blocked"
     ws = _agent_workspace_root(agent_id)
     try:
         if tool_name in {"delete_file", "write_file", "move_file", "edit_file"}:
@@ -3085,6 +3154,10 @@ async def _execute_tool_direct(
                 lambda temp_ws: _execute_code(agent_id, temp_ws, arguments, tool_name=tool_name),
                 sync_back=True,
             )
+        elif tool_name == "agentbay_code_execute":
+            return await _agentbay_code_execute(agent_id, ws, arguments)
+        elif tool_name == "agentbay_command_exec":
+            return await _agentbay_command_exec(agent_id, ws, arguments)
         elif tool_name == "web_search":
             return await _web_search(arguments, agent_id)
         elif tool_name == "jina_search":
@@ -3183,6 +3256,9 @@ async def execute_tool(
         .replace("\ufeff", "")
         .strip()
     )
+    denial = await _code_tool_denial_reason(tool_name, agent_id)
+    if denial:
+        return f"❌ {denial}"
     if tool_name == FINISH_TOOL_NAME:
         content = arguments.get("content", "")
         return content if isinstance(content, str) else str(content)
@@ -3191,18 +3267,43 @@ async def execute_tool(
 
     ws = _agent_workspace_root(agent_id)
 
+    # Bind AgentBay calls to the originating session before approval so the
+    # immutable payload executes in the same sandbox. Human Take Control also
+    # blocks approval creation while the session is locked.
+    if tool_name.startswith("agentbay_"):
+        arguments = {**arguments, "_session_id": session_id}
+        from app.api.agentbay_control import is_session_locked
+
+        if is_session_locked(str(agent_id), session_id):
+            return (
+                "⏸️ A human operator is currently controlling this browser session "
+                "(Take Control mode). Please wait for them to finish before retrying "
+                "browser/computer operations."
+            )
+
     # ── Autonomy boundary check ──
     action_type = _TOOL_AUTONOMY_MAP.get(tool_name)
     if action_type:
         try:
-            from app.services.autonomy_service import autonomy_service
+            from app.services.autonomy_service import (
+                autonomy_service,
+                build_tool_approval_details,
+            )
             from app.models.agent import Agent as AgentModel
             async with async_session() as _adb:
                 _ar = await _adb.execute(select(AgentModel).where(AgentModel.id == agent_id))
                 _agent = _ar.scalar_one_or_none()
                 if _agent:
                     result_check = await autonomy_service.check_and_enforce(
-                        _adb, _agent, action_type, {"tool": tool_name, "args": str(arguments)[:200], "requested_by": str(user_id)}
+                        _adb,
+                        _agent,
+                        action_type,
+                        build_tool_approval_details(
+                            agent_id,
+                            tool_name,
+                            arguments,
+                            user_id,
+                        ),
                     )
                     await _adb.commit()
                     if not result_check.get("allowed"):
@@ -3214,23 +3315,6 @@ async def execute_tool(
         except Exception as e:
             logger.exception(f"[Autonomy] Check failed: {e}")
             return f"⚠️ Autonomy check failed ({e}). Operation blocked for safety. Please retry or contact admin."
-
-    # Pre-inject session_id into arguments for AgentBay tools so each
-    # _agentbay_* handler can pass it to get_agentbay_client_for_agent()
-    # for per-ChatSession isolation of cloud instances.
-    if tool_name.startswith("agentbay_"):
-        arguments["_session_id"] = session_id
-
-        # Take Control lock: block automatic tool execution while a human
-        # is manually controlling the browser/desktop session. This prevents
-        # input collisions between human clicks and agent-initiated actions.
-        from app.api.agentbay_control import is_session_locked
-        if is_session_locked(str(agent_id), session_id):
-            return (
-                "⏸️ A human operator is currently controlling this browser session "
-                "(Take Control mode). Please wait for them to finish before retrying "
-                "browser/computer operations."
-            )
 
     try:
         if tool_name == "list_files":
@@ -8703,6 +8787,19 @@ async def _execute_code(
             sandbox_config = fallback_config
             logger.info(f"[Sandbox] No per-agent config found for '{tool_name}', using fallback")
 
+        from app.config import get_settings
+        from app.services.code_execution_policy import code_execution_denial_reason
+
+        tenant_id = await _get_agent_tenant_id(agent_id) if agent_id else None
+        denial = code_execution_denial_reason(
+            get_settings(),
+            tenant_id,
+            sandbox_type=str(sandbox_config.type),
+            allow_network=sandbox_config.allow_network,
+        )
+        if denial:
+            return f"❌ {denial}"
+
         # Clamp timeout by configured max_timeout (default 60s, up to 3600s)
         timeout = min(requested_timeout, sandbox_config.max_timeout)
 
@@ -8725,20 +8822,17 @@ async def _execute_code(
         if is_e2b_tool:
             # Do not silently fall back — surface the config error to the user
             return f"❌ E2B sandbox configuration error: {str(e)[:300]}\nPlease check the API key in the tool settings."
-        logger.warning(f"[Sandbox] Config issue, falling back to legacy subprocess: {e}")
-        return await _execute_code_legacy(ws, arguments, allow_network=fallback_config.allow_network, max_timeout=fallback_config.max_timeout, on_output=on_output)
+        logger.warning(f"[Sandbox] Configuration blocked local execution: {e}")
+        return f"❌ Sandbox configuration error: {str(e)[:300]}"
 
     except Exception as e:
         logger.exception(f"[Sandbox] Execution failed for agent {agent_id} (tool={tool_name})")
         if is_e2b_tool:
             # Do not silently fall back to local execution
             return f"❌ E2B execution error: {str(e)[:200]}"
-        # For local tool: try legacy subprocess as last resort
-        try:
-            return await _execute_code_legacy(ws, arguments, allow_network=sandbox_config.allow_network, max_timeout=sandbox_config.max_timeout, on_output=on_output)
-        except Exception:
-            logger.exception(f"[Sandbox] Fallback also failed for agent {agent_id}")
-            return f"❌ Execution error: {str(e)[:200]}"
+        # Production execution must never escape to a host subprocess after an
+        # isolation failure. The selected backend owns its fail-closed path.
+        return f"❌ Execution error: {str(e)[:200]}"
 
 
 async def _execute_code_legacy(ws: Path, arguments: dict, allow_network: bool = False, max_timeout: int = 60, on_output=None) -> str:

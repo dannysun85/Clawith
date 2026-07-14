@@ -1,8 +1,7 @@
 """E2B API-based sandbox backend."""
 
+import shlex
 import time
-from typing import Any
-
 from app.services.sandbox.base import BaseSandboxBackend, ExecutionResult, SandboxCapabilities
 from app.services.sandbox.config import SandboxConfig
 from loguru import logger
@@ -33,6 +32,18 @@ _LANGUAGE_MAP = {
     "node": "node",
     "javascript": "javascript",
 }
+
+
+def _build_e2b_command(language: str, code: str) -> str:
+    """Quote the complete user program as one interpreter argument."""
+
+    if language == "python":
+        return f"python3 -c {shlex.quote(code)}"
+    if language == "bash":
+        return f"bash -c {shlex.quote(code)}"
+    if language in ("node", "javascript"):
+        return f"node -e {shlex.quote(code)}"
+    raise ValueError(f"Unsupported language: {language}")
 
 
 class E2bBackend(BaseSandboxBackend):
@@ -109,29 +120,9 @@ class E2bBackend(BaseSandboxBackend):
                 api_key=self.config.api_key,
                 timeout=timeout,
             ) as sandbox:
-                # Build the command based on language
-                if e2b_language == "python":
-                    cmd = "python3"
-                    args = ["-c", code]
-                elif e2b_language == "bash":
-                    cmd = "bash"
-                    args = ["-c", code]
-                elif e2b_language in ("node", "javascript"):
-                    cmd = "node"
-                    args = ["-e", code]
-                else:
-                    return ExecutionResult(
-                        success=False,
-                        stdout="",
-                        stderr="",
-                        exit_code=1,
-                        duration_ms=int((time.time() - start_time) * 1000),
-                        error=f"Unsupported language: {language}"
-                    )
-
-                # Run the command - use string format for e2b
-                cmd_str = f"{cmd} {args[0]} '{args[1]}'"
-                result = await sandbox.commands.run(cmd_str)
+                result = await sandbox.commands.run(
+                    _build_e2b_command(e2b_language, code)
+                )
 
             duration_ms = int((time.time() - start_time) * 1000)
 
@@ -147,7 +138,7 @@ class E2bBackend(BaseSandboxBackend):
         except Exception as e:
             duration_ms = int((time.time() - start_time) * 1000)
             error_msg = str(e)
-            logger.exception(f"[E2B] Execution error")
+            logger.exception("[E2B] Execution error")
 
             # Handle timeout
             if "timeout" in error_msg.lower():

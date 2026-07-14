@@ -87,6 +87,33 @@ def test_production_compose_splits_api_and_worker_roles_and_shares_durable_volum
     assert "BACKEND_NETWORK_ALIAS" in compose
 
 
+def test_production_code_execution_defaults_fail_closed():
+    compose = (ROOT / "deploy/astra-poc/docker-compose.prod.yml").read_text(encoding="utf-8")
+
+    assert "CODE_EXECUTION_ENABLED: ${CODE_EXECUTION_ENABLED:-false}" in compose
+    assert "CODE_EXECUTION_ALLOWED_TENANT_IDS: ${CODE_EXECUTION_ALLOWED_TENANT_IDS:-}" in compose
+    assert "CODE_EXECUTION_REQUIRE_APPROVAL: ${CODE_EXECUTION_REQUIRE_APPROVAL:-true}" in compose
+    assert "SANDBOX_ALLOW_NETWORK: ${SANDBOX_ALLOW_NETWORK:-false}" in compose
+    assert 'SANDBOX_ALLOW_UNSAFE_FALLBACK_WHEN_BWRAP_MISSING: "false"' in compose
+    assert "privileged: true" not in compose
+    assert "/var/run/docker.sock" not in compose
+    assert "SYS_ADMIN" not in compose
+    assert "seccomp=unconfined" not in compose
+    assert "apparmor=unconfined" not in compose
+
+
+def test_production_release_gate_covers_code_execution_security():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    workflow = (ROOT / ".agents/workflows/deploy-production.md").read_text(encoding="utf-8")
+
+    assert "tests/test_code_execution_security.py" in script
+    assert "tests/test_tool_tenant_scope.py" in script
+    assert "tests/test_process_utils.py" in script
+    assert 'CODE_EXECUTION_ENABLED=true' in workflow
+    assert "精确 tenant UUID" in workflow
+    assert "生产禁止 `subprocess`、`docker`" in workflow
+
+
 def test_production_deploy_health_checks_candidate_before_nginx_cutover():
     script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
 
@@ -242,7 +269,31 @@ server {{
     assert configurator.audit_effective_config(effective) == (2, 2)
 
 
-@pytest.mark.parametrize("map_include", ['"include"', r"incl\ude"])
+def test_nginx_cutover_treats_plain_directive_shaped_map_keys_as_data():
+    configurator = _load_nginx_configurator()
+    original = """map $request_method $mapped_log_value {
+    access_log mapped_access_log;
+    proxy_pass http://127.0.0.1:3009;
+    log_format mapped_log_format;
+}
+server {
+    access_log /tmp/unsafe.log combined;
+    location / { proxy_pass http://127.0.0.1:3008; }
+}
+"""
+
+    assert configurator.active_upstream_port(original) == "3008"
+    configured, server_count = configurator.configure_site(original, "3008", "3009")
+
+    assert server_count == 1
+    assert "access_log mapped_access_log;" in configured
+    assert "proxy_pass http://127.0.0.1:3009;" in configured
+    assert "log_format mapped_log_format;" in configured
+    assert "/tmp/unsafe.log" not in configured
+    assert configurator.active_upstream_port(configured) == "3009"
+
+
+@pytest.mark.parametrize("map_include", ["include", '"include"', r"incl\ude"])
 def test_nginx_cutover_rejects_quoted_or_escaped_map_include(map_include):
     configurator = _load_nginx_configurator()
     original = f"""map $http_upgrade $connection_upgrade {{
@@ -258,6 +309,7 @@ server {{ location / {{ proxy_pass http://127.0.0.1:3008; }} }}
 @pytest.mark.parametrize(
     "nested_map",
     [
+        "map $x $y { access_log /tmp/raw.log; }",
         'map $x $y { "access_log" /tmp/raw.log; }',
         'location /nested { map $x $y { "proxy_pass" http://127.0.0.1:3009; } }',
     ],
