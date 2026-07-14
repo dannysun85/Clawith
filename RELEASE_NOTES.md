@@ -56,7 +56,7 @@
 ## Validation
 
 - New source-level privacy contracts reject known payload/preview logging patterns, and unit tests verify that diagnostic shape summaries cannot contain values or mapping keys.
-- Local release gates passed twice with 829 backend tests, 60 frontend tests, a 6,995-module production frontend build, and the complete PostgreSQL migration/rollback/re-upgrade smoke covering Credits settlement, production issue aggregation, media-generation exactly-once behavior, A2A queue serialization, and preference/queue concurrency contracts. The 92 deployment and worker-runtime contract tests also passed in both the full suite and the focused release gate. Production cutover and post-release observation remain separate gates.
+- RC2 local release gates passed twice with 835 backend tests, 60 frontend tests, a 6,995-module production frontend build, and the complete PostgreSQL migration/rollback/re-upgrade smoke covering Credits settlement, production issue aggregation, media-generation exactly-once behavior, A2A queue serialization, and preference/queue concurrency contracts. The focused deployment gate passed 98 cases in both rounds: 94 production-deploy contracts cover live Nginx `map` table syntax and full-length Worker container identity, while four Worker-runtime checks preserve the exactly-one healthy Worker boundary. Changed-file Ruff, Python compile, Bash syntax, development/production Compose parsing, and `git diff --check` also passed. Independent review, production cutover, browser business-flow proof, and post-release observation remain separate gates.
 
 # v1.10.11 — Verified Public Blue/Green Cutover
 
