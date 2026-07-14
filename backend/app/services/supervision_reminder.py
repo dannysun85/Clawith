@@ -210,7 +210,7 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
             tenant_id=invocation.tenant_id,
             provider_failed=not llm_provider_may_have_accepted(client),
         )
-        logger.error(f"_get_agent_reply LLM error: {e}")
+        logger.error("_get_agent_reply LLM error_type={}", type(e).__name__)
     except Exception as e:
         await release_llm_round_credits(
             round_reservation_id,
@@ -221,17 +221,23 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
             tenant_id=invocation.tenant_id,
             provider_failed=not llm_provider_may_have_accepted(client),
         )
-        logger.error(f"_get_agent_reply LLM call failed: {e}")
+        logger.error("_get_agent_reply LLM call failed error_type={}", type(e).__name__)
     finally:
         try:
             await client.close()
         except Exception as e:
-            logger.warning(f"Failed to close supervision LLM client: {e}")
+            logger.warning(
+                "Failed to close supervision LLM client error_type={}",
+                type(e).__name__,
+            )
         if usage is not None and usage.total_tokens > 0:
             try:
                 await record_token_usage(target_agent.id, usage)
             except Exception as e:
-                logger.exception(f"Failed to record supervision LLM tokens: {e}")
+                logger.exception(
+                    "Failed to record supervision LLM tokens error_type={}",
+                    type(e).__name__,
+                )
             try:
                 await settle_agent_llm_invocation(
                     invocation,
@@ -240,7 +246,10 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
                     usage=usage,
                 )
             except Exception as e:
-                logger.exception(f"Failed to settle supervision LLM Credits: {e}")
+                logger.exception(
+                    "Failed to settle supervision LLM Credits error_type={}",
+                    type(e).__name__,
+                )
     return None
 
 
@@ -359,7 +368,10 @@ async def _send_supervision_reminder(task: Task, agent_name: str):
                             len(reply),
                         )
                 except Exception as e:
-                    logger.warning(f"Target agent reply failed: {e}")
+                    logger.warning(
+                        "Target agent reply failed error_type={}",
+                        type(e).__name__,
+                    )
             else:
                 # 2. Fallback: find target as a Member in relationships
                 rel_result = await db.execute(
@@ -425,7 +437,11 @@ async def _send_supervision_reminder(task: Task, agent_name: str):
             logger.info(f"📋 Supervision reminder task={task.id} sent={sent}")
 
     except Exception as e:
-        logger.exception(f"Supervision reminder error for task {task.id}: {e}")
+        logger.exception(
+            "Supervision reminder error for task={} error_type={}",
+            task.id,
+            type(e).__name__,
+        )
 
 
 async def _supervision_tick():
@@ -472,10 +488,14 @@ async def _supervision_tick():
                         await _send_supervision_reminder(task, agent_name)
 
                 except Exception as e:
-                    logger.error(f"Error checking supervision task {task.id}: {e}")
+                    logger.error(
+                        "Error checking supervision task={} error_type={}",
+                        task.id,
+                        type(e).__name__,
+                    )
 
     except Exception as e:
-        logger.exception(f"Supervision tick error: {e}")
+        logger.exception("Supervision tick error_type={}", type(e).__name__)
         await write_audit_log("supervision_error", {"error_type": type(e).__name__})
 
 

@@ -197,7 +197,7 @@ async def test_minimax_business_error_in_http_200_releases_provider_hold():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("output_before_error", [False, True])
-async def test_stream_business_error_releases_only_before_provider_output(
+async def test_transient_stream_business_error_always_retains_provider_hold(
     output_before_error,
 ):
     chunks = []
@@ -224,7 +224,158 @@ async def test_stream_business_error_releases_only_before_provider_output(
         await client.close()
 
     assert client.provider_output_started is output_before_error
-    assert llm_provider_may_have_accepted(client) is output_before_error
+    assert llm_provider_may_have_accepted(client) is True
+
+
+@pytest.mark.asyncio
+async def test_deterministic_stream_quota_rejection_releases_provider_hold():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=_SSESequence(
+                b'data: {"base_resp":{"status_code":2056,"status_msg":"quota"}}\n\n'
+            ),
+            request=request,
+        )
+
+    client = OpenAICompatibleClient(
+        api_key="test-key",
+        base_url="https://provider.test/v1",
+        model="MiniMax-M3",
+    )
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    try:
+        with pytest.raises(LLMError, match="code=2056"):
+            await client.stream(messages=[LLMMessage(role="user", content="hello")])
+    finally:
+        await client.close()
+
+    assert llm_provider_may_have_accepted(client) is False
+
+
+@pytest.mark.asyncio
+async def test_transient_nonstream_business_error_retains_provider_hold():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+                "base_resp": {"status_code": 1001, "status_msg": "timeout"},
+            },
+            request=request,
+        )
+
+    client = OpenAICompatibleClient(
+        api_key="test-key",
+        base_url="https://provider.test/v1",
+        model="MiniMax-M3",
+    )
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    try:
+        with pytest.raises(LLMError, match="code=1001"):
+            await client.complete(messages=[LLMMessage(role="user", content="hello")])
+    finally:
+        await client.close()
+
+    assert llm_provider_may_have_accepted(client) is True
+
+
+@pytest.mark.asyncio
+async def test_minimax_nonstream_reasoning_details_are_preserved_for_tool_replay():
+    reasoning_details = [
+        {"type": "reasoning.text", "text": "inspect the workbook", "index": 0}
+    ]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "content": "",
+                        "reasoning_details": reasoning_details,
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": "{}"},
+                        }],
+                    },
+                }],
+                "usage": {"total_tokens": 10},
+            },
+            request=request,
+        )
+
+    client = OpenAICompatibleClient(
+        api_key="test-key",
+        base_url="https://provider.test/v1",
+        model="MiniMax-M3",
+    )
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    try:
+        response = await client.complete(
+            messages=[LLMMessage(role="user", content="make a report")]
+        )
+    finally:
+        await client.close()
+
+    replayed = LLMMessage(
+        role="assistant",
+        content=response.content,
+        tool_calls=response.tool_calls,
+        reasoning_details=response.reasoning_details,
+    ).to_openai_format()
+    assert response.reasoning_details == reasoning_details
+    assert replayed["reasoning_details"] == reasoning_details
+    assert replayed["tool_calls"] == response.tool_calls
+
+
+@pytest.mark.asyncio
+async def test_minimax_stream_reasoning_snapshots_are_aggregated_without_duplication():
+    chunks = (
+        b'data: {"choices":[{"delta":{"reasoning_details":'
+        b'[{"type":"reasoning.text","text":"inspect","index":0}]}}]}\n\n',
+        b'data: {"choices":[{"delta":{"reasoning_details":'
+        b'[{"type":"reasoning.text","text":"inspect then act","index":0}],'
+        b'"tool_calls":[{"index":0,"id":"call_1","function":'
+        b'{"name":"read_file","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}\n\n',
+        b'data: [DONE]\n\n',
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=_SSESequence(*chunks), request=request)
+
+    thinking_parts: list[str] = []
+
+    async def on_thinking(text: str) -> None:
+        thinking_parts.append(text)
+
+    client = OpenAICompatibleClient(
+        api_key="test-key",
+        base_url="https://provider.test/v1",
+        model="MiniMax-M3",
+    )
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    try:
+        response = await client.stream(
+            messages=[LLMMessage(role="user", content="make a report")],
+            on_thinking=on_thinking,
+        )
+    finally:
+        await client.close()
+
+    assert response.reasoning_content == "inspect then act"
+    assert response.reasoning_details == [
+        {"type": "reasoning.text", "text": "inspect then act", "index": 0}
+    ]
+    assert "".join(thinking_parts) == "inspect then act"
+    assert response.tool_calls[0]["id"] == "call_1"
 
 
 @pytest.mark.asyncio

@@ -246,7 +246,10 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                         itms.append(f"- [{ts}] {act.action_type}: {act.summary[:120]}")
                     recent_context = "\\n\\n---\\n## Recent Activity Context\\nHere are your recent interactions and work to help you identify relevant topics:\\n\\n" + "\\n".join(itms)
             except Exception as e:
-                logger.warning(f"Failed to fetch recent activity for heartbeat context: {e}")
+                logger.warning(
+                    "Failed to fetch recent activity for heartbeat context error_type={}",
+                    type(e).__name__,
+                )
 
             # Fetch unread notifications for this agent (plaza replies, mentions, broadcasts)
             inbox_context = ""
@@ -267,7 +270,10 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                         notif_lines.append(f"- [{n.type}] {n.title} {sender}: {(n.body or '')[:150]}")
                         n.is_read = True
             except Exception as e:
-                logger.warning(f"Failed to drain agent notifications: {e}")
+                logger.warning(
+                    "Failed to drain agent notifications error_type={}",
+                    type(e).__name__,
+                )
             
             inbox_context = "\\n".join(notif_lines)
             
@@ -301,7 +307,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                 timeout=float(model_request_timeout or 120.0),
             )
         except Exception as e:
-            logger.error(f"Failed to create LLM client: {e}")
+            logger.error("Failed to create LLM client error_type={}", type(e).__name__)
             return
 
         tools_for_llm = await get_agent_tools_for_llm(agent_id)
@@ -393,7 +399,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                     tenant_id=llm_invocation.tenant_id,
                     provider_failed=not llm_provider_may_have_accepted(client),
                 )
-                logger.error(f"LLM error in heartbeat: {e}")
+                logger.error("LLM error in heartbeat error_type={}", type(e).__name__)
                 reply = ""
                 break
             except Exception as e:
@@ -406,7 +412,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                     tenant_id=llm_invocation.tenant_id,
                     provider_failed=not llm_provider_may_have_accepted(client),
                 )
-                logger.error(f"LLM call error in heartbeat: {e}")
+                logger.error("LLM call error in heartbeat error_type={}", type(e).__name__)
                 reply = ""
                 break
 
@@ -444,6 +450,7 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                         "function": tc["function"],
                     } for tc in response.tool_calls],
                     reasoning_content=response.reasoning_content,
+                    reasoning_details=getattr(response, "reasoning_details", None),
                 ))
 
                 finish_call = find_finish_call(response.tool_calls)
@@ -544,13 +551,21 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
     except QuotaExceeded:
         logger.warning(f"Heartbeat skipped for agent {agent_id}: quota exceeded")
     except Exception as e:
-        logger.exception(f"Heartbeat error for agent {agent_id}: {e}")
+        logger.exception(
+            "Heartbeat error for agent={} error_type={}",
+            agent_id,
+            type(e).__name__,
+        )
     finally:
         if client is not None:
             try:
                 await client.close()
             except Exception as e:
-                logger.warning(f"Failed to close heartbeat LLM client for agent {agent_id}: {e}")
+                logger.warning(
+                    "Failed to close heartbeat LLM client for agent={} error_type={}",
+                    agent_id,
+                    type(e).__name__,
+                )
 
         if _hb_unsaved_usage and _hb_unsaved_usage.total_tokens > 0:
             try:
@@ -558,7 +573,11 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
 
                 await record_token_usage(agent_id, _hb_unsaved_usage)
             except Exception as e:
-                logger.exception(f"Failed to record heartbeat tokens for agent {agent_id}: {e}")
+                logger.exception(
+                    "Failed to record heartbeat tokens for agent={} error_type={}",
+                    agent_id,
+                    type(e).__name__,
+                )
 
         if _hb_accumulated_usage and _hb_accumulated_usage.total_tokens > 0 and llm_invocation:
             try:
@@ -571,7 +590,11 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
                     usage=_hb_accumulated_usage,
                 )
             except Exception as e:
-                logger.exception(f"Failed to settle heartbeat Credits for agent {agent_id}: {e}")
+                logger.exception(
+                    "Failed to settle heartbeat Credits for agent={} error_type={}",
+                    agent_id,
+                    type(e).__name__,
+                )
 
         _HEARTBEAT_SEMAPHORE.release()
 
@@ -655,7 +678,11 @@ async def _heartbeat_tick():
                 try:
                     await write_audit_log("heartbeat_fire", {"agent_name": agent.name}, agent_id=agent.id)
                 except Exception as e:
-                    logger.warning(f"Failed to write heartbeat_fire audit log for {agent.id}: {e}")
+                    logger.warning(
+                        "Failed to write heartbeat_fire audit log for agent={} error_type={}",
+                        agent.id,
+                        type(e).__name__,
+                    )
                 asyncio.create_task(_execute_heartbeat(agent.id))
                 triggered += 1
 
@@ -665,10 +692,13 @@ async def _heartbeat_tick():
                 try:
                     await write_audit_log("heartbeat_tick", {"eligible_agents": len(agents), "triggered": triggered})
                 except Exception as e:
-                    logger.warning(f"Failed to write heartbeat_tick audit log: {e}")
+                    logger.warning(
+                        "Failed to write heartbeat_tick audit log error_type={}",
+                        type(e).__name__,
+                    )
 
     except Exception as e:
-        logger.exception(f"Heartbeat tick error: {e}")
+        logger.exception("Heartbeat tick error_type={}", type(e).__name__)
         await write_audit_log("heartbeat_error", {"error_type": type(e).__name__})
 
 
@@ -705,7 +735,10 @@ async def _notify_oneshot_error(
             await db.commit()
         logger.info(f"[Oneshot] Failure notification created agent={agent_id} user={triggered_by_user_id}")
     except Exception as e:
-        logger.warning(f"[Oneshot] Failed to create error notification: {e}")
+        logger.warning(
+            "[Oneshot] Failed to create error notification error_type={}",
+            type(e).__name__,
+        )
 
 
 async def run_agent_oneshot(
@@ -808,8 +841,12 @@ async def run_agent_oneshot(
                 timeout=float(model_request_timeout or 120.0),
             )
         except Exception as e:
-            msg = f"Failed to initialise the LLM client: {e}"
-            logger.error(f"[Oneshot] Failed to create LLM client for {agent_id}: {e}")
+            msg = "Failed to initialise the LLM client. Please contact an administrator."
+            logger.error(
+                "[Oneshot] Failed to create LLM client for agent={} error_type={}",
+                agent_id,
+                type(e).__name__,
+            )
             await _notify_oneshot_error(triggered_by_user_id, agent_id, agent_name, msg)
             return ""
 
@@ -832,7 +869,10 @@ async def run_agent_oneshot(
                     try:
                         await record_token_usage(agent_id, unsaved_usage)
                     except Exception as e:
-                        logger.warning(f"[Oneshot] Failed to record token usage mid-loop: {e}")
+                        logger.warning(
+                            "[Oneshot] Failed to record token usage mid-loop error_type={}",
+                            type(e).__name__,
+                        )
                     else:
                         unsaved_usage = TokenUsage()
                     from app.services.llm.caller import _get_agent_config
@@ -893,10 +933,14 @@ async def run_agent_oneshot(
                     tenant_id=llm_invocation.tenant_id,
                     provider_failed=not llm_provider_may_have_accepted(client),
                 )
-                logger.error(f"[Oneshot] LLM error (round {round_i}): {e}")
+                logger.error(
+                    "[Oneshot] LLM error round={} error_type={}",
+                    round_i,
+                    type(e).__name__,
+                )
                 await _notify_oneshot_error(
                     triggered_by_user_id, agent_id, agent_name,
-                    f"LLM call failed (round {round_i}): {e}",
+                    f"LLM call failed in round {round_i}. Please retry or contact an administrator.",
                 )
                 break
             except Exception as e:
@@ -909,10 +953,14 @@ async def run_agent_oneshot(
                     tenant_id=llm_invocation.tenant_id,
                     provider_failed=not llm_provider_may_have_accepted(client),
                 )
-                logger.error(f"[Oneshot] Unexpected LLM error (round {round_i}): {e}")
+                logger.error(
+                    "[Oneshot] Unexpected LLM error round={} error_type={}",
+                    round_i,
+                    type(e).__name__,
+                )
                 await _notify_oneshot_error(
                     triggered_by_user_id, agent_id, agent_name,
-                    f"Unexpected error during LLM call (round {round_i}): {e}",
+                    f"Unexpected error during LLM call in round {round_i}. Please retry or contact an administrator.",
                 )
                 break
 
@@ -954,6 +1002,7 @@ async def run_agent_oneshot(
                         "function": tc["function"],
                     } for tc in response.tool_calls],
                     reasoning_content=response.reasoning_content,
+                    reasoning_details=getattr(response, "reasoning_details", None),
                 ))
 
                 finish_call = find_finish_call(response.tool_calls)
@@ -1028,7 +1077,10 @@ async def run_agent_oneshot(
                     )
                     await db.commit()
             except Exception as e:
-                logger.warning(f"[Oneshot] Failed to clear error notifications: {e}")
+                logger.warning(
+                    "[Oneshot] Failed to clear error notifications error_type={}",
+                    type(e).__name__,
+                )
 
         logger.info(
             f"[Oneshot] Agent {agent_id} completed "
@@ -1041,14 +1093,22 @@ async def run_agent_oneshot(
         await _notify_oneshot_error(triggered_by_user_id, agent_id, str(agent_id), e.message)
         return ""
     except Exception as e:
-        logger.exception(f"[Oneshot] Unexpected error for agent {agent_id}: {e}")
+        logger.exception(
+            "[Oneshot] Unexpected error for agent={} error_type={}",
+            agent_id,
+            type(e).__name__,
+        )
         return ""
     finally:
         if client is not None:
             try:
                 await client.close()
             except Exception as e:
-                logger.warning(f"[Oneshot] Failed to close LLM client for agent {agent_id}: {e}")
+                logger.warning(
+                    "[Oneshot] Failed to close LLM client for agent={} error_type={}",
+                    agent_id,
+                    type(e).__name__,
+                )
 
         if unsaved_usage and unsaved_usage.total_tokens > 0:
             try:
@@ -1056,7 +1116,11 @@ async def run_agent_oneshot(
 
                 await record_token_usage(agent_id, unsaved_usage)
             except Exception as e:
-                logger.exception(f"[Oneshot] Failed to record token usage for agent {agent_id}: {e}")
+                logger.exception(
+                    "[Oneshot] Failed to record token usage for agent={} error_type={}",
+                    agent_id,
+                    type(e).__name__,
+                )
 
         if accumulated_usage and accumulated_usage.total_tokens > 0 and llm_invocation:
             try:
@@ -1069,4 +1133,8 @@ async def run_agent_oneshot(
                     usage=accumulated_usage,
                 )
             except Exception as e:
-                logger.exception(f"[Oneshot] Failed to settle Credits for agent {agent_id}: {e}")
+                logger.exception(
+                    "[Oneshot] Failed to settle Credits for agent={} error_type={}",
+                    agent_id,
+                    type(e).__name__,
+                )

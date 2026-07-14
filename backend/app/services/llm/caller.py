@@ -1619,6 +1619,7 @@ async def call_llm(
                 content=response.content or None,
                 tool_calls=sanitized_tool_calls,
                 reasoning_content=response.reasoning_content,
+                reasoning_details=getattr(response, "reasoning_details", None),
             ))
             api_messages.append(LLMMessage(
                 role="tool",
@@ -1633,6 +1634,7 @@ async def call_llm(
             content=response.content or None,
             tool_calls=sanitized_tool_calls,
             reasoning_content=response.reasoning_content,
+            reasoning_details=getattr(response, "reasoning_details", None),
         ))
 
         full_reasoning_content = response.reasoning_content or ""
@@ -2405,6 +2407,7 @@ async def call_agent_llm_with_tools(
                         content=response.content or None,
                         tool_calls=sanitized_tool_calls,
                         reasoning_content=response.reasoning_content,
+                        reasoning_details=getattr(response, "reasoning_details", None),
                     ))
                     api_messages.append(LLMMessage(
                         role="tool",
@@ -2418,6 +2421,7 @@ async def call_agent_llm_with_tools(
                     content=response.content or None,
                     tool_calls=sanitized_tool_calls,
                     reasoning_content=response.reasoning_content,
+                    reasoning_details=getattr(response, "reasoning_details", None),
                 ))
 
                 for tc in sanitized_tool_calls or []:

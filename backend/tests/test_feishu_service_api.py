@@ -1,5 +1,10 @@
+import asyncio
+import uuid
+from types import SimpleNamespace
+
 import pytest
 
+from app.api import feishu as feishu_api
 from app.services import feishu_service as feishu_service_module
 
 
@@ -156,3 +161,58 @@ async def test_download_message_resource_returns_bounded_stream(monkeypatch):
     )
 
     assert content == b"1234"
+
+
+@pytest.mark.asyncio
+async def test_feishu_timeout_cancels_unified_failover_once_without_replay(monkeypatch):
+    calls: list[dict] = []
+    cancelled = asyncio.Event()
+
+    async def fake_unified_failover(**kwargs):
+        calls.append(kwargs)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    monkeypatch.setattr(
+        "app.services.llm.call_llm_with_failover",
+        fake_unified_failover,
+    )
+
+    primary = SimpleNamespace(
+        model="MiniMax-M3",
+        request_timeout=0.01,
+        supports_vision=True,
+    )
+    fallback = SimpleNamespace(
+        model="MiniMax-M3-highspeed",
+        request_timeout=0.01,
+        supports_vision=True,
+    )
+    agent = SimpleNamespace(
+        name="Channel agent",
+        role_description="assistant",
+        context_window_size=20,
+        is_expired=False,
+        expires_at=None,
+    )
+    route_meta = SimpleNamespace(saas_tier="pro", modality="text")
+
+    result = await feishu_api._call_llm_with_config(
+        agent,
+        primary,
+        fallback,
+        route_meta,
+        uuid.uuid4(),
+        "hello",
+    )
+
+    assert "timed out" in result
+    assert cancelled.is_set()
+    assert len(calls) == 1
+    assert calls[0]["primary_model"] is primary
+    assert calls[0]["fallback_model"] is fallback
+    assert calls[0]["route_meta"] is route_meta
+    assert calls[0]["messages"] == [{"role": "user", "content": "hello"}]

@@ -269,7 +269,10 @@ class _SerialPatchQueue:
                 try:
                     await prev
                 except Exception as e:
-                    logger.warning(f"[Feishu] Previous patch job failed before next job: {e}")
+                    logger.warning(
+                        "[Feishu] Previous patch job failed before next job error_type={}",
+                        type(e).__name__,
+                    )
             await job_factory()
 
         self._tail = asyncio.create_task(_runner())
@@ -420,7 +423,11 @@ async def feishu_oauth_callback(
         token = create_access_token(str(user.id), user.role)
 
     except Exception as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Feishu auth failed: {e}")
+        logger.warning("[Feishu] OAuth callback failed error_type={}", type(e).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Feishu authentication failed. Please retry.",
+        )
 
     # If this is an SSO session, store result and redirect to frontend completion
     if state:
@@ -882,7 +889,10 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
                                 except Exception as _ce:
                                     logger.error(f"[Feishu] Cache write failed: {_ce}")
             except Exception as e:
-                logger.error(f"[Feishu] Failed to resolve sender: {e}")
+                logger.error(
+                    "[Feishu] Failed to resolve sender error_type={}",
+                    type(e).__name__,
+                )
 
             # Resolve channel user via unified service (uses OrgMember + SSO patterns)
             from app.services.channel_user_service import channel_user_service
@@ -899,7 +909,10 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
                 from app.services.channel_user_service import ChannelUserResolutionError
 
                 if isinstance(e, ChannelUserResolutionError):
-                    logger.warning(f"[Feishu] Sender resolution refused: {e}")
+                    logger.warning(
+                        "[Feishu] Sender resolution refused error_type={}",
+                        type(e).__name__,
+                    )
                     _reply_to = chat_id if chat_type == "group" else sender_open_id
                     _rid_type = "chat_id" if chat_type == "group" else "open_id"
                     await feishu_service.send_message(
@@ -1093,7 +1106,10 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
                 )
                 _patch_msg_id = _init_resp.get("data", {}).get("message_id")
             except Exception as e:
-                logger.error(f"[Feishu] Failed to send init streaming card: {e}")
+                logger.error(
+                    "[Feishu] Failed to send init streaming card error_type={}",
+                    type(e).__name__,
+                )
 
             async def _flush_stream(reason: str, force: bool = False):
                 nonlocal _last_flushed_hash, _last_flush_time
@@ -1239,8 +1255,11 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
                             len(task_title),
                         )
                     except Exception as e:
-                        logger.error(f"[Feishu] Failed to create task: {e}")
-                        reply_text += f"\n\n⚠️ 任务已识别，但写入任务面板失败：{str(e)[:150]}"
+                        logger.error(
+                            "[Feishu] Failed to create task error_type={}",
+                            type(e).__name__,
+                        )
+                        reply_text += "\n\n⚠️ 任务已识别，但写入任务面板失败，请稍后重试。"
 
             final_reply_text = _append_error_details(reply_text, _tool_errors)
             final_card = _build_card(
@@ -1255,7 +1274,10 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
                 try:
                     await _patch_queue.drain()
                 except Exception as e:
-                    logger.warning(f"[Feishu] Drain patch queue failed before final patch: {e}")
+                    logger.warning(
+                        "[Feishu] Drain patch queue failed before final patch error_type={}",
+                        type(e).__name__,
+                    )
                 try:
                     await feishu_service.patch_message(
                         config.app_id,
@@ -1265,7 +1287,10 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
                         stage="stream_final",
                     )
                 except Exception as e:
-                    logger.error(f"[Feishu] Failed to patch final interactive reply: {e}")
+                    logger.error(
+                        "[Feishu] Failed to patch final interactive reply error_type={}",
+                        type(e).__name__,
+                    )
                     try:
                         await feishu_service.send_message(
                             config.app_id,
@@ -1290,7 +1315,10 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
                         stage="final_after_task",
                     )
                 except Exception as e:
-                    logger.error(f"[Feishu] Failed to send final interactive reply: {e}")
+                    logger.error(
+                        "[Feishu] Failed to send final interactive reply error_type={}",
+                        type(e).__name__,
+                    )
                     try:
                         await feishu_service.send_message(
                             config.app_id,
@@ -1393,7 +1421,11 @@ async def _handle_feishu_file(
         )
         logger.info(f"[Feishu] Saved {msg_type} upload bytes={len(file_bytes)}")
     except Exception as e:
-        logger.error(f"[Feishu] Failed to download {msg_type}: {e}")
+        logger.error(
+            "[Feishu] Failed to download media_type={} error_type={}",
+            msg_type,
+            type(e).__name__,
+        )
         if isinstance(e, FeishuResourceTooLargeError):
             err_tip = f"抱歉，文件过大，当前最多支持 {e.limit // 1024 // 1024}MB。请压缩或拆分后重试。"
         else:
@@ -1476,7 +1508,10 @@ async def _handle_feishu_file(
             from app.services.channel_user_service import ChannelUserResolutionError
 
             if isinstance(e, ChannelUserResolutionError):
-                logger.warning(f"[Feishu] File sender resolution refused: {e}")
+                logger.warning(
+                    "[Feishu] File sender resolution refused error_type={}",
+                    type(e).__name__,
+                )
                 _reply_to = chat_id if chat_type == "group" else sender_open_id
                 _rid_type = "chat_id" if chat_type == "group" else "open_id"
                 await feishu_service.send_message(
@@ -1715,7 +1750,7 @@ async def _handle_feishu_file(
                 json.dumps({"text": ack}),
             )
     except Exception as e:
-        logger.error(f"[Feishu] Failed to send ack: {e}")
+        logger.error("[Feishu] Failed to send ack error_type={}", type(e).__name__)
 
     # Store ack in DB
     async with _async_session() as db2:
@@ -1740,7 +1775,10 @@ async def _download_post_images(agent_id, config, message_id, image_keys):
             )
             logger.info(f"[Feishu] Saved post image bytes={len(file_bytes)}")
         except Exception as e:
-                logger.error(f"[Feishu] Failed to download post image: {e}")
+            logger.error(
+                "[Feishu] Failed to download post image error_type={}",
+                type(e).__name__,
+            )
 
 
 async def _load_agent_and_model(
@@ -1797,7 +1835,7 @@ async def _call_llm_with_config(
 
     This is the hot path — all DB queries should be done before calling this.
     """
-    from app.services.llm import call_llm
+    from app.services.llm import call_llm_with_failover
 
     if is_agent_expired(agent):
         return "This Agent has expired and is off duty. Please contact your admin to extend its service."
@@ -1814,15 +1852,22 @@ async def _call_llm_with_config(
     messages.append({"role": "user", "content": user_text})
 
     effective_user_id = user_id or agent_id
+    # Keep one channel-level safety budget around the unified failover path.
+    # Individual provider calls still enforce their own request_timeout.  The
+    # outer timeout must never replay a cancelled request because cancellation
+    # after network start is an ambiguous, potentially billable outcome.
     _timeout = _get_llm_timeout(model)
+    if fallback_model:
+        _timeout += _get_llm_timeout(fallback_model)
 
     try:
         reply = await asyncio.wait_for(
-            call_llm(
-                model,
-                messages,
-                agent.name,
-                agent.role_description or "",
+            call_llm_with_failover(
+                primary_model=model,
+                fallback_model=fallback_model,
+                messages=messages,
+                agent_name=agent.name,
+                role_description=agent.role_description or "",
                 agent_id=agent_id,
                 user_id=effective_user_id,
                 session_id=session_id,
@@ -1837,76 +1882,19 @@ async def _call_llm_with_config(
         return reply
     except asyncio.TimeoutError:
         logger.error(
-            f"[LLM] Call timed out after {_timeout}s "
-            f"(agent_id={agent_id}, model={getattr(model, 'model', 'unknown')})"
+            "[LLM] Feishu unified call timed out after {}s agent_id={} model={}; "
+            "request was not replayed",
+            _timeout,
+            agent_id,
+            getattr(model, "model", "unknown"),
         )
-        if fallback_model:
-            _fb_timeout = _get_llm_timeout(fallback_model)
-            logger.info(f"[LLM] Retrying timed-out request with fallback model: {fallback_model.model} (timeout={_fb_timeout}s)")
-            try:
-                reply = await asyncio.wait_for(
-                    call_llm(
-                        fallback_model,
-                        messages,
-                        agent.name,
-                        agent.role_description or "",
-                        agent_id=agent_id,
-                        user_id=effective_user_id,
-                        session_id=session_id,
-                        supports_vision=getattr(fallback_model, 'supports_vision', False),
-                        on_chunk=on_chunk,
-                        on_thinking=on_thinking,
-                        on_tool_call=on_tool_call,
-                        route_meta=route_meta,
-                    ),
-                    timeout=_fb_timeout,
-                )
-                return reply
-            except asyncio.TimeoutError:
-                logger.error(
-                    f"[LLM] Fallback call also timed out after {_fb_timeout}s "
-                    f"(agent_id={agent_id}, model={getattr(fallback_model, 'model', 'unknown')})"
-                )
-                return f"⚠️ Model response timed out (>{int(_fb_timeout)}s). Please retry or shorten your request."
-            except Exception as e2:
-                logger.error(f"[LLM] Fallback model failed error_type={type(e2).__name__}: {e2}")
-                return f"⚠️ Model error: Primary Timeout | Fallback: {str(e2)[:80]}"
         return f"⚠️ Model response timed out (>{int(_timeout)}s). Please retry or shorten your request."
     except Exception as e:
-        error_msg = str(e) or repr(e)
-        logger.error(f"[LLM] Primary model error error_type={type(e).__name__}")
-        if fallback_model:
-            logger.info(f"[LLM] Retrying with fallback model: {fallback_model.model}")
-            try:
-                _fb_timeout = _get_llm_timeout(fallback_model)
-                reply = await asyncio.wait_for(
-                    call_llm(
-                        fallback_model,
-                        messages,
-                        agent.name,
-                        agent.role_description or "",
-                        agent_id=agent_id,
-                        user_id=effective_user_id,
-                        session_id=session_id,
-                        supports_vision=getattr(fallback_model, 'supports_vision', False),
-                        on_chunk=on_chunk,
-                        on_thinking=on_thinking,
-                        on_tool_call=on_tool_call,
-                        route_meta=route_meta,
-                    ),
-                    timeout=_fb_timeout,
-                )
-                return reply
-            except asyncio.TimeoutError:
-                logger.error(
-                    f"[LLM] Fallback call timed out after {_fb_timeout}s "
-                    f"(agent_id={agent_id}, model={getattr(fallback_model, 'model', 'unknown')})"
-                )
-                return f"⚠️ Model error: Primary: {str(e)[:80]} | Fallback Timeout"
-            except Exception as e2:
-                logger.error(f"[LLM] Fallback model failed error_type={type(e2).__name__}: {e2}")
-                return f"⚠️ Model error: Primary: {str(e)[:80]} | Fallback: {str(e2)[:80]}"
-        return f"⚠️ 调用模型出错: {error_msg[:150]}"
+        logger.error(
+            "[LLM] Feishu unified model call failed error_type={}",
+            type(e).__name__,
+        )
+        return "⚠️ 调用模型出错，请稍后重试或联系管理员。"
 
 
 async def _call_agent_llm(

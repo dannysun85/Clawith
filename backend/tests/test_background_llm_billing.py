@@ -1175,6 +1175,7 @@ def test_autonomous_entrypoints_keep_routing_and_settlement_hooks():
     feishu_loader_source = inspect.getsource(feishu._load_agent_and_model)
     feishu_call_source = inspect.getsource(feishu._call_llm_with_config)
     gateway_source = inspect.getsource(gateway._send_to_agent_background)
+    foreground_tools_source = inspect.getsource(llm_caller.call_llm)
     background_tools_source = inspect.getsource(llm_caller.call_agent_llm_with_tools)
 
     assert "prepare_agent_llm_invocation" in heartbeat_source
@@ -1195,9 +1196,27 @@ def test_autonomous_entrypoints_keep_routing_and_settlement_hooks():
     assert "llm_provider_may_have_accepted" in supervision_source
     assert supervision_source.count("**request_options") == 1
     assert "resolve_agent_model" in feishu_loader_source
+    assert "call_llm_with_failover" in feishu_call_source
+    assert "call_llm(" not in feishu_call_source
     assert "route_meta=route_meta" in feishu_call_source
     assert "resolve_agent_model" in gateway_source
     assert "route_meta=route_meta" in gateway_source
     assert "_prepare_llm_billing_context" in background_tools_source
     assert "_finalize_background_usage" in background_tools_source
     assert "llm_provider_may_have_accepted" in background_tools_source
+    assert "reasoning_details=getattr(response" in foreground_tools_source
+    assert "reasoning_details=getattr(response" in background_tools_source
+    assert "reasoning_details=getattr(response" in heartbeat_source
+    assert "reasoning_details=getattr(response" in oneshot_source
+
+    # Provider error bodies may contain prompts or credentials.  Autonomous
+    # entrypoints log only stable error types and notify users with generic
+    # messages, never raw exception interpolation.
+    for source in (
+        heartbeat_source,
+        oneshot_source,
+        supervision_source,
+        feishu_call_source,
+    ):
+        assert ": {e}" not in source
+        assert "str(e)" not in source
