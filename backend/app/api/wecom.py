@@ -167,50 +167,86 @@ async def configure_wecom_channel(
     if not is_agent_creator(current_user, agent):
         raise HTTPException(status_code=403, detail="Only creator can configure channel")
 
+    requested_mode = str(data.get("connection_mode") or "").strip().lower()
+    if requested_mode not in {"", "websocket", "webhook"}:
+        raise HTTPException(
+            status_code=422,
+            detail="connection_mode must be websocket or webhook",
+        )
+
     # WebSocket mode fields (AI Bot)
-    bot_id = data.get("bot_id", "").strip()
-    bot_secret = data.get("bot_secret", "").strip()
+    bot_id = str(data.get("bot_id") or "").strip()
+    bot_secret = str(data.get("bot_secret") or "").strip()
 
     # Legacy webhook mode fields
-    corp_id = data.get("corp_id", "").strip()
+    corp_id = str(data.get("corp_id") or "").strip()
     wecom_agent_id_raw = data.get("wecom_agent_id", "")
     wecom_agent_id_text = str(wecom_agent_id_raw or "").strip()
     numeric_wecom_agent_id = normalize_wecom_agent_id(wecom_agent_id_raw)
-    secret = data.get("secret", "").strip()
-    token = data.get("token", "").strip()
-    encoding_aes_key = data.get("encoding_aes_key", "").strip()
+    secret = str(data.get("secret") or "").strip()
+    token = str(data.get("token") or "").strip()
+    encoding_aes_key = str(data.get("encoding_aes_key") or "").strip()
 
-    # At least one mode must be configured
+    # Select the explicitly requested mode. Legacy clients without this field
+    # retain the old inference rule, but an edit form can no longer be kept in
+    # WebSocket mode merely because hidden stale bot fields were submitted.
     has_ws_mode = bool(bot_id and bot_secret)
     has_webhook_mode = bool(corp_id and secret and token and encoding_aes_key)
-    if not has_ws_mode and not has_webhook_mode:
+    connection_mode = requested_mode or (
+        "websocket" if has_ws_mode else "webhook" if has_webhook_mode else ""
+    )
+    if not connection_mode:
         raise HTTPException(
             status_code=422,
             detail="Either bot_id+bot_secret (WebSocket) or corp_id+secret+token+encoding_aes_key (Webhook) required"
         )
+    if connection_mode == "websocket" and not has_ws_mode:
+        raise HTTPException(
+            status_code=422,
+            detail="bot_id+bot_secret required for WebSocket mode",
+        )
+    if connection_mode == "webhook" and not has_webhook_mode:
+        raise HTTPException(
+            status_code=422,
+            detail="corp_id+secret+token+encoding_aes_key required for Webhook mode",
+        )
+    # Customer Service (KF) callbacks use open_kfid and the dedicated KF send
+    # API, so they do not have an application AgentID. Keep AgentID optional for
+    # that valid configuration, while rejecting malformed values when supplied.
+    # Ordinary application messages still fail closed before LLM/Credits work
+    # at runtime when the field is absent.
+    if (
+        connection_mode == "webhook"
+        and wecom_agent_id_text
+        and numeric_wecom_agent_id is None
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="wecom_agent_id must be a positive ASCII numeric value when provided",
+        )
 
-    # The webhook message/send API cannot operate without a positive AgentID.
-    # WebSocket-only AI Bot mode does not need one, but reject an explicitly
-    # supplied malformed value instead of persisting a latent runtime failure.
-    if has_webhook_mode and not has_ws_mode and numeric_wecom_agent_id is None:
-        raise HTTPException(
-            status_code=422,
-            detail="A positive numeric wecom_agent_id is required for Webhook mode",
+    # Persist only the active mode. This both clears hidden stale credentials
+    # during a mode switch and keeps later runtime inference unambiguous.
+    if connection_mode == "websocket":
+        corp_id = ""
+        secret = ""
+        token = ""
+        encoding_aes_key = ""
+        wecom_agent_id = ""
+    else:
+        bot_id = ""
+        bot_secret = ""
+        wecom_agent_id = (
+            str(numeric_wecom_agent_id)
+            if numeric_wecom_agent_id is not None
+            else ""
         )
-    if wecom_agent_id_text and numeric_wecom_agent_id is None:
-        raise HTTPException(
-            status_code=422,
-            detail="wecom_agent_id must be a positive ASCII numeric value",
-        )
-    wecom_agent_id = (
-        str(numeric_wecom_agent_id) if numeric_wecom_agent_id is not None else ""
-    )
 
     extra_config = {
         "wecom_agent_id": wecom_agent_id,
         "bot_id": bot_id,
         "bot_secret": bot_secret,
-        "connection_mode": "websocket" if has_ws_mode else "webhook",
+        "connection_mode": connection_mode,
     }
 
     result = await db.execute(
@@ -247,7 +283,7 @@ async def configure_wecom_channel(
         config_out = ChannelConfigOut.model_validate(config)
 
     try:
-        if has_ws_mode:
+        if connection_mode == "websocket":
             asyncio.create_task(
                 wecom_stream_manager.start_client(agent_id, bot_id, bot_secret)
             )

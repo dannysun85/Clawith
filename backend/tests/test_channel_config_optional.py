@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,6 +28,17 @@ class MissingResult:
 class MissingConfigDB:
     async def execute(self, _statement):
         return MissingResult()
+
+
+class NewConfigDB(MissingConfigDB):
+    def __init__(self):
+        self.added = None
+
+    def add(self, value):
+        self.added = value
+
+    async def flush(self):
+        return None
 
 
 CHANNEL_GETTERS = [
@@ -67,6 +79,52 @@ async def test_missing_channel_config_still_defaults_to_not_found(module, getter
             )
 
     assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_new_dingtalk_channel_preserves_optional_agent_id(monkeypatch):
+    agent_id = uuid.uuid4()
+    user = SimpleNamespace(id=uuid.uuid4())
+    db = NewConfigDB()
+    start_client = AsyncMock()
+
+    monkeypatch.setattr(
+        dingtalk,
+        "check_agent_access",
+        AsyncMock(return_value=(SimpleNamespace(id=agent_id), "manage")),
+    )
+    monkeypatch.setattr(dingtalk, "is_agent_creator", lambda _user, _agent: True)
+    monkeypatch.setattr(
+        dingtalk.ChannelConfigOut,
+        "model_validate",
+        staticmethod(lambda config: config),
+    )
+    monkeypatch.setattr(
+        "app.services.dingtalk_stream.dingtalk_stream_manager.start_client",
+        start_client,
+    )
+
+    await dingtalk.configure_dingtalk_channel(
+        agent_id,
+        {
+            "app_key": "ding-key",
+            "app_secret": "ding-secret",
+            "extra_config": {
+                "connection_mode": "websocket",
+                "agent_id": "123456",
+            },
+        },
+        current_user=user,
+        db=db,
+    )
+    await asyncio.sleep(0)
+
+    assert db.added is not None
+    assert db.added.extra_config == {
+        "connection_mode": "websocket",
+        "agent_id": "123456",
+    }
+    start_client.assert_awaited_once_with(agent_id, "ding-key", "ding-secret")
 
 
 @pytest.mark.asyncio

@@ -137,3 +137,101 @@ async def test_delete_wecom_channel_stops_runtime_client(monkeypatch):
 
     assert stop_calls == [agent_id]
     assert db.deleted == [config]
+
+
+@pytest.mark.asyncio
+async def test_configure_wecom_explicit_webhook_mode_clears_stale_websocket_credentials(monkeypatch):
+    agent_id = uuid.uuid4()
+    creator = make_user()
+    config = make_channel(agent_id, connection_mode="websocket")
+    db = RecordingDB([DummyResult(config)])
+    scheduled = []
+
+    async def fake_check_agent_access(_db, _user, _agent_id):
+        return SimpleNamespace(creator_id=creator.id), None
+
+    def fake_create_task(coroutine):
+        scheduled.append(coroutine)
+        coroutine.close()
+        return None
+
+    monkeypatch.setattr(wecom_api, "check_agent_access", fake_check_agent_access)
+    monkeypatch.setattr(wecom_api, "is_agent_creator", lambda _user, _agent: True)
+    monkeypatch.setattr(wecom_api.asyncio, "create_task", fake_create_task)
+
+    await wecom_api.configure_wecom_channel(
+        agent_id,
+        {
+            "connection_mode": "webhook",
+            "bot_id": "stale-bot",
+            "bot_secret": "stale-bot-secret",
+            "corp_id": "corp-current",
+            "wecom_agent_id": "00123",
+            "secret": "app-secret-current",
+            "token": "token-current",
+            "encoding_aes_key": "aes-current",
+        },
+        current_user=creator,
+        db=db,
+    )
+
+    assert config.app_id == "corp-current"
+    assert config.app_secret == "app-secret-current"
+    assert config.verification_token == "token-current"
+    assert config.encrypt_key == "aes-current"
+    assert config.extra_config == {
+        "wecom_agent_id": "123",
+        "bot_id": "",
+        "bot_secret": "",
+        "connection_mode": "webhook",
+    }
+    assert len(scheduled) == 1
+
+
+@pytest.mark.asyncio
+async def test_configure_wecom_explicit_websocket_mode_clears_stale_webhook_credentials(monkeypatch):
+    agent_id = uuid.uuid4()
+    creator = make_user()
+    config = make_channel(agent_id, connection_mode="webhook")
+    db = RecordingDB([DummyResult(config)])
+    scheduled = []
+
+    async def fake_check_agent_access(_db, _user, _agent_id):
+        return SimpleNamespace(creator_id=creator.id), None
+
+    def fake_create_task(coroutine):
+        scheduled.append(coroutine)
+        coroutine.close()
+        return None
+
+    monkeypatch.setattr(wecom_api, "check_agent_access", fake_check_agent_access)
+    monkeypatch.setattr(wecom_api, "is_agent_creator", lambda _user, _agent: True)
+    monkeypatch.setattr(wecom_api.asyncio, "create_task", fake_create_task)
+
+    await wecom_api.configure_wecom_channel(
+        agent_id,
+        {
+            "connection_mode": "websocket",
+            "bot_id": "bot-current",
+            "bot_secret": "bot-secret-current",
+            "corp_id": "stale-corp",
+            "wecom_agent_id": "not-required-for-websocket",
+            "secret": "stale-app-secret",
+            "token": "stale-token",
+            "encoding_aes_key": "stale-aes",
+        },
+        current_user=creator,
+        db=db,
+    )
+
+    assert config.app_id == ""
+    assert config.app_secret == ""
+    assert config.verification_token == ""
+    assert config.encrypt_key == ""
+    assert config.extra_config == {
+        "wecom_agent_id": "",
+        "bot_id": "bot-current",
+        "bot_secret": "bot-secret-current",
+        "connection_mode": "websocket",
+    }
+    assert len(scheduled) == 1

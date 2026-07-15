@@ -16,9 +16,15 @@ def normalize_wecom_agent_id(value: object) -> int | None:
         not agent_id_text
         or not agent_id_text.isascii()
         or not agent_id_text.isdigit()
+        or len(agent_id_text) > 64
     ):
         return None
-    numeric_agent_id = int(agent_id_text)
+    try:
+        numeric_agent_id = int(agent_id_text)
+    except (ValueError, OverflowError):
+        # Python limits decimal integer conversion length.  Provider-facing
+        # configuration must fail closed instead of surfacing a 500 response.
+        return None
     return numeric_agent_id if numeric_agent_id > 0 else None
 
 

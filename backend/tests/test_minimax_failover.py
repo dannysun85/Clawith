@@ -285,6 +285,33 @@ class TestCredentialFailurePolicy:
         degrade.assert_not_awaited()
         global_quota.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_media_2062_opens_short_provider_cooldown(self, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        from app.services import agent_tools
+        from app.services.llm import load_balancer
+
+        cooldown = AsyncMock(return_value=True)
+        degrade = AsyncMock()
+        global_quota = AsyncMock()
+        scoped_quota = AsyncMock()
+        monkeypatch.setattr(load_balancer, "mark_credential_rate_saturated", cooldown)
+        monkeypatch.setattr(load_balancer, "mark_credential_degraded", degrade)
+        monkeypatch.setattr(load_balancer, "mark_credential_quota_exceeded", global_quota)
+        monkeypatch.setattr(load_balancer, "mark_credential_modality_quota_exceeded", scoped_quota)
+
+        await agent_tools._mark_minimax_tool_credential_failure(
+            "credential-id",
+            LLMError("MiniMax API error (2062): Token Plan traffic is high"),
+            modality="video",
+        )
+
+        cooldown.assert_awaited_once_with("credential-id", error_code="2062")
+        degrade.assert_not_awaited()
+        global_quota.assert_not_awaited()
+        scoped_quota.assert_not_awaited()
+
 
 # --- mark_credential_quota_exceeded ---
 

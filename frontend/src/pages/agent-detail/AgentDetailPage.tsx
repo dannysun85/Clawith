@@ -2031,6 +2031,31 @@ export default function AgentDetailPage() {
     const navigate = useNavigate();
     const location = useLocation();
     const queryClient = useQueryClient();
+    const channelSetupNoticeHandled = useRef(false);
+    useEffect(() => {
+        const failures = (
+            location.state as { channelSetupFailures?: unknown } | null
+        )?.channelSetupFailures;
+        if (
+            channelSetupNoticeHandled.current
+            || !Array.isArray(failures)
+            || failures.length === 0
+        ) {
+            return;
+        }
+        channelSetupNoticeHandled.current = true;
+        const names = failures.filter((name): name is string => typeof name === 'string');
+        toast.warning(
+            t('agent.settings.channel.partialCreateFailure', 'Agent created, but some channels were not connected.'),
+            {
+                details: names.join(', '),
+            },
+        );
+        navigate(
+            `${location.pathname}${location.search}${location.hash}`,
+            { replace: true, state: null },
+        );
+    }, [location.hash, location.pathname, location.search, location.state, navigate, t, toast]);
     const requestedSessionId = useMemo(
         () => new URLSearchParams(location.search).get('session_id') || '',
         [location.search],

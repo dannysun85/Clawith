@@ -199,7 +199,11 @@ const CHANNEL_REGISTRY: ChannelDef[] = [
         connectionMode: true,
         fields: [
             { key: 'corp_id', label: 'CorpID', required: true },
-            { key: 'wecom_agent_id', label: 'AgentID', required: true },
+            {
+                key: 'wecom_agent_id',
+                label: 'AgentID',
+                placeholder: 'Required for app messages; optional for Customer Service',
+            },
             { key: 'secret', label: 'Secret', type: 'password', required: true },
             { key: 'token', label: 'Token', required: true },
             { key: 'encoding_aes_key', label: 'EncodingAESKey', required: true },
@@ -219,7 +223,6 @@ const CHANNEL_REGISTRY: ChannelDef[] = [
         nameFallback: 'DingTalk',
         desc: 'Stream Mode',
         apiSlug: 'dingtalk-channel',
-        connectionMode: true,
         fields: [
             { key: 'app_key', label: 'AppKey', type: 'password', required: true },
             { key: 'app_secret', label: 'AppSecret', type: 'password', required: true },
@@ -335,7 +338,7 @@ export default function ChannelConfig({ mode, agentId, canManage = true, values,
         feishu: 'websocket',
         wecom: 'websocket',
         dingtalk: 'websocket',
-        discord: 'gateway',
+        discord: 'websocket',
     });
 
     // Password visibility
@@ -850,11 +853,17 @@ export default function ChannelConfig({ mode, agentId, canManage = true, values,
                             <div style={{ marginBottom: '16px', display: 'flex', alignItems: 'center', gap: '8px' }}>
                                 <label style={{ fontSize: '12px', fontWeight: 500, width: '120px' }}>{t('agent.settings.channel.mode', 'Connection Mode')}</label>
                                 <label style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '13px', cursor: 'pointer' }}>
-                                    <input type="radio" checked={isWs} onChange={() => setConnectionModes(p => ({ ...p, [ch.id]: 'websocket' }))} />
+                                    <input type="radio" checked={isWs} onChange={() => {
+                                        setConnectionModes(p => ({ ...p, [ch.id]: 'websocket' }));
+                                        onChange?.({ ...values, [`${ch.id}_connection_mode`]: 'websocket' });
+                                    }} />
                                     {t('agent.settings.channel.modeWs', 'WebSocket (Recommended)')}
                                 </label>
                                 <label style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '13px', cursor: 'pointer', marginLeft: '12px' }}>
-                                    <input type="radio" checked={!isWs} onChange={() => setConnectionModes(p => ({ ...p, [ch.id]: 'webhook' }))} />
+                                    <input type="radio" checked={!isWs} onChange={() => {
+                                        setConnectionModes(p => ({ ...p, [ch.id]: 'webhook' }));
+                                        onChange?.({ ...values, [`${ch.id}_connection_mode`]: 'webhook' });
+                                    }} />
                                     {t('agent.settings.channel.modeWebhook', 'Webhook')}
                                 </label>
                             </div>

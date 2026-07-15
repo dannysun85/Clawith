@@ -2680,6 +2680,14 @@ class TempWorkspace:
         self.temp_dir.cleanup()
 
 
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
 async def _materialize_storage_workspace(storage, storage_key: str, local_root: Path) -> None:
     if not await storage.is_dir(storage_key):
         return
@@ -2690,7 +2698,7 @@ async def _materialize_storage_workspace(storage, storage_key: str, local_root: 
 async def _materialize_storage_entry(storage, entry_key: str, root_key: str, local_root: Path) -> None:
     rel = entry_key.removeprefix(root_key.rstrip("/") + "/")
     target = (local_root / rel).resolve()
-    if not str(target).startswith(str(local_root.resolve())):
+    if not _path_is_within(target, local_root.resolve()):
         return
     if await storage.is_dir(entry_key):
         target.mkdir(parents=True, exist_ok=True)
@@ -2708,26 +2716,37 @@ async def _prepare_temp_workspace(
 ) -> TempWorkspace:
     tmp = tempfile.TemporaryDirectory(prefix=f"clawith-agent-{str(agent_id)[:8]}-")
     temp_ws = Path(tmp.name)
-    for folder in ("workspace", "memory", "skills"):
-        (temp_ws / folder).mkdir(parents=True, exist_ok=True)
+    try:
+        for folder in ("workspace", "memory", "skills"):
+            (temp_ws / folder).mkdir(parents=True, exist_ok=True)
 
-    storage = get_storage_backend()
-    budget = {"total": 0}
-    selected = TEMP_WORKSPACE_DEFAULT_PATHS if paths is None else [path for path in paths if path]
-    manifest: dict[str, TempWorkspaceManifestEntry] = {}
-    for rel_path in selected:
-        storage_key, normalized, is_enterprise = _tool_storage_key(agent_id, rel_path, tenant_id)
-        if is_enterprise:
-            continue
-        await _materialize_storage_path_with_budget(storage, storage_key, normalized, temp_ws, budget, manifest)
-    return TempWorkspace(
-        temp_dir=tmp,
-        root=temp_ws,
-        agent_id=agent_id,
-        tenant_id=tenant_id,
-        selected_paths=list(selected),
-        manifest=manifest,
-    )
+        storage = get_storage_backend()
+        budget = {"total": 0}
+        selected = TEMP_WORKSPACE_DEFAULT_PATHS if paths is None else [path for path in paths if path]
+        manifest: dict[str, TempWorkspaceManifestEntry] = {}
+        for rel_path in selected:
+            storage_key, normalized, is_enterprise = _tool_storage_key(agent_id, rel_path, tenant_id)
+            if is_enterprise:
+                continue
+            await _materialize_storage_path_with_budget(
+                storage,
+                storage_key,
+                normalized,
+                temp_ws,
+                budget,
+                manifest,
+            )
+        return TempWorkspace(
+            temp_dir=tmp,
+            root=temp_ws,
+            agent_id=agent_id,
+            tenant_id=tenant_id,
+            selected_paths=list(selected),
+            manifest=manifest,
+        )
+    except BaseException:
+        tmp.cleanup()
+        raise
 
 
 async def _materialize_storage_path_with_budget(
@@ -2745,7 +2764,7 @@ async def _materialize_storage_path_with_budget(
         if budget["total"] + version.size > TOOL_MATERIALIZE_MAX_TOTAL_BYTES:
             return
         target = (local_root / rel_path).resolve()
-        if not str(target).startswith(str(local_root.resolve())):
+        if not _path_is_within(target, local_root.resolve()):
             return
         target.parent.mkdir(parents=True, exist_ok=True)
         data = await storage.read_bytes(storage_key)
@@ -2863,7 +2882,7 @@ def _collect_temp_workspace_files(root: Path, selected_paths: list[str]) -> dict
         if not selected:
             continue
         target = (root_resolved / selected).resolve()
-        if not str(target).startswith(str(root_resolved)):
+        if not _path_is_within(target, root_resolved):
             continue
         if target.is_file():
             files[normalize_workspace_path(selected)] = target
@@ -10691,19 +10710,33 @@ async def _mark_minimax_tool_credential_failure(
         MINIMAX_QUOTA_CODES,
         credential_failure_action,
         extract_minimax_code,
+        is_rate_limit_error,
     )
     from app.services.llm.load_balancer import (
         mark_credential_degraded,
         mark_credential_modality_quota_exceeded,
         mark_credential_quota_exceeded,
+        mark_credential_rate_saturated,
     )
+
+    error_code = extract_minimax_code(str(error))
+    if is_rate_limit_error(error):
+        cooldown_recorded = await mark_credential_rate_saturated(
+            credential_id,
+            error_code=error_code or "rate_limit",
+        )
+        if not cooldown_recorded:
+            # Match the text caller's bounded local backoff when Redis cannot
+            # persist the provider cooldown. The credential remains healthy.
+            await asyncio.sleep(1.0)
+        return
 
     # A bare provider 2056 does not prove which concrete media allowance was
     # exhausted. Current MiniMax Token Plan calls share the plan resource;
     # exact model circuits are created only by the quota poller's named rows.
     quota_resource = (
         "plan"
-        if extract_minimax_code(str(error)) in MINIMAX_QUOTA_CODES
+        if error_code in MINIMAX_QUOTA_CODES
         else modality
     )
     action = credential_failure_action(error, modality=quota_resource)
@@ -10715,7 +10748,7 @@ async def _mark_minimax_tool_credential_failure(
         await mark_credential_modality_quota_exceeded(
             credential_id,
             quota_resource,
-            error_code=extract_minimax_code(str(error)) or "2056",
+            error_code=error_code or "2056",
         )
 
 

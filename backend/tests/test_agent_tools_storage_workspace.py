@@ -1,10 +1,13 @@
 import uuid
+from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import HTTPException
 
 from app.services import agent_tools
 from app.services import workspace_collaboration
 from app.services.storage_runtime.base import StorageBackend, StorageEntry, StorageVersion, WriteCondition, ConditionalWriteResult
+from app.services.storage_runtime.local import LocalStorageBackend
 
 
 class MemoryStorageBackend(StorageBackend):
@@ -126,6 +129,91 @@ async def test_temp_workspace_materializes_only_requested_paths(monkeypatch):
         assert not (temp_ws.root / "workspace" / "other.md").exists()
     finally:
         temp_ws.cleanup()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_kind", ["other_agent", "external", "root_prefix_collision"])
+async def test_send_channel_file_rejects_local_storage_symlink_before_materialization(
+    monkeypatch,
+    tmp_path,
+    target_kind,
+):
+    storage_root = tmp_path / "storage"
+    temp_root = tmp_path / "temp"
+    temp_root.mkdir()
+    source_agent_id = uuid.uuid4()
+    source_workspace = storage_root / str(source_agent_id) / "workspace"
+    source_workspace.mkdir(parents=True)
+    if target_kind == "other_agent":
+        victim = storage_root / str(uuid.uuid4()) / "workspace" / "private.txt"
+    elif target_kind == "external":
+        victim = tmp_path / "external" / "private.txt"
+    else:
+        victim = tmp_path / "storage-escape" / "private.txt"
+    victim.parent.mkdir(parents=True)
+    victim.write_text("other-agent-secret", encoding="utf-8")
+    (source_workspace / "linked.txt").symlink_to(victim)
+
+    storage = LocalStorageBackend(str(storage_root))
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+    real_temporary_directory = agent_tools.tempfile.TemporaryDirectory
+    created_temp_paths = []
+
+    def make_temporary_directory(*args, **kwargs):
+        temporary_directory = real_temporary_directory(*args, dir=temp_root, **kwargs)
+        created_temp_paths.append(temporary_directory.name)
+        return temporary_directory
+
+    monkeypatch.setattr(agent_tools.tempfile, "TemporaryDirectory", make_temporary_directory)
+    monkeypatch.setattr(
+        agent_tools,
+        "_get_agent_tenant_id",
+        AsyncMock(return_value=None),
+    )
+    sender = AsyncMock(return_value=True)
+    sender_token = agent_tools.channel_file_sender.set(sender)
+
+    try:
+        result = await agent_tools.execute_tool(
+            "send_channel_file",
+            {"file_path": "workspace/linked.txt"},
+            source_agent_id,
+            uuid.uuid4(),
+        )
+    finally:
+        agent_tools.channel_file_sender.reset(sender_token)
+
+    assert result.startswith("Tool execution error (send_channel_file): HTTPException")
+    assert "other-agent-secret" not in result
+    sender.assert_not_awaited()
+    assert created_temp_paths
+    assert all(not agent_tools.Path(path).exists() for path in created_temp_paths)
+    assert victim.read_text(encoding="utf-8") == "other-agent-secret"
+
+
+def test_local_storage_rejects_absolute_and_parent_traversal_keys(tmp_path):
+    storage = LocalStorageBackend(str(tmp_path / "storage"))
+
+    with pytest.raises(HTTPException) as absolute_error:
+        storage._full_path("/etc/passwd")
+    with pytest.raises(HTTPException) as traversal_error:
+        storage._full_path("agent/workspace/../../other-agent/private.txt")
+
+    assert absolute_error.value.status_code == 403
+    assert traversal_error.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_local_storage_normal_read_write_and_listing_remain_available(tmp_path):
+    storage = LocalStorageBackend(str(tmp_path / "storage"))
+
+    await storage.write_bytes("agent-id/workspace/report.txt", b"normal-content")
+
+    assert await storage.read_bytes("agent-id/workspace/report.txt") == b"normal-content"
+    entries = await storage.list_dir("agent-id/workspace")
+    assert [(entry.name, entry.key, entry.is_dir) for entry in entries] == [
+        ("report.txt", "agent-id/workspace/report.txt", False),
+    ]
 
 
 @pytest.mark.asyncio

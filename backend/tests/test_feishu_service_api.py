@@ -43,10 +43,16 @@ class _FakeAsyncClient:
         self,
         *,
         send_payload: dict | None = None,
+        upload_payload: dict | None = None,
         patch_payload: dict | None = None,
         download_response: _FakeResponse | None = None,
     ):
         self._send_payload = send_payload or {"code": 0, "msg": "ok", "data": {"message_id": "m_1"}}
+        self._upload_payload = upload_payload or {
+            "code": 0,
+            "msg": "ok",
+            "data": {"file_key": "file_v2_1"},
+        }
         self._patch_payload = patch_payload or {"code": 0, "msg": "ok"}
         self._download_response = download_response or _FakeResponse(200, {}, chunks=[b"file"])
 
@@ -59,6 +65,8 @@ class _FakeAsyncClient:
     async def post(self, url, **_kwargs):
         if "app_access_token/internal" in url:
             return _FakeResponse(200, {"app_access_token": "token_x"})
+        if "/im/v1/files" in url:
+            return _FakeResponse(200, self._upload_payload)
         return _FakeResponse(200, self._send_payload)
 
     async def patch(self, _url, **_kwargs):
@@ -102,6 +110,27 @@ async def test_patch_message_raises_when_business_code_nonzero(monkeypatch):
             "om_xxx",
             "{\"content\":\"test\"}",
             stage="unit_test_patch",
+        )
+
+
+@pytest.mark.asyncio
+async def test_upload_and_send_file_rejects_http_200_business_failure(monkeypatch, tmp_path):
+    file_path = tmp_path / "report.txt"
+    file_path.write_text("release evidence", encoding="utf-8")
+    monkeypatch.setattr(
+        feishu_service_module.httpx,
+        "AsyncClient",
+        lambda **_kwargs: _FakeAsyncClient(
+            send_payload={"code": 230002, "msg": "permission denied"},
+        ),
+    )
+
+    with pytest.raises(feishu_service_module.FeishuAPIError, match="code=230002"):
+        await feishu_service_module.feishu_service.upload_and_send_file(
+            "app_id",
+            "app_secret",
+            "ou_xxx",
+            file_path,
         )
 
 

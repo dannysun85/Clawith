@@ -572,7 +572,17 @@ class FeishuService:
             token_resp = await client.post(FEISHU_APP_TOKEN_URL, json={
                 "app_id": app_id, "app_secret": app_secret,
             })
-            app_token = token_resp.json().get("app_access_token", "")
+            token_resp.raise_for_status()
+            token_data = self._parse_api_response(
+                token_resp,
+                stage="upload_file_token",
+            )
+            app_token = token_data.get("app_access_token", "")
+            if not app_token:
+                raise FeishuAPIError(
+                    stage="upload_file_token",
+                    msg="missing app access token",
+                )
             headers = {"Authorization": f"Bearer {app_token}"}
 
             # Upload file
@@ -589,9 +599,11 @@ class FeishuService:
                 data={"file_type": feishu_file_type, "file_name": fp.name},
                 headers=headers,
             )
-            upload_data = upload_resp.json()
-            if upload_data.get("code") != 0:
-                raise RuntimeError(f"Feishu file upload failed: {upload_data.get('msg')}")
+            upload_resp.raise_for_status()
+            upload_data = self._parse_api_response(
+                upload_resp,
+                stage="upload_file",
+            )
             file_key = upload_data["data"]["file_key"]
 
             # Send text accompany message first if provided
@@ -618,15 +630,11 @@ class FeishuService:
                       "content": _json.dumps({"file_key": file_key})},
                 headers=headers,
             )
-            if resp.status_code != 200:
-                logger.error(
-                    "[Feishu] Failed to send file message status={} response_chars={} "
-                    "receive_id_type={}",
-                    resp.status_code,
-                    len(resp.text),
-                    receive_id_type,
-                )
-            return resp.json()
+            resp.raise_for_status()
+            return self._parse_api_response(
+                resp,
+                stage="send_file_message",
+            )
 
     # --- Bitable (多维表格) API ---
 

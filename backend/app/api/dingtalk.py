@@ -56,7 +56,11 @@ async def configure_dingtalk_channel(
         existing.app_id = app_key
         existing.app_secret = app_secret
         existing.is_configured = True
-        existing.extra_config = {**existing.extra_config, "connection_mode": conn_mode, "agent_id": dingtalk_agent_id}
+        existing.extra_config = {
+            **(existing.extra_config or {}),
+            "connection_mode": conn_mode,
+            "agent_id": dingtalk_agent_id,
+        }
         await db.flush()
 
         # Restart Stream client if in websocket mode
@@ -78,7 +82,10 @@ async def configure_dingtalk_channel(
         app_id=app_key,
         app_secret=app_secret,
         is_configured=True,
-        extra_config={"connection_mode": conn_mode},
+        extra_config={
+            "connection_mode": conn_mode,
+            "agent_id": dingtalk_agent_id,
+        },
     )
     db.add(config)
     await db.flush()

@@ -13,6 +13,10 @@ import {
 import TierSelector, { type SaasTier } from '../components/TierSelector';
 import ChannelConfig from '../components/ChannelConfig';
 import LinearCopyButton from '../components/LinearCopyButton';
+import {
+    buildAgentChannelSetups,
+    findIncompleteAgentChannels,
+} from '../utils/agentChannelSetup';
 const STEPS = ['basicInfo', 'personality', 'skills', 'permissions', 'channel'] as const;
 const OPENCLAW_STEPS = ['basicInfo', 'permissions'] as const;
 
@@ -93,81 +97,23 @@ export default function AgentCreate() {
             queryClient.invalidateQueries({ queryKey: ['agents'] });
             queryClient.invalidateQueries({ queryKey: ['subscription-seats'] });
 
-            // Automatically bind channels if configured in wizard
-            // Feishu
-            if (channelValues.feishu_app_id && channelValues.feishu_app_secret) {
+            // Bind every completed channel form through its provider endpoint.
+            // `/channel` is Feishu-only and must never receive another provider.
+            const channelSetupFailures: string[] = [];
+            for (const setup of buildAgentChannelSetups(channelValues)) {
                 try {
-                    await channelApi.create(agent.id, {
-                        channel_type: 'feishu',
-                        app_id: channelValues.feishu_app_id,
-                        app_secret: channelValues.feishu_app_secret,
-                        encrypt_key: channelValues.feishu_encrypt_key || undefined,
-                        extra_config: {
-                            connection_mode: channelValues.feishu_connection_mode || 'websocket',
-                            activation_mode: channelValues.feishu_activation_mode || 'mention',
-                        }
-                    });
+                    await channelApi.configure(agent.id, setup.endpoint, setup.payload);
                 } catch (err) {
-                    console.error('Failed to bind Feishu channel:', err);
-                    setError(
-                        'Failed to bind the Feishu channel. Please verify the Feishu configuration on the agent settings page and try again.'
-                    );
+                    console.error(`Failed to bind ${setup.channel} channel:`, err);
+                    channelSetupFailures.push(setup.channel);
                 }
             }
 
-            // Slack
-            if (channelValues.slack_bot_token && channelValues.slack_signing_secret) {
-                try {
-                    await channelApi.create(agent.id, {
-                        channel_type: 'slack',
-                        app_id: channelValues.slack_bot_token,
-                        app_secret: channelValues.slack_signing_secret,
-                    });
-                } catch (err) {
-                    console.error('Failed to bind Slack channel:', err);
-                    setError(
-                        'Failed to bind the Slack channel. Please verify the Slack configuration on the agent settings page and try again.'
-                    );
-                }
-            }
-
-            // Discord
-            if (channelValues.discord_bot_token && channelValues.discord_application_id) {
-                try {
-                    await channelApi.create(agent.id, {
-                        channel_type: 'discord',
-                        app_id: channelValues.discord_application_id,
-                        app_secret: channelValues.discord_bot_token,
-                        encrypt_key: channelValues.discord_public_key || undefined,
-                    });
-                } catch (err) {
-                    console.error('Failed to bind Discord channel:', err);
-                    setError(
-                        'Failed to bind the Discord channel. Please verify the Discord configuration on the agent settings page and try again.'
-                    );
-                }
-            }
-
-            // WeCom
-            if (channelValues.wecom_bot_id && channelValues.wecom_bot_secret) {
-                try {
-                    const connMode = channelValues.wecom_connection_mode || 'websocket';
-                    await channelApi.create(agent.id, {
-                        channel_type: 'wecom',
-                        app_id: connMode === 'websocket' ? channelValues.wecom_bot_id : undefined,
-                        app_secret: connMode === 'websocket' ? channelValues.wecom_bot_secret : undefined,
-                        extra_config: {
-                            connection_mode: connMode,
-                            bot_id: channelValues.wecom_bot_id,
-                            bot_secret: channelValues.wecom_bot_secret,
-                        }
-                    });
-                } catch (err) {
-                    console.error('Failed to bind WeCom channel:', err);
-                    setError(
-                        'Failed to bind the WeCom channel. Please verify the WeCom configuration on the agent settings page and try again.'
-                    );
-                }
+            if (channelSetupFailures.length > 0) {
+                navigate(`/agents/${agent.id}/settings#settings`, {
+                    state: { channelSetupFailures },
+                });
+                return;
             }
 
             if (agent.api_key) {
@@ -220,6 +166,13 @@ export default function AgentCreate() {
         setUpgradeUrl('');
         if (step === 0 || agentType === 'openclaw') {
             if (!validateStep0()) return;
+        }
+        const incompleteChannels = findIncompleteAgentChannels(channelValues);
+        if (incompleteChannels.length > 0) {
+            setError(
+                `Complete or clear the partially configured channels before creating the Agent: ${incompleteChannels.join(', ')}`,
+            );
+            return;
         }
         createMutation.mutate({
             name: form.name,

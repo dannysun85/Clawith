@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -32,6 +33,7 @@ class _SessionContext:
         ("-1", None),
         ("not-a-number", None),
         ("１００００１", None),
+        ("9" * 5000, None),
     ],
 )
 def test_normalize_wecom_agent_id(value, expected):
@@ -39,7 +41,7 @@ def test_normalize_wecom_agent_id(value, expected):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("agent_id_value", [None, "", "0", "-1", "abc", "１００００１"])
+@pytest.mark.parametrize("agent_id_value", ["0", "-1", "abc", "１００００１"])
 async def test_wecom_webhook_configuration_rejects_invalid_application_agent_id(
     monkeypatch,
     agent_id_value,
@@ -74,9 +76,10 @@ async def test_wecom_webhook_configuration_rejects_invalid_application_agent_id(
 
 
 @pytest.mark.asyncio
-async def test_wecom_websocket_configuration_rejects_explicit_invalid_agent_id(
+async def test_wecom_customer_service_webhook_configuration_allows_empty_agent_id(
     monkeypatch,
 ):
+    agent_id = uuid.uuid4()
     agent = SimpleNamespace()
     monkeypatch.setattr(
         wecom,
@@ -84,23 +87,66 @@ async def test_wecom_websocket_configuration_rejects_explicit_invalid_agent_id(
         AsyncMock(return_value=(agent, None)),
     )
     monkeypatch.setattr(wecom, "is_agent_creator", lambda _user, _agent: True)
+    monkeypatch.setattr(wecom.asyncio, "create_task", lambda coroutine: coroutine.close())
     db = AsyncMock()
+    existing = SimpleNamespace(
+        id=uuid.uuid4(),
+        agent_id=agent_id,
+        channel_type="wecom",
+        app_id="old-corp",
+        app_secret="old-secret",
+        encrypt_key="old-key",
+        verification_token="old-token",
+        is_configured=True,
+        is_connected=False,
+        last_tested_at=None,
+        extra_config={"connection_mode": "webhook"},
+        created_at=datetime.now(timezone.utc),
+    )
+    db.execute = AsyncMock(
+        return_value=SimpleNamespace(scalar_one_or_none=lambda: existing),
+    )
 
-    with pytest.raises(HTTPException) as exc_info:
-        await wecom.configure_wecom_channel(
+    result = await wecom.configure_wecom_channel(
+        agent_id,
+        {
+            "connection_mode": "webhook",
+            "corp_id": "corp-id",
+            "secret": "corp-secret",
+            "token": "verification-token",
+            "encoding_aes_key": "encoding-key",
+            "wecom_agent_id": "",
+        },
+        current_user=SimpleNamespace(),
+        db=db,
+    )
+
+    assert result.extra_config["connection_mode"] == "webhook"
+    assert result.extra_config["wecom_agent_id"] == ""
+
+
+@pytest.mark.asyncio
+async def test_wecom_customer_service_reply_bypasses_application_agent_id_gate(
+    monkeypatch,
+):
+    class CustomerServiceRuntimeReached(Exception):
+        pass
+
+    monkeypatch.setattr(
+        wecom,
+        "async_session",
+        lambda: (_ for _ in ()).throw(CustomerServiceRuntimeReached()),
+    )
+
+    with pytest.raises(CustomerServiceRuntimeReached):
+        await wecom._process_wecom_text(
             uuid.uuid4(),
-            {
-                "bot_id": "bot-id",
-                "bot_secret": "bot-secret",
-                "wecom_agent_id": "not-a-number",
-            },
-            current_user=SimpleNamespace(),
-            db=db,
+            SimpleNamespace(extra_config={}),
+            "external-user",
+            "hello",
+            is_kf=True,
+            open_kfid="wkf-customer-service",
         )
-
-    assert exc_info.value.status_code == 422
-    assert exc_info.value.detail == "wecom_agent_id must be a positive ASCII numeric value"
-    db.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio

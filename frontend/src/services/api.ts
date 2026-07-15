@@ -4,6 +4,7 @@ import type { Agent, TokenResponse, User, Task, ChatMessage } from '../types';
 import { clearAuthStorage } from '../utils/authStorage';
 import { buildWorkspaceDownloadUrl } from '../utils/authTransport';
 import { reportClientIssue } from './productionIssueReporter';
+import type { AgentChannelEndpoint } from '../utils/agentChannelSetup';
 
 const API_BASE = '/api';
 
@@ -454,6 +455,9 @@ export const channelApi = {
 
     create: (agentId: string, data: any) =>
         request<any>(`/agents/${agentId}/channel`, { method: 'POST', body: JSON.stringify(data) }),
+
+    configure: (agentId: string, endpoint: AgentChannelEndpoint, data: any) =>
+        request<any>(`/agents/${agentId}/${endpoint}`, { method: 'POST', body: JSON.stringify(data) }),
 
     update: (agentId: string, data: any) =>
         request<any>(`/agents/${agentId}/channel`, { method: 'PUT', body: JSON.stringify(data) }),

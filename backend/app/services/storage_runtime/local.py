@@ -21,14 +21,41 @@ from app.services.storage_runtime.utils import normalize_storage_key
 
 class LocalStorageBackend(StorageBackend):
     def __init__(self, root: str):
-        self.root = Path(root)
+        # Resolve the configured root once. A deployment may intentionally mount
+        # the storage root through a symlink, but no child storage key may cross
+        # that resolved boundary or traverse a child symlink.
+        self.root = Path(root).expanduser().resolve()
 
     def _full_path(self, key: str) -> Path:
-        normalized = normalize_storage_key(key)
-        full = (self.root / normalized).resolve()
-        root_resolved = self.root.resolve()
-        if not str(full).startswith(str(root_resolved)):
+        raw_key = str(key or "").replace("\\", "/").strip()
+        if (
+            "\x00" in raw_key
+            or raw_key.startswith("/")
+            or any(part == ".." for part in raw_key.split("/"))
+        ):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Path traversal not allowed")
+
+        normalized = normalize_storage_key(raw_key)
+        full = self.root / normalized
+
+        # Path.resolve() follows symlinks. Check every existing component first
+        # so one Agent cannot point its storage subtree at another Agent's files.
+        current = self.root
+        for part in Path(normalized).parts:
+            current /= part
+            if current.is_symlink():
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Symbolic links are not allowed in local storage",
+                )
+
+        try:
+            full.resolve().relative_to(self.root)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Path traversal not allowed",
+            ) from exc
         return full
 
     async def exists(self, key: str) -> bool:
@@ -45,19 +72,28 @@ class LocalStorageBackend(StorageBackend):
         if not base.exists() or not base.is_dir():
             return []
         entries: list[StorageEntry] = []
-        for entry in sorted(base.iterdir(), key=lambda item: (not item.is_dir(), item.name)):
+        local_entries: list[tuple[Path, bool]] = []
+        for entry in base.iterdir():
             if entry.name == ".gitkeep":
                 continue
-            stat = entry.stat()
-            rel = str(entry.resolve().relative_to(self.root.resolve()))
+            if entry.is_symlink():
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Symbolic links are not allowed in local storage",
+                )
+            local_entries.append((entry, entry.is_dir()))
+
+        for entry, is_dir in sorted(local_entries, key=lambda item: (not item[1], item[0].name)):
+            entry_stat = entry.stat()
+            rel = entry.relative_to(self.root).as_posix()
             entries.append(
                 StorageEntry(
                     name=entry.name,
                     key=rel,
-                    is_dir=entry.is_dir(),
-                    size=stat.st_size if entry.is_file() else 0,
-                    modified_at=str(stat.st_mtime),
-                    version_id=_local_version_token(stat, None),
+                    is_dir=is_dir,
+                    size=entry_stat.st_size if not is_dir else 0,
+                    modified_at=str(entry_stat.st_mtime),
+                    version_id=_local_version_token(entry_stat, None),
                 )
             )
         return entries
