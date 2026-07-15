@@ -12,6 +12,35 @@ from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 
 
+def build_persisted_trigger_notification(
+    *,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    conversation_id: str,
+    content: str,
+    triggers: list[str],
+) -> tuple[ChatMessage, dict[str, object]]:
+    """Build one persisted assistant message and its matching realtime payload."""
+
+    message_id = uuid.uuid4()
+    message = ChatMessage(
+        id=message_id,
+        agent_id=agent_id,
+        user_id=user_id,
+        role="assistant",
+        content=content,
+        conversation_id=conversation_id,
+    )
+    payload: dict[str, object] = {
+        "type": "trigger_notification",
+        "content": content,
+        "triggers": triggers,
+        "session_id": conversation_id,
+        "message_id": str(message_id),
+    }
+    return message, payload
+
+
 async def get_primary_platform_session(
     db: AsyncSession,
     agent_id: uuid.UUID,
@@ -107,7 +136,7 @@ async def save_tool_call_log(
     status: str = "done",
     tool_call_id: str | None = None,
     reasoning_content: str | None = None,
-) -> None:
+) -> str | None:
     """Save a tool call execution log into chat history as a ChatMessage."""
     if not conversation_id:
         return
@@ -123,10 +152,12 @@ async def save_tool_call_log(
         "tool_call_id": tool_call_id,
         "reasoning_content": reasoning_content,
     }
+    message_id = uuid.uuid4()
 
     try:
         async with async_session() as db:
             db.add(ChatMessage(
+                id=message_id,
                 agent_id=agent_id,
                 user_id=user_id,
                 role="tool_call",
@@ -134,6 +165,7 @@ async def save_tool_call_log(
                 conversation_id=conversation_id,
             ))
             await db.commit()
+        return str(message_id)
     except Exception as e:
         logger.warning(f"Failed to save tool call log: {e}")
-
+        return None

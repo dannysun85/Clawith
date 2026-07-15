@@ -14,6 +14,23 @@ from app.services.storage import get_storage_backend, normalize_storage_key
 
 settings = get_settings()
 
+
+def _render_active_trigger_lines(triggers) -> list[str]:
+    """Render trigger context without service routing metadata or credentials."""
+
+    from app.services.trigger_runtime.config import agent_visible_trigger_config
+
+    lines = ["You have the following active triggers:"]
+    for trigger in triggers:
+        config_str = str(agent_visible_trigger_config(trigger.config))[:80]
+        reason_str = (trigger.reason or "")[:500]
+        ref_str = f" (focus: {trigger.focus_ref})" if trigger.focus_ref else ""
+        lines.append(
+            f"\n- **{trigger.name}** [{trigger.type}]{ref_str}"
+            f"\n  Config: `{config_str}`\n  Reason: {reason_str}"
+        )
+    return lines
+
 async def _read_file_safe(key: str, max_chars: int = 3000) -> str:
     """Read a storage-backed text file, return empty string if missing."""
     storage = get_storage_backend()
@@ -702,12 +719,7 @@ If no search or webpage-reading tool is available, say that web lookup is not en
             )
             triggers = result.scalars().all()
             if triggers:
-                lines = ["You have the following active triggers:"]
-                for t in triggers:
-                    config_str = str(t.config)[:80]
-                    reason_str = (t.reason or "")[:500]
-                    ref_str = f" (focus: {t.focus_ref})" if t.focus_ref else ""
-                    lines.append(f"\n- **{t.name}** [{t.type}]{ref_str}\n  Config: `{config_str}`\n  Reason: {reason_str}")
+                lines = _render_active_trigger_lines(triggers)
                 dynamic_parts.append("\n## Active Triggers\n" + "\n".join(lines))
     except Exception:
         pass

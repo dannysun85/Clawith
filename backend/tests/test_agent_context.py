@@ -4,6 +4,37 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 
+def test_active_trigger_prompt_omits_internal_routing_and_webhook_secrets():
+    from types import SimpleNamespace
+
+    from app.services.agent_context import _render_active_trigger_lines
+
+    lines = _render_active_trigger_lines(
+        [
+            SimpleNamespace(
+                name="webhook",
+                type="webhook",
+                config={
+                    "event": "push",
+                    "token": "private-url-token",
+                    "secret": "private-hmac-secret",
+                    "_origin_session_id": "private-session-id",
+                    "_origin_user_id": "private-user-id",
+                },
+                reason="Process a push event",
+                focus_ref=None,
+            )
+        ]
+    )
+
+    rendered = "\n".join(lines)
+    assert "event" in rendered
+    assert "private-url-token" not in rendered
+    assert "private-hmac-secret" not in rendered
+    assert "private-session-id" not in rendered
+    assert "private-user-id" not in rendered
+
+
 @pytest.mark.asyncio
 async def test_build_agent_context_reads_focus_from_storage_key():
     from app.services.agent_context import build_agent_context

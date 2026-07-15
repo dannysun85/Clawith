@@ -1,5 +1,6 @@
 """Regression tests for durable and isolated async A2A delivery."""
 
+import asyncio
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -194,6 +195,185 @@ def test_a2a_invocation_batches_never_merge_durable_messages():
         ["a2a"],
         ["poll"],
     ]
+
+
+def test_ordinary_trigger_batches_are_isolated_by_delivery_principal():
+    from app.services.trigger_daemon import _build_invocation_batches
+
+    agent_id = uuid.uuid4()
+    first_user_id = uuid.uuid4()
+    second_user_id = uuid.uuid4()
+    first_session_id = uuid.uuid4()
+    second_session_id = uuid.uuid4()
+    triggers = [
+        AgentTrigger(
+            id=uuid.uuid4(),
+            agent_id=agent_id,
+            name="first-a",
+            type="cron",
+            config={
+                "_origin_user_id": str(first_user_id),
+                "_origin_session_id": str(first_session_id),
+                "_origin_source_channel": "web",
+            },
+            reason="first",
+        ),
+        AgentTrigger(
+            id=uuid.uuid4(),
+            agent_id=agent_id,
+            name="first-b",
+            type="interval",
+            config={
+                "_origin_user_id": str(first_user_id),
+                "_origin_session_id": str(first_session_id),
+                "_origin_source_channel": "web",
+            },
+            reason="first again",
+        ),
+        AgentTrigger(
+            id=uuid.uuid4(),
+            agent_id=agent_id,
+            name="second",
+            type="poll",
+            config={
+                "_origin_user_id": str(second_user_id),
+                "_origin_session_id": str(second_session_id),
+                "_origin_source_channel": "web",
+            },
+            reason="second",
+        ),
+    ]
+
+    batches = _build_invocation_batches(triggers)
+
+    assert [[trigger.name for trigger in batch] for batch in batches] == [
+        ["first-a", "first-b"],
+        ["second"],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_waiting_batch_claim_is_renewed_while_first_batch_runs(monkeypatch):
+    from app.services import trigger_daemon
+
+    agent_id = uuid.uuid4()
+    first_execution_id = uuid.uuid4()
+    second_execution_id = uuid.uuid4()
+    first = AgentTrigger(
+        id=uuid.uuid4(),
+        agent_id=agent_id,
+        name="first",
+        type="cron",
+        config={
+            "_execution_id": str(first_execution_id),
+            "_execution_lease_token": "worker:first",
+        },
+        reason="first",
+    )
+    second = AgentTrigger(
+        id=uuid.uuid4(),
+        agent_id=agent_id,
+        name="second",
+        type="cron",
+        config={
+            "_execution_id": str(second_execution_id),
+            "_execution_lease_token": "worker:second",
+        },
+        reason="second",
+    )
+    waiting_claim_renewed = asyncio.Event()
+    invocation_order: list[str] = []
+
+    async def renew_waiting(claims):
+        assert claims == [(second_execution_id, "worker:second")]
+        waiting_claim_renewed.set()
+        return len(claims)
+
+    async def invoke(_agent_id, triggers):
+        invocation_order.append(triggers[0].name)
+        if triggers[0].name == "first":
+            await asyncio.wait_for(waiting_claim_renewed.wait(), timeout=1)
+
+    monkeypatch.setattr(
+        trigger_daemon,
+        "_WAITING_BATCH_LEASE_RENEW_INTERVAL_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(trigger_daemon, "renew_trigger_execution_leases", renew_waiting)
+    monkeypatch.setattr(trigger_daemon, "_invoke_agent_for_triggers", invoke)
+
+    await trigger_daemon._invoke_agent_batches(agent_id, [[first], [second]])
+
+    assert invocation_order == ["first", "second"]
+    assert waiting_claim_renewed.is_set()
+
+
+@pytest.mark.parametrize(
+    "renew_outcome",
+    [0, RuntimeError("temporary database failure")],
+    ids=["short-count", "renew-error"],
+)
+@pytest.mark.asyncio
+async def test_waiting_batch_renewal_failure_cancels_before_later_execution(
+    monkeypatch,
+    renew_outcome,
+):
+    from app.services import trigger_daemon
+
+    agent_id = uuid.uuid4()
+    first = AgentTrigger(
+        id=uuid.uuid4(),
+        agent_id=agent_id,
+        name="first",
+        type="cron",
+        config={
+            "_execution_id": str(uuid.uuid4()),
+            "_execution_lease_token": "worker:first",
+        },
+        reason="first",
+    )
+    second = AgentTrigger(
+        id=uuid.uuid4(),
+        agent_id=agent_id,
+        name="second",
+        type="cron",
+        config={
+            "_execution_id": str(uuid.uuid4()),
+            "_execution_lease_token": "worker:second",
+        },
+        reason="second",
+    )
+    invocation_order: list[str] = []
+    active_batch_blocker = asyncio.Event()
+
+    async def invoke(_agent_id, triggers):
+        invocation_order.append(triggers[0].name)
+        await active_batch_blocker.wait()
+
+    async def renew_waiting(_claims):
+        if isinstance(renew_outcome, Exception):
+            raise renew_outcome
+        return renew_outcome
+
+    monkeypatch.setattr(
+        trigger_daemon,
+        "_WAITING_BATCH_LEASE_RENEW_INTERVAL_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(
+        trigger_daemon,
+        "renew_trigger_execution_leases",
+        renew_waiting,
+    )
+    monkeypatch.setattr(trigger_daemon, "_invoke_agent_for_triggers", invoke)
+
+    task = asyncio.create_task(
+        trigger_daemon._invoke_agent_batches(agent_id, [[first], [second]])
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+
+    assert invocation_order == ["first"]
 
 
 def test_a2a_claim_head_includes_live_processing_execution():

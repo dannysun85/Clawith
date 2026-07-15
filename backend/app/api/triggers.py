@@ -10,6 +10,10 @@ from app.api.auth import get_current_user
 from app.core.permissions import check_agent_access
 from app.database import async_session
 from app.models.trigger import AgentTrigger
+from app.services.trigger_runtime.config import (
+    reserved_trigger_config_keys,
+    without_reserved_trigger_config,
+)
 
 router = APIRouter(prefix="/api/agents", tags=["triggers"])
 REDACTED_TRIGGER_SECRET = "********"
@@ -17,7 +21,7 @@ INTERNAL_A2A_TRIGGER_NAME = "__a2a_wake__"
 
 
 def _public_trigger_config(config: dict | None) -> dict:
-    visible = dict(config or {})
+    visible = without_reserved_trigger_config(config)
     if visible.get("secret"):
         visible["secret"] = REDACTED_TRIGGER_SECRET
     return visible
@@ -123,6 +127,13 @@ async def update_trigger(
         if body.config is not None:
             old_config = dict(trigger.config or {})
             incoming_config = dict(body.config)
+            reserved_keys = reserved_trigger_config_keys(incoming_config)
+            if reserved_keys:
+                raise HTTPException(
+                    400,
+                    "Internal trigger config fields cannot be modified: "
+                    + ", ".join(reserved_keys),
+                )
             if incoming_config.get("secret") == REDACTED_TRIGGER_SECRET:
                 incoming_config.pop("secret")
             if trigger.type == "webhook":

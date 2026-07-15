@@ -7754,18 +7754,22 @@ async def _send_platform_message(agent_id: uuid.UUID, args: dict) -> str:
             # Agent-initiated platform messages should always go to the long-lived primary session
             # for this agent+user pair, so trigger-driven outreach does not fragment into dozens of
             # tiny one-off web sessions.
-            from app.services.chat_session_service import ensure_primary_platform_session
+            from app.services.chat_session_service import (
+                build_persisted_trigger_notification,
+                ensure_primary_platform_session,
+            )
 
             session = await ensure_primary_platform_session(db, agent_id, target_user.id)
 
             # Save the message
-            db.add(ChatMessage(
+            message, notification_payload = build_persisted_trigger_notification(
                 agent_id=agent_id,
                 user_id=target_user.id,
-                role="assistant",
-                content=message_text,
                 conversation_id=str(session.id),
-            ))
+                content=message_text,
+                triggers=["web_message"],
+            )
+            db.add(message)
             session.last_message_at = _dt.now(_tz.utc)
             try:
                 from app.api.websocket import maybe_mark_session_read_for_active_viewer
@@ -7786,12 +7790,7 @@ async def _send_platform_message(agent_id: uuid.UUID, args: dict) -> str:
                 await ws_manager.send_to_user(
                     str(agent_id),
                     str(target_user.id),
-                    {
-                        "type": "trigger_notification",
-                        "content": message_text,
-                        "triggers": ["web_message"],
-                        "session_id": str(session.id),
-                    },
+                    notification_payload,
                 )
             except Exception:
                 pass
@@ -9582,6 +9581,14 @@ async def _handle_set_trigger(
     if not isinstance(raw_config, dict):
         return "❌ Invalid trigger config: expected a JSON object"
     config = dict(raw_config)
+    from app.services.trigger_runtime.config import reserved_trigger_config_keys
+
+    reserved_keys = reserved_trigger_config_keys(config)
+    if reserved_keys:
+        return (
+            "❌ Internal trigger config fields are reserved: "
+            + ", ".join(reserved_keys)
+        )
     reason = arguments.get("reason", "").strip()
     focus_ref = arguments.get("focus_ref", "") or arguments.get("agenda_ref", "")  # backward compat
 
@@ -9822,6 +9829,14 @@ async def _handle_update_trigger(agent_id: uuid.UUID, arguments: dict) -> str:
             return "❌ Invalid trigger config: expected a JSON object"
     if new_config is not None and not isinstance(new_config, dict):
         return "❌ Invalid trigger config: expected a JSON object"
+    from app.services.trigger_runtime.config import reserved_trigger_config_keys
+
+    reserved_keys = reserved_trigger_config_keys(new_config)
+    if reserved_keys:
+        return (
+            "❌ Internal trigger config fields are reserved: "
+            + ", ".join(reserved_keys)
+        )
 
     if new_config is None and new_reason is None:
         return "❌ Provide at least one of 'config' or 'reason' to update"
@@ -9917,6 +9932,7 @@ async def _handle_cancel_trigger(agent_id: uuid.UUID, arguments: dict) -> str:
 async def _handle_list_triggers(agent_id: uuid.UUID) -> str:
     """List all active triggers for the agent."""
     from app.models.trigger import AgentTrigger
+    from app.services.trigger_runtime.config import agent_visible_trigger_config
 
     try:
         async with async_session() as db:
@@ -9934,9 +9950,7 @@ async def _handle_list_triggers(agent_id: uuid.UUID) -> str:
         lines = ["| Name | Type | Config | Reason | Status | Fires |", "|------|------|--------|--------|--------|-------|"]
         for t in triggers:
             status = "✅ active" if t.is_enabled else "⏸ disabled"
-            visible_config = dict(t.config or {})
-            if "secret" in visible_config:
-                visible_config["secret"] = "********"
+            visible_config = agent_visible_trigger_config(t.config)
             config_str = str(visible_config)[:80]
             reason_str = t.reason[:40] if t.reason else ""
             lines.append(f"| {t.name} | {t.type} | {config_str} | {reason_str} | {status} | {t.fire_count} |")

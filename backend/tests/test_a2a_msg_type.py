@@ -857,6 +857,78 @@ async def test_handle_set_trigger_rejects_non_object_config(config):
 
 
 @pytest.mark.asyncio
+async def test_handle_set_trigger_rejects_internal_routing_config():
+    from app.services.agent_tools import _handle_set_trigger
+
+    result = await _handle_set_trigger(
+        uuid.uuid4(),
+        {
+            "name": "unsafe-routing",
+            "type": "interval",
+            "config": {
+                "minutes": 5,
+                "_origin_session_id": str(uuid.uuid4()),
+            },
+            "reason": "test",
+        },
+    )
+
+    assert result == (
+        "❌ Internal trigger config fields are reserved: _origin_session_id"
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_update_trigger_rejects_internal_routing_config():
+    from app.services.agent_tools import _handle_update_trigger
+
+    result = await _handle_update_trigger(
+        uuid.uuid4(),
+        {
+            "name": "unsafe-routing",
+            "config": {"_origin_user_id": str(uuid.uuid4())},
+        },
+    )
+
+    assert result == (
+        "❌ Internal trigger config fields are reserved: _origin_user_id"
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_list_triggers_omits_internal_routing_and_secrets():
+    from app.services.agent_tools import _handle_list_triggers
+
+    trigger = MagicMock()
+    trigger.name = "webhook"
+    trigger.type = "webhook"
+    trigger.config = {
+        "event": "push",
+        "token": "private-url-token",
+        "secret": "private-hmac-secret",
+        "_origin_session_id": "private-session-id",
+        "_origin_user_id": "private-user-id",
+    }
+    trigger.reason = "Process a push event"
+    trigger.is_enabled = True
+    trigger.fire_count = 0
+    db = RecordingDB(
+        responses=[DummyResult(scalars_list=[trigger])]
+    )
+
+    with patch("app.services.agent_tools.async_session") as session_factory:
+        session_factory.return_value.__aenter__ = AsyncMock(return_value=db)
+        session_factory.return_value.__aexit__ = AsyncMock(return_value=False)
+        result = await _handle_list_triggers(uuid.uuid4())
+
+    assert "event" in result
+    assert "private-url-token" not in result
+    assert "private-hmac-secret" not in result
+    assert "private-session-id" not in result
+    assert "private-user-id" not in result
+
+
+@pytest.mark.asyncio
 async def test_execute_tool_failure_writes_system_message():
     """execute_tool should write a system error message to the session if a messaging tool fails."""
     from app.services.agent_tools import execute_tool

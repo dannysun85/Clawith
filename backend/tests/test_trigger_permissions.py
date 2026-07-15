@@ -102,13 +102,56 @@ async def test_trigger_mutations_require_manage_access(monkeypatch, operation):
 
 
 def test_public_trigger_config_redacts_hmac_secret():
-    config = {"token": "public-token", "secret": "private-secret"}
+    config = {
+        "token": "public-token",
+        "secret": "private-secret",
+        "_origin_user_id": "private-routing-context",
+    }
 
     assert triggers_api._public_trigger_config(config) == {
         "token": "public-token",
         "secret": triggers_api.REDACTED_TRIGGER_SECRET,
     }
     assert config["secret"] == "private-secret"
+
+
+@pytest.mark.asyncio
+async def test_trigger_update_rejects_internal_routing_fields(monkeypatch):
+    agent_id = uuid.uuid4()
+    trigger = SimpleNamespace(
+        id=uuid.uuid4(),
+        agent_id=agent_id,
+        name="user-trigger",
+        type="interval",
+        config={"minutes": 30, "_origin_user_id": str(uuid.uuid4())},
+        reason="old",
+        is_enabled=True,
+        is_system=False,
+        max_fires=None,
+        cooldown_seconds=0,
+        expires_at=None,
+    )
+    session = MutableTriggerSession(trigger)
+
+    async def grant_manage(*_args):
+        return SimpleNamespace(id=agent_id), "manage"
+
+    monkeypatch.setattr(triggers_api, "async_session", FakeSessionFactory(session))
+    monkeypatch.setattr(triggers_api, "check_agent_access", grant_manage)
+
+    with pytest.raises(HTTPException) as exc:
+        await triggers_api.update_trigger(
+            agent_id,
+            trigger.id,
+            triggers_api.TriggerUpdate(
+                config={"_origin_user_id": str(uuid.uuid4())},
+            ),
+            SimpleNamespace(),
+        )
+
+    assert exc.value.status_code == 400
+    assert "_origin_user_id" in exc.value.detail
+    assert session.committed is False
 
 
 @pytest.mark.asyncio

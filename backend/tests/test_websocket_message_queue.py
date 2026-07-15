@@ -1,5 +1,6 @@
 import uuid
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -37,6 +38,10 @@ class RecordingDB:
     def __init__(self, values):
         self.values = list(values)
         self.committed = False
+        self.added = []
+
+    def add(self, value):
+        self.added.append(value)
 
     async def execute(self, _statement):
         if not self.values:
@@ -80,6 +85,88 @@ async def test_messages_received_during_generation_are_not_dropped():
     assert websocket.receive_calls == 0
     assert await handler._receive_next_message() == {"content": "from-socket"}
     assert websocket.receive_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_message_loop_uses_validated_client_id_and_emits_assistant_id():
+    websocket = FakeWebSocket()
+    client_message_id = uuid.uuid4()
+    handler = WebSocketChatHandler(websocket, uuid.uuid4(), "token", str(uuid.uuid4()))
+    handler.user = SimpleNamespace(id=uuid.uuid4())
+    handler.agent_name = "Test Agent"
+    handler.agent_type = ""
+    handler.conv_id = handler.session_id_param
+    handler._receive_next_message = AsyncMock(
+        side_effect=[
+            {
+                "content": "hello",
+                "display_content": "hello",
+                "client_message_id": str(client_message_id),
+            },
+            StopAsyncIteration,
+        ]
+    )
+    handler._resolve_route = AsyncMock(return_value=(None, None))
+    handler._check_quotas = AsyncMock(return_value=True)
+    handler._save_user_message = AsyncMock(return_value="user-message-1")
+    handler._save_assistant_reply = AsyncMock(return_value="assistant-message-1")
+
+    with pytest.raises(StopAsyncIteration):
+        await handler.message_loop()
+
+    handler._save_user_message.assert_awaited_once_with(
+        "hello",
+        "hello",
+        "",
+        False,
+        message_id=client_message_id,
+    )
+    assert websocket.sent == [
+        {
+            "type": "done",
+            "role": "assistant",
+            "content": (
+                "⚠️ Test Agent has no LLM model configured. "
+                "Please select a tier in the agent's Settings tab or ask an admin to configure model routes."
+            ),
+            "message_id": "assistant-message-1",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_saved_chat_messages_return_their_database_ids(monkeypatch):
+    user_db = RecordingDB([None])
+    assistant_db = RecordingDB([])
+    dbs = iter([user_db, assistant_db])
+    monkeypatch.setattr(
+        "app.api.websocket.async_session",
+        lambda: RecordingDBContext(next(dbs)),
+    )
+    monkeypatch.setattr(
+        "app.api.websocket.maybe_mark_session_read_for_active_viewer",
+        AsyncMock(),
+    )
+
+    handler = WebSocketChatHandler(FakeWebSocket(), uuid.uuid4(), "token", str(uuid.uuid4()))
+    handler.user = SimpleNamespace(id=uuid.uuid4())
+    handler.conv_id = handler.session_id_param
+
+    requested_user_message_id = uuid.uuid4()
+    user_message_id = await handler._save_user_message(
+        "hello",
+        "hello",
+        "",
+        False,
+        message_id=requested_user_message_id,
+    )
+    assistant_message_id = await handler._save_assistant_reply("world", [])
+
+    assert user_message_id == str(user_db.added[0].id)
+    assert user_message_id == str(requested_user_message_id)
+    assert assistant_message_id == str(assistant_db.added[0].id)
+    assert user_db.committed is True
+    assert assistant_db.committed is True
 
 
 @pytest.mark.asyncio

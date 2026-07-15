@@ -12,6 +12,7 @@ from app.config import get_settings
 from app.database import async_session
 from app.models.trigger import AgentTrigger
 from app.models.trigger_execution import TriggerExecution
+from app.services.trigger_runtime.config import trusted_execution_runtime_payload
 
 settings = get_settings()
 TRIGGER_EXECUTION_LEASE_SECONDS = 300
@@ -185,8 +186,9 @@ def build_execution_runtime_trigger(trigger: AgentTrigger, execution: TriggerExe
         "_execution_id": str(execution.id),
         "_execution_lease_token": execution.lease_owner,
     }
-    if execution.payload:
-        runtime_cfg.update(execution.payload)
+    runtime_cfg.update(
+        trusted_execution_runtime_payload(execution.source, execution.payload)
+    )
     if execution.payload_text:
         runtime_cfg["_webhook_payload"] = execution.payload_text
     return AgentTrigger(

@@ -29,7 +29,9 @@ from app.services.trigger_runtime import (
     claim_ready_trigger_invocations,
     enqueue_due_trigger,
     enqueue_trigger_execution,
+    renew_trigger_execution_leases,
 )
+from app.services.trigger_runtime.config import trigger_delivery_identity
 
 settings = get_settings()
 
@@ -44,6 +46,7 @@ _last_invoke: dict[uuid.UUID, datetime] = {}
 _invocation_tasks: set[asyncio.Task[None]] = set()
 
 _A2A_WAKE_TRIGGER_NAME = "__a2a_wake__"
+_WAITING_BATCH_LEASE_RENEW_INTERVAL_SECONDS = 60
 
 
 def _cleanup_stale_invoke_cache():
@@ -92,26 +95,104 @@ async def _invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTr
 
 
 def _build_invocation_batches(triggers: list[AgentTrigger]) -> list[list[AgentTrigger]]:
-    """Keep durable A2A messages isolated while preserving queue order."""
+    """Keep A2A and distinct delivery principals isolated in queue order."""
     batches: list[list[AgentTrigger]] = []
     ordinary: list[AgentTrigger] = []
+    ordinary_identity: tuple[str, str, str] | None = None
     for trigger in triggers:
         if trigger.type == "a2a":
             if ordinary:
                 batches.append(ordinary)
                 ordinary = []
+                ordinary_identity = None
             batches.append([trigger])
         else:
+            identity = trigger_delivery_identity(trigger.config)
+            if ordinary and identity != ordinary_identity:
+                batches.append(ordinary)
+                ordinary = []
             ordinary.append(trigger)
+            ordinary_identity = identity
     if ordinary:
         batches.append(ordinary)
     return batches
 
 
 async def _invoke_agent_batches(agent_id: uuid.UUID, batches: list[list[AgentTrigger]]) -> None:
-    """Run one agent's claimed work sequentially to avoid merged A2A replies."""
+    """Run batches sequentially while retaining every waiting execution claim.
+
+    The claim query can return several principals for one Agent at once.  Only
+    the active batch is renewed by the invoker, so this outer keeper renews all
+    later batches until each one starts.  Without it, a long first generation
+    could let a later batch expire and be executed concurrently by another
+    worker.
+    """
+
+    claims_by_batch: list[list[tuple[uuid.UUID, str]]] = []
     for triggers in batches:
-        await _invoke_agent_for_triggers(agent_id, triggers)
+        claims: list[tuple[uuid.UUID, str]] = []
+        for trigger in triggers:
+            config = trigger.config or {}
+            execution_id = config.get("_execution_id")
+            lease_token = config.get("_execution_lease_token")
+            if execution_id and lease_token:
+                claims.append((uuid.UUID(str(execution_id)), str(lease_token)))
+        claims_by_batch.append(claims)
+
+    waiting_claims = {
+        claim
+        for batch_claims in claims_by_batch[1:]
+        for claim in batch_claims
+    }
+    claims_lock = asyncio.Lock()
+    invocation_task = asyncio.current_task()
+
+    async def _renew_waiting_claims() -> None:
+        while True:
+            await asyncio.sleep(_WAITING_BATCH_LEASE_RENEW_INTERVAL_SECONDS)
+            async with claims_lock:
+                if not waiting_claims:
+                    return
+                claims = list(waiting_claims)
+                try:
+                    renewed = await renew_trigger_execution_leases(claims)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.error(
+                        "Waiting trigger batch lease renewal failed "
+                        "agent_id={} error_type={}",
+                        agent_id,
+                        type(exc).__name__,
+                    )
+                    renewed = 0
+                if renewed != len(claims):
+                    logger.error(
+                        "Waiting trigger batch lease fence lost "
+                        "agent_id={} expected={} renewed={}",
+                        agent_id,
+                        len(claims),
+                        renewed,
+                    )
+                    if invocation_task is not None:
+                        invocation_task.cancel()
+                    return
+
+    lease_keeper = (
+        asyncio.create_task(_renew_waiting_claims())
+        if waiting_claims
+        else None
+    )
+    try:
+        for index, triggers in enumerate(batches):
+            if index:
+                async with claims_lock:
+                    waiting_claims.difference_update(claims_by_batch[index])
+            await _invoke_agent_for_triggers(agent_id, triggers)
+    finally:
+        if lease_keeper is not None:
+            lease_keeper.cancel()
+            await asyncio.gather(lease_keeper, return_exceptions=True)
 
 
 def _max_invocation_concurrency() -> int:

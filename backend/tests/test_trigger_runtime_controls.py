@@ -7,6 +7,7 @@ import pytest
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from app.models.trigger import AgentTrigger
+from app.models.trigger_execution import TriggerExecution
 
 
 @pytest.mark.asyncio
@@ -24,6 +25,85 @@ async def test_dispatch_forwards_bounded_claim_limit(monkeypatch):
     claim.assert_awaited_once_with(limit=8)
     assert fired == {}
     assert forced == set()
+
+
+def test_webhook_payload_cannot_override_runtime_routing_or_execution_fence():
+    from app.services.trigger_runtime.executions import build_execution_runtime_trigger
+
+    agent_id = uuid.uuid4()
+    trusted_user_id = uuid.uuid4()
+    trigger = AgentTrigger(
+        id=uuid.uuid4(),
+        agent_id=agent_id,
+        name="webhook",
+        type="webhook",
+        config={"_origin_user_id": str(trusted_user_id)},
+        reason="webhook",
+        is_enabled=True,
+        is_system=False,
+    )
+    execution = TriggerExecution(
+        id=uuid.uuid4(),
+        trigger_id=trigger.id,
+        agent_id=agent_id,
+        source="webhook",
+        status="processing",
+        idempotency_key="delivery-1",
+        payload={
+            "_origin_user_id": str(uuid.uuid4()),
+            "_a2a_session_id": str(uuid.uuid4()),
+            "_execution_id": None,
+            "_execution_lease_token": "attacker-lease",
+        },
+        payload_text='{"_a2a_session_id":"external-data"}',
+        lease_owner="worker:trusted-generation",
+    )
+
+    runtime = build_execution_runtime_trigger(trigger, execution)
+
+    assert runtime.config["_origin_user_id"] == str(trusted_user_id)
+    assert "_a2a_session_id" not in runtime.config
+    assert runtime.config["_execution_id"] == str(execution.id)
+    assert runtime.config["_execution_lease_token"] == execution.lease_owner
+    assert runtime.config["_webhook_payload"] == execution.payload_text
+
+
+def test_service_execution_payload_uses_an_explicit_allowlist():
+    from app.services.trigger_runtime.executions import build_execution_runtime_trigger
+
+    agent_id = uuid.uuid4()
+    origin_user_id = uuid.uuid4()
+    trigger = AgentTrigger(
+        id=uuid.uuid4(),
+        agent_id=agent_id,
+        name="scheduled",
+        type="cron",
+        config={},
+        reason="scheduled",
+        is_enabled=True,
+        is_system=False,
+    )
+    execution = TriggerExecution(
+        id=uuid.uuid4(),
+        trigger_id=trigger.id,
+        agent_id=agent_id,
+        source="cron",
+        status="processing",
+        idempotency_key="scheduled-1",
+        payload={
+            "_origin_user_id": str(origin_user_id),
+            "untrusted_extra": "must-not-enter-runtime-config",
+            "_execution_lease_token": "must-not-override",
+        },
+        payload_text="",
+        lease_owner="worker:trusted-generation",
+    )
+
+    runtime = build_execution_runtime_trigger(trigger, execution)
+
+    assert runtime.config["_origin_user_id"] == str(origin_user_id)
+    assert "untrusted_extra" not in runtime.config
+    assert runtime.config["_execution_lease_token"] == execution.lease_owner
 
 
 @pytest.mark.asyncio

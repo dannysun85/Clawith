@@ -29,6 +29,16 @@ import { canAccessSaasAdmin } from '../../utils/saasAdmin';
 import { displaySessionTitle } from '../../utils/sessionDisplay';
 import { appendUniqueById, safeWorkspaceMediaPath } from '../../utils/mediaCompletion';
 import {
+    activeSessionMatchesRequestedSession,
+    chatSessionRequestIdentityIsCurrent,
+    chatHistoryIsReady,
+    mergeLoadedHistoryWithLiveMessages,
+    resolveRequestedChatSession,
+    searchForSelectedChatSession,
+    shouldRetrySessionHistoryResponse,
+    upsertPersistedRealtimeMessage,
+} from '../../utils/agentChatLifecycle';
+import {
     resolveChatSessionModality,
     resolveChatSessionTier,
     resolveOutboundChatRoute,
@@ -2161,10 +2171,12 @@ export default function AgentDetailPage() {
     const [historyHasMore, setHistoryHasMore] = useState(true);
     const [historyLoadingMore, setHistoryLoadingMore] = useState(false);
     const HISTORY_PAGE_SIZE = 20;
+    const SESSION_HISTORY_LOAD_ATTEMPTS = 3;
     // Chat history pagination state (for writable/live sessions)
     const [chatOldestTimestamp, setChatOldestTimestamp] = useState<string | null>(null);
     const [chatHistoryHasMore, setChatHistoryHasMore] = useState(true);
     const [chatHistoryLoadingMore, setChatHistoryLoadingMore] = useState(false);
+    const [chatHistoryReadyRuntimeKey, setChatHistoryReadyRuntimeKey] = useState<string | null>(null);
     const [sessionsLoading, setSessionsLoading] = useState(false);
     const [allSessionsLoading, setAllSessionsLoading] = useState(false);
     const [agentExpired, setAgentExpired] = useState(false);
@@ -2461,6 +2473,7 @@ export default function AgentDetailPage() {
         setChatOldestTimestamp(null);
         setChatHistoryHasMore(true);
         setChatHistoryLoadingMore(false);
+        setChatHistoryReadyRuntimeKey(null);
         setHistoryMsgs([]);
         setWsConnected(false);
         setIsStreaming(false);
@@ -2491,33 +2504,63 @@ export default function AgentDetailPage() {
 
     const fetchMySessions = async (silent = false, agentId: string | undefined = id) => {
         if (!agentId) return [];
-        if (!silent && currentAgentIdRef.current === agentId) setSessionsLoading(true);
+        const requestUserId = currentUser?.id == null ? '' : String(currentUser.id);
+        const requestToken = token || '';
+        const requestIsCurrent = () => {
+            const auth = useAuthStore.getState();
+            return currentAgentIdRef.current === agentId
+                && chatSessionRequestIdentityIsCurrent(
+                    requestUserId,
+                    requestToken,
+                    auth.user?.id,
+                    auth.token,
+                );
+        };
+        if (!requestIsCurrent()) return [];
+        if (!silent) setSessionsLoading(true);
         try {
-            const tkn = localStorage.getItem('token');
-            const res = await fetch(`/api/agents/${agentId}/sessions?scope=mine`, { headers: { Authorization: `Bearer ${tkn}` } });
+            const res = await fetch(`/api/agents/${agentId}/sessions?scope=mine`, { headers: { Authorization: `Bearer ${requestToken}` } });
             if (res.ok) {
-                const data = (await res.json()).map((row: any) => normalizeChatSession(row));
-                if (currentAgentIdRef.current === agentId) setSessions(data);
-                if (!silent && currentAgentIdRef.current === agentId) setSessionsLoading(false);
+                const rows = await res.json();
+                if (!requestIsCurrent()) return [];
+                const data = rows.map((row: any) => normalizeChatSession(row));
+                setSessions(data);
                 return data;
             }
         } catch { }
-        if (!silent && currentAgentIdRef.current === agentId) setSessionsLoading(false);
+        finally {
+            if (!silent && requestIsCurrent()) setSessionsLoading(false);
+        }
         return [];
     };
 
-    const fetchAllSessions = async () => {
-        if (!id || !canViewAllAgentChatSessions) return;
+    const fetchAllSessions = async (agentId: string | undefined = id) => {
+        if (!agentId || !canViewAllAgentChatSessions) return [];
+        const requestUserId = currentUser?.id == null ? '' : String(currentUser.id);
+        const requestToken = token || '';
+        const requestIsCurrent = () => {
+            const auth = useAuthStore.getState();
+            return currentAgentIdRef.current === agentId
+                && chatSessionRequestIdentityIsCurrent(
+                    requestUserId,
+                    requestToken,
+                    auth.user?.id,
+                    auth.token,
+                );
+        };
+        if (!requestIsCurrent()) return [];
         setAllSessionsLoading(true);
         try {
-            const tkn = localStorage.getItem('token');
-            const res = await fetch(`/api/agents/${id}/sessions?scope=all`, { headers: { Authorization: `Bearer ${tkn}` } });
-            if (!currentAgentIdRef.current || currentAgentIdRef.current !== id) return;
+            const res = await fetch(`/api/agents/${agentId}/sessions?scope=all`, { headers: { Authorization: `Bearer ${requestToken}` } });
+            if (!requestIsCurrent()) return [];
             if (res.ok) {
-                const all = (await res.json())
+                const rows = await res.json();
+                if (!requestIsCurrent()) return [];
+                const all = rows
                     .filter((s: any) => String(s.source_channel || 'direct').toLowerCase() !== 'trigger')
                     .map((row: any) => normalizeChatSession(row));
                 setAllSessions(all);
+                return all;
             } else {
                 setAllSessions([]);
                 if (res.status === 403) {
@@ -2525,20 +2568,32 @@ export default function AgentDetailPage() {
                 }
             }
         } catch {
-            if (currentAgentIdRef.current === id) setAllSessions([]);
+            if (requestIsCurrent()) setAllSessions([]);
         } finally {
-            setAllSessionsLoading(false);
+            if (requestIsCurrent()) setAllSessionsLoading(false);
         }
+        return [];
     };
 
-    const selectSession = async (rawSess: any, scopeOverride: 'mine' | 'all' = chatScope) => {
+    const selectSession = async (
+        rawSess: any,
+        scopeOverride: 'mine' | 'all' = chatScope,
+        syncLocation = false,
+    ) => {
         const sess = normalizeChatSession(rawSess);
         const targetAgentId = id;
         if (!targetAgentId) return;
-        const runtimeKey = buildSessionRuntimeKey(targetAgentId, String(sess.id));
+        const sessionId = String(sess.id);
+        activeSessionIdRef.current = sessionId;
+        if (syncLocation) {
+            navigate({
+                pathname: `/agents/${targetAgentId}/chat`,
+                search: searchForSelectedChatSession(location.search, sessionId),
+            }, { replace: true });
+        }
+        const runtimeKey = buildSessionRuntimeKey(targetAgentId, sessionId);
         const runtimeState = sessionUiStateRef.current[runtimeKey] || { isWaiting: false, isStreaming: false };
         const writable = isWritableSession(sess, scopeOverride);
-        activeSessionIdRef.current = sess.id;
         isFirstLoad.current = true;
         isNearBottom.current = true;
         userPinnedAwayFromBottomRef.current = false;
@@ -2548,6 +2603,7 @@ export default function AgentDetailPage() {
         setChatOldestTimestamp(null);
         setChatHistoryHasMore(true);
         setChatHistoryLoadingMore(false);
+        setChatHistoryReadyRuntimeKey(null);
         setHistoryMsgs([]);
         setHistoryOldestTimestamp(null);
         setHistoryHasMore(true);
@@ -2566,12 +2622,34 @@ export default function AgentDetailPage() {
         const loadSeq = ++sessionLoadSeqRef.current;
         try {
             const tkn = localStorage.getItem('token');
-            const res = await fetch(`/api/agents/${targetAgentId}/sessions/${sess.id}/messages?limit=${HISTORY_PAGE_SIZE}`, {
-                headers: { Authorization: `Bearer ${tkn}` },
-                signal: controller.signal,
-            });
-            if (!res.ok) return;
-            const msgs = await res.json();
+            let msgs: any[] | null = null;
+            for (let attempt = 0; attempt < SESSION_HISTORY_LOAD_ATTEMPTS; attempt += 1) {
+                try {
+                    const res = await fetch(`/api/agents/${targetAgentId}/sessions/${sess.id}/messages?limit=${HISTORY_PAGE_SIZE}`, {
+                        headers: { Authorization: `Bearer ${tkn}` },
+                        signal: controller.signal,
+                    });
+                    if (!res.ok) {
+                        if (!shouldRetrySessionHistoryResponse(
+                            res.status,
+                            attempt,
+                            SESSION_HISTORY_LOAD_ATTEMPTS,
+                        )) {
+                            console.error(`Failed to load session messages: HTTP ${res.status}`);
+                            return;
+                        }
+                    } else {
+                        msgs = await res.json();
+                        break;
+                    }
+                } catch (err: any) {
+                    if (err?.name === 'AbortError') return;
+                    if (attempt === SESSION_HISTORY_LOAD_ATTEMPTS - 1) throw err;
+                }
+                await new Promise((resolve) => setTimeout(resolve, 150 * (attempt + 1)));
+                if (controller.signal.aborted || loadSeq !== sessionLoadSeqRef.current) return;
+            }
+            if (!msgs) return;
             if (controller.signal.aborted || loadSeq !== sessionLoadSeqRef.current) return;
             if (currentAgentIdRef.current !== targetAgentId) return;
             if (activeSessionIdRef.current !== sess.id) return;
@@ -2587,7 +2665,7 @@ export default function AgentDetailPage() {
             const oldestTimestamp = msgs.length > 0 ? msgs[0].created_at : null;
 
             if (writable) {
-                setChatMessages(preParsed);
+                setChatMessages((current) => mergeLoadedHistoryWithLiveMessages(preParsed, current));
                 setChatOldestTimestamp(oldestTimestamp);
                 setChatHistoryHasMore(msgs.length >= HISTORY_PAGE_SIZE);
             } else {
@@ -2595,6 +2673,7 @@ export default function AgentDetailPage() {
                 setHistoryOldestTimestamp(oldestTimestamp);
                 setHistoryHasMore(msgs.length >= HISTORY_PAGE_SIZE);
             }
+            setChatHistoryReadyRuntimeKey(runtimeKey);
             // The backend marks the session as read when the current user opens it. Mirror that
             // immediately in local state so unread badges clear without waiting for the next poll.
             clearUnreadForSession(String(sess.id));
@@ -2619,7 +2698,7 @@ export default function AgentDetailPage() {
                 setSessions((prev) => [newSess, ...prev]);
                 setIsStreaming(false);
                 setIsWaiting(false);
-                await selectSession(newSess, 'mine');
+                await selectSession(newSess, 'mine', true);
             } else {
                 const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }));
                 console.error('Failed to create session:', err);
@@ -2653,6 +2732,7 @@ export default function AgentDetailPage() {
                 setChatOldestTimestamp(null);
                 setChatHistoryHasMore(true);
                 setChatHistoryLoadingMore(false);
+                setChatHistoryReadyRuntimeKey(null);
                 setHistoryMsgs([]);
                 setWsConnected(false);
                 setIsStreaming(false);
@@ -2738,9 +2818,9 @@ export default function AgentDetailPage() {
             const runningIdx = [...prev].reverse().findIndex(sameTool);
             if (runningIdx >= 0) {
                 const idx = prev.length - 1 - runningIdx;
-                return [...prev.slice(0, idx), { ...prev[idx], ...toolMsg }, ...prev.slice(idx + 1)];
+                return upsertPersistedRealtimeMessage(prev, toolMsg, idx);
             }
-            return [...prev, toolMsg];
+            return upsertPersistedRealtimeMessage(prev, toolMsg);
         });
     };
     // Transient info banner (e.g. fallback model switch notification)
@@ -2764,7 +2844,6 @@ export default function AgentDetailPage() {
     const [workspaceLockedPath, setWorkspaceLockedPath] = useState<string | null>(null);
     const [workspaceActivities, setWorkspaceActivities] = useState<WorkspaceActivity[]>([]);
     const [workspaceLiveDraft, setWorkspaceLiveDraft] = useState<WorkspaceLiveDraft | null>(null);
-    const handledWorkspaceDeepLinkRef = useRef<string>('');
     const workspaceEditingRef = useRef(false);
     const workspaceLockedPathRef = useRef<string | null>(null);
     const [wsSessionId, setWsSessionId] = useState<string>('');
@@ -2854,9 +2933,7 @@ export default function AgentDetailPage() {
     }, []);
     useEffect(() => {
         if (!id || activeTab !== 'chat' || !requestedWorkspacePath) return;
-        const deepLinkKey = `${id}:${requestedWorkspacePath}`;
-        if (handledWorkspaceDeepLinkRef.current === deepLinkKey) return;
-        handledWorkspaceDeepLinkRef.current = deepLinkKey;
+        if (!activeSessionMatchesRequestedSession(requestedSessionId, activeSession?.id)) return;
         setWorkspaceActivePath(requestedWorkspacePath);
         setSidePanelTab('workspace');
         setLivePanelVisible(true);
@@ -2865,6 +2942,9 @@ export default function AgentDetailPage() {
         activeTab,
         collapseSidebarsForLivePanel,
         id,
+        location.key,
+        activeSession?.id,
+        requestedSessionId,
         requestedWorkspacePath,
     ]);
     useEffect(() => {
@@ -3067,6 +3147,7 @@ export default function AgentDetailPage() {
         setChatOldestTimestamp(null);
         setChatHistoryHasMore(true);
         setChatHistoryLoadingMore(false);
+        setChatHistoryReadyRuntimeKey(null);
         setHistoryMsgs([]);
         setIsStreaming(false);
         setIsWaiting(false);
@@ -3101,6 +3182,7 @@ export default function AgentDetailPage() {
         setChatOldestTimestamp(null);
         setChatHistoryHasMore(true);
         setChatHistoryLoadingMore(false);
+        setChatHistoryReadyRuntimeKey(null);
         setHistoryMsgs([]);
         setWsConnected(false);
         setIsStreaming(false);
@@ -3125,17 +3207,51 @@ export default function AgentDetailPage() {
 
     useEffect(() => {
         if (!id || !token || activeTab !== 'chat') return;
-        fetchMySessions(false, id).then((data: any) => {
+        if (requestedSessionId && activeSessionIdRef.current === requestedSessionId) return;
+        let cancelled = false;
+        const initializeRequestedSession = async () => {
+            const data = await fetchMySessions(false, id);
+            if (cancelled) return;
             if (currentAgentIdRef.current !== id) return;
             setSessionsLoading(false);
-            if (data && data.length > 0) {
-                const requested = requestedSessionId
-                    ? data.find((session: any) => String(session.id) === requestedSessionId)
-                    : null;
-                selectSession(requested || data[0], 'mine');
+            if (requestedSessionId) {
+                const requestedMine = resolveRequestedChatSession(
+                    requestedSessionId,
+                    data,
+                    [],
+                    false,
+                );
+                if (requestedMine) {
+                    setChatScope('mine');
+                    await selectSession(requestedMine.session, 'mine');
+                    return;
+                }
+                if (canViewAllAgentChatSessions) {
+                    const all = await fetchAllSessions(id);
+                    if (cancelled || currentAgentIdRef.current !== id) return;
+                    const requestedAll = resolveRequestedChatSession(
+                        requestedSessionId,
+                        [],
+                        all,
+                        true,
+                    );
+                    if (requestedAll) {
+                        setChatScope('all');
+                        await selectSession(requestedAll.session, 'all');
+                        return;
+                    }
+                }
             }
-        });
-    }, [id, token, activeTab, currentUser?.id, requestedSessionId]);
+            if (data.length > 0) {
+                setChatScope('mine');
+                await selectSession(data[0], 'mine', !!requestedSessionId);
+            }
+        };
+        void initializeRequestedSession();
+        return () => {
+            cancelled = true;
+        };
+    }, [id, token, activeTab, currentUser?.id, requestedSessionId, canViewAllAgentChatSessions]);
 
     const ensureSessionSocket = (sess: any, agentId: string, authToken: string) => {
         const sessionId = String(sess.id);
@@ -3404,6 +3520,7 @@ export default function AgentDetailPage() {
                     }
                 }
                 upsertToolCallMessage({
+                    id: d.message_id ? String(d.message_id) : undefined,
                     role: 'tool_call',
                     content: '',
                     toolName: d.name,
@@ -3436,8 +3553,12 @@ export default function AgentDetailPage() {
                 setChatMessages(prev => {
                     const last = prev[prev.length - 1];
                     const thinking = (last && last.role === 'assistant' && (last as any)._streaming) ? last.thinking : undefined;
-                    if (last && last.role === 'assistant' && (last as any)._streaming) return [...prev.slice(0, -1), parseChatMsg({ role: 'assistant', content: d.content, thinking, timestamp: new Date().toISOString(), quotaError: d.quota_error })];
-                    return [...prev, parseChatMsg({ role: d.role, content: d.content, timestamp: new Date().toISOString(), quotaError: d.quota_error })];
+                    const persistedId = d.message_id ? String(d.message_id) : undefined;
+                    const finalized = parseChatMsg({ id: persistedId, role: d.role, content: d.content, thinking, timestamp: new Date().toISOString(), quotaError: d.quota_error });
+                    const withoutStreaming = last && last.role === 'assistant' && (last as any)._streaming
+                        ? prev.slice(0, -1)
+                        : prev;
+                    return appendUniqueById(withoutStreaming, finalized);
                 });
                 const currentSessionId = activeSessionIdRef.current ? String(activeSessionIdRef.current) : '';
                 if (currentSessionId) clearUnreadForSession(currentSessionId);
@@ -3500,7 +3621,12 @@ export default function AgentDetailPage() {
                 const targetSessionId = d.session_id ? String(d.session_id) : '';
                 const currentSessionId = activeSessionIdRef.current ? String(activeSessionIdRef.current) : '';
                 if (targetSessionId && currentSessionId === targetSessionId) {
-                    setChatMessages(prev => [...prev, parseChatMsg({ role: 'assistant', content: d.content })]);
+                    const incoming = parseChatMsg({
+                        id: d.message_id ? String(d.message_id) : undefined,
+                        role: 'assistant',
+                        content: d.content,
+                    });
+                    setChatMessages((prev) => upsertPersistedRealtimeMessage(prev, incoming));
                     clearUnreadForSession(targetSessionId);
                 }
                 fetchMySessions(true, agentId);
@@ -3545,10 +3671,12 @@ export default function AgentDetailPage() {
     };
 
     const dispatchChatMessage = (socket: WebSocket, runtimeKey: SessionRuntimeKey, payload: PendingChatMessage) => {
+        const clientMessageId = crypto.randomUUID();
         setIsWaiting(true);
         setIsStreaming(false);
         setSessionUiState(runtimeKey, { isWaiting: true, isStreaming: false });
         setChatMessages(prev => [...prev, parseChatMsg({
+            id: clientMessageId,
             role: 'user',
             content: payload.userMsg,
             fileName: payload.fileName,
@@ -3562,6 +3690,7 @@ export default function AgentDetailPage() {
             tier: payload.tier,
             modality: payload.modality,
             ephemeral_modality: payload.ephemeralModality === true,
+            client_message_id: clientMessageId,
         }));
     };
 
@@ -4519,6 +4648,7 @@ export default function AgentDetailPage() {
         if (!wsConnected || !id || !activeSession?.id) return;
         if (!agent || agent.onboarded_for_me !== false) return;
         if (!effectiveTierReady || !effectiveChatTier) return;
+        if (!chatHistoryIsReady(chatHistoryReadyRuntimeKey, id, activeSession.id)) return;
         if (chatMessages.length > 0) return;
         const runtimeKey = buildSessionRuntimeKey(id, String(activeSession.id));
         if (onboardingKickoffRef.current.has(runtimeKey)) return;
@@ -4533,7 +4663,7 @@ export default function AgentDetailPage() {
             tier: effectiveChatTier,
             modality: effectiveChatModality,
         }));
-    }, [wsConnected, id, activeSession?.id, agent?.onboarded_for_me, effectiveTierReady, effectiveChatTier, effectiveChatModality, chatMessages.length]);
+    }, [wsConnected, id, activeSession?.id, agent?.onboarded_for_me, effectiveTierReady, effectiveChatTier, effectiveChatModality, chatHistoryReadyRuntimeKey, chatMessages.length]);
 
     const { data: permData } = useQuery({
         queryKey: ['agent-permissions', id],
@@ -6416,7 +6546,7 @@ export default function AgentDetailPage() {
                                                     };
                                                     const chLabel = channelLabel[s.source_channel];
                                                     return (
-                                                        <div key={s.id} onClick={() => { setChatScope('mine'); selectSession(s, 'mine'); }}
+                                                        <div key={s.id} onClick={() => { setChatScope('mine'); selectSession(s, 'mine', true); }}
                                                             className="session-item"
                                                             style={{ padding: '8px 12px', cursor: 'pointer', borderLeft: isActive ? '2px solid var(--accent-primary)' : '2px solid transparent', background: isActive ? 'var(--bg-secondary)' : 'transparent', marginBottom: '1px', display: 'flex', alignItems: 'center', gap: '4px' }}
                                                             onMouseEnter={e => { if (!isActive) e.currentTarget.style.background = 'var(--bg-secondary)'; }}
@@ -6500,7 +6630,7 @@ export default function AgentDetailPage() {
                                                         };
                                                         const chLabel = channelLabel[s.source_channel];
                                                         return (
-                                                            <div key={s.id} onClick={() => selectSession(s, 'all')}
+                                                            <div key={s.id} onClick={() => selectSession(s, 'all', true)}
                                                                 className="session-item"
                                                                 style={{ padding: '6px 12px', cursor: 'pointer', borderLeft: isActive ? '2px solid var(--accent-primary)' : '2px solid transparent', background: isActive ? 'var(--bg-secondary)' : 'transparent', position: 'relative' }}
                                                                 onMouseEnter={e => { if (!isActive) e.currentTarget.style.background = 'var(--bg-secondary)'; }}

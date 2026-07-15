@@ -560,6 +560,16 @@ class WebSocketChatHandler:
             content = data.get("content", "")
             display_content = data.get("display_content", "")
             file_name = data.get("file_name", "")
+            raw_client_message_id = data.get("client_message_id")
+            client_message_id: uuid.UUID | None = None
+            if isinstance(raw_client_message_id, str) and len(raw_client_message_id) <= 100:
+                try:
+                    candidate_message_id = uuid.UUID(raw_client_message_id)
+                except (TypeError, ValueError):
+                    pass
+                else:
+                    if candidate_message_id.version == 4:
+                        client_message_id = candidate_message_id
             chat_tier = data.get("tier") or self.session_model_tier
             chat_modality = data.get("modality") or self.session_model_modality
             ephemeral_modality = data.get("ephemeral_modality") is True
@@ -625,7 +635,13 @@ class WebSocketChatHandler:
             self.conversation.append({"role": "user", "content": content})
 
             # Save user message to DB
-            await self._save_user_message(content, display_content, file_name, is_onboarding_trigger)
+            await self._save_user_message(
+                content,
+                display_content,
+                file_name,
+                is_onboarding_trigger,
+                message_id=client_message_id,
+            )
 
             # OpenClaw routing check
             if self.agent_type == "openclaw":
@@ -662,10 +678,17 @@ class WebSocketChatHandler:
             self.conversation.append({"role": "assistant", "content": assistant_response})
 
             # Save assistant reply
-            await self._save_assistant_reply(assistant_response, thinking_content)
+            assistant_message_id = await self._save_assistant_reply(assistant_response, thinking_content)
 
             # Final 'done' packet
-            await self.websocket.send_json({"type": "done", "role": "assistant", "content": assistant_response})
+            await self.websocket.send_json(
+                {
+                    "type": "done",
+                    "role": "assistant",
+                    "content": assistant_response,
+                    "message_id": assistant_message_id,
+                }
+            )
 
             # Messages arriving during generation are processed in arrival order on
             # the next loop iterations instead of being silently discarded.
@@ -793,7 +816,15 @@ class WebSocketChatHandler:
             await self.websocket.send_json({"type": "done", "role": "assistant", "content": f"⚠️ {ae.message}"})
             return False
 
-    async def _save_user_message(self, content: str, display_content: str, file_name: str, is_onboarding_trigger: bool):
+    async def _save_user_message(
+        self,
+        content: str,
+        display_content: str,
+        file_name: str,
+        is_onboarding_trigger: bool,
+        *,
+        message_id: uuid.UUID | None = None,
+    ) -> str | None:
         """Saves user message to the database and updates session title/time."""
         has_image_marker = "[image_data:" in content
         if has_image_marker:
@@ -811,9 +842,12 @@ class WebSocketChatHandler:
                 if _s and _s.title.startswith("Session "):
                     _s.title = "Onboarding"
                     await _sdb.commit()
+            return None
         else:
+            persisted_message_id = message_id or uuid.uuid4()
             async with async_session() as db:
                 user_msg = ChatMessage(
+                    id=persisted_message_id,
                     agent_id=self.agent_id,
                     user_id=self.user.id,
                     role="user",
@@ -835,6 +869,7 @@ class WebSocketChatHandler:
                         _sess.title = clean_title[:40] if clean_title else content[:40]
                 await db.commit()
             logger.info("[WS] User message saved")
+            return str(persisted_message_id)
 
     async def _route_openclaw(self, content: str):
         """Enqueues message for OpenClaw edge node poll."""
@@ -931,11 +966,14 @@ class WebSocketChatHandler:
                             path for path in verified if path not in completed_artifact_paths
                         )
 
-                await self.websocket.send_json({"type": "tool_call", **data})
-
-                # Save completed tool calls to DB so they persist in chat history
+                # Persist before publishing the final frame so history hydration and
+                # realtime delivery share one stable database message ID.
                 if data.get("status") == "done":
-                    await self._save_completed_tool_call_to_db(data)
+                    message_id = await self._save_completed_tool_call_to_db(data)
+                    if message_id:
+                        data["message_id"] = message_id
+
+                await self.websocket.send_json({"type": "tool_call", **data})
 
             # Track thinking content for storage
             thinking_content = []
@@ -1225,11 +1263,11 @@ class WebSocketChatHandler:
                 _pending_approval,
             )
 
-    async def _save_completed_tool_call_to_db(self, data: dict):
+    async def _save_completed_tool_call_to_db(self, data: dict) -> str | None:
         """Persist completed tool calls in ChatMessage DB logs."""
         try:
             from app.services.chat_session_service import save_tool_call_log
-            await save_tool_call_log(
+            message_id = await save_tool_call_log(
                 agent_id=self.agent_id,
                 user_id=self.user.id,
                 conversation_id=self.conv_id,
@@ -1240,6 +1278,13 @@ class WebSocketChatHandler:
                 tool_call_id=data.get("call_id"),
                 reasoning_content=data.get("reasoning_content"),
             )
+            if not message_id:
+                return None
+        except Exception as _tc_err:
+            logger.warning(f"[WS] Failed to save tool_call: {_tc_err}")
+            return None
+
+        try:
             async with async_session() as _tc_db:
                 await maybe_mark_session_read_for_active_viewer(
                     _tc_db,
@@ -1249,7 +1294,8 @@ class WebSocketChatHandler:
                 )
                 await _tc_db.commit()
         except Exception as _tc_err:
-            logger.warning(f"[WS] Failed to save tool_call: {_tc_err}")
+            logger.warning(f"[WS] Failed to mark tool_call session read: {_tc_err}")
+        return message_id
 
     async def _update_activity_and_quota(self, assistant_response: str):
         """Update last_active_at, conversation/agent LLM usage, and log activity."""
@@ -1303,10 +1349,12 @@ class WebSocketChatHandler:
             logger.error(f"[WS] Task creation failed: {te}")
         return assistant_response
 
-    async def _save_assistant_reply(self, assistant_response: str, thinking_content: list[str]):
+    async def _save_assistant_reply(self, assistant_response: str, thinking_content: list[str]) -> str:
         """Saves assistant reply to DB."""
+        message_id = uuid.uuid4()
         async with async_session() as db:
             assistant_msg = ChatMessage(
+                id=message_id,
                 agent_id=self.agent_id,
                 user_id=self.user.id,
                 role="assistant",
@@ -1323,3 +1371,4 @@ class WebSocketChatHandler:
             )
             await db.commit()
         logger.info("[WS] Assistant message saved")
+        return str(message_id)
