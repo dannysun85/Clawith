@@ -16,6 +16,7 @@ import LinearCopyButton from '../components/LinearCopyButton';
 import {
     buildAgentChannelSetups,
     findIncompleteAgentChannels,
+    shouldConfigureAgentChannels,
 } from '../utils/agentChannelSetup';
 const STEPS = ['basicInfo', 'personality', 'skills', 'permissions', 'channel'] as const;
 const OPENCLAW_STEPS = ['basicInfo', 'permissions'] as const;
@@ -93,14 +94,17 @@ export default function AgentCreate() {
             const agent = await agentApi.create(data);
             return agent;
         },
-        onSuccess: async (agent) => {
+        onSuccess: async (agent, variables) => {
             queryClient.invalidateQueries({ queryKey: ['agents'] });
             queryClient.invalidateQueries({ queryKey: ['subscription-seats'] });
 
             // Bind every completed channel form through its provider endpoint.
             // `/channel` is Feishu-only and must never receive another provider.
             const channelSetupFailures: string[] = [];
-            for (const setup of buildAgentChannelSetups(channelValues)) {
+            const channelSetups = shouldConfigureAgentChannels(variables.agent_type)
+                ? buildAgentChannelSetups(channelValues)
+                : [];
+            for (const setup of channelSetups) {
                 try {
                     await channelApi.configure(agent.id, setup.endpoint, setup.payload);
                 } catch (err) {
@@ -167,7 +171,9 @@ export default function AgentCreate() {
         if (step === 0 || agentType === 'openclaw') {
             if (!validateStep0()) return;
         }
-        const incompleteChannels = findIncompleteAgentChannels(channelValues);
+        const incompleteChannels = shouldConfigureAgentChannels(agentType)
+            ? findIncompleteAgentChannels(channelValues)
+            : [];
         if (incompleteChannels.length > 0) {
             setError(
                 `Complete or clear the partially configured channels before creating the Agent: ${incompleteChannels.join(', ')}`,
@@ -376,7 +382,11 @@ For humans, the message is delivered via their available channel (e.g. Feishu).`
                 <div style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>{t('openclaw.nativeDesc', 'Full agent running on Astra platform')}</div>
             </div>
             <div
-                onClick={() => { setAgentType('openclaw'); setStep(0); }}
+                onClick={() => {
+                    setAgentType('openclaw');
+                    setStep(0);
+                    setChannelValues({});
+                }}
                 style={{
                     padding: '16px', borderRadius: '8px', cursor: 'pointer', position: 'relative',
                     border: `1.5px solid ${agentType === 'openclaw' ? 'var(--accent-primary)' : 'var(--border-default)'}`,

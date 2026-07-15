@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import HTTPException
 
 from app.api import pages as pages_api
 from app.services import agent_tools
@@ -135,3 +136,51 @@ async def test_publish_page_returns_absolute_public_url(monkeypatch, tmp_path):
     assert "Public URL: https://astra.example/p/" in result
     assert db.committed is True
     assert len(db.added) == 1
+
+
+@pytest.mark.asyncio
+async def test_publish_page_rejects_cross_agent_source_before_storage_read(
+    monkeypatch,
+    tmp_path,
+):
+    storage = SimpleNamespace(
+        exists=AsyncMock(return_value=True),
+        is_file=AsyncMock(return_value=True),
+        read_text=AsyncMock(return_value="<html>private</html>"),
+    )
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+
+    result = await agent_tools._publish_page(
+        uuid.uuid4(),
+        uuid.uuid4(),
+        tmp_path,
+        {"path": f"../{uuid.uuid4()}/workspace/private.html"},
+    )
+
+    assert result == "File path must stay within the Agent workspace"
+    storage.exists.assert_not_awaited()
+    storage.is_file.assert_not_awaited()
+    storage.read_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_public_page_rejects_unsafe_legacy_source_path(monkeypatch):
+    page = SimpleNamespace(
+        agent_id=uuid.uuid4(),
+        source_path=f"../{uuid.uuid4()}/workspace/private.html",
+    )
+    db = _RecordingDB([_ScalarResult(scalar=page)])
+    storage = SimpleNamespace(
+        exists=AsyncMock(return_value=True),
+        is_file=AsyncMock(return_value=True),
+        read_text=AsyncMock(return_value="<html>private</html>"),
+    )
+    monkeypatch.setattr(pages_api, "get_storage_backend", lambda: storage)
+
+    with pytest.raises(HTTPException) as exc:
+        await pages_api.render_page("unsafe", db=db)
+
+    assert exc.value.status_code == 404
+    storage.exists.assert_not_awaited()
+    storage.is_file.assert_not_awaited()
+    storage.read_text.assert_not_awaited()

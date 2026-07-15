@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Optional
 
 from app.core.email import force_ipv4, send_smtp_email
+from app.services.storage import agent_storage_key, get_storage_backend
+from app.services.workspace_paths import WorkspacePathError, resolve_path_within_root
 
 # Preset email provider configurations
 EMAIL_PROVIDERS = {
@@ -195,13 +197,23 @@ async def send_email(
 
     # Attach files
     if attachments and workspace_path:
-        from app.services.storage import get_storage_backend, normalize_storage_key
         storage = get_storage_backend()
 
         for rel_path in attachments:
-            clean_rel = rel_path.replace("\\", "/").strip().lstrip("/")
             prefix = str(agent_id) if agent_id else workspace_path.name
-            storage_key = normalize_storage_key(f"{prefix}/{clean_rel}")
+            try:
+                storage_key = agent_storage_key(prefix, rel_path)
+                full_path = resolve_path_within_root(
+                    workspace_path,
+                    rel_path,
+                    allow_root=False,
+                    require_subpath=True,
+                    label="email attachment path",
+                )
+            except (TypeError, ValueError, WorkspacePathError):
+                return "❌ Attachment path must stay within the Agent workspace."
+
+            clean_rel = rel_path.replace("\\", "/").strip()
             file_bytes = None
             filename = Path(clean_rel).name
 
@@ -214,7 +226,6 @@ async def send_email(
 
             # 2. Fall back to local disk if not found in storage backend
             if file_bytes is None:
-                full_path = workspace_path / rel_path
                 if full_path.exists() and full_path.is_file():
                     try:
                         with open(full_path, "rb") as f:

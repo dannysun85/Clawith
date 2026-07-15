@@ -3,6 +3,8 @@ import { describe, expect, it } from 'vitest';
 import {
     buildAgentChannelSetups,
     findIncompleteAgentChannels,
+    getAgentChannelConnectionMode,
+    shouldConfigureAgentChannels,
 } from './agentChannelSetup';
 
 describe('buildAgentChannelSetups', () => {
@@ -103,5 +105,21 @@ describe('buildAgentChannelSetups', () => {
         expect(findIncompleteAgentChannels({
             discord_connection_mode: 'websocket',
         })).toEqual([]);
+    });
+
+    it('restores create-mode channel selection from the parent form after remount', () => {
+        const persistedValues = {
+            discord_connection_mode: 'webhook',
+            wecom_connection_mode: 'webhook',
+        };
+
+        expect(getAgentChannelConnectionMode(persistedValues, 'discord')).toBe('webhook');
+        expect(getAgentChannelConnectionMode(persistedValues, 'wecom')).toBe('webhook');
+        expect(getAgentChannelConnectionMode(persistedValues, 'feishu')).toBe('websocket');
+    });
+
+    it('never applies hidden native channel drafts to OpenClaw Agents', () => {
+        expect(shouldConfigureAgentChannels('native')).toBe(true);
+        expect(shouldConfigureAgentChannels('openclaw')).toBe(false);
     });
 });

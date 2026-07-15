@@ -8,6 +8,7 @@ channel handlers and background services do not manually assemble
 from __future__ import annotations
 
 import os
+import re
 import uuid
 from pathlib import Path
 
@@ -25,8 +26,34 @@ def sanitize_filename(filename: str, fallback: str = "file.bin") -> str:
 
 
 def agent_storage_key(agent_id: uuid.UUID | str, rel_path: str = "") -> str:
-    prefix = str(agent_id)
-    rel = normalize_storage_key(rel_path)
+    """Build an Agent-scoped key without ever folding parent traversal.
+
+    ``normalize_storage_key`` is intentionally permissive for legacy object
+    keys.  Applying it after ``agent_id`` is prepended can therefore erase the
+    Agent namespace when an untrusted relative path contains ``..``.  Validate
+    both components before normalization so every caller gets the same
+    fail-closed boundary.
+    """
+    prefix = str(agent_id).strip()
+    if (
+        not prefix
+        or "\x00" in prefix
+        or "/" in prefix
+        or "\\" in prefix
+        or prefix in {".", ".."}
+    ):
+        raise ValueError("Invalid Agent storage scope")
+
+    raw_rel = str(rel_path or "").replace("\\", "/").strip()
+    if (
+        "\x00" in raw_rel
+        or raw_rel.startswith("/")
+        or re.match(r"^[A-Za-z]:/", raw_rel)
+        or any(part == ".." for part in raw_rel.split("/"))
+    ):
+        raise ValueError("Agent storage path must be relative")
+
+    rel = normalize_storage_key(raw_rel)
     return f"{prefix}/{rel}" if rel else prefix
 
 

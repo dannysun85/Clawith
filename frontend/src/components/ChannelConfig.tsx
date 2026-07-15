@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import QRCode from 'qrcode';
 import { channelApi } from '../services/api';
+import { getAgentChannelConnectionMode } from '../utils/agentChannelSetup';
 import LinearCopyButton from './LinearCopyButton';
 // ─── Shared fetchAuth (same as AgentDetail) ─────────────
 function fetchAuth<T>(url: string, options?: RequestInit): Promise<T> {
@@ -809,7 +810,12 @@ export default function ChannelConfig({ mode, agentId, canManage = true, values,
         const isOpen = openChannels[ch.id] || false;
 
         // Ensure we default to 'websocket' for connectionMode in create view if enabled
-        const connMode = ch.connectionMode ? (connectionModes[ch.id] || 'websocket') : null;
+        const connMode = ch.connectionMode
+            ? getAgentChannelConnectionMode(
+                values,
+                ch.id as 'feishu' | 'wecom' | 'discord',
+            )
+            : null;
         const isWs = connMode === 'websocket';
 
         // Active fields for current mode
@@ -854,14 +860,12 @@ export default function ChannelConfig({ mode, agentId, canManage = true, values,
                                 <label style={{ fontSize: '12px', fontWeight: 500, width: '120px' }}>{t('agent.settings.channel.mode', 'Connection Mode')}</label>
                                 <label style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '13px', cursor: 'pointer' }}>
                                     <input type="radio" checked={isWs} onChange={() => {
-                                        setConnectionModes(p => ({ ...p, [ch.id]: 'websocket' }));
                                         onChange?.({ ...values, [`${ch.id}_connection_mode`]: 'websocket' });
                                     }} />
                                     {t('agent.settings.channel.modeWs', 'WebSocket (Recommended)')}
                                 </label>
                                 <label style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '13px', cursor: 'pointer', marginLeft: '12px' }}>
                                     <input type="radio" checked={!isWs} onChange={() => {
-                                        setConnectionModes(p => ({ ...p, [ch.id]: 'webhook' }));
                                         onChange?.({ ...values, [`${ch.id}_connection_mode`]: 'webhook' });
                                     }} />
                                     {t('agent.settings.channel.modeWebhook', 'Webhook')}

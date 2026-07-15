@@ -62,7 +62,7 @@ from app.services.workspace_collaboration import (
     read_text_if_exists,
     write_workspace_file,
 )
-from app.services.storage import get_storage_backend, normalize_storage_key
+from app.services.storage import agent_storage_key, get_storage_backend, normalize_storage_key
 from app.services.storage_runtime.base import WriteCondition, content_hash_bytes
 from app.services.workspace_locking import workspace_locks
 from app.services.workspace_paths import WorkspacePathError, resolve_path_within_root
@@ -7886,8 +7886,17 @@ async def _send_file_to_agent(
             error_code="MissingFileRecipientOrPath",
         )
 
+    try:
+        source_key = agent_storage_key(from_agent_id, rel_path)
+    except (TypeError, ValueError):
+        return _delivery_execution_result(
+            "❌ Source file path must stay within the Agent workspace",
+            structured=structured,
+            status="failed",
+            error_code="InvalidSourceFilePath",
+        )
+
     storage = get_storage_backend()
-    source_key = normalize_storage_key(f"{from_agent_id}/{rel_path}")
     if not await storage.is_file(source_key):
         return _delivery_execution_result(
             f"❌ Source file not found: {rel_path}",
@@ -14618,7 +14627,10 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
 
     # Resolve via storage backend (supports local FS and S3)
     storage = get_storage_backend()
-    storage_key = normalize_storage_key(f"{agent_id}/{path}")
+    try:
+        storage_key = agent_storage_key(agent_id, path)
+    except (TypeError, ValueError):
+        return "File path must stay within the Agent workspace"
     if not await storage.exists(storage_key) or not await storage.is_file(storage_key):
         return f"File not found: {path}"
 

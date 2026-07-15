@@ -12,7 +12,7 @@ from app.database import get_db
 from app.models.published_page import PublishedPage
 from app.models.user import User
 from app.services.platform_service import platform_service
-from app.services.storage import get_storage_backend, normalize_storage_key
+from app.services.storage import agent_storage_key, get_storage_backend
 
 # Public router — no /api prefix, no auth
 public_router = APIRouter(tags=["pages"])
@@ -33,7 +33,12 @@ async def render_page(short_id: str, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Page not found")
 
     storage = get_storage_backend()
-    storage_key = normalize_storage_key(f"{page.agent_id}/{page.source_path}")
+    try:
+        storage_key = agent_storage_key(page.agent_id, page.source_path)
+    except (TypeError, ValueError) as exc:
+        # Legacy rows with unsafe source paths must not become a public
+        # cross-Agent read primitive.
+        raise HTTPException(status_code=404, detail="Source file no longer exists") from exc
     if not await storage.exists(storage_key) or not await storage.is_file(storage_key):
         raise HTTPException(status_code=404, detail="Source file no longer exists")
 

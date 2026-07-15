@@ -5,8 +5,10 @@ import pytest
 from fastapi import HTTPException
 
 from app.services import agent_tools
+from app.services import email_service
 from app.services import workspace_collaboration
 from app.services.storage_runtime.base import StorageBackend, StorageEntry, StorageVersion, WriteCondition, ConditionalWriteResult
+from app.services.storage_runtime.agent_files import agent_storage_key
 from app.services.storage_runtime.local import LocalStorageBackend
 
 
@@ -214,6 +216,93 @@ async def test_local_storage_normal_read_write_and_listing_remain_available(tmp_
     assert [(entry.name, entry.key, entry.is_dir) for entry in entries] == [
         ("report.txt", "agent-id/workspace/report.txt", False),
     ]
+
+
+@pytest.mark.parametrize(
+    "rel_path",
+    [
+        "../other-agent/workspace/private.txt",
+        "workspace/../../other-agent/private.txt",
+        "/absolute/private.txt",
+        r"C:\\private.txt",
+    ],
+)
+def test_agent_storage_key_rejects_untrusted_scope_escape(rel_path):
+    with pytest.raises(ValueError, match="must be relative"):
+        agent_storage_key(uuid.uuid4(), rel_path)
+
+
+@pytest.mark.asyncio
+async def test_send_file_to_agent_rejects_scope_escape_before_storage_read(
+    monkeypatch,
+    tmp_path,
+):
+    source_agent_id = uuid.uuid4()
+    victim_agent_id = uuid.uuid4()
+    storage_root = tmp_path / "storage"
+    victim_file = storage_root / str(victim_agent_id) / "workspace" / "private.txt"
+    victim_file.parent.mkdir(parents=True)
+    victim_file.write_text("victim-private-content", encoding="utf-8")
+
+    storage = LocalStorageBackend(str(storage_root))
+    is_file = AsyncMock(wraps=storage.is_file)
+    read_bytes = AsyncMock(wraps=storage.read_bytes)
+    monkeypatch.setattr(storage, "is_file", is_file)
+    monkeypatch.setattr(storage, "read_bytes", read_bytes)
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+
+    result = await agent_tools._send_file_to_agent(
+        source_agent_id,
+        {
+            "agent_name": "target-agent",
+            "file_path": f"../{victim_agent_id}/workspace/private.txt",
+        },
+    )
+
+    assert "Source file path must stay within the Agent workspace" in result
+    assert "victim-private-content" not in result
+    is_file.assert_not_awaited()
+    read_bytes.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_email_attachment_rejects_scope_escape_before_storage_or_smtp(
+    monkeypatch,
+    tmp_path,
+):
+    source_agent_id = uuid.uuid4()
+    victim_agent_id = uuid.uuid4()
+    workspace_root = tmp_path / "storage" / str(source_agent_id)
+    workspace_root.mkdir(parents=True)
+    victim_file = tmp_path / "storage" / str(victim_agent_id) / "private.txt"
+    victim_file.parent.mkdir(parents=True)
+    victim_file.write_text("victim-email-content", encoding="utf-8")
+
+    storage = LocalStorageBackend(str(tmp_path / "storage"))
+    read_bytes = AsyncMock(wraps=storage.read_bytes)
+    smtp_send = AsyncMock()
+    monkeypatch.setattr(storage, "read_bytes", read_bytes)
+    monkeypatch.setattr(email_service, "get_storage_backend", lambda: storage)
+    monkeypatch.setattr(email_service, "send_smtp_email", smtp_send)
+
+    result = await email_service.send_email(
+        {
+            "email_address": "sender@example.com",
+            "auth_code": "test-auth-code",
+            "smtp_host": "smtp.example.com",
+        },
+        "recipient@example.com",
+        "subject",
+        "body",
+        attachments=[f"../{victim_agent_id}/private.txt"],
+        workspace_path=workspace_root,
+        agent_id=source_agent_id,
+    )
+
+    assert result == "❌ Attachment path must stay within the Agent workspace."
+    assert "victim-email-content" not in result
+    read_bytes.assert_not_awaited()
+    smtp_send.assert_not_called()
 
 
 @pytest.mark.asyncio

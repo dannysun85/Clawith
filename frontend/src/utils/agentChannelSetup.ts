@@ -25,6 +25,19 @@ const value = (values: Record<string, string>, key: string) =>
 const anyValue = (values: Record<string, string>, keys: string[]) =>
     keys.some((key) => Boolean(value(values, key)));
 
+export function getAgentChannelConnectionMode(
+    values: Record<string, string> | undefined,
+    channel: 'feishu' | 'wecom' | 'discord',
+): 'websocket' | 'webhook' {
+    return value(values || {}, `${channel}_connection_mode`) === 'webhook'
+        ? 'webhook'
+        : 'websocket';
+}
+
+export function shouldConfigureAgentChannels(agentType: string): boolean {
+    return agentType === 'native';
+}
+
 /** Return optional channel forms that are partially filled and must not be skipped. */
 export function findIncompleteAgentChannels(
     values: Record<string, string>,
