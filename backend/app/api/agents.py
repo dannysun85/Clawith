@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response, status
 from loguru import logger
 from sqlalchemy import cast, func, select, String
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,7 +23,7 @@ from app.models.org import OrgMember
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.user import User
-from app.schemas.schemas import AgentCreate, AgentOut, AgentUpdate
+from app.schemas.schemas import AgentCreate, AgentOut, AgentUpdate, ApprovalAction, ApprovalRequestOut
 from app.services.storage import get_storage_backend
 from app.services.access_relationships import ensure_access_granted_platform_relationships
 from app.services.quota_guard import check_agent_creation_quota, QuotaExceeded, quota_error_payload
@@ -458,7 +458,11 @@ async def _background_agent_setup(
                     )
             except Exception as e:
                 logger.warning(
-                    f"[create_agent] background MCP pre-install for '{server_id}' on agent {agent_id} raised: {e}"
+                    "[create_agent] background MCP pre-install failed "
+                    "server_id={} agent={} error_type={}",
+                    server_id,
+                    agent_id,
+                    type(e).__name__,
                 )
 
     # 5. Start container and Hook OKR Agent
@@ -1356,10 +1360,12 @@ async def stop_agent(
 # ─── Agent-Level Approvals ──────────────────────────────
 
 
-@router.get("/{agent_id}/approvals")
+@router.get("/{agent_id}/approvals", response_model=list[ApprovalRequestOut])
 async def list_agent_approvals(
     agent_id: uuid.UUID,
+    response: Response,
     status_filter: str | None = None,
+    limit: int = Query(100, ge=1, le=200),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1371,34 +1377,29 @@ async def list_agent_approvals(
         )
 
     from app.models.audit import ApprovalRequest
+    from app.services.autonomy_service import approval_to_public_dict
+
+    response.headers["Cache-Control"] = "no-store"
 
     query = select(ApprovalRequest).where(ApprovalRequest.agent_id == agent_id)
     if status_filter:
         query = query.where(ApprovalRequest.status == status_filter)
-    query = query.order_by(ApprovalRequest.created_at.desc())
+    query = query.order_by(ApprovalRequest.created_at.desc()).limit(limit)
     result = await db.execute(query)
     approvals = result.scalars().all()
 
-    return [
-        {
-            "id": str(a.id),
-            "agent_id": str(a.agent_id),
-            "action_type": a.action_type,
-            "details": a.details,
-            "status": a.status,
-            "created_at": a.created_at.isoformat() if a.created_at else None,
-            "resolved_at": a.resolved_at.isoformat() if a.resolved_at else None,
-            "resolved_by": str(a.resolved_by) if a.resolved_by else None,
-        }
-        for a in approvals
-    ]
+    return [approval_to_public_dict(approval) for approval in approvals]
 
 
-@router.post("/{agent_id}/approvals/{approval_id}/resolve")
+@router.post(
+    "/{agent_id}/approvals/{approval_id}/resolve",
+    response_model=ApprovalRequestOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
 async def resolve_agent_approval(
     agent_id: uuid.UUID,
     approval_id: uuid.UUID,
-    data: dict,
+    data: ApprovalAction,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1407,18 +1408,20 @@ async def resolve_agent_approval(
 
     from app.services.autonomy_service import autonomy_service
 
-    action = data.get("action", "reject")
     try:
-        approval = await autonomy_service.resolve_approval(db, approval_id, current_user, action)
+        approval = await autonomy_service.resolve_approval(
+            db,
+            approval_id,
+            current_user,
+            data.action,
+            expected_agent_id=agent.id,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    await db.commit()
-    return {
-        "id": str(approval.id),
-        "status": approval.status,
-        "resolved_at": approval.resolved_at.isoformat() if approval.resolved_at else None,
-    }
+    from app.services.autonomy_service import approval_to_public_dict
+
+    return approval_to_public_dict(approval)
 
 
 # ─── OpenClaw API Key Management ────────────────────────

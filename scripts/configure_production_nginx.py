@@ -29,6 +29,13 @@ SAFE_LOG_VARIABLES = {
 }
 SAFE_ACCESS_LOG_ARGUMENTS = ("/var/log/nginx/access.log", "astra_no_args")
 MAP_ENTRY_NAME = "__map_entry__"
+MAINTENANCE_BEGIN = "# ASTRA_DEPLOY_MAINTENANCE_BEGIN"
+MAINTENANCE_END = "# ASTRA_DEPLOY_MAINTENANCE_END"
+MAINTENANCE_DIRECTIVES = (
+    'add_header Retry-After "60" always;',
+    'add_header Cache-Control "no-store" always;',
+    "return 503;",
+)
 
 
 @dataclass(frozen=True)
@@ -395,6 +402,84 @@ def _directive_removal_span(text: str, directive: _Directive) -> tuple[int, int]
     return directive.start, directive.end
 
 
+def _remove_maintenance_blocks(text: str) -> str:
+    """Remove only complete deployment-owned maintenance blocks."""
+
+    lines = text.splitlines(keepends=True)
+    output: list[str] = []
+    inside = False
+    found = 0
+    for line in lines:
+        marker = line.strip()
+        if marker == MAINTENANCE_BEGIN:
+            if inside:
+                raise ValueError("nested Astra maintenance markers")
+            inside = True
+            found += 1
+            continue
+        if marker == MAINTENANCE_END:
+            if not inside:
+                raise ValueError("unmatched Astra maintenance end marker")
+            inside = False
+            continue
+        if not inside:
+            output.append(line)
+    if inside:
+        raise ValueError("unterminated Astra maintenance block")
+    if found != text.count(MAINTENANCE_END):
+        raise ValueError("mismatched Astra maintenance markers")
+    return "".join(output)
+
+
+def _maintenance_insertion(text: str, server: _Block) -> tuple[int, str]:
+    offset, safe_log = _insertion_point(text, server)
+    indent = safe_log.removesuffix(f"{REDACTED_ACCESS_LOG}\n")
+    block_lines = [MAINTENANCE_BEGIN, *MAINTENANCE_DIRECTIVES, MAINTENANCE_END]
+    content = "".join(f"{indent}{line}\n" for line in block_lines)
+    return offset, content
+
+
+def maintenance_enabled(text: str) -> bool:
+    """Return true only when every server is explicitly fail-closed with 503."""
+
+    parsed = _parse_nginx(text)
+    servers = _server_blocks(parsed)
+    if not servers or text.count(MAINTENANCE_BEGIN) != len(servers):
+        return False
+    if text.count(MAINTENANCE_END) != len(servers):
+        return False
+    for server in servers:
+        direct_returns = [
+            directive
+            for directive in parsed.directives
+            if directive.name == "return"
+            and _directive_in_server(directive, server, direct_only=True)
+            and tuple(token.value for token in directive.arguments) == ("503",)
+        ]
+        if len(direct_returns) != 1:
+            return False
+    return True
+
+
+def configure_maintenance(text: str) -> tuple[str, int]:
+    """Install an idempotent, explicit 503 fence in every server block."""
+
+    text = _remove_maintenance_blocks(text)
+    active_port = active_upstream_port(text)
+    other_port = "3009" if active_port == "3008" else "3008"
+    text, _ = configure_site(text, other_port, active_port)
+    parsed = _parse_nginx(text)
+    servers = _server_blocks(parsed)
+    for offset, content in sorted(
+        (_maintenance_insertion(text, server) for server in servers),
+        reverse=True,
+    ):
+        text = text[:offset] + content + text[offset:]
+    if not maintenance_enabled(text):
+        raise ValueError("Astra maintenance fence did not cover every server")
+    return text, len(servers)
+
+
 def configure_site(text: str, old_port: str, candidate_port: str) -> tuple[str, int]:
     """Return a cutover config whose every server block has privacy-safe logging."""
 
@@ -403,6 +488,7 @@ def configure_site(text: str, old_port: str, candidate_port: str) -> tuple[str, 
     if {old_port, candidate_port} != {"3008", "3009"}:
         raise ValueError("production Nginx ports must be 3008 and 3009")
 
+    text = _remove_maintenance_blocks(text)
     parsed = _parse_nginx(text)
     if any(directive.name == "include" for directive in parsed.directives):
         raise ValueError("Nginx include cannot be rewritten safely in the target site")
@@ -507,6 +593,18 @@ def install_configuration(
     return server_count
 
 
+def install_maintenance(
+    site_path: Path,
+    log_format_path: Path,
+) -> int:
+    configured, server_count = configure_maintenance(
+        site_path.read_text(encoding="utf-8"),
+    )
+    _atomic_write(log_format_path, REDACTED_LOG_FORMAT)
+    _atomic_write(site_path, configured)
+    return server_count
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         raise SystemExit("usage: configure_production_nginx.py COMMAND ...")
@@ -521,6 +619,14 @@ def main() -> None:
         )
         print(f"configured_privacy_safe_server_blocks={count}")
         return
+    if command == "maintenance-on" and len(sys.argv) == 4:
+        count = install_maintenance(Path(sys.argv[2]), Path(sys.argv[3]))
+        print(f"maintenance_server_blocks={count}")
+        return
+    if command == "maintenance-status" and len(sys.argv) == 3:
+        enabled = maintenance_enabled(Path(sys.argv[2]).read_text(encoding="utf-8"))
+        print("enabled" if enabled else "disabled")
+        raise SystemExit(0 if enabled else 1)
     if command == "active-port" and len(sys.argv) == 3:
         print(active_upstream_port(Path(sys.argv[2]).read_text(encoding="utf-8")))
         return
@@ -533,6 +639,7 @@ def main() -> None:
     raise SystemExit(
         "usage: configure_production_nginx.py "
         "install SITE OLD_PORT CANDIDATE_PORT LOG_FORMAT | "
+        "maintenance-on SITE LOG_FORMAT | maintenance-status SITE | "
         "active-port SITE | audit-effective PATH_OR_DASH [SOURCE_PATH]"
     )
 

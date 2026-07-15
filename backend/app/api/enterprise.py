@@ -2,7 +2,7 @@
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response, status
 from loguru import logger
 from pydantic import BaseModel
 from sqlalchemy import select, func, update, or_
@@ -10,7 +10,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.core.security import get_current_admin, get_current_user, require_role, encrypt_data
+from app.core.security import encrypt_data, get_current_admin, get_current_user
 from app.database import async_session, get_db
 from app.models.org import OrgDepartment, OrgMember
 from app.models.identity import IdentityProvider
@@ -24,7 +24,7 @@ from app.schemas.schemas import (
     EnterpriseInfoUpdate, LLMModelCreate, LLMModelOut, LLMModelUpdate,
     IdentityProviderOut, UserInviteRequest
 )
-from app.services.autonomy_service import autonomy_service
+from app.services.autonomy_service import approval_to_public_dict, autonomy_service
 from app.services.enterprise_sync import enterprise_sync_service
 from app.services.llm import get_provider_manifest, get_model_api_key, get_provider_spec, create_llm_client, LLMMessage
 from app.services.platform_service import platform_service
@@ -441,8 +441,10 @@ async def update_enterprise_info(
 
 @router.get("/approvals", response_model=list[ApprovalRequestOut])
 async def list_approvals(
+    response: Response,
     tenant_id: str | None = None,
     status_filter: str | None = None,
+    limit: int = Query(100, ge=1, le=200),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -453,14 +455,19 @@ async def list_approvals(
     if tid:
         tenant_agent_ids = select(Agent.id).where(Agent.tenant_id == tid)
         query = query.where(ApprovalRequest.agent_id.in_(tenant_agent_ids))
-    # Non-admins further restricted to their own agents
-    if current_user.role != "platform_admin":
+    # Organization administrators can resolve requests for every Agent in
+    # their own tenant. Other users only see requests for Agents they created.
+    same_tenant_org_admin = current_user.role == "org_admin" and tid == (
+        str(current_user.tenant_id) if current_user.tenant_id else None
+    )
+    if not _is_platform_admin_user(current_user) and not same_tenant_org_admin:
         query = query.where(ApprovalRequest.agent_id.in_(
             select(Agent.id).where(Agent.creator_id == current_user.id)
         ))
     if status_filter:
         query = query.where(ApprovalRequest.status == status_filter)
-    query = query.order_by(ApprovalRequest.created_at.desc())
+    response.headers["Cache-Control"] = "no-store"
+    query = query.order_by(ApprovalRequest.created_at.desc()).limit(limit)
 
     result = await db.execute(query)
     approvals = result.scalars().all()
@@ -472,15 +479,20 @@ async def list_approvals(
         agents_r = await db.execute(select(Agent.id, Agent.name).where(Agent.id.in_(agent_ids_set)))
         agent_names = {row.id: row.name for row in agents_r.all()}
 
-    out = []
-    for a in approvals:
-        d = ApprovalRequestOut.model_validate(a)
-        d.agent_name = agent_names.get(a.agent_id)
-        out.append(d)
-    return out
+    return [
+        approval_to_public_dict(
+            approval,
+            agent_name=agent_names.get(approval.agent_id),
+        )
+        for approval in approvals
+    ]
 
 
-@router.post("/approvals/{approval_id}/resolve", response_model=ApprovalRequestOut)
+@router.post(
+    "/approvals/{approval_id}/resolve",
+    response_model=ApprovalRequestOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
 async def resolve_approval(
     approval_id: uuid.UUID,
     data: ApprovalAction,
@@ -492,7 +504,7 @@ async def resolve_approval(
         approval = await autonomy_service.resolve_approval(
             db, approval_id, current_user, data.action
         )
-        return ApprovalRequestOut.model_validate(approval)
+        return approval_to_public_dict(approval)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

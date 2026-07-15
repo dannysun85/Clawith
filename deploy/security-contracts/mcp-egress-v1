@@ -1,0 +1,25 @@
+Contract: astra-mcp-egress-v1
+
+The production Docker application network must have exactly one IPv4 subnet
+and Docker IPv6 must be disabled until an equivalent IPv6 host policy exists.
+The first matching DOCKER-USER rule for that source subnet jumps to the
+ASTRA_MCP_EGRESS_V1 chain.
+
+The chain permits the application subnet for PostgreSQL, Redis, frontend and
+backend traffic. It rejects non-public, loopback, link-local, carrier-grade
+NAT, documentation, benchmark, multicast and reserved IPv4 destinations. It
+then permits remaining public destinations on their product-selected ports;
+this is required for SMTP, public HTTP retrieval, HTTPS/WSS and reviewed
+public proxy integrations that share the application network. MCP itself
+still requires HTTPS and validates every resolved and connected address in the
+application layer. This host contract is the independent private-address and
+metadata barrier, not a product-wide public-port allowlist.
+
+The installed marker records this file's SHA-256, Docker network name and
+subnet. A root-owned systemd timer reapplies the exact rule set after Docker
+or host restarts. Every install, repair and verify holds one host process lock.
+Repair first installs a temporary source-subnet REJECT fence;
+the fence remains if any chain write or verification fails, and is removed
+only after the exact body and unique first jump are verified.
+Normal application deployment only verifies this contract; installing or changing
+it is a separately authorized host-security operation.

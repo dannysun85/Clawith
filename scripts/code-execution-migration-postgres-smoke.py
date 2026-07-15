@@ -7,10 +7,12 @@ import argparse
 import asyncio
 import uuid
 
-from sqlalchemy import insert, select
+from sqlalchemy import func, insert, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.database import async_session
 from app.models.agent import Agent
+from app.models.tenant import Tenant
 from app.models.tenant_setting import TenantSetting
 from app.models.tool import AgentTool, Tool
 from app.models.user import User
@@ -19,6 +21,9 @@ from app.models.user import User
 TENANT_ID = uuid.UUID("07500000-0000-4000-8000-000000000002")
 USER_ID = uuid.UUID("07500000-0000-4000-8000-000000000060")
 AGENT_ID = uuid.UUID("07500000-0000-4000-8000-000000000061")
+SECOND_TENANT_ID = uuid.UUID("07500000-0000-4000-8000-000000000062")
+SECOND_USER_ID = uuid.UUID("07500000-0000-4000-8000-000000000063")
+SECOND_AGENT_ID = uuid.UUID("07500000-0000-4000-8000-000000000064")
 CODE_TOOL_NAMES = (
     "execute_code",
     "execute_code_e2b",
@@ -33,13 +38,28 @@ MISSING_CODE_HELPERS = frozenset({
     "agentbay_code_read_file",
     "agentbay_code_edit_file",
 })
+MISSING_CODE_TOOL_ROWS = frozenset({"agentbay_command_exec"})
 FILE_TRANSFER_TOOL_ID = uuid.UUID("07500000-0000-4000-8000-000000000079")
+LEGACY_MCP_SINGLE_ID = uuid.UUID("07500000-0000-4000-8000-000000000070")
+LEGACY_MCP_SHARED_ID = uuid.UUID("07500000-0000-4000-8000-000000000071")
+LEGACY_MCP_ORPHAN_ID = uuid.UUID("07500000-0000-4000-8000-000000000072")
+DUPLICATE_ASSIGNMENT_TOOL_ID = uuid.UUID("07500000-0000-4000-8000-000000000075")
+CONCURRENT_ASSIGNMENT_TOOL_ID = uuid.UUID("07500000-0000-4000-8000-000000000076")
 
 
 async def seed_unsafe_history() -> None:
     """Reproduce the permissive Code state observed before revision 095."""
 
     async with async_session() as db:
+        await db.execute(
+            insert(Tenant.__table__).values(
+                id=SECOND_TENANT_ID,
+                name="Code Migration Smoke Two",
+                slug="migration-smoke-two",
+                im_provider="web_only",
+                is_active=True,
+            )
+        )
         await db.execute(
             insert(User.__table__).values(
                 id=USER_ID,
@@ -59,11 +79,30 @@ async def seed_unsafe_history() -> None:
                 status="idle",
             )
         )
+        await db.execute(
+            insert(User.__table__).values(
+                id=SECOND_USER_ID,
+                tenant_id=SECOND_TENANT_ID,
+                display_name="Code Migration Smoke Two",
+                role="member",
+                is_active=True,
+                registration_source="migration-smoke",
+            )
+        )
+        await db.execute(
+            insert(Agent.__table__).values(
+                id=SECOND_AGENT_ID,
+                name="Code Migration Smoke Agent Two",
+                creator_id=SECOND_USER_ID,
+                tenant_id=SECOND_TENANT_ID,
+                status="idle",
+            )
+        )
         # This non-Code anchor was historically enough for the startup seeder
         # to recreate missing Code helper assignments as enabled. Keep it on
         # while deliberately omitting those helper rows below.
         await db.execute(
-            insert(Tool.__table__).values(
+            pg_insert(Tool.__table__).values(
                 id=FILE_TRANSFER_TOOL_ID,
                 name="agentbay_file_transfer",
                 display_name="agentbay_file_transfer",
@@ -87,7 +126,37 @@ async def seed_unsafe_history() -> None:
                 config={},
             )
         )
+        await db.execute(
+            insert(Tool.__table__).values(
+                id=DUPLICATE_ASSIGNMENT_TOOL_ID,
+                name="migration_duplicate_assignment",
+                display_name="Migration duplicate assignment",
+                description="historical SELECT-then-INSERT race fixture",
+                type="builtin",
+                category="test",
+                icon="D",
+                parameters_schema={},
+                config={},
+                config_schema={},
+                enabled=True,
+                is_default=False,
+                source="builtin",
+            )
+        )
+        for enabled, marker in ((True, "first-secret"), (False, "second-secret")):
+            await db.execute(
+                insert(AgentTool.__table__).values(
+                    agent_id=AGENT_ID,
+                    tool_id=DUPLICATE_ASSIGNMENT_TOOL_ID,
+                    enabled=enabled,
+                    config={"api_key": marker},
+                    source="user_installed",
+                    installed_by_agent_id=AGENT_ID,
+                )
+            )
         for index, name in enumerate(CODE_TOOL_NAMES, start=80):
+            if name in MISSING_CODE_TOOL_ROWS:
+                continue
             config: dict = {}
             if name == "execute_code":
                 config = {
@@ -126,6 +195,12 @@ async def seed_unsafe_history() -> None:
                         tool_id=tool_id,
                         enabled=True,
                         config={
+                            "api_key": "legacy-code-secret",
+                            "cpu_limit": 99,
+                            "memory_limit": "99g",
+                            "default_timeout": 999,
+                            "max_timeout": 999,
+                            "language_mapping": {"python": "unsafe"},
                             "allow_network": True,
                             "allow_unsafe_fallback_when_bwrap_missing": True,
                         },
@@ -138,10 +213,59 @@ async def seed_unsafe_history() -> None:
                     key=f"tool_config:{tool_name}",
                     value={
                         "config": {
+                            "api_key": "legacy-code-secret",
+                            "cpu_limit": 99,
+                            "memory_limit": "99g",
+                            "default_timeout": 999,
+                            "max_timeout": 999,
+                            "language_mapping": {"python": "unsafe"},
                             "allow_network": True,
                             "allow_unsafe_fallback_when_bwrap_missing": True,
                         }
                     },
+                )
+            )
+        for tool_id, name in (
+            (LEGACY_MCP_SINGLE_ID, "legacy_mcp_single"),
+            (LEGACY_MCP_SHARED_ID, "legacy_mcp_shared"),
+            (LEGACY_MCP_ORPHAN_ID, "legacy_mcp_orphan"),
+        ):
+            await db.execute(
+                insert(Tool.__table__).values(
+                    id=tool_id,
+                    name=name,
+                    display_name=name,
+                    description="legacy tenantless MCP",
+                    type="mcp",
+                    category="mcp",
+                    icon="M",
+                    parameters_schema={},
+                    config={"api_key": "legacy-mcp-secret"},
+                    config_schema={},
+                    mcp_server_url="https://mcp.example.test/api",
+                    mcp_server_name="Legacy",
+                    mcp_tool_name=name,
+                    enabled=True,
+                    is_default=False,
+                    source="agent",
+                    tenant_id=None,
+                )
+            )
+        await db.execute(
+            insert(AgentTool.__table__).values(
+                agent_id=AGENT_ID,
+                tool_id=LEGACY_MCP_SINGLE_ID,
+                enabled=True,
+                config={"api_key": "single-secret"},
+            )
+        )
+        for agent_id in (AGENT_ID, SECOND_AGENT_ID):
+            await db.execute(
+                insert(AgentTool.__table__).values(
+                    agent_id=agent_id,
+                    tool_id=LEGACY_MCP_SHARED_ID,
+                    enabled=True,
+                    config={"api_key": "shared-secret"},
                 )
             )
         await db.commit()
@@ -210,6 +334,21 @@ async def assert_secured() -> None:
             for assignment in assignments
         ):
             raise SystemExit("Code migration left an unsafe Agent override enabled")
+        controlled_override_keys = {
+            "sandbox_type",
+            "api_url",
+            "api_key",
+            "cpu_limit",
+            "memory_limit",
+            "default_timeout",
+            "max_timeout",
+            "language_mapping",
+        }
+        if any(
+            controlled_override_keys.intersection(assignment.config or {})
+            for assignment in assignments
+        ):
+            raise SystemExit("Code migration retained a platform-controlled Agent override")
 
         tenant_settings = (
             await db.execute(
@@ -236,6 +375,62 @@ async def assert_secured() -> None:
             for setting in tenant_settings
         ):
             raise SystemExit("Code migration left an unsafe company override enabled")
+        if any(
+            controlled_override_keys.intersection(
+                (setting.value or {}).get("config", {})
+            )
+            for setting in tenant_settings
+        ):
+            raise SystemExit("Code migration retained a platform-controlled company override")
+
+        legacy_tools = (
+            await db.execute(
+                select(
+                    Tool.__table__.c.id,
+                    Tool.__table__.c.tenant_id,
+                    Tool.__table__.c.enabled,
+                    Tool.__table__.c.config,
+                    Tool.__table__.c.mcp_server_url,
+                ).where(
+                    Tool.__table__.c.id.in_(
+                        {
+                            LEGACY_MCP_SINGLE_ID,
+                            LEGACY_MCP_SHARED_ID,
+                            LEGACY_MCP_ORPHAN_ID,
+                        }
+                    )
+                )
+            )
+        ).all()
+        legacy_by_id = {row.id: row for row in legacy_tools}
+        single = legacy_by_id[LEGACY_MCP_SINGLE_ID]
+        if single.tenant_id != TENANT_ID or single.enabled is not True:
+            raise SystemExit("MCP migration did not preserve the single-tenant legacy tool")
+        if not single.mcp_server_url or not single.config:
+            raise SystemExit("MCP migration erased the safe single-tenant legacy tool")
+        for tool_id in (LEGACY_MCP_SHARED_ID, LEGACY_MCP_ORPHAN_ID):
+            quarantined = legacy_by_id[tool_id]
+            if (
+                quarantined.tenant_id is not None
+                or quarantined.enabled is not False
+                or quarantined.config
+                or quarantined.mcp_server_url is not None
+            ):
+                raise SystemExit("MCP migration did not quarantine an ambiguous legacy tool")
+
+        shared_assignments = (
+            await db.execute(
+                select(
+                    AgentTool.__table__.c.enabled,
+                    AgentTool.__table__.c.config,
+                ).where(AgentTool.__table__.c.tool_id == LEGACY_MCP_SHARED_ID)
+            )
+        ).all()
+        if not shared_assignments or any(
+            assignment.enabled or assignment.config
+            for assignment in shared_assignments
+        ):
+            raise SystemExit("MCP migration retained a shared cross-tenant grant")
 
         file_transfer_enabled = (
             await db.execute(
@@ -247,6 +442,111 @@ async def assert_secured() -> None:
         ).scalar_one()
         if file_transfer_enabled is not True:
             raise SystemExit("Code migration changed a non-Code file-transfer grant")
+
+        duplicate_rows = (
+            await db.execute(
+                select(
+                    AgentTool.__table__.c.enabled,
+                    AgentTool.__table__.c.config,
+                    AgentTool.__table__.c.source,
+                    AgentTool.__table__.c.installed_by_agent_id,
+                ).where(
+                    AgentTool.__table__.c.agent_id == AGENT_ID,
+                    AgentTool.__table__.c.tool_id == DUPLICATE_ASSIGNMENT_TOOL_ID,
+                )
+            )
+        ).all()
+        if len(duplicate_rows) != 1:
+            raise SystemExit("AgentTool migration did not collapse duplicate grants")
+        duplicate = duplicate_rows[0]
+        if (
+            duplicate.enabled
+            or duplicate.config
+            or duplicate.source != "system"
+            or duplicate.installed_by_agent_id is not None
+        ):
+            raise SystemExit("AgentTool duplicate quarantine was not fail-closed")
+
+
+async def assert_concurrent_agent_tool_upsert() -> None:
+    """Prove the production lock/upsert path converges under concurrent writes."""
+
+    from app.services.agent_tool_assignments import (
+        lock_agent_tool_owner,
+        upsert_agent_tool,
+    )
+
+    async with async_session() as db:
+        await db.execute(
+            pg_insert(Tool.__table__).values(
+                id=CONCURRENT_ASSIGNMENT_TOOL_ID,
+                name="migration_concurrent_assignment",
+                display_name="Migration concurrent assignment",
+                description="real PostgreSQL upsert race fixture",
+                type="builtin",
+                category="test",
+                icon="C",
+                parameters_schema={},
+                config={},
+                config_schema={},
+                enabled=True,
+                is_default=False,
+                source="builtin",
+            ).on_conflict_do_nothing(index_elements=[Tool.__table__.c.id])
+        )
+        await db.execute(
+            AgentTool.__table__.delete().where(
+                AgentTool.__table__.c.agent_id == AGENT_ID,
+                AgentTool.__table__.c.tool_id == CONCURRENT_ASSIGNMENT_TOOL_ID,
+            )
+        )
+        await db.commit()
+
+    async def writer(enabled: bool, marker: str) -> None:
+        async with async_session() as db:
+            async with db.begin():
+                await lock_agent_tool_owner(db, AGENT_ID)
+                await upsert_agent_tool(
+                    db,
+                    agent_id=AGENT_ID,
+                    tool_id=CONCURRENT_ASSIGNMENT_TOOL_ID,
+                    enabled=enabled,
+                    config={"writer": marker},
+                    source="system",
+                    on_conflict="enabled",
+                )
+
+    await asyncio.gather(
+        writer(True, "first"),
+        writer(False, "second"),
+    )
+
+    async with async_session() as db:
+        count = (
+            await db.execute(
+                select(func.count())
+                .select_from(AgentTool.__table__)
+                .where(
+                    AgentTool.__table__.c.agent_id == AGENT_ID,
+                    AgentTool.__table__.c.tool_id == CONCURRENT_ASSIGNMENT_TOOL_ID,
+                )
+            )
+        ).scalar_one()
+        row = (
+            await db.execute(
+                select(
+                    AgentTool.__table__.c.enabled,
+                    AgentTool.__table__.c.config,
+                ).where(
+                    AgentTool.__table__.c.agent_id == AGENT_ID,
+                    AgentTool.__table__.c.tool_id == CONCURRENT_ASSIGNMENT_TOOL_ID,
+                )
+            )
+        ).one()
+        if count != 1:
+            raise SystemExit("Concurrent AgentTool writes created duplicate grants")
+        if row.config not in ({"writer": "first"}, {"writer": "second"}):
+            raise SystemExit("AgentTool conflict update overwrote unrelated config")
 
 
 async def run_seeder_and_assert() -> None:
@@ -262,11 +562,18 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "mode",
-        choices=("seed", "assert-secured", "run-seeder-and-assert"),
+        choices=(
+            "seed",
+            "assert-secured",
+            "run-seeder-and-assert",
+            "assert-agent-tool-upsert",
+        ),
     )
     args = parser.parse_args()
     if args.mode == "seed":
         coroutine = seed_unsafe_history()
+    elif args.mode == "assert-agent-tool-upsert":
+        coroutine = assert_concurrent_agent_tool_upsert()
     elif args.mode == "run-seeder-and-assert":
         coroutine = run_seeder_and_assert()
     else:

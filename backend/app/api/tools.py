@@ -1,5 +1,6 @@
 """Tool management API — CRUD for tools and per-agent assignments."""
 
+import hashlib
 import uuid
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -24,6 +25,18 @@ from app.services.tool_config import (
     set_tenant_tool_config,
     tenant_scoped_tool_name,
 )
+from app.services.mcp_security import (
+    MCPURLPolicyError,
+    is_sensitive_mcp_query_key,
+    mcp_server_namespace,
+    normalized_mcp_endpoint,
+    split_mcp_url_secrets,
+    validate_public_mcp_url,
+)
+from app.services.agent_tool_assignments import (
+    lock_agent_tool_owner,
+    upsert_agent_tool,
+)
 
 router = APIRouter(prefix="/tools", tags=["tools"])
 
@@ -31,21 +44,6 @@ router = APIRouter(prefix="/tools", tags=["tools"])
 CATEGORY_CONFIG_PRIMARY_TOOL = {
     "agentbay": "agentbay_browser_navigate",
 }
-
-_SENSITIVE_URL_QUERY_MARKERS = (
-    "apikey",
-    "api_key",
-    "auth",
-    "password",
-    "secret",
-    "token",
-)
-
-
-def _is_sensitive_url_query_key(key: str) -> bool:
-    normalized = key.lower().replace("-", "_")
-    return any(marker in normalized for marker in _SENSITIVE_URL_QUERY_MARKERS)
-
 
 def _mask_mcp_server_url(server_url: str | None) -> str | None:
     """Keep an MCP endpoint useful to the UI without returning URL credentials."""
@@ -59,13 +57,29 @@ def _mask_mcp_server_url(server_url: str | None) -> str | None:
         netloc = f"****@{host}"
     query = urlencode(
         [
-            (key, "****" if _is_sensitive_url_query_key(key) and value else value)
+            (key, "****" if is_sensitive_mcp_query_key(key) and value else value)
             for key, value in parse_qsl(parts.query, keep_blank_values=True)
         ],
         doseq=True,
     )
     fragment = "****" if parts.fragment else ""
     return urlunsplit((parts.scheme, netloc, parts.path, query, fragment))
+
+
+def _mcp_group_identity(tool: Tool) -> tuple[str, str]:
+    """Identify valid groups directly and invalid legacy groups opaquely."""
+
+    try:
+        return "valid", mcp_server_namespace(
+            tool.mcp_server_name,
+            tool.mcp_server_url,
+        ) or ""
+    except MCPURLPolicyError:
+        material = (
+            f"{str(tool.mcp_server_name or '').casefold()}\0"
+            f"{str(tool.mcp_server_url or '')}"
+        ).encode()
+        return "legacy", hashlib.sha256(material).hexdigest()
 
 
 def _merge_masked_mcp_server_url(
@@ -111,6 +125,44 @@ def _merge_masked_mcp_server_url(
     )
 
 
+async def _validated_mcp_url_update(
+    incoming_url: str,
+    *,
+    existing_url: str | None = None,
+    existing_config: dict | None = None,
+) -> tuple[str, dict]:
+    """Validate an MCP URL and move credential-like query values to config.
+
+    Existing encrypted query credentials survive a masked/sanitized round trip
+    only while the public endpoint identity is unchanged. They are never
+    carried to a different host/path implicitly.
+    """
+
+    merged_url = _merge_masked_mcp_server_url(existing_url, incoming_url)
+    if not merged_url:
+        raise HTTPException(status_code=400, detail="MCP server URL is required")
+    try:
+        await validate_public_mcp_url(merged_url)
+        public_url, secret_payload = split_mcp_url_secrets(merged_url)
+    except MCPURLPolicyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    next_config = dict(existing_config or {})
+    same_endpoint = False
+    if existing_url:
+        try:
+            same_endpoint = normalized_mcp_endpoint(existing_url) == normalized_mcp_endpoint(public_url)
+        except MCPURLPolicyError:
+            # Invalid legacy endpoints must be re-entered; their credentials
+            # are not copied into a newly accepted URL.
+            same_endpoint = False
+    if secret_payload:
+        next_config["mcp_url_query_secrets"] = secret_payload
+    elif not same_endpoint:
+        next_config.pop("mcp_url_query_secrets", None)
+    return public_url, next_config
+
+
 def _is_platform_admin(user: User) -> bool:
     return user.role == "platform_admin" or bool(
         getattr(getattr(user, "identity", None), "is_platform_admin", False)
@@ -146,7 +198,8 @@ def _agent_visible_tool_clause(agent_tenant_id: uuid.UUID | None, assignments: d
     Visibility rules:
     - builtin tools are global platform capabilities
     - admin tools belong only to the agent's company or are platform-wide (tenant_id is NULL)
-    - agent-installed tools require an explicit assignment
+    - agent-installed tools require both an explicit assignment and exact
+      company ownership
     """
     clauses = [Tool.source == "builtin"]
     admin_cond = Tool.tenant_id.is_(None)
@@ -155,9 +208,11 @@ def _agent_visible_tool_clause(agent_tenant_id: uuid.UUID | None, assignments: d
     clauses.append((Tool.source == "admin") & admin_cond)
 
     assigned_tool_ids = [uuid.UUID(tool_id) for tool_id in assignments]
-    if assigned_tool_ids:
+    if assigned_tool_ids and agent_tenant_id is not None:
         clauses.append(
-            (Tool.source == "agent") & Tool.id.in_(assigned_tool_ids)
+            (Tool.source == "agent")
+            & (Tool.tenant_id == agent_tenant_id)
+            & Tool.id.in_(assigned_tool_ids)
         )
 
     return or_(*clauses)
@@ -174,7 +229,12 @@ def _tool_record_visible_to_agent(
     if tool.source == "admin":
         return tool.tenant_id is None or (agent_tenant_id is not None and tool.tenant_id == agent_tenant_id)
     if tool.source == "agent":
-        return str(tool.id) in assignments
+        return (
+            agent_tenant_id is not None
+            and tool.tenant_id is not None
+            and tool.tenant_id == agent_tenant_id
+            and str(tool.id) in assignments
+        )
     return False
 
 
@@ -231,15 +291,10 @@ def _enforce_code_control_permission(
 
     from app.services.code_execution_policy import is_code_execution_tool
 
-    controlled = CODE_PLATFORM_CONTROLLED_CONFIG_KEYS.intersection(incoming_config)
-    if (
-        controlled
-        and is_code_execution_tool(tool.name)
-        and not _is_platform_admin(current_user)
-    ):
+    if is_code_execution_tool(tool.name) and not _is_platform_admin(current_user):
         raise HTTPException(
             status_code=403,
-            detail="Only a platform admin can modify Code isolation settings",
+            detail="Only a platform admin can modify Code tool configuration",
         )
 
 
@@ -397,10 +452,34 @@ async def create_tool(
     # platform admins importing tools for another company work correctly.
     target_tenant_id = _resolve_target_tenant_id(current_user, data.tenant_id)
 
+    stored_mcp_url = data.mcp_server_url
+    stored_config: dict = {}
+    if data.type == "mcp":
+        if not data.mcp_server_url:
+            raise HTTPException(status_code=400, detail="MCP server URL is required")
+        stored_mcp_url, stored_config = await _validated_mcp_url_update(
+            data.mcp_server_url,
+        )
+        if target_tenant_id is None and stored_config:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Global MCP tools cannot contain credentials; create a "
+                    "tenant-owned tool or configure the exact Agent assignment"
+                ),
+            )
+
     # Keep Tool.name globally unique for old-application rollback safety. The
     # upstream MCP name remains in mcp_tool_name, while this internal name is
     # deterministically namespaced so tenant tools cannot shadow builtins.
-    storage_name = tenant_scoped_tool_name(data.name, target_tenant_id)
+    storage_name = tenant_scoped_tool_name(
+        data.name,
+        target_tenant_id,
+        namespace=mcp_server_namespace(
+            data.mcp_server_name,
+            stored_mcp_url,
+        ),
+    )
     existing = await db.execute(
         select(Tool).where(Tool.name == storage_name)
     )
@@ -415,12 +494,13 @@ async def create_tool(
         category=data.category,
         icon=data.icon,
         parameters_schema=data.parameters_schema,
-        mcp_server_url=data.mcp_server_url,
+        mcp_server_url=stored_mcp_url,
         mcp_server_name=data.mcp_server_name,
         mcp_tool_name=data.mcp_tool_name,
         is_default=data.is_default,
         tenant_id=target_tenant_id,
         source="admin",
+        config=_encrypt_sensitive_fields(stored_config),
     )
     db.add(tool)
     await db.commit()
@@ -473,20 +553,38 @@ async def update_tool(
     update_data = data.model_dump(exclude_unset=True)
     target_tenant_id = _resolve_target_tenant_id(current_user, update_data.pop("tenant_id", None))
     _authorize_tool_record(current_user, tool, target_tenant_id)
+    mcp_config_from_url: dict | None = None
     if "mcp_server_url" in update_data:
-        update_data["mcp_server_url"] = _merge_masked_mcp_server_url(
-            tool.mcp_server_url,
+        existing_plain = await get_tool_company_config(db, tool, target_tenant_id)
+        update_data["mcp_server_url"], mcp_config_from_url = await _validated_mcp_url_update(
             update_data["mcp_server_url"],
+            existing_url=tool.mcp_server_url,
+            existing_config=existing_plain,
         )
+        if tool.type == "mcp" and tool.tenant_id is None and mcp_config_from_url:
+            raise HTTPException(
+                status_code=400,
+                detail="Global MCP endpoints cannot contain credentials",
+            )
 
     tenant_tool_config_update: dict | None = None
     if "config" in update_data:
         incoming_config = update_data.pop("config") or {}
+        if tool.type == "mcp" and tool.tenant_id is None and incoming_config:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Global MCP tools cannot store configuration; configure "
+                    "the exact Agent assignment"
+                ),
+            )
         _enforce_code_control_permission(current_user, tool, incoming_config)
+        existing_config = mcp_config_from_url
+        if existing_config is None:
+            existing_config = await get_tool_company_config(db, tool, target_tenant_id)
         if tool.source == "builtin":
             if not target_tenant_id:
                 raise HTTPException(status_code=400, detail="tenant_id is required to configure builtin tools")
-            existing_config = await get_tool_company_config(db, tool, target_tenant_id)
             config_value = merge_config_preserving_sensitive(
                 existing_config,
                 incoming_config,
@@ -494,7 +592,6 @@ async def update_tool(
             )
             await set_tenant_tool_config(db, target_tenant_id, tool.name, config_value, tool.config_schema)
         else:
-            existing_config = _decrypt_sensitive_fields(tool.config or {}, tool.config_schema)
             config_value = merge_config_preserving_sensitive(
                 existing_config,
                 incoming_config,
@@ -502,6 +599,22 @@ async def update_tool(
             )
             tenant_tool_config_update = _encrypt_sensitive_fields(
                 config_value,
+                tool.config_schema,
+            )
+    elif mcp_config_from_url is not None:
+        if tool.source == "builtin":
+            if not target_tenant_id:
+                raise HTTPException(status_code=400, detail="tenant_id is required to configure builtin tools")
+            await set_tenant_tool_config(
+                db,
+                target_tenant_id,
+                tool.name,
+                mcp_config_from_url,
+                tool.config_schema,
+            )
+        else:
+            tenant_tool_config_update = _encrypt_sensitive_fields(
+                mcp_config_from_url,
                 tool.config_schema,
             )
 
@@ -512,6 +625,10 @@ async def update_tool(
 
     if tenant_tool_config_update is not None:
         tool.config = tenant_tool_config_update
+    if tool.type == "mcp" and tool.tenant_id is None:
+        # Scrub any pre-policy legacy value whenever the shared definition is
+        # touched, even for a metadata-only update.
+        tool.config = {}
     for field, value in update_data.items():
         setattr(tool, field, value)
     await db.commit()
@@ -576,20 +693,23 @@ async def get_agent_tools(
     # now rely on explicit AgentTool records instead of the implicit
     # `is_default` fallback.
     if assignments:
+        await lock_agent_tool_owner(db, agent_id)
+        assignments = await _load_agent_tool_assignments(db, agent_id)
         backfilled = 0
         for t in all_tools:
             tid = str(t.id)
             if tid not in assignments:
-                new_at = AgentTool(
+                await upsert_agent_tool(
+                    db,
                     agent_id=agent_id,
                     tool_id=t.id,
                     enabled=t.is_default,
+                    on_conflict="preserve",
                 )
-                db.add(new_at)
-                assignments[tid] = new_at
                 backfilled += 1
         if backfilled:
             await db.commit()
+            assignments = await _load_agent_tool_assignments(db, agent_id)
             logger.info(
                 f"[Tools] Backfilled {backfilled} AgentTool records for "
                 f"agent={agent_id}"
@@ -649,6 +769,7 @@ async def update_agent_tools(
         agent_id,
         manage=True,
     )
+    await lock_agent_tool_owner(db, agent_id)
     assignments = await _load_agent_tool_assignments(db, agent_id)
     for u in updates:
         tool_id = uuid.UUID(u.tool_id)
@@ -677,15 +798,13 @@ async def update_agent_tools(
         if tool_obj.category == "system" and not u.enabled:
             continue
 
-        # Upsert
-        result = await db.execute(
-            select(AgentTool).where(AgentTool.agent_id == agent_id, AgentTool.tool_id == tool_id)
+        await upsert_agent_tool(
+            db,
+            agent_id=agent_id,
+            tool_id=tool_id,
+            enabled=u.enabled,
+            on_conflict="enabled",
         )
-        at = result.scalar_one_or_none()
-        if at:
-            at.enabled = u.enabled
-        else:
-            db.add(AgentTool(agent_id=agent_id, tool_id=tool_id, enabled=u.enabled))
     await db.commit()
     return {"ok": True}
 
@@ -712,11 +831,15 @@ async def test_mcp_connection(
     from app.services.mcp_client import MCPClient
 
     try:
+        await validate_public_mcp_url(data.server_url)
         client = MCPClient(data.server_url, api_key=data.api_key or None)
         tools = await client.list_tools()
         return {"ok": True, "tools": tools}
     except Exception as e:
-        return {"ok": False, "error": str(e)[:300]}
+        return {
+            "ok": False,
+            "error": f"MCP connection failed ({type(e).__name__})",
+        }
 
 
 # ─── MCP Server-level Credential Management ────────────────
@@ -724,6 +847,9 @@ class MCPServerUpdate(BaseModel):
     server_name: str            # Identifies which server's tools to update
     server_url: str             # New MCP server URL (may contain embedded key)
     api_key: str | None = None  # Optional standalone Bearer key
+    # Stable anchors supplied by the UI. They prevent one same-name server
+    # group from updating another group in the same company.
+    tool_ids: list[str] | None = None
     # Target tenant (platform admins may manage another company's tools)
     tenant_id: str | None = None
 
@@ -751,14 +877,66 @@ async def update_mcp_server(
     if not target_tenant_id:
         raise HTTPException(status_code=400, detail="tenant_id is required")
 
-    # Load all tools from this server under the target tenant
-    result = await db.execute(
-        select(Tool).where(
-            Tool.mcp_server_name == data.server_name,
-            Tool.tenant_id == target_tenant_id,
+    # Validate and sanitize before selecting or mutating any rows. Query
+    # credentials are encrypted into each selected tool's config below.
+    public_url, _ = await _validated_mcp_url_update(data.server_url)
+
+    tools: list[Tool]
+    if data.tool_ids:
+        try:
+            anchored_ids = {uuid.UUID(value) for value in data.tool_ids}
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="Invalid MCP tool_ids") from exc
+        result = await db.execute(
+            select(Tool).where(
+                Tool.id.in_(anchored_ids),
+                Tool.tenant_id == target_tenant_id,
+                Tool.type == "mcp",
+            )
         )
-    )
-    tools = result.scalars().all()
+        tools = result.scalars().all()
+        if len(tools) != len(anchored_ids):
+            raise HTTPException(status_code=404, detail="One or more MCP tools were not found")
+        current_namespaces = {_mcp_group_identity(tool) for tool in tools}
+        if len(current_namespaces) != 1 or any(
+            tool.mcp_server_name != data.server_name for tool in tools
+        ):
+            raise HTTPException(status_code=409, detail="MCP tool_ids do not identify one server group")
+    else:
+        # Backward-compatible fallback for older clients. If a display name is
+        # ambiguous, only an exact endpoint match is accepted; URL changes then
+        # require tool_ids so no same-name group can be cross-written.
+        result = await db.execute(
+            select(Tool).where(
+                Tool.mcp_server_name == data.server_name,
+                Tool.tenant_id == target_tenant_id,
+                Tool.type == "mcp",
+            )
+        )
+        candidates = result.scalars().all()
+        groups: dict[tuple[str, str], list[Tool]] = {}
+        for tool in candidates:
+            groups.setdefault(_mcp_group_identity(tool), []).append(tool)
+        if any(kind == "legacy" for kind, _ in groups):
+            raise HTTPException(
+                status_code=409,
+                detail="Legacy MCP server URL requires explicit tool_ids for remediation",
+            )
+        incoming_namespace = (
+            "valid",
+            mcp_server_namespace(data.server_name, public_url) or "",
+        )
+        if incoming_namespace in groups:
+            tools = groups[incoming_namespace]
+        elif len(groups) == 1:
+            tools = next(iter(groups.values()))
+        elif len(groups) > 1:
+            raise HTTPException(
+                status_code=409,
+                detail="MCP server name is ambiguous; tool_ids are required",
+            )
+        else:
+            tools = []
     if not tools:
         raise HTTPException(
             status_code=404,
@@ -766,28 +944,29 @@ async def update_mcp_server(
         )
 
     for tool in tools:
-        tool.mcp_server_url = _merge_masked_mcp_server_url(
-            tool.mcp_server_url,
-            data.server_url,
+        current_config = _decrypt_sensitive_fields(
+            tool.config or {},
+            tool.config_schema,
         )
+        # Preserve an existing encrypted URL query only for the same endpoint;
+        # otherwise use the newly supplied credential payload (if any).
+        secured_url, secured_config = await _validated_mcp_url_update(
+            data.server_url,
+            existing_url=tool.mcp_server_url,
+            existing_config=current_config,
+        )
+        tool.mcp_server_url = secured_url
         if data.api_key is not None:
             # Decrypt before merging so existing encrypted fields are never
             # encrypted a second time. A mask/blank round-trip preserves the
             # stored secret just like the per-tool configuration endpoint.
-            current_config = _decrypt_sensitive_fields(
-                tool.config or {},
-                tool.config_schema,
-            )
             merged_config = merge_config_preserving_sensitive(
-                current_config,
-                {**current_config, "api_key": data.api_key},
+                secured_config,
+                {**secured_config, "api_key": data.api_key},
                 tool.config_schema,
             )
-            tool.config = _encrypt_sensitive_fields(
-                merged_config,
-                tool.config_schema,
-            )
-        # If api_key is None (not provided), preserve the existing encrypted key
+            secured_config = merged_config
+        tool.config = _encrypt_sensitive_fields(secured_config, tool.config_schema)
 
     await db.commit()
     return {"ok": True, "updated": len(tools)}
@@ -870,7 +1049,23 @@ async def delete_agent_tool(
         at.agent_id,
         manage=True,
     )
+    # Use the same Agent -> Tool -> AgentTool lock order as every assignment
+    # upsert.  Re-read after acquiring the owner lock so an uninstall cannot
+    # race with a concurrent import/re-authorization and delete its result.
+    await lock_agent_tool_owner(db, at.agent_id)
+    at_r = await db.execute(
+        select(AgentTool)
+        .where(AgentTool.id == agent_tool_id)
+        .with_for_update()
+    )
+    at = at_r.scalar_one_or_none()
+    if not at:
+        raise HTTPException(status_code=404, detail="Agent tool assignment not found")
     tool_id = at.tool_id
+    tool_r = await db.execute(
+        select(Tool).where(Tool.id == tool_id).with_for_update()
+    )
+    tool = tool_r.scalar_one_or_none()
     await db.delete(at)
     await db.flush()
     # If no other Agent uses a user-installed MCP tool, remove that private
@@ -878,8 +1073,6 @@ async def delete_agent_tool(
     # company/platform-owned MCP definition.
     remaining_r = await db.execute(select(AgentTool).where(AgentTool.tool_id == tool_id).limit(1))
     if not remaining_r.scalar_one_or_none():
-        tool_r = await db.execute(select(Tool).where(Tool.id == tool_id))
-        tool = tool_r.scalar_one_or_none()
         if tool and tool.type == "mcp" and tool.source == "agent":
             await db.delete(tool)
     await db.commit()
@@ -956,6 +1149,7 @@ async def update_agent_tool_config(
         agent_id,
         manage=True,
     )
+    await lock_agent_tool_owner(db, agent_id)
     assignments = await _load_agent_tool_assignments(db, agent_id)
     # The tool itself must be visible inside this agent's tenant boundary.
     tool_r2 = await db.execute(
@@ -1002,12 +1196,16 @@ async def update_agent_tool_config(
         merged_config,
         tool_for_schema.config_schema,
     )
-    if at:
-        at.config = encrypted_config
-    else:
-        # Saving configuration is not an authorization action. The Agent must
-        # still be enabled explicitly through the assignment endpoint.
-        db.add(AgentTool(agent_id=agent_id, tool_id=tool_id, enabled=False, config=encrypted_config))
+    # Saving configuration is not an authorization action. On a concurrent
+    # existing grant, preserve its enabled state and update only config.
+    await upsert_agent_tool(
+        db,
+        agent_id=agent_id,
+        tool_id=tool_id,
+        enabled=False,
+        config=encrypted_config,
+        on_conflict="config",
+    )
     await db.commit()
     return {"ok": True}
 
@@ -1256,13 +1454,19 @@ async def update_category_config(
     from app.models.channel_config import ChannelConfig
 
     await _require_agent_tool_access(db, current_user, agent_id, manage=True)
+    if category == "atlassian":
+        from app.api.atlassian import lock_atlassian_agent
+
+        await lock_atlassian_agent(agent_id, db)
 
     # Encrypt sensitive fields
     result = await db.execute(
-        select(ChannelConfig).where(
+        select(ChannelConfig)
+        .where(
             ChannelConfig.agent_id == agent_id,
             ChannelConfig.channel_type == category,
         )
+        .with_for_update()
     )
     existing = result.scalar_one_or_none()
     existing_plain: dict = {}
@@ -1272,6 +1476,17 @@ async def update_category_config(
             **(existing.extra_config or {}),
         })
     merged_config = merge_config_preserving_sensitive(existing_plain, data.config)
+    plaintext_key = (
+        merged_config.get("api_key")
+        or merged_config.get("api_secret")
+        or merged_config.get("app_secret")
+    )
+    if category == "atlassian":
+        if not plaintext_key:
+            raise HTTPException(status_code=422, detail="Atlassian api_key is required")
+        from app.api.atlassian import revoke_atlassian_tool_grants
+
+        await revoke_atlassian_tool_grants(agent_id, db)
     encrypted_config = _encrypt_sensitive_fields(merged_config)
     app_secret = encrypted_config.get("api_key") or encrypted_config.get("api_secret") or encrypted_config.get("app_secret")
     extra = {
@@ -1279,6 +1494,12 @@ async def update_category_config(
         for key, value in encrypted_config.items()
         if key not in ("api_key", "api_secret", "app_secret")
     }
+    if category == "atlassian":
+        extra.update({
+            "tool_sync_status": "syncing",
+            "tool_count": 0,
+            "tool_sync_error_code": None,
+        })
     if existing:
         existing.app_secret = app_secret
         existing.extra_config = extra
@@ -1296,14 +1517,13 @@ async def update_category_config(
 
     await db.commit()
 
-    # Special logic for Atlassian: trigger sync
+    # The Tools-page entry point must use the same synchronous, durable status
+    # contract as the Channels-page endpoint.  A detached task could report a
+    # false success and lose its exception forever.
     if category == "atlassian":
-        from app.api.atlassian import _sync_atlassian_tools_for_agent
-        import asyncio
-        # Use the preserved plaintext value when a masked/omitted secret was
-        # resubmitted with unrelated settings.
-        plaintext_key = merged_config.get("api_key") or merged_config.get("api_secret") or merged_config.get("app_secret")
-        asyncio.create_task(_sync_atlassian_tools_for_agent(agent_id, plaintext_key))
+        from app.api.atlassian import _complete_atlassian_tool_sync
+
+        await _complete_atlassian_tool_sync(agent_id, plaintext_key)
 
     return {"ok": True}
 
@@ -1320,12 +1540,26 @@ async def delete_category_config(
 
     await _require_agent_tool_access(db, current_user, agent_id, manage=True)
 
-    await db.execute(
-        delete(ChannelConfig).where(
+    if category == "atlassian":
+        from app.api.atlassian import lock_atlassian_agent
+
+        await lock_atlassian_agent(agent_id, db)
+
+    config_result = await db.execute(
+        select(ChannelConfig)
+        .where(
             ChannelConfig.agent_id == agent_id,
             ChannelConfig.channel_type == category,
         )
+        .with_for_update()
     )
+    config = config_result.scalar_one_or_none()
+    if category == "atlassian":
+        from app.api.atlassian import revoke_atlassian_tool_grants
+
+        await revoke_atlassian_tool_grants(agent_id, db)
+    if config:
+        await db.delete(config)
     await db.commit()
 
 

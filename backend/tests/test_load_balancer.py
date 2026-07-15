@@ -173,6 +173,20 @@ async def test_pick_uses_only_the_centrally_funded_platform_pool():
 
 
 @pytest.mark.asyncio
+async def test_pick_casts_capabilities_for_json_and_jsonb_schemas():
+    """Fresh bootstrap DBs use JSON while upgraded DBs historically use JSONB."""
+
+    credential = _cred(capabilities=["text"])
+    session, fake_db = _patch_session(execute_result=[credential])
+
+    with session:
+        await pick_credential("minimax", "text")
+
+    query = str(fake_db.execute.await_args.args[0]).lower()
+    assert "cast(llm_credentials.capabilities as jsonb)" in query
+
+
+@pytest.mark.asyncio
 async def test_pick_empty_pool_raises():
     sess, _ = _patch_session(execute_result=[])
     with sess:

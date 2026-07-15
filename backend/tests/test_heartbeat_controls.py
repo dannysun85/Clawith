@@ -105,7 +105,6 @@ def test_production_deploy_pins_autonomous_runners_off():
     assert '"TRIGGER_MAX_CONCURRENCY": "8"' in deploy_script
     assert '"TRIGGER_CLAIM_BATCH_SIZE": "16"' in deploy_script
     assert '"COMPANY_ASSIGNMENT_RUNNER_ENABLED": "false"' in deploy_script
-    assert "--exclude .omx" in deploy_script
-    assert "--exclude '*/__pycache__'" in deploy_script
-    assert "--exclude '*.pyc'" in deploy_script
-    assert "--exclude frontend/dist" in deploy_script
+    assert 'git archive --format=tar --output="$PACKAGE_TAR" "$COMMIT"' in deploy_script
+    assert 'git get-tar-commit-id < "$PACKAGE_TAR"' in deploy_script
+    assert 'write_atomic_line "$RELEASE/PACKAGE_SHA256" "$PACKAGE_SHA256"' in deploy_script

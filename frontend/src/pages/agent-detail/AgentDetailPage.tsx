@@ -27,6 +27,7 @@ import { copyToClipboard } from '../../utils/clipboard';
 import { formatFileSize } from '../../utils/formatFileSize';
 import { canAccessSaasAdmin } from '../../utils/saasAdmin';
 import { displaySessionTitle } from '../../utils/sessionDisplay';
+import { appendUniqueById, safeWorkspaceMediaPath } from '../../utils/mediaCompletion';
 import {
     resolveChatSessionModality,
     resolveChatSessionTier,
@@ -2020,6 +2021,16 @@ export default function AgentDetailPage() {
     const navigate = useNavigate();
     const location = useLocation();
     const queryClient = useQueryClient();
+    const requestedSessionId = useMemo(
+        () => new URLSearchParams(location.search).get('session_id') || '',
+        [location.search],
+    );
+    const requestedWorkspacePath = useMemo(
+        () => safeWorkspaceMediaPath(
+            new URLSearchParams(location.search).get('workspace_path'),
+        ),
+        [location.search],
+    );
     const {
         activeTab,
         isChatRoute,
@@ -2690,7 +2701,7 @@ export default function AgentDetailPage() {
         } catch (e: any) { toast.error(t('common.error.saveFailed', '保存失败'), { details: String(e?.message || e) }); }
         setExpirySaving(false);
     };
-    interface ChatMsg { role: 'user' | 'assistant' | 'tool_call'; content: string; fileName?: string; toolName?: string; toolCallId?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; toolThinking?: string; thinking?: string; imageUrl?: string; timestamp?: string; quotaError?: { quota_type?: string; action?: string; details?: { upgrade_url?: string } }; }
+    interface ChatMsg { id?: string; role: 'user' | 'assistant' | 'tool_call'; content: string; fileName?: string; toolName?: string; toolCallId?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; toolThinking?: string; thinking?: string; imageUrl?: string; timestamp?: string; quotaError?: { quota_type?: string; action?: string; details?: { upgrade_url?: string } }; }
     const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
     const getToolTargetKey = (args: any): string => {
         if (!args) return '';
@@ -2753,6 +2764,7 @@ export default function AgentDetailPage() {
     const [workspaceLockedPath, setWorkspaceLockedPath] = useState<string | null>(null);
     const [workspaceActivities, setWorkspaceActivities] = useState<WorkspaceActivity[]>([]);
     const [workspaceLiveDraft, setWorkspaceLiveDraft] = useState<WorkspaceLiveDraft | null>(null);
+    const handledWorkspaceDeepLinkRef = useRef<string>('');
     const workspaceEditingRef = useRef(false);
     const workspaceLockedPathRef = useRef<string | null>(null);
     const [wsSessionId, setWsSessionId] = useState<string>('');
@@ -2840,6 +2852,21 @@ export default function AgentDetailPage() {
         setSessionListCollapsed(true);
         useAppStore.setState({ sidebarCollapsed: true });
     }, []);
+    useEffect(() => {
+        if (!id || activeTab !== 'chat' || !requestedWorkspacePath) return;
+        const deepLinkKey = `${id}:${requestedWorkspacePath}`;
+        if (handledWorkspaceDeepLinkRef.current === deepLinkKey) return;
+        handledWorkspaceDeepLinkRef.current = deepLinkKey;
+        setWorkspaceActivePath(requestedWorkspacePath);
+        setSidePanelTab('workspace');
+        setLivePanelVisible(true);
+        collapseSidebarsForLivePanel();
+    }, [
+        activeTab,
+        collapseSidebarsForLivePanel,
+        id,
+        requestedWorkspacePath,
+    ]);
     useEffect(() => {
         if (!livePanelVisible) {
             livePanelAutoCollapsedRef.current = false;
@@ -3101,9 +3128,14 @@ export default function AgentDetailPage() {
         fetchMySessions(false, id).then((data: any) => {
             if (currentAgentIdRef.current !== id) return;
             setSessionsLoading(false);
-            if (data && data.length > 0) selectSession(data[0], 'mine');
+            if (data && data.length > 0) {
+                const requested = requestedSessionId
+                    ? data.find((session: any) => String(session.id) === requestedSessionId)
+                    : null;
+                selectSession(requested || data[0], 'mine');
+            }
         });
-    }, [id, token, activeTab, currentUser?.id]);
+    }, [id, token, activeTab, currentUser?.id, requestedSessionId]);
 
     const ensureSessionSocket = (sess: any, agentId: string, authToken: string) => {
         const sessionId = String(sess.id);
@@ -3212,7 +3244,7 @@ export default function AgentDetailPage() {
                 });
             }
             if (!isActiveRuntime) {
-                if (['done', 'error', 'quota_exceeded', 'trigger_notification'].includes(d.type)) {
+                if (['done', 'error', 'quota_exceeded', 'trigger_notification', 'media_generation_result'].includes(d.type)) {
                     fetchMySessions(true, agentId);
                     queryClient.invalidateQueries({ queryKey: ['agents'] });
                 }
@@ -3431,6 +3463,39 @@ export default function AgentDetailPage() {
                     reconnectDisabledRef.current[key] = true;
                     if (msg.includes('expired')) setAgentExpired(true);
                 }
+            } else if (d.type === 'media_generation_result') {
+                const targetSessionId = d.session_id ? String(d.session_id) : '';
+                const currentSessionId = activeSessionIdRef.current ? String(activeSessionIdRef.current) : '';
+                if (targetSessionId && currentSessionId === targetSessionId) {
+                    const rawMessage = d.message || {};
+                    const incoming = parseChatMsg({
+                        id: String(rawMessage.id || d.event_id || ''),
+                        role: 'assistant',
+                        content: String(rawMessage.content || ''),
+                        timestamp: rawMessage.created_at || new Date().toISOString(),
+                    });
+                    setChatMessages((prev) => appendUniqueById(prev, incoming));
+                    const mediaPath = safeWorkspaceMediaPath(d.workspace_path);
+                    if (mediaPath) {
+                        const activity: WorkspaceActivity = {
+                            action: 'write',
+                            path: mediaPath,
+                            tool: 'generate_video_minimax',
+                            ok: true,
+                        };
+                        setWorkspaceActivePath(mediaPath);
+                        setWorkspaceActivities((prev) => [
+                            activity,
+                            ...prev.filter((item) => item.path !== mediaPath),
+                        ].slice(0, 20));
+                        setSidePanelTab('workspace');
+                        setLivePanelVisible(true);
+                        collapseSidebarsForLivePanel();
+                    }
+                    clearUnreadForSession(targetSessionId);
+                }
+                fetchMySessions(true, agentId);
+                queryClient.invalidateQueries({ queryKey: ['agents'] });
             } else if (d.type === 'trigger_notification') {
                 const targetSessionId = d.session_id ? String(d.session_id) : '';
                 const currentSessionId = activeSessionIdRef.current ? String(activeSessionIdRef.current) : '';

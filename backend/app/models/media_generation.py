@@ -5,7 +5,19 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSON, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -19,7 +31,21 @@ class MediaGenerationTask(Base):
     __table_args__ = (
         UniqueConstraint("provider", "provider_task_id", name="uq_media_generation_provider_task"),
         UniqueConstraint("reservation_id", name="uq_media_generation_reservation"),
+        UniqueConstraint("completion_message_id", name="uq_media_generation_completion_message"),
+        CheckConstraint(
+            "completion_delivery_status IN ('pending', 'inline', 'persisted', 'not_applicable')",
+            name="ck_media_generation_completion_delivery_status",
+        ),
         Index("ix_media_generation_due", "status", "next_poll_at"),
+        Index(
+            "ix_media_generation_completion_outbox",
+            "realtime_next_attempt_at",
+            "completed_at",
+            postgresql_where=text(
+                "status = 'succeeded' AND completion_message_id IS NOT NULL "
+                "AND realtime_published_at IS NULL"
+            ),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -38,6 +64,25 @@ class MediaGenerationTask(Base):
     reservation_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("credit_reservations.id", ondelete="SET NULL"), nullable=True
     )
+    origin_session_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "chat_sessions.id",
+            name="fk_media_generation_origin_session",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+        index=True,
+    )
+    completion_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "chat_messages.id",
+            name="fk_media_generation_completion_message",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
 
     provider: Mapped[str] = mapped_column(String(50), nullable=False)
     modality: Mapped[str] = mapped_column(String(20), nullable=False)
@@ -50,6 +95,23 @@ class MediaGenerationTask(Base):
     request_metadata: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     last_response: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    output_size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    completion_delivery_status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="pending", server_default=text("'pending'")
+    )
+    realtime_attempt_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+    )
+    realtime_next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    realtime_published_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    realtime_last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     consecutive_error_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 

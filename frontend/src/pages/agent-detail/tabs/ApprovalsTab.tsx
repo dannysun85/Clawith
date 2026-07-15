@@ -1,13 +1,20 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 
+import ApprovalPreview, {
+    approvalExecutionLabel,
+    approvalExecutionErrorLabel,
+    approvalNeedsPolling,
+    type ApprovalRecord,
+    isApprovalApprovable,
+} from '../../../components/ApprovalPreview';
 import { fetchAuth } from '../utils/fetchAuth';
 
-export function normalizeApprovals(value: unknown): any[] {
-    if (Array.isArray(value)) return value;
+export function normalizeApprovals(value: unknown): ApprovalRecord[] {
+    if (Array.isArray(value)) return value as ApprovalRecord[];
     if (value && typeof value === 'object' && 'items' in value) {
         const items = (value as { items?: unknown }).items;
-        return Array.isArray(items) ? items : [];
+        return Array.isArray(items) ? items as ApprovalRecord[] : [];
     }
     return [];
 }
@@ -20,17 +27,15 @@ export default function ApprovalsTab({ agentId, canManage }: { agentId: string; 
         queryKey: ['agent-approvals', agentId],
         queryFn: () => fetchAuth<unknown>(`/agents/${agentId}/approvals`),
         enabled: !!agentId,
-        refetchInterval: 15000,
+        refetchInterval: (query) => approvalNeedsPolling(normalizeApprovals(query.state.data)) ? 3000 : false,
     });
     const approvals = normalizeApprovals(approvalData);
 
     const resolveMut = useMutation({
-        mutationFn: async ({ approvalId, action }: { approvalId: string; action: string }) => {
+        mutationFn: async ({ approvalId, action }: { approvalId: string; action: 'approve' | 'reject' }) => {
             if (!canManage) return;
-            const token = localStorage.getItem('token');
-            return fetch(`/api/agents/${agentId}/approvals/${approvalId}/resolve`, {
+            return fetchAuth(`/agents/${agentId}/approvals/${approvalId}/resolve`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
                 body: JSON.stringify({ action }),
             });
         },
@@ -40,8 +45,8 @@ export default function ApprovalsTab({ agentId, canManage }: { agentId: string; 
         },
     });
 
-    const pending = approvals.filter((approval: any) => approval.status === 'pending');
-    const resolved = approvals.filter((approval: any) => approval.status !== 'pending');
+    const pending = approvals.filter((approval) => approval.status === 'pending');
+    const resolved = approvals.filter((approval) => approval.status !== 'pending');
     const statusStyle = (status: string) => ({
         padding: '2px 8px',
         borderRadius: '4px',
@@ -66,12 +71,18 @@ export default function ApprovalsTab({ agentId, canManage }: { agentId: string; 
                     {isChinese ? '审批记录加载失败，请稍后重试。' : 'Failed to load approvals. Please try again.'}
                 </div>
             )}
+            {resolveMut.isError && (
+                <div role="alert" style={{ marginBottom: '12px', color: 'var(--error)', fontSize: '13px' }}>
+                    {isChinese ? '审批操作失败：' : 'Approval action failed: '}
+                    {resolveMut.error instanceof Error ? resolveMut.error.message : String(resolveMut.error)}
+                </div>
+            )}
             {pending.length > 0 && (
                 <>
                     <h4 style={{ margin: '0 0 12px', fontSize: '13px', color: 'var(--warning)' }}>
                         {isChinese ? `${pending.length} 个待审批` : `${pending.length} Pending`}
                     </h4>
-                    {pending.map((approval: any) => (
+                    {pending.map((approval) => (
                         <div
                             key={approval.id}
                             style={{
@@ -90,11 +101,7 @@ export default function ApprovalsTab({ agentId, canManage }: { agentId: string; 
                                     {approval.created_at ? new Date(approval.created_at).toLocaleString() : ''}
                                 </span>
                             </div>
-                            {approval.details && (
-                                <div style={{ fontSize: '12px', color: 'var(--text-secondary)', marginBottom: '10px', lineHeight: '1.5', maxHeight: '80px', overflow: 'hidden' }}>
-                                    {typeof approval.details === 'string' ? approval.details : JSON.stringify(approval.details, null, 2)}
-                                </div>
-                            )}
+                            <ApprovalPreview details={approval.details} isChinese={isChinese} />
                             {canManage && <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
                                 <button
                                     className="btn btn-primary"
@@ -102,7 +109,10 @@ export default function ApprovalsTab({ agentId, canManage }: { agentId: string; 
                                     onClick={() => {
                                         if (canManage) resolveMut.mutate({ approvalId: approval.id, action: 'approve' });
                                     }}
-                                    disabled={!canManage || resolveMut.isPending}
+                                    disabled={!canManage || resolveMut.isPending || !isApprovalApprovable(approval.details)}
+                                    title={!isApprovalApprovable(approval.details)
+                                        ? (isChinese ? '审批内容未通过完整性校验，只能拒绝。' : 'Payload integrity is not verified; reject it.')
+                                        : undefined}
                                 >
                                     {isChinese ? '批准' : 'Approve'}
                                 </button>
@@ -131,7 +141,7 @@ export default function ApprovalsTab({ agentId, canManage }: { agentId: string; 
                     {isChinese ? '暂无审批记录' : 'No approval records'}
                 </div>
             )}
-            {resolved.map((approval: any) => (
+            {resolved.map((approval) => (
                 <div
                     key={approval.id}
                     style={{
@@ -140,17 +150,25 @@ export default function ApprovalsTab({ agentId, canManage }: { agentId: string; 
                         borderRadius: '8px',
                         background: 'var(--bg-secondary)',
                         border: '1px solid var(--border-subtle)',
-                        opacity: 0.7,
                     }}
                 >
                     <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                         <span style={statusStyle(approval.status)}>{approval.status}</span>
                         <span style={{ fontSize: '12px' }}>{approval.action_type}</span>
+                        <span style={{ fontSize: '12px', color: approval.execution_status === 'ambiguous' ? 'var(--warning)' : 'var(--text-secondary)' }}>
+                            {approvalExecutionLabel(approval, isChinese)}
+                        </span>
+                        {approvalExecutionErrorLabel(approval, isChinese) && (
+                            <span style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
+                                {approvalExecutionErrorLabel(approval, isChinese)}
+                            </span>
+                        )}
                         <span style={{ flex: 1 }} />
                         <span style={{ fontSize: '10px', color: 'var(--text-tertiary)' }}>
                             {approval.resolved_at ? new Date(approval.resolved_at).toLocaleString() : ''}
                         </span>
                     </div>
+                    <ApprovalPreview details={approval.details} isChinese={isChinese} />
                 </div>
             ))}
         </div>

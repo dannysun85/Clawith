@@ -135,6 +135,7 @@ async def test_org_admin_can_view_other_users_session_messages(monkeypatch):
     agent_id = uuid.uuid4()
     owner_id = uuid.uuid4()
     session_id = uuid.uuid4()
+    message_id = uuid.uuid4()
     now = datetime.now(UTC)
 
     current_user = SimpleNamespace(id=viewer_id, role="org_admin")
@@ -146,6 +147,7 @@ async def test_org_admin_can_view_other_users_session_messages(monkeypatch):
         source_channel="web",
     )
     message = SimpleNamespace(
+        id=message_id,
         role="user",
         content="hello",
         created_at=now,
@@ -172,6 +174,7 @@ async def test_org_admin_can_view_other_users_session_messages(monkeypatch):
 
     assert messages == [
         {
+            "id": str(message_id),
             "role": "user",
             "content": "hello",
             "created_at": now.isoformat(),
@@ -221,6 +224,8 @@ async def test_a2a_messages_include_stable_sender_identity(monkeypatch):
     session_id = uuid.uuid4()
     current_participant_id = uuid.uuid4()
     peer_participant_id = uuid.uuid4()
+    current_message_id = uuid.uuid4()
+    peer_message_id = uuid.uuid4()
     now = datetime.now(UTC)
     session = SimpleNamespace(
         id=session_id,
@@ -231,12 +236,14 @@ async def test_a2a_messages_include_stable_sender_identity(monkeypatch):
         is_group=False,
     )
     current_message = SimpleNamespace(
+        id=current_message_id,
         role="user",
         content="from current",
         created_at=now,
         participant_id=current_participant_id,
     )
     peer_message = SimpleNamespace(
+        id=peer_message_id,
         role="user",
         content="from peer",
         created_at=now,
@@ -264,8 +271,10 @@ async def test_a2a_messages_include_stable_sender_identity(monkeypatch):
     )
 
     assert messages[0]["sender_agent_id"] == str(current_agent_id)
+    assert messages[0]["id"] == str(current_message_id)
     assert messages[0]["is_current_agent"] is True
     assert messages[1]["sender_agent_id"] == str(peer_agent_id)
+    assert messages[1]["id"] == str(peer_message_id)
     assert messages[1]["is_current_agent"] is False
 
 

@@ -87,6 +87,11 @@ class ProductionIssueOut(BaseModel):
     release_version: str | None = None
     last_metadata: dict | None = None
     alerted_at: datetime | None = None
+    alert_epoch: int = 1
+    alert_attempts: int = 0
+    alert_next_attempt_at: datetime | None = None
+    alert_last_error_code: str | None = None
+    alert_notification_sent_at: datetime | None = None
     acknowledged_at: datetime | None = None
     resolved_at: datetime | None = None
 

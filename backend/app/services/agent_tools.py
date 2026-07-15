@@ -26,6 +26,7 @@ from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Any
+from urllib.parse import urlencode
 import re
 
 from loguru import logger
@@ -194,45 +195,15 @@ class _MiniMaxToolCredential:
 # Key: (agent_id, tool_name), Value: (config, expiry_time)
 _tool_config_cache: dict[tuple, tuple[dict, datetime]] = {}
 _TOOL_CONFIG_CACHE_TTL_SECONDS = 60
-
-# Sensitive field keys that should be encrypted/decrypted
-SENSITIVE_FIELD_KEYS = {"api_key", "private_key", "auth_code", "password", "secret", "atlassian_api_key"}
+_mcp_tenant_semaphores: dict[str, asyncio.Semaphore] = {}
+_MCP_MAX_CONCURRENT_CALLS_PER_TENANT = 4
 
 def _decrypt_sensitive_fields(config: dict, config_schema: dict | None = None) -> dict:
-    """Decrypt sensitive fields in config dict.
+    """Use the canonical tool-config secret registry at every runtime call."""
 
-    When config_schema is provided, also decrypts fields with type='password'
-    (e.g. smithery_api_key) that are not in the hardcoded SENSITIVE_FIELD_KEYS.
-    """
-    if not config:
-        return config
+    from app.services.tool_config import decrypt_sensitive_fields
 
-    from app.core.security import decrypt_data
-    from app.config import get_settings
-
-    settings = get_settings()
-    result = dict(config)
-
-    # Build the set of sensitive keys: hardcoded + schema-derived
-    sensitive_keys = set(SENSITIVE_FIELD_KEYS)
-    if config_schema:
-        for field in config_schema.get("fields", []):
-            if field.get("type") == "password":
-                key = field.get("key", "")
-                if key:
-                    sensitive_keys.add(key)
-
-    for key in sensitive_keys:
-        if key in result and result[key]:
-            value = result[key]
-            if isinstance(value, str) and value:
-                try:
-                    result[key] = decrypt_data(value, settings.SECRET_KEY)
-                except Exception:
-                    # If decryption fails, assume it's plaintext
-                    pass
-
-    return result
+    return decrypt_sensitive_fields(config, config_schema)
 
 
 def _get_cached_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Optional[dict]:
@@ -2473,6 +2444,7 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
 
     try:
         from app.models.tool import Tool, AgentTool
+        from app.services.tool_seeder import is_registered_builtin_tool_name
 
         async with async_session() as db:
             # Get agent-specific assignments
@@ -2486,11 +2458,14 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
             if agent_tenant_id:
                 admin_cond = admin_cond | (Tool.tenant_id == agent_tenant_id)
             visible_clauses.append((Tool.source == "admin") & admin_cond)
-            # Agent-installed tools require an explicit assignment. An
-            # assignment must never override an admin tool's tenant boundary.
-            if assigned_tool_ids:
+            # Agent-installed tools require both an explicit assignment and
+            # exact company ownership. A stale cross-company AgentTool row
+            # must not expose even the tool schema/name to the LLM.
+            if assigned_tool_ids and agent_tenant_id is not None:
                 visible_clauses.append(
-                    (Tool.source == "agent") & Tool.id.in_(assigned_tool_ids)
+                    (Tool.source == "agent")
+                    & (Tool.tenant_id == agent_tenant_id)
+                    & Tool.id.in_(assigned_tool_ids)
                 )
 
             # Get all tools visible within this agent's tenant boundary.
@@ -2511,6 +2486,27 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
             for t in all_tools:
                 tid = str(t.id)
                 at = assignments.get(tid)
+
+                if (
+                    getattr(t, "source", None) == "builtin"
+                    or getattr(t, "type", None) == "builtin"
+                ) and not is_registered_builtin_tool_name(t.name):
+                    logger.warning(
+                        "[Tools] Quarantined stale builtin id={}",
+                        t.id,
+                    )
+                    continue
+
+                # Agent-owned legacy generic MCP rows have no upstream name,
+                # so exposing their internal tenant-scoped name to the LLM
+                # guarantees an invalid tools/call request. Builtin/admin MCP
+                # definitions may intentionally use their public Tool.name.
+                if (
+                    getattr(t, "type", None) == "mcp"
+                    and getattr(t, "source", None) == "agent"
+                    and not getattr(t, "mcp_tool_name", None)
+                ):
+                    continue
 
                 # If no explicit assignment, fallback to t.is_default
                 enabled = at.enabled if at is not None else t.is_default
@@ -2889,6 +2885,7 @@ def _collect_temp_workspace_files(root: Path, selected_paths: list[str]) -> dict
 _TOOL_AUTONOMY_MAP = {
     "write_file": "write_workspace_files",
     "move_file": "write_workspace_files",
+    "edit_file": "write_workspace_files",
     "delete_file": "delete_files",
     "send_feishu_message": "send_feishu_message",
     "send_message_to_agent": "send_message_to_agent",  # A2A messaging — distinct from feishu
@@ -2903,6 +2900,17 @@ _TOOL_AUTONOMY_MAP = {
     "agentbay_command_exec": "execute_code",
     "douyin_run_publish_job": "douyin_publish_job",
 }
+
+
+def _queued_approval_message(approval_id: object) -> str:
+    """Tell the model that durable approval execution owns the retry."""
+
+    return (
+        "⏳ This action requires approval. The approval request has been queued "
+        "and the system will execute it automatically after approval. Do not "
+        "retry this tool call; check Approvals for the final status. "
+        f"(Approval ID: {approval_id or 'N/A'})"
+    )
 
 
 async def _code_tool_denial_reason(
@@ -2994,6 +3002,49 @@ def _non_empty_paths(*paths: str | None) -> list[str] | None:
     return selected or None
 
 
+@dataclass(frozen=True)
+class ApprovedToolExecutionOutcome:
+    """Typed result consumed only by the durable approval worker."""
+
+    status: str
+    result: object | None = None
+    error_code: str | None = None
+    outcome_code: str | None = None
+
+
+def _delivery_execution_result(
+    message: str,
+    *,
+    structured: bool,
+    status: str,
+    error_code: str | None = None,
+) -> str | ApprovedToolExecutionOutcome:
+    """Return an explicit delivery state without parsing presentation text."""
+
+    if not structured:
+        return message
+    return ApprovedToolExecutionOutcome(
+        status=status,
+        result={"confirmation": "accepted"} if status == "succeeded" else None,
+        error_code=error_code,
+    )
+
+
+def _workspace_mutation_result(
+    ok: bool,
+    message: str,
+    *,
+    structured: bool,
+) -> str | ApprovedToolExecutionOutcome:
+    if structured:
+        return ApprovedToolExecutionOutcome(
+            status="succeeded" if ok else "failed",
+            result=message if ok else None,
+            error_code=None if ok else "WorkspaceMutationRejected",
+        )
+    return message
+
+
 async def _run_with_temp_workspace(
     agent_id: uuid.UUID,
     tenant_id: str | None,
@@ -3023,19 +3074,20 @@ async def _execute_workspace_mutation(
     agent_id: uuid.UUID,
     base_dir: Path,
     session_id: str | None,
-) -> str:
+    structured: bool = False,
+) -> str | ApprovedToolExecutionOutcome:
     """Handle shared workspace mutations for both direct and normal tool execution."""
     if tool_name == "write_file":
         path = arguments.get("path")
         content = arguments.get("content")
         if not path:
-            return "❌ Missing required argument 'path' for write_file. Please provide a file path like 'skills/my-skill/SKILL.md'"
+            return _workspace_mutation_result(False, "❌ Missing required argument 'path' for write_file. Please provide a file path like 'skills/my-skill/SKILL.md'", structured=structured)
         if content is None:
-            return "❌ Missing required argument 'content' for write_file"
+            return _workspace_mutation_result(False, "❌ Missing required argument 'content' for write_file", structured=structured)
         if is_focus_file_path(path):
-            return "❌ Focus is no longer stored in focus.md. Use upsert_focus_item or complete_focus_item."
+            return _workspace_mutation_result(False, "❌ Focus is no longer stored in focus.md. Use upsert_focus_item or complete_focus_item.", structured=structured)
         if _is_enterprise_info_path(path):
-            return "❌ enterprise_info is shared company context and is read-only for agents. Ask an admin to update it."
+            return _workspace_mutation_result(False, "❌ enterprise_info is shared company context and is read-only for agents. Ask an admin to update it.", structured=structured)
         async with async_session() as _wdb:
             write_result = await write_workspace_file(
                 _wdb,
@@ -3050,25 +3102,26 @@ async def _execute_workspace_mutation(
                 enforce_human_lock=True,
             )
             await _wdb.commit()
-        return (
+        message = (
             f"✅ Written to {write_result.path} ({len(content)} chars)"
             if write_result.ok
             else f"❌ {write_result.message}"
         )
+        return _workspace_mutation_result(write_result.ok, message, structured=structured)
 
     if tool_name == "move_file":
         source_path = arguments.get("source_path")
         destination_path = arguments.get("destination_path")
         if not source_path:
-            return "❌ Missing required argument 'source_path' for move_file"
+            return _workspace_mutation_result(False, "❌ Missing required argument 'source_path' for move_file", structured=structured)
         if not destination_path:
-            return "❌ Missing required argument 'destination_path' for move_file"
+            return _workspace_mutation_result(False, "❌ Missing required argument 'destination_path' for move_file", structured=structured)
         if is_focus_file_path(source_path) or is_focus_file_path(destination_path):
-            return "❌ Focus is no longer stored in focus.md. Use Focus tools instead."
+            return _workspace_mutation_result(False, "❌ Focus is no longer stored in focus.md. Use Focus tools instead.", structured=structured)
         if str(source_path).strip("/") in {"tasks.json", "soul.md"}:
-            return f"❌ {source_path} cannot be moved (protected)"
+            return _workspace_mutation_result(False, f"❌ {source_path} cannot be moved (protected)", structured=structured)
         if _is_enterprise_info_path(source_path) or _is_enterprise_info_path(destination_path):
-            return "❌ enterprise_info is shared company context and is read-only for agents. Ask an admin to update it."
+            return _workspace_mutation_result(False, "❌ enterprise_info is shared company context and is read-only for agents. Ask an admin to update it.", structured=structured)
         async with async_session() as _wdb:
             move_result = await move_workspace_path(
                 _wdb,
@@ -3083,14 +3136,15 @@ async def _execute_workspace_mutation(
                 overwrite=bool(arguments.get("overwrite", False)),
             )
             await _wdb.commit()
-        return f"✅ {move_result.message}" if move_result.ok else f"❌ {move_result.message}"
+        message = f"✅ {move_result.message}" if move_result.ok else f"❌ {move_result.message}"
+        return _workspace_mutation_result(move_result.ok, message, structured=structured)
 
     if tool_name == "delete_file":
         path = arguments.get("path", "")
         if is_focus_file_path(path):
-            return "❌ Focus is no longer stored in focus.md. Use Focus tools instead."
+            return _workspace_mutation_result(False, "❌ Focus is no longer stored in focus.md. Use Focus tools instead.", structured=structured)
         if _is_enterprise_info_path(path):
-            return "❌ enterprise_info is shared company context and is read-only for agents. Ask an admin to update it."
+            return _workspace_mutation_result(False, "❌ enterprise_info is shared company context and is read-only for agents. Ask an admin to update it.", structured=structured)
         async with async_session() as _wdb:
             delete_result = await delete_workspace_file(
                 _wdb,
@@ -3103,38 +3157,40 @@ async def _execute_workspace_mutation(
                 enforce_human_lock=True,
             )
             await _wdb.commit()
-        return f"✅ Deleted {delete_result.path}" if delete_result.ok else f"❌ {delete_result.message}"
+        message = f"✅ Deleted {delete_result.path}" if delete_result.ok else f"❌ {delete_result.message}"
+        return _workspace_mutation_result(delete_result.ok, message, structured=structured)
 
     if tool_name == "edit_file":
         path = arguments.get("path")
         old_string = arguments.get("old_string")
         new_string = arguments.get("new_string")
         if not path:
-            return "❌ Missing required argument 'path' for edit_file"
+            return _workspace_mutation_result(False, "❌ Missing required argument 'path' for edit_file", structured=structured)
         if old_string is None:
-            return "❌ Missing required argument 'old_string' for edit_file"
+            return _workspace_mutation_result(False, "❌ Missing required argument 'old_string' for edit_file", structured=structured)
         if new_string is None:
-            return "❌ Missing required argument 'new_string' for edit_file"
+            return _workspace_mutation_result(False, "❌ Missing required argument 'new_string' for edit_file", structured=structured)
         if is_focus_file_path(path):
-            return "❌ Focus is no longer stored in focus.md. Use upsert_focus_item or complete_focus_item."
+            return _workspace_mutation_result(False, "❌ Focus is no longer stored in focus.md. Use upsert_focus_item or complete_focus_item.", structured=structured)
         if _is_enterprise_info_path(path):
-            return "❌ enterprise_info is shared company context and is read-only for agents. Ask an admin to update it."
+            return _workspace_mutation_result(False, "❌ enterprise_info is shared company context and is read-only for agents. Ask an admin to update it.", structured=structured)
 
         replace_all = arguments.get("replace_all", False)
         storage = get_storage_backend()
         storage_key, normalized_path, _ = _tool_storage_key(agent_id, path, None)
         if not await storage.is_file(storage_key):
-            return f"File not found: {path}"
+            return _workspace_mutation_result(False, f"File not found: {path}", structured=structured)
 
         content = await storage.read_text(storage_key, encoding="utf-8", errors="replace")
         if old_string not in content:
-            return (
-                f"⚠️ No changes made: 'old_string' was not found in {path}. "
-                "The file may already be up to date."
+            return _workspace_mutation_result(
+                False,
+                f"⚠️ No changes made: 'old_string' was not found in {path}. The file may already be up to date.",
+                structured=structured,
             )
         count = content.count(old_string)
         if count > 1 and not replace_all:
-            return f"❌ 'old_string' appears {count} times in {path}. Use replace_all=true or provide more context to make the match unique."
+            return _workspace_mutation_result(False, f"❌ 'old_string' appears {count} times in {path}. Use replace_all=true or provide more context to make the match unique.", structured=structured)
 
         new_content = content.replace(old_string, new_string) if replace_all else content.replace(old_string, new_string, 1)
         async with async_session() as _wdb:
@@ -3152,19 +3208,24 @@ async def _execute_workspace_mutation(
             )
             await _wdb.commit()
         replaced = count if replace_all else 1
-        return (
+        message = (
             f"✅ Replaced {replaced} occurrence(s) in {write_result.path}"
             if write_result.ok
             else f"❌ {write_result.message}"
         )
+        return _workspace_mutation_result(write_result.ok, message, structured=structured)
 
-    return f"Tool {tool_name} does not support workspace mutation execution"
+    return _workspace_mutation_result(False, f"Tool {tool_name} does not support workspace mutation execution", structured=structured)
 
 
 async def _execute_tool_direct(
     tool_name: str,
     arguments: dict,
     agent_id: uuid.UUID,
+    *,
+    approval_id: uuid.UUID | None = None,
+    approval_claim_token: uuid.UUID | None = None,
+    raise_exceptions: bool = False,
 ) -> str:
     """Execute a tool directly, bypassing autonomy checks.
 
@@ -3174,12 +3235,16 @@ async def _execute_tool_direct(
     _agent_tenant_id = await _get_agent_tenant_id(agent_id)
     denial = await _code_tool_denial_reason(tool_name, agent_id)
     if denial:
+        if raise_exceptions:
+            raise PermissionError(denial)
         return f"❌ {denial}"
     if tool_name.startswith("agentbay_"):
         from app.api.agentbay_control import is_session_locked
 
         session_id = str(arguments.get("_session_id") or "")
         if is_session_locked(str(agent_id), session_id):
+            if raise_exceptions:
+                raise PermissionError("AgentBay session is under human control")
             return "❌ AgentBay session is under human control; approved execution was blocked"
     ws = _agent_workspace_root(agent_id)
     try:
@@ -3244,7 +3309,12 @@ async def _execute_tool_direct(
             from app.services.douyin.operations import douyin_operations_service
             job_id = uuid.UUID(str(arguments.get("job_id")))
             async with async_session() as _ddb:
-                job = await douyin_operations_service.run_publish_job(_ddb, job_id=job_id)
+                job = await douyin_operations_service.run_publish_job(
+                    _ddb,
+                    job_id=job_id,
+                    approval_id=approval_id,
+                    approval_claim_token=approval_claim_token,
+                )
                 await _ddb.commit()
                 return json.dumps(
                     {
@@ -3268,6 +3338,8 @@ async def _execute_tool_direct(
                     operation_id=uuid.UUID(str(operation_id)),
                     reply_text=arguments.get("reply_text"),
                     item_id=arguments.get("item_id"),
+                    approval_id=approval_id,
+                    approval_claim_token=approval_claim_token,
                 )
                 await _ddb.commit()
                 return json.dumps(
@@ -3279,10 +3351,140 @@ async def _execute_tool_direct(
                     ensure_ascii=False,
                 )
         else:
+            if raise_exceptions:
+                raise ValueError(f"Tool {tool_name} does not support post-approval execution")
             return f"Tool {tool_name} does not support post-approval execution"
     except Exception as e:
         logger.exception(f"[DirectTool] Error executing {tool_name}: {e}")
+        if raise_exceptions:
+            raise
         return f"Error executing {tool_name}: {e}"
+
+
+async def _execute_approved_tool(
+    tool_name: str,
+    arguments: dict,
+    agent_id: uuid.UUID,
+    *,
+    approval_id: uuid.UUID,
+    approval_claim_token: uuid.UUID,
+) -> ApprovedToolExecutionOutcome:
+    """Execute through the durable approval contract with a typed outcome.
+
+    Each write path returns an explicit confirmed/rejected/unknown state.
+    Transport uncertainty is marked ambiguous and is never replayed
+    automatically; human-readable presentation strings are not parsed.
+    """
+
+    if tool_name in {"delete_file", "write_file", "move_file", "edit_file"}:
+        outcome = await _execute_workspace_mutation(
+            tool_name,
+            arguments,
+            agent_id=agent_id,
+            base_dir=_agent_workspace_root(agent_id),
+            session_id=None,
+            structured=True,
+        )
+        if not isinstance(outcome, ApprovedToolExecutionOutcome):
+            raise RuntimeError("Workspace approval executor returned an invalid outcome")
+        return outcome
+
+    if tool_name == "send_feishu_message":
+        outcome = await _send_feishu_message(
+            agent_id,
+            arguments,
+            structured=True,
+        )
+        if not isinstance(outcome, ApprovedToolExecutionOutcome):
+            raise RuntimeError("Feishu approval executor returned an invalid outcome")
+        return outcome
+    if tool_name == "send_message_to_agent":
+        outcome = await _send_message_to_agent(
+            agent_id,
+            arguments,
+            user_id=None,
+            origin_session_id=None,
+            structured=True,
+        )
+        if not isinstance(outcome, ApprovedToolExecutionOutcome):
+            raise RuntimeError("Agent message approval executor returned an invalid outcome")
+        return outcome
+    if tool_name == "send_file_to_agent":
+        outcome = await _send_file_to_agent(
+            agent_id,
+            arguments,
+            structured=True,
+        )
+        if not isinstance(outcome, ApprovedToolExecutionOutcome):
+            raise RuntimeError("Agent file approval executor returned an invalid outcome")
+        return outcome
+
+    result = await _execute_tool_direct(
+        tool_name,
+        arguments,
+        agent_id,
+        approval_id=approval_id,
+        approval_claim_token=approval_claim_token,
+        raise_exceptions=True,
+    )
+    if tool_name in {"douyin_run_publish_job", "douyin_reply_comment"}:
+        try:
+            payload = json.loads(result)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Douyin executor returned an invalid outcome") from exc
+        successful_statuses = {
+            "awaiting_user_publish": "DouyinUserActionRequired",
+            "created_reviewing": "DouyinAcceptedPendingReview",
+            "published_unverified": "DouyinPublishedPendingVerification",
+            "user_confirmed_waiting_verification": (
+                "DouyinUserConfirmedPendingVerification"
+            ),
+            "succeeded": "DouyinConfirmed",
+        }
+        status = payload.get("status")
+        if status in successful_statuses:
+            return ApprovedToolExecutionOutcome(
+                status="succeeded",
+                result=payload,
+                outcome_code=successful_statuses[status],
+            )
+        if status == "verification_required":
+            return ApprovedToolExecutionOutcome(
+                status="ambiguous",
+                error_code="DouyinVerificationRequired",
+            )
+        deterministic_failures = {
+            "blocked": "DouyinBlocked",
+            "permission_missing": "DouyinPermissionMissing",
+            "needs_reauth": "DouyinAuthenticationRequired",
+            "rate_limited": "DouyinRateLimited",
+            "failed": "DouyinRejected",
+        }
+        if status in deterministic_failures:
+            return ApprovedToolExecutionOutcome(
+                status="failed",
+                error_code=deterministic_failures[status],
+            )
+        return ApprovedToolExecutionOutcome(
+            status="failed",
+            error_code="DouyinInvalidBusinessStatus",
+        )
+    if tool_name in {
+        "execute_code",
+        "execute_code_e2b",
+        "agentbay_code_execute",
+        "agentbay_code_write_file",
+        "agentbay_code_read_file",
+        "agentbay_code_edit_file",
+        "agentbay_command_exec",
+    }:
+        return ApprovedToolExecutionOutcome(
+            status="ambiguous",
+            error_code="CodeOutcomeNotDurable",
+        )
+    # Read-only approved tools are safe to consider complete once the direct
+    # call returns: there is no external write to replay.
+    return ApprovedToolExecutionOutcome(status="succeeded", result=result)
 
 
 async def execute_tool(
@@ -3355,6 +3557,7 @@ async def execute_tool(
                         action_type,
                         build_tool_approval_details(
                             agent_id,
+                            action_type,
                             tool_name,
                             arguments,
                             user_id,
@@ -3365,7 +3568,9 @@ async def execute_tool(
                         level = result_check.get("level", "L3")
                         logger.info(f"[Autonomy] Tool {tool_name} denied, level: {level}")
                         if level == "L3":
-                            return f"⏳ This action requires approval. An approval request has been sent. Please wait for approval before retrying. (Approval ID: {result_check.get('approval_id', 'N/A')})"
+                            return _queued_approval_message(
+                                result_check.get("approval_id")
+                            )
                         return f"❌ Action denied: {result_check.get('message', 'unknown reason')}"
         except Exception as e:
             logger.exception(f"[Autonomy] Check failed: {e}")
@@ -3787,16 +3992,24 @@ async def execute_tool(
                 agent_id,
                 _agent_tenant_id,
                 lambda temp_ws: _generate_video_minimax(
-                    agent_id, temp_ws, arguments, user_id=user_id, saas_tier=saas_tier
+                    agent_id,
+                    temp_ws,
+                    arguments,
+                    user_id=user_id,
+                    saas_tier=saas_tier,
+                    session_id=session_id,
                 ),
-                sync_back=True,
+                # The durable media service writes metadata and output to the
+                # authoritative storage backend. Re-flushing the temp copy
+                # would race that write and produce a false CAS conflict.
+                sync_back=False,
             )
         elif tool_name == "check_video_minimax":
             result = await _run_with_temp_workspace(
                 agent_id,
                 _agent_tenant_id,
                 lambda temp_ws: _check_video_minimax(agent_id, temp_ws, arguments),
-                sync_back=True,
+                sync_back=False,
             )
         elif tool_name == "discover_resources":
             result = await _discover_resources(agent_id, arguments)
@@ -4889,6 +5102,12 @@ def _mcp_tool_visible_to_tenant(tool, tenant_id: uuid.UUID | str | None) -> bool
     tool_tenant_id = getattr(tool, "tenant_id", None)
     if source not in {"builtin", "admin", "agent"}:
         return False
+    if source == "agent":
+        return (
+            tool_tenant_id is not None
+            and tenant_id is not None
+            and str(tool_tenant_id) == str(tenant_id)
+        )
     if tool_tenant_id is None:
         return True
     return tenant_id is not None and str(tool_tenant_id) == str(tenant_id)
@@ -4942,43 +5161,94 @@ async def _execute_mcp_tool(tool_name: str, arguments: dict, agent_id=None) -> s
                 return "❌ MCP tool is unavailable for this Agent"
             tool, agent_config = selected[0]
 
+        if (
+            getattr(tool, "source", None) == "agent"
+            and not getattr(tool, "mcp_tool_name", None)
+        ):
+            logger.warning(
+                "[MCP] quarantined legacy generic tool rejected tool={} agent={}",
+                tool_name,
+                agent_id,
+            )
+            return "❌ MCP tool is unavailable for this Agent"
+
         if not tool.mcp_server_url:
             logger.error(f"[MCP] Tool {tool_name} has no server URL configured")
             return f"❌ MCP tool {tool_name} has no server URL configured"
 
-        # Merge global config + agent override
-        merged_config = {**(tool.config or {}), **agent_config}
+        # Tenantless MCP rows are shared capability definitions. Ignore any
+        # legacy Tool.config defensively so one company's historic key cannot
+        # become another company's runtime credential.
+        global_config = {} if tool.tenant_id is None else (tool.config or {})
+        merged_config = {**global_config, **agent_config}
         merged_config = _decrypt_sensitive_fields(
             merged_config,
             tool.config_schema,
         )
 
-        mcp_url = tool.mcp_server_url
+        from app.services.mcp_security import (
+            is_smithery_runtime_url,
+            restore_mcp_url_secrets,
+        )
+
+        mcp_url = restore_mcp_url_secrets(
+            tool.mcp_server_url,
+            merged_config.get("mcp_url_query_secrets"),
+        )
         mcp_name = tool.mcp_tool_name or tool_name
         arguments = _coerce_mcp_arguments(arguments, tool.parameters_schema or {})
 
-        # Detect Smithery-hosted MCP servers (*.run.tools URLs)
-        # These need Smithery Connect to route tool calls
-        if ".run.tools" in mcp_url and merged_config:
-            return await _execute_via_smithery_connect(mcp_url, mcp_name, arguments, merged_config, agent_id=agent_id)
+        tenant_key = str(agent_tenant_id)
+        semaphore = _mcp_tenant_semaphores.setdefault(
+            tenant_key,
+            asyncio.Semaphore(_MCP_MAX_CONCURRENT_CALLS_PER_TENANT),
+        )
+        try:
+            await asyncio.wait_for(semaphore.acquire(), timeout=5)
+        except TimeoutError:
+            return "❌ This company's MCP call limit is busy; try again shortly"
+        try:
+            # Detect Smithery-hosted MCP servers (*.run.tools URLs)
+            # These need Smithery Connect to route tool calls
+            if is_smithery_runtime_url(mcp_url) and merged_config:
+                return await _execute_via_smithery_connect(
+                    mcp_url,
+                    mcp_name,
+                    arguments,
+                    merged_config,
+                    agent_id=agent_id,
+                )
 
-        # Direct MCP call for non-Smithery servers
-        # Priority for API key:
-        # 1. Per-agent tool config (api_key / atlassian_api_key)
-        # 2. Agent's Atlassian channel config (for atlassian_* tools)
-        direct_api_key = merged_config.get("api_key") or merged_config.get("atlassian_api_key")
-        if not direct_api_key and tool.mcp_server_name == "Atlassian Rovo":
-            try:
-                from app.api.atlassian import get_atlassian_api_key_for_agent
-                direct_api_key = await get_atlassian_api_key_for_agent(agent_id)
-            except Exception:
-                pass
-        client = MCPClient(mcp_url, api_key=direct_api_key)
-        return await client.call_tool(mcp_name, arguments)
+            # Atlassian always resolves its current ChannelConfig credential;
+            # generic MCP tools use the per-Agent encrypted config.
+            direct_api_key = None
+            if tool.mcp_server_name == "Atlassian Rovo":
+                try:
+                    from app.api.atlassian import get_atlassian_api_key_for_agent
+
+                    direct_api_key = await get_atlassian_api_key_for_agent(agent_id)
+                except Exception:
+                    pass
+                if not direct_api_key:
+                    return "❌ Atlassian is not configured for this Agent"
+            else:
+                direct_api_key = merged_config.get("api_key") or merged_config.get(
+                    "atlassian_api_key"
+                )
+            client = MCPClient(mcp_url, api_key=direct_api_key)
+            return await client.call_tool(mcp_name, arguments)
+        finally:
+            semaphore.release()
 
     except Exception as e:
-        logger.exception(f"[MCP] Tool execution error: {tool_name}")
-        return f"❌ MCP tool execution error: {str(e)[:200]}"
+        incident_id = uuid.uuid4().hex[:12]
+        logger.exception(
+            "[MCP] Tool execution failed tool={} error_type={} incident_id={}",
+            tool_name,
+            type(e).__name__,
+            incident_id,
+        )
+        return f"❌ MCP tool execution failed (incident {incident_id})"
 
 
 def _coerce_mcp_arguments(arguments: dict, schema: dict) -> dict:
@@ -5053,11 +5323,11 @@ async def _execute_via_smithery_connect(mcp_url: str, tool_name: str, arguments:
     Uses stored namespace/connection or falls back to creating one.
     Smithery Connect returns SSE-format responses that need special parsing.
     """
-    import httpx
-    import json as json_mod
-
     # Get Smithery API key centrally (from discover_resources/import_mcp_server AgentTool config)
     from app.services.resource_discovery import _get_smithery_api_key
+    from app.services.mcp_client import MCPClient
+    from app.services.mcp_security import MCPURLPolicyError, smithery_connect_url
+
     api_key = await _get_smithery_api_key(agent_id)
     if not api_key:
         return (
@@ -5069,21 +5339,8 @@ async def _execute_via_smithery_connect(mcp_url: str, tool_name: str, arguments:
         )
 
     # Get namespace + connection from tool config, or use defaults
-    namespace = config.pop("smithery_namespace", None)
-    connection_id = config.pop("smithery_connection_id", None)
-
-    if not namespace or not connection_id:
-        # Fallback: try to get from Smithery settings
-        try:
-            from app.models.tool import Tool
-            async with async_session() as db:
-                r = await db.execute(select(Tool).where(Tool.name == "discover_resources"))
-                disc_tool = r.scalar_one_or_none()
-                if disc_tool and disc_tool.config:
-                    namespace = namespace or disc_tool.config.get("smithery_namespace")
-                    connection_id = connection_id or disc_tool.config.get("smithery_connection_id")
-        except Exception:
-            pass
+    namespace = config.get("smithery_namespace")
+    connection_id = config.get("smithery_connection_id")
 
     if not namespace or not connection_id:
         return (
@@ -5091,99 +5348,30 @@ async def _execute_via_smithery_connect(mcp_url: str, tool_name: str, arguments:
             "Please set smithery_namespace and smithery_connection_id in the tool configuration."
         )
 
-    # Smithery Connect (and many MCP servers) emit SSE responses for tools/call.
-    # The server returns 406 Not Acceptable if the client doesn't declare both
-    # application/json and text/event-stream in the Accept header. We parse
-    # both formats below, so advertise both.
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/event-stream",
-    }
-
     try:
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            # Call the tool via the existing connection
-            tool_resp = await client.post(
-                f"https://api.smithery.ai/connect/{namespace}/{connection_id}/mcp",
-                json={
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "tools/call",
-                    "params": {
-                        "name": tool_name,
-                        "arguments": arguments,
-                    },
-                },
-                headers=headers,
-            )
-
-            # Detect auth/connection failures and attempt auto-recovery
-            if tool_resp.status_code in (401, 403, 404):
-                recovery_result = await _smithery_auto_recover(
-                    api_key, mcp_url, namespace, connection_id, agent_id
-                )
-                if recovery_result:
-                    return recovery_result
-                # If recovery returned None, fall through to normal parsing
-
-            # Smithery Connect returns SSE format: "event: message\ndata: {...}\n"
-            raw = tool_resp.text
-            data = None
-
-            # Parse SSE response
-            for line in raw.split("\n"):
-                line = line.strip()
-                if line.startswith("data: "):
-                    try:
-                        data = json_mod.loads(line[6:])
-                        break
-                    except json_mod.JSONDecodeError:
-                        pass
-
-            # Fallback: try parsing as plain JSON
-            if data is None:
-                try:
-                    data = json_mod.loads(raw)
-                except json_mod.JSONDecodeError:
-                    return f"❌ Unexpected response from Smithery: {raw[:300]}"
-
-            if "error" in data:
-                err = data["error"]
-                msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-                # Check if error indicates auth/connection issue
-                auth_keywords = ["auth", "unauthorized", "forbidden", "expired", "not found", "connection"]
-                if any(kw in msg.lower() for kw in auth_keywords):
-                    recovery_result = await _smithery_auto_recover(
-                        api_key, mcp_url, namespace, connection_id, agent_id
-                    )
-                    if recovery_result:
-                        return recovery_result
-                return f"❌ MCP tool error: {msg[:300]}"
-
-            result = data.get("result", {})
-            if isinstance(result, str):
-                return result
-
-            content_blocks = result.get("content", []) if isinstance(result, dict) else []
-            texts = []
-            for block in content_blocks:
-                if isinstance(block, str):
-                    texts.append(block)
-                elif isinstance(block, dict):
-                    if block.get("type") == "text":
-                        texts.append(block.get("text", ""))
-                    elif block.get("type") == "image":
-                        texts.append(f"[Image: {block.get('mimeType', 'image')}]")
-                    else:
-                        texts.append(str(block))
-                else:
-                    texts.append(str(block))
-
-            return "\n".join(texts) if texts else str(result)
-
-    except Exception as e:
-        return f"❌ Smithery Connect error: {str(e)[:200]}"
+        connect_url = smithery_connect_url(str(namespace), str(connection_id))
+        result = await MCPClient(connect_url, api_key=api_key).call_tool(
+            tool_name,
+            arguments,
+        )
+        if not result.startswith("❌ MCP"):
+            return result
+        recovery_result = await _smithery_auto_recover(
+            api_key,
+            mcp_url,
+            str(namespace),
+            str(connection_id),
+            agent_id,
+        )
+        return recovery_result or result
+    except (MCPURLPolicyError, Exception) as exc:
+        incident_id = uuid.uuid4().hex[:12]
+        logger.warning(
+            "[SmitheryConnect] Tool execution failed error_type={} incident_id={}",
+            type(exc).__name__,
+            incident_id,
+        )
+        return f"❌ Smithery Connect failed (incident {incident_id})"
 
 
 async def _smithery_auto_recover(api_key: str, mcp_url: str, namespace: str, connection_id: str, agent_id=None) -> str | None:
@@ -5198,20 +5386,23 @@ async def _smithery_auto_recover(api_key: str, mcp_url: str, namespace: str, con
 
         conn_result = await _ensure_smithery_connection(api_key, mcp_url, display_name)
         if "error" in conn_result:
-            return (
-                f"❌ MCP tool connection expired and auto-recovery failed: {conn_result['error']}\n\n"
-                f"💡 Please re-authorize by telling me: `import_mcp_server(server_id=\"...\", reauthorize=true)`"
-            )
+            return "❌ MCP tool connection recovery failed; re-import or re-authorize the server"
 
         if conn_result.get("auth_url"):
             # A newly-created Smithery connection is not usable until the user
             # completes OAuth. Keep the existing stored connection in place so
             # a still-valid old connection is not overwritten by an unauthenticated
             # replacement. The user-facing auth URL is enough for recovery.
+            from app.services.mcp_security import validate_public_mcp_url
+
+            try:
+                auth_url = await validate_public_mcp_url(conn_result["auth_url"])
+            except Exception:
+                return "❌ MCP tool connection recovery returned an unsafe authorization URL"
             return (
                 f"🔐 MCP tool connection expired. Re-authorization needed.\n\n"
                 f"Please visit the following URL to re-authorize:\n"
-                f"{conn_result['auth_url']}\n\n"
+                f"{auth_url}\n\n"
                 f"After completing authorization, the tools will work again automatically."
             )
 
@@ -5223,30 +5414,68 @@ async def _smithery_auto_recover(api_key: str, mcp_url: str, namespace: str, con
         if agent_id:
             try:
                 from app.models.tool import Tool, AgentTool
+                from app.services.agent_tool_assignments import (
+                    lock_agent_tool_owner,
+                    upsert_agent_tool,
+                )
+                from app.services.mcp_security import normalized_mcp_endpoint
+
                 async with async_session() as db:
-                    # Update all MCP tools for this server URL
+                    agent_uuid = uuid.UUID(str(agent_id))
+                    # Serialize the read/merge/write sequence with every other
+                    # assignment writer.  Without the stable Agent owner lock,
+                    # a delayed recovery could overwrite a newer credential or
+                    # enablement decision made in the API.
+                    await lock_agent_tool_owner(db, agent_uuid)
+                    target_endpoint = normalized_mcp_endpoint(mcp_url)
                     r = await db.execute(
-                        select(Tool).where(Tool.mcp_server_url == mcp_url, Tool.type == "mcp")
+                        select(Tool)
+                        .join(AgentTool, AgentTool.tool_id == Tool.id)
+                        .where(
+                            AgentTool.agent_id == agent_uuid,
+                            Tool.type == "mcp",
+                        )
                     )
                     for tool in r.scalars().all():
+                        try:
+                            if normalized_mcp_endpoint(tool.mcp_server_url) != target_endpoint:
+                                continue
+                        except Exception:
+                            continue
                         at_r = await db.execute(
                             select(AgentTool).where(
-                                AgentTool.agent_id == agent_id,
+                                AgentTool.agent_id == agent_uuid,
                                 AgentTool.tool_id == tool.id,
                             )
                         )
                         at = at_r.scalar_one_or_none()
                         if at:
-                            at.config = {**(at.config or {}), **new_config}
+                            await upsert_agent_tool(
+                                db,
+                                agent_id=agent_uuid,
+                                tool_id=tool.id,
+                                enabled=at.enabled,
+                                source=at.source,
+                                installed_by_agent_id=at.installed_by_agent_id,
+                                config={**(at.config or {}), **new_config},
+                                on_conflict="config",
+                            )
                     await db.commit()
-            except Exception:
-                pass  # Non-critical — connection may still work
+            except Exception as exc:
+                logger.warning(
+                    "[SmitheryConnect] Failed to persist recovered connection error_type={}",
+                    type(exc).__name__,
+                )
 
         # Connection re-created without OAuth — should work now
         return None  # Signal caller to retry (but we don't retry here to avoid loops)
 
-    except Exception as e:
-        return f"❌ Auto-recovery failed: {str(e)[:200]}"
+    except Exception as exc:
+        logger.warning(
+            "[SmitheryConnect] Auto-recovery failed error_type={}",
+            type(exc).__name__,
+        )
+        return "❌ MCP tool connection recovery failed"
 
 
 def _normalize_tool_rel_path(rel_path: str) -> str:
@@ -6619,16 +6848,32 @@ async def _manage_tasks(
         return f"Unknown action: {action}"
 
 
-async def _send_feishu_message(agent_id: uuid.UUID, args: dict) -> str:
+async def _send_feishu_message(
+    agent_id: uuid.UUID,
+    args: dict,
+    *,
+    structured: bool = False,
+) -> str | ApprovedToolExecutionOutcome:
     """Send a Feishu message to a person in the agent's relationship list."""
     member_name = (args.get("member_name") or "").strip()
     direct_user_id = (args.get("user_id") or "").strip()
     message_text = (args.get("message") or "").strip()
 
+    dispatched = False
     if not message_text:
-        return "❌ Please provide message content"
+        return _delivery_execution_result(
+            "❌ Please provide message content",
+            structured=structured,
+            status="failed",
+            error_code="MissingMessage",
+        )
     if not member_name and not direct_user_id:
-        return "❌ Please provide member_name or user_id"
+        return _delivery_execution_result(
+            "❌ Please provide member_name or user_id",
+            structured=structured,
+            status="failed",
+            error_code="MissingRecipient",
+        )
 
     try:
         from app.services.feishu_service import FeishuAPIError, feishu_service
@@ -6641,7 +6886,12 @@ async def _send_feishu_message(agent_id: uuid.UUID, args: dict) -> str:
             )
             config = config_result.scalar_one_or_none()
             if not config:
-                return "❌ This agent has no Feishu channel configured"
+                return _delivery_execution_result(
+                    "❌ This agent has no Feishu channel configured",
+                    structured=structured,
+                    status="failed",
+                    error_code="FeishuNotConfigured",
+                )
             if direct_user_id and not member_name:
                 rel_result = await db.execute(
                     select(AgentRelationship)
@@ -6655,11 +6905,22 @@ async def _send_feishu_message(agent_id: uuid.UUID, args: dict) -> str:
                 )
                 direct_rel = rel_result.scalars().first()
                 if not direct_rel:
-                    return "❌ Recipient is not in your active relationship network"
+                    return _delivery_execution_result(
+                        "❌ Recipient is not in your active relationship network",
+                        structured=structured,
+                        status="failed",
+                        error_code="RecipientNotAuthorized",
+                    )
                 status_info = await evaluate_human_relationship_status(db, direct_rel)
                 if status_info["access_status"] != "active":
-                    return f"❌ Relationship to recipient is not active ({status_info['access_status_reason'] or 'restricted'})"
+                    return _delivery_execution_result(
+                        f"❌ Relationship to recipient is not active ({status_info['access_status_reason'] or 'restricted'})",
+                        structured=structured,
+                        status="failed",
+                        error_code="RecipientRelationshipInactive",
+                    )
                 try:
+                    dispatched = True
                     resp = await feishu_service.send_message(
                         config.app_id, config.app_secret,
                         receive_id=direct_user_id, msg_type="text",
@@ -6694,15 +6955,29 @@ async def _send_feishu_message(agent_id: uuid.UUID, args: dict) -> str:
                             await db.commit()
                         except Exception as history_error:
                             logger.error(f"[Feishu] Failed to save outgoing message to history: {history_error}")
-                        return f"✅ 消息已发送（user_id: {direct_user_id}）"
-                    return f"❌ 发送失败：{resp.get('msg')} (code {resp.get('code')})"
+                        return _delivery_execution_result(
+                            f"✅ 消息已发送（user_id: {direct_user_id}）",
+                            structured=structured,
+                            status="succeeded",
+                        )
+                    return _delivery_execution_result(
+                        f"❌ 发送失败：{resp.get('msg')} (code {resp.get('code')})",
+                        structured=structured,
+                        status="failed",
+                        error_code="FeishuProviderRejected",
+                    )
                 except FeishuAPIError as user_id_err:
                     logger.info(
                         "[Feishu] Send failed via direct user_id http_status={} error_code={}",
                         user_id_err.http_status,
                         user_id_err.code,
                     )
-                    return f"❌ 飞书发送失败：{user_id_err.user_message}"
+                    return _delivery_execution_result(
+                        f"❌ 飞书发送失败：{user_id_err.user_message}",
+                        structured=structured,
+                        status="failed",
+                        error_code="FeishuProviderRejected",
+                    )
 
             # Find the relationship member by name
             result = await db.execute(
@@ -6721,7 +6996,12 @@ async def _send_feishu_message(agent_id: uuid.UUID, args: dict) -> str:
 
             if not target_member:
                 logger.info("[Feishu] Relationship target not found")
-                return f"❌ {member_name} 不是我的关系"
+                return _delivery_execution_result(
+                    f"❌ {member_name} 不是我的关系",
+                    structured=structured,
+                    status="failed",
+                    error_code="RecipientNotAuthorized",
+                )
                 
             logger.info(
                 "[Feishu] Relationship target resolved external_id_present={} open_id_present={}",
@@ -6730,7 +7010,12 @@ async def _send_feishu_message(agent_id: uuid.UUID, args: dict) -> str:
             )
             if not target_member.external_id:
                 logger.error(f"[Feishu] Relationship {target_member.id} has no linked user_id")
-                return f"❌ {member_name} 没有关联可用的飞书 user_id"
+                return _delivery_execution_result(
+                    f"❌ {member_name} 没有关联可用的飞书 user_id",
+                    structured=structured,
+                    status="failed",
+                    error_code="RecipientIdentityMissing",
+                )
 
             content = json.dumps({"text": message_text}, ensure_ascii=False)
 
@@ -6782,15 +7067,25 @@ async def _send_feishu_message(agent_id: uuid.UUID, args: dict) -> str:
                     logger.error(f"[Feishu] Failed to save outgoing message to history: {e}")
 
             try:
+                dispatched = True
                 resp = await _try_send(config.app_id, config.app_secret, target_member.external_id, "user_id")
                 if resp.get("code") == 0:
                     await _save_outgoing_to_feishu_session(target_member.external_id)
-                    return f"✅ Successfully sent message to {member_name}"
+                    return _delivery_execution_result(
+                        f"✅ Successfully sent message to {member_name}",
+                        structured=structured,
+                        status="succeeded",
+                    )
                 logger.info(
                     "[Feishu] Send failed via user_id error_code={}",
                     resp.get("code") if isinstance(resp, dict) else "unknown",
                 )
-                return f"发送失败: {resp.get('msg')} (code {resp.get('code')})"
+                return _delivery_execution_result(
+                    f"发送失败: {resp.get('msg')} (code {resp.get('code')})",
+                    structured=structured,
+                    status="failed",
+                    error_code="FeishuProviderRejected",
+                )
             except FeishuAPIError as user_id_err:
                 logger.info(
                     "[Feishu] Send failed via relationship={} http_status={} error_code={}",
@@ -6798,9 +7093,19 @@ async def _send_feishu_message(agent_id: uuid.UUID, args: dict) -> str:
                     user_id_err.http_status,
                     user_id_err.code,
                 )
-                return f"❌ 飞书发送失败：{user_id_err.user_message}"
+                return _delivery_execution_result(
+                    f"❌ 飞书发送失败：{user_id_err.user_message}",
+                    structured=structured,
+                    status="failed",
+                    error_code="FeishuProviderRejected",
+                )
     except Exception as e:
-        return f"❌ Message send error: {str(e)[:200]}"
+        return _delivery_execution_result(
+            f"❌ Message send error: {str(e)[:200]}",
+            structured=structured,
+            status="ambiguous" if dispatched else "failed",
+            error_code="FeishuDeliveryUnknown" if dispatched else "FeishuValidationFailed",
+        )
 
 
 async def _send_channel_message(agent_id: uuid.UUID, args: dict) -> str:
@@ -7499,19 +7804,35 @@ async def _send_platform_message(agent_id: uuid.UUID, args: dict) -> str:
         return f"❌ Web message send error: {str(e)[:200]}"
 
 
-async def _send_file_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
+async def _send_file_to_agent(
+    from_agent_id: uuid.UUID,
+    args: dict,
+    *,
+    structured: bool = False,
+) -> str | ApprovedToolExecutionOutcome:
     """Send a workspace file to another digital employee (agent)."""
     agent_name = (args.get("agent_name") or "").strip()
     rel_path = (args.get("file_path") or "").strip()
     delivery_note = (args.get("message") or "").strip()
 
+    side_effect_started = False
     if not agent_name or not rel_path:
-        return "❌ Please provide both agent_name and file_path"
+        return _delivery_execution_result(
+            "❌ Please provide both agent_name and file_path",
+            structured=structured,
+            status="failed",
+            error_code="MissingFileRecipientOrPath",
+        )
 
     storage = get_storage_backend()
     source_key = normalize_storage_key(f"{from_agent_id}/{rel_path}")
     if not await storage.is_file(source_key):
-        return f"❌ Source file not found: {rel_path}"
+        return _delivery_execution_result(
+            f"❌ Source file not found: {rel_path}",
+            structured=structured,
+            status="failed",
+            error_code="SourceFileMissing",
+        )
     source_entry = await storage.stat(source_key)
 
     # File size limit (50 MB)
@@ -7519,7 +7840,12 @@ async def _send_file_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
     file_size = source_entry.size
     if file_size > MAX_FILE_SIZE:
         size_mb = file_size / (1024 * 1024)
-        return f"❌ File too large ({size_mb:.1f} MB). Maximum allowed is 50 MB."
+        return _delivery_execution_result(
+            f"❌ File too large ({size_mb:.1f} MB). Maximum allowed is 50 MB.",
+            structured=structured,
+            status="failed",
+            error_code="SourceFileTooLarge",
+        )
     source_bytes = await storage.read_bytes(source_key)
     source_name = Path(rel_path).name
 
@@ -7562,10 +7888,20 @@ async def _send_file_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
                     )
                 )
                 rel_names = [n for (n,) in rel_r.all()]
-                return f"❌ No agent found matching '{agent_name}'. Your connected colleagues: {', '.join(rel_names) if rel_names else 'none — ask your administrator to set up relationships'}"
+                return _delivery_execution_result(
+                    f"❌ No agent found matching '{agent_name}'. Your connected colleagues: {', '.join(rel_names) if rel_names else 'none — ask your administrator to set up relationships'}",
+                    structured=structured,
+                    status="failed",
+                    error_code="RecipientAgentMissing",
+                )
 
             if target_agent.is_expired or (target_agent.expires_at and datetime.now(timezone.utc) >= target_agent.expires_at):
-                return f"⚠️ {target_agent.name} is currently unavailable — their service period has ended. Please contact the platform administrator."
+                return _delivery_execution_result(
+                    f"⚠️ {target_agent.name} is currently unavailable — their service period has ended. Please contact the platform administrator.",
+                    structured=structured,
+                    status="failed",
+                    error_code="RecipientAgentExpired",
+                )
 
             # Enforce relationship: only allow file transfer with agents in relationships
             rel_check = await db.execute(
@@ -7576,11 +7912,21 @@ async def _send_file_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
             )
             rel = rel_check.scalar_one_or_none()
             if not rel:
-                return f"❌ You do not have a relationship with {target_agent.name}. Only agents in your relationship list can receive files. Ask your administrator to add a relationship if needed."
+                return _delivery_execution_result(
+                    f"❌ You do not have a relationship with {target_agent.name}. Only agents in your relationship list can receive files. Ask your administrator to add a relationship if needed.",
+                    structured=structured,
+                    status="failed",
+                    error_code="RecipientRelationshipMissing",
+                )
             if hasattr(rel, "agent_id"):
                 status_info = await evaluate_agent_relationship_status(db, rel)
                 if status_info["access_status"] != "active":
-                    return f"❌ Relationship to {target_agent.name} is not active ({status_info['access_status_reason'] or 'restricted'}). Ask a manager of both agents to review Relationships."
+                    return _delivery_execution_result(
+                        f"❌ Relationship to {target_agent.name} is not active ({status_info['access_status_reason'] or 'restricted'}). Ask a manager of both agents to review Relationships.",
+                        structured=structured,
+                        status="failed",
+                        error_code="RecipientRelationshipInactive",
+                    )
 
             target_name = target_agent.name
             target_id = target_agent.id
@@ -7595,6 +7941,7 @@ async def _send_file_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
             target_rel_path = f"workspace/inbox/files/{delivered_name}"
             target_key = normalize_storage_key(f"{target_id}/{target_rel_path}")
 
+        side_effect_started = True
         await storage.write_bytes(target_key, source_bytes)
 
         sender_short = str(from_agent_id)[:8]
@@ -7727,13 +8074,26 @@ async def _send_file_to_agent(from_agent_id: uuid.UUID, args: dict) -> str:
         except Exception as e:
             logger.error(f"[A2A-File] FAILED to inject file delivery message: {e}")
 
-        return (
-            f"✅ File sent to {target_name}.\n"
-            f"- Delivered to: {target_rel_path}\n"
-            f"- Inbox note: {note_rel_path}"
+        return _delivery_execution_result(
+            (
+                f"✅ File sent to {target_name}.\n"
+                f"- Delivered to: {target_rel_path}\n"
+                f"- Inbox note: {note_rel_path}"
+            ),
+            structured=structured,
+            status="succeeded",
         )
     except Exception as e:
-        return f"❌ Agent file send error: {str(e)[:200]}"
+        return _delivery_execution_result(
+            f"❌ Agent file send error: {str(e)[:200]}",
+            structured=structured,
+            status="ambiguous" if side_effect_started else "failed",
+            error_code=(
+                "AgentFileDeliveryUnknown"
+                if side_effect_started
+                else "AgentFileDeliveryRejected"
+            ),
+        )
 
 
 async def _resolve_a2a_target(
@@ -8213,7 +8573,12 @@ async def _build_a2a_context(
         return f"❌ A2A context error ({type(e).__name__}): {str(e)[:200]}"
 
 
-async def _a2a_handle_openclaw(ctx: A2AContext) -> str:
+async def _a2a_handle_openclaw(
+    ctx: A2AContext,
+    *,
+    structured: bool = False,
+) -> str | ApprovedToolExecutionOutcome:
+    dispatch_started = False
     try:
         async with async_session() as db:
             # 2. Queue for Gateway
@@ -8227,27 +8592,47 @@ async def _a2a_handle_openclaw(ctx: A2AContext) -> str:
                 conversation_id=ctx.chat_session_id,
             )
             db.add(gw_msg)
+            dispatch_started = True
             await db.commit()
             
             # 3. Log activity
-            from app.services.activity_logger import log_activity
-            await log_activity(
-                ctx.source_agent.id, "agent_msg_sent",
-                f"Sent message to {ctx.target_agent.name} (queued)",
-                detail={"partner": ctx.target_agent.name, "message": ctx.message_text[:200]},
-            )
+            try:
+                from app.services.activity_logger import log_activity
+
+                await log_activity(
+                    ctx.source_agent.id, "agent_msg_sent",
+                    f"Sent message to {ctx.target_agent.name} (queued)",
+                    detail={"partner": ctx.target_agent.name, "message": ctx.message_text[:200]},
+                )
+            except Exception:
+                logger.warning("[A2A] OpenClaw queue activity log failed")
 
             online = ctx.target_agent.openclaw_last_seen and (datetime.now(timezone.utc) - ctx.target_agent.openclaw_last_seen).total_seconds() < 300
             status_hint = "online" if online else "offline (message will be delivered on next heartbeat)"
-            return f"✅ Message sent to {ctx.target_agent.name} (OpenClaw agent, currently {status_hint}). The message has been queued and will be delivered when the agent polls for updates."
+            return _delivery_execution_result(
+                f"✅ Message sent to {ctx.target_agent.name} (OpenClaw agent, currently {status_hint}). The message has been queued and will be delivered when the agent polls for updates.",
+                structured=structured,
+                status="succeeded",
+            )
     except Exception as e:
         logger.exception(f"[A2A] _a2a_handle_openclaw failed: from={ctx.source_agent.id}, to={ctx.target_agent.id}")
-        return f"❌ OpenClaw send error ({type(e).__name__}): {str(e)[:200]}"
+        return _delivery_execution_result(
+            f"❌ OpenClaw send error ({type(e).__name__}): {str(e)[:200]}",
+            structured=structured,
+            status="ambiguous" if dispatch_started else "failed",
+            error_code="OpenClawQueueUnknown" if dispatch_started else "OpenClawQueueRejected",
+        )
 
 
-async def _a2a_handle_notify(ctx: A2AContext) -> str:
+async def _a2a_handle_notify(
+    ctx: A2AContext,
+    *,
+    structured: bool = False,
+) -> str | ApprovedToolExecutionOutcome:
+    dispatch_started = False
     try:
         try:
+            dispatch_started = True
             accepted = await _wake_agent_async(
                 ctx.target_agent.id,
                 f"[From {ctx.source_agent.name}] {ctx.message_text}",
@@ -8260,9 +8645,19 @@ async def _a2a_handle_notify(ctx: A2AContext) -> str:
             )
         except Exception as e:
             logger.exception(f"[A2A] Failed to queue notify for {ctx.target_agent.id}: {e}")
-            return f"❌ Notification delivery failed ({type(e).__name__}): {str(e)[:200]}"
+            return _delivery_execution_result(
+                f"❌ Notification delivery failed ({type(e).__name__}): {str(e)[:200]}",
+                structured=structured,
+                status="ambiguous",
+                error_code="AgentNotificationQueueUnknown",
+            )
         if not accepted:
-            return f"❌ Notification to {ctx.target_agent.name} could not be queued. Please retry."
+            return _delivery_execution_result(
+                f"❌ Notification to {ctx.target_agent.name} could not be queued. Please retry.",
+                structured=structured,
+                status="failed",
+                error_code="AgentNotificationQueueRejected",
+            )
 
         try:
             from app.services.activity_logger import log_activity
@@ -8274,13 +8669,31 @@ async def _a2a_handle_notify(ctx: A2AContext) -> str:
         except Exception:
             pass
 
-        return f"✅ Notification sent to {ctx.target_agent.name}. They will process it asynchronously."
+        return _delivery_execution_result(
+            f"✅ Notification sent to {ctx.target_agent.name}. They will process it asynchronously.",
+            structured=structured,
+            status="succeeded",
+        )
     except Exception as e:
         logger.exception(f"[A2A] _a2a_handle_notify failed: from={ctx.source_agent.id}, to={ctx.target_agent.id}")
-        return f"❌ Notification error ({type(e).__name__}): {str(e)[:200]}"
+        return _delivery_execution_result(
+            f"❌ Notification error ({type(e).__name__}): {str(e)[:200]}",
+            structured=structured,
+            status="ambiguous" if dispatch_started else "failed",
+            error_code=(
+                "AgentNotificationQueueUnknown"
+                if dispatch_started
+                else "AgentNotificationRejected"
+            ),
+        )
 
 
-async def _a2a_handle_task_delegate(ctx: A2AContext) -> str:
+async def _a2a_handle_task_delegate(
+    ctx: A2AContext,
+    *,
+    structured: bool = False,
+) -> str | ApprovedToolExecutionOutcome:
+    dispatch_started = False
     try:
         target_slug = re.sub(r"[^a-z0-9]+", "_", ctx.target_agent.name.lower()).strip("_")[:32] or "agent"
         task_suffix = ctx.source_message_id.hex
@@ -8317,9 +8730,15 @@ async def _a2a_handle_task_delegate(ctx: A2AContext) -> str:
             )
         except Exception as e:
             logger.exception(f"[A2A] Failed to create callback for delegate: {e}")
-            return f"❌ Task delegation setup failed ({type(e).__name__}): {str(e)[:200]}"
+            return _delivery_execution_result(
+                f"❌ Task delegation setup failed ({type(e).__name__}): {str(e)[:200]}",
+                structured=structured,
+                status="failed",
+                error_code="AgentDelegationSetupRejected",
+            )
 
         try:
+            dispatch_started = True
             accepted = await _wake_agent_async(
                 ctx.target_agent.id,
                 f"[From {ctx.source_agent.name}] {ctx.message_text}",
@@ -8333,10 +8752,20 @@ async def _a2a_handle_task_delegate(ctx: A2AContext) -> str:
         except Exception as e:
             logger.exception(f"[A2A] Failed to queue delegate for {ctx.target_agent.id}: {e}")
             await _cleanup_failed_delegate(ctx.source_agent.id, trigger_name, focus_id)
-            return f"❌ Task delivery failed ({type(e).__name__}): {str(e)[:200]}"
+            return _delivery_execution_result(
+                f"❌ Task delivery failed ({type(e).__name__}): {str(e)[:200]}",
+                structured=structured,
+                status="ambiguous",
+                error_code="AgentDelegationQueueUnknown",
+            )
         if not accepted:
             await _cleanup_failed_delegate(ctx.source_agent.id, trigger_name, focus_id)
-            return f"❌ Task for {ctx.target_agent.name} could not be queued. Please retry."
+            return _delivery_execution_result(
+                f"❌ Task for {ctx.target_agent.name} could not be queued. Please retry.",
+                structured=structured,
+                status="failed",
+                error_code="AgentDelegationQueueRejected",
+            )
 
         try:
             await _append_focus_item(ctx.source_agent.id, focus_id, focus_desc)
@@ -8353,13 +8782,31 @@ async def _a2a_handle_task_delegate(ctx: A2AContext) -> str:
         except Exception:
             pass
 
-        return f"✅ Task delegated to {ctx.target_agent.name}. You will be notified when they complete it."
+        return _delivery_execution_result(
+            f"✅ Task delegated to {ctx.target_agent.name}. You will be notified when they complete it.",
+            structured=structured,
+            status="succeeded",
+        )
     except Exception as e:
         logger.exception(f"[A2A] _a2a_handle_task_delegate failed: from={ctx.source_agent.id}, to={ctx.target_agent.id}")
-        return f"❌ Task delegation error ({type(e).__name__}): {str(e)[:200]}"
+        return _delivery_execution_result(
+            f"❌ Task delegation error ({type(e).__name__}): {str(e)[:200]}",
+            structured=structured,
+            status="ambiguous" if dispatch_started else "failed",
+            error_code=(
+                "AgentDelegationQueueUnknown"
+                if dispatch_started
+                else "AgentDelegationRejected"
+            ),
+        )
 
 
-async def _a2a_handle_consult(ctx: A2AContext) -> str:
+async def _a2a_handle_consult(
+    ctx: A2AContext,
+    *,
+    structured: bool = False,
+) -> str | ApprovedToolExecutionOutcome:
+    commit_started = False
     try:
         suffix = (
             "\n\n--- Agent-to-Agent Message ---\n"
@@ -8395,7 +8842,12 @@ async def _a2a_handle_consult(ctx: A2AContext) -> str:
         )
 
         if not target_reply or target_reply.startswith("⚠️") or target_reply.startswith("[Error]") or target_reply.startswith("[LLM Error]") or target_reply.startswith("[LLM call error]"):
-            return target_reply or f"⚠️ {ctx.target_agent.name} did not respond (LLM returned empty)"
+            return _delivery_execution_result(
+                target_reply or f"⚠️ {ctx.target_agent.name} did not respond (LLM returned empty)",
+                structured=structured,
+                status="failed",
+                error_code="AgentConsultNoResponse",
+            )
 
         # Save target reply
         async with async_session() as db2:
@@ -8410,26 +8862,40 @@ async def _a2a_handle_consult(ctx: A2AContext) -> str:
                 conversation_id=ctx.chat_session_id,
                 participant_id=tgt_part.id if tgt_part else None,
             ))
+            commit_started = True
             await db2.commit()
 
         # Log activity
-        from app.services.activity_logger import log_activity
-        await log_activity(
-            ctx.target_agent.id, "agent_msg_sent",
-            f"Replied to message from {ctx.source_agent.name}",
-            detail={"partner": ctx.source_agent.name, "message": ctx.message_text[:200], "reply": target_reply[:200]},
-        )
-        await log_activity(
-            ctx.source_agent.id, "agent_msg_sent",
-            f"Sent message to {ctx.target_agent.name} and received reply",
-            detail={"partner": ctx.target_agent.name, "message": ctx.message_text[:200], "reply": target_reply[:200]},
-        )
+        try:
+            from app.services.activity_logger import log_activity
 
-        return f"💬 {ctx.target_agent.name} replied:\n{target_reply}"
+            await log_activity(
+                ctx.target_agent.id, "agent_msg_sent",
+                f"Replied to message from {ctx.source_agent.name}",
+                detail={"partner": ctx.source_agent.name, "message": ctx.message_text[:200], "reply": target_reply[:200]},
+            )
+            await log_activity(
+                ctx.source_agent.id, "agent_msg_sent",
+                f"Sent message to {ctx.target_agent.name} and received reply",
+                detail={"partner": ctx.target_agent.name, "message": ctx.message_text[:200], "reply": target_reply[:200]},
+            )
+        except Exception:
+            logger.warning("[A2A] Consult activity log failed after reply commit")
+
+        return _delivery_execution_result(
+            f"💬 {ctx.target_agent.name} replied:\n{target_reply}",
+            structured=structured,
+            status="succeeded",
+        )
 
     except Exception as e:
         logger.exception(f"[A2A] _a2a_handle_consult failed: from={ctx.source_agent.id}, to={ctx.target_agent.id}")
-        return f"❌ Consult request error ({type(e).__name__}): {str(e)[:200]}"
+        return _delivery_execution_result(
+            f"❌ Consult request error ({type(e).__name__}): {str(e)[:200]}",
+            structured=structured,
+            status="ambiguous" if commit_started else "failed",
+            error_code="AgentConsultCommitUnknown" if commit_started else "AgentConsultFailed",
+        )
 
 
 async def _send_message_to_agent(
@@ -8437,7 +8903,9 @@ async def _send_message_to_agent(
     args: dict,
     user_id: uuid.UUID | None = None,
     origin_session_id: str | None = None,
-) -> str:
+    *,
+    structured: bool = False,
+) -> str | ApprovedToolExecutionOutcome:
     """Send a message to another digital employee.
 
     Behaviour depends on ``msg_type``:
@@ -8450,16 +8918,21 @@ async def _send_message_to_agent(
     """
     ctx_or_err = await _build_a2a_context(from_agent_id, args, user_id, origin_session_id)
     if isinstance(ctx_or_err, str):
-        return ctx_or_err
+        return _delivery_execution_result(
+            ctx_or_err,
+            structured=structured,
+            status="failed",
+            error_code="AgentMessageContextRejected",
+        )
     ctx = ctx_or_err
 
     if ctx.target_agent.agent_type == "openclaw":
-        return await _a2a_handle_openclaw(ctx)
+        return await _a2a_handle_openclaw(ctx, structured=structured)
     if ctx.msg_type == "notify":
-        return await _a2a_handle_notify(ctx)
+        return await _a2a_handle_notify(ctx, structured=structured)
     if ctx.msg_type == "task_delegate":
-        return await _a2a_handle_task_delegate(ctx)
-    return await _a2a_handle_consult(ctx)
+        return await _a2a_handle_task_delegate(ctx, structured=structured)
+    return await _a2a_handle_consult(ctx, structured=structured)
 
 
 
@@ -9988,6 +10461,7 @@ async def _reserve_minimax_tool_credits(
     tier: str,
     model: str,
     credits: int,
+    initial_status: str = "reserved",
 ):
     from app.services.credit_service import reserve_credits
 
@@ -10002,6 +10476,7 @@ async def _reserve_minimax_tool_credits(
         model=model,
         amount=credits,
         ref_type="minimax_task",
+        initial_status=initial_status,
     )
 
 
@@ -10011,10 +10486,17 @@ async def _finalize_minimax_tool_reservation(reservation_id: uuid.UUID) -> None:
     await finalize_reserved_credits(reservation_id)
 
 
-async def _release_minimax_tool_reservation(reservation_id: uuid.UUID) -> None:
+async def _release_minimax_tool_reservation(
+    reservation_id: uuid.UUID,
+    *,
+    release_provider_inflight: bool = False,
+) -> None:
     from app.services.credit_service import release_reserved_credits
 
-    await release_reserved_credits(reservation_id)
+    await release_reserved_credits(
+        reservation_id,
+        release_provider_inflight=release_provider_inflight,
+    )
 
 
 async def _finalize_minimax_tool_reservation_for_delivery(
@@ -10311,7 +10793,10 @@ def _resolve_workspace_read_path(ws: Path, rel_path: str) -> Path:
 
 
 def _agent_file_download_url(agent_id: uuid.UUID, rel_path: str) -> str:
-    return f"/api/agents/{agent_id}/files/download?path={rel_path}"
+    return (
+        f"/api/agents/{agent_id}/files/download?"
+        f"{urlencode({'path': rel_path, 'inline': '1'})}"
+    )
 
 
 async def _prepare_minimax_tool_credential(
@@ -10687,12 +11172,32 @@ async def _generate_music_minimax(
     )
 
 
+def _write_minimax_video_metadata_best_effort(
+    path: Path,
+    metadata: dict[str, Any],
+) -> bool:
+    """Persist the editable compatibility file without blocking durable recovery."""
+    try:
+        path.write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        logger.warning(
+            "[MiniMaxVideo] Workspace metadata write skipped error_type={}",
+            type(exc).__name__,
+        )
+        return False
+    return True
+
+
 async def _generate_video_minimax(
     agent_id: uuid.UUID,
     ws: Path,
     arguments: dict,
     user_id: uuid.UUID | None = None,
     saas_tier: str | None = None,
+    session_id: str = "",
 ) -> str:
     prompt = (arguments.get("prompt") or "").strip()
     if not prompt:
@@ -10773,9 +11278,11 @@ async def _generate_video_minimax(
     reservation_id: uuid.UUID | None = None
     record_id: uuid.UUID | None = None
     provider_task_id: str | None = None
+    provider_request_started = False
     meta_path = ""
     full_meta_path: Path | None = None
     metadata: dict[str, Any] = {}
+    metadata_persisted = False
     try:
         from app.services.media_generation import (
             ProviderTaskIdentityCollision,
@@ -10783,25 +11290,19 @@ async def _generate_video_minimax(
             find_media_generation_task,
             mark_minimax_video_task_submitted,
             reconcile_minimax_video_task,
+            validate_media_origin_session,
         )
         from app.services.provider_pricing import minimax_video_credits
 
         credit_cost = minimax_video_credits(model, duration=duration, resolution=resolution)
         tenant_id = await _get_minimax_tenant_uuid(agent_id)
+        await validate_media_origin_session(
+            origin_session_id=session_id,
+            agent_id=agent_id,
+            user_id=user_id,
+        )
         if tenant_id:
             await _check_minimax_credit_amount(tenant_id, credit_cost)
-        if tenant_id and credit_cost > 0:
-            reservation = await _reserve_minimax_tool_credits(
-                tenant_id=tenant_id,
-                user_id=user_id,
-                agent_id=agent_id,
-                action="video",
-                modality="video",
-                tier=tier,
-                model=model,
-                credits=credit_cost,
-            )
-            reservation_id = reservation.id
 
         record_id = uuid.uuid4()
         output_path, _ = _resolve_workspace_output_path(
@@ -10835,6 +11336,19 @@ async def _generate_video_minimax(
             "overlay_text": overlay_text,
             "overlay_position": overlay_position,
         }
+        if tenant_id and credit_cost > 0:
+            reservation = await _reserve_minimax_tool_credits(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                agent_id=agent_id,
+                action="video",
+                modality="video",
+                tier=tier,
+                model=model,
+                credits=credit_cost,
+                initial_status="provider_inflight",
+            )
+            reservation_id = reservation.id
         await create_minimax_video_task_record(
             record_id=record_id,
             tenant_id=tenant_id,
@@ -10842,12 +11356,14 @@ async def _generate_video_minimax(
             user_id=user_id,
             credential_id=credential.id,
             reservation_id=reservation_id,
+            origin_session_id=session_id,
             model=model,
             metadata_path=meta_path,
             output_path=output_path,
             request_metadata=request_metadata,
         )
 
+        provider_request_started = True
         provider_task_id = await _minimax_create_video_task(
             api_key=credential.api_key,
             base_url=credential.base_url,
@@ -10859,13 +11375,6 @@ async def _generate_video_minimax(
             last_frame_image=last_frame_image,
             prompt_optimizer=bool(prompt_optimizer),
         )
-        await _record_minimax_tool_success(
-            agent_id,
-            credential.id,
-            tier=tier,
-            modality="video",
-            model=model,
-        )
         metadata = {
             "provider": "minimax",
             "task_record_id": str(record_id),
@@ -10876,7 +11385,9 @@ async def _generate_video_minimax(
             "status": "submitted",
             "save_path": output_path,
         }
-        full_meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        # The provider has accepted a paid task. Bind its identity to the
+        # durable database row before any compatibility-file or accounting
+        # write that can fail independently.
         canonical_record_id = await mark_minimax_video_task_submitted(
             record_id,
             provider_task_id=provider_task_id,
@@ -10896,6 +11407,18 @@ async def _generate_video_minimax(
                 metadata["save_path"] = durable_task.output_path
                 reservation_id = durable_task.reservation_id
 
+        await _record_minimax_tool_success(
+            agent_id,
+            credential.id,
+            tier=tier,
+            modality="video",
+            model=model,
+        )
+        metadata_persisted = _write_minimax_video_metadata_best_effort(
+            full_meta_path,
+            metadata,
+        )
+
         downloaded_path = None
         status = "submitted"
         if wait_for_completion:
@@ -10907,7 +11430,11 @@ async def _generate_video_minimax(
             status = _minimax_video_status(status_data)
             metadata["status"] = status
             metadata["last_response"] = status_data
-            outcome = await reconcile_minimax_video_task(record_id, status_data=status_data)
+            outcome = await reconcile_minimax_video_task(
+                record_id,
+                status_data=status_data,
+                deliver_completion=False,
+            )
             if outcome.status == "succeeded":
                 downloaded_path = outcome.output_path
                 metadata["status"] = "Success"
@@ -10920,7 +11447,10 @@ async def _generate_video_minimax(
                 metadata["reservation_status"] = "released" if reservation_id else "not_required"
                 metadata["error"] = outcome.error or "MiniMax video generation failed"
 
-        full_meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        metadata_persisted = _write_minimax_video_metadata_best_effort(
+            full_meta_path,
+            metadata,
+        )
     except ProviderTaskIdentityCollision:
         logger.error("[MiniMaxVideo] Provider task identity collision blocked for agent {}", agent_id)
         await _record_minimax_tool_product_issue(
@@ -10954,7 +11484,10 @@ async def _generate_video_minimax(
                     "status": "retrying",
                     "last_error": str(exc)[:400],
                 })
-                full_meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+                metadata_persisted = _write_minimax_video_metadata_best_effort(
+                    full_meta_path,
+                    metadata,
+                )
                 try:
                     from app.services.storage import store_agent_bytes
 
@@ -10964,6 +11497,7 @@ async def _generate_video_minimax(
                         json.dumps(metadata, ensure_ascii=False, indent=2).encode("utf-8"),
                         content_type="application/json",
                     )
+                    metadata_persisted = True
                 except Exception:
                     logger.exception("[MiniMaxVideo] Failed to persist recovery metadata")
             await _mark_minimax_tool_credential_failure(
@@ -10973,27 +11507,55 @@ async def _generate_video_minimax(
                 model=model,
             )
             logger.warning(f"[MiniMaxVideo] Submitted task queued for automatic recovery: {exc}")
+            metadata_notice = (
+                f"Task metadata: {meta_path}"
+                if metadata_persisted
+                else "Workspace metadata is unavailable; durable database recovery is continuing."
+            )
             return (
                 f"⏳ MiniMax video task was submitted and automatic recovery is continuing. "
-                f"Task metadata: {meta_path}"
+                f"{metadata_notice}"
             )
 
         incident_recorded = False
         if record_id:
             try:
-                from app.services.media_generation import mark_media_generation_submission_failed
+                if provider_request_started:
+                    from app.services.media_generation import (
+                        mark_media_generation_submission_ambiguous,
+                    )
 
-                await mark_media_generation_submission_failed(record_id, exc)
-                incident_recorded = True
+                    await mark_media_generation_submission_ambiguous(record_id, exc)
+                    incident_recorded = True
+                else:
+                    from app.services.media_generation import (
+                        mark_media_generation_submission_failed,
+                    )
+
+                    incident_recorded = await mark_media_generation_submission_failed(
+                        record_id,
+                        exc,
+                    )
+                    if not incident_recorded and reservation_id:
+                        await _release_minimax_tool_reservation(
+                            reservation_id,
+                            release_provider_inflight=True,
+                        )
             except Exception:
                 if reservation_id:
                     try:
-                        await _release_minimax_tool_reservation(reservation_id)
+                        await _release_minimax_tool_reservation(
+                            reservation_id,
+                            release_provider_inflight=not provider_request_started,
+                        )
                     except Exception:
                         pass
         elif reservation_id:
             try:
-                await _release_minimax_tool_reservation(reservation_id)
+                await _release_minimax_tool_reservation(
+                    reservation_id,
+                    release_provider_inflight=not provider_request_started,
+                )
             except Exception:
                 pass
         await _mark_minimax_tool_credential_failure(
@@ -11012,22 +11574,33 @@ async def _generate_video_minimax(
                 user_id=user_id,
             )
         _log_minimax_operation_failure("MiniMaxVideo", exc)
+        if record_id and provider_request_started and not provider_task_id:
+            return (
+                "⚠️ MiniMax video submission outcome is uncertain. The system retained "
+                "the Credits hold and opened an operator alert to prevent duplicate generation. "
+                "Please do not retry this request yet."
+            )
         return f"❌ Video generation failed (minimax): {str(exc)[:400]}"
 
+    metadata_notice = (
+        f"Task metadata: {meta_path}"
+        if metadata_persisted
+        else "Workspace metadata is unavailable; the durable task remains recoverable."
+    )
     if downloaded_path:
         return (
             f"✅ Video generated and saved to: {downloaded_path}\n"
-            f"Task metadata: {meta_path}\n\n"
+            f"{metadata_notice}\n\n"
             f"▶️ Play the video:\n![]({_agent_file_download_url(agent_id, downloaded_path)})"
         )
     if wait_for_completion and status != "Success":
         return (
-            f"⏳ MiniMax video task is still {status}. Task metadata saved to: {meta_path}\n"
+            f"⏳ MiniMax video task is still {status}. {metadata_notice}\n"
             "The system will keep checking automatically and save the video when it is ready."
         )
     return (
         f"✅ MiniMax video task submitted. task_id={provider_task_id}\n"
-        f"Task metadata saved to: {meta_path}\n"
+        f"{metadata_notice}\n"
         "The system will keep checking automatically and save the video when it is ready."
     )
 
@@ -11040,102 +11613,68 @@ async def _check_video_minimax(agent_id: uuid.UUID, ws: Path, arguments: dict) -
     try:
         full_meta_path = _resolve_workspace_read_path(ws, task_meta_path)
         metadata = json.loads(full_meta_path.read_text(encoding="utf-8"))
-        task_id = metadata.get("task_id")
-        credential_id = uuid.UUID(str(metadata.get("credential_id")))
+        task_id = str(metadata.get("task_id") or "").strip()
         if not task_id:
             return "❌ Invalid MiniMax video metadata: missing task_id"
-        reservation_id = None
-        if metadata.get("reservation_id"):
-            reservation_id = uuid.UUID(str(metadata.get("reservation_id")))
-
-        credential = await _load_minimax_tool_credential_by_id(credential_id)
-        status_data = await _minimax_query_video_task(credential.api_key, credential.base_url, task_id)
-        status = _minimax_video_status(status_data)
-        metadata["status"] = status
-        metadata["last_checked_at"] = datetime.now(timezone.utc).isoformat()
-        metadata["last_response"] = status_data
 
         from app.services.media_generation import find_media_generation_task, reconcile_minimax_video_task
 
-        durable_task = await find_media_generation_task(agent_id=agent_id, provider_task_id=str(task_id))
-        if durable_task:
-            outcome = await reconcile_minimax_video_task(durable_task.id, status_data=status_data)
-            if outcome.status == "succeeded":
-                metadata["status"] = "Success"
-                metadata["reservation_status"] = "finalized" if reservation_id else "not_required"
-                metadata["downloaded_path"] = outcome.output_path
-                metadata["completed_at"] = datetime.now(timezone.utc).isoformat()
-                full_meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-                return (
-                    f"✅ MiniMax video is ready and saved to: {outcome.output_path}\n\n"
-                    f"▶️ Play the video:\n![]({_agent_file_download_url(agent_id, outcome.output_path or durable_task.output_path)})"
-                )
-            if outcome.status == "failed":
-                metadata["status"] = "Fail"
-                metadata["reservation_status"] = "released" if reservation_id else "not_required"
-                metadata["error"] = outcome.error or "unknown"
-                full_meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-                return f"❌ MiniMax video task failed: {outcome.error or 'unknown'}"
-            full_meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-            return "⏳ MiniMax video task is still processing. The system will continue checking automatically."
-
-        if status == "Success":
-            save_path = arguments.get("save_path") or metadata.get("save_path") or ""
-            downloaded_path = await _download_minimax_video_from_status(
-                credential,
-                status_data,
-                ws,
-                save_path,
-                metadata.get("prompt") or task_id,
-                task_id,
-            )
-            # Legacy fallback preserves the same invariant as the durable path:
-            # the asset must exist before Credits are finalized.
-            if reservation_id:
-                await _finalize_minimax_tool_reservation(reservation_id)
-                metadata["reservation_status"] = "finalized"
-            metadata["downloaded_path"] = downloaded_path
-            metadata["completed_at"] = datetime.now(timezone.utc).isoformat()
-            full_meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-            return (
-                f"✅ MiniMax video is ready and saved to: {downloaded_path}\n\n"
-                f"▶️ Play the video:\n![]({_agent_file_download_url(agent_id, downloaded_path)})"
-            )
-
-        full_meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-        if status == "Fail":
-            if reservation_id:
-                await _release_minimax_tool_reservation(reservation_id)
-                metadata["reservation_status"] = "released"
-                full_meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-            fail_reason = status_data.get("fail_reason") or status_data.get("base_resp", {}).get("status_msg") or "unknown"
+        durable_task = await find_media_generation_task(
+            agent_id=agent_id,
+            provider_task_id=task_id,
+        )
+        if not durable_task:
             await _record_minimax_tool_product_issue(
                 agent_id,
                 "video",
-                error_code="provider_task_failed",
+                error_code="legacy_media_task_unbound",
                 model=str(metadata.get("model") or "") or None,
                 tier=str(metadata.get("tier") or "") or None,
             )
-            return f"❌ MiniMax video task failed: {fail_reason}"
-        return f"⏳ MiniMax video task status: {status}. Check again later with task_meta_path='{task_meta_path}'."
+            return (
+                "❌ This legacy video task is not bound to a durable Agent task, so its "
+                "editable metadata cannot be used for provider access or Credits settlement. "
+                "Automatic recovery will import eligible historical tasks; contact an admin "
+                "if this message persists."
+            )
+
+        outcome = await reconcile_minimax_video_task(
+            durable_task.id,
+            deliver_completion=False,
+        )
+        metadata["last_checked_at"] = datetime.now(timezone.utc).isoformat()
+        if outcome.status == "succeeded":
+            output_path = outcome.output_path or durable_task.output_path
+            metadata["status"] = "Success"
+            metadata["reservation_status"] = (
+                "finalized" if durable_task.reservation_id else "not_required"
+            )
+            metadata["downloaded_path"] = output_path
+            metadata["completed_at"] = datetime.now(timezone.utc).isoformat()
+            full_meta_path.write_text(
+                json.dumps(metadata, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            return (
+                f"✅ MiniMax video is ready and saved to: {output_path}\n\n"
+                f"▶️ Play the video:\n![]({_agent_file_download_url(agent_id, output_path)})"
+            )
+        if outcome.status == "failed":
+            metadata["status"] = "Fail"
+            metadata["error"] = outcome.error or "unknown"
+            full_meta_path.write_text(
+                json.dumps(metadata, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            return f"❌ MiniMax video task failed: {outcome.error or 'unknown'}"
+
+        metadata["status"] = outcome.status
+        full_meta_path.write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return "⏳ MiniMax video task is still processing. The system will continue checking automatically."
     except Exception as exc:
-        credential_id_raw = None
-        try:
-            credential_id_raw = json.loads(full_meta_path.read_text(encoding="utf-8")).get("credential_id")
-        except Exception:
-            credential_id_raw = None
-        if credential_id_raw:
-            try:
-                await _mark_minimax_tool_credential_failure(
-                    uuid.UUID(str(credential_id_raw)),
-                    exc,
-                    modality="video",
-                    model=(str(metadata.get("model") or "") or None)
-                    if "metadata" in locals()
-                    else None,
-                )
-            except Exception:
-                pass
         await _record_minimax_tool_product_issue(
             agent_id,
             "video",

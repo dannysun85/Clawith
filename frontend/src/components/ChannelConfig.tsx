@@ -1043,7 +1043,15 @@ export default function ChannelConfig({ mode, agentId, canManage = true, values,
                                 {ch.id === 'atlassian' && (
                                     <div style={{ background: 'var(--bg-secondary)', borderRadius: '6px', padding: '10px', fontSize: '12px', marginBottom: '12px' }}>
                                         <div style={{ color: 'var(--text-tertiary)', marginBottom: '4px' }}>Status</div>
-                                        <div style={{ color: 'var(--text-primary)', fontWeight: 500 }}>API Key configured — Jira / Confluence / Compass tools available</div>
+                                        <div style={{ color: config.extra_config?.tool_sync_status === 'failed' ? 'rgb(220,38,38)' : 'var(--text-primary)', fontWeight: 500 }}>
+                                            {config.extra_config?.tool_sync_status === 'ready'
+                                                ? `API Key configured — ${config.extra_config?.tool_count || 0} Jira / Confluence / Compass tools available`
+                                                : config.extra_config?.tool_sync_status === 'syncing'
+                                                    ? 'API Key saved — tool synchronization in progress'
+                                                    : config.extra_config?.tool_sync_status === 'failed'
+                                                        ? `API Key saved — tools unavailable (${config.extra_config?.tool_sync_error_code || 'atlassian_tool_sync_failed'})`
+                                                        : 'API Key configured — tool availability has not been verified'}
+                                        </div>
                                         {config.cloud_id && <div style={{ color: 'var(--text-tertiary)', marginTop: '4px', fontSize: '11px' }}>Cloud ID: <code>{config.cloud_id}</code></div>}
                                     </div>
                                 )}

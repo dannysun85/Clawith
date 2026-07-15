@@ -20,6 +20,7 @@ from app.config import get_settings
 from app.services.agent_manager import agent_manager
 from app.services.skill_scope import prefer_tenant_skill_overrides, scope_skill_query
 from app.services.storage import get_storage_backend, store_agent_bytes
+from app.services.agent_tool_assignments import upsert_agent_tool
 
 settings = get_settings()
 SEED_MARKER_KEY = "_bootstrap/.seeded"
@@ -388,7 +389,13 @@ async def seed_default_agents():
 
         for agent in created_agents:
             for tool in default_tools:
-                db.add(AgentTool(agent_id=agent.id, tool_id=tool.id, enabled=True))
+                await upsert_agent_tool(
+                    db,
+                    agent_id=agent.id,
+                    tool_id=tool.id,
+                    enabled=True,
+                    on_conflict="preserve",
+                )
 
         # ── Mutual relationships ──
         relationship_specs = []
@@ -572,7 +579,13 @@ async def seed_okr_agent():
         )
         default_tools = default_tools_result.scalars().all()
         for tool in default_tools:
-            db.add(AgentTool(agent_id=okr_agent.id, tool_id=tool.id, enabled=True))
+            await upsert_agent_tool(
+                db,
+                agent_id=okr_agent.id,
+                tool_id=tool.id,
+                enabled=True,
+                on_conflict="preserve",
+            )
 
         # OKR-specific tools: assigned explicitly (is_default=False)
         # All 10 OKR tools: 3 global read/self-report + 3 scheduler + 4 management (OKR Agent exclusive)
@@ -605,7 +618,13 @@ async def seed_okr_agent():
                     )
                 )
                 if not existing_at.scalar_one_or_none():
-                    db.add(AgentTool(agent_id=okr_agent.id, tool_id=tool.id, enabled=True))
+                    await upsert_agent_tool(
+                        db,
+                        agent_id=okr_agent.id,
+                        tool_id=tool.id,
+                        enabled=True,
+                        on_conflict="preserve",
+                    )
                     logger.info(f"[AgentSeeder] Assigned OKR tool '{tool_name}' to OKR Agent")
             else:
                 logger.warning(f"[AgentSeeder] OKR tool '{tool_name}' not found in DB — run tool seeder first")
@@ -921,7 +940,13 @@ async def patch_existing_okr_agent() -> None:
                     select(AgentTool).where(AgentTool.agent_id == agent.id, AgentTool.tool_id == tool.id)
                 )
                 if not at_res.scalar_one_or_none():
-                    db.add(AgentTool(agent_id=agent.id, tool_id=tool.id, enabled=True))
+                    await upsert_agent_tool(
+                        db,
+                        agent_id=agent.id,
+                        tool_id=tool.id,
+                        enabled=True,
+                        on_conflict="preserve",
+                    )
                     changed = True
                     logger.info(f"[AgentSeeder] Patched OKR Agent {agent.id}: assigned tool '{tool_name}'")
 
@@ -1042,7 +1067,13 @@ async def seed_okr_agent_for_tenant(tenant_id: uuid.UUID, creator_id: uuid.UUID)
             select(Tool).where(Tool.is_default == True)  # noqa: E712
         )
         for tool in default_tools_result.scalars().all():
-            db.add(AgentTool(agent_id=okr_agent.id, tool_id=tool.id, enabled=True))
+            await upsert_agent_tool(
+                db,
+                agent_id=okr_agent.id,
+                tool_id=tool.id,
+                enabled=True,
+                on_conflict="preserve",
+            )
 
         # ── Assign OKR-specific tools ──
         okr_tool_names = [
@@ -1062,7 +1093,13 @@ async def seed_okr_agent_for_tenant(tenant_id: uuid.UUID, creator_id: uuid.UUID)
                     )
                 )
                 if not existing_at.scalar_one_or_none():
-                    db.add(AgentTool(agent_id=okr_agent.id, tool_id=tool.id, enabled=True))
+                    await upsert_agent_tool(
+                        db,
+                        agent_id=okr_agent.id,
+                        tool_id=tool.id,
+                        enabled=True,
+                        on_conflict="preserve",
+                    )
             else:
                 logger.warning(
                     f"[AgentSeeder] OKR tool '{tool_name}' not found — run tool seeder first"

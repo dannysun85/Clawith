@@ -11,9 +11,26 @@ Reference: https://modelcontextprotocol.io/docs
 import httpx
 import json
 import asyncio
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+import uuid
+from collections.abc import AsyncIterator
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from loguru import logger
+
+from app.services.mcp_security import MCPHTTPGuard
+
+
+MAX_MCP_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_MCP_SSE_LINE_BYTES = 64 * 1024
+MAX_MCP_SSE_LINES = 4096
+MAX_MCP_TOOL_RESULT_BYTES = 128 * 1024
+MAX_MCP_TOOLS = 100
+MAX_MCP_TOOL_NAME_CHARS = 200
+MAX_MCP_TOOL_DESCRIPTION_CHARS = 4096
+MAX_MCP_TOOL_SCHEMA_BYTES = 64 * 1024
+MAX_MCP_LIST_SECONDS = 45
+MAX_MCP_CALL_SECONDS = 90
+_MCP_GLOBAL_CONCURRENCY = asyncio.Semaphore(32)
 
 
 class MCPClient:
@@ -25,15 +42,19 @@ class MCPClient:
     def __init__(self, server_url: str, api_key: str | None = None):
         # Extract apiKey from URL query params and move to Authorization header
         parsed = urlparse(server_url)
-        qs = parse_qs(parsed.query, keep_blank_values=True)
-
         self.api_key = api_key
-        if not self.api_key and "apiKey" in qs:
-            self.api_key = qs.pop("apiKey")[0]
+        remaining_pairs: list[tuple[str, str]] = []
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+            if key.lower().replace("-", "_") in {"apikey", "api_key"}:
+                if not self.api_key:
+                    self.api_key = value
+                continue
+            remaining_pairs.append((key, value))
 
         # Rebuild URL without apiKey in query string
-        remaining_qs = urlencode({k: v[0] for k, v in qs.items()}) if qs else ""
+        remaining_qs = urlencode(remaining_pairs, doseq=True)
         self.server_url = urlunparse(parsed._replace(query=remaining_qs)).rstrip("/")
+        self._http_guard = MCPHTTPGuard(self.server_url)
 
         # Transport state
         self._transport: str | None = None  # "streamable" or "sse"
@@ -52,6 +73,17 @@ class MCPClient:
             h["Mcp-Session-Id"] = self._session_id
         return h
 
+    @staticmethod
+    def _bounded_tool_result(value: str) -> str:
+        encoded = value.encode("utf-8")
+        if len(encoded) <= MAX_MCP_TOOL_RESULT_BYTES:
+            return value
+        prefix = encoded[:MAX_MCP_TOOL_RESULT_BYTES].decode(
+            "utf-8",
+            errors="ignore",
+        )
+        return f"{prefix}\n...[MCP tool result truncated]"
+
     def _parse_response(self, resp: httpx.Response) -> dict:
         """Parse response — handles both JSON and SSE (text/event-stream) formats."""
         content_type = resp.headers.get("content-type", "")
@@ -69,7 +101,12 @@ class MCPClient:
     def _parse_sse_response(self, text: str) -> dict:
         """Extract the last JSON-RPC result from an SSE stream."""
         last_data = None
-        for line in text.splitlines():
+        lines = text.splitlines()
+        if len(lines) > MAX_MCP_SSE_LINES:
+            raise ValueError("MCP SSE response exceeded the line limit")
+        for line in lines:
+            if len(line.encode("utf-8")) > MAX_MCP_SSE_LINE_BYTES:
+                raise ValueError("MCP SSE line exceeded the 64 KiB limit")
             if line.startswith("data:"):
                 raw = line[5:].strip()
                 if raw and raw != "[DONE]":
@@ -81,12 +118,67 @@ class MCPClient:
             raise Exception("No valid JSON found in SSE response")
         return last_data
 
+    async def _read_bounded_response(
+        self,
+        response: httpx.Response,
+    ) -> httpx.Response:
+        body = bytearray()
+        async for chunk in response.aiter_bytes():
+            body.extend(chunk)
+            if len(body) > MAX_MCP_RESPONSE_BYTES:
+                raise ValueError("MCP response exceeded the 2 MiB limit")
+        return httpx.Response(
+            status_code=response.status_code,
+            headers=response.headers,
+            content=bytes(body),
+            request=response.request,
+            extensions=response.extensions,
+        )
+
+    async def _post_bounded(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        **kwargs,
+    ) -> httpx.Response:
+        async with client.stream("POST", url, **kwargs) as response:
+            return await self._read_bounded_response(response)
+
+    async def _iter_bounded_sse_lines(
+        self,
+        response: httpx.Response,
+    ) -> AsyncIterator[str]:
+        total = 0
+        line_count = 0
+        pending = bytearray()
+        async for chunk in response.aiter_bytes():
+            total += len(chunk)
+            if total > MAX_MCP_RESPONSE_BYTES:
+                raise ValueError("MCP SSE response exceeded the 2 MiB limit")
+            pending.extend(chunk)
+            if len(pending) > MAX_MCP_SSE_LINE_BYTES and b"\n" not in pending:
+                raise ValueError("MCP SSE line exceeded the 64 KiB limit")
+            while b"\n" in pending:
+                raw_line, _, remainder = pending.partition(b"\n")
+                pending = bytearray(remainder)
+                line_count += 1
+                if line_count > MAX_MCP_SSE_LINES:
+                    raise ValueError("MCP SSE response exceeded the line limit")
+                if len(raw_line) > MAX_MCP_SSE_LINE_BYTES:
+                    raise ValueError("MCP SSE line exceeded the 64 KiB limit")
+                yield raw_line.rstrip(b"\r").decode("utf-8", errors="replace")
+        if pending:
+            if len(pending) > MAX_MCP_SSE_LINE_BYTES:
+                raise ValueError("MCP SSE line exceeded the 64 KiB limit")
+            yield bytes(pending).rstrip(b"\r").decode("utf-8", errors="replace")
+
     # ── Streamable HTTP Transport ────────────────────────────────
 
     async def _streamable_initialize(self, client: httpx.AsyncClient) -> None:
         """Send MCP initialize + initialized handshake (Streamable HTTP)."""
         try:
-            resp = await client.post(
+            resp = await self._post_bounded(
+                client,
                 self.server_url,
                 json={
                     "jsonrpc": "2.0",
@@ -103,7 +195,8 @@ class MCPClient:
             if resp.status_code == 200:
                 self._parse_response(resp)  # captures Mcp-Session-Id if present
             # Send initialized notification (required by MCP spec before other requests)
-            await client.post(
+            await self._post_bounded(
+                client,
                 self.server_url,
                 json={"jsonrpc": "2.0", "method": "notifications/initialized"},
                 headers=self._headers(),
@@ -113,13 +206,21 @@ class MCPClient:
 
     async def _streamable_request(self, method: str, params: dict | None = None) -> dict:
         """Send a JSON-RPC request via Streamable HTTP transport."""
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            timeout=30,
+            **self._http_guard.client_kwargs(),
+        ) as client:
             if not self._session_id:
                 await self._streamable_initialize(client)
 
             body: dict = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}
 
-            resp = await client.post(self.server_url, json=body, headers=self._headers())
+            resp = await self._post_bounded(
+                client,
+                self.server_url,
+                json=body,
+                headers=self._headers(),
+            )
             if resp.status_code not in (200, 201):
                 raise Exception(f"HTTP {resp.status_code}")
             return self._parse_response(resp)
@@ -143,13 +244,17 @@ class MCPClient:
 
         messages_url = None
 
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            timeout=15,
+            **self._http_guard.client_kwargs(),
+        ) as client:
             async with client.stream("GET", sse_url, headers=headers) as resp:
                 if resp.status_code != 200:
                     raise Exception(f"SSE connect failed: HTTP {resp.status_code}")
 
                 # Read SSE events until we get the endpoint event
-                async for line in resp.aiter_lines():
+                event_type = ""
+                async for line in self._iter_bounded_sse_lines(resp):
                     line = line.strip()
                     if line.startswith("event:"):
                         event_type = line[6:].strip()
@@ -169,6 +274,7 @@ class MCPClient:
         if not messages_url:
             raise Exception("SSE endpoint did not return a messages URL")
 
+        await self._http_guard.validate_url(messages_url)
         return messages_url
 
     async def _sse_request(self, method: str, params: dict | None = None) -> dict:
@@ -192,7 +298,10 @@ class MCPClient:
 
         timeout = 60 if method == "tools/call" else 30
 
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            **self._http_guard.client_kwargs(),
+        ) as client:
             # Open the SSE stream
             async with client.stream("GET", sse_url, headers=headers_sse) as sse_resp:
                 if sse_resp.status_code != 200:
@@ -202,7 +311,7 @@ class MCPClient:
                 event_type = ""
 
                 # Phase 1: Read until we get the endpoint event
-                line_iter = sse_resp.aiter_lines()
+                line_iter = self._iter_bounded_sse_lines(sse_resp)
                 async for line in line_iter:
                     line = line.strip()
                     if line.startswith("event:"):
@@ -218,6 +327,7 @@ class MCPClient:
 
                 if not messages_url:
                     raise Exception("SSE endpoint did not return a messages URL")
+                await self._http_guard.validate_url(messages_url)
 
                 # Phase 2: MCP handshake — initialize + initialized notification
                 init_body = {
@@ -228,16 +338,27 @@ class MCPClient:
                         "clientInfo": {"name": "astra", "version": "1.0"},
                     },
                 }
-                await client.post(messages_url, json=init_body, headers=headers_post)
+                await self._post_bounded(
+                    client,
+                    messages_url,
+                    json=init_body,
+                    headers=headers_post,
+                )
                 # Send initialized notification (required before other requests)
-                await client.post(
+                await self._post_bounded(
+                    client,
                     messages_url,
                     json={"jsonrpc": "2.0", "method": "notifications/initialized"},
                     headers=headers_post,
                 )
 
                 # Send the actual request
-                post_resp = await client.post(messages_url, json=body, headers=headers_post)
+                post_resp = await self._post_bounded(
+                    client,
+                    messages_url,
+                    json=body,
+                    headers=headers_post,
+                )
 
                 # Phase 3: Read the response — either from POST response or from SSE stream
                 if post_resp.status_code == 200:
@@ -284,14 +405,17 @@ class MCPClient:
         # Auto-detect: try Streamable HTTP first. Python clears exception
         # variables after an `except ... as name` block exits, so keep a stable
         # string copy for the later SSE fallback error.
-        streamable_error_message = ""
+        streamable_error_type = "unknown"
         try:
             result = await self._streamable_request(method, params)
             self._transport = "streamable"
             return result
         except Exception as streamable_err:
-            streamable_error_message = str(streamable_err)
-            logger.info(f"[MCPClient] Streamable HTTP failed ({streamable_err}), trying SSE transport...")
+            streamable_error_type = type(streamable_err).__name__
+            logger.info(
+                "[MCPClient] Streamable HTTP failed error_type={}; trying SSE",
+                streamable_error_type,
+            )
 
         # Fallback to SSE
         try:
@@ -300,17 +424,80 @@ class MCPClient:
             return result
         except Exception as sse_err:
             raise Exception(
-                f"Both transports failed. "
-                f"Streamable HTTP: {streamable_error_message}; "
-                f"SSE: {sse_err}"
+                "Both MCP transports failed "
+                f"(streamable={streamable_error_type}, sse={type(sse_err).__name__})"
             )
 
+    async def _bounded_request(
+        self,
+        method: str,
+        params: dict | None,
+        total_seconds: int,
+    ) -> dict:
+        async with asyncio.timeout(total_seconds):
+            async with _MCP_GLOBAL_CONCURRENCY:
+                return await self._detect_and_request(method, params)
+
     # ── Public API ───────────────────────────────────────────────
+
+    @staticmethod
+    def _validated_tool_catalog(tools: object) -> list[dict]:
+        if not isinstance(tools, list):
+            raise ValueError("MCP tools/list returned a non-list catalog")
+        if len(tools) > MAX_MCP_TOOLS:
+            raise ValueError("MCP tools/list exceeded the tool count limit")
+
+        catalog: list[dict] = []
+        seen_names: set[str] = set()
+        for raw_tool in tools:
+            if not isinstance(raw_tool, dict):
+                raise ValueError("MCP tools/list returned an invalid tool")
+            name = raw_tool.get("name")
+            if not isinstance(name, str):
+                raise ValueError("MCP tool name must be a string")
+            name = name.strip()
+            if not name or len(name) > MAX_MCP_TOOL_NAME_CHARS:
+                raise ValueError("MCP tool name is missing or too long")
+            if name in seen_names:
+                raise ValueError("MCP tools/list returned duplicate tool names")
+            seen_names.add(name)
+
+            description = raw_tool.get("description", "")
+            if not isinstance(description, str):
+                raise ValueError("MCP tool description must be a string")
+            if len(description) > MAX_MCP_TOOL_DESCRIPTION_CHARS:
+                description = (
+                    description[:MAX_MCP_TOOL_DESCRIPTION_CHARS]
+                    + "...[description truncated]"
+                )
+
+            schema = raw_tool.get("inputSchema", {})
+            if not isinstance(schema, dict):
+                raise ValueError("MCP tool inputSchema must be an object")
+            serialized_schema = json.dumps(
+                schema,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            if len(serialized_schema) > MAX_MCP_TOOL_SCHEMA_BYTES:
+                raise ValueError("MCP tool inputSchema exceeded the size limit")
+            catalog.append(
+                {
+                    "name": name,
+                    "description": description,
+                    "inputSchema": schema,
+                }
+            )
+        return catalog
 
     async def list_tools(self) -> list[dict]:
         """Fetch available tools from the MCP server."""
         try:
-            data = await self._detect_and_request("tools/list")
+            data = await self._bounded_request(
+                "tools/list",
+                None,
+                MAX_MCP_LIST_SECONDS,
+            )
 
             if "error" in data:
                 err = data["error"]
@@ -319,33 +506,35 @@ class MCPClient:
 
             result = data.get("result", {})
             tools = result.get("tools", []) if isinstance(result, dict) else []
-            return [
-                {
-                    "name": t.get("name", ""),
-                    "description": t.get("description", ""),
-                    "inputSchema": t.get("inputSchema", {}),
-                }
-                for t in tools
-            ]
-        except httpx.HTTPError as e:
-            raise Exception(f"Connection failed: {str(e)[:200]}")
+            return self._validated_tool_catalog(tools)
+        except Exception as exc:
+            raise Exception(
+                f"MCP connection failed ({type(exc).__name__})"
+            ) from None
 
     async def call_tool(self, tool_name: str, arguments: dict) -> str:
         """Execute a tool on the MCP server."""
         try:
-            data = await self._detect_and_request(
+            data = await self._bounded_request(
                 "tools/call",
                 {"name": tool_name, "arguments": arguments},
+                MAX_MCP_CALL_SECONDS,
             )
 
             if "error" in data:
-                err = data["error"]
-                msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-                return f"❌ MCP tool execution error: {msg[:200]}"
+                incident_id = uuid.uuid4().hex[:12]
+                error = data["error"]
+                error_code = error.get("code") if isinstance(error, dict) else None
+                logger.warning(
+                    "[MCPClient] Tool returned an error error_code={} incident_id={}",
+                    error_code if isinstance(error_code, (int, str)) else "unknown",
+                    incident_id,
+                )
+                return f"❌ MCP tool execution failed (incident {incident_id})"
 
             result = data.get("result", {})
             if isinstance(result, str):
-                return result
+                return self._bounded_tool_result(result)
 
             # MCP returns content as list of content blocks
             content_blocks = result.get("content", []) if isinstance(result, dict) else []
@@ -363,7 +552,12 @@ class MCPClient:
                 else:
                     texts.append(str(block))
 
-            return "\n".join(texts) if texts else str(result)
+            rendered = "\n".join(texts) if texts else str(result)
+            return self._bounded_tool_result(rendered)
 
-        except httpx.HTTPError as e:
-            return f"❌ MCP connection failed: {str(e)[:200]}"
+        except Exception as exc:
+            logger.warning(
+                "[MCPClient] Tool call failed error_type={}",
+                type(exc).__name__,
+            )
+            return "❌ MCP connection failed"

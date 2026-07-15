@@ -45,13 +45,19 @@ from app.services.quota_guard import (
     increment_conversation_usage,
     quota_error_payload,
 )
-from app.services.realtime import realtime_router
+from app.services.realtime import PRESENCE_TTL_SECONDS, realtime_router
 from app.services.task_executor import execute_task
 
 router = APIRouter(tags=["websocket"])
 
 MAX_LIVE_CODE_STREAM_CHARS = 120_000
 LIVE_CODE_TRUNCATED_NOTICE = "\n\n[... live output truncated; execution continues ...]\n"
+
+
+def generic_llm_failure_user_message() -> str:
+    """Return a stable chat error without exposing database/provider details."""
+
+    return "[LLM call error] 系统暂时无法完成模型调用，请稍后重试；若持续出现请联系管理员。"
 
 
 def extract_partial_content(args_str: str) -> str:
@@ -128,6 +134,7 @@ class ConnectionManager:
     def __init__(self):
         # agent_id_str -> list of (WebSocket, session_id_str | None, user_id_str | None)
         self.active_connections: dict[str, list[tuple]] = {}
+        self._presence_heartbeat_tasks: dict[int, asyncio.Task] = {}
 
     async def connect(self, agent_id: str, websocket: WebSocket, session_id: str = None, user_id: str | None = None):
         if agent_id not in self.active_connections:
@@ -139,12 +146,42 @@ class ConnectionManager:
             session_id=session_id,
             user_id=user_id,
         )
+        heartbeat_key = id(websocket)
+        previous = self._presence_heartbeat_tasks.pop(heartbeat_key, None)
+        if previous:
+            previous.cancel()
+        self._presence_heartbeat_tasks[heartbeat_key] = asyncio.create_task(
+            self._presence_heartbeat(agent_id, websocket),
+            name=f"ws-presence-{agent_id[:8]}",
+        )
+
+    async def _presence_heartbeat(self, agent_id: str, websocket: WebSocket) -> None:
+        interval = max(PRESENCE_TTL_SECONDS // 3, 1)
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    await realtime_router.refresh_connection(
+                        agent_id=agent_id,
+                        websocket=websocket,
+                    )
+                except Exception:
+                    logger.warning(
+                        "[Realtime] Presence heartbeat retry agent_id={}",
+                        agent_id,
+                    )
+        except asyncio.CancelledError:
+            raise
 
     async def disconnect(self, agent_id: str, websocket: WebSocket):
         if agent_id in self.active_connections:
             self.active_connections[agent_id] = [
                 (ws, sid, uid) for ws, sid, uid in self.active_connections[agent_id] if ws != websocket
             ]
+        heartbeat = self._presence_heartbeat_tasks.pop(id(websocket), None)
+        if heartbeat:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
         await realtime_router.unregister_connection(agent_id=agent_id, websocket=websocket)
 
     def _local_connections(self, agent_id: str) -> list[tuple[WebSocket, str | None, str | None]]:
@@ -193,6 +230,23 @@ class ConnectionManager:
             message=message,
             local_connections=self._local_connections(agent_id),
             user_id=user_id,
+        )
+
+    async def send_to_session_user(
+        self,
+        agent_id: str,
+        session_id: str,
+        user_id: str,
+        message: dict,
+    ) -> bool:
+        """Send only to the exact authenticated user/session pair."""
+        return await realtime_router.route_message(
+            agent_id=agent_id,
+            message=message,
+            local_connections=self._local_connections(agent_id),
+            session_id=session_id,
+            user_id=user_id,
+            require_target_success=True,
         )
 
     async def get_active_session_ids(self, agent_id: str) -> list[str]:
@@ -1113,7 +1167,7 @@ class WebSocketChatHandler:
                     "provider": getattr(self.llm_model, "provider", None),
                 },
             )
-            return f"[LLM call error] {str(e)[:200]}", [], []
+            return generic_llm_failure_user_message(), [], []
 
     async def _inject_live_preview_and_workspace_metadata(self, data: dict):
         """Injects live previews and workspace panel activity tracking into tool results."""

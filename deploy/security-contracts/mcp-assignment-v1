@@ -1,0 +1,9 @@
+MCP execution requires an enabled AgentTool assignment and exact tenant scope.
+Tenant-configurable MCP endpoints require HTTPS, reject mixed/private DNS answers,
+pin the TCP connection to a validated numeric public IP before any HTTP bytes are
+written, re-check the connected peer, and reject cross-origin redirects.
+
+Production DNS must return genuine public addresses. DNS proxy modes that return
+198.18.0.0/15 fake IPs are intentionally incompatible; configure real container
+DNS or a separately authorized security egress proxy instead of weakening this
+contract.

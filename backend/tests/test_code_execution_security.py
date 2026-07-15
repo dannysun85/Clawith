@@ -183,6 +183,7 @@ def test_signed_approval_preserves_complete_long_payload_and_rejects_tampering(
     details = build_tool_approval_details(
         agent_id,
         "execute_code",
+        "execute_code",
         arguments,
         requested_by,
     )
@@ -208,8 +209,18 @@ async def test_execute_code_is_forced_to_l3_even_if_agent_policy_requests_l1(
     monkeypatch.setattr(
         config_module,
         "get_settings",
-        lambda: SimpleNamespace(CODE_EXECUTION_REQUIRE_APPROVAL=True),
+        lambda: SimpleNamespace(
+            CODE_EXECUTION_REQUIRE_APPROVAL=True,
+            SECRET_KEY="approval-test-secret",
+        ),
     )
+
+    class NestedTransaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
 
     class FakeDB:
         def __init__(self):
@@ -220,6 +231,12 @@ async def test_execute_code_is_forced_to_l3_even_if_agent_policy_requests_l1(
 
         async def flush(self):
             return None
+
+        async def execute(self, _query):
+            return SimpleNamespace(scalar_one_or_none=lambda: None)
+
+        def begin_nested(self):
+            return NestedTransaction()
 
     service = AutonomyService()
 
@@ -232,17 +249,76 @@ async def test_execute_code_is_forced_to_l3_even_if_agent_policy_requests_l1(
         id=uuid.uuid4(),
         autonomy_policy={"execute_code": "L1"},
     )
+    details = build_tool_approval_details(
+        agent.id,
+        "execute_code",
+        "execute_code",
+        {"code": "print(1)"},
+        uuid.uuid4(),
+    )
 
     result = await service.check_and_enforce(
         db,
         agent,
         "execute_code",
-        {"tool": "execute_code", "args": {"code": "print(1)"}},
+        details,
     )
 
     assert result["allowed"] is False
     assert result["level"] == "L3"
     assert any(value.__class__.__name__ == "ApprovalRequest" for value in db.added)
+
+
+@pytest.mark.asyncio
+async def test_approval_feishu_card_is_never_sent_before_durable_commit(
+    monkeypatch,
+):
+    from app.services import notification_service
+    from app.services import autonomy_service as autonomy_module
+
+    events = []
+
+    async def persist_notification(*_args, **_kwargs):
+        events.append("web_notification")
+        return SimpleNamespace()
+
+    async def send_card(*_args, **_kwargs):
+        events.append("feishu_card")
+
+    class FailingCommitDB:
+        async def commit(self):
+            events.append("commit")
+            raise RuntimeError("commit failed")
+
+    monkeypatch.setattr(notification_service, "send_notification", persist_notification)
+    monkeypatch.setattr(
+        autonomy_module.feishu_service,
+        "send_approval_card",
+        send_card,
+    )
+    service = AutonomyService()
+    agent = SimpleNamespace(
+        id=uuid.uuid4(),
+        creator_id=uuid.uuid4(),
+        name="Approval Commit Test",
+    )
+    details = build_tool_approval_details(
+        agent.id,
+        "write_workspace_files",
+        "write_file",
+        {"path": "workspace/test.txt", "content": "test"},
+        agent.creator_id,
+    )
+    approval = SimpleNamespace(
+        id=uuid.uuid4(),
+        action_type="write_workspace_files",
+        details=details,
+    )
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        await service._request_approval(FailingCommitDB(), agent, approval)
+
+    assert events == ["web_notification", "commit"]
 
 
 def test_masked_or_omitted_secret_never_overwrites_stored_value():
@@ -331,6 +407,18 @@ def test_every_code_tool_is_mapped_to_l3_autonomy_action():
         name for name in CODE_EXECUTION_TOOL_NAMES
         if agent_tools._TOOL_AUTONOMY_MAP.get(name) != "execute_code"
     } == set()
+
+
+def test_l3_approval_message_forbids_model_retry_and_points_to_terminal_status():
+    approval_id = uuid.uuid4()
+
+    message = agent_tools._queued_approval_message(approval_id)
+
+    assert "execute it automatically after approval" in message
+    assert "Do not retry this tool call" in message
+    assert "check Approvals for the final status" in message
+    assert str(approval_id) in message
+    assert "Please wait for approval before retrying" not in message
 
 
 @pytest.mark.asyncio

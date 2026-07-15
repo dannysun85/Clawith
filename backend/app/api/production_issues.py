@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -9,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.events import get_redis
 from app.core.permissions import check_agent_access
 from app.core.security import get_current_user, get_saas_admin
 from app.database import get_db
@@ -27,6 +29,40 @@ from app.services.production_issue_monitor import record_production_issue
 
 client_router = APIRouter(prefix="/production-issues", tags=["production-issues"])
 admin_router = APIRouter(prefix="/saas/production-issues", tags=["saas-production-issues"])
+CLIENT_REPORT_RATE_LIMIT = 30
+CLIENT_REPORT_RATE_WINDOW_SECONDS = 60
+CLIENT_REPORT_RATE_SCRIPT = """
+redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[1])
+local count = redis.call('ZCARD', KEYS[1])
+local limit = tonumber(ARGV[4])
+if count >= limit then
+    redis.call('EXPIRE', KEYS[1], ARGV[5])
+    return count + 1
+end
+redis.call('ZADD', KEYS[1], ARGV[2], ARGV[3])
+redis.call('EXPIRE', KEYS[1], ARGV[5])
+return count + 1
+"""
+
+
+async def _record_and_count_client_reports(user_id: uuid.UUID) -> int:
+    """Return this authenticated user's rolling client-report count."""
+
+    redis = await get_redis()
+    now = time.time()
+    key = f"production-issue-report:rate:{user_id}"
+    member = f"{now}:{uuid.uuid4().hex}"
+    count = await redis.eval(
+        CLIENT_REPORT_RATE_SCRIPT,
+        1,
+        key,
+        now - CLIENT_REPORT_RATE_WINDOW_SECONDS,
+        now,
+        member,
+        CLIENT_REPORT_RATE_LIMIT,
+        CLIENT_REPORT_RATE_WINDOW_SECONDS * 2,
+    )
+    return int(count)
 
 
 async def _authorized_client_agent_id(
@@ -54,6 +90,12 @@ async def report_client_issue(
 ):
     """Accept only operational metadata; prompts, bodies and messages are rejected by allowlist."""
 
+    report_count = await _record_and_count_client_reports(current_user.id)
+    if report_count > CLIENT_REPORT_RATE_LIMIT:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many client issue reports",
+        )
     summaries = {
         "api": "Client observed an API operation failure",
         "runtime": "Client runtime operation failed",
@@ -183,7 +225,13 @@ async def update_production_issue_status(
     issue.acknowledged_at = now if data.status == "acknowledged" else None
     issue.resolved_at = now if data.status in {"resolved", "ignored"} else None
     if data.status == "open":
+        if before != "open":
+            issue.alert_epoch = int(issue.alert_epoch or 1) + 1
         issue.alerted_at = None
+        issue.alert_attempts = 0
+        issue.alert_next_attempt_at = None
+        issue.alert_last_error_code = None
+        issue.alert_notification_sent_at = None
     db.add(AuditLog(
         user_id=current_user.id,
         action="production_issue_status_update",

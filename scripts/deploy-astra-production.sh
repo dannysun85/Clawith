@@ -13,8 +13,8 @@ COMPOSE_PROFILES="${COMPOSE_PROFILES:-}"
 COMPOSE_PROFILES_ARG="${COMPOSE_PROFILES:-__none__}"
 PUBLIC_URL="${PUBLIC_URL:-https://opc.reeftotem.ai}"
 RUN_LOCAL_CHECKS="${RUN_LOCAL_CHECKS:-1}"
-RUN_REMOTE_SMOKE="${RUN_REMOTE_SMOKE:-0}"
-ALLOW_DIRTY="${ALLOW_DIRTY:-0}"
+RUN_REMOTE_SMOKE="${RUN_REMOTE_SMOKE:-1}"
+REMOTE_SMOKE_BREAK_GLASS_ARTIFACT="${REMOTE_SMOKE_BREAK_GLASS_ARTIFACT:-}"
 DRAIN_TIMEOUT_SECONDS="${DRAIN_TIMEOUT_SECONDS:-900}"
 
 SMOKE_ENV_KEYS=(
@@ -42,9 +42,137 @@ require_cmd() {
 
 require_cmd git
 require_cmd tar
+require_cmd gzip
 require_cmd ssh
 require_cmd scp
 require_cmd python3
+require_cmd uv
+require_cmd npm
+require_cmd docker
+require_cmd createdb
+require_cmd dropdb
+require_cmd psql
+
+if [ "$RUN_LOCAL_CHECKS" != "1" ]; then
+    echo "production releases cannot disable local release gates" >&2
+    exit 1
+fi
+case "$RUN_REMOTE_SMOKE" in
+    0|1) ;;
+    *)
+        echo "RUN_REMOTE_SMOKE must be 0 or 1" >&2
+        exit 1
+        ;;
+esac
+
+if [ -n "$(git status --short)" ]; then
+    echo "working tree is dirty; production releases require a reviewed commit" >&2
+    exit 1
+fi
+
+VERSION="$(tr -d '[:space:]' < backend/VERSION)"
+FRONTEND_VERSION="$(tr -d '[:space:]' < frontend/VERSION)"
+if [ -z "$VERSION" ] || [ "$VERSION" != "$FRONTEND_VERSION" ]; then
+    echo "backend/VERSION and frontend/VERSION must be identical and non-empty" >&2
+    exit 1
+fi
+if ! grep -Fq "$VERSION" RELEASE_NOTES.md; then
+    echo "RELEASE_NOTES.md does not mention version $VERSION" >&2
+    exit 1
+fi
+COMMIT="$(git rev-parse HEAD)"
+case "$COMMIT" in
+    ''|*[!0-9a-f]*)
+        echo "release commit must be a full lowercase Git object ID" >&2
+        exit 1
+        ;;
+    *) ;;
+esac
+[ "${#COMMIT}" = "40" ] || {
+    echo "release commit must contain exactly 40 hexadecimal characters" >&2
+    exit 1
+}
+RELEASE_BASE_TAG="$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null)" || {
+    echo "release requires an ancestor tag to define the complete Ruff baseline" >&2
+    exit 1
+}
+RELEASE_BASE_COMMIT="$(git rev-parse "${RELEASE_BASE_TAG}^{commit}")"
+git merge-base --is-ancestor "$RELEASE_BASE_COMMIT" HEAD || {
+    echo "release Ruff baseline is not an ancestor of the candidate" >&2
+    exit 1
+}
+
+REMOTE_SMOKE_BREAK_GLASS_DIGEST="none"
+REMOTE_SMOKE_BREAK_GLASS_NONCE_HASH="none"
+if [ "$RUN_REMOTE_SMOKE" = "0" ]; then
+    if [ -z "$REMOTE_SMOKE_BREAK_GLASS_ARTIFACT" ] || \
+        [ ! -f "$REMOTE_SMOKE_BREAK_GLASS_ARTIFACT" ] || \
+        [ -L "$REMOTE_SMOKE_BREAK_GLASS_ARTIFACT" ]; then
+        echo "RUN_REMOTE_SMOKE=0 requires a regular break-glass approval artifact" >&2
+        exit 1
+    fi
+    BREAK_GLASS_VALIDATION="$(python3 - \
+        "$REMOTE_SMOKE_BREAK_GLASS_ARTIFACT" "$VERSION" "$COMMIT" <<'PY_BREAK_GLASS'
+from datetime import datetime, timedelta, timezone
+import hashlib
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+version = sys.argv[2]
+commit = sys.argv[3]
+if path.stat().st_size > 16_384:
+    raise SystemExit("break-glass artifact is too large")
+fields = {}
+for line in path.read_text(encoding="utf-8").splitlines():
+    if not line or line.lstrip().startswith("#") or "=" not in line:
+        continue
+    key, value = line.split("=", 1)
+    key = key.strip()
+    if key in fields:
+        raise SystemExit(f"break-glass artifact contains duplicate field: {key}")
+    fields[key] = value.strip()
+required = {
+    "approval_id",
+    "approval_nonce",
+    "approved_by",
+    "reason",
+    "issued_at_utc",
+    "expires_at_utc",
+    "release_version",
+    "release_commit",
+}
+if required - fields.keys():
+    raise SystemExit("break-glass artifact is missing required fields")
+if any(not fields[key] for key in required):
+    raise SystemExit("break-glass artifact contains an empty required field")
+if fields["release_version"] != version:
+    raise SystemExit("break-glass artifact targets a different release version")
+if fields["release_commit"] != commit:
+    raise SystemExit("break-glass artifact targets a different release commit")
+if not re.fullmatch(r"[A-Za-z0-9._-]{16,128}", fields["approval_nonce"]):
+    raise SystemExit("break-glass approval_nonce has an invalid format")
+issued = datetime.fromisoformat(fields["issued_at_utc"].replace("Z", "+00:00"))
+expires = datetime.fromisoformat(fields["expires_at_utc"].replace("Z", "+00:00"))
+if issued.tzinfo is None or expires.tzinfo is None:
+    raise SystemExit("break-glass artifact timestamps must include a timezone")
+now = datetime.now(timezone.utc)
+if issued > now + timedelta(minutes=5):
+    raise SystemExit("break-glass artifact was issued in the future")
+if expires <= now:
+    raise SystemExit("break-glass artifact is expired")
+if expires <= issued or expires - issued > timedelta(hours=4):
+    raise SystemExit("break-glass approval window must be positive and at most four hours")
+print(
+    hashlib.sha256(path.read_bytes()).hexdigest(),
+    hashlib.sha256(fields["approval_nonce"].encode("utf-8")).hexdigest(),
+)
+PY_BREAK_GLASS
+    )"
+    read -r REMOTE_SMOKE_BREAK_GLASS_DIGEST \
+        REMOTE_SMOKE_BREAK_GLASS_NONCE_HASH <<< "$BREAK_GLASS_VALIDATION"
+fi
 
 case "$DRAIN_TIMEOUT_SECONDS" in
     ''|*[!0-9]*)
@@ -71,92 +199,83 @@ if [ ! -f "$SSH_KEY" ]; then
     exit 1
 fi
 
-if [ "$RUN_LOCAL_CHECKS" = "1" ]; then
-    echo "[local] checking Alembic heads"
-    ALEMBIC_HEADS="$(cd backend && uv run alembic heads)"
-    ALEMBIC_HEAD_COUNT="$(printf '%s\n' "$ALEMBIC_HEADS" | grep -c '(head)')"
-    if [ "$ALEMBIC_HEAD_COUNT" != "1" ]; then
-        printf '%s\n' "$ALEMBIC_HEADS" >&2
-        echo "expected exactly one Alembic head" >&2
-        exit 1
-    fi
-
-    echo "[local] running focused backend release-gate tests"
-    (cd backend && uv run pytest \
-        tests/test_minimax_failover.py \
-        tests/test_load_balancer.py \
-        tests/test_credentials_verification.py \
-        tests/test_media_generation_lifecycle.py \
-        tests/test_media_incident_remediation.py \
-        tests/test_production_issue_monitoring.py \
-        tests/test_saas_admin.py \
-        tests/test_subscription_lifecycle.py \
-        tests/test_plan_crud.py \
-        tests/test_subscription_billing.py \
-        tests/test_code_execution_security.py \
-        tests/test_mcp_runtime_scope.py \
-        tests/test_tool_tenant_scope.py \
-        tests/test_process_utils.py \
-        tests/test_production_deploy_contract.py \
-        tests/test_worker_runtime_health.py \
-        -q)
-
-    echo "[local] building frontend"
-    (cd frontend && npm run build)
-fi
-
-if [ -n "$(git status --short)" ] && [ "$ALLOW_DIRTY" != "1" ]; then
-    echo "working tree is dirty; commit first or run with ALLOW_DIRTY=1 for an explicit dirty release" >&2
+echo "[local] checking Alembic heads"
+ALEMBIC_HEADS="$(cd backend && uv run alembic heads)"
+ALEMBIC_HEAD_COUNT="$(printf '%s\n' "$ALEMBIC_HEADS" | grep -c '(head)')"
+if [ "$ALEMBIC_HEAD_COUNT" != "1" ]; then
+    printf '%s\n' "$ALEMBIC_HEADS" >&2
+    echo "expected exactly one Alembic head" >&2
     exit 1
 fi
 
-COMMIT="$(git rev-parse --short HEAD)"
-DIRTY_SUFFIX=""
-if [ -n "$(git status --short)" ]; then
-    DIRTY_SUFFIX="-dirty"
-fi
-VERSION="$(tr -d '[:space:]' < backend/VERSION)"
+echo "[local] checking that the release adds no Ruff violations"
+uv run --project backend python scripts/ruff_diff_gate.py \
+    --base "$RELEASE_BASE_COMMIT" --target HEAD
+git diff --check
+
+echo "[local] running full backend suite"
+(cd backend && uv run pytest -q)
+
+echo "[local] running full frontend suite and production build"
+(cd frontend && npm test)
+(cd frontend && npm run build)
+
+echo "[local] running PostgreSQL upgrade/downgrade/re-upgrade smoke"
+bash scripts/postgres-migration-smoke.sh
+
+echo "[local] validating effective production compose"
+POSTGRES_PASSWORD=release-gate \
+SECRET_KEY=release-gate-secret \
+JWT_SECRET_KEY=release-gate-jwt \
+CORS_ORIGINS=https://release-gate.invalid \
+PUBLIC_BASE_URL=https://release-gate.invalid \
+docker compose -f deploy/astra-poc/docker-compose.prod.yml config --quiet
+
 STAMP="$(date -u +%Y%m%d-%H%M%S)"
 NONCE="$(python3 -c 'import secrets; print(secrets.token_hex(4))')"
-RELEASE_ID="${STAMP}-${COMMIT}-${NONCE}-clawith-saas${DIRTY_SUFFIX}"
+RELEASE_ID="${STAMP}-${COMMIT:0:12}-${NONCE}-clawith-saas"
 PACKAGE_DIR="$ROOT_DIR/.tmp/releases"
+PACKAGE_TAR="$PACKAGE_DIR/${RELEASE_ID}.tar"
 PACKAGE="$PACKAGE_DIR/${RELEASE_ID}.tar.gz"
 SMOKE_ENV_FILE="$PACKAGE_DIR/${RELEASE_ID}.smoke.env"
 SMOKE_ENV_REMOTE="/tmp/${RELEASE_ID}.smoke.env"
+BREAK_GLASS_FILE="$PACKAGE_DIR/${RELEASE_ID}.break-glass.approval"
+BREAK_GLASS_FILE_REMOTE="/tmp/${RELEASE_ID}.break-glass.approval"
 SMOKE_ENV_UPLOADED=0
+BREAK_GLASS_UPLOADED=0
 
 cleanup_local() {
-    rm -f "$PACKAGE" "$SMOKE_ENV_FILE"
+    rm -f "$PACKAGE_TAR" "$PACKAGE" "$SMOKE_ENV_FILE" "$BREAK_GLASS_FILE"
     if [ "$SMOKE_ENV_UPLOADED" = "1" ]; then
         ssh "${SSH_OPTS[@]}" "$SSH_TARGET" rm -f "$SMOKE_ENV_REMOTE" >/dev/null 2>&1 || true
+    fi
+    if [ "$BREAK_GLASS_UPLOADED" = "1" ]; then
+        ssh "${SSH_OPTS[@]}" "$SSH_TARGET" rm -f "$BREAK_GLASS_FILE_REMOTE" >/dev/null 2>&1 || true
     fi
 }
 trap cleanup_local EXIT
 
 mkdir -p "$PACKAGE_DIR"
+if [ "$RUN_REMOTE_SMOKE" = "0" ]; then
+    cp "$REMOTE_SMOKE_BREAK_GLASS_ARTIFACT" "$BREAK_GLASS_FILE"
+    chmod 0600 "$BREAK_GLASS_FILE"
+fi
 echo "[local] packaging $RELEASE_ID"
-COPYFILE_DISABLE=1 tar \
-    --no-xattrs \
-    --no-mac-metadata \
-    --no-fflags \
-    --exclude .git \
-    --exclude .tmp \
-    --exclude .data \
-    --exclude .deepseek \
-    --exclude .playwright-cli \
-    --exclude .omx \
-    --exclude output \
-    --exclude .pytest_cache \
-    --exclude .ruff_cache \
-    --exclude .mypy_cache \
-    --exclude '*/__pycache__' \
-    --exclude '*.pyc' \
-    --exclude node_modules \
-    --exclude frontend/node_modules \
-    --exclude frontend/dist \
-    --exclude backend/.venv \
-    --exclude .env \
-    -czf "$PACKAGE" .
+git archive --format=tar --output="$PACKAGE_TAR" "$COMMIT"
+ARCHIVE_COMMIT="$(git get-tar-commit-id < "$PACKAGE_TAR")"
+[ "$ARCHIVE_COMMIT" = "$COMMIT" ] || {
+    echo "release archive is not bound to the reviewed commit" >&2
+    exit 1
+}
+gzip -n -c "$PACKAGE_TAR" > "$PACKAGE"
+PACKAGE_SHA256="$(python3 - "$PACKAGE" <<'PY_PACKAGE_SHA256'
+import hashlib
+from pathlib import Path
+import sys
+
+print(hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest())
+PY_PACKAGE_SHA256
+)"
 
 if [ "$RUN_REMOTE_SMOKE" = "1" ]; then
     (
@@ -174,11 +293,20 @@ if [ "$RUN_REMOTE_SMOKE" = "1" ]; then
     scp "${SSH_OPTS[@]}" "$SMOKE_ENV_FILE" "${SSH_TARGET}:${SMOKE_ENV_REMOTE}"
     SMOKE_ENV_UPLOADED=1
     ssh "${SSH_OPTS[@]}" "$SSH_TARGET" chmod 600 "$SMOKE_ENV_REMOTE"
+else
+    scp "${SSH_OPTS[@]}" "$BREAK_GLASS_FILE" "${SSH_TARGET}:${BREAK_GLASS_FILE_REMOTE}"
+    BREAK_GLASS_UPLOADED=1
+    ssh "${SSH_OPTS[@]}" "$SSH_TARGET" chmod 600 "$BREAK_GLASS_FILE_REMOTE"
 fi
 
 echo "[remote] deploying $RELEASE_ID"
 ssh "${SSH_OPTS[@]}" "$SSH_TARGET" bash -s -- \
-    "$APP_ROOT" "$RELEASE_ID" "$COMPOSE_PROJECT" "$COMPOSE_PROFILES_ARG" "$VERSION" "$COMMIT" "$PUBLIC_URL" "$RUN_REMOTE_SMOKE" "$SMOKE_ENV_REMOTE" "$DRAIN_TIMEOUT_SECONDS" <<'REMOTE_SCRIPT'
+    "$APP_ROOT" "$RELEASE_ID" "$COMPOSE_PROJECT" "$COMPOSE_PROFILES_ARG" \
+    "$VERSION" "$COMMIT" "$PUBLIC_URL" "$RUN_REMOTE_SMOKE" \
+    "$SMOKE_ENV_REMOTE" "$DRAIN_TIMEOUT_SECONDS" \
+    "$REMOTE_SMOKE_BREAK_GLASS_DIGEST" "$BREAK_GLASS_FILE_REMOTE" \
+    "$RELEASE_BASE_COMMIT" "$REMOTE_SMOKE_BREAK_GLASS_NONCE_HASH" \
+    "$PACKAGE_SHA256" <<'REMOTE_SCRIPT'
 set -euo pipefail
 
 APP_ROOT="$1"
@@ -194,6 +322,11 @@ PUBLIC_URL="$7"
 RUN_REMOTE_SMOKE="$8"
 SMOKE_ENV_FILE="$9"
 DRAIN_TIMEOUT_SECONDS="${10}"
+REMOTE_SMOKE_BREAK_GLASS_DIGEST="${11}"
+REMOTE_SMOKE_BREAK_GLASS_FILE="${12}"
+RELEASE_BASE_COMMIT="${13}"
+REMOTE_SMOKE_BREAK_GLASS_NONCE_HASH="${14}"
+PACKAGE_SHA256="${15}"
 
 CURRENT="$APP_ROOT/current"
 CURRENT_TARGET=""
@@ -208,6 +341,10 @@ CUTOVER_STATE_FILE="$APP_ROOT/cutover-state"
 PENDING_DRAIN_FILE="$APP_ROOT/pending-drain"
 NGINX_SITE="/etc/nginx/sites-enabled/astra-poc.conf"
 NGINX_LOG_FORMAT="/etc/nginx/conf.d/00-astra-log-redaction.conf"
+MCP_QUARANTINE_SNAPSHOT_ID=""
+ROLLBACK_REQUIRES_MCP_QUARANTINE=0
+SCHEMA_FORWARD_ONLY=0
+MAINTENANCE_ENABLED=0
 
 mkdir -p "$APP_ROOT"
 if ! command -v flock >/dev/null 2>&1; then
@@ -220,7 +357,9 @@ if ! flock -n 9; then
     rm -f "$PACKAGE" "$SMOKE_ENV_FILE"
     exit 1
 fi
-CURRENT_TARGET="$(readlink -f "$CURRENT")"
+CURRENT_TARGET="$(python3 -c \
+    'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' \
+    "$CURRENT" 2>/dev/null)"
 
 write_atomic_line() {
     local path="$1"
@@ -464,6 +603,498 @@ compose_project() {
     fi
 }
 
+approval_schema_forward_state() {
+    local release="$1"
+    local postgres_user
+    local postgres_db
+    local result
+
+    postgres_user="$(read_release_env "$release" POSTGRES_USER astra)" || return 1
+    postgres_db="$(read_release_env "$release" POSTGRES_DB astra)" || return 1
+    result="$(
+        compose_project \
+            "$COMPOSE_PROJECT" "$release/.env" "$release/$COMPOSE_FILE" \
+            exec -T postgres psql -qAt -v ON_ERROR_STOP=1 \
+            -U "$postgres_user" -d "$postgres_db" \
+            -c "SELECT count(*) FROM pg_constraint WHERE conname = 'ck_approval_execution_state_consistency' AND conrelid = 'approval_requests'::regclass;"
+    )" || return 1
+    case "$result" in
+        0|1) printf '%s' "$result" ;;
+        *) return 1 ;;
+    esac
+}
+
+verify_public_maintenance() {
+    local headers
+    headers="$(curl -sS -D - -o /dev/null "$PUBLIC_URL/api/health?maintenance=$RELEASE_ID" | tr -d '\r')" || return 1
+    printf '%s\n' "$headers" | head -1 | grep -Eq '^HTTP/[0-9.]+ 503([[:space:]]|$)' || return 1
+    printf '%s\n' "$headers" | grep -Eqi '^Retry-After:[[:space:]]*60[[:space:]]*$' || return 1
+    printf '%s\n' "$headers" | grep -Eqi '^Cache-Control:[[:space:]]*"?no-store"?[[:space:]]*$' || return 1
+}
+
+enable_web_maintenance() {
+    # Arm rollback before the first persistent Nginx mutation. If validation
+    # fails after maintenance-on writes the files, rollback must never leave a
+    # latent 503 configuration that appears on a later reload/restart.
+    NGINX_CONFIG_TOUCHED=1
+    sudo python3 "$RELEASE/scripts/configure_production_nginx.py" \
+        maintenance-on "$NGINX_SITE" "$NGINX_LOG_FORMAT" || return 1
+    sudo nginx -t >/dev/null || return 1
+    audit_effective_nginx >/dev/null || return 1
+    sudo python3 "$RELEASE/scripts/configure_production_nginx.py" \
+        maintenance-status "$NGINX_SITE" >/dev/null || return 1
+    reload_nginx_with_worker_snapshot || return 1
+    NGINX_WORKER_GRACE_SECONDS=60 retire_pre_reload_nginx_workers || return 1
+    verify_public_maintenance || return 1
+    MAINTENANCE_ENABLED=1
+}
+
+preserve_forward_only_maintenance() {
+    echo "[remote] schema is forward-only; refusing to restore the previous application" >&2
+    sudo python3 "$RELEASE/scripts/configure_production_nginx.py" \
+        maintenance-on "$NGINX_SITE" "$NGINX_LOG_FORMAT" || return 1
+    sudo nginx -t >/dev/null || return 1
+    audit_effective_nginx >/dev/null || return 1
+    reload_nginx_with_worker_snapshot || return 1
+    compose_project \
+        "$OLD_PROJECT" "$PREVIOUS/.env" "$PREVIOUS/$COMPOSE_FILE" \
+        stop --timeout 30 worker frontend backend >/dev/null 2>&1 || true
+    MAINTENANCE_ENABLED=1
+    write_cutover_state schema_forward_only "$CANDIDATE_SLOT" "$RELEASE_ID"
+}
+
+release_has_mcp_assignment_contract() {
+    test -f "$1/deploy/security-contracts/mcp-assignment-v1"
+}
+
+read_release_env() {
+    local release="$1"
+    local key="$2"
+    local default="$3"
+    local value
+    value="$(grep -E "^${key}=" "$release/.env" | tail -1 | cut -d= -f2- | sed -E 's/^"//; s/"$//')"
+    if [ -z "$value" ]; then
+        value="$default"
+    fi
+    printf '%s' "$value"
+}
+
+mcp_endpoint_preflight() {
+    local release="$1"
+    local postgres_user
+    local postgres_db
+    local counts
+    local non_https
+    local userinfo
+    local fragments
+    local query_secrets
+
+    postgres_user="$(read_release_env "$release" POSTGRES_USER astra)" || return 1
+    postgres_db="$(read_release_env "$release" POSTGRES_DB astra)" || return 1
+    counts="$(
+        compose_project \
+            "$COMPOSE_PROJECT" "$release/.env" "$release/$COMPOSE_FILE" \
+            exec -T postgres psql -v ON_ERROR_STOP=1 -At \
+            -U "$postgres_user" -d "$postgres_db" <<'SQL_MCP_PREFLIGHT'
+SELECT
+    count(*) FILTER (
+        WHERE mcp_server_url IS NOT NULL
+          AND lower(mcp_server_url) !~ '^https://'
+    ),
+    count(*) FILTER (
+        WHERE mcp_server_url ~* '^https://[^/?#]*@'
+    ),
+    count(*) FILTER (
+        WHERE position('#' in mcp_server_url) > 0
+    ),
+    count(*) FILTER (
+        WHERE EXISTS (
+            SELECT 1
+            FROM regexp_split_to_table(
+                split_part(split_part(mcp_server_url, '?', 2), '#', 1),
+                '&'
+            ) AS query_pair
+            CROSS JOIN LATERAL (
+                SELECT trim(BOTH '_' FROM lower(
+                    regexp_replace(
+                        regexp_replace(
+                            split_part(query_pair, '=', 1),
+                            '([a-z0-9])([A-Z])',
+                            '\1_\2',
+                            'g'
+                        ),
+                        '[^a-zA-Z0-9]+',
+                        '_',
+                        'g'
+                    )
+                )) AS normalized_key
+            ) AS query_key
+            WHERE query_key.normalized_key IN (
+                'api_key', 'apikey', 'auth', 'authorization',
+                'credential', 'key', 'password', 'passwd', 'secret',
+                'sig', 'signature', 'token'
+            )
+               OR query_key.normalized_key ~
+                    '(_api_key|_access_key|_credential|_key|_password|_secret|_sig|_signature|_token|_apikey)$'
+        )
+    )
+FROM tools
+WHERE type = 'mcp';
+SQL_MCP_PREFLIGHT
+    )" || return 1
+    IFS='|' read -r non_https userinfo fragments query_secrets <<< "$counts"
+    for count in "$non_https" "$userinfo" "$fragments" "$query_secrets"; do
+        case "$count" in
+            ''|*[!0-9]*)
+                echo "invalid MCP endpoint preflight result" >&2
+                return 1
+                ;;
+        esac
+    done
+    if [ "$non_https" != "0" ] || [ "$userinfo" != "0" ] || \
+        [ "$fragments" != "0" ] || [ "$query_secrets" != "0" ]; then
+        echo "MCP endpoint preflight failed: non_https=$non_https userinfo=$userinfo fragments=$fragments query_secrets=$query_secrets" >&2
+        return 1
+    fi
+}
+
+quarantine_mcp_for_unsafe_release() {
+    local target_release="$1"
+    local snapshot_id="$2"
+    local postgres_user
+    local postgres_db
+    local effective_snapshot
+
+    if release_has_mcp_assignment_contract "$target_release"; then
+        return 0
+    fi
+    case "$snapshot_id" in
+        ''|*[!A-Za-z0-9._-]*)
+            echo "invalid MCP quarantine snapshot identity" >&2
+            return 1
+            ;;
+    esac
+    postgres_user="$(read_release_env "$target_release" POSTGRES_USER astra)" || return 1
+    postgres_db="$(read_release_env "$target_release" POSTGRES_DB astra)" || return 1
+    echo "[remote] previous release lacks MCP assignment enforcement; quarantining MCP before rollback" >&2
+    effective_snapshot="$(compose_project \
+        "$COMPOSE_PROJECT" "$target_release/.env" "$target_release/$COMPOSE_FILE" \
+        exec -T postgres psql -qAt -v ON_ERROR_STOP=1 \
+        -v snapshot_id="$snapshot_id" -U "$postgres_user" -d "$postgres_db" \
+        <<'SQL_MCP_QUARANTINE'
+BEGIN;
+SELECT pg_advisory_xact_lock(hashtext('astra-deploy-mcp-quarantine-v1'));
+LOCK TABLE tools IN SHARE ROW EXCLUSIVE MODE;
+LOCK TABLE agent_tools IN SHARE ROW EXCLUSIVE MODE;
+CREATE TABLE IF NOT EXISTS astra_deploy_mcp_quarantine_state (
+    singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    snapshot_id text NOT NULL UNIQUE,
+    quarantined_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS astra_deploy_mcp_quarantine_tools (
+    snapshot_id text NOT NULL,
+    tool_id uuid NOT NULL,
+    enabled boolean NOT NULL,
+    mcp_server_url text,
+    config jsonb NOT NULL,
+    quarantined_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (snapshot_id, tool_id)
+);
+CREATE TABLE IF NOT EXISTS astra_deploy_mcp_quarantine_assignments (
+    snapshot_id text NOT NULL,
+    agent_tool_id uuid NOT NULL,
+    enabled boolean NOT NULL,
+    config jsonb NOT NULL,
+    quarantined_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (snapshot_id, agent_tool_id)
+);
+CREATE TEMP TABLE astra_new_mcp_quarantine_snapshot
+ON COMMIT DROP AS
+WITH inserted AS (
+    INSERT INTO astra_deploy_mcp_quarantine_state (singleton, snapshot_id)
+    VALUES (true, :'snapshot_id')
+    ON CONFLICT (singleton) DO NOTHING
+    RETURNING snapshot_id
+)
+SELECT snapshot_id FROM inserted;
+INSERT INTO astra_deploy_mcp_quarantine_tools (
+    snapshot_id, tool_id, enabled, mcp_server_url, config
+)
+SELECT snapshot.snapshot_id, tool.id, tool.enabled, tool.mcp_server_url,
+       COALESCE(tool.config::jsonb, '{}'::jsonb)
+FROM tools AS tool
+CROSS JOIN astra_new_mcp_quarantine_snapshot AS snapshot
+WHERE tool.type = 'mcp'
+ON CONFLICT (snapshot_id, tool_id) DO NOTHING;
+INSERT INTO astra_deploy_mcp_quarantine_assignments (
+    snapshot_id, agent_tool_id, enabled, config
+)
+SELECT snapshot.snapshot_id, agent_tools.id, agent_tools.enabled,
+       COALESCE(agent_tools.config::jsonb, '{}'::jsonb)
+FROM agent_tools
+JOIN tools ON tools.id = agent_tools.tool_id
+CROSS JOIN astra_new_mcp_quarantine_snapshot AS snapshot
+WHERE tools.type = 'mcp'
+ON CONFLICT (snapshot_id, agent_tool_id) DO NOTHING;
+CREATE OR REPLACE FUNCTION astra_deploy_guard_mcp_tools()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF current_setting('astra.mcp_quarantine_restore', true) = 'on' THEN
+        IF TG_OP = 'DELETE' THEN
+            RETURN OLD;
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM astra_deploy_mcp_quarantine_state WHERE singleton = true
+    ) THEN
+        IF TG_OP = 'DELETE' THEN
+            RETURN OLD;
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF TG_OP = 'DELETE' THEN
+        IF OLD.type = 'mcp' THEN
+            RETURN NULL;
+        END IF;
+        RETURN OLD;
+    END IF;
+    IF NEW.type = 'mcp' OR (TG_OP = 'UPDATE' AND OLD.type = 'mcp') THEN
+        IF TG_OP = 'UPDATE' AND OLD.type = 'mcp' THEN
+            NEW.type := 'mcp';
+            NEW.source := OLD.source;
+            NEW.tenant_id := OLD.tenant_id;
+            NEW.name := OLD.name;
+            NEW.display_name := OLD.display_name;
+            NEW.description := OLD.description;
+            NEW.category := OLD.category;
+            NEW.icon := OLD.icon;
+            NEW.parameters_schema := OLD.parameters_schema;
+            NEW.mcp_server_name := OLD.mcp_server_name;
+            NEW.mcp_tool_name := OLD.mcp_tool_name;
+            NEW.config_schema := OLD.config_schema;
+            NEW.is_default := OLD.is_default;
+        ELSE
+            NEW.is_default := false;
+        END IF;
+        NEW.enabled := false;
+        NEW.mcp_server_url := NULL;
+        NEW.config := '{}'::json;
+    END IF;
+    RETURN NEW;
+END
+$$;
+CREATE OR REPLACE FUNCTION astra_deploy_guard_mcp_assignments()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    guarded_tool_is_mcp boolean;
+    old_tool_is_mcp boolean := false;
+BEGIN
+    IF current_setting('astra.mcp_quarantine_restore', true) = 'on' THEN
+        IF TG_OP = 'DELETE' THEN
+            RETURN OLD;
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM astra_deploy_mcp_quarantine_state WHERE singleton = true
+    ) THEN
+        IF TG_OP = 'DELETE' THEN
+            RETURN OLD;
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF TG_OP = 'INSERT' THEN
+        SELECT type = 'mcp' INTO guarded_tool_is_mcp
+        FROM tools WHERE id = NEW.tool_id;
+    ELSIF TG_OP = 'DELETE' THEN
+        SELECT type = 'mcp' INTO guarded_tool_is_mcp
+        FROM tools WHERE id = OLD.tool_id;
+    ELSE
+        SELECT EXISTS (
+            SELECT 1 FROM tools WHERE id = OLD.tool_id AND type = 'mcp'
+        ) INTO old_tool_is_mcp;
+        SELECT EXISTS (
+            SELECT 1 FROM tools
+            WHERE id IN (OLD.tool_id, NEW.tool_id) AND type = 'mcp'
+        ) INTO guarded_tool_is_mcp;
+    END IF;
+    IF COALESCE(guarded_tool_is_mcp, false) THEN
+        IF TG_OP = 'DELETE' THEN
+            RETURN NULL;
+        END IF;
+        IF TG_OP = 'UPDATE' AND old_tool_is_mcp THEN
+            NEW.agent_id := OLD.agent_id;
+            NEW.tool_id := OLD.tool_id;
+            NEW.source := OLD.source;
+            NEW.installed_by_agent_id := OLD.installed_by_agent_id;
+        END IF;
+        NEW.enabled := false;
+        NEW.config := '{}'::json;
+    END IF;
+    RETURN NEW;
+END
+$$;
+DROP TRIGGER IF EXISTS astra_deploy_mcp_quarantine_tools_guard ON tools;
+CREATE TRIGGER astra_deploy_mcp_quarantine_tools_guard
+BEFORE INSERT OR UPDATE OR DELETE ON tools
+FOR EACH ROW EXECUTE FUNCTION astra_deploy_guard_mcp_tools();
+DROP TRIGGER IF EXISTS astra_deploy_mcp_quarantine_assignments_guard ON agent_tools;
+CREATE TRIGGER astra_deploy_mcp_quarantine_assignments_guard
+BEFORE INSERT OR UPDATE OR DELETE ON agent_tools
+FOR EACH ROW EXECUTE FUNCTION astra_deploy_guard_mcp_assignments();
+UPDATE agent_tools
+SET enabled = false, config = '{}'::json
+FROM tools
+WHERE tools.id = agent_tools.tool_id
+  AND tools.type = 'mcp';
+UPDATE tools
+SET enabled = false, mcp_server_url = NULL, config = '{}'::json
+WHERE type = 'mcp';
+SELECT snapshot_id
+FROM astra_deploy_mcp_quarantine_state
+WHERE singleton = true;
+COMMIT;
+SQL_MCP_QUARANTINE
+    )" || return 1
+    case "$effective_snapshot" in
+        ''|*[!A-Za-z0-9._-]*)
+            echo "invalid effective MCP quarantine snapshot identity" >&2
+            return 1
+            ;;
+    esac
+    MCP_QUARANTINE_SNAPSHOT_ID="$effective_snapshot"
+}
+
+secure_mcp_quarantine_snapshot() {
+    local target_release="$1"
+    local target_project="$2"
+
+    if [ -z "$MCP_QUARANTINE_SNAPSHOT_ID" ]; then
+        return 0
+    fi
+    if ! release_has_mcp_assignment_contract "$target_release"; then
+        echo "refusing to sanitize MCP quarantine with an unsafe release" >&2
+        return 1
+    fi
+    compose_project \
+        "$target_project" "$target_release/.env" "$target_release/$COMPOSE_FILE" \
+        run --rm --no-deps -T --entrypoint python backend \
+        -m app.scripts.secure_mcp_quarantine \
+        "$MCP_QUARANTINE_SNAPSHOT_ID" < /dev/null
+}
+
+restore_mcp_quarantine_for_safe_release() {
+    local target_release="$1"
+    local target_project="$2"
+    local postgres_user
+    local postgres_db
+    local snapshot_id
+
+    if ! release_has_mcp_assignment_contract "$target_release"; then
+        return 0
+    fi
+    postgres_user="$(read_release_env "$target_release" POSTGRES_USER astra)" || return 1
+    postgres_db="$(read_release_env "$target_release" POSTGRES_DB astra)" || return 1
+    snapshot_id="$(compose_project \
+        "$COMPOSE_PROJECT" "$target_release/.env" "$target_release/$COMPOSE_FILE" \
+        exec -T postgres psql -qAt -v ON_ERROR_STOP=1 \
+        -U "$postgres_user" -d "$postgres_db" <<'SQL_MCP_PENDING_SNAPSHOT'
+CREATE TABLE IF NOT EXISTS astra_deploy_mcp_quarantine_state (
+    singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    snapshot_id text NOT NULL UNIQUE,
+    quarantined_at timestamptz NOT NULL DEFAULT now()
+);
+SELECT snapshot_id
+FROM astra_deploy_mcp_quarantine_state
+WHERE singleton = true;
+SQL_MCP_PENDING_SNAPSHOT
+    )" || return 1
+    if [ -z "$snapshot_id" ]; then
+        MCP_QUARANTINE_SNAPSHOT_ID=""
+        return 0
+    fi
+    case "$snapshot_id" in
+        *$'\n'*|*[!A-Za-z0-9._-]*)
+            echo "invalid pending MCP quarantine snapshot identity" >&2
+            return 1
+            ;;
+    esac
+
+    echo "[remote] sanitizing and restoring MCP quarantine under safe release" >&2
+    MCP_QUARANTINE_SNAPSHOT_ID="$snapshot_id"
+    secure_mcp_quarantine_snapshot \
+        "$target_release" "$target_project" || return 1
+
+    compose_project \
+        "$COMPOSE_PROJECT" "$target_release/.env" "$target_release/$COMPOSE_FILE" \
+        exec -T postgres psql -q -v ON_ERROR_STOP=1 \
+        -v snapshot_id="$snapshot_id" -U "$postgres_user" -d "$postgres_db" \
+        <<'SQL_MCP_RESTORE'
+BEGIN;
+SELECT pg_advisory_xact_lock(hashtext('astra-deploy-mcp-quarantine-v1'));
+LOCK TABLE tools IN SHARE ROW EXCLUSIVE MODE;
+LOCK TABLE agent_tools IN SHARE ROW EXCLUSIVE MODE;
+SET LOCAL astra.mcp_quarantine_restore = 'on';
+CREATE TEMP TABLE astra_expected_mcp_quarantine_snapshot
+ON COMMIT DROP AS
+SELECT snapshot_id
+FROM astra_deploy_mcp_quarantine_state
+WHERE singleton = true AND snapshot_id = :'snapshot_id';
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM astra_expected_mcp_quarantine_snapshot) THEN
+        RAISE EXCEPTION 'MCP quarantine snapshot changed before restore';
+    END IF;
+END
+$$;
+UPDATE tools AS tool
+SET enabled = snapshot.enabled,
+    mcp_server_url = snapshot.mcp_server_url,
+    config = snapshot.config::json
+FROM astra_deploy_mcp_quarantine_tools AS snapshot
+WHERE snapshot.snapshot_id = :'snapshot_id'
+  AND snapshot.tool_id = tool.id
+  AND tool.type = 'mcp'
+  AND tool.source IN ('builtin', 'admin', 'agent')
+  AND (tool.source <> 'agent' OR tool.tenant_id IS NOT NULL);
+UPDATE agent_tools AS assignment
+SET enabled = snapshot.enabled,
+    config = snapshot.config::json
+FROM astra_deploy_mcp_quarantine_assignments AS snapshot,
+     tools AS tool,
+     agents AS agent
+WHERE snapshot.snapshot_id = :'snapshot_id'
+  AND snapshot.agent_tool_id = assignment.id
+  AND tool.id = assignment.tool_id
+  AND agent.id = assignment.agent_id
+  AND tool.type = 'mcp'
+  AND (
+      (tool.source = 'agent' AND tool.tenant_id IS NOT NULL
+       AND tool.tenant_id = agent.tenant_id)
+      OR
+      (tool.source IN ('builtin', 'admin')
+       AND (tool.tenant_id IS NULL OR tool.tenant_id = agent.tenant_id))
+  );
+DELETE FROM astra_deploy_mcp_quarantine_assignments
+WHERE snapshot_id = :'snapshot_id';
+DELETE FROM astra_deploy_mcp_quarantine_tools
+WHERE snapshot_id = :'snapshot_id';
+DELETE FROM astra_deploy_mcp_quarantine_state
+WHERE singleton = true AND snapshot_id = :'snapshot_id';
+DROP TRIGGER IF EXISTS astra_deploy_mcp_quarantine_assignments_guard ON agent_tools;
+DROP TRIGGER IF EXISTS astra_deploy_mcp_quarantine_tools_guard ON tools;
+DROP FUNCTION IF EXISTS astra_deploy_guard_mcp_assignments();
+DROP FUNCTION IF EXISTS astra_deploy_guard_mcp_tools();
+COMMIT;
+SQL_MCP_RESTORE
+    MCP_QUARANTINE_SNAPSHOT_ID=""
+}
+
 project_for_slot() {
     case "$1" in
         legacy) printf '%s' "$COMPOSE_PROJECT" ;;
@@ -546,7 +1177,9 @@ complete_pending_drain() {
         echo "pending-drain release directory is missing" >&2
         return 1
     fi
-    pending_release="$(readlink -f "$pending_release")" || return 1
+    pending_release="$(python3 -c \
+        'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' \
+        "$pending_release" 2>/dev/null)" || return 1
     case "$pending_release" in
         "$APP_ROOT"/releases/*) ;;
         *)
@@ -649,7 +1282,9 @@ PY_STRICT_SLOT_JOURNAL
     if [ -z "$release" ] || [ ! -d "$release" ]; then
         return 1
     fi
-    release="$(readlink -f "$release")"
+    release="$(python3 -c \
+        'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' \
+        "$release" 2>/dev/null)" || return 1
     case "$release" in
         "$APP_ROOT"/releases/*) ;;
         *) return 1 ;;
@@ -976,6 +1611,7 @@ parse_cutover_state() {
     case "$CUTOVER_PHASE" in
         complete|rollback_complete|recovery_complete)
             ;;
+        maintenance_enabled|migration_started|schema_forward_only|candidate_services_ready|\
         candidate_ready|nginx_reloaded|public_verified|traffic_and_worker_committed|\
         rollback_started|rollback_incomplete|rollback_partial|\
         rollback_recovering_candidate|recovery_started|recovery_incomplete)
@@ -1031,7 +1667,9 @@ validate_stable_state() {
         return 0
     fi
 
-    canonical_current="$(readlink -f "$CURRENT")" || return 1
+    canonical_current="$(python3 -c \
+        'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' \
+        "$CURRENT" 2>/dev/null)" || return 1
     if [ ! -L "$CURRENT" ]; then
         echo "current release is not an atomic symlink" >&2
         return 1
@@ -1105,6 +1743,10 @@ recover_indeterminate_cutover() {
     local target_commit
     local target_project
     local fallback_slot
+    local fallback_project
+    local fallback_release
+    local pre_schema_rollback=0
+    local schema_state
 
     if ! target_release="$(release_for_slot "$target_slot")"; then
         echo "cannot recover cutover: target slot $target_slot has no valid release journal" >&2
@@ -1142,10 +1784,73 @@ recover_indeterminate_cutover() {
     fi
 
     write_cutover_state recovery_started "$target_slot" "$target_release_id" || return 1
+
+    # Recovery first reconstructs the same explicit writer fence as a fresh
+    # deployment. It never exposes either schema epoch while old writers can
+    # still accept HTTP/WebSocket traffic.
+    if ! sudo python3 "$RELEASE/scripts/configure_production_nginx.py" \
+        maintenance-on "$NGINX_SITE" "$NGINX_LOG_FORMAT" || \
+        ! sudo nginx -t >/dev/null || ! audit_effective_nginx >/dev/null; then
+        write_cutover_state recovery_incomplete "$target_slot" "$target_release_id" || true
+        return 1
+    fi
+    if ! reload_nginx_with_worker_snapshot || \
+        ! NGINX_WORKER_GRACE_SECONDS=60 retire_pre_reload_nginx_workers; then
+        write_cutover_state recovery_incomplete "$target_slot" "$target_release_id" || true
+        return 1
+    fi
+    if fallback_release="$(release_for_slot "$fallback_slot" 2>/dev/null)"; then
+        fallback_project="$(project_for_slot "$fallback_slot")" || return 1
+        compose_project \
+            "$fallback_project" "$fallback_release/.env" \
+            "$fallback_release/$COMPOSE_FILE" \
+            stop --timeout 90 worker frontend backend || return 1
+    fi
+    if ! quarantine_mcp_for_unsafe_release \
+        "$target_release" "recovery-${RELEASE_ID}-${target_release_id}"; then
+        write_cutover_state recovery_incomplete "$target_slot" "$target_release_id" || true
+        return 1
+    fi
+    case "${CUTOVER_PHASE:-}" in
+        rollback_started|rollback_incomplete|rollback_partial)
+            pre_schema_rollback=1
+            ;;
+    esac
+    if [ "$pre_schema_rollback" = "1" ]; then
+        schema_state="$(approval_schema_forward_state "$target_release" 2>/dev/null)" || \
+            schema_state="unknown"
+        if [ "$schema_state" != "0" ]; then
+            echo "cannot recover pre-schema rollback after the forward-only schema appeared" >&2
+            write_cutover_state recovery_incomplete "$target_slot" "$target_release_id" || true
+            return 1
+        fi
+    elif ! compose_project \
+        "$target_project" "$target_release/.env" "$target_release/$COMPOSE_FILE" \
+        run --rm --no-deps -T --entrypoint alembic backend upgrade head < /dev/null || \
+        [ "$(approval_schema_forward_state "$target_release")" != "1" ]; then
+        echo "cannot recover cutover: durable approval schema did not converge" >&2
+        write_cutover_state recovery_incomplete "$target_slot" "$target_release_id" || true
+        return 1
+    fi
+    if ! compose_project \
+        "$target_project" "$target_release/.env" "$target_release/$COMPOSE_FILE" \
+        up -d --no-deps backend frontend; then
+        write_cutover_state recovery_incomplete "$target_slot" "$target_release_id" || true
+        return 1
+    fi
     if ! wait_for_local_release \
         "$target_port" "$target_version" "$target_commit" \
         "recovery-local-$target_release_id" 30; then
         echo "cannot recover cutover: target slot identity is not healthy" >&2
+        write_cutover_state recovery_incomplete "$target_slot" "$target_release_id" || true
+        return 1
+    fi
+
+    if ! restore_mcp_quarantine_for_safe_release \
+        "$target_release" "$target_project" || \
+        ! activate_worker_release \
+            "$target_project" "$target_release/.env" "$target_release/$COMPOSE_FILE" \
+            "$target_release_id" 90; then
         write_cutover_state recovery_incomplete "$target_slot" "$target_release_id" || true
         return 1
     fi
@@ -1176,12 +1881,6 @@ recover_indeterminate_cutover() {
         return 1
     fi
 
-    if ! activate_worker_release \
-        "$target_project" "$target_release/.env" "$target_release/$COMPOSE_FILE" \
-        "$target_release_id" 90; then
-        write_cutover_state recovery_incomplete "$target_slot" "$target_release_id" || true
-        return 1
-    fi
     if ! retire_pre_reload_nginx_workers; then
         write_cutover_state recovery_incomplete "$target_slot" "$target_release_id" || true
         return 1
@@ -1201,8 +1900,102 @@ if ! parse_cutover_state; then
     exit 1
 fi
 
+case "$PACKAGE_SHA256" in
+    ''|*[!0-9a-f]*)
+        echo "release package digest is invalid" >&2
+        exit 1
+        ;;
+    *) ;;
+esac
+[ "${#PACKAGE_SHA256}" = "64" ] || {
+    echo "release package digest must contain 64 hexadecimal characters" >&2
+    exit 1
+}
+[ -f "$PACKAGE" ] && [ ! -L "$PACKAGE" ] || {
+    echo "release package is missing or unsafe" >&2
+    exit 1
+}
+ACTUAL_PACKAGE_SHA256="$(sha256sum "$PACKAGE" | awk '{print $1}')"
+[ "$ACTUAL_PACKAGE_SHA256" = "$PACKAGE_SHA256" ] || {
+    echo "release package digest mismatch" >&2
+    exit 1
+}
+
+if [ "$RUN_REMOTE_SMOKE" = "0" ]; then
+    [ -f "$REMOTE_SMOKE_BREAK_GLASS_FILE" ] && \
+        [ ! -L "$REMOTE_SMOKE_BREAK_GLASS_FILE" ] || {
+        echo "remote break-glass approval artifact is missing or unsafe" >&2
+        exit 1
+    }
+    ACTUAL_BREAK_GLASS_DIGEST="$(sha256sum "$REMOTE_SMOKE_BREAK_GLASS_FILE" | awk '{print $1}')"
+    [ "$ACTUAL_BREAK_GLASS_DIGEST" = "$REMOTE_SMOKE_BREAK_GLASS_DIGEST" ] || {
+        echo "remote break-glass approval artifact digest mismatch" >&2
+        exit 1
+    }
+    case "$REMOTE_SMOKE_BREAK_GLASS_NONCE_HASH" in
+        ''|*[!0-9a-f]*)
+            echo "remote break-glass nonce hash is invalid" >&2
+            exit 1
+            ;;
+        *) ;;
+    esac
+    [ "${#REMOTE_SMOKE_BREAK_GLASS_NONCE_HASH}" = "64" ] || {
+        echo "remote break-glass nonce hash must contain 64 hexadecimal characters" >&2
+        exit 1
+    }
+fi
+
 mkdir -p "$RELEASE" "$BACKUP"
 tar -xzf "$PACKAGE" -C "$RELEASE"
+write_atomic_line "$RELEASE/PACKAGE_SHA256" "$PACKAGE_SHA256"
+
+# This must precede every cutover recovery, active-state rewrite, pending-drain
+# completion, service action, Nginx change, database backup, or migration.
+# Package extraction and state parsing above do not expose or mutate runtime
+# traffic. A missing or drifted host contract stops before recovery can act.
+EARLY_ENV="$CURRENT_TARGET/.env"
+[ -f "$EARLY_ENV" ] && [ ! -L "$EARLY_ENV" ] || {
+    echo "current release environment is missing before host egress verification" >&2
+    exit 1
+}
+DOCKER_NETWORK_NAME="$(
+    grep -E '^DOCKER_NETWORK=' "$EARLY_ENV" | tail -1 | \
+        cut -d= -f2- | sed -E 's/^"//; s/"$//'
+)"
+if [ -z "$DOCKER_NETWORK_NAME" ]; then
+    DOCKER_NETWORK_NAME="astra_network"
+fi
+echo "[remote] verifying host-level MCP egress contract"
+sudo bash "$RELEASE/scripts/manage-production-mcp-egress-guard.sh" verify \
+    "$DOCKER_NETWORK_NAME" \
+    "$RELEASE/deploy/security-contracts/mcp-egress-v1"
+
+if [ "$RUN_REMOTE_SMOKE" = "0" ]; then
+    # Publish one complete, fsynced approval record after the pre-mutation host
+    # gate but before recovery, service, Nginx, backup, or migration actions.
+    # A crash before atomic publication does not consume the nonce; a crash
+    # after publication leaves the full approval artifact and release binding.
+    BREAK_GLASS_NONCE_ROOT="$APP_ROOT/break-glass-nonces"
+    sudo python3 "$RELEASE/scripts/consume_break_glass_approval.py" \
+        --ledger-dir "$BREAK_GLASS_NONCE_ROOT" \
+        --artifact "$REMOTE_SMOKE_BREAK_GLASS_FILE" \
+        --artifact-sha256 "$REMOTE_SMOKE_BREAK_GLASS_DIGEST" \
+        --nonce-sha256 "$REMOTE_SMOKE_BREAK_GLASS_NONCE_HASH" \
+        --release-id "$RELEASE_ID" \
+        --release-version "$VERSION" \
+        --release-commit "$COMMIT"
+
+    install -m 0600 "$REMOTE_SMOKE_BREAK_GLASS_FILE" \
+        "$BACKUP/remote-smoke-break-glass.approval"
+    printf '%s\n' "$REMOTE_SMOKE_BREAK_GLASS_DIGEST" > \
+        "$BACKUP/remote-smoke-break-glass.sha256"
+    printf '%s\n' "$REMOTE_SMOKE_BREAK_GLASS_NONCE_HASH" > \
+        "$BACKUP/remote-smoke-break-glass.nonce-sha256"
+    chmod 0600 \
+        "$BACKUP/remote-smoke-break-glass.sha256" \
+        "$BACKUP/remote-smoke-break-glass.nonce-sha256"
+    rm -f "$REMOTE_SMOKE_BREAK_GLASS_FILE"
+fi
 
 NGINX_ACTIVE_PORT="$(
     sudo python3 "$RELEASE/scripts/configure_production_nginx.py" \
@@ -1230,7 +2023,9 @@ if [ "$RECOVERY_REQUIRED" = "1" ]; then
     fi
     DISK_SLOT="$RECOVERY_TARGET_SLOT"
     NGINX_ACTIVE_PORT="$RECOVERY_TARGET_PORT"
-    CURRENT_TARGET="$(readlink -f "$CURRENT")"
+    CURRENT_TARGET="$(python3 -c \
+        'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' \
+        "$CURRENT" 2>/dev/null)"
     if ! load_active_state || ! parse_cutover_state || ! validate_stable_state; then
         echo "cutover recovery did not produce a consistent terminal state" >&2
         exit 1
@@ -1293,7 +2088,9 @@ if [ ! -L "$CURRENT" ] || [ -z "$PREVIOUS" ] || [ ! -d "$PREVIOUS" ]; then
     echo "previous release not found from $CURRENT" >&2
     exit 1
 fi
-PREVIOUS="$(readlink -f "$PREVIOUS")"
+PREVIOUS="$(python3 -c \
+    'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' \
+    "$PREVIOUS" 2>/dev/null)"
 case "$PREVIOUS" in
     "$APP_ROOT"/releases/*) ;;
     *)
@@ -1422,14 +2219,22 @@ echo "[remote] backing up database to $BACKUP/db.sql.gz"
 compose_project "$COMPOSE_PROJECT" "$PREVIOUS/.env" "$PREVIOUS/$COMPOSE_FILE" \
     exec -T postgres pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB" < /dev/null | gzip > "$BACKUP/db.sql.gz"
 
+echo "[remote] validating persisted MCP endpoint policy"
+mcp_endpoint_preflight "$PREVIOUS"
+
 printf '%s\n' "$VERSION" > "$RELEASE/VERSION"
 printf '%s\n' "$COMMIT" > "$RELEASE/COMMIT"
+printf '%s\n' "$RELEASE_BASE_COMMIT" > "$RELEASE/BASE_COMMIT"
 printf '%s\n' "$PREVIOUS" > "$RELEASE/PREVIOUS_RELEASE"
 
 NGINX_BACKUP="$BACKUP/astra-poc.nginx.before.conf"
 NGINX_LOG_FORMAT_BACKUP="$BACKUP/00-astra-log-redaction.before.conf"
 NGINX_CONFIG_TOUCHED=0
 CANDIDATE_READY_FOR_FALLBACK=0
+sudo cp "$NGINX_SITE" "$NGINX_BACKUP"
+if sudo test -f "$NGINX_LOG_FORMAT"; then
+    sudo cp "$NGINX_LOG_FORMAT" "$NGINX_LOG_FORMAT_BACKUP"
+fi
 
 ensure_old_application_ready() {
     if wait_for_local_release \
@@ -1496,6 +2301,8 @@ recover_candidate_traffic() {
         return 1
     fi
     commit_active_state "$CANDIDATE_SLOT" "$RELEASE_ID" || return 1
+    restore_mcp_quarantine_for_safe_release \
+        "$RELEASE" "$CANDIDATE_PROJECT" || return 1
     write_cutover_state recovery_complete "$CANDIDATE_SLOT" "$RELEASE_ID"
 }
 
@@ -1508,14 +2315,37 @@ recover_candidate_if_ready() {
 
 rollback() {
     local rollback_status
+    local schema_state
     echo "[remote] rollback to $PREVIOUS" >&2
     trap - ERR HUP INT TERM
     set +e
     rm -f "$SMOKE_ENV_FILE"
+    # Once the durable approval consistency constraint exists, the old API and
+    # worker are no longer schema-compatible. A failed/unknown probe is also
+    # treated as forward-only: availability must never win over duplicate
+    # external side effects or silent MCP configuration loss.
+    schema_state="$(approval_schema_forward_state "$PREVIOUS" 2>/dev/null)" || schema_state="unknown"
+    if [ "$schema_state" != "0" ]; then
+        SCHEMA_FORWARD_ONLY=1
+        write_cutover_state \
+            schema_forward_only "$CANDIDATE_SLOT" "$RELEASE_ID" || true
+        preserve_forward_only_maintenance || true
+        return 1
+    fi
     if ! write_cutover_state \
         rollback_started "$ACTIVE_SLOT" "$PREVIOUS_RELEASE_ID"; then
         echo "[remote] rollback refused: cannot persist rollback intent" >&2
         return 1
+    fi
+
+    if [ "$ROLLBACK_REQUIRES_MCP_QUARANTINE" = "1" ]; then
+        if ! quarantine_mcp_for_unsafe_release \
+            "$PREVIOUS" "rollback-${RELEASE_ID}"; then
+            echo "[remote] rollback refused: MCP quarantine failed" >&2
+            write_cutover_state \
+                rollback_incomplete "$ACTIVE_SLOT" "$PREVIOUS_RELEASE_ID" || true
+            return 1
+        fi
     fi
 
     if ! ensure_old_application_ready; then
@@ -1639,12 +2469,37 @@ compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" rm
 echo "[remote] building candidate slot $CANDIDATE_SLOT"
 compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" build backend frontend
 
-echo "[remote] quiescing old worker before automation-state migrations"
-compose_project "$OLD_PROJECT" "$PREVIOUS/.env" "$PREVIOUS/$COMPOSE_FILE" stop --timeout 90 worker
+# The candidate journal is durable before the first traffic mutation, so an
+# interrupted forward-only migration can only recover toward this exact code.
+write_atomic_line "$APP_ROOT/slot-${CANDIDATE_SLOT}-release" "$RELEASE"
 
+echo "[remote] enabling explicit Web/API/WebSocket maintenance fence"
+if ! enable_web_maintenance; then
+    abort_release "cannot establish and verify the production maintenance fence"
+fi
+write_cutover_state maintenance_enabled "$CANDIDATE_SLOT" "$RELEASE_ID"
+
+echo "[remote] stopping every old application writer before quarantine/migration"
+compose_project "$OLD_PROJECT" "$PREVIOUS/.env" "$PREVIOUS/$COMPOSE_FILE" \
+    stop --timeout 90 worker frontend backend
+
+if ! quarantine_mcp_for_unsafe_release \
+    "$PREVIOUS" "migration-${RELEASE_ID}"; then
+    abort_release "cannot install the MCP rollback guard before migrations"
+fi
+ROLLBACK_REQUIRES_MCP_QUARANTINE=1
+if ! secure_mcp_quarantine_snapshot "$RELEASE" "$CANDIDATE_PROJECT"; then
+    abort_release "cannot encrypt and sanitize the MCP rollback snapshot"
+fi
 echo "[remote] applying migrations before candidate startup"
+write_cutover_state migration_started "$CANDIDATE_SLOT" "$RELEASE_ID"
 compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" \
     run --rm --no-deps -T --entrypoint alembic backend upgrade head < /dev/null
+if [ "$(approval_schema_forward_state "$RELEASE")" != "1" ]; then
+    abort_release "durable approval schema constraint is missing after migration"
+fi
+SCHEMA_FORWARD_ONLY=1
+write_cutover_state schema_forward_only "$CANDIDATE_SLOT" "$RELEASE_ID"
 
 compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" up -d --no-deps backend
 echo "[remote] waiting for candidate backend health"
@@ -1667,20 +2522,18 @@ if ! wait_for_local_release \
 fi
 curl -fsS "http://127.0.0.1:${CANDIDATE_PORT}/api/version" | tee "$BACKUP/version.candidate.json"
 CANDIDATE_READY_FOR_FALLBACK=1
-write_atomic_line "$APP_ROOT/slot-${CANDIDATE_SLOT}-release" "$RELEASE"
 
-# Persist the source release before any traffic mutation. If the host stops at
-# any later instruction, cutover recovery converges first and the next deploy
-# either resumes this exact inactive drain or cancels it after an exact rollback.
-write_atomic_line "$PENDING_DRAIN_FILE" "$OLD_PROJECT $OLD_PORT $PREVIOUS"
-write_cutover_state candidate_ready "$CANDIDATE_SLOT" "$RELEASE_ID"
-
-echo "[remote] installing privacy-safe access logging and switching traffic"
-sudo cp "$NGINX_SITE" "$NGINX_BACKUP"
-if sudo test -f "$NGINX_LOG_FORMAT"; then
-    sudo cp "$NGINX_LOG_FORMAT" "$NGINX_LOG_FORMAT_BACKUP"
+# Restore sanitized MCP assignments while all public API writers remain fenced,
+# then bring up the one candidate worker/connector on the new schema.
+restore_mcp_quarantine_for_safe_release "$RELEASE" "$CANDIDATE_PROJECT"
+if ! activate_worker_release \
+    "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" \
+    "$RELEASE_ID" 90; then
+    abort_release "candidate worker did not become healthy on release $RELEASE_ID"
 fi
-NGINX_CONFIG_TOUCHED=1
+write_cutover_state candidate_services_ready "$CANDIDATE_SLOT" "$RELEASE_ID"
+
+echo "[remote] switching the verified maintenance fence to candidate traffic"
 sudo python3 "$RELEASE/scripts/configure_production_nginx.py" \
     install "$NGINX_SITE" "$OLD_PORT" "$CANDIDATE_PORT" \
     "$NGINX_LOG_FORMAT"
@@ -1699,11 +2552,6 @@ printf '%s\n' "$PUBLIC_HEALTH" > "$BACKUP/health.public.json"
 printf '%s\n' "$PUBLIC_VERSION" > "$BACKUP/version.public.json"
 write_cutover_state public_verified "$CANDIDATE_SLOT" "$RELEASE_ID"
 
-if ! activate_worker_release \
-    "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" \
-    "$RELEASE_ID" 90; then
-    abort_release "candidate worker did not become healthy on release $RELEASE_ID"
-fi
 if ! retire_pre_reload_nginx_workers; then
     abort_release "pre-cutover Nginx workers did not drain within the bounded window"
 fi

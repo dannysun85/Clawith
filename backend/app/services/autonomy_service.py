@@ -6,14 +6,18 @@ Implements the three-level autonomy system:
   L3 — Require explicit approval before execution
 """
 
+import asyncio
 import hashlib
 import hmac
 import json
+import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit, urlunsplit
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging_config import privacy_safe_shape
@@ -21,6 +25,7 @@ from app.models.agent import Agent
 from app.models.audit import ApprovalRequest, AuditLog
 from app.models.channel_config import ChannelConfig
 from app.models.user import User
+from app.database import async_session
 from app.services.feishu_service import feishu_service
 
 
@@ -31,15 +36,143 @@ HIGH_RISK_DEFAULT_L3_ACTIONS = {
     "execute_code",
 }
 
+APPROVAL_EXECUTION_STALE_AFTER = timedelta(minutes=20)
+APPROVAL_EXECUTION_HARD_TIMEOUT_SECONDS = 15 * 60
+APPROVAL_EXECUTION_POLL_SECONDS = 2.0
+APPROVAL_EXECUTION_CONCURRENCY = 4
+APPROVAL_DAEMON_MAX_CONSECUTIVE_FAILURES = 5
+APPROVAL_PREVIEW_MAX_DEPTH = 6
+APPROVAL_PREVIEW_MAX_NODES = 160
+APPROVAL_PREVIEW_MAX_STRING = 16_000
+APPROVAL_PREVIEW_MAX_BYTES = 64 * 1024
+APPROVAL_ARGUMENTS_MAX_BYTES = 128 * 1024
+APPROVAL_CIPHERTEXT_MAX_CHARS = 512 * 1024
+_PREVIEW_SECRET_KEY_RE = re.compile(
+    r"(^|_)(api_?key|access_?key|authorization|bearer|client_?secret|cookie|"
+    r"credential|jwt|password|passwd|private_?key|refresh_?token|secret|"
+    r"session|signature|token)(_|$)",
+    re.IGNORECASE,
+)
+
+
+def _normalized_preview_key(key: object) -> str:
+    value = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(key))
+    return re.sub(r"[^a-zA-Z0-9]+", "_", value).strip("_").lower()
+
+
+def _redact_preview_string(value: str) -> str:
+    """Bound strings and remove credentials carried by public URLs."""
+
+    bounded = value[:APPROVAL_PREVIEW_MAX_STRING]
+    if len(value) > APPROVAL_PREVIEW_MAX_STRING:
+        bounded += "…[truncated]"
+    if not bounded.lower().startswith(("http://", "https://")):
+        return bounded
+    try:
+        parsed = urlsplit(bounded)
+        host = parsed.hostname or ""
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        # Query strings frequently contain expiring media signatures.  The
+        # approver needs the destination/path, never the bearer value.
+        query = "[redacted]" if parsed.query else ""
+        return urlunsplit((parsed.scheme, host, parsed.path, query, ""))
+    except ValueError:
+        return "[invalid URL]"
+
+
+def _bounded_approval_preview(
+    value: object,
+    *,
+    depth: int = 0,
+    budget: list[int] | None = None,
+) -> object:
+    """Return an action preview without persisted ciphertext or credentials."""
+
+    if budget is None:
+        budget = [APPROVAL_PREVIEW_MAX_NODES]
+    if budget[0] <= 0:
+        return "[preview limit reached]"
+    budget[0] -= 1
+    if depth >= APPROVAL_PREVIEW_MAX_DEPTH:
+        return "[depth limit reached]"
+    if isinstance(value, dict):
+        preview: dict[str, object] = {}
+        for raw_key, child in list(value.items())[:40]:
+            key = str(raw_key)[:120]
+            if _PREVIEW_SECRET_KEY_RE.search(_normalized_preview_key(key)):
+                preview[key] = "[redacted]"
+            else:
+                preview[key] = _bounded_approval_preview(
+                    child,
+                    depth=depth + 1,
+                    budget=budget,
+                )
+        if len(value) > 40:
+            preview["__truncated__"] = f"{len(value) - 40} more fields"
+        return preview
+    if isinstance(value, (list, tuple)):
+        preview_list = [
+            _bounded_approval_preview(child, depth=depth + 1, budget=budget)
+            for child in list(value)[:30]
+        ]
+        if len(value) > 30:
+            preview_list.append(f"[{len(value) - 30} more items]")
+        return preview_list
+    if isinstance(value, str):
+        return _redact_preview_string(value)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return _redact_preview_string(str(value))
+
+
+def _approval_preview_fits(
+    value: object,
+    *,
+    depth: int = 0,
+    budget: list[int] | None = None,
+) -> bool:
+    if budget is None:
+        budget = [APPROVAL_PREVIEW_MAX_NODES]
+    if budget[0] <= 0 or depth >= APPROVAL_PREVIEW_MAX_DEPTH:
+        return False
+    budget[0] -= 1
+    if isinstance(value, dict):
+        if len(value) > 40:
+            return False
+        return all(
+            len(str(key)) <= 120
+            and _approval_preview_fits(child, depth=depth + 1, budget=budget)
+            for key, child in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        if len(value) > 30:
+            return False
+        return all(
+            _approval_preview_fits(child, depth=depth + 1, budget=budget)
+            for child in value
+        )
+    if isinstance(value, str):
+        return len(value) <= APPROVAL_PREVIEW_MAX_STRING
+    return value is None or isinstance(value, (bool, int, float))
+
 
 def _canonical_tool_arguments(arguments: dict) -> str:
     return json.dumps(arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def _tool_approval_signature(agent_id: uuid.UUID, tool_name: str, arguments: dict) -> str:
+def _tool_approval_signature(
+    agent_id: uuid.UUID,
+    action_type: str,
+    tool_name: str,
+    arguments: dict,
+) -> str:
     from app.config import get_settings
 
-    payload = f"v1\n{agent_id}\n{tool_name}\n{_canonical_tool_arguments(arguments)}"
+    payload = (
+        f"v2\n{agent_id}\n{action_type}\n{tool_name}\n"
+        f"{_canonical_tool_arguments(arguments)}"
+    )
     return hmac.new(
         get_settings().SECRET_KEY.encode("utf-8"),
         payload.encode("utf-8"),
@@ -49,6 +182,7 @@ def _tool_approval_signature(agent_id: uuid.UUID, tool_name: str, arguments: dic
 
 def build_tool_approval_details(
     agent_id: uuid.UUID,
+    action_type: str,
     tool_name: str,
     arguments: dict,
     requested_by: uuid.UUID,
@@ -59,9 +193,14 @@ def build_tool_approval_details(
     from app.core.security import encrypt_data
 
     canonical_arguments = _canonical_tool_arguments(arguments)
+    if len(canonical_arguments.encode("utf-8")) > APPROVAL_ARGUMENTS_MAX_BYTES:
+        raise ValueError("Approval payload is too large")
+    if not _approval_preview_fits(arguments):
+        raise ValueError("Approval payload is too complex to preview safely")
 
     return {
         "payload_version": 2,
+        "action_type": action_type,
         "tool": tool_name,
         "args_encrypted": encrypt_data(
             canonical_arguments,
@@ -70,24 +209,43 @@ def build_tool_approval_details(
         "args_hash": hashlib.sha256(
             canonical_arguments.encode("utf-8")
         ).hexdigest(),
-        "args_signature": _tool_approval_signature(agent_id, tool_name, arguments),
+        "args_signature": _tool_approval_signature(
+            agent_id,
+            action_type,
+            tool_name,
+            arguments,
+        ),
         "request_shape": privacy_safe_shape(arguments),
         "requested_by": str(requested_by),
     }
 
 
-def _verified_tool_arguments(agent_id: uuid.UUID, details: dict) -> tuple[str, dict]:
+def _verified_tool_arguments(
+    agent_id: uuid.UUID,
+    details: dict,
+    *,
+    expected_action_type: str | None = None,
+) -> tuple[str, dict]:
     from app.config import get_settings
     from app.core.security import decrypt_data
 
+    if details.get("payload_version") != 2:
+        raise ValueError("Approved tool payload version is unsupported; request a new approval")
+    action_type = details.get("action_type")
     tool_name = details.get("tool")
     encrypted_arguments = details.get("args_encrypted")
     expected_hash = details.get("args_hash")
     signature = details.get("args_signature")
+    if not isinstance(action_type, str) or not action_type:
+        raise ValueError("Approved tool payload is incomplete; request a new approval")
+    if expected_action_type is not None and action_type != expected_action_type:
+        raise ValueError("Approval action does not match its signed payload")
     if not isinstance(tool_name, str) or not tool_name:
         raise ValueError("Approved tool payload is missing the tool name")
     if not isinstance(encrypted_arguments, str) or not encrypted_arguments:
         raise ValueError("Approved tool payload is incomplete; request a new approval")
+    if len(encrypted_arguments) > APPROVAL_CIPHERTEXT_MAX_CHARS:
+        raise ValueError("Approved tool payload is too large")
     try:
         canonical_arguments = decrypt_data(
             encrypted_arguments,
@@ -98,6 +256,8 @@ def _verified_tool_arguments(agent_id: uuid.UUID, details: dict) -> tuple[str, d
         raise ValueError("Approved tool payload cannot be decrypted") from exc
     if not isinstance(arguments, dict):
         raise ValueError("Approved tool payload is incomplete; request a new approval")
+    if len(canonical_arguments.encode("utf-8")) > APPROVAL_ARGUMENTS_MAX_BYTES:
+        raise ValueError("Approved tool payload is too large")
     actual_hash = hashlib.sha256(canonical_arguments.encode("utf-8")).hexdigest()
     if not isinstance(expected_hash, str) or not hmac.compare_digest(
         expected_hash,
@@ -106,10 +266,116 @@ def _verified_tool_arguments(agent_id: uuid.UUID, details: dict) -> tuple[str, d
         raise ValueError("Approved tool payload integrity check failed")
     if not isinstance(signature, str) or not hmac.compare_digest(
         signature,
-        _tool_approval_signature(agent_id, tool_name, arguments),
+        _tool_approval_signature(agent_id, action_type, tool_name, arguments),
     ):
         raise ValueError("Approved tool payload integrity check failed")
     return tool_name, arguments
+
+
+def _approval_request_fingerprint(details: dict) -> str:
+    """Return the signed payload identity used for active-request deduping."""
+
+    signature = details.get("args_signature")
+    if not isinstance(signature, str) or not re.fullmatch(r"[0-9a-f]{64}", signature):
+        raise ValueError("Approved tool payload is incomplete; request a new approval")
+    return signature
+
+
+def public_approval_details(
+    agent_id: uuid.UUID,
+    action_type: str,
+    details: dict | None,
+) -> dict:
+    """Project private signed details into a bounded, safe approval preview."""
+
+    raw_details = details if isinstance(details, dict) else {}
+    try:
+        tool_name, arguments = _verified_tool_arguments(
+            agent_id,
+            raw_details,
+            expected_action_type=action_type,
+        )
+    except ValueError:
+        return {
+            "payload_state": "invalid",
+            "approvable": False,
+            "message": "This approval payload is legacy, incomplete, or no longer verifiable. Reject it and request a new approval.",
+        }
+    if not _approval_preview_fits(arguments):
+        return {
+            "payload_state": "invalid",
+            "approvable": False,
+            "message": "This approval cannot be shown completely within the safe preview limit. Split the action and request a new approval.",
+        }
+    preview = _bounded_approval_preview(arguments)
+    if len(json.dumps(preview, ensure_ascii=False).encode("utf-8")) > APPROVAL_PREVIEW_MAX_BYTES:
+        return {
+            "payload_state": "invalid",
+            "approvable": False,
+            "message": "This approval is too large to preview safely. Split the action and request a new approval.",
+        }
+    return {
+        "payload_state": "verified",
+        "approvable": True,
+        "tool": tool_name,
+        "parameters": preview,
+    }
+
+
+def approval_to_public_dict(approval: ApprovalRequest, *, agent_name: str | None = None) -> dict:
+    """Serialize an approval without exposing encrypted payload internals."""
+
+    projected_details = public_approval_details(
+        approval.agent_id,
+        approval.action_type,
+        approval.details,
+    )
+    if approval.execution_status in {"legacy", "invalid"}:
+        projected_details = {
+            "payload_state": "invalid",
+            "approvable": False,
+            "message": "This approval predates the secure execution contract. Reject it and request a new approval.",
+        }
+    return {
+        "id": approval.id,
+        "agent_id": approval.agent_id,
+        "agent_name": agent_name,
+        "action_type": approval.action_type,
+        "details": projected_details,
+        "status": approval.status,
+        "created_at": approval.created_at,
+        "resolved_at": approval.resolved_at,
+        "resolved_by": approval.resolved_by,
+        "execution_status": approval.execution_status,
+        "execution_claimed_at": approval.execution_claimed_at,
+        "execution_finished_at": approval.execution_finished_at,
+        "execution_attempts": approval.execution_attempts,
+        "execution_result_summary": approval.execution_result_summary or {},
+        "execution_error_code": approval.execution_error_code,
+    }
+
+
+def _approval_action_matches_tool(action_type: str, tool_name: str) -> bool:
+    expected: dict[str, set[str]] = {
+        "write_workspace_files": {"write_file", "move_file", "edit_file"},
+        "delete_files": {"delete_file"},
+        "send_feishu_message": {"send_feishu_message"},
+        "send_message_to_agent": {"send_message_to_agent"},
+        "send_file_to_agent": {"send_file_to_agent"},
+        "web_search": {"web_search"},
+        "execute_code": {
+            "execute_code",
+            "execute_code_e2b",
+            "agentbay_code_execute",
+            "agentbay_code_write_file",
+            "agentbay_code_read_file",
+            "agentbay_code_edit_file",
+            "agentbay_command_exec",
+        },
+        "douyin_publish_job": {"douyin_run_publish_job"},
+        "douyin_reply_comment": {"douyin_reply_comment"},
+    }
+    return tool_name in expected.get(action_type, set())
 
 
 class AutonomyService:
@@ -165,14 +431,79 @@ class AutonomyService:
             }
 
         elif level == "L3":
-            # Create approval request and block
+            # Persist only a complete signed payload.  Repeated model retries
+            # for the same immutable action reuse the active request rather
+            # than creating multiple independently executable approvals.
+            _verified_tool_arguments(
+                agent.id,
+                details,
+                expected_action_type=action_type,
+            )
+            request_fingerprint = _approval_request_fingerprint(details)
+            existing_result = await db.execute(
+                select(ApprovalRequest)
+                .where(
+                    ApprovalRequest.agent_id == agent.id,
+                    ApprovalRequest.request_fingerprint == request_fingerprint,
+                    or_(
+                        ApprovalRequest.status == "pending",
+                        and_(
+                            ApprovalRequest.status == "approved",
+                            ApprovalRequest.execution_status.in_(("pending", "executing")),
+                        ),
+                    ),
+                )
+                .order_by(ApprovalRequest.created_at.desc())
+                .limit(1)
+            )
+            existing = existing_result.scalar_one_or_none()
+            if existing:
+                return {
+                    "allowed": False,
+                    "level": "L3",
+                    "approval_id": str(existing.id),
+                    "message": "An identical approval is already active",
+                }
+
             approval = ApprovalRequest(
                 agent_id=agent.id,
                 action_type=action_type,
                 details=details,
+                request_fingerprint=request_fingerprint,
             )
-            db.add(approval)
-            await db.flush()
+            try:
+                # The partial unique index is the final concurrency authority.
+                # A savepoint keeps the caller's outer transaction usable when
+                # another request commits the same signed action first.
+                async with db.begin_nested():
+                    db.add(approval)
+                    await db.flush()
+            except IntegrityError:
+                existing_result = await db.execute(
+                    select(ApprovalRequest)
+                    .where(
+                        ApprovalRequest.agent_id == agent.id,
+                        ApprovalRequest.request_fingerprint == request_fingerprint,
+                        or_(
+                            ApprovalRequest.status == "pending",
+                            and_(
+                                ApprovalRequest.status == "approved",
+                                ApprovalRequest.execution_status.in_(("pending", "executing")),
+                            ),
+                        ),
+                    )
+                    .order_by(ApprovalRequest.created_at.desc())
+                    .limit(1)
+                )
+                existing = existing_result.scalar_one_or_none()
+                if existing is None:
+                    raise
+                return {
+                    "allowed": False,
+                    "level": "L3",
+                    "approval_id": str(existing.id),
+                    "message": "An identical approval is already active",
+                }
 
             logger.info(f"L3: Approval required for {action_type} by agent {agent.id}")
             await self._request_approval(db, agent, approval)
@@ -187,9 +518,23 @@ class AutonomyService:
         return {"allowed": False, "level": "unknown", "message": "Unknown autonomy level"}
 
     async def resolve_approval(
-        self, db: AsyncSession, approval_id: uuid.UUID, user: User, action: str
+        self,
+        db: AsyncSession,
+        approval_id: uuid.UUID,
+        user: User,
+        action: str,
+        *,
+        expected_agent_id: uuid.UUID | None = None,
     ) -> ApprovalRequest:
-        """Approve or reject a pending approval request."""
+        """Commit an approval decision without executing its side effect.
+
+        The dedicated approval worker is the only execution owner.  This
+        method intentionally commits the decision before returning so the
+        caller's request transaction cannot execute an action whose approval
+        state later rolls back.
+        """
+        if action not in {"approve", "reject"}:
+            raise ValueError("Approval action must be 'approve' or 'reject'")
         result = await db.execute(
             select(ApprovalRequest)
             .where(ApprovalRequest.id == approval_id)
@@ -198,6 +543,9 @@ class AutonomyService:
         approval = result.scalar_one_or_none()
         if not approval:
             raise ValueError("Approval not found")
+
+        if expected_agent_id is not None and approval.agent_id != expected_agent_id:
+            raise ValueError("Approval does not belong to this Agent")
 
         if approval.status != "pending":
             raise ValueError("Approval already resolved")
@@ -217,12 +565,34 @@ class AutonomyService:
         if agent and agent.creator_id != user.id and user.role != "platform_admin" and not identity_is_platform_admin and not same_tenant_org_admin:
             raise ValueError("Only the agent creator or platform admin can resolve approvals")
 
-        if action == "approve" and approval.details and approval.details.get("tool"):
-            _verified_tool_arguments(approval.agent_id, approval.details)
+        if action == "approve":
+            if approval.execution_status in {"legacy", "invalid"}:
+                raise ValueError("Approval payload is invalid; reject it and request a new approval")
+            projection = public_approval_details(
+                approval.agent_id,
+                approval.action_type,
+                approval.details,
+            )
+            if not projection.get("approvable"):
+                raise ValueError("Approval payload cannot be previewed safely; reject it and request a new approval")
+            tool_name, _arguments = _verified_tool_arguments(
+                approval.agent_id,
+                approval.details or {},
+                expected_action_type=approval.action_type,
+            )
+            if not _approval_action_matches_tool(approval.action_type, tool_name):
+                raise ValueError("Approval action does not match its signed tool payload")
 
         approval.status = "approved" if action == "approve" else "rejected"
         approval.resolved_at = datetime.now(timezone.utc)
         approval.resolved_by = user.id
+        approval.execution_status = "pending" if action == "approve" else "not_required"
+        approval.execution_claim_token = None
+        approval.execution_claimed_at = None
+        approval.execution_finished_at = None
+        approval.execution_attempts = 0
+        approval.execution_result_summary = {}
+        approval.execution_error_code = None
 
         # Log
         db.add(AuditLog(
@@ -232,28 +602,15 @@ class AutonomyService:
             details={"approval_id": str(approval.id), "action_type": approval.action_type},
         ))
 
-        # Post-processing: execute the approved action
-        execution_result = None
-        if approval.status == "approved" and approval.details:
-            execution_result = await self._execute_approved_action(
-                approval.agent_id, approval.action_type, approval.details
-            )
-            logger.info(
-                "Post-approval execution action_type={} result_shape={}",
-                approval.action_type,
-                privacy_safe_shape(execution_result),
-            )
-
         # Web notification to agent creator about the result
         if agent:
             from app.services.notification_service import send_notification
-            status_label = "approved" if approval.status == "approved" else "rejected"
-            body_text = json.dumps(
-                privacy_safe_shape(approval.details),
-                ensure_ascii=False,
-            )[:200]
-            if execution_result:
-                body_text = f"Result: {execution_result}"
+            status_label = "approved — queued for execution" if approval.status == "approved" else "rejected"
+            body_text = (
+                "Approval recorded. The action is waiting for the background worker; approval is not execution success."
+                if approval.status == "approved"
+                else "Approval rejected. The action will not execute."
+            )
             await send_notification(
                 db,
                 user_id=agent.creator_id,
@@ -283,27 +640,548 @@ class AutonomyService:
                     pass  # Invalid UUID, skip
 
         await db.flush()
+        await db.commit()
         return approval
 
-    async def _execute_approved_action(
-        self, agent_id: uuid.UUID, action_type: str, details: dict
-    ) -> str | None:
-        """Execute the tool action that was approved.
+    async def execute_pending_approval(self, approval_id: uuid.UUID) -> bool:
+        """Atomically claim and execute one approved action at most once.
 
-        Reads the tool name and arguments from the approval details,
-        then directly calls the tool executor (bypassing autonomy check).
+        The claim token fences stale workers.  Once a claim is committed, no
+        code path ever resets it to ``pending``.  Unknown/cancelled outcomes
+        become ``ambiguous`` and require a brand-new approval instead of an
+        automatic replay.
         """
-        tool_name = str(details.get("tool") or "unknown")
-        try:
-            tool_name, arguments = _verified_tool_arguments(agent_id, details)
 
-            # Import and call the tool's direct executor (no autonomy re-check)
-            from app.services.agent_tools import _execute_tool_direct
-            result = await _execute_tool_direct(tool_name, arguments, agent_id)
-            return result
-        except Exception as e:
-            logger.error(f"Failed to execute approved action {tool_name}: {e}")
-            return f"Execution failed: {e}"
+        claim_token = uuid.uuid4()
+        claimed_at = datetime.now(timezone.utc)
+        async with async_session() as claim_db:
+            claim_result = await claim_db.execute(
+                update(ApprovalRequest)
+                .where(
+                    ApprovalRequest.id == approval_id,
+                    ApprovalRequest.status == "approved",
+                    ApprovalRequest.execution_status == "pending",
+                    ApprovalRequest.execution_attempts == 0,
+                    or_(
+                        ApprovalRequest.execution_not_before.is_(None),
+                        ApprovalRequest.execution_not_before <= claimed_at,
+                    ),
+                )
+                .values(
+                    execution_status="executing",
+                    execution_claim_token=claim_token,
+                    execution_claimed_at=claimed_at,
+                    execution_attempts=1,
+                    execution_error_code=None,
+                )
+                .returning(
+                    ApprovalRequest.agent_id,
+                    ApprovalRequest.action_type,
+                    ApprovalRequest.details,
+                )
+            )
+            claimed = claim_result.one_or_none()
+            await claim_db.commit()
+        if claimed is None:
+            return False
+
+        agent_id, action_type, details = claimed
+        dispatched = False
+        try:
+            tool_name, arguments = _verified_tool_arguments(
+                agent_id,
+                details or {},
+                expected_action_type=action_type,
+            )
+            if not _approval_action_matches_tool(action_type, tool_name):
+                raise ValueError("Approval action does not match its signed tool payload")
+            await self._assert_execution_permission(agent_id, tool_name)
+
+            from app.services.agent_tools import _execute_approved_tool
+
+            dispatched = True
+            async with asyncio.timeout(APPROVAL_EXECUTION_HARD_TIMEOUT_SECONDS):
+                outcome = await _execute_approved_tool(
+                    tool_name,
+                    arguments,
+                    agent_id,
+                    approval_id=approval_id,
+                    approval_claim_token=claim_token,
+                )
+        except asyncio.CancelledError:
+            await asyncio.shield(
+                self._finish_approval_execution(
+                    approval_id,
+                    claim_token,
+                    status="ambiguous" if dispatched else "failed",
+                    error_code="CancelledDuringDispatch" if dispatched else "CancelledBeforeDispatch",
+                )
+            )
+            raise
+        except ValueError as exc:
+            await self._finish_approval_execution(
+                approval_id,
+                claim_token,
+                status="failed" if not dispatched else "ambiguous",
+                error_code=type(exc).__name__,
+            )
+            return True
+        except Exception as exc:
+            await self._finish_approval_execution(
+                approval_id,
+                claim_token,
+                status="ambiguous" if dispatched else "failed",
+                error_code=type(exc).__name__,
+            )
+            logger.error(
+                "Approval execution failed approval={} claim={} phase={} error_type={}",
+                approval_id,
+                claim_token,
+                "dispatch" if dispatched else "validation",
+                type(exc).__name__,
+            )
+            return True
+
+        await self._finish_approval_execution(
+            approval_id,
+            claim_token,
+            status=outcome.status,
+            result=outcome.result,
+            error_code=outcome.error_code,
+            outcome_code=outcome.outcome_code,
+        )
+        return True
+
+    async def _assert_execution_permission(
+        self,
+        agent_id: uuid.UUID,
+        tool_name: str,
+    ) -> None:
+        """Recheck Agent existence and current Tool grant before dispatch."""
+
+        from app.models.tool import AgentTool, Tool
+        from app.services.agent_tools import _code_tool_denial_reason
+
+        async with async_session() as permission_db:
+            agent_result = await permission_db.execute(
+                select(Agent).where(Agent.id == agent_id)
+            )
+            agent = agent_result.scalar_one_or_none()
+            if agent is None or agent.tenant_id is None:
+                raise ValueError("Approval Agent is no longer available")
+            tool_result = await permission_db.execute(
+                select(Tool, AgentTool)
+                .outerjoin(
+                    AgentTool,
+                    and_(
+                        AgentTool.tool_id == Tool.id,
+                        AgentTool.agent_id == agent_id,
+                    ),
+                )
+                .where(Tool.name == tool_name, Tool.enabled.is_(True))
+            )
+            row = tool_result.one_or_none()
+            if row is None:
+                raise ValueError("Approved Tool is no longer available")
+            tool, assignment = row
+            currently_enabled = (
+                bool(assignment.enabled)
+                if assignment is not None
+                else bool(tool.is_default)
+            )
+            if not currently_enabled:
+                raise ValueError("Approved Tool permission has been revoked")
+            if tool.tenant_id is not None and tool.tenant_id != agent.tenant_id:
+                raise ValueError("Approved Tool no longer belongs to this company")
+            if tool.source == "agent" and (
+                assignment is None or tool.tenant_id != agent.tenant_id
+            ):
+                raise ValueError("Approved Agent-installed Tool is no longer authorized")
+
+        code_denial = await _code_tool_denial_reason(tool_name, agent_id)
+        if code_denial:
+            raise ValueError(code_denial)
+
+    async def _finish_approval_execution(
+        self,
+        approval_id: uuid.UUID,
+        claim_token: uuid.UUID,
+        *,
+        status: str,
+        result: object | None = None,
+        error_code: str | None = None,
+        outcome_code: str | None = None,
+    ) -> bool:
+        """CAS one claim into a terminal state without leaking result data."""
+
+        if status not in {"succeeded", "failed", "ambiguous"}:
+            raise ValueError("Invalid approval execution terminal status")
+        finished_at = datetime.now(timezone.utc)
+        result_summary = {}
+        if result is not None:
+            result_summary["shape"] = privacy_safe_shape(result)
+        if outcome_code:
+            result_summary["outcome_code"] = outcome_code[:100]
+        async with async_session() as finish_db:
+            finish_result = await finish_db.execute(
+                update(ApprovalRequest)
+                .where(
+                    ApprovalRequest.id == approval_id,
+                    ApprovalRequest.status == "approved",
+                    ApprovalRequest.execution_status == "executing",
+                    ApprovalRequest.execution_claim_token == claim_token,
+                )
+                .values(
+                    execution_status=status,
+                    execution_finished_at=finished_at,
+                    execution_result_summary=result_summary,
+                    execution_error_code=(error_code or None),
+                )
+            )
+            updated = finish_result.rowcount == 1
+            if updated:
+                approval = (
+                    await finish_db.execute(
+                        select(ApprovalRequest).where(ApprovalRequest.id == approval_id)
+                    )
+                ).scalar_one()
+                finish_db.add(
+                    AuditLog(
+                        agent_id=approval.agent_id,
+                        action=f"approval_execution_{status}",
+                        details={
+                            "approval_id": str(approval_id),
+                            "error_code": error_code,
+                        },
+                    )
+                )
+                if status == "ambiguous":
+                    await self._project_ambiguous_external_state(
+                        finish_db,
+                        approval,
+                        error_code=error_code,
+                    )
+            await finish_db.commit()
+        if updated:
+            await self._notify_execution_terminal_safely(
+                approval_id,
+                status=status,
+            )
+        if not updated:
+            logger.warning(
+                "Approval terminal CAS rejected approval={} claim={} status={}",
+                approval_id,
+                claim_token,
+                status,
+            )
+        return updated
+
+    async def _project_ambiguous_external_state(
+        self,
+        db: AsyncSession,
+        approval: ApprovalRequest,
+        *,
+        error_code: str | None,
+    ) -> None:
+        """Project unknown Douyin dispatches onto their business records.
+
+        A hard timeout or worker crash can happen outside the Douyin service's
+        transaction. The durable Approval is then ambiguous, but the linked
+        Job/Operation must not keep advertising a retryable pre-dispatch state.
+        Stronger official states are deliberately excluded from these updates.
+        """
+
+        if approval.action_type not in {
+            "douyin_publish_job",
+            "douyin_reply_comment",
+        }:
+            return
+        from app.models.douyin import DouyinOperation, DouyinPublishJob
+
+        response_summary = {
+            "message": (
+                "抖音写入过程在官方结果确认前中断。禁止自动重试；"
+                "请先在抖音官方后台核验，确认未生效后再新建审批任务。"
+            ),
+            "verification_required": True,
+            "retry_safe": False,
+            "error_code": (error_code or "UnknownDispatchOutcome")[:100],
+        }
+        if approval.action_type == "douyin_publish_job":
+            await db.execute(
+                update(DouyinPublishJob)
+                .where(
+                    DouyinPublishJob.approval_id == approval.id,
+                    DouyinPublishJob.status.in_({
+                        "approval_required",
+                        "preparing_share_package",
+                        "creating",
+                    }),
+                )
+                .values(
+                    status="verification_required",
+                    response_summary=response_summary,
+                )
+            )
+            await db.execute(
+                update(DouyinOperation)
+                .where(
+                    DouyinOperation.approval_id == approval.id,
+                    DouyinOperation.status.in_({"pending_approval", "running"}),
+                )
+                .values(
+                    status="verification_required",
+                    response_summary=response_summary,
+                    finished_at=datetime.now(timezone.utc),
+                )
+            )
+            return
+        await db.execute(
+            update(DouyinOperation)
+            .where(
+                DouyinOperation.approval_id == approval.id,
+                DouyinOperation.status.in_({"pending_approval", "running"}),
+            )
+            .values(
+                status="verification_required",
+                response_summary=response_summary,
+                finished_at=datetime.now(timezone.utc),
+            )
+        )
+
+    async def _notify_execution_terminal(
+        self,
+        db: AsyncSession,
+        approval: ApprovalRequest,
+        *,
+        status: str,
+    ) -> None:
+        """Persist bounded terminal notifications without payload or result data."""
+
+        from app.services.notification_service import send_notification
+
+        agent = (
+            await db.execute(select(Agent).where(Agent.id == approval.agent_id))
+        ).scalar_one_or_none()
+        if agent is None:
+            return
+        labels = {
+            "succeeded": "execution succeeded",
+            "failed": "execution failed",
+            "ambiguous": "execution outcome needs verification",
+        }
+        bodies = {
+            "succeeded": "The approved action completed successfully.",
+            "failed": "The approved action was not completed. Submit a new request only after reviewing the failure.",
+            "ambiguous": (
+                "The worker cannot prove whether the side effect completed. Verify it manually; "
+                "the system will not replay this action automatically."
+            ),
+        }
+        outcome_code = (approval.execution_result_summary or {}).get("outcome_code")
+        douyin_outcomes = {
+            "DouyinUserActionRequired": (
+                "publish package ready; user confirmation required",
+                "The Douyin publish package is ready. A user must still confirm in Douyin; this is not a public publish success.",
+            ),
+            "DouyinAcceptedPendingReview": (
+                "accepted by Douyin; review pending",
+                "Douyin accepted the submission for review. It is not yet confirmed as publicly published.",
+            ),
+            "DouyinPublishedPendingVerification": (
+                "Douyin callback received; verification pending",
+                "Douyin reported a publish callback. Final public visibility and data verification are still pending.",
+            ),
+            "DouyinUserConfirmedPendingVerification": (
+                "user confirmed; verification pending",
+                "The user confirmed the Douyin action. The system is still waiting for official verification.",
+            ),
+            "DouyinConfirmed": (
+                "Douyin operation confirmed",
+                "The approved Douyin operation was confirmed by the official workflow.",
+            ),
+        }
+        if status == "succeeded" and outcome_code in douyin_outcomes:
+            labels[status], bodies[status] = douyin_outcomes[outcome_code]
+        recipients = {agent.creator_id}
+        requested_by = (approval.details or {}).get("requested_by")
+        try:
+            if requested_by:
+                recipients.add(uuid.UUID(str(requested_by)))
+        except (TypeError, ValueError):
+            pass
+        for recipient_id in recipients:
+            await send_notification(
+                db,
+                user_id=recipient_id,
+                type="approval_execution_terminal",
+                title=f"[{agent.name}] {approval.action_type} — {labels[status]}",
+                body=bodies[status],
+                link=f"/agents/{agent.id}#approvals",
+                ref_id=approval.id,
+            )
+
+    async def _notify_execution_terminal_safely(
+        self,
+        approval_id: uuid.UUID,
+        *,
+        status: str,
+    ) -> None:
+        """Send terminal UX feedback without making the durable CAS rollback."""
+
+        try:
+            async with async_session() as notification_db:
+                approval = (
+                    await notification_db.execute(
+                        select(ApprovalRequest).where(ApprovalRequest.id == approval_id)
+                    )
+                ).scalar_one_or_none()
+                if approval is None:
+                    return
+                await self._notify_execution_terminal(
+                    notification_db,
+                    approval,
+                    status=status,
+                )
+                await notification_db.commit()
+        except Exception as exc:
+            logger.warning(
+                "Approval terminal notification failed approval={} status={} error_type={}",
+                approval_id,
+                status,
+                type(exc).__name__,
+            )
+
+    async def reconcile_stale_executions(self) -> int:
+        """Fence abandoned dispatches as ambiguous; never make them retryable."""
+
+        cutoff = datetime.now(timezone.utc) - APPROVAL_EXECUTION_STALE_AFTER
+        finished_at = datetime.now(timezone.utc)
+        async with async_session() as db:
+            result = await db.execute(
+                update(ApprovalRequest)
+                .where(
+                    ApprovalRequest.status == "approved",
+                    ApprovalRequest.execution_status == "executing",
+                    ApprovalRequest.execution_claimed_at < cutoff,
+                )
+                .values(
+                    execution_status="ambiguous",
+                    execution_finished_at=finished_at,
+                    execution_error_code="StaleExecutionClaim",
+                )
+                .returning(ApprovalRequest.id)
+            )
+            stale_ids = list(result.scalars().all())
+            for approval_id in stale_ids:
+                approval = (
+                    await db.execute(
+                        select(ApprovalRequest).where(ApprovalRequest.id == approval_id)
+                    )
+                ).scalar_one()
+                db.add(
+                    AuditLog(
+                        agent_id=approval.agent_id,
+                        action="approval_execution_ambiguous",
+                        details={
+                            "approval_id": str(approval.id),
+                            "error_code": "StaleExecutionClaim",
+                        },
+                    )
+                )
+                await self._project_ambiguous_external_state(
+                    db,
+                    approval,
+                    error_code="StaleExecutionClaim",
+                )
+            count = len(stale_ids)
+            await db.commit()
+        for approval_id in stale_ids:
+            await self._notify_execution_terminal_safely(
+                approval_id,
+                status="ambiguous",
+            )
+        if count:
+            logger.error("Approval stale claims fenced ambiguous count={}", count)
+        return count
+
+    async def process_next_pending_approval(self) -> bool:
+        """Find the oldest durable execution request and attempt one claim."""
+
+        async with async_session() as db:
+            result = await db.execute(
+                select(ApprovalRequest.id)
+                .where(
+                    ApprovalRequest.status == "approved",
+                    ApprovalRequest.execution_status == "pending",
+                    ApprovalRequest.execution_attempts == 0,
+                    or_(
+                        ApprovalRequest.execution_not_before.is_(None),
+                        ApprovalRequest.execution_not_before <= datetime.now(timezone.utc),
+                    ),
+                )
+                .order_by(ApprovalRequest.resolved_at, ApprovalRequest.id)
+                .limit(1)
+            )
+            approval_id = result.scalar_one_or_none()
+        if approval_id is None:
+            return False
+        return await self.execute_pending_approval(approval_id)
+
+    async def process_pending_approval_batch(
+        self,
+        *,
+        limit: int = APPROVAL_EXECUTION_CONCURRENCY,
+    ) -> int:
+        """Run a small bounded batch so one slow tenant cannot block all others."""
+
+        bounded_limit = max(1, min(limit, APPROVAL_EXECUTION_CONCURRENCY))
+        async with async_session() as db:
+            tenant_rank = func.row_number().over(
+                partition_by=Agent.tenant_id,
+                order_by=(ApprovalRequest.resolved_at, ApprovalRequest.id),
+            ).label("tenant_rank")
+            eligible = (
+                select(
+                    ApprovalRequest.id.label("approval_id"),
+                    ApprovalRequest.resolved_at.label("resolved_at"),
+                    tenant_rank,
+                )
+                .join(Agent, Agent.id == ApprovalRequest.agent_id)
+                .where(
+                    ApprovalRequest.status == "approved",
+                    ApprovalRequest.execution_status == "pending",
+                    ApprovalRequest.execution_attempts == 0,
+                    or_(
+                        ApprovalRequest.execution_not_before.is_(None),
+                        ApprovalRequest.execution_not_before
+                        <= datetime.now(timezone.utc),
+                    ),
+                )
+                .subquery()
+            )
+            result = await db.execute(
+                select(eligible.c.approval_id)
+                .order_by(
+                    eligible.c.tenant_rank,
+                    eligible.c.resolved_at,
+                    eligible.c.approval_id,
+                )
+                .limit(bounded_limit)
+            )
+            approval_ids = list(result.scalars().all())
+        if not approval_ids:
+            return 0
+        outcomes = await asyncio.gather(
+            *(self.execute_pending_approval(approval_id) for approval_id in approval_ids),
+            return_exceptions=True,
+        )
+        failures = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
+        if failures:
+            raise RuntimeError(
+                f"{len(failures)} approval execution task(s) failed"
+            ) from failures[0]
+        return sum(bool(outcome) for outcome in outcomes)
 
     async def _notify_creator(self, db: AsyncSession, agent: Agent,
                                action_type: str, details: dict) -> None:
@@ -321,9 +1199,12 @@ class AutonomyService:
 
         # Try Feishu notification if channel is configured
         channel_result = await db.execute(
-            select(ChannelConfig).where(ChannelConfig.agent_id == agent.id)
+            select(ChannelConfig).where(
+                ChannelConfig.agent_id == agent.id,
+                ChannelConfig.channel_type == "feishu",
+            )
         )
-        channel = channel_result.scalars().first()
+        channel = channel_result.scalar_one_or_none()
 
         if channel and channel.app_id and channel.app_secret:
             creator_result = await db.execute(
@@ -361,7 +1242,19 @@ class AutonomyService:
 
     async def _request_approval(self, db: AsyncSession, agent: Agent,
                                  approval: ApprovalRequest) -> None:
-        """Send L3 approval request to creator via Feishu card + web notification."""
+        """Durably create the request notification, then try external delivery.
+
+        The approval row and in-app notification must commit before any Feishu
+        side effect.  Otherwise a later database failure could leave a phantom
+        card whose approval ID never existed.  Feishu is best-effort after the
+        durable in-app request and cannot roll that request back.
+        """
+        preview = public_approval_details(
+            agent.id,
+            approval.action_type,
+            approval.details,
+        )
+        preview_text = json.dumps(preview, ensure_ascii=False)[:1000]
         # Web notification (always)
         from app.services.notification_service import send_notification
         await send_notification(
@@ -369,50 +1262,102 @@ class AutonomyService:
             user_id=agent.creator_id,
             type="approval_pending",
             title=f"[{agent.name}] requests approval: {approval.action_type}",
-            body=json.dumps(privacy_safe_shape(approval.details), ensure_ascii=False)[:200],
+            body=preview_text,
             link=f"/agents/{agent.id}#approvals",
             ref_id=approval.id,
         )
 
-        # Try Feishu notification
-        channel_result = await db.execute(
-            select(ChannelConfig).where(ChannelConfig.agent_id == agent.id)
-        )
-        channel = channel_result.scalars().first()
+        # This service is called with a dedicated approval session.  Commit the
+        # durable request and web notification before crossing the network.
+        await db.commit()
 
-        if channel and channel.app_id and channel.app_secret:
-            creator_result = await db.execute(
-                select(User).where(User.id == agent.creator_id)
-            )
-            creator = creator_result.scalar_one_or_none()
-            if creator:
-                from app.models.identity import IdentityProvider
-                from app.models.org import OrgMember
-
-                provider_r = await db.execute(
-                    select(IdentityProvider).where(
-                        IdentityProvider.provider_type == "feishu",
-                        IdentityProvider.tenant_id == creator.tenant_id,
-                    )
+        # Try Feishu notification only after the commit.  A delivery failure is
+        # visible in logs while the already-persisted web approval remains the
+        # source of truth.
+        try:
+            channel_result = await db.execute(
+                select(ChannelConfig).where(
+                    ChannelConfig.agent_id == agent.id,
+                    ChannelConfig.channel_type == "feishu",
                 )
-                provider = provider_r.scalar_one_or_none()
-                if provider:
-                    member_r = await db.execute(
-                        select(OrgMember).where(
-                            OrgMember.user_id == creator.id,
-                            OrgMember.provider_id == provider.id,
+            )
+            channel = channel_result.scalar_one_or_none()
+
+            if channel and channel.app_id and channel.app_secret:
+                creator_result = await db.execute(
+                    select(User).where(User.id == agent.creator_id)
+                )
+                creator = creator_result.scalar_one_or_none()
+                if creator:
+                    from app.models.identity import IdentityProvider
+                    from app.models.org import OrgMember
+
+                    provider_r = await db.execute(
+                        select(IdentityProvider).where(
+                            IdentityProvider.provider_type == "feishu",
+                            IdentityProvider.tenant_id == creator.tenant_id,
                         )
                     )
-                    member = member_r.scalar_one_or_none()
-                    if member and (member.external_id or member.open_id):
-                        receive_id = member.external_id or member.open_id
-                        await feishu_service.send_approval_card(
-                            channel.app_id, channel.app_secret,
-                            receive_id,
-                            agent.name, approval.action_type,
-                            json.dumps(privacy_safe_shape(approval.details), ensure_ascii=False),
-                            str(approval.id),
+                    provider = provider_r.scalar_one_or_none()
+                    if provider:
+                        member_r = await db.execute(
+                            select(OrgMember).where(
+                                OrgMember.user_id == creator.id,
+                                OrgMember.provider_id == provider.id,
+                            )
                         )
-
+                        member = member_r.scalar_one_or_none()
+                        if member and (member.external_id or member.open_id):
+                            receive_id = member.external_id or member.open_id
+                            await feishu_service.send_approval_card(
+                                channel.app_id,
+                                channel.app_secret,
+                                receive_id,
+                                agent.name,
+                                approval.action_type,
+                                preview_text,
+                                str(approval.id),
+                            )
+        except Exception as exc:
+            logger.warning(
+                "Approval Feishu notification failed after durable commit "
+                "approval={} error_type={}",
+                approval.id,
+                type(exc).__name__,
+            )
 
 autonomy_service = AutonomyService()
+
+
+async def start_approval_execution_daemon() -> None:
+    """Continuously execute durable approvals on the dedicated worker role."""
+
+    logger.info(
+        "Approval execution daemon started poll_interval={}s stale_after={}s",
+        APPROVAL_EXECUTION_POLL_SECONDS,
+        int(APPROVAL_EXECUTION_STALE_AFTER.total_seconds()),
+    )
+    last_reconcile = datetime.min.replace(tzinfo=timezone.utc)
+    consecutive_failures = 0
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            if now - last_reconcile >= timedelta(minutes=1):
+                await autonomy_service.reconcile_stale_executions()
+                last_reconcile = now
+            processed = await autonomy_service.process_pending_approval_batch()
+            consecutive_failures = 0
+            if processed == 0:
+                await asyncio.sleep(APPROVAL_EXECUTION_POLL_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            consecutive_failures += 1
+            logger.error(
+                "Approval execution daemon iteration failed error_type={} consecutive_failures={}",
+                type(exc).__name__,
+                consecutive_failures,
+            )
+            if consecutive_failures >= APPROVAL_DAEMON_MAX_CONSECUTIVE_FAILURES:
+                raise RuntimeError("Approval execution daemon exceeded its failure threshold") from exc
+            await asyncio.sleep(APPROVAL_EXECUTION_POLL_SECONDS)

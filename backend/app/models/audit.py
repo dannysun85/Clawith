@@ -3,9 +3,9 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Integer, String, Text, func
+from sqlalchemy import CheckConstraint, DateTime, Enum, ForeignKey, Index, Integer, String, Text, func, text
 from sqlalchemy.dialects.postgresql import JSON, UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
 
@@ -28,6 +28,52 @@ class ApprovalRequest(Base):
     """Approval request for L3 autonomy operations."""
 
     __tablename__ = "approval_requests"
+    __table_args__ = (
+        CheckConstraint(
+            "execution_status IS NULL OR execution_status IN "
+            "('legacy', 'invalid', 'pending', 'executing', 'succeeded', "
+            "'failed', 'ambiguous', 'not_required')",
+            name="ck_approval_execution_status",
+        ),
+        CheckConstraint(
+            "execution_attempts >= 0 AND execution_attempts <= 1",
+            name="ck_approval_execution_single_attempt",
+        ),
+        CheckConstraint(
+            "(status = 'pending' AND (execution_status IS NULL OR execution_status = 'invalid') "
+            "AND execution_attempts = 0 AND execution_claim_token IS NULL "
+            "AND execution_claimed_at IS NULL AND execution_finished_at IS NULL) OR "
+            "(status = 'rejected' AND execution_status IN ('legacy', 'not_required') "
+            "AND execution_attempts = 0 AND execution_claim_token IS NULL "
+            "AND execution_claimed_at IS NULL AND execution_finished_at IS NULL) OR "
+            "(status = 'approved' AND ((execution_status = 'legacy' AND execution_attempts = 0 "
+            "AND execution_claim_token IS NULL AND execution_claimed_at IS NULL "
+            "AND execution_finished_at IS NULL) OR (execution_status = 'pending' "
+            "AND execution_attempts = 0 AND execution_claim_token IS NULL "
+            "AND execution_claimed_at IS NULL AND execution_finished_at IS NULL) OR "
+            "(execution_status = 'executing' AND execution_attempts = 1 "
+            "AND execution_claim_token IS NOT NULL AND execution_claimed_at IS NOT NULL "
+            "AND execution_finished_at IS NULL) OR (execution_status IN "
+            "('succeeded', 'failed', 'ambiguous') AND execution_attempts = 1 "
+            "AND execution_claim_token IS NOT NULL AND execution_claimed_at IS NOT NULL "
+            "AND execution_finished_at IS NOT NULL)))",
+            name="ck_approval_execution_state_consistency",
+        ),
+        Index(
+            "uq_active_approval_request_fingerprint",
+            "agent_id",
+            "request_fingerprint",
+            unique=True,
+            postgresql_where=text(
+                "request_fingerprint IS NOT NULL AND (status = 'pending' OR "
+                "(status = 'approved' AND execution_status IN ('pending', 'executing')))"
+            ),
+            sqlite_where=text(
+                "request_fingerprint IS NOT NULL AND (status = 'pending' OR "
+                "(status = 'approved' AND execution_status IN ('pending', 'executing')))"
+            ),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("agents.id"), nullable=False)
@@ -41,6 +87,20 @@ class ApprovalRequest(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     resolved_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    request_fingerprint: Mapped[str | None] = mapped_column(String(64), index=True)
+    # Approval resolution and action execution are deliberately separate
+    # durable states.  An approved row is committed before a worker claims the
+    # external side effect, so a failed commit can never make an action
+    # replayable.  A process crash while ``executing`` is reconciled to
+    # ``ambiguous`` and is never retried automatically.
+    execution_status: Mapped[str | None] = mapped_column(String(32), index=True)
+    execution_claim_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    execution_not_before: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    execution_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    execution_finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    execution_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    execution_result_summary: Mapped[dict] = mapped_column(JSON, default=dict)
+    execution_error_code: Mapped[str | None] = mapped_column(String(100))
 
 
 class ChatMessage(Base):

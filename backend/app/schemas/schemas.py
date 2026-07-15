@@ -497,12 +497,18 @@ class ApprovalRequestOut(BaseModel):
     created_at: datetime
     resolved_at: datetime | None = None
     resolved_by: uuid.UUID | None = None
+    execution_status: str | None = None
+    execution_claimed_at: datetime | None = None
+    execution_finished_at: datetime | None = None
+    execution_attempts: int = 0
+    execution_result_summary: dict = Field(default_factory=dict)
+    execution_error_code: str | None = None
 
     model_config = {"from_attributes": True}
 
 
 class ApprovalAction(BaseModel):
-    action: str  # "approve" | "reject"
+    action: Literal["approve", "reject"]
 
 
 # ─── Enterprise Info ────────────────────────────────────

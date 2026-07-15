@@ -136,7 +136,16 @@ async def expire_stale_credit_reservations(
 
     now = now or datetime.now(timezone.utc)
     active_media_reservations = select(MediaGenerationTask.reservation_id).where(
-        MediaGenerationTask.status.in_(("submitting", "submitted", "processing", "retrying", "downloading")),
+        MediaGenerationTask.status.in_((
+            "submitting",
+            "submitted",
+            "processing",
+            "retrying",
+            "downloading",
+            "asset_repairing",
+            "settlement_ready",
+            "backfill_scanning",
+        )),
         MediaGenerationTask.reservation_id.is_not(None),
     )
     result = await db.execute(

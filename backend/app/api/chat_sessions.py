@@ -608,7 +608,12 @@ async def get_session_messages(
 
         if m.role == "tool_call":
             import json
-            entry: dict = {"role": m.role, "content": m.content, "created_at": m.created_at.isoformat() if m.created_at else None}
+            entry: dict = {
+                "id": str(m.id),
+                "role": m.role,
+                "content": m.content,
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+            }
             try:
                 data = json.loads(m.content)
                 entry["content"] = ""
@@ -630,7 +635,12 @@ async def get_session_messages(
                 add_sender_metadata(part)
                 out.append(part)
         else:
-            entry = {"role": m.role, "content": m.content, "created_at": m.created_at.isoformat() if m.created_at else None}
+            entry = {
+                "id": str(m.id),
+                "role": m.role,
+                "content": m.content,
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+            }
             if hasattr(m, 'thinking') and m.thinking:
                 entry["thinking"] = m.thinking
             add_sender_metadata(entry)

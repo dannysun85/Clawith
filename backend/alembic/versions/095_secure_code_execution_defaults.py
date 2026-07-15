@@ -75,6 +75,33 @@ def upgrade() -> None:
     _ensure_tenant_settings_table()
     names = _quoted_names()
     bind = op.get_bind()
+    # Production may install a persistent MCP quarantine trigger immediately
+    # before this migration. This exact transaction is the trusted safe writer:
+    # it backfills ownership and revokes ambiguous grants before restoration.
+    bind.exec_driver_sql("SET LOCAL astra.mcp_quarantine_restore = 'on'")
+    # Older seeders auto-enabled a Code tool when its Tool row was missing.
+    # Materialize the complete catalog first so an application rollback cannot
+    # reopen that create-and-auto-assign path on an incomplete database.
+    bind.exec_driver_sql(
+        f"""
+        INSERT INTO tools (
+            id, name, display_name, description, type, category, icon,
+            parameters_schema, config, config_schema, enabled, is_default,
+            source
+        )
+        SELECT
+            gen_random_uuid(), seed.name, seed.name,
+            'Code execution disabled pending explicit authorization',
+            'builtin', 'code', 'C', '{{}}'::json, '{{}}'::json, '{{}}'::json,
+            true, false, 'builtin'
+        FROM (VALUES
+            {", ".join(f"('{name}')" for name in CODE_TOOL_NAMES)}
+        ) AS seed(name)
+        WHERE NOT EXISTS (
+            SELECT 1 FROM tools AS existing WHERE existing.name = seed.name
+        )
+        """
+    )
     bind.exec_driver_sql(
         f"""
         UPDATE tools
@@ -86,7 +113,11 @@ def upgrade() -> None:
         """
         UPDATE tools
         SET config = (
-            (COALESCE(config::jsonb, '{}'::jsonb) - 'api_url')
+            (
+                COALESCE(config::jsonb, '{}'::jsonb)
+                - 'api_url'
+                - 'api_key'
+            )
             || jsonb_build_object(
                 'sandbox_type', CASE
                     WHEN name = 'execute_code_e2b' THEN 'e2b'
@@ -142,6 +173,14 @@ def upgrade() -> None:
                 COALESCE(assignment.config::jsonb, '{{}}'::jsonb)
                 - 'sandbox_type'
                 - 'api_url'
+                - 'api_key'
+                - 'cpu_limit'
+                - 'memory_limit'
+                - 'default_timeout'
+                - 'max_timeout'
+                - 'language_mapping'
+                - 'allow_network'
+                - 'allow_unsafe_fallback_when_bwrap_missing'
                 || '{{
                     "allow_network": false,
                     "allow_unsafe_fallback_when_bwrap_missing": false
@@ -162,6 +201,14 @@ def upgrade() -> None:
                 COALESCE(value::jsonb -> 'config', '{}'::jsonb)
                 - 'sandbox_type'
                 - 'api_url'
+                - 'api_key'
+                - 'cpu_limit'
+                - 'memory_limit'
+                - 'default_timeout'
+                - 'max_timeout'
+                - 'language_mapping'
+                - 'allow_network'
+                - 'allow_unsafe_fallback_when_bwrap_missing'
             )
                 || '{
                     "allow_network": false,
@@ -175,6 +222,115 @@ def upgrade() -> None:
         )
         """
     )
+    # Agent-installed MCP tools created before tenant scoping are safe to
+    # preserve only when every assignment resolves to one exact company.
+    bind.exec_driver_sql(
+        """
+        WITH ownership AS (
+            SELECT
+                tool.id AS tool_id,
+                (array_agg(DISTINCT agent.tenant_id)
+                    FILTER (WHERE agent.tenant_id IS NOT NULL))[1] AS tenant_id,
+                count(DISTINCT agent.tenant_id) AS tenant_count
+            FROM tools AS tool
+            LEFT JOIN agent_tools AS assignment ON assignment.tool_id = tool.id
+            LEFT JOIN agents AS agent ON agent.id = assignment.agent_id
+            WHERE tool.type = 'mcp'
+              AND tool.source = 'agent'
+              AND tool.tenant_id IS NULL
+            GROUP BY tool.id
+        )
+        UPDATE tools AS tool
+        SET tenant_id = ownership.tenant_id
+        FROM ownership
+        WHERE tool.id = ownership.tool_id
+          AND ownership.tenant_count = 1
+        """
+    )
+    # A stale assignment must never make a tenant-scoped MCP tool visible to
+    # another company. Run this only after the unique-owner legacy backfill so
+    # valid historical credentials are preserved for their exact company.
+    bind.exec_driver_sql(
+        """
+        UPDATE agent_tools AS assignment
+        SET enabled = false,
+            config = '{}'::json
+        FROM tools AS tool,
+             agents AS agent
+        WHERE assignment.tool_id = tool.id
+          AND assignment.agent_id = agent.id
+          AND tool.type = 'mcp'
+          AND (
+              (
+                  tool.source = 'agent'
+                  AND (
+                      tool.tenant_id IS NULL
+                      OR agent.tenant_id IS NULL
+                      OR tool.tenant_id <> agent.tenant_id
+                  )
+              )
+              OR
+              (
+                  tool.source = 'admin'
+                  AND tool.tenant_id IS NOT NULL
+                  AND (
+                      agent.tenant_id IS NULL
+                      OR tool.tenant_id <> agent.tenant_id
+                  )
+              )
+          )
+        """
+    )
+    # Orphaned and cross-tenant shared legacy rows cannot be attributed safely.
+    # Remove execution grants and credential-bearing fields for manual repair.
+    bind.exec_driver_sql(
+        """
+        UPDATE agent_tools AS assignment
+        SET enabled = false,
+            config = '{}'::json
+        FROM tools AS tool
+        WHERE assignment.tool_id = tool.id
+          AND tool.type = 'mcp'
+          AND tool.source = 'agent'
+          AND tool.tenant_id IS NULL
+        """
+    )
+    bind.exec_driver_sql(
+        """
+        UPDATE tools
+        SET enabled = false,
+            config = '{}'::json,
+            mcp_server_url = NULL
+        WHERE type = 'mcp'
+          AND source = 'agent'
+          AND tenant_id IS NULL
+        """
+    )
+    # Global Atlassian tool definitions may remain visible, but a platform
+    # credential must never be inherited by every tenant through Tool.config.
+    bind.exec_driver_sql(
+        """
+        UPDATE agent_tools AS assignment
+        SET config = '{}'::json
+        FROM tools AS tool
+        WHERE assignment.tool_id = tool.id
+          AND tool.mcp_server_name = 'Atlassian Rovo'
+        """
+    )
+    bind.exec_driver_sql(
+        """
+        UPDATE tools
+        SET config = '{}'::json
+        WHERE (
+            name = 'atlassian_rovo'
+            OR mcp_server_name = 'Atlassian Rovo'
+        )
+          AND tenant_id IS NULL
+        """
+    )
+    # Do not leak the trusted-writer bypass into a later revision that Alembic
+    # may execute in the same outer transaction.
+    bind.exec_driver_sql("SET LOCAL astra.mcp_quarantine_restore = 'off'")
 
 
 def downgrade() -> None:

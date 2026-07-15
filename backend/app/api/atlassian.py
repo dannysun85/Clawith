@@ -6,6 +6,7 @@ the agent uses Jira, Confluence, and Compass via the Atlassian Rovo MCP server.
 """
 
 import uuid
+import hmac
 
 from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger
@@ -21,6 +22,74 @@ from app.models.user import User
 router = APIRouter(tags=["atlassian"])
 
 ATLASSIAN_MCP_URL = "https://mcp.atlassian.com/v1/mcp"
+
+
+async def lock_atlassian_agent(agent_id: uuid.UUID, db: AsyncSession) -> None:
+    """Serialize configure/sync/revoke with one stable lock order."""
+
+    from app.models.agent import Agent
+
+    await db.execute(
+        select(Agent.id).where(Agent.id == agent_id).with_for_update()
+    )
+
+
+async def revoke_atlassian_tool_grants(agent_id: uuid.UUID, db: AsyncSession) -> None:
+    """Disable Rovo assignments and erase every per-Agent fallback secret."""
+
+    from app.models.tool import AgentTool, Tool
+
+    await lock_atlassian_agent(agent_id, db)
+    assignments = await db.execute(
+        select(AgentTool)
+        .join(Tool, Tool.id == AgentTool.tool_id)
+        .where(
+            AgentTool.agent_id == agent_id,
+            Tool.type == "mcp",
+            Tool.mcp_server_name == "Atlassian Rovo",
+        )
+    )
+    for assignment in assignments.scalars().all():
+        assignment.enabled = False
+        assignment.config = {}
+
+
+async def _atlassian_credential_matches(
+    agent_id: uuid.UUID,
+    expected_key: str,
+    db: AsyncSession,
+) -> bool:
+    from app.config import get_settings
+    from app.core.security import decrypt_data
+
+    await lock_atlassian_agent(agent_id, db)
+    result = await db.execute(
+        select(ChannelConfig)
+        .where(
+            ChannelConfig.agent_id == agent_id,
+            ChannelConfig.channel_type == "atlassian",
+            ChannelConfig.is_configured.is_(True),
+        )
+        .with_for_update()
+    )
+    config = result.scalar_one_or_none()
+    if not config or not config.app_secret:
+        return False
+    try:
+        current = decrypt_data(config.app_secret, get_settings().SECRET_KEY)
+    except Exception as exc:
+        logger.error(
+            "[AtlassianChannel] Credential comparison failed closed "
+            "agent_id={} error_type={}",
+            agent_id,
+            type(exc).__name__,
+        )
+        return False
+    return bool(
+        current
+        and expected_key
+        and hmac.compare_digest(current, expected_key)
+    )
 
 
 # ─── Config CRUD ────────────────────────────────────────
@@ -51,21 +120,28 @@ async def configure_atlassian_channel(
     from app.config import get_settings
     encrypted_key = encrypt_data(api_key, get_settings().SECRET_KEY)
 
+    await lock_atlassian_agent(agent_id, db)
     result = await db.execute(
         select(ChannelConfig).where(
             ChannelConfig.agent_id == agent_id,
             ChannelConfig.channel_type == "atlassian",
-        )
+        ).with_for_update()
     )
     existing = result.scalar_one_or_none()
+    await revoke_atlassian_tool_grants(agent_id, db)
     if existing:
         existing.app_secret = encrypted_key
         existing.is_configured = True
-        existing.extra_config = {**(existing.extra_config or {}), "cloud_id": cloud_id}
+        existing.extra_config = {
+            **(existing.extra_config or {}),
+            "cloud_id": cloud_id,
+            "tool_sync_status": "syncing",
+            "tool_count": 0,
+            "tool_sync_error_code": None,
+        }
         await db.commit()
-        # Sync tools for this agent in background
-        import asyncio
-        asyncio.create_task(_sync_atlassian_tools_for_agent(agent_id, api_key))
+        await _complete_atlassian_tool_sync(agent_id, api_key)
+        await db.refresh(existing)
         return _serialize(existing)
 
     config = ChannelConfig(
@@ -74,14 +150,18 @@ async def configure_atlassian_channel(
         app_id="atlassian",
         app_secret=encrypted_key,
         is_configured=True,
-        extra_config={"cloud_id": cloud_id},
+        extra_config={
+            "cloud_id": cloud_id,
+            "tool_sync_status": "syncing",
+            "tool_count": 0,
+            "tool_sync_error_code": None,
+        },
     )
     db.add(config)
     await db.commit()
     await db.refresh(config)
-    # Sync tools for this agent in background
-    import asyncio
-    asyncio.create_task(_sync_atlassian_tools_for_agent(agent_id, api_key))
+    await _complete_atlassian_tool_sync(agent_id, api_key)
+    await db.refresh(config)
     return _serialize(config)
 
 
@@ -116,15 +196,17 @@ async def delete_atlassian_channel(
     agent, _ = await check_agent_access(db, current_user, agent_id)
     if not is_agent_creator(current_user, agent):
         raise HTTPException(status_code=403, detail="Only creator can remove channel")
+    await lock_atlassian_agent(agent_id, db)
     result = await db.execute(
         select(ChannelConfig).where(
             ChannelConfig.agent_id == agent_id,
             ChannelConfig.channel_type == "atlassian",
-        )
+        ).with_for_update()
     )
     config = result.scalar_one_or_none()
     if not config:
         raise HTTPException(status_code=404, detail="Atlassian not configured")
+    await revoke_atlassian_tool_grants(agent_id, db)
     await db.delete(config)
     await db.commit()
 
@@ -149,7 +231,10 @@ async def test_atlassian_channel(
 
     from app.services.mcp_client import MCPClient
     try:
-        client = MCPClient(ATLASSIAN_MCP_URL, api_key=config.app_secret)
+        api_key = await get_atlassian_api_key_for_agent(agent_id, db)
+        if not api_key:
+            raise HTTPException(status_code=400, detail="Atlassian credential is unavailable")
+        client = MCPClient(ATLASSIAN_MCP_URL, api_key=api_key)
         tools = await client.list_tools()
         return {
             "ok": True,
@@ -157,8 +242,11 @@ async def test_atlassian_channel(
             "tools": [{"name": t["name"], "description": t.get("description", "")[:100]} for t in tools[:10]],
             "message": f"✅ Connected to Atlassian Rovo MCP — {len(tools)} tools available",
         }
-    except Exception as e:
-        return {"ok": False, "error": str(e)[:300]}
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"Atlassian connection failed ({type(exc).__name__})",
+        }
 
 
 # ─── Internal helper ────────────────────────────────────
@@ -178,32 +266,119 @@ def _serialize(config: ChannelConfig) -> dict:
 
 # ─── Utility for internal use ──────────────────────────
 
-async def _sync_atlassian_tools_for_agent(agent_id: uuid.UUID, api_key: str) -> None:
+class AtlassianToolSyncError(RuntimeError):
+    """Stable, credential-free reason for an incomplete tool sync."""
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
+async def _mark_atlassian_sync_failed(
+    agent_id: uuid.UUID,
+    api_key: str,
+    error_code: str,
+) -> None:
+    """Persist a retryable sync failure only for the still-current key."""
+
+    from app.database import async_session
+
+    async with async_session() as db:
+        await lock_atlassian_agent(agent_id, db)
+        if not await _atlassian_credential_matches(agent_id, api_key, db):
+            await db.rollback()
+            return
+        result = await db.execute(
+            select(ChannelConfig)
+            .where(
+                ChannelConfig.agent_id == agent_id,
+                ChannelConfig.channel_type == "atlassian",
+            )
+            .with_for_update()
+        )
+        config = result.scalar_one_or_none()
+        if not config:
+            await db.rollback()
+            return
+        config.extra_config = {
+            **(config.extra_config or {}),
+            "tool_sync_status": "failed",
+            "tool_count": 0,
+            "tool_sync_error_code": error_code,
+        }
+        await db.commit()
+
+
+async def _complete_atlassian_tool_sync(
+    agent_id: uuid.UUID,
+    api_key: str,
+) -> int:
+    """Synchronously finish configuration or return an explicit failure."""
+
+    try:
+        return await _sync_atlassian_tools_for_agent(agent_id, api_key)
+    except AtlassianToolSyncError as exc:
+        error_code = exc.code
+    except Exception as exc:
+        error_code = "atlassian_tool_sync_failed"
+        logger.error(
+            "[AtlassianChannel] Tool sync failed agent_id={} error_type={}",
+            agent_id,
+            type(exc).__name__,
+        )
+    await _mark_atlassian_sync_failed(agent_id, api_key, error_code)
+    raise HTTPException(
+        status_code=502,
+        detail={
+            "code": error_code,
+            "message": "Atlassian credential saved, but tool synchronization failed",
+        },
+    )
+
+
+async def _sync_atlassian_tools_for_agent(agent_id: uuid.UUID, api_key: str) -> int:
     """Connect to Atlassian Rovo MCP and ensure all tools are seeded + assigned to this agent.
 
     Discovers tools from the MCP server, creates Tool records if needed,
     and creates AgentTool assignments for this specific agent.
     """
     from app.services.mcp_client import MCPClient
-    from app.models.tool import Tool, AgentTool
+    from app.models.tool import Tool
     from app.database import async_session
     from sqlalchemy import select as sa_select
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from app.services.agent_tool_assignments import (
+        lock_agent_tool_owner,
+        upsert_agent_tool,
+    )
 
     logger.info(f"[AtlassianChannel] Syncing tools for agent {agent_id} ...")
     try:
         client = MCPClient(ATLASSIAN_MCP_URL, api_key=api_key)
         tools_discovered = await client.list_tools()
     except Exception as e:
-        logger.error(f"[AtlassianChannel] Could not list tools: {e}")
-        return
+        logger.error(
+            "[AtlassianChannel] Could not list tools error_type={}",
+            type(e).__name__,
+        )
+        raise AtlassianToolSyncError("atlassian_discovery_failed") from e
 
     if not tools_discovered:
         logger.warning("[AtlassianChannel] No tools returned from Atlassian MCP")
-        return
+        raise AtlassianToolSyncError("atlassian_no_tools")
 
     logger.info(f"[AtlassianChannel] Found {len(tools_discovered)} tools, assigning to agent {agent_id}")
 
     async with async_session() as db:
+        await lock_agent_tool_owner(db, agent_id)
+        # A configure/delete or credential rotation may have completed while
+        # discovery was in flight. A stale task must never resurrect its key.
+        if not await _atlassian_credential_matches(agent_id, api_key, db):
+            logger.info(
+                "[AtlassianChannel] Ignoring stale sync for agent {}",
+                agent_id,
+            )
+            raise AtlassianToolSyncError("atlassian_credential_changed")
         assigned = 0
         for mcp_tool in tools_discovered:
             raw_name = mcp_tool.get("name", "")
@@ -223,11 +398,12 @@ async def _sync_atlassian_tools_for_agent(agent_id: uuid.UUID, api_key: str) -> 
             else:
                 icon = "🔷"
 
-            # Ensure Tool record exists (shared across all agents)
-            tool_r = await db.execute(sa_select(Tool).where(Tool.name == tool_name))
-            tool = tool_r.scalar_one_or_none()
-            if not tool:
-                tool = Tool(
+            # The global name is shared, so creation must be race-safe. Never
+            # repurpose an unrelated row that happens to have the same name.
+            await db.execute(
+                pg_insert(Tool)
+                .values(
+                    id=uuid.uuid4(),
                     name=tool_name,
                     display_name=f"Atlassian: {raw_name}",
                     description=tool_desc,
@@ -235,45 +411,73 @@ async def _sync_atlassian_tools_for_agent(agent_id: uuid.UUID, api_key: str) -> 
                     category="atlassian",
                     icon=icon,
                     parameters_schema=tool_schema,
+                    config={},
+                    config_schema={},
                     mcp_server_url=ATLASSIAN_MCP_URL,
                     mcp_server_name="Atlassian Rovo",
                     mcp_tool_name=raw_name,
                     enabled=True,
                     is_default=False,
                     source="admin",
+                    tenant_id=None,
                 )
-                db.add(tool)
-                await db.flush()
-            else:
-                # Update schema in case it changed
-                tool.description = tool_desc
-                tool.parameters_schema = tool_schema
-
-            # Assign to this specific agent (api_key stored per-agent via channel config,
-            # but we also put it in AgentTool.config as fallback for _execute_mcp_tool)
-            at_r = await db.execute(
-                sa_select(AgentTool).where(
-                    AgentTool.agent_id == agent_id,
-                    AgentTool.tool_id == tool.id,
-                )
+                .on_conflict_do_nothing(index_elements=[Tool.name])
             )
-            at = at_r.scalar_one_or_none()
-            if at:
-                at.enabled = True
-                at.config = {"api_key": api_key}
-            else:
-                db.add(AgentTool(
-                    agent_id=agent_id,
-                    tool_id=tool.id,
-                    enabled=True,
-                    source="user_installed",
-                    installed_by_agent_id=agent_id,
-                    config={"api_key": api_key},
-                ))
-                assigned += 1
+            tool_r = await db.execute(
+                sa_select(Tool).where(Tool.name == tool_name).with_for_update()
+            )
+            tool = tool_r.scalar_one()
+            if not (
+                tool.type == "mcp"
+                and tool.mcp_server_name == "Atlassian Rovo"
+                and tool.mcp_tool_name == raw_name
+                and tool.source == "admin"
+                and tool.tenant_id is None
+            ):
+                raise RuntimeError("Atlassian tool name conflicts with an unrelated Tool")
+            tool.display_name = f"Atlassian: {raw_name}"
+            tool.description = tool_desc
+            tool.category = "atlassian"
+            tool.icon = icon
+            tool.parameters_schema = tool_schema
+            tool.mcp_server_url = ATLASSIAN_MCP_URL
+            tool.enabled = True
+            tool.config = {}
 
+            # Assign to this specific agent. The credential remains exclusively
+            # in ChannelConfig and is resolved just in time at execution.
+            await upsert_agent_tool(
+                db,
+                agent_id=agent_id,
+                tool_id=tool.id,
+                enabled=True,
+                source="user_installed",
+                installed_by_agent_id=agent_id,
+                config={},
+                on_conflict="reauthorize",
+            )
+            assigned += 1
+
+        config_result = await db.execute(
+            sa_select(ChannelConfig)
+            .where(
+                ChannelConfig.agent_id == agent_id,
+                ChannelConfig.channel_type == "atlassian",
+            )
+            .with_for_update()
+        )
+        config = config_result.scalar_one_or_none()
+        if not config:
+            raise AtlassianToolSyncError("atlassian_configuration_removed")
+        config.extra_config = {
+            **(config.extra_config or {}),
+            "tool_sync_status": "ready",
+            "tool_count": assigned,
+            "tool_sync_error_code": None,
+        }
         await db.commit()
-    logger.info(f"[AtlassianChannel] {assigned} new tool assignments for agent {agent_id}")
+    logger.info(f"[AtlassianChannel] Synced {assigned} tool assignments for agent {agent_id}")
+    return assigned
 
 
 async def get_atlassian_api_key_for_agent(agent_id: uuid.UUID, db=None) -> str | None:
@@ -287,7 +491,7 @@ async def get_atlassian_api_key_for_agent(agent_id: uuid.UUID, db=None) -> str |
             select(ChannelConfig).where(
                 ChannelConfig.agent_id == agent_id,
                 ChannelConfig.channel_type == "atlassian",
-                ChannelConfig.is_configured == True,
+                ChannelConfig.is_configured.is_(True),
             )
         )
         config = result.scalar_one_or_none()
@@ -297,7 +501,11 @@ async def get_atlassian_api_key_for_agent(agent_id: uuid.UUID, db=None) -> str |
         try:
             return decrypt_data(config.app_secret, get_settings().SECRET_KEY)
         except Exception:
-            return config.app_secret
+            logger.error(
+                "[AtlassianChannel] Refusing undecryptable credential for agent %s",
+                agent_id,
+            )
+            return None
 
     if db is not None:
         return await _fetch(db)

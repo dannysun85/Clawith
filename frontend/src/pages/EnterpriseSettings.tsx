@@ -8,8 +8,16 @@ import UserManagement from './UserManagement';
 import InvitationCodes from './InvitationCodes';
 import { useDialog } from '../components/Dialog/DialogProvider';
 import { useToast } from '../components/Toast/ToastProvider';
+import ApprovalPreview, {
+    approvalExecutionLabel,
+    approvalExecutionErrorLabel,
+    approvalNeedsPolling,
+    type ApprovalRecord,
+    isApprovalApprovable,
+} from '../components/ApprovalPreview';
 import { buildCompanyRegions, type CompanyRegion } from '../utils/companyRegions';
 import { canAccessSaasAdmin } from '../utils/saasAdmin';
+import { defaultMcpServerName, mcpToolGroupKey } from '../utils/mcpToolGrouping';
 import OrgTab from './enterprise-settings/tabs/OrgTab';
 import SkillsTab from './enterprise-settings/tabs/SkillsTab';
 import OkrTab from './enterprise-settings/tabs/OkrTab';
@@ -303,7 +311,8 @@ function DouyinAccountTab({ onCreateAgent }: { onCreateAgent: () => void }) {
 
 
 export default function EnterpriseSettings() {
-    const { t } = useTranslation();
+    const { t, i18n } = useTranslation();
+    const isChinese = i18n.language?.startsWith('zh');
     const navigate = useNavigate();
     const outletContext = useOutletContext<{ openTalentMarket?: (options?: { initialSearchQuery?: string }) => void }>();
     const user = useAuthStore((s) => s.user);
@@ -423,6 +432,7 @@ export default function EnterpriseSettings() {
         server_name: string;
         server_url: string;
         api_key: string;
+        tool_ids: string[];
     } | null>(null);
     const [mcpServerSaving, setMcpServerSaving] = useState(false);
     const [editingToolId, setEditingToolId] = useState<string | null>(null);
@@ -504,12 +514,6 @@ export default function EnterpriseSettings() {
             case 'custom': return <IconSettings size={size} stroke={1.8} style={style} />;
             default: return <IconTools size={size} stroke={1.8} style={style} />;
         }
-    };
-    const mcpToolGroupKey = (tool: any) => {
-        const serverName = String(tool.mcp_server_name || '').trim();
-        return tool.type === 'mcp' && serverName
-            ? `mcp:${serverName.toLowerCase()}`
-            : (tool.category || 'general');
     };
     const getToolGroupMeta = (groupKey: string, toolsInGroup: any[]) => {
         const first = toolsInGroup.find((tool: any) => tool.type === 'mcp' && tool.mcp_server_name) || toolsInGroup[0];
@@ -634,13 +638,14 @@ export default function EnterpriseSettings() {
     });
 
     // ─── Approvals
-    const { data: approvals = [] } = useQuery({
+    const { data: approvals = [] } = useQuery<ApprovalRecord[]>({
         queryKey: ['approvals', selectedTenantId],
         queryFn: () => fetchJson<any[]>(`/enterprise/approvals${selectedTenantId ? `?tenant_id=${selectedTenantId}` : ''}`),
         enabled: activeTab === 'approvals',
+        refetchInterval: (query) => approvalNeedsPolling(query.state.data) ? 3000 : false,
     });
     const resolveApproval = useMutation({
-        mutationFn: ({ id, action }: { id: string; action: string }) =>
+        mutationFn: ({ id, action }: { id: string; action: 'approve' | 'reject' }) =>
             fetchJson(`/enterprise/approvals/${id}/resolve`, { method: 'POST', body: JSON.stringify({ action }) }),
         onSuccess: () => qc.invalidateQueries({ queryKey: ['approvals', selectedTenantId] }),
     });
@@ -713,23 +718,51 @@ export default function EnterpriseSettings() {
                 {/* ── Approvals ── */}
                 {activeTab === 'approvals' && (
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                        {approvals.map((a: any) => (
-                            <div key={a.id} className="card" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                        {resolveApproval.isError && (
+                            <div role="alert" style={{ color: 'var(--error)', fontSize: 13 }}>
+                                {isChinese ? '审批操作失败：' : 'Approval action failed: '}
+                                {resolveApproval.error instanceof Error ? resolveApproval.error.message : String(resolveApproval.error)}
+                            </div>
+                        )}
+                        {approvals.map((a) => (
+                            <div key={a.id} className="card" style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
                                 <div>
                                     <div style={{ fontWeight: 500 }}>{a.action_type}</div>
                                     <div style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>
-                                        {a.agent_name || `Agent ${a.agent_id.slice(0, 8)}`} · {new Date(a.created_at).toLocaleString()}
+                                        {a.agent_name || `Agent ${a.agent_id.slice(0, 8)}`} · {a.created_at ? new Date(a.created_at).toLocaleString() : ''}
                                     </div>
                                 </div>
+                                <ApprovalPreview details={a.details} isChinese={isChinese} />
                                 {a.status === 'pending' ? (
                                     <div style={{ display: 'flex', gap: '8px' }}>
-                                        <button className="btn btn-primary" onClick={() => resolveApproval.mutate({ id: a.id, action: 'approve' })}>{t('common.confirm')}</button>
-                                        <button className="btn btn-danger" onClick={() => resolveApproval.mutate({ id: a.id, action: 'reject' })}>Reject</button>
+                                        <button
+                                            className="btn btn-primary"
+                                            disabled={resolveApproval.isPending || !isApprovalApprovable(a.details)}
+                                            title={!isApprovalApprovable(a.details)
+                                                ? (isChinese ? '审批内容未通过完整性校验，只能拒绝。' : 'Payload integrity is not verified; reject it.')
+                                                : undefined}
+                                            onClick={() => resolveApproval.mutate({ id: a.id, action: 'approve' })}
+                                        >
+                                            {t('common.confirm')}
+                                        </button>
+                                        <button className="btn btn-danger" disabled={resolveApproval.isPending} onClick={() => resolveApproval.mutate({ id: a.id, action: 'reject' })}>
+                                            {isChinese ? '拒绝' : 'Reject'}
+                                        </button>
                                     </div>
                                 ) : (
-                                    <span className={`badge ${a.status === 'approved' ? 'badge-success' : 'badge-error'}`}>
-                                        {a.status === 'approved' ? 'Approved' : 'Rejected'}
-                                    </span>
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                                        <span className={`badge ${a.status === 'approved' ? 'badge-success' : 'badge-error'}`}>
+                                            {a.status === 'approved' ? (isChinese ? '已批准' : 'Approved') : (isChinese ? '已拒绝' : 'Rejected')}
+                                        </span>
+                                        <span style={{ fontSize: 12, color: a.execution_status === 'ambiguous' ? 'var(--warning)' : 'var(--text-secondary)' }}>
+                                            {approvalExecutionLabel(a, isChinese)}
+                                        </span>
+                                        {approvalExecutionErrorLabel(a, isChinese) && (
+                                            <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
+                                                {approvalExecutionErrorLabel(a, isChinese)}
+                                            </span>
+                                        )}
+                                    </div>
                                 )}
                             </div>
                         ))}
@@ -1223,8 +1256,8 @@ export default function EnterpriseSettings() {
                                                                 </div>
                                                                 <button className="btn btn-secondary" style={{ padding: '4px 10px', fontSize: '11px' }} onClick={async () => {
                                                                     try {
-                                                                        const serverName = mcpForm.server_name || mcpForm.server_url;
-                                                                        await fetchJson('/tools', {
+                                                                        const serverName = mcpForm.server_name || defaultMcpServerName(mcpForm.server_url);
+                                                                        const created = await fetchJson<{ id: string; name: string }>('/tools', {
                                                                             method: 'POST', body: JSON.stringify({
                                                                                 name: `mcp_${tool.name}`,
                                                                                 display_name: tool.name,
@@ -1242,7 +1275,7 @@ export default function EnterpriseSettings() {
                                                                         });
                                                                         // Store API key on all tools from this server after creation
                                                                         if (mcpForm.api_key) {
-                                                                            await fetchJson('/tools/mcp-server', { method: 'PUT', body: JSON.stringify({ server_name: serverName, server_url: mcpForm.server_url, api_key: mcpForm.api_key, tenant_id: selectedTenantId || undefined }) });
+                                                                            await fetchJson('/tools/mcp-server', { method: 'PUT', body: JSON.stringify({ server_name: serverName, server_url: mcpForm.server_url, api_key: mcpForm.api_key, tool_ids: [created.id], tenant_id: selectedTenantId || undefined }) });
                                                                         }
                                                                         await loadAllTools();
                                                                     } catch (e: any) {
@@ -1255,11 +1288,12 @@ export default function EnterpriseSettings() {
                                                             <button className="btn btn-primary" style={{ padding: '6px 14px', fontSize: '12px' }} onClick={async () => {
                                                                 const tools = mcpTestResult.tools || [];
                                                                 let successCount = 0;
+                                                                const createdToolIds: string[] = [];
                                                                 const errors: string[] = [];
-                                                                const serverName = mcpForm.server_name || mcpForm.server_url;
+                                                                const serverName = mcpForm.server_name || defaultMcpServerName(mcpForm.server_url);
                                                                 for (const tool of tools) {
                                                                     try {
-                                                                        await fetchJson('/tools', {
+                                                                        const created = await fetchJson<{ id: string; name: string }>('/tools', {
                                                                             method: 'POST', body: JSON.stringify({
                                                                                 name: `mcp_${tool.name}`,
                                                                                 display_name: tool.name,
@@ -1275,6 +1309,7 @@ export default function EnterpriseSettings() {
                                                                                 tenant_id: selectedTenantId || undefined,
                                                                             })
                                                                         });
+                                                                        createdToolIds.push(created.id);
                                                                         successCount++;
                                                                     } catch (e: any) {
                                                                         errors.push(`${tool.name}: ${e.message}`);
@@ -1283,7 +1318,7 @@ export default function EnterpriseSettings() {
                                                                 // Store API key on all tools from this server in one request
                                                                 if (mcpForm.api_key && successCount > 0) {
                                                                     try {
-                                                                        await fetchJson('/tools/mcp-server', { method: 'PUT', body: JSON.stringify({ server_name: serverName, server_url: mcpForm.server_url, api_key: mcpForm.api_key, tenant_id: selectedTenantId || undefined }) });
+                                                                        await fetchJson('/tools/mcp-server', { method: 'PUT', body: JSON.stringify({ server_name: serverName, server_url: mcpForm.server_url, api_key: mcpForm.api_key, tool_ids: createdToolIds, tenant_id: selectedTenantId || undefined }) });
                                                                     } catch (e: any) {
                                                                         errors.push(`MCP credentials: ${e.message}`);
                                                                     }
@@ -1396,6 +1431,7 @@ export default function EnterpriseSettings() {
                                                             server_name: tool.mcp_server_name,
                                                             server_url: tool.mcp_server_url || '',
                                                             api_key: '',
+                                                            tool_ids: (allGrouped[category] || [tool]).map((item: any) => item.id),
                                                         })}
                                                     >
                                                         Edit Server
@@ -1621,6 +1657,7 @@ export default function EnterpriseSettings() {
                                                             server_url: editingMcpServer.server_url,
                                                             // Only send api_key if the user typed something; null = keep existing
                                                             api_key: editingMcpServer.api_key || undefined,
+                                                            tool_ids: editingMcpServer.tool_ids,
                                                             tenant_id: selectedTenantId || undefined,
                                                         })
                                                     });

@@ -3,19 +3,31 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 db_name="clawith_migration_smoke_${USER//[^a-zA-Z0-9_]/_}_$$"
+fresh_db_name="${db_name}_fresh"
 db_user="${PGUSER:-$USER}"
 db_host="${PGHOST:-127.0.0.1}"
 db_port="${PGPORT:-5432}"
 
 cleanup() {
   dropdb --if-exists --host "$db_host" --port "$db_port" --username "$db_user" "$db_name"
+  dropdb --if-exists --host "$db_host" --port "$db_port" --username "$db_user" "$fresh_db_name"
 }
 trap cleanup EXIT
 
 createdb --host "$db_host" --port "$db_port" --username "$db_user" "$db_name"
+createdb --host "$db_host" --port "$db_port" --username "$db_user" "$fresh_db_name"
 export DATABASE_URL="postgresql+asyncpg://${db_user}@${db_host}:${db_port}/${db_name}"
 
 cd "$repo_root/backend"
+
+# The bootstrap revision reflects current ORM metadata, so a true empty-db
+# install exercises a different path from the production-era reconstruction
+# below. Both must reach the one release head without duplicate DDL.
+DATABASE_URL="postgresql+asyncpg://${db_user}@${db_host}:${db_port}/${fresh_db_name}" \
+  .venv/bin/alembic upgrade head
+DATABASE_URL="postgresql+asyncpg://${db_user}@${db_host}:${db_port}/${fresh_db_name}" \
+  .venv/bin/alembic current | grep -F "durable_media_completion (head)"
+
 .venv/bin/alembic upgrade add_douyin_collab_publish_fields
 
 # Simulate a deployment already stamped beyond revisions that were later
@@ -145,11 +157,163 @@ INSERT INTO billing_rules (
 SQL
 
 .venv/bin/alembic upgrade disable_system_okr_automation
+# The bootstrap migration creates tables from current ORM metadata, while this
+# smoke deliberately reconstructs the pre-096 production epoch. Remove the
+# future constraint so duplicate historical grants can be seeded and 096 is
+# proven to quarantine them before recreating uniqueness.
+psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+ALTER TABLE agent_tools
+DROP CONSTRAINT IF EXISTS uq_agent_tools_agent_tool;
+ALTER TABLE approval_requests
+DROP CONSTRAINT IF EXISTS ck_approval_execution_state_consistency,
+DROP CONSTRAINT IF EXISTS ck_approval_execution_single_attempt,
+DROP CONSTRAINT IF EXISTS ck_approval_execution_status;
+DROP INDEX IF EXISTS uq_active_approval_request_fingerprint;
+DROP INDEX IF EXISTS ix_approval_execution_claimable;
+DROP INDEX IF EXISTS ix_approval_requests_execution_status;
+DROP INDEX IF EXISTS ix_approval_requests_execution_not_before;
+DROP INDEX IF EXISTS ix_approval_requests_request_fingerprint;
+DROP TABLE IF EXISTS production_issue_alert_deliveries CASCADE;
+ALTER TABLE approval_requests
+DROP COLUMN IF EXISTS execution_error_code,
+DROP COLUMN IF EXISTS execution_result_summary,
+DROP COLUMN IF EXISTS execution_attempts,
+DROP COLUMN IF EXISTS execution_finished_at,
+DROP COLUMN IF EXISTS execution_claimed_at,
+DROP COLUMN IF EXISTS execution_not_before,
+DROP COLUMN IF EXISTS execution_claim_token,
+DROP COLUMN IF EXISTS execution_status,
+DROP COLUMN IF EXISTS request_fingerprint;
+ALTER TABLE production_issues
+DROP CONSTRAINT IF EXISTS ck_production_issue_alert_attempts_nonnegative,
+DROP CONSTRAINT IF EXISTS ck_production_issue_alert_epoch_positive;
+DROP INDEX IF EXISTS ix_production_issues_alert_retry;
+ALTER TABLE production_issues
+DROP COLUMN IF EXISTS alert_notification_sent_at,
+DROP COLUMN IF EXISTS alert_last_error_code,
+DROP COLUMN IF EXISTS alert_next_attempt_at,
+DROP COLUMN IF EXISTS alert_attempts,
+DROP COLUMN IF EXISTS alert_epoch;
+SQL
 PYTHONPATH=. .venv/bin/python ../scripts/code-execution-migration-postgres-smoke.py seed
+
+# Install and execute the exact production rollback guard before 095. This
+# proves that an unsafe old process cannot resurrect MCP while migrations are
+# in flight, and that 095's narrowly scoped trusted GUC can still backfill the
+# one-company legacy rows.
+PYTHONPATH=. .venv/bin/python ../scripts/extract-deploy-mcp-sql.py quarantine | \
+  psql --host "$db_host" --port "$db_port" --username "$db_user" \
+    --dbname "$db_name" --set ON_ERROR_STOP=1 \
+    --set snapshot_id=migration-smoke
+
+psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+UPDATE tools
+SET tenant_id = '07500000-0000-4000-8000-000000000062',
+    source = 'admin',
+    type = 'builtin',
+    is_default = true,
+    enabled = true,
+    mcp_server_url = 'https://unsafe-change.example/mcp',
+    config = '{"api_key":"unsafe-change"}'::json
+WHERE id = '07500000-0000-4000-8000-000000000070';
+INSERT INTO tools (
+  id, name, display_name, description, type, category, icon,
+  parameters_schema, config, config_schema, mcp_server_url,
+  mcp_server_name, mcp_tool_name, enabled, is_default, source, tenant_id
+) VALUES (
+  '07500000-0000-4000-8000-000000000073',
+  'guard_created_mcp', 'Guard-created MCP', '', 'mcp', 'mcp', 'M',
+  '{}'::json, '{"api_key":"old-writer-secret"}'::json, '{}'::json,
+  'https://old-writer.example/mcp', 'Old writer', 'run', true, true,
+  'agent', '07500000-0000-4000-8000-000000000002'
+);
+INSERT INTO agent_tools (
+  id, agent_id, tool_id, enabled, config, source
+) VALUES (
+  '07500000-0000-4000-8000-000000000074',
+  '07500000-0000-4000-8000-000000000061',
+  '07500000-0000-4000-8000-000000000073',
+  true, '{"api_key":"old-writer-secret"}'::json, 'user_installed'
+);
+UPDATE agent_tools
+SET tool_id = '07500000-0000-4000-8000-000000000071',
+    agent_id = '07500000-0000-4000-8000-000000000064',
+    enabled = true,
+    config = '{"api_key":"rebound-secret"}'::json
+WHERE agent_id = '07500000-0000-4000-8000-000000000061'
+  AND tool_id = '07500000-0000-4000-8000-000000000070';
+DELETE FROM tools WHERE id = '07500000-0000-4000-8000-000000000070';
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM tools
+    WHERE id = '07500000-0000-4000-8000-000000000070'
+      AND type = 'mcp' AND source = 'agent' AND tenant_id IS NULL
+      AND is_default = false AND enabled = false
+      AND mcp_server_url IS NULL AND config::jsonb = '{}'::jsonb
+  ) THEN
+    RAISE EXCEPTION 'quarantine guard allowed Tool mutation or deletion';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM tools
+    WHERE id = '07500000-0000-4000-8000-000000000073'
+      AND type = 'mcp' AND is_default = false AND enabled = false
+      AND mcp_server_url IS NULL AND config::jsonb = '{}'::jsonb
+  ) THEN
+    RAISE EXCEPTION 'quarantine guard allowed unsafe MCP insert';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM agent_tools
+    WHERE id = '07500000-0000-4000-8000-000000000074'
+      AND enabled = false AND config::jsonb = '{}'::jsonb
+  ) THEN
+    RAISE EXCEPTION 'quarantine guard allowed unsafe assignment insert';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM agent_tools
+    WHERE agent_id = '07500000-0000-4000-8000-000000000061'
+      AND tool_id = '07500000-0000-4000-8000-000000000070'
+      AND enabled = false AND config::jsonb = '{}'::jsonb
+  ) THEN
+    RAISE EXCEPTION 'quarantine guard allowed assignment identity mutation';
+  END IF;
+END $$;
+SQL
+
+PYTHONPATH=. .venv/bin/python -m app.scripts.secure_mcp_quarantine migration-smoke
 .venv/bin/alembic upgrade head
-.venv/bin/alembic current | grep -F "secure_code_execution_defaults (head)"
+.venv/bin/alembic current | grep -F "durable_media_completion (head)"
+
+# 095 must turn its trusted bypass back off before commit; the still-pending
+# guard therefore continues to reject an ordinary writer after migration.
+psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+UPDATE tools
+SET enabled = true,
+    mcp_server_url = 'https://post-migration-writer.example/mcp',
+    config = '{"api_key":"post-migration-secret"}'::json
+WHERE id = '07500000-0000-4000-8000-000000000070';
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM tools
+    WHERE id = '07500000-0000-4000-8000-000000000070'
+      AND tenant_id = '07500000-0000-4000-8000-000000000002'
+      AND enabled = false AND mcp_server_url IS NULL
+      AND config::jsonb = '{}'::jsonb
+  ) THEN
+    RAISE EXCEPTION '095 bypass leaked beyond the trusted migration';
+  END IF;
+END $$;
+SQL
+
+PYTHONPATH=. .venv/bin/python ../scripts/extract-deploy-mcp-sql.py restore | \
+  psql --host "$db_host" --port "$db_port" --username "$db_user" \
+    --dbname "$db_name" --set ON_ERROR_STOP=1 \
+    --set snapshot_id=migration-smoke
 PYTHONPATH=. .venv/bin/python ../scripts/code-execution-migration-postgres-smoke.py assert-secured
 PYTHONPATH=. .venv/bin/python ../scripts/code-execution-migration-postgres-smoke.py run-seeder-and-assert
+PYTHONPATH=. .venv/bin/python ../scripts/code-execution-migration-postgres-smoke.py assert-agent-tool-upsert
+PYTHONPATH=. .venv/bin/python ../scripts/mcp-import-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/plan-update-postgres-smoke.py
 
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
@@ -175,8 +339,29 @@ BEGIN
   ) THEN
     RAISE EXCEPTION 'missing bounded media recovery counter';
   END IF;
+  IF (
+    SELECT count(*) FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'media_generation_tasks'
+      AND column_name IN (
+        'origin_session_id', 'completion_message_id', 'output_size',
+        'completion_delivery_status', 'realtime_attempt_count',
+        'realtime_next_attempt_at', 'realtime_published_at',
+        'realtime_last_error'
+      )
+  ) <> 8 OR NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'media_generation_tasks'::regclass
+      AND conname = 'ck_media_generation_completion_delivery_status'
+  ) OR NOT EXISTS (
+    SELECT 1 FROM pg_indexes
+    WHERE schemaname = 'public' AND tablename = 'media_generation_tasks'
+      AND indexname = 'ix_media_generation_completion_outbox'
+  ) THEN
+    RAISE EXCEPTION 'missing durable media completion delivery contract';
+  END IF;
   IF to_regclass('public.production_issues') IS NULL
-    OR to_regclass('public.production_issue_events') IS NULL THEN
+    OR to_regclass('public.production_issue_events') IS NULL
+    OR to_regclass('public.production_issue_alert_deliveries') IS NULL THEN
     RAISE EXCEPTION 'missing production issue monitoring tables';
   END IF;
   IF NOT EXISTS (
@@ -189,6 +374,25 @@ BEGIN
       AND indexname = 'ix_production_issue_events_issue_created'
   ) THEN
     RAISE EXCEPTION 'missing production issue monitoring indexes';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_indexes
+    WHERE schemaname = 'public'
+      AND tablename = 'production_issue_alert_deliveries'
+      AND indexname = 'ix_production_issue_alert_delivery_due'
+  ) OR NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'production_issues'
+      AND column_name = 'alert_epoch'
+  ) THEN
+    RAISE EXCEPTION 'missing durable production issue alert outbox contract';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'production_issue_alert_deliveries'::regclass
+      AND conname = 'ck_production_issue_alert_delivery_state'
+  ) THEN
+    RAISE EXCEPTION 'missing production issue alert delivery state constraint';
   END IF;
   IF NOT EXISTS (
     SELECT 1 FROM information_schema.columns
@@ -520,12 +724,13 @@ BEGIN
 END $$;
 SQL
 .venv/bin/alembic upgrade head
-.venv/bin/alembic current | grep -F "secure_code_execution_defaults (head)"
+.venv/bin/alembic current | grep -F "durable_media_completion (head)"
 PYTHONPATH=. .venv/bin/python ../scripts/code-execution-migration-postgres-smoke.py assert-secured
 
 PYTHONPATH=. .venv/bin/python ../scripts/a2a-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/media-generation-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/production-issue-postgres-smoke.py
+PYTHONPATH=. .venv/bin/python ../scripts/approval-execution-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/chat-tier-preference-postgres-smoke.py
 
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
@@ -550,7 +755,7 @@ FROM users
 WHERE id = '07500000-0000-4000-8000-000000000070';
 SQL
 .venv/bin/alembic upgrade head
-.venv/bin/alembic current | grep -F "secure_code_execution_defaults (head)"
+.venv/bin/alembic current | grep -F "durable_media_completion (head)"
 PYTHONPATH=. .venv/bin/python ../scripts/code-execution-migration-postgres-smoke.py assert-secured
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 --tuples-only --no-align <<'SQL' | grep -Fx 'ultra|7'
 SELECT preferred_chat_tier || '|' || preferred_chat_tier_revision

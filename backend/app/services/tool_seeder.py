@@ -1,13 +1,19 @@
 """Seed builtin tools into the database on startup."""
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from app.database import async_session
 from app.models.tenant import Tenant
 from app.models.tenant_setting import TenantSetting
 from app.models.tool import Tool
 from app.services.llm.finish import FINISH_TOOL_SEED
-from app.services.tool_config import meaningful_config, tenant_tool_config_key
+from app.services.tool_config import (
+    encrypt_sensitive_fields,
+    meaningful_config,
+    tenant_tool_config_key,
+)
+from app.services.code_execution_policy import CODE_EXECUTION_TOOL_NAMES
+from app.services.agent_tool_assignments import upsert_agent_tool
 
 SYNC_IS_DEFAULT_TOOL_NAMES = {
     "finish",
@@ -3578,6 +3584,11 @@ BUILTIN_TOOLS = [
     *OKR_BUILTIN_TOOLS,
     *DEPLOY_BUILTIN_TOOLS,
 ]
+BUILTIN_TOOL_NAMES = frozenset(tool["name"] for tool in BUILTIN_TOOLS)
+
+
+def is_registered_builtin_tool_name(name: str) -> bool:
+    return str(name or "") in BUILTIN_TOOL_NAMES
 
 
 async def seed_builtin_tools():
@@ -3708,7 +3719,13 @@ async def seed_builtin_tools():
                         )
                     )
                     if not check.scalar_one_or_none():
-                        db.add(AgentTool(agent_id=agent_id, tool_id=tool_id, enabled=True))
+                        await upsert_agent_tool(
+                            db,
+                            agent_id=agent_id,
+                            tool_id=tool_id,
+                            enabled=True,
+                            on_conflict="preserve",
+                        )
             logger.info(f"[ToolSeeder] Auto-assigned {len(new_tool_ids)} new tools to {len(agent_ids)} agents")
 
         # AgentBay desktop window helpers are non-default tools, but should be
@@ -3748,7 +3765,13 @@ async def seed_builtin_tools():
                         )
                     )
                     if not existing_assignment.scalar_one_or_none():
-                        db.add(AgentTool(agent_id=agent_id, tool_id=helper_tool.id, enabled=True))
+                        await upsert_agent_tool(
+                            db,
+                            agent_id=agent_id,
+                            tool_id=helper_tool.id,
+                            enabled=True,
+                            on_conflict="preserve",
+                        )
                         assigned_count += 1
             if assigned_count:
                 logger.info(
@@ -3784,7 +3807,13 @@ async def seed_builtin_tools():
                         )
                     )
                     if not existing_assignment.scalar_one_or_none():
-                        db.add(AgentTool(agent_id=agent_id, tool_id=helper_tool.id, enabled=True))
+                        await upsert_agent_tool(
+                            db,
+                            agent_id=agent_id,
+                            tool_id=helper_tool.id,
+                            enabled=True,
+                            on_conflict="preserve",
+                        )
                         browser_assigned_count += 1
             if browser_assigned_count:
                 logger.info(
@@ -3800,6 +3829,31 @@ async def seed_builtin_tools():
                 await db.delete(obsolete)
                 logger.info(f"[ToolSeeder] Removed obsolete tool: {obsolete_name}")
 
+        # A row marked builtin is executable only when it is present in the
+        # source-controlled catalog. Fail closed on drift instead of exposing
+        # an unknown name that the dispatcher may incorrectly route as MCP.
+        stale_builtin_r = await db.execute(
+            select(Tool).where(
+                or_(Tool.source == "builtin", Tool.type == "builtin"),
+                Tool.name.not_in(BUILTIN_TOOL_NAMES),
+            )
+        )
+        stale_builtins = list(stale_builtin_r.scalars().all())
+        if stale_builtins:
+            stale_ids = [tool.id for tool in stale_builtins]
+            stale_assignments_r = await db.execute(
+                select(AgentTool).where(AgentTool.tool_id.in_(stale_ids))
+            )
+            for assignment in stale_assignments_r.scalars().all():
+                assignment.enabled = False
+            for tool in stale_builtins:
+                tool.enabled = False
+                tool.is_default = False
+            logger.warning(
+                "[ToolSeeder] Quarantined stale builtin tools count={}",
+                len(stale_builtins),
+            )
+
         # Legacy deployments stored company credentials for builtin tools in
         # the global tools.config row. Move those values into the first tenant's
         # tenant_settings once, then clear the global row so new companies do
@@ -3810,6 +3864,10 @@ async def seed_builtin_tools():
             builtin_config_tools_r = await db.execute(select(Tool).where(Tool.source == "builtin"))
             migrated = 0
             for tool in builtin_config_tools_r.scalars().all():
+                # Code isolation/provider values are platform controls. Never
+                # reinterpret a legacy global value as one company's override.
+                if tool.name in CODE_EXECUTION_TOOL_NAMES:
+                    continue
                 if not (tool.config_schema or {}).get("fields"):
                     continue
                 legacy_config = meaningful_config(tool.config or {})
@@ -3843,6 +3901,50 @@ async def seed_builtin_tools():
                     f"[ToolSeeder] Migrated {migrated} legacy builtin tool config(s) "
                     f"to tenant_settings for tenant {first_tenant.id}"
                 )
+
+        # Encrypt legacy MCP config secrets in place. Older application
+        # versions already decrypt these canonical fields, so this hardening is
+        # compatible with a blue/green overlap. URL query credentials are not
+        # rewritten here because old runtimes do not understand the split
+        # field; production deployment preflight blocks such rows explicitly.
+        mcp_tools_r = await db.execute(select(Tool).where(Tool.type == "mcp"))
+        mcp_tools = mcp_tools_r.scalars().all()
+        encrypted_tool_configs = 0
+        for mcp_tool in mcp_tools:
+            if mcp_tool.mcp_server_name == "Atlassian Rovo":
+                secured_config = {}
+            else:
+                secured_config = encrypt_sensitive_fields(
+                    mcp_tool.config or {},
+                    mcp_tool.config_schema,
+                )
+            if secured_config != (mcp_tool.config or {}):
+                mcp_tool.config = secured_config
+                encrypted_tool_configs += 1
+
+        mcp_assignments_r = await db.execute(
+            select(AgentTool, Tool)
+            .join(Tool, Tool.id == AgentTool.tool_id)
+            .where(Tool.type == "mcp")
+        )
+        encrypted_assignment_configs = 0
+        for assignment, mcp_tool in mcp_assignments_r.all():
+            if mcp_tool.mcp_server_name == "Atlassian Rovo":
+                secured_config = {}
+            else:
+                secured_config = encrypt_sensitive_fields(
+                    assignment.config or {},
+                    mcp_tool.config_schema,
+                )
+            if secured_config != (assignment.config or {}):
+                assignment.config = secured_config
+                encrypted_assignment_configs += 1
+        if encrypted_tool_configs or encrypted_assignment_configs:
+            logger.info(
+                "[ToolSeeder] Hardened legacy MCP configs tool_count={} assignment_count={}",
+                encrypted_tool_configs,
+                encrypted_assignment_configs,
+            )
 
         await db.commit()
         logger.info("[ToolSeeder] Builtin tools seeded")
@@ -3917,20 +4019,14 @@ ATLASSIAN_ROVO_CONFIG_TOOL = {
 async def seed_atlassian_rovo_config():
     """Ensure the Atlassian Rovo platform config tool exists in the database.
 
-    If the env var ATLASSIAN_API_KEY is set, it will be written into the tool config
-    so the platform is immediately ready without manual UI setup.
+    A platform environment key may be used transiently for schema discovery,
+    but tenantless Tool rows never persist it.
     """
-    import os
-    env_key = os.environ.get("ATLASSIAN_API_KEY", "").strip()
-
     async with async_session() as db:
         t = ATLASSIAN_ROVO_CONFIG_TOOL
         result = await db.execute(select(Tool).where(Tool.name == t["name"]))
         existing = result.scalar_one_or_none()
         if not existing:
-            initial_config = dict(t["config"])
-            if env_key:
-                initial_config["api_key"] = env_key
             tool = Tool(
                 name=t["name"],
                 display_name=t["display_name"],
@@ -3940,7 +4036,7 @@ async def seed_atlassian_rovo_config():
                 icon=t["icon"],
                 is_default=t["is_default"],
                 parameters_schema=t["parameters_schema"],
-                config=initial_config,
+                config={},
                 config_schema=t["config_schema"],
                 mcp_server_url=ATLASSIAN_ROVO_MCP_URL,
                 mcp_server_name="Atlassian Rovo",
@@ -3957,20 +4053,34 @@ async def seed_atlassian_rovo_config():
             if existing.mcp_server_url != ATLASSIAN_ROVO_MCP_URL:
                 existing.mcp_server_url = ATLASSIAN_ROVO_MCP_URL
                 updated = True
-            # Write env key into DB if not already stored
-            if env_key and (not existing.config or not existing.config.get("api_key")):
-                existing.config = {**(existing.config or {}), "api_key": env_key}
+            if existing.config:
+                existing.config = {}
                 updated = True
             if updated:
                 await db.commit()
                 logger.info("[ToolSeeder] Updated Atlassian Rovo config tool")
 
+        legacy_tools_r = await db.execute(
+            select(Tool).where(
+                Tool.type == "mcp",
+                Tool.mcp_server_name == "Atlassian Rovo",
+            )
+        )
+        scrubbed = 0
+        for legacy_tool in legacy_tools_r.scalars().all():
+            if legacy_tool.config:
+                legacy_tool.config = {}
+                scrubbed += 1
+        if scrubbed:
+            await db.commit()
+            logger.info(
+                "[ToolSeeder] Scrubbed global Atlassian credential copies count={}",
+                scrubbed,
+            )
+
 
 async def get_atlassian_api_key() -> str:
-    """Read the Atlassian API key from the platform config tool."""
-    async with async_session() as db:
-        result = await db.execute(select(Tool).where(Tool.name == "atlassian_rovo"))
-        tool = result.scalar_one_or_none()
-        if tool and tool.config:
-            return tool.config.get("api_key", "")
-    return ""
+    """Return the transient platform discovery key without persisting it."""
+    import os
+
+    return os.environ.get("ATLASSIAN_API_KEY", "").strip()

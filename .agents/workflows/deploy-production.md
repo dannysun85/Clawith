@@ -19,8 +19,9 @@
 
 1. 确认当前分支、完整 commit、`backend/VERSION` 和发布说明一致，工作区干净。
 2. Alembic 必须只有一个 head，并完成 PostgreSQL 升级、降级、再升级 smoke。
-3. 后端全量 pytest、前端测试与 `npm run build`、部署契约测试、Ruff 变更文件
-   检查和 `git diff --check` 全部通过。
+3. 后端全量 pytest、前端测试与 `npm run build`、部署契约测试、Ruff Git
+   基线差异检查（不得新增 violation）和 `git diff --check` 全部通过。历史存量
+   Ruff 告警不作为本次伪失败，但新增文件或新增问题必须阻断发布。
 4. 至少完成一次独立 code review 和 architecture review；存在 `REQUEST CHANGES`
    或 `BLOCKED` 时禁止打发布标签或部署。
 5. 本地 Git 保存候选提交和证据；本项目不要求把代码上传 GitHub。
@@ -64,12 +65,37 @@ Docker 控制权重新交给通用 API/worker。
 bash scripts/deploy-astra-production.sh
 ```
 
-该脚本负责本地发布检查、不可变发布包、远程蓝绿部署、Nginx 校验、版本/commit
-身份校验、单 worker 交接和失败回滚。不得使用 `ALLOW_DIRTY=1` 发布正式版本。
+该脚本负责不可跳过的本地全量检查、由已审查 commit 直接生成的不可变发布包、
+包内 commit 与远端 SHA-256 双重校验、远程蓝绿部署、Nginx 校验、版本/commit
+身份校验、单 worker 交接和失败回滚。脏工作区会直接失败，不存在
+`ALLOW_DIRTY` 或 `RUN_LOCAL_CHECKS=0` 的正式发布旁路。
 
-如获准执行真实账号 smoke，使用临时、最小权限的环境变量并设置
-`RUN_REMOTE_SMOKE=1`；临时凭据文件必须由脚本清理，报告只记录通过/失败和 trace
-ID，不记录凭据。
+真实账号 smoke 默认必跑（`RUN_REMOTE_SMOKE=1`），使用临时、最小权限的环境变量；
+临时凭据文件必须由脚本清理，报告只记录通过/失败和 trace ID，不记录凭据。只有
+紧急恢复才允许 `RUN_REMOTE_SMOKE=0`，且必须同时提供带审批号、一次性随机
+`approval_nonce`、审批人、原因、目标版本、完整 commit、签发时间和未过期 UTC 时间的
+`REMOTE_SMOKE_BREAK_GLASS_ARTIFACT`。字段不得为空或重复，审批有效期最长 4 小时；
+`approval_nonce` 只有在包含完整原始审批、文件 SHA-256、nonce SHA-256、版本和完整
+commit 的 root-owned 证据完成 fsync 并原子发布后才算消费；发布前中断可安全重试，
+发布后失败必须取得新审批。该证据不能以口头说明、空文件、重放旧审批或同版本其他
+提交的审批替代。
+
+普通发布只验证、不自动安装主机防火墙。首次发布本合同前，平台管理员必须另行
+授权并在生产主机执行：
+
+```bash
+sudo bash scripts/manage-production-mcp-egress-guard.sh install \
+  astra_network deploy/security-contracts/mcp-egress-v1
+```
+
+该操作安装 root-owned `DOCKER-USER` 出网规则和 systemd watchdog：应用网络保留
+内部 PostgreSQL/Redis/服务通信以及现有产品所需的公网端口，私网、loopback、
+link-local、metadata、benchmark 和保留地址全部拒绝。MCP 的 HTTPS、DNS 解析和
+connected-peer 校验仍由应用层独立执行；主机层不把整个共享应用网络误收窄为
+53/443。规则修复先插入临时 REJECT 栅栏，完整链和唯一首条 jump 校验成功后才
+移除，禁止瞬时 fail-open。普通部署在备份、维护窗口和迁移之前核对合同 SHA-256、
+network subnet、规则顺序和 watchdog marker；缺失或漂移时停止发布。安装或修改
+该规则属于独立的生产主机安全变更，必须先验证现有公网集成与内部服务均正常。
 
 ## 5. 发布后验收
 

@@ -50,10 +50,26 @@ def test_assignment_cannot_expose_foreign_admin_tool():
     )
 
 
-def test_agent_installed_tools_require_explicit_assignment():
+def test_agent_installed_tools_require_assignment_and_exact_tenant():
     tenant_id = uuid.uuid4()
     tool_id = uuid.uuid4()
-    installed_tool = make_tool(source="agent", id=tool_id, tenant_id=uuid.uuid4())
+    installed_tool = make_tool(source="agent", id=tool_id, tenant_id=tenant_id)
+    foreign_tool = make_tool(
+        source="agent",
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+    )
+    ownerless_tool = make_tool(source="agent", id=uuid.uuid4(), tenant_id=None)
 
     assert _tool_record_visible_to_agent(installed_tool, tenant_id, {}) is False
     assert _tool_record_visible_to_agent(installed_tool, tenant_id, {str(tool_id): object()}) is True
+    assert _tool_record_visible_to_agent(
+        foreign_tool,
+        tenant_id,
+        {str(foreign_tool.id): object()},
+    ) is False
+    assert _tool_record_visible_to_agent(
+        ownerless_tool,
+        tenant_id,
+        {str(ownerless_tool.id): object()},
+    ) is False

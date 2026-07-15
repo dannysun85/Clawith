@@ -7,19 +7,24 @@ import hashlib
 import re
 import uuid
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
 from loguru import logger
-from sqlalchemy import case, delete, func, or_, select
+from sqlalchemy import and_, case, delete, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.config import get_settings
 from app.database import async_session
 from app.models.agent import Agent
 from app.models.notification import Notification
-from app.models.production_issue import ProductionIssue, ProductionIssueEvent
+from app.models.production_issue import (
+    ProductionIssue,
+    ProductionIssueAlertDelivery,
+    ProductionIssueEvent,
+)
 from app.models.user import Identity, User
 
 
@@ -28,9 +33,18 @@ _LONG_NUMBER_RE = re.compile(r"(?<![A-Za-z])\d{6,}(?![A-Za-z])")
 _SECRETISH_RE = re.compile(r"(?i)(bearer\s+\S+|sk-[A-Za-z0-9_-]{8,}|api[_ -]?key\s*[:=]\s*\S+)")
 _ALLOWED_SEVERITIES = {"warning", "error", "critical"}
 _FAILED_CAPTURE_QUEUE_LIMIT = 1000
+PRODUCTION_ISSUE_MONITOR_MAX_CONSECUTIVE_FAILURES = 5
+PRODUCTION_ISSUE_ALERT_CLAIM_LEASE_SECONDS = 90
+PRODUCTION_ISSUE_ALERT_BATCH_SIZE = 20
+PRODUCTION_ISSUE_ALERT_MAX_CONCURRENCY = 4
 _failed_capture_queue: deque[dict[str, Any]] = deque(
     maxlen=_FAILED_CAPTURE_QUEUE_LIMIT
 )
+_monitor_started_at: datetime | None = None
+_monitor_last_db_loop_success_at: datetime | None = None
+_monitor_oldest_due_delivery_age_seconds = 0.0
+_monitor_consecutive_db_failures = 0
+_monitor_interval_seconds = 30
 _ALLOWED_METADATA_KEYS = {
     "status_code",
     "error_type",
@@ -54,6 +68,17 @@ _ALLOWED_METADATA_KEYS = {
     "close_code",
     "release_version",
 }
+
+
+@dataclass(frozen=True)
+class AlertDeliveryClaim:
+    delivery_id: uuid.UUID
+    issue_id: uuid.UUID
+    alert_epoch: int
+    sink: str
+    idempotency_key: str
+    claim_token: uuid.UUID
+    payload: dict[str, Any]
 
 
 def _safe_operational_text(value: Any, max_length: int) -> str:
@@ -177,6 +202,7 @@ async def record_production_issue(
     """Persist one occurrence and update its rollup; never break the caller."""
 
     try:
+        settings = get_settings()
         now = datetime.now(timezone.utc)
         severity = severity if severity in _ALLOWED_SEVERITIES else "error"
         normalized_route = normalize_issue_route(route)
@@ -185,7 +211,7 @@ async def record_production_issue(
         normalized_category = _safe_operational_text(category, 64).lower() or "unknown"
         normalized_error_code = _safe_operational_text(error_code, 100) if error_code else None
         clean_metadata = sanitize_issue_metadata(metadata)
-        release_version = str(clean_metadata.get("release_version") or get_settings().APP_VERSION)[:50]
+        release_version = str(clean_metadata.get("release_version") or settings.APP_VERSION)[:50]
         fingerprint = issue_fingerprint(
             source=normalized_source,
             category=normalized_category,
@@ -222,6 +248,7 @@ async def record_production_issue(
                 last_trace_id=(str(trace_id)[:64] if trace_id else None),
                 release_version=release_version,
                 last_metadata=clean_metadata or None,
+                alert_epoch=1,
             )
             .on_conflict_do_update(
                 index_elements=[ProductionIssue.fingerprint],
@@ -250,16 +277,40 @@ async def record_production_issue(
                         (ProductionIssue.status == "resolved", None),
                         else_=ProductionIssue.alerted_at,
                     ),
+                    "alert_epoch": case(
+                        (
+                            ProductionIssue.status == "resolved",
+                            ProductionIssue.alert_epoch + 1,
+                        ),
+                        else_=ProductionIssue.alert_epoch,
+                    ),
+                    "alert_attempts": case(
+                        (ProductionIssue.status == "resolved", 0),
+                        else_=ProductionIssue.alert_attempts,
+                    ),
+                    "alert_next_attempt_at": case(
+                        (ProductionIssue.status == "resolved", None),
+                        else_=ProductionIssue.alert_next_attempt_at,
+                    ),
+                    "alert_last_error_code": case(
+                        (ProductionIssue.status == "resolved", None),
+                        else_=ProductionIssue.alert_last_error_code,
+                    ),
+                    "alert_notification_sent_at": case(
+                        (ProductionIssue.status == "resolved", None),
+                        else_=ProductionIssue.alert_notification_sent_at,
+                    ),
                 },
             )
-            .returning(ProductionIssue.id)
+            .returning(ProductionIssue)
         )
         async with async_session() as db:
             if tenant_id is None and agent_id is not None:
                 tenant_id = await db.scalar(
                     select(Agent.tenant_id).where(Agent.id == agent_id)
                 )
-            issue_id = (await db.execute(statement)).scalar_one()
+            issue = (await db.execute(statement)).scalar_one()
+            issue_id = issue.id
             db.add(ProductionIssueEvent(
                 issue_id=issue_id,
                 tenant_id=tenant_id,
@@ -272,6 +323,11 @@ async def record_production_issue(
                 metadata_json=clean_metadata or None,
                 created_at=now,
             ))
+            if issue_requires_alert(
+                issue,
+                threshold=max(int(settings.PRODUCTION_ISSUE_ALERT_THRESHOLD), 1),
+            ):
+                await _enqueue_issue_alert_deliveries(db, issue, settings=settings)
             await db.commit()
         return issue_id
     except Exception as exc:
@@ -316,49 +372,188 @@ def issue_requires_alert(issue: ProductionIssue, threshold: int) -> bool:
     )
 
 
+def _production_issue_alert_payload(issue: ProductionIssue) -> dict[str, Any]:
+    """Freeze a privacy-safe webhook payload for one alert epoch."""
+
+    return {
+        "issue_id": str(issue.id),
+        "alert_epoch": int(issue.alert_epoch or 1),
+        "severity": issue.severity,
+        "category": issue.category,
+        "summary": _safe_summary(issue.summary),
+        "route": normalize_issue_route(issue.route),
+        "operation": _safe_operational_text(issue.operation, 100)
+        if issue.operation
+        else None,
+        "event_count": int(issue.event_count or 0),
+        "last_seen_at": issue.last_seen_at.isoformat(),
+        "release_version": _safe_operational_text(issue.release_version, 50)
+        if issue.release_version
+        else None,
+    }
+
+
+async def _enqueue_issue_alert_deliveries(
+    db,
+    issue: ProductionIssue,
+    *,
+    settings,
+) -> None:
+    """Insert each required alert sink once in the aggregation transaction."""
+
+    epoch = int(issue.alert_epoch or 1)
+    existing_sinks = set(
+        (
+            await db.execute(
+                select(ProductionIssueAlertDelivery.sink).where(
+                    ProductionIssueAlertDelivery.issue_id == issue.id,
+                    ProductionIssueAlertDelivery.alert_epoch == epoch,
+                )
+            )
+        ).scalars().all()
+    )
+    # Freeze the real sink set once an epoch has been enqueued. This prevents a
+    # later configuration change from silently adding a new required delivery
+    # to an incident that is already being processed.
+    real_existing_sinks = existing_sinks - {"missing_sink"}
+    if real_existing_sinks:
+        return
+
+    sinks: list[str] = []
+    if (settings.SAAS_ADMIN_EMAIL or "").strip():
+        sinks.append("notification")
+    if (settings.PRODUCTION_ISSUE_ALERT_WEBHOOK_URL or "").strip():
+        sinks.append("webhook")
+    if not sinks:
+        sinks.append("missing_sink")
+    elif "missing_sink" in existing_sinks:
+        # A missing-sink row is an operational placeholder, not a real
+        # delivery. Replace it once an operator configures a usable sink.
+        await db.execute(
+            delete(ProductionIssueAlertDelivery).where(
+                ProductionIssueAlertDelivery.issue_id == issue.id,
+                ProductionIssueAlertDelivery.alert_epoch == epoch,
+                ProductionIssueAlertDelivery.sink == "missing_sink",
+            )
+        )
+    payload = _production_issue_alert_payload(issue)
+    for sink in sinks:
+        idempotency_key = f"production-issue:{issue.id}:{epoch}:{sink}"
+        await db.execute(
+            pg_insert(ProductionIssueAlertDelivery)
+            .values(
+                id=uuid.uuid4(),
+                issue_id=issue.id,
+                alert_epoch=epoch,
+                sink=sink,
+                idempotency_key=idempotency_key,
+                status="pending",
+                payload_snapshot=payload,
+                attempts=0,
+            )
+            .on_conflict_do_nothing(
+                index_elements=[
+                    ProductionIssueAlertDelivery.issue_id,
+                    ProductionIssueAlertDelivery.alert_epoch,
+                    ProductionIssueAlertDelivery.sink,
+                ]
+            )
+        )
+
+
 def _production_issue_alert_log_level(severity: str) -> str:
     """Keep warning-class incidents out of the platform error log stream."""
     return "warning" if severity == "warning" else "error"
 
 
-def _production_issue_notification(issue: ProductionIssue, user_id: uuid.UUID) -> Notification:
+def _production_issue_notification_ref_id(
+    issue_id: uuid.UUID,
+    alert_epoch: int,
+) -> uuid.UUID:
+    """Stable notification identity that remains distinct across reopen epochs."""
+
+    return uuid.uuid5(issue_id, f"astra-production-alert:{alert_epoch}")
+
+
+def _production_issue_notification(
+    issue: ProductionIssue,
+    user_id: uuid.UUID,
+    *,
+    payload: dict[str, Any] | None = None,
+    alert_epoch: int | None = None,
+) -> Notification:
+    snapshot = payload if payload is not None else {}
+    severity = str(snapshot.get("severity") or issue.severity)
     level = {
         "critical": "严重",
         "error": "错误",
         "warning": "警告",
-    }.get(issue.severity, "错误")
-    location = issue.route or issue.operation or issue.category
+    }.get(severity, "错误")
+    summary = _safe_summary(str(snapshot.get("summary") or issue.summary))
+    event_count = int(snapshot.get("event_count") or issue.event_count or 0)
+    location = (
+        snapshot.get("route")
+        or snapshot.get("operation")
+        or snapshot.get("category")
+        or issue.route
+        or issue.operation
+        or issue.category
+    )
+    frozen_epoch = int(
+        alert_epoch
+        or snapshot.get("alert_epoch")
+        or getattr(issue, "alert_epoch", 1)
+        or 1
+    )
     return Notification(
         user_id=user_id,
         type="system",
         title=f"[{level}] 生产问题告警",
-        body=f"{issue.summary} · {issue.event_count} 次 · {location}",
+        body=f"{summary} · {event_count} 次 · {location}",
         link="/admin/saas?tab=production-issues",
-        ref_id=issue.id,
+        ref_id=_production_issue_notification_ref_id(
+            issue.id,
+            frozen_epoch,
+        ),
         sender_name="Astra Monitor",
     )
 
 
-async def dispatch_production_issue_alerts() -> int:
-    """Emit first-alert logs and optionally deliver a privacy-safe webhook."""
+def _alert_retry_delay_seconds(attempts: int) -> int:
+    return min(30 * (2 ** min(max(attempts, 1) - 1, 7)), 3600)
+
+
+def _schedule_alert_retry(
+    target,
+    *,
+    now: datetime,
+    error_code: str,
+) -> None:
+    """Persist bounded exponential backoff without marking delivery complete."""
+
+    target.alert_attempts = int(target.alert_attempts or 0) + 1
+    target.alert_next_attempt_at = now + timedelta(
+        seconds=_alert_retry_delay_seconds(target.alert_attempts)
+    )
+    target.alert_last_error_code = _safe_operational_text(error_code, 100)
+
+
+async def _claim_production_issue_alert_deliveries() -> list[AlertDeliveryClaim]:
+    """Claim a bounded batch and commit before any external operation."""
+
+    global _monitor_oldest_due_delivery_age_seconds
 
     settings = get_settings()
     threshold = max(int(settings.PRODUCTION_ISSUE_ALERT_THRESHOLD), 1)
     now = datetime.now(timezone.utc)
+    stale_cutoff = now - timedelta(
+        seconds=PRODUCTION_ISSUE_ALERT_CLAIM_LEASE_SECONDS
+    )
+    claims: list[AlertDeliveryClaim] = []
     async with async_session() as db:
-        owner_ids: list[uuid.UUID] = []
-        owner_email = (settings.SAAS_ADMIN_EMAIL or "").strip().lower()
-        if owner_email:
-            owner_result = await db.execute(
-                select(User.id)
-                .join(Identity, User.identity_id == Identity.id)
-                .where(
-                    func.lower(Identity.email) == owner_email,
-                    User.is_active.is_(True),
-                )
-            )
-            owner_ids = list(dict.fromkeys(owner_result.scalars().all()))
-        result = await db.execute(
+        # Backfill eligible rollups created before this outbox contract. New
+        # captures enqueue in record_production_issue's own transaction.
+        issue_result = await db.execute(
             select(ProductionIssue)
             .where(
                 ProductionIssue.status == "open",
@@ -372,49 +567,504 @@ async def dispatch_production_issue_alerts() -> int:
             .limit(100)
             .with_for_update(skip_locked=True)
         )
-        issues = list(result.scalars().all())
+        issues = list(issue_result.scalars().all())
         for issue in issues:
-            payload = {
-                "issue_id": str(issue.id),
-                "severity": issue.severity,
-                "category": issue.category,
-                "summary": issue.summary,
-                "route": issue.route,
-                "operation": issue.operation,
-                "event_count": issue.event_count,
-                "last_seen_at": issue.last_seen_at.isoformat(),
-                "release_version": issue.release_version,
-            }
-            alert_log = getattr(logger, _production_issue_alert_log_level(issue.severity))
-            alert_log(
-                "[PRODUCTION_ISSUE_ALERT] issue_id={} severity={} category={} "
-                "event_count={} release_version={}",
-                issue.id,
-                issue.severity,
-                issue.category,
-                issue.event_count,
-                issue.release_version,
+            await _enqueue_issue_alert_deliveries(db, issue, settings=settings)
+        await db.flush()
+
+        # Repair the narrow crash/concurrency window where every sink row was
+        # committed as delivered but the aggregate marker was not projected.
+        # The issue locks above serialize this reconciliation with finalizers.
+        for issue in issues:
+            total = await db.scalar(
+                select(func.count())
+                .select_from(ProductionIssueAlertDelivery)
+                .where(
+                    ProductionIssueAlertDelivery.issue_id == issue.id,
+                    ProductionIssueAlertDelivery.alert_epoch == issue.alert_epoch,
+                )
             )
-            for owner_id in owner_ids:
-                db.add(_production_issue_notification(issue, owner_id))
-            if settings.PRODUCTION_ISSUE_ALERT_WEBHOOK_URL:
-                try:
-                    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
-                        response = await client.post(
-                            settings.PRODUCTION_ISSUE_ALERT_WEBHOOK_URL,
-                            json=payload,
-                        )
-                        response.raise_for_status()
-                except httpx.HTTPError as exc:
-                    logger.error(
-                        "[production-issues] alert webhook failed issue_id={} error_type={}",
-                        issue.id,
-                        type(exc).__name__,
-                    )
-            issue.alerted_at = now
-        if issues:
+            outstanding = await db.scalar(
+                select(func.count())
+                .select_from(ProductionIssueAlertDelivery)
+                .where(
+                    ProductionIssueAlertDelivery.issue_id == issue.id,
+                    ProductionIssueAlertDelivery.alert_epoch == issue.alert_epoch,
+                    ProductionIssueAlertDelivery.status != "delivered",
+                )
+            )
+            if int(total or 0) > 0 and int(outstanding or 0) == 0:
+                issue.alerted_at = now
+                issue.alert_attempts = 0
+                issue.alert_next_attempt_at = None
+                issue.alert_last_error_code = None
+
+        due_time = func.coalesce(
+            ProductionIssueAlertDelivery.next_attempt_at,
+            ProductionIssueAlertDelivery.created_at,
+        )
+        oldest_due = await db.scalar(
+            select(func.min(due_time))
+            .select_from(ProductionIssueAlertDelivery)
+            .join(
+                ProductionIssue,
+                ProductionIssue.id == ProductionIssueAlertDelivery.issue_id,
+            )
+            .where(
+                ProductionIssue.status == "open",
+                ProductionIssue.alerted_at.is_(None),
+                ProductionIssue.alert_epoch
+                == ProductionIssueAlertDelivery.alert_epoch,
+                or_(
+                    and_(
+                        ProductionIssueAlertDelivery.status == "pending",
+                        or_(
+                            ProductionIssueAlertDelivery.next_attempt_at.is_(None),
+                            ProductionIssueAlertDelivery.next_attempt_at <= now,
+                        ),
+                    ),
+                    and_(
+                        ProductionIssueAlertDelivery.status == "delivering",
+                        ProductionIssueAlertDelivery.claimed_at <= stale_cutoff,
+                    ),
+                ),
+            )
+        )
+        if oldest_due is None:
+            _monitor_oldest_due_delivery_age_seconds = 0.0
+        else:
+            _monitor_oldest_due_delivery_age_seconds = max(
+                (now - oldest_due).total_seconds(),
+                0.0,
+            )
+
+        # Only claim deliveries whose parent rows were locked above. This
+        # keeps every monitor transaction on the same Issue -> Delivery lock
+        # order and bounds the parent working set.
+        locked_issue_ids = [issue.id for issue in issues]
+        if not locked_issue_ids:
             await db.commit()
-        return len(issues)
+            return claims
+
+        result = await db.execute(
+            select(ProductionIssueAlertDelivery)
+            .join(
+                ProductionIssue,
+                ProductionIssue.id == ProductionIssueAlertDelivery.issue_id,
+            )
+            .where(
+                ProductionIssueAlertDelivery.issue_id.in_(locked_issue_ids),
+                ProductionIssue.status == "open",
+                ProductionIssue.alerted_at.is_(None),
+                ProductionIssue.alert_epoch
+                == ProductionIssueAlertDelivery.alert_epoch,
+                or_(
+                    and_(
+                        ProductionIssueAlertDelivery.status == "pending",
+                        or_(
+                            ProductionIssueAlertDelivery.next_attempt_at.is_(None),
+                            ProductionIssueAlertDelivery.next_attempt_at <= now,
+                        ),
+                    ),
+                    and_(
+                        ProductionIssueAlertDelivery.status == "delivering",
+                        ProductionIssueAlertDelivery.claimed_at <= stale_cutoff,
+                    ),
+                )
+            )
+            .order_by(
+                ProductionIssueAlertDelivery.next_attempt_at.asc().nullsfirst(),
+                ProductionIssueAlertDelivery.created_at.asc(),
+            )
+            .limit(PRODUCTION_ISSUE_ALERT_BATCH_SIZE)
+            .with_for_update(skip_locked=True)
+        )
+        for delivery in result.scalars().all():
+            claim_token = uuid.uuid4()
+            delivery.status = "delivering"
+            delivery.claim_token = claim_token
+            delivery.claimed_at = now
+            delivery.attempts = int(delivery.attempts or 0) + 1
+            delivery.next_attempt_at = now + timedelta(
+                seconds=PRODUCTION_ISSUE_ALERT_CLAIM_LEASE_SECONDS
+            )
+            delivery.last_error_code = None
+            claims.append(
+                AlertDeliveryClaim(
+                    delivery_id=delivery.id,
+                    issue_id=delivery.issue_id,
+                    alert_epoch=delivery.alert_epoch,
+                    sink=delivery.sink,
+                    idempotency_key=delivery.idempotency_key,
+                    claim_token=claim_token,
+                    payload=dict(delivery.payload_snapshot or {}),
+                )
+            )
+        await db.commit()
+    return claims
+
+
+async def _finish_alert_delivery_row(
+    db,
+    issue: ProductionIssue,
+    delivery: ProductionIssueAlertDelivery,
+    *,
+    success: bool,
+    error_code: str | None = None,
+    notification_sent: bool = False,
+) -> bool:
+    """Finish one claimed row after its parent Issue has been locked."""
+
+    now = datetime.now(timezone.utc)
+    if success:
+        delivery.status = "delivered"
+        delivery.delivered_at = now
+        delivery.next_attempt_at = None
+        delivery.last_error_code = None
+        delivery.claim_token = None
+        delivery.claimed_at = None
+        if delivery.sink == "notification" and notification_sent:
+            issue.alert_notification_sent_at = now
+        await db.flush()
+        outstanding = await db.scalar(
+            select(func.count())
+            .select_from(ProductionIssueAlertDelivery)
+            .where(
+                ProductionIssueAlertDelivery.issue_id == delivery.issue_id,
+                ProductionIssueAlertDelivery.alert_epoch == delivery.alert_epoch,
+                ProductionIssueAlertDelivery.status != "delivered",
+            )
+        )
+        if (
+            int(outstanding or 0) == 0
+            and issue.status == "open"
+            and int(issue.alert_epoch or 1) == delivery.alert_epoch
+            and issue.alerted_at is None
+        ):
+            issue.alerted_at = now
+            issue.alert_attempts = 0
+            issue.alert_next_attempt_at = None
+            issue.alert_last_error_code = None
+            return True
+        return False
+
+    delivery.status = "pending"
+    delivery.claim_token = None
+    delivery.claimed_at = None
+    delivery.last_error_code = _safe_operational_text(
+        error_code or "UnknownAlertDeliveryError",
+        100,
+    )
+    delivery.next_attempt_at = now + timedelta(
+        seconds=_alert_retry_delay_seconds(delivery.attempts)
+    )
+    issue.alert_attempts = max(
+        int(issue.alert_attempts or 0),
+        int(delivery.attempts or 0),
+    )
+    issue.alert_next_attempt_at = delivery.next_attempt_at
+    issue.alert_last_error_code = delivery.last_error_code
+    return False
+
+
+async def _finalize_alert_delivery(
+    claim: AlertDeliveryClaim,
+    *,
+    success: bool,
+    error_code: str | None = None,
+) -> bool:
+    async with async_session() as db:
+        # Claiming and every finalizer lock the parent before the child. The
+        # common order prevents issue->delivery / delivery->issue deadlocks.
+        issue = await db.get(
+            ProductionIssue,
+            claim.issue_id,
+            with_for_update=True,
+        )
+        if issue is None:
+            return False
+        delivery = (
+            await db.execute(
+                select(ProductionIssueAlertDelivery)
+                .where(
+                    ProductionIssueAlertDelivery.id == claim.delivery_id,
+                    ProductionIssueAlertDelivery.status == "delivering",
+                    ProductionIssueAlertDelivery.claim_token == claim.claim_token,
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if delivery is None:
+            return False
+        if (
+            issue.status != "open"
+            or int(issue.alert_epoch or 1) != claim.alert_epoch
+        ):
+            await _finish_alert_delivery_row(
+                db,
+                issue,
+                delivery,
+                success=True,
+            )
+            await db.commit()
+            return False
+        issue_alerted = await _finish_alert_delivery_row(
+            db,
+            issue,
+            delivery,
+            success=success,
+            error_code=error_code,
+        )
+        await db.commit()
+        return issue_alerted
+
+
+async def _deliver_notification_claim(claim: AlertDeliveryClaim) -> bool:
+    """Create owner notifications and finish the outbox row atomically."""
+
+    settings = get_settings()
+    async with async_session() as db:
+        issue = await db.get(
+            ProductionIssue,
+            claim.issue_id,
+            with_for_update=True,
+        )
+        if issue is None:
+            return False
+        delivery = (
+            await db.execute(
+                select(ProductionIssueAlertDelivery)
+                .where(
+                    ProductionIssueAlertDelivery.id == claim.delivery_id,
+                    ProductionIssueAlertDelivery.status == "delivering",
+                    ProductionIssueAlertDelivery.claim_token == claim.claim_token,
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if delivery is None:
+            return False
+        if (
+            issue.status != "open"
+            or int(issue.alert_epoch or 1) != claim.alert_epoch
+        ):
+            # A resolved or reopened issue makes an older notification
+            # obsolete. Complete only that old delivery, without notifying or
+            # projecting notification success onto the current epoch.
+            await _finish_alert_delivery_row(
+                db,
+                issue,
+                delivery,
+                success=True,
+                notification_sent=False,
+            )
+            await db.commit()
+            return False
+        owner_email = (settings.SAAS_ADMIN_EMAIL or "").strip().lower()
+        owner_ids: list[uuid.UUID] = []
+        if owner_email:
+            owner_result = await db.execute(
+                select(User.id)
+                .join(Identity, User.identity_id == Identity.id)
+                .where(
+                    func.lower(Identity.email) == owner_email,
+                    User.is_active.is_(True),
+                )
+            )
+            owner_ids = list(dict.fromkeys(owner_result.scalars().all()))
+        if not owner_ids:
+            await _finish_alert_delivery_row(
+                db,
+                issue,
+                delivery,
+                success=False,
+                error_code="SaaSAlertOwnerNotFound",
+            )
+            await db.commit()
+            return False
+
+        notification_ref_id = _production_issue_notification_ref_id(
+            issue.id,
+            claim.alert_epoch,
+        )
+        existing_ids = set(
+            (
+                await db.execute(
+                    select(Notification.user_id).where(
+                        Notification.ref_id == notification_ref_id,
+                        Notification.type == "system",
+                        Notification.sender_name == "Astra Monitor",
+                        Notification.user_id.in_(owner_ids),
+                    )
+                )
+            ).scalars().all()
+        )
+        for owner_id in owner_ids:
+            if owner_id not in existing_ids:
+                db.add(_production_issue_notification(
+                    issue,
+                    owner_id,
+                    payload=claim.payload,
+                    alert_epoch=claim.alert_epoch,
+                ))
+        issue_alerted = await _finish_alert_delivery_row(
+            db,
+            issue,
+            delivery,
+            success=True,
+            notification_sent=True,
+        )
+        await db.commit()
+        return issue_alerted
+
+
+async def _deliver_webhook_claim(
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+    claim: AlertDeliveryClaim,
+    webhook_url: str,
+) -> bool:
+    """Fence Issue state across the external webhook and durable completion."""
+
+    async with semaphore:
+        async with async_session() as db:
+            # Status changes use the same parent row lock. Keeping it through
+            # the bounded HTTP call guarantees a resolve/reopen cannot race
+            # between epoch validation and the external side effect.
+            issue = await db.get(
+                ProductionIssue,
+                claim.issue_id,
+                with_for_update=True,
+            )
+            if issue is None:
+                return False
+            delivery = (
+                await db.execute(
+                    select(ProductionIssueAlertDelivery)
+                    .where(
+                        ProductionIssueAlertDelivery.id == claim.delivery_id,
+                        ProductionIssueAlertDelivery.status == "delivering",
+                        ProductionIssueAlertDelivery.claim_token == claim.claim_token,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if delivery is None:
+                return False
+            if (
+                issue.status != "open"
+                or int(issue.alert_epoch or 1) != claim.alert_epoch
+            ):
+                await _finish_alert_delivery_row(
+                    db,
+                    issue,
+                    delivery,
+                    success=True,
+                )
+                await db.commit()
+                return False
+
+            error_code: str | None = None
+            try:
+                response = await client.post(
+                    webhook_url,
+                    json=claim.payload,
+                    headers={"X-Astra-Idempotency-Key": claim.idempotency_key},
+                )
+                response.raise_for_status()
+            except Exception as exc:
+                error_code = type(exc).__name__[:100]
+                logger.error(
+                    "[production-issues] alert webhook failed "
+                    "delivery_id={} error_type={}",
+                    claim.delivery_id,
+                    error_code,
+                )
+            issue_alerted = await _finish_alert_delivery_row(
+                db,
+                issue,
+                delivery,
+                success=error_code is None,
+                error_code=error_code,
+            )
+            await db.commit()
+            return issue_alerted
+
+
+async def dispatch_production_issue_alerts() -> int:
+    """Claim briefly, then deliver each sink under its required state fence."""
+
+    settings = get_settings()
+    claims = await _claim_production_issue_alert_deliveries()
+    if not claims:
+        return 0
+
+    for claim in claims:
+        if claim.payload:
+            alert_log = getattr(
+                logger,
+                _production_issue_alert_log_level(
+                    str(claim.payload.get("severity") or "error")
+                ),
+            )
+            alert_log(
+                "[PRODUCTION_ISSUE_ALERT] issue_id={} alert_epoch={} sink={} "
+                "severity={} category={} event_count={} release_version={}",
+                claim.issue_id,
+                claim.alert_epoch,
+                claim.sink,
+                claim.payload.get("severity"),
+                claim.payload.get("category"),
+                claim.payload.get("event_count"),
+                claim.payload.get("release_version"),
+            )
+
+    webhook_claims = [claim for claim in claims if claim.sink == "webhook"]
+    webhook_results: dict[uuid.UUID, bool] = {}
+    webhook_url = (settings.PRODUCTION_ISSUE_ALERT_WEBHOOK_URL or "").strip()
+    if webhook_claims and webhook_url:
+        semaphore = asyncio.Semaphore(PRODUCTION_ISSUE_ALERT_MAX_CONCURRENCY)
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0),
+            follow_redirects=False,
+            trust_env=False,
+        ) as client:
+            results = await asyncio.gather(*[
+                _deliver_webhook_claim(client, semaphore, claim, webhook_url)
+                for claim in webhook_claims
+            ])
+        webhook_results = {
+            claim.delivery_id: issue_alerted
+            for claim, issue_alerted in zip(webhook_claims, results, strict=True)
+        }
+
+    alerted_count = 0
+    for claim in claims:
+        if claim.sink == "notification":
+            alerted_count += int(await _deliver_notification_claim(claim))
+            continue
+        if claim.sink == "webhook":
+            if webhook_url:
+                alerted_count += int(webhook_results.get(claim.delivery_id, False))
+            else:
+                alerted_count += int(
+                    await _finalize_alert_delivery(
+                        claim,
+                        success=False,
+                        error_code="WebhookConfigurationMissing",
+                    )
+                )
+            continue
+        logger.error(
+            "[production-issues] no alert sink configured issue_id={}",
+            claim.issue_id,
+        )
+        await _finalize_alert_delivery(
+            claim,
+            success=False,
+            error_code="NoConfiguredAlertSink",
+        )
+    return alerted_count
 
 
 async def purge_old_production_issue_events() -> int:
@@ -430,11 +1080,51 @@ async def purge_old_production_issue_events() -> int:
         return int(result.rowcount or 0)
 
 
+def production_issue_monitor_health(
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Return DB-loop health without querying the database from /api/health."""
+
+    current = now or datetime.now(timezone.utc)
+    deadline_seconds = max(3 * int(_monitor_interval_seconds), 120)
+    reference = _monitor_last_db_loop_success_at or _monitor_started_at
+    stale_seconds = (
+        max((current - reference).total_seconds(), 0.0)
+        if reference is not None
+        else float("inf")
+    )
+    return {
+        "healthy": stale_seconds <= deadline_seconds,
+        "last_db_loop_success_at": (
+            _monitor_last_db_loop_success_at.isoformat()
+            if _monitor_last_db_loop_success_at
+            else None
+        ),
+        "oldest_due_delivery_age_seconds": round(
+            _monitor_oldest_due_delivery_age_seconds,
+            3,
+        ),
+        "consecutive_db_failures": int(_monitor_consecutive_db_failures),
+        "stale_seconds": round(stale_seconds, 3),
+        "deadline_seconds": deadline_seconds,
+    }
+
+
 async def start_production_issue_monitor_daemon() -> None:
     """Continuously alert and cap event retention on the worker process."""
 
+    global _monitor_consecutive_db_failures
+    global _monitor_interval_seconds
+    global _monitor_last_db_loop_success_at
+    global _monitor_started_at
+
     settings = get_settings()
     interval = max(int(settings.PRODUCTION_ISSUE_MONITOR_INTERVAL_SECONDS), 10)
+    _monitor_interval_seconds = interval
+    _monitor_started_at = datetime.now(timezone.utc)
+    _monitor_last_db_loop_success_at = None
+    _monitor_consecutive_db_failures = 0
     logger.info("[production-issues] monitor started interval={}s", interval)
     purge_counter = 0
     while True:
@@ -445,11 +1135,31 @@ async def start_production_issue_monitor_daemon() -> None:
             if purge_counter >= max(3600 // interval, 1):
                 await purge_old_production_issue_events()
                 purge_counter = 0
+            _monitor_last_db_loop_success_at = datetime.now(timezone.utc)
+            _monitor_consecutive_db_failures = 0
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            _monitor_consecutive_db_failures += 1
             logger.error(
-                "[production-issues] monitor iteration failed error_type={}",
+                "[production-issues] monitor iteration failed error_type={} "
+                "consecutive_failures={}",
                 type(exc).__name__,
+                _monitor_consecutive_db_failures,
             )
+            if (
+                _monitor_consecutive_db_failures
+                >= PRODUCTION_ISSUE_MONITOR_MAX_CONSECUTIVE_FAILURES
+            ):
+                logger.critical(
+                    "PRODUCTION_MONITOR_FATAL release={} task={} error_type={} "
+                    "consecutive_failures={}",
+                    getattr(settings, "APP_VERSION", "unknown"),
+                    "production_issue_monitor",
+                    type(exc).__name__,
+                    _monitor_consecutive_db_failures,
+                )
+                raise RuntimeError(
+                    "Production issue monitor exceeded its failure threshold"
+                ) from exc
         await asyncio.sleep(interval)

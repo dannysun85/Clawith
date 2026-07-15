@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import re
 import uuid
+from copy import deepcopy
 from typing import Any
 
 from sqlalchemy import select
@@ -19,14 +20,33 @@ from app.config import get_settings
 from app.core.security import decrypt_data, encrypt_data
 from app.models.tenant_setting import TenantSetting
 from app.models.tool import Tool
+from app.services.mcp_security import is_sensitive_mcp_query_key
 
 
-SENSITIVE_FIELD_KEYS = {"api_key", "private_key", "auth_code", "password", "secret"}
+SENSITIVE_FIELD_KEYS = {
+    "api_key",
+    "private_key",
+    "auth_code",
+    "password",
+    "secret",
+    "access_token",
+    "refresh_token",
+    "atlassian_api_key",
+    "smithery_api_key",
+    "modelscope_api_token",
+    # JSON-encoded key/value pairs removed from persisted MCP URLs.
+    "mcp_url_query_secrets",
+}
 TENANT_TOOL_CONFIG_PREFIX = "tool_config:"
 TOOL_FUNCTION_NAME_MAX_LENGTH = 64
 
 
-def tenant_scoped_tool_name(name: str, tenant_id: uuid.UUID | str | None) -> str:
+def tenant_scoped_tool_name(
+    name: str,
+    tenant_id: uuid.UUID | str | None,
+    *,
+    namespace: str | None = None,
+) -> str:
     """Return a deterministic, globally unique internal name for tenant tools.
 
     ``tools.name`` remains globally unique because older application versions
@@ -46,7 +66,15 @@ def tenant_scoped_tool_name(name: str, tenant_id: uuid.UUID | str | None) -> str
         tenant_id if isinstance(tenant_id, uuid.UUID) else uuid.UUID(str(tenant_id))
     )
     safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", logical_name).strip("_-") or "tool"
-    digest = hashlib.sha256(logical_name.encode("utf-8")).hexdigest()[:12]
+    # Preserve the pre-namespace digest for every existing caller. Only MCP
+    # paths that explicitly provide a server identity opt into the new digest.
+    normalized_namespace = (namespace or "").strip()
+    identity = (
+        f"{normalized_namespace}\0{logical_name}"
+        if normalized_namespace
+        else logical_name
+    )
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
     suffix = f"__t_{resolved_tenant_id.hex}_{digest}"
     prefix_length = TOOL_FUNCTION_NAME_MAX_LENGTH - len(suffix)
     prefix = safe_name[:prefix_length].rstrip("_-") or "tool"
@@ -72,21 +100,36 @@ def encrypt_sensitive_fields(config: dict, config_schema: dict | None = None) ->
         return config
 
     settings = get_settings()
-    result = dict(config)
-    for key in get_sensitive_keys(config_schema):
-        value = result.get(key)
-        if not isinstance(value, str) or not value:
-            continue
+    sensitive_keys = get_sensitive_keys(config_schema)
+
+    def encrypt_value(value: Any, *, sensitive: bool = False) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: encrypt_value(
+                    nested,
+                    sensitive=(
+                        sensitive
+                        or str(key) in sensitive_keys
+                        or is_sensitive_mcp_query_key(str(key))
+                    ),
+                )
+                for key, nested in value.items()
+            }
+        if isinstance(value, list):
+            return [encrypt_value(item, sensitive=sensitive) for item in value]
+        if not sensitive or not isinstance(value, str) or not value:
+            return value
         try:
             decrypt_data(value, settings.SECRET_KEY)
-            continue
+            return value
         except Exception:
             pass
-        try:
-            result[key] = encrypt_data(value, settings.SECRET_KEY)
-        except Exception:
-            pass
-    return result
+        encrypted = encrypt_data(value, settings.SECRET_KEY)
+        if decrypt_data(encrypted, settings.SECRET_KEY) != value:
+            raise RuntimeError("tool credential encryption verification failed")
+        return encrypted
+
+    return encrypt_value(dict(config))
 
 
 def decrypt_sensitive_fields(config: dict, config_schema: dict | None = None) -> dict:
@@ -94,16 +137,31 @@ def decrypt_sensitive_fields(config: dict, config_schema: dict | None = None) ->
         return config
 
     settings = get_settings()
-    result = dict(config)
-    for key in get_sensitive_keys(config_schema):
-        value = result.get(key)
-        if not isinstance(value, str) or not value:
-            continue
+    sensitive_keys = get_sensitive_keys(config_schema)
+
+    def decrypt_value(value: Any, *, sensitive: bool = False) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: decrypt_value(
+                    nested,
+                    sensitive=(
+                        sensitive
+                        or str(key) in sensitive_keys
+                        or is_sensitive_mcp_query_key(str(key))
+                    ),
+                )
+                for key, nested in value.items()
+            }
+        if isinstance(value, list):
+            return [decrypt_value(item, sensitive=sensitive) for item in value]
+        if not sensitive or not isinstance(value, str) or not value:
+            return value
         try:
-            result[key] = decrypt_data(value, settings.SECRET_KEY)
+            return decrypt_data(value, settings.SECRET_KEY)
         except Exception:
-            pass
-    return result
+            return value
+
+    return decrypt_value(dict(config))
 
 
 def meaningful_config(config: dict | None) -> dict:
@@ -177,17 +235,38 @@ async def get_tool_company_config(db: AsyncSession, tool: Tool, tenant_id: uuid.
     """Return company config for a tool without leaking builtin config across tenants."""
     if tool.source == "builtin":
         return await get_tenant_tool_config(db, tenant_id, tool.name, tool.config_schema)
+    if tool.type == "mcp" and tool.tenant_id is None:
+        # Tenantless MCP rows are shared capability definitions. Their URL and
+        # schema may be global, but credentials/options belong to an exact
+        # Agent assignment and must never come from the shared Tool row.
+        return {}
     return decrypt_sensitive_fields(tool.config or {}, tool.config_schema)
 
 
 def mask_sensitive_fields(config: dict, config_schema: dict | None = None) -> dict:
-    masked = dict(config or {})
-    for key in get_sensitive_keys(config_schema):
-        value = masked.get(key)
-        if value and isinstance(value, str):
+    sensitive_keys = get_sensitive_keys(config_schema)
+
+    def mask_value(value: Any, *, sensitive: bool = False) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: mask_value(
+                    nested,
+                    sensitive=(
+                        sensitive
+                        or str(key) in sensitive_keys
+                        or is_sensitive_mcp_query_key(str(key))
+                    ),
+                )
+                for key, nested in value.items()
+            }
+        if isinstance(value, list):
+            return [mask_value(item, sensitive=sensitive) for item in value]
+        if sensitive and isinstance(value, str) and value:
             suffix = value[-4:] if len(value) > 4 else value
-            masked[key] = f"****{suffix}"
-    return masked
+            return f"****{suffix}"
+        return value
+
+    return mask_value(dict(config or {}))
 
 
 def merge_config_preserving_sensitive(
@@ -204,14 +283,77 @@ def merge_config_preserving_sensitive(
 
     if not incoming:
         return {}
-    current = dict(existing or {})
-    merged = dict(incoming)
-    for key in get_sensitive_keys(config_schema):
-        value = incoming.get(key)
-        is_placeholder = isinstance(value, str) and value.startswith("****")
-        if key not in incoming or value in (None, "") or is_placeholder:
-            if key in current:
-                merged[key] = current[key]
+    current = deepcopy(existing or {})
+    merged = deepcopy(incoming)
+    sensitive_keys = get_sensitive_keys(config_schema)
+    missing = object()
+
+    def sensitive_leaves(
+        value: Any,
+        path: tuple[str | int, ...] = (),
+        *,
+        sensitive: bool = False,
+    ):
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                yield from sensitive_leaves(
+                    nested,
+                    (*path, key),
+                    sensitive=(
+                        sensitive
+                        or str(key) in sensitive_keys
+                        or is_sensitive_mcp_query_key(str(key))
+                    ),
+                )
+        elif isinstance(value, list):
+            for index, nested in enumerate(value):
+                yield from sensitive_leaves(
+                    nested,
+                    (*path, index),
+                    sensitive=sensitive,
+                )
+        elif sensitive:
+            yield path, value
+
+    def get_path(value: Any, path: tuple[str | int, ...]) -> Any:
+        current_value = value
+        for part in path:
+            if isinstance(part, int):
+                if not isinstance(current_value, list) or part >= len(current_value):
+                    return missing
+                current_value = current_value[part]
             else:
-                merged.pop(key, None)
+                if not isinstance(current_value, dict) or part not in current_value:
+                    return missing
+                current_value = current_value[part]
+        return current_value
+
+    def set_path(value: dict, path: tuple[str | int, ...], replacement: Any) -> None:
+        cursor: Any = value
+        for index, part in enumerate(path[:-1]):
+            next_part = path[index + 1]
+            if isinstance(part, int):
+                while len(cursor) <= part:
+                    cursor.append({} if isinstance(next_part, str) else [])
+                if not isinstance(cursor[part], (dict, list)):
+                    cursor[part] = {} if isinstance(next_part, str) else []
+                cursor = cursor[part]
+            else:
+                expected = {} if isinstance(next_part, str) else []
+                if not isinstance(cursor.get(part), type(expected)):
+                    cursor[part] = expected
+                cursor = cursor[part]
+        last = path[-1]
+        if isinstance(last, int):
+            while len(cursor) <= last:
+                cursor.append(None)
+            cursor[last] = replacement
+        else:
+            cursor[last] = replacement
+
+    for path, existing_value in sensitive_leaves(current):
+        incoming_value = get_path(incoming, path)
+        placeholder = isinstance(incoming_value, str) and incoming_value.startswith("****")
+        if incoming_value is missing or incoming_value in (None, "") or placeholder:
+            set_path(merged, path, existing_value)
     return meaningful_config(merged)

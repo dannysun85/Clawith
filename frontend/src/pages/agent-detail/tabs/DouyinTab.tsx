@@ -20,7 +20,11 @@ export default function DouyinTab({ agentId, canManage }: { agentId: string; can
         queryKey: ['douyin-agent-dashboard', agentId],
         queryFn: () => fetchAuth<any>(`/douyin/agent/${agentId}/dashboard`),
         enabled: !!agentId,
-        refetchInterval: 15000,
+        refetchInterval: (query) => {
+            const jobs = (query.state.data as any)?.publish_jobs;
+            if (!Array.isArray(jobs)) return 15000;
+            return jobs.some((job: any) => ['approval_required', 'preparing_share_package', 'creating'].includes(job.status)) ? 3000 : 15000;
+        },
     });
 
     const createJob = useMutation({
@@ -48,21 +52,6 @@ export default function DouyinTab({ agentId, canManage }: { agentId: string; can
         onError: (err: any) => toast.error(isZh ? '创建失败' : 'Create failed', { details: String(err?.message || err) }),
     });
 
-    const preparePackage = useMutation({
-        mutationFn: async (job: any) => {
-            if (job.approval_status !== 'approved') {
-                await fetchAuth<any>(`/douyin/publish-jobs/${job.id}/approve`, { method: 'POST' });
-            }
-            return fetchAuth<any>(`/douyin/publish-jobs/${job.id}/run`, { method: 'POST' });
-        },
-        onSuccess: () => {
-            qc.invalidateQueries({ queryKey: ['douyin-agent-dashboard', agentId] });
-            qc.invalidateQueries({ queryKey: ['agent-approvals', agentId] });
-            toast.success(isZh ? '已生成抖音确认发布包' : 'Douyin publish package prepared');
-        },
-        onError: (err: any) => toast.error(isZh ? '生成发布包失败' : 'Prepare failed', { details: String(err?.message || err) }),
-    });
-
     const confirmPublish = useMutation({
         mutationFn: (jobId: string) => fetchAuth<any>(`/douyin/publish-jobs/${jobId}/confirm-user-publish`, { method: 'POST' }),
         onSuccess: () => {
@@ -84,6 +73,19 @@ export default function DouyinTab({ agentId, canManage }: { agentId: string; can
         : status === 'failed' || status === 'blocked' || status === 'permission_missing' || status === 'needs_reauth'
             ? 'badge badge-error'
             : 'badge badge-warning';
+
+    const statusLabel = (status: string) => {
+        if (status === 'verification_required') {
+            return isZh ? '待人工核验' : 'Manual verification required';
+        }
+        if (status === 'created_reviewing') {
+            return isZh ? '已受理，待审核' : 'Accepted; review pending';
+        }
+        if (status === 'awaiting_user_publish') {
+            return isZh ? '待用户在抖音确认' : 'User confirmation required';
+        }
+        return status;
+    };
 
     if (isLoading) {
         return <div style={{ padding: '24px', color: 'var(--text-tertiary)' }}>{t('common.loading')}</div>;
@@ -158,7 +160,7 @@ export default function DouyinTab({ agentId, canManage }: { agentId: string; can
                     ) : jobs.slice(0, 8).map((job: any) => (
                         <div key={job.id} style={{ padding: '10px 0', borderTop: '1px solid var(--border-subtle)' }}>
                             <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                                <span className={badgeClass(job.status)}>{job.status}</span>
+                                <span className={badgeClass(job.status)}>{statusLabel(job.status)}</span>
                                 <span style={{ fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{job.title}</span>
                             </div>
                             <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginTop: 4 }}>
@@ -169,16 +171,21 @@ export default function DouyinTab({ agentId, canManage }: { agentId: string; can
                                     {job.response_summary.message}
                                 </div>
                             )}
+                            {job.status === 'verification_required' && (
+                                <div role="alert" style={{ fontSize: 12, color: 'var(--warning-text, #9a6700)', marginTop: 8, lineHeight: 1.5 }}>
+                                    {isZh
+                                        ? '结果未知：必须先去抖音官方后台核验，禁止重新提交同一素材。'
+                                        : 'Outcome unknown: verify in Douyin first. Do not resubmit the same media.'}
+                                </div>
+                            )}
                             {canManage && job.status === 'approval_required' && (
-                                <button
+                                <a
                                     className="btn btn-secondary"
-                                    type="button"
-                                    disabled={preparePackage.isPending}
-                                    onClick={() => preparePackage.mutate(job)}
+                                    href={`/agents/${agentId}/settings#approvals`}
                                     style={{ marginTop: 8 }}
                                 >
-                                    {isZh ? '批准并生成发布包' : 'Approve and prepare'}
-                                </button>
+                                    {isZh ? '查看完整参数后审批' : 'Review full payload'}
+                                </a>
                             )}
                             {job.share_schema_url && (
                                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 8 }}>
@@ -212,12 +219,19 @@ export default function DouyinTab({ agentId, canManage }: { agentId: string; can
                     ) : operations.slice(0, 8).map((op: any) => (
                         <div key={op.id} style={{ padding: '10px 0', borderTop: '1px solid var(--border-subtle)' }}>
                             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                                <span className={badgeClass(op.status)}>{op.status}</span>
+                                <span className={badgeClass(op.status)}>{statusLabel(op.status)}</span>
                                 <span style={{ fontSize: 13, fontWeight: 600 }}>{op.operation_type}</span>
                             </div>
                             <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginTop: 4 }}>
                                 {op.created_at ? new Date(op.created_at).toLocaleString() : ''}
                             </div>
+                            {op.status === 'verification_required' && (
+                                <div role="alert" style={{ fontSize: 12, color: 'var(--warning-text, #9a6700)', marginTop: 6, lineHeight: 1.5 }}>
+                                    {isZh
+                                        ? '结果未知：请先在抖音核验，禁止重复回复。'
+                                        : 'Outcome unknown: verify in Douyin before sending another reply.'}
+                                </div>
+                            )}
                         </div>
                     ))}
                 </section>

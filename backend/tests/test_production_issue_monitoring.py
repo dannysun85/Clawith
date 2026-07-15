@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import HTTPException
 from pydantic import ValidationError
 
 from app.api import production_issues
@@ -138,8 +139,6 @@ async def test_client_agent_context_uses_the_product_access_policy(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_unauthorized_client_agent_context_is_dropped(monkeypatch):
-    from fastapi import HTTPException
-
     async def deny_agent(_db, _user, _agent_id):
         raise HTTPException(status_code=403, detail="No access to this agent")
 
@@ -148,6 +147,61 @@ async def test_unauthorized_client_agent_context_is_dropped(monkeypatch):
     assert await production_issues._authorized_client_agent_id(
         object(), SimpleNamespace(tenant_id=uuid.uuid4()), uuid.uuid4()
     ) is None
+
+
+@pytest.mark.asyncio
+async def test_client_issue_report_rate_limit_is_enforced_before_persistence(monkeypatch):
+    persist = AsyncMock()
+    authorize = AsyncMock()
+    monkeypatch.setattr(production_issues, "record_production_issue", persist)
+    monkeypatch.setattr(production_issues, "_authorized_client_agent_id", authorize)
+    monkeypatch.setattr(
+        production_issues,
+        "_record_and_count_client_reports",
+        AsyncMock(return_value=production_issues.CLIENT_REPORT_RATE_LIMIT + 1),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await production_issues.report_client_issue(
+            ClientIssueReportIn.model_validate({
+                "category": "api",
+                "error_code": "http_500",
+            }),
+            SimpleNamespace(state=SimpleNamespace(trace_id="abc123")),
+            SimpleNamespace(id=uuid.uuid4(), tenant_id=uuid.uuid4()),
+            object(),
+        )
+
+    assert exc_info.value.status_code == 429
+    authorize.assert_not_awaited()
+    persist.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_client_issue_report_rate_counter_uses_a_bounded_redis_window(monkeypatch):
+    calls = []
+
+    class Redis:
+        async def eval(self, *args):
+            calls.append(args)
+            return 12
+
+    monkeypatch.setattr(production_issues, "get_redis", AsyncMock(return_value=Redis()))
+
+    count = await production_issues._record_and_count_client_reports(uuid.uuid4())
+
+    assert count == 12
+    assert len(calls) == 1
+    script, key_count, key, _cutoff, _now, member, limit, ttl = calls[0]
+    assert key_count == 1
+    assert key.startswith("production-issue-report:rate:")
+    assert member.count(":") == 1
+    assert limit == production_issues.CLIENT_REPORT_RATE_LIMIT
+    assert ttl == (
+        production_issues.CLIENT_REPORT_RATE_WINDOW_SECONDS * 2
+    )
+    assert "if count >= limit" in script
+    assert script.index("if count >= limit") < script.index("redis.call('ZADD'")
 
 
 def test_issue_fingerprint_groups_same_failure_across_tenants():
@@ -202,7 +256,13 @@ async def test_issue_capture_stores_only_sanitized_occurrence_metadata(monkeypat
 
     class Result:
         def scalar_one(self):
-            return expected_id
+            return SimpleNamespace(
+                id=expected_id,
+                status="open",
+                severity="error",
+                event_count=1,
+                alerted_at=None,
+            )
 
     class Session:
         def __init__(self):
@@ -231,7 +291,10 @@ async def test_issue_capture_stores_only_sanitized_occurrence_metadata(monkeypat
     monkeypatch.setattr(
         production_issue_monitor,
         "get_settings",
-        lambda: SimpleNamespace(APP_VERSION="1.10.8"),
+        lambda: SimpleNamespace(
+            APP_VERSION="1.10.8",
+            PRODUCTION_ISSUE_ALERT_THRESHOLD=3,
+        ),
     )
 
     issue_id = await production_issue_monitor.record_production_issue(
@@ -261,7 +324,13 @@ async def test_issue_capture_derives_tenant_from_agent(monkeypatch):
 
     class Result:
         def scalar_one(self):
-            return expected_issue_id
+            return SimpleNamespace(
+                id=expected_issue_id,
+                status="open",
+                severity="error",
+                event_count=1,
+                alerted_at=None,
+            )
 
     class Session:
         def __init__(self):
@@ -290,7 +359,10 @@ async def test_issue_capture_derives_tenant_from_agent(monkeypatch):
     monkeypatch.setattr(
         production_issue_monitor,
         "get_settings",
-        lambda: SimpleNamespace(APP_VERSION="1.10.8"),
+        lambda: SimpleNamespace(
+            APP_VERSION="1.10.8",
+            PRODUCTION_ISSUE_ALERT_THRESHOLD=3,
+        ),
     )
     agent_id = uuid.uuid4()
 
@@ -317,6 +389,46 @@ def test_worker_and_production_compose_enable_monitoring_contract():
     assert '("production_issue_monitor", start_production_issue_monitor_daemon())' in main_source
     assert "PRODUCTION_ISSUE_MONITOR_ENABLED" in compose
     assert "PRODUCTION_ISSUE_ALERT_THRESHOLD" in compose
+
+
+@pytest.mark.asyncio
+async def test_monitor_exits_after_consecutive_failures_for_worker_restart(
+    monkeypatch,
+):
+    attempts = 0
+
+    async def fail_flush():
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("database unavailable")
+
+    async def no_wait(_seconds):
+        return None
+
+    monkeypatch.setattr(
+        production_issue_monitor,
+        "get_settings",
+        lambda: SimpleNamespace(
+            APP_VERSION="1.10.12",
+            PRODUCTION_ISSUE_MONITOR_INTERVAL_SECONDS=10,
+        ),
+    )
+    monkeypatch.setattr(
+        production_issue_monitor,
+        "PRODUCTION_ISSUE_MONITOR_MAX_CONSECUTIVE_FAILURES",
+        2,
+    )
+    monkeypatch.setattr(
+        production_issue_monitor,
+        "flush_failed_production_issue_captures",
+        fail_flush,
+    )
+    monkeypatch.setattr(production_issue_monitor.asyncio, "sleep", no_wait)
+
+    with pytest.raises(RuntimeError, match="failure threshold"):
+        await production_issue_monitor.start_production_issue_monitor_daemon()
+
+    assert attempts == 2
 
 
 def test_first_alert_creates_a_privacy_safe_saas_owner_notification():
@@ -352,6 +464,367 @@ def test_warning_alert_notification_is_not_labeled_as_error():
     notification = production_issue_monitor._production_issue_notification(issue, uuid.uuid4())
 
     assert notification.title == "[警告] 生产问题告警"
+
+
+def test_alert_notification_uses_the_claimed_epoch_snapshot():
+    issue = SimpleNamespace(
+        id=uuid.uuid4(),
+        alert_epoch=7,
+        severity="critical",
+        summary="Mutated live summary",
+        event_count=99,
+        route="/mutated-live-route",
+        operation="mutated.operation",
+        category="mutated-category",
+    )
+    snapshot = {
+        "alert_epoch": 2,
+        "severity": "warning",
+        "summary": "Frozen provider warning",
+        "event_count": 3,
+        "route": "/api/frozen/{uuid}",
+        "operation": "frozen.operation",
+        "category": "llm_provider",
+    }
+
+    notification = production_issue_monitor._production_issue_notification(
+        issue,
+        uuid.uuid4(),
+        payload=snapshot,
+        alert_epoch=2,
+    )
+
+    assert notification.title == "[警告] 生产问题告警"
+    assert notification.body == "Frozen provider warning · 3 次 · /api/frozen/{uuid}"
+    assert notification.ref_id == (
+        production_issue_monitor._production_issue_notification_ref_id(issue.id, 2)
+    )
+    assert "Mutated" not in notification.body
+
+
+@pytest.mark.asyncio
+async def test_alert_finalizer_locks_issue_before_delivery(monkeypatch):
+    issue_id = uuid.uuid4()
+    delivery_id = uuid.uuid4()
+    claim_token = uuid.uuid4()
+    issue = SimpleNamespace(
+        id=issue_id,
+        status="open",
+        alert_epoch=1,
+        alerted_at=None,
+        alert_attempts=0,
+        alert_next_attempt_at=None,
+        alert_last_error_code=None,
+        alert_notification_sent_at=None,
+    )
+    delivery = SimpleNamespace(
+        id=delivery_id,
+        issue_id=issue_id,
+        alert_epoch=1,
+        sink="webhook",
+        status="delivering",
+        attempts=1,
+        claim_token=claim_token,
+        claimed_at=datetime.now(timezone.utc),
+        delivered_at=None,
+        next_attempt_at=None,
+        last_error_code=None,
+    )
+
+    class Result:
+        def scalar_one_or_none(self):
+            return delivery
+
+    class Session:
+        def __init__(self):
+            self.events = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, model, object_id, *, with_for_update=False):
+            self.events.append(("issue", model, object_id, with_for_update))
+            return issue
+
+        async def execute(self, _statement):
+            self.events.append(("delivery",))
+            return Result()
+
+        async def flush(self):
+            self.events.append(("flush",))
+
+        async def scalar(self, _statement):
+            return 0
+
+        async def commit(self):
+            self.events.append(("commit",))
+
+    session = Session()
+    monkeypatch.setattr(production_issue_monitor, "async_session", lambda: session)
+    claim = production_issue_monitor.AlertDeliveryClaim(
+        delivery_id=delivery_id,
+        issue_id=issue_id,
+        alert_epoch=1,
+        sink="webhook",
+        idempotency_key="production-issue:test:1:webhook",
+        claim_token=claim_token,
+        payload={},
+    )
+
+    assert await production_issue_monitor._finalize_alert_delivery(
+        claim,
+        success=True,
+    ) is True
+    assert [event[0] for event in session.events[:2]] == ["issue", "delivery"]
+
+
+@pytest.mark.asyncio
+async def test_obsolete_notification_delivery_completes_without_notifying(monkeypatch):
+    issue_id = uuid.uuid4()
+    delivery_id = uuid.uuid4()
+    claim_token = uuid.uuid4()
+    issue = SimpleNamespace(
+        id=issue_id,
+        status="open",
+        alert_epoch=2,
+        alerted_at=None,
+        alert_attempts=0,
+        alert_next_attempt_at=None,
+        alert_last_error_code=None,
+        alert_notification_sent_at=None,
+    )
+    delivery = SimpleNamespace(
+        id=delivery_id,
+        issue_id=issue_id,
+        alert_epoch=1,
+        sink="notification",
+        status="delivering",
+        attempts=1,
+        claim_token=claim_token,
+        claimed_at=datetime.now(timezone.utc),
+        delivered_at=None,
+        next_attempt_at=None,
+        last_error_code=None,
+    )
+
+    class Result:
+        def scalar_one_or_none(self):
+            return delivery
+
+    class Session:
+        def __init__(self):
+            self.added = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            return issue
+
+        async def execute(self, _statement):
+            return Result()
+
+        async def flush(self):
+            return None
+
+        async def scalar(self, _statement):
+            return 0
+
+        async def commit(self):
+            return None
+
+        def add(self, value):
+            self.added.append(value)
+
+    session = Session()
+    monkeypatch.setattr(production_issue_monitor, "async_session", lambda: session)
+    monkeypatch.setattr(
+        production_issue_monitor,
+        "get_settings",
+        lambda: SimpleNamespace(SAAS_ADMIN_EMAIL="owner@example.com"),
+    )
+    claim = production_issue_monitor.AlertDeliveryClaim(
+        delivery_id=delivery_id,
+        issue_id=issue_id,
+        alert_epoch=1,
+        sink="notification",
+        idempotency_key="production-issue:test:1:notification",
+        claim_token=claim_token,
+        payload={"alert_epoch": 1},
+    )
+
+    assert await production_issue_monitor._deliver_notification_claim(claim) is False
+    assert delivery.status == "delivered"
+    assert issue.alert_notification_sent_at is None
+    assert session.added == []
+
+
+@pytest.mark.asyncio
+async def test_obsolete_webhook_delivery_never_calls_the_http_client(monkeypatch):
+    issue_id = uuid.uuid4()
+    delivery_id = uuid.uuid4()
+    claim_token = uuid.uuid4()
+    issue = SimpleNamespace(
+        id=issue_id,
+        status="open",
+        alert_epoch=2,
+        alerted_at=None,
+        alert_attempts=0,
+        alert_next_attempt_at=None,
+        alert_last_error_code=None,
+        alert_notification_sent_at=None,
+    )
+    delivery = SimpleNamespace(
+        id=delivery_id,
+        issue_id=issue_id,
+        alert_epoch=1,
+        sink="webhook",
+        status="delivering",
+        attempts=1,
+        claim_token=claim_token,
+        claimed_at=datetime.now(timezone.utc),
+        delivered_at=None,
+        next_attempt_at=None,
+        last_error_code=None,
+    )
+
+    class Result:
+        def scalar_one_or_none(self):
+            return delivery
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            return issue
+
+        async def execute(self, _statement):
+            return Result()
+
+        async def flush(self):
+            return None
+
+        async def scalar(self, _statement):
+            return 0
+
+        async def commit(self):
+            return None
+
+    client = SimpleNamespace(post=AsyncMock(side_effect=AssertionError("stale webhook")))
+    monkeypatch.setattr(production_issue_monitor, "async_session", lambda: Session())
+    claim = production_issue_monitor.AlertDeliveryClaim(
+        delivery_id=delivery_id,
+        issue_id=issue_id,
+        alert_epoch=1,
+        sink="webhook",
+        idempotency_key="production-issue:test:1:webhook",
+        claim_token=claim_token,
+        payload={"alert_epoch": 1},
+    )
+
+    assert await production_issue_monitor._deliver_webhook_claim(
+        client,
+        production_issue_monitor.asyncio.Semaphore(1),
+        claim,
+        "https://alerts.example.test/hook",
+    ) is False
+    client.post.assert_not_awaited()
+    assert delivery.status == "delivered"
+
+
+def test_reopened_issue_uses_a_distinct_stable_notification_identity():
+    issue_id = uuid.uuid4()
+
+    first = production_issue_monitor._production_issue_notification_ref_id(
+        issue_id,
+        1,
+    )
+    replay = production_issue_monitor._production_issue_notification_ref_id(
+        issue_id,
+        1,
+    )
+    reopened = production_issue_monitor._production_issue_notification_ref_id(
+        issue_id,
+        2,
+    )
+
+    assert first == replay
+    assert reopened != first
+
+
+def test_monitor_health_turns_unhealthy_after_the_db_loop_deadline(monkeypatch):
+    started_at = datetime.now(timezone.utc)
+    monkeypatch.setattr(
+        production_issue_monitor,
+        "_monitor_started_at",
+        started_at,
+    )
+    monkeypatch.setattr(
+        production_issue_monitor,
+        "_monitor_last_db_loop_success_at",
+        None,
+    )
+    monkeypatch.setattr(production_issue_monitor, "_monitor_interval_seconds", 30)
+
+    healthy = production_issue_monitor.production_issue_monitor_health(
+        now=started_at + production_issue_monitor.timedelta(seconds=119),
+    )
+    stale = production_issue_monitor.production_issue_monitor_health(
+        now=started_at + production_issue_monitor.timedelta(seconds=121),
+    )
+
+    assert healthy["healthy"] is True
+    assert healthy["deadline_seconds"] == 120
+    assert stale["healthy"] is False
+
+
+def test_failed_external_alert_schedules_retry_without_false_delivery():
+    now = datetime.now(timezone.utc)
+    issue = SimpleNamespace(
+        alert_attempts=0,
+        alert_next_attempt_at=None,
+        alert_last_error_code=None,
+        alerted_at=None,
+    )
+
+    production_issue_monitor._schedule_alert_retry(
+        issue,
+        now=now,
+        error_code="ConnectTimeout",
+    )
+
+    assert issue.alerted_at is None
+    assert issue.alert_attempts == 1
+    assert issue.alert_last_error_code == "ConnectTimeout"
+    assert issue.alert_next_attempt_at == now + production_issue_monitor.timedelta(seconds=30)
+
+
+def test_alert_retry_backoff_is_capped_at_one_hour():
+    now = datetime.now(timezone.utc)
+    issue = SimpleNamespace(
+        alert_attempts=100,
+        alert_next_attempt_at=None,
+        alert_last_error_code=None,
+        alerted_at=None,
+    )
+
+    production_issue_monitor._schedule_alert_retry(
+        issue,
+        now=now,
+        error_code="ReadTimeout",
+    )
+
+    assert issue.alert_next_attempt_at == now + production_issue_monitor.timedelta(hours=1)
 
 
 @pytest.mark.asyncio

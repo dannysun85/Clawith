@@ -251,7 +251,11 @@ async def get_douyin_publish_job(
     return job
 
 
-@router.post("/publish-jobs/{job_id}/approve", response_model=DouyinPublishJobOut)
+@router.post(
+    "/publish-jobs/{job_id}/approve",
+    response_model=DouyinPublishJobOut,
+    status_code=202,
+)
 async def approve_douyin_publish_job(
     job_id: uuid.UUID,
     current_user: User = Depends(get_current_user),
@@ -261,9 +265,17 @@ async def approve_douyin_publish_job(
     if not job.approval_id:
         raise HTTPException(status_code=400, detail="Publish job has no approval request")
     try:
-        await autonomy_service.resolve_approval(db, job.approval_id, current_user, "approve")
+        await autonomy_service.resolve_approval(
+            db,
+            job.approval_id,
+            current_user,
+            "approve",
+            expected_agent_id=job.agent_id,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    job.approval_status = "approved"
+    await db.commit()
     result = await db.execute(select(DouyinPublishJob).where(DouyinPublishJob.id == job_id))
     return result.scalar_one()
 
@@ -274,8 +286,11 @@ async def run_douyin_publish_job(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    job = await get_douyin_publish_job(job_id, current_user=current_user, db=db)
-    return await douyin_operations_service.run_publish_job(db, job_id=job.id)
+    await get_douyin_publish_job(job_id, current_user=current_user, db=db)
+    raise HTTPException(
+        status_code=409,
+        detail="Approved Douyin jobs are executed only by the durable approval worker",
+    )
 
 
 @router.post("/publish-jobs/{job_id}/confirm-user-publish", response_model=DouyinPublishJobOut)

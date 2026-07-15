@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.api.websocket import WebSocketChatHandler
+from app.api.websocket import WebSocketChatHandler, generic_llm_failure_user_message
 from app.services.llm import caller as llm_caller
 from app.services.llm.caller import RouteMeta
 
@@ -56,6 +56,14 @@ class RecordingDBContext:
 
     async def __aexit__(self, exc_type, exc, tb):
         return False
+
+
+def test_generic_llm_failure_does_not_expose_internal_exception_details():
+    message = generic_llm_failure_user_message()
+
+    assert message.startswith("[LLM call error]")
+    assert "sqlalchemy" not in message.lower()
+    assert "api_key" not in message.lower()
 
 
 @pytest.mark.asyncio

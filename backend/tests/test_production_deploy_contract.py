@@ -1,6 +1,9 @@
 import importlib.util
+import json
+import os
 import re
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -61,6 +64,12 @@ def _recovery_shell_source(script: str) -> tuple[str, str, str]:
     )
     recovery_helpers = "\n".join(
         [
+            # MCP quarantine/restore has its own database contract tests. The
+            # cutover state-machine fixtures deliberately isolate networking
+            # and persistence from those deployment-security side effects.
+            "quarantine_mcp_for_unsafe_release() { :; }",
+            "restore_mcp_quarantine_for_safe_release() { :; }",
+            "approval_schema_forward_state() { printf '%s' \"${SCHEMA_FORWARD_STATE:-1}\"; }",
             _shell_function_source(
                 script,
                 "project_for_slot",
@@ -90,13 +99,16 @@ def test_production_compose_splits_api_and_worker_roles_and_shares_durable_volum
 def test_production_code_execution_defaults_fail_closed():
     compose = (ROOT / "deploy/astra-poc/docker-compose.prod.yml").read_text(encoding="utf-8")
 
-    assert "CODE_EXECUTION_ENABLED: ${CODE_EXECUTION_ENABLED:-false}" in compose
-    assert "CODE_EXECUTION_ALLOWED_TENANT_IDS: ${CODE_EXECUTION_ALLOWED_TENANT_IDS:-}" in compose
-    assert "CODE_EXECUTION_ALLOWED_TOOL_NAMES: ${CODE_EXECUTION_ALLOWED_TOOL_NAMES:-}" in compose
-    assert "CODE_EXECUTION_ALLOWED_SANDBOX_TYPES: ${CODE_EXECUTION_ALLOWED_SANDBOX_TYPES:-}" in compose
-    assert "CODE_EXECUTION_ALLOWED_SANDBOX_ENDPOINTS: ${CODE_EXECUTION_ALLOWED_SANDBOX_ENDPOINTS:-}" in compose
-    assert "CODE_EXECUTION_REQUIRE_APPROVAL: ${CODE_EXECUTION_REQUIRE_APPROVAL:-true}" in compose
-    assert "SANDBOX_ALLOW_NETWORK: ${SANDBOX_ALLOW_NETWORK:-false}" in compose
+    assert 'CODE_EXECUTION_ENABLED: "false"' in compose
+    assert 'CODE_EXECUTION_ALLOWED_TENANT_IDS: ""' in compose
+    assert 'CODE_EXECUTION_ALLOWED_TOOL_NAMES: ""' in compose
+    assert 'CODE_EXECUTION_ALLOWED_SANDBOX_TYPES: ""' in compose
+    assert 'CODE_EXECUTION_ALLOWED_SANDBOX_ENDPOINTS: ""' in compose
+    assert 'CODE_EXECUTION_REQUIRE_APPROVAL: "true"' in compose
+    assert 'SANDBOX_TYPE: "e2b"' in compose
+    assert 'SANDBOX_API_KEY: ""' in compose
+    assert 'SANDBOX_API_URL: ""' in compose
+    assert 'SANDBOX_ALLOW_NETWORK: "false"' in compose
     assert 'SANDBOX_ALLOW_UNSAFE_FALLBACK_WHEN_BWRAP_MISSING: "false"' in compose
     assert "privileged: true" not in compose
     assert "/var/run/docker.sock" not in compose
@@ -105,16 +117,173 @@ def test_production_code_execution_defaults_fail_closed():
     assert "apparmor=unconfined" not in compose
 
 
+def test_polluted_parent_environment_cannot_activate_code_in_effective_compose():
+    if shutil.which("docker") is None:
+        pytest.skip("docker CLI is not installed")
+    version = subprocess.run(
+        ["docker", "compose", "version"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if version.returncode != 0:
+        pytest.skip("docker compose plugin is not installed")
+
+    env = {
+        **os.environ,
+        "POSTGRES_PASSWORD": "contract-test",
+        "SECRET_KEY": "contract-test-secret",
+        "JWT_SECRET_KEY": "contract-test-jwt",
+        "CORS_ORIGINS": "https://example.test",
+        "PUBLIC_BASE_URL": "https://example.test",
+        "CODE_EXECUTION_ENABLED": "true",
+        "CODE_EXECUTION_ALLOWED_TENANT_IDS": "tenant-from-parent",
+        "CODE_EXECUTION_ALLOWED_TOOL_NAMES": "execute_code",
+        "CODE_EXECUTION_ALLOWED_SANDBOX_TYPES": "subprocess",
+        "CODE_EXECUTION_ALLOWED_SANDBOX_ENDPOINTS": "https://unsafe.example",
+        "CODE_EXECUTION_REQUIRE_APPROVAL": "false",
+        "SANDBOX_TYPE": "subprocess",
+        "SANDBOX_API_KEY": "parent-secret",
+        "SANDBOX_API_URL": "https://unsafe.example",
+        "SANDBOX_ALLOW_NETWORK": "true",
+        "SANDBOX_ALLOW_UNSAFE_FALLBACK_WHEN_BWRAP_MISSING": "true",
+    }
+    rendered = subprocess.run(
+        [
+            "docker", "compose", "-f",
+            "deploy/astra-poc/docker-compose.prod.yml",
+            "config", "--format", "json",
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    config = json.loads(rendered.stdout)
+    for service_name in ("backend", "worker"):
+        effective = config["services"][service_name]["environment"]
+        assert effective["CODE_EXECUTION_ENABLED"] == "false"
+        assert effective["CODE_EXECUTION_ALLOWED_TENANT_IDS"] == ""
+        assert effective["CODE_EXECUTION_ALLOWED_TOOL_NAMES"] == ""
+        assert effective["CODE_EXECUTION_ALLOWED_SANDBOX_TYPES"] == ""
+        assert effective["CODE_EXECUTION_ALLOWED_SANDBOX_ENDPOINTS"] == ""
+        assert effective["CODE_EXECUTION_REQUIRE_APPROVAL"] == "true"
+        assert effective["SANDBOX_TYPE"] == "e2b"
+        assert effective["SANDBOX_API_KEY"] == ""
+        assert effective["SANDBOX_API_URL"] == ""
+        assert effective["SANDBOX_ALLOW_NETWORK"] == "false"
+        assert effective["SANDBOX_ALLOW_UNSAFE_FALLBACK_WHEN_BWRAP_MISSING"] == "false"
+
+
 def test_production_release_gate_covers_code_execution_security():
     script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
     workflow = (ROOT / ".agents/workflows/deploy-production.md").read_text(encoding="utf-8")
 
-    assert "tests/test_code_execution_security.py" in script
-    assert "tests/test_tool_tenant_scope.py" in script
-    assert "tests/test_process_utils.py" in script
+    assert '(cd backend && uv run pytest -q)' in script
+    assert "production releases cannot disable local release gates" in script
+    assert "scripts/ruff_diff_gate.py" in script
+    assert "git describe --tags --abbrev=0 HEAD^" in script
+    assert '--base "$RELEASE_BASE_COMMIT" --target HEAD' in script
+    assert '"$RELEASE/BASE_COMMIT"' in script
+    assert "bash scripts/postgres-migration-smoke.sh" in script
+    assert "docker compose -f deploy/astra-poc/docker-compose.prod.yml config --quiet" in script
+    assert 'git archive --format=tar --output="$PACKAGE_TAR" "$COMMIT"' in script
+    assert 'git get-tar-commit-id < "$PACKAGE_TAR"' in script
+    assert 'gzip -n -c "$PACKAGE_TAR" > "$PACKAGE"' in script
+    assert '"$PACKAGE_SHA256" <<\'REMOTE_SCRIPT\'' in script
+    assert "release package digest mismatch" in script
+    assert 'write_atomic_line "$RELEASE/PACKAGE_SHA256" "$PACKAGE_SHA256"' in script
+    assert script.index('echo "[local] running full backend suite"') < script.index(
+        'git archive --format=tar'
+    ) < script.index(
+        'echo "[remote] uploading package"'
+    )
+    assert script.index("release package digest mismatch") < script.index(
+        'tar -xzf "$PACKAGE" -C "$RELEASE"'
+    )
     assert "Code 激活状态为\n`BLOCKED`" in workflow
     assert "精确 tenant UUID" in workflow
     assert "生产禁止 `subprocess`、`docker`" in workflow
+
+
+def test_remote_product_smoke_is_required_unless_break_glass_is_audited():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    consumer_path = ROOT / "scripts/consume_break_glass_approval.py"
+    consumer = consumer_path.read_text(encoding="utf-8")
+
+    assert 'RUN_REMOTE_SMOKE="${RUN_REMOTE_SMOKE:-1}"' in script
+    assert "REMOTE_SMOKE_BREAK_GLASS_ARTIFACT" in script
+    for field in (
+        '"approval_id"',
+        '"approval_nonce"',
+        '"approved_by"',
+        '"reason"',
+        '"issued_at_utc"',
+        '"expires_at_utc"',
+        '"release_version"',
+        '"release_commit"',
+    ):
+        assert field in script
+    assert 'fields["release_commit"] != commit' in script
+    assert "break-glass artifact contains duplicate field" in script
+    assert "break-glass approval_nonce has an invalid format" in script
+    assert "timedelta(hours=4)" in script
+    assert 'BREAK_GLASS_NONCE_ROOT="$APP_ROOT/break-glass-nonces"' in script
+    assert "break-glass approval nonce has already been used" in consumer
+    assert consumer_path.is_file()
+    assert 'sudo python3 "$RELEASE/scripts/consume_break_glass_approval.py"' in script
+    assert '"approval_artifact_base64"' in consumer
+    assert "os.fsync(temporary_fd)" in consumer
+    assert "os.link(" in consumer
+    assert "os.fsync(ledger_fd)" in consumer
+    assert "remote-smoke-break-glass.approval" in script
+    assert "remote-smoke-break-glass.sha256" in script
+    assert "remote-smoke-break-glass.nonce-sha256" in script
+    assert "subscription-production-smoke.sh" in script
+    consume = script.index("consume_break_glass_approval.py")
+    recovery = script.index('if [ "$RECOVERY_REQUIRED" = "1" ]', consume)
+    assert consume < recovery
+
+
+def test_mcp_host_egress_guard_is_a_pre_mutation_release_gate():
+    deploy_script = (ROOT / "scripts/deploy-astra-production.sh").read_text(
+        encoding="utf-8"
+    )
+    guard_path = ROOT / "scripts/manage-production-mcp-egress-guard.sh"
+    contract_path = ROOT / "deploy/security-contracts/mcp-egress-v1"
+    guard = guard_path.read_text(encoding="utf-8")
+    contract = contract_path.read_text(encoding="utf-8")
+
+    assert guard_path.is_file()
+    assert contract_path.is_file()
+    assert "ASTRA_MCP_EGRESS_V1" in guard
+    assert "DOCKER-USER" in guard
+    assert "198.18.0.0/15" in guard
+    assert "169.254.0.0/16" in guard
+    assert "astra-mcp-egress-public-v1" in guard
+    assert "astra-mcp-egress-repair-v1" in guard
+    assert "MCP egress chain must have exactly one DOCKER-USER jump" in guard
+    assert "repair can interrupt" in guard
+    assert "flock -w 30" in guard
+    assert "public-port allowlist" in contract
+    assert "astra-mcp-egress-guard.timer" in guard
+    assert "OnUnitActiveSec=30s" in guard
+    assert "Normal application deployment only verifies this contract" in contract
+
+    gate = deploy_script.index(
+        'echo "[remote] verifying host-level MCP egress contract"'
+    )
+    recovery = deploy_script.index('if [ "$RECOVERY_REQUIRED" = "1" ]', gate)
+    backup = deploy_script.index('echo "[remote] backing up database')
+    maintenance = deploy_script.index(
+        'echo "[remote] enabling explicit Web/API/WebSocket maintenance fence"',
+        gate,
+    )
+    migration = deploy_script.index("backend upgrade head", maintenance)
+    assert gate < recovery < backup < maintenance < migration
+    assert 'manage-production-mcp-egress-guard.sh" verify' in deploy_script
 
 
 def test_normal_production_deploy_force_disables_code_activation():
@@ -133,6 +302,162 @@ def test_normal_production_deploy_force_disables_code_activation():
         assert expected in script
 
 
+def test_mcp_deployment_contract_is_fail_closed_and_matches_runtime_classifier():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    sanitizer = ROOT / "backend/app/scripts/secure_mcp_quarantine.py"
+    marker = ROOT / "deploy/security-contracts/mcp-assignment-v1"
+
+    assert marker.is_file()
+    assert sanitizer.is_file()
+    assert "regexp_split_to_table" in script
+    assert "([a-z0-9])([A-Z])" in script
+    assert "_access_key" in script
+    assert "_apikey" in script
+    assert "astra_deploy_mcp_quarantine_state" in script
+    assert "secure_mcp_quarantine" in script
+    assert "restore_mcp_quarantine_for_safe_release" in script
+    assert "astra_deploy_mcp_quarantine_tools_guard" in script
+    assert "astra_deploy_mcp_quarantine_assignments_guard" in script
+    assert "NEW.enabled := false" in script
+    assert "NEW.mcp_server_url := NULL" in script
+    assert "RETURN NULL" in script
+    assert "NEW.tenant_id := OLD.tenant_id" in script
+    assert "NEW.agent_id := OLD.agent_id" in script
+    assert "NEW.is_default := OLD.is_default" in script
+    assert "NEW.is_default := false" in script
+    assert "SET LOCAL astra.mcp_quarantine_restore = 'on'" in script
+
+    quarantine_start = script.index("quarantine_mcp_for_unsafe_release() {")
+    restore_start = script.index("restore_mcp_quarantine_for_safe_release() {")
+    quarantine = script[quarantine_start:restore_start]
+    restore = script[restore_start:script.index("project_for_slot() {", restore_start)]
+    assert quarantine.index("CREATE TRIGGER astra_deploy_mcp_quarantine_tools_guard") < (
+        quarantine.index("UPDATE tools")
+    )
+    assert restore.index("SET LOCAL astra.mcp_quarantine_restore") < restore.index(
+        "UPDATE tools AS tool"
+    )
+    assert restore.index("UPDATE agent_tools AS assignment") < restore.index(
+        "DELETE FROM astra_deploy_mcp_quarantine_state"
+    )
+    assert restore.index("DELETE FROM astra_deploy_mcp_quarantine_state") < (
+        restore.index("DROP TRIGGER")
+    )
+
+    trap = script.index("trap 'on_error $?' ERR")
+    build = script.index('echo "[remote] building candidate slot')
+    migration_quarantine = script.index(
+        '"$PREVIOUS" "migration-${RELEASE_ID}"',
+        build,
+    )
+    migration_gate = script.index(
+        "ROLLBACK_REQUIRES_MCP_QUARANTINE=1",
+        migration_quarantine,
+    )
+    migration = script.index("backend upgrade head", migration_gate)
+    assert "ROLLBACK_REQUIRES_MCP_QUARANTINE=0" in script[:trap]
+    assert trap < build < migration_quarantine < migration_gate < migration
+
+    rollback_start = script.index("rollback() {")
+    rollback_end = script.index("abort_release() {", rollback_start)
+    rollback = script[rollback_start:rollback_end]
+    assert 'if [ "$ROLLBACK_REQUIRES_MCP_QUARANTINE" = "1" ]' in rollback
+    assert rollback.index("ROLLBACK_REQUIRES_MCP_QUARANTINE") < rollback.index(
+        "quarantine_mcp_for_unsafe_release"
+    )
+
+
+def test_pre_migration_rollback_never_quarantines_live_mcp(tmp_path):
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    rollback_start = script.index("rollback() {")
+    rollback_end = script.index("abort_release() {", rollback_start)
+    rollback = script[rollback_start:rollback_end]
+    harness = f"""set -eu
+SMOKE_ENV_FILE={shlex.quote(str(tmp_path / 'missing-smoke'))}
+PREVIOUS={shlex.quote(str(tmp_path / 'previous'))}
+PREVIOUS_RELEASE_ID=release-old
+PREVIOUS_VERSION=1.10.11
+PREVIOUS_COMMIT=old1234
+RELEASE={shlex.quote(str(tmp_path / 'candidate'))}
+RELEASE_ID=release-new
+ACTIVE_SLOT=b
+CANDIDATE_SLOT=a
+ROLLBACK_REQUIRES_MCP_QUARANTINE=0
+CANDIDATE_READY_FOR_FALLBACK=0
+NGINX_CONFIG_TOUCHED=0
+CURRENT={shlex.quote(str(tmp_path / 'current'))}
+OLD_PROJECT=astra-app-b
+OLD_PORT=3009
+CANDIDATE_PROJECT=astra-app-a
+COMPOSE_FILE=docker-compose.prod.yml
+write_cutover_state() {{ :; }}
+approval_schema_forward_state() {{ printf '0'; }}
+preserve_forward_only_maintenance() {{ echo unexpected_forward_only; return 1; }}
+quarantine_mcp_for_unsafe_release() {{ echo unexpected_mcp_quarantine; return 1; }}
+ensure_old_application_ready() {{ :; }}
+write_atomic_symlink() {{ :; }}
+wait_for_public_release() {{ :; }}
+activate_worker_release() {{ :; }}
+commit_active_state() {{ :; }}
+cancel_pending_drain_for_active_release() {{ :; }}
+compose_project() {{ :; }}
+{rollback}
+rollback
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "unexpected_mcp_quarantine" not in result.stdout
+    assert "unexpected_forward_only" not in result.stdout
+
+
+def test_forward_only_rollback_preserves_maintenance_and_never_starts_old_code(tmp_path):
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    rollback_start = script.index("rollback() {")
+    rollback_end = script.index("abort_release() {", rollback_start)
+    rollback = script[rollback_start:rollback_end]
+    harness = f"""set +e
+SMOKE_ENV_FILE={shlex.quote(str(tmp_path / 'missing-smoke'))}
+PREVIOUS={shlex.quote(str(tmp_path / 'previous'))}
+PREVIOUS_RELEASE_ID=release-old
+RELEASE={shlex.quote(str(tmp_path / 'candidate'))}
+RELEASE_ID=release-new
+ACTIVE_SLOT=b
+CANDIDATE_SLOT=a
+ROLLBACK_REQUIRES_MCP_QUARANTINE=1
+NGINX_CONFIG_TOUCHED=1
+write_cutover_state() {{ :; }}
+approval_schema_forward_state() {{ printf '1'; }}
+preserve_forward_only_maintenance() {{ echo maintenance_preserved; }}
+ensure_old_application_ready() {{ echo unexpected_old_app; }}
+restore_previous_nginx() {{ echo unexpected_old_nginx; }}
+activate_worker_release() {{ echo unexpected_old_worker; }}
+quarantine_mcp_for_unsafe_release() {{ echo unexpected_quarantine; }}
+{rollback}
+rollback
+status=$?
+echo status=$status
+exit $status
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1, result.stderr
+    assert "maintenance_preserved" in result.stdout
+    assert "unexpected_" not in result.stdout
+
+
 def test_production_deploy_health_checks_candidate_before_nginx_cutover():
     script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
 
@@ -143,7 +468,7 @@ def test_production_deploy_health_checks_candidate_before_nginx_cutover():
     assert candidate_identity < nginx_reload
     assert "ACTIVE_SLOT_FILE" in script
     assert "DRAIN_TIMEOUT_SECONDS" in script
-    assert "tests/test_worker_runtime_health.py" in script
+    assert '(cd backend && uv run pytest -q)' in script
     assert "JWT_ROTATION_MARKER" in script
     assert 'install "$NGINX_SITE" "$OLD_PORT" "$CANDIDATE_PORT"' in script
     assert '"$RELEASE/scripts/configure_production_nginx.py"' in script
@@ -153,6 +478,15 @@ def test_production_deploy_health_checks_candidate_before_nginx_cutover():
     assert "audit_effective_config" in configurator
     assert "active_upstream_port" in configurator
     assert "run --rm --no-deps -T --entrypoint alembic backend upgrade head < /dev/null" in script
+
+
+def test_douyin_ui_cannot_bypass_immutable_approval_preview():
+    source = (ROOT / "frontend/src/pages/agent-detail/tabs/DouyinTab.tsx").read_text(encoding="utf-8")
+
+    assert "/approve" not in source
+    assert "/run" not in source
+    assert "settings#approvals" in source
+    assert "查看完整参数后审批" in source
 
 
 def test_nginx_cutover_redacts_query_strings_in_every_server_block():
@@ -198,6 +532,48 @@ def test_nginx_cutover_is_idempotent_and_can_switch_back():
     assert retry == first
     assert "proxy_pass http://127.0.0.1:3008;" in switched_back
     assert switched_back.count(configurator.REDACTED_ACCESS_LOG) == 1
+
+
+def test_nginx_maintenance_is_idempotent_and_removed_only_by_cutover():
+    configurator = _load_nginx_configurator()
+    original = """server {
+    listen 80;
+}
+server {
+    listen 443 ssl;
+    location / { proxy_pass http://127.0.0.1:3008; }
+}
+"""
+
+    first, count = configurator.configure_maintenance(original)
+    second, retry_count = configurator.configure_maintenance(first)
+
+    assert count == retry_count == 2
+    assert second == first
+    assert configurator.maintenance_enabled(first)
+    assert first.count("return 503;") == 2
+    assert first.count('add_header Retry-After "60" always;') == 2
+    assert first.count('add_header Cache-Control "no-store" always;') == 2
+    assert configurator.active_upstream_port(first) == "3008"
+
+    cutover, _ = configurator.configure_site(first, "3008", "3009")
+    assert not configurator.maintenance_enabled(cutover)
+    assert configurator.MAINTENANCE_BEGIN not in cutover
+    assert "return 503;" not in cutover
+    assert configurator.active_upstream_port(cutover) == "3009"
+
+
+def test_nginx_maintenance_rejects_partial_owned_markers():
+    configurator = _load_nginx_configurator()
+    partial = f"""server {{
+    {configurator.MAINTENANCE_BEGIN}
+    return 503;
+    location / {{ proxy_pass http://127.0.0.1:3008; }}
+}}
+"""
+
+    with pytest.raises(ValueError, match="unterminated"):
+        configurator.configure_maintenance(partial)
 
 
 def test_nginx_cutover_ignores_commented_upstream_examples():
@@ -630,11 +1006,6 @@ def test_production_deploy_rollback_keeps_privacy_safe_nginx_format():
     rollback_start = script.index("rollback() {")
     rollback_end = script.index("abort_release() {", rollback_start)
     rollback = script[rollback_start:rollback_end]
-    mutation_start = script.index(
-        'echo "[remote] installing privacy-safe access logging and switching traffic"'
-    )
-    mutation = script[mutation_start:]
-
     assert 'NGINX_CONFIG_TOUCHED=0' in script[:rollback_start]
     assert 'install "$NGINX_SITE" "$CANDIDATE_PORT" "$OLD_PORT"' in restore
     assert '"$NGINX_LOG_FORMAT"' in restore
@@ -644,19 +1015,25 @@ def test_production_deploy_rollback_keeps_privacy_safe_nginx_format():
     assert "restore_previous_nginx" in rollback
     assert "candidate remains running" in rollback
 
-    site_backup = mutation.index('sudo cp "$NGINX_SITE" "$NGINX_BACKUP"')
-    format_backup = mutation.index(
+    site_backup = script.index('sudo cp "$NGINX_SITE" "$NGINX_BACKUP"')
+    format_backup = script.index(
         'sudo cp "$NGINX_LOG_FORMAT" "$NGINX_LOG_FORMAT_BACKUP"'
     )
-    rollback_armed = mutation.index("NGINX_CONFIG_TOUCHED=1")
-    configurator_call = mutation.index(
-        'sudo python3 "$RELEASE/scripts/configure_production_nginx.py"'
+    maintenance_call = script.index(
+        "if ! enable_web_maintenance",
+        format_backup,
     )
-    nginx_test = mutation.index("sudo nginx -t")
-    nginx_audit = mutation.index("audit_effective_nginx")
-    nginx_reload = mutation.index("reload_nginx_with_worker_snapshot")
-    assert site_backup < format_backup < rollback_armed < configurator_call
-    assert configurator_call < nginx_test < nginx_audit < nginx_reload
+    assert site_backup < format_backup < maintenance_call
+    maintenance_helper = _shell_function_source(
+        script,
+        "enable_web_maintenance",
+        "preserve_forward_only_maintenance",
+    )
+    assert "maintenance-on" in maintenance_helper
+    assert "NGINX_CONFIG_TOUCHED=1" in maintenance_helper
+    assert "sudo nginx -t" in maintenance_helper
+    assert "audit_effective_nginx" in maintenance_helper
+    assert "reload_nginx_with_worker_snapshot" in maintenance_helper
 
 
 def test_production_deploy_error_trap_is_terminal():
@@ -778,26 +1155,30 @@ def test_production_deploy_explicit_failures_invoke_rollback_before_exit():
     assert 'abort_release "remote smoke environment file is missing"' in script
 
 
-def test_production_deploy_verifies_public_release_identity_before_stopping_old_slot():
+def test_production_deploy_starts_candidate_worker_before_unfreezing_public_traffic():
     script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
 
     verifier_start = script.index("release_payloads_match() {")
     verifier_end = script.index("audit_effective_nginx() {", verifier_start)
     verifier = script[verifier_start:verifier_end]
-    public_gate = script.index('echo "[remote] verifying public cutover identity"')
+    old_stop = script.index(
+        'compose_project "$OLD_PROJECT" "$PREVIOUS/.env" "$PREVIOUS/$COMPOSE_FILE" \\\n'
+        "    stop --timeout 90 worker frontend backend"
+    )
+    migration = script.index("backend upgrade head", old_stop)
     worker_handoff = script.index(
         'if ! activate_worker_release \\\n    "$CANDIDATE_PROJECT"',
-        public_gate,
+        migration,
     )
-    assert public_gate < worker_handoff
+    public_gate = script.index('echo "[remote] verifying public cutover identity"')
+
+    assert old_stop < migration < worker_handoff < public_gate
     assert "'Cache-Control: no-cache'" in verifier
     assert 'health.get("version") != expected_version' in verifier
     assert 'version.get("commit") != expected_commit' in verifier
-    assert 'wait_for_public_release "$VERSION" "$COMMIT"' in script[
-        public_gate:worker_handoff
-    ]
+    assert 'wait_for_public_release "$VERSION" "$COMMIT"' in script[public_gate:]
     assert 'abort_release "public cutover did not expose expected release' in script[
-        public_gate:worker_handoff
+        public_gate:
     ]
 
 
@@ -952,10 +1333,19 @@ compose_project() {{
         return 1
     fi
     shift 3
-    if [ "$1" = stop ] && [ "$2" = worker ]; then
+    if [ "$1" = stop ] && [ "$2" = --timeout ] && [ "$4" = worker ]; then
         test "$project" = astra-app-b
         WORKER_SLOT=stopped
-        echo old_worker_stopped
+        echo fallback_application_stopped
+        return 0
+    fi
+    if [ "$1" = run ] && [ "$project" = astra-app-a ]; then
+        echo target_schema_migrated
+        return 0
+    fi
+    if [ "$1" = up ] && [ "$2" = -d ] && [ "${{!#}}" = frontend ]; then
+        test "$project" = astra-app-a
+        echo target_web_started
         return 0
     fi
     if [ "$1" = up ] && [ "${{!#}}" = worker ]; then
@@ -982,9 +1372,16 @@ docker() {{
 }}
 sudo() {{
     if [ "$1" = python3 ]; then
-        test "$3" = install
-        echo "normalized $5->$6"
-        return 0
+        case "$3" in
+            maintenance-on)
+                echo maintenance_enabled
+                return 0
+                ;;
+            install)
+                echo "normalized $5->$6"
+                return 0
+                ;;
+        esac
     fi
     if [ "$1" = nginx ]; then
         test "$2" = -t
@@ -1020,6 +1417,9 @@ echo "current=$(readlink "$CURRENT")"
     assert "public_identity_verified" in result.stdout
     assert "old_worker_stopped" in result.stdout
     assert "target_worker_started" in result.stdout
+    assert "fallback_application_stopped" in result.stdout
+    assert "target_schema_migrated" in result.stdout
+    assert "target_web_started" in result.stdout
     assert "runtime_slot=a" in result.stdout
     assert "worker_slot=a" in result.stdout
     assert "recorded_slot=a" in result.stdout
@@ -1027,8 +1427,6 @@ echo "current=$(readlink "$CURRENT")"
     assert "active_release=candidate-release" in result.stdout
     assert "active_state=slot=a release=candidate-release" in result.stdout
     assert f"current={target_release}" in result.stdout
-    assert "frontend" not in result.stdout
-    assert "backend" not in result.stdout
 
 
 def test_production_deploy_failed_recovery_preserves_both_slots(tmp_path):
@@ -1071,10 +1469,36 @@ write_atomic_line() {{ printf '%s\n' "$2" > "$1"; }}
 write_cutover_state() {{ write_atomic_line "$CUTOVER_STATE_FILE" "$1 slot=$2 release=$3"; }}
 wait_for_local_release() {{ echo target_identity_failed; return 1; }}
 wait_for_public_release() {{ echo unexpected_public_check; return 1; }}
-audit_effective_nginx() {{ echo unexpected_audit; return 1; }}
-compose_project() {{ echo unexpected_compose; return 1; }}
+audit_effective_nginx() {{ echo maintenance_audited; return 0; }}
+reload_nginx_with_worker_snapshot() {{ echo maintenance_reloaded; return 0; }}
+retire_pre_reload_nginx_workers() {{ echo maintenance_workers_retired; return 0; }}
+compose_project() {{
+    local project="$1"
+    shift 3
+    if [ "$project" = astra-app-b ] && [ "$1" = stop ]; then
+        echo fallback_application_stopped
+        return 0
+    fi
+    if [ "$project" = astra-app-a ] && [ "$1" = run ]; then
+        echo target_schema_migrated
+        return 0
+    fi
+    if [ "$project" = astra-app-a ] && [ "$1" = up ]; then
+        echo target_web_started
+        return 0
+    fi
+    echo unexpected_compose
+    return 1
+}}
 docker() {{ echo unexpected_docker; return 1; }}
-sudo() {{ echo unexpected_mutation; return 1; }}
+sudo() {{
+    if [ "$1" = python3 ] || [ "$1" = nginx ]; then
+        echo maintenance_configured
+        return 0
+    fi
+    echo unexpected_mutation
+    return 1
+}}
 {port_function}
 {recovery_helpers}
 {recovery_function}
@@ -1095,13 +1519,15 @@ exit "$status"
 
     assert result.returncode == 1
     assert "target_identity_failed" in result.stdout
+    assert "fallback_application_stopped" in result.stdout
+    assert "target_schema_migrated" in result.stdout
+    assert "target_web_started" in result.stdout
     assert "status=1" in result.stdout
     assert "active_slot=b" in result.stdout
-    assert "unexpected_mutation" not in result.stdout
     assert "unexpected_public_check" not in result.stdout
-    assert "unexpected_audit" not in result.stdout
     assert "unexpected_compose" not in result.stdout
     assert "unexpected_docker" not in result.stdout
+    assert "unexpected_mutation" not in result.stdout
 
 
 def test_recovery_fails_closed_without_committing_an_unhealthy_target_worker(tmp_path):
@@ -1170,13 +1596,22 @@ compose_project() {{
         return 1
     fi
     shift 3
-    if [ "$1" = stop ] && [ "$2" = worker ]; then
+    if [ "$1" = stop ] && [ "$2" = --timeout ] && [ "$4" = worker ]; then
         if [ "$project" = astra-app-b ]; then
             echo fallback_stopped
         else
             echo target_partial_stopped
         fi
         WORKER_SLOT=stopped
+        return 0
+    fi
+    if [ "$1" = run ] && [ "$project" = astra-app-a ]; then
+        echo target_schema_migrated
+        return 0
+    fi
+    if [ "$1" = up ] && [ "$2" = -d ] && [ "${{!#}}" = frontend ]; then
+        test "$project" = astra-app-a
+        echo target_web_started
         return 0
     fi
     if [ "$1" = up ] && [ "${{!#}}" = worker ]; then
@@ -1256,39 +1691,61 @@ def test_production_deploy_reconciles_live_nginx_before_clearing_inactive_slot()
     recovery_start = script.index("recover_indeterminate_cutover() {")
     recovery_end = script.index("\nif ! load_active_state", recovery_start)
     recovery = script[recovery_start:recovery_end]
+    assert active_port < recovery_call < pending_drain < clear_candidate
+    recovery_maintenance = recovery.index("maintenance-on")
+    recovery_old_stop = recovery.index("stop --timeout 90 worker frontend backend")
+    recovery_migration = recovery.index("backend upgrade head")
+    recovery_local = recovery.index("wait_for_local_release", recovery_migration)
+    recovery_worker = recovery.index("activate_worker_release", recovery_local)
+    recovery_install = recovery.index('install "$NGINX_SITE"', recovery_worker)
+    recovery_public = recovery.index("wait_for_public_release", recovery_install)
+    recovery_commit = recovery.index("commit_active_state", recovery_public)
+    assert (
+        recovery_maintenance
+        < recovery_old_stop
+        < recovery_migration
+        < recovery_local
+        < recovery_worker
+        < recovery_install
+        < recovery_public
+        < recovery_commit
+    )
+    assert "rm -sf" not in recovery
+
     candidate_journal = script.index(
-        'write_atomic_line "$APP_ROOT/slot-${CANDIDATE_SLOT}-release"'
+        'write_atomic_line "$APP_ROOT/slot-${CANDIDATE_SLOT}-release" "$RELEASE"'
     )
-    nginx_reload = script.index(
-        "reload_nginx_with_worker_snapshot",
-        candidate_journal,
+    maintenance = script.index("if ! enable_web_maintenance", candidate_journal)
+    old_stop = script.index(
+        "stop --timeout 90 worker frontend backend",
+        maintenance,
     )
-    active_state_persist = script.index(
-        'commit_active_state "$CANDIDATE_SLOT" "$RELEASE_ID"',
-        nginx_reload,
+    migration = script.index("backend upgrade head", old_stop)
+    schema_fence = script.index("write_cutover_state schema_forward_only", migration)
+    candidate_worker = script.index("if ! activate_worker_release", schema_fence)
+    cutover_install = script.index(
+        'install "$NGINX_SITE" "$OLD_PORT" "$CANDIDATE_PORT"',
+        candidate_worker,
     )
     public_identity = script.index(
         'wait_for_public_release "$VERSION" "$COMMIT"',
-        nginx_reload,
+        cutover_install,
     )
-    candidate_worker_handoff = script.index(
-        "if ! activate_worker_release",
+    active_state_persist = script.index(
+        'commit_active_state "$CANDIDATE_SLOT" "$RELEASE_ID"',
         public_identity,
     )
-
-    assert active_port < recovery_call < pending_drain < clear_candidate
-    assert "wait_for_local_release" in recovery
-    assert "audit_effective_nginx" in recovery
-    assert "wait_for_public_release" in recovery
-    assert 'commit_active_state "$target_slot"' in recovery
-    public_identity = recovery.index("wait_for_public_release")
-    target_worker_handoff = recovery.index("activate_worker_release", public_identity)
-    state_persist = recovery.index("commit_active_state", target_worker_handoff)
-    assert public_identity < target_worker_handoff < state_persist
-    assert "rm -sf" not in recovery
-    assert "stop frontend backend" not in recovery
-    assert candidate_journal < nginx_reload < candidate_worker_handoff
-    assert candidate_worker_handoff < active_state_persist
+    assert (
+        candidate_journal
+        < maintenance
+        < old_stop
+        < migration
+        < schema_fence
+        < candidate_worker
+        < cutover_install
+        < public_identity
+        < active_state_persist
+    )
     assert "CUTOVER_STATE_FILE" in script
     assert "logrotate -f" not in script
 
@@ -1431,7 +1888,10 @@ OLD_WORKER_STOP_REQUESTED=1
 CANDIDATE_PROJECT=astra-app-a
 OLD_PROJECT=astra-app-b
 COMPOSE_FILE=docker-compose.prod.yml
+ROLLBACK_REQUIRES_MCP_QUARANTINE=0
 write_cutover_state() {{ echo "state:$1:$2:$3"; return 0; }}
+approval_schema_forward_state() {{ printf '0'; }}
+preserve_forward_only_maintenance() {{ echo unexpected_forward_only; return 1; }}
 write_atomic_line() {{ echo "unexpected_active_write:$1:$2"; return 0; }}
 commit_active_state() {{ echo "unexpected_active_commit:$1:$2"; return 0; }}
 ensure_old_application_ready() {{ echo old_app_ready; return 0; }}
@@ -1489,17 +1949,21 @@ def test_nginx_reload_validates_public_before_retiring_old_workers():
     helper_start = script.index("remaining_old_nginx_workers() {")
     helper_end = script.index("parse_cutover_state() {", helper_start)
     helper = script[helper_start:helper_end]
-    cutover = script.index(
-        "reload_nginx_with_worker_snapshot",
-        script.index('echo "[remote] installing privacy-safe access logging'),
+    candidate_worker = script.index(
+        "if ! activate_worker_release",
+        script.index("write_cutover_state schema_forward_only"),
     )
+    cutover_start = script.index(
+        'echo "[remote] switching the verified maintenance fence to candidate traffic"',
+        candidate_worker,
+    )
+    cutover = script.index("reload_nginx_with_worker_snapshot", cutover_start)
     reloaded_state = script.index("write_cutover_state nginx_reloaded", cutover)
     public_gate = script.index('echo "[remote] verifying public cutover identity"', cutover)
     public_identity = script.index(
         'wait_for_public_release "$VERSION" "$COMMIT"', public_gate
     )
-    worker_handoff = script.index("if ! activate_worker_release", public_identity)
-    retirement = script.index("if ! retire_pre_reload_nginx_workers", worker_handoff)
+    retirement = script.index("if ! retire_pre_reload_nginx_workers", public_identity)
     active_commit = script.index(
         'commit_active_state "$CANDIDATE_SLOT" "$RELEASE_ID"', retirement
     )
@@ -1512,30 +1976,50 @@ def test_nginx_reload_validates_public_before_retiring_old_workers():
     assert "sudo kill -TERM" in helper
     assert "sudo systemctl is-active --quiet nginx" in helper
     assert '${NGINX_WORKER_GRACE_SECONDS:-$DRAIN_TIMEOUT_SECONDS}' in helper
-    assert cutover < reloaded_state < public_gate < public_identity
-    assert public_identity < worker_handoff < retirement < active_commit
+    assert candidate_worker < cutover_start < cutover < reloaded_state
+    assert reloaded_state < public_gate < public_identity < retirement < active_commit
 
 
-def test_pending_drain_intent_is_durable_before_nginx_traffic_mutation():
+def test_maintenance_writer_fence_is_durable_before_schema_migration():
     script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
     candidate_journal = script.index(
         'write_atomic_line "$APP_ROOT/slot-${CANDIDATE_SLOT}-release" "$RELEASE"'
     )
-    pending_intent = script.index(
-        'write_atomic_line "$PENDING_DRAIN_FILE" "$OLD_PROJECT $OLD_PORT $PREVIOUS"',
+    maintenance = script.index(
+        "if ! enable_web_maintenance",
         candidate_journal,
     )
-    candidate_state = script.index(
-        'write_cutover_state candidate_ready "$CANDIDATE_SLOT" "$RELEASE_ID"',
-        pending_intent,
+    maintenance_state = script.index(
+        'write_cutover_state maintenance_enabled "$CANDIDATE_SLOT" "$RELEASE_ID"',
+        maintenance,
     )
-    nginx_install = script.index(
-        'install "$NGINX_SITE" "$OLD_PORT" "$CANDIDATE_PORT"',
-        pending_intent,
+    old_stop = script.index(
+        "stop --timeout 90 worker frontend backend",
+        maintenance_state,
     )
-    nginx_reload = script.index("reload_nginx_with_worker_snapshot", nginx_install)
+    migration_state = script.index(
+        'write_cutover_state migration_started "$CANDIDATE_SLOT" "$RELEASE_ID"',
+        old_stop,
+    )
+    migration = script.index("backend upgrade head", migration_state)
+    schema_state = script.index(
+        'write_cutover_state schema_forward_only "$CANDIDATE_SLOT" "$RELEASE_ID"',
+        migration,
+    )
 
-    assert candidate_journal < pending_intent < candidate_state < nginx_install < nginx_reload
+    assert (
+        candidate_journal
+        < maintenance
+        < maintenance_state
+        < old_stop
+        < migration_state
+        < migration
+        < schema_state
+    )
+    assert (
+        'write_atomic_line "$PENDING_DRAIN_FILE" '
+        '"$OLD_PROJECT $OLD_PORT $PREVIOUS"'
+    ) not in script[candidate_journal:]
 
 
 def test_production_deploy_does_not_rebuild_the_live_project_in_place():
@@ -1558,7 +2042,7 @@ def test_deploy_state_is_serialized_and_durably_committed_before_legacy_mirrors(
 
     lock = script.index('exec 9>"$APP_ROOT/deploy.lock"')
     lock_acquired = script.index("flock -n 9", lock)
-    current_read = script.index('CURRENT_TARGET="$(readlink -f "$CURRENT")"')
+    current_read = script.index('CURRENT_TARGET="$(python3 -c')
     release_create = script.index('mkdir -p "$RELEASE" "$BACKUP"')
     assert lock < lock_acquired < current_read < release_create
     assert 'NONCE="$(python3 -c' in script
@@ -1736,7 +2220,7 @@ if [ "$status" != 0 ]; then
     echo "status=$status"
     exit "$status"
 fi
-PREVIOUS=$(readlink -f "$CURRENT")
+PREVIOUS=$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' "$CURRENT")
 ACTIVE_SLOT=$RECORDED_SLOT
 PREVIOUS_RELEASE_ID=$(basename "$PREVIOUS")
 write_atomic_line "$APP_ROOT/slot-${{ACTIVE_SLOT}}-release" "$PREVIOUS"
@@ -1881,6 +2365,8 @@ NGINX_LOG_FORMAT=/etc/nginx/conf.d/00-astra-log-redaction.conf
 CURRENT={shlex.quote(str(current))}
 CUTOVER_STATE_FILE={shlex.quote(str(cutover_state))}
 RECORDED_SLOT=a
+CUTOVER_PHASE=rollback_started
+SCHEMA_FORWARD_STATE=0
 write_cutover_state() {{ printf '%s\n' "$1 slot=$2 release=$3" > "$CUTOVER_STATE_FILE"; }}
 write_atomic_symlink() {{ command ln -sfn "$2" "$1"; }}
 wait_for_local_release() {{ echo local_ready; }}
@@ -1890,6 +2376,20 @@ reload_nginx_with_worker_snapshot() {{ :; }}
 retire_pre_reload_nginx_workers() {{ :; }}
 activate_worker_release() {{ echo worker_ready; }}
 commit_active_state() {{ echo "active=$1:$2"; }}
+compose_project() {{
+    local project="$1"
+    shift 3
+    test "$project" = astra-app-a
+    if [ "$1" = run ]; then
+        echo schema_ready
+        return 0
+    fi
+    if [ "$1" = up ]; then
+        echo web_ready
+        return 0
+    fi
+    return 1
+}}
 sudo() {{ :; }}
 {port_function}
 {recovery_helpers}
@@ -2341,19 +2841,26 @@ exit $status
     assert "unexpected_" not in result.stdout
 
 
-def test_candidate_identity_precedes_journal_and_fallback_eligibility():
+def test_candidate_journal_precedes_writer_fence_and_identity_gate():
     script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    journal = script.index(
+        'write_atomic_line "$APP_ROOT/slot-${CANDIDATE_SLOT}-release" "$RELEASE"'
+    )
+    maintenance = script.index("if ! enable_web_maintenance", journal)
+    schema_fence = script.index(
+        'write_cutover_state schema_forward_only "$CANDIDATE_SLOT" "$RELEASE_ID"',
+        maintenance,
+    )
     identity = script.index(
         'if ! wait_for_local_release \\\n    "$CANDIDATE_PORT" "$VERSION" "$COMMIT" "$RELEASE_ID" 60'
     )
     fallback = script.index("CANDIDATE_READY_FOR_FALLBACK=1", identity)
-    journal = script.index(
-        'write_atomic_line "$APP_ROOT/slot-${CANDIDATE_SLOT}-release"',
-        identity,
+    candidate_state = script.index(
+        "write_cutover_state candidate_services_ready",
+        fallback,
     )
-    candidate_state = script.index("write_cutover_state candidate_ready", journal)
 
-    assert identity < fallback < journal < candidate_state
+    assert journal < maintenance < schema_fence < identity < fallback < candidate_state
 
 
 @pytest.mark.parametrize("failure_point", ["old_application", "nginx_rollback"])
@@ -2382,6 +2889,8 @@ CANDIDATE_PROJECT=astra-app-a
 COMPOSE_FILE=docker-compose.prod.yml
 FAILURE_POINT={failure_point}
 write_cutover_state() {{ echo "state=$1:$2:$3"; }}
+approval_schema_forward_state() {{ printf '0'; }}
+preserve_forward_only_maintenance() {{ echo unexpected_forward_only; return 1; }}
 ensure_old_application_ready() {{
     [ "$FAILURE_POINT" != old_application ]
 }}

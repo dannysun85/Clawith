@@ -30,6 +30,9 @@ class MemoryStorage:
     async def exists(self, key: str) -> bool:
         return key in self.objects
 
+    async def is_file(self, key: str) -> bool:
+        return key in self.objects
+
     async def read_text(self, key: str, encoding: str = "utf-8", errors: str = "replace") -> str:
         return self.objects[key].decode(encoding, errors=errors)
 
@@ -170,8 +173,9 @@ async def main() -> None:
     assert notification_count == 1
     assert storage.objects[f"{agent_id}/workspace/videos/smoke.mp4"].startswith(b"\x00\x00\x00\x18ftyp")
 
-    # The media daemon and billing reconciliation both run at startup. Prove
-    # that two concurrent legacy scans claim one reservation only once.
+    # Editable legacy metadata cannot authorize a provider request or refund.
+    # Prove that two concurrent scans create one durable attention record and
+    # retain the hold for operator reconciliation.
     legacy_reservation_id = uuid.uuid4()
     legacy_provider_task_id = f"legacy-{uuid.uuid4()}"
     async with async_session() as db:
@@ -211,11 +215,67 @@ async def main() -> None:
             .select_from(MediaGenerationTask)
             .where(MediaGenerationTask.reservation_id == legacy_reservation_id)
         )
-    assert sum(backfill_counts) == 1
+        legacy_task = await db.scalar(
+            select(MediaGenerationTask).where(
+                MediaGenerationTask.reservation_id == legacy_reservation_id
+            )
+        )
+        legacy_reservation = await db.get(CreditReservation, legacy_reservation_id)
+    assert sum(backfill_counts) == 0
     assert legacy_task_count == 1
+    assert legacy_task is not None and legacy_task.status == "backfill_attention"
+    assert legacy_reservation is not None and legacy_reservation.status == "provider_inflight"
 
-    # Prove the terminal failure path is also exactly once when two workers
-    # observe the final allowed consecutive recovery error concurrently.
+    # A finalized legacy reservation may be imported only when the already-paid
+    # artifact exists inside that Agent's workspace. This path performs no
+    # provider or credential call and remains exactly once under concurrent scans.
+    finalized_reservation_id = uuid.uuid4()
+    finalized_provider_task_id = f"legacy-finalized-{uuid.uuid4()}"
+    async with async_session() as db:
+        db.add(CreditReservation(
+            id=finalized_reservation_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            agent_id=agent_id,
+            action="video",
+            modality="video",
+            tier="lite",
+            provider="minimax",
+            model="MiniMax-Hailuo-2.3",
+            amount=1,
+            status="finalized",
+        ))
+        await db.commit()
+
+    finalized_metadata_key = f"{agent_id}/workspace/videos/legacy-finalized.json"
+    storage.objects[finalized_metadata_key] = json.dumps({
+        "task_id": finalized_provider_task_id,
+        "credential_id": str(credential_id),
+        "reservation_id": str(finalized_reservation_id),
+        "downloaded_path": "workspace/videos/legacy-finalized.mp4",
+        "status": "Success",
+    }).encode()
+    storage.objects[
+        f"{agent_id}/workspace/videos/legacy-finalized.mp4"
+    ] = b"\x00\x00\x00\x18ftypmp42legacy-video"
+    finalized_counts = await asyncio.gather(
+        media_generation.backfill_legacy_minimax_video_tasks(),
+        media_generation.backfill_legacy_minimax_video_tasks(),
+    )
+    async with async_session() as db:
+        finalized_task = await db.scalar(
+            select(MediaGenerationTask).where(
+                MediaGenerationTask.reservation_id == finalized_reservation_id
+            )
+        )
+    assert sum(finalized_counts) == 1
+    assert finalized_task is not None and finalized_task.status == "succeeded"
+    assert finalized_task.credential_id is None
+    assert finalized_task.provider_task_id is None
+
+    # Prove the pre-acceptance terminal failure path is exactly once when two
+    # workers observe the final allowed recovery error concurrently. Accepted
+    # provider tasks intentionally retain their hold and keep recovering.
     failure_reservation_id = uuid.uuid4()
     failure_task_id = uuid.uuid4()
     async with async_session() as db:
@@ -246,7 +306,7 @@ async def main() -> None:
             provider="minimax",
             modality="video",
             model="MiniMax-Hailuo-2.3",
-            provider_task_id=f"failure-{uuid.uuid4()}",
+            provider_task_id=None,
             status="retrying",
             metadata_path="workspace/videos/failure.json",
             output_path="workspace/videos/failure.mp4",
@@ -285,15 +345,19 @@ async def main() -> None:
             .select_from(Notification)
             .where(Notification.ref_id == failure_task_id)
         )
-        reserved_total = await db.scalar(
+        held_total = await db.scalar(
             select(func.coalesce(func.sum(CreditReservation.amount), 0)).where(
                 CreditReservation.tenant_id == tenant_id,
-                CreditReservation.status == "reserved",
+                CreditReservation.status.in_((
+                    "reserved",
+                    "provider_inflight",
+                    "settlement_ready",
+                )),
             )
         )
 
     assert balance is not None and balance.balance == 510
-    assert balance.reserved == reserved_total == 1
+    assert balance.reserved == held_total == 1
     assert reservation is not None and reservation.status == "released"
     assert failure_task is not None and failure_task.status == "failed"
     assert failure_task.consecutive_error_count == 12

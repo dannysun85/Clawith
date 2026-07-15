@@ -15,6 +15,7 @@ import {
 import { useDialog } from '../../../components/Dialog/DialogProvider';
 import { useToast } from '../../../components/Toast/ToastProvider';
 import { useAuthStore } from '../../../stores';
+import { bulkEligibleToolIds, mcpToolGroupKey } from '../../../utils/mcpToolGrouping';
 
 const getCategoryLabels = (t: any): Record<string, string> => ({
     file: t('agent.toolCategories.file'),
@@ -249,13 +250,6 @@ export default function ToolsManager({ agentId, canManage = false }: { agentId: 
     const companyTools = tools.filter(t => (t.source === 'builtin' || t.source === 'admin') && t.category !== 'system');
     const agentInstalledTools = tools.filter(t => t.source === 'agent' && t.category !== 'system');
 
-    const mcpGroupKey = (tool: any) => {
-        const serverName = String(tool.mcp_server_name || '').trim();
-        return tool.type === 'mcp' && serverName
-            ? `mcp:${serverName.toLowerCase()}`
-            : (tool.category || 'general');
-    };
-
     const getToolGroupMeta = (groupKey: string, toolsInGroup: any[]) => {
         const first = toolsInGroup.find((tool) => tool.type === 'mcp' && tool.mcp_server_name) || toolsInGroup[0];
         if (groupKey.startsWith('mcp:') && first?.mcp_server_name) {
@@ -276,7 +270,7 @@ export default function ToolsManager({ agentId, canManage = false }: { agentId: 
 
     const groupByCategory = (toolList: any[]) =>
         toolList.reduce((acc: Record<string, any[]>, t) => {
-            const cat = mcpGroupKey(t);
+            const cat = mcpToolGroupKey(t);
             (acc[cat] = acc[cat] || []).push(t);
             return acc;
         }, {});
@@ -347,19 +341,27 @@ export default function ToolsManager({ agentId, canManage = false }: { agentId: 
     };
 
     const bulkToggleCategory = async (catTools: any[], enabled: boolean) => {
-        const catToolIds = new Set(catTools.map(t => t.id));
+        const catToolIds = new Set(bulkEligibleToolIds(catTools));
+        if (catToolIds.size === 0) return;
         setTools(prev => prev.map(t => catToolIds.has(t.id) ? { ...t, enabled } : t));
         try {
             const token = localStorage.getItem('token');
             const payload = Array.from(catToolIds).map(id => ({ tool_id: id, enabled }));
-            await fetch(`/api/tools/agents/${agentId}`, {
+            const response = await fetch(`/api/tools/agents/${agentId}`, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
                 body: JSON.stringify(payload),
             });
+            if (!response.ok) {
+                const detail = await response.json().catch(() => null);
+                throw new Error(detail?.detail || `HTTP ${response.status}`);
+            }
         } catch (err: any) {
             console.error('Bulk update failed', err);
-            loadTools();
+            toast.error(t('agent.tools.bulkUpdateFailed', 'Bulk update failed'), {
+                details: String(err?.message || err),
+            });
+            await loadTools();
         }
     };
 
@@ -465,12 +467,13 @@ export default function ToolsManager({ agentId, canManage = false }: { agentId: 
             })
             .map(([category, catTools]) => {
                 const allCatTools = allGroupedTools[category] || catTools;
+                const eligibleCatTools = allCatTools.filter((tool: any) => tool.available !== false);
                 const meta = getToolGroupMeta(category, allCatTools);
                 const label = meta.label;
-                const enabledCount = allCatTools.filter((tool: any) => tool.enabled).length;
+                const enabledCount = eligibleCatTools.filter((tool: any) => tool.enabled).length;
                 const configuredCount = allCatTools.filter((tool: any) => tool.agent_config && Object.keys(tool.agent_config).length > 0).length;
-                const allEnabled = allCatTools.length > 0 && enabledCount === allCatTools.length;
-                const mixed = enabledCount > 0 && enabledCount < allCatTools.length;
+                const allEnabled = eligibleCatTools.length > 0 && enabledCount === eligibleCatTools.length;
+                const mixed = enabledCount > 0 && enabledCount < eligibleCatTools.length;
                 const expanded = expandedCategories.has(category) || !!toolSearch.trim();
                 const visibleCount = (catTools as any[]).length;
                 return (
@@ -552,9 +555,10 @@ export default function ToolsManager({ agentId, canManage = false }: { agentId: 
                                     ><IconSettings size={12} stroke={1.8} /> {t('agent.tools.config', 'Config')}</button>
                                 )}
                                 {canManage && (
-                                    <label style={{ position: 'relative', display: 'inline-block', width: '40px', height: '22px', cursor: 'pointer', flexShrink: 0 }} title={t('agent.tools.enableDisableAll', 'Enable/Disable all {{category}} tools', { category: label })}>
+                                    <label style={{ position: 'relative', display: 'inline-block', width: '40px', height: '22px', cursor: eligibleCatTools.length > 0 ? 'pointer' : 'not-allowed', flexShrink: 0, opacity: eligibleCatTools.length > 0 ? 1 : 0.55 }} title={t('agent.tools.enableDisableAll', 'Enable/Disable all {{category}} tools', { category: label })}>
                                         <input type="checkbox"
                                             checked={allEnabled}
+                                            disabled={eligibleCatTools.length === 0}
                                             onChange={(e) => void bulkToggleCategory(allCatTools, e.target.checked)}
                                             style={{ opacity: 0, width: 0, height: 0 }} />
                                         <span style={switchTrack(allEnabled, mixed)}>

@@ -600,6 +600,78 @@ async def test_generate_video_minimax_creates_task_metadata(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_generate_video_minimax_binds_provider_before_metadata_enospc(tmp_path):
+    agent_id = uuid.uuid4()
+    tenant_id = uuid.uuid4()
+    cred_id = uuid.uuid4()
+    reservation_id = uuid.uuid4()
+    cred = SimpleNamespace(id=cred_id, base_url=None)
+    reservation = SimpleNamespace(id=reservation_id)
+    durable_bound = False
+    write_attempts = 0
+
+    async def mark_submitted(record_id, **_kwargs):
+        nonlocal durable_bound
+        durable_bound = True
+        return record_id
+
+    def fail_metadata_write(_path, *_args, **_kwargs):
+        nonlocal write_attempts
+        write_attempts += 1
+        assert durable_bound is True
+        raise OSError(28, "No space left on device")
+
+    with (
+        patch(
+            "app.services.agent_tools._get_tool_config",
+            AsyncMock(return_value={"model": "MiniMax-Hailuo-2.3", "duration": 6, "resolution": "1080P"}),
+        ),
+        patch("app.services.agent_tools._get_agent_tenant_id", AsyncMock(return_value=str(tenant_id))),
+        patch("app.services.agent_tools._resolve_minimax_tool_tier", AsyncMock(return_value="pro")),
+        patch(
+            "app.services.minimax_media_profiles.load_platform_minimax_media_profile",
+            AsyncMock(return_value=resolve_minimax_media_profile("video", "pro")),
+        ),
+        patch("app.services.agent_tools._check_minimax_credit_amount", AsyncMock()),
+        patch(
+            "app.services.agent_tools._reserve_minimax_tool_credits",
+            AsyncMock(return_value=reservation),
+        ),
+        patch("app.services.quota_guard.check_plan_generation_entitlement", AsyncMock()),
+        patch("app.services.quota_guard.check_agent_llm_quota", AsyncMock()),
+        patch("app.services.llm.load_balancer.pick_credential", AsyncMock(return_value=cred)),
+        patch("app.services.llm.utils.get_credential_api_key", MagicMock(return_value="sk-test")),
+        patch(
+            "app.services.agent_tools._minimax_create_video_task",
+            AsyncMock(return_value="provider-task-enospc"),
+        ),
+        patch(
+            "app.services.media_generation.create_minimax_video_task_record",
+            AsyncMock(),
+        ),
+        patch(
+            "app.services.media_generation.mark_minimax_video_task_submitted",
+            AsyncMock(side_effect=mark_submitted),
+        ) as bind_provider,
+        patch("app.services.llm.load_balancer.record_credential_call", AsyncMock()),
+        patch("app.services.quota_guard.consume_agent_llm_quota", AsyncMock()),
+        patch("pathlib.Path.write_text", autospec=True, side_effect=fail_metadata_write),
+    ):
+        result = await _generate_video_minimax(
+            agent_id,
+            tmp_path,
+            {"prompt": "durable video", "wait_for_completion": False},
+        )
+
+    assert durable_bound is True
+    assert write_attempts >= 1
+    bind_provider.assert_awaited_once()
+    assert bind_provider.await_args.kwargs["provider_task_id"] == "provider-task-enospc"
+    assert "task_id=provider-task-enospc" in result
+    assert "durable task remains recoverable" in result
+
+
+@pytest.mark.asyncio
 async def test_resolve_minimax_tool_tier_maps_legacy_standard_to_pro():
     assert await _resolve_minimax_tool_tier(uuid.uuid4(), {"tier": "standard"}) == "pro"
 
@@ -633,7 +705,7 @@ async def test_resolve_minimax_tool_tier_defaults_to_lite():
 
 
 @pytest.mark.asyncio
-async def test_check_video_minimax_downloads_ready_video(tmp_path):
+async def test_check_video_minimax_rejects_unbound_editable_legacy_metadata(tmp_path):
     agent_id = uuid.uuid4()
     cred_id = uuid.uuid4()
     reservation_id = uuid.uuid4()
@@ -653,32 +725,12 @@ async def test_check_video_minimax_downloads_ready_video(tmp_path):
         ),
         encoding="utf-8",
     )
-    credential = SimpleNamespace(id=cred_id, api_key="sk-test", base_url="https://minimax.example")
-
-    settlement_order: list[str] = []
-
-    async def download_video(*_args, **_kwargs):
-        settlement_order.append("download")
-        return "workspace/videos/out.mp4"
-
-    async def finalize_video(*_args, **_kwargs):
-        settlement_order.append("finalize")
-
     with (
-        patch("app.services.agent_tools._load_minimax_tool_credential_by_id", AsyncMock(return_value=credential)),
-        patch(
-            "app.services.agent_tools._minimax_query_video_task",
-            AsyncMock(return_value={"status": "Success", "file_id": "file-123"}),
-        ),
-        patch(
-            "app.services.agent_tools._download_minimax_video_from_status",
-            AsyncMock(side_effect=download_video),
-        ),
-        patch(
-            "app.services.agent_tools._finalize_minimax_tool_reservation",
-            AsyncMock(side_effect=finalize_video),
-        ) as finalize_reservation,
+        patch("app.services.agent_tools._load_minimax_tool_credential_by_id", AsyncMock()) as load_credential,
+        patch("app.services.agent_tools._minimax_query_video_task", AsyncMock()) as query_provider,
+        patch("app.services.agent_tools._finalize_minimax_tool_reservation", AsyncMock()) as finalize_reservation,
         patch("app.services.media_generation.find_media_generation_task", AsyncMock(return_value=None)),
+        patch("app.services.agent_tools._record_minimax_tool_product_issue", AsyncMock()),
     ):
         result = await _check_video_minimax(
             agent_id,
@@ -686,16 +738,15 @@ async def test_check_video_minimax_downloads_ready_video(tmp_path):
             {"task_meta_path": "workspace/videos/task.json"},
         )
 
-    assert "✅ MiniMax video is ready" in result
-    updated = json.loads(meta_path.read_text(encoding="utf-8"))
-    assert updated["status"] == "Success"
-    assert updated["downloaded_path"] == "workspace/videos/out.mp4"
-    assert settlement_order == ["download", "finalize"]
-    finalize_reservation.assert_awaited_once_with(reservation_id)
+    assert "not bound to a durable Agent task" in result
+    load_credential.assert_not_awaited()
+    query_provider.assert_not_awaited()
+    finalize_reservation.assert_not_awaited()
+    assert json.loads(meta_path.read_text(encoding="utf-8"))["reservation_id"] == str(reservation_id)
 
 
 @pytest.mark.asyncio
-async def test_check_video_minimax_releases_reserved_credits_on_provider_failure(tmp_path):
+async def test_check_video_minimax_never_releases_from_unbound_legacy_metadata(tmp_path):
     agent_id = uuid.uuid4()
     cred_id = uuid.uuid4()
     reservation_id = uuid.uuid4()
@@ -715,16 +766,12 @@ async def test_check_video_minimax_releases_reserved_credits_on_provider_failure
         ),
         encoding="utf-8",
     )
-    credential = SimpleNamespace(id=cred_id, api_key="sk-test", base_url="https://minimax.example")
-
     with (
-        patch("app.services.agent_tools._load_minimax_tool_credential_by_id", AsyncMock(return_value=credential)),
-        patch(
-            "app.services.agent_tools._minimax_query_video_task",
-            AsyncMock(return_value={"status": "Fail", "fail_reason": "provider quota"}),
-        ),
+        patch("app.services.agent_tools._load_minimax_tool_credential_by_id", AsyncMock()) as load_credential,
+        patch("app.services.agent_tools._minimax_query_video_task", AsyncMock()) as query_provider,
         patch("app.services.agent_tools._release_minimax_tool_reservation", AsyncMock()) as release_reservation,
         patch("app.services.media_generation.find_media_generation_task", AsyncMock(return_value=None)),
+        patch("app.services.agent_tools._record_minimax_tool_product_issue", AsyncMock()),
     ):
         result = await _check_video_minimax(
             agent_id,
@@ -732,7 +779,8 @@ async def test_check_video_minimax_releases_reserved_credits_on_provider_failure
             {"task_meta_path": "workspace/videos/task.json"},
         )
 
-    assert "❌ MiniMax video task failed: provider quota" in result
-    updated = json.loads(meta_path.read_text(encoding="utf-8"))
-    assert updated["status"] == "Fail"
-    release_reservation.assert_awaited_once_with(reservation_id)
+    assert "not bound to a durable Agent task" in result
+    load_credential.assert_not_awaited()
+    query_provider.assert_not_awaited()
+    release_reservation.assert_not_awaited()
+    assert json.loads(meta_path.read_text(encoding="utf-8"))["reservation_id"] == str(reservation_id)

@@ -343,9 +343,10 @@ async def pick_credential(
             capability_conditions = [LLMCredential.capabilities.is_(None)]
             for idx, value in enumerate(capability_values):
                 capability_conditions.append(
-                    text(f"capabilities @> cast(:cap_{idx} as jsonb)").bindparams(
-                        **{f"cap_{idx}": json.dumps([value])}
-                    )
+                    text(
+                        f"cast(llm_credentials.capabilities as jsonb) "
+                        f"@> cast(:cap_{idx} as jsonb)"
+                    ).bindparams(**{f"cap_{idx}": json.dumps([value])})
                 )
             conditions.append(
                 or_(*capability_conditions)

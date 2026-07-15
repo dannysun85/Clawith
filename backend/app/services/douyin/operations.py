@@ -26,7 +26,13 @@ from app.models.douyin import (
 )
 from app.models.user import User
 from app.services.douyin.client import DouyinOpenAPIClient, summarize_error
-from app.services.douyin.errors import DouyinAuthError
+from app.services.douyin.errors import (
+    DouyinAuthError,
+    DouyinOfficialError,
+    DouyinPermissionError,
+    DouyinRateLimitError,
+    is_douyin_submission_indeterminate,
+)
 from app.services.douyin.policy import (
     callback_url,
     capability_status,
@@ -36,10 +42,103 @@ from app.services.douyin.policy import (
     is_configured,
 )
 from app.services.douyin.token_store import get_valid_access_token, store_oauth_tokens
+from app.services.autonomy_service import (
+    _verified_tool_arguments,
+    build_tool_approval_details,
+)
 
 
 class DouyinOperationsService:
     """Application service for production Douyin Agent workflows."""
+
+    @staticmethod
+    def _external_write_failure(
+        exc: Exception,
+        *,
+        write_started: bool,
+        action_label: str,
+    ) -> tuple[str, dict]:
+        """Classify a failed official call without encouraging duplicates."""
+
+        summary = summarize_error(exc)
+        if isinstance(exc, DouyinAuthError):
+            return "needs_reauth", summary
+        if isinstance(exc, DouyinPermissionError):
+            return "permission_missing", summary
+        if isinstance(exc, DouyinRateLimitError):
+            return "rate_limited", summary
+        if write_started and (
+            is_douyin_submission_indeterminate(exc)
+            or not isinstance(exc, DouyinOfficialError)
+        ):
+            return (
+                "verification_required",
+                {
+                    **summary,
+                    "message": (
+                        f"{action_label}的官方返回结果无法确认。禁止自动重试；"
+                        "请先在抖音官方后台核验，确认未生效后再新建审批任务。"
+                    ),
+                    "verification_required": True,
+                    "retry_safe": False,
+                },
+            )
+        return "failed", summary
+
+    @staticmethod
+    def _publish_approval_arguments(job: DouyinPublishJob) -> dict:
+        """Build the immutable publish payload shown to and signed for approvers."""
+
+        return {
+            "job_id": str(job.id),
+            "tenant_id": str(job.tenant_id),
+            "agent_id": str(job.agent_id),
+            "account_id": str(job.account_id) if job.account_id else None,
+            "content_type": job.content_type,
+            "title": job.title,
+            "body": job.body,
+            "hashtags": list(job.hashtags or []),
+            "visibility": job.visibility,
+            "asset_refs": list(job.asset_refs or []),
+            "scheduled_at": job.scheduled_at.isoformat() if job.scheduled_at else None,
+            "idempotency_key": job.idempotency_key,
+        }
+
+    @staticmethod
+    async def _fenced_approval_arguments(
+        db: AsyncSession,
+        *,
+        approval_id: uuid.UUID | None,
+        approval_claim_token: uuid.UUID | None,
+        agent_id: uuid.UUID | None,
+        action_type: str,
+        tool_name: str,
+    ) -> dict:
+        """Require the durable worker's exact execution fence."""
+
+        if approval_id is None or approval_claim_token is None or agent_id is None:
+            raise ValueError("Douyin execution requires a durable approval claim")
+        result = await db.execute(
+            select(ApprovalRequest).where(
+                ApprovalRequest.id == approval_id,
+                ApprovalRequest.agent_id == agent_id,
+                ApprovalRequest.status == "approved",
+                ApprovalRequest.execution_status == "executing",
+                ApprovalRequest.execution_claim_token == approval_claim_token,
+                ApprovalRequest.execution_attempts == 1,
+            )
+        )
+        approval = result.scalar_one_or_none()
+        if approval is None:
+            raise ValueError("Douyin approval execution fence is invalid")
+        signed_tool_name, arguments = _verified_tool_arguments(
+            agent_id,
+            approval.details or {},
+            expected_action_type=action_type,
+        )
+        if signed_tool_name != tool_name:
+            raise ValueError("Douyin approval tool does not match its execution")
+        return arguments
 
     def config_status(self) -> dict:
         configured = is_configured()
@@ -254,10 +353,15 @@ class DouyinOperationsService:
         if existing:
             return existing
         account = await self._get_or_first_account(db, tenant_id, account_id)
+        if account is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Connect a Douyin account before creating a publish approval",
+            )
         job = DouyinPublishJob(
             tenant_id=tenant_id,
             agent_id=agent_id,
-            account_id=account.id if account else None,
+            account_id=account.id,
             created_by=user_id,
             content_type=content_type,
             title=title,
@@ -283,15 +387,16 @@ class DouyinOperationsService:
         approval = ApprovalRequest(
             agent_id=agent_id,
             action_type="douyin_publish_job",
-            details={
-                "tool": "douyin_run_publish_job",
-                "args": {"job_id": str(job.id)},
-                "requested_by": str(user_id),
-                "title": title,
-                "account_id": str(job.account_id) if job.account_id else None,
-                "summary": job.redacted_request_summary,
-            },
+            details=build_tool_approval_details(
+                agent_id,
+                "douyin_publish_job",
+                "douyin_run_publish_job",
+                self._publish_approval_arguments(job),
+                user_id,
+            ),
         )
+        approval.request_fingerprint = approval.details["args_signature"]
+        approval.execution_not_before = scheduled_at
         db.add(approval)
         await db.flush()
         job.approval_id = approval.id
@@ -305,22 +410,34 @@ class DouyinOperationsService:
         *,
         job_id: uuid.UUID,
         client: DouyinOpenAPIClient | None = None,
+        approval_id: uuid.UUID | None = None,
+        approval_claim_token: uuid.UUID | None = None,
     ) -> DouyinPublishJob:
         result = await db.execute(select(DouyinPublishJob).where(DouyinPublishJob.id == job_id))
         job = result.scalar_one_or_none()
         if not job:
             raise ValueError("Douyin publish job not found")
-        if job.status in {"created_reviewing", "published_unverified", "awaiting_user_publish", "user_confirmed_waiting_verification"}:
+        if job.approval_id is None or approval_id != job.approval_id:
+            raise ValueError("Douyin publish job requires its exact approval claim")
+        approved_arguments = await self._fenced_approval_arguments(
+            db,
+            approval_id=approval_id,
+            approval_claim_token=approval_claim_token,
+            agent_id=job.agent_id,
+            action_type="douyin_publish_job",
+            tool_name="douyin_run_publish_job",
+        )
+        if approved_arguments != self._publish_approval_arguments(job):
+            raise ValueError("Douyin publish job changed after approval")
+        if job.status in {
+            "created_reviewing",
+            "published_unverified",
+            "awaiting_user_publish",
+            "user_confirmed_waiting_verification",
+            "verification_required",
+        }:
             return job
-        if job.approval_id:
-            approval_result = await db.execute(select(ApprovalRequest).where(ApprovalRequest.id == job.approval_id))
-            approval = approval_result.scalar_one_or_none()
-            if not approval or approval.status != "approved":
-                job.status = "approval_required"
-                job.approval_status = "pending"
-                await db.flush()
-                return job
-            job.approval_status = "approved"
+        job.approval_status = "approved"
 
         account = await self._get_or_first_account(db, job.tenant_id, job.account_id)
         if not account:
@@ -367,10 +484,12 @@ class DouyinOperationsService:
         job.publish_mode = "collaborative_h5"
         await db.flush()
 
+        external_write_started = False
         try:
             client = client or DouyinOpenAPIClient()
             client_token_payload = await client.get_client_token()
             ticket_payload = await client.get_open_ticket(client_token_payload["client_token"])
+            external_write_started = True
             share_payload = await client.create_share_id(
                 client_token_payload["client_token"],
                 default_hashtag=self._first_hashtag(job),
@@ -401,8 +520,11 @@ class DouyinOperationsService:
             operation.finished_at = datetime.now(timezone.utc)
             db.add(AuditLog(agent_id=job.agent_id, action="douyin_h5_share_package_prepared", details={"job_id": str(job.id)}))
         except Exception as exc:
-            summary = summarize_error(exc)
-            job.status = "needs_reauth" if isinstance(exc, DouyinAuthError) else "failed"
+            job.status, summary = self._external_write_failure(
+                exc,
+                write_started=external_write_started,
+                action_label="抖音发布包创建",
+            )
             job.response_summary = summary
             job.official_error_code = summary.get("code")
             job.official_log_id = summary.get("log_id")
@@ -441,9 +563,11 @@ class DouyinOperationsService:
         job.status = "creating"
         job.publish_mode = "direct_openapi"
         await db.flush()
+        external_write_started = False
         try:
             access_token = await get_valid_access_token(db, account, client=client)
             client = client or DouyinOpenAPIClient()
+            external_write_started = True
             official_result = await client.create_video(
                 access_token,
                 {
@@ -454,7 +578,6 @@ class DouyinOperationsService:
             job.external_item_id = official_result.get("item_id")
             job.external_video_id = official_video_id
             job.status = "created_reviewing"
-            job.published_at = datetime.now(timezone.utc)
             job.official_error_code = official_result.get("official_error_code")
             job.official_log_id = official_result.get("official_log_id")
             job.response_summary = {
@@ -469,8 +592,11 @@ class DouyinOperationsService:
             operation.finished_at = datetime.now(timezone.utc)
             db.add(AuditLog(agent_id=job.agent_id, action="douyin_direct_publish_job_run", details={"job_id": str(job.id)}))
         except Exception as exc:
-            summary = summarize_error(exc)
-            job.status = "needs_reauth" if isinstance(exc, DouyinAuthError) else "failed"
+            job.status, summary = self._external_write_failure(
+                exc,
+                write_started=external_write_started,
+                action_label="抖音视频发布",
+            )
             job.response_summary = summary
             job.official_error_code = summary.get("code")
             job.official_log_id = summary.get("log_id")
@@ -565,10 +691,15 @@ class DouyinOperationsService:
         if existing:
             return existing
         account = await self._get_or_first_account(db, tenant_id, account_id)
+        if account is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Connect a Douyin account before creating a reply approval",
+            )
         operation = DouyinOperation(
             tenant_id=tenant_id,
             agent_id=agent_id,
-            account_id=account.id if account else None,
+            account_id=account.id,
             created_by=user_id,
             operation_type="reply_comment",
             target_id=comment_id,
@@ -587,15 +718,24 @@ class DouyinOperationsService:
         approval = ApprovalRequest(
             agent_id=agent_id,
             action_type="douyin_reply_comment",
-            details={
-                "tool": "douyin_reply_comment",
-                "args": {"operation_id": str(operation.id), "reply_text": reply_text, "item_id": item_id},
-                "requested_by": str(user_id),
-                "comment_id": comment_id,
-                "account_id": str(operation.account_id) if operation.account_id else None,
-                "summary": operation.request_summary,
-            },
+            details=build_tool_approval_details(
+                agent_id,
+                "douyin_reply_comment",
+                "douyin_reply_comment",
+                {
+                    "operation_id": str(operation.id),
+                    "tenant_id": str(tenant_id),
+                    "agent_id": str(agent_id),
+                    "account_id": str(operation.account_id) if operation.account_id else None,
+                    "comment_id": comment_id,
+                    "reply_text": reply_text,
+                    "item_id": item_id,
+                    "idempotency_key": key,
+                },
+                user_id,
+            ),
         )
+        approval.request_fingerprint = approval.details["args_signature"]
         db.add(approval)
         await db.flush()
         operation.approval_id = approval.id
@@ -611,23 +751,44 @@ class DouyinOperationsService:
         reply_text: str | None = None,
         item_id: str | None = None,
         client: DouyinOpenAPIClient | None = None,
+        approval_id: uuid.UUID | None = None,
+        approval_claim_token: uuid.UUID | None = None,
     ) -> DouyinOperation:
         result = await db.execute(select(DouyinOperation).where(DouyinOperation.id == operation_id))
         operation = result.scalar_one_or_none()
         if not operation:
             raise ValueError("Douyin operation not found")
-        if operation.status == "succeeded":
+        if operation.approval_id is None or approval_id != operation.approval_id:
+            raise ValueError("Douyin reply operation requires its exact approval claim")
+        args = await self._fenced_approval_arguments(
+            db,
+            approval_id=approval_id,
+            approval_claim_token=approval_claim_token,
+            agent_id=operation.agent_id,
+            action_type="douyin_reply_comment",
+            tool_name="douyin_reply_comment",
+        )
+        expected_identity = {
+            "operation_id": str(operation.id),
+            "tenant_id": str(operation.tenant_id),
+            "agent_id": str(operation.agent_id),
+            "account_id": str(operation.account_id) if operation.account_id else None,
+            "comment_id": operation.target_id,
+            "idempotency_key": operation.idempotency_key,
+        }
+        if any(args.get(key) != value for key, value in expected_identity.items()):
+            raise ValueError("Douyin reply operation changed after approval")
+        operation.approval_status = "approved"
+        signed_reply_text = args.get("reply_text")
+        signed_item_id = args.get("item_id")
+        if reply_text is not None and reply_text != signed_reply_text:
+            raise ValueError("Douyin reply text does not match its signed approval")
+        if item_id is not None and item_id != signed_item_id:
+            raise ValueError("Douyin reply item does not match its signed approval")
+        reply_text = signed_reply_text
+        item_id = signed_item_id
+        if operation.status in {"succeeded", "verification_required"}:
             return operation
-        if operation.approval_id:
-            approval_result = await db.execute(select(ApprovalRequest).where(ApprovalRequest.id == operation.approval_id))
-            approval = approval_result.scalar_one_or_none()
-            if not approval or approval.status != "approved":
-                return operation
-            operation.approval_status = "approved"
-            details = approval.details or {}
-            args = details.get("args") or {}
-            reply_text = reply_text or args.get("reply_text")
-            item_id = item_id or args.get("item_id")
 
         account = await self._get_or_first_account(db, operation.tenant_id, operation.account_id)
         if not account:
@@ -648,9 +809,11 @@ class DouyinOperationsService:
 
         operation.status = "running"
         await db.flush()
+        external_write_started = False
         try:
             access_token = await get_valid_access_token(db, account, client=client)
             client = client or DouyinOpenAPIClient()
+            external_write_started = True
             official = await client.reply_comment(
                 access_token,
                 {
@@ -668,8 +831,11 @@ class DouyinOperationsService:
             operation.official_log_id = official.get("official_log_id")
             operation.finished_at = datetime.now(timezone.utc)
         except Exception as exc:
-            summary = summarize_error(exc)
-            operation.status = "needs_reauth" if isinstance(exc, DouyinAuthError) else "failed"
+            operation.status, summary = self._external_write_failure(
+                exc,
+                write_started=external_write_started,
+                action_label="抖音评论回复",
+            )
             operation.response_summary = summary
             operation.official_error_code = summary.get("code")
             operation.official_log_id = summary.get("log_id")
@@ -749,7 +915,18 @@ class DouyinOperationsService:
             return "当前没有连接抖音账号。建议先连接账号，然后基于真实数据生成计划。"
         latest = dashboard["metric_snapshots"][0] if dashboard["metric_snapshots"] else None
         last_sync = latest.captured_at.isoformat() if latest else "暂无同步数据"
-        pending_jobs = [job for job in dashboard["publish_jobs"] if job.status in {"approval_required", "creating", "failed", "blocked"}]
+        pending_jobs = [
+            job
+            for job in dashboard["publish_jobs"]
+            if job.status
+            in {
+                "approval_required",
+                "creating",
+                "failed",
+                "blocked",
+                "verification_required",
+            }
+        ]
         return "\n".join(
             [
                 f"运营目标：{goal or '提升账号稳定内容产出和评论响应质量'}",

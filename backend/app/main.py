@@ -1,8 +1,10 @@
 """Astra Backend — FastAPI Application Entry Point."""
 
 from contextlib import asynccontextmanager
+import os
 from pathlib import Path
 import shutil
+import signal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,6 +24,7 @@ _worker_runtime_tracking_started = False
 _worker_runtime_ready = False
 _worker_runtime_failed = False
 _critical_background_task_names: set[str] = set()
+_worker_termination_scheduled = False
 
 
 def _process_roles() -> set[str]:
@@ -50,11 +53,13 @@ def _begin_worker_runtime_tracking(task_names: set[str]) -> None:
     global _worker_runtime_ready
     global _worker_runtime_failed
     global _critical_background_task_names
+    global _worker_termination_scheduled
 
     _worker_runtime_tracking_started = True
     _worker_runtime_ready = False
     _worker_runtime_failed = False
     _critical_background_task_names = set(task_names)
+    _worker_termination_scheduled = False
 
 
 def _mark_worker_runtime_ready() -> None:
@@ -79,9 +84,60 @@ def _mark_worker_runtime_failed(task_name: str) -> None:
 def _stop_worker_runtime_tracking() -> None:
     global _worker_runtime_tracking_started
     global _worker_runtime_ready
+    global _worker_termination_scheduled
 
     _worker_runtime_tracking_started = False
     _worker_runtime_ready = False
+    _worker_termination_scheduled = False
+
+
+async def _terminate_failed_worker(
+    task_name: str,
+    error_type: str,
+    *,
+    issue_recorder=None,
+) -> None:
+    """Record a fatal daemon exit, then terminate PID 1 for Docker restart.
+
+    ``restart: unless-stopped`` restarts a container after both graceful and
+    non-graceful process exits.  SIGTERM lets Uvicorn run its normal lifespan
+    cleanup instead of leaving the dedicated worker alive-but-idle forever.
+    The issue write is bounded so a database outage cannot suppress restart.
+    """
+
+    if issue_recorder is None:
+        from app.services.production_issue_monitor import record_production_issue
+
+        issue_recorder = record_production_issue
+    try:
+        import asyncio
+
+        await asyncio.wait_for(
+            issue_recorder(
+                source="background_task",
+                category="worker",
+                summary="A production background task stopped unexpectedly",
+                severity="critical",
+                error_code=error_type,
+                operation=task_name,
+                metadata={
+                    "error_type": error_type,
+                    "component": task_name,
+                },
+            ),
+            timeout=5,
+        )
+    except Exception as exc:
+        logger.error(
+            "[startup] Fatal worker issue capture failed task={} error_type={}",
+            task_name,
+            type(exc).__name__,
+        )
+    logger.critical(
+        "[startup] Terminating dedicated worker after critical task exit task={}",
+        task_name,
+    )
+    os.kill(os.getpid(), signal.SIGTERM)
 
 
 def _log_bwrap_startup_status() -> None:
@@ -223,6 +279,7 @@ async def lifespan(app: FastAPI):
     from app.services.subscription_lifecycle import start_subscription_lifecycle_daemon
     from app.services.billing_reconciliation import start_billing_reconciliation_daemon
     from app.services.media_generation import start_media_generation_daemon
+    from app.services.autonomy_service import start_approval_execution_daemon
     from app.services.production_issue_monitor import (
         record_production_issue,
         start_production_issue_monitor_daemon,
@@ -379,6 +436,8 @@ async def lifespan(app: FastAPI):
     def _bg_task_error(task: asyncio.Task) -> None:
         """Surface unexpected task exits and fail dedicated worker health."""
 
+        global _worker_termination_scheduled
+
         task_name = task.get_name()
         try:
             exc = task.exception()
@@ -397,21 +456,34 @@ async def lifespan(app: FastAPI):
             f"[startup] Background task {task_name} STOPPED "
             f"error_type={error_type}"
         )
-        asyncio.create_task(
-            record_production_issue(
-                source="background_task",
-                category="worker",
-                summary="A production background task stopped unexpectedly",
-                severity="critical",
-                error_code=error_type,
-                operation=task_name,
-                metadata={
-                    "error_type": error_type,
-                    "component": task_name,
-                },
-            ),
-            name=f"capture-crash-{task_name}",
-        )
+        if _worker_health_required():
+            if _worker_termination_scheduled:
+                return
+            _worker_termination_scheduled = True
+            asyncio.create_task(
+                _terminate_failed_worker(
+                    task_name,
+                    error_type,
+                    issue_recorder=record_production_issue,
+                ),
+                name=f"terminate-worker-{task_name}",
+            )
+        else:
+            asyncio.create_task(
+                record_production_issue(
+                    source="background_task",
+                    category="worker",
+                    summary="A production background task stopped unexpectedly",
+                    severity="critical",
+                    error_code=error_type,
+                    operation=task_name,
+                    metadata={
+                        "error_type": error_type,
+                        "component": task_name,
+                    },
+                ),
+                name=f"capture-crash-{task_name}",
+            )
 
     try:
         logger.info("[startup] starting background tasks...")
@@ -425,6 +497,7 @@ async def lifespan(app: FastAPI):
                 ("subscription_lifecycle", start_subscription_lifecycle_daemon()),
                 ("media_generation", start_media_generation_daemon()),
                 ("billing_reconciliation", start_billing_reconciliation_daemon()),
+                ("approval_execution", start_approval_execution_daemon()),
             ]
             if settings.PRODUCTION_ISSUE_MONITOR_ENABLED:
                 worker_task_specs.append(
@@ -472,6 +545,13 @@ async def lifespan(app: FastAPI):
         logger.error(
             f"[startup] Background tasks failed error_type={type(e).__name__}"
         )
+        if _worker_health_required():
+            for task in background_tasks:
+                if not task.done():
+                    task.cancel()
+            if background_tasks:
+                await asyncio.gather(*background_tasks, return_exceptions=True)
+            raise RuntimeError("dedicated worker startup failed") from e
 
     # Start ss-local SOCKS5 proxy for Discord API calls (non-fatal)
     ss_task = asyncio.create_task(_start_ss_local(), name="ss-local-proxy")
@@ -638,6 +718,17 @@ async def health_check():
         or _worker_runtime_failed
     ):
         raise HTTPException(status_code=503, detail="worker runtime unavailable")
+    if _worker_health_required() and settings.PRODUCTION_ISSUE_MONITOR_ENABLED:
+        from app.services.production_issue_monitor import (
+            production_issue_monitor_health,
+        )
+
+        monitor_health = production_issue_monitor_health()
+        if not monitor_health["healthy"]:
+            raise HTTPException(
+                status_code=503,
+                detail="production issue monitor database loop unavailable",
+            )
     return HealthResponse(status="ok", version=settings.APP_VERSION)
 
 
