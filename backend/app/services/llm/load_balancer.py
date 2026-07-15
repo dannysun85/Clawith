@@ -33,8 +33,11 @@ from app.services.modalities import canonicalize_modalities, modality_match_valu
 _KEY_PREFIX = "cred:rate:"
 _KEY_RPM = _KEY_PREFIX + "rpm:{cred_id}"        # sorted set of request timestamps (score=ts, member=nonce)
 _KEY_TPM = _KEY_PREFIX + "tpm:{cred_id}"        # sorted set of token counts (score=ts, member=f"ts:tokens")
+_KEY_PROVIDER_COOLDOWN = _KEY_PREFIX + "cooldown:{cred_id}"
 _RPM_WINDOW = 60                                # 60 second window for RPM
 _TPM_WINDOW = 60                                # 60 second window for TPM
+PROVIDER_RATE_COOLDOWN_SECONDS = 30
+_PROVIDER_RATE_CODES = frozenset({"1002", "1041", "2045", "2062", "rate_limit"})
 PLAN_QUOTA_RESOURCE = "plan"
 
 
@@ -228,6 +231,10 @@ def _cred_tpm_key(cred_id: uuid.UUID) -> str:
     return _KEY_TPM.format(cred_id=cred_id)
 
 
+def _cred_provider_cooldown_key(cred_id: uuid.UUID) -> str:
+    return _KEY_PROVIDER_COOLDOWN.format(cred_id=cred_id)
+
+
 async def _get_redis_or_none():
     """Return Redis client if available, else None (graceful fallback to no rate limiting)."""
     try:
@@ -252,6 +259,60 @@ async def _check_rate_window(redis, key: str, window: int, limit: int | None) ->
         _, count = await pipe.execute()
     count = int(count)
     return count < limit, count
+
+
+async def _provider_cooldown_active(redis, credential_id: uuid.UUID) -> bool:
+    if redis is None:
+        return False
+    try:
+        return bool(await redis.exists(_cred_provider_cooldown_key(credential_id)))
+    except Exception as exc:
+        logger.warning(
+            "[load_balancer] provider cooldown read unavailable error_type={}",
+            type(exc).__name__,
+        )
+        return False
+
+
+async def mark_credential_rate_saturated(
+    credential_id: uuid.UUID,
+    *,
+    cooldown_seconds: int = PROVIDER_RATE_COOLDOWN_SECONDS,
+    error_code: str = "rate_limit",
+) -> bool:
+    """Temporarily remove one provider account from immediate retry rotation.
+
+    MiniMax 2062 is a deterministic high-traffic rejection from a Token Plan,
+    not proof that the key is invalid or that the rolling plan allowance is
+    exhausted. A short Redis-backed cooldown lets a different independent
+    account serve failover without poisoning the shared credential row.
+    """
+
+    bounded_seconds = max(1, min(int(cooldown_seconds), 300))
+    redis = await _get_redis_or_none()
+    if redis is None:
+        return False
+    candidate_code = str(error_code or "")
+    stable_error_code = (
+        candidate_code if candidate_code in _PROVIDER_RATE_CODES else "rate_limit"
+    )
+    try:
+        await redis.set(
+            _cred_provider_cooldown_key(credential_id),
+            stable_error_code,
+            ex=bounded_seconds,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[load_balancer] provider cooldown write unavailable error_type={}",
+            type(exc).__name__,
+        )
+        return False
+    logger.warning(
+        "[load_balancer] credential provider cooldown opened seconds={}",
+        bounded_seconds,
+    )
+    return True
 
 
 async def _record_request(redis, cred_id: uuid.UUID, tokens_used: int = 0) -> None:
@@ -405,6 +466,9 @@ async def pick_credential(
         eligible = []
         skip_reasons: dict[str, str] = {}
         for c in top_group:
+            if await _provider_cooldown_active(redis, c.id):
+                skip_reasons[str(c.id)] = "provider_cooldown"
+                continue
             rpm_limit = getattr(c, 'rpm_limit', None)
             tpm_limit = getattr(c, 'tpm_limit', None)
             ok, rpm_count = await _check_rate_window(redis, _cred_rpm_key(c.id), _RPM_WINDOW, rpm_limit)
@@ -430,6 +494,9 @@ async def pick_credential(
             for p in priorities:
                 grp = [c for c in lower_groups if c.priority == p]
                 for c in grp:
+                    if await _provider_cooldown_active(redis, c.id):
+                        skip_reasons[str(c.id)] = "provider_cooldown"
+                        continue
                     rpm_limit = getattr(c, 'rpm_limit', None)
                     tpm_limit = getattr(c, 'tpm_limit', None)
                     ok, rpm_count = await _check_rate_window(redis, _cred_rpm_key(c.id), _RPM_WINDOW, rpm_limit)

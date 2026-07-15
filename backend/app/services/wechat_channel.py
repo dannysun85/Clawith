@@ -21,6 +21,7 @@ from app.models.audit import ChatMessage
 from app.models.channel_config import ChannelConfig
 from app.services.channel_session import find_or_create_channel_session
 from app.services.channel_user_service import channel_user_service
+from app.services.llm.utils import convert_chat_messages_to_llm_format
 
 
 WECHAT_ILINK_BASE_URL = "https://ilinkai.weixin.qq.com"
@@ -246,7 +247,7 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
             .order_by(ChatMessage.created_at.desc())
             .limit(agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE)
         )
-        history = [{"role": m.role, "content": m.content} for m in reversed(history_r.scalars().all())]
+        history = convert_chat_messages_to_llm_format(reversed(history_r.scalars().all()))
 
         db.add(
             ChatMessage(
@@ -271,7 +272,7 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
     route_tag = str((config.extra_config or {}).get("route_tag") or "").strip() or None
 
     reply_text = await _call_llm_with_config(
-        _agent_model, _llm_model, _fallback_model,
+        _agent_model, _llm_model, _fallback_model, _route_meta,
         agent_id,
         user_text,
         history=history,
@@ -354,7 +355,7 @@ class WeChatPollManager:
             result = await db.execute(
                 select(ChannelConfig).where(
                     ChannelConfig.channel_type == "wechat",
-                    ChannelConfig.is_configured == True,
+                    ChannelConfig.is_configured,
                 )
             )
             for cfg in result.scalars().all():

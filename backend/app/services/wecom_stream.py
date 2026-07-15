@@ -524,7 +524,7 @@ async def _process_wecom_stream_message(
 
     # ── Phase 2: LLM call (no DB session) ──
     reply_text = await _call_llm_with_config(
-        _agent_model, _llm_model, _fallback_model,
+        _agent_model, _llm_model, _fallback_model, _route_meta,
         agent_id, user_text,
         history=history, user_id=platform_user_id,
         session_id=session_conv_id,

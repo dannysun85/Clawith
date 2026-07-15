@@ -314,8 +314,9 @@ async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Opt
     logger.debug(f"[ToolConfig] No DB config found for {tool_name}, agent_id={agent_id}")
     return None
 
-# ContextVar set by each channel handler so send_channel_file knows where to send
-# Value: async callable(file_path: Path) -> None  |  None for web chat (returns URL)
+# ContextVar set only by file-capable channel handlers. The async callback must
+# return True only after provider-confirmed attachment delivery; every other
+# result falls back to an authenticated web-chat download URL.
 channel_file_sender: ContextVar = ContextVar('channel_file_sender', default=None)
 # For web chat: agent_id needed to build download URL
 channel_web_agent_id: ContextVar = ContextVar('channel_web_agent_id', default=None)
@@ -670,7 +671,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "send_channel_file",
-            "description": "Send a file to a specific person or back to the current conversation. If member_name is provided, the system resolves the recipient across all connected channels (Feishu, Slack, etc.) and delivers the file via the appropriate channel. If member_name is omitted, the file is sent back through the current conversation channel.",
+            "description": "Send a workspace file to a named recipient on Feishu or Slack, return it through the current conversation when that channel supports file delivery, or provide a web download link. Named-recipient file delivery is supported only on Feishu and Slack; other external connectors are text-only.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -680,7 +681,7 @@ AGENT_TOOLS = [
                     },
                     "member_name": {
                         "type": "string",
-                        "description": "Name of the person to send the file to. If provided, the system looks up this person across all configured channels and delivers via the appropriate one.",
+                        "description": "Optional recipient name for Feishu or Slack only. Omit it to return the file through the current conversation where supported, otherwise as a web download link.",
                     },
                     "message": {
                         "type": "string",
@@ -4862,10 +4863,9 @@ async def _send_channel_file(agent_id: uuid.UUID, ws: Path, arguments: dict) -> 
     """Send a file to a person or back to the current channel.
     
     Priority:
-    1. If member_name is provided, resolve the recipient across all configured channels
-       and deliver via the appropriate one (Feishu, Slack, etc.).
-    2. If channel_file_sender ContextVar is set (channel-initiated), use it directly.
-    3. Fall back to web chat download URL when no explicit recipient is requested.
+    1. If member_name is provided, resolve it only through Feishu or Slack.
+    2. If channel_file_sender ContextVar is set and supports files, use it directly.
+    3. Fall back to a web chat download URL when no explicit recipient is requested.
     """
     rel_path = arguments.get("file_path", "").strip()
     accompany_msg = arguments.get("message", "")
@@ -4893,14 +4893,20 @@ async def _send_channel_file(agent_id: uuid.UUID, ws: Path, arguments: dict) -> 
             "Use send_message_to_agent for digital employees, or omit member_name to return a download link."
         )
 
-    # Priority 2: channel-initiated (ContextVar set by channel webhook handler)
+    # Priority 2: channel-initiated (ContextVar set only by a file-capable handler).
+    # A callback must explicitly return True after a provider confirms the
+    # attachment. ``None`` and other values are not success: several legacy
+    # text-only handlers used to return silently and caused a false claim.
     sender = channel_file_sender.get()
     if sender is not None:
         try:
-            await sender(file_path, accompany_msg)
-            return f"File '{file_path.name}' sent to user via channel."
-        except Exception as e:
-            return f"Failed to send file: {e}"
+            delivery_confirmed = await sender(file_path, accompany_msg)
+            if delivery_confirmed is True:
+                return f"File '{file_path.name}' sent to user via channel."
+        except Exception:
+            # Fall through to the authenticated workspace link. Provider
+            # exception text is deliberately not copied into the Agent reply.
+            pass
 
     # Priority 3: Web chat fallback — return download URL
     aid = channel_web_agent_id.get() or str(agent_id)
@@ -4914,6 +4920,8 @@ async def _send_channel_file(agent_id: uuid.UUID, ws: Path, arguments: dict) -> 
     base_url = getattr(_s, 'BASE_URL', '').rstrip('/') or ''
     download_url = f"{base_url}/api/agents/{aid}/files/download?path={file_rel}"
     msg = f"File ready: [{file_path.name}]({download_url})"
+    if sender is not None:
+        msg = "Direct channel attachment was not confirmed.\n\n" + msg
     if accompany_msg:
         msg = accompany_msg + "\n\n" + msg
     return msg
@@ -7364,12 +7372,25 @@ async def _send_wecom_message(
                 select(ChannelConfig).where(
                     ChannelConfig.agent_id == agent_id,
                     ChannelConfig.channel_type == "wecom",
-                    ChannelConfig.is_configured == True,
+                    ChannelConfig.is_configured,
                 )
             )
             config = config_result.scalar_one_or_none()
             if not config:
                 return "❌ This agent has no WeCom channel configured"
+
+            wecom_agent_id_text = str(
+                (config.extra_config or {}).get("wecom_agent_id") or ""
+            ).strip()
+            if not wecom_agent_id_text:
+                return "❌ WeCom channel is missing the application agent ID"
+            if (
+                not wecom_agent_id_text.isascii()
+                or not wecom_agent_id_text.isdigit()
+                or int(wecom_agent_id_text) <= 0
+            ):
+                return "❌ WeCom application agent ID must be a positive numeric value"
+            wecom_agent_id = int(wecom_agent_id_text)
 
             # 2. Get recipient's user_id
             user_id = target_member.external_id
@@ -7386,6 +7407,7 @@ async def _send_wecom_message(
                 config.app_secret,
                 user_id,
                 message_text,
+                agent_id=wecom_agent_id,
             )
 
             if result.get("errcode") == 0:

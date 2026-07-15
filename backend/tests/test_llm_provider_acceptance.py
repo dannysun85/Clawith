@@ -196,6 +196,38 @@ async def test_minimax_business_error_in_http_200_releases_provider_hold():
 
 
 @pytest.mark.asyncio
+async def test_minimax_2062_high_traffic_rejection_releases_provider_hold():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+                "base_resp": {
+                    "status_code": 2062,
+                    "status_msg": "Token Plan traffic is high",
+                },
+            },
+            request=request,
+        )
+
+    client = OpenAICompatibleClient(
+        api_key="test-key",
+        base_url="https://provider.test/v1",
+        model="MiniMax-M3",
+    )
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    try:
+        with pytest.raises(LLMError, match="code=2062"):
+            await client.complete(messages=[LLMMessage(role="user", content="hello")])
+    finally:
+        await client.close()
+
+    assert llm_provider_may_have_accepted(client) is False
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("output_before_error", [False, True])
 async def test_transient_stream_business_error_always_retains_provider_hold(
     output_before_error,

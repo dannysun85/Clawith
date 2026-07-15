@@ -370,7 +370,7 @@ async def discord_interaction_webhook(
             # ── Phase 2: LLM call (no DB session needed) ──
             from app.api.feishu import _call_llm_with_config
             reply_text = await _call_llm_with_config(
-                _agent_model, _llm_model, _fallback_model,
+                _agent_model, _llm_model, _fallback_model, _route_meta,
                 agent_id,
                 user_text,
                 history=history,

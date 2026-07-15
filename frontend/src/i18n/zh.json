@@ -3,6 +3,10 @@
         "name": "Astra",
         "tagline": "Enterprise Digital Employee Platform"
     },
+    "account": {
+        "providerCapacityNotice": "Token Plan 适合个人交互和有限流量；多租户生产环境应配置 PAYG 或企业容量，并至少准备两个相互独立的已验证账号。错误 2062 表示供应商高流量拒绝，不是本地 token 阈值耗尽。",
+        "providerQuotaNotice": "Token Plan 的 5 小时及每周额度由供应商用量接口自动同步，不使用本地 token 阈值。"
+    },
     "login": {
         "hero": {
             "badge": "开源 · 多智能体协作",

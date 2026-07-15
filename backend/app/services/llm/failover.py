@@ -46,7 +46,12 @@ MINIMAX_POLICY_CODES = {"1026", "1027"}      # input/output sensitive content
 MINIMAX_NOTFOUND_CODES = set()               # model not found (currently returns 2013)
 
 # RETRYABLE (transient, safe to retry or fail over):
-MINIMAX_RATELIMIT_CODES = {"1002", "2045", "1041"}  # rate limit / growth exceeded / conn limit
+MINIMAX_RATELIMIT_CODES = {
+    "1002",
+    "1041",
+    "2045",
+    "2062",
+}  # rate / connection / Token Plan interactive-traffic limit
 MINIMAX_TRANSIENT_CODES = {"1000", "1001", "1013", "1024", "1033"}  # unknown/timeout/internal/downstream
 
 # Pattern to extract MiniMax code from error strings like "(1004)" or "code=1004"
@@ -187,7 +192,7 @@ def is_billing_or_quota_error(error: Exception) -> bool:
 
 
 def is_rate_limit_error(error: Exception) -> bool:
-    """Return True if the error is a transient rate-limit (429 / MiniMax 1002/2045)
+    """Return True if the error is a transient rate-limit (429 / MiniMax 1002/2045/2062)
     that may succeed on another credential or after a brief backoff."""
     msg = str(error).lower()
     code = extract_minimax_code(msg)

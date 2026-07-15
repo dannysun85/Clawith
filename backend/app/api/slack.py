@@ -403,10 +403,10 @@ async def slack_event_webhook(
 
     # Set channel_file_sender contextvar for agent → user file delivery
     from app.services.agent_tools import channel_file_sender as _cfs_s
-    async def _slack_file_sender(file_path, msg: str = ""):
+    async def _slack_file_sender(file_path, msg: str = "") -> bool:
         _fp = Path(file_path)
         if not _bot_token or not channel_id:
-            return
+            return False
         async with _httpx.AsyncClient(timeout=60) as _hc:
             _upload_url_resp = await _hc.post(
                 "https://slack.com/api/files.getUploadURLExternal",
@@ -428,12 +428,13 @@ async def slack_event_webhook(
             )
             if not _complete.json().get("ok"):
                 raise RuntimeError(f"Slack upload complete error: {_complete.json()}")
+        return True
     _cfs_s_token = _cfs_s.set(_slack_file_sender)
 
     # Call LLM (no DB session needed)
     from app.api.feishu import _call_llm_with_config
     reply_text = await _call_llm_with_config(
-        _agent_model, _llm_model, _fallback_model,
+        _agent_model, _llm_model, _fallback_model, _route_meta,
         agent_id,
         user_text,
         history=history,

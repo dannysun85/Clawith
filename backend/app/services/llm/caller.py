@@ -75,6 +75,7 @@ from .load_balancer import (
     record_credential_call,
     mark_credential_degraded,
     mark_credential_quota_exceeded,
+    mark_credential_rate_saturated,
     pick_credential,
 )
 # Backward compat alias (record_credential_call supersedes increment_credential_usage)
@@ -245,8 +246,21 @@ async def _apply_credential_failure_policy(
             error_code=extract_minimax_code(str(error)) or "2056",
         )
     elif is_rate_limit_error(error):
-        logger.warning(f"[{log_context}] Rate limit on credential {credential_id}")
-        await asyncio.sleep(1.0)
+        error_code = extract_minimax_code(str(error)) or "rate_limit"
+        logger.warning(
+            "[{}] Provider rate limit error_code={}",
+            log_context,
+            error_code,
+        )
+        cooldown_recorded = await mark_credential_rate_saturated(
+            credential_id,
+            error_code=error_code,
+        )
+        if not cooldown_recorded:
+            # Preserve a bounded local backoff when Redis is unavailable. The
+            # credential stays healthy because a rate rejection is not an
+            # authentication or provider-quota failure.
+            await asyncio.sleep(1.0)
 
 # NOTE: agent_tools imports are deferred to function bodies to avoid circular
 # import: agent_tools → llm.finish → llm/__init__ → caller → agent_tools

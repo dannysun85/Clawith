@@ -316,7 +316,7 @@ async def whatsapp_event_webhook(
 
                 try:
                     reply_text = await _call_llm_with_config(
-                        _agent_model, _llm_model, _fallback_model,
+                        _agent_model, _llm_model, _fallback_model, _route_meta,
                         agent_id,
                         user_text,
                         history=history,

@@ -37,7 +37,7 @@ async def send_wecom_message(
     secret: str,
     user_id: str,
     message: str,
-    agent_id: str = None,
+    agent_id: str | int | None = None,
 ) -> dict:
     """Send a text message to a WeCom user.
 
@@ -48,11 +48,27 @@ async def send_wecom_message(
         secret: WeCom app secret
         user_id: Recipient's user_id
         message: Message content
-        agent_id: Optional agent ID (if not specified, uses first available)
+        agent_id: Positive numeric WeCom application AgentID
 
     Returns:
         Dict with errcode on success
     """
+    # Validate operator-controlled configuration before making a provider call.
+    # ``str.isdigit`` also accepts non-ASCII numerals, while WeCom AgentID is an
+    # ASCII decimal integer.
+    agent_id_text = str(agent_id or "").strip()
+    if (
+        not agent_id_text
+        or not agent_id_text.isascii()
+        or not agent_id_text.isdigit()
+        or int(agent_id_text) <= 0
+    ):
+        return {
+            "errcode": -1,
+            "errmsg": "a positive numeric agent_id is required for WeCom messages",
+        }
+    numeric_agent_id = int(agent_id_text)
+
     # 1. Get access token
     token_result = await get_wecom_access_token(corp_id, secret)
     access_token = token_result.get("access_token")
@@ -64,15 +80,10 @@ async def send_wecom_message(
     url = "https://qyapi.weixin.qq.com/cgi-bin/message/send"
     params = {"access_token": access_token}
 
-    # If agent_id is not provided, we'll try to get it from the config
-    # For now, require agent_id or fail
-    if not agent_id:
-        return {"errcode": -1, "errmsg": "agent_id is required for WeCom messages"}
-
     payload = {
         "touser": user_id,
         "msgtype": "text",
-        "agentid": agent_id,
+        "agentid": numeric_agent_id,
         "text": {
             "content": message,
         },

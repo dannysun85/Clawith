@@ -15,6 +15,7 @@ from app.services.llm.failover import (
     extract_minimax_code,
     is_auth_error,
     is_billing_or_quota_error,
+    is_rate_limit_error,
 )
 from app.services.llm.load_balancer import mark_credential_quota_exceeded
 
@@ -64,6 +65,11 @@ class TestClassifyMinimaxErrors:
     def test_rate_growth_2045_is_retryable(self):
         err = LLMError("Stream error (2045): request rate growth exceeded")
         assert classify_error(err) == FailoverErrorType.RETRYABLE
+
+    def test_token_plan_high_traffic_2062_is_retryable(self):
+        err = LLMError("Request rejected (429): Token Plan traffic is high (2062)")
+        assert classify_error(err) == FailoverErrorType.RETRYABLE
+        assert is_rate_limit_error(err)
 
     def test_timeout_1001_is_retryable(self):
         err = LLMError("API error (code=1001): timeout")
@@ -176,6 +182,7 @@ class TestCredentialFailurePolicy:
             "MiniMax API error (1000): unexpected error",
             "API error (1001): timeout",
             "API error (1002): rate limit",
+            "API error (2062): Token Plan traffic is high",
             "API error (2013): param error",
             "API error (1026): sensitive content",
             "connection reset by peer",
@@ -185,6 +192,31 @@ class TestCredentialFailurePolicy:
     )
     def test_operation_scoped_errors_never_poison_shared_pool(self, message):
         assert credential_failure_action(LLMError(message)) is CredentialFailureAction.NONE
+
+    @pytest.mark.asyncio
+    async def test_2062_opens_short_cooldown_without_poisoning_pool(self, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        from app.services.llm import caller
+
+        cooldown = AsyncMock(return_value=True)
+        degrade = AsyncMock()
+        quota = AsyncMock()
+        monkeypatch.setattr(caller, "mark_credential_rate_saturated", cooldown)
+        monkeypatch.setattr(caller, "mark_credential_degraded", degrade)
+        monkeypatch.setattr(caller, "mark_credential_quota_exceeded", quota)
+
+        credential_id = "credential-id"
+        await caller._apply_credential_failure_policy(
+            credential_id,
+            LLMError("Request rejected (429): Token Plan traffic is high (2062)"),
+            log_context="test",
+            modality="plan",
+        )
+
+        cooldown.assert_awaited_once_with(credential_id, error_code="2062")
+        degrade.assert_not_awaited()
+        quota.assert_not_awaited()
 
     def test_invalid_key_opens_shared_pool_circuit(self):
         assert credential_failure_action(LLMError("login fail (1004)")) is CredentialFailureAction.DEGRADE

@@ -194,7 +194,7 @@ const CHANNEL_REGISTRY: ChannelDef[] = [
         icon: WeComIcon,
         nameKey: 'common.channels.wecom',
         nameFallback: 'WeCom',
-        desc: 'WebSocket / Webhook',
+        desc: 'Text only · WebSocket / Webhook',
         apiSlug: 'wecom-channel',
         connectionMode: true,
         fields: [

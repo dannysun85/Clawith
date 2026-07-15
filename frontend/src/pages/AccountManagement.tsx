@@ -196,7 +196,7 @@ export default function AccountManagement() {
                             {['minimax', 'openai', 'anthropic', 'deepseek', 'qwen', 'zhipu', 'gemini', 'kimi', 'custom'].map((p) => <option key={p} value={p}>{p}</option>)}
                         </select>
                     </div>
-                    <div className="form-group"><label className="form-label">label</label><input className="form-input" value={form.label} onChange={(e) => setForm({ ...form, label: e.target.value })} placeholder="MiniMax Token Plan #1" /></div>
+                    <div className="form-group"><label className="form-label">label</label><input className="form-input" value={form.label} onChange={(e) => setForm({ ...form, label: e.target.value })} placeholder="MiniMax PAYG Production A" /></div>
                     {editingId ? (
                         <div className="form-group" style={{ gridColumn: 'span 2' }}>
                             <label className="form-label">API key</label>
@@ -214,9 +214,15 @@ export default function AccountManagement() {
                     <div className="form-group"><label className="form-label">每日配额 (可选)</label><input className="form-input" type="number" value={form.daily_quota} onChange={(e) => setForm({ ...form, daily_quota: e.target.value })} placeholder="留空=不限" /></div>
                     <div className="form-group"><label className="form-label" title="每分钟最大请求数">RPM 限流 (每分钟请求数)</label><input className="form-input" type="number" value={form.rpm_limit} onChange={(e) => setForm({ ...form, rpm_limit: e.target.value })} placeholder="留空=不限, e.g. 200" /></div>
                     <div className="form-group"><label className="form-label" title="每分钟最大 token 数">TPM 限流 (每分钟 tokens)</label><input className="form-input" type="number" value={form.tpm_limit} onChange={(e) => setForm({ ...form, tpm_limit: e.target.value })} placeholder="留空=不限, e.g. 10000000" /></div>
-                    <div className="form-group" style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>
-                        {t('account.providerQuotaNotice', 'Token Plan 的 5 小时/周额度由供应商用量接口自动同步，不使用本地 token 阈值。')}
-                    </div>
+                    {form.provider === 'minimax' && (
+                        <div className="form-group" style={{ gridColumn: 'span 2', fontSize: 12, color: 'var(--warning)' }}>
+                            {t('account.providerCapacityNotice')}
+                            <br />
+                            <span style={{ color: 'var(--text-tertiary)' }}>
+                                {t('account.providerQuotaNotice')}
+                            </span>
+                        </div>
+                    )}
                     <div className="form-group"><label className="form-label">weight</label><input className="form-input" type="number" value={form.weight} onChange={(e) => setForm({ ...form, weight: e.target.value })} /></div>
                     <div className="form-group"><label className="form-label">priority</label><input className="form-input" type="number" value={form.priority} onChange={(e) => setForm({ ...form, priority: e.target.value })} /></div>
                     <div className="form-group" style={{ gridColumn: 'span 2' }}>

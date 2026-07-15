@@ -3,6 +3,10 @@
     "name": "Astra",
     "tagline": "Enterprise Digital Employee Platform"
   },
+  "account": {
+    "providerCapacityNotice": "Token Plan is intended for individual interactive or limited traffic. Multi-tenant production should use PAYG or enterprise capacity and at least two independently verified accounts. Error 2062 means provider traffic saturation, not a local token threshold.",
+    "providerQuotaNotice": "The provider usage API synchronizes the Token Plan five-hour and weekly allowance; local token thresholds are not used."
+  },
   "login": {
     "hero": {
       "badge": "Open Source · Multi-Agent Collaboration",

@@ -35,6 +35,7 @@ _MINIMAX_DETERMINISTIC_REJECTION_CODES = frozenset({
     "2045",  # request growth limit
     "2049",  # invalid API key
     "2056",  # Token Plan resource exhausted
+    "2062",  # Token Plan high-traffic rejection
 })
 
 _DETERMINISTIC_PROVIDER_ERROR_TYPES = frozenset({

@@ -38,6 +38,30 @@ def _load_call_assignments(path: Path) -> list[int]:
     return target_lengths
 
 
+def _load_called_function_names(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name):
+            names.add(node.func.id)
+        elif isinstance(node.func, ast.Attribute):
+            names.add(node.func.attr)
+    return names
+
+
+def _load_llm_call_positional_arg_counts(path: Path) -> list[int]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return [
+        len(node.args)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_call_llm_with_config"
+    ]
+
+
 def test_external_channels_unpack_routed_model_metadata():
     backend_root = Path(__file__).parents[1]
     checked = 0
@@ -47,3 +71,23 @@ def test_external_channels_unpack_routed_model_metadata():
         assert assignments, f"No routed model load found in {relative_path}"
         assert set(assignments) == {4}, f"{relative_path} still unpacks the legacy 3-value contract"
     assert checked >= len(CHANNEL_FILES)
+
+
+def test_external_channels_forward_routed_model_metadata():
+    backend_root = Path(__file__).parents[1]
+    checked = 0
+    for relative_path in CHANNEL_FILES:
+        arg_counts = _load_llm_call_positional_arg_counts(backend_root / relative_path)
+        checked += len(arg_counts)
+        assert arg_counts, f"No routed LLM call found in {relative_path}"
+        assert min(arg_counts) >= 6, f"{relative_path} drops routed model metadata"
+    assert checked >= len(CHANNEL_FILES)
+
+
+def test_wechat_history_converts_internal_tool_call_records():
+    backend_root = Path(__file__).parents[1]
+    called_functions = _load_called_function_names(
+        backend_root / "app/services/wechat_channel.py"
+    )
+
+    assert "convert_chat_messages_to_llm_format" in called_functions

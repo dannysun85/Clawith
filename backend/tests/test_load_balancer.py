@@ -75,6 +75,108 @@ async def test_pick_returns_top_priority_cred():
 
 
 @pytest.mark.asyncio
+async def test_pick_skips_provider_cooldown_and_uses_independent_credential(monkeypatch):
+    blocked = _cred(priority=10)
+    fallback = _cred(priority=0)
+    redis = AsyncMock()
+    redis.exists = AsyncMock(side_effect=lambda key: str(blocked.id) in key)
+    monkeypatch.setattr(
+        load_balancer,
+        "_get_redis_or_none",
+        AsyncMock(return_value=redis),
+    )
+    sess, _ = _patch_session(execute_result=[blocked, fallback])
+
+    with sess:
+        chosen = await pick_credential("minimax", "text")
+
+    assert chosen.id == fallback.id
+
+
+@pytest.mark.asyncio
+async def test_provider_cooldown_read_failure_does_not_disable_credential(monkeypatch):
+    credential = _cred(priority=10)
+    redis = AsyncMock()
+    redis.exists = AsyncMock(side_effect=ConnectionError("sensitive redis endpoint"))
+    monkeypatch.setattr(
+        load_balancer,
+        "_get_redis_or_none",
+        AsyncMock(return_value=redis),
+    )
+    sess, _ = _patch_session(execute_result=[credential])
+
+    with sess:
+        chosen = await pick_credential("minimax", "text")
+
+    assert chosen.id == credential.id
+
+
+@pytest.mark.asyncio
+async def test_mark_provider_rate_saturated_sets_bounded_redis_cooldown(monkeypatch):
+    credential = _cred()
+    redis = AsyncMock()
+    monkeypatch.setattr(
+        load_balancer,
+        "_get_redis_or_none",
+        AsyncMock(return_value=redis),
+    )
+
+    recorded = await load_balancer.mark_credential_rate_saturated(
+        credential.id,
+        cooldown_seconds=30,
+        error_code="2062",
+    )
+
+    assert recorded is True
+    redis.set.assert_awaited_once_with(
+        load_balancer._cred_provider_cooldown_key(credential.id),
+        "2062",
+        ex=30,
+    )
+
+
+@pytest.mark.asyncio
+async def test_mark_provider_rate_saturated_does_not_persist_unknown_error_text(monkeypatch):
+    credential = _cred()
+    redis = AsyncMock()
+    monkeypatch.setattr(
+        load_balancer,
+        "_get_redis_or_none",
+        AsyncMock(return_value=redis),
+    )
+
+    await load_balancer.mark_credential_rate_saturated(
+        credential.id,
+        error_code="provider payload must not enter diagnostics",
+    )
+
+    redis.set.assert_awaited_once_with(
+        load_balancer._cred_provider_cooldown_key(credential.id),
+        "rate_limit",
+        ex=load_balancer.PROVIDER_RATE_COOLDOWN_SECONDS,
+    )
+
+
+@pytest.mark.asyncio
+async def test_mark_provider_rate_saturated_write_failure_uses_local_backoff(monkeypatch):
+    credential = _cred()
+    redis = AsyncMock()
+    redis.set = AsyncMock(side_effect=ConnectionError("sensitive redis endpoint"))
+    monkeypatch.setattr(
+        load_balancer,
+        "_get_redis_or_none",
+        AsyncMock(return_value=redis),
+    )
+
+    recorded = await load_balancer.mark_credential_rate_saturated(
+        credential.id,
+        error_code="2062",
+    )
+
+    assert recorded is False
+
+
+@pytest.mark.asyncio
 async def test_pick_skips_only_the_quota_blocked_modality():
     video_blocked = _cred(
         priority=10,

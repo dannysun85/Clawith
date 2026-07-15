@@ -278,74 +278,69 @@ async def process_dingtalk_message(
             )
             llm_user_text = f"{user_text}\n{image_markers}" if user_text else image_markers
 
-        # ── Set up channel_file_sender so the agent can send files via DingTalk ──
+        # Register current-conversation file delivery only when the DingTalk
+        # application credentials needed for a real media upload are present.
+        # A text-only filename fallback is not attachment delivery.
         from app.services.agent_tools import channel_file_sender as _cfs
         from app.services.dingtalk_stream import (
-            _upload_dingtalk_media,
             _send_dingtalk_media_message,
+            _upload_dingtalk_media,
         )
 
         _cfs_token = None
         if _dt_app_key and _dt_app_secret:
-            # Determine send target: group -> conversation_id, P2P -> sender_staff_id
             _dt_target_id = conversation_id if conversation_type == "2" else sender_staff_id
             _dt_conv_type = conversation_type
 
-            async def _dingtalk_file_sender(file_path: str, msg: str = ""):
-                """Send a file/image/video via DingTalk proactive message API."""
+            async def _dingtalk_file_sender(file_path: str, msg: str = "") -> bool:
+                """Return True only after DingTalk confirms the media message."""
                 from pathlib import Path as _P
 
-                _fp = _P(file_path)
-                _ext = _fp.suffix.lower()
-
-                # Determine media type from extension
-                if _ext in (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"):
-                    _media_type = "image"
-                elif _ext in (".mp4", ".mov", ".avi", ".mkv"):
-                    _media_type = "video"
-                elif _ext in (".mp3", ".wav", ".ogg", ".amr", ".m4a"):
-                    _media_type = "voice"
+                file_name = _P(file_path).name
+                extension = _P(file_path).suffix.lower()
+                if extension in (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"):
+                    media_type = "image"
+                elif extension in (".mp4", ".mov", ".avi", ".mkv"):
+                    media_type = "video"
+                elif extension in (".mp3", ".wav", ".ogg", ".amr", ".m4a"):
+                    media_type = "voice"
                 else:
-                    _media_type = "file"
+                    media_type = "file"
 
-                # Upload media to DingTalk
-                _mid = await _upload_dingtalk_media(
-                    _dt_app_key, _dt_app_secret, file_path, _media_type
+                media_id = await _upload_dingtalk_media(
+                    _dt_app_key,
+                    _dt_app_secret,
+                    file_path,
+                    media_type,
                 )
+                if not media_id:
+                    return False
 
-                if _mid:
-                    # Send via proactive message API
-                    _ok = await _send_dingtalk_media_message(
-                        _dt_app_key, _dt_app_secret,
-                        _dt_target_id, _mid, _media_type,
-                        _dt_conv_type, filename=_fp.name,
-                    )
-                    if _ok:
-                        # Also send accompany text if provided
-                        if msg:
-                            try:
-                                async with httpx.AsyncClient(timeout=10) as _cl:
-                                    await _cl.post(session_webhook, json={
-                                        "msgtype": "text",
-                                        "text": {"content": msg},
-                                    })
-                            except Exception:
-                                pass
-                        return
+                delivered = await _send_dingtalk_media_message(
+                    _dt_app_key,
+                    _dt_app_secret,
+                    _dt_target_id,
+                    media_id,
+                    media_type,
+                    _dt_conv_type,
+                    filename=file_name,
+                )
+                if not delivered:
+                    return False
 
-                # Fallback: send a text message with file info
-                _fallback_parts = []
                 if msg:
-                    _fallback_parts.append(msg)
-                _fallback_parts.append(f"[File: {_fp.name}]")
-                try:
-                    async with httpx.AsyncClient(timeout=10) as _cl:
-                        await _cl.post(session_webhook, json={
-                            "msgtype": "text",
-                            "text": {"content": "\n\n".join(_fallback_parts)},
-                        })
-                except Exception as _fb_err:
-                    logger.error(f"[DingTalk] Fallback file text also failed: {_fb_err}")
+                    try:
+                        async with httpx.AsyncClient(timeout=10) as client:
+                            await client.post(
+                                session_webhook,
+                                json={
+                                    "msgtype": "text",
+                                    "text": {"content": msg},
+                                },
+                            )
+                    except Exception:
+                        pass
+                return True
 
             _cfs_token = _cfs.set(_dingtalk_file_sender)
 
@@ -353,12 +348,11 @@ async def process_dingtalk_message(
         from app.api.feishu import _call_llm_with_config
         try:
             reply_text = await _call_llm_with_config(
-                _agent_model, _llm_model, _fallback_model,
+                _agent_model, _llm_model, _fallback_model, _route_meta,
                 agent_id, llm_user_text,
                 history=history, user_id=platform_user_id,
             )
         finally:
-            # Reset ContextVar
             if _cfs_token is not None:
                 _cfs.reset(_cfs_token)
             # Recall thinking reaction (before sending reply)

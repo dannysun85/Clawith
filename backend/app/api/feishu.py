@@ -999,7 +999,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
             from app.services.agent_tools import channel_file_sender as _cfs
             _reply_to_id = chat_id if chat_type == "group" else sender_open_id
             _rid_type = "chat_id" if chat_type == "group" else "open_id"
-            async def _feishu_file_sender(file_path, msg: str = ""):
+            async def _feishu_file_sender(file_path, msg: str = "") -> bool:
                 try:
                     await feishu_service.upload_and_send_file(
                         config.app_id, config.app_secret,
@@ -1007,7 +1007,8 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
                         receive_id_type=_rid_type,
                         accompany_msg=msg,
                     )
-                except Exception as _upload_err:
+                    return True
+                except Exception:
                     # Fallback: send a download link when upload permission is not granted
                     from pathlib import Path as _P
                     from app.config import get_settings as _gs_fallback
@@ -1031,7 +1032,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
                         _dl_url = f"{_base_url}/api/agents/{agent_id}/files/download?path={_rel}"
                         _fallback_parts.append(f"📎 {_fp.name}\n🔗 {_dl_url}")
                     _fallback_parts.append(
-                        f"⚠️ 文件直接发送失败（{_upload_err}）\n"
+                        "⚠️ 文件直接发送失败\n"
                         "如需 Agent 直接发飞书文件，请在飞书开放平台为应用开启 "
                         "`im:resource`（即 `im:resource:upload`）权限并发布版本。"
                     )
@@ -1041,6 +1042,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
                         _json.dumps({"text": "\n\n".join(_fallback_parts)}),
                         receive_id_type=_rid_type,
                     )
+                    return False
             _cfs_token = _cfs.set(_feishu_file_sender)
 
             _reply_target = chat_id if chat_type == "group" and chat_id else sender_open_id

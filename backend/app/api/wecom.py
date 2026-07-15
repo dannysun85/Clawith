@@ -615,7 +615,7 @@ async def _process_wecom_text(
         # Call LLM (no DB session needed)
         from app.api.feishu import _call_llm_with_config
         reply_text = await _call_llm_with_config(
-            _agent_model, _llm_model, _fallback_model,
+            _agent_model, _llm_model, _fallback_model, _route_meta,
             agent_id, user_text,
             history=history, user_id=platform_user_id,
             session_id=session_conv_id,

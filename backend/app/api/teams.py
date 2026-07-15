@@ -25,9 +25,7 @@ from app.models.user import User
 from app.schemas.schemas import ChannelConfigOut
 from app.services.channel_session import find_or_create_channel_session
 from app.api.feishu import _call_llm_with_config, _load_agent_and_model
-from app.services.agent_tools import channel_file_sender as _cfs_s
 from app.core.security import hash_password as _hp
-from pathlib import Path as _Path
 import asyncio as _asyncio
 import random as _random
 
@@ -506,28 +504,10 @@ async def teams_event_webhook(
         # ── Phase 1 complete: release connection before slow LLM call ──
         await db.close()
 
-        # Set channel_file_sender contextvar for agent → user file delivery
-        async def _teams_file_sender(file_path, msg: str = ""):
-            _fp = _Path(file_path)
-            use_mi = config.extra_config.get("use_managed_identity", False)
-            has_creds = (config.app_id and config.app_secret) or use_mi
-            if not has_creds or not conversation_id:
-                return
-            # For simplicity, just send file info as text for now
-            file_msg_activity = {
-                "type": "message",
-                "conversation": {"id": conversation_id},
-                "replyToId": reply_to_id,
-                "text": f"Agent sent file: {_fp.name} (Note: file content not directly supported yet, but I can tell you about it: {msg})",
-            }
-            await _send_teams_message(config, conversation_id, file_msg_activity)
-
-        _cfs_s_token = _cfs_s.set(_teams_file_sender)
-
         # Call LLM (no DB session needed)
         try:
             reply_text = await _call_llm_with_config(
-                _agent_model, _llm_model, _fallback_model,
+                _agent_model, _llm_model, _fallback_model, _route_meta,
                 agent_id,
                 user_text,
                 history=history,
@@ -542,9 +522,6 @@ async def teams_event_webhook(
         except Exception as e:
             logger.exception(f"Teams: Failed to call LLM for agent {agent_id}: {e}")
             reply_text = "Sorry, I encountered an error processing your message."
-        finally:
-            _cfs_s.reset(_cfs_s_token)
-
         # Save reply (new short transaction)
         try:
             async with _async_session() as _save_db:
