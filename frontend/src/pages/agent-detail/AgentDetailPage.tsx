@@ -18,6 +18,7 @@ import { websocketAuthProtocols } from '../../utils/authTransport';
 import { reportClientIssue, shouldReportWebSocketClose } from '../../services/productionIssueReporter';
 import type { FocusApiItem } from '../../services/api';
 import { isA2AMessageLeft } from '../../utils/a2aMessageSide';
+import { refreshAgentQueriesAfterDelete } from '../../utils/agentDeletionCache';
 import TierSelector, { resolveAllowedTier, type SaasTier } from '../../components/TierSelector';
 import { useAllowedTiers } from '../../hooks/useLlmModels';
 import { SUBSCRIPTION_UPGRADE_PATH } from '../../hooks/useAgentCreationLimit';
@@ -7462,7 +7463,7 @@ export default function AgentDetailPage() {
                             onDeleteAgent={async () => {
                                 try {
                                     await agentApi.delete(id);
-                                    queryClient.invalidateQueries({ queryKey: ['agents'] });
+                                    refreshAgentQueriesAfterDelete(queryClient, id);
                                     navigate('/');
                                 } catch (err: any) {
                                     await dialog.alert(t('common.error.agentDeleteFailed', '删除数字员工失败'), { type: 'error', details: String(err?.message || err) });

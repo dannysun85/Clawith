@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import { agentApi } from '../services/api';
 import LinearCopyButton from '../components/LinearCopyButton';
+import { refreshAgentQueriesAfterDelete } from '../utils/agentDeletionCache';
 function fetchAuth<T>(url: string, options?: RequestInit): Promise<T> {
     const token = localStorage.getItem('token');
     return fetch(`/api${url}`, {
@@ -62,7 +63,7 @@ export default function OpenClawSettings({ agent, agentId, canManage }: OpenClaw
         setDeleting(true);
         try {
             await agentApi.delete(agentId);
-            queryClient.invalidateQueries({ queryKey: ['agents'] });
+            refreshAgentQueriesAfterDelete(queryClient, agentId);
             navigate('/');
         } catch (e) {
             console.error('Failed to delete agent', e);

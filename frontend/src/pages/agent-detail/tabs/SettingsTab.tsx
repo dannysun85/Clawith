@@ -1,4 +1,4 @@
-import { useMemo, type Dispatch, type ReactNode, type SetStateAction } from 'react';
+import { useMemo, useState, type Dispatch, type ReactNode, type SetStateAction } from 'react';
 import { IconTools, IconWorld } from '@tabler/icons-react';
 import { useTranslation } from 'react-i18next';
 
@@ -69,6 +69,7 @@ export default function SettingsTab(props: Props) {
         onDeleteAgent,
     } = props;
     const { t, i18n } = useTranslation();
+    const [deletingAgent, setDeletingAgent] = useState(false);
     const { data: entitlements } = useEntitlements();
     const allowedTiers = useMemo(
         () => entitlements?.allowed_tiers?.length ? entitlements.allowed_tiers : ['lite', 'pro', 'ultra'],
@@ -413,8 +414,30 @@ export default function SettingsTab(props: Props) {
                 ) : (
                     <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
                         <span style={{ fontSize: '13px', color: 'var(--error)', fontWeight: 600 }}>{t('agent.settings.danger.deleteWarning')}</span>
-                        <button className="btn btn-danger" onClick={onDeleteAgent}>{t('agent.settings.danger.confirmDelete')}</button>
-                        <button className="btn btn-secondary" onClick={() => setShowDeleteConfirm(false)}>{t('common.cancel')}</button>
+                        <button
+                            className="btn btn-danger"
+                            disabled={deletingAgent}
+                            onClick={async () => {
+                                if (deletingAgent) return;
+                                setDeletingAgent(true);
+                                try {
+                                    await onDeleteAgent();
+                                } finally {
+                                    setDeletingAgent(false);
+                                }
+                            }}
+                        >
+                            {deletingAgent
+                                ? t('agent.settings.deleting', 'Deleting...')
+                                : t('agent.settings.danger.confirmDelete')}
+                        </button>
+                        <button
+                            className="btn btn-secondary"
+                            disabled={deletingAgent}
+                            onClick={() => setShowDeleteConfirm(false)}
+                        >
+                            {t('common.cancel')}
+                        </button>
                     </div>
                 )}
             </div>}
