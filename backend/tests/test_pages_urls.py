@@ -1,7 +1,7 @@
 import uuid
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi import HTTPException
@@ -148,7 +148,8 @@ async def test_publish_page_rejects_cross_agent_source_before_storage_read(
         is_file=AsyncMock(return_value=True),
         read_text=AsyncMock(return_value="<html>private</html>"),
     )
-    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+    storage_factory = Mock(return_value=storage)
+    monkeypatch.setattr(agent_tools, "get_storage_backend", storage_factory)
 
     result = await agent_tools._publish_page(
         uuid.uuid4(),
@@ -158,6 +159,7 @@ async def test_publish_page_rejects_cross_agent_source_before_storage_read(
     )
 
     assert result == "File path must stay within the Agent workspace"
+    storage_factory.assert_not_called()
     storage.exists.assert_not_awaited()
     storage.is_file.assert_not_awaited()
     storage.read_text.assert_not_awaited()
@@ -175,12 +177,14 @@ async def test_public_page_rejects_unsafe_legacy_source_path(monkeypatch):
         is_file=AsyncMock(return_value=True),
         read_text=AsyncMock(return_value="<html>private</html>"),
     )
-    monkeypatch.setattr(pages_api, "get_storage_backend", lambda: storage)
+    storage_factory = Mock(return_value=storage)
+    monkeypatch.setattr(pages_api, "get_storage_backend", storage_factory)
 
     with pytest.raises(HTTPException) as exc:
         await pages_api.render_page("unsafe", db=db)
 
     assert exc.value.status_code == 404
+    storage_factory.assert_not_called()
     storage.exists.assert_not_awaited()
     storage.is_file.assert_not_awaited()
     storage.read_text.assert_not_awaited()

@@ -197,11 +197,12 @@ async def send_email(
 
     # Attach files
     if attachments and workspace_path:
-        storage = get_storage_backend()
-
+        resolved_attachments: list[tuple[str, Path, str]] = []
         for rel_path in attachments:
             prefix = str(agent_id) if agent_id else workspace_path.name
             try:
+                if not isinstance(rel_path, str):
+                    raise TypeError("Attachment path must be a string")
                 storage_key = agent_storage_key(prefix, rel_path)
                 full_path = resolve_path_within_root(
                     workspace_path,
@@ -214,6 +215,12 @@ async def send_email(
                 return "❌ Attachment path must stay within the Agent workspace."
 
             clean_rel = rel_path.replace("\\", "/").strip()
+            resolved_attachments.append((storage_key, full_path, clean_rel))
+
+        # Validate the complete attachment list before constructing a storage
+        # backend or reading any otherwise-valid attachment.
+        storage = get_storage_backend()
+        for storage_key, full_path, clean_rel in resolved_attachments:
             file_bytes = None
             filename = Path(clean_rel).name
 

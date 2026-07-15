@@ -32,13 +32,13 @@ async def render_page(short_id: str, db: AsyncSession = Depends(get_db)):
     if not page:
         raise HTTPException(status_code=404, detail="Page not found")
 
-    storage = get_storage_backend()
     try:
         storage_key = agent_storage_key(page.agent_id, page.source_path)
     except (TypeError, ValueError) as exc:
         # Legacy rows with unsafe source paths must not become a public
         # cross-Agent read primitive.
         raise HTTPException(status_code=404, detail="Source file no longer exists") from exc
+    storage = get_storage_backend()
     if not await storage.exists(storage_key) or not await storage.is_file(storage_key):
         raise HTTPException(status_code=404, detail="Source file no longer exists")
 

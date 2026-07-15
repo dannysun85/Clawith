@@ -14625,12 +14625,13 @@ async def _publish_page(agent_id: uuid.UUID, user_id: uuid.UUID, ws: Path, argum
     if not path.lower().endswith((".html", ".htm")):
         return "Only .html and .htm files can be published"
 
-    # Resolve via storage backend (supports local FS and S3)
-    storage = get_storage_backend()
     try:
         storage_key = agent_storage_key(agent_id, path)
     except (TypeError, ValueError):
         return "File path must stay within the Agent workspace"
+    # Resolve via storage backend (supports local FS and S3) only after the
+    # untrusted path is known to stay inside the Agent namespace.
+    storage = get_storage_backend()
     if not await storage.exists(storage_key) or not await storage.is_file(storage_key):
         return f"File not found: {path}"
 

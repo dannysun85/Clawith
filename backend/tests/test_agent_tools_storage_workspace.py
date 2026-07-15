@@ -1,5 +1,5 @@
 import uuid
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi import HTTPException
@@ -249,7 +249,8 @@ async def test_send_file_to_agent_rejects_scope_escape_before_storage_read(
     read_bytes = AsyncMock(wraps=storage.read_bytes)
     monkeypatch.setattr(storage, "is_file", is_file)
     monkeypatch.setattr(storage, "read_bytes", read_bytes)
-    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+    storage_factory = Mock(return_value=storage)
+    monkeypatch.setattr(agent_tools, "get_storage_backend", storage_factory)
 
     result = await agent_tools._send_file_to_agent(
         source_agent_id,
@@ -261,6 +262,7 @@ async def test_send_file_to_agent_rejects_scope_escape_before_storage_read(
 
     assert "Source file path must stay within the Agent workspace" in result
     assert "victim-private-content" not in result
+    storage_factory.assert_not_called()
     is_file.assert_not_awaited()
     read_bytes.assert_not_awaited()
 
@@ -282,7 +284,8 @@ async def test_email_attachment_rejects_scope_escape_before_storage_or_smtp(
     read_bytes = AsyncMock(wraps=storage.read_bytes)
     smtp_send = AsyncMock()
     monkeypatch.setattr(storage, "read_bytes", read_bytes)
-    monkeypatch.setattr(email_service, "get_storage_backend", lambda: storage)
+    storage_factory = Mock(return_value=storage)
+    monkeypatch.setattr(email_service, "get_storage_backend", storage_factory)
     monkeypatch.setattr(email_service, "send_smtp_email", smtp_send)
 
     result = await email_service.send_email(
@@ -301,6 +304,7 @@ async def test_email_attachment_rejects_scope_escape_before_storage_or_smtp(
 
     assert result == "❌ Attachment path must stay within the Agent workspace."
     assert "victim-email-content" not in result
+    storage_factory.assert_not_called()
     read_bytes.assert_not_awaited()
     smtp_send.assert_not_called()
 
