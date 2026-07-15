@@ -3,7 +3,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import HTTPException
 
+from app.api import wecom
 from app.services import agent_tools, wecom_service
 
 
@@ -16,6 +18,112 @@ class _SessionContext:
 
     async def __aexit__(self, exc_type, exc, tb):
         return False
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("100001", 100001),
+        (100001, 100001),
+        (" 100001 ", 100001),
+        (None, None),
+        ("", None),
+        ("0", None),
+        ("-1", None),
+        ("not-a-number", None),
+        ("１００００１", None),
+    ],
+)
+def test_normalize_wecom_agent_id(value, expected):
+    assert wecom_service.normalize_wecom_agent_id(value) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("agent_id_value", [None, "", "0", "-1", "abc", "１００００１"])
+async def test_wecom_webhook_configuration_rejects_invalid_application_agent_id(
+    monkeypatch,
+    agent_id_value,
+):
+    agent = SimpleNamespace()
+    monkeypatch.setattr(
+        wecom,
+        "check_agent_access",
+        AsyncMock(return_value=(agent, None)),
+    )
+    monkeypatch.setattr(wecom, "is_agent_creator", lambda _user, _agent: True)
+    db = AsyncMock()
+    payload = {
+        "corp_id": "corp-id",
+        "secret": "corp-secret",
+        "token": "verification-token",
+        "encoding_aes_key": "encoding-key",
+        "wecom_agent_id": agent_id_value,
+    }
+
+    with pytest.raises(HTTPException) as exc_info:
+        await wecom.configure_wecom_channel(
+            uuid.uuid4(),
+            payload,
+            current_user=SimpleNamespace(),
+            db=db,
+        )
+
+    assert exc_info.value.status_code == 422
+    assert "wecom_agent_id" in exc_info.value.detail
+    db.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_wecom_websocket_configuration_rejects_explicit_invalid_agent_id(
+    monkeypatch,
+):
+    agent = SimpleNamespace()
+    monkeypatch.setattr(
+        wecom,
+        "check_agent_access",
+        AsyncMock(return_value=(agent, None)),
+    )
+    monkeypatch.setattr(wecom, "is_agent_creator", lambda _user, _agent: True)
+    db = AsyncMock()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await wecom.configure_wecom_channel(
+            uuid.uuid4(),
+            {
+                "bot_id": "bot-id",
+                "bot_secret": "bot-secret",
+                "wecom_agent_id": "not-a-number",
+            },
+            current_user=SimpleNamespace(),
+            db=db,
+        )
+
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.detail == "wecom_agent_id must be a positive ASCII numeric value"
+    db.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_wecom_standard_webhook_reply_rejects_legacy_invalid_agent_id_before_llm(
+    monkeypatch,
+):
+    config = SimpleNamespace(extra_config={"wecom_agent_id": "invalid"})
+    send = AsyncMock()
+    monkeypatch.setattr(wecom, "send_wecom_message", send)
+    monkeypatch.setattr(
+        wecom,
+        "async_session",
+        lambda: (_ for _ in ()).throw(AssertionError("database session must not open")),
+    )
+
+    await wecom._process_wecom_text(
+        uuid.uuid4(),
+        config,
+        "wecom-user",
+        "hello",
+    )
+
+    send.assert_not_awaited()
 
 
 @pytest.mark.asyncio

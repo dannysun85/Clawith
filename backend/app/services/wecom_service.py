@@ -4,6 +4,24 @@ import httpx
 from loguru import logger
 
 
+def normalize_wecom_agent_id(value: object) -> int | None:
+    """Return a canonical positive WeCom application AgentID.
+
+    WeCom expects an ASCII decimal integer in ``agentid``.  Keeping this
+    parser in the provider service gives configuration, webhook replies, and
+    proactive delivery one fail-closed contract.
+    """
+    agent_id_text = str(value or "").strip()
+    if (
+        not agent_id_text
+        or not agent_id_text.isascii()
+        or not agent_id_text.isdigit()
+    ):
+        return None
+    numeric_agent_id = int(agent_id_text)
+    return numeric_agent_id if numeric_agent_id > 0 else None
+
+
 async def get_wecom_access_token(corp_id: str, secret: str) -> dict:
     """Get WeCom access_token using corp_id and secret.
 
@@ -54,20 +72,12 @@ async def send_wecom_message(
         Dict with errcode on success
     """
     # Validate operator-controlled configuration before making a provider call.
-    # ``str.isdigit`` also accepts non-ASCII numerals, while WeCom AgentID is an
-    # ASCII decimal integer.
-    agent_id_text = str(agent_id or "").strip()
-    if (
-        not agent_id_text
-        or not agent_id_text.isascii()
-        or not agent_id_text.isdigit()
-        or int(agent_id_text) <= 0
-    ):
+    numeric_agent_id = normalize_wecom_agent_id(agent_id)
+    if numeric_agent_id is None:
         return {
             "errcode": -1,
             "errmsg": "a positive numeric agent_id is required for WeCom messages",
         }
-    numeric_agent_id = int(agent_id_text)
 
     # 1. Get access token
     token_result = await get_wecom_access_token(corp_id, secret)

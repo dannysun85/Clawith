@@ -138,3 +138,49 @@ async def test_channel_file_delivery_requires_explicit_provider_confirmation(
     if provider_result is not True:
         assert "sent to user via channel" not in result
         assert "File ready:" in result
+
+
+@pytest.mark.asyncio
+async def test_channel_file_delivery_rejects_all_workspace_escape_forms(tmp_path):
+    from app.services import agent_tools
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("private", encoding="utf-8")
+    prefix_collision = tmp_path / "workspace-escape"
+    prefix_collision.mkdir()
+    (prefix_collision / "secret.txt").write_text("private", encoding="utf-8")
+    (workspace / "symlink.txt").symlink_to(outside)
+
+    sender = AsyncMock(return_value=True)
+    token = agent_tools.channel_file_sender.set(sender)
+    try:
+        for hostile_path in (
+            str(outside),
+            "../outside.txt",
+            "../workspace-escape/secret.txt",
+            "symlink.txt",
+        ):
+            result = await agent_tools._send_channel_file(
+                uuid.uuid4(),
+                workspace,
+                {"file_path": hostile_path},
+            )
+            assert result == "Error: file_path must stay within the Agent workspace"
+    finally:
+        agent_tools.channel_file_sender.reset(token)
+
+    sender.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "hostile_path",
+    [".", "/etc/passwd", "../secret.txt", "nested/../secret.txt", "..\\secret.txt", "C:/secret.txt"],
+)
+def test_channel_file_path_syntax_is_rejected_before_materialization(hostile_path):
+    from app.services import agent_tools
+    from app.services.workspace_paths import WorkspacePathError
+
+    with pytest.raises(WorkspacePathError):
+        agent_tools._validate_channel_file_path_syntax(hostile_path)

@@ -65,6 +65,7 @@ from app.services.workspace_collaboration import (
 from app.services.storage import get_storage_backend, normalize_storage_key
 from app.services.storage_runtime.base import WriteCondition, content_hash_bytes
 from app.services.workspace_locking import workspace_locks
+from app.services.workspace_paths import WorkspacePathError, resolve_path_within_root
 from app.core.permissions import evaluate_agent_relationship_status, evaluate_human_relationship_status
 from app.services.access_relationships import ensure_access_granted_platform_relationships
 from app.config import get_settings
@@ -3741,12 +3742,17 @@ async def execute_tool(
             if not file_path:
                 result = "Error: file_path is required"
             else:
-                result = await _run_with_temp_workspace(
-                    agent_id,
-                    _agent_tenant_id,
-                    lambda temp_ws: _send_channel_file(agent_id, temp_ws, arguments),
-                    paths=[file_path],
-                )
+                try:
+                    _validate_channel_file_path_syntax(file_path)
+                except WorkspacePathError:
+                    result = "Error: file_path must stay within the Agent workspace"
+                else:
+                    result = await _run_with_temp_workspace(
+                        agent_id,
+                        _agent_tenant_id,
+                        lambda temp_ws: _send_channel_file(agent_id, temp_ws, arguments),
+                        paths=[file_path.replace("\\", "/")],
+                    )
         elif tool_name == "web_search":
             result = await _web_search(arguments, agent_id)
         elif tool_name == "jina_search":
@@ -4873,14 +4879,20 @@ async def _send_channel_file(agent_id: uuid.UUID, ws: Path, arguments: dict) -> 
     if not rel_path:
         return "Error: file_path is required"
 
-    # Resolve file path within agent workspace
-    file_path = (ws / rel_path).resolve()
-    ws_resolved = ws.resolve()
-    if not str(file_path).startswith(str(ws_resolved)):
-        file_path = (WORKSPACE_ROOT / str(agent_id) / rel_path).resolve()
-        if not file_path.exists():
-            return f"Error: File not found: {rel_path}"
-    if not file_path.exists():
+    # Reject traversal syntax before resolving, then use real path containment
+    # so prefix-collision and symlink escapes fail closed as well.
+    try:
+        _validate_channel_file_path_syntax(rel_path)
+        file_path = resolve_path_within_root(
+            ws,
+            rel_path.replace("\\", "/"),
+            allow_root=False,
+            require_subpath=True,
+            label="file path",
+        )
+    except (WorkspacePathError, OSError, ValueError):
+        return "Error: file_path must stay within the Agent workspace"
+    if not file_path.is_file():
         return f"Error: File not found: {rel_path}"
 
     # Priority 1: explicit recipient - resolve member across channels
@@ -4925,6 +4937,22 @@ async def _send_channel_file(agent_id: uuid.UUID, ws: Path, arguments: dict) -> 
     if accompany_msg:
         msg = accompany_msg + "\n\n" + msg
     return msg
+
+
+def _validate_channel_file_path_syntax(rel_path: str) -> None:
+    """Reject dangerous input before storage materialization starts."""
+    normalized = str(rel_path or "").strip().replace("\\", "/")
+    parts = normalized.split("/")
+    meaningful_parts = [part for part in parts if part not in {"", "."}]
+    if (
+        not normalized
+        or not meaningful_parts
+        or "\x00" in normalized
+        or normalized.startswith("/")
+        or re.match(r"^[A-Za-z]:/", normalized)
+        or ".." in parts
+    ):
+        raise WorkspacePathError("Access denied for this file path")
 
 
 async def _send_file_to_recipient(
@@ -7362,7 +7390,7 @@ async def _send_wecom_message(
     target_member: "OrgMember",
 ) -> str:
     """Send message via WeCom channel using Open API."""
-    from app.services.wecom_service import send_wecom_message
+    from app.services.wecom_service import normalize_wecom_agent_id, send_wecom_message
 
 
     try:
@@ -7379,18 +7407,12 @@ async def _send_wecom_message(
             if not config:
                 return "❌ This agent has no WeCom channel configured"
 
-            wecom_agent_id_text = str(
-                (config.extra_config or {}).get("wecom_agent_id") or ""
-            ).strip()
-            if not wecom_agent_id_text:
+            wecom_agent_id_raw = (config.extra_config or {}).get("wecom_agent_id")
+            if not str(wecom_agent_id_raw or "").strip():
                 return "❌ WeCom channel is missing the application agent ID"
-            if (
-                not wecom_agent_id_text.isascii()
-                or not wecom_agent_id_text.isdigit()
-                or int(wecom_agent_id_text) <= 0
-            ):
+            wecom_agent_id = normalize_wecom_agent_id(wecom_agent_id_raw)
+            if wecom_agent_id is None:
                 return "❌ WeCom application agent ID must be a positive numeric value"
-            wecom_agent_id = int(wecom_agent_id_text)
 
             # 2. Get recipient's user_id
             user_id = target_member.external_id
