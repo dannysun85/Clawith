@@ -3792,47 +3792,6 @@ async def seed_builtin_tools():
                     f"to {len(browser_enabled_agent_ids)} agent(s)"
                 )
 
-        # Code sandbox file helpers are non-default, but should be available
-        # wherever the user has already enabled AgentBay code execution tools.
-        code_anchor_names = [
-            "agentbay_code_execute",
-            "agentbay_command_exec",
-            "agentbay_file_transfer",
-        ]
-        code_helper_names = [
-            "agentbay_code_write_file",
-            "agentbay_code_read_file",
-            "agentbay_code_edit_file",
-        ]
-        code_anchor_tools_r = await db.execute(select(Tool.id).where(Tool.name.in_(code_anchor_names)))
-        code_anchor_tool_ids = [row[0] for row in code_anchor_tools_r.fetchall()]
-        code_helper_tools_r = await db.execute(select(Tool).where(Tool.name.in_(code_helper_names)))
-        code_helper_tools = code_helper_tools_r.scalars().all()
-        if code_anchor_tool_ids and code_helper_tools:
-            code_enabled_agent_r = await db.execute(
-                select(AgentTool.agent_id)
-                .where(AgentTool.tool_id.in_(code_anchor_tool_ids), AgentTool.enabled == True)  # noqa: E712
-                .distinct()
-            )
-            code_enabled_agent_ids = [row[0] for row in code_enabled_agent_r.fetchall()]
-            code_assigned_count = 0
-            for agent_id in code_enabled_agent_ids:
-                for helper_tool in code_helper_tools:
-                    existing_assignment = await db.execute(
-                        select(AgentTool).where(
-                            AgentTool.agent_id == agent_id,
-                            AgentTool.tool_id == helper_tool.id,
-                        )
-                    )
-                    if not existing_assignment.scalar_one_or_none():
-                        db.add(AgentTool(agent_id=agent_id, tool_id=helper_tool.id, enabled=True))
-                        code_assigned_count += 1
-            if code_assigned_count:
-                logger.info(
-                    f"[ToolSeeder] Auto-assigned {code_assigned_count} AgentBay code file helper tool(s) "
-                    f"to {len(code_enabled_agent_ids)} agent(s)"
-                )
-
         OBSOLETE_TOOLS = ["bing_search", "manage_tasks"]
         for obsolete_name in OBSOLETE_TOOLS:
             result = await db.execute(select(Tool).where(Tool.name == obsolete_name))

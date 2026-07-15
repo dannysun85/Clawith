@@ -184,7 +184,9 @@ class Settings(BaseSettings):
     # plan or from an AgentTool row alone.
     CODE_EXECUTION_ENABLED: bool = False
     CODE_EXECUTION_ALLOWED_TENANT_IDS: str = ""
-    CODE_EXECUTION_ALLOWED_SANDBOX_TYPES: str = "e2b,aio_sandbox,self_hosted,judge0,codesandbox"
+    CODE_EXECUTION_ALLOWED_TOOL_NAMES: str = ""
+    CODE_EXECUTION_ALLOWED_SANDBOX_TYPES: str = ""
+    CODE_EXECUTION_ALLOWED_SANDBOX_ENDPOINTS: str = ""
     CODE_EXECUTION_REQUIRE_APPROVAL: bool = True
 
     # SaaS console owner. This is intentionally narrower than platform_admin:

@@ -9,8 +9,9 @@
   环境时只读执行。
 - 上传包、执行迁移、修改 `.env`、切换 Nginx、重启容器、回滚和启用产品
   能力都属于生产写操作，执行前必须在当前任务中取得明确授权。
-- “发布新版本”和“启用 Code”是两个独立授权动作。普通版本部署不得顺带设置
-  `CODE_EXECUTION_ENABLED=true`。
+- “发布新版本”和“启用 Code”是两个独立授权动作。普通版本部署会主动重写
+  `CODE_EXECUTION_ENABLED=false`，并清空 tenant、tool、provider 和 endpoint
+  allowlist；不会继承上一版本 `.env` 中的 Code 开启状态。
 - 不在终端输出、报告、日志或审批消息中展示 API Key、JWT、数据库密码或完整
   工具配置。
 
@@ -24,21 +25,30 @@
    或 `BLOCKED` 时禁止打发布标签或部署。
 5. 本地 Git 保存候选提交和证据；本项目不要求把代码上传 GitHub。
 
-## 3. Code 独立授权清单
+## 3. Code 独立授权清单（当前阻断）
 
-Code 默认关闭。申请启用时必须明确记录以下全部内容：
+v1.10.12 只发布 Code 的安全关闭态，不包含生产启用。当前禁止通过手工修改
+`.env` 绕过普通部署的强制关闭。后续申请启用前，除明确记录以下全部内容外：
 
 - 精确 tenant UUID；不接受 `*` 或全租户授权。
 - 精确 Agent UUID 及业务负责人。
-- 外部隔离沙箱类型、供应商账户、资源上限和健康检查证据。
+- 精确 Code tool 名、外部隔离 provider 和自定义 endpoint；不接受 `*`。
+- 供应商依赖锁定、真实容器 import/contract smoke、资源上限和健康检查证据。
 - 网络是否开启；默认关闭。需要联网时由平台管理员单独批准。
 - 审批级别；首次灰度必须保持 `CODE_EXECUTION_REQUIRE_APPROVAL=true`。
 - 灰度时间窗、最大并发、Credits 上限、监控人和回滚负责人。
 
+还必须先完成并复审：审批人可看到实际 code/command 而非密文；外部执行具备
+持久化 claimed/terminal 状态且崩溃歧义不会自动重放；provider 有硬超时、输出
+上限和可验证 egress；Code 有按 tenant 的并发/额度、Credits 预留结算，以及独立
+成功率、超时、拒绝、费用和告警指标。在这些条件闭环前，Code 激活状态为
+`BLOCKED`。
+
 生产禁止 `subprocess`、`docker` 本地 Code 后端，禁止
 `SANDBOX_ALLOW_UNSAFE_FALLBACK_WHEN_BWRAP_MISSING=true`。隔离失败必须
-fail-closed。启用顺序固定为：平台开关 → tenant 白名单 → Agent 工具分配；关闭
-顺序相反，并优先关闭平台开关。
+fail-closed。未来通过独立流程启用时，顺序固定为：精确 provider/endpoint/tool
+白名单 → tenant 白名单 → Agent 工具分配 → 平台开关；关闭顺序相反，并优先关闭
+平台开关。普通版本部署不是该独立启用流程。
 
 生产 API/worker 容器不得挂载 `/var/run/docker.sock`，不得启用 `privileged`、
 `SYS_ADMIN`、`seccomp=unconfined` 或 `apparmor=unconfined`。如未来恢复 OpenClaw

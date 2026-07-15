@@ -149,6 +149,7 @@ PYTHONPATH=. .venv/bin/python ../scripts/code-execution-migration-postgres-smoke
 .venv/bin/alembic upgrade head
 .venv/bin/alembic current | grep -F "secure_code_execution_defaults (head)"
 PYTHONPATH=. .venv/bin/python ../scripts/code-execution-migration-postgres-smoke.py assert-secured
+PYTHONPATH=. .venv/bin/python ../scripts/code-execution-migration-postgres-smoke.py run-seeder-and-assert
 PYTHONPATH=. .venv/bin/python ../scripts/plan-update-postgres-smoke.py
 
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'

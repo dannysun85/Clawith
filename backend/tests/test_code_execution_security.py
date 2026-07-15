@@ -1,5 +1,6 @@
 import shlex
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -13,20 +14,25 @@ from app.services.autonomy_service import (
     build_tool_approval_details,
 )
 from app.services.code_execution_policy import (
+    CODE_EXECUTION_TOOL_NAMES,
     code_execution_denial_reason,
     code_execution_tenant_authorized,
 )
 from app.services.sandbox.api.e2b_backend import _build_e2b_command
+from app.services.sandbox.config import SandboxConfig
 from app.services.tool_config import merge_config_preserving_sensitive
+
+
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def _settings(**overrides):
     values = {
         "CODE_EXECUTION_ENABLED": False,
         "CODE_EXECUTION_ALLOWED_TENANT_IDS": "",
-        "CODE_EXECUTION_ALLOWED_SANDBOX_TYPES": (
-            "e2b,aio_sandbox,self_hosted,judge0,codesandbox"
-        ),
+        "CODE_EXECUTION_ALLOWED_TOOL_NAMES": "execute_code,execute_code_e2b",
+        "CODE_EXECUTION_ALLOWED_SANDBOX_TYPES": "e2b",
+        "CODE_EXECUTION_ALLOWED_SANDBOX_ENDPOINTS": "",
         "ENVIRONMENT": "production",
     }
     values.update(overrides)
@@ -69,26 +75,86 @@ def test_production_code_execution_rejects_local_or_unapproved_sandbox():
     assert "isolated external sandbox" in code_execution_denial_reason(
         settings,
         tenant_id,
+        tool_name="execute_code",
         sandbox_type="subprocess",
     )
     assert "not approved" in code_execution_denial_reason(
         settings,
         tenant_id,
+        tool_name="execute_code_e2b",
         sandbox_type="unknown-provider",
     )
     assert (
         code_execution_denial_reason(
             settings,
             tenant_id,
+            tool_name="execute_code_e2b",
             sandbox_type="e2b",
             allow_network=True,
         )
         is None
     )
-    assert "network access" in code_execution_denial_reason(
+    assert "network approval" in code_execution_denial_reason(
         settings,
         tenant_id,
+        tool_name="execute_code_e2b",
         sandbox_type="e2b",
+        allow_network=False,
+    )
+
+
+def test_production_code_requires_exact_tool_provider_and_endpoint_grants():
+    tenant_id = uuid.uuid4()
+    settings = _settings(
+        CODE_EXECUTION_ENABLED=True,
+        CODE_EXECUTION_ALLOWED_TENANT_IDS=str(tenant_id),
+        CODE_EXECUTION_ALLOWED_TOOL_NAMES="execute_code_e2b,agentbay_code_execute",
+        CODE_EXECUTION_ALLOWED_SANDBOX_TYPES="e2b,self_hosted,agentbay",
+        CODE_EXECUTION_ALLOWED_SANDBOX_ENDPOINTS="https://sandbox.example.test/api",
+    )
+
+    assert "not approved" in code_execution_denial_reason(
+        settings,
+        tenant_id,
+        tool_name="agentbay_command_exec",
+    )
+    assert "cannot be rerouted" in code_execution_denial_reason(
+        settings,
+        tenant_id,
+        tool_name="execute_code_e2b",
+        sandbox_type="self_hosted",
+        allow_network=True,
+        api_url="https://sandbox.example.test/api",
+    )
+    assert "endpoint is not approved" in code_execution_denial_reason(
+        settings,
+        tenant_id,
+        tool_name=None,
+        sandbox_type="self_hosted",
+        allow_network=True,
+        api_url="http://169.254.169.254/latest/meta-data",
+    )
+    assert "endpoint is not approved" in code_execution_denial_reason(
+        settings,
+        tenant_id,
+        tool_name=None,
+        sandbox_type="self_hosted",
+        allow_network=True,
+        api_url="https://user:secret@sandbox.example.test/api?token=x",
+    )
+    assert code_execution_denial_reason(
+        settings,
+        tenant_id,
+        tool_name=None,
+        sandbox_type="self_hosted",
+        allow_network=True,
+        api_url="https://sandbox.example.test/api/",
+    ) is None
+    assert "network approval" in code_execution_denial_reason(
+        settings,
+        tenant_id,
+        tool_name="agentbay_code_execute",
+        sandbox_type="agentbay",
         allow_network=False,
     )
 
@@ -222,7 +288,7 @@ def test_cross_tenant_tool_target_requires_platform_admin():
     )
 
 
-def test_only_platform_admin_can_enable_code_network_access():
+def test_only_platform_admin_can_modify_code_isolation_controls():
     tool = SimpleNamespace(name="execute_code")
     org_admin = SimpleNamespace(
         tenant_id=uuid.uuid4(),
@@ -236,17 +302,77 @@ def test_only_platform_admin_can_enable_code_network_access():
     )
 
     with pytest.raises(HTTPException) as denied:
-        tools_api._enforce_code_network_permission(
+        tools_api._enforce_code_control_permission(
             org_admin,
             tool,
-            {"allow_network": True},
+            {"sandbox_type": "self_hosted", "allow_network": False},
         )
     assert denied.value.status_code == 403
-    tools_api._enforce_code_network_permission(
+    tools_api._enforce_code_control_permission(
         platform_admin,
         tool,
-        {"allow_network": True},
+        {"sandbox_type": "e2b", "allow_network": True},
     )
+
+
+def test_sandbox_config_accepts_runtime_plaintext_api_key():
+    fallback = SandboxConfig(api_key="environment-fallback")
+
+    resolved = SandboxConfig.from_dict(
+        {"sandbox_type": "e2b", "api_key": "tenant-runtime-plaintext"},
+        fallback,
+    )
+
+    assert resolved.api_key == "tenant-runtime-plaintext"
+
+
+def test_every_code_tool_is_mapped_to_l3_autonomy_action():
+    assert {
+        name for name in CODE_EXECUTION_TOOL_NAMES
+        if agent_tools._TOOL_AUTONOMY_MAP.get(name) != "execute_code"
+    } == set()
+
+
+@pytest.mark.asyncio
+async def test_direct_approval_dispatch_supports_agentbay_file_helpers(
+    monkeypatch,
+    tmp_path,
+):
+    async def no_denial(*_args, **_kwargs):
+        return None
+
+    async def tenant_id(*_args, **_kwargs):
+        return str(uuid.uuid4())
+
+    async def write_file(agent_id, workspace, arguments):
+        return f"wrote:{agent_id}:{workspace}:{arguments['path']}"
+
+    monkeypatch.setattr(agent_tools, "_code_tool_denial_reason", no_denial)
+    monkeypatch.setattr(agent_tools, "_get_agent_tenant_id", tenant_id)
+    monkeypatch.setattr(agent_tools, "_agent_workspace_root", lambda _agent_id: tmp_path)
+    monkeypatch.setattr(agent_tools, "_agentbay_code_write_file", write_file)
+
+    result = await agent_tools._execute_tool_direct(
+        "agentbay_code_write_file",
+        {"path": "script.py", "content": "print(1)"},
+        uuid.uuid4(),
+    )
+
+    assert "script.py" in result
+
+
+def test_startup_seeder_never_auto_assigns_code_helpers():
+    source = (ROOT / "backend/app/services/tool_seeder.py").read_text(
+        encoding="utf-8"
+    )
+    auto_assignment_region = source[
+        source.index("# AgentBay desktop window helpers") :
+        source.index("OBSOLETE_TOOLS")
+    ]
+
+    assert "agentbay_file_transfer" not in auto_assignment_region
+    assert "agentbay_code_" not in auto_assignment_region
+    assert "agentbay_command_exec" not in auto_assignment_region
 
 
 def test_mcp_url_credentials_are_masked_and_preserved_on_round_trip():

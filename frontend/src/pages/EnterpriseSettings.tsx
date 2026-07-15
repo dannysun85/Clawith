@@ -1242,7 +1242,7 @@ export default function EnterpriseSettings() {
                                                                         });
                                                                         // Store API key on all tools from this server after creation
                                                                         if (mcpForm.api_key) {
-                                                                            await fetchJson('/tools/mcp-server', { method: 'PUT', body: JSON.stringify({ server_name: serverName, server_url: mcpForm.server_url, api_key: mcpForm.api_key, tenant_id: selectedTenantId || undefined }) }).catch(() => {});
+                                                                            await fetchJson('/tools/mcp-server', { method: 'PUT', body: JSON.stringify({ server_name: serverName, server_url: mcpForm.server_url, api_key: mcpForm.api_key, tenant_id: selectedTenantId || undefined }) });
                                                                         }
                                                                         await loadAllTools();
                                                                     } catch (e: any) {
@@ -1282,7 +1282,11 @@ export default function EnterpriseSettings() {
                                                                 }
                                                                 // Store API key on all tools from this server in one request
                                                                 if (mcpForm.api_key && successCount > 0) {
-                                                                    await fetchJson('/tools/mcp-server', { method: 'PUT', body: JSON.stringify({ server_name: serverName, server_url: mcpForm.server_url, api_key: mcpForm.api_key, tenant_id: selectedTenantId || undefined }) }).catch(() => {});
+                                                                    try {
+                                                                        await fetchJson('/tools/mcp-server', { method: 'PUT', body: JSON.stringify({ server_name: serverName, server_url: mcpForm.server_url, api_key: mcpForm.api_key, tenant_id: selectedTenantId || undefined }) });
+                                                                    } catch (e: any) {
+                                                                        errors.push(`MCP credentials: ${e.message}`);
+                                                                    }
                                                                 }
                                                                 await loadAllTools();
                                                                 setShowAddMCP(false); setMcpTestResult(null); setMcpForm({ server_url: '', server_name: '', api_key: '' }); setMcpRawInput('');

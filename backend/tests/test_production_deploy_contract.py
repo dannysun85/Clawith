@@ -92,6 +92,9 @@ def test_production_code_execution_defaults_fail_closed():
 
     assert "CODE_EXECUTION_ENABLED: ${CODE_EXECUTION_ENABLED:-false}" in compose
     assert "CODE_EXECUTION_ALLOWED_TENANT_IDS: ${CODE_EXECUTION_ALLOWED_TENANT_IDS:-}" in compose
+    assert "CODE_EXECUTION_ALLOWED_TOOL_NAMES: ${CODE_EXECUTION_ALLOWED_TOOL_NAMES:-}" in compose
+    assert "CODE_EXECUTION_ALLOWED_SANDBOX_TYPES: ${CODE_EXECUTION_ALLOWED_SANDBOX_TYPES:-}" in compose
+    assert "CODE_EXECUTION_ALLOWED_SANDBOX_ENDPOINTS: ${CODE_EXECUTION_ALLOWED_SANDBOX_ENDPOINTS:-}" in compose
     assert "CODE_EXECUTION_REQUIRE_APPROVAL: ${CODE_EXECUTION_REQUIRE_APPROVAL:-true}" in compose
     assert "SANDBOX_ALLOW_NETWORK: ${SANDBOX_ALLOW_NETWORK:-false}" in compose
     assert 'SANDBOX_ALLOW_UNSAFE_FALLBACK_WHEN_BWRAP_MISSING: "false"' in compose
@@ -109,9 +112,25 @@ def test_production_release_gate_covers_code_execution_security():
     assert "tests/test_code_execution_security.py" in script
     assert "tests/test_tool_tenant_scope.py" in script
     assert "tests/test_process_utils.py" in script
-    assert 'CODE_EXECUTION_ENABLED=true' in workflow
+    assert "Code 激活状态为\n`BLOCKED`" in workflow
     assert "精确 tenant UUID" in workflow
     assert "生产禁止 `subprocess`、`docker`" in workflow
+
+
+def test_normal_production_deploy_force_disables_code_activation():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+
+    for expected in (
+        '"CODE_EXECUTION_ENABLED": "false"',
+        '"CODE_EXECUTION_ALLOWED_TENANT_IDS": ""',
+        '"CODE_EXECUTION_ALLOWED_TOOL_NAMES": ""',
+        '"CODE_EXECUTION_ALLOWED_SANDBOX_TYPES": ""',
+        '"CODE_EXECUTION_ALLOWED_SANDBOX_ENDPOINTS": ""',
+        '"CODE_EXECUTION_REQUIRE_APPROVAL": "true"',
+        '"SANDBOX_ALLOW_NETWORK": "false"',
+        '"SANDBOX_ALLOW_UNSAFE_FALLBACK_WHEN_BWRAP_MISSING": "false"',
+    ):
+        assert expected in script
 
 
 def test_production_deploy_health_checks_candidate_before_nginx_cutover():

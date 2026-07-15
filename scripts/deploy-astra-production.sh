@@ -94,6 +94,7 @@ if [ "$RUN_LOCAL_CHECKS" = "1" ]; then
         tests/test_plan_crud.py \
         tests/test_subscription_billing.py \
         tests/test_code_execution_security.py \
+        tests/test_mcp_runtime_scope.py \
         tests/test_tool_tenant_scope.py \
         tests/test_process_utils.py \
         tests/test_production_deploy_contract.py \
@@ -1353,6 +1354,16 @@ updates = {
     "TRIGGER_MAX_CONCURRENCY": "8",
     "TRIGGER_CLAIM_BATCH_SIZE": "16",
     "COMPANY_ASSIGNMENT_RUNNER_ENABLED": "false",
+    # A normal version deployment is never a Code capability activation.
+    # Activation requires a separately authorized, provider-specific workflow.
+    "CODE_EXECUTION_ENABLED": "false",
+    "CODE_EXECUTION_ALLOWED_TENANT_IDS": "",
+    "CODE_EXECUTION_ALLOWED_TOOL_NAMES": "",
+    "CODE_EXECUTION_ALLOWED_SANDBOX_TYPES": "",
+    "CODE_EXECUTION_ALLOWED_SANDBOX_ENDPOINTS": "",
+    "CODE_EXECUTION_REQUIRE_APPROVAL": "true",
+    "SANDBOX_ALLOW_NETWORK": "false",
+    "SANDBOX_ALLOW_UNSAFE_FALLBACK_WHEN_BWRAP_MISSING": "false",
     "API_PROCESS_ROLE": "api,bootstrap",
     "WORKER_PROCESS_ROLE": "worker,connector",
     "FRONTEND_BIND": "127.0.0.1",

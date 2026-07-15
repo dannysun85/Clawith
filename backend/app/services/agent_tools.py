@@ -265,11 +265,16 @@ async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Opt
     Both configs are decrypted using the tool's config_schema for
     schema-aware field detection (e.g. smithery_api_key with type=password).
     """
-    # Check cache first
-    cached = _get_cached_tool_config(agent_id, tool_name)
-    if cached is not None:
-        logger.debug(f"[ToolConfig] Cache hit for {tool_name}, agent_id={agent_id}")
-        return cached
+    # Code authorization/config revocation must take effect before a pending
+    # approval can execute, so Code never uses the 60-second general cache.
+    from app.services.code_execution_policy import is_code_execution_tool
+
+    bypass_cache = is_code_execution_tool(tool_name)
+    if not bypass_cache:
+        cached = _get_cached_tool_config(agent_id, tool_name)
+        if cached is not None:
+            logger.debug(f"[ToolConfig] Cache hit for {tool_name}, agent_id={agent_id}")
+            return cached
 
     from app.models.tool import Tool, AgentTool
     from app.models.agent import Agent as AgentModel
@@ -301,11 +306,20 @@ async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Opt
                     # Decrypt with schema awareness
                     merged = _decrypt_sensitive_fields(merged, config_schema)
                     logger.info(f"[ToolConfig] DB merged config for {tool_name}, agent_id={agent_id}")
-                    _set_cached_tool_config(agent_id, tool_name, merged)
+                    if not bypass_cache:
+                        _set_cached_tool_config(agent_id, tool_name, merged)
                     return merged
 
-        # 2. Fallback to global config only
-        result = await db.execute(select(Tool).where(Tool.name == tool_name))
+        # 2. Fallback only to a canonical global builtin. Tenant/admin/Agent
+        # tools require an explicit AgentTool assignment and must never be
+        # selected by a cross-tenant name-only lookup.
+        result = await db.execute(
+            select(Tool).where(
+                Tool.name == tool_name,
+                Tool.source == "builtin",
+                Tool.tenant_id.is_(None),
+            )
+        )
         tool = result.scalar_one_or_none()
         if tool:
             tenant_config = {}
@@ -319,7 +333,8 @@ async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Opt
             # Decrypt with schema awareness
             decrypted = _decrypt_sensitive_fields(merged, tool.config_schema)
             logger.info(f"[ToolConfig] DB global config for {tool_name}")
-            _set_cached_tool_config(agent_id, tool_name, decrypted)
+            if not bypass_cache:
+                _set_cached_tool_config(agent_id, tool_name, decrypted)
             return decrypted
 
     # Missing configuration is normal for optional tools and for lookups that
@@ -2447,14 +2462,11 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
 
     from app.config import get_settings
     from app.services.code_execution_policy import (
-        code_execution_tenant_authorized,
+        code_execution_denial_reason,
         is_code_execution_tool,
     )
 
-    code_execution_authorized = code_execution_tenant_authorized(
-        get_settings(),
-        agent_tenant_id,
-    )
+    runtime_settings = get_settings()
 
     # Read os_type once; used to patch agentbay_file_transfer paths below
     computer_os_type = await _get_computer_os_type(agent_id)
@@ -2497,8 +2509,6 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
             default_included_names = []
 
             for t in all_tools:
-                if is_code_execution_tool(t.name) and not code_execution_authorized:
-                    continue
                 tid = str(t.id)
                 at = assignments.get(tid)
 
@@ -2512,6 +2522,25 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                     if at and not at.enabled:
                         explicitly_disabled_names.add(t.name)
                     continue
+
+                if is_code_execution_tool(t.name):
+                    code_config = await _get_tool_config(agent_id, t.name) or (t.config or {})
+                    sandbox_type = code_config.get("sandbox_type")
+                    allow_network = code_config.get("allow_network")
+                    if t.name.startswith("agentbay_"):
+                        sandbox_type = "agentbay"
+                        # AgentBay has no proven production egress-off control.
+                        allow_network = False
+                    denial = code_execution_denial_reason(
+                        runtime_settings,
+                        agent_tenant_id,
+                        tool_name=t.name,
+                        sandbox_type=sandbox_type,
+                        allow_network=allow_network,
+                        api_url=code_config.get("api_url"),
+                    )
+                    if denial:
+                        continue
 
                 # Skip feishu tools if the agent has no Feishu channel configured
                 if t.category == "feishu" and not has_feishu:
@@ -2868,6 +2897,9 @@ _TOOL_AUTONOMY_MAP = {
     "execute_code": "execute_code",
     "execute_code_e2b": "execute_code",
     "agentbay_code_execute": "execute_code",
+    "agentbay_code_write_file": "execute_code",
+    "agentbay_code_read_file": "execute_code",
+    "agentbay_code_edit_file": "execute_code",
     "agentbay_command_exec": "execute_code",
     "douyin_run_publish_job": "douyin_publish_job",
 }
@@ -2888,9 +2920,26 @@ async def _code_tool_denial_reason(
     if not is_code_execution_tool(tool_name):
         return None
     tenant_id = await _get_agent_tenant_id(agent_id) if agent_id else None
-    denial = code_execution_denial_reason(get_settings(), tenant_id)
+    denial = code_execution_denial_reason(
+        get_settings(),
+        tenant_id,
+        tool_name=tool_name,
+    )
     if denial:
         return denial
+    if tool_name.startswith("agentbay_"):
+        # AgentBay does not currently expose a proven per-session egress-off
+        # control, so it remains unavailable in production even if somebody
+        # accidentally adds it to a tool allowlist.
+        denial = code_execution_denial_reason(
+            get_settings(),
+            tenant_id,
+            tool_name=tool_name,
+            sandbox_type="agentbay",
+            allow_network=False,
+        )
+        if denial:
+            return denial
     if agent_id is None:
         return "Code execution requires an Agent authorization"
 
@@ -3156,6 +3205,12 @@ async def _execute_tool_direct(
             )
         elif tool_name == "agentbay_code_execute":
             return await _agentbay_code_execute(agent_id, ws, arguments)
+        elif tool_name == "agentbay_code_write_file":
+            return await _agentbay_code_write_file(agent_id, ws, arguments)
+        elif tool_name == "agentbay_code_read_file":
+            return await _agentbay_code_read_file(agent_id, ws, arguments)
+        elif tool_name == "agentbay_code_edit_file":
+            return await _agentbay_code_edit_file(agent_id, ws, arguments)
         elif tool_name == "agentbay_command_exec":
             return await _agentbay_command_exec(agent_id, ws, arguments)
         elif tool_name == "web_search":
@@ -4827,42 +4882,65 @@ async def _send_file_via_slack(agent_id, config, file_path: Path, member_name: s
         return f"Failed to send file via Slack: {e}"
 
 
+def _mcp_tool_visible_to_tenant(tool, tenant_id: uuid.UUID | str | None) -> bool:
+    """Defense-in-depth tenant check after the assignment-scoped DB lookup."""
+
+    source = str(getattr(tool, "source", ""))
+    tool_tenant_id = getattr(tool, "tenant_id", None)
+    if source not in {"builtin", "admin", "agent"}:
+        return False
+    if tool_tenant_id is None:
+        return True
+    return tenant_id is not None and str(tool_tenant_id) == str(tenant_id)
+
+
 async def _execute_mcp_tool(tool_name: str, arguments: dict, agent_id=None) -> str:
-    """Execute a tool via MCP if it exists in the DB as an MCP tool."""
+    """Execute only an enabled MCP assignment visible to this exact Agent."""
     try:
         from app.models.tool import Tool, AgentTool
         from app.services.mcp_client import MCPClient
 
+        if not agent_id:
+            return "❌ MCP tools require an Agent-scoped assignment"
+
         async with async_session() as db:
-            # Primary lookup: clawith-prefixed name (e.g.
-            # mcp_shibui_finance_unlock_financial_analysis).
-            result = await db.execute(select(Tool).where(Tool.name == tool_name, Tool.type == "mcp"))
-            tool = result.scalar_one_or_none()
+            tenant_result = await db.execute(
+                select(AgentModel.tenant_id).where(AgentModel.id == agent_id)
+            )
+            agent_tenant_id = tenant_result.scalar_one_or_none()
+            if agent_tenant_id is None:
+                return "❌ MCP tool is unavailable for this Agent"
 
-            # Fallback: LLM sometimes drops the mcp_<server>_ prefix and calls
-            # the bare MCP-side tool name (e.g. unlock_financial_analysis).
-            # Resolve by mcp_tool_name when the prefixed name doesn't match.
-            if not tool:
-                result = await db.execute(
-                    select(Tool).where(Tool.mcp_tool_name == tool_name, Tool.type == "mcp")
+            # Assignment is mandatory at runtime. The name fallback is only
+            # evaluated inside the Agent's enabled set, never against global
+            # Tool rows or another tenant's credential-bearing record.
+            result = await db.execute(
+                select(Tool, AgentTool.config)
+                .join(AgentTool, AgentTool.tool_id == Tool.id)
+                .where(
+                    AgentTool.agent_id == agent_id,
+                    AgentTool.enabled.is_(True),
+                    Tool.enabled.is_(True),
+                    Tool.type == "mcp",
+                    or_(Tool.name == tool_name, Tool.mcp_tool_name == tool_name),
                 )
-                tool = result.scalar_one_or_none()
-
-            if not tool:
-                logger.warning(f"[MCP] Unknown tool: {tool_name}")
-                return f"Unknown tool: {tool_name}"
-
-            # Load per-agent config override
-            agent_config = {}
-            if tool and agent_id:
-                at_r = await db.execute(
-                    select(AgentTool).where(
-                        AgentTool.agent_id == agent_id,
-                        AgentTool.tool_id == tool.id,
-                    )
+            )
+            candidates = [
+                (row[0], row[1] or {})
+                for row in result.all()
+                if _mcp_tool_visible_to_tenant(row[0], agent_tenant_id)
+            ]
+            exact = [item for item in candidates if item[0].name == tool_name]
+            selected = exact if exact else candidates
+            if len(selected) != 1:
+                logger.warning(
+                    "[MCP] unavailable or ambiguous assignment tool={} agent={} matches={}",
+                    tool_name,
+                    agent_id,
+                    len(selected),
                 )
-                at = at_r.scalar_one_or_none()
-                agent_config = (at.config or {}) if at else {}
+                return "❌ MCP tool is unavailable for this Agent"
+            tool, agent_config = selected[0]
 
         if not tool.mcp_server_url:
             logger.error(f"[MCP] Tool {tool_name} has no server URL configured")
@@ -4870,7 +4948,10 @@ async def _execute_mcp_tool(tool_name: str, arguments: dict, agent_id=None) -> s
 
         # Merge global config + agent override
         merged_config = {**(tool.config or {}), **agent_config}
-        merged_config = _decrypt_sensitive_fields(merged_config)
+        merged_config = _decrypt_sensitive_fields(
+            merged_config,
+            tool.config_schema,
+        )
 
         mcp_url = tool.mcp_server_url
         mcp_name = tool.mcp_tool_name or tool_name
@@ -8794,8 +8875,10 @@ async def _execute_code(
         denial = code_execution_denial_reason(
             get_settings(),
             tenant_id,
+            tool_name=tool_name,
             sandbox_type=str(sandbox_config.type),
             allow_network=sandbox_config.allow_network,
+            api_url=sandbox_config.api_url,
         )
         if denial:
             return f"❌ {denial}"

@@ -22,6 +22,7 @@ from app.services.tool_config import (
     mask_sensitive_fields,
     merge_config_preserving_sensitive,
     set_tenant_tool_config,
+    tenant_scoped_tool_name,
 )
 
 router = APIRouter(prefix="/tools", tags=["tools"])
@@ -207,21 +208,38 @@ def _require_platform_admin(current_user: User) -> None:
         raise HTTPException(status_code=403, detail="Platform admin access required")
 
 
-def _enforce_code_network_permission(
+CODE_PLATFORM_CONTROLLED_CONFIG_KEYS = frozenset({
+    "sandbox_type",
+    "api_url",
+    "api_key",
+    "allow_network",
+    "allow_unsafe_fallback_when_bwrap_missing",
+    "cpu_limit",
+    "memory_limit",
+    "default_timeout",
+    "max_timeout",
+    "language_mapping",
+})
+
+
+def _enforce_code_control_permission(
     current_user: User,
     tool: Tool,
     incoming_config: dict,
 ) -> None:
-    """Only a platform administrator may grant Code sandbox egress."""
+    """Keep Code provider, credential, egress and limits platform-controlled."""
 
-    if not bool(incoming_config.get("allow_network")):
-        return
     from app.services.code_execution_policy import is_code_execution_tool
 
-    if is_code_execution_tool(tool.name) and not _is_platform_admin(current_user):
+    controlled = CODE_PLATFORM_CONTROLLED_CONFIG_KEYS.intersection(incoming_config)
+    if (
+        controlled
+        and is_code_execution_tool(tool.name)
+        and not _is_platform_admin(current_user)
+    ):
         raise HTTPException(
             status_code=403,
-            detail="Only a platform admin can enable Code network access",
+            detail="Only a platform admin can modify Code isolation settings",
         )
 
 
@@ -244,8 +262,10 @@ async def _code_tool_availability(
     denial = code_execution_denial_reason(
         get_settings(),
         tenant_id,
+        tool_name=tool.name,
         sandbox_type=str(sandbox_type) if sandbox_type else None,
         allow_network=effective_config.get("allow_network"),
+        api_url=effective_config.get("api_url"),
     )
     return denial is None, denial
 
@@ -377,15 +397,18 @@ async def create_tool(
     # platform admins importing tools for another company work correctly.
     target_tenant_id = _resolve_target_tenant_id(current_user, data.tenant_id)
 
-    # Unique name check is scoped per tenant to avoid cross-tenant collisions.
+    # Keep Tool.name globally unique for old-application rollback safety. The
+    # upstream MCP name remains in mcp_tool_name, while this internal name is
+    # deterministically namespaced so tenant tools cannot shadow builtins.
+    storage_name = tenant_scoped_tool_name(data.name, target_tenant_id)
     existing = await db.execute(
-        select(Tool).where(Tool.name == data.name, Tool.tenant_id == target_tenant_id)
+        select(Tool).where(Tool.name == storage_name)
     )
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=400, detail=f"Tool '{data.name}' already exists")
 
     tool = Tool(
-        name=data.name,
+        name=storage_name,
         display_name=data.display_name,
         description=data.description,
         type=data.type,
@@ -405,9 +428,8 @@ async def create_tool(
     return {"id": str(tool.id), "name": tool.name}
 
 
-# NOTE: Literal path routes (/bulk, /mcp-server) MUST be defined BEFORE
-# parameterized routes (/{tool_id}) to avoid older FastAPI/Starlette versions
-# matching "bulk" as a uuid.UUID path parameter and returning 422.
+# UUID path converters keep later literal routes such as /mcp-server from
+# being captured by the generic per-tool update/delete endpoints.
 
 class BulkToolUpdateItem(BaseModel):
     tool_id: str
@@ -435,7 +457,7 @@ async def update_tools_bulk(
     return {"ok": True}
 
 
-@router.put("/{tool_id}")
+@router.put("/{tool_id:uuid}")
 async def update_tool(
     tool_id: uuid.UUID,
     data: ToolUpdate,
@@ -460,7 +482,7 @@ async def update_tool(
     tenant_tool_config_update: dict | None = None
     if "config" in update_data:
         incoming_config = update_data.pop("config") or {}
-        _enforce_code_network_permission(current_user, tool, incoming_config)
+        _enforce_code_control_permission(current_user, tool, incoming_config)
         if tool.source == "builtin":
             if not target_tenant_id:
                 raise HTTPException(status_code=400, detail="tenant_id is required to configure builtin tools")
@@ -496,7 +518,7 @@ async def update_tool(
     return {"ok": True}
 
 
-@router.delete("/{tool_id}")
+@router.delete("/{tool_id:uuid}")
 async def delete_tool(
     tool_id: uuid.UUID,
     current_user: User = Depends(get_current_admin),
@@ -946,9 +968,9 @@ async def update_agent_tool_config(
     if not tool_for_schema:
         raise HTTPException(status_code=404, detail="Tool not found")
 
-    # Network access is a separate privilege. Organization admins may manage
-    # ordinary tools, but only a platform administrator can enable network for
-    # a Code executor.
+    # Code provider, endpoint, credential, egress and resource limits are a
+    # separate platform privilege. Organization admins may still configure
+    # ordinary tools within their tenant.
     if "allow_network" in data.config:
         if current_user.role not in ("platform_admin", "org_admin") and not _is_platform_admin(
             current_user
@@ -957,11 +979,11 @@ async def update_agent_tool_config(
                 status_code=403,
                 detail="Only platform or organization admins can modify network access",
             )
-        _enforce_code_network_permission(
-            current_user,
-            tool_for_schema,
-            data.config,
-        )
+    _enforce_code_control_permission(
+        current_user,
+        tool_for_schema,
+        data.config,
+    )
 
     at_r = await db.execute(
         select(AgentTool).where(AgentTool.agent_id == agent_id, AgentTool.tool_id == tool_id)

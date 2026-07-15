@@ -62,7 +62,7 @@ class SandboxConfig(BaseModel):
         Returns:
             SandboxConfig 实例
         """
-        def get_value(key: str, default=None, encrypt: bool = False):
+        def get_value(key: str, default=None):
             """获取配置值，优先从 config 读取，缺失则使用 fallback。"""
             value = config.get(key)
             if value is None or value == "":
@@ -73,22 +73,6 @@ class SandboxConfig(BaseModel):
             if key == "allow_network":
                 logger.info(f"[SandboxConfig] allow_network resolved={bool(value)}")
 
-            # 解密敏感字段
-            if encrypt and value:
-                try:
-                    from app.core.security import decrypt_data
-                    from app.config import get_settings
-
-                    settings = get_settings()
-                    decrypted = decrypt_data(value, settings.SECRET_KEY)
-                    value = decrypted
-                except Exception as e:
-                    logger.warning(f"[SandboxConfig] Failed to decrypt {key}: {e}")
-                    # 解密失败，使用 fallback
-                    if fallback_config:
-                        value = getattr(fallback_config, key, default)
-                    else:
-                        value = default
             return value
 
         # Map config key names to SandboxConfig attributes
@@ -101,7 +85,10 @@ class SandboxConfig(BaseModel):
         result = cls(
             type=sandbox_type,
             enabled=True,  # Always enabled when explicitly configured
-            api_key=get_value("api_key", "", encrypt=True),
+            # The tool-config service already decrypts secrets at the storage
+            # boundary. Treat this input contract as runtime plaintext; a
+            # second decrypt silently replaced valid tenant keys with env data.
+            api_key=get_value("api_key", ""),
             api_url=get_value("api_url", ""),
             cpu_limit=get_value("cpu_limit", "0.5"),
             memory_limit=get_value("memory_limit", "256m"),

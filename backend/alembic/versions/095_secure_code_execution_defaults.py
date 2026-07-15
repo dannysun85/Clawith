@@ -85,34 +85,67 @@ def upgrade() -> None:
     bind.exec_driver_sql(
         """
         UPDATE tools
-        SET config = jsonb_set(
-            jsonb_set(
-                COALESCE(config::jsonb, '{}'::jsonb),
-                '{allow_network}',
-                'false'::jsonb,
-                true
-            ),
-            '{allow_unsafe_fallback_when_bwrap_missing}',
-            'false'::jsonb,
-            true
+        SET config = (
+            (COALESCE(config::jsonb, '{}'::jsonb) - 'api_url')
+            || jsonb_build_object(
+                'sandbox_type', CASE
+                    WHEN name = 'execute_code_e2b' THEN 'e2b'
+                    ELSE 'subprocess'
+                END,
+                'allow_network', false,
+                'allow_unsafe_fallback_when_bwrap_missing', false
+            )
         )::json
         WHERE name IN ('execute_code', 'execute_code_e2b')
+        """
+    )
+    # Pre-create every missing Agent/Code assignment as disabled. This is
+    # intentionally stronger than only updating existing rows: if application
+    # code is rolled back to the historical seeder, its "create if missing"
+    # behavior still cannot resurrect an enabled Code helper grant.
+    bind.exec_driver_sql(
+        f"""
+        INSERT INTO agent_tools (
+            id,
+            agent_id,
+            tool_id,
+            enabled,
+            config,
+            source
+        )
+        SELECT
+            gen_random_uuid(),
+            agent.id,
+            tool.id,
+            false,
+            '{{
+                "allow_network": false,
+                "allow_unsafe_fallback_when_bwrap_missing": false
+            }}'::json,
+            'system'
+        FROM agents AS agent
+        CROSS JOIN tools AS tool
+        WHERE tool.name IN ({names})
+          AND NOT EXISTS (
+              SELECT 1
+              FROM agent_tools AS existing
+              WHERE existing.agent_id = agent.id
+                AND existing.tool_id = tool.id
+          )
         """
     )
     bind.exec_driver_sql(
         f"""
         UPDATE agent_tools AS assignment
         SET enabled = false,
-            config = jsonb_set(
-                jsonb_set(
-                    COALESCE(assignment.config::jsonb, '{{}}'::jsonb),
-                    '{{allow_network}}',
-                    'false'::jsonb,
-                    true
-                ),
-                '{{allow_unsafe_fallback_when_bwrap_missing}}',
-                'false'::jsonb,
-                true
+            config = (
+                COALESCE(assignment.config::jsonb, '{{}}'::jsonb)
+                - 'sandbox_type'
+                - 'api_url'
+                || '{{
+                    "allow_network": false,
+                    "allow_unsafe_fallback_when_bwrap_missing": false
+                }}'::jsonb
             )::json
         FROM tools AS tool
         WHERE assignment.tool_id = tool.id
@@ -125,7 +158,11 @@ def upgrade() -> None:
         SET value = jsonb_set(
             COALESCE(value::jsonb, '{}'::jsonb),
             '{config}',
-            COALESCE(value::jsonb -> 'config', '{}'::jsonb)
+            (
+                COALESCE(value::jsonb -> 'config', '{}'::jsonb)
+                - 'sandbox_type'
+                - 'api_url'
+            )
                 || '{
                     "allow_network": false,
                     "allow_unsafe_fallback_when_bwrap_missing": false
