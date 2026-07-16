@@ -138,8 +138,8 @@ verify_jump_rules() {
     chain_jump_count="$(
         iptables --wait 10 -S DOCKER-USER | awk -v target="$CHAIN" '
             $1 == "-A" && $2 == "DOCKER-USER" {
-                for (index = 3; index <= NF; index += 1) {
-                    if ($index == "-j" && $(index + 1) == target) count += 1
+                for (field_idx = 3; field_idx <= NF; field_idx += 1) {
+                    if ($field_idx == "-j" && $(field_idx + 1) == target) count += 1
                 }
             }
             END { print count + 0 }
@@ -201,8 +201,8 @@ apply_rules() {
             iptables --wait 10 -S DOCKER-USER | awk -v target="$CHAIN" '
                 $1 == "-A" && $2 == "DOCKER-USER" { rule_number += 1 }
                 $1 == "-A" && $2 == "DOCKER-USER" {
-                    for (index = 3; index <= NF; index += 1) {
-                        if ($index == "-j" && $(index + 1) == target) {
+                    for (field_idx = 3; field_idx <= NF; field_idx += 1) {
+                        if ($field_idx == "-j" && $(field_idx + 1) == target) {
                             print rule_number
                             exit
                         }

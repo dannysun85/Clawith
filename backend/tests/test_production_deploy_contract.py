@@ -267,6 +267,11 @@ def test_mcp_host_egress_guard_is_a_pre_mutation_release_gate():
     assert "MCP egress chain must have exactly one DOCKER-USER jump" in guard
     assert "repair can interrupt" in guard
     assert "flock -w 30" in guard
+    # POSIX awk implementations reserve `index` as a built-in function name.
+    # Using it as a loop variable passed source inspection but failed on the
+    # Ubuntu production host before the guard could be installed.
+    assert "for (index =" not in guard
+    assert "for (field_idx =" in guard
     assert "public-port allowlist" in contract
     assert "astra-mcp-egress-guard.timer" in guard
     assert "OnUnitActiveSec=30s" in guard
