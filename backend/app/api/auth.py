@@ -305,8 +305,6 @@ async def register_init(
                 role="platform_admin" if is_first_user else "member",
                 tenant_id=tenant_uuid,
             )
-            # Set initial status
-            user.is_active = is_first_user  # Active immediately if first user
             user.email_verified = identity.email_verified
             await session.flush()
             created_user = True

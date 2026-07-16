@@ -26,6 +26,7 @@
 
 ## Tenant and Data Integrity
 
+- Password registration now preserves the activation decision made by the email-verification service. On installations without SMTP, a newly auto-verified non-bootstrap user is no longer overwritten to inactive after registration, so joining a company and opening authenticated subscription/Credits routes cannot fail with a misleading `401 User not found or inactive`; installations with SMTP still keep unverified users inactive until verification succeeds.
 - Plaza likes now have one database-enforced row per post/author, delete paths cascade dependent comments/likes, and post counters are repaired and updated under PostgreSQL row locks. Concurrent likes, comments, and post deletion cannot leave duplicate reactions or drifted counters.
 - Collaboration listing passes the exact Agent already authorized by the canonical access check, while collaboration, delegation, handover, and visibility queries preserve the requesting tenant/user boundary. The previous undefined endpoint variable can no longer fail an otherwise authorized collaborator request at runtime.
 - Media incident remediation reuses the same locked reservation ownership contract as normal settlement: tenant, Agent, user, `ref_type=media_task`, and task ID must all match before compensation. Concurrent repair remains exactly once and a same-company mismatched reservation cannot be consumed or refunded.

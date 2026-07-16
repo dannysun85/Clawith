@@ -1,6 +1,7 @@
 """Unit tests for the authentication API (app/api/auth.py)."""
 
 import uuid
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -105,6 +106,93 @@ def _make_login_data(login_identifier="test@example.com", password="correctpassw
         password=password,
         tenant_id=None,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("identity_verified", "service_active"),
+    [(True, True), (False, False)],
+    ids=["no-smtp-auto-verified", "smtp-verification-required"],
+)
+async def test_register_init_preserves_service_activation_decision(
+    monkeypatch,
+    identity_verified,
+    service_active,
+):
+    """The API must not overwrite the registration service's activation policy."""
+
+    identity = SimpleNamespace(
+        id=uuid.uuid4(),
+        email="new-user@example.com",
+        username="new-user",
+        email_verified=identity_verified,
+        is_platform_admin=False,
+    )
+    user = SimpleNamespace(
+        id=uuid.uuid4(),
+        identity_id=identity.id,
+        identity=identity,
+        tenant_id=None,
+        role="member",
+        is_active=service_active,
+        email_verified=identity_verified,
+    )
+    db = RecordingDB()
+
+    @asynccontextmanager
+    async def registration_transaction():
+        yield db
+
+    registration_service = SimpleNamespace(
+        find_or_create_identity=AsyncMock(return_value=identity),
+        create_user_with_identity=AsyncMock(return_value=user),
+    )
+    monkeypatch.setattr(auth_api, "transaction", registration_transaction)
+    monkeypatch.setattr(auth_api, "hash_password_async", AsyncMock(return_value="password-hash"))
+    monkeypatch.setattr(auth_api.identity_dao, "is_empty", AsyncMock(return_value=False))
+    monkeypatch.setattr(auth_api.identity_dao, "get_by_email", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        auth_api.user_dao,
+        "get_by_identity_and_tenant",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        auth_api,
+        "_prepare_signup_code_if_required",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        auth_api,
+        "_send_verification_email_task",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(auth_api, "create_access_token", lambda *_args: "access-token")
+    monkeypatch.setattr(auth_api, "serialize_user", lambda value: value)
+    monkeypatch.setattr(
+        auth_api,
+        "RegisterInitResponse",
+        lambda **values: SimpleNamespace(**values),
+    )
+
+    data = SimpleNamespace(
+        email=identity.email,
+        username=identity.username,
+        password="correctpassword",
+        display_name="New User",
+        invitation_code="REGISTER-CODE",
+        target_tenant_id=None,
+    )
+    with patch(
+        "app.services.system_email_service.resolve_email_config_async",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "app.services.registration_service.registration_service",
+        new=registration_service,
+    ):
+        result = await auth_api.register_init(data, AsyncMock())
+
+    assert result.access_token == "access-token"
+    assert user.is_active is service_active
 
 
 # ---------------------------------------------------------------------------
