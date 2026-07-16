@@ -15,7 +15,11 @@ from loguru import logger
 from sqlalchemy import func, select
 
 from app.database import async_session
-from app.models.agentbay_session import AgentBaySessionLedger
+from app.models.agentbay_session import (
+    AGENTBAY_PROVIDER_COLLISION_STATUS,
+    AGENTBAY_UNRESOLVED_STATUSES,
+    AgentBaySessionLedger,
+)
 from app.services.agentbay_client import _configured_agentbay_client
 
 
@@ -43,10 +47,25 @@ async def _reconcile_one(ledger_id) -> bool:
                 .where(AgentBaySessionLedger.id == ledger_id)
             )
         ).scalar_one_or_none()
-        if ledger is None or ledger.status not in {"active", "cleanup_required"}:
+        if ledger is None or ledger.status not in AGENTBAY_UNRESOLVED_STATUSES:
             return True
-        if not ledger.agent_id or not ledger.provider_session_id:
-            logger.error("AgentBay cleanup row lacks a verifiable provider binding")
+        context = ledger.context if isinstance(ledger.context, dict) else {}
+        if ledger.status == AGENTBAY_PROVIDER_COLLISION_STATUS:
+            logger.error(
+                "AgentBay provider identity collision requires out-of-band verification"
+            )
+            return False
+        if (
+            context.get("binding_version") != 2
+            or not ledger.tenant_id
+            or not ledger.agent_id
+            or not ledger.user_id
+            or not ledger.chat_session_id
+            or not ledger.provider_session_id
+        ):
+            logger.error(
+                "AgentBay cleanup row lacks a trusted v2 owner/provider binding"
+            )
             return False
         agent_id = ledger.agent_id
         provider_session_id = ledger.provider_session_id
@@ -77,10 +96,12 @@ async def _reconcile_one(ledger_id) -> bool:
         if ledger is None:
             logger.error("AgentBay cleanup row disappeared during reconciliation")
             return False
-        if ledger.status not in {
-            "active",
-            "cleanup_required",
-        } or ledger.provider_session_id != provider_session_id:
+        context = ledger.context if isinstance(ledger.context, dict) else {}
+        if (
+            ledger.status not in {"active", "cleanup_required"}
+            or ledger.provider_session_id != provider_session_id
+            or context.get("binding_version") != 2
+        ):
             logger.error("AgentBay cleanup row changed during reconciliation")
             return False
         ledger.status = "closed"
@@ -99,7 +120,7 @@ async def main() -> int:
                     select(AgentBaySessionLedger.id)
                     .where(
                         AgentBaySessionLedger.status.in_(
-                            ["active", "cleanup_required"]
+                            tuple(AGENTBAY_UNRESOLVED_STATUSES)
                         )
                     )
                     .order_by(AgentBaySessionLedger.id)
@@ -124,7 +145,7 @@ async def main() -> int:
                     .select_from(AgentBaySessionLedger)
                     .where(
                         AgentBaySessionLedger.status.in_(
-                            ["active", "cleanup_required"]
+                            tuple(AGENTBAY_UNRESOLVED_STATUSES)
                         )
                     )
                 )

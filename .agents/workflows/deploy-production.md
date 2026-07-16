@@ -75,6 +75,8 @@ bash scripts/deploy-astra-production.sh
 紧急恢复才允许 `RUN_REMOTE_SMOKE=0`，且必须同时提供带审批号、一次性随机
 `approval_nonce`、审批人、原因、目标版本、完整 commit、签发时间和未过期 UTC 时间的
 `REMOTE_SMOKE_BREAK_GLASS_ARTIFACT`。字段不得为空或重复，审批有效期最长 4 小时；
+审批文件还必须显式包含 `bypassed_gates=subscription_api,subscription_browser`，避免把
+跳过真实 API 与跳过浏览器业务流混成一个没有范围的口头授权；
 `approval_nonce` 只有在包含完整原始审批、文件 SHA-256、nonce SHA-256、版本和完整
 commit 的 root-owned 证据完成 fsync 并原子发布后才算消费；发布前中断可安全重试，
 发布后失败必须取得新审批。该证据不能以口头说明、空文件、重放旧审批或同版本其他
@@ -106,6 +108,13 @@ network subnet、规则顺序和 watchdog marker；缺失或漂移时停止发�
 - 检查生产问题监控、错误率、队列积压、Credits ledger drift 和媒体任务超时。
 - Code 未获独立授权时，验证平台开关为 false、tenant 白名单为空、历史 Agent
   Code 分配已由迁移关闭。
+- 候选切流前的 `verify_channel_secrets` 门禁必须确认所有当前渠道密钥均已封装，
+  并可由候选版本使用生产 `SECRET_KEY` 完整认证和读取；门禁只输出行数，禁止输出
+  密钥或数据库原值。
+- 迁移不能擦除历史 WAL、旧物理页、快照或备份中的既有明文。切流后必须按渠道
+  逐一轮换 bot token、签名/加密密钥和 verification token，验证收发后吊销旧值，
+  并执行已审批的 WAL/备份保留策略。轮换和保留窗口完成前，历史密钥风险不得标记
+  为完全闭环。
 
 ## 6. 停止与回滚条件
 

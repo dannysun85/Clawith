@@ -277,10 +277,12 @@ async def lifespan(app: FastAPI):
     import os
     from app.services.trigger_daemon import start_trigger_daemon
     from app.services.subscription_lifecycle import start_subscription_lifecycle_daemon
+    from app.services.llm.minimax_quota import start_minimax_quota_monitor_daemon
     from app.services.billing_reconciliation import start_billing_reconciliation_daemon
     from app.services.media_generation import start_media_generation_daemon
     from app.services.agentbay_client import start_agentbay_session_cache_daemon
     from app.services.autonomy_service import start_approval_execution_daemon
+    from app.services.scheduler import start_scheduler
     from app.services.production_issue_monitor import (
         record_production_issue,
         start_production_issue_monitor_daemon,
@@ -499,7 +501,9 @@ async def lifespan(app: FastAPI):
         if _role_enabled("all", "worker"):
             worker_task_specs = [
                 ("trigger_daemon", start_trigger_daemon()),
+                ("user_schedule", start_scheduler()),
                 ("subscription_lifecycle", start_subscription_lifecycle_daemon()),
+                ("minimax_quota_monitor", start_minimax_quota_monitor_daemon()),
                 ("media_generation", start_media_generation_daemon()),
                 ("billing_reconciliation", start_billing_reconciliation_daemon()),
                 ("approval_execution", start_approval_execution_daemon()),
@@ -734,6 +738,15 @@ async def health_check():
                 status_code=503,
                 detail="production issue monitor database loop unavailable",
             )
+    if _worker_health_required():
+        from app.services.llm.minimax_quota import minimax_quota_monitor_health
+
+        quota_monitor_health = minimax_quota_monitor_health()
+        if not quota_monitor_health["healthy"]:
+            raise HTTPException(
+                status_code=503,
+                detail="MiniMax quota monitor loop unavailable",
+            )
     return HealthResponse(status="ok", version=settings.APP_VERSION)
 
 
@@ -775,7 +788,8 @@ def _load_version_info() -> dict[str, str]:
             ).decode().strip()
         except Exception:
             pass
-    return {"version": version, "commit": commit}
+    release_id = os.environ.get("ASTRA_RELEASE_ID", "").strip()
+    return {"version": version, "commit": commit, "release_id": release_id}
 
 _version_cache = _load_version_info()
 

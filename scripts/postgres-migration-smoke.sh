@@ -14,6 +14,31 @@ cleanup() {
 }
 trap cleanup EXIT
 
+assert_legacy_channel_config_downgraded() {
+  psql --host "$db_host" --port "$db_port" --username "$db_user" \
+    --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM channel_configs
+    WHERE id = '07500000-0000-4000-8000-000000000190'
+      AND app_secret = 'legacy-channel-app-secret'
+      AND encrypt_key = 'legacy-channel-signing-secret'
+      AND verification_token = 'legacy-channel-verification-token'
+      AND extra_config::jsonb =
+          '{"connection_mode":"webhook","future":{"token":"legacy-channel-nested-token"}}'::jsonb
+      AND app_secret NOT LIKE 'enc:channel:v1:%'
+      AND encrypt_key NOT LIKE 'enc:channel:v1:%'
+      AND verification_token NOT LIKE 'enc:channel:v1:%'
+      AND extra_config::text NOT LIKE 'enc:channel:v1:%'
+  ) THEN
+    RAISE EXCEPTION '104 downgrade did not restore the legacy ChannelConfig contract';
+  END IF;
+END $$;
+SQL
+}
+
 createdb --host "$db_host" --port "$db_port" --username "$db_user" "$db_name"
 createdb --host "$db_host" --port "$db_port" --username "$db_user" "$fresh_db_name"
 export DATABASE_URL="postgresql+asyncpg://${db_user}@${db_host}:${db_port}/${db_name}"
@@ -26,7 +51,7 @@ cd "$repo_root/backend"
 DATABASE_URL="postgresql+asyncpg://${db_user}@${db_host}:${db_port}/${fresh_db_name}" \
   .venv/bin/alembic upgrade head
 DATABASE_URL="postgresql+asyncpg://${db_user}@${db_host}:${db_port}/${fresh_db_name}" \
-  .venv/bin/alembic current | grep -F "model_route_integrity (head)"
+  .venv/bin/alembic current | grep -F "alert_worker_attribution (head)"
 
 .venv/bin/alembic upgrade add_douyin_collab_publish_fields
 
@@ -196,6 +221,26 @@ DROP COLUMN IF EXISTS alert_attempts,
 DROP COLUMN IF EXISTS alert_epoch;
 SQL
 PYTHONPATH=. .venv/bin/python ../scripts/code-execution-migration-postgres-smoke.py seed
+
+# Reproduce a production-era plaintext ChannelConfig. Revision 104 must encrypt
+# both the known credential columns and the complete extensible config object,
+# then keep the row readable across every downgrade/re-upgrade sequence below.
+psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+INSERT INTO channel_configs (
+  id, agent_id, channel_type, app_id,
+  app_secret, encrypt_key, verification_token,
+  is_configured, is_connected, extra_config
+) VALUES (
+  '07500000-0000-4000-8000-000000000190',
+  '07500000-0000-4000-8000-000000000061',
+  'slack', 'legacy-channel-client-id',
+  'legacy-channel-app-secret',
+  'legacy-channel-signing-secret',
+  'legacy-channel-verification-token',
+  true, false,
+  '{"connection_mode":"webhook","future":{"token":"legacy-channel-nested-token"}}'
+);
+SQL
 
 # Pre-099 trigger metadata came through APIs that accepted arbitrary reserved
 # names. Neither a forged value equal to the new attestation version nor a
@@ -466,6 +511,79 @@ SET tool_id = '07500000-0000-4000-8000-000000000071',
     config = '{"api_key":"rebound-secret"}'::json
 WHERE agent_id = '07500000-0000-4000-8000-000000000061'
   AND tool_id = '07500000-0000-4000-8000-000000000070';
+
+-- Reproduce ambiguous historical ownership of one live AgentBay provider
+-- sandbox. 101 must quarantine every claimant before creating uniqueness.
+INSERT INTO agentbay_session_ledger (
+  id, tenant_id, agent_id, user_id, chat_session_id,
+  provider_session_id, image_type, purpose, status
+) VALUES
+  (
+    '07500000-0000-4000-8000-000000000140',
+    '07500000-0000-4000-8000-000000000002',
+    '07500000-0000-4000-8000-000000000061',
+    '07500000-0000-4000-8000-000000000060',
+    'migration-agentbay-lane-a', 'provider-duplicate-live',
+    'browser', 'interactive', 'active'
+  ),
+  (
+    '07500000-0000-4000-8000-000000000141',
+    '07500000-0000-4000-8000-000000000002',
+    '07500000-0000-4000-8000-000000000061',
+    '07500000-0000-4000-8000-000000000060',
+    'migration-agentbay-lane-b', 'provider-duplicate-live',
+    'browser', 'interactive', 'cleanup_required'
+  );
+
+-- Reproduce the pre-102 media reservation shape. The first row is an exact
+-- one-to-one owner match and must be relinked. The second deliberately binds
+-- a different Agent and must remain untouched for fail-closed review.
+INSERT INTO credit_reservations (
+  id, tenant_id, user_id, agent_id, action, modality, tier,
+  provider, model, amount, status, ref_type, ref_id
+) VALUES
+  (
+    '07500000-0000-4000-8000-000000000180',
+    '07500000-0000-4000-8000-000000000002',
+    '07500000-0000-4000-8000-000000000060',
+    '07500000-0000-4000-8000-000000000061',
+    'video', 'video', 'pro', 'minimax', 'MiniMax-Hailuo-2.3',
+    49, 'provider_inflight', 'minimax_task', NULL
+  ),
+  (
+    '07500000-0000-4000-8000-000000000182',
+    '07500000-0000-4000-8000-000000000002',
+    '07500000-0000-4000-8000-000000000060',
+    '07500000-0000-4000-8000-000000000061',
+    'video', 'video', 'pro', 'minimax', 'MiniMax-Hailuo-2.3',
+    51, 'provider_inflight', 'minimax_task', NULL
+  );
+INSERT INTO media_generation_tasks (
+  id, tenant_id, agent_id, user_id, reservation_id,
+  provider, modality, model, status, metadata_path, output_path,
+  request_metadata, completion_delivery_status,
+  attempt_count, consecutive_error_count
+) VALUES
+  (
+    '07500000-0000-4000-8000-000000000181',
+    '07500000-0000-4000-8000-000000000002',
+    '07500000-0000-4000-8000-000000000061',
+    '07500000-0000-4000-8000-000000000060',
+    '07500000-0000-4000-8000-000000000180',
+    'minimax', 'video', 'MiniMax-Hailuo-2.3', 'submitted',
+    'workspace/videos/relink-safe.json',
+    'workspace/videos/relink-safe.mp4', '{}'::json, 'pending', 0, 0
+  ),
+  (
+    '07500000-0000-4000-8000-000000000183',
+    '07500000-0000-4000-8000-000000000002',
+    '07500000-0000-4000-8000-000000000113',
+    '07500000-0000-4000-8000-000000000060',
+    '07500000-0000-4000-8000-000000000182',
+    'minimax', 'video', 'MiniMax-Hailuo-2.3', 'submitted',
+    'workspace/videos/relink-mismatch.json',
+    'workspace/videos/relink-mismatch.mp4', '{}'::json, 'pending', 0, 0
+  );
 DELETE FROM tools WHERE id = '07500000-0000-4000-8000-000000000070';
 DO $$
 BEGIN
@@ -506,11 +624,97 @@ SQL
 
 PYTHONPATH=. .venv/bin/python -m app.scripts.secure_mcp_quarantine migration-smoke
 .venv/bin/alembic upgrade head
-.venv/bin/alembic current | grep -F "model_route_integrity (head)"
+.venv/bin/alembic current | grep -F "alert_worker_attribution (head)"
 
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
 DO $$
 BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM credit_reservations
+    WHERE id = '07500000-0000-4000-8000-000000000180'
+      AND ref_type = 'media_task'
+      AND ref_id = '07500000-0000-4000-8000-000000000181'
+  ) THEN
+    RAISE EXCEPTION '102 did not relink the exact legacy media owner';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM credit_reservations
+    WHERE id = '07500000-0000-4000-8000-000000000182'
+      AND ref_type = 'minimax_task'
+      AND ref_id IS NULL
+  ) THEN
+    RAISE EXCEPTION '102 guessed ownership for a mismatched legacy media row';
+  END IF;
+  IF (
+    SELECT count(*)
+    FROM agentbay_session_ledger
+    WHERE id IN (
+      '07500000-0000-4000-8000-000000000140',
+      '07500000-0000-4000-8000-000000000141'
+    )
+      AND status = 'provider_identity_collision'
+      AND close_reason = 'provider_identity_collision'
+      AND context::jsonb ->> 'provider_identity_collision_ledger_id'
+        = '07500000-0000-4000-8000-000000000140'
+  ) <> 2 THEN
+    RAISE EXCEPTION '101 did not quarantine every duplicate provider owner';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1
+    FROM agentbay_session_ledger
+    WHERE id = '07500000-0000-4000-8000-000000000140'
+      AND provider_session_id = 'provider-duplicate-live'
+  ) OR NOT EXISTS (
+    SELECT 1
+    FROM agentbay_session_ledger
+    WHERE id = '07500000-0000-4000-8000-000000000141'
+      AND provider_session_id IS NULL
+  ) THEN
+    RAISE EXCEPTION '101 did not retain exactly one canonical provider identity';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_indexes
+    WHERE schemaname = 'public'
+      AND tablename = 'agentbay_session_ledger'
+      AND indexname = 'uq_agentbay_live_provider_session_id'
+      AND indexdef LIKE '%UNIQUE%'
+      AND indexdef LIKE '%provider_identity_collision%'
+  ) THEN
+    RAISE EXCEPTION '101 live provider ownership unique index is missing';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM notifications
+    WHERE title = 'Automatic triggers paused for safety review'
+  ) THEN
+    RAISE EXCEPTION '101 left a stale global automation pause notice';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1
+    FROM notifications
+    WHERE title = 'User automation security upgrade completed'
+      AND body LIKE 'Durable user triggers and approved actions can run again.%'
+      AND body LIKE '%schedules and todo tasks are retained but automatic execution remains paused%'
+  ) THEN
+    RAISE EXCEPTION '101 published an inaccurate automation availability notice';
+  END IF;
+  BEGIN
+    INSERT INTO agentbay_session_ledger (
+      id, tenant_id, agent_id, user_id, chat_session_id,
+      provider_session_id, image_type, purpose, status
+    ) VALUES (
+      '07500000-0000-4000-8000-000000000145',
+      '07500000-0000-4000-8000-000000000002',
+      '07500000-0000-4000-8000-000000000061',
+      '07500000-0000-4000-8000-000000000060',
+      'migration-agentbay-reuse-attempt', 'provider-duplicate-live',
+      'browser', 'interactive', 'active'
+    );
+    RAISE EXCEPTION '101 allowed a new live claim for quarantined provider identity';
+  EXCEPTION
+    WHEN unique_violation THEN NULL;
+  END;
   IF NOT EXISTS (
     SELECT 1
     FROM agent_triggers
@@ -678,6 +882,172 @@ BEGIN
 END $$;
 SQL
 
+# Reproduce a production-era administrator fallback that already points to the
+# 093 M3 route. 100 must not select it as M3's fallback and create a 2-cycle.
+.venv/bin/alembic downgrade trigger_privacy_serial
+assert_legacy_channel_config_downgraded
+psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+UPDATE llm_models
+SET supports_vision = true
+WHERE id = '07500000-0000-4000-8000-000000000023';
+INSERT INTO model_routes (
+  id, saas_tier, modality, llm_model_id, priority, fallback_route_id, enabled
+) VALUES (
+  '07500000-0000-4000-8000-000000000026', 'lite', 'image',
+  '07500000-0000-4000-8000-000000000023', 999,
+  '09300000-0000-4000-8000-000000000102', true
+);
+SQL
+.venv/bin/alembic upgrade head
+.venv/bin/alembic current | grep -F "alert_worker_attribution (head)"
+psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+INSERT INTO llm_models (
+  id, provider, model, api_key_encrypted, label, enabled, supports_vision,
+  modality, modalities, tier
+) VALUES
+  (
+    '07500000-0000-4000-8000-000000000027', 'minimax', 'conflicting-capability',
+    'migration-smoke-placeholder', 'Conflicting Capability', true, false,
+    'video', '["text"]'::json, 'basic'
+  ),
+  (
+    '07500000-0000-4000-8000-000000000028', 'minimax', 'legacy-vision-alias',
+    'migration-smoke-placeholder', 'Legacy Vision Alias', true, false,
+    'text', '["vision"]'::json, 'basic'
+  );
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM model_routes
+    WHERE id = '09300000-0000-4000-8000-000000000102'
+      AND fallback_route_id = '07500000-0000-4000-8000-000000000026'
+  ) THEN
+    RAISE EXCEPTION '100 created a reverse M3 fallback cycle';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1
+    FROM model_routes
+    WHERE id = '09300000-0000-4000-8000-000000000102'
+      AND priority > 999
+      AND enabled = true
+  ) THEN
+    RAISE EXCEPTION '100 did not keep M3 as the exact top image route';
+  END IF;
+  BEGIN
+    INSERT INTO model_routes (
+      id, saas_tier, modality, llm_model_id, priority, enabled
+    ) VALUES (
+      '07500000-0000-4000-8000-000000000027', 'lite', 'video',
+      '07500000-0000-4000-8000-000000000023', 77, true
+    );
+    RAISE EXCEPTION '100 allowed an enabled modality-incompatible route';
+  EXCEPTION
+    WHEN raise_exception THEN
+      IF SQLERRM NOT LIKE 'enabled model route requires an enabled modality-compatible model%' THEN
+        RAISE;
+      END IF;
+  END;
+  BEGIN
+    UPDATE llm_models
+    SET enabled = false
+    WHERE id = '09300000-0000-4000-8000-000000000001';
+    RAISE EXCEPTION '100 allowed a routed model to be disabled';
+  EXCEPTION
+    WHEN raise_exception THEN
+      IF SQLERRM NOT LIKE 'a globally routed model must remain platform-owned, enabled, modality-compatible, and connection-stable%' THEN
+        RAISE;
+      END IF;
+  END;
+  BEGIN
+    UPDATE llm_models
+    SET tenant_id = '07500000-0000-4000-8000-000000000002'
+    WHERE id = '09300000-0000-4000-8000-000000000001';
+    RAISE EXCEPTION '100 allowed a global route to adopt a tenant credential';
+  EXCEPTION
+    WHEN raise_exception THEN
+      IF SQLERRM NOT LIKE 'a globally routed model must remain platform-owned, enabled, modality-compatible, and connection-stable%' THEN
+        RAISE;
+      END IF;
+  END;
+  BEGIN
+    UPDATE llm_models
+    SET provider = 'openai'
+    WHERE id = '09300000-0000-4000-8000-000000000001';
+    RAISE EXCEPTION '100 allowed routed model connection identity to change';
+  EXCEPTION
+    WHEN raise_exception THEN
+      IF SQLERRM NOT LIKE 'a globally routed model must remain platform-owned, enabled, modality-compatible, and connection-stable%' THEN
+        RAISE;
+      END IF;
+  END;
+  BEGIN
+    INSERT INTO model_routes (
+      id, saas_tier, modality, llm_model_id, priority, enabled
+    ) VALUES (
+      '07500000-0000-4000-8000-000000000029', 'lite', 'video',
+      '07500000-0000-4000-8000-000000000027', 76, true
+    );
+    RAISE EXCEPTION '100 allowed singular modality to override declared modalities';
+  EXCEPTION
+    WHEN raise_exception THEN
+      IF SQLERRM NOT LIKE 'enabled model route requires an enabled modality-compatible model%' THEN
+        RAISE;
+      END IF;
+  END;
+  INSERT INTO model_routes (
+    id, saas_tier, modality, llm_model_id, priority, enabled
+  ) VALUES (
+    '07500000-0000-4000-8000-000000000029', 'lite', 'image',
+    '07500000-0000-4000-8000-000000000028', 76, true
+  );
+  BEGIN
+    UPDATE model_routes
+    SET enabled = false
+    WHERE id = '09300000-0000-4000-8000-000000000102';
+    RAISE EXCEPTION '100 allowed an active fallback target to be disabled';
+  EXCEPTION
+    WHEN raise_exception THEN
+      IF SQLERRM NOT LIKE 'active fallback target cannot be disabled or moved to another slot%' THEN
+        RAISE;
+      END IF;
+  END;
+  BEGIN
+    DELETE FROM model_routes
+    WHERE id = '09300000-0000-4000-8000-000000000102';
+    RAISE EXCEPTION '100 allowed a referenced fallback target to be deleted';
+  EXCEPTION
+    WHEN raise_exception THEN
+      IF SQLERRM NOT LIKE 'model route remains referenced as a fallback target%' THEN
+        RAISE;
+      END IF;
+  END;
+  BEGIN
+    UPDATE model_routes
+    SET fallback_route_id = '07500000-0000-4000-8000-000000000026'
+    WHERE id = '09300000-0000-4000-8000-000000000102';
+    RAISE EXCEPTION '100 allowed a direct-SQL fallback cycle';
+  EXCEPTION
+    WHEN raise_exception THEN
+      IF SQLERRM NOT LIKE 'model route fallback cycle detected%' THEN
+        RAISE;
+      END IF;
+  END;
+END $$;
+DELETE FROM model_routes
+WHERE id = '07500000-0000-4000-8000-000000000029';
+DELETE FROM model_routes
+WHERE id = '07500000-0000-4000-8000-000000000026';
+DELETE FROM llm_models
+WHERE id IN (
+  '07500000-0000-4000-8000-000000000027',
+  '07500000-0000-4000-8000-000000000028'
+);
+UPDATE llm_models
+SET supports_vision = false
+WHERE id = '07500000-0000-4000-8000-000000000023';
+SQL
+
 # 095 must turn its trusted bypass back off before commit; the still-pending
 # guard therefore continues to reject an ordinary writer after migration.
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
@@ -709,6 +1079,13 @@ PYTHONPATH=. .venv/bin/python ../scripts/code-execution-migration-postgres-smoke
 PYTHONPATH=. .venv/bin/python ../scripts/code-execution-migration-postgres-smoke.py assert-agent-tool-upsert
 PYTHONPATH=. .venv/bin/python ../scripts/mcp-import-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/plan-update-postgres-smoke.py
+PYTHONPATH=. .venv/bin/python ../scripts/media-remediation-postgres-smoke.py
+PYTHONPATH=. .venv/bin/python ../scripts/billing-reconciliation-postgres-smoke.py
+PYTHONPATH=. .venv/bin/python ../scripts/agentbay-identity-postgres-smoke.py
+PYTHONPATH=. .venv/bin/python ../scripts/plaza-postgres-smoke.py
+PYTHONPATH=. .venv/bin/python ../scripts/channel-config-encryption-postgres-smoke.py \
+  --require-legacy-fixture
+PYTHONPATH=. .venv/bin/python -m app.scripts.verify_channel_secrets
 
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
 DO $$
@@ -787,6 +1164,30 @@ BEGIN
       AND conname = 'ck_production_issue_alert_delivery_state'
   ) THEN
     RAISE EXCEPTION 'missing production issue alert delivery state constraint';
+  END IF;
+  IF (
+    SELECT count(*) FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'production_issue_alert_deliveries'
+      AND column_name IN (
+        'attribution_version',
+        'claim_worker_actor_id',
+        'claim_worker_release_id',
+        'claim_worker_release_commit',
+        'delivered_by_worker_actor_id',
+        'delivered_by_release_id',
+        'delivered_by_release_commit'
+      )
+  ) <> 7 OR NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'production_issue_alert_deliveries'::regclass
+      AND conname = 'ck_production_issue_alert_delivery_attribution'
+  ) OR NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'production_issue_alert_deliveries'::regclass
+      AND conname = 'ck_production_issue_alert_delivery_attribution_version'
+  ) THEN
+    RAISE EXCEPTION 'missing production issue alert worker attribution contract';
   END IF;
   IF NOT EXISTS (
     SELECT 1 FROM information_schema.columns
@@ -1017,7 +1418,7 @@ WHERE code = 'scale';
 INSERT INTO model_routes (
   id, saas_tier, modality, llm_model_id, priority, fallback_route_id, enabled
 ) VALUES (
-  '07500000-0000-4000-8000-000000000025', 'lite', 'custom-understanding',
+  '07500000-0000-4000-8000-000000000025', 'lite', 'text',
   '07500000-0000-4000-8000-000000000023', 77,
   '09300000-0000-4000-8000-000000000101', true
 );
@@ -1027,6 +1428,7 @@ WHERE id = '07500000-0000-4000-8000-000000000002';
 SQL
 .venv/bin/alembic downgrade add_user_chat_tier_preference
 .venv/bin/alembic current | grep -F "add_user_chat_tier_preference"
+assert_legacy_channel_config_downgraded
 PYTHONPATH=. .venv/bin/python ../scripts/code-execution-migration-postgres-smoke.py assert-secured
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
 DO $$
@@ -1118,8 +1520,11 @@ BEGIN
 END $$;
 SQL
 .venv/bin/alembic upgrade head
-.venv/bin/alembic current | grep -F "model_route_integrity (head)"
+.venv/bin/alembic current | grep -F "alert_worker_attribution (head)"
 PYTHONPATH=. .venv/bin/python ../scripts/code-execution-migration-postgres-smoke.py assert-secured
+PYTHONPATH=. .venv/bin/python ../scripts/channel-config-encryption-postgres-smoke.py \
+  --require-legacy-fixture --legacy-only
+PYTHONPATH=. .venv/bin/python -m app.scripts.verify_channel_secrets
 
 PYTHONPATH=. .venv/bin/python ../scripts/a2a-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/media-generation-postgres-smoke.py
@@ -1143,14 +1548,18 @@ SQL
 
 .venv/bin/alembic downgrade seed_saas_mvp_catalog
 .venv/bin/alembic current | grep -F "seed_saas_mvp_catalog"
+assert_legacy_channel_config_downgraded
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 --tuples-only --no-align <<'SQL' | grep -Fx 'ultra|7'
 SELECT preferred_chat_tier || '|' || preferred_chat_tier_revision
 FROM users
 WHERE id = '07500000-0000-4000-8000-000000000070';
 SQL
 .venv/bin/alembic upgrade head
-.venv/bin/alembic current | grep -F "model_route_integrity (head)"
+.venv/bin/alembic current | grep -F "alert_worker_attribution (head)"
 PYTHONPATH=. .venv/bin/python ../scripts/code-execution-migration-postgres-smoke.py assert-secured
+PYTHONPATH=. .venv/bin/python ../scripts/channel-config-encryption-postgres-smoke.py \
+  --require-legacy-fixture --legacy-only
+PYTHONPATH=. .venv/bin/python -m app.scripts.verify_channel_secrets
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 --tuples-only --no-align <<'SQL' | grep -Fx 'ultra|7'
 SELECT preferred_chat_tier || '|' || preferred_chat_tier_revision
 FROM users

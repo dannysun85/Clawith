@@ -36,6 +36,7 @@ from .caller import (
     RouteMeta,
     AgentLLMInvocation,
     FailoverGuard,
+    is_llm_error_result,
     is_retryable_error,
 )
 from .client import (
@@ -72,6 +73,7 @@ __all__ = [
     "AgentLLMInvocation",
     # Failover utilities
     "FailoverGuard",
+    "is_llm_error_result",
     "is_retryable_error",
     "classify_error",
     "FailoverErrorType",

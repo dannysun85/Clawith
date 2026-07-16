@@ -30,10 +30,12 @@ class FakeProxyProcess:
 def test_release_version_info_prefers_deployment_environment(monkeypatch):
     monkeypatch.setenv("ASTRA_RELEASE_VERSION", "1.10.5")
     monkeypatch.setenv("ASTRA_RELEASE_COMMIT", "deadbee")
+    monkeypatch.setenv("ASTRA_RELEASE_ID", "release-123")
 
     assert main._load_version_info() == {
         "version": "1.10.5",
         "commit": "deadbee",
+        "release_id": "release-123",
     }
 
 

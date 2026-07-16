@@ -11,6 +11,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    SmallInteger,
     String,
     UniqueConstraint,
     func,
@@ -130,13 +131,48 @@ class ProductionIssueAlertDelivery(Base):
             name="ck_production_issue_alert_delivery_attempts_nonnegative",
         ),
         CheckConstraint(
+            "status IN ('pending', 'delivering', 'delivered', 'cancelled')",
+            name="ck_production_issue_alert_delivery_status",
+        ),
+        CheckConstraint(
             "(status = 'pending' AND claim_token IS NULL "
             "AND claimed_at IS NULL AND delivered_at IS NULL) OR "
             "(status = 'delivering' AND claim_token IS NOT NULL "
             "AND claimed_at IS NOT NULL AND delivered_at IS NULL) OR "
             "(status = 'delivered' AND claim_token IS NULL "
-            "AND claimed_at IS NULL AND delivered_at IS NOT NULL)",
+            "AND claimed_at IS NULL AND delivered_at IS NOT NULL) OR "
+            "(status = 'cancelled' AND claim_token IS NULL "
+            "AND claimed_at IS NULL AND delivered_at IS NULL)",
             name="ck_production_issue_alert_delivery_state",
+        ),
+        CheckConstraint(
+            "attribution_version = 0 OR (attribution_version = 1 AND ("
+            "(status IN ('pending', 'cancelled') "
+            "AND claim_worker_actor_id IS NULL "
+            "AND claim_worker_release_id IS NULL "
+            "AND claim_worker_release_commit IS NULL "
+            "AND delivered_by_worker_actor_id IS NULL "
+            "AND delivered_by_release_id IS NULL "
+            "AND delivered_by_release_commit IS NULL) OR "
+            "(status = 'delivering' "
+            "AND claim_worker_actor_id IS NOT NULL "
+            "AND claim_worker_release_id IS NOT NULL "
+            "AND claim_worker_release_commit IS NOT NULL "
+            "AND delivered_by_worker_actor_id IS NULL "
+            "AND delivered_by_release_id IS NULL "
+            "AND delivered_by_release_commit IS NULL) OR "
+            "(status = 'delivered' "
+            "AND claim_worker_actor_id IS NULL "
+            "AND claim_worker_release_id IS NULL "
+            "AND claim_worker_release_commit IS NULL "
+            "AND delivered_by_worker_actor_id IS NOT NULL "
+            "AND delivered_by_release_id IS NOT NULL "
+            "AND delivered_by_release_commit IS NOT NULL)))",
+            name="ck_production_issue_alert_delivery_attribution",
+        ),
+        CheckConstraint(
+            "attribution_version IN (0, 1)",
+            name="ck_production_issue_alert_delivery_attribution_version",
         ),
     )
 
@@ -164,6 +200,12 @@ class ProductionIssueAlertDelivery(Base):
         default="pending",
     )
     payload_snapshot: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    attribution_version: Mapped[int] = mapped_column(
+        SmallInteger,
+        nullable=False,
+        default=1,
+        server_default="0",
+    )
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     next_attempt_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
@@ -177,11 +219,23 @@ class ProductionIssueAlertDelivery(Base):
         DateTime(timezone=True),
         nullable=True,
     )
+    claim_worker_actor_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+    )
+    claim_worker_release_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    claim_worker_release_commit: Mapped[str | None] = mapped_column(String(64), nullable=True)
     last_error_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
     delivered_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
     )
+    delivered_by_worker_actor_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+    )
+    delivered_by_release_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    delivered_by_release_commit: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),

@@ -9,7 +9,9 @@ both shapes and never re-enables a globally degraded credential.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -27,7 +29,16 @@ from app.services.llm.utils import get_credential_api_key
 CN_REMAINS_URL = "https://www.minimaxi.com/v1/token_plan/remains"
 GLOBAL_REMAINS_URL = "https://www.minimax.io/v1/token_plan/remains"
 POLL_TIMEOUT = 15.0
+MINIMAX_QUOTA_MONITOR_MAX_CONSECUTIVE_FAILURES = 3
 _ACTIVE_CREDENTIAL_STATUSES = ("healthy", "degraded", "quota_exceeded")
+_quota_cycle_active_credentials = 0
+_quota_cycle_provider_evidence = 0
+_quota_monitor_interval_seconds = 300
+_quota_monitor_started_at: datetime | None = None
+_quota_monitor_last_loop_success_at: datetime | None = None
+_quota_monitor_last_provider_evidence_at: datetime | None = None
+_quota_monitor_consecutive_failures = 0
+_quota_monitor_stale_evidence_reported = False
 
 
 class MiniMaxQuotaPollIndeterminate(RuntimeError):
@@ -189,6 +200,9 @@ async def poll_minimax_quota() -> int:
     resource in this cycle.
     """
 
+    global _quota_cycle_active_credentials
+    global _quota_cycle_provider_evidence
+
     checked = 0
     depleted_credentials = 0
     async with async_session() as db:
@@ -201,6 +215,8 @@ async def poll_minimax_quota() -> int:
             )
         )
         credentials = result.scalars().all()
+    _quota_cycle_active_credentials = len(credentials)
+    _quota_cycle_provider_evidence = 0
 
     for credential in credentials:
         api_key = get_credential_api_key(credential)
@@ -211,6 +227,8 @@ async def poll_minimax_quota() -> int:
                 api_key,
                 remains_url=_remains_url(credential.base_url),
             )
+            if not observations:
+                raise MiniMaxQuotaPollIndeterminate("no recognized quota observations")
             checked += 1
             credential_depleted = False
             for observation in observations:
@@ -237,9 +255,9 @@ async def poll_minimax_quota() -> int:
                 )
         except MiniMaxQuotaPollIndeterminate as exc:
             logger.debug(
-                "[minimax_quota] quota evidence unavailable credential={} reason={}",
+                "[minimax_quota] quota evidence unavailable credential={} reason_type={}",
                 credential.id,
-                str(exc),
+                type(exc).__name__,
             )
         except Exception as exc:
             logger.debug(
@@ -254,4 +272,127 @@ async def poll_minimax_quota() -> int:
             checked,
             depleted_credentials,
         )
+    _quota_cycle_provider_evidence = checked
     return depleted_credentials
+
+
+def minimax_quota_monitor_health(
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Expose loop liveness separately from external provider-evidence age."""
+
+    current = now or datetime.now(timezone.utc)
+    loop_deadline_seconds = max(3 * int(_quota_monitor_interval_seconds), 120)
+    evidence_deadline_seconds = max(4 * int(_quota_monitor_interval_seconds), 1200)
+    loop_reference = _quota_monitor_last_loop_success_at or _quota_monitor_started_at
+    loop_stale_seconds = (
+        max((current - loop_reference).total_seconds(), 0.0) if loop_reference is not None else float("inf")
+    )
+    evidence_required = _quota_cycle_active_credentials > 0
+    evidence_reference = _quota_monitor_last_provider_evidence_at or _quota_monitor_started_at
+    evidence_stale_seconds = (
+        max((current - evidence_reference).total_seconds(), 0.0) if evidence_reference is not None else float("inf")
+    )
+    evidence_fresh = not evidence_required or evidence_stale_seconds <= evidence_deadline_seconds
+    return {
+        "healthy": loop_stale_seconds <= loop_deadline_seconds,
+        "provider_evidence_fresh": evidence_fresh,
+        "provider_evidence_required": evidence_required,
+        "active_credentials": int(_quota_cycle_active_credentials),
+        "credentials_with_provider_evidence": int(_quota_cycle_provider_evidence),
+        "last_loop_success_at": (
+            _quota_monitor_last_loop_success_at.isoformat() if _quota_monitor_last_loop_success_at else None
+        ),
+        "last_provider_evidence_at": (
+            _quota_monitor_last_provider_evidence_at.isoformat() if _quota_monitor_last_provider_evidence_at else None
+        ),
+        "consecutive_failures": int(_quota_monitor_consecutive_failures),
+        "loop_stale_seconds": round(loop_stale_seconds, 3),
+        "loop_deadline_seconds": loop_deadline_seconds,
+        "provider_evidence_stale_seconds": round(evidence_stale_seconds, 3),
+        "provider_evidence_deadline_seconds": evidence_deadline_seconds,
+    }
+
+
+async def _record_stale_quota_evidence_issue() -> None:
+    """Send one privacy-safe issue when every configured probe stays unclear."""
+
+    from app.services.production_issue_monitor import record_production_issue
+
+    await record_production_issue(
+        source="minimax_quota_monitor",
+        category="llm_provider",
+        summary="MiniMax quota monitor lacks fresh provider evidence",
+        severity="error",
+        error_code="QuotaEvidenceStale",
+        operation="minimax.token_plan.remains",
+        metadata={
+            "component": "minimax_quota_monitor",
+            "active_credentials": int(_quota_cycle_active_credentials),
+            "credentials_with_provider_evidence": int(_quota_cycle_provider_evidence),
+        },
+    )
+
+
+async def start_minimax_quota_monitor_daemon() -> None:
+    """Run the provider quota loop as a first-class, health-tracked worker."""
+
+    global _quota_monitor_consecutive_failures
+    global _quota_monitor_interval_seconds
+    global _quota_monitor_last_loop_success_at
+    global _quota_monitor_last_provider_evidence_at
+    global _quota_monitor_started_at
+    global _quota_monitor_stale_evidence_reported
+
+    from app.config import get_settings
+
+    settings = get_settings()
+    interval = max(
+        int(settings.MINIMAX_QUOTA_MONITOR_INTERVAL_SECONDS),
+        30,
+    )
+    _quota_monitor_interval_seconds = interval
+    _quota_monitor_started_at = datetime.now(timezone.utc)
+    _quota_monitor_last_loop_success_at = None
+    _quota_monitor_last_provider_evidence_at = None
+    _quota_monitor_consecutive_failures = 0
+    _quota_monitor_stale_evidence_reported = False
+    logger.info("[minimax_quota] monitor started interval={}s", interval)
+
+    while True:
+        try:
+            await poll_minimax_quota()
+            now = datetime.now(timezone.utc)
+            _quota_monitor_last_loop_success_at = now
+            _quota_monitor_consecutive_failures = 0
+            if _quota_cycle_provider_evidence > 0:
+                _quota_monitor_last_provider_evidence_at = now
+            health = minimax_quota_monitor_health(now=now)
+            if (
+                health["provider_evidence_required"]
+                and not health["provider_evidence_fresh"]
+                and not _quota_monitor_stale_evidence_reported
+            ):
+                await _record_stale_quota_evidence_issue()
+                _quota_monitor_stale_evidence_reported = True
+            elif health["provider_evidence_fresh"]:
+                _quota_monitor_stale_evidence_reported = False
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _quota_monitor_consecutive_failures += 1
+            logger.error(
+                "[minimax_quota] monitor iteration failed error_type={} consecutive_failures={}",
+                type(exc).__name__,
+                _quota_monitor_consecutive_failures,
+            )
+            if _quota_monitor_consecutive_failures >= MINIMAX_QUOTA_MONITOR_MAX_CONSECUTIVE_FAILURES:
+                logger.critical(
+                    "MINIMAX_QUOTA_MONITOR_FATAL release={} error_type={} consecutive_failures={}",
+                    getattr(settings, "APP_VERSION", "unknown"),
+                    type(exc).__name__,
+                    _quota_monitor_consecutive_failures,
+                )
+                raise RuntimeError("MiniMax quota monitor exceeded its failure threshold") from exc
+        await asyncio.sleep(interval)

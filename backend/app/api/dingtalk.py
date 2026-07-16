@@ -51,8 +51,6 @@ async def configure_dingtalk_channel(
 
     app_key = data.get("app_key", "").strip()
     app_secret = data.get("app_secret", "").strip()
-    if not app_key or not app_secret:
-        raise HTTPException(status_code=422, detail="app_key and app_secret are required")
 
     # Handle connection mode (Stream/WebSocket vs Webhook) and agent_id
     extra_config = data.get("extra_config", {})
@@ -66,6 +64,11 @@ async def configure_dingtalk_channel(
         )
     )
     existing = result.scalar_one_or_none()
+    if existing:
+        app_key = app_key or existing.app_id or ""
+        app_secret = app_secret or existing.app_secret or ""
+    if not app_key or not app_secret:
+        raise HTTPException(status_code=422, detail="app_key and app_secret are required")
     if existing:
         existing.app_id = app_key
         existing.app_secret = app_secret

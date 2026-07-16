@@ -1,16 +1,19 @@
 """Agent collaboration and template market API routes."""
 
 import uuid
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
-from sqlalchemy import select
+from pydantic import BaseModel, Field
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.permissions import check_agent_access
 from app.core.security import get_current_user, get_current_admin
 from app.database import get_db
-from app.models.agent import Agent, AgentTemplate
+from app.models.agent import Agent, AgentPermission, AgentTemplate
+from app.models.org import AgentRelationship, OrgMember
 from app.models.user import User
 from app.services.collaboration import collaboration_service
 
@@ -21,14 +24,14 @@ router = APIRouter(tags=["advanced"])
 
 class DelegateRequest(BaseModel):
     to_agent_id: uuid.UUID
-    task_title: str
-    task_description: str = ""
+    task_title: str = Field(min_length=1, max_length=200)
+    task_description: str = Field(default="", max_length=10000)
 
 
 class InterAgentMessage(BaseModel):
     to_agent_id: uuid.UUID
-    message: str
-    msg_type: str = "notify"  # notify | consult
+    message: str = Field(min_length=1, max_length=20000)
+    msg_type: Literal["notify", "consult"] = "notify"
 
 
 @router.get("/agents/{agent_id}/collaborators")
@@ -38,8 +41,12 @@ async def list_collaborators(
     db: AsyncSession = Depends(get_db),
 ):
     """List agents that can collaborate with this agent."""
-    await check_agent_access(db, current_user, agent_id)
-    return await collaboration_service.list_collaborators(db, agent_id)
+    agent, _access = await check_agent_access(db, current_user, agent_id)
+    return await collaboration_service.list_collaborators(
+        db,
+        agent,
+        requester=current_user,
+    )
 
 
 @router.post("/agents/{agent_id}/collaborate/delegate")
@@ -53,11 +60,18 @@ async def delegate_task(
     await check_agent_access(db, current_user, agent_id)
     try:
         result = await collaboration_service.delegate_task(
-            db, agent_id, data.to_agent_id, data.task_title, data.task_description
+            db,
+            agent_id,
+            data.to_agent_id,
+            data.task_title,
+            data.task_description,
+            requester=current_user,
         )
         return result
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @router.post("/agents/{agent_id}/collaborate/message")
@@ -69,9 +83,19 @@ async def send_inter_agent_message(
 ):
     """Send a message between agents."""
     await check_agent_access(db, current_user, agent_id)
-    return await collaboration_service.send_message_between_agents(
-        db, agent_id, data.to_agent_id, data.message, data.msg_type
-    )
+    try:
+        return await collaboration_service.send_message_between_agents(
+            db,
+            agent_id,
+            data.to_agent_id,
+            data.message,
+            data.msg_type,
+            requester=current_user,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 # ─── Template Market ────────────────────────────────────
@@ -178,17 +202,94 @@ async def handover_agent(
     from app.models.audit import AuditLog
 
     agent, _access = await check_agent_access(db, current_user, agent_id)
-    if not is_agent_creator(current_user, agent):
+    locked_agent = (
+        await db.execute(
+            select(Agent).where(Agent.id == agent_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if locked_agent is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if not is_agent_creator(current_user, locked_agent):
         raise HTTPException(status_code=403, detail="Only creator can handover agent")
 
-    # Verify new creator exists
-    new_creator_result = await db.execute(select(User).where(User.id == data.new_creator_id))
+    # A handover is an in-tenant ownership change. Cross-tenant moves require a
+    # separate platform-admin migration workflow because billing, automation,
+    # relationships and storage are tenant-bound.
+    new_creator_result = await db.execute(
+        select(User)
+        .where(
+            User.id == data.new_creator_id,
+            User.tenant_id == locked_agent.tenant_id,
+            User.is_active == True,  # noqa: E712
+        )
+        .options(selectinload(User.identity))
+        .with_for_update()
+    )
     new_creator = new_creator_result.scalar_one_or_none()
-    if not new_creator:
-        raise HTTPException(status_code=404, detail="Target user not found")
+    if (
+        not new_creator
+        or new_creator.identity is None
+        or not new_creator.identity.is_active
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Target user must be an active member of this tenant",
+        )
 
-    old_creator_id = agent.creator_id
-    agent.creator_id = data.new_creator_id
+    old_creator_id = locked_agent.creator_id
+    if old_creator_id != data.new_creator_id:
+        permission_result = await db.execute(
+            select(AgentPermission)
+            .where(
+                AgentPermission.agent_id == agent_id,
+                AgentPermission.scope_type == "user",
+                AgentPermission.scope_id.in_([old_creator_id, data.new_creator_id]),
+            )
+            .with_for_update()
+        )
+        permissions = permission_result.scalars().all()
+        new_creator_permission = None
+        for permission in permissions:
+            if permission.scope_id == old_creator_id:
+                await db.delete(permission)
+            elif permission.scope_id == data.new_creator_id:
+                new_creator_permission = permission
+        if new_creator_permission is None:
+            db.add(
+                AgentPermission(
+                    agent_id=agent_id,
+                    scope_type="user",
+                    scope_id=data.new_creator_id,
+                    access_level="manage",
+                )
+            )
+        else:
+            new_creator_permission.access_level = "manage"
+
+        if (locked_agent.access_mode or "company") in {"private", "custom"}:
+            await db.execute(
+                delete(AgentRelationship).where(
+                    AgentRelationship.agent_id == agent_id,
+                    AgentRelationship.member_id.in_(
+                        select(OrgMember.id).where(
+                            OrgMember.tenant_id == locked_agent.tenant_id,
+                            OrgMember.user_id == old_creator_id,
+                        )
+                    ),
+                )
+            )
+
+        locked_agent.creator_id = data.new_creator_id
+        await db.flush()
+        from app.services.access_relationships import (
+            ensure_access_granted_platform_relationships,
+        )
+
+        await ensure_access_granted_platform_relationships(
+            db,
+            locked_agent,
+            created_by_user_id=current_user.id,
+        )
 
     db.add(AuditLog(
         user_id=current_user.id,
@@ -203,7 +304,7 @@ async def handover_agent(
 
     return {
         "status": "transferred",
-        "agent_name": agent.name,
+        "agent_name": locked_agent.name,
         "new_creator": new_creator.display_name,
     }
 

@@ -216,6 +216,7 @@ export default function SubscriptionDetail() {
                             value={`${creditsUsed.toLocaleString()} / ${creditsTotal.toLocaleString()}`}
                             suffix={t('subscription.detail.points', '积分')}
                             progress={creditsProgress}
+                            testId="subscription-credits-usage-value"
                         />
                         <UsageMetric
                             icon={<IconBolt size={20} />}
@@ -224,6 +225,8 @@ export default function SubscriptionDetail() {
                             value={`${(summary?.available_balance ?? 0).toLocaleString()} / ${(summary?.balance ?? 0).toLocaleString()}`}
                             suffix={summary?.reserved ? `${t('subscription.detail.reservedCredits', '预占')} ${summary.reserved.toLocaleString()}` : t('subscription.detail.points', '积分')}
                             progress={summary?.balance ? Math.max(0, Math.min(100, ((summary.available_balance || 0) / summary.balance) * 100)) : 0}
+                            testId="subscription-available-credits-value"
+                            suffixTestId="subscription-available-credits-reserved"
                         />
                         <UsageMetric
                             icon={<IconUsers size={20} />}
@@ -365,6 +368,8 @@ function UsageMetric({
     value,
     suffix,
     progress,
+    testId,
+    suffixTestId,
 }: {
     icon: ReactNode;
     accent: string;
@@ -372,6 +377,8 @@ function UsageMetric({
     value: string;
     suffix: string;
     progress: number;
+    testId?: string;
+    suffixTestId?: string;
 }) {
     return (
         <div className="subscription-usage-metric" style={{ border: '1px solid var(--border-subtle)', borderRadius: 12, padding: 22, background: 'var(--bg-secondary)' }}>
@@ -381,8 +388,8 @@ function UsageMetric({
                     <div style={{ fontWeight: 700, fontSize: 15 }}>{title}</div>
                 </div>
                 <div className="subscription-usage-metric-value" style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
-                    <span style={{ fontSize: 22, fontWeight: 760 }}>{value}</span>
-                    <span style={{ color: 'var(--text-tertiary)', fontSize: 13 }}>{suffix}</span>
+                    <span data-testid={testId} style={{ fontSize: 22, fontWeight: 760 }}>{value}</span>
+                    <span data-testid={suffixTestId} style={{ color: 'var(--text-tertiary)', fontSize: 13 }}>{suffix}</span>
                 </div>
             </div>
             <div style={{ height: 8, borderRadius: 999, background: 'var(--bg-primary)', marginTop: 18, overflow: 'hidden' }}>

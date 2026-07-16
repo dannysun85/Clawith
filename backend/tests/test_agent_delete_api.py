@@ -148,6 +148,25 @@ def make_agent(creator_id: uuid.UUID, **overrides):
 
 
 @pytest.mark.asyncio
+async def test_agent_deletion_blocks_zero_credit_unresolved_media_task():
+    media_task_id = uuid.uuid4()
+    db = RecordingDB(
+        required_cleanup=[],
+        responses=[
+            DummyResult(),
+            DummyResult([media_task_id]),
+            DummyResult(),
+            DummyResult(),
+            DummyResult(),
+        ],
+    )
+
+    blockers = await agents_api._agent_deletion_blockers(db, uuid.uuid4())
+
+    assert blockers == ["media generation"]
+
+
+@pytest.mark.asyncio
 async def test_delete_agent_cleans_remaining_foreign_key_rows(monkeypatch):
     creator = make_user()
     agent = make_agent(creator.id)
@@ -176,6 +195,18 @@ async def test_delete_agent_cleans_remaining_foreign_key_rows(monkeypatch):
         no_provider_sessions,
     )
 
+    async def cleanup_private_brand_assets(_agent_id):
+        assert not any(
+            "UPDATE media_generation_tasks SET agent_id = NULL" in sql
+            for sql in db.executed_sql
+        )
+        return 0
+
+    monkeypatch.setattr(
+        "app.services.media_generation.delete_private_media_recovery_assets_for_agent",
+        cleanup_private_brand_assets,
+    )
+
     await agents_api.delete_agent(
         agent_id=agent.id,
         current_user=creator,
@@ -184,6 +215,10 @@ async def test_delete_agent_cleans_remaining_foreign_key_rows(monkeypatch):
 
     assert db.deleted == [agent]
     assert db.committed is True
+    assert any(
+        "UPDATE media_generation_tasks SET agent_id = NULL" in sql
+        for sql in db.executed_sql
+    )
     assert db.executed_sql.index("DELETE FROM task_logs WHERE task_id IN (SELECT id FROM tasks WHERE agent_id = :aid)") < (
         db.executed_sql.index("DELETE FROM tasks WHERE agent_id = :aid")
     )

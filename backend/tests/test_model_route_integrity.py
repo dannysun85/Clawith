@@ -8,9 +8,12 @@ import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
 
+from app.api import enterprise as enterprise_api
 from app.api import saas as saas_api
+from app.schemas.schemas import LLMModelUpdate
 from app.schemas.saas import ModelRouteCreateIn, ModelRouteUpdateIn
 from app.services import model_router
+from app.services.modalities import model_supports_modality
 from app.services.quota_guard import QuotaExceeded
 
 
@@ -37,6 +40,11 @@ async def test_route_selection_has_stable_tie_breakers():
     assert "model_routes.priority DESC" in query
     assert "model_routes.created_at ASC" in query
     assert "model_routes.id ASC" in query
+    assert "JOIN llm_models" in query
+    assert "llm_models.tenant_id IS NULL" in query
+    assert "llm_models.enabled = true" in query.lower()
+    assert "jsonb_exists" in query
+    assert "jsonb_array_length" in query
 
 
 @pytest.mark.asyncio
@@ -48,6 +56,22 @@ async def test_fallback_loader_requires_enabled_route():
 
     query = str(db.execute.await_args.args[0])
     assert "model_routes.enabled = true" in query.lower()
+    assert "JOIN llm_models" in query
+    assert "llm_models.tenant_id IS NULL" in query
+    assert "jsonb_exists" in query
+    assert "jsonb_array_length" in query
+
+
+@pytest.mark.asyncio
+async def test_model_loader_rejects_tenant_owned_rows_at_query_boundary():
+    session, db = _session_with_result(None)
+
+    with patch.object(model_router, "async_session", return_value=session):
+        await model_router._load_model(uuid.uuid4(), enabled_only=True)
+
+    query = str(db.execute.await_args.args[0])
+    assert "llm_models.tenant_id IS NULL" in query
+    assert "llm_models.enabled = true" in query.lower()
 
 
 @pytest.mark.asyncio
@@ -126,6 +150,145 @@ async def test_admin_rejects_disabled_and_self_fallbacks():
             saas_tier="ultra",
             modality="text",
         )
+
+
+def test_saas_routes_reject_tenant_owned_model_credentials():
+    model = SimpleNamespace(tenant_id=uuid.uuid4())
+
+    with pytest.raises(HTTPException, match="platform-owned"):
+        saas_api._validate_platform_route_model(model)
+
+
+def test_enterprise_model_editor_cannot_break_live_route():
+    model = SimpleNamespace(
+        provider="minimax",
+        model="MiniMax-M3",
+        base_url=None,
+        enabled=True,
+        modality="text",
+        modalities=["text", "image", "video"],
+        supports_vision=True,
+    )
+    route = SimpleNamespace(saas_tier="ultra", modality="video")
+
+    with pytest.raises(HTTPException, match="Disable every active") as exc:
+        enterprise_api._validate_routed_model_update(
+            model,
+            LLMModelUpdate(enabled=False),
+            [route],
+        )
+    assert exc.value.status_code == 409
+
+    legacy_image_model = SimpleNamespace(
+        provider="minimax",
+        model="MiniMax-M3",
+        base_url=None,
+        enabled=True,
+        modality="text",
+        modalities=None,
+        supports_vision=True,
+    )
+    with pytest.raises(HTTPException, match="would break active") as exc:
+        enterprise_api._validate_routed_model_update(
+            legacy_image_model,
+            LLMModelUpdate(supports_vision=False),
+            [SimpleNamespace(saas_tier="lite", modality="image")],
+        )
+    assert exc.value.status_code == 409
+
+
+def test_enterprise_model_editor_cannot_change_live_route_connection_identity():
+    model = SimpleNamespace(
+        provider="minimax",
+        model="MiniMax-M3",
+        base_url="https://api.minimax.io/v1",
+        enabled=True,
+        modality="text",
+        modalities=["text", "image", "video"],
+        supports_vision=True,
+    )
+    route = SimpleNamespace(saas_tier="ultra", modality="text")
+
+    for update in (
+        LLMModelUpdate(provider="openai"),
+        LLMModelUpdate(model="MiniMax-M2.5"),
+        LLMModelUpdate(base_url="https://example.invalid/v1"),
+    ):
+        with pytest.raises(HTTPException, match="connection identity") as exc:
+            enterprise_api._validate_routed_model_update(model, update, [route])
+        assert exc.value.status_code == 409
+
+
+def test_nonempty_modalities_are_authoritative_with_legacy_alias_support():
+    assert not model_supports_modality(
+        "text",
+        model_modality="text",
+        model_modalities=["video"],
+        supports_vision=False,
+    )
+    assert model_supports_modality(
+        "image",
+        model_modality="text",
+        model_modalities=["vision"],
+        supports_vision=False,
+    )
+    assert model_supports_modality(
+        "text",
+        model_modality="text",
+        model_modalities=[],
+        supports_vision=False,
+    )
+
+
+def test_active_inbound_fallback_target_cannot_be_invalidated():
+    dependant = SimpleNamespace(
+        id=uuid.uuid4(),
+        saas_tier="ultra",
+        modality="video",
+    )
+
+    for prospective in (
+        {"enabled": False, "saas_tier": "ultra", "modality": "video"},
+        {"enabled": True, "saas_tier": "pro", "modality": "video"},
+        {"enabled": True, "saas_tier": "ultra", "modality": "text"},
+    ):
+        with pytest.raises(HTTPException, match="active fallback target") as exc:
+            saas_api._validate_inbound_fallback_continuity(
+                [dependant],
+                **prospective,
+            )
+        assert exc.value.status_code == 409
+
+    saas_api._validate_inbound_fallback_continuity(
+        [dependant],
+        enabled=True,
+        saas_tier="ultra",
+        modality="video",
+    )
+
+
+@pytest.mark.asyncio
+async def test_enterprise_model_delete_rejects_any_saas_route(monkeypatch):
+    model_id = uuid.uuid4()
+    route_id = uuid.uuid4()
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = SimpleNamespace(id=model_id)
+    db = MagicMock()
+    db.execute = AsyncMock(return_value=result)
+    routes = AsyncMock(return_value=[SimpleNamespace(id=route_id)])
+    monkeypatch.setattr(enterprise_api, "_model_routes", routes)
+    actor = SimpleNamespace(role="platform_admin", identity=None)
+
+    with pytest.raises(HTTPException, match="every SaaS model route") as exc:
+        await enterprise_api.remove_llm_model(
+            model_id,
+            force=True,
+            current_user=actor,
+            db=db,
+        )
+
+    assert exc.value.status_code == 409
+    routes.assert_awaited_once_with(db, model_id, enabled_only=False)
 
 
 def test_model_route_schema_normalizes_and_bounds_tier_modality_priority():

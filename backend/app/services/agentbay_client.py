@@ -42,9 +42,12 @@ class AgentBaySession:
 @dataclass(frozen=True, slots=True)
 class _AgentBayLaneSnapshot:
     id: uuid.UUID
+    tenant_id: uuid.UUID
+    agent_id: uuid.UUID
+    user_id: uuid.UUID
     provider_session_id: str | None
     image_type: str
-    chat_session_id: str | None
+    chat_session_id: str
 
 
 class AgentBayClient:
@@ -1126,7 +1129,10 @@ async def _get_active_agentbay_ledger(
     from sqlalchemy import and_, or_, select
 
     from app.database import async_session
-    from app.models.agentbay_session import AgentBaySessionLedger
+    from app.models.agentbay_session import (
+        AGENTBAY_PROVIDER_COLLISION_STATUS,
+        AgentBaySessionLedger,
+    )
 
     async with async_session() as db:
         result = await db.execute(
@@ -1136,6 +1142,8 @@ async def _get_active_agentbay_ledger(
                 AgentBaySessionLedger.image_type == image_type,
                 or_(
                     AgentBaySessionLedger.status == "cleanup_required",
+                    AgentBaySessionLedger.status
+                    == AGENTBAY_PROVIDER_COLLISION_STATUS,
                     and_(
                         AgentBaySessionLedger.status == "active",
                         AgentBaySessionLedger.user_id == user_id,
@@ -1157,7 +1165,10 @@ async def _get_active_agentbay_ledger(
         ledger_changed = False
         for row in rows:
             context = row.context if isinstance(row.context, dict) else {}
-            if row.status == "cleanup_required":
+            if row.status in {
+                "cleanup_required",
+                AGENTBAY_PROVIDER_COLLISION_STATUS,
+            }:
                 # A v2 row has an exact owner/chat binding, so its ambiguous
                 # deletion poisons only that lane. Legacy/untrusted rows lack
                 # enough identity to narrow safely and remain Agent-wide.
@@ -1179,7 +1190,12 @@ async def _get_active_agentbay_ledger(
         rows = relevant_rows
         if not rows:
             return None
-        cleanup_rows = [row for row in rows if row.status == "cleanup_required"]
+        cleanup_rows = [
+            row
+            for row in rows
+            if row.status
+            in {"cleanup_required", AGENTBAY_PROVIDER_COLLISION_STATUS}
+        ]
         if cleanup_rows:
             # Never create/attach another sandbox while an unconfirmed provider
             # deletion remains associated with this exact user/chat lane.
@@ -1262,6 +1278,181 @@ async def _mark_agentbay_ledger_cleanup_required(
             await db.commit()
 
 
+async def _lock_agentbay_provider_identity(db, provider_session_id: str) -> None:
+    """Serialize every ownership mutation for one provider sandbox identity.
+
+    Row locks alone are insufficient once the canonical poison row becomes
+    closed because a waiting quarantine transaction could observe no live row
+    and create a new claim while an operator is still reconciling an older
+    snapshot.  Both quarantine and administrator reconciliation therefore use
+    this exact PostgreSQL transaction-advisory-lock namespace first.
+    """
+    from sqlalchemy import text
+
+    normalized = str(provider_session_id or "").strip()
+    if not normalized:
+        raise ValueError("AgentBay provider session identity is required")
+    bind = db.get_bind()
+    if bind.dialect.name != "postgresql":
+        return
+    await db.execute(
+        text(
+            "SELECT pg_advisory_xact_lock("
+            "hashtextextended(:lock_key, 0))"
+        ),
+        {"lock_key": f"astra:agentbay-provider-identity:{normalized}"},
+    )
+
+
+async def _quarantine_agentbay_provider_identity(
+    *,
+    tenant_id: uuid.UUID | None,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    session_id: str,
+    provider_session_id: str,
+    image_type: str,
+    ensure_collision_record: bool,
+) -> None:
+    """Quarantine every unresolved claim to one provider sandbox identity."""
+
+    from sqlalchemy import select
+
+    from app.database import async_session
+    from app.models.agentbay_session import (
+        AGENTBAY_PROVIDER_COLLISION_STATUS,
+        AGENTBAY_UNRESOLVED_STATUSES,
+        AgentBaySessionLedger,
+    )
+
+    now = datetime.now(timezone.utc)
+    async with async_session() as db:
+        await _lock_agentbay_provider_identity(db, provider_session_id)
+        rows = list(
+            (
+                await db.execute(
+                    select(AgentBaySessionLedger)
+                    .where(
+                        AgentBaySessionLedger.provider_session_id
+                        == provider_session_id,
+                        AgentBaySessionLedger.status.in_(
+                            tuple(AGENTBAY_UNRESOLVED_STATUSES)
+                        ),
+                    )
+                    .with_for_update()
+                )
+            ).scalars().all()
+        )
+        rows.sort(key=lambda row: str(row.id))
+        keeper = rows[0] if rows else None
+        if keeper is None:
+            keeper = AgentBaySessionLedger(
+                id=uuid.uuid4(),
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                user_id=user_id,
+                chat_session_id=str(session_id),
+                provider_session_id=provider_session_id,
+                image_type=image_type,
+                purpose="provider_identity_quarantine",
+                status=AGENTBAY_PROVIDER_COLLISION_STATUS,
+                started_at=now,
+                last_used_at=now,
+                close_reason="provider_identity_collision",
+                error_message=(
+                    "Provider identity ownership is ambiguous; out-of-band "
+                    "verification is required"
+                ),
+                context={"binding_version": 2},
+            )
+            db.add(keeper)
+            rows.append(keeper)
+        group_id = str(keeper.id)
+        matching_record = False
+        for row in rows:
+            if (
+                row.agent_id == agent_id
+                and row.user_id == user_id
+                and row.chat_session_id == str(session_id)
+                and row.image_type == image_type
+            ):
+                matching_record = True
+            row.status = AGENTBAY_PROVIDER_COLLISION_STATUS
+            row.close_reason = "provider_identity_collision"
+            row.error_message = (
+                "Provider identity ownership is ambiguous; out-of-band "
+                "verification is required"
+            )
+            row.closed_at = None
+            row.updated_at = now
+            row.context = {
+                **(row.context if isinstance(row.context, dict) else {}),
+                "provider_identity_collision_ledger_id": group_id,
+            }
+            if row.id != keeper.id:
+                # Exactly one canonical poison row retains the provider UUID.
+                # The DB unique index includes collision status, so this row
+                # prevents any later active/cleanup claim to the same sandbox.
+                row.provider_session_id = None
+        if ensure_collision_record and not matching_record:
+            db.add(
+                AgentBaySessionLedger(
+                    id=uuid.uuid4(),
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                    user_id=user_id,
+                    chat_session_id=str(session_id),
+                    provider_session_id=None,
+                    image_type=image_type,
+                    purpose="provider_identity_quarantine",
+                    status=AGENTBAY_PROVIDER_COLLISION_STATUS,
+                    started_at=now,
+                    last_used_at=now,
+                    close_reason="provider_identity_collision",
+                    error_message=(
+                        "Provider identity ownership is ambiguous; out-of-band "
+                        "verification is required"
+                    ),
+                    context={
+                        "binding_version": 2,
+                        "provider_identity_collision_ledger_id": group_id,
+                    },
+                )
+            )
+        await db.commit()
+
+
+async def _agentbay_provider_identity_conflicts(ledger) -> bool:
+    """Return whether another unresolved row claims this provider identity."""
+
+    if not ledger or not ledger.provider_session_id:
+        return False
+    from sqlalchemy import select
+
+    from app.database import async_session
+    from app.models.agentbay_session import (
+        AGENTBAY_UNRESOLVED_STATUSES,
+        AgentBaySessionLedger,
+    )
+
+    async with async_session() as db:
+        conflicting_id = (
+            await db.execute(
+                select(AgentBaySessionLedger.id)
+                .where(
+                    AgentBaySessionLedger.provider_session_id
+                    == ledger.provider_session_id,
+                    AgentBaySessionLedger.id != ledger.id,
+                    AgentBaySessionLedger.status.in_(
+                        tuple(AGENTBAY_UNRESOLVED_STATUSES)
+                    ),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+    return conflicting_id is not None
+
+
 async def _record_agentbay_cleanup_required(
     *,
     tenant_id: uuid.UUID | None,
@@ -1272,11 +1463,42 @@ async def _record_agentbay_cleanup_required(
     image_type: str,
     reason: str,
 ) -> None:
+    from sqlalchemy import select
+    from sqlalchemy.exc import IntegrityError
+
     from app.database import async_session
-    from app.models.agentbay_session import AgentBaySessionLedger
+    from app.models.agentbay_session import (
+        AGENTBAY_UNRESOLVED_STATUSES,
+        AgentBaySessionLedger,
+    )
 
     now = datetime.now(timezone.utc)
     async with async_session() as db:
+        existing_claim = (
+            await db.execute(
+                select(AgentBaySessionLedger.id)
+                .where(
+                    AgentBaySessionLedger.provider_session_id
+                    == provider_session_id,
+                    AgentBaySessionLedger.status.in_(
+                        tuple(AGENTBAY_UNRESOLVED_STATUSES)
+                    ),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if existing_claim is not None:
+            await db.rollback()
+            await _quarantine_agentbay_provider_identity(
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                user_id=user_id,
+                session_id=session_id,
+                provider_session_id=provider_session_id,
+                image_type=image_type,
+                ensure_collision_record=True,
+            )
+            return
         db.add(
             AgentBaySessionLedger(
                 id=uuid.uuid4(),
@@ -1295,7 +1517,19 @@ async def _record_agentbay_cleanup_required(
                 context={"binding_version": 2},
             )
         )
-        await db.commit()
+        try:
+            await db.commit()
+        except IntegrityError:
+            await db.rollback()
+            await _quarantine_agentbay_provider_identity(
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                user_id=user_id,
+                session_id=session_id,
+                provider_session_id=provider_session_id,
+                image_type=image_type,
+                ensure_collision_record=True,
+            )
 
 
 async def _mark_agentbay_ledger_closed(
@@ -1330,14 +1564,43 @@ async def _record_agentbay_ledger(
     session_id: str,
     provider_session_id: str,
     image_type: str,
-) -> bool:
+) -> str:
+    from sqlalchemy import select
     from sqlalchemy.exc import IntegrityError
 
     from app.database import async_session
-    from app.models.agentbay_session import AgentBaySessionLedger
+    from app.models.agentbay_session import (
+        AGENTBAY_UNRESOLVED_STATUSES,
+        AgentBaySessionLedger,
+    )
 
     now = datetime.now(timezone.utc)
     async with async_session() as db:
+        provider_claim = (
+            await db.execute(
+                select(AgentBaySessionLedger.id)
+                .where(
+                    AgentBaySessionLedger.provider_session_id
+                    == provider_session_id,
+                    AgentBaySessionLedger.status.in_(
+                        tuple(AGENTBAY_UNRESOLVED_STATUSES)
+                    ),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if provider_claim is not None:
+            await db.rollback()
+            await _quarantine_agentbay_provider_identity(
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                user_id=user_id,
+                session_id=session_id,
+                provider_session_id=provider_session_id,
+                image_type=image_type,
+                ensure_collision_record=True,
+            )
+            return "provider_collision"
         db.add(
             AgentBaySessionLedger(
                 id=uuid.uuid4(),
@@ -1357,10 +1620,35 @@ async def _record_agentbay_ledger(
         )
         try:
             await db.commit()
-            return True
+            return "recorded"
         except IntegrityError:
             await db.rollback()
-            return False
+            provider_claim = (
+                await db.execute(
+                    select(AgentBaySessionLedger.id)
+                    .where(
+                        AgentBaySessionLedger.provider_session_id
+                        == provider_session_id,
+                        AgentBaySessionLedger.status.in_(
+                            tuple(AGENTBAY_UNRESOLVED_STATUSES)
+                        ),
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if provider_claim is None:
+                return "lane_conflict"
+            await db.rollback()
+            await _quarantine_agentbay_provider_identity(
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                user_id=user_id,
+                session_id=session_id,
+                provider_session_id=provider_session_id,
+                image_type=image_type,
+                ensure_collision_record=True,
+            )
+            return "provider_collision"
 
 
 def _agentbay_creation_lock_key(
@@ -1370,6 +1658,56 @@ def _agentbay_creation_lock_key(
     image_type: str,
 ) -> str:
     return f"agentbay-session-create:{agent_id}:{user_id}:{session_id}:{image_type}"
+
+
+def _trusted_agentbay_delete_binding(
+    row,
+    *,
+    tenant_id: uuid.UUID,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID | None = None,
+    session_id: str | None = None,
+) -> bool:
+    """Accept only a server-attested v2 owner binding for provider deletion."""
+
+    context = row.context if isinstance(row.context, dict) else {}
+    canonical_row_session = _canonical_chat_session_id(row.chat_session_id)
+    if (
+        context.get("binding_version") != 2
+        or row.tenant_id != tenant_id
+        or row.agent_id != agent_id
+        or row.user_id is None
+        or canonical_row_session is None
+    ):
+        return False
+    if user_id is not None and row.user_id != user_id:
+        return False
+    if session_id is not None:
+        canonical_expected_session = _canonical_chat_session_id(session_id)
+        if (
+            canonical_expected_session is None
+            or canonical_row_session != canonical_expected_session
+        ):
+            return False
+    return True
+
+
+def _agentbay_snapshot_matches_row(
+    snapshot: _AgentBayLaneSnapshot,
+    row,
+) -> bool:
+    return (
+        row.id == snapshot.id
+        and _trusted_agentbay_delete_binding(
+            row,
+            tenant_id=snapshot.tenant_id,
+            agent_id=snapshot.agent_id,
+            user_id=snapshot.user_id,
+            session_id=snapshot.chat_session_id,
+        )
+        and row.provider_session_id == snapshot.provider_session_id
+        and row.image_type == snapshot.image_type
+    )
 
 
 async def _agentbay_agent_has_live_fences(redis, agent_id: uuid.UUID) -> bool:
@@ -1410,9 +1748,8 @@ async def _set_agentbay_lane_cleanup_required(
         ).scalar_one_or_none()
         if row is None or row.status == "closed":
             return
-        if (
-            row.status not in {"active", "cleanup_required"}
-            or row.provider_session_id != snapshot.provider_session_id
+        if row.status not in {"active", "cleanup_required"} or not (
+            _agentbay_snapshot_matches_row(snapshot, row)
         ):
             raise RuntimeError("AgentBay cleanup ledger changed during provider deletion")
         row.status = "cleanup_required"
@@ -1446,9 +1783,8 @@ async def _close_agentbay_lane_after_provider_delete(
             raise RuntimeError("AgentBay cleanup ledger disappeared")
         if row.status == "closed" and row.provider_session_id == snapshot.provider_session_id:
             return
-        if (
-            row.status not in {"active", "cleanup_required"}
-            or row.provider_session_id != snapshot.provider_session_id
+        if row.status not in {"active", "cleanup_required"} or not (
+            _agentbay_snapshot_matches_row(snapshot, row)
         ):
             raise RuntimeError("AgentBay cleanup ledger changed during provider deletion")
         row.status = "closed"
@@ -1479,9 +1815,24 @@ async def _close_agentbay_lanes_for_agent(*, agent_id: uuid.UUID) -> None:
     from sqlalchemy import select
 
     from app.database import async_session
-    from app.models.agentbay_session import AgentBaySessionLedger
+    from app.models.agent import Agent
+    from app.models.agentbay_session import (
+        AGENTBAY_PROVIDER_COLLISION_STATUS,
+        AGENTBAY_UNRESOLVED_STATUSES,
+        AgentBaySessionLedger,
+    )
 
     async with async_session() as db:
+        agent_tenant_id = (
+            await db.execute(
+                select(Agent.tenant_id).where(Agent.id == agent_id)
+            )
+        ).scalar_one_or_none()
+        if agent_tenant_id is None:
+            await db.rollback()
+            raise RuntimeError(
+                "AgentBay Agent deletion requires an exact tenant owner"
+            )
         rows = list(
             (
                 await db.execute(
@@ -1489,7 +1840,7 @@ async def _close_agentbay_lanes_for_agent(*, agent_id: uuid.UUID) -> None:
                     .where(
                         AgentBaySessionLedger.agent_id == agent_id,
                         AgentBaySessionLedger.status.in_(
-                            ["active", "cleanup_required"]
+                            tuple(AGENTBAY_UNRESOLVED_STATUSES)
                         ),
                     )
                     .order_by(
@@ -1500,12 +1851,36 @@ async def _close_agentbay_lanes_for_agent(*, agent_id: uuid.UUID) -> None:
                 )
             ).scalars().all()
         )
+        if any(
+            row.status == AGENTBAY_PROVIDER_COLLISION_STATUS for row in rows
+        ):
+            await db.rollback()
+            raise RuntimeError(
+                "AgentBay provider identity collision must be reconciled "
+                "before deleting this Agent"
+            )
+        if any(
+            not _trusted_agentbay_delete_binding(
+                row,
+                tenant_id=agent_tenant_id,
+                agent_id=agent_id,
+            )
+            for row in rows
+        ):
+            await db.rollback()
+            raise RuntimeError(
+                "AgentBay legacy or untrusted provider binding requires "
+                "out-of-band cleanup before deleting this Agent"
+            )
         snapshots = [
             _AgentBayLaneSnapshot(
                 id=row.id,
+                tenant_id=row.tenant_id,
+                agent_id=row.agent_id,
+                user_id=row.user_id,
                 provider_session_id=row.provider_session_id,
                 image_type=row.image_type,
-                chat_session_id=row.chat_session_id,
+                chat_session_id=_canonical_chat_session_id(row.chat_session_id),
             )
             for row in rows
         ]
@@ -1639,26 +2014,69 @@ async def _close_agentbay_lanes_for_chat_session(
     from sqlalchemy import select
 
     from app.database import async_session
-    from app.models.agentbay_session import AgentBaySessionLedger
+    from app.models.agent import Agent
+    from app.models.agentbay_session import (
+        AGENTBAY_PROVIDER_COLLISION_STATUS,
+        AGENTBAY_UNRESOLVED_STATUSES,
+        AgentBaySessionLedger,
+    )
 
     async with async_session() as db:
+        agent_tenant_id = (
+            await db.execute(
+                select(Agent.tenant_id).where(Agent.id == agent_id)
+            )
+        ).scalar_one_or_none()
+        if agent_tenant_id is None:
+            await db.rollback()
+            raise RuntimeError(
+                "AgentBay chat deletion requires an exact tenant owner"
+            )
         result = await db.execute(
             select(AgentBaySessionLedger)
             .where(
                 AgentBaySessionLedger.agent_id == agent_id,
                 AgentBaySessionLedger.user_id == user_id,
                 AgentBaySessionLedger.chat_session_id == str(session_id),
-                AgentBaySessionLedger.status.in_(["active", "cleanup_required"]),
+                AgentBaySessionLedger.status.in_(
+                    tuple(AGENTBAY_UNRESOLVED_STATUSES)
+                ),
             )
             .order_by(AgentBaySessionLedger.image_type, AgentBaySessionLedger.id)
         )
         rows = list(result.scalars().all())
+        if any(
+            row.status == AGENTBAY_PROVIDER_COLLISION_STATUS for row in rows
+        ):
+            await db.rollback()
+            raise RuntimeError(
+                "AgentBay provider identity collision must be reconciled "
+                "before deleting this chat"
+            )
+        if any(
+            not _trusted_agentbay_delete_binding(
+                row,
+                tenant_id=agent_tenant_id,
+                agent_id=agent_id,
+                user_id=user_id,
+                session_id=session_id,
+            )
+            for row in rows
+        ):
+            await db.rollback()
+            raise RuntimeError(
+                "AgentBay legacy or untrusted provider binding requires "
+                "out-of-band cleanup before deleting this chat"
+            )
         snapshots = [
             _AgentBayLaneSnapshot(
                 id=row.id,
+                tenant_id=row.tenant_id,
+                agent_id=row.agent_id,
+                user_id=row.user_id,
                 provider_session_id=row.provider_session_id,
                 image_type=row.image_type,
-                chat_session_id=row.chat_session_id,
+                chat_session_id=_canonical_chat_session_id(row.chat_session_id),
             )
             for row in rows
         ]
@@ -1813,13 +2231,21 @@ async def _attach_from_ledger(
     *,
     image_type: str,
 ) -> bool:
-    if not ledger or not ledger.provider_session_id:
+    if not ledger:
         return False
+    from app.models.agentbay_session import AGENTBAY_PROVIDER_COLLISION_STATUS
+
     context = ledger.context if isinstance(ledger.context, dict) else {}
+    if ledger.status == AGENTBAY_PROVIDER_COLLISION_STATUS:
+        raise RuntimeError(
+            "AgentBay provider identity collision requires operator review"
+        )
     if ledger.status == "cleanup_required":
         raise RuntimeError(
             "AgentBay provider cleanup must be verified before this lane can resume"
         )
+    if not ledger.provider_session_id:
+        return False
     if (
         ledger.status != "active"
         or context.get("binding_version") != 2
@@ -1829,6 +2255,19 @@ async def _attach_from_ledger(
         or not ledger.chat_session_id
     ):
         return False
+    if await _agentbay_provider_identity_conflicts(ledger):
+        await _quarantine_agentbay_provider_identity(
+            tenant_id=ledger.tenant_id,
+            agent_id=ledger.agent_id,
+            user_id=ledger.user_id,
+            session_id=ledger.chat_session_id,
+            provider_session_id=ledger.provider_session_id,
+            image_type=ledger.image_type,
+            ensure_collision_record=False,
+        )
+        raise RuntimeError(
+            "AgentBay provider identity collision requires operator review"
+        )
     try:
         await client.attach_session(ledger.provider_session_id, image_type)
         if ledger.expires_at and ledger.expires_at <= datetime.now(timezone.utc):
@@ -2056,7 +2495,7 @@ async def get_agentbay_client_for_agent(
                 raise PermissionError(
                     "AgentBay chat lane was revoked during provider creation"
                 )
-            recorded = await _record_agentbay_ledger(
+            record_status = await _record_agentbay_ledger(
                 tenant_id=tenant_id,
                 agent_id=agent_id,
                 user_id=user_id,
@@ -2064,8 +2503,19 @@ async def get_agentbay_client_for_agent(
                 provider_session_id=provider_session_id,
                 image_type=image_type,
             )
-            if recorded:
+            if record_status == "recorded":
                 durable_registered = True
+            elif record_status == "provider_collision":
+                # The provider returned an identity already claimed by another
+                # unresolved lane. Deleting it could destroy the other
+                # principal's sandbox, so detach locally and require explicit
+                # out-of-band provider verification for every quarantined row.
+                durable_registered = True
+                client._session = None
+                client._image_type = None
+                raise RuntimeError(
+                    "AgentBay provider identity collision requires operator review"
+                )
             else:
                 # A creator that lost the durable unique race must delete its
                 # untracked provider sandbox before attaching the winner.

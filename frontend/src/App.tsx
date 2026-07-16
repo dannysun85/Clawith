@@ -298,7 +298,7 @@ export default function App() {
                     <Route path="okr" element={<OKR />} />
                     <Route path="invitations" element={<InvitationCodes />} />
                     <Route path="admin/platform-settings" element={<AdminCompanies />} />
-                    <Route path="account" element={<AccountManagement />} />
+                    <Route path="account" element={<SaasAdminRoute><AccountManagement /></SaasAdminRoute>} />
                     <Route path="account/subscription" element={<SubscriptionDetail />} />
                     <Route path="billing/success" element={<BillingSuccess />} />
                 </Route>

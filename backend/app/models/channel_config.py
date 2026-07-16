@@ -3,10 +3,12 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, ForeignKey, String, Text, UniqueConstraint, func
-from sqlalchemy.dialects.postgresql import JSON, UUID
+from sqlalchemy import DateTime, Enum, ForeignKey, String, UniqueConstraint, func
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from app.core.channel_secrets import EncryptedChannelJSON, EncryptedChannelText
 from app.database import Base
 
 
@@ -27,9 +29,15 @@ class ChannelConfig(Base):
 
     # Feishu specific config
     app_id: Mapped[str | None] = mapped_column(String(255))
-    app_secret: Mapped[str | None] = mapped_column(String(512))
-    encrypt_key: Mapped[str | None] = mapped_column(String(255))
-    verification_token: Mapped[str | None] = mapped_column(String(255))
+    app_secret: Mapped[str | None] = mapped_column(
+        EncryptedChannelText(purpose="app_secret")
+    )
+    encrypt_key: Mapped[str | None] = mapped_column(
+        EncryptedChannelText(purpose="encrypt_key")
+    )
+    verification_token: Mapped[str | None] = mapped_column(
+        EncryptedChannelText(purpose="verification_token")
+    )
 
     # Status
     is_configured: Mapped[bool] = mapped_column(default=False)
@@ -37,7 +45,12 @@ class ChannelConfig(Base):
     last_tested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     # Additional config as JSON for extensibility
-    extra_config: Mapped[dict] = mapped_column(JSON, default={})
+    extra_config: Mapped[dict] = mapped_column(
+        MutableDict.as_mutable(
+            EncryptedChannelJSON(purpose="extra_config")
+        ),
+        default=dict,
+    )
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(

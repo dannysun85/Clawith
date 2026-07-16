@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import uuid
+from pathlib import Path
 from unittest.mock import AsyncMock
 import pytest
 from types import SimpleNamespace
@@ -10,11 +11,18 @@ from app.api import webhooks as webhooks_api
 from app.main import app
 
 
+VALID_TOKEN = "a" * 32
+PRIVATE_TOKEN = "b" * 32
+UNKNOWN_TOKEN = "z" * 32
+
+
 class FakeScalarResult:
     def __init__(self, value):
         self._value = value
 
     def scalar_one_or_none(self):
+        if isinstance(self._value, list):
+            return self._value[0] if self._value else None
         return self._value
 
     def scalars(self):
@@ -31,8 +39,10 @@ class FakeSession:
         self.added = []
         self.committed = False
         self.expunged = []
+        self.execute_calls = 0
 
     async def execute(self, statement):
+        self.execute_calls += 1
         stmt_str = str(statement)
         if "agent_triggers" in stmt_str:
             return FakeScalarResult(self.triggers)
@@ -84,7 +94,7 @@ async def test_receive_webhook_success(monkeypatch, client):
         agent_id=agent_id,
         name="test-trigger",
         type="webhook",
-        config={"token": "valid_token", "secret": "webhook-secret"},
+        config={"token": VALID_TOKEN, "secret": "webhook-secret"},
         is_enabled=True,
     )
     agent = SimpleNamespace(id=agent_id, webhook_rate_limit=5)
@@ -110,7 +120,7 @@ async def test_receive_webhook_success(monkeypatch, client):
     signature = "sha256=" + hmac.new(b"webhook-secret", body, hashlib.sha256).hexdigest()
     async with await client() as ac:
         response = await ac.post(
-            "/api/webhooks/t/valid_token",
+            f"/api/webhooks/t/{VALID_TOKEN}",
             content=body,
             headers={
                 "content-type": "application/json",
@@ -128,9 +138,9 @@ async def test_receive_webhook_success(monkeypatch, client):
 @pytest.mark.parametrize(
     ("config", "headers", "expected_status"),
     [
-        ({"token": "valid_token", "secret": "webhook-secret"}, {}, 401),
-        ({"token": "valid_token", "secret": "webhook-secret"}, {"x-hub-signature-256": "sha256=bad"}, 401),
-        ({"token": "valid_token"}, {}, 403),
+        ({"token": VALID_TOKEN, "secret": "webhook-secret"}, {}, 401),
+        ({"token": VALID_TOKEN, "secret": "webhook-secret"}, {"x-hub-signature-256": "sha256=bad"}, 401),
+        ({"token": VALID_TOKEN}, {}, 403),
     ],
 )
 async def test_receive_webhook_fails_closed_without_valid_signature(
@@ -163,7 +173,7 @@ async def test_receive_webhook_fails_closed_without_valid_signature(
 
     async with await client() as ac:
         response = await ac.post(
-            "/api/webhooks/t/valid_token",
+            f"/api/webhooks/t/{VALID_TOKEN}",
             content=b'{"event":"test"}',
             headers={"content-type": "application/json", **headers},
         )
@@ -184,7 +194,7 @@ async def test_rate_limited_webhook_keeps_user_visible_trigger_context_without_t
         agent_id=agent_id,
         name="customer-visible-trigger",
         type="webhook",
-        config={"token": "private_token", "secret": "webhook-secret"},
+        config={"token": PRIVATE_TOKEN, "secret": "webhook-secret"},
         is_enabled=True,
     )
     agent = SimpleNamespace(id=agent_id, webhook_rate_limit=5)
@@ -200,7 +210,7 @@ async def test_rate_limited_webhook_keeps_user_visible_trigger_context_without_t
 
     async with await client() as ac:
         response = await ac.post(
-            "/api/webhooks/t/private_token",
+            f"/api/webhooks/t/{PRIVATE_TOKEN}",
             content=b'{}',
             headers={"content-type": "application/json"},
         )
@@ -215,6 +225,31 @@ async def test_rate_limited_webhook_keeps_user_visible_trigger_context_without_t
     }
     assert "token" not in audit.details
     enqueue.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("token", ["short", "!" * 32, UNKNOWN_TOKEN])
+async def test_unknown_webhook_tokens_never_allocate_rate_limit_keys(
+    monkeypatch,
+    client,
+    token,
+):
+    monkeypatch.setattr(webhooks_api, "AUTOMATIC_TRIGGER_EXECUTION_ENABLED", True)
+    session = FakeSession(triggers=[])
+    monkeypatch.setattr(webhooks_api, "async_session", FakeAsyncSessionFactory(session))
+    rate_limit = AsyncMock()
+    enqueue = AsyncMock()
+    monkeypatch.setattr(webhooks_api, "_record_and_count_hits", rate_limit)
+    monkeypatch.setattr(webhooks_api, "enqueue_webhook_execution", enqueue)
+
+    async with await client() as ac:
+        response = await ac.post(f"/api/webhooks/t/{token}", content=b"{}")
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    rate_limit.assert_not_awaited()
+    enqueue.assert_not_awaited()
+    assert session.execute_calls == (1 if token == UNKNOWN_TOKEN else 0)
 
 
 @pytest.mark.asyncio
@@ -243,3 +278,16 @@ async def test_maintenance_paused_webhook_rejects_before_side_effects(
     }
     rate_limit.assert_not_awaited()
     enqueue.assert_not_awaited()
+
+
+def test_frontend_proxy_bounds_public_webhook_ingress():
+    root = Path(__file__).parents[2]
+    template = (root / "frontend/nginx.conf.template").read_text(encoding="utf-8")
+    zone = (root / "frontend/webhook-rate-limit.conf").read_text(encoding="utf-8")
+    dockerfile = (root / "frontend/Dockerfile").read_text(encoding="utf-8")
+
+    assert "limit_req_zone $binary_remote_addr zone=webhook_ingress:10m" in zone
+    assert "location ~ ^/api/webhooks/t/[A-Za-z0-9_-]{32}$" in template
+    assert "limit_req zone=webhook_ingress burst=20 nodelay" in template
+    assert "client_max_body_size 64k" in template
+    assert "webhook-rate-limit.conf" in dockerfile

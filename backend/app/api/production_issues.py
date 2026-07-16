@@ -24,7 +24,10 @@ from app.schemas.production_issue import (
     ProductionIssueStatusIn,
     ProductionIssueSummaryOut,
 )
-from app.services.production_issue_monitor import record_production_issue
+from app.services.production_issue_monitor import (
+    RELEASE_ALERT_CANARY_SOURCE,
+    record_production_issue,
+)
 
 
 client_router = APIRouter(prefix="/production-issues", tags=["production-issues"])
@@ -170,7 +173,10 @@ async def production_issue_summary(
             func.count(ProductionIssue.id).filter(ProductionIssue.severity == "warning"),
             func.count(ProductionIssue.id).filter(ProductionIssue.severity == "error"),
             func.count(ProductionIssue.id).filter(ProductionIssue.severity == "critical"),
-        ).where(ProductionIssue.status == "open")
+        ).where(
+            ProductionIssue.status == "open",
+            ProductionIssue.source != RELEASE_ALERT_CANARY_SOURCE,
+        )
     )
     total, warning, error, critical = open_counts.one()
     cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
@@ -178,7 +184,15 @@ async def production_issue_summary(
         select(
             func.count(ProductionIssueEvent.id),
             func.count(distinct(ProductionIssueEvent.tenant_id)),
-        ).where(ProductionIssueEvent.created_at >= cutoff)
+        )
+        .join(
+            ProductionIssue,
+            ProductionIssue.id == ProductionIssueEvent.issue_id,
+        )
+        .where(
+            ProductionIssueEvent.created_at >= cutoff,
+            ProductionIssue.source != RELEASE_ALERT_CANARY_SOURCE,
+        )
     )
     event_count, tenant_count = recent.one()
     return ProductionIssueSummaryOut(
@@ -219,6 +233,11 @@ async def update_production_issue_status(
     issue = await db.get(ProductionIssue, issue_id, with_for_update=True)
     if not issue:
         raise HTTPException(status_code=404, detail="Production issue not found")
+    if issue.source == RELEASE_ALERT_CANARY_SOURCE:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Release alert canary status is managed by the release verifier",
+        )
     now = datetime.now(timezone.utc)
     before = issue.status
     issue.status = data.status
@@ -232,11 +251,13 @@ async def update_production_issue_status(
         issue.alert_next_attempt_at = None
         issue.alert_last_error_code = None
         issue.alert_notification_sent_at = None
-    db.add(AuditLog(
-        user_id=current_user.id,
-        action="production_issue_status_update",
-        details={"issue_id": str(issue.id), "before": before, "after": data.status},
-    ))
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            action="production_issue_status_update",
+            details={"issue_id": str(issue.id), "before": before, "after": data.status},
+        )
+    )
     await db.commit()
     await db.refresh(issue)
     tenant_count = (

@@ -32,10 +32,19 @@ async def list_users(
     )
 
     target_tenant_id = current_user.tenant_id
-    if current_user.role == "platform_admin" and tenant_id:
-        target_tenant_id = tenant_id
-    if target_tenant_id:
-        query = query.where(User.tenant_id == target_tenant_id)
+    if current_user.role == "platform_admin":
+        target_tenant_id = tenant_id or current_user.tenant_id
+        if target_tenant_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail="tenant_id is required for a tenantless platform administrator",
+            )
+    elif target_tenant_id is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Organization membership is required",
+        )
+    query = query.where(User.tenant_id == target_tenant_id)
 
     query = query.order_by(User.display_name)
     result = await db.execute(query)

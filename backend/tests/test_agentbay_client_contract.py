@@ -10,6 +10,8 @@ from app.services.agentbay_client import (
     AGENTBAY_SDK_TIMEOUT_MS,
     AgentBayClient,
     _agentbay_sessions,
+    _close_agentbay_lanes_for_agent,
+    _close_agentbay_lanes_for_chat_session,
     get_existing_agentbay_client_for_agent,
     _get_active_agentbay_ledger,
     _inject_credentials,
@@ -20,6 +22,7 @@ from app.api.admin import (
     AgentBayCleanupReconcileRequest,
     reconcile_agentbay_cleanup_required,
 )
+from app.services import agent_tools
 
 
 def _failed_result(**values):
@@ -361,9 +364,11 @@ class _RowsResult:
 
 
 class _LedgerSession:
-    def __init__(self, rows):
+    def __init__(self, rows, tenant_id=None):
         self.rows = rows
+        self.tenant_id = tenant_id or uuid.uuid4()
         self.commit = AsyncMock()
+        self.rollback = AsyncMock()
 
     async def __aenter__(self):
         return self
@@ -372,6 +377,8 @@ class _LedgerSession:
         return None
 
     async def execute(self, _query):
+        if "agents.tenant_id" in str(_query):
+            return _ScalarResult(self.tenant_id)
         return _RowsResult(self.rows)
 
 
@@ -389,6 +396,112 @@ def _ledger(*, user_id, session_id, status="active", binding_version=2):
         error_message=None,
         closed_at=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_agent_delete_is_blocked_by_provider_identity_collision():
+    collision = SimpleNamespace(status="provider_identity_collision")
+    session = _LedgerSession([collision])
+
+    with patch("app.database.async_session", return_value=session):
+        with pytest.raises(RuntimeError, match="collision must be reconciled"):
+            await _close_agentbay_lanes_for_agent(agent_id=uuid.uuid4())
+
+    session.rollback.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_chat_delete_is_blocked_by_provider_identity_collision():
+    collision = SimpleNamespace(status="provider_identity_collision")
+    session = _LedgerSession([collision])
+
+    with patch("app.database.async_session", return_value=session):
+        with pytest.raises(RuntimeError, match="collision must be reconciled"):
+            await _close_agentbay_lanes_for_chat_session(
+                agent_id=uuid.uuid4(),
+                user_id=uuid.uuid4(),
+                session_id="collision-chat",
+            )
+
+    session.rollback.assert_awaited_once()
+
+
+def _deletion_ledger(
+    *,
+    tenant_id,
+    agent_id,
+    user_id,
+    session_id,
+    binding_version=2,
+):
+    return SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        user_id=user_id,
+        chat_session_id=str(session_id),
+        provider_session_id="provider-session",
+        image_type="browser",
+        status="cleanup_required",
+        context={"binding_version": binding_version},
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_delete_never_attaches_untrusted_legacy_provider_identity():
+    tenant_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    row = _deletion_ledger(
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        user_id=uuid.uuid4(),
+        session_id=uuid.uuid4(),
+        binding_version=1,
+    )
+    session = _LedgerSession([row], tenant_id=tenant_id)
+
+    with (
+        patch("app.database.async_session", return_value=session),
+        patch(
+            "app.services.agentbay_client._configured_agentbay_client",
+            AsyncMock(),
+        ) as configured,
+    ):
+        with pytest.raises(RuntimeError, match="untrusted provider binding"):
+            await _close_agentbay_lanes_for_agent(agent_id=agent_id)
+
+    configured.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_chat_delete_never_attaches_cross_owner_provider_identity():
+    tenant_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    session_id = uuid.uuid4()
+    row = _deletion_ledger(
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        user_id=uuid.uuid4(),
+        session_id=session_id,
+    )
+    session = _LedgerSession([row], tenant_id=tenant_id)
+
+    with (
+        patch("app.database.async_session", return_value=session),
+        patch(
+            "app.services.agentbay_client._configured_agentbay_client",
+            AsyncMock(),
+        ) as configured,
+    ):
+        with pytest.raises(RuntimeError, match="untrusted provider binding"):
+            await _close_agentbay_lanes_for_chat_session(
+                agent_id=agent_id,
+                user_id=user_id,
+                session_id=str(session_id),
+            )
+
+    configured.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -468,6 +581,7 @@ async def test_admin_can_close_orphan_cleanup_only_with_exact_out_of_band_proof(
         tenant_id=None,
         agent_id=None,
         user_id=None,
+        chat_session_id=None,
         status="cleanup_required",
         provider_session_id=provider_session_id,
         image_type="browser_latest",
@@ -520,10 +634,11 @@ async def test_admin_releases_db_transaction_before_provider_cleanup():
         tenant_id=uuid.uuid4(),
         agent_id=agent_id,
         user_id=uuid.uuid4(),
+        chat_session_id="trusted-chat-lane",
         status="cleanup_required",
         provider_session_id=provider_session_id,
         image_type="browser_latest",
-        context={},
+        context={"binding_version": 2},
         close_reason=None,
         error_message="cleanup required",
         closed_at=None,
@@ -581,10 +696,14 @@ async def test_admin_provider_cleanup_propagates_cancellation():
     provider_session_id = "provider-session-exact"
     ledger = SimpleNamespace(
         id=ledger_id,
+        tenant_id=uuid.uuid4(),
         agent_id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+        chat_session_id="trusted-chat-lane",
         status="cleanup_required",
         provider_session_id=provider_session_id,
         image_type="browser_latest",
+        context={"binding_version": 2},
     )
     db = SimpleNamespace(
         execute=AsyncMock(return_value=_ScalarResult(ledger)),
@@ -611,3 +730,261 @@ async def test_admin_provider_cleanup_propagates_cancellation():
 
     db.rollback.assert_awaited()
     client.delete_session_strict.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_admin_never_attaches_untrusted_legacy_cleanup_binding():
+    ledger_id = uuid.uuid4()
+    provider_session_id = "provider-session-legacy"
+    ledger = SimpleNamespace(
+        id=ledger_id,
+        tenant_id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+        chat_session_id="legacy-chat-lane",
+        status="cleanup_required",
+        provider_session_id=provider_session_id,
+        image_type="browser_latest",
+        context={"binding_version": 1},
+    )
+    db = SimpleNamespace(
+        execute=AsyncMock(return_value=_ScalarResult(ledger)),
+        rollback=AsyncMock(),
+    )
+    configured_client = AsyncMock()
+
+    with patch(
+        "app.services.agentbay_client._configured_agentbay_client",
+        configured_client,
+    ):
+        with pytest.raises(Exception) as exc_info:
+            await reconcile_agentbay_cleanup_required(
+                ledger_id,
+                AgentBayCleanupReconcileRequest(
+                    provider_session_id=provider_session_id,
+                ),
+                current_user=SimpleNamespace(id=uuid.uuid4()),
+                db=db,
+            )
+
+    assert getattr(exc_info.value, "status_code", None) == 409
+    assert "cannot be attached automatically" in str(
+        getattr(exc_info.value, "detail", "")
+    )
+    db.rollback.assert_awaited_once()
+    configured_client.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_release_disabled_browser_login_rejects_before_provider_use():
+    provider_login = AsyncMock()
+
+    with patch.object(agent_tools, "_agentbay_browser_login", provider_login):
+        result = await agent_tools.execute_tool(
+            "agentbay_browser_login",
+            {
+                "url": "https://example.test/login",
+                "login_config": '{"api_key":"must-not-reach-provider"}',
+            },
+            uuid.uuid4(),
+            uuid.uuid4(),
+        )
+
+    assert "disabled by the release safety policy" in result
+    provider_login.assert_not_awaited()
+    login_schema = next(
+        tool["function"]
+        for tool in agent_tools.AGENT_TOOLS
+        if tool["function"]["name"] == "agentbay_browser_login"
+    )
+    assert "login_config" not in str(login_schema)
+
+
+@pytest.mark.asyncio
+async def test_release_disabled_file_transfer_rejects_before_provider_use():
+    transfer = AsyncMock()
+
+    with patch.object(agent_tools, "_run_agentbay_file_transfer", transfer):
+        result = await agent_tools.execute_tool(
+            "agentbay_file_transfer",
+            {
+                "from_type": "computer",
+                "from_path": "/home/wuying/桌面/large.bin",
+                "to_type": "workspace",
+                "to_path": "workspace/large.bin",
+            },
+            uuid.uuid4(),
+            uuid.uuid4(),
+        )
+
+    assert "disabled by the release safety policy" in result
+    transfer.assert_not_awaited()
+    transfer_schema = next(
+        tool["function"]
+        for tool in agent_tools.AGENT_TOOLS
+        if tool["function"]["name"] == "agentbay_file_transfer"
+    )
+    assert transfer_schema["parameters"]["properties"] == {}
+
+
+def test_agentbay_workspace_transfer_rejects_sibling_prefix_escape(tmp_path):
+    workspace = tmp_path / "agent"
+    sibling = tmp_path / "agent-other"
+    workspace.mkdir()
+    sibling.mkdir()
+    (sibling / "secret.txt").write_text("secret", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="inside this Agent workspace"):
+        agent_tools._normalize_agentbay_workspace_transfer_path(
+            "../agent-other/secret.txt"
+        )
+    with pytest.raises(ValueError, match="inside this Agent workspace"):
+        agent_tools._agentbay_temp_workspace_file(
+            workspace,
+            "../agent-other/secret.txt",
+        )
+
+
+@pytest.mark.asyncio
+async def test_agentbay_file_transfer_never_executes_model_controlled_path(
+    tmp_path,
+):
+    workspace = tmp_path / "materialized-agent"
+    source = workspace / "workspace" / "report.txt"
+    source.parent.mkdir(parents=True)
+    source.write_text("safe", encoding="utf-8")
+    command_exec = MagicMock()
+    upload_file = MagicMock(
+        return_value=SimpleNamespace(success=True, bytes_sent=4)
+    )
+    client = SimpleNamespace(
+        _session=SimpleNamespace(
+            file_system=SimpleNamespace(upload_file=upload_file),
+            command=SimpleNamespace(exec=command_exec),
+        )
+    )
+    destination = "/home/wuying/桌面/report'; touch /tmp/injected; '.txt"
+
+    with patch(
+        "app.services.agentbay_client.get_agentbay_client_for_agent",
+        AsyncMock(return_value=client),
+    ):
+        outcome = await agent_tools._agentbay_file_transfer(
+            uuid.uuid4(),
+            workspace,
+            {
+                "from_type": "workspace",
+                "from_path": "workspace/report.txt",
+                "to_type": "computer",
+                "to_path": destination,
+                "_session_id": str(uuid.uuid4()),
+            },
+        )
+
+    assert outcome.ok is True
+    command_exec.assert_not_called()
+    assert upload_file.call_args.args[1] == destination
+
+
+@pytest.mark.asyncio
+async def test_agentbay_file_transfer_rejects_oversized_workspace_file(
+    tmp_path,
+):
+    workspace = tmp_path / "materialized-agent"
+    source = workspace / "workspace" / "large.bin"
+    source.parent.mkdir(parents=True)
+    with source.open("wb") as handle:
+        handle.seek(agent_tools.MAX_AGENTBAY_TRANSFER_BYTES)
+        handle.write(b"x")
+    provider = AsyncMock()
+
+    with patch(
+        "app.services.agentbay_client.get_agentbay_client_for_agent",
+        provider,
+    ):
+        outcome = await agent_tools._agentbay_file_transfer(
+            uuid.uuid4(),
+            workspace,
+            {
+                "from_type": "workspace",
+                "from_path": "workspace/large.bin",
+                "to_type": "computer",
+                "to_path": "/home/wuying/桌面/large.bin",
+            },
+        )
+
+    assert outcome.ok is False
+    assert "size limit" in outcome.message
+    provider.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_failed_agentbay_download_never_flushes_partial_workspace_file(
+    tmp_path,
+):
+    root = tmp_path / "temporary-materialization"
+    root.mkdir()
+    temp_workspace = SimpleNamespace(root=root, cleanup=MagicMock())
+    flush = AsyncMock()
+    failed_transfer = AsyncMock(
+        return_value=agent_tools.AgentBayFileTransferOutcome(
+            False,
+            "❌ AgentBay file download failed",
+        )
+    )
+
+    with (
+        patch.object(
+            agent_tools,
+            "_prepare_temp_workspace",
+            AsyncMock(return_value=temp_workspace),
+        ),
+        patch.object(agent_tools, "_agentbay_file_transfer", failed_transfer),
+        patch.object(agent_tools, "flush_temp_workspace", flush),
+    ):
+        result = await agent_tools._run_agentbay_file_transfer(
+            uuid.uuid4(),
+            str(uuid.uuid4()),
+            {
+                "from_type": "computer",
+                "from_path": "/home/wuying/桌面/report.txt",
+                "to_type": "workspace",
+                "to_path": "workspace/report.txt",
+            },
+        )
+
+    assert "download failed" in result
+    flush.assert_not_awaited()
+    temp_workspace.cleanup.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_agentbay_code_transfer_is_blocked_before_materialization():
+    prepare = AsyncMock()
+
+    with (
+        patch.object(
+            agent_tools,
+            "_get_agent_tenant_id",
+            AsyncMock(return_value=str(uuid.uuid4())),
+        ),
+        patch.object(
+            agent_tools,
+            "get_settings",
+            return_value=SimpleNamespace(CODE_EXECUTION_ENABLED=False),
+        ),
+        patch.object(agent_tools, "_prepare_temp_workspace", prepare),
+    ):
+        result = await agent_tools._run_agentbay_file_transfer(
+            uuid.uuid4(),
+            str(uuid.uuid4()),
+            {
+                "from_type": "workspace",
+                "from_path": "workspace/report.txt",
+                "to_type": "code",
+                "to_path": "/home/wuying/report.txt",
+            },
+        )
+
+    assert "Code execution is disabled" in result
+    prepare.assert_not_awaited()

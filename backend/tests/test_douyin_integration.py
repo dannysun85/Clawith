@@ -8,6 +8,7 @@ import hashlib
 import json
 from urllib.parse import parse_qs, urlparse
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -246,7 +247,7 @@ def test_douyin_h5_share_schema_is_server_signed():
 
 
 @pytest.mark.asyncio
-async def test_douyin_publish_job_is_approval_first_and_persists_schedule():
+async def test_douyin_publish_job_is_approval_first_and_persists_schedule(monkeypatch):
     tenant_id = uuid.uuid4()
     agent_id = uuid.uuid4()
     user_id = uuid.uuid4()
@@ -265,11 +266,17 @@ async def test_douyin_publish_job_is_approval_first_and_persists_schedule():
             account,  # _get_or_first_account
         ]
     )
+    monkeypatch.setattr(
+        douyin_operations,
+        "get_agent_access_level_for_user_id",
+        AsyncMock(return_value="manage"),
+    )
 
     job = await douyin_operations_service.create_publish_job(
         db,
         tenant_id=tenant_id,
         user_id=user_id,
+        requester_id=user_id,
         agent_id=agent_id,
         account_id=account_id,
         content_type="video",

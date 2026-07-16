@@ -4,6 +4,7 @@ import base64
 import os
 import uuid
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, Form
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,18 +29,31 @@ TEXT_EXTENSIONS = {
     ".ini", ".cfg", ".conf", ".env", ".toml",
 }
 OFFICE_EXTENSIONS = {".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt"}
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
 EXTRACTABLE = TEXT_EXTENSIONS | OFFICE_EXTENSIONS
 
 MIME_MAP = {
     ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-    ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+    ".webp": "image/webp",
     ".mp4": "video/mp4", ".avi": "video/x-msvideo", ".mov": "video/quicktime",
     ".mkv": "video/x-matroska",
 }
 
 MAX_CHAT_UPLOAD_BYTES = 25 * 1024 * 1024
+
+
+def _validate_multimodal_upload_extension(extension: str) -> None:
+    """Reject formats that local decoders accept but MiniMax M3 does not."""
+
+    if extension in {".bmp", ".gif"}:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{extension.removeprefix('.').upper()} is not supported for multimodal chat. "
+                "Convert the image to JPEG, PNG, or WEBP before uploading."
+            ),
+        )
 
 
 async def _read_upload_with_limit(file: UploadFile, limit: int = MAX_CHAT_UPLOAD_BYTES) -> bytes:
@@ -115,6 +129,7 @@ async def upload_file(
         raise HTTPException(status_code=400, detail="No filename")
 
     ext = os.path.splitext(file.filename)[1].lower()
+    _validate_multimodal_upload_extension(ext)
 
     content = await _read_upload_with_limit(file)
     is_image = ext in IMAGE_EXTENSIONS
@@ -135,6 +150,7 @@ async def upload_file(
 
     # Determine save directory
     workspace_path = ""
+    saved_filename = ""
     if agent_id:
         try:
             parsed_agent_id = uuid.UUID(agent_id)
@@ -143,24 +159,35 @@ async def upload_file(
         await check_agent_access(db, current_user, parsed_agent_id)
         storage = get_storage_backend()
         filename = file.filename.replace("/", "_").replace("\\", "_")
-        workspace_path = f"workspace/uploads/{filename}"
+        stem, suffix = os.path.splitext(filename)
+        # Object stores and local storage both overwrite an existing key.  A
+        # check-then-write loop is therefore racy when two users upload the
+        # same name concurrently.  Allocate a unique key up front instead.
+        stored_filename = f"{stem}_{uuid.uuid4().hex[:12]}{suffix}"
+        saved_filename = stored_filename
+        workspace_path = f"workspace/uploads/{stored_filename}"
         key = normalize_storage_key(f"{parsed_agent_id}/{workspace_path}")
-        counter = 1
-        while await storage.exists(key):
-            stem, ext = os.path.splitext(filename)
-            filename = f"{stem}_{counter}{ext}"
-            workspace_path = f"workspace/uploads/{filename}"
-            key = normalize_storage_key(f"{parsed_agent_id}/{workspace_path}")
-            counter += 1
-        await storage.write_bytes(key, content, content_type=guess_content_type(filename))
+        await storage.write_bytes(
+            key,
+            content,
+            content_type=guess_content_type(stored_filename),
+        )
         save_path = await ensure_local_path(key)
     else:
         # Fallback: save to /tmp (legacy behavior)
         fallback_dir = Path("/tmp/clawith_uploads")
-        fallback_dir.mkdir(exist_ok=True)
-        file_id = str(uuid.uuid4())[:8]
-        save_path = fallback_dir / f"{file_id}_{file.filename}"
-        save_path.write_bytes(content)
+        fallback_dir.mkdir(mode=0o700, exist_ok=True)
+        suffix = Path(file.filename.replace("\\", "/")).suffix[:20]
+        with NamedTemporaryFile(
+            mode="wb",
+            prefix="chat-upload-",
+            suffix=suffix,
+            dir=fallback_dir,
+            delete=False,
+        ) as handle:
+            handle.write(content)
+            save_path = Path(handle.name)
+        saved_filename = save_path.name
 
     # Extract text (only for known formats)
     image_data_url = ""
@@ -187,7 +214,7 @@ async def upload_file(
 
     return {
         "filename": file.filename,
-        "saved_filename": save_path.name,
+        "saved_filename": saved_filename,
         "size": len(content),
         "extracted_text": extracted,
         "workspace_path": workspace_path,

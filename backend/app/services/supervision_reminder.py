@@ -19,12 +19,13 @@ from app.database import async_session
 from app.models.task import Task, TaskLog
 from app.models.agent import Agent
 from app.services.llm import LLMError
+from app.config import get_settings
 
 # Fail closed for v1.10.12 RC5. The previous implementation held database
 # transactions across LLM/provider calls and had no durable exactly-once claim,
 # so enabling it could duplicate sends, token spend, and Credits settlement.
 # Re-enabling requires a separate durable-worker design and explicit release.
-SUPERVISION_EXECUTION_ENABLED = False
+SUPERVISION_EXECUTION_ENABLED = get_settings().SUPERVISION_EXECUTION_ENABLED
 
 # Schedule JSON format:
 # {"freq": "daily"|"weekly", "interval": N, "time": "HH:MM", "weekdays": [0-6]}

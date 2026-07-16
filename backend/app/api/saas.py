@@ -77,7 +77,7 @@ from app.services.minimax_media_profiles import (
     minimax_media_override_snapshot,
     resolve_minimax_media_profile,
 )
-from app.services.modalities import canonicalize_modalities, canonicalize_modality
+from app.services.modalities import canonicalize_modalities, canonicalize_modality, model_supports_modality
 from app.services.provider_pricing import (
     minimax_image_credits,
     minimax_music_credits,
@@ -147,19 +147,30 @@ def _validate_model_route(model: LLMModel, modality: str) -> str:
             status_code=400,
             detail=f"{canonical} generation must be configured in SaaS media routes, not LLM model routes.",
         )
-    model_modalities = set(canonicalize_modalities(model.modalities or [model.modality]))
-    if model.supports_vision:
-        model_modalities.add("image")
-    if canonical == "multimodal":
-        compatible = "multimodal" in model_modalities
-    else:
-        compatible = canonical in model_modalities or "multimodal" in model_modalities
-    if not compatible:
+    if not model_supports_modality(
+        canonical,
+        model_modality=model.modality,
+        model_modalities=model.modalities,
+        supports_vision=model.supports_vision,
+    ):
         raise HTTPException(
             status_code=400,
             detail=f"Model '{model.label}' does not support the '{canonical}' route modality.",
         )
     return canonical
+
+
+def _validate_platform_route_model(model: LLMModel) -> None:
+    """Global Lite/Pro/Ultra routes may only use platform-owned models."""
+
+    if getattr(model, "tenant_id", None) is not None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "SaaS model routes can only use platform-owned models; "
+                "tenant API keys are never shared through global routes."
+            ),
+        )
 
 
 async def _ensure_model_route_slot_available(
@@ -220,6 +231,7 @@ async def _validate_fallback_route(
     fallback_model = await db.get(LLMModel, fallback.llm_model_id)
     if not fallback_model or not fallback_model.enabled:
         raise HTTPException(status_code=400, detail="Fallback model must be enabled")
+    _validate_platform_route_model(fallback_model)
     _validate_model_route(fallback_model, modality)
 
     visited: set[uuid.UUID] = set()
@@ -233,6 +245,49 @@ async def _validate_fallback_route(
         cursor = await db.get(ModelRoute, cursor.fallback_route_id)
         if not cursor:
             break
+
+
+async def _inbound_fallback_routes(
+    db: AsyncSession,
+    route_id: uuid.UUID,
+    *,
+    enabled_only: bool,
+) -> list[ModelRoute]:
+    """Lock routes that depend on ``route_id`` as their fallback target."""
+
+    query = select(ModelRoute).where(ModelRoute.fallback_route_id == route_id)
+    if enabled_only:
+        query = query.where(ModelRoute.enabled == True)  # noqa: E712
+    result = await db.execute(query.order_by(ModelRoute.id).with_for_update())
+    return list(result.scalars().all())
+
+
+def _validate_inbound_fallback_continuity(
+    inbound_routes: list[ModelRoute],
+    *,
+    enabled: bool,
+    saas_tier: str,
+    modality: str,
+) -> None:
+    """Prevent an edit from silently invalidating active fallback users."""
+
+    incompatible = [
+        route
+        for route in inbound_routes
+        if not enabled
+        or route.saas_tier != saas_tier
+        or route.modality != modality
+    ]
+    if not incompatible:
+        return
+    dependants = ", ".join(str(route.id) for route in incompatible[:5])
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            "This route is an active fallback target. Remove the inbound fallback "
+            f"references before disabling it or changing its slot: {dependants}"
+        ),
+    )
 
 
 @router.get("/model-routes", response_model=list[ModelRouteOut])
@@ -255,6 +310,7 @@ async def create_model_route(
     model = await db.get(LLMModel, data.llm_model_id)
     if not model:
         raise HTTPException(status_code=404, detail="LLM model not found")
+    _validate_platform_route_model(model)
     if data.enabled and not model.enabled:
         raise HTTPException(status_code=400, detail="Enabled routes require an enabled LLM model")
     data.modality = _validate_model_route(model, data.modality)
@@ -293,7 +349,10 @@ async def update_model_route(
     db: AsyncSession = Depends(get_db),
 ):
     """Update a model route."""
-    route = await db.get(ModelRoute, route_id)
+    result = await db.execute(
+        select(ModelRoute).where(ModelRoute.id == route_id).with_for_update()
+    )
+    route = result.scalar_one_or_none()
     if not route:
         raise HTTPException(status_code=404, detail="Route not found")
     before = _snapshot(route, ["saas_tier", "modality", "llm_model_id", "priority", "fallback_route_id", "enabled"])
@@ -305,6 +364,9 @@ async def update_model_route(
             raise HTTPException(status_code=404, detail="LLM model not found")
     else:
         model = await db.get(LLMModel, route.llm_model_id)
+    if not model:
+        raise HTTPException(status_code=404, detail="LLM model not found")
+    _validate_platform_route_model(model)
     prospective_tier = update.get("saas_tier", route.saas_tier)
     prospective_modality = _validate_model_route(
         model,
@@ -316,6 +378,17 @@ async def update_model_route(
     update["modality"] = prospective_modality
     if prospective_enabled and not model.enabled:
         raise HTTPException(status_code=400, detail="Enabled routes require an enabled LLM model")
+    inbound_routes = await _inbound_fallback_routes(
+        db,
+        route_id,
+        enabled_only=True,
+    )
+    _validate_inbound_fallback_continuity(
+        inbound_routes,
+        enabled=prospective_enabled,
+        saas_tier=prospective_tier,
+        modality=prospective_modality,
+    )
     await _ensure_model_route_slot_available(
         db,
         saas_tier=prospective_tier,
@@ -567,9 +640,26 @@ async def delete_model_route(
     db: AsyncSession = Depends(get_db),
 ):
     """Delete a model route."""
-    route = await db.get(ModelRoute, route_id)
+    result = await db.execute(
+        select(ModelRoute).where(ModelRoute.id == route_id).with_for_update()
+    )
+    route = result.scalar_one_or_none()
     if not route:
         raise HTTPException(status_code=404, detail="Route not found")
+    inbound_routes = await _inbound_fallback_routes(
+        db,
+        route_id,
+        enabled_only=False,
+    )
+    if inbound_routes:
+        dependants = ", ".join(str(item.id) for item in inbound_routes[:5])
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Remove every inbound fallback reference before deleting this route: "
+                f"{dependants}"
+            ),
+        )
     before = _snapshot(route, ["saas_tier", "modality", "llm_model_id", "priority", "fallback_route_id", "enabled"])
     await db.delete(route)
     db.add(_admin_audit(

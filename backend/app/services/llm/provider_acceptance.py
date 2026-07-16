@@ -14,7 +14,6 @@ MINIMAX_DETERMINISTIC_REJECTION_CODES = frozenset(
         "1004",  # authentication
         "1008",  # insufficient balance
         "1026",  # input policy
-        "1027",  # output policy
         "1039",  # token limit / validation
         "1041",  # concurrent request limit
         "2013",  # invalid parameter

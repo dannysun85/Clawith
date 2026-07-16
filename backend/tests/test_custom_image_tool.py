@@ -1,5 +1,4 @@
 import base64
-from contextlib import ExitStack
 from functools import lru_cache
 from io import BytesIO
 import json
@@ -29,6 +28,7 @@ from app.services.agent_tools import (
     _json_path_get,
     _is_minimax_deterministic_rejection,
     _minimax_image_acceptance_evidence_key,
+    _minimax_http_error,
     _minimax_audio_hex_to_bytes,
     _load_minimax_image_acceptance_evidence,
     _merge_runtime_tool_config,
@@ -43,7 +43,6 @@ from app.services.agent_tools import (
 )
 from app.api import tools as tools_api
 from app.services.quota_guard import QuotaExceeded
-from app.services.media_assets import validate_generated_image
 from app.services.minimax_media_profiles import resolve_minimax_media_profile
 
 
@@ -706,45 +705,51 @@ async def test_generate_image_minimax_records_success(tmp_path):
     agent_id = uuid.uuid4()
     tenant_id = uuid.uuid4()
     cred_id = uuid.uuid4()
-    reservation_id = uuid.uuid4()
     cred = SimpleNamespace(id=cred_id, base_url=None)
-    reservation = SimpleNamespace(id=reservation_id)
     generated = _valid_png_bytes()
+
+    async def provider(**kwargs):
+        await kwargs["on_provider_accepted"]("https://asset.example/generated.png")
+        return generated
+
+    created_task = SimpleNamespace(
+        request_metadata={"recovery_asset_storage_key": "_internal/recovery/image.bin"}
+    )
 
     with (
         patch("app.services.agent_tools._get_tool_config", AsyncMock(return_value={"model": "image-01"})),
-        patch("app.services.agent_tools._get_agent_tenant_id", AsyncMock(return_value=str(tenant_id))),
         patch("app.services.agent_tools._resolve_minimax_tool_tier", AsyncMock(return_value="pro")),
         patch("app.services.agent_tools._check_minimax_credit_amount", AsyncMock()) as check_credits,
-        patch("app.services.agent_tools._reserve_minimax_tool_credits", AsyncMock(return_value=reservation)) as reserve_credits,
-        patch("app.services.agent_tools._mark_minimax_tool_reservation_settlement_ready", AsyncMock()) as mark_settlement_ready,
-        patch("app.services.agent_tools._finalize_minimax_tool_reservation", AsyncMock()) as finalize_credits,
-        patch("app.services.agent_tools._release_minimax_tool_reservation", AsyncMock()) as release_credits,
-        patch("app.services.quota_guard.check_plan_generation_entitlement", AsyncMock()),
-        patch("app.services.quota_guard.check_agent_llm_quota", AsyncMock()),
+        patch("app.services.agent_tools._get_minimax_tenant_uuid", AsyncMock(return_value=tenant_id)),
+        patch("app.services.agent_tools._check_minimax_tool_allowed", AsyncMock(return_value=None)),
         patch("app.services.llm.load_balancer.pick_credential", AsyncMock(return_value=cred)),
         patch("app.services.llm.utils.get_credential_api_key", MagicMock(return_value="sk-test")),
         patch(
             "app.services.minimax_media_profiles.load_platform_minimax_media_profile",
             AsyncMock(return_value=resolve_minimax_media_profile("image", "pro")),
         ),
-        patch("app.services.agent_tools._generate_image_minimax", AsyncMock(return_value=generated)),
+        patch("app.services.agent_tools._generate_image_minimax", AsyncMock(side_effect=provider)) as provider_call,
         patch(
             "app.services.agent_tools._store_minimax_image_acceptance_evidence",
-            AsyncMock(
-                return_value=(
-                    "_internal/provider-recovery.json",
-                    f"minimax-image-recovery:{reservation_id}",
-                )
-            ),
+            AsyncMock(return_value=("_internal/provider-recovery.json", "opaque")),
         ) as store_evidence,
         patch(
-            "app.services.agent_tools._delete_minimax_image_acceptance_evidence",
+            "app.services.media_generation.create_minimax_sync_media_task_record",
+            AsyncMock(return_value=created_task),
+        ) as create_task,
+        patch(
+            "app.services.media_generation.mark_minimax_sync_provider_accepted",
             AsyncMock(),
-        ) as delete_evidence,
-        patch("app.services.storage.store_agent_bytes", AsyncMock(return_value="stored-key")) as store_bytes,
-        patch("app.services.llm.load_balancer.record_credential_call", AsyncMock()) as record_call,
-        patch("app.services.quota_guard.consume_agent_llm_quota", AsyncMock()) as consume_quota,
+        ) as mark_accepted,
+        patch(
+            "app.services.media_generation.store_minimax_sync_recovery_asset",
+            AsyncMock(),
+        ) as store_recovery,
+        patch(
+            "app.services.media_generation.reconcile_minimax_sync_media_task",
+            AsyncMock(return_value=SimpleNamespace(status="succeeded")),
+        ) as reconcile,
+        patch("app.services.agent_tools._record_minimax_tool_success", AsyncMock()) as record_success,
     ):
         result = await _generate_image(
             agent_id,
@@ -754,100 +759,115 @@ async def test_generate_image_minimax_records_success(tmp_path):
         )
 
     assert "✅ Image generated" in result
-    saved = (tmp_path / "workspace/images/cat.png").read_bytes()
-    assert validate_generated_image(saved) == (512, 512)
-    record_call.assert_awaited_once_with(cred_id, tokens_used=0)
-    consume_quota.assert_awaited_once_with(agent_id, model_tier="pro")
     check_credits.assert_awaited_once_with(tenant_id, 4)
-    reserve_credits.assert_awaited_once()
-    assert reserve_credits.await_args.kwargs["tenant_id"] == tenant_id
-    assert reserve_credits.await_args.kwargs["action"] == "image"
-    assert reserve_credits.await_args.kwargs["modality"] == "image"
-    assert reserve_credits.await_args.kwargs["tier"] == "pro"
-    assert reserve_credits.await_args.kwargs["model"] == "image-01"
-    assert reserve_credits.await_args.kwargs["credits"] == 4
-    assert reserve_credits.await_args.kwargs["initial_status"] == "provider_inflight"
-    mark_settlement_ready.assert_awaited_once_with(reservation_id, amount=4)
-    store_evidence.assert_awaited_once()
-    assert store_evidence.await_args.kwargs["agent_id"] == agent_id
-    assert store_evidence.await_args.kwargs["recovery_id"] == reservation_id
-    assert store_evidence.await_args.kwargs["image_url"] is None
-    delete_evidence.assert_awaited_once_with("_internal/provider-recovery.json")
-    store_bytes.assert_awaited_once()
-    final_call = store_bytes.await_args
-    assert final_call.args[:2] == (agent_id, "workspace/images/cat.png")
-    assert validate_generated_image(final_call.args[2]) == (512, 512)
-    assert final_call.kwargs["content_type"] == "image/png"
-    finalize_credits.assert_awaited_once_with(reservation_id)
-    release_credits.assert_not_awaited()
+    create_task.assert_awaited_once()
+    creation = create_task.await_args.kwargs
+    assert creation["tenant_id"] == tenant_id
+    assert creation["credential_id"] == cred_id
+    assert creation["modality"] == "image"
+    assert creation["tier"] == "pro"
+    assert creation["model"] == "image-01"
+    assert creation["credit_cost"] == 4
+    assert creation["output_path"].startswith("workspace/images/cat_")
+    assert creation["output_path"].endswith(".png")
+    record_id = creation["record_id"]
+    provider_call.assert_awaited_once()
+    assert store_evidence.await_args.kwargs["recovery_id"] == record_id
+    mark_accepted.assert_awaited_once_with(
+        record_id,
+        evidence_key="_internal/provider-recovery.json",
+        accepted_metadata={"status": "Accepted"},
+    )
+    store_recovery.assert_awaited_once_with(
+        record_id,
+        generated,
+        content_type="application/octet-stream",
+        expected_key="_internal/recovery/image.bin",
+    )
+    reconcile.assert_awaited_once_with(record_id, deliver_completion=False)
+    record_success.assert_awaited_once_with(
+        agent_id,
+        cred_id,
+        tier="pro",
+        modality="image",
+        model="image-01",
+    )
 
 
 @pytest.mark.asyncio
 async def test_generate_image_storage_failure_preserves_provider_debt_and_raw_recovery(tmp_path):
     agent_id = uuid.uuid4()
     tenant_id = uuid.uuid4()
-    reservation_id = uuid.uuid4()
-    cred = SimpleNamespace(id=uuid.uuid4(), base_url=None)
-    reservation = SimpleNamespace(id=reservation_id)
+    credential_id = uuid.uuid4()
+    generated = _valid_png_bytes()
 
-    storage_calls: list[str] = []
-
-    async def store_with_recovery(_agent_id, rel_path, _data, *, content_type=None):
-        storage_calls.append(rel_path)
-        if len(storage_calls) == 1:
-            raise OSError("object store full")
-        assert content_type == "application/octet-stream"
-        return f"{agent_id}/{rel_path}"
+    async def provider(**kwargs):
+        await kwargs["on_provider_accepted"]("https://asset.example/generated.png")
+        return generated
 
     with (
-        patch("app.services.agent_tools._get_tool_config", AsyncMock(return_value={})),
-        patch("app.services.agent_tools._get_agent_tenant_id", AsyncMock(return_value=str(tenant_id))),
-        patch("app.services.agent_tools._resolve_minimax_tool_tier", AsyncMock(return_value="pro")),
-        patch(
-            "app.services.minimax_media_profiles.load_platform_minimax_media_profile",
-            AsyncMock(return_value=resolve_minimax_media_profile("image", "pro")),
-        ),
-        patch("app.services.agent_tools._check_minimax_credit_amount", AsyncMock()),
-        patch("app.services.agent_tools._reserve_minimax_tool_credits", AsyncMock(return_value=reservation)),
-        patch("app.services.agent_tools._mark_minimax_tool_reservation_settlement_ready", AsyncMock()) as mark_settlement_ready,
-        patch("app.services.agent_tools._finalize_minimax_tool_reservation", AsyncMock()) as finalize_credits,
-        patch("app.services.agent_tools._release_minimax_tool_reservation", AsyncMock()) as release_credits,
-        patch("app.services.quota_guard.check_plan_generation_entitlement", AsyncMock()),
-        patch("app.services.quota_guard.check_agent_llm_quota", AsyncMock()),
-        patch("app.services.llm.load_balancer.pick_credential", AsyncMock(return_value=cred)),
-        patch("app.services.llm.utils.get_credential_api_key", MagicMock(return_value="sk-test")),
-        patch("app.services.agent_tools._generate_image_minimax", AsyncMock(return_value=_valid_png_bytes())),
+        patch("app.services.agent_tools._generate_image_minimax", AsyncMock(side_effect=provider)),
         patch(
             "app.services.agent_tools._store_minimax_image_acceptance_evidence",
-            AsyncMock(
-                return_value=(
-                    "_internal/provider-recovery.json",
-                    f"minimax-image-recovery:{reservation_id}",
-                )
-            ),
+            AsyncMock(return_value=("_internal/provider-recovery.json", "opaque")),
         ),
         patch(
-            "app.services.agent_tools._delete_minimax_image_acceptance_evidence",
-            AsyncMock(),
-        ),
-        patch("app.services.storage.store_agent_bytes", AsyncMock(side_effect=store_with_recovery)),
+            "app.services.media_generation.create_minimax_sync_media_task_record",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    request_metadata={"recovery_asset_storage_key": "_internal/recovery/image.bin"}
+                )
+            ),
+        ) as create_task,
+        patch("app.services.media_generation.mark_minimax_sync_provider_accepted", AsyncMock()) as mark_accepted,
+        patch(
+            "app.services.media_generation.store_minimax_sync_recovery_asset",
+            AsyncMock(side_effect=OSError("object store full")),
+        ) as store_recovery,
+        patch("app.services.media_generation.mark_media_generation_submission_ambiguous", AsyncMock()) as ambiguous,
+        patch("app.services.media_generation.mark_media_generation_submission_failed", AsyncMock()) as failed,
+        patch("app.services.media_generation.reconcile_minimax_sync_media_task", AsyncMock()) as reconcile,
         patch("app.services.agent_tools._record_minimax_tool_product_issue", AsyncMock()) as record_issue,
-        patch("app.services.llm.load_balancer.record_credential_call", AsyncMock()) as record_call,
-        patch("app.services.quota_guard.consume_agent_llm_quota", AsyncMock()) as consume_quota,
+        patch("app.services.agent_tools._mark_minimax_tool_credential_failure", AsyncMock()) as mark_credential,
     ):
-        result = await _generate_image(agent_id, tmp_path, {"prompt": "cat"}, "minimax")
+        result = await agent_tools._generate_image_minimax_durable(
+            agent_id=agent_id,
+            ws=tmp_path,
+            arguments={},
+            user_id=None,
+            session_id="",
+            tenant_id=tenant_id,
+            credential_id=credential_id,
+            api_key="sk-test",
+            base_url="https://api.minimax.test",
+            model="image-01",
+            tier="pro",
+            credit_cost=4,
+            provider_prompt="cat",
+            save_path="workspace/images/cat.png",
+            output_extension=".png",
+            overlay_text="",
+            overlay_position="bottom",
+            brand_asset=None,
+            brand_position="center",
+            brand_scale=0.42,
+        )
 
-    assert "No usable asset was delivered" in result
+    assert "held by the durable recovery worker" in result
     assert "object store full" not in result
-    mark_settlement_ready.assert_awaited_once_with(reservation_id, amount=4)
-    assert storage_calls[0].startswith("workspace/images/cat_")
-    assert storage_calls[0].endswith(".png")
-    assert storage_calls[1] == f"workspace/media_inputs/{reservation_id}_provider_image.bin"
-    finalize_credits.assert_awaited_once_with(reservation_id)
-    release_credits.assert_not_awaited()
-    assert record_issue.await_args.kwargs["recovery_path"] == storage_calls[1]
-    record_call.assert_not_awaited()
-    consume_quota.assert_not_awaited()
+    record_id = create_task.await_args.kwargs["record_id"]
+    mark_accepted.assert_awaited_once()
+    store_recovery.assert_awaited_once_with(
+        record_id,
+        generated,
+        content_type="application/octet-stream",
+        expected_key="_internal/recovery/image.bin",
+    )
+    ambiguous.assert_not_awaited()
+    failed.assert_not_awaited()
+    reconcile.assert_not_awaited()
+    mark_credential.assert_not_awaited()
+    assert record_issue.await_args.kwargs["recovery_path"] == f"media-task:{record_id}"
 
 
 @pytest.mark.parametrize(
@@ -866,12 +886,8 @@ async def test_generate_image_accepted_provider_faults_never_refund_or_replay(
 ):
     agent_id = uuid.uuid4()
     tenant_id = uuid.uuid4()
-    reservation_id = uuid.uuid4()
     credential_id = uuid.uuid4()
-    reservation = SimpleNamespace(id=reservation_id)
-    credential = SimpleNamespace(id=credential_id, base_url=None)
     generated = _valid_png_bytes()
-    storage_calls: list[str] = []
 
     async def provider(**kwargs):
         if failure_mode == "missing_image_url":
@@ -881,176 +897,116 @@ async def test_generate_image_accepted_provider_faults_never_refund_or_replay(
             raise httpx.ReadTimeout("accepted image download timed out")
         return generated
 
-    async def store(_agent_id, rel_path, _data, *, content_type=None):
-        storage_calls.append(rel_path)
-        return f"{agent_id}/{rel_path}"
-
     async def store_evidence(**_kwargs):
         if failure_mode == "evidence_store":
             raise OSError("evidence storage unavailable")
-        return (
-            "_internal/provider-recovery.json",
-            f"minimax-image-recovery:{reservation_id}",
-        )
+        return "_internal/provider-recovery.json", "opaque"
 
-    mark_side_effect = (
-        [RuntimeError("settlement database unavailable"), None]
+    accepted_error = (
+        RuntimeError("settlement database unavailable")
         if failure_mode == "settlement_mark"
         else None
     )
-
-    with ExitStack() as stack:
-        stack.enter_context(
-            patch("app.services.agent_tools._get_tool_config", AsyncMock(return_value={}))
-        )
-        stack.enter_context(
-            patch(
-                "app.services.agent_tools._get_agent_tenant_id",
-                AsyncMock(return_value=str(tenant_id)),
-            )
-        )
-        stack.enter_context(
-            patch(
-                "app.services.agent_tools._resolve_minimax_tool_tier",
-                AsyncMock(return_value="pro"),
-            )
-        )
-        stack.enter_context(
-            patch(
-                "app.services.minimax_media_profiles.load_platform_minimax_media_profile",
-                AsyncMock(return_value=resolve_minimax_media_profile("image", "pro")),
-            )
-        )
-        stack.enter_context(
-            patch("app.services.agent_tools._check_minimax_credit_amount", AsyncMock())
-        )
-        reserve = stack.enter_context(
-            patch(
-                "app.services.agent_tools._reserve_minimax_tool_credits",
-                AsyncMock(return_value=reservation),
-            )
-        )
-        mark_settlement = stack.enter_context(
-            patch(
-                "app.services.agent_tools._mark_minimax_tool_reservation_settlement_ready",
-                AsyncMock(side_effect=mark_side_effect),
-            )
-        )
-        finalize = stack.enter_context(
-            patch(
-                "app.services.agent_tools._finalize_minimax_tool_reservation",
-                AsyncMock(),
-            )
-        )
-        release = stack.enter_context(
-            patch(
-                "app.services.agent_tools._release_minimax_tool_reservation",
-                AsyncMock(),
-            )
-        )
-        stack.enter_context(
-            patch(
-                "app.services.quota_guard.check_plan_generation_entitlement",
-                AsyncMock(),
-            )
-        )
-        stack.enter_context(
-            patch("app.services.quota_guard.check_agent_llm_quota", AsyncMock())
-        )
-        stack.enter_context(
-            patch(
-                "app.services.llm.load_balancer.pick_credential",
-                AsyncMock(return_value=credential),
-            )
-        )
-        stack.enter_context(
-            patch(
-                "app.services.llm.utils.get_credential_api_key",
-                MagicMock(return_value="sk-test"),
-            )
-        )
-        provider_call = stack.enter_context(
-            patch(
-                "app.services.agent_tools._generate_image_minimax",
-                AsyncMock(side_effect=provider),
-            )
-        )
-        evidence_store = stack.enter_context(
-            patch(
-                "app.services.agent_tools._store_minimax_image_acceptance_evidence",
-                AsyncMock(side_effect=store_evidence),
-            )
-        )
-        stack.enter_context(
-            patch(
-                "app.services.agent_tools._delete_minimax_image_acceptance_evidence",
-                AsyncMock(),
-            )
-        )
-        stack.enter_context(
-            patch("app.services.storage.store_agent_bytes", AsyncMock(side_effect=store))
-        )
-        issue = stack.enter_context(
-            patch(
-                "app.services.agent_tools._record_minimax_tool_product_issue",
-                AsyncMock(),
-            )
-        )
-        stack.enter_context(
-            patch("app.services.llm.load_balancer.record_credential_call", AsyncMock())
-        )
-        stack.enter_context(
-            patch("app.services.quota_guard.consume_agent_llm_quota", AsyncMock())
-        )
-        mark_credential = stack.enter_context(
-            patch(
-                "app.services.agent_tools._mark_minimax_tool_credential_failure",
-                AsyncMock(),
-            )
-        )
-        result = await _generate_image(
-            agent_id,
-            tmp_path,
-            {"prompt": "cat", "save_path": "workspace/images/cat.png"},
-            "minimax",
+    with (
+        patch("app.services.agent_tools._generate_image_minimax", AsyncMock(side_effect=provider)) as provider_call,
+        patch(
+            "app.services.agent_tools._store_minimax_image_acceptance_evidence",
+            AsyncMock(side_effect=store_evidence),
+        ) as evidence_store,
+        patch(
+            "app.services.media_generation.create_minimax_sync_media_task_record",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    request_metadata={"recovery_asset_storage_key": "_internal/recovery/image.bin"}
+                )
+            ),
+        ) as create_task,
+        patch(
+            "app.services.media_generation.mark_minimax_sync_provider_accepted",
+            AsyncMock(side_effect=accepted_error),
+        ) as mark_accepted,
+        patch("app.services.media_generation.store_minimax_sync_recovery_asset", AsyncMock()) as store_recovery,
+        patch("app.services.media_generation.reconcile_minimax_sync_media_task", AsyncMock()) as reconcile,
+        patch(
+            "app.services.media_generation.record_minimax_sync_provider_response_retry",
+            AsyncMock(),
+        ) as recovery_retry,
+        patch("app.services.media_generation.mark_media_generation_submission_ambiguous", AsyncMock()) as ambiguous,
+        patch("app.services.media_generation.mark_media_generation_submission_failed", AsyncMock()) as failed,
+        patch("app.services.agent_tools._record_minimax_tool_product_issue", AsyncMock()) as issue,
+        patch("app.services.agent_tools._mark_minimax_tool_credential_failure", AsyncMock()) as mark_credential,
+    ):
+        result = await agent_tools._generate_image_minimax_durable(
+            agent_id=agent_id,
+            ws=tmp_path,
+            arguments={},
+            user_id=None,
+            session_id="",
+            tenant_id=tenant_id,
+            credential_id=credential_id,
+            api_key="sk-test",
+            base_url="https://api.minimax.test",
+            model="image-01",
+            tier="pro",
+            credit_cost=4,
+            provider_prompt="cat",
+            save_path="workspace/images/cat.png",
+            output_extension=".png",
+            overlay_text="",
+            overlay_position="bottom",
+            brand_asset=None,
+            brand_position="center",
+            brand_scale=0.42,
         )
 
-    assert reserve.await_args.kwargs["initial_status"] == "provider_inflight"
+    record_id = create_task.await_args.kwargs["record_id"]
     provider_call.assert_awaited_once()
-    release.assert_not_awaited()
+    failed.assert_not_awaited()
+    reconcile.assert_not_awaited()
+    store_recovery.assert_not_awaited()
+    issue.assert_awaited_once()
     if failure_mode == "missing_image_url":
         evidence_store.assert_not_awaited()
-        mark_settlement.assert_not_awaited()
-        finalize.assert_not_awaited()
+        mark_accepted.assert_not_awaited()
+        recovery_retry.assert_not_awaited()
+        ambiguous.assert_awaited_once()
+        assert ambiguous.await_args.args[0] == record_id
+        assert isinstance(ambiguous.await_args.args[1], ValueError)
         mark_credential.assert_awaited_once()
-        assert "being held for safe reconciliation" in result
-        assert storage_calls == []
+        assert "submission outcome is uncertain" in result
     elif failure_mode == "settlement_mark":
-        evidence_store.assert_awaited()
+        evidence_store.assert_awaited_once()
+        mark_accepted.assert_awaited_once()
+        recovery_retry.assert_awaited_once()
+        ambiguous.assert_not_awaited()
         mark_credential.assert_not_awaited()
-        finalize.assert_awaited_once_with(reservation_id)
-        assert mark_settlement.await_count == 2
-        assert "✅ Image generated" in result
-        assert issue.await_count >= 1
+        assert "repairing the acceptance record" in result
     elif failure_mode == "evidence_store":
-        evidence_store.assert_awaited()
+        evidence_store.assert_awaited_once()
+        mark_accepted.assert_not_awaited()
+        recovery_retry.assert_awaited_once()
+        ambiguous.assert_not_awaited()
         mark_credential.assert_not_awaited()
-        finalize.assert_awaited_once_with(reservation_id)
-        mark_settlement.assert_awaited_once_with(reservation_id, amount=4)
-        assert "✅ Image generated" in result
-        assert issue.await_count >= 1
+        assert "repairing the acceptance record" in result
     else:
-        evidence_store.assert_awaited()
+        evidence_store.assert_awaited_once()
+        mark_accepted.assert_awaited_once()
+        recovery_retry.assert_not_awaited()
+        ambiguous.assert_not_awaited()
         mark_credential.assert_not_awaited()
-        finalize.assert_awaited_once_with(reservation_id)
-        mark_settlement.assert_awaited_once_with(reservation_id, amount=4)
-        assert "being held for safe reconciliation" in result
-        assert storage_calls == []
+        assert "held by the durable recovery worker" in result
 
 
 @pytest.mark.parametrize(
     ("code", "deterministic"),
-    [("1000", False), ("1001", False), ("2056", True), ("2062", True)],
+    [
+        ("1000", False),
+        ("1001", False),
+        ("1027", False),
+        ("1004", True),
+        ("2056", True),
+        ("2062", True),
+    ],
 )
 def test_minimax_business_code_rejection_contract_is_shared(code, deterministic):
     with pytest.raises(ValueError) as captured:
@@ -1060,6 +1016,34 @@ def test_minimax_business_code_rejection_contract_is_shared(code, deterministic)
 
     assert isinstance(captured.value, MiniMaxProviderRejected) is deterministic
     assert _is_minimax_deterministic_rejection(captured.value) is deterministic
+
+
+@pytest.mark.parametrize("http_status", [400, 401, 409, 422, 429, 451])
+def test_minimax_http_status_without_reviewed_business_code_is_ambiguous(http_status):
+    response = SimpleNamespace(
+        status_code=http_status,
+        text="gateway rejection",
+        json=lambda: {"message": "gateway rejection"},
+    )
+
+    error = _minimax_http_error(response)
+
+    assert type(error) is ValueError
+    assert not _is_minimax_deterministic_rejection(error)
+
+
+def test_minimax_http_error_uses_reviewed_business_code_not_status_class():
+    response = SimpleNamespace(
+        status_code=500,
+        text="provider response",
+        json=lambda: {
+            "base_resp": {"status_code": 1004, "status_msg": "invalid api key"}
+        },
+    )
+
+    error = _minimax_http_error(response)
+
+    assert isinstance(error, MiniMaxProviderRejected)
 
 
 @pytest.mark.asyncio
@@ -1122,47 +1106,60 @@ async def test_generate_image_minimax_auth_error_degrades_credential(tmp_path):
     agent_id = uuid.uuid4()
     tenant_id = uuid.uuid4()
     cred_id = uuid.uuid4()
-    reservation_id = uuid.uuid4()
-    cred = SimpleNamespace(id=cred_id, base_url=None)
-    reservation = SimpleNamespace(id=reservation_id)
     error = MiniMaxProviderRejected("MiniMax API error (1004): invalid api key")
 
     with (
-        patch("app.services.agent_tools._get_tool_config", AsyncMock(return_value={})),
-        patch(
-            "app.services.minimax_media_profiles.load_platform_minimax_media_profile",
-            AsyncMock(return_value=resolve_minimax_media_profile("image", "lite")),
-        ),
-        patch("app.services.quota_guard.check_plan_generation_entitlement", AsyncMock()),
-        patch("app.services.quota_guard.check_agent_llm_quota", AsyncMock()),
-        patch(
-            "app.services.agent_tools._get_agent_tenant_id",
-            AsyncMock(return_value=str(tenant_id)),
-        ),
-        patch("app.services.agent_tools._check_minimax_credit_amount", AsyncMock()),
-        patch(
-            "app.services.agent_tools._reserve_minimax_tool_credits",
-            AsyncMock(return_value=reservation),
-        ),
-        patch(
-            "app.services.agent_tools._release_minimax_tool_reservation",
-            AsyncMock(),
-        ) as release_credits,
-        patch("app.services.llm.load_balancer.pick_credential", AsyncMock(return_value=cred)),
-        patch("app.services.llm.utils.get_credential_api_key", MagicMock(return_value="sk-test")),
         patch("app.services.agent_tools._generate_image_minimax", AsyncMock(side_effect=error)),
+        patch(
+            "app.services.media_generation.create_minimax_sync_media_task_record",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    request_metadata={"recovery_asset_storage_key": "_internal/recovery/image.bin"}
+                )
+            ),
+        ) as create_task,
+        patch(
+            "app.services.media_generation.mark_media_generation_submission_failed",
+            AsyncMock(),
+        ) as mark_failed,
+        patch(
+            "app.services.media_generation.mark_media_generation_submission_ambiguous",
+            AsyncMock(),
+        ) as mark_ambiguous,
+        patch("app.services.agent_tools._record_minimax_tool_product_issue", AsyncMock()),
         patch("app.services.llm.load_balancer.mark_credential_degraded", AsyncMock()) as mark_degraded,
         patch("app.services.llm.load_balancer.mark_credential_quota_exceeded", AsyncMock()) as mark_quota,
-        patch("app.services.llm.load_balancer.record_credential_call", AsyncMock()) as record_call,
     ):
-        result = await _generate_image(agent_id, tmp_path, {"prompt": "cat"}, "minimax")
+        result = await agent_tools._generate_image_minimax_durable(
+            agent_id=agent_id,
+            ws=tmp_path,
+            arguments={},
+            user_id=None,
+            session_id="",
+            tenant_id=tenant_id,
+            credential_id=cred_id,
+            api_key="sk-test",
+            base_url="https://api.minimax.test",
+            model="image-01",
+            tier="lite",
+            credit_cost=4,
+            provider_prompt="cat",
+            save_path="workspace/images/cat.png",
+            output_extension=".png",
+            overlay_text="",
+            overlay_position="bottom",
+            brand_asset=None,
+            brand_position="center",
+            brand_scale=0.42,
+        )
 
     assert "❌ Image generation failed (minimax). Provider code: 1004." in result
     assert "invalid api key" not in result
+    record_id = create_task.await_args.kwargs["record_id"]
+    mark_failed.assert_awaited_once_with(record_id, error)
+    mark_ambiguous.assert_not_awaited()
     mark_degraded.assert_awaited_once_with(cred_id, immediate=True)
     mark_quota.assert_not_awaited()
-    record_call.assert_not_awaited()
-    release_credits.assert_awaited_once()
 
 
 def test_media_provider_failure_message_never_leaks_response_body():
@@ -1183,34 +1180,52 @@ async def test_generate_speech_minimax_records_success(tmp_path):
     agent_id = uuid.uuid4()
     tenant_id = uuid.uuid4()
     cred_id = uuid.uuid4()
-    reservation_id = uuid.uuid4()
-    cred = SimpleNamespace(id=cred_id, base_url=None)
-    reservation = SimpleNamespace(id=reservation_id)
+    credential = SimpleNamespace(
+        id=cred_id,
+        api_key="sk-test",
+        base_url="https://api.minimax.test",
+    )
+    generated = _valid_mp3_bytes()
+
+    async def provider(**kwargs):
+        await kwargs["on_provider_accepted"](generated)
+        return generated
 
     with (
         patch(
             "app.services.agent_tools._get_tool_config",
             AsyncMock(return_value={"model": "speech-2.8-turbo", "voice_id": "v1", "format": "mp3"}),
         ),
-        patch("app.services.agent_tools._get_agent_tenant_id", AsyncMock(return_value=str(tenant_id))),
         patch("app.services.agent_tools._resolve_minimax_tool_tier", AsyncMock(return_value="pro")),
         patch(
             "app.services.minimax_media_profiles.load_platform_minimax_media_profile",
             AsyncMock(return_value=resolve_minimax_media_profile("audio", "pro")),
         ),
         patch("app.services.agent_tools._check_minimax_credit_amount", AsyncMock()) as check_credits,
-        patch("app.services.agent_tools._reserve_minimax_tool_credits", AsyncMock(return_value=reservation)) as reserve_credits,
-        patch("app.services.agent_tools._mark_minimax_tool_reservation_settlement_ready", AsyncMock()) as mark_settlement_ready,
-        patch("app.services.agent_tools._finalize_minimax_tool_reservation", AsyncMock()) as finalize_credits,
-        patch("app.services.agent_tools._release_minimax_tool_reservation", AsyncMock()) as release_credits,
-        patch("app.services.quota_guard.check_plan_generation_entitlement", AsyncMock()),
-        patch("app.services.quota_guard.check_agent_llm_quota", AsyncMock()),
-        patch("app.services.llm.load_balancer.pick_credential", AsyncMock(return_value=cred)),
-        patch("app.services.llm.utils.get_credential_api_key", MagicMock(return_value="sk-test")),
-        patch("app.services.agent_tools._minimax_tts_http", AsyncMock(return_value=_valid_mp3_bytes())),
-        patch("app.services.storage.store_agent_bytes", AsyncMock(return_value="stored-key")) as store_bytes,
-        patch("app.services.llm.load_balancer.record_credential_call", AsyncMock()) as record_call,
-        patch("app.services.quota_guard.consume_agent_llm_quota", AsyncMock()) as consume_quota,
+        patch("app.services.agent_tools._get_minimax_tenant_uuid", AsyncMock(return_value=tenant_id)),
+        patch(
+            "app.services.agent_tools._prepare_minimax_tool_credential",
+            AsyncMock(return_value=(credential, None)),
+        ),
+        patch("app.services.agent_tools._minimax_tts_http", AsyncMock(side_effect=provider)) as provider_call,
+        patch(
+            "app.services.media_generation.create_minimax_sync_media_task_record",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    request_metadata={"recovery_asset_storage_key": "_internal/recovery/audio.mp3"}
+                )
+            ),
+        ) as create_task,
+        patch("app.services.media_generation.mark_minimax_sync_provider_accepted", AsyncMock()) as mark_accepted,
+        patch(
+            "app.services.media_generation.store_minimax_sync_recovery_asset",
+            AsyncMock(),
+        ) as store_recovery,
+        patch(
+            "app.services.media_generation.reconcile_minimax_sync_media_task",
+            AsyncMock(return_value=SimpleNamespace(status="succeeded")),
+        ) as reconcile,
+        patch("app.services.agent_tools._record_minimax_tool_success", AsyncMock()) as record_success,
     ):
         result = await _generate_speech_minimax(
             agent_id,
@@ -1219,27 +1234,32 @@ async def test_generate_speech_minimax_records_success(tmp_path):
         )
 
     assert "✅ Speech generated" in result
-    assert (tmp_path / "workspace/audio/hello.mp3").read_bytes() == _valid_mp3_bytes()
-    record_call.assert_awaited_once_with(cred_id, tokens_used=0)
-    consume_quota.assert_awaited_once_with(agent_id, model_tier="pro")
     check_credits.assert_awaited_once_with(tenant_id, 1)
-    reserve_credits.assert_awaited_once()
-    assert reserve_credits.await_args.kwargs["tenant_id"] == tenant_id
-    assert reserve_credits.await_args.kwargs["action"] == "audio"
-    assert reserve_credits.await_args.kwargs["modality"] == "audio"
-    assert reserve_credits.await_args.kwargs["tier"] == "pro"
-    assert reserve_credits.await_args.kwargs["model"] == "speech-2.8-turbo"
-    assert reserve_credits.await_args.kwargs["credits"] == 1
-    assert reserve_credits.await_args.kwargs["initial_status"] == "provider_inflight"
-    mark_settlement_ready.assert_awaited_once_with(reservation_id, amount=1)
-    store_bytes.assert_awaited_once_with(
-        agent_id,
-        "workspace/audio/hello.mp3",
-        _valid_mp3_bytes(),
+    creation = create_task.await_args.kwargs
+    assert creation["tenant_id"] == tenant_id
+    assert creation["credential_id"] == cred_id
+    assert creation["modality"] == "audio"
+    assert creation["tier"] == "pro"
+    assert creation["model"] == "speech-2.8-turbo"
+    assert creation["credit_cost"] == 1
+    assert creation["output_path"].startswith("workspace/audio/hello_")
+    record_id = creation["record_id"]
+    provider_call.assert_awaited_once()
+    store_recovery.assert_awaited_once_with(
+        record_id,
+        generated,
         content_type="audio/mpeg",
+        expected_key="_internal/recovery/audio.mp3",
     )
-    finalize_credits.assert_awaited_once_with(reservation_id)
-    release_credits.assert_not_awaited()
+    mark_accepted.assert_not_awaited()
+    reconcile.assert_awaited_once_with(record_id, deliver_completion=False)
+    record_success.assert_awaited_once_with(
+        agent_id,
+        cred_id,
+        tier="pro",
+        modality="audio",
+        model="speech-2.8-turbo",
+    )
 
 
 @pytest.mark.asyncio
@@ -1247,34 +1267,52 @@ async def test_generate_music_minimax_records_success(tmp_path):
     agent_id = uuid.uuid4()
     tenant_id = uuid.uuid4()
     cred_id = uuid.uuid4()
-    reservation_id = uuid.uuid4()
-    cred = SimpleNamespace(id=cred_id, base_url="https://minimax.example")
-    reservation = SimpleNamespace(id=reservation_id)
+    credential = SimpleNamespace(
+        id=cred_id,
+        api_key="sk-test",
+        base_url="https://api.minimax.test",
+    )
+    generated = _valid_mp3_bytes()
+
+    async def provider(**kwargs):
+        await kwargs["on_provider_accepted"](generated)
+        return generated
 
     with (
         patch(
             "app.services.agent_tools._get_tool_config",
             AsyncMock(return_value={"model": "music-2.6", "format": "mp3"}),
         ),
-        patch("app.services.agent_tools._get_agent_tenant_id", AsyncMock(return_value=str(tenant_id))),
         patch("app.services.agent_tools._resolve_minimax_tool_tier", AsyncMock(return_value="pro")),
         patch(
             "app.services.minimax_media_profiles.load_platform_minimax_media_profile",
             AsyncMock(return_value=resolve_minimax_media_profile("music", "pro")),
         ),
         patch("app.services.agent_tools._check_minimax_credit_amount", AsyncMock()) as check_credits,
-        patch("app.services.agent_tools._reserve_minimax_tool_credits", AsyncMock(return_value=reservation)) as reserve_credits,
-        patch("app.services.agent_tools._mark_minimax_tool_reservation_settlement_ready", AsyncMock()) as mark_settlement_ready,
-        patch("app.services.agent_tools._finalize_minimax_tool_reservation", AsyncMock()) as finalize_credits,
-        patch("app.services.agent_tools._release_minimax_tool_reservation", AsyncMock()) as release_credits,
-        patch("app.services.quota_guard.check_plan_generation_entitlement", AsyncMock()),
-        patch("app.services.quota_guard.check_agent_llm_quota", AsyncMock()),
-        patch("app.services.llm.load_balancer.pick_credential", AsyncMock(return_value=cred)),
-        patch("app.services.llm.utils.get_credential_api_key", MagicMock(return_value="sk-test")),
-        patch("app.services.agent_tools._minimax_music_http", AsyncMock(return_value=_valid_mp3_bytes())),
-        patch("app.services.storage.store_agent_bytes", AsyncMock(return_value="stored-key")) as store_bytes,
-        patch("app.services.llm.load_balancer.record_credential_call", AsyncMock()) as record_call,
-        patch("app.services.quota_guard.consume_agent_llm_quota", AsyncMock()) as consume_quota,
+        patch("app.services.agent_tools._get_minimax_tenant_uuid", AsyncMock(return_value=tenant_id)),
+        patch(
+            "app.services.agent_tools._prepare_minimax_tool_credential",
+            AsyncMock(return_value=(credential, None)),
+        ),
+        patch("app.services.agent_tools._minimax_music_http", AsyncMock(side_effect=provider)) as provider_call,
+        patch(
+            "app.services.media_generation.create_minimax_sync_media_task_record",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    request_metadata={"recovery_asset_storage_key": "_internal/recovery/music.mp3"}
+                )
+            ),
+        ) as create_task,
+        patch("app.services.media_generation.mark_minimax_sync_provider_accepted", AsyncMock()) as mark_accepted,
+        patch(
+            "app.services.media_generation.store_minimax_sync_recovery_asset",
+            AsyncMock(),
+        ) as store_recovery,
+        patch(
+            "app.services.media_generation.reconcile_minimax_sync_media_task",
+            AsyncMock(return_value=SimpleNamespace(status="succeeded")),
+        ) as reconcile,
+        patch("app.services.agent_tools._record_minimax_tool_success", AsyncMock()) as record_success,
     ):
         result = await _generate_music_minimax(
             agent_id,
@@ -1287,27 +1325,32 @@ async def test_generate_music_minimax_records_success(tmp_path):
         )
 
     assert "✅ Music generated" in result
-    assert (tmp_path / "workspace/audio/song.mp3").read_bytes() == _valid_mp3_bytes()
-    record_call.assert_awaited_once_with(cred_id, tokens_used=0)
-    consume_quota.assert_awaited_once_with(agent_id, model_tier="pro")
     check_credits.assert_awaited_once_with(tenant_id, 150)
-    reserve_credits.assert_awaited_once()
-    assert reserve_credits.await_args.kwargs["tenant_id"] == tenant_id
-    assert reserve_credits.await_args.kwargs["action"] == "music"
-    assert reserve_credits.await_args.kwargs["modality"] == "music"
-    assert reserve_credits.await_args.kwargs["tier"] == "pro"
-    assert reserve_credits.await_args.kwargs["model"] == "music-2.6"
-    assert reserve_credits.await_args.kwargs["credits"] == 150
-    assert reserve_credits.await_args.kwargs["initial_status"] == "provider_inflight"
-    mark_settlement_ready.assert_awaited_once_with(reservation_id, amount=150)
-    store_bytes.assert_awaited_once_with(
-        agent_id,
-        "workspace/audio/song.mp3",
-        _valid_mp3_bytes(),
+    creation = create_task.await_args.kwargs
+    assert creation["tenant_id"] == tenant_id
+    assert creation["credential_id"] == cred_id
+    assert creation["modality"] == "music"
+    assert creation["tier"] == "pro"
+    assert creation["model"] == "music-2.6"
+    assert creation["credit_cost"] == 150
+    assert creation["output_path"].startswith("workspace/audio/song_")
+    record_id = creation["record_id"]
+    provider_call.assert_awaited_once()
+    store_recovery.assert_awaited_once_with(
+        record_id,
+        generated,
         content_type="audio/mpeg",
+        expected_key="_internal/recovery/music.mp3",
     )
-    finalize_credits.assert_awaited_once_with(reservation_id)
-    release_credits.assert_not_awaited()
+    mark_accepted.assert_not_awaited()
+    reconcile.assert_awaited_once_with(record_id, deliver_completion=False)
+    record_success.assert_awaited_once_with(
+        agent_id,
+        cred_id,
+        tier="pro",
+        modality="music",
+        model="music-2.6",
+    )
 
 
 @pytest.mark.parametrize("modality", ["audio", "music"])
@@ -1328,186 +1371,140 @@ async def test_sync_minimax_audio_accounting_fault_matrix(
 ):
     agent_id = uuid.uuid4()
     tenant_id = uuid.uuid4()
-    reservation_id = uuid.uuid4()
     credential_id = uuid.uuid4()
-    reservation = SimpleNamespace(id=reservation_id)
-    credential = SimpleNamespace(id=credential_id, base_url=None)
+    credential = SimpleNamespace(
+        id=credential_id,
+        api_key="sk-test",
+        base_url="https://api.minimax.test",
+    )
 
     if modality == "audio":
-        generator = _generate_speech_minimax
-        provider_patch = "app.services.agent_tools._minimax_tts_http"
-        profile = resolve_minimax_media_profile("audio", "pro")
-        arguments = {
-            "text": "hello world",
-            "save_path": "workspace/audio/hello.mp3",
-        }
-        final_path = "workspace/audio/hello.mp3"
-        recovery_path = f"workspace/media_inputs/{reservation_id}_provider_audio.mp3"
+        save_path = "workspace/audio/hello.mp3"
+        recovery_key = "_internal/recovery/audio.mp3"
         provider_bytes = _valid_mp3_bytes()
         credit_cost = 1
+        model = "speech-2.8-turbo"
     else:
-        generator = _generate_music_minimax
-        provider_patch = "app.services.agent_tools._minimax_music_http"
-        profile = resolve_minimax_media_profile("music", "pro")
-        arguments = {
-            "prompt": "bright pop",
-            "lyrics": "verse one",
-            "save_path": "workspace/audio/song.mp3",
-        }
-        final_path = "workspace/audio/song.mp3"
-        recovery_path = f"workspace/media_inputs/{reservation_id}_provider_music.mp3"
+        save_path = "workspace/audio/song.mp3"
+        recovery_key = "_internal/recovery/music.mp3"
         provider_bytes = _valid_mp3_bytes()
         credit_cost = 150
+        model = "music-2.6"
 
-    provider_error = None
-    if failure_mode == "ambiguous_timeout":
-        provider_error = httpx.ReadTimeout("provider outcome unknown")
-    elif failure_mode == "deterministic_rejection":
-        provider_error = MiniMaxProviderRejected(
-            "MiniMax API error (2056): plan exhausted"
-        )
-    provider = AsyncMock(
-        side_effect=provider_error,
-        return_value=None if provider_error else provider_bytes,
-    )
-    storage_calls: list[str] = []
-
-    async def store(_agent_id, rel_path, _data, *, content_type=None):
-        storage_calls.append(rel_path)
-        if failure_mode == "provider_success_storage_failure" and len(storage_calls) == 1:
-            raise OSError("durable delivery failed")
-        assert content_type == "audio/mpeg"
-        return f"{agent_id}/{rel_path}"
-
-    with ExitStack() as stack:
-        stack.enter_context(
-            patch("app.services.agent_tools._get_tool_config", AsyncMock(return_value={}))
-        )
-        stack.enter_context(
-            patch(
-                "app.services.agent_tools._get_agent_tenant_id",
-                AsyncMock(return_value=str(tenant_id)),
+    async def provider(on_accepted):
+        if failure_mode == "ambiguous_timeout":
+            raise httpx.ReadTimeout("provider outcome unknown")
+        if failure_mode == "deterministic_rejection":
+            raise MiniMaxProviderRejected(
+                "MiniMax API error (2056): plan exhausted"
             )
-        )
-        stack.enter_context(
-            patch(
-                "app.services.agent_tools._resolve_minimax_tool_tier",
-                AsyncMock(return_value="pro"),
-            )
-        )
-        stack.enter_context(
-            patch(
-                "app.services.minimax_media_profiles.load_platform_minimax_media_profile",
-                AsyncMock(return_value=profile),
-            )
-        )
-        stack.enter_context(
-            patch("app.services.agent_tools._check_minimax_credit_amount", AsyncMock())
-        )
-        reserve = stack.enter_context(
-            patch(
-                "app.services.agent_tools._reserve_minimax_tool_credits",
-                AsyncMock(return_value=reservation),
-            )
-        )
-        mark_settlement = stack.enter_context(
-            patch(
-                "app.services.agent_tools._mark_minimax_tool_reservation_settlement_ready",
-                AsyncMock(
-                    side_effect=(
-                        [RuntimeError("settlement unavailable"), None]
-                        if failure_mode == "settlement_mark_failure"
-                        else None
-                    )
-                ),
-            )
-        )
-        finalize = stack.enter_context(
-            patch(
-                "app.services.agent_tools._finalize_minimax_tool_reservation",
-                AsyncMock(),
-            )
-        )
-        release = stack.enter_context(
-            patch(
-                "app.services.agent_tools._release_minimax_tool_reservation",
-                AsyncMock(),
-            )
-        )
-        stack.enter_context(
-            patch(
-                "app.services.quota_guard.check_plan_generation_entitlement",
-                AsyncMock(),
-            )
-        )
-        stack.enter_context(
-            patch("app.services.quota_guard.check_agent_llm_quota", AsyncMock())
-        )
-        stack.enter_context(
-            patch(
-                "app.services.llm.load_balancer.pick_credential",
-                AsyncMock(return_value=credential),
-            )
-        )
-        stack.enter_context(
-            patch(
-                "app.services.llm.utils.get_credential_api_key",
-                MagicMock(return_value="sk-test"),
-            )
-        )
-        stack.enter_context(patch(provider_patch, provider))
-        stack.enter_context(
-            patch("app.services.storage.store_agent_bytes", AsyncMock(side_effect=store))
-        )
-        issue = stack.enter_context(
-            patch(
-                "app.services.agent_tools._record_minimax_tool_product_issue",
-                AsyncMock(),
-            )
-        )
-        mark_credential = stack.enter_context(
-            patch(
-                "app.services.agent_tools._mark_minimax_tool_credential_failure",
-                AsyncMock(),
-            )
-        )
-        result = await generator(agent_id, tmp_path, arguments)
-
-    assert "failed (minimax)" in result
-    assert reserve.await_args.kwargs["initial_status"] == "provider_inflight"
-    issue.assert_awaited()
-    if failure_mode in {
-        "provider_success_storage_failure",
-        "settlement_mark_failure",
-    }:
-        if failure_mode == "provider_success_storage_failure":
-            mark_settlement.assert_awaited_once_with(
-                reservation_id,
-                amount=credit_cost,
-            )
-            assert storage_calls == [final_path, recovery_path]
+        if failure_mode == "settlement_mark_failure":
+            await on_accepted(None)
         else:
-            assert mark_settlement.await_count == 2
-            assert storage_calls == [recovery_path]
-        finalize.assert_awaited_once_with(reservation_id)
-        release.assert_not_awaited()
-        mark_credential.assert_not_awaited()
-        assert issue.await_args.kwargs["recovery_path"] == recovery_path
-    elif failure_mode == "ambiguous_timeout":
-        mark_settlement.assert_not_awaited()
-        finalize.assert_not_awaited()
-        release.assert_not_awaited()
-        mark_credential.assert_awaited_once()
-        assert storage_calls == []
-    else:
-        mark_settlement.assert_not_awaited()
-        finalize.assert_not_awaited()
-        release.assert_awaited_once_with(
-            reservation_id,
-            release_provider_inflight=True,
+            await on_accepted(provider_bytes)
+        return provider_bytes
+
+    recovery_error = (
+        OSError("durable recovery storage unavailable")
+        if failure_mode == "provider_success_storage_failure"
+        else None
+    )
+    accepted_error = (
+        RuntimeError("provider acceptance database unavailable")
+        if failure_mode == "settlement_mark_failure"
+        else None
+    )
+    with (
+        patch(
+            "app.services.media_generation.create_minimax_sync_media_task_record",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    request_metadata={"recovery_asset_storage_key": recovery_key}
+                )
+            ),
+        ) as create_task,
+        patch(
+            "app.services.media_generation.store_minimax_sync_recovery_asset",
+            AsyncMock(side_effect=recovery_error),
+        ) as store_recovery,
+        patch(
+            "app.services.media_generation.mark_minimax_sync_provider_accepted",
+            AsyncMock(side_effect=accepted_error),
+        ) as mark_accepted,
+        patch("app.services.media_generation.reconcile_minimax_sync_media_task", AsyncMock()) as reconcile,
+        patch(
+            "app.services.media_generation.record_minimax_sync_provider_response_retry",
+            AsyncMock(),
+        ) as recovery_retry,
+        patch("app.services.media_generation.mark_media_generation_submission_ambiguous", AsyncMock()) as ambiguous,
+        patch("app.services.media_generation.mark_media_generation_submission_failed", AsyncMock()) as failed,
+        patch("app.services.agent_tools._record_minimax_tool_product_issue", AsyncMock()) as issue,
+        patch("app.services.agent_tools._mark_minimax_tool_credential_failure", AsyncMock()) as mark_credential,
+        patch("app.services.agent_tools._record_minimax_tool_success", AsyncMock()) as record_success,
+    ):
+        result = await agent_tools._generate_minimax_audio_durable(
+            agent_id=agent_id,
+            user_id=None,
+            session_id="",
+            tenant_id=tenant_id,
+            credential=credential,
+            modality=modality,
+            tier="pro",
+            model=model,
+            credit_cost=credit_cost,
+            save_path=save_path,
+            audio_format="mp3",
+            content_type="audio/mpeg",
+            sample_rate=32000 if modality == "audio" else 44100,
+            provider_call=provider,
         )
+
+    creation = create_task.await_args.kwargs
+    record_id = creation["record_id"]
+    assert creation["tenant_id"] == tenant_id
+    assert creation["modality"] == modality
+    assert creation["credit_cost"] == credit_cost
+    reconcile.assert_not_awaited()
+    record_success.assert_not_awaited()
+    issue.assert_awaited_once()
+    assert issue.await_args.kwargs["recovery_path"] == f"media-task:{record_id}"
+    if failure_mode == "provider_success_storage_failure":
+        store_recovery.assert_awaited_once_with(
+            record_id,
+            provider_bytes,
+            content_type="audio/mpeg",
+            expected_key=recovery_key,
+        )
+        mark_accepted.assert_not_awaited()
+        recovery_retry.assert_awaited_once()
+        ambiguous.assert_not_awaited()
+        failed.assert_not_awaited()
+        mark_credential.assert_not_awaited()
+        assert "repairing the acceptance record" in result
+    elif failure_mode == "settlement_mark_failure":
+        store_recovery.assert_not_awaited()
+        mark_accepted.assert_awaited_once()
+        recovery_retry.assert_awaited_once()
+        ambiguous.assert_not_awaited()
+        failed.assert_not_awaited()
+        mark_credential.assert_not_awaited()
+        assert "repairing the acceptance record" in result
+    elif failure_mode == "ambiguous_timeout":
+        store_recovery.assert_not_awaited()
+        mark_accepted.assert_not_awaited()
+        recovery_retry.assert_not_awaited()
+        ambiguous.assert_awaited_once()
+        failed.assert_not_awaited()
         mark_credential.assert_awaited_once()
-        assert storage_calls == []
+        assert "submission outcome is uncertain" in result
+    else:
+        store_recovery.assert_not_awaited()
+        mark_accepted.assert_not_awaited()
+        recovery_retry.assert_not_awaited()
+        ambiguous.assert_not_awaited()
+        failed.assert_awaited_once()
+        mark_credential.assert_awaited_once()
+        assert "Provider code: 2056" in result
 
 
 @pytest.mark.asyncio
@@ -1517,7 +1514,6 @@ async def test_generate_video_minimax_creates_task_metadata(tmp_path):
     cred_id = uuid.uuid4()
     reservation_id = uuid.uuid4()
     cred = SimpleNamespace(id=cred_id, base_url=None)
-    reservation = SimpleNamespace(id=reservation_id)
     lifecycle_order: list[str] = []
     reference_path = tmp_path / "workspace/images/product.png"
     reference_path.parent.mkdir(parents=True)
@@ -1525,6 +1521,7 @@ async def test_generate_video_minimax_creates_task_metadata(tmp_path):
 
     async def register_task(**_kwargs):
         lifecycle_order.append("register")
+        return SimpleNamespace(reservation_id=reservation_id)
 
     async def create_provider_task(**_kwargs):
         lifecycle_order.append("provider")
@@ -1534,28 +1531,34 @@ async def test_generate_video_minimax_creates_task_metadata(tmp_path):
         lifecycle_order.append("submitted")
         return _args[0]
 
+    async def store_provider_identity(**_kwargs):
+        lifecycle_order.append("evidence")
+        return "_internal/provider-recovery.json"
+
     with (
         patch(
             "app.services.agent_tools._get_tool_config",
             AsyncMock(return_value={"model": "MiniMax-Hailuo-2.3", "duration": 6, "resolution": "1080P"}),
         ),
-        patch("app.services.agent_tools._get_agent_tenant_id", AsyncMock(return_value=str(tenant_id))),
+        patch("app.services.agent_tools._get_minimax_tenant_uuid", AsyncMock(return_value=tenant_id)),
         patch("app.services.agent_tools._resolve_minimax_tool_tier", AsyncMock(return_value="pro")),
         patch(
             "app.services.minimax_media_profiles.load_platform_minimax_media_profile",
             AsyncMock(return_value=resolve_minimax_media_profile("video", "pro")),
         ),
         patch("app.services.agent_tools._check_minimax_credit_amount", AsyncMock()) as check_credits,
-        patch("app.services.agent_tools._reserve_minimax_tool_credits", AsyncMock(return_value=reservation)) as reserve_credits,
-        patch("app.services.quota_guard.check_plan_generation_entitlement", AsyncMock()),
-        patch("app.services.quota_guard.check_agent_llm_quota", AsyncMock()),
+        patch("app.services.agent_tools._check_minimax_tool_allowed", AsyncMock(return_value=None)),
         patch("app.services.llm.load_balancer.pick_credential", AsyncMock(return_value=cred)),
         patch("app.services.llm.utils.get_credential_api_key", MagicMock(return_value="sk-test")),
         patch("app.services.agent_tools._minimax_create_video_task", AsyncMock(side_effect=create_provider_task)) as create_task,
         patch("app.services.media_generation.create_minimax_video_task_record", AsyncMock(side_effect=register_task)) as register,
+        patch(
+            "app.services.media_generation.store_minimax_video_provider_identity_evidence",
+            AsyncMock(side_effect=store_provider_identity),
+        ),
         patch("app.services.media_generation.mark_minimax_video_task_submitted", AsyncMock(side_effect=mark_submitted)),
-        patch("app.services.llm.load_balancer.record_credential_call", AsyncMock()) as record_call,
-        patch("app.services.quota_guard.consume_agent_llm_quota", AsyncMock()) as consume_quota,
+        patch("app.services.media_generation.validate_media_origin_session", AsyncMock()),
+        patch("app.services.agent_tools._record_minimax_tool_success", AsyncMock()) as record_success,
     ):
         result = await _generate_video_minimax(
             agent_id,
@@ -1579,20 +1582,21 @@ async def test_generate_video_minimax_creates_task_metadata(tmp_path):
     assert metadata["has_first_frame"] is True
     assert "data:image" not in json.dumps(metadata)
     assert metadata["save_path"].endswith(".mp4")
-    assert lifecycle_order == ["register", "provider", "submitted"]
-    assert register.await_args.kwargs["reservation_id"] == reservation_id
+    assert lifecycle_order == ["register", "provider", "evidence", "submitted"]
+    assert register.await_args.kwargs["tenant_id"] == tenant_id
+    assert register.await_args.kwargs["credential_id"] == cred_id
+    assert register.await_args.kwargs["tier"] == "pro"
+    assert register.await_args.kwargs["credit_cost"] == 280
     assert create_task.await_args.kwargs["first_frame_image"].startswith("data:image/png;base64,")
     assert "automatic" in result.lower()
-    record_call.assert_awaited_once_with(cred_id, tokens_used=0)
-    consume_quota.assert_awaited_once_with(agent_id, model_tier="pro")
+    record_success.assert_awaited_once_with(
+        agent_id,
+        cred_id,
+        tier="pro",
+        modality="video",
+        model="MiniMax-Hailuo-2.3",
+    )
     check_credits.assert_awaited_once_with(tenant_id, 280)
-    reserve_credits.assert_awaited_once()
-    assert reserve_credits.await_args.kwargs["tenant_id"] == tenant_id
-    assert reserve_credits.await_args.kwargs["action"] == "video"
-    assert reserve_credits.await_args.kwargs["modality"] == "video"
-    assert reserve_credits.await_args.kwargs["tier"] == "pro"
-    assert reserve_credits.await_args.kwargs["model"] == "MiniMax-Hailuo-2.3"
-    assert reserve_credits.await_args.kwargs["credits"] == 280
 
 
 @pytest.mark.asyncio
@@ -1629,10 +1633,6 @@ async def test_generate_video_minimax_binds_provider_before_metadata_enospc(tmp_
             AsyncMock(return_value=resolve_minimax_media_profile("video", "pro")),
         ),
         patch("app.services.agent_tools._check_minimax_credit_amount", AsyncMock()),
-        patch(
-            "app.services.agent_tools._reserve_minimax_tool_credits",
-            AsyncMock(return_value=reservation),
-        ),
         patch("app.services.quota_guard.check_plan_generation_entitlement", AsyncMock()),
         patch("app.services.quota_guard.check_agent_llm_quota", AsyncMock()),
         patch("app.services.llm.load_balancer.pick_credential", AsyncMock(return_value=cred)),
@@ -1643,12 +1643,16 @@ async def test_generate_video_minimax_binds_provider_before_metadata_enospc(tmp_
         ),
         patch(
             "app.services.media_generation.create_minimax_video_task_record",
-            AsyncMock(),
+            AsyncMock(return_value=SimpleNamespace(reservation_id=reservation.id)),
         ),
         patch(
             "app.services.media_generation.mark_minimax_video_task_submitted",
             AsyncMock(side_effect=mark_submitted),
         ) as bind_provider,
+        patch(
+            "app.services.media_generation.store_minimax_video_provider_identity_evidence",
+            AsyncMock(return_value="_internal/provider-recovery.json"),
+        ),
         patch("app.services.llm.load_balancer.record_credential_call", AsyncMock()),
         patch("app.services.quota_guard.consume_agent_llm_quota", AsyncMock()),
         patch("pathlib.Path.write_text", autospec=True, side_effect=fail_metadata_write),
@@ -1724,8 +1728,8 @@ async def test_check_video_minimax_rejects_unbound_editable_legacy_metadata(tmp_
     with (
         patch("app.services.agent_tools._load_minimax_tool_credential_by_id", AsyncMock()) as load_credential,
         patch("app.services.agent_tools._minimax_query_video_task", AsyncMock()) as query_provider,
-        patch("app.services.agent_tools._finalize_minimax_tool_reservation", AsyncMock()) as finalize_reservation,
         patch("app.services.media_generation.find_media_generation_task", AsyncMock(return_value=None)),
+        patch("app.services.media_generation.reconcile_minimax_video_task", AsyncMock()) as reconcile,
         patch("app.services.agent_tools._record_minimax_tool_product_issue", AsyncMock()),
     ):
         result = await _check_video_minimax(
@@ -1737,7 +1741,7 @@ async def test_check_video_minimax_rejects_unbound_editable_legacy_metadata(tmp_
     assert "not bound to a durable Agent task" in result
     load_credential.assert_not_awaited()
     query_provider.assert_not_awaited()
-    finalize_reservation.assert_not_awaited()
+    reconcile.assert_not_awaited()
     assert json.loads(meta_path.read_text(encoding="utf-8"))["reservation_id"] == str(reservation_id)
 
 

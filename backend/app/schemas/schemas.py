@@ -1,10 +1,11 @@
 """Pydantic schemas for request/response validation."""
 
+import re
 import uuid
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, model_validator
 
 
 # ─── Auth ───────────────────────────────────────────────
@@ -480,9 +481,10 @@ class ChannelConfigOut(BaseModel):
     agent_id: uuid.UUID
     channel_type: str
     app_id: str | None = None
-    app_secret: str | None = None
-    encrypt_key: str | None = None
-    verification_token: str | None = None
+    app_secret_configured: bool = False
+    encrypt_key_configured: bool = False
+    verification_token_configured: bool = False
+    configured_secret_fields: list[str] = Field(default_factory=list)
     is_configured: bool
     is_connected: bool
     last_tested_at: datetime | None = None
@@ -490,6 +492,91 @@ class ChannelConfigOut(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+    @model_validator(mode="before")
+    @classmethod
+    def redact_channel_credentials(cls, value):
+        """Convert a ChannelConfig into a status-only public representation."""
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, dict):
+            getter = value.get
+        else:
+            def getter(key, default=None):
+                return getattr(value, key, default)
+
+        raw_extra = getter("extra_config", {}) or {}
+        configured_secret_fields: list[str] = []
+        private_extra_keys = {
+            "access_token",
+            "api_key",
+            "app_secret",
+            "bot_secret",
+            "bot_token",
+            "client_secret",
+            "conversation_id",
+            "encrypt_key",
+            "password",
+            "private_key",
+            "secret",
+            "service_url",
+            "signing_secret",
+            "token",
+            "verification_token",
+            "verify_token",
+        }
+        compact_private_keys = {
+            re.sub(r"[^a-z0-9]", "", key.lower()) for key in private_extra_keys
+        }
+
+        def is_private_key(key: object) -> bool:
+            compact = re.sub(r"[^a-z0-9]", "", str(key).strip().lower())
+            return compact in compact_private_keys or compact.endswith(
+                ("secret", "token", "password", "privatekey")
+            )
+
+        def scrub_extra(item, path: str = ""):
+            if isinstance(item, dict):
+                public: dict = {}
+                for key, nested in item.items():
+                    field_path = f"{path}.{key}" if path else str(key)
+                    if is_private_key(key):
+                        if nested:
+                            configured_secret_fields.append(field_path)
+                        continue
+                    public[key] = scrub_extra(nested, field_path)
+                return public
+            if isinstance(item, list):
+                return [scrub_extra(nested, path) for nested in item]
+            return item
+
+        extra_config = scrub_extra(raw_extra) if isinstance(raw_extra, dict) else {}
+
+        return {
+            "id": getter("id"),
+            "agent_id": getter("agent_id"),
+            "channel_type": getter("channel_type"),
+            "app_id": getter("app_id"),
+            "app_secret_configured": bool(
+                getter("app_secret_configured", False) or getter("app_secret")
+            ),
+            "encrypt_key_configured": bool(
+                getter("encrypt_key_configured", False) or getter("encrypt_key")
+            ),
+            "verification_token_configured": bool(
+                getter("verification_token_configured", False)
+                or getter("verification_token")
+            ),
+            "configured_secret_fields": sorted(
+                set(configured_secret_fields)
+                | set(getter("configured_secret_fields", []) or [])
+            ),
+            "is_configured": bool(getter("is_configured", False)),
+            "is_connected": bool(getter("is_connected", False)),
+            "last_tested_at": getter("last_tested_at"),
+            "extra_config": extra_config,
+            "created_at": getter("created_at"),
+        }
 
 
 # ─── Approval ───────────────────────────────────────────

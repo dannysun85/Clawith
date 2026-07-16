@@ -21,6 +21,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging_config import privacy_safe_shape
+from app.config import get_settings
 from app.models.agent import Agent
 from app.models.audit import ApprovalRequest, AuditLog
 from app.models.channel_config import ChannelConfig
@@ -37,7 +38,25 @@ HIGH_RISK_DEFAULT_L3_ACTIONS = {
 }
 
 APPROVAL_EXECUTION_STALE_AFTER = timedelta(minutes=20)
-APPROVAL_AUTOMATIC_EXECUTION_ENABLED = False
+APPROVAL_AUTOMATIC_EXECUTION_ENABLED = get_settings().APPROVAL_EXECUTION_ENABLED
+
+
+def _approval_resolution_copy(status: str) -> tuple[str, str]:
+    """Return notification copy that matches the effective execution switch."""
+
+    if status != "approved":
+        return "rejected", "Approval rejected. The action will not execute."
+    if APPROVAL_AUTOMATIC_EXECUTION_ENABLED:
+        return (
+            "approved — queued for execution",
+            "Approval recorded. The secure worker queued the signed action; "
+            "no side effect has completed yet.",
+        )
+    return (
+        "approved — execution paused",
+        "Approval recorded. Automatic approval execution is paused in this "
+        "release; no side effect has run.",
+    )
 APPROVAL_EXECUTION_HARD_TIMEOUT_SECONDS = 15 * 60
 APPROVAL_EXECUTION_POLL_SECONDS = 2.0
 APPROVAL_EXECUTION_CONCURRENCY = 4
@@ -699,17 +718,7 @@ class AutonomyService:
         # Web notification to agent creator about the result
         if agent:
             from app.services.notification_service import send_notification
-            status_label = (
-                "approved — execution paused"
-                if approval.status == "approved"
-                else "rejected"
-            )
-            body_text = (
-                "Approval recorded. Automatic approval execution is paused in "
-                "this release; no side effect has run."
-                if approval.status == "approved"
-                else "Approval rejected. The action will not execute."
-            )
+            status_label, body_text = _approval_resolution_copy(approval.status)
             await send_notification(
                 db,
                 user_id=agent.creator_id,
@@ -806,13 +815,17 @@ class AutonomyService:
             )
             if not _approval_action_matches_tool(action_type, tool_name):
                 raise ValueError("Approval action does not match its signed tool payload")
-            await self._assert_execution_permission(agent_id, tool_name)
             if requested_by is not None:
                 await self._assert_requester_execution_scope(
                     agent_id,
                     requested_by,
                     origin_session_id,
                 )
+            # Keep the mutable Agent/Tool lifecycle check immediately before
+            # dispatch.  An approval is authority to attempt the signed action,
+            # not authority to bypass a later stop, expiry, deletion, or grant
+            # revocation.
+            await self._assert_execution_permission(agent_id, tool_name)
 
             from app.services.agent_tools import _execute_approved_tool
 
@@ -876,8 +889,9 @@ class AutonomyService:
         agent_id: uuid.UUID,
         tool_name: str,
     ) -> None:
-        """Recheck Agent existence and current Tool grant before dispatch."""
+        """Recheck Agent lifecycle and current Tool grant before dispatch."""
 
+        from app.core.permissions import is_agent_expired
         from app.models.tool import AgentTool, Tool
         from app.services.agent_tools import _code_tool_denial_reason
 
@@ -888,6 +902,12 @@ class AutonomyService:
             agent = agent_result.scalar_one_or_none()
             if agent is None or agent.tenant_id is None:
                 raise ValueError("Approval Agent is no longer available")
+            if (
+                agent.status not in {"running", "idle"}
+                or agent.deletion_requested_at is not None
+                or is_agent_expired(agent)
+            ):
+                raise ValueError("Approval Agent is no longer executable")
             tool_result = await permission_db.execute(
                 select(Tool, AgentTool)
                 .outerjoin(
@@ -937,8 +957,25 @@ class AutonomyService:
                 select(Agent).where(Agent.id == agent_id)
             )
             agent = agent_result.scalar_one_or_none()
-            if agent is None:
+            if agent is None or agent.tenant_id is None:
                 raise ValueError("Approval Agent is no longer available")
+            requester_result = await permission_db.execute(
+                select(User).where(User.id == requested_by)
+            )
+            requester = requester_result.scalar_one_or_none()
+            requester_identity = (
+                getattr(requester, "identity", None) if requester else None
+            )
+            if (
+                requester is None
+                or not requester.is_active
+                or requester.tenant_id != agent.tenant_id
+                or (
+                    requester_identity is not None
+                    and not requester_identity.is_active
+                )
+            ):
+                raise ValueError("Approval requester is no longer active")
             if not await get_agent_access_level_for_user_id(
                 permission_db,
                 requested_by,

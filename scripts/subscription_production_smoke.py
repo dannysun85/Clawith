@@ -7,7 +7,11 @@ surface through HTTP instead of unit-test fixtures:
 1. tenant user can read subscription summary, ledger, orders, plans, packs;
 2. platform admin can run read-only ledger/payment reconciliation;
 3. platform admin can export order and credit CSVs;
-4. optional UI check verifies subscription pages are reachable after login.
+4. release identity is bound to the isolated candidate slot.
+
+The browser portion is intentionally implemented by the pinned, isolated
+``deploy/browser-smoke`` image. This standard-library runner never injects
+credentials into JavaScript or process arguments.
 
 Environment variables:
   SMOKE_TENANT_EMAIL / SMOKE_TENANT_PASSWORD
@@ -21,7 +25,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -29,9 +32,14 @@ from pathlib import Path
 from typing import Any
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_API_BASE = "http://127.0.0.1:3008/api"
 DEFAULT_FRONTEND_URL = "http://127.0.0.1:3008"
+REQUIRED_CREDENTIAL_KEYS = {
+    "SMOKE_TENANT_EMAIL",
+    "SMOKE_TENANT_PASSWORD",
+    "SMOKE_PLATFORM_ADMIN_EMAIL",
+    "SMOKE_PLATFORM_ADMIN_PASSWORD",
+}
 
 
 class SmokeFailure(RuntimeError):
@@ -87,6 +95,41 @@ def require(condition: bool, stage: str, detail: Any) -> None:
         raise SmokeFailure(stage, detail)
 
 
+def summarize_reconciliation(
+    payload: Any,
+    *,
+    checked_field: str,
+    stage: str,
+) -> dict[str, int]:
+    """Fail closed on reconciliation drift without copying issue rows to logs."""
+    require(
+        isinstance(payload, dict),
+        stage,
+        {"code": "invalid_reconciliation_response"},
+    )
+    checked = payload.get(checked_field)
+    issues = payload.get("issues")
+    require(
+        type(checked) is int and checked >= 0,
+        stage,
+        {"code": "invalid_checked_count", "field": checked_field},
+    )
+    require(
+        isinstance(issues, list),
+        stage,
+        {"code": "invalid_issues_collection"},
+    )
+    require(
+        not issues,
+        stage,
+        {
+            "code": "reconciliation_issues_detected",
+            "issue_count": len(issues),
+        },
+    )
+    return {checked_field: checked, "issue_count": 0}
+
+
 def login(api_base: str, email: str, password: str, stage: str) -> dict[str, Any]:
     status, payload = call_api(
         "POST",
@@ -94,70 +137,114 @@ def login(api_base: str, email: str, password: str, stage: str) -> dict[str, Any
         "/auth/login",
         {"login_identifier": email, "password": password},
     )
-    require(status == 200 and isinstance(payload, dict) and payload.get("access_token"), stage, {"status": status, "body": payload})
+    require(
+        status == 200 and isinstance(payload, dict) and payload.get("access_token"),
+        stage,
+        {"status": status, "body": payload},
+    )
     return payload
 
 
-def run_ui_check(frontend_url: str, tenant_email: str, tenant_password: str, playwright_cli: str | None) -> dict[str, Any]:
-    pwcli = playwright_cli or os.getenv("PWCLI") or str(Path.home() / ".codex/skills/playwright/scripts/playwright_cli.sh")
-    if not Path(pwcli).exists():
-        raise SmokeFailure("ui_playwright_cli_found", {"path": pwcli})
-
-    code = f"""
-async (page) => {{
-  await page.goto('{frontend_url.rstrip("/")}/login');
-  await page.locator('input[type="text"], input[type="email"]').first().fill('{tenant_email}');
-  await page.locator('input[type="password"]').first().fill('{tenant_password}');
-  await page.getByRole('button', {{ name: /登录|Login|Sign in/i }}).click();
-  await page.waitForURL(/\\/(dashboard|account|agents|plaza|$)/, {{ timeout: 30000 }}).catch(() => {{}});
-  await page.goto('{frontend_url.rstrip("/")}/account/subscription');
-  await page.waitForTimeout(1200);
-  const text = await page.locator('body').innerText();
-  if (!/Credits|积分|套餐详情|订阅|消耗明细/.test(text)) {{
-    throw new Error('subscription detail page did not expose billing text');
-  }}
-  return {{ ok: true }};
-}}
-""".strip()
-    open_proc = subprocess.run(
-        [pwcli, "open", f"{frontend_url.rstrip('/')}/login"],
-        cwd=REPO_ROOT,
-        text=True,
-        capture_output=True,
-        timeout=60,
-    )
-    if open_proc.returncode != 0:
-        raise SmokeFailure("ui_open_login", {"stdout": open_proc.stdout, "stderr": open_proc.stderr})
+def load_credentials(path_value: str | None) -> dict[str, str]:
+    if not path_value:
+        return {}
+    path = Path(path_value)
     try:
-        run_proc = subprocess.run(
-            [pwcli, "run-code", code, "--json"],
-            cwd=REPO_ROOT,
-            text=True,
-            capture_output=True,
-            timeout=90,
+        stat = path.lstat()
+    except FileNotFoundError as exc:
+        raise SmokeFailure("credentials_file", {"present": False}) from exc
+    require(
+        path.is_file() and not path.is_symlink() and 0 < stat.st_size <= 16_384,
+        "credentials_file",
+        {"regular_file": path.is_file() and not path.is_symlink(), "size": stat.st_size},
+    )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise SmokeFailure("credentials_file", {"format": "invalid_json"}) from exc
+    require(isinstance(payload, dict), "credentials_file", {"format": "object_required"})
+    require(set(payload) == REQUIRED_CREDENTIAL_KEYS, "credentials_file", {"keys": "exact_required_keys_only"})
+    for key in REQUIRED_CREDENTIAL_KEYS:
+        value = payload[key]
+        require(
+            isinstance(value, str) and 0 < len(value) <= 4096,
+            "credentials_file",
+            {"invalid_key": key},
         )
-        if run_proc.returncode != 0:
-            raise SmokeFailure("ui_subscription_page", {"stdout": run_proc.stdout, "stderr": run_proc.stderr})
-        payload = json.loads(run_proc.stdout)
-        if payload.get("isError"):
-            raise SmokeFailure("ui_subscription_page", payload)
-        return payload.get("result", payload)
-    finally:
-        subprocess.run([pwcli, "close"], cwd=REPO_ROOT, text=True, capture_output=True, timeout=30)
+    return payload
 
 
 def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
-    tenant_email = args.tenant_email or os.getenv("SMOKE_TENANT_EMAIL")
-    tenant_password = args.tenant_password or os.getenv("SMOKE_TENANT_PASSWORD")
-    admin_email = args.platform_admin_email or os.getenv("SMOKE_PLATFORM_ADMIN_EMAIL")
-    admin_password = args.platform_admin_password or os.getenv("SMOKE_PLATFORM_ADMIN_PASSWORD")
+    credentials = load_credentials(args.credentials_file)
+    tenant_email = args.tenant_email or credentials.get("SMOKE_TENANT_EMAIL") or os.getenv("SMOKE_TENANT_EMAIL")
+    tenant_password = (
+        args.tenant_password or credentials.get("SMOKE_TENANT_PASSWORD") or os.getenv("SMOKE_TENANT_PASSWORD")
+    )
+    admin_email = (
+        args.platform_admin_email
+        or credentials.get("SMOKE_PLATFORM_ADMIN_EMAIL")
+        or os.getenv("SMOKE_PLATFORM_ADMIN_EMAIL")
+    )
+    admin_password = (
+        args.platform_admin_password
+        or credentials.get("SMOKE_PLATFORM_ADMIN_PASSWORD")
+        or os.getenv("SMOKE_PLATFORM_ADMIN_PASSWORD")
+    )
     api_base = (args.api_base or os.getenv("SMOKE_API_BASE") or DEFAULT_API_BASE).rstrip("/")
     frontend_url = (args.frontend_url or os.getenv("SMOKE_FRONTEND_URL") or DEFAULT_FRONTEND_URL).rstrip("/")
 
-    require(bool(tenant_email and tenant_password), "tenant_credentials_configured", "Set SMOKE_TENANT_EMAIL and SMOKE_TENANT_PASSWORD")
-    require(bool(admin_email and admin_password), "platform_admin_credentials_configured", "Set SMOKE_PLATFORM_ADMIN_EMAIL and SMOKE_PLATFORM_ADMIN_PASSWORD")
+    require(
+        bool(tenant_email and tenant_password),
+        "tenant_credentials_configured",
+        "Set SMOKE_TENANT_EMAIL and SMOKE_TENANT_PASSWORD",
+    )
+    require(
+        bool(admin_email and admin_password),
+        "platform_admin_credentials_configured",
+        "Set SMOKE_PLATFORM_ADMIN_EMAIL and SMOKE_PLATFORM_ADMIN_PASSWORD",
+    )
 
-    summary: dict[str, Any] = {"api_base": api_base, "checks": []}
+    expected_identity = (args.expected_version, args.expected_commit, args.expected_release_id)
+    require(
+        all(expected_identity) or not any(expected_identity),
+        "release_identity_arguments",
+        "expected version, commit, and release ID must be supplied together",
+    )
+    if args.evidence_nonce is not None:
+        require(
+            len(args.evidence_nonce) == 32
+            and all(character in "0123456789abcdef" for character in args.evidence_nonce),
+            "evidence_nonce",
+            "evidence nonce must contain 32 lowercase hexadecimal characters",
+        )
+
+    summary: dict[str, Any] = {
+        "evidence_schema_version": 2,
+        "evidence_kind": "subscription_api",
+        "api_base": api_base,
+        "frontend_url": frontend_url,
+        "evidence_nonce": args.evidence_nonce,
+        "checks": [],
+    }
+    status, release_identity = call_api("GET", api_base, "/version")
+    require(
+        status == 200 and isinstance(release_identity, dict),
+        "release_identity",
+        {
+            "status": status,
+            "body": release_identity,
+        },
+    )
+    if all(expected_identity):
+        require(
+            release_identity.get("version") == args.expected_version
+            and release_identity.get("commit") == args.expected_commit
+            and release_identity.get("release_id") == args.expected_release_id,
+            "release_identity",
+            release_identity,
+        )
+    summary["release_identity"] = release_identity
+    summary["checks"].append("candidate_release_identity_ok")
 
     tenant_login = login(api_base, tenant_email, tenant_password, "tenant_login")
     tenant_token = tenant_login["access_token"]
@@ -189,13 +276,29 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
     admin_token = admin_login["access_token"]
     summary["checks"].append("platform_admin_login_ok")
 
-    for path, stage in [
-        ("/saas/reconciliation/ledger", "saas_ledger_reconciliation"),
-        ("/saas/reconciliation/payments", "saas_payment_reconciliation"),
+    for path, stage, checked_field in [
+        (
+            "/saas/reconciliation/ledger",
+            "saas_ledger_reconciliation",
+            "checked_tenants",
+        ),
+        (
+            "/saas/reconciliation/payments",
+            "saas_payment_reconciliation",
+            "checked_orders",
+        ),
     ]:
         status, body = call_api("GET", api_base, path, token=admin_token)
-        require(status == 200 and isinstance(body, dict), stage, {"status": status, "body": body})
-        summary[stage] = body
+        require(
+            status == 200,
+            stage,
+            {"code": "unexpected_http_status", "status": status},
+        )
+        summary[stage] = summarize_reconciliation(
+            body,
+            checked_field=checked_field,
+            stage=stage,
+        )
         summary["checks"].append(f"{stage}_ok")
 
     for path, stage in [
@@ -203,12 +306,12 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
         ("/saas/credit-transactions/export.csv", "credit_transactions_csv_export"),
     ]:
         status, body = call_api("GET", api_base, path, token=admin_token, accept="text/csv")
-        require(status == 200 and isinstance(body, str) and "," in body, stage, {"status": status, "body": body[:200] if isinstance(body, str) else body})
+        require(
+            status == 200 and isinstance(body, str) and "," in body,
+            stage,
+            {"status": status, "body": body[:200] if isinstance(body, str) else body},
+        )
         summary["checks"].append(f"{stage}_ok")
-
-    if args.ui:
-        summary["ui"] = run_ui_check(frontend_url, tenant_email, tenant_password, args.playwright_cli)
-        summary["checks"].append("ui_subscription_page_ok")
 
     summary["ok"] = True
     return summary
@@ -222,8 +325,11 @@ def main() -> int:
     parser.add_argument("--tenant-password", default=None)
     parser.add_argument("--platform-admin-email", default=None)
     parser.add_argument("--platform-admin-password", default=None)
-    parser.add_argument("--ui", action="store_true")
-    parser.add_argument("--playwright-cli", default=None)
+    parser.add_argument("--credentials-file", default=None)
+    parser.add_argument("--expected-version", default=None)
+    parser.add_argument("--expected-commit", default=None)
+    parser.add_argument("--expected-release-id", default=None)
+    parser.add_argument("--evidence-nonce", default=None)
     args = parser.parse_args()
 
     try:

@@ -271,6 +271,65 @@ async def test_legacy_unsigned_webhook_cannot_be_enabled(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("execution_enabled", "expected_status", "expected_enabled"),
+    [(True, None, True), (False, 409, False)],
+)
+async def test_trigger_enable_uses_the_same_runtime_gate(
+    monkeypatch,
+    execution_enabled,
+    expected_status,
+    expected_enabled,
+):
+    agent_id = uuid.uuid4()
+    trigger = SimpleNamespace(
+        id=uuid.uuid4(),
+        agent_id=agent_id,
+        name="user-trigger",
+        type="interval",
+        config={"minutes": 30},
+        reason="user requested",
+        is_enabled=False,
+        is_system=False,
+        max_fires=None,
+        cooldown_seconds=0,
+        expires_at=None,
+    )
+    session = MutableTriggerSession(trigger)
+
+    async def grant_manage(*_args):
+        return SimpleNamespace(id=agent_id), "manage"
+
+    monkeypatch.setattr(triggers_api, "async_session", FakeSessionFactory(session))
+    monkeypatch.setattr(triggers_api, "check_agent_access", grant_manage)
+    monkeypatch.setattr(
+        triggers_api,
+        "AUTOMATIC_TRIGGER_EXECUTION_ENABLED",
+        execution_enabled,
+    )
+
+    if expected_status is None:
+        await triggers_api.update_trigger(
+            agent_id,
+            trigger.id,
+            triggers_api.TriggerUpdate(is_enabled=True),
+            SimpleNamespace(),
+        )
+    else:
+        with pytest.raises(HTTPException) as exc:
+            await triggers_api.update_trigger(
+                agent_id,
+                trigger.id,
+                triggers_api.TriggerUpdate(is_enabled=True),
+                SimpleNamespace(),
+            )
+        assert exc.value.status_code == expected_status
+
+    assert trigger.is_enabled is expected_enabled
+    assert session.committed is expected_enabled
+
+
+@pytest.mark.asyncio
 async def test_internal_a2a_trigger_cannot_be_modified(monkeypatch):
     agent_id = uuid.uuid4()
     trigger = SimpleNamespace(

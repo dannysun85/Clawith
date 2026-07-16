@@ -4,18 +4,24 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import io
 import json
 import subprocess
 import tempfile
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+from PIL import Image
 from sqlalchemy import func, select
 
 from app.database import async_session
 from app.models.activity_log import AgentActivityLog
 from app.models.agent import Agent
+from app.models.audit import ChatMessage
+from app.models.chat_session import ChatSession
 from app.models.llm import LLMCredential
 from app.models.media_generation import MediaGenerationTask
 from app.models.notification import Notification
@@ -23,6 +29,7 @@ from app.models.subscription import CreditBalance, CreditReservation, CreditTran
 from app.models.tenant import Tenant
 from app.models.user import User
 from app.services import agent_tools, media_generation
+from app.services.media_assets import MediaContractError
 from app.services.storage import StorageEntry
 
 
@@ -58,6 +65,12 @@ def _valid_mp4_fixture() -> bytes:
         return output_path.read_bytes()
 
 
+def _valid_png_fixture(color: tuple[int, int, int]) -> bytes:
+    output = io.BytesIO()
+    Image.new("RGB", (64, 64), color).save(output, format="PNG")
+    return output.getvalue()
+
+
 class MemoryStorage:
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
@@ -83,8 +96,14 @@ class MemoryStorage:
         self.objects[key] = content.encode(encoding)
 
     async def write_bytes(self, key: str, data: bytes, content_type: str | None = None) -> None:
-        assert content_type == "video/mp4"
+        assert content_type
         self.objects[key] = data
+
+    async def read_bytes(self, key: str) -> bytes:
+        return self.objects[key]
+
+    async def delete(self, key: str) -> bool:
+        return self.objects.pop(key, None) is not None
 
 
 async def main() -> None:
@@ -138,6 +157,8 @@ async def main() -> None:
             model="MiniMax-Hailuo-2.3",
             amount=490,
             status="reserved",
+            ref_type="media_task",
+            ref_id=task_id,
         ))
         await db.flush()
 
@@ -178,8 +199,8 @@ async def main() -> None:
     status = {"status": "Success", "file_id": "smoke-file"}
     first = await media_generation.reconcile_minimax_video_task(task_id, status_data=status)
     second = await media_generation.reconcile_minimax_video_task(task_id, status_data=status)
-    assert first.status == "succeeded"
-    assert second.status == "succeeded"
+    assert first.status == "succeeded", first
+    assert second.status == "succeeded", second
 
     async with async_session() as db:
         balance = await db.get(CreditBalance, tenant_id)
@@ -330,6 +351,8 @@ async def main() -> None:
             model="MiniMax-Hailuo-2.3",
             amount=50,
             status="reserved",
+            ref_type="media_task",
+            ref_id=failure_task_id,
         ))
         await db.flush()
         db.add(MediaGenerationTask(
@@ -399,7 +422,394 @@ async def main() -> None:
     assert failure_task.consecutive_error_count == 12
     assert failure_consume_count == 0
     assert failure_notification_count == 1
-    print("Media generation PostgreSQL success/failure exactly-once smoke passed")
+
+    # Exercise the synchronous image state machine against real PostgreSQL.
+    # This covers object-first/DB-second restart recovery, stale lease fencing,
+    # exactly-once settlement/delivery, and compensating refund semantics.
+    sync_tenant_id = uuid.uuid4()
+    sync_user_id = uuid.uuid4()
+    sync_agent_id = uuid.uuid4()
+    sync_session_id = uuid.uuid4()
+    sync_topup_ref = uuid.uuid4()
+    async with async_session() as db:
+        db.add(Tenant(
+            id=sync_tenant_id,
+            name="Sync Media Smoke",
+            slug=f"sync-media-smoke-{sync_tenant_id.hex[:12]}",
+        ))
+        await db.flush()
+        db.add(User(
+            id=sync_user_id,
+            tenant_id=sync_tenant_id,
+            display_name="Sync Media Smoke User",
+            role="member",
+        ))
+        await db.flush()
+        db.add(Agent(
+            id=sync_agent_id,
+            tenant_id=sync_tenant_id,
+            creator_id=sync_user_id,
+            name="Sync Media Smoke Agent",
+            status="idle",
+        ))
+        await db.flush()
+        db.add(ChatSession(
+            id=sync_session_id,
+            agent_id=sync_agent_id,
+            user_id=sync_user_id,
+            title="Sync Media Smoke Session",
+            source_channel="web",
+            is_group=False,
+        ))
+        db.add(CreditBalance(tenant_id=sync_tenant_id, balance=1000, reserved=0))
+        db.add(CreditTransaction(
+            tenant_id=sync_tenant_id,
+            delta=1000,
+            balance_after=1000,
+            reason="topup",
+            ref_type="media_smoke",
+            ref_id=sync_topup_ref,
+            user_id=sync_user_id,
+        ))
+        await db.commit()
+
+    async def no_publish(_record_id):
+        return False
+
+    async def no_issue(*_args, **_kwargs):
+        return None
+
+    media_generation.publish_media_completion_event = no_publish
+    media_generation._record_media_failure_issue = no_issue
+
+    async def create_sync_image_task(
+        record_id: uuid.UUID,
+        *,
+        credit_cost: int,
+        output_name: str,
+    ) -> MediaGenerationTask:
+        return await media_generation.create_minimax_sync_media_task_record(
+            record_id=record_id,
+            tenant_id=sync_tenant_id,
+            agent_id=sync_agent_id,
+            user_id=sync_user_id,
+            credential_id=credential_id,
+            origin_session_id=sync_session_id,
+            modality="image",
+            tier="pro",
+            model="image-01",
+            credit_cost=credit_cost,
+            output_path=f"workspace/images/{output_name}.png",
+            request_metadata={
+                "recovery_extension": "bin",
+                "output_extension": ".png",
+                "output_content_type": "image/png",
+                "overlay_text": "",
+                "overlay_text_sha256": hashlib.sha256(b"").hexdigest(),
+                "overlay_position": "bottom",
+                "brand_position": "center",
+                "brand_scale": 0.42,
+            },
+        )
+
+    recovery_task_id = uuid.uuid4()
+    recovery_created = await create_sync_image_task(
+        recovery_task_id,
+        credit_cost=40,
+        output_name="restart-recovery",
+    )
+    recovery_raw_key = str(
+        (recovery_created.request_metadata or {})["recovery_asset_storage_key"]
+    )
+    recovery_png = _valid_png_fixture((12, 120, 220))
+    # Provider response/object survived, but the acceptance/raw DB commit did
+    # not. The callback's active retry transition makes the daemon pick it up.
+    await media_generation.record_minimax_sync_provider_response_retry(
+        recovery_task_id,
+        RuntimeError("synthetic acceptance commit interruption"),
+    )
+    storage.objects[recovery_raw_key] = recovery_png
+    async with async_session() as db:
+        recovery_row = await db.get(
+            MediaGenerationTask,
+            recovery_task_id,
+            with_for_update=True,
+        )
+        assert recovery_row is not None
+        metadata = dict(recovery_row.request_metadata or {})
+        metadata["raw_capture_deadline_at"] = (
+            datetime.now(timezone.utc) - timedelta(minutes=1)
+        ).isoformat()
+        recovery_row.request_metadata = metadata
+        await db.commit()
+    compensation_race = await media_generation._compensate_unrecoverable_sync_task(
+        recovery_task_id,
+        "stale no-raw observer",
+    )
+    assert compensation_race.outcome == "asset_appeared"
+    recovery_results = await asyncio.gather(
+        media_generation.reconcile_minimax_sync_media_task(recovery_task_id),
+        media_generation.reconcile_minimax_sync_media_task(recovery_task_id),
+    )
+    recovery_final = await media_generation.reconcile_minimax_sync_media_task(
+        recovery_task_id
+    )
+    assert "succeeded" in {result.status for result in recovery_results}
+    assert recovery_final.status == "succeeded"
+
+    lease_task_id = uuid.uuid4()
+    lease_created = await create_sync_image_task(
+        lease_task_id,
+        credit_cost=50,
+        output_name="lease-fence",
+    )
+    lease_raw_key = str(
+        (lease_created.request_metadata or {})["recovery_asset_storage_key"]
+    )
+    lease_png_a = _valid_png_fixture((220, 20, 20))
+    lease_png_b = _valid_png_fixture((20, 200, 80))
+    await media_generation.store_minimax_sync_recovery_asset(
+        lease_task_id,
+        lease_png_b,
+        content_type="image/png",
+        expected_key=lease_raw_key,
+    )
+    claim_a_status, claim_a = await media_generation._claim_sync_local_processing(
+        lease_task_id
+    )
+    assert claim_a_status == "claimed"
+    token_a = str((claim_a.request_metadata or {})["processing_lease_token"])
+    async with async_session() as db:
+        lease_row = await db.get(
+            MediaGenerationTask,
+            lease_task_id,
+            with_for_update=True,
+        )
+        assert lease_row is not None
+        lease_row.next_poll_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        await db.commit()
+    claim_b_status, claim_b = await media_generation._claim_sync_local_processing(
+        lease_task_id
+    )
+    assert claim_b_status == "claimed"
+    token_b = str((claim_b.request_metadata or {})["processing_lease_token"])
+    assert token_a != token_b
+
+    status_a = {
+        "status": "Success",
+        "worker": "A",
+        "_astra_output_sha256": hashlib.sha256(lease_png_a).hexdigest(),
+    }
+    status_b = {
+        "status": "Success",
+        "worker": "B",
+        "_astra_output_sha256": hashlib.sha256(lease_png_b).hexdigest(),
+    }
+    store_results = await asyncio.gather(
+        media_generation._store_authoritative_media_output(
+            lease_task_id,
+            lease_png_a,
+            content_type="image/png",
+            status_data=status_a,
+            expected_working_status="sync_processing",
+            processing_lease_token=token_a,
+        ),
+        media_generation._store_authoritative_media_output(
+            lease_task_id,
+            lease_png_b,
+            content_type="image/png",
+            status_data=status_b,
+            expected_working_status="sync_processing",
+            processing_lease_token=token_b,
+        ),
+        return_exceptions=True,
+    )
+    assert sum(isinstance(result, MediaGenerationTask) for result in store_results) == 1
+    assert sum(isinstance(result, MediaContractError) for result in store_results) == 1
+    stale_failure_applied, _stale_task = await media_generation._record_sync_recovery_retry(
+        lease_task_id,
+        RuntimeError("worker A completed after its lease expired"),
+        expected_working_status="sync_processing",
+        processing_lease_token=token_a,
+    )
+    assert stale_failure_applied is False
+    finalize_results = await asyncio.gather(
+        media_generation._finalize_verified_success(
+            lease_task_id,
+            status_b,
+            len(lease_png_b),
+            deliver_completion=True,
+        ),
+        media_generation._finalize_verified_success(
+            lease_task_id,
+            status_b,
+            len(lease_png_b),
+            deliver_completion=True,
+        ),
+    )
+    assert all(result is not None and result.status == "succeeded" for result in finalize_results)
+    assert storage.objects[
+        f"{sync_agent_id}/workspace/images/lease-fence.png"
+    ] == lease_png_b
+
+    compensation_task_id = uuid.uuid4()
+    await create_sync_image_task(
+        compensation_task_id,
+        credit_cost=30,
+        output_name="compensated",
+    )
+    await media_generation.record_minimax_sync_provider_response_retry(
+        compensation_task_id,
+        RuntimeError("synthetic raw capture interruption"),
+    )
+    async with async_session() as db:
+        compensation_row = await db.get(
+            MediaGenerationTask,
+            compensation_task_id,
+            with_for_update=True,
+        )
+        assert compensation_row is not None
+        metadata = dict(compensation_row.request_metadata or {})
+        metadata["raw_capture_deadline_at"] = (
+            datetime.now(timezone.utc) - timedelta(minutes=1)
+        ).isoformat()
+        compensation_row.request_metadata = metadata
+        await db.commit()
+    compensation_results = await asyncio.gather(
+        media_generation.reconcile_minimax_sync_media_task(compensation_task_id),
+        media_generation.reconcile_minimax_sync_media_task(compensation_task_id),
+    )
+    compensation_final = await media_generation.reconcile_minimax_sync_media_task(
+        compensation_task_id
+    )
+    assert "compensated" in {result.status for result in compensation_results}
+    assert compensation_final.status == "compensated"
+
+    async with async_session() as db:
+        sync_balance = await db.get(CreditBalance, sync_tenant_id)
+        recovery_task = await db.get(MediaGenerationTask, recovery_task_id)
+        lease_task = await db.get(MediaGenerationTask, lease_task_id)
+        compensation_task = await db.get(MediaGenerationTask, compensation_task_id)
+        sync_consume_count = await db.scalar(
+            select(func.count())
+            .select_from(CreditTransaction)
+            .where(
+                CreditTransaction.tenant_id == sync_tenant_id,
+                CreditTransaction.reason == "consume",
+            )
+        )
+        compensation_consume_count = await db.scalar(
+            select(func.count())
+            .select_from(CreditTransaction)
+            .where(
+                CreditTransaction.reason == "consume",
+                CreditTransaction.ref_type == "reservation",
+                CreditTransaction.ref_id == compensation_task.reservation_id,
+            )
+        )
+        compensation_refund_count = await db.scalar(
+            select(func.count())
+            .select_from(CreditTransaction)
+            .where(
+                CreditTransaction.reason == "refund",
+                CreditTransaction.ref_type == "media_task",
+                CreditTransaction.ref_id == compensation_task_id,
+            )
+        )
+        sync_message_count = await db.scalar(
+            select(func.count())
+            .select_from(ChatMessage)
+            .where(
+                ChatMessage.id.in_((
+                    recovery_task.completion_message_id,
+                    lease_task.completion_message_id,
+                ))
+            )
+        )
+        recovery_activity_count = await db.scalar(
+            select(func.count())
+            .select_from(AgentActivityLog)
+            .where(AgentActivityLog.related_id == recovery_task_id)
+        )
+        lease_activity_count = await db.scalar(
+            select(func.count())
+            .select_from(AgentActivityLog)
+            .where(AgentActivityLog.related_id == lease_task_id)
+        )
+
+    assert sync_balance is not None
+    assert sync_balance.balance == 910 and sync_balance.reserved == 0
+    assert recovery_task is not None and recovery_task.status == "succeeded"
+    assert lease_task is not None and lease_task.status == "succeeded"
+    assert compensation_task is not None and compensation_task.status == "compensated"
+    assert sync_consume_count == 3
+    assert compensation_consume_count == 1
+    assert compensation_refund_count == 1
+    assert sync_message_count == 2
+    assert recovery_activity_count == 1
+    assert lease_activity_count == 1
+
+    # A corrupt cross-tenant binding must fail closed before touching either
+    # tenant's balance or reservation state.
+    corrupt_task_id = uuid.uuid4()
+    corrupt_reservation_id = uuid.uuid4()
+    async with async_session() as db:
+        source_balance = await db.get(CreditBalance, tenant_id, with_for_update=True)
+        assert source_balance is not None
+        source_balance.reserved += 1
+        db.add(CreditReservation(
+            id=corrupt_reservation_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            agent_id=agent_id,
+            action="image",
+            modality="image",
+            tier="lite",
+            provider="minimax",
+            model="image-01",
+            amount=1,
+            status="provider_inflight",
+            ref_type="media_task",
+            ref_id=corrupt_task_id,
+        ))
+        # These fixtures intentionally do not declare an ORM relationship.
+        # Flush the referenced reservation before inserting the corrupt task
+        # so PostgreSQL can enforce the real foreign-key order deterministically.
+        await db.flush()
+        db.add(MediaGenerationTask(
+            id=corrupt_task_id,
+            tenant_id=sync_tenant_id,
+            user_id=sync_user_id,
+            agent_id=sync_agent_id,
+            credential_id=credential_id,
+            reservation_id=corrupt_reservation_id,
+            provider="minimax",
+            modality="image",
+            model="image-01",
+            status="submitting",
+            metadata_path="workspace/media_tasks/corrupt.json",
+            output_path="workspace/images/corrupt.png",
+            request_metadata={
+                "recovery_asset_storage_key": (
+                    f"_internal/provider_recovery/minimax/sync/{sync_agent_id}/"
+                    f"{corrupt_task_id}/image.bin"
+                ),
+            },
+        ))
+        await db.commit()
+    try:
+        await media_generation.mark_minimax_sync_provider_accepted(corrupt_task_id)
+    except MediaContractError as exc:
+        assert "ownership" in str(exc)
+    else:
+        raise AssertionError("Cross-tenant media reservation binding was accepted")
+    async with async_session() as db:
+        corrupt_task = await db.get(MediaGenerationTask, corrupt_task_id)
+        corrupt_reservation = await db.get(CreditReservation, corrupt_reservation_id)
+    assert corrupt_task is not None and corrupt_task.status == "submitting"
+    assert corrupt_reservation is not None and corrupt_reservation.status == "provider_inflight"
+
+    print("Media generation PostgreSQL video/sync exactly-once smoke passed")
 
 
 if __name__ == "__main__":

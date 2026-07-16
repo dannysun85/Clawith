@@ -14,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.core.permissions import get_agent_access_level_for_user_id
 from app.models.agent import Agent
 from app.models.audit import ApprovalRequest, AuditLog
 from app.models.douyin import (
@@ -336,6 +337,7 @@ class DouyinOperationsService:
         *,
         tenant_id: uuid.UUID,
         user_id: uuid.UUID,
+        requester_id: uuid.UUID,
         agent_id: uuid.UUID,
         account_id: uuid.UUID | None,
         content_type: str,
@@ -347,7 +349,12 @@ class DouyinOperationsService:
         scheduled_at: datetime | None,
         idempotency_key: str | None,
     ) -> DouyinPublishJob:
-        await self._assert_agent_in_tenant(db, tenant_id, agent_id)
+        await self._assert_agent_in_tenant(
+            db,
+            tenant_id,
+            agent_id,
+            requester_id=requester_id,
+        )
         key = idempotency_key or f"publish:{agent_id}:{secrets.token_urlsafe(16)}"
         existing = await self._get_existing_publish_job(db, tenant_id, key)
         if existing:
@@ -614,6 +621,7 @@ class DouyinOperationsService:
         *,
         tenant_id: uuid.UUID,
         user_id: uuid.UUID,
+        requester_id: uuid.UUID,
         job_id: uuid.UUID,
     ) -> DouyinPublishJob:
         result = await db.execute(
@@ -622,6 +630,12 @@ class DouyinOperationsService:
         job = result.scalar_one_or_none()
         if not job:
             raise HTTPException(status_code=404, detail="Douyin publish job not found")
+        await self._assert_agent_in_tenant(
+            db,
+            tenant_id,
+            job.agent_id,
+            requester_id=requester_id,
+        )
         if job.status not in {"awaiting_user_publish", "user_confirmed_waiting_verification", "published_unverified"}:
             raise HTTPException(status_code=400, detail="Publish job is not waiting for user confirmation")
         now = datetime.now(timezone.utc)
@@ -675,6 +689,7 @@ class DouyinOperationsService:
         *,
         tenant_id: uuid.UUID,
         user_id: uuid.UUID,
+        requester_id: uuid.UUID,
         agent_id: uuid.UUID,
         account_id: uuid.UUID | None,
         comment_id: str,
@@ -682,7 +697,12 @@ class DouyinOperationsService:
         item_id: str | None,
         idempotency_key: str | None,
     ) -> DouyinOperation:
-        await self._assert_agent_in_tenant(db, tenant_id, agent_id)
+        await self._assert_agent_in_tenant(
+            db,
+            tenant_id,
+            agent_id,
+            requester_id=requester_id,
+        )
         key = idempotency_key or f"reply:{agent_id}:{comment_id}:{secrets.token_urlsafe(12)}"
         existing_result = await db.execute(
             select(DouyinOperation).where(DouyinOperation.tenant_id == tenant_id, DouyinOperation.idempotency_key == key)
@@ -843,8 +863,20 @@ class DouyinOperationsService:
         await db.flush()
         return operation
 
-    async def agent_dashboard(self, db: AsyncSession, *, tenant_id: uuid.UUID, agent_id: uuid.UUID) -> dict:
-        await self._assert_agent_in_tenant(db, tenant_id, agent_id)
+    async def agent_dashboard(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: uuid.UUID,
+        agent_id: uuid.UUID,
+        requester_id: uuid.UUID,
+    ) -> dict:
+        await self._assert_agent_in_tenant(
+            db,
+            tenant_id,
+            agent_id,
+            requester_id=requester_id,
+        )
         account = await self._get_or_first_account(db, tenant_id, None)
         jobs_result = await db.execute(
             select(DouyinPublishJob)
@@ -885,10 +917,18 @@ class DouyinOperationsService:
             "message": "已连接抖音账号" if account else "需要先在企业设置连接抖音账号",
         }
 
-    async def account_snapshot_tool(self, db: AsyncSession, *, agent_id: uuid.UUID) -> str:
+    async def account_snapshot_tool(
+        self,
+        db: AsyncSession,
+        *,
+        agent_id: uuid.UUID,
+        requester_id: uuid.UUID,
+    ) -> str:
         agent = await self._get_agent(db, agent_id)
         if not agent or not agent.tenant_id:
             return "需要先将 Agent 归属到企业后才能读取抖音账号。"
+        if not await get_agent_access_level_for_user_id(db, requester_id, agent):
+            return "无权读取此 Agent 的抖音账号。"
         account = await self._get_or_first_account(db, agent.tenant_id, None)
         if not account:
             return "需要先在企业设置连接抖音官方账号，当前不能读取抖音数据。"
@@ -905,11 +945,25 @@ class DouyinOperationsService:
             ]
         )
 
-    async def make_operation_plan_tool(self, db: AsyncSession, *, agent_id: uuid.UUID, goal: str | None = None) -> str:
+    async def make_operation_plan_tool(
+        self,
+        db: AsyncSession,
+        *,
+        agent_id: uuid.UUID,
+        requester_id: uuid.UUID,
+        goal: str | None = None,
+    ) -> str:
         agent = await self._get_agent(db, agent_id)
         if not agent or not agent.tenant_id:
             return "需要先将 Agent 归属到企业。"
-        dashboard = await self.agent_dashboard(db, tenant_id=agent.tenant_id, agent_id=agent_id)
+        if not await get_agent_access_level_for_user_id(db, requester_id, agent):
+            return "无权读取此 Agent 的抖音运营数据。"
+        dashboard = await self.agent_dashboard(
+            db,
+            tenant_id=agent.tenant_id,
+            agent_id=agent_id,
+            requester_id=requester_id,
+        )
         account = dashboard["account"]
         if not account:
             return "当前没有连接抖音账号。建议先连接账号，然后基于真实数据生成计划。"
@@ -973,10 +1027,19 @@ class DouyinOperationsService:
         result = await db.execute(select(Agent).where(Agent.id == agent_id))
         return result.scalar_one_or_none()
 
-    async def _assert_agent_in_tenant(self, db: AsyncSession, tenant_id: uuid.UUID, agent_id: uuid.UUID) -> Agent:
+    async def _assert_agent_in_tenant(
+        self,
+        db: AsyncSession,
+        tenant_id: uuid.UUID,
+        agent_id: uuid.UUID,
+        *,
+        requester_id: uuid.UUID,
+    ) -> Agent:
         agent = await self._get_agent(db, agent_id)
         if not agent or agent.tenant_id != tenant_id:
             raise HTTPException(status_code=404, detail="Agent not found in current tenant")
+        if not await get_agent_access_level_for_user_id(db, requester_id, agent):
+            raise HTTPException(status_code=403, detail="No access to this Agent")
         if agent.deletion_requested_at is not None:
             raise HTTPException(
                 status_code=409,

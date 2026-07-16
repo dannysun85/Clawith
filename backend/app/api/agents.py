@@ -28,6 +28,7 @@ from app.models.subscription import CreditReservation
 from app.models.user import User
 from app.schemas.schemas import AgentCreate, AgentOut, AgentUpdate, ApprovalAction, ApprovalRequestOut
 from app.services.storage import get_storage_backend
+from app.services.media_generation import UNRESOLVED_MEDIA_STATUSES
 from app.services.access_relationships import ensure_access_granted_platform_relationships
 from app.services.quota_guard import check_agent_creation_quota, QuotaExceeded, quota_error_payload
 from app.services.entitlements import get_tenant_entitlements
@@ -185,19 +186,7 @@ async def _agent_deletion_blockers(
             select(MediaGenerationTask.id)
             .where(
                 MediaGenerationTask.agent_id == agent_id,
-                MediaGenerationTask.status.in_(
-                    (
-                        "submitting",
-                        "submitted",
-                        "processing",
-                        "retrying",
-                        "downloading",
-                        "asset_repairing",
-                        "asset_delivery_failed",
-                        "settlement_ready",
-                        "submission_ambiguous",
-                    )
-                ),
+                MediaGenerationTask.status.in_(UNRESOLVED_MEDIA_STATUSES),
             )
             .limit(1),
         ),
@@ -380,6 +369,7 @@ def _apply_release_capabilities(model: AgentOut) -> None:
         APPROVAL_AUTOMATIC_EXECUTION_ENABLED,
     )
     from app.services.scheduler import AUTOMATIC_SCHEDULE_EXECUTION_ENABLED
+    from app.services.supervision_reminder import SUPERVISION_EXECUTION_ENABLED
     from app.services.task_executor import AUTOMATIC_TASK_EXECUTION_ENABLED
     from app.services.trigger_runtime.config import (
         AUTOMATIC_TRIGGER_EXECUTION_ENABLED,
@@ -398,6 +388,7 @@ def _apply_release_capabilities(model: AgentOut) -> None:
     model.execution_capabilities = {
         "schedule_execution": AUTOMATIC_SCHEDULE_EXECUTION_ENABLED,
         "task_execution": AUTOMATIC_TASK_EXECUTION_ENABLED,
+        "supervision_execution": SUPERVISION_EXECUTION_ENABLED,
         "trigger_execution": AUTOMATIC_TRIGGER_EXECUTION_ENABLED,
         "approval_dispatch": APPROVAL_AUTOMATIC_EXECUTION_ENABLED,
         # Gateway-to-human delivery is fail-closed until a durable provider
@@ -1440,6 +1431,17 @@ async def delete_agent(
     ]
     try:
         async with agentbay_agent_deletion_fence(agent_id=agent_id):
+            from app.services.media_generation import (
+                delete_private_media_recovery_assets_for_agent,
+            )
+
+            # Object storage is not transactional. The helper first commits a
+            # durable deletion intent in its own short transaction, performs
+            # idempotent object deletion without SQL locks, and then records
+            # the acknowledgement. A later Agent-row failure cannot erase the
+            # evidence or turn the deletion into an unexplained asset loss.
+            await delete_private_media_recovery_assets_for_agent(agent_id)
+
             # Re-lock the parent before child deletes. The durable phase-1
             # fence must still exist; start/recover cannot clear it.
             locked_agent = (

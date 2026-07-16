@@ -11,6 +11,7 @@ from app.core.permissions import check_agent_access
 from app.database import async_session
 from app.models.trigger import AgentTrigger
 from app.services.trigger_runtime.config import (
+    AUTOMATIC_TRIGGER_EXECUTION_ENABLED,
     changes_on_message_binding,
     on_message_source_binding_error,
     reserved_trigger_config_keys,
@@ -176,10 +177,11 @@ async def update_trigger(
                         400,
                         "Webhook triggers require an HMAC secret before they can be enabled",
                     )
-                raise HTTPException(
-                    409,
-                    "Automatic trigger execution is paused in this release",
-                )
+                if not AUTOMATIC_TRIGGER_EXECUTION_ENABLED:
+                    raise HTTPException(
+                        409,
+                        "Automatic trigger execution is paused in this release",
+                    )
             trigger.is_enabled = body.is_enabled
         if body.max_fires is not None:
             trigger.max_fires = body.max_fires

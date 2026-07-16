@@ -74,6 +74,21 @@ async def test_org_admin_cannot_edit_user_from_another_tenant():
     assert db.flushed is False
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("role", "expected_status"),
+    [("member", 403), ("platform_admin", 400)],
+)
+async def test_tenantless_user_cannot_list_every_organization(role, expected_status):
+    actor = SimpleNamespace(id=uuid.uuid4(), role=role, tenant_id=None)
+    db = FakeDB(None)
+
+    with pytest.raises(HTTPException) as exc:
+        await organization.list_users(current_user=actor, db=db)
+
+    assert exc.value.status_code == expected_status
+
+
 def test_org_admin_cannot_manage_any_real_model():
     actor = SimpleNamespace(
         id=uuid.uuid4(), role="org_admin", tenant_id=uuid.uuid4(), identity=None,

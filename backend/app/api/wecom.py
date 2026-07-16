@@ -37,7 +37,6 @@ from app.services.channel_session import find_or_create_channel_session
 from app.services.channel_user_service import channel_user_service
 from app.services.platform_service import platform_service
 from app.services.wecom_service import normalize_wecom_agent_id, send_wecom_message
-from app.api.feishu import _call_agent_llm
 from app.schemas.schemas import ChannelConfigOut
 from app.services.wecom_stream import wecom_stream_manager
 
@@ -132,7 +131,7 @@ async def serve_wecom_verify_file(
     result = await db.execute(
         select(IdentityProvider).where(
             IdentityProvider.provider_type == "wecom",
-            IdentityProvider.is_active == True,
+            IdentityProvider.is_active.is_(True),
         )
     )
     providers = result.scalars().all()
@@ -174,18 +173,72 @@ async def configure_wecom_channel(
             detail="connection_mode must be websocket or webhook",
         )
 
-    # WebSocket mode fields (AI Bot)
-    bot_id = str(data.get("bot_id") or "").strip()
-    bot_secret = str(data.get("bot_secret") or "").strip()
-
-    # Legacy webhook mode fields
-    corp_id = str(data.get("corp_id") or "").strip()
     wecom_agent_id_raw = data.get("wecom_agent_id", "")
     wecom_agent_id_text = str(wecom_agent_id_raw or "").strip()
     numeric_wecom_agent_id = normalize_wecom_agent_id(wecom_agent_id_raw)
+
+    # Parse the submitted transport fields before the database read. A complete
+    # legacy webhook form (or an explicit webhook request) has enough context
+    # to reject a malformed application AgentID immediately. Explicit
+    # WebSocket switches deliberately ignore and later clear stale webhook
+    # fields from older frontend forms.
+    bot_id = str(data.get("bot_id") or "").strip()
+    bot_secret = str(data.get("bot_secret") or "").strip()
+    corp_id = str(data.get("corp_id") or "").strip()
     secret = str(data.get("secret") or "").strip()
     token = str(data.get("token") or "").strip()
     encoding_aes_key = str(data.get("encoding_aes_key") or "").strip()
+    submitted_ws_mode = bool(bot_id and bot_secret)
+    submitted_webhook_mode = bool(corp_id and secret and token and encoding_aes_key)
+    can_infer_submitted_webhook = (
+        requested_mode == "webhook"
+        or (
+            not requested_mode
+            and submitted_webhook_mode
+            and not submitted_ws_mode
+        )
+    )
+    if (
+        can_infer_submitted_webhook
+        and wecom_agent_id_text
+        and numeric_wecom_agent_id is None
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="wecom_agent_id must be a positive ASCII numeric value when provided",
+        )
+
+    result = await db.execute(
+        select(ChannelConfig).where(
+            ChannelConfig.agent_id == agent_id,
+            ChannelConfig.channel_type == "wecom",
+        )
+    )
+    existing = result.scalar_one_or_none()
+    existing_mode = str(
+        ((existing.extra_config or {}).get("connection_mode") if existing else "")
+        or ""
+    )
+
+    # Secret inputs are write-only. Blank values retain credentials only while
+    # editing the same transport mode; switching modes always requires the new
+    # mode's complete credential set.
+    effective_requested_mode = requested_mode or existing_mode
+    if existing and effective_requested_mode == existing_mode == "websocket":
+        bot_id = bot_id or str((existing.extra_config or {}).get("bot_id") or "")
+        bot_secret = bot_secret or str(
+            (existing.extra_config or {}).get("bot_secret") or ""
+        )
+    if existing and effective_requested_mode == existing_mode == "webhook":
+        corp_id = corp_id or str(existing.app_id or "")
+        secret = secret or str(existing.app_secret or "")
+        token = token or str(existing.verification_token or "")
+        encoding_aes_key = encoding_aes_key or str(existing.encrypt_key or "")
+        if not wecom_agent_id_text:
+            wecom_agent_id_text = str(
+                (existing.extra_config or {}).get("wecom_agent_id") or ""
+            )
+            numeric_wecom_agent_id = normalize_wecom_agent_id(wecom_agent_id_text)
 
     # Select the explicitly requested mode. Legacy clients without this field
     # retain the old inference rule, but an edit form can no longer be kept in
@@ -210,11 +263,6 @@ async def configure_wecom_channel(
             status_code=422,
             detail="corp_id+secret+token+encoding_aes_key required for Webhook mode",
         )
-    # Customer Service (KF) callbacks use open_kfid and the dedicated KF send
-    # API, so they do not have an application AgentID. Keep AgentID optional for
-    # that valid configuration, while rejecting malformed values when supplied.
-    # Ordinary application messages still fail closed before LLM/Credits work
-    # at runtime when the field is absent.
     if (
         connection_mode == "webhook"
         and wecom_agent_id_text
@@ -224,7 +272,11 @@ async def configure_wecom_channel(
             status_code=422,
             detail="wecom_agent_id must be a positive ASCII numeric value when provided",
         )
-
+    # Customer Service (KF) callbacks use open_kfid and the dedicated KF send
+    # API, so they do not have an application AgentID. Keep AgentID optional for
+    # that valid configuration, while rejecting malformed values when supplied.
+    # Ordinary application messages still fail closed before LLM/Credits work
+    # at runtime when the field is absent.
     # Persist only the active mode. This both clears hidden stale credentials
     # during a mode switch and keeps later runtime inference unambiguous.
     if connection_mode == "websocket":
@@ -249,13 +301,6 @@ async def configure_wecom_channel(
         "connection_mode": connection_mode,
     }
 
-    result = await db.execute(
-        select(ChannelConfig).where(
-            ChannelConfig.agent_id == agent_id,
-            ChannelConfig.channel_type == "wecom",
-        )
-    )
-    existing = result.scalar_one_or_none()
     if existing:
         existing.app_id = corp_id
         existing.app_secret = secret
@@ -799,10 +844,6 @@ async def wecom_callback(
     provider = provider_result.scalar_one_or_none()
     if not provider:
         raise HTTPException(status_code=404, detail="WeCom provider not configured for this tenant")
-
-    config = provider.config
-    corp_id = config.get("app_id") or config.get("corp_id")
-    secret = config.get("app_secret") or config.get("secret")
 
     # 2. Extract user info and login/register via RegistrationService
     try:

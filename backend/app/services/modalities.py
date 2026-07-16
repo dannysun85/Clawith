@@ -53,3 +53,32 @@ def modality_match_values(value: str | None) -> list[str]:
             seen.add(item)
             out.append(item)
     return out
+
+
+def model_supports_modality(
+    route_modality: str | None,
+    *,
+    model_modality: str | None,
+    model_modalities: list[str] | tuple[str, ...] | None,
+    supports_vision: bool,
+) -> bool:
+    """Return whether an LLM model can safely back an understanding route.
+
+    ``llm_models.modalities`` is the authoritative multi-capability declaration.
+    Historical rows may only have the singular ``modality`` column, and
+    ``supports_vision`` is retained as an image-capability compatibility flag.
+    Keeping this policy in one pure helper prevents the SaaS editor and the
+    enterprise model editor from applying different route rules.
+    """
+
+    canonical = canonicalize_modality(route_modality)
+    if not canonical:
+        return False
+    declared = set(
+        canonicalize_modalities(model_modalities or ([model_modality] if model_modality else []))
+    )
+    if supports_vision:
+        declared.add("image")
+    if canonical == "multimodal":
+        return "multimodal" in declared
+    return canonical in declared or "multimodal" in declared

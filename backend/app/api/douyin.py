@@ -12,10 +12,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.core.permissions import build_visible_agents_query, check_agent_access
 from app.core.events import get_redis
 from app.core.security import get_current_admin, get_current_user
 from app.database import get_db
 from app.models.audit import AuditLog
+from app.models.agent import Agent
 from app.models.douyin import DouyinComment, DouyinMetricSnapshot, DouyinPublishJob
 from app.models.user import User
 from app.schemas.douyin import (
@@ -188,7 +190,13 @@ async def get_douyin_agent_dashboard(
 ):
     if not current_user.tenant_id:
         raise HTTPException(status_code=400, detail="Current user has no tenant")
-    return await douyin_operations_service.agent_dashboard(db, tenant_id=current_user.tenant_id, agent_id=agent_id)
+    await check_agent_access(db, current_user, agent_id)
+    return await douyin_operations_service.agent_dashboard(
+        db,
+        tenant_id=current_user.tenant_id,
+        agent_id=agent_id,
+        requester_id=current_user.id,
+    )
 
 
 @router.get("/publish-jobs", response_model=list[DouyinPublishJobOut])
@@ -201,7 +209,13 @@ async def list_douyin_publish_jobs(
         raise HTTPException(status_code=400, detail="Current user has no tenant")
     query = select(DouyinPublishJob).where(DouyinPublishJob.tenant_id == current_user.tenant_id)
     if agent_id:
+        await check_agent_access(db, current_user, agent_id)
         query = query.where(DouyinPublishJob.agent_id == agent_id)
+    else:
+        visible_agent_ids = build_visible_agents_query(current_user).with_only_columns(
+            Agent.id,
+        )
+        query = query.where(DouyinPublishJob.agent_id.in_(visible_agent_ids))
     result = await db.execute(query.order_by(DouyinPublishJob.created_at.desc()).limit(100))
     return list(result.scalars().all())
 
@@ -218,6 +232,7 @@ async def create_douyin_publish_job(
         db,
         tenant_id=current_user.tenant_id,
         user_id=current_user.id,
+        requester_id=current_user.id,
         agent_id=data.agent_id,
         account_id=data.account_id,
         content_type=data.content_type,
@@ -248,6 +263,7 @@ async def get_douyin_publish_job(
     job = result.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="Douyin publish job not found")
+    await check_agent_access(db, current_user, job.agent_id)
     return job
 
 
@@ -305,6 +321,7 @@ async def confirm_douyin_user_publish(
         db,
         tenant_id=current_user.tenant_id,
         user_id=current_user.id,
+        requester_id=current_user.id,
         job_id=job_id,
     )
 
@@ -321,6 +338,7 @@ async def create_douyin_comment_reply(
         db,
         tenant_id=current_user.tenant_id,
         user_id=current_user.id,
+        requester_id=current_user.id,
         agent_id=data.agent_id,
         account_id=data.account_id,
         comment_id=data.comment_id,

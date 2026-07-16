@@ -4,8 +4,6 @@ Uses the same agent context (soul, memory, skills, relationships, tools)
 as the chat dialog. Supports tool-calling loop for autonomous execution.
 """
 
-import asyncio
-import json
 import uuid
 from datetime import datetime, timezone
 
@@ -15,11 +13,10 @@ from sqlalchemy import select
 from app.config import get_settings
 from app.database import async_session
 from app.models.agent import Agent
-from app.models.llm import LLMModel
 from app.models.task import Task, TaskLog
 
 settings = get_settings()
-AUTOMATIC_TASK_EXECUTION_ENABLED = False
+AUTOMATIC_TASK_EXECUTION_ENABLED = settings.USER_TASK_EXECUTION_ENABLED
 
 
 async def execute_task(task_id: uuid.UUID, agent_id: uuid.UUID) -> None:
@@ -40,13 +37,17 @@ async def execute_task(task_id: uuid.UUID, agent_id: uuid.UUID) -> None:
         )
         return
 
+    task_id = uuid.UUID(str(task_id))
+    agent_id = uuid.UUID(str(agent_id))
     logger.info(f"[TaskExec] Starting task {task_id} for agent {agent_id}")
 
-    # Step 1: Mark as doing
+    # Step 1: atomically claim the task and revalidate the durable requester.
     async with async_session() as db:
-        result = await db.execute(select(Task).where(Task.id == task_id))
+        result = await db.execute(
+            select(Task).where(Task.id == task_id).with_for_update()
+        )
         task = result.scalar_one_or_none()
-        if not task:
+        if not task or task.agent_id != agent_id:
             logger.warning(f"[TaskExec] Task {task_id} not found")
             return
 
@@ -66,28 +67,73 @@ async def execute_task(task_id: uuid.UUID, agent_id: uuid.UUID) -> None:
             )
             return
 
+        if task.status != "pending":
+            logger.info(
+                "[TaskExec] Task {} is not pending status={}",
+                task_id,
+                task.status,
+            )
+            return
+
+        agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
+        agent = agent_result.scalar_one_or_none()
+        if agent is None:
+            logger.warning("[TaskExec] Agent {} no longer exists", agent_id)
+            return
+
+        from app.core.permissions import (
+            get_agent_access_level_for_user_id,
+            is_agent_expired,
+        )
+        from app.models.user import User
+
+        creator = (
+            await db.execute(select(User).where(User.id == task.created_by))
+        ).scalar_one_or_none()
+        identity = getattr(creator, "identity", None) if creator else None
+        access_level = await get_agent_access_level_for_user_id(
+            db, task.created_by, agent
+        )
+        if (
+            creator is None
+            or not creator.is_active
+            or (identity is not None and not identity.is_active)
+            or creator.tenant_id != agent.tenant_id
+            or access_level is None
+        ):
+            logger.warning(
+                "[TaskExec] Task {} requester authorization is no longer valid",
+                task_id,
+            )
+            return
+        if (
+            agent.status != "running"
+            or agent.deletion_requested_at is not None
+            or is_agent_expired(agent)
+        ):
+            logger.info("[TaskExec] Agent {} is not executable", agent_id)
+            return
+
         task.status = "doing"
+        task.completed_at = None
         db.add(TaskLog(task_id=task_id, content="🤖 开始执行任务..."))
         await db.commit()
         task_title = task.title
         task_description = task.description or ""
         task_type = task.type  # 'todo' or 'supervision'
         supervision_target = task.supervision_target_name or ""
-
-    # Step 2: Load agent
-    async with async_session() as db:
-        agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
-        agent = agent_result.scalar_one_or_none()
-        if not agent:
-            await _log_error(task_id, "数字员工未找到")
-            if task_type == 'supervision':
-                await _restore_supervision_status(task_id)
-            return
         agent_name = agent.name
+        agent_role_description = agent.role_description or ""
+        creator_name = creator.display_name
 
-    # Step 3: Build full agent context (same as chat dialog)
+    # Step 2: Build full agent context (same as chat dialog)
     from app.services.agent_context import build_agent_context
-    static_prompt, dynamic_prompt = await build_agent_context(agent_id, agent_name, agent.role_description or "")
+    static_prompt, dynamic_prompt = await build_agent_context(
+        agent_id,
+        agent_name,
+        agent_role_description,
+        current_user_name=creator_name,
+    )
 
     # Add task-execution-specific instructions
     task_addendum = """
@@ -120,7 +166,7 @@ You are now in TASK EXECUTION MODE (not a conversation). A task has been assigne
             user_prompt += f"\n任务描述: {task_description}"
         user_prompt += "\n\n请认真完成此任务，给出详细的执行结果。"
 
-    # Step 4: Call LLM with unified failover support
+    # Step 3: Call LLM with unified failover support
     from app.services.llm import call_agent_llm_with_tools
     
     try:
@@ -134,22 +180,21 @@ You are now in TASK EXECUTION MODE (not a conversation). A task has been assigne
                 user_prompt=user_prompt,
                 max_rounds=50,
                 session_id=str(task_id),
+                requester_user_id=creator.id,
             )
             
         logger.info(f"[TaskExec] LLM reply generated task={task_id} reply_chars={len(reply)}")
-    except Exception as e:
-        error_msg = str(e) or repr(e)
+    except Exception as exc:
         logger.error(
             "[TaskExec] Execution failed task={} error_type={}",
             task_id,
-            type(e).__name__,
+            type(exc).__name__,
         )
-        await _log_error(task_id, f"执行出错: {error_msg[:150]}")
-        if task_type == 'supervision':
-            await _restore_supervision_status(task_id)
+        await _log_error(task_id, "执行出错：系统未能安全完成本次任务，请稍后重试或联系管理员。")
+        await _restore_task_pending(task_id)
         return
 
-    # Step 5: Save result and update status
+    # Step 4: Save result and update status
     async with async_session() as db:
         result = await db.execute(select(Task).where(Task.id == task_id))
         task = result.scalar_one_or_none()
@@ -188,11 +233,14 @@ async def _log_error(task_id: uuid.UUID, message: str) -> None:
         await db.commit()
 
 
-async def _restore_supervision_status(task_id: uuid.UUID) -> None:
-    """Restore supervision task status back to pending after a failed execution."""
+async def _restore_task_pending(task_id: uuid.UUID) -> None:
+    """Make a failed claim explicitly retryable."""
     async with async_session() as db:
         result = await db.execute(select(Task).where(Task.id == task_id))
         task = result.scalar_one_or_none()
         if task and task.status == "doing":
             task.status = "pending"
             await db.commit()
+
+
+_restore_supervision_status = _restore_task_pending

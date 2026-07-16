@@ -162,6 +162,98 @@ async def test_temp_workspace_materializes_only_requested_paths(monkeypatch):
         temp_ws.cleanup()
 
 
+def test_explicit_media_paths_ignore_data_urls_and_never_fall_back_to_workspace():
+    assert agent_tools._explicit_media_workspace_paths(
+        "data:image/png;base64,AAAA",
+        " workspace/images/product.png ",
+        None,
+    ) == ["workspace/images/product.png"]
+    assert agent_tools._explicit_media_workspace_paths(None, "", "data:video/mp4;base64,AAAA") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "expected_paths"),
+    [
+        (
+            "generate_image_minimax",
+            {
+                "prompt": "product poster",
+                "reference_image": "workspace/images/reference.png",
+                "brand_asset": "data:image/png;base64,AAAA",
+            },
+            ["workspace/images/reference.png"],
+        ),
+        (
+            "generate_video_minimax",
+            {
+                "prompt": "product video",
+                "first_frame_image": "workspace/images/first.png",
+                "last_frame_image": "workspace/images/last.png",
+            },
+            ["workspace/images/first.png", "workspace/images/last.png"],
+        ),
+        (
+            "check_video_minimax",
+            {"task_meta_path": "workspace/videos/task.json"},
+            ["workspace/videos/task.json"],
+        ),
+    ],
+)
+async def test_minimax_dispatcher_materializes_only_explicit_media_inputs(
+    monkeypatch,
+    tool_name,
+    arguments,
+    expected_paths,
+):
+    captured: dict[str, object] = {}
+
+    async def run_with_temp_workspace(_agent_id, _tenant_id, runner, **kwargs):
+        captured["paths"] = kwargs.get("paths")
+        return "ok"
+
+    monkeypatch.setattr(agent_tools, "release_tool_denial_reason", lambda _name: None)
+    monkeypatch.setattr(agent_tools, "_code_tool_denial_reason", AsyncMock(return_value=None))
+    monkeypatch.setattr(agent_tools, "_get_agent_tenant_id", AsyncMock(return_value=str(uuid.uuid4())))
+    monkeypatch.setattr(agent_tools, "_run_with_temp_workspace", run_with_temp_workspace)
+    monkeypatch.setitem(agent_tools._TOOL_AUTONOMY_MAP, tool_name, None)
+
+    result = await agent_tools.execute_tool(
+        tool_name,
+        arguments,
+        uuid.uuid4(),
+        uuid.uuid4(),
+        session_id=str(uuid.uuid4()),
+        saas_tier="lite",
+    )
+
+    assert result == "ok"
+    assert captured["paths"] == expected_paths
+
+
+@pytest.mark.asyncio
+async def test_explicit_media_input_survives_unrelated_workspace_budget(monkeypatch):
+    agent_id = uuid.uuid4()
+    storage = MemoryStorageBackend(
+        {
+            f"{agent_id}/workspace/large/unrelated.bin": b"x" * 16,
+            f"{agent_id}/workspace/images/product.png": b"product",
+        }
+    )
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+    monkeypatch.setattr(agent_tools, "TOOL_MATERIALIZE_MAX_TOTAL_BYTES", 8)
+
+    temp_ws = await agent_tools._prepare_temp_workspace(
+        agent_id,
+        paths=["workspace/images/product.png"],
+    )
+    try:
+        assert (temp_ws.root / "workspace/images/product.png").read_bytes() == b"product"
+        assert not (temp_ws.root / "workspace/large/unrelated.bin").exists()
+    finally:
+        temp_ws.cleanup()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("target_kind", ["other_agent", "external", "root_prefix_collision"])
 async def test_send_channel_file_rejects_local_storage_symlink_before_materialization(

@@ -12,7 +12,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import func as sqla_func, select
+from sqlalchemy import func as sqla_func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import require_role
@@ -270,11 +270,18 @@ async def list_agentbay_cleanup_required(
 ):
     """Release preflight and operator queue for unconfirmed provider cleanup."""
 
-    from app.models.agentbay_session import AgentBaySessionLedger
+    from app.models.agentbay_session import (
+        AGENTBAY_PROVIDER_COLLISION_STATUS,
+        AgentBaySessionLedger,
+    )
 
     result = await db.execute(
         select(AgentBaySessionLedger)
-        .where(AgentBaySessionLedger.status == "cleanup_required")
+        .where(
+            AgentBaySessionLedger.status.in_(
+                ["cleanup_required", AGENTBAY_PROVIDER_COLLISION_STATUS]
+            )
+        )
         .order_by(
             AgentBaySessionLedger.agent_id,
             AgentBaySessionLedger.image_type,
@@ -294,12 +301,179 @@ async def list_agentbay_cleanup_required(
                 "user_id": str(row.user_id) if row.user_id else None,
                 "chat_session_id": row.chat_session_id,
                 "provider_session_id": row.provider_session_id,
+                "provider_identity_collision_ledger_id": (
+                    (row.context or {}).get(
+                        "provider_identity_collision_ledger_id"
+                    )
+                    if isinstance(row.context, dict)
+                    else None
+                ),
                 "image_type": row.image_type,
+                "status": row.status,
                 "reason": row.close_reason,
                 "started_at": row.started_at,
             }
             for row in rows
         ],
+    }
+
+
+async def _reconcile_agentbay_provider_collision_group(
+    ledger,
+    body: AgentBayCleanupReconcileRequest,
+    *,
+    current_user: User,
+    db: AsyncSession,
+):
+    """Close one collision group only after the provider UUID is absent."""
+
+    from app.models.agentbay_session import (
+        AGENTBAY_PROVIDER_COLLISION_STATUS,
+        AgentBaySessionLedger,
+    )
+    from app.models.audit import AuditLog
+    from app.services.agentbay_client import _lock_agentbay_provider_identity
+
+    context = ledger.context if isinstance(ledger.context, dict) else {}
+    raw_group_id = context.get("provider_identity_collision_ledger_id") or str(
+        ledger.id
+    )
+    try:
+        group_id = uuid.UUID(str(raw_group_id))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Provider collision group identity is invalid",
+        ) from exc
+
+    if not body.provider_deleted_out_of_band:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "A provider identity collision cannot be attached automatically; "
+                "verify the exact provider session out of band"
+            ),
+        )
+    verification_note = body.verification_note.strip()
+    if len(verification_note) < 20:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "An out-of-band provider verification note of at least 20 "
+                "characters is required"
+            ),
+        )
+
+    requested_ledger_id = ledger.id
+    provider_session_id = body.provider_session_id
+    await db.rollback()
+
+    # Lock the provider identity before any row lookup, then reload both the
+    # canonical keeper and the complete JSON-linked group in this transaction.
+    # Quarantine uses the same advisory-lock namespace, so no new group member
+    # can be inserted between these reads and the closing commit.
+    await _lock_agentbay_provider_identity(db, provider_session_id)
+    keeper = (
+        await db.execute(
+            select(AgentBaySessionLedger)
+            .where(AgentBaySessionLedger.id == group_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if (
+        keeper is None
+        or keeper.status != AGENTBAY_PROVIDER_COLLISION_STATUS
+        or not keeper.provider_session_id
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Provider collision group is incomplete",
+        )
+    if provider_session_id != keeper.provider_session_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Provider session confirmation mismatch",
+        )
+
+    group_pointer = AgentBaySessionLedger.context[
+        "provider_identity_collision_ledger_id"
+    ].as_string()
+    locked_rows = list(
+        (
+            await db.execute(
+                select(AgentBaySessionLedger)
+                .where(
+                    AgentBaySessionLedger.status
+                    == AGENTBAY_PROVIDER_COLLISION_STATUS,
+                    or_(
+                        AgentBaySessionLedger.id == group_id,
+                        group_pointer == str(group_id),
+                    ),
+                )
+                .order_by(AgentBaySessionLedger.id)
+                .with_for_update()
+            )
+        ).scalars().all()
+    )
+    matching_keepers = [
+        row
+        for row in locked_rows
+        if row.id == group_id and row.provider_session_id == provider_session_id
+    ]
+    if (
+        len(matching_keepers) != 1
+        or requested_ledger_id not in {row.id for row in locked_rows}
+        or any(
+        row.status != AGENTBAY_PROVIDER_COLLISION_STATUS
+        or str(
+            (
+                row.context
+                if isinstance(row.context, dict)
+                else {}
+            ).get("provider_identity_collision_ledger_id")
+            or row.id
+        )
+        != str(group_id)
+        for row in locked_rows
+        )
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Provider collision group changed during reconciliation",
+        )
+
+    now = datetime.now(timezone.utc)
+    for row in locked_rows:
+        row.status = "closed"
+        row.close_reason = "provider_identity_collision_verified_absent"
+        row.error_message = None
+        row.closed_at = now
+        row.context = {
+            **(row.context if isinstance(row.context, dict) else {}),
+            "reconciled_at": now.isoformat(),
+            "reconciled_by_user_id": str(current_user.id),
+            "reconciliation_mode": "operator_confirmed_absent",
+            "verification_note": verification_note,
+        }
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            agent_id=keeper.agent_id,
+            action="agentbay:provider_collision_reconciled",
+            details={
+                "collision_group_id": str(group_id),
+                "claim_count": len(locked_rows),
+                "mode": "operator_confirmed_absent",
+            },
+        )
+    )
+    await db.commit()
+    return {
+        "status": "closed",
+        "mode": "operator_confirmed_absent",
+        "collision_group_id": str(group_id),
+        "claim_count": len(locked_rows),
+        "provider_session_id": provider_session_id,
     }
 
 
@@ -312,7 +486,10 @@ async def reconcile_agentbay_cleanup_required(
 ):
     """Close a poison row only after provider deletion is proven explicitly."""
 
-    from app.models.agentbay_session import AgentBaySessionLedger
+    from app.models.agentbay_session import (
+        AGENTBAY_PROVIDER_COLLISION_STATUS,
+        AgentBaySessionLedger,
+    )
     from app.models.audit import AuditLog
     from app.services.agentbay_client import _configured_agentbay_client
 
@@ -325,6 +502,13 @@ async def reconcile_agentbay_cleanup_required(
     ledger = result.scalar_one_or_none()
     if ledger is None:
         raise HTTPException(status_code=404, detail="Cleanup record not found")
+    if ledger.status == AGENTBAY_PROVIDER_COLLISION_STATUS:
+        return await _reconcile_agentbay_provider_collision_group(
+            ledger,
+            body,
+            current_user=current_user,
+            db=db,
+        )
     if ledger.status != "cleanup_required":
         raise HTTPException(status_code=409, detail="Cleanup record is not pending")
     if not ledger.provider_session_id:
@@ -334,19 +518,32 @@ async def reconcile_agentbay_cleanup_required(
         )
     if body.provider_session_id != ledger.provider_session_id:
         raise HTTPException(status_code=409, detail="Provider session confirmation mismatch")
+    snapshot_tenant_id = ledger.tenant_id
     snapshot_agent_id = ledger.agent_id
+    snapshot_user_id = ledger.user_id
+    snapshot_chat_session_id = ledger.chat_session_id
     snapshot_provider_session_id = ledger.provider_session_id
     snapshot_image_type = ledger.image_type
+    snapshot_context = ledger.context if isinstance(ledger.context, dict) else {}
+    trusted_v2_binding = bool(
+        snapshot_context.get("binding_version") == 2
+        and snapshot_tenant_id
+        and snapshot_agent_id
+        and snapshot_user_id
+        and snapshot_chat_session_id
+        and snapshot_provider_session_id
+    )
     await db.rollback()
 
     mode = "operator_confirmed_absent"
     if not body.provider_deleted_out_of_band:
-        if not snapshot_agent_id:
+        if not trusted_v2_binding:
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    "The owning Agent no longer exists; verify the exact provider "
-                    "session out of band and submit an operator note"
+                    "This cleanup row lacks a trusted v2 owner binding and cannot "
+                    "be attached automatically; verify the exact provider session "
+                    "out of band and submit an operator note"
                 ),
             )
         mode = "provider_delete_confirmed"
@@ -393,6 +590,17 @@ async def reconcile_agentbay_cleanup_required(
         raise HTTPException(status_code=409, detail="Cleanup record changed during reconciliation")
     if ledger.provider_session_id != snapshot_provider_session_id:
         raise HTTPException(status_code=409, detail="Provider identity changed during reconciliation")
+    if (
+        ledger.tenant_id != snapshot_tenant_id
+        or ledger.agent_id != snapshot_agent_id
+        or ledger.user_id != snapshot_user_id
+        or ledger.chat_session_id != snapshot_chat_session_id
+        or ledger.image_type != snapshot_image_type
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Provider ownership changed during reconciliation",
+        )
 
     now = datetime.now(timezone.utc)
     ledger.status = "closed"

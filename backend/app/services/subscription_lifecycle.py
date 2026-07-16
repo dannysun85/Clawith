@@ -9,6 +9,7 @@
   quota_guard rejects their LLM calls. Restored on renewal via
   restore_stopped_agents.
 - start_subscription_lifecycle_daemon(): background loop registered in app lifespan.
+  MiniMax Token Plan polling is a separate health-tracked worker task.
 """
 
 import asyncio
@@ -162,26 +163,28 @@ async def enforce_agent_limit(tenant_id: uuid.UUID) -> int:
     )
     async with async_session() as db:
         active = (
-            await db.execute(
-                select(Agent)
-                .outerjoin(AgentTemplate, Agent.template_id == AgentTemplate.id)
-                .where(
-                    Agent.tenant_id == tenant_id,
-                    Agent.status.notin_(("stopped", "error")),
-                    Agent.is_expired == False,  # noqa: E712
-                    Agent.is_system == False,  # noqa: E712
+            (
+                await db.execute(
+                    select(Agent)
+                    .outerjoin(AgentTemplate, Agent.template_id == AgentTemplate.id)
+                    .where(
+                        Agent.tenant_id == tenant_id,
+                        Agent.status.notin_(("stopped", "error")),
+                        Agent.is_expired == False,  # noqa: E712
+                        Agent.is_system == False,  # noqa: E712
+                    )
+                    .order_by(assistant_priority.asc(), Agent.created_at.asc(), Agent.id.asc())
                 )
-                .order_by(assistant_priority.asc(), Agent.created_at.asc(), Agent.id.asc())
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         excess = active[max_agents:]  # newest beyond the limit (ordered asc → kept oldest)
         for a in excess:
             a.status = "stopped"
         if excess:
             await db.commit()
-            logger.info(
-                f"[subscription_lifecycle] stopped {len(excess)} excess agent(s) in tenant {tenant_id}"
-            )
+            logger.info(f"[subscription_lifecycle] stopped {len(excess)} excess agent(s) in tenant {tenant_id}")
         return len(excess)
 
 
@@ -198,66 +201,59 @@ async def restore_stopped_agents(tenant_id: uuid.UUID) -> int:
     )
     async with async_session() as db:
         active = (
-            await db.execute(
-                select(Agent).where(
-                    Agent.tenant_id == tenant_id,
-                    Agent.status.notin_(("stopped", "error")),
-                    Agent.is_expired == False,  # noqa: E712
-                    Agent.is_system == False,  # noqa: E712
+            (
+                await db.execute(
+                    select(Agent).where(
+                        Agent.tenant_id == tenant_id,
+                        Agent.status.notin_(("stopped", "error")),
+                        Agent.is_expired == False,  # noqa: E712
+                        Agent.is_system == False,  # noqa: E712
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         slots = max_agents - len(active)
         if slots <= 0:
             return 0
         stopped = (
-            await db.execute(
-                select(Agent)
-                .outerjoin(AgentTemplate, Agent.template_id == AgentTemplate.id)
-                .where(
-                    Agent.tenant_id == tenant_id,
-                    Agent.status == "stopped",
-                    Agent.is_expired == False,  # noqa: E712
-                    Agent.is_system == False,  # noqa: E712
+            (
+                await db.execute(
+                    select(Agent)
+                    .outerjoin(AgentTemplate, Agent.template_id == AgentTemplate.id)
+                    .where(
+                        Agent.tenant_id == tenant_id,
+                        Agent.status == "stopped",
+                        Agent.is_expired == False,  # noqa: E712
+                        Agent.is_system == False,  # noqa: E712
+                    )
+                    .order_by(assistant_priority.asc(), Agent.created_at.asc(), Agent.id.asc())
                 )
-                .order_by(assistant_priority.asc(), Agent.created_at.asc(), Agent.id.asc())
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         to_restore = stopped[:slots]
         for a in to_restore:
             a.status = "idle"
         if to_restore:
             await db.commit()
-            logger.info(
-                f"[subscription_lifecycle] restored {len(to_restore)} agent(s) in tenant {tenant_id}"
-            )
+            logger.info(f"[subscription_lifecycle] restored {len(to_restore)} agent(s) in tenant {tenant_id}")
         return len(to_restore)
 
 
 async def start_subscription_lifecycle_daemon() -> None:
-    """Background loop: expire past-due subscriptions + daily-reset the credential pool hourly (3.6 兜底).
-
-    Also runs a concurrent MiniMax Token Plan quota poller every 5 minutes that
-    actively marks depleted subscription keys as quota_exceeded.
-    """
+    """Expire past-due subscriptions and reset daily credential usage hourly."""
     logger.info("[subscription_lifecycle] daemon started")
-
-    async def _minimax_quota_loop():
-        from app.services.llm.minimax_quota import poll_minimax_quota
-        while True:
-            try:
-                await poll_minimax_quota()
-            except Exception as e:
-                logger.error(f"[subscription_lifecycle] minimax quota poll failed: {e}")
-            await asyncio.sleep(300)  # 5 minutes
-
-    # Run the quota poller concurrently alongside the main lifecycle loop.
-    asyncio.create_task(_minimax_quota_loop())
 
     while True:
         try:
             await expire_subscriptions()
             await reset_daily_usage()  # idempotent within a day (date guard in reset_daily_usage)
-        except Exception as e:
-            logger.error(f"[subscription_lifecycle] job failed: {e}")
+        except Exception as exc:
+            logger.error(
+                "[subscription_lifecycle] job failed error_type={}",
+                type(exc).__name__,
+            )
         await asyncio.sleep(LIFECYCLE_INTERVAL_SECONDS)

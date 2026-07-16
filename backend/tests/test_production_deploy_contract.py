@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import json
 import os
@@ -70,6 +71,10 @@ def _recovery_shell_source(script: str) -> tuple[str, str, str]:
             "quarantine_mcp_for_unsafe_release() { :; }",
             "restore_mcp_quarantine_for_safe_release() { :; }",
             "reconcile_agentbay_for_cutover() { :; }",
+            # Recovery state-machine fixtures model a candidate whose durable
+            # authenticated-smoke marker was already verified. The evidence
+            # parser has its own contract test below.
+            "candidate_business_evidence_valid() { :; }",
             "approval_schema_forward_state() { printf '%s' \"${SCHEMA_FORWARD_STATE:-1}\"; }",
             _shell_function_source(
                 script,
@@ -142,6 +147,7 @@ def test_polluted_parent_environment_cannot_activate_code_in_effective_compose()
         "JWT_SECRET_KEY": "contract-test-jwt",
         "CORS_ORIGINS": "https://example.test",
         "PUBLIC_BASE_URL": "https://example.test",
+        "ASTRA_ALERT_WORKER_ACTOR_ID": "00000000-0000-4000-8000-000000000001",
         "CODE_EXECUTION_ENABLED": "true",
         "CODE_EXECUTION_ALLOWED_TENANT_IDS": "tenant-from-parent",
         "CODE_EXECUTION_ALLOWED_TOOL_NAMES": "execute_code",
@@ -156,9 +162,13 @@ def test_polluted_parent_environment_cannot_activate_code_in_effective_compose()
     }
     rendered = subprocess.run(
         [
-            "docker", "compose", "-f",
+            "docker",
+            "compose",
+            "-f",
             "deploy/astra-poc/docker-compose.prod.yml",
-            "config", "--format", "json",
+            "config",
+            "--format",
+            "json",
         ],
         cwd=ROOT,
         env=env,
@@ -187,49 +197,71 @@ def test_production_release_gate_covers_code_execution_security():
     script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
     workflow = (ROOT / ".agents/workflows/deploy-production.md").read_text(encoding="utf-8")
 
-    assert '(cd backend && uv run pytest -q)' in script
+    assert "(cd backend && uv run pytest -q)" in script
     assert "production releases cannot disable local release gates" in script
     assert "agentbay_unresolved_count" in script
-    assert "status IN ('active', 'cleanup_required')" in script
+    assert ("status IN ('active', 'cleanup_required', 'provider_identity_collision')") in script
     assert "AGENTBAY_RECONCILE_DEADLINE_SECONDS=120" in script
-    assert script.index(
-        'AGENTBAY_UNRESOLVED_BEFORE_MAINTENANCE="$(agentbay_unresolved_count'
-    ) < script.index(
+    assert script.index('AGENTBAY_UNRESOLVED_BEFORE_MAINTENANCE="$(agentbay_unresolved_count') < script.index(
         'echo "[remote] enabling explicit Web/API/WebSocket maintenance fence"'
     )
-    stop_old_writers = script.index(
-        'echo "[remote] stopping every old application writer before quarantine/migration"'
+    stop_old_writers = script.index('echo "[remote] stopping every old application writer before quarantine/migration"')
+    migration = script.index('echo "[remote] applying migrations before candidate startup"')
+    post_migration_cleanup = script.index('if ! reconcile_agentbay_for_cutover "$CANDIDATE_PROJECT" "$RELEASE";')
+    candidate_start = script.index(
+        'compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" up -d --no-deps backend'
     )
-    pre_migration_cleanup = script.index(
-        'echo "[remote] deleting every retained AgentBay provider session before migration"'
-    )
-    migration = script.index(
-        'echo "[remote] applying migrations before candidate startup"'
-    )
-    assert stop_old_writers < pre_migration_cleanup < migration
+    assert stop_old_writers < migration < post_migration_cleanup < candidate_start
+    assert "reconcile_agentbay_for_cutover" not in script[stop_old_writers:migration]
     assert "scripts/ruff_diff_gate.py" in script
     assert "git describe --tags --abbrev=0 HEAD^" in script
     assert '--base "$RELEASE_BASE_COMMIT" --target HEAD' in script
     assert '"$RELEASE/BASE_COMMIT"' in script
     assert "bash scripts/postgres-migration-smoke.sh" in script
+    assert "-m app.scripts.verify_channel_secrets" in script
     assert "docker compose -f deploy/astra-poc/docker-compose.prod.yml config --quiet" in script
     assert 'git archive --format=tar --output="$PACKAGE_TAR" "$COMMIT"' in script
     assert 'git get-tar-commit-id < "$PACKAGE_TAR"' in script
     assert 'gzip -n -c "$PACKAGE_TAR" > "$PACKAGE"' in script
-    assert '"$PACKAGE_SHA256" <<\'REMOTE_SCRIPT\'' in script
+    assert ('"$PACKAGE_SHA256" "$REMOTE_SMOKE_CREDENTIAL_DIGEST" <<\'REMOTE_SCRIPT\'') in script
     assert "release package digest mismatch" in script
     assert 'write_atomic_line "$RELEASE/PACKAGE_SHA256" "$PACKAGE_SHA256"' in script
-    assert script.index('echo "[local] running full backend suite"') < script.index(
-        'git archive --format=tar'
-    ) < script.index(
-        'echo "[remote] uploading package"'
+    assert (
+        script.index('echo "[local] running full backend suite"')
+        < script.index("git archive --format=tar")
+        < script.index('echo "[remote] uploading package"')
     )
-    assert script.index("release package digest mismatch") < script.index(
-        'tar -xzf "$PACKAGE" -C "$RELEASE"'
+    assert script.index("release package digest mismatch") < script.index('tar -xzf "$PACKAGE" -C "$RELEASE"')
+    channel_secret_gate = script.index(
+        "-m app.scripts.verify_channel_secrets",
+        migration,
     )
+    schema_forward = script.index(
+        'write_cutover_state schema_forward_only "$CANDIDATE_SLOT" "$RELEASE_ID"',
+        channel_secret_gate,
+    )
+    assert migration < channel_secret_gate < schema_forward
     assert "Code 激活状态为\n`BLOCKED`" in workflow
     assert "精确 tenant UUID" in workflow
     assert "生产禁止 `subprocess`、`docker`" in workflow
+
+
+def test_production_model_route_gate_rejects_invalid_platform_models():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    preflight = _shell_function_source(
+        script,
+        "model_route_credential_preflight",
+        "m3_route_post_migration_preflight",
+    )
+
+    assert "model.tenant_id IS NOT NULL" in preflight
+    assert "fallback_model.tenant_id IS NOT NULL" in preflight
+    assert "model.enabled IS NOT TRUE" in preflight
+    assert "fallback_model.enabled IS NOT TRUE" in preflight
+    assert preflight.count("jsonb_exists") >= 6
+    assert preflight.count("jsonb_array_length") >= 4
+    assert "expected.modality = 'image'" in preflight
+    assert "'[\"vision\"]'::jsonb" in preflight
 
 
 def test_remote_product_smoke_is_required_unless_break_glass_is_audited():
@@ -243,6 +275,7 @@ def test_remote_product_smoke_is_required_unless_break_glass_is_audited():
         '"approval_id"',
         '"approval_nonce"',
         '"approved_by"',
+        '"bypassed_gates"',
         '"reason"',
         '"issued_at_utc"',
         '"expires_at_utc"',
@@ -253,6 +286,7 @@ def test_remote_product_smoke_is_required_unless_break_glass_is_audited():
     assert 'fields["release_commit"] != commit' in script
     assert "break-glass artifact contains duplicate field" in script
     assert "break-glass approval_nonce has an invalid format" in script
+    assert ("break-glass artifact must explicitly bypass subscription_api and subscription_browser") in script
     assert "timedelta(hours=4)" in script
     assert 'BREAK_GLASS_NONCE_ROOT="$APP_ROOT/break-glass-nonces"' in script
     assert "break-glass approval nonce has already been used" in consumer
@@ -265,16 +299,694 @@ def test_remote_product_smoke_is_required_unless_break_glass_is_audited():
     assert "remote-smoke-break-glass.approval" in script
     assert "remote-smoke-break-glass.sha256" in script
     assert "remote-smoke-break-glass.nonce-sha256" in script
-    assert "subscription-production-smoke.sh" in script
+    assert 'python3 "$target_release/scripts/subscription_production_smoke.py"' in script
+    assert '"$image" \\\n        --frontend-url "http://candidate-frontend:3000"' in script
+    assert 'source "$SMOKE_ENV_FILE"' not in script
+    assert '--credentials-file "$SMOKE_ENV_FILE"' in script
+    candidate_worker = script.index('write_cutover_state candidate_services_ready "$CANDIDATE_SLOT" "$RELEASE_ID"')
+    candidate_smoke = script.index(
+        "if ! run_candidate_business_smoke \\\n",
+        candidate_worker,
+    )
+    verified = script.index('write_cutover_state candidate_business_verified "$CANDIDATE_SLOT" "$RELEASE_ID"')
+    cutover = script.index('echo "[remote] switching the verified maintenance fence to candidate traffic"')
+    assert candidate_worker < candidate_smoke < verified < cutover
+    assert '--api-base "$PUBLIC_URL/api"' not in script
+    assert 'candidate_business_evidence_valid "$RELEASE_ID" "$CANDIDATE_PORT"' in script
+    recovery = script.index("recover_indeterminate_cutover() {")
+    recovery_evidence = script.index(
+        'candidate_business_evidence_valid \\\n        "$target_release_id" "$target_port"',
+        recovery,
+    )
+    recovery_cutover = script.index(
+        'install "$NGINX_SITE" "$source_port" "$target_port"',
+        recovery,
+    )
+    assert recovery_evidence < recovery_cutover
     consume = script.index("consume_break_glass_approval.py")
-    recovery = script.index('if [ "$RECOVERY_REQUIRED" = "1" ]', consume)
-    assert consume < recovery
+    recovery_call = script.index('if [ "$RECOVERY_REQUIRED" = "1" ]', consume)
+    assert consume < recovery_call
+
+
+def test_candidate_business_evidence_rejects_tampering_and_wrong_slot(tmp_path):
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    verifier = _shell_function_source(
+        script,
+        "candidate_business_evidence_valid",
+        "write_atomic_symlink",
+    )
+    release_id = "candidate-release"
+    _write_test_release(tmp_path, release_id, commit="a" * 40)
+    backup = tmp_path / "backups" / release_id
+    backup.mkdir(parents=True)
+    evidence = backup / "subscription-smoke.candidate.json"
+    payload = {
+        "ok": True,
+        "api_base": "http://127.0.0.1:3009/api",
+        "checks": [
+            "tenant_login_ok",
+            "tenant_me_ok",
+            "client_subscription_summary_ok",
+            "client_credit_transactions_ok",
+            "client_orders_ok",
+            "platform_admin_login_ok",
+            "saas_ledger_reconciliation_ok",
+            "saas_payment_reconciliation_ok",
+            "orders_csv_export_ok",
+            "credit_transactions_csv_export_ok",
+        ],
+    }
+    evidence.write_text(json.dumps(payload), encoding="utf-8")
+    digest = hashlib.sha256(evidence.read_bytes()).hexdigest()
+    marker = backup / "candidate-business-verification"
+    marker.write_text(f"smoke:{digest}\n", encoding="utf-8")
+    # Exercise the shell verifier with the same interpreter that runs the
+    # suite.  A developer machine may expose an unrelated preview/system
+    # ``python3`` first on PATH; that must not make this hermetic contract test
+    # hang or validate a different Python runtime than the project supports.
+    child_env = {
+        **os.environ,
+        "PATH": f"{Path(sys.executable).parent}:{os.environ.get('PATH', '')}",
+    }
+    harness = f"""set -e
+APP_ROOT={shlex.quote(str(tmp_path))}
+{verifier}
+candidate_business_evidence_valid {release_id} 3009
+"""
+
+    valid = subprocess.run(
+        ["bash", "-c", harness],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=child_env,
+        timeout=10,
+    )
+    assert valid.returncode == 0, valid.stderr
+
+    wrong_slot = subprocess.run(
+        ["bash", "-c", harness.replace(" 3009\n", " 3008\n")],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=child_env,
+        timeout=10,
+    )
+    assert wrong_slot.returncode != 0
+
+    evidence.write_text(json.dumps({**payload, "ok": False}), encoding="utf-8")
+    tampered = subprocess.run(
+        ["bash", "-c", harness],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=child_env,
+        timeout=10,
+    )
+    assert tampered.returncode != 0
+
+
+def test_v2_candidate_evidence_binds_ui_release_runner_and_candidate_slot(tmp_path):
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    browser_helpers = _shell_function_source(
+        script,
+        "browser_smoke_bundle_digest",
+        "cleanup_browser_smoke_runtime",
+    )
+    verifier = _shell_function_source(
+        script,
+        "candidate_business_evidence_valid",
+        "write_atomic_symlink",
+    )
+    release_id = "candidate-release-v2"
+    commit = "b" * 40
+    release = _write_test_release(tmp_path, release_id, commit=commit)
+    browser_dir = release / "deploy/browser-smoke"
+    browser_dir.mkdir(parents=True)
+    bundle_names = (
+        "Dockerfile",
+        "EVIDENCE_SCHEMA",
+        "browser_launch_selftest.mjs",
+        "browser_assertions.mjs",
+        "package-lock.json",
+        "package.json",
+        "seccomp_profile.json",
+        "subscription_browser_smoke.mjs",
+    )
+    for name in bundle_names:
+        (browser_dir / name).write_text(
+            "2\n" if name == "EVIDENCE_SCHEMA" else f"fixture:{name}\n",
+            encoding="utf-8",
+        )
+    bundle_digest = hashlib.sha256()
+    for name in bundle_names:
+        bundle_digest.update(name.encode())
+        bundle_digest.update(b"\0")
+        bundle_digest.update((browser_dir / name).read_bytes())
+        bundle_digest.update(b"\0")
+    runner_digest = f"sha256:{bundle_digest.hexdigest()}"
+
+    required_checks = [
+        "candidate_release_identity_ok",
+        "tenant_login_ok",
+        "tenant_me_ok",
+        "client_plans_ok",
+        "client_subscription_summary_ok",
+        "client_credit_transactions_ok",
+        "client_orders_ok",
+        "client_credit_packs_ok",
+        "platform_admin_login_ok",
+        "saas_ledger_reconciliation_ok",
+        "saas_payment_reconciliation_ok",
+        "orders_csv_export_ok",
+        "credit_transactions_csv_export_ok",
+        "ui_release_identity_ok",
+        "ui_tenant_login_ok",
+        "ui_subscription_summary_api_ok",
+        "ui_subscription_balance_rendered_ok",
+        "ui_subscription_page_ok",
+        "ui_no_server_error_ok",
+    ]
+    payload = {
+        "evidence_schema_version": 2,
+        "evidence_kind": "subscription_composite",
+        "ok": True,
+        "api_base": "http://127.0.0.1:3009/api",
+        "frontend_url": "http://127.0.0.1:3009",
+        "release_identity": {
+            "version": "1.10.12",
+            "commit": commit,
+            "release_id": release_id,
+        },
+        "evidence_nonce": "1" * 32,
+        "browser_gate": {
+            "runner_bundle_sha256": runner_digest,
+            "image_id": f"sha256:{'2' * 64}",
+        },
+        "checks": required_checks,
+        "subscription_summary": {
+            "plan_code": "pro",
+            "balance": 100,
+            "available_balance": 90,
+            "reserved": 10,
+        },
+        "saas_ledger_reconciliation": {
+            "checked_tenants": 2,
+            "issue_count": 0,
+        },
+        "saas_payment_reconciliation": {
+            "checked_orders": 1,
+            "issue_count": 0,
+        },
+        "ui": {
+            "final_path": "/account/subscription",
+            "browser_target": "isolated_candidate_frontend_network",
+        },
+    }
+    backup = tmp_path / "backups" / release_id
+    backup.mkdir(parents=True)
+    evidence = backup / "subscription-smoke.candidate.json"
+    marker = backup / "candidate-business-verification"
+
+    def write_evidence(value: dict) -> None:
+        evidence.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
+        digest = hashlib.sha256(evidence.read_bytes()).hexdigest()
+        marker.write_text(f"smoke-v2:{digest}\n", encoding="utf-8")
+
+    write_evidence(payload)
+    child_env = {
+        **os.environ,
+        "PATH": f"{Path(sys.executable).parent}:{os.environ.get('PATH', '')}",
+    }
+    harness = f"""set -e
+APP_ROOT={shlex.quote(str(tmp_path))}
+{browser_helpers}
+{verifier}
+candidate_business_evidence_valid {release_id} 3009
+"""
+
+    def verify() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", "-c", harness],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=child_env,
+            timeout=10,
+        )
+
+    assert verify().returncode == 0
+    invalid_payloads = [
+        {**payload, "frontend_url": "http://127.0.0.1:3008"},
+        {**payload, "checks": required_checks[:-1]},
+        {
+            **payload,
+            "release_identity": {**payload["release_identity"], "release_id": "other"},
+        },
+        {
+            **payload,
+            "browser_gate": {
+                **payload["browser_gate"],
+                "runner_bundle_sha256": f"sha256:{'3' * 64}",
+            },
+        },
+    ]
+    for invalid in invalid_payloads:
+        write_evidence(invalid)
+        assert verify().returncode != 0
+
+
+def test_browser_smoke_runner_is_isolated_pinned_and_pre_mutation():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    dockerfile = (ROOT / "deploy/browser-smoke/Dockerfile").read_text(encoding="utf-8")
+    browser_runner = (ROOT / "deploy/browser-smoke/subscription_browser_smoke.mjs").read_text(encoding="utf-8")
+
+    assert "@sha256:5b8f294aff9041b7191c34a4bab3ac270157a28774d4b0660e9743297b697e48" in dockerfile
+    assert "USER pwuser" in dockerfile
+    assert 'browser-smoke-schema="2"' in dockerfile
+    for contract in (
+        "--internal",
+        "--read-only",
+        "--cap-drop ALL",
+        "--security-opt no-new-privileges:true",
+        '--security-opt "seccomp=$target_release/deploy/browser-smoke/seccomp_profile.json"',
+        "--pids-limit 256",
+        "--memory 1g",
+        "--cpus 1.0",
+        "--mount",
+    ):
+        assert contract in script
+    assert "host-gateway" not in script
+    assert "--network host" not in script
+    assert "SMOKE_PLATFORM_ADMIN" not in browser_runner
+    assert "credentials.SMOKE_TENANT_PASSWORD" in browser_runner
+    assert "isolated_candidate_frontend_network" in browser_runner
+    assert "subscription-credits-usage-value" in browser_runner
+    assert "subscription-available-credits-value" in browser_runner
+    assert "subscription-available-credits-reserved" in browser_runner
+    assert "waitForExactText" in browser_runner
+    assert "await Promise.all" in browser_runner
+    assert '(cd deploy/browser-smoke && npm test)' in script
+    assert 'BROWSER_SMOKE_RUNTIME_ROOT="/dev/shm/astra-deploy-smoke"' in script
+    assert 'mktemp -d "$BROWSER_SMOKE_RUNTIME_ROOT/.candidate-smoke.XXXXXX"' in script
+    assert 'mktemp -d "$target_backup/.candidate-smoke.XXXXXX"' not in script
+    current_preflight = script.index('ensure_browser_smoke_image "$RELEASE" "$RELEASE_ID"')
+    recovery = script.index('if [ "$RECOVERY_REQUIRED" = "1" ]', current_preflight)
+    maintenance = script.index('echo "[remote] enabling explicit Web/API/WebSocket maintenance fence"')
+    assert current_preflight < recovery < maintenance
+
+
+def test_browser_smoke_runtime_cleans_stale_credentials_and_rejects_symlinks(tmp_path):
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    cleanup = _shell_function_source(
+        script,
+        "prepare_browser_smoke_runtime_root",
+        "cleanup_browser_smoke_runtime",
+    )
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir(mode=0o700)
+    stale = runtime_root / ".candidate-smoke.interrupted"
+    stale.mkdir()
+    (stale / "browser-credentials.json").write_text(
+        "must-be-removed",
+        encoding="utf-8",
+    )
+    stale.chmod(0o700)
+    current = runtime_root / "current.smoke-credentials.json"
+    current.write_text("preserve-current-upload", encoding="utf-8")
+    current.chmod(0o600)
+    old = runtime_root / "old.smoke-credentials.json"
+    old.write_text("remove-interrupted-upload", encoding="utf-8")
+    old.chmod(0o600)
+    harness = f"""set -e
+BROWSER_SMOKE_RUNTIME_ROOT={shlex.quote(str(runtime_root))}
+SMOKE_ENV_FILE={shlex.quote(str(current))}
+RUN_REMOTE_SMOKE=1
+{cleanup}
+prepare_browser_smoke_runtime_root
+"""
+
+    cleaned = subprocess.run(
+        ["bash", "-c", harness],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    assert cleaned.returncode == 0, cleaned.stderr
+    assert not stale.exists()
+    assert not old.exists()
+    assert current.read_text(encoding="utf-8") == "preserve-current-upload"
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    unsafe = runtime_root / ".candidate-smoke.symlink"
+    unsafe.symlink_to(outside, target_is_directory=True)
+    rejected = subprocess.run(
+        ["bash", "-c", harness],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    assert rejected.returncode != 0
+    assert outside.is_dir()
+    unsafe.unlink()
+
+    unsafe_credential_target = tmp_path / "unsafe-credential-target"
+    unsafe_credential_target.write_text("do-not-touch", encoding="utf-8")
+    unsafe_credential = runtime_root / "unsafe.smoke-credentials.json"
+    unsafe_credential.symlink_to(unsafe_credential_target)
+    rejected_credential = subprocess.run(
+        ["bash", "-c", harness],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    assert rejected_credential.returncode != 0
+    assert unsafe_credential_target.read_text(encoding="utf-8") == "do-not-touch"
+    unsafe_credential.unlink()
+
+    wrong_mode = runtime_root / "wrong-mode.smoke-credentials.json"
+    wrong_mode.write_text("must-fail-closed", encoding="utf-8")
+    wrong_mode.chmod(0o644)
+    rejected_mode = subprocess.run(
+        ["bash", "-c", harness],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    assert rejected_mode.returncode != 0
+    assert wrong_mode.read_text(encoding="utf-8") == "must-fail-closed"
+
+
+def test_deploy_streams_smoke_credentials_without_local_disk_file():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+
+    assert 'SMOKE_ENV_FILE="$PACKAGE_DIR/' not in script
+    assert 'scp "${SSH_OPTS[@]}" "$SMOKE_ENV_FILE"' not in script
+    assert "emit_smoke_credential_payload |" in script
+    assert "REMOTE_CREDENTIAL_WRITER_B64" in script
+    assert "os.O_EXCL" in script
+    assert "os.O_NOFOLLOW" in script
+
+
+def test_smoke_credentials_are_hidden_from_local_gate_children_and_emit_exact_json():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    capture = _shell_function_source(
+        script,
+        "capture_smoke_credentials",
+        "assert_smoke_credentials_not_exported",
+    )
+    isolation = _shell_function_source(
+        script,
+        "assert_smoke_credentials_not_exported",
+        "emit_smoke_credential_payload",
+    )
+    emitter = _shell_function_source(
+        script,
+        "emit_smoke_credential_payload",
+        "require_cmd",
+    )
+    expected = {
+        "SMOKE_TENANT_EMAIL": "tenant@example.com",
+        "SMOKE_TENANT_PASSWORD": "tenant password with spaces",
+        "SMOKE_PLATFORM_ADMIN_EMAIL": "admin@example.com",
+        "SMOKE_PLATFORM_ADMIN_PASSWORD": "管理员-password",
+    }
+    harness = f"""set -euo pipefail
+SMOKE_ENV_KEYS=(SMOKE_TENANT_EMAIL SMOKE_TENANT_PASSWORD SMOKE_PLATFORM_ADMIN_EMAIL SMOKE_PLATFORM_ADMIN_PASSWORD)
+SMOKE_ENV_VALUES=()
+export SMOKE_TENANT_EMAIL={shlex.quote(expected["SMOKE_TENANT_EMAIL"])}
+export SMOKE_TENANT_PASSWORD={shlex.quote(expected["SMOKE_TENANT_PASSWORD"])}
+export SMOKE_PLATFORM_ADMIN_EMAIL={shlex.quote(expected["SMOKE_PLATFORM_ADMIN_EMAIL"])}
+export SMOKE_PLATFORM_ADMIN_PASSWORD={shlex.quote(expected["SMOKE_PLATFORM_ADMIN_PASSWORD"])}
+{capture}
+{isolation}
+{emitter}
+capture_smoke_credentials
+assert_smoke_credentials_not_exported
+emit_smoke_credential_payload
+"""
+
+    emitted = subprocess.run(
+        ["bash", "-c", harness],
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert emitted.returncode == 0, emitted.stderr.decode()
+    assert json.loads(emitted.stdout) == expected
+
+
+def test_smoke_credentials_never_enter_bash_xtrace_output():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    credential_prefix = script[: script.index("ROOT_DIR=")]
+    expected = {
+        "SMOKE_TENANT_EMAIL": "xtrace-tenant@example.test",
+        "SMOKE_TENANT_PASSWORD": "xtrace-tenant-password-sentinel",
+        "SMOKE_PLATFORM_ADMIN_EMAIL": "xtrace-admin@example.test",
+        "SMOKE_PLATFORM_ADMIN_PASSWORD": "xtrace-admin-password-sentinel",
+    }
+    canonical = (json.dumps(expected, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+    expected_digest = hashlib.sha256(canonical).hexdigest()
+    harness = credential_prefix + r'''
+emit_smoke_credential_payload | python3 -c '
+import hashlib
+import sys
+print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())
+'
+'''
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        **expected,
+    }
+
+    traced = subprocess.run(
+        ["bash", "-x", "-c", harness],
+        env=env,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert traced.returncode == 0, traced.stderr.decode()
+    assert traced.stdout.decode().strip() == expected_digest
+    combined_output = traced.stdout + traced.stderr
+    for sentinel in expected.values():
+        assert sentinel.encode() not in combined_output
+
+
+def test_remote_worker_identity_is_allowlisted_and_xtrace_safe(tmp_path):
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    helper = _shell_function_source(
+        script,
+        "inspect_worker_runtime_identity",
+        "run_candidate_alert_canary",
+    )
+    remote_body = script.split("<<'REMOTE_SCRIPT'\n", 1)[1].split("\nREMOTE_SCRIPT", 1)[0]
+    runtime_root_body = script.split("<<'REMOTE_SMOKE_RUNTIME_ROOT'\n", 1)[1].split(
+        "\nREMOTE_SMOKE_RUNTIME_ROOT",
+        1,
+    )[0]
+
+    assert remote_body.startswith("{ set +x; } 2>/dev/null\nset -euo pipefail\n")
+    assert runtime_root_body.startswith("{ set +x; } 2>/dev/null\nset -euo pipefail\n")
+    assert script.count("env -u BASH_ENV -u BASHOPTS -u SHELLOPTS bash -s --") == 2
+    assert "worker_environment" not in script
+    assert "{{range .Config.Env}}{{println .}}{{end}}" not in script
+    assert '"ASTRA_RELEASE_ID"}}{{println .}}' in helper
+    assert '"ASTRA_RELEASE_COMMIT"}}{{println .}}' in helper
+    assert '"ASTRA_ALERT_WORKER_ACTOR_ID"}}{{println .}}' in helper
+    assert '"PROCESS_ROLE"}}{{println .}}' in helper
+
+    sentinel = "remote-worker-secret-must-not-be-traced"
+    docker_stub = tmp_path / "docker"
+    docker_stub.write_text(
+        "#!/usr/bin/env python3\n"
+        "print('ASTRA_RELEASE_ID=release-canary')\n"
+        f"print('ASTRA_RELEASE_COMMIT={'a' * 40}')\n"
+        "print('ASTRA_ALERT_WORKER_ACTOR_ID=00000000-0000-4000-8000-000000000001')\n"
+        "print('PROCESS_ROLE=worker,connector')\n"
+        f"print('DATABASE_URL={sentinel}')\n",
+        encoding="utf-8",
+    )
+    docker_stub.chmod(0o700)
+    env = {
+        "PATH": (
+            f"{tmp_path}{os.pathsep}{Path(sys.executable).parent}"
+            f"{os.pathsep}{os.environ.get('PATH', '')}"
+        )
+    }
+
+    traced = subprocess.run(
+        ["bash", "-x", "-c", f"set -euo pipefail\n{helper}\ninspect_worker_runtime_identity worker-id"],
+        env=env,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert traced.returncode == 0, traced.stderr.decode()
+    assert traced.stdout.decode().splitlines() == [
+        "release-canary",
+        "a" * 40,
+        "00000000-0000-4000-8000-000000000001",
+        "worker,connector",
+    ]
+    assert sentinel.encode() not in traced.stdout + traced.stderr
+
+    duplicate_dir = tmp_path / "duplicate"
+    duplicate_dir.mkdir()
+    duplicate_stub = duplicate_dir / "docker"
+    duplicate_stub.write_text(
+        "#!/usr/bin/env python3\n"
+        "print('ASTRA_RELEASE_ID=release-canary')\n"
+        "print('ASTRA_RELEASE_ID=duplicate-release')\n"
+        f"print('ASTRA_RELEASE_COMMIT={'a' * 40}')\n"
+        "print('ASTRA_ALERT_WORKER_ACTOR_ID=00000000-0000-4000-8000-000000000001')\n"
+        "print('PROCESS_ROLE=worker,connector')\n",
+        encoding="utf-8",
+    )
+    duplicate_stub.chmod(0o700)
+    duplicate_env = {
+        "PATH": (
+            f"{duplicate_dir}{os.pathsep}{Path(sys.executable).parent}"
+            f"{os.pathsep}{os.environ.get('PATH', '')}"
+        ),
+    }
+    duplicated = subprocess.run(
+        ["bash", "-c", f"set -euo pipefail\n{helper}\ninspect_worker_runtime_identity worker-id"],
+        env=duplicate_env,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    assert duplicated.returncode != 0
+
+
+def test_remote_smoke_credential_writer_is_exclusive_and_symlink_safe(tmp_path):
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    marker = "source = r'''\n"
+    source = script.split(marker, 1)[1].split("\n'''", 1)[0]
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir(mode=0o700)
+    credential = runtime_root / "candidate.smoke-credentials.json"
+    payload = b'{"SMOKE_TENANT_EMAIL":"release@example.com"}\n'
+    digest = hashlib.sha256(payload).hexdigest()
+
+    written = subprocess.run(
+        [sys.executable, "-c", source, str(credential), digest],
+        input=payload,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert written.returncode == 0, written.stderr.decode()
+    assert credential.read_bytes() == payload
+    assert stat.S_IMODE(credential.stat().st_mode) == 0o600
+
+    replacement = b'{"SMOKE_TENANT_EMAIL":"attacker@example.com"}\n'
+    rejected_overwrite = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            source,
+            str(credential),
+            hashlib.sha256(replacement).hexdigest(),
+        ],
+        input=replacement,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    assert rejected_overwrite.returncode != 0
+    assert credential.read_bytes() == payload
+
+    credential.unlink()
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"do-not-overwrite")
+    credential.symlink_to(outside)
+    rejected_symlink = subprocess.run(
+        [sys.executable, "-c", source, str(credential), digest],
+        input=payload,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    assert rejected_symlink.returncode != 0
+    assert outside.read_bytes() == b"do-not-overwrite"
+
+
+def test_browser_smoke_runtime_without_current_upload_removes_all_stale_credentials(
+    tmp_path,
+):
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    cleanup = _shell_function_source(
+        script,
+        "prepare_browser_smoke_runtime_root",
+        "cleanup_browser_smoke_runtime",
+    )
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir(mode=0o700)
+    stale = runtime_root / "interrupted.smoke-credentials.json"
+    stale.write_text("remove-without-current-deploy", encoding="utf-8")
+    stale.chmod(0o600)
+    harness = f"""set -e
+BROWSER_SMOKE_RUNTIME_ROOT={shlex.quote(str(runtime_root))}
+SMOKE_ENV_FILE={shlex.quote(str(runtime_root / "unused.smoke-credentials.json"))}
+RUN_REMOTE_SMOKE=0
+{cleanup}
+prepare_browser_smoke_runtime_root
+"""
+
+    cleaned = subprocess.run(
+        ["bash", "-c", harness],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert cleaned.returncode == 0, cleaned.stderr
+    assert not stale.exists()
+
+
+def test_media_credit_inventory_fences_migration_for_every_company():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+
+    stop_writers = script.index("stop --timeout 90 worker frontend backend")
+    pre_inventory = script.index(
+        "media-credit-inventory.pre-migration.json",
+        stop_writers,
+    )
+    migration = script.index(
+        "--entrypoint alembic backend upgrade head",
+        pre_inventory,
+    )
+    post_inventory = script.index(
+        "media-credit-inventory.post-migration.json",
+        migration,
+    )
+    candidate_start = script.index(
+        "up -d --no-deps backend",
+        post_inventory,
+    )
+
+    assert stop_writers < pre_inventory < migration < post_inventory < candidate_start
+    inventory_module = "-m app.scripts.inventory_legacy_media_reservations"
+    assert script.count(inventory_module) == 2
+    assert script.count("--fail-on-blocking") == 2
+    assert "--fail-on-blocking --require-no-legacy" in script
+    assert 'abort_release "media Credits inventory' in script
 
 
 def test_mcp_host_egress_guard_is_a_pre_mutation_release_gate():
-    deploy_script = (ROOT / "scripts/deploy-astra-production.sh").read_text(
-        encoding="utf-8"
-    )
+    deploy_script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
     guard_path = ROOT / "scripts/manage-production-mcp-egress-guard.sh"
     contract_path = ROOT / "deploy/security-contracts/mcp-egress-v1"
     guard = guard_path.read_text(encoding="utf-8")
@@ -301,9 +1013,7 @@ def test_mcp_host_egress_guard_is_a_pre_mutation_release_gate():
     assert "OnUnitActiveSec=30s" in guard
     assert "Normal application deployment only verifies this contract" in contract
 
-    gate = deploy_script.index(
-        'echo "[remote] verifying host-level MCP egress contract"'
-    )
+    gate = deploy_script.index('echo "[remote] verifying host-level MCP egress contract"')
     recovery = deploy_script.index('if [ "$RECOVERY_REQUIRED" = "1" ]', gate)
     backup = deploy_script.index('echo "[remote] backing up database')
     maintenance = deploy_script.index(
@@ -359,19 +1069,15 @@ def test_mcp_deployment_contract_is_fail_closed_and_matches_runtime_classifier()
     quarantine_start = script.index("quarantine_mcp_for_unsafe_release() {")
     restore_start = script.index("restore_mcp_quarantine_for_safe_release() {")
     quarantine = script[quarantine_start:restore_start]
-    restore = script[restore_start:script.index("project_for_slot() {", restore_start)]
+    restore = script[restore_start : script.index("project_for_slot() {", restore_start)]
     assert quarantine.index("CREATE TRIGGER astra_deploy_mcp_quarantine_tools_guard") < (
         quarantine.index("UPDATE tools")
     )
-    assert restore.index("SET LOCAL astra.mcp_quarantine_restore") < restore.index(
-        "UPDATE tools AS tool"
-    )
+    assert restore.index("SET LOCAL astra.mcp_quarantine_restore") < restore.index("UPDATE tools AS tool")
     assert restore.index("UPDATE agent_tools AS assignment") < restore.index(
         "DELETE FROM astra_deploy_mcp_quarantine_state"
     )
-    assert restore.index("DELETE FROM astra_deploy_mcp_quarantine_state") < (
-        restore.index("DROP TRIGGER")
-    )
+    assert restore.index("DELETE FROM astra_deploy_mcp_quarantine_state") < (restore.index("DROP TRIGGER"))
 
     trap = script.index("trap 'on_error $?' ERR")
     build = script.index('echo "[remote] building candidate slot')
@@ -391,9 +1097,7 @@ def test_mcp_deployment_contract_is_fail_closed_and_matches_runtime_classifier()
     rollback_end = script.index("abort_release() {", rollback_start)
     rollback = script[rollback_start:rollback_end]
     assert 'if [ "$ROLLBACK_REQUIRES_MCP_QUARANTINE" = "1" ]' in rollback
-    assert rollback.index("ROLLBACK_REQUIRES_MCP_QUARANTINE") < rollback.index(
-        "quarantine_mcp_for_unsafe_release"
-    )
+    assert rollback.index("ROLLBACK_REQUIRES_MCP_QUARANTINE") < rollback.index("quarantine_mcp_for_unsafe_release")
 
 
 def test_pre_migration_rollback_never_quarantines_live_mcp(tmp_path):
@@ -402,19 +1106,19 @@ def test_pre_migration_rollback_never_quarantines_live_mcp(tmp_path):
     rollback_end = script.index("abort_release() {", rollback_start)
     rollback = script[rollback_start:rollback_end]
     harness = f"""set -eu
-SMOKE_ENV_FILE={shlex.quote(str(tmp_path / 'missing-smoke'))}
-PREVIOUS={shlex.quote(str(tmp_path / 'previous'))}
+SMOKE_ENV_FILE={shlex.quote(str(tmp_path / "missing-smoke"))}
+PREVIOUS={shlex.quote(str(tmp_path / "previous"))}
 PREVIOUS_RELEASE_ID=release-old
 PREVIOUS_VERSION=1.10.11
 PREVIOUS_COMMIT=old1234
-RELEASE={shlex.quote(str(tmp_path / 'candidate'))}
+RELEASE={shlex.quote(str(tmp_path / "candidate"))}
 RELEASE_ID=release-new
 ACTIVE_SLOT=b
 CANDIDATE_SLOT=a
 ROLLBACK_REQUIRES_MCP_QUARANTINE=0
 CANDIDATE_READY_FOR_FALLBACK=0
 NGINX_CONFIG_TOUCHED=0
-CURRENT={shlex.quote(str(tmp_path / 'current'))}
+CURRENT={shlex.quote(str(tmp_path / "current"))}
 OLD_PROJECT=astra-app-b
 OLD_PORT=3009
 CANDIDATE_PROJECT=astra-app-a
@@ -452,10 +1156,10 @@ def test_forward_only_rollback_preserves_maintenance_and_never_starts_old_code(t
     rollback_end = script.index("abort_release() {", rollback_start)
     rollback = script[rollback_start:rollback_end]
     harness = f"""set +e
-SMOKE_ENV_FILE={shlex.quote(str(tmp_path / 'missing-smoke'))}
-PREVIOUS={shlex.quote(str(tmp_path / 'previous'))}
+SMOKE_ENV_FILE={shlex.quote(str(tmp_path / "missing-smoke"))}
+PREVIOUS={shlex.quote(str(tmp_path / "previous"))}
 PREVIOUS_RELEASE_ID=release-old
-RELEASE={shlex.quote(str(tmp_path / 'candidate'))}
+RELEASE={shlex.quote(str(tmp_path / "candidate"))}
 RELEASE_ID=release-new
 ACTIVE_SLOT=b
 CANDIDATE_SLOT=a
@@ -497,7 +1201,7 @@ def test_production_deploy_health_checks_candidate_before_nginx_cutover():
     assert candidate_identity < nginx_reload
     assert "ACTIVE_SLOT_FILE" in script
     assert "DRAIN_TIMEOUT_SECONDS" in script
-    assert '(cd backend && uv run pytest -q)' in script
+    assert "(cd backend && uv run pytest -q)" in script
     assert "JWT_ROTATION_MARKER" in script
     assert 'install "$NGINX_SITE" "$OLD_PORT" "$CANDIDATE_PORT"' in script
     assert '"$RELEASE/scripts/configure_production_nginx.py"' in script
@@ -1035,7 +1739,7 @@ def test_production_deploy_rollback_keeps_privacy_safe_nginx_format():
     rollback_start = script.index("rollback() {")
     rollback_end = script.index("abort_release() {", rollback_start)
     rollback = script[rollback_start:rollback_end]
-    assert 'NGINX_CONFIG_TOUCHED=0' in script[:rollback_start]
+    assert "NGINX_CONFIG_TOUCHED=0" in script[:rollback_start]
     assert 'install "$NGINX_SITE" "$CANDIDATE_PORT" "$OLD_PORT"' in restore
     assert '"$NGINX_LOG_FORMAT"' in restore
     assert " restore " not in restore
@@ -1045,9 +1749,7 @@ def test_production_deploy_rollback_keeps_privacy_safe_nginx_format():
     assert "candidate remains running" in rollback
 
     site_backup = script.index('sudo cp "$NGINX_SITE" "$NGINX_BACKUP"')
-    format_backup = script.index(
-        'sudo cp "$NGINX_LOG_FORMAT" "$NGINX_LOG_FORMAT_BACKUP"'
-    )
+    format_backup = script.index('sudo cp "$NGINX_LOG_FORMAT" "$NGINX_LOG_FORMAT_BACKUP"')
     maintenance_call = script.index(
         "if ! enable_web_maintenance",
         format_backup,
@@ -1134,9 +1836,9 @@ ACTIVE_SLOT=b
 PREVIOUS_RELEASE_ID=previous-release
 CANDIDATE_SLOT=a
 NGINX_CONFIG_TOUCHED=1
-CURRENT={shlex.quote(str(tmp_path / 'current'))}
-ACTIVE_SLOT_FILE={shlex.quote(str(tmp_path / 'active-slot'))}
-ACTIVE_RELEASE_FILE={shlex.quote(str(tmp_path / 'active-release'))}
+CURRENT={shlex.quote(str(tmp_path / "current"))}
+ACTIVE_SLOT_FILE={shlex.quote(str(tmp_path / "active-slot"))}
+ACTIVE_RELEASE_FILE={shlex.quote(str(tmp_path / "active-release"))}
 OLD_WORKER_STOP_REQUESTED=0
 COMPOSE_PROJECT=astra
 CANDIDATE_PROJECT=astra-app-a
@@ -1148,6 +1850,7 @@ restore_previous_nginx() {{ echo unexpected_nginx_mutation; return 0; }}
 recover_candidate_traffic() {{ echo unexpected_candidate_recovery; return 0; }}
 wait_for_public_release() {{ echo unexpected_public_check; return 0; }}
 compose_project() {{ echo unexpected_compose; return 0; }}
+cleanup_browser_smoke_runtime() {{ :; }}
 {rollback}
 rollback
 status=$?
@@ -1177,11 +1880,9 @@ def test_production_deploy_explicit_failures_invoke_rollback_before_exit():
     assert "rollback" in abort_function
     assert "trap - ERR" in abort_function
     assert "exit 1" in abort_function
-    assert (
-        'abort_release "public cutover did not expose expected release '
-        '$VERSION/$COMMIT"'
-    ) in script
-    assert 'abort_release "remote smoke environment file is missing"' in script
+    assert ('abort_release "public cutover did not expose expected release $VERSION/$COMMIT"') in script
+    assert ('abort_release "browser smoke image did not pass its pre-mutation launch self-test"') in script
+    assert 'abort_release "authenticated candidate API/browser smoke failed"' in script
 
 
 def test_production_deploy_starts_candidate_worker_before_unfreezing_public_traffic():
@@ -1206,9 +1907,7 @@ def test_production_deploy_starts_candidate_worker_before_unfreezing_public_traf
     assert 'health.get("version") != expected_version' in verifier
     assert 'version.get("commit") != expected_commit' in verifier
     assert 'wait_for_public_release "$VERSION" "$COMMIT"' in script[public_gate:]
-    assert 'abort_release "public cutover did not expose expected release' in script[
-        public_gate:
-    ]
+    assert 'abort_release "public cutover did not expose expected release' in script[public_gate:]
 
 
 def test_single_worker_assertion_compares_full_container_ids(tmp_path):
@@ -1305,13 +2004,13 @@ APP_ROOT={shlex.quote(str(app_root))}
 COMPOSE_PROJECT=astra
 COMPOSE_PROFILES=
 COMPOSE_FILE=docker-compose.prod.yml
-RELEASE={shlex.quote(str(app_root / 'releases' / 'incoming-release'))}
+RELEASE={shlex.quote(str(app_root / "releases" / "incoming-release"))}
 NGINX_SITE=/etc/nginx/sites-enabled/astra-poc.conf
 NGINX_LOG_FORMAT=/etc/nginx/conf.d/00-astra-log-redaction.conf
 CURRENT={shlex.quote(str(current))}
 ACTIVE_SLOT_FILE={shlex.quote(str(active_slot))}
 ACTIVE_RELEASE_FILE={shlex.quote(str(active_release))}
-ACTIVE_STATE_FILE={shlex.quote(str(app_root / 'active-state'))}
+ACTIVE_STATE_FILE={shlex.quote(str(app_root / "active-state"))}
 CUTOVER_STATE_FILE={shlex.quote(str(cutover_state))}
 RECORDED_SLOT=b
 DISK_SLOT=a
@@ -1345,7 +2044,7 @@ reload_nginx_with_worker_snapshot() {{
 retire_pre_reload_nginx_workers() {{ echo nginx_workers_retired; }}
 activate_worker_release() {{
     test "$1" = astra-app-a
-    test "$2" = {shlex.quote(str(target_release / '.env'))}
+    test "$2" = {shlex.quote(str(target_release / ".env"))}
     test "$4" = candidate-release
     echo old_worker_stopped
     WORKER_SLOT=a
@@ -1355,9 +2054,9 @@ compose_project() {{
     local project="$1"
     local env_file="$2"
     if [ "$project" = astra-app-a ]; then
-        test "$env_file" = {shlex.quote(str(target_release / '.env'))}
+        test "$env_file" = {shlex.quote(str(target_release / ".env"))}
     elif [ "$project" = astra-app-b ]; then
-        test "$env_file" = {shlex.quote(str(fallback_release / '.env'))}
+        test "$env_file" = {shlex.quote(str(fallback_release / ".env"))}
     else
         return 1
     fi
@@ -1458,6 +2157,184 @@ echo "current=$(readlink "$CURRENT")"
     assert f"current={target_release}" in result.stdout
 
 
+@pytest.mark.parametrize(
+    ("cutover_phase", "initial_evidence", "expects_regeneration"),
+    [
+        ("maintenance_enabled", "0", True),
+        ("migration_started", "0", True),
+        ("schema_forward_only", "0", True),
+        ("candidate_services_ready", "0", True),
+        ("candidate_business_verified", "1", False),
+    ],
+)
+def test_recovery_rebuilds_preverified_candidate_before_public_cutover(
+    tmp_path,
+    cutover_phase,
+    initial_evidence,
+    expects_regeneration,
+):
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    port_function, recovery_helpers, recovery_function = _recovery_shell_source(script)
+
+    app_root = tmp_path / "app"
+    target_release = _write_test_release(app_root, "candidate-release")
+    fallback_release = _write_test_release(
+        app_root,
+        "previous-release",
+        version="1.10.11",
+        commit="old1234",
+    )
+    (app_root / "slot-a-release").write_text(f"{target_release}\n", encoding="utf-8")
+    (app_root / "slot-b-release").write_text(f"{fallback_release}\n", encoding="utf-8")
+
+    harness = f"""set -e
+APP_ROOT={shlex.quote(str(app_root))}
+COMPOSE_PROJECT=astra
+COMPOSE_PROFILES=
+COMPOSE_FILE=docker-compose.prod.yml
+RELEASE={shlex.quote(str(app_root / "releases" / "incoming-release"))}
+NGINX_SITE=/etc/nginx/sites-enabled/astra-poc.conf
+NGINX_LOG_FORMAT=/etc/nginx/conf.d/00-astra-log-redaction.conf
+CURRENT={shlex.quote(str(app_root / "current"))}
+CUTOVER_STATE_FILE={shlex.quote(str(app_root / "cutover-state"))}
+CUTOVER_PHASE={cutover_phase}
+RECORDED_SLOT=b
+EVIDENCE={initial_evidence}
+write_atomic_line() {{ printf '%s\n' "$2" > "$1"; }}
+write_cutover_state() {{ write_atomic_line "$CUTOVER_STATE_FILE" "$1 slot=$2 release=$3"; }}
+write_atomic_symlink() {{ command ln -sfn "$2" "$1"; }}
+commit_active_state() {{ echo "active_committed:$1:$2"; }}
+wait_for_local_release() {{ echo local_identity_verified; }}
+wait_for_public_release() {{ test "$EVIDENCE" = 1; echo public_identity_verified; }}
+audit_effective_nginx() {{ :; }}
+reload_nginx_with_worker_snapshot() {{ :; }}
+retire_pre_reload_nginx_workers() {{ :; }}
+activate_worker_release() {{ echo candidate_worker_ready; }}
+compose_project() {{
+    local project="$1"
+    shift 3
+    case "$1" in
+        stop) echo fallback_stopped ;;
+        run) echo schema_converged ;;
+        up) echo candidate_services_ready ;;
+        *) return 1 ;;
+    esac
+}}
+sudo() {{
+    if [ "$1" = python3 ] && [ "$3" = install ]; then
+        test "$EVIDENCE" = 1
+        echo public_install_after_evidence
+        return 0
+    fi
+    if [ "$1" = python3 ] || [ "$1" = nginx ]; then
+        return 0
+    fi
+    return 1
+}}
+{port_function}
+{recovery_helpers}
+{recovery_function}
+candidate_business_evidence_valid() {{ test "$EVIDENCE" = 1; }}
+regenerate_candidate_business_evidence() {{
+    echo authenticated_candidate_smoke
+    EVIDENCE=1
+}}
+recover_indeterminate_cutover b a 3008 candidate-release
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    events = result.stdout
+    if expects_regeneration:
+        assert "authenticated_candidate_smoke" in events
+        assert events.index("authenticated_candidate_smoke") < events.index("public_install_after_evidence")
+    else:
+        assert "authenticated_candidate_smoke" not in events
+    assert (
+        events.index("candidate_worker_ready")
+        < events.index("public_install_after_evidence")
+        < events.index("public_identity_verified")
+    )
+
+
+def test_verified_recovery_rejects_missing_evidence_before_public_cutover(tmp_path):
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    port_function, recovery_helpers, recovery_function = _recovery_shell_source(script)
+    app_root = tmp_path / "app"
+    target_release = _write_test_release(app_root, "candidate-release")
+    fallback_release = _write_test_release(
+        app_root,
+        "previous-release",
+        version="1.10.11",
+        commit="old1234",
+    )
+    (app_root / "slot-a-release").write_text(f"{target_release}\n", encoding="utf-8")
+    (app_root / "slot-b-release").write_text(f"{fallback_release}\n", encoding="utf-8")
+    current = app_root / "current"
+
+    harness = f"""set +e
+APP_ROOT={shlex.quote(str(app_root))}
+COMPOSE_PROJECT=astra
+COMPOSE_PROFILES=
+COMPOSE_FILE=docker-compose.prod.yml
+RELEASE={shlex.quote(str(app_root / "releases" / "incoming-release"))}
+NGINX_SITE=/etc/nginx/sites-enabled/astra-poc.conf
+NGINX_LOG_FORMAT=/etc/nginx/conf.d/00-astra-log-redaction.conf
+CURRENT={shlex.quote(str(current))}
+CUTOVER_STATE_FILE={shlex.quote(str(app_root / "cutover-state"))}
+CUTOVER_PHASE=candidate_business_verified
+RECORDED_SLOT=b
+write_atomic_line() {{ printf '%s\n' "$2" > "$1"; }}
+write_cutover_state() {{ write_atomic_line "$CUTOVER_STATE_FILE" "$1 slot=$2 release=$3"; }}
+write_atomic_symlink() {{ command ln -sfn "$2" "$1"; }}
+wait_for_local_release() {{ :; }}
+wait_for_public_release() {{ echo unexpected_public_check; return 1; }}
+audit_effective_nginx() {{ :; }}
+reload_nginx_with_worker_snapshot() {{ :; }}
+retire_pre_reload_nginx_workers() {{ :; }}
+activate_worker_release() {{ :; }}
+compose_project() {{ :; }}
+sudo() {{
+    if [ "$1" = python3 ] && [ "$3" = install ]; then
+        echo unexpected_public_install
+        return 1
+    fi
+    return 0
+}}
+{port_function}
+{recovery_helpers}
+{recovery_function}
+candidate_business_evidence_valid() {{ return 1; }}
+regenerate_candidate_business_evidence() {{ echo unexpected_regeneration; return 0; }}
+recover_indeterminate_cutover b a 3008 candidate-release
+status=$?
+echo "status=$status"
+test ! -e "$CURRENT"
+exit "$status"
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 1
+    assert "status=1" in result.stdout
+    assert "unexpected_regeneration" not in result.stdout
+    assert "unexpected_public_install" not in result.stdout
+    assert "unexpected_public_check" not in result.stdout
+
+
 def test_production_deploy_failed_recovery_preserves_both_slots(tmp_path):
     script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
     port_function, recovery_helpers, recovery_function = _recovery_shell_source(script)
@@ -1486,13 +2363,13 @@ APP_ROOT={shlex.quote(str(app_root))}
 COMPOSE_PROJECT=astra
 COMPOSE_PROFILES=
 COMPOSE_FILE=docker-compose.prod.yml
-RELEASE={shlex.quote(str(app_root / 'releases' / 'incoming-release'))}
+RELEASE={shlex.quote(str(app_root / "releases" / "incoming-release"))}
 NGINX_SITE=/etc/nginx/sites-enabled/astra-poc.conf
 NGINX_LOG_FORMAT=/etc/nginx/conf.d/00-astra-log-redaction.conf
-CURRENT={shlex.quote(str(app_root / 'current'))}
+CURRENT={shlex.quote(str(app_root / "current"))}
 ACTIVE_SLOT_FILE={shlex.quote(str(active_slot))}
-ACTIVE_RELEASE_FILE={shlex.quote(str(app_root / 'active-release'))}
-CUTOVER_STATE_FILE={shlex.quote(str(app_root / 'cutover-state'))}
+ACTIVE_RELEASE_FILE={shlex.quote(str(app_root / "active-release"))}
+CUTOVER_STATE_FILE={shlex.quote(str(app_root / "cutover-state"))}
 RECORDED_SLOT=b
 write_atomic_line() {{ printf '%s\n' "$2" > "$1"; }}
 write_cutover_state() {{ write_atomic_line "$CUTOVER_STATE_FILE" "$1 slot=$2 release=$3"; }}
@@ -1588,12 +2465,12 @@ APP_ROOT={shlex.quote(str(app_root))}
 COMPOSE_PROJECT=astra
 COMPOSE_PROFILES=
 COMPOSE_FILE=docker-compose.prod.yml
-RELEASE={shlex.quote(str(app_root / 'releases' / 'incoming-release'))}
+RELEASE={shlex.quote(str(app_root / "releases" / "incoming-release"))}
 NGINX_SITE=/etc/nginx/sites-enabled/astra-poc.conf
 NGINX_LOG_FORMAT=/etc/nginx/conf.d/00-astra-log-redaction.conf
 CURRENT={shlex.quote(str(current))}
 ACTIVE_SLOT_FILE={shlex.quote(str(active_slot))}
-ACTIVE_RELEASE_FILE={shlex.quote(str(app_root / 'active-release'))}
+ACTIVE_RELEASE_FILE={shlex.quote(str(app_root / "active-release"))}
 CUTOVER_STATE_FILE={shlex.quote(str(cutover_state))}
 RECORDED_SLOT=b
 WORKER_SLOT=b
@@ -1618,9 +2495,9 @@ compose_project() {{
     local project="$1"
     local env_file="$2"
     if [ "$project" = astra-app-a ]; then
-        test "$env_file" = {shlex.quote(str(target_release / '.env'))} || return 1
+        test "$env_file" = {shlex.quote(str(target_release / ".env"))} || return 1
     elif [ "$project" = astra-app-b ]; then
-        test "$env_file" = {shlex.quote(str(fallback_release / '.env'))} || return 1
+        test "$env_file" = {shlex.quote(str(fallback_release / ".env"))} || return 1
     else
         return 1
     fi
@@ -1741,9 +2618,7 @@ def test_production_deploy_reconciles_live_nginx_before_clearing_inactive_slot()
     )
     assert "rm -sf" not in recovery
 
-    candidate_journal = script.index(
-        'write_atomic_line "$APP_ROOT/slot-${CANDIDATE_SLOT}-release" "$RELEASE"'
-    )
+    candidate_journal = script.index('write_atomic_line "$APP_ROOT/slot-${CANDIDATE_SLOT}-release" "$RELEASE"')
     maintenance = script.index("if ! enable_web_maintenance", candidate_journal)
     old_stop = script.index(
         "stop --timeout 90 worker frontend backend",
@@ -1783,6 +2658,7 @@ def test_production_deploy_reconciles_live_nginx_before_clearing_inactive_slot()
     "phase",
     [
         "candidate_ready",
+        "candidate_business_verified",
         "nginx_reloaded",
         "public_verified",
         "traffic_and_worker_committed",
@@ -1910,9 +2786,9 @@ RELEASE_ID=candidate-release
 ACTIVE_SLOT=b
 CANDIDATE_SLOT=a
 NGINX_CONFIG_TOUCHED=1
-CURRENT={shlex.quote(str(tmp_path / 'current'))}
-ACTIVE_SLOT_FILE={shlex.quote(str(tmp_path / 'active-slot'))}
-ACTIVE_RELEASE_FILE={shlex.quote(str(tmp_path / 'active-release'))}
+CURRENT={shlex.quote(str(tmp_path / "current"))}
+ACTIVE_SLOT_FILE={shlex.quote(str(tmp_path / "active-slot"))}
+ACTIVE_RELEASE_FILE={shlex.quote(str(tmp_path / "active-release"))}
 OLD_WORKER_STOP_REQUESTED=1
 CANDIDATE_PROJECT=astra-app-a
 OLD_PROJECT=astra-app-b
@@ -1989,31 +2865,23 @@ def test_nginx_reload_validates_public_before_retiring_old_workers():
     cutover = script.index("reload_nginx_with_worker_snapshot", cutover_start)
     reloaded_state = script.index("write_cutover_state nginx_reloaded", cutover)
     public_gate = script.index('echo "[remote] verifying public cutover identity"', cutover)
-    public_identity = script.index(
-        'wait_for_public_release "$VERSION" "$COMMIT"', public_gate
-    )
+    public_identity = script.index('wait_for_public_release "$VERSION" "$COMMIT"', public_gate)
     retirement = script.index("if ! retire_pre_reload_nginx_workers", public_identity)
-    active_commit = script.index(
-        'commit_active_state "$CANDIDATE_SLOT" "$RELEASE_ID"', retirement
-    )
+    active_commit = script.index('commit_active_state "$CANDIDATE_SLOT" "$RELEASE_ID"', retirement)
 
     assert script.count("sudo systemctl reload nginx") == 1
     assert "NGINX_RELOAD_OLD_WORKERS=" in helper
-    assert helper.index("NGINX_RELOAD_OLD_WORKERS=") < helper.index(
-        "sudo systemctl reload nginx"
-    )
+    assert helper.index("NGINX_RELOAD_OLD_WORKERS=") < helper.index("sudo systemctl reload nginx")
     assert "sudo kill -TERM" in helper
     assert "sudo systemctl is-active --quiet nginx" in helper
-    assert '${NGINX_WORKER_GRACE_SECONDS:-$DRAIN_TIMEOUT_SECONDS}' in helper
+    assert "${NGINX_WORKER_GRACE_SECONDS:-$DRAIN_TIMEOUT_SECONDS}" in helper
     assert candidate_worker < cutover_start < cutover < reloaded_state
     assert reloaded_state < public_gate < public_identity < retirement < active_commit
 
 
 def test_maintenance_writer_fence_is_durable_before_schema_migration():
     script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
-    candidate_journal = script.index(
-        'write_atomic_line "$APP_ROOT/slot-${CANDIDATE_SLOT}-release" "$RELEASE"'
-    )
+    candidate_journal = script.index('write_atomic_line "$APP_ROOT/slot-${CANDIDATE_SLOT}-release" "$RELEASE"')
     maintenance = script.index(
         "if ! enable_web_maintenance",
         candidate_journal,
@@ -2036,27 +2904,18 @@ def test_maintenance_writer_fence_is_durable_before_schema_migration():
         migration,
     )
 
-    assert (
-        candidate_journal
-        < maintenance
-        < maintenance_state
-        < old_stop
-        < migration_state
-        < migration
-        < schema_state
-    )
-    assert (
-        'write_atomic_line "$PENDING_DRAIN_FILE" '
-        '"$OLD_PROJECT $OLD_PORT $PREVIOUS"'
-    ) not in script[candidate_journal:]
+    assert candidate_journal < maintenance < maintenance_state < old_stop < migration_state < migration < schema_state
+    assert ('write_atomic_line "$PENDING_DRAIN_FILE" "$OLD_PROJECT $OLD_PORT $PREVIOUS"') not in script[
+        candidate_journal:
+    ]
 
 
 def test_production_deploy_does_not_rebuild_the_live_project_in_place():
     script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
 
     assert 'compose .env "$COMPOSE_FILE" up -d --build' not in script
-    assert 'build backend frontend' in script
-    assert 'stop frontend backend' in script
+    assert "build backend frontend" in script
+    assert "stop frontend backend" in script
 
 
 def test_deploy_state_is_serialized_and_durably_committed_before_legacy_mirrors():
@@ -2232,7 +3091,7 @@ def test_legacy_active_pair_slot_journal_is_strictly_migrated(
 APP_ROOT={shlex.quote(str(app_root))}
 COMPOSE_FILE=docker-compose.prod.yml
 CURRENT={shlex.quote(str(current))}
-ACTIVE_STATE_FILE={shlex.quote(str(app_root / 'active-state'))}
+ACTIVE_STATE_FILE={shlex.quote(str(app_root / "active-state"))}
 ACTIVE_SLOT_FILE={shlex.quote(str(active_slot))}
 ACTIVE_RELEASE_FILE={shlex.quote(str(active_release))}
 CUTOVER_PHASE=
@@ -2288,9 +3147,7 @@ exit "$status"
         elif mutation == "invalid_journal":
             assert slot_journal.read_text(encoding="utf-8") == "not-a-release\n"
         elif mutation == "multiline_journal":
-            assert slot_journal.read_text(encoding="utf-8") == (
-                f"{str(release_b)[:-1]}\n{str(release_b)[-1:]}\n"
-            )
+            assert slot_journal.read_text(encoding="utf-8") == (f"{str(release_b)[:-1]}\n{str(release_b)[-1:]}\n")
         elif mutation == "empty_journal":
             assert slot_journal.read_bytes() == b""
         elif mutation == "directory_journal":
@@ -2449,9 +3306,14 @@ def test_worker_handoff_enforces_one_exact_healthy_release(
     expected_status,
 ):
     script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    identity_helper = _shell_function_source(
+        script,
+        "inspect_worker_runtime_identity",
+        "run_candidate_alert_canary",
+    )
     worker_start = script.index("wait_for_worker_release() {")
     worker_end = script.index("remaining_old_nginx_workers() {", worker_start)
-    worker_functions = script[worker_start:worker_end]
+    worker_functions = identity_helper + script[worker_start:worker_end]
     harness = f"""set +e
 COMPOSE_PROJECT=astra
 RUNNING_BASE=legacy-worker
@@ -2521,7 +3383,11 @@ docker() {{
             *.Image*:backend-b) echo sha256:same ;;
             *.Image*:worker-b) echo "$WORKER_IMAGE_ID" ;;
             *Config.Env*:worker-b)
-                printf '%s\n' ASTRA_RELEASE_ID=release-b PROCESS_ROLE=worker,connector
+                printf '%s\n' \
+                    ASTRA_RELEASE_ID=release-b \
+                    ASTRA_RELEASE_COMMIT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+                    ASTRA_ALERT_WORKER_ACTOR_ID=00000000-0000-4000-8000-000000000001 \
+                    PROCESS_ROLE=worker,connector
                 ;;
             *Config.Labels*:worker-b) echo astra-app-b ;;
             *) return 1 ;;
@@ -2542,6 +3408,10 @@ exit $status
         check=False,
         capture_output=True,
         text=True,
+        env={
+            **os.environ,
+            "PATH": f"{Path(sys.executable).parent}:{os.environ.get('PATH', '')}",
+        },
     )
 
     assert result.returncode == expected_status, result.stderr
@@ -2783,17 +3653,13 @@ def test_rollback_cancels_only_its_exact_pending_drain_marker(
     )
     marker = tmp_path / "pending-drain"
     expected = f"astra-app-b 3009 {tmp_path / 'release-b'}"
-    marker_state = (
-        expected
-        if matches_active_release
-        else f"astra-app-a 3008 {tmp_path / 'release-a'}"
-    )
+    marker_state = expected if matches_active_release else f"astra-app-a 3008 {tmp_path / 'release-a'}"
     marker.write_text(f"{marker_state}\n", encoding="utf-8")
     harness = f"""set +e
 PENDING_DRAIN_FILE={shlex.quote(str(marker))}
 OLD_PROJECT=astra-app-b
 OLD_PORT=3009
-PREVIOUS={shlex.quote(str(tmp_path / 'release-b'))}
+PREVIOUS={shlex.quote(str(tmp_path / "release-b"))}
 remove_durable_file() {{ rm -f "$1"; echo marker_removed; }}
 {cancel_function}
 cancel_pending_drain_for_active_release
@@ -2872,9 +3738,7 @@ exit $status
 
 def test_candidate_journal_precedes_writer_fence_and_identity_gate():
     script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
-    journal = script.index(
-        'write_atomic_line "$APP_ROOT/slot-${CANDIDATE_SLOT}-release" "$RELEASE"'
-    )
+    journal = script.index('write_atomic_line "$APP_ROOT/slot-${CANDIDATE_SLOT}-release" "$RELEASE"')
     maintenance = script.index("if ! enable_web_maintenance", journal)
     schema_fence = script.index(
         'write_cutover_state schema_forward_only "$CANDIDATE_SLOT" "$RELEASE_ID"',
@@ -2902,12 +3766,12 @@ def test_rollback_uses_strictly_ready_candidate_when_old_path_cannot_converge(
     rollback_end = script.index("abort_release() {", ready_start)
     recovery_and_rollback = script[ready_start:rollback_end]
     harness = f"""set +e
-SMOKE_ENV_FILE={shlex.quote(str(tmp_path / 'smoke'))}
-PREVIOUS={shlex.quote(str(tmp_path / 'previous'))}
+SMOKE_ENV_FILE={shlex.quote(str(tmp_path / "smoke"))}
+PREVIOUS={shlex.quote(str(tmp_path / "previous"))}
 PREVIOUS_RELEASE_ID=release-old
 PREVIOUS_VERSION=1.10.11
 PREVIOUS_COMMIT=old1234
-RELEASE={shlex.quote(str(tmp_path / 'candidate'))}
+RELEASE={shlex.quote(str(tmp_path / "candidate"))}
 RELEASE_ID=release-new
 ACTIVE_SLOT=b
 CANDIDATE_SLOT=a
@@ -2931,6 +3795,7 @@ wait_for_public_release() {{ echo unexpected_public; return 1; }}
 activate_worker_release() {{ echo unexpected_worker; return 1; }}
 commit_active_state() {{ echo unexpected_commit; return 1; }}
 compose_project() {{ echo unexpected_compose; return 1; }}
+cleanup_browser_smoke_runtime() {{ :; }}
 {recovery_and_rollback}
 rollback
 status=$?
@@ -2950,3 +3815,54 @@ exit $status
     assert "state=rollback_started:b:release-old" in result.stdout
     assert "rollback_incomplete" not in result.stdout
     assert "unexpected_" not in result.stdout
+
+
+def test_remote_preflight_requires_timeout_before_deploy_lock_mutation():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+
+    timeout_check = script.index("if ! command -v timeout")
+    deploy_lock = script.index('exec 9>"$APP_ROOT/deploy.lock"')
+    first_timed_call = script.index("compose_project_timed 45 5")
+
+    assert timeout_check < deploy_lock < first_timed_call
+
+
+def test_recovery_persists_existing_proof_requirements_across_interruptions():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    recovery_start = script.index("recover_indeterminate_cutover() {")
+    recovery_end = script.index("\nif ! load_active_state", recovery_start)
+    recovery = script[recovery_start:recovery_end]
+
+    for phase in (
+        "recovery_started_alert_proof",
+        "recovery_incomplete_alert_proof",
+        "recovery_started_business_proof",
+        "recovery_incomplete_business_proof",
+    ):
+        assert phase in script
+    assert 'write_cutover_state "$recovery_incomplete_phase"' in recovery
+    assert "recovery_started_phase=recovery_started_business_proof" in recovery
+    business_proof = recovery.rindex(
+        'write_cutover_state "$recovery_started_phase"'
+    )
+    nginx_install = recovery.index("install \"$NGINX_SITE\"", business_proof)
+    assert business_proof < nginx_install
+
+
+def test_alert_canary_evidence_is_bound_to_the_actual_worker_actor():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    inspect_identity = _shell_function_source(
+        script,
+        "inspect_worker_runtime_identity",
+        "run_candidate_alert_canary",
+    )
+    canary = _shell_function_source(
+        script,
+        "run_candidate_alert_canary",
+        "publish_alert_canary_evidence",
+    )
+
+    assert "ASTRA_ALERT_WORKER_ACTOR_ID" in inspect_identity
+    assert "ASTRA_RELEASE_COMMIT" in inspect_identity
+    assert 'delivery.get("attribution_version") != 1' in canary
+    assert 'delivered_by.get("worker_actor_id") != sys.argv[9]' in canary

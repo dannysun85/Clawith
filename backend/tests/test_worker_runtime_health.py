@@ -4,6 +4,7 @@ from fastapi import HTTPException
 
 import app.main as main
 from app.services import production_issue_monitor
+from app.services.llm import minimax_quota
 
 
 @pytest.fixture(autouse=True)
@@ -45,12 +46,18 @@ async def test_dedicated_worker_health_fails_before_runtime_is_ready(monkeypatch
 @pytest.mark.asyncio
 async def test_dedicated_worker_health_is_ok_after_critical_tasks_start(monkeypatch):
     monkeypatch.setattr(main.settings, "PROCESS_ROLE", "worker,connector")
+    monkeypatch.setattr(
+        minimax_quota,
+        "minimax_quota_monitor_health",
+        lambda: {"healthy": True},
+    )
     main._begin_worker_runtime_tracking({"trigger_daemon", "media_generation"})
     main._mark_worker_runtime_ready()
 
     response = await main.health_check()
 
     assert response.status == "ok"
+
 
 @pytest.mark.asyncio
 async def test_critical_task_exit_makes_dedicated_worker_unhealthy(monkeypatch):
@@ -97,9 +104,7 @@ async def test_dedicated_worker_health_fails_when_monitor_db_loop_is_stale(
         await main.health_check()
 
     assert exc_info.value.status_code == 503
-    assert exc_info.value.detail == (
-        "production issue monitor database loop unavailable"
-    )
+    assert exc_info.value.detail == ("production issue monitor database loop unavailable")
 
 
 @pytest.mark.asyncio

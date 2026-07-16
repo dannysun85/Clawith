@@ -178,8 +178,8 @@ function ModelRoutesTab() {
         queryFn: () => fetchJson<ModelRoute[]>('/saas/model-routes'),
     });
     const { data: models = [] } = useQuery({
-        queryKey: ['llm-models-admin'],
-        queryFn: () => enterpriseApi.llmModels(),
+        queryKey: ['llm-models-platform-routes'],
+        queryFn: () => enterpriseApi.platformLlmModels(),
     });
     const [form, setForm] = useState({ saas_tier: 'pro', modality: 'text', llm_model_id: '', priority: '0' });
     const modelMap = useMemo(() => new Map(models.map((m: any) => [m.id, m])), [models]);

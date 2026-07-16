@@ -11,16 +11,19 @@ from sqlalchemy import select
 from app.database import async_session
 from app.models.audit import AuditLog
 from app.models.media_generation import MediaGenerationTask
+from app.models.notification import Notification
 from app.models.subscription import CreditReservation
 from app.services.credit_service import (
     finalize_reserved_credits_in_session,
+    grant_credits_in_session,
     mark_credit_reservation_settlement_ready_in_session,
     release_reserved_credits_in_session,
 )
 from app.services.media_generation import (
     TERMINAL_MEDIA_STATUSES,
-    _delete_private_video_brand_asset,
+    _delete_private_media_recovery_assets,
     _finalize_failure_in_session,
+    _lock_owned_media_reservation,
 )
 
 
@@ -40,6 +43,7 @@ class MediaRemediationItem:
     reservation_id: str | None
     reservation_status_before: str | None
     reservation_amount: int
+    compensation_credits: int = 0
 
 
 @dataclass(frozen=True)
@@ -131,15 +135,11 @@ async def remediate_media_tasks(
             task = task_by_id[task_id]
             reservation = None
             if task.reservation_id:
-                reservation = await db.get(
-                    CreditReservation,
-                    task.reservation_id,
+                reservation = await _lock_owned_media_reservation(
+                    db,
+                    task,
                     with_for_update=apply,
                 )
-                if not reservation:
-                    raise ValueError(f"reservation missing for media task {task.id}")
-                if reservation.tenant_id != task.tenant_id:
-                    raise ValueError(f"reservation tenant mismatch for media task {task.id}")
 
             if apply:
                 _validate_refundable_state(task, reservation)
@@ -199,11 +199,16 @@ def _validate_provider_debt_state(
             raise ValueError("provider_rejected requires a provider_inflight reservation")
         return False
 
-    if task.status == "closed_nonrefundable" and (
+    if task.status == "compensated" and (
         reservation is None or reservation.status == "finalized"
     ):
         return True
     if resolution == "provider_accepted":
+        if task.status == "closed_nonrefundable" and (
+            reservation is None or reservation.status == "finalized"
+        ):
+            # Repair rows closed by an older release without compensation.
+            return False
         if task.status != "submission_ambiguous":
             raise ValueError("provider_accepted requires a submission_ambiguous task")
         if not reservation or reservation.status not in {"provider_inflight", "settlement_ready"}:
@@ -212,6 +217,11 @@ def _validate_provider_debt_state(
             )
         return False
 
+    if task.status == "closed_nonrefundable" and (
+        reservation is None or reservation.status == "finalized"
+    ):
+        # Repair rows closed by an older release without compensation.
+        return False
     if task.status != "asset_delivery_failed":
         raise ValueError("close_asset_loss requires an asset_delivery_failed task")
     if reservation and reservation.status not in {"settlement_ready", "finalized"}:
@@ -256,19 +266,16 @@ async def resolve_media_provider_debt(
         task_by_id = {task.id: task for task in tasks}
 
         items: list[MediaRemediationItem] = []
+        compensation_total = 0
         for task_id in normalized_ids:
             task = task_by_id[task_id]
             reservation = None
             if task.reservation_id:
-                reservation = await db.get(
-                    CreditReservation,
-                    task.reservation_id,
+                reservation = await _lock_owned_media_reservation(
+                    db,
+                    task,
                     with_for_update=apply,
                 )
-                if not reservation:
-                    raise ValueError(f"reservation missing for media task {task.id}")
-                if reservation.tenant_id != task.tenant_id:
-                    raise ValueError(f"reservation tenant mismatch for media task {task.id}")
 
             already_resolved = _validate_provider_debt_state(
                 task,
@@ -277,8 +284,8 @@ async def resolve_media_provider_debt(
             )
             status_before = task.status
             reservation_status_before = reservation.status if reservation else None
-            if apply and not already_resolved:
-                if normalized_resolution == "provider_rejected":
+            if apply:
+                if not already_resolved and normalized_resolution == "provider_rejected":
                     assert reservation is not None
                     await release_reserved_credits_in_session(
                         db,
@@ -287,23 +294,70 @@ async def resolve_media_provider_debt(
                         release_provider_inflight=True,
                     )
                     task.status = "failed"
-                else:
+                elif not already_resolved:
                     if reservation and reservation.status == "provider_inflight":
                         await mark_credit_reservation_settlement_ready_in_session(
                             db,
                             reservation.id,
                             amount=reservation.amount,
                         )
+                    compensation_amount = int(reservation.amount or 0) if reservation else 0
+                    if compensation_amount > 0:
+                        # The provider debt remains visible as a consume ledger
+                        # entry, while an idempotent task-scoped refund keeps the
+                        # customer whole when no usable asset can be delivered.
+                        # Grant first so an accepted debt resize above the
+                        # current balance can still be finalized atomically.
+                        await grant_credits_in_session(
+                            db,
+                            tenant_id=task.tenant_id,
+                            amount=compensation_amount,
+                            reason="refund",
+                            granted_by=getattr(task, "user_id", None),
+                            ref_type="media_task",
+                            ref_id=task.id,
+                        )
+                        compensation_total += compensation_amount
                     if reservation and reservation.status == "settlement_ready":
                         await finalize_reserved_credits_in_session(db, reservation.id)
-                    task.status = "closed_nonrefundable"
-                    closed_tasks.append(task)
-                task.last_error = (
-                    f"Operator resolution {normalized_resolution}; "
-                    f"incident={normalized_incident_key}; evidence={normalized_evidence}"
-                )[:1000]
-                task.completed_at = task.completed_at or datetime.now(timezone.utc)
-                task.next_poll_at = None
+                    task.status = "compensated"
+                    task.last_response = {
+                        **(
+                            task.last_response
+                            if isinstance(getattr(task, "last_response", None), dict)
+                            else {}
+                        ),
+                        "status": "Compensated",
+                        "resolution": normalized_resolution,
+                        "refunded_credits": compensation_amount,
+                    }
+                    task.completion_delivery_status = "not_applicable"
+                    if getattr(task, "user_id", None):
+                        db.add(
+                            Notification(
+                                user_id=task.user_id,
+                                agent_id=getattr(task, "agent_id", None),
+                                type="system",
+                                title="媒体生成结果已退款",
+                                body=(
+                                    "供应商已受理，但没有可安全交付的媒体结果。"
+                                    f"系统已退回 {compensation_amount} Credits。"
+                                ),
+                                link=f"/agents/{task.agent_id}/chat"
+                                if getattr(task, "agent_id", None)
+                                else None,
+                                ref_id=task.id,
+                                sender_name="Astra",
+                            )
+                        )
+                if not already_resolved:
+                    task.last_error = (
+                        f"Operator resolution {normalized_resolution}; "
+                        f"incident={normalized_incident_key}; evidence={normalized_evidence}"
+                    )[:1000]
+                    task.completed_at = task.completed_at or datetime.now(timezone.utc)
+                    task.next_poll_at = None
+                closed_tasks.append(task)
 
             items.append(MediaRemediationItem(
                 task_id=str(task.id),
@@ -313,6 +367,11 @@ async def resolve_media_provider_debt(
                 reservation_id=str(task.reservation_id) if task.reservation_id else None,
                 reservation_status_before=reservation_status_before,
                 reservation_amount=int(reservation.amount) if reservation else 0,
+                compensation_credits=(
+                    int(reservation.amount or 0)
+                    if normalized_resolution != "provider_rejected" and reservation
+                    else 0
+                ),
             ))
 
         if apply:
@@ -325,12 +384,13 @@ async def resolve_media_provider_debt(
                     "resolution": normalized_resolution,
                     "task_ids": [str(task_id) for task_id in normalized_ids],
                     "expected_tenant_id": str(expected_tenant_id),
+                    "customer_compensation_credits": compensation_total,
                 },
             ))
             await db.commit()
 
     for task in closed_tasks:
-        await _delete_private_video_brand_asset(task)
+        await _delete_private_media_recovery_assets(task, strict=True)
     return MediaRemediationResult(
         incident_key=normalized_incident_key,
         applied=apply,

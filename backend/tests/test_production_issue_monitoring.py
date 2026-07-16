@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime, timezone
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -16,39 +17,48 @@ from app.services import production_issue_monitor
 ROOT = Path(__file__).parents[2]
 
 
-def test_route_normalization_removes_queries_and_high_cardinality_ids():
-    route = (
-        "/api/agents/123e4567-e89b-42d3-a456-426614174000/"
-        "tasks/123456789?token=must-not-survive"
+def _alert_worker_identity():
+    return production_issue_monitor.AlertWorkerIdentity(
+        actor_id=uuid.UUID("11111111-1111-4111-8111-111111111111"),
+        release_id="1.10.12-test",
+        release_commit="a" * 40,
     )
 
-    assert production_issue_monitor.normalize_issue_route(route) == (
-        "/api/agents/{uuid}/tasks/{id}"
-    )
+
+def test_route_normalization_removes_queries_and_high_cardinality_ids():
+    route = "/api/agents/123e4567-e89b-42d3-a456-426614174000/tasks/123456789?token=must-not-survive"
+
+    assert production_issue_monitor.normalize_issue_route(route) == ("/api/agents/{uuid}/tasks/{id}")
 
 
 def test_monitor_index_fields_redact_secret_shaped_values():
-    assert production_issue_monitor.normalize_issue_route(
-        "/api/jobs/sk-secret-value-123456?token=also-secret"
-    ) == "/api/jobs/[redacted]"
-    assert production_issue_monitor._safe_operational_text(
-        "WebSocket sk-secret-value-123456\nclose",
-        100,
-    ) == "WebSocket [redacted] close"
+    assert (
+        production_issue_monitor.normalize_issue_route("/api/jobs/sk-secret-value-123456?token=also-secret")
+        == "/api/jobs/[redacted]"
+    )
+    assert (
+        production_issue_monitor._safe_operational_text(
+            "WebSocket sk-secret-value-123456\nclose",
+            100,
+        )
+        == "WebSocket [redacted] close"
+    )
 
 
 def test_monitor_metadata_is_allowlisted_and_credentials_are_redacted():
-    clean = production_issue_monitor.sanitize_issue_metadata({
-        "component": "AgentDetailPage",
-        "provider": "minimax",
-        "error_type": "Bearer secret-token-value",
-        "model": "sk-123456789abcdef",
-        "prompt": "customer private prompt",
-        "content": "customer private content",
-        "api_key": "should-not-survive",
-        "token": "should-not-survive",
-        "status_code": 503,
-    })
+    clean = production_issue_monitor.sanitize_issue_metadata(
+        {
+            "component": "AgentDetailPage",
+            "provider": "minimax",
+            "error_type": "Bearer secret-token-value",
+            "model": "sk-123456789abcdef",
+            "prompt": "customer private prompt",
+            "content": "customer private content",
+            "api_key": "should-not-survive",
+            "token": "should-not-survive",
+            "status_code": 503,
+        }
+    )
 
     assert clean == {
         "component": "AgentDetailPage",
@@ -61,12 +71,14 @@ def test_monitor_metadata_is_allowlisted_and_credentials_are_redacted():
 
 def test_client_report_contract_rejects_message_and_identity_fields():
     with pytest.raises(ValidationError):
-        ClientIssueReportIn.model_validate({
-            "category": "api",
-            "error_code": "http_500",
-            "summary": "raw server response",
-            "tenant_id": str(uuid.uuid4()),
-        })
+        ClientIssueReportIn.model_validate(
+            {
+                "category": "api",
+                "error_code": "http_500",
+                "summary": "raw server response",
+                "tenant_id": str(uuid.uuid4()),
+            }
+        )
 
 
 @pytest.mark.parametrize(
@@ -103,20 +115,24 @@ def test_client_report_contract_rejects_free_form_diagnostic_text(payload):
 def test_client_report_contract_accepts_agent_context_but_not_tenant_override():
     agent_id = uuid.uuid4()
 
-    report = ClientIssueReportIn.model_validate({
-        "category": "websocket",
-        "error_code": "close_1006",
-        "agent_id": str(agent_id),
-    })
-    assert report.agent_id == agent_id
-
-    with pytest.raises(ValidationError):
-        ClientIssueReportIn.model_validate({
+    report = ClientIssueReportIn.model_validate(
+        {
             "category": "websocket",
             "error_code": "close_1006",
             "agent_id": str(agent_id),
-            "tenant_id": str(uuid.uuid4()),
-        })
+        }
+    )
+    assert report.agent_id == agent_id
+
+    with pytest.raises(ValidationError):
+        ClientIssueReportIn.model_validate(
+            {
+                "category": "websocket",
+                "error_code": "close_1006",
+                "agent_id": str(agent_id),
+                "tenant_id": str(uuid.uuid4()),
+            }
+        )
 
 
 @pytest.mark.asyncio
@@ -132,9 +148,7 @@ async def test_client_agent_context_uses_the_product_access_policy(monkeypatch):
 
     monkeypatch.setattr(production_issues, "check_agent_access", allow_agent)
 
-    assert await production_issues._authorized_client_agent_id(
-        object(), user, requested_agent_id
-    ) == requested_agent_id
+    assert await production_issues._authorized_client_agent_id(object(), user, requested_agent_id) == requested_agent_id
 
 
 @pytest.mark.asyncio
@@ -144,9 +158,12 @@ async def test_unauthorized_client_agent_context_is_dropped(monkeypatch):
 
     monkeypatch.setattr(production_issues, "check_agent_access", deny_agent)
 
-    assert await production_issues._authorized_client_agent_id(
-        object(), SimpleNamespace(tenant_id=uuid.uuid4()), uuid.uuid4()
-    ) is None
+    assert (
+        await production_issues._authorized_client_agent_id(
+            object(), SimpleNamespace(tenant_id=uuid.uuid4()), uuid.uuid4()
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -163,10 +180,12 @@ async def test_client_issue_report_rate_limit_is_enforced_before_persistence(mon
 
     with pytest.raises(HTTPException) as exc_info:
         await production_issues.report_client_issue(
-            ClientIssueReportIn.model_validate({
-                "category": "api",
-                "error_code": "http_500",
-            }),
+            ClientIssueReportIn.model_validate(
+                {
+                    "category": "api",
+                    "error_code": "http_500",
+                }
+            ),
             SimpleNamespace(state=SimpleNamespace(trace_id="abc123")),
             SimpleNamespace(id=uuid.uuid4(), tenant_id=uuid.uuid4()),
             object(),
@@ -197,9 +216,7 @@ async def test_client_issue_report_rate_counter_uses_a_bounded_redis_window(monk
     assert key.startswith("production-issue-report:rate:")
     assert member.count(":") == 1
     assert limit == production_issues.CLIENT_REPORT_RATE_LIMIT
-    assert ttl == (
-        production_issues.CLIENT_REPORT_RATE_WINDOW_SECONDS * 2
-    )
+    assert ttl == (production_issues.CLIENT_REPORT_RATE_WINDOW_SECONDS * 2)
     assert "if count >= limit" in script
     assert script.index("if count >= limit") < script.index("redis.call('ZADD'")
 
@@ -466,6 +483,75 @@ def test_warning_alert_notification_is_not_labeled_as_error():
     assert notification.title == "[警告] 生产问题告警"
 
 
+def test_release_canary_payload_and_notification_are_explicitly_synthetic():
+    now = datetime.now(timezone.utc)
+    issue = SimpleNamespace(
+        id=uuid.uuid4(),
+        source=production_issue_monitor.RELEASE_ALERT_CANARY_SOURCE,
+        alert_epoch=1,
+        severity="warning",
+        summary="Astra production alert delivery canary; no customer incident",
+        event_count=1,
+        route=None,
+        operation="release.alert_canary.1.10.12-test",
+        category="observability",
+        last_seen_at=now,
+        release_version="1.10.12",
+    )
+
+    payload = production_issue_monitor._production_issue_alert_payload(issue)
+    notification = production_issue_monitor._production_issue_notification(
+        issue,
+        uuid.uuid4(),
+        payload=payload,
+    )
+
+    assert payload["event_kind"] == "release_alert_canary"
+    assert payload["is_canary"] is True
+    assert notification.title == "[演练] 生产告警通道验证"
+    assert (
+        production_issue_monitor._production_issue_alert_log_level(
+            "warning",
+            is_canary=True,
+        )
+        == "info"
+    )
+
+
+@pytest.mark.asyncio
+async def test_alert_owner_resolver_requires_active_platform_identity_and_user():
+    first_user_id = uuid.uuid4()
+    second_user_id = uuid.uuid4()
+
+    class Result:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [first_user_id, first_user_id, second_user_id]
+
+    class Session:
+        statement = None
+
+        async def execute(self, statement):
+            self.statement = statement
+            return Result()
+
+    session = Session()
+    owner_ids = await production_issue_monitor.resolve_production_alert_owner_ids(
+        session,
+        SimpleNamespace(SAAS_ADMIN_EMAIL="  Owner@Example.Test "),
+    )
+
+    statement = str(session.statement).lower()
+    assert owner_ids == [first_user_id, second_user_id]
+    assert "lower(identities.email)" in statement
+    assert "identities.is_active is true" in statement
+    assert "identities.is_platform_admin is true" in statement
+    assert "users.is_active is true" in statement
+    assert "order by users.id" in statement
+
+
 def test_alert_notification_uses_the_claimed_epoch_snapshot():
     issue = SimpleNamespace(
         id=uuid.uuid4(),
@@ -496,9 +582,7 @@ def test_alert_notification_uses_the_claimed_epoch_snapshot():
 
     assert notification.title == "[警告] 生产问题告警"
     assert notification.body == "Frozen provider warning · 3 次 · /api/frozen/{uuid}"
-    assert notification.ref_id == (
-        production_issue_monitor._production_issue_notification_ref_id(issue.id, 2)
-    )
+    assert notification.ref_id == (production_issue_monitor._production_issue_notification_ref_id(issue.id, 2))
     assert "Mutated" not in notification.body
 
 
@@ -572,13 +656,22 @@ async def test_alert_finalizer_locks_issue_before_delivery(monkeypatch):
         idempotency_key="production-issue:test:1:webhook",
         claim_token=claim_token,
         payload={},
+        worker_identity=_alert_worker_identity(),
     )
 
-    assert await production_issue_monitor._finalize_alert_delivery(
-        claim,
-        success=True,
-    ) is True
+    assert (
+        await production_issue_monitor._finalize_alert_delivery(
+            claim,
+            success=True,
+        )
+        is True
+    )
     assert [event[0] for event in session.events[:2]] == ["issue", "delivery"]
+    assert delivery.attribution_version == 1
+    assert delivery.claim_worker_actor_id is None
+    assert delivery.delivered_by_worker_actor_id == _alert_worker_identity().actor_id
+    assert delivery.delivered_by_release_id == "1.10.12-test"
+    assert delivery.delivered_by_release_commit == "a" * 40
 
 
 @pytest.mark.asyncio
@@ -657,10 +750,13 @@ async def test_obsolete_notification_delivery_completes_without_notifying(monkey
         idempotency_key="production-issue:test:1:notification",
         claim_token=claim_token,
         payload={"alert_epoch": 1},
+        worker_identity=_alert_worker_identity(),
     )
 
     assert await production_issue_monitor._deliver_notification_claim(claim) is False
-    assert delivery.status == "delivered"
+    assert delivery.status == "cancelled"
+    assert delivery.delivered_at is None
+    assert delivery.delivered_by_worker_actor_id is None
     assert issue.alert_notification_sent_at is None
     assert session.added == []
 
@@ -730,16 +826,49 @@ async def test_obsolete_webhook_delivery_never_calls_the_http_client(monkeypatch
         idempotency_key="production-issue:test:1:webhook",
         claim_token=claim_token,
         payload={"alert_epoch": 1},
+        worker_identity=_alert_worker_identity(),
     )
 
-    assert await production_issue_monitor._deliver_webhook_claim(
-        client,
-        production_issue_monitor.asyncio.Semaphore(1),
-        claim,
-        "https://alerts.example.test/hook",
-    ) is False
+    assert (
+        await production_issue_monitor._deliver_webhook_claim(
+            client,
+            production_issue_monitor.asyncio.Semaphore(1),
+            claim,
+            "https://alerts.example.test/hook",
+        )
+        is False
+    )
     client.post.assert_not_awaited()
-    assert delivery.status == "delivered"
+    assert delivery.status == "cancelled"
+    assert delivery.delivered_at is None
+
+
+def test_release_worker_identity_fails_closed_when_partially_configured(monkeypatch):
+    monkeypatch.setenv("ASTRA_RELEASE_ID", "1.10.12-test")
+    monkeypatch.setenv("ASTRA_RELEASE_COMMIT", "a" * 40)
+    monkeypatch.delenv("ASTRA_ALERT_WORKER_ACTOR_ID", raising=False)
+
+    with pytest.raises(RuntimeError, match="actor identity"):
+        production_issue_monitor._current_alert_worker_identity()
+
+
+def test_claim_finalizer_is_fenced_by_worker_identity():
+    source = inspect.getsource(production_issue_monitor._claimed_delivery_predicates)
+
+    assert "claim_worker_actor_id" in source
+    assert "claim_worker_release_id" in source
+    assert "claim_worker_release_commit" in source
+    assert "attribution_version == 1" in source
+
+
+def test_webhook_delivery_has_total_wall_clock_timeout_and_never_buffers_body():
+    source = inspect.getsource(production_issue_monitor._deliver_webhook_claim)
+
+    assert "async with asyncio.timeout(" in source
+    assert "async with client.stream(" in source
+    assert "response.raise_for_status()" in source
+    assert "await client.post(" not in source
+    assert "response.aread" not in source
 
 
 def test_reopened_issue_uses_a_distinct_stable_notification_identity():
@@ -760,6 +889,28 @@ def test_reopened_issue_uses_a_distinct_stable_notification_identity():
 
     assert first == replay
     assert reopened != first
+
+
+@pytest.mark.asyncio
+async def test_release_alert_canary_status_cannot_be_changed_through_admin_api():
+    issue_id = uuid.uuid4()
+    issue = SimpleNamespace(
+        id=issue_id,
+        source=production_issue_monitor.RELEASE_ALERT_CANARY_SOURCE,
+        status="resolved",
+    )
+    db = SimpleNamespace(get=AsyncMock(return_value=issue))
+
+    with pytest.raises(HTTPException) as exc_info:
+        await production_issues.update_production_issue_status(
+            issue_id,
+            production_issues.ProductionIssueStatusIn(status="open"),
+            SimpleNamespace(id=uuid.uuid4()),
+            db,
+        )
+
+    assert exc_info.value.status_code == 409
+    assert "release verifier" in exc_info.value.detail.lower()
 
 
 def test_monitor_health_turns_unhealthy_after_the_db_loop_deadline(monkeypatch):

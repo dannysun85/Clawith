@@ -38,11 +38,6 @@ async def configure_slack_channel(
     if not is_agent_creator(current_user, agent):
         raise HTTPException(status_code=403, detail="Only creator can configure channel")
 
-    bot_token = data.get("bot_token", "").strip()
-    signing_secret = data.get("signing_secret", "").strip()
-    if not bot_token or not signing_secret:
-        raise HTTPException(status_code=422, detail="bot_token and signing_secret are required")
-
     result = await db.execute(
         select(ChannelConfig).where(
             ChannelConfig.agent_id == agent_id,
@@ -50,13 +45,19 @@ async def configure_slack_channel(
         )
     )
     existing = result.scalar_one_or_none()
+    bot_token = data.get("bot_token", "").strip()
+    signing_secret = data.get("signing_secret", "").strip()
     if existing:
-        existing.app_secret = bot_token        # Bot Token
-        existing.encrypt_key = signing_secret  # Signing Secret
+        existing.app_secret = bot_token or existing.app_secret
+        existing.encrypt_key = signing_secret or existing.encrypt_key
+        if not existing.app_secret or not existing.encrypt_key:
+            raise HTTPException(status_code=422, detail="bot_token and signing_secret are required")
         existing.is_configured = True
         await db.flush()
         return ChannelConfigOut.model_validate(existing)
 
+    if not bot_token or not signing_secret:
+        raise HTTPException(status_code=422, detail="bot_token and signing_secret are required")
     config = ChannelConfig(
         agent_id=agent_id,
         channel_type="slack",
@@ -93,7 +94,13 @@ async def get_slack_channel(
 
 
 @router.get("/agents/{agent_id}/slack-channel/webhook-url")
-async def get_slack_webhook_url(agent_id: uuid.UUID, request: Request, db: AsyncSession = Depends(get_db)):
+async def get_slack_webhook_url(
+    agent_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await check_agent_access(db, current_user, agent_id)
     from app.services.platform_service import platform_service
     public_base = await platform_service.get_public_base_url(db, request)
     return {"webhook_url": f"{public_base}/api/channel/slack/{agent_id}/webhook"}
@@ -174,9 +181,10 @@ async def slack_event_webhook(
 
     # Verify Slack signature
     signing_secret = config.encrypt_key or ""
-    if signing_secret:
-        if not _verify_slack_signature(signing_secret, body_bytes, dict(request.headers)):
-            return Response(status_code=401)
+    if not signing_secret:
+        return Response(status_code=503)
+    if not _verify_slack_signature(signing_secret, body_bytes, dict(request.headers)):
+        return Response(status_code=401)
 
     import json
     body = json.loads(body_bytes)

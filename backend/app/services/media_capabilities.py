@@ -26,6 +26,17 @@ MEDIA_MODALITIES = tuple(MEDIA_TOOL_NAMES)
 SAAS_TIERS = ("lite", "pro", "ultra")
 
 
+def _credential_media_modalities(credential: LLMCredential) -> set[str]:
+    """Mirror load-balancer semantics for None versus an explicit empty list."""
+
+    if credential.capabilities is None:
+        return set(MEDIA_MODALITIES)
+    capabilities = set(canonicalize_modalities(credential.capabilities))
+    if "multimodal" in capabilities:
+        return set(MEDIA_MODALITIES)
+    return capabilities.intersection(MEDIA_MODALITIES)
+
+
 def evaluate_media_capabilities(
     entitlements: Entitlements | None,
     *,
@@ -131,8 +142,7 @@ async def get_agent_media_capabilities(
     )
     pool_modalities: set[str] = set()
     for credential in credentials_result.scalars().all():
-        capabilities = canonicalize_modalities(credential.capabilities)
-        supported = set(MEDIA_MODALITIES) if not capabilities or "multimodal" in capabilities else set(capabilities)
+        supported = _credential_media_modalities(credential)
         pool_modalities.update(
             modality
             for modality in supported

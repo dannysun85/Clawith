@@ -338,6 +338,33 @@ def test_execution_completion_cannot_overwrite_migration_or_operator_terminal_st
     assert invocation.index("await _stop_lease_renewal()\n            completed =") < invocation.index(
         "await mark_trigger_executions_completed(execution_claims)"
     )
+    assert invocation.index("_successful_trigger_reply(reply, collected_content)") < invocation.index(
+        'role="assistant"'
+    )
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "⚠️ 未配置 API key",
+        "[LLM Error] provider unavailable",
+        "[LLM call error] TimeoutError",
+        "[Error] Tool execution failed",
+        "⚠️ Credits 结算暂时不可用，本轮结果未执行，请稍后重试。",
+    ],
+)
+def test_trigger_llm_error_outcomes_cannot_be_persisted_as_success(outcome):
+    from app.services.trigger_runtime import invoker
+
+    with pytest.raises(invoker.TriggerModelOutcomeError):
+        invoker._successful_trigger_reply(outcome, ["partial provider output"])
+
+
+def test_trigger_llm_content_remains_deliverable():
+    from app.services.trigger_runtime import invoker
+
+    assert invoker._successful_trigger_reply("完成", []) == "完成"
+    assert invoker._successful_trigger_reply(None, ["分", "段"]) == "分段"
 
 
 @pytest.mark.asyncio

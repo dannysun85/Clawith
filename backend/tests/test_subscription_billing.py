@@ -14,7 +14,15 @@ from app.services import credit_service
 from app.services import quota_guard
 from app.services.llm import caller as llm_caller
 from app.models.agent import Agent
-from app.models.subscription import CreditBalance, CreditPack, CreditReservation, CreditTransaction, PaymentOrder, Plan, Subscription
+from app.models.subscription import (
+    CreditBalance,
+    CreditPack,
+    CreditReservation,
+    CreditTransaction,
+    PaymentOrder,
+    Plan,
+    Subscription,
+)
 from app.models.user import User
 from app.schemas.saas import AssignSubscriptionIn, BillingRuleCreateIn, GrantCreditsIn
 from app.schemas.schemas import AgentCreate
@@ -365,17 +373,134 @@ async def test_credit_ledger_integrity_detects_balance_and_reserved_drift():
         status="reserved",
         action="video",
     )
-    db = MockDB(execute_results=[
-        DummyManyResult([balance]),
-        DummyManyResult(txs),
-        DummyManyResult([reservation]),
-    ])
+    db = MockDB(
+        execute_results=[
+            DummyManyResult(
+                [
+                    SimpleNamespace(
+                        tenant_id=tenant_id,
+                        actual_balance=balance.balance,
+                        actual_reserved=balance.reserved,
+                        expected_balance=sum(tx.delta for tx in txs),
+                        expected_reserved=reservation.amount,
+                    )
+                ]
+            )
+        ]
+    )
 
     report = await check_credit_ledger_integrity(db, tenant_id=tenant_id)
 
     assert report.checked_tenants == 1
     assert {issue.code for issue in report.issues} == {"balance_drift", "reserved_drift"}
     assert report.issues[0].tenant_id == tenant_id
+
+
+@pytest.mark.asyncio
+async def test_credit_ledger_integrity_detects_transaction_tenant_without_balance():
+    from app.services.billing_reconciliation import check_credit_ledger_integrity
+
+    tenant_id = uuid.uuid4()
+    transaction = CreditTransaction(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        delta=1000,
+        balance_after=1000,
+        reason="subscribe",
+        created_at=datetime.now(timezone.utc),
+    )
+    db = MockDB(
+        execute_results=[
+            DummyManyResult(
+                [
+                    SimpleNamespace(
+                        tenant_id=tenant_id,
+                        actual_balance=None,
+                        actual_reserved=None,
+                        expected_balance=transaction.delta,
+                        expected_reserved=0,
+                    )
+                ]
+            )
+        ]
+    )
+
+    report = await check_credit_ledger_integrity(db, tenant_id=tenant_id)
+
+    assert report.checked_tenants == 1
+    assert len(report.issues) == 1
+    assert report.issues[0].code == "missing_credit_balance"
+    assert report.issues[0].tenant_id == tenant_id
+    assert report.issues[0].expected == 1
+    assert report.issues[0].actual == 0
+
+
+@pytest.mark.asyncio
+async def test_credit_ledger_integrity_detects_reservation_tenant_without_balance():
+    from app.services.billing_reconciliation import check_credit_ledger_integrity
+
+    tenant_id = uuid.uuid4()
+    reservation = CreditReservation(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        amount=25,
+        status="provider_inflight",
+        action="video",
+    )
+    db = MockDB(
+        execute_results=[
+            DummyManyResult(
+                [
+                    SimpleNamespace(
+                        tenant_id=tenant_id,
+                        actual_balance=None,
+                        actual_reserved=None,
+                        expected_balance=0,
+                        expected_reserved=reservation.amount,
+                    )
+                ]
+            )
+        ]
+    )
+
+    report = await check_credit_ledger_integrity(db, tenant_id=tenant_id)
+
+    assert report.checked_tenants == 1
+    assert len(report.issues) == 1
+    assert report.issues[0].code == "missing_credit_balance"
+    assert report.issues[0].tenant_id == tenant_id
+
+
+@pytest.mark.asyncio
+async def test_payment_reconciliation_log_excludes_order_and_tenant_details():
+    from app.services.billing_reconciliation import reconcile_pending_payment_orders
+
+    order = PaymentOrder(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        type="subscribe",
+        amount_cents=16000,
+        currency="USD",
+        provider="stripe",
+        provider_session_id=None,
+        status="pending",
+    )
+    db = MockDB(execute_results=[DummyManyResult([order])])
+
+    with patch("app.services.billing_reconciliation.logger.warning") as warning:
+        report = await reconcile_pending_payment_orders(db)
+
+    assert report.checked_orders == 1
+    assert [issue.code for issue in report.issues] == ["missing_provider_session"]
+    warning.assert_called_once_with(
+        "[billing] payment reconciliation issues detected issue_count={} code_counts={}",
+        1,
+        {"missing_provider_session": 1},
+    )
+    serialized_log_args = repr(warning.call_args)
+    assert str(order.id) not in serialized_log_args
+    assert str(order.tenant_id) not in serialized_log_args
+    assert order.provider not in serialized_log_args
 
 
 @pytest.mark.asyncio
@@ -390,11 +515,21 @@ async def test_saas_reconciliation_endpoint_returns_jsonable_report():
         reason="subscribe",
         created_at=datetime.now(timezone.utc),
     )
-    db = MockDB(execute_results=[
-        DummyManyResult([balance]),
-        DummyManyResult([tx]),
-        DummyManyResult([]),
-    ])
+    db = MockDB(
+        execute_results=[
+            DummyManyResult(
+                [
+                    SimpleNamespace(
+                        tenant_id=tenant_id,
+                        actual_balance=balance.balance,
+                        actual_reserved=balance.reserved,
+                        expected_balance=tx.delta,
+                        expected_reserved=0,
+                    )
+                ]
+            )
+        ]
+    )
 
     report = await saas_api.get_ledger_reconciliation(
         tenant_id=tenant_id,
@@ -927,7 +1062,14 @@ async def test_stale_sweep_finalizes_provider_debt_and_releases_plain_hold():
         action="chat",
         expires_at=now,
     )
-    db = MockDB(execute_results=[DummyManyResult([settlement, plain, provider_inflight])])
+    db = MockDB(
+        execute_results=[
+            DummyManyResult([settlement.id, plain.id, provider_inflight.id]),
+            DummyResult(settlement),
+            DummyResult(plain),
+            DummyResult(provider_inflight),
+        ]
+    )
 
     with (
         patch.object(
@@ -956,11 +1098,35 @@ async def test_stale_sweep_finalizes_provider_debt_and_releases_plain_hold():
     finalize.assert_awaited_once_with(db, settlement.id)
     release.assert_awaited_once_with(db, plain.id, status="expired")
     monitor.assert_awaited_once()
-    assert monitor.await_args.kwargs["metadata"] == {
-        "reservation_id": str(provider_inflight.id)
-    }
+    assert monitor.await_args.kwargs["metadata"] == {"reservation_id": str(provider_inflight.id)}
     assert provider_inflight.status == "provider_inflight"
     assert provider_inflight.expires_at > now
+
+
+@pytest.mark.asyncio
+async def test_stale_sweep_protects_every_unresolved_media_status():
+    from app.services import billing_reconciliation, media_generation
+
+    class RecordingSweepDB(MockDB):
+        def __init__(self):
+            super().__init__(execute_results=[DummyManyResult([])])
+            self.statements = []
+
+        async def execute(self, statement=None, _params=None):
+            self.statements.append(statement)
+            return await super().execute(statement, _params)
+
+    db = RecordingSweepDB()
+    with patch(
+        "app.services.media_generation.backfill_legacy_minimax_video_tasks",
+        AsyncMock(return_value=0),
+    ):
+        assert await billing_reconciliation.expire_stale_credit_reservations(db) == 0
+
+    assert db.statements
+    compiled = db.statements[0].compile()
+    sequence_params = [tuple(value) for value in compiled.params.values() if isinstance(value, (list, tuple))]
+    assert media_generation.UNRESOLVED_MEDIA_STATUSES in sequence_params
 
 
 @pytest.mark.asyncio
@@ -1218,10 +1384,12 @@ async def test_get_credit_transactions_adds_client_labels_for_consumer_and_actor
         tier="lite",
         created_at=datetime.now(timezone.utc),
     )
-    db = MockDB(get_map={
-        (Agent, agent_id): Agent(id=agent_id, name="Clawiee", creator_id=user_id, tenant_id=tenant_id),
-        (User, user_id): User(id=user_id, display_name="tyree sun", tenant_id=tenant_id),
-    })
+    db = MockDB(
+        get_map={
+            (Agent, agent_id): Agent(id=agent_id, name="Clawiee", creator_id=user_id, tenant_id=tenant_id),
+            (User, user_id): User(id=user_id, display_name="tyree sun", tenant_id=tenant_id),
+        }
+    )
 
     with patch.object(subscription_api, "list_credit_transactions", AsyncMock(return_value=([tx], 1))):
         result = await subscription_api.get_credit_transactions(

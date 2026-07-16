@@ -1,7 +1,7 @@
 """Schedule API — CRUD for agent cron jobs."""
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import check_agent_access, is_agent_creator, is_agent_expired
-from app.core.security import get_current_user, require_role
+from app.core.security import get_current_user
 from app.database import get_db
 from app.models.schedule import AgentSchedule
 from app.models.user import User
@@ -22,7 +22,7 @@ class ScheduleCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     instruction: str = Field(default='', max_length=5000)
     cron_expr: str = Field(min_length=1, max_length=100)
-    is_enabled: bool = False
+    is_enabled: bool = True
 
 
 class ScheduleUpdate(BaseModel):
@@ -88,10 +88,12 @@ async def create_schedule(
     agent, _access = await check_agent_access(db, current_user, agent_id)
     if not is_agent_creator(current_user, agent):
         raise HTTPException(status_code=403, detail="Only creator can manage schedules")
-    if data.is_enabled:
+    from app.services.scheduler import AUTOMATIC_SCHEDULE_EXECUTION_ENABLED
+
+    if data.is_enabled and not AUTOMATIC_SCHEDULE_EXECUTION_ENABLED:
         raise HTTPException(
             status_code=409,
-            detail="Schedule execution is paused in this release",
+            detail="Schedule execution is disabled by the operator",
         )
 
     # Validate cron expression
@@ -104,8 +106,8 @@ async def create_schedule(
         name=data.name,
         instruction=data.instruction,
         cron_expr=data.cron_expr,
-        is_enabled=False,
-        next_run_at=None,
+        is_enabled=data.is_enabled,
+        next_run_at=next_run if data.is_enabled else None,
         created_by=current_user.id,
     )
     db.add(sched)
@@ -134,10 +136,12 @@ async def update_schedule(
         raise HTTPException(status_code=404, detail="Schedule not found")
 
     updates = data.model_dump(exclude_unset=True)
-    if updates.get("is_enabled"):
+    from app.services.scheduler import AUTOMATIC_SCHEDULE_EXECUTION_ENABLED
+
+    if updates.get("is_enabled") and not AUTOMATIC_SCHEDULE_EXECUTION_ENABLED:
         raise HTTPException(
             status_code=409,
-            detail="Schedule execution is paused in this release",
+            detail="Schedule execution is disabled by the operator",
         )
     for field, value in updates.items():
         setattr(sched, field, value)
@@ -185,6 +189,8 @@ async def trigger_schedule(
 ):
     """Manually trigger a schedule execution."""
     agent, _access = await check_agent_access(db, current_user, agent_id)
+    if not is_agent_creator(current_user, agent):
+        raise HTTPException(status_code=403, detail="Only creator can run schedules")
     if is_agent_expired(agent):
         raise HTTPException(status_code=403, detail="Agent has expired and cannot be triggered.")
 
@@ -195,13 +201,27 @@ async def trigger_schedule(
     if not sched:
         raise HTTPException(status_code=404, detail="Schedule not found")
 
-    raise HTTPException(
-        status_code=409,
-        detail=(
-            "Schedule execution is paused in this release; configuration "
-            "remains available for review"
-        ),
+    from app.services.scheduler import (
+        AUTOMATIC_SCHEDULE_EXECUTION_ENABLED,
+        _execute_schedule,
     )
+
+    if not AUTOMATIC_SCHEDULE_EXECUTION_ENABLED:
+        raise HTTPException(
+            status_code=409,
+            detail="Schedule execution is disabled by the operator",
+        )
+
+    # The worker reloads the durable schedule, requester, and Agent before it
+    # can spend Credits or invoke tools.
+    import asyncio
+
+    asyncio.create_task(_execute_schedule(sched.id, require_enabled=False))
+    sched.last_run_at = datetime.now(timezone.utc)
+    sched.run_count = (sched.run_count or 0) + 1
+    await db.flush()
+
+    return {"status": "triggered", "schedule_id": str(schedule_id)}
 
 
 @router.get("/{schedule_id}/history")

@@ -18,6 +18,7 @@ from app.models.user import User
 from app.services.org_sync_adapter import derive_member_department_paths
 from app.models.agent import Agent
 from app.models.llm import LLMModel
+from app.models.subscription import ModelRoute
 from app.models.audit import AuditLog, ApprovalRequest, EnterpriseInfo
 from app.schemas.schemas import (
     ApprovalAction, ApprovalRequestOut, AuditLogOut, EnterpriseInfoOut,
@@ -27,6 +28,7 @@ from app.schemas.schemas import (
 from app.services.autonomy_service import approval_to_public_dict, autonomy_service
 from app.services.enterprise_sync import enterprise_sync_service
 from app.services.llm import get_provider_manifest, get_model_api_key, get_provider_spec, create_llm_client, LLMMessage
+from app.services.modalities import model_supports_modality
 from app.services.platform_service import platform_service
 from app.services.sso_service import sso_service
 
@@ -63,6 +65,79 @@ def _require_platform_model_admin(user: User) -> None:
     """
     if not _is_platform_admin_user(user):
         raise HTTPException(status_code=403, detail="Model management is restricted to platform administrators")
+
+
+async def _model_routes(
+    db: AsyncSession,
+    model_id: uuid.UUID,
+    *,
+    enabled_only: bool,
+) -> list[ModelRoute]:
+    """Lock and return global routes that depend on a platform model."""
+
+    query = select(ModelRoute).where(ModelRoute.llm_model_id == model_id)
+    if enabled_only:
+        query = query.where(ModelRoute.enabled == True)  # noqa: E712
+    result = await db.execute(query.order_by(ModelRoute.id).with_for_update())
+    return list(result.scalars().all())
+
+
+def _validate_routed_model_update(
+    model: LLMModel,
+    data: LLMModelUpdate,
+    routes: list[ModelRoute],
+) -> None:
+    """Prevent an enterprise edit from invalidating a live SaaS route."""
+
+    if not routes:
+        return
+    prospective_enabled = data.enabled if data.enabled is not None else model.enabled
+    if not prospective_enabled:
+        raise HTTPException(
+            status_code=409,
+            detail="Disable every active SaaS model route before disabling this model.",
+        )
+    connection_changes = [
+        field
+        for field, value, current in (
+            ("provider", data.provider, model.provider),
+            ("model", data.model, model.model),
+            ("base_url", data.base_url, model.base_url),
+        )
+        if value is not None and value != current
+    ]
+    if connection_changes:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Disable every active SaaS model route before changing model "
+                f"connection identity: {', '.join(connection_changes)}"
+            ),
+        )
+    prospective_modality = data.modality if data.modality is not None else model.modality
+    prospective_vision = (
+        data.supports_vision
+        if data.supports_vision is not None
+        else model.supports_vision
+    )
+    unsupported = [
+        route
+        for route in routes
+        if not model_supports_modality(
+            route.modality,
+            model_modality=prospective_modality,
+            model_modalities=model.modalities,
+            supports_vision=prospective_vision,
+        )
+    ]
+    if unsupported:
+        slots = ", ".join(
+            f"{route.saas_tier}/{route.modality}" for route in unsupported[:5]
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=f"Model capability change would break active SaaS routes: {slots}",
+        )
 
 
 # ─── Public: Check Email Exists ────────────────────────
@@ -189,6 +264,7 @@ async def test_llm_model(
 @router.get("/llm-models", response_model=list[LLMModelOut])
 async def list_llm_models(
     tenant_id: str | None = None,
+    platform_only: bool = False,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -201,7 +277,9 @@ async def list_llm_models(
 
     tid = tenant_id or str(current_user.tenant_id) if current_user.tenant_id else None
     query = select(LLMModel).order_by(LLMModel.created_at.desc())
-    if tid:
+    if platform_only:
+        query = query.where(LLMModel.tenant_id.is_(None))
+    elif tid:
         # Tenant sees its own models + platform-level models (tenant_id=null, shared pool).
         query = query.where(or_(LLMModel.tenant_id == uuid.UUID(tid), LLMModel.tenant_id.is_(None)))
     result = await db.execute(query)
@@ -317,11 +395,23 @@ async def remove_llm_model(
     db: AsyncSession = Depends(get_db),
 ):
     """Remove an LLM model from the pool."""
-    result = await db.execute(select(LLMModel).where(LLMModel.id == model_id))
+    result = await db.execute(
+        select(LLMModel).where(LLMModel.id == model_id).with_for_update()
+    )
     model = result.scalar_one_or_none()
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
     _require_platform_model_admin(current_user)
+
+    routes = await _model_routes(db, model_id, enabled_only=False)
+    if routes:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Remove this model from every SaaS model route before deleting it",
+                "routes": [str(route.id) for route in routes],
+            },
+        )
 
     # Check if any agents reference this model
     from sqlalchemy import or_
@@ -361,7 +451,9 @@ async def update_llm_model(
     db: AsyncSession = Depends(get_db),
 ):
     """Update an existing LLM model in the pool (admin)."""
-    result = await db.execute(select(LLMModel).where(LLMModel.id == model_id))
+    result = await db.execute(
+        select(LLMModel).where(LLMModel.id == model_id).with_for_update()
+    )
     model = result.scalar_one_or_none()
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
@@ -372,6 +464,8 @@ async def update_llm_model(
         data.max_output_tokens if data.max_output_tokens is not None else model.max_output_tokens
     )
     _validate_provider_token_limit(effective_provider, effective_max_output_tokens)
+    routes = await _model_routes(db, model_id, enabled_only=True)
+    _validate_routed_model_update(model, data, routes)
 
     try:
         if data.provider:

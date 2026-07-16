@@ -43,11 +43,6 @@ async def configure_discord_channel(
     application_id = data.get("application_id", "").strip()
     public_key = data.get("public_key", "").strip()
 
-    if not bot_token:
-        raise HTTPException(status_code=422, detail="bot_token is required")
-    if connection_mode == "webhook" and (not application_id or not public_key):
-        raise HTTPException(status_code=422, detail="application_id and public_key are required for webhook mode")
-
     extra_config = {"connection_mode": connection_mode}
 
     result = await db.execute(
@@ -57,6 +52,14 @@ async def configure_discord_channel(
         )
     )
     existing = result.scalar_one_or_none()
+    if existing:
+        bot_token = bot_token or existing.app_secret or ""
+        application_id = application_id or existing.app_id or ""
+        public_key = public_key or existing.encrypt_key or ""
+    if not bot_token:
+        raise HTTPException(status_code=422, detail="bot_token is required")
+    if connection_mode == "webhook" and (not application_id or not public_key):
+        raise HTTPException(status_code=422, detail="application_id and public_key are required for webhook mode")
     if existing:
         existing.app_id = application_id or existing.app_id
         existing.app_secret = bot_token
@@ -116,7 +119,13 @@ async def get_discord_channel(
 
 
 @router.get("/agents/{agent_id}/discord-channel/webhook-url")
-async def get_discord_webhook_url(agent_id: uuid.UUID, request: Request, db: AsyncSession = Depends(get_db)):
+async def get_discord_webhook_url(
+    agent_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await check_agent_access(db, current_user, agent_id)
     from app.services.platform_service import platform_service
     public_base = await platform_service.get_public_base_url(db, request)
     return {"webhook_url": f"{public_base}/api/channel/discord/{agent_id}/webhook"}
@@ -243,7 +252,9 @@ async def discord_interaction_webhook(
 
     # Verify Discord signature
     public_key = config.encrypt_key or ""
-    if public_key and not _verify_discord_signature(public_key, body_bytes, dict(request.headers)):
+    if not public_key:
+        return Response(content="Webhook verification is not configured", status_code=503)
+    if not _verify_discord_signature(public_key, body_bytes, dict(request.headers)):
         return Response(content="Invalid signature", status_code=401)
 
     import json

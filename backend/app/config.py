@@ -128,6 +128,19 @@ class Settings(BaseSettings):
     # Claim and concurrency limits are process-local safety bounds; durable
     # executions remain queued until a worker slot is available.
     TRIGGER_DAEMON_ENABLED: bool = True
+    # Durable, user-created triggers are distinct from platform heartbeat/OKR
+    # automation. Keep this operator kill switch independent so disabling the
+    # CEO loop never silently disables explicit customer work.
+    USER_AUTOMATION_EXECUTION_ENABLED: bool = True
+    # Legacy schedule/task executors still use fire-and-forget delivery and do
+    # not yet have a durable lease/recovery contract. Keep them fail-closed in
+    # every environment until they are moved onto the durable trigger queue.
+    USER_SCHEDULE_EXECUTION_ENABLED: bool = False
+    USER_TASK_EXECUTION_ENABLED: bool = False
+    APPROVAL_EXECUTION_ENABLED: bool = True
+    # The legacy supervision reminder has no durable exactly-once delivery
+    # claim yet and remains separately quarantined.
+    SUPERVISION_EXECUTION_ENABLED: bool = False
     OKR_AUTOMATION_ENABLED: bool = False
     TRIGGER_MAX_CONCURRENCY: int = 8
     TRIGGER_CLAIM_BATCH_SIZE: int = 16
@@ -143,6 +156,11 @@ class Settings(BaseSettings):
     FEISHU_REDIRECT_URI: str = ""
     PUBLIC_BASE_URL: str = ""
     HTTP_PROXY: str = ""
+    # Public webhook transports stay fail-closed until their provider-native
+    # authentication contract is implemented and regression-tested. Feishu
+    # websocket and other authenticated connector modes remain available.
+    FEISHU_WEBHOOK_ENABLED: bool = False
+    TEAMS_WEBHOOK_ENABLED: bool = False
 
     # Douyin official OpenAPI. In hosted SaaS mode the platform owns this app,
     # while each company only OAuth-connects its own Douyin account.
@@ -172,11 +190,17 @@ class Settings(BaseSettings):
     MEDIA_GENERATION_SUBMISSION_TIMEOUT_SECONDS: int = 60 * 10
     MEDIA_GENERATION_MAX_AGE_SECONDS: int = 60 * 60 * 48
     MEDIA_GENERATION_MAX_CONSECUTIVE_ERRORS: int = 12
+    # Keep production recovery serial until measured memory/CPU/disk pressure
+    # proves that concurrent provider downloads and ffmpeg work are safe.
+    MEDIA_GENERATION_RECONCILIATION_CONCURRENCY: int = 1
+    MEDIA_GENERATION_TASK_LEASE_SECONDS: int = 30 * 60
+    MEDIA_GENERATION_BRAND_RECOVERY_RETENTION_DAYS: int = 30
     PRODUCTION_ISSUE_MONITOR_ENABLED: bool = True
     PRODUCTION_ISSUE_MONITOR_INTERVAL_SECONDS: int = 30
     PRODUCTION_ISSUE_ALERT_THRESHOLD: int = 1
     PRODUCTION_ISSUE_RETENTION_DAYS: int = 30
     PRODUCTION_ISSUE_ALERT_WEBHOOK_URL: str = ""
+    MINIMAX_QUOTA_MONITOR_INTERVAL_SECONDS: int = 300
 
     # Code execution is a separate high-risk product capability. Production
     # requires an explicit platform switch, an explicit tenant allowlist, and

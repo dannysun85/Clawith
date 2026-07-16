@@ -435,7 +435,12 @@ async def mark_credit_reservation_settlement_ready_in_session(
 ) -> CreditReservation:
     """Resize and mark a reservation as an irrevocable provider debt."""
     exact_amount = max(int(amount or 0), 0)
-    reservation = await db.get(CreditReservation, reservation_id, with_for_update=True)
+    reservation = await db.get(
+        CreditReservation,
+        reservation_id,
+        with_for_update=True,
+        populate_existing=True,
+    )
     if not reservation:
         raise ValueError("Credit reservation not found")
     if reservation.status == "finalized":
@@ -477,7 +482,12 @@ async def finalize_reserved_credits_in_session(
     reservation_id: uuid.UUID,
 ) -> CreditTransaction:
     """Consume a reserved amount exactly once and write the ledger row."""
-    reservation = await db.get(CreditReservation, reservation_id, with_for_update=True)
+    reservation = await db.get(
+        CreditReservation,
+        reservation_id,
+        with_for_update=True,
+        populate_existing=True,
+    )
     if not reservation:
         raise ValueError("Credit reservation not found")
 
@@ -565,7 +575,12 @@ async def release_reserved_credits_in_session(
     release_provider_inflight: bool = False,
 ) -> CreditReservation:
     """Release held credits without writing a consume ledger row."""
-    reservation = await db.get(CreditReservation, reservation_id, with_for_update=True)
+    reservation = await db.get(
+        CreditReservation,
+        reservation_id,
+        with_for_update=True,
+        populate_existing=True,
+    )
     if not reservation:
         raise ValueError("Credit reservation not found")
     releasable_statuses = {"reserved"}

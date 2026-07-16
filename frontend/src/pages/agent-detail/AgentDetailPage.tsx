@@ -7359,7 +7359,14 @@ export default function AgentDetailPage() {
                                                         />
                                                     </div>
                                                     <div className="chat-composer-toolbar">
-                                                        <input type="file" multiple ref={fileInputRef} onChange={handleChatFile} style={{ display: 'none' }} />
+                                                        <input
+                                                            type="file"
+                                                            multiple
+                                                            accept=".png,.jpg,.jpeg,.webp,.mp4,.avi,.mov,.mkv,.pdf,.docx,.doc,.xlsx,.xls,.pptx,.ppt,.txt,.md,.csv,.json,.xml,.yaml,.yml,.py,.js,.ts,.html,.css,.sql,.sh,.log,.ini,.cfg,.conf,.env,.toml"
+                                                            ref={fileInputRef}
+                                                            onChange={handleChatFile}
+                                                            style={{ display: 'none' }}
+                                                        />
                                                         <button
                                                             type="button"
                                                             className="chat-composer-btn"

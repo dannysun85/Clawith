@@ -12,6 +12,8 @@ The agent reads/writes these files directly. No per-concept tools needed.
 """
 
 import asyncio
+import base64
+import hashlib
 from dataclasses import dataclass, field as dataclass_field
 import fnmatch
 import json
@@ -83,6 +85,10 @@ from app.services.llm.finish import (
     parse_tool_arguments,
 )
 from app.services.process_utils import settle_tasks, terminate_process_group
+from app.services.tool_release_policy import (
+    RELEASE_DISABLED_TOOL_NAMES,
+    release_tool_denial_reason,
+)
 
 if TYPE_CHECKING:
     from app.models.llm import LLMModel
@@ -101,6 +107,8 @@ MAX_PROVIDER_IMAGE_JSON_BYTES = 30 * 1024 * 1024
 MAX_PROVIDER_AUDIO_JSON_BYTES = 33 * 1024 * 1024
 MAX_PROVIDER_CONTROL_JSON_BYTES = 1024 * 1024
 MAX_MINIMAX_VIDEO_DOWNLOAD_BYTES = 256 * 1024 * 1024
+MAX_AGENTBAY_TRANSFER_BYTES = TOOL_MATERIALIZE_MAX_FILE_BYTES
+MAX_AGENTBAY_REMOTE_PATH_CHARS = 2048
 _MINIMAX_AUDIO_RESPONSE_SEMAPHORE = asyncio.Semaphore(1)
 DOUYIN_AGENT_TEMPLATE_NAME = "Douyin Operations Manager"
 
@@ -1279,7 +1287,7 @@ AGENT_TOOLS = [
                 "properties": {
                     "text": {"type": "string", "description": "Text to synthesize."},
                     "voice_id": {"type": "string", "description": "MiniMax voice_id. Defaults to the tool config."},
-                    "format": {"type": "string", "description": "Audio format: mp3, wav, flac, or pcm. Default: mp3."},
+                    "format": {"type": "string", "description": "Browser-playable audio format: mp3, wav, or flac. Default: mp3."},
                     "save_path": {"type": "string", "description": "Workspace path to save the audio file."},
                 },
                 "required": ["text"],
@@ -2113,15 +2121,8 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "agentbay_browser_login",
-            "description": "Use AgentBay's AI-driven login skill to automate complex login flows (CAPTCHAs, OTP, multi-step auth). Requires a login_config JSON with AgentBay skill credentials. Navigate to the login page and execute the login skill.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "The login page URL to navigate to"},
-                    "login_config": {"type": "string", "description": "JSON string with login config, e.g. '{\"api_key\": \"xxx\", \"skill_id\": \"yyy\"}'"},
-                },
-                "required": ["url", "login_config"],
-            },
+            "description": "Release-disabled legacy login tool. Credentials must never be supplied by the model.",
+            "parameters": {"type": "object", "properties": {}},
         },
     },
     {
@@ -2219,51 +2220,8 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "agentbay_file_transfer",
-            "description": (
-                "Transfer a file between any two endpoints: the agent workspace, "
-                "the AgentBay browser environment, the cloud desktop (computer), or the code sandbox.\n\n"
-                "VERIFIED PATH CONVENTIONS (all Linux environments run as user 'wuying', HOME=/home/wuying/):\n"
-                "- code env:     use /home/wuying/<filename>  (working directory, e.g. /home/wuying/data.csv)\n"
-                "- browser env:  use /home/wuying/下载/<filename>  (download folder, e.g. /home/wuying/下载/file.pdf)\n"
-                "- computer env: use /home/wuying/桌面/<filename>  (Desktop, e.g. /home/wuying/桌面/report.xlsx)\n"
-                "- workspace:    use relative path, e.g. 'workspace/data.csv'\n\n"
-                "Transfer directions:\n"
-                "- workspace -> env: upload a workspace file into a cloud environment\n"
-                "- env -> workspace: download a file from a cloud environment into the workspace\n"
-                "- env A -> env B:   transfer between environments (transparent backend temp, no workspace involvement)"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "from_type": {
-                        "type": "string",
-                        "enum": ["workspace", "browser", "computer", "code"],
-                        "description": "Source endpoint: 'workspace' for agent workspace, or the AgentBay environment name.",
-                    },
-                    "from_path": {
-                        "type": "string",
-                        "description": (
-                            "Source path. Relative if workspace (e.g. 'workspace/data.csv'). "
-                            "Absolute if env: code → /home/wuying/file, "
-                            "browser → /home/wuying/下载/file, computer → /home/wuying/桌面/file."
-                        ),
-                    },
-                    "to_type": {
-                        "type": "string",
-                        "enum": ["workspace", "browser", "computer", "code"],
-                        "description": "Destination endpoint: 'workspace' for agent workspace, or the AgentBay environment name.",
-                    },
-                    "to_path": {
-                        "type": "string",
-                        "description": (
-                            "Destination path. Relative if workspace (e.g. 'workspace/output.csv'). "
-                            "Absolute if env: code → /home/wuying/file, "
-                            "browser → /home/wuying/下载/file, computer → /home/wuying/桌面/file."
-                        ),
-                    },
-                },
-                "required": ["from_type", "from_path", "to_type", "to_path"],
-            },
+            "description": "Release-disabled until bounded provider transfer and durable approval contracts are available.",
+            "parameters": {"type": "object", "properties": {}},
         },
     },
 ]
@@ -2692,6 +2650,10 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
             for t in all_tools:
                 tid = str(t.id)
                 at = assignments.get(tid)
+
+                if t.name in RELEASE_DISABLED_TOOL_NAMES:
+                    explicitly_disabled_names.add(t.name)
+                    continue
 
                 if (
                     getattr(t, "source", None) == "builtin"
@@ -3129,7 +3091,18 @@ _TOOL_AUTONOMY_MAP = {
 
 
 def _queued_approval_message(approval_id: object) -> str:
-    """Tell the model that the approved side effect remains paused."""
+    """Tell the model whether the durable worker can execute approval."""
+
+    from app.config import get_settings
+
+    if get_settings().APPROVAL_EXECUTION_ENABLED:
+        return (
+            "⏳ This action requires approval. The approval request has been queued. "
+            "Do not retry this tool call. If an authorized user approves it, the "
+            "secure worker will execute the signed action once and report its "
+            "terminal status. No side effect has completed yet. "
+            f"(Approval ID: {approval_id or 'N/A'})"
+        )
 
     return (
         "⏳ This action requires approval. The approval request has been queued "
@@ -3234,6 +3207,24 @@ def _agent_workspace_root(agent_id: uuid.UUID) -> Path:
 def _non_empty_paths(*paths: str | None) -> list[str] | None:
     selected = [path for path in paths if path]
     return selected or None
+
+
+def _explicit_media_workspace_paths(*values: object) -> list[str]:
+    """Return only explicit storage-backed media inputs.
+
+    An empty list is intentional: unlike ``None`` it prevents the temporary
+    workspace helper from materializing the Agent's complete workspace. Data
+    URLs are already self-contained and must never be interpreted as paths.
+    """
+    selected: list[str] = []
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        candidate = value.strip()
+        if not candidate or candidate.lower().startswith("data:"):
+            continue
+        selected.append(candidate.replace("\\", "/"))
+    return selected
 
 
 @dataclass(frozen=True)
@@ -3468,6 +3459,11 @@ async def _execute_tool_direct(
     Used by the approval post-processing hook after an action
     has been approved and needs to actually run.
     """
+    release_denial = release_tool_denial_reason(tool_name)
+    if release_denial:
+        if raise_exceptions:
+            raise PermissionError(release_denial)
+        return f"❌ {release_denial}"
     _agent_tenant_id = await _get_agent_tenant_id(agent_id)
     denial = await _code_tool_denial_reason(tool_name, agent_id)
     if denial:
@@ -3805,6 +3801,9 @@ async def execute_tool(
         .replace("\ufeff", "")
         .strip()
     )
+    release_denial = release_tool_denial_reason(tool_name)
+    if release_denial:
+        return f"❌ {release_denial}"
     if tool_name in {
         "set_trigger",
         "update_trigger",
@@ -4134,7 +4133,11 @@ async def execute_tool(
         elif tool_name == "douyin_account_snapshot":
             from app.services.douyin.operations import douyin_operations_service
             async with async_session() as _ddb:
-                result = await douyin_operations_service.account_snapshot_tool(_ddb, agent_id=agent_id)
+                result = await douyin_operations_service.account_snapshot_tool(
+                    _ddb,
+                    agent_id=agent_id,
+                    requester_id=user_id,
+                )
         elif tool_name == "douyin_make_operation_plan":
             from app.services.douyin.operations import douyin_operations_service
             async with async_session() as _ddb:
@@ -4142,6 +4145,7 @@ async def execute_tool(
                     _ddb,
                     agent_id=agent_id,
                     goal=arguments.get("goal"),
+                    requester_id=user_id,
                 )
         elif tool_name == "douyin_video_metrics":
             from app.models.douyin import DouyinMetricSnapshot
@@ -4221,6 +4225,7 @@ async def execute_tool(
                         _ddb,
                         tenant_id=uuid.UUID(tenant_id),
                         user_id=user_id,
+                        requester_id=user_id,
                         agent_id=agent_id,
                         account_id=account_id,
                         content_type=str(arguments.get("content_type") or "video"),
@@ -4254,6 +4259,7 @@ async def execute_tool(
                         _ddb,
                         tenant_id=uuid.UUID(tenant_id),
                         user_id=user_id,
+                        requester_id=user_id,
                         agent_id=agent_id,
                         account_id=account_id,
                         comment_id=comment_id,
@@ -4326,26 +4332,41 @@ async def execute_tool(
                     "minimax",
                     user_id=user_id,
                     saas_tier=saas_tier,
+                    session_id=session_id,
                 ),
-                sync_back=True,
+                paths=_explicit_media_workspace_paths(
+                    arguments.get("reference_image"),
+                    arguments.get("brand_asset"),
+                ),
+                sync_back=False,
             )
         elif tool_name == "generate_speech_minimax":
             result = await _run_with_temp_workspace(
                 agent_id,
                 _agent_tenant_id,
                 lambda temp_ws: _generate_speech_minimax(
-                    agent_id, temp_ws, arguments, user_id=user_id, saas_tier=saas_tier
+                    agent_id,
+                    temp_ws,
+                    arguments,
+                    user_id=user_id,
+                    saas_tier=saas_tier,
+                    session_id=session_id,
                 ),
-                sync_back=True,
+                sync_back=False,
             )
         elif tool_name == "generate_music_minimax":
             result = await _run_with_temp_workspace(
                 agent_id,
                 _agent_tenant_id,
                 lambda temp_ws: _generate_music_minimax(
-                    agent_id, temp_ws, arguments, user_id=user_id, saas_tier=saas_tier
+                    agent_id,
+                    temp_ws,
+                    arguments,
+                    user_id=user_id,
+                    saas_tier=saas_tier,
+                    session_id=session_id,
                 ),
-                sync_back=True,
+                sync_back=False,
             )
         elif tool_name == "generate_video_minimax":
             result = await _run_with_temp_workspace(
@@ -4359,6 +4380,11 @@ async def execute_tool(
                     saas_tier=saas_tier,
                     session_id=session_id,
                 ),
+                paths=_explicit_media_workspace_paths(
+                    arguments.get("first_frame_image"),
+                    arguments.get("last_frame_image"),
+                    arguments.get("brand_asset"),
+                ),
                 # The durable media service writes metadata and output to the
                 # authoritative storage backend. Re-flushing the temp copy
                 # would race that write and produce a false CAS conflict.
@@ -4369,6 +4395,9 @@ async def execute_tool(
                 agent_id,
                 _agent_tenant_id,
                 lambda temp_ws: _check_video_minimax(agent_id, temp_ws, arguments),
+                paths=_explicit_media_workspace_paths(
+                    arguments.get("task_meta_path"),
+                ),
                 sync_back=False,
             )
         elif tool_name == "discover_resources":
@@ -4496,7 +4525,11 @@ async def execute_tool(
         elif tool_name == "agentbay_computer_list_visible_apps":
             result = await _agentbay_computer_list_visible_apps(agent_id, ws, arguments)
         elif tool_name == "agentbay_file_transfer":
-            result = await _agentbay_file_transfer(agent_id, ws, arguments)
+            result = await _run_agentbay_file_transfer(
+                agent_id,
+                _agent_tenant_id,
+                arguments,
+            )
         # ── Skill Management ──
         elif tool_name == "search_clawhub":
             result = await _search_clawhub(agent_id, arguments)
@@ -4616,9 +4649,6 @@ async def _web_search(arguments: dict, agent_id: uuid.UUID | None = None) -> str
 
     Config resolution priority: Agent config > Company config > Defaults.
     """
-    import httpx
-    import re
-
     query = arguments.get("query", "")
     if not query:
         return "❌ Please provide search keywords"
@@ -10843,7 +10873,7 @@ async def _handle_update_trigger(agent_id: uuid.UUID, arguments: dict) -> str:
                 changes.append("config updated")
             if new_reason is not None:
                 trigger.reason = new_reason
-                changes.append(f"reason updated")
+                changes.append("reason updated")
 
             await db.commit()
 
@@ -10953,12 +10983,10 @@ async def _upload_image(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
 
     # ── Load ImageKit credentials (Agent > Company priority) ──
     private_key = ""
-    url_endpoint = ""
     try:
         # Use standard _get_tool_config (Agent > Company, cached, schema-aware decryption)
         config = await _get_tool_config(agent_id, "upload_image") or {}
         private_key = config.get("private_key", "")
-        url_endpoint = config.get("url_endpoint", "")
     except Exception as e:
         logger.error(f"[UploadImage] Config load error: {e}")
 
@@ -10971,8 +10999,15 @@ async def _upload_image(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
 
     if file_path:
         # Read from workspace
-        full_path = (ws / file_path).resolve()
-        if not str(full_path).startswith(str(ws)):
+        try:
+            full_path = resolve_path_within_root(
+                ws,
+                str(file_path),
+                allow_root=False,
+                require_subpath=True,
+                label="upload image path",
+            )
+        except WorkspacePathError:
             return "❌ Access denied: path is outside the workspace"
         if not full_path.exists():
             return f"❌ File not found: {file_path}"
@@ -10989,10 +11024,17 @@ async def _upload_image(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
             file_name = full_path.name
     elif url:
         # Pass URL directly to ImageKit
-        form_data["file"] = url
+        normalized_url, validation_error = await _validate_public_http_url(
+            str(url)
+        )
+        if validation_error:
+            return validation_error
+        form_data["file"] = normalized_url
         if not file_name:
             from urllib.parse import urlparse
-            file_name = urlparse(url).path.split("/")[-1] or "image.jpg"
+            file_name = (
+                urlparse(normalized_url).path.split("/")[-1] or "image.jpg"
+            )
 
     if not file_name:
         file_name = "image.png"
@@ -11056,6 +11098,7 @@ async def _generate_image(
     provider: str,
     user_id: uuid.UUID | None = None,
     saas_tier: str | None = None,
+    session_id: str = "",
 ) -> str:
     """Generate an image using the configured provider and save to workspace.
 
@@ -11143,17 +11186,6 @@ async def _generate_image(
     minimax_tier: str | None = None
     minimax_tenant_id: uuid.UUID | None = None
     minimax_credit_cost = 0
-    minimax_reservation_id: uuid.UUID | None = None
-    minimax_reservation_finalized = False
-    minimax_provider_succeeded = False
-    minimax_provider_request_started = False
-    minimax_provider_rejected = False
-    minimax_final_object_stored = False
-    minimax_recovery_path: str | None = None
-    minimax_evidence_key: str | None = None
-    minimax_recovery_id = uuid.uuid4()
-    minimax_accepted_url: str | None = None
-    minimax_settlement_ready = False
     image_bytes = b""
 
     # MiniMax uses the central credential pool (账号池) instead of per-tool config
@@ -11213,22 +11245,33 @@ async def _generate_image(
             "Ask your admin to configure it in Enterprise Settings → Tools → Generate Image."
         )
 
-    try:
-        if provider == "minimax" and minimax_credit_cost > 0:
-            assert minimax_tenant_id is not None
-            reservation = await _reserve_minimax_tool_credits(
-                tenant_id=minimax_tenant_id,
-                user_id=user_id,
-                agent_id=agent_id,
-                action="image",
-                modality="image",
-                tier=minimax_tier or "lite",
-                model=model or "image-01",
-                credits=minimax_credit_cost,
-                initial_status="provider_inflight",
-            )
-            minimax_reservation_id = reservation.id
+    if provider == "minimax":
+        assert minimax_cred_id is not None
+        assert minimax_tenant_id is not None
+        return await _generate_image_minimax_durable(
+            agent_id=agent_id,
+            ws=ws,
+            arguments=arguments,
+            user_id=user_id,
+            session_id=session_id,
+            tenant_id=minimax_tenant_id,
+            credential_id=minimax_cred_id,
+            api_key=api_key,
+            base_url=base_url,
+            model=model or "image-01",
+            tier=minimax_tier or "lite",
+            credit_cost=minimax_credit_cost,
+            provider_prompt=provider_prompt,
+            save_path=save_path,
+            output_extension=full_save_path.suffix.lower(),
+            overlay_text=overlay_text,
+            overlay_position=overlay_position,
+            brand_asset=brand_asset,
+            brand_position=brand_position,
+            brand_scale=brand_scale,
+        )
 
+    try:
         if provider == "siliconflow":
             image_bytes = await _generate_image_siliconflow(
                 api_key,
@@ -11263,114 +11306,11 @@ async def _generate_image(
                 prompt=provider_prompt,
                 size=size,
             )
-        elif provider == "minimax":
-            from app.services.media_assets import image_reference_for_provider
-
-            reference_image = image_reference_for_provider(
-                ws,
-                arguments.get("reference_image"),
-                label="Reference image",
-            )
-            async def record_provider_acceptance(image_url: str | None) -> None:
-                nonlocal minimax_provider_succeeded, minimax_recovery_path
-                nonlocal minimax_evidence_key
-                nonlocal minimax_accepted_url, minimax_settlement_ready
-                minimax_provider_succeeded = True
-                minimax_accepted_url = image_url
-                # MiniMax URLs expire. Keep the accepted provider identity in
-                # private Agent storage until the final object is durable.
-                try:
-                    evidence_key, recovery_ref = (
-                        await _store_minimax_image_acceptance_evidence(
-                            agent_id=agent_id,
-                            recovery_id=(
-                                minimax_reservation_id or minimax_recovery_id
-                            ),
-                            model=model,
-                            image_url=image_url,
-                            save_path=save_path,
-                        )
-                    )
-                    # Publish the pointer only after the object exists.
-                    minimax_evidence_key = evidence_key
-                    minimax_recovery_path = recovery_ref
-                except Exception as evidence_exc:
-                    logger.exception(
-                        "[GenerateImage] Accepted-response evidence store failed"
-                    )
-                    try:
-                        await _record_minimax_tool_product_issue(
-                            agent_id,
-                            "image",
-                            error=evidence_exc,
-                            model=model,
-                            tier=minimax_tier,
-                            user_id=user_id,
-                            category="asset_recovery",
-                            severity="critical",
-                        )
-                    except Exception:
-                        pass
-                if minimax_reservation_id:
-                    try:
-                        await _mark_minimax_tool_reservation_settlement_ready(
-                            minimax_reservation_id,
-                            amount=minimax_credit_cost,
-                        )
-                        minimax_settlement_ready = True
-                    except Exception as settlement_exc:
-                        # Continue the immediate download while the signed URL
-                        # is still valid; retry settlement before finalization.
-                        logger.exception(
-                            "[GenerateImage] Provider debt outbox mark failed"
-                        )
-                        try:
-                            await _record_minimax_tool_product_issue(
-                                agent_id,
-                                "image",
-                                error=settlement_exc,
-                                model=model,
-                                tier=minimax_tier,
-                                user_id=user_id,
-                                category="billing_settlement",
-                                severity="critical",
-                                recovery_path=minimax_recovery_path,
-                            )
-                        except Exception:
-                            pass
-
-            try:
-                minimax_provider_request_started = True
-                image_bytes = await _generate_image_minimax(
-                    api_key=api_key,
-                    base_url=base_url,
-                    model=model,
-                    prompt=provider_prompt,
-                    aspect_ratio=arguments.get("aspect_ratio", "1:1"),
-                    reference_image=reference_image,
-                    on_provider_accepted=record_provider_acceptance,
-                )
-            except Exception as e:
-                minimax_provider_rejected = _is_minimax_deterministic_rejection(e)
-                if minimax_cred_id and not minimax_provider_succeeded:
-                    await _mark_minimax_tool_credential_failure(
-                        minimax_cred_id,
-                        e,
-                        modality="image",
-                        model=model,
-                    )
-                raise
         else:
             return f"❌ Unknown image generation provider: {provider}. Supported: siliconflow, openai, google, custom, minimax"
 
         if not image_bytes:
             return "❌ Image generation returned empty result. Please try a different prompt."
-
-        if provider == "minimax":
-            # Provider cost is now irreversible. Persist that debt before any
-            # local validation/overlay/storage step that can still fail.
-            if not minimax_provider_succeeded:
-                await record_provider_acceptance(None)
 
         from app.services.media_assets import apply_image_brand_overlays, validate_generated_image
 
@@ -11386,70 +11326,7 @@ async def _generate_image(
         )
         validate_generated_image(image_bytes)
 
-        if provider == "minimax":
-            from app.services.storage import store_agent_bytes
-
-            final_content_type = {
-                ".jpg": "image/jpeg",
-                ".jpeg": "image/jpeg",
-            }.get(full_save_path.suffix.lower(), "image/png")
-            await store_agent_bytes(
-                agent_id,
-                save_path,
-                image_bytes,
-                content_type=final_content_type,
-            )
-            minimax_final_object_stored = True
-            if minimax_reservation_id:
-                if not minimax_settlement_ready:
-                    await _mark_minimax_tool_reservation_settlement_ready(
-                        minimax_reservation_id,
-                        amount=minimax_credit_cost,
-                    )
-                    minimax_settlement_ready = True
-                await _finalize_minimax_tool_reservation_for_delivery(
-                    minimax_reservation_id,
-                    agent_id=agent_id,
-                    modality="image",
-                    model=model,
-                    tier=minimax_tier,
-                    user_id=user_id,
-                )
-                minimax_reservation_finalized = True
-            if minimax_evidence_key:
-                try:
-                    await _delete_minimax_image_acceptance_evidence(
-                        minimax_evidence_key
-                    )
-                    minimax_evidence_key = None
-                    minimax_recovery_path = None
-                except Exception:
-                    logger.warning(
-                        "[GenerateImage] Accepted-response evidence cleanup deferred"
-                    )
-            try:
-                full_save_path.write_bytes(image_bytes)
-            except OSError:
-                # The shared object is authoritative; a disposable local
-                # workspace cache must not turn successful delivery into a
-                # duplicate provider request.
-                logger.warning(
-                    "[GenerateImage] Local cache write failed after durable store"
-                )
-        else:
-            full_save_path.write_bytes(image_bytes)
-
-        # Non-MiniMax providers have no Credits reservation. MiniMax was
-        # settled at the provider-success boundary above and is not replayed.
-        if provider == "minimax":
-            if minimax_cred_id:
-                await _record_minimax_tool_success(
-                    agent_id,
-                    minimax_cred_id,
-                    tier=minimax_tier or "lite",
-                    modality="image",
-                    model=model,
-                )
+        full_save_path.write_bytes(image_bytes)
 
         size_kb = len(image_bytes) / 1024
 
@@ -11471,140 +11348,13 @@ async def _generate_image(
             f"![generated image]({api_image_path})"
         )
     except Exception as e:
-        if provider == "minimax":
-            recovery_path: str | None = (
-                save_path if minimax_final_object_stored else minimax_recovery_path
-            )
-            if minimax_provider_succeeded and image_bytes and not minimax_final_object_stored:
-                # A paid provider result that cannot be post-processed or
-                # delivered must remain recoverable, but successful requests
-                # must not accumulate a second orphaned raw object.
-                recovery_path = (
-                    "workspace/media_inputs/"
-                    f"{minimax_reservation_id or uuid.uuid4()}_provider_image.bin"
-                )
-                try:
-                    from app.services.storage import store_agent_bytes
-
-                    await store_agent_bytes(
-                        agent_id,
-                        recovery_path,
-                        image_bytes,
-                        content_type="application/octet-stream",
-                    )
-                    if minimax_evidence_key:
-                        try:
-                            await _delete_minimax_image_acceptance_evidence(
-                                minimax_evidence_key
-                            )
-                            minimax_evidence_key = None
-                        except Exception:
-                            logger.warning(
-                                "[GenerateImage] URL evidence cleanup deferred after raw recovery"
-                            )
-                    minimax_recovery_path = recovery_path
-                except Exception as recovery_exc:
-                    logger.error(
-                        "[GenerateImage] Provider result recovery failed "
-                        "error_type={}",
-                        type(recovery_exc).__name__,
-                    )
-                    recovery_path = None
-            if (
-                minimax_provider_succeeded
-                and not recovery_path
-                and minimax_accepted_url
-            ):
-                try:
-                    evidence_key, recovery_ref = (
-                        await _store_minimax_image_acceptance_evidence(
-                            agent_id=agent_id,
-                            recovery_id=(
-                                minimax_reservation_id or minimax_recovery_id
-                            ),
-                            model=model,
-                            image_url=minimax_accepted_url,
-                            save_path=save_path,
-                        )
-                    )
-                    minimax_evidence_key = evidence_key
-                    recovery_path = recovery_ref
-                    minimax_recovery_path = recovery_ref
-                except Exception:
-                    logger.exception(
-                        "[GenerateImage] Accepted-response evidence retry failed"
-                    )
-            if (
-                minimax_provider_succeeded
-                and minimax_reservation_id
-                and not minimax_settlement_ready
-            ):
-                try:
-                    await _mark_minimax_tool_reservation_settlement_ready(
-                        minimax_reservation_id,
-                        amount=minimax_credit_cost,
-                    )
-                    minimax_settlement_ready = True
-                except Exception:
-                    logger.exception(
-                        "[GenerateImage] Provider debt outbox retry failed"
-                    )
-            if (
-                minimax_provider_succeeded
-                and recovery_path
-                and minimax_reservation_id
-                and minimax_settlement_ready
-                and not minimax_reservation_finalized
-            ):
-                try:
-                    await _finalize_minimax_tool_reservation_for_delivery(
-                        minimax_reservation_id,
-                        agent_id=agent_id,
-                        modality="image",
-                        model=model,
-                        tier=minimax_tier,
-                        user_id=user_id,
-                    )
-                    minimax_reservation_finalized = True
-                except Exception:
-                    # The reservation remains settlement-ready for operator or
-                    # background reconciliation; never refund provider debt.
-                    pass
-            await _record_minimax_tool_product_issue(
-                agent_id,
-                "image",
-                error=e,
-                model=model,
-                tier=minimax_tier,
-                user_id=user_id,
-                recovery_path=recovery_path,
-            )
         if isinstance(e, httpx.TimeoutException):
             logger.error(
                 f"[GenerateImage] Timeout ({provider}): request or storage operation timed out."
             )
-            if provider != "minimax":
-                return (
-                    f"❌ Image generation failed ({provider}): API request timed out "
-                    "after 120 seconds."
-                )
             return (
-                f"❌ Image generation failed ({provider}): the request outcome is "
-                "being held for safe reconciliation. Please do not retry immediately."
-            )
-        if (
-            provider == "minimax"
-            and minimax_provider_request_started
-            and not minimax_provider_rejected
-            and not minimax_provider_succeeded
-        ):
-            logger.error(
-                "[GenerateImage] MiniMax response was incomplete; reservation retained"
-            )
-            return (
-                "❌ Image generation failed (minimax): the provider response was "
-                "incomplete and the request is being held for safe reconciliation. "
-                "Please do not retry immediately."
+                f"❌ Image generation failed ({provider}): API request timed out "
+                "after 120 seconds."
             )
         logger.error(
             "[GenerateImage] Generation failed provider={} error_type={}",
@@ -11612,24 +11362,268 @@ async def _generate_image(
             type(e).__name__,
         )
         return _safe_media_failure_message("Image generation", provider, e)
-    finally:
-        if (
-            minimax_reservation_id
-            and not minimax_reservation_finalized
-            and (
-                not minimax_provider_request_started
-                or minimax_provider_rejected
+
+
+async def _finish_durable_media_side_effect(awaitable: Awaitable[Any]) -> Any:
+    """Do not abandon a provider-acceptance/raw write on request cancellation."""
+
+    task = asyncio.create_task(awaitable)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            await task
+        except Exception:
+            logger.exception("[MiniMaxMedia] durable side effect failed during cancellation")
+        raise
+
+
+async def _generate_image_minimax_durable(
+    *,
+    agent_id: uuid.UUID,
+    ws: Path,
+    arguments: dict,
+    user_id: uuid.UUID | None,
+    session_id: str,
+    tenant_id: uuid.UUID,
+    credential_id: uuid.UUID,
+    api_key: str,
+    base_url: str,
+    model: str,
+    tier: str,
+    credit_cost: int,
+    provider_prompt: str,
+    save_path: str,
+    output_extension: str,
+    overlay_text: str,
+    overlay_position: str,
+    brand_asset,
+    brand_position: str,
+    brand_scale: float,
+) -> str:
+    """Run MiniMax image generation through the durable media state machine."""
+
+    from app.services.media_assets import image_reference_for_provider
+    from app.services.media_generation import (
+        create_minimax_sync_media_task_record,
+        mark_media_generation_submission_ambiguous,
+        mark_media_generation_submission_failed,
+        mark_minimax_sync_provider_accepted,
+        minimax_sync_brand_asset_key,
+        record_minimax_sync_provider_response_retry,
+        reconcile_minimax_sync_media_task,
+        store_minimax_sync_brand_asset,
+        store_minimax_sync_recovery_asset,
+    )
+
+    reference_image = image_reference_for_provider(
+        ws,
+        arguments.get("reference_image"),
+        label="Reference image",
+    )
+    output_content_type = (
+        "image/jpeg" if output_extension in {".jpg", ".jpeg"} else "image/png"
+    )
+    record_id = uuid.uuid4()
+    save_path = _version_durable_media_output_path(save_path, record_id)
+    brand_extension: str | None = None
+    brand_metadata: dict[str, str] = {}
+    if brand_asset:
+        brand_extension = {
+            "image/jpeg": "jpg",
+            "image/png": "png",
+            "image/webp": "webp",
+        }[brand_asset.mime_type]
+        brand_metadata = {
+            "brand_asset_storage_key": minimax_sync_brand_asset_key(
+                agent_id,
+                record_id,
+                brand_extension,
+            ),
+            "brand_asset_extension": brand_extension,
+            "brand_asset_sha256": brand_asset.sha256,
+        }
+    task_created = False
+    provider_request_started = False
+    provider_response_accepted = False
+    provider_accepted = False
+    evidence_key: str | None = None
+    recovery_key: str | None = None
+    try:
+        created_task = await create_minimax_sync_media_task_record(
+            record_id=record_id,
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+            user_id=user_id,
+            credential_id=credential_id,
+            origin_session_id=session_id,
+            modality="image",
+            tier=tier,
+            model=model,
+            credit_cost=credit_cost,
+            output_path=save_path,
+            request_metadata={
+                "recovery_extension": "bin",
+                "output_extension": output_extension,
+                "output_content_type": output_content_type,
+                "overlay_text": overlay_text,
+                "overlay_text_sha256": hashlib.sha256(
+                    overlay_text.encode("utf-8")
+                ).hexdigest(),
+                "overlay_position": overlay_position,
+                "brand_position": brand_position,
+                "brand_scale": brand_scale,
+                **brand_metadata,
+            },
+        )
+        recovery_key = str(
+            (created_task.request_metadata or {}).get("recovery_asset_storage_key")
+            or ""
+        )
+        task_created = True
+        if brand_asset:
+            assert brand_extension is not None
+            await _finish_durable_media_side_effect(
+                store_minimax_sync_brand_asset(
+                    record_id,
+                    brand_asset.raw,
+                    extension=brand_extension,
+                )
             )
-        ):
-            await _release_minimax_tool_reservation_safely(
-                minimax_reservation_id,
-                agent_id=agent_id,
+
+        async def record_provider_acceptance(image_url: str | None) -> None:
+            nonlocal provider_response_accepted, provider_accepted, evidence_key
+            provider_response_accepted = True
+            evidence_key, _opaque_reference = (
+                await _store_minimax_image_acceptance_evidence(
+                    agent_id=agent_id,
+                    recovery_id=record_id,
+                    model=model,
+                    image_url=image_url,
+                    save_path=save_path,
+                )
+            )
+            await mark_minimax_sync_provider_accepted(
+                record_id,
+                evidence_key=evidence_key,
+                accepted_metadata={"status": "Accepted"},
+            )
+            provider_accepted = True
+
+        provider_request_started = True
+        image_bytes = await _generate_image_minimax(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            prompt=provider_prompt,
+            aspect_ratio=arguments.get("aspect_ratio", "1:1"),
+            reference_image=reference_image,
+            on_provider_accepted=lambda image_url: _finish_durable_media_side_effect(
+                record_provider_acceptance(image_url)
+            ),
+        )
+        if not provider_accepted:
+            # Defensive fallback for compatible provider adapters that return
+            # bytes directly without invoking the acceptance callback.
+            await _finish_durable_media_side_effect(
+                mark_minimax_sync_provider_accepted(
+                    record_id,
+                    accepted_metadata={"status": "Accepted", "direct_bytes": True},
+                )
+            )
+            provider_response_accepted = True
+            provider_accepted = True
+        await _finish_durable_media_side_effect(
+            store_minimax_sync_recovery_asset(
+                record_id,
+                image_bytes,
+                content_type="application/octet-stream",
+                expected_key=recovery_key,
+            )
+        )
+        await _record_minimax_tool_success(
+            agent_id,
+            credential_id,
+            tier=tier,
+            modality="image",
+            model=model,
+        )
+        outcome = await reconcile_minimax_sync_media_task(
+            record_id,
+            # This tool result still flows into the current LLM turn. Persisting
+            # a separate completion message here would duplicate the final
+            # assistant reply; background recovery remains outbox-delivered.
+            deliver_completion=False,
+        )
+        if outcome.status == "succeeded":
+            return (
+                f"✅ Image generated and durably delivered: {save_path}\n"
+                f"Provider: minimax | Model: {model}\n"
+                f"Task ID: {record_id}"
+            )
+        if outcome.status == "compensated":
+            return (
+                "❌ MiniMax accepted the image request but no safe artifact could "
+                "be recovered. Credits were refunded."
+            )
+        return (
+            "⏳ MiniMax accepted the image request. The durable media worker is "
+            f"finishing delivery (task {record_id}); please do not submit it again."
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        from app.services.quota_guard import QuotaExceeded
+
+        if isinstance(exc, QuotaExceeded):
+            return f"⚠️ {exc.message}"
+        deterministic_rejection = _is_minimax_deterministic_rejection(exc)
+        if task_created:
+            try:
+                if deterministic_rejection or not provider_request_started:
+                    await mark_media_generation_submission_failed(record_id, exc)
+                elif provider_response_accepted and not provider_accepted:
+                    await record_minimax_sync_provider_response_retry(record_id, exc)
+                elif not provider_accepted:
+                    await mark_media_generation_submission_ambiguous(record_id, exc)
+            except Exception:
+                logger.exception(
+                    "[GenerateImage] durable failure transition failed task_id={}",
+                    record_id,
+                )
+        if not provider_response_accepted:
+            await _mark_minimax_tool_credential_failure(
+                credential_id,
+                exc,
                 modality="image",
                 model=model,
-                tier=minimax_tier,
-                user_id=user_id,
-                release_provider_inflight=True,
             )
+        await _record_minimax_tool_product_issue(
+            agent_id,
+            "image",
+            error=exc,
+            model=model,
+            tier=tier,
+            user_id=user_id,
+            recovery_path=(f"media-task:{record_id}" if task_created else None),
+        )
+        if provider_accepted:
+            return (
+                "⏳ MiniMax accepted the image request. The result is held by the "
+                f"durable recovery worker (task {record_id}); please do not retry."
+            )
+        if provider_response_accepted:
+            return (
+                "⏳ MiniMax accepted the image response. Its durable recovery worker "
+                f"is repairing the acceptance record (task {record_id}); please do "
+                "not retry."
+            )
+        if provider_request_started and not deterministic_rejection:
+            return (
+                "❌ MiniMax image submission outcome is uncertain. Credits remain "
+                f"held for reconciliation (task {record_id}); please do not retry."
+            )
+        return _safe_media_failure_message("Image generation", "minimax", exc)
 
 
 async def _check_minimax_tool_allowed(agent_id: uuid.UUID, modality: str, tier: str) -> str | None:
@@ -11740,55 +11734,6 @@ async def _check_minimax_credit_amount(tenant_id: uuid.UUID, credits: int) -> No
     await check_credit_amount(tenant_id, credits)
 
 
-async def _reserve_minimax_tool_credits(
-    *,
-    tenant_id: uuid.UUID,
-    user_id: uuid.UUID | None,
-    agent_id: uuid.UUID,
-    action: str,
-    modality: str,
-    tier: str,
-    model: str,
-    credits: int,
-    initial_status: str = "reserved",
-):
-    from app.services.credit_service import reserve_credits
-
-    return await reserve_credits(
-        tenant_id=tenant_id,
-        user_id=user_id,
-        agent_id=agent_id,
-        action=action,
-        modality=modality,
-        saas_tier=tier,
-        provider="minimax",
-        model=model,
-        amount=credits,
-        ref_type="minimax_task",
-        initial_status=initial_status,
-    )
-
-
-async def _finalize_minimax_tool_reservation(reservation_id: uuid.UUID) -> None:
-    from app.services.credit_service import finalize_reserved_credits
-
-    await finalize_reserved_credits(reservation_id)
-
-
-async def _mark_minimax_tool_reservation_settlement_ready(
-    reservation_id: uuid.UUID,
-    *,
-    amount: int,
-) -> None:
-    """Persist MiniMax provider debt before local asset post-processing."""
-    from app.services.credit_service import mark_credit_reservation_settlement_ready
-
-    await mark_credit_reservation_settlement_ready(
-        reservation_id,
-        amount=amount,
-    )
-
-
 def _minimax_image_acceptance_evidence_key(
     agent_id: uuid.UUID,
     recovery_id: uuid.UUID,
@@ -11868,76 +11813,6 @@ async def _release_minimax_tool_reservation(
         reservation_id,
         release_provider_inflight=release_provider_inflight,
     )
-
-
-async def _finalize_minimax_tool_reservation_for_delivery(
-    reservation_id: uuid.UUID,
-    *,
-    agent_id: uuid.UUID,
-    modality: str,
-    model: str | None,
-    tier: str | None,
-    user_id: uuid.UUID | None,
-) -> None:
-    """Finalize Credits before returning a synchronously generated asset."""
-    try:
-        await _finalize_minimax_tool_reservation(reservation_id)
-    except Exception as exc:
-        logger.error(
-            "[MiniMaxTool] Credit reservation finalization failed error_type={}",
-            type(exc).__name__,
-        )
-        try:
-            await _record_minimax_tool_product_issue(
-                agent_id,
-                modality,
-                error=exc,
-                model=model,
-                tier=tier,
-                user_id=user_id,
-                category="billing_settlement",
-                severity="critical",
-            )
-        except Exception:
-            pass
-        raise
-
-
-async def _release_minimax_tool_reservation_safely(
-    reservation_id: uuid.UUID,
-    *,
-    agent_id: uuid.UUID,
-    modality: str,
-    model: str | None,
-    tier: str | None,
-    user_id: uuid.UUID | None,
-    release_provider_inflight: bool = False,
-) -> None:
-    """Release an unfinished reservation without hiding the original result."""
-    try:
-        await _release_minimax_tool_reservation(
-            reservation_id,
-            release_provider_inflight=release_provider_inflight,
-        )
-    except Exception as exc:
-        logger.error(
-            "[MiniMaxTool] Credit reservation release failed error_type={}",
-            type(exc).__name__,
-        )
-        try:
-            await _record_minimax_tool_product_issue(
-                agent_id,
-                modality,
-                error=exc,
-                model=model,
-                tier=tier,
-                user_id=user_id,
-                category="billing_settlement",
-                severity="critical",
-            )
-        except Exception:
-            # Monitoring must never replace the original provider/product result.
-            pass
 
 
 async def _record_minimax_tool_success(
@@ -12197,6 +12072,19 @@ def _resolve_workspace_output_path(
     return rel_path, full_path
 
 
+def _version_durable_media_output_path(
+    rel_path: str,
+    record_id: uuid.UUID,
+) -> str:
+    """Bind a generated artifact path to one durable task identity."""
+
+    path = Path(str(rel_path).strip())
+    token = record_id.hex[:12]
+    if token in path.stem.split("_"):
+        return str(path)
+    return str(path.with_name(f"{path.stem}_{token}{path.suffix}"))
+
+
 def _resolve_workspace_read_path(ws: Path, rel_path: str) -> Path:
     target = (ws / str(rel_path).strip()).resolve()
     try:
@@ -12328,9 +12216,16 @@ def _minimax_http_error(resp) -> ValueError:
     except Exception:
         code = resp.status_code
         msg = resp.text[:300]
+    from app.services.llm.provider_acceptance import (
+        is_minimax_deterministic_rejection_code,
+    )
+
+    # HTTP status classes can be rewritten by gateways and do not establish
+    # MiniMax billing semantics. Only a reviewed provider business code may
+    # authorize release of a provider-inflight Credits hold.
     error_type = (
         MiniMaxProviderRejected
-        if 400 <= int(resp.status_code) < 500 and int(resp.status_code) != 408
+        if is_minimax_deterministic_rejection_code(code)
         else ValueError
     )
     return error_type(f"MiniMax API error ({code}): {msg}")
@@ -12502,12 +12397,196 @@ def _minimax_audio_hex_to_bytes(data: dict, label: str) -> bytes:
         raise ValueError(f"Invalid audio hex payload in {label} response") from exc
 
 
+async def _generate_minimax_audio_durable(
+    *,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID | None,
+    session_id: str,
+    tenant_id: uuid.UUID,
+    credential: _MiniMaxToolCredential,
+    modality: str,
+    tier: str,
+    model: str,
+    credit_cost: int,
+    save_path: str,
+    audio_format: str,
+    content_type: str,
+    sample_rate: int,
+    provider_call: Callable[
+        [Callable[[bytes | None], Awaitable[None]]],
+        Awaitable[bytes],
+    ],
+) -> str:
+    """Run MiniMax speech/music through one restart-safe settlement state machine."""
+
+    from app.services.media_generation import (
+        create_minimax_sync_media_task_record,
+        mark_media_generation_submission_ambiguous,
+        mark_media_generation_submission_failed,
+        mark_minimax_sync_provider_accepted,
+        record_minimax_sync_provider_response_retry,
+        reconcile_minimax_sync_media_task,
+        store_minimax_sync_recovery_asset,
+    )
+
+    record_id = uuid.uuid4()
+    save_path = _version_durable_media_output_path(save_path, record_id)
+    task_created = False
+    provider_request_started = False
+    provider_response_accepted = False
+    provider_accepted = False
+    recovery_key: str | None = None
+    try:
+        created_task = await create_minimax_sync_media_task_record(
+            record_id=record_id,
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+            user_id=user_id,
+            credential_id=credential.id,
+            origin_session_id=session_id,
+            modality=modality,
+            tier=tier,
+            model=model,
+            credit_cost=credit_cost,
+            output_path=save_path,
+            request_metadata={
+                "recovery_extension": audio_format,
+                "output_extension": f".{audio_format}",
+                "output_content_type": content_type,
+                "sample_rate": sample_rate,
+            },
+        )
+        recovery_key = str(
+            (created_task.request_metadata or {}).get("recovery_asset_storage_key")
+            or ""
+        )
+        task_created = True
+
+        async def record_provider_acceptance(audio_bytes: bytes | None) -> None:
+            nonlocal provider_response_accepted, provider_accepted
+            provider_response_accepted = True
+            if audio_bytes is None:
+                await mark_minimax_sync_provider_accepted(
+                    record_id,
+                    accepted_metadata={"status": "Accepted", "raw_decode_failed": True},
+                )
+            else:
+                await store_minimax_sync_recovery_asset(
+                    record_id,
+                    audio_bytes,
+                    content_type=content_type,
+                    expected_key=recovery_key,
+                )
+            provider_accepted = True
+
+        provider_request_started = True
+        audio_bytes = await provider_call(
+            lambda raw: _finish_durable_media_side_effect(
+                record_provider_acceptance(raw)
+            )
+        )
+        if not provider_accepted:
+            await _finish_durable_media_side_effect(
+                store_minimax_sync_recovery_asset(
+                    record_id,
+                    audio_bytes,
+                    content_type=content_type,
+                    expected_key=recovery_key,
+                )
+            )
+            provider_response_accepted = True
+            provider_accepted = True
+        await _record_minimax_tool_success(
+            agent_id,
+            credential.id,
+            tier=tier,
+            modality=modality,
+            model=model,
+        )
+        outcome = await reconcile_minimax_sync_media_task(
+            record_id,
+            deliver_completion=False,
+        )
+        label = "Speech" if modality == "audio" else "Music"
+        if outcome.status == "succeeded":
+            return (
+                f"✅ {label} generated and durably delivered: {save_path}\n"
+                f"Provider: minimax | Model: {model}\n"
+                f"Task ID: {record_id}"
+            )
+        if outcome.status == "compensated":
+            return (
+                f"❌ MiniMax accepted the {label.lower()} request but no safe "
+                "artifact could be recovered. Credits were refunded."
+            )
+        return (
+            f"⏳ MiniMax accepted the {label.lower()} request. The durable media "
+            f"worker is finishing delivery (task {record_id}); do not submit it again."
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        from app.services.quota_guard import QuotaExceeded
+
+        if isinstance(exc, QuotaExceeded):
+            return f"⚠️ {exc.message}"
+        deterministic_rejection = _is_minimax_deterministic_rejection(exc)
+        if task_created:
+            try:
+                if deterministic_rejection or not provider_request_started:
+                    await mark_media_generation_submission_failed(record_id, exc)
+                elif provider_response_accepted and not provider_accepted:
+                    await record_minimax_sync_provider_response_retry(record_id, exc)
+                elif not provider_accepted:
+                    await mark_media_generation_submission_ambiguous(record_id, exc)
+            except Exception:
+                logger.exception(
+                    "[MiniMaxAudio] durable failure transition failed task_id={}",
+                    record_id,
+                )
+        if not provider_response_accepted:
+            await _mark_minimax_tool_credential_failure(
+                credential.id,
+                exc,
+                modality=modality,
+                model=model,
+            )
+        await _record_minimax_tool_product_issue(
+            agent_id,
+            modality,
+            error=exc,
+            model=model,
+            tier=tier,
+            user_id=user_id,
+            recovery_path=(f"media-task:{record_id}" if task_created else None),
+        )
+        label = "Speech" if modality == "audio" else "Music"
+        if provider_accepted:
+            return (
+                f"⏳ MiniMax accepted the {label.lower()} request. The result is held "
+                f"by durable recovery (task {record_id}); do not retry."
+            )
+        if provider_response_accepted:
+            return (
+                f"⏳ MiniMax accepted the {label.lower()} response. Its durable "
+                f"recovery worker is repairing the acceptance record (task {record_id}); "
+                "do not retry."
+            )
+        if provider_request_started and not deterministic_rejection:
+            return (
+                f"❌ MiniMax {label.lower()} submission outcome is uncertain. Credits "
+                f"remain held for reconciliation (task {record_id}); do not retry."
+            )
+        return _safe_media_failure_message(f"{label} generation", "minimax", exc)
+
+
 async def _generate_speech_minimax(
     agent_id: uuid.UUID,
     ws: Path,
     arguments: dict,
     user_id: uuid.UUID | None = None,
     saas_tier: str | None = None,
+    session_id: str = "",
 ) -> str:
     text = (arguments.get("text") or "").strip()
     if not text:
@@ -12535,204 +12614,68 @@ async def _generate_speech_minimax(
     assert credential is not None
 
     audio_format = (arguments.get("format") or config.get("format") or "mp3").strip().lower()
-    if audio_format not in {"mp3", "wav", "flac", "pcm"}:
-        return "❌ Unsupported audio format. Use mp3, wav, flac, or pcm."
+    if audio_format not in {"mp3", "wav", "flac"}:
+        return "❌ Unsupported audio format. Use mp3, wav, or flac."
 
-    reservation_id: uuid.UUID | None = None
-    reservation_finalized = False
-    provider_request_started = False
-    provider_succeeded = False
-    provider_rejected = False
-    final_object_stored = False
-    settlement_ready = False
-    recovery_path: str | None = None
-    audio_bytes = b""
+    from app.services.provider_pricing import minimax_tts_credits
+
+    credit_cost = minimax_tts_credits(model, characters=len(text))
+    try:
+        await _check_minimax_credit_amount(tenant_id, credit_cost)
+    except Exception as exc:
+        from app.services.quota_guard import QuotaExceeded
+
+        if isinstance(exc, QuotaExceeded):
+            return f"⚠️ {exc.message}"
+        raise
+    save_path, _full_save_path = _resolve_workspace_output_path(
+        ws,
+        arguments.get("save_path"),
+        "workspace/audio",
+        "minimax_tts",
+        audio_format,
+        text,
+    )
     content_type = {
         "mp3": "audio/mpeg",
         "wav": "audio/wav",
         "flac": "audio/flac",
-        "pcm": "application/octet-stream",
     }[audio_format]
-    try:
-        from app.services.provider_pricing import minimax_tts_credits
-        credit_cost = minimax_tts_credits(model, characters=len(text))
-        await _check_minimax_credit_amount(tenant_id, credit_cost)
-        if credit_cost > 0:
-            reservation = await _reserve_minimax_tool_credits(
-                tenant_id=tenant_id,
-                user_id=user_id,
-                agent_id=agent_id,
-                action="audio",
-                modality="audio",
-                tier=tier,
-                model=model,
-                credits=credit_cost,
-                initial_status="provider_inflight",
-            )
-            reservation_id = reservation.id
-        save_path, full_save_path = _resolve_workspace_output_path(
-            ws,
-            arguments.get("save_path"),
-            "workspace/audio",
-            "minimax_tts",
-            audio_format,
-            text,
-        )
-        provider_request_started = True
-        audio_bytes = await _minimax_tts_http(
+    sample_rate = int(profile.sample_rate or 32000)
+    return await _generate_minimax_audio_durable(
+        agent_id=agent_id,
+        user_id=user_id,
+        session_id=session_id,
+        tenant_id=tenant_id,
+        credential=credential,
+        modality="audio",
+        tier=tier,
+        model=model,
+        credit_cost=credit_cost,
+        save_path=save_path,
+        audio_format=audio_format,
+        content_type=content_type,
+        sample_rate=sample_rate,
+        provider_call=lambda on_accepted: _minimax_tts_http(
             api_key=credential.api_key,
             base_url=credential.base_url,
             model=model,
             text=text,
-            voice_id=arguments.get("voice_id") or config.get("voice_id") or "English_expressive_narrator",
+            voice_id=(
+                arguments.get("voice_id")
+                or config.get("voice_id")
+                or "English_expressive_narrator"
+            ),
             audio_format=audio_format,
             speed=float(config.get("speed") or 1.0),
             volume=float(config.get("volume") or config.get("vol") or 1.0),
             pitch=int(config.get("pitch") or 0),
-            sample_rate=int(profile.sample_rate or 32000),
+            sample_rate=sample_rate,
             bitrate=int(profile.bitrate or 128000),
             language_boost=config.get("language_boost") or "auto",
-        )
-        provider_succeeded = True
-        if reservation_id:
-            await _mark_minimax_tool_reservation_settlement_ready(
-                reservation_id,
-                amount=credit_cost,
-            )
-            settlement_ready = True
-        from app.services.media_assets import validate_generated_audio
-
-        await validate_generated_audio(
-            audio_bytes,
-            audio_format=audio_format,
-            sample_rate=int(profile.sample_rate or 32000),
-            label="MiniMax speech output",
-        )
-        from app.services.storage import store_agent_bytes
-
-        await store_agent_bytes(
-            agent_id,
-            save_path,
-            audio_bytes,
-            content_type=content_type,
-        )
-        final_object_stored = True
-        if reservation_id:
-            await _finalize_minimax_tool_reservation_for_delivery(
-                reservation_id,
-                agent_id=agent_id,
-                modality="audio",
-                model=model,
-                tier=tier,
-                user_id=user_id,
-            )
-            reservation_finalized = True
-        try:
-            full_save_path.write_bytes(audio_bytes)
-        except OSError:
-            logger.warning(
-                "[MiniMaxSpeech] Local cache write failed after durable store"
-            )
-        await _record_minimax_tool_success(
-            agent_id,
-            credential.id,
-            tier=tier,
-            modality="audio",
-            model=model,
-        )
-    except Exception as exc:
-        from app.services.quota_guard import QuotaExceeded
-        if isinstance(exc, QuotaExceeded):
-            return f"⚠️ {exc.message}"
-        provider_rejected = _is_minimax_deterministic_rejection(exc)
-        if provider_succeeded and audio_bytes and not final_object_stored:
-            recovery_path = (
-                "workspace/media_inputs/"
-                f"{reservation_id or uuid.uuid4()}_provider_audio.{audio_format}"
-            )
-            try:
-                from app.services.storage import store_agent_bytes
-
-                await store_agent_bytes(
-                    agent_id,
-                    recovery_path,
-                    audio_bytes,
-                    content_type=content_type,
-                )
-            except Exception:
-                recovery_path = None
-                logger.exception("[MiniMaxSpeech] Provider result recovery failed")
-        elif final_object_stored:
-            recovery_path = save_path
-        if provider_succeeded and reservation_id and not settlement_ready:
-            try:
-                await _mark_minimax_tool_reservation_settlement_ready(
-                    reservation_id,
-                    amount=credit_cost,
-                )
-                settlement_ready = True
-            except Exception:
-                logger.exception("[MiniMaxSpeech] Provider debt outbox retry failed")
-        if (
-            provider_succeeded
-            and recovery_path
-            and reservation_id
-            and settlement_ready
-            and not reservation_finalized
-        ):
-            try:
-                await _finalize_minimax_tool_reservation_for_delivery(
-                    reservation_id,
-                    agent_id=agent_id,
-                    modality="audio",
-                    model=model,
-                    tier=tier,
-                    user_id=user_id,
-                )
-                reservation_finalized = True
-            except Exception:
-                pass
-        if not provider_succeeded:
-            await _mark_minimax_tool_credential_failure(
-                credential.id,
-                exc,
-                modality="audio",
-                model=model,
-            )
-        await _record_minimax_tool_product_issue(
-            agent_id,
-            "audio",
-            error=exc,
-            model=model,
-            tier=tier,
-            user_id=user_id,
-            recovery_path=recovery_path,
-        )
-        _log_minimax_operation_failure("MiniMaxSpeech", exc)
-        return _safe_media_failure_message("Speech generation", "minimax", exc)
-    finally:
-        if (
-            reservation_id
-            and not reservation_finalized
-            and (not provider_request_started or provider_rejected)
-        ):
-            await _release_minimax_tool_reservation_safely(
-                reservation_id,
-                agent_id=agent_id,
-                modality="audio",
-                model=model,
-                tier=tier,
-                user_id=user_id,
-                release_provider_inflight=True,
-            )
-
-    size_kb = len(audio_bytes) / 1024
-    return (
-        f"✅ Speech generated and saved to: {save_path}\n"
-        f"Size: {size_kb:.1f} KB | Provider: minimax | Model: {model}\n\n"
-        f"🔊 Play the audio:\n![]({_agent_file_download_url(agent_id, save_path)})"
+            on_provider_accepted=on_accepted,
+        ),
     )
-
 
 async def _generate_music_minimax(
     agent_id: uuid.UUID,
@@ -12740,6 +12683,7 @@ async def _generate_music_minimax(
     arguments: dict,
     user_id: uuid.UUID | None = None,
     saas_tier: str | None = None,
+    session_id: str = "",
 ) -> str:
     prompt = (arguments.get("prompt") or "").strip()
     lyrics = (arguments.get("lyrics") or "").strip()
@@ -12773,192 +12717,53 @@ async def _generate_music_minimax(
     if audio_format not in {"mp3", "wav"}:
         return "❌ Unsupported music format. Use mp3 or wav."
 
-    reservation_id: uuid.UUID | None = None
-    reservation_finalized = False
-    provider_request_started = False
-    provider_succeeded = False
-    provider_rejected = False
-    final_object_stored = False
-    settlement_ready = False
-    recovery_path: str | None = None
-    audio_bytes = b""
-    content_type = "audio/mpeg" if audio_format == "mp3" else "audio/wav"
+    from app.services.provider_pricing import minimax_music_credits
+
+    credit_cost = minimax_music_credits(model)
     try:
-        from app.services.provider_pricing import minimax_music_credits
-        credit_cost = minimax_music_credits(model)
         await _check_minimax_credit_amount(tenant_id, credit_cost)
-        if credit_cost > 0:
-            reservation = await _reserve_minimax_tool_credits(
-                tenant_id=tenant_id,
-                user_id=user_id,
-                agent_id=agent_id,
-                action="music",
-                modality="music",
-                tier=tier,
-                model=model,
-                credits=credit_cost,
-                initial_status="provider_inflight",
-            )
-            reservation_id = reservation.id
-        save_path, full_save_path = _resolve_workspace_output_path(
-            ws,
-            arguments.get("save_path"),
-            "workspace/audio",
-            "minimax_music",
-            audio_format,
-            prompt,
-        )
-        provider_request_started = True
-        audio_bytes = await _minimax_music_http(
+    except Exception as exc:
+        from app.services.quota_guard import QuotaExceeded
+
+        if isinstance(exc, QuotaExceeded):
+            return f"⚠️ {exc.message}"
+        raise
+    save_path, _full_save_path = _resolve_workspace_output_path(
+        ws,
+        arguments.get("save_path"),
+        "workspace/audio",
+        "minimax_music",
+        audio_format,
+        prompt,
+    )
+    content_type = "audio/mpeg" if audio_format == "mp3" else "audio/wav"
+    sample_rate = int(profile.sample_rate or 44100)
+    return await _generate_minimax_audio_durable(
+        agent_id=agent_id,
+        user_id=user_id,
+        session_id=session_id,
+        tenant_id=tenant_id,
+        credential=credential,
+        modality="music",
+        tier=tier,
+        model=model,
+        credit_cost=credit_cost,
+        save_path=save_path,
+        audio_format=audio_format,
+        content_type=content_type,
+        sample_rate=sample_rate,
+        provider_call=lambda on_accepted: _minimax_music_http(
             api_key=credential.api_key,
             base_url=credential.base_url,
             model=model,
             prompt=prompt,
             lyrics=lyrics,
             audio_format=audio_format,
-            sample_rate=int(profile.sample_rate or 44100),
+            sample_rate=sample_rate,
             bitrate=int(profile.bitrate or 256000),
-        )
-        provider_succeeded = True
-        if reservation_id:
-            await _mark_minimax_tool_reservation_settlement_ready(
-                reservation_id,
-                amount=credit_cost,
-            )
-            settlement_ready = True
-        from app.services.media_assets import validate_generated_audio
-
-        await validate_generated_audio(
-            audio_bytes,
-            audio_format=audio_format,
-            sample_rate=int(profile.sample_rate or 44100),
-            label="MiniMax music output",
-        )
-        from app.services.storage import store_agent_bytes
-
-        await store_agent_bytes(
-            agent_id,
-            save_path,
-            audio_bytes,
-            content_type=content_type,
-        )
-        final_object_stored = True
-        if reservation_id:
-            await _finalize_minimax_tool_reservation_for_delivery(
-                reservation_id,
-                agent_id=agent_id,
-                modality="music",
-                model=model,
-                tier=tier,
-                user_id=user_id,
-            )
-            reservation_finalized = True
-        try:
-            full_save_path.write_bytes(audio_bytes)
-        except OSError:
-            logger.warning(
-                "[MiniMaxMusic] Local cache write failed after durable store"
-            )
-        await _record_minimax_tool_success(
-            agent_id,
-            credential.id,
-            tier=tier,
-            modality="music",
-            model=model,
-        )
-    except Exception as exc:
-        from app.services.quota_guard import QuotaExceeded
-        if isinstance(exc, QuotaExceeded):
-            return f"⚠️ {exc.message}"
-        provider_rejected = _is_minimax_deterministic_rejection(exc)
-        if provider_succeeded and audio_bytes and not final_object_stored:
-            recovery_path = (
-                "workspace/media_inputs/"
-                f"{reservation_id or uuid.uuid4()}_provider_music.{audio_format}"
-            )
-            try:
-                from app.services.storage import store_agent_bytes
-
-                await store_agent_bytes(
-                    agent_id,
-                    recovery_path,
-                    audio_bytes,
-                    content_type=content_type,
-                )
-            except Exception:
-                recovery_path = None
-                logger.exception("[MiniMaxMusic] Provider result recovery failed")
-        elif final_object_stored:
-            recovery_path = save_path
-        if provider_succeeded and reservation_id and not settlement_ready:
-            try:
-                await _mark_minimax_tool_reservation_settlement_ready(
-                    reservation_id,
-                    amount=credit_cost,
-                )
-                settlement_ready = True
-            except Exception:
-                logger.exception("[MiniMaxMusic] Provider debt outbox retry failed")
-        if (
-            provider_succeeded
-            and recovery_path
-            and reservation_id
-            and settlement_ready
-            and not reservation_finalized
-        ):
-            try:
-                await _finalize_minimax_tool_reservation_for_delivery(
-                    reservation_id,
-                    agent_id=agent_id,
-                    modality="music",
-                    model=model,
-                    tier=tier,
-                    user_id=user_id,
-                )
-                reservation_finalized = True
-            except Exception:
-                pass
-        if not provider_succeeded:
-            await _mark_minimax_tool_credential_failure(
-                credential.id,
-                exc,
-                modality="music",
-                model=model,
-            )
-        await _record_minimax_tool_product_issue(
-            agent_id,
-            "music",
-            error=exc,
-            model=model,
-            tier=tier,
-            user_id=user_id,
-            recovery_path=recovery_path,
-        )
-        _log_minimax_operation_failure("MiniMaxMusic", exc)
-        return _safe_media_failure_message("Music generation", "minimax", exc)
-    finally:
-        if (
-            reservation_id
-            and not reservation_finalized
-            and (not provider_request_started or provider_rejected)
-        ):
-            await _release_minimax_tool_reservation_safely(
-                reservation_id,
-                agent_id=agent_id,
-                modality="music",
-                model=model,
-                tier=tier,
-                user_id=user_id,
-                release_provider_inflight=True,
-            )
-
-    size_kb = len(audio_bytes) / 1024
-    return (
-        f"✅ Music generated and saved to: {save_path}\n"
-        f"Size: {size_kb:.1f} KB | Provider: minimax | Model: {model}\n\n"
-        f"🎵 Play the music:\n![]({_agent_file_download_url(agent_id, save_path)})"
+            on_provider_accepted=on_accepted,
+        ),
     )
-
 
 def _write_minimax_video_metadata_best_effort(
     path: Path,
@@ -13117,6 +12922,7 @@ async def _generate_video_minimax(
             mark_minimax_video_task_submitted,
             minimax_video_brand_asset_key,
             reconcile_minimax_video_task,
+            store_minimax_video_provider_identity_evidence,
             validate_media_origin_session,
         )
         from app.services.provider_pricing import minimax_video_credits
@@ -13141,11 +12947,6 @@ async def _generate_video_minimax(
                 record_id,
                 extension,
             )
-            await get_storage_backend().write_bytes(
-                frozen_brand_key,
-                brand_asset.raw,
-                content_type=brand_asset.mime_type,
-            )
         output_path, _ = _resolve_workspace_output_path(
             ws,
             arguments.get("save_path"),
@@ -13154,6 +12955,7 @@ async def _generate_video_minimax(
             "mp4",
             prompt,
         )
+        output_path = _version_durable_media_output_path(output_path, record_id)
         meta_path, full_meta_path = _resolve_workspace_output_path(
             ws,
             arguments.get("task_meta_path"),
@@ -13162,6 +12964,8 @@ async def _generate_video_minimax(
             "json",
             prompt,
         )
+        meta_path = _version_durable_media_output_path(meta_path, record_id)
+        full_meta_path = (ws / meta_path).resolve()
         created_at = datetime.now(timezone.utc).isoformat()
         request_metadata = {
             "credit_cost": credit_cost,
@@ -13182,32 +12986,29 @@ async def _generate_video_minimax(
             "brand_position": brand_position,
             "brand_scale": brand_scale,
         }
-        if credit_cost > 0:
-            reservation = await _reserve_minimax_tool_credits(
-                tenant_id=tenant_id,
-                user_id=user_id,
-                agent_id=agent_id,
-                action="video",
-                modality="video",
-                tier=tier,
-                model=model,
-                credits=credit_cost,
-                initial_status="provider_inflight",
-            )
-            reservation_id = reservation.id
-        await create_minimax_video_task_record(
+        created_task = await create_minimax_video_task_record(
             record_id=record_id,
             tenant_id=tenant_id,
             agent_id=agent_id,
             user_id=user_id,
             credential_id=credential.id,
-            reservation_id=reservation_id,
             origin_session_id=session_id,
             model=model,
+            tier=tier,
+            credit_cost=credit_cost,
             metadata_path=meta_path,
             output_path=output_path,
             request_metadata=request_metadata,
         )
+        reservation_id = created_task.reservation_id
+        if brand_asset and frozen_brand_key:
+            await _finish_durable_media_side_effect(
+                get_storage_backend().write_bytes(
+                    frozen_brand_key,
+                    brand_asset.raw,
+                    content_type=brand_asset.mime_type,
+                )
+            )
 
         provider_request_started = True
         provider_task_id = await _minimax_create_video_task(
@@ -13221,6 +13022,36 @@ async def _generate_video_minimax(
             last_frame_image=last_frame_image,
             prompt_optimizer=bool(prompt_optimizer),
         )
+        try:
+            await _finish_durable_media_side_effect(
+                store_minimax_video_provider_identity_evidence(
+                    record_id=record_id,
+                    agent_id=agent_id,
+                    tenant_id=tenant_id,
+                    credential_id=credential.id,
+                    model=model,
+                    provider_task_id=provider_task_id,
+                )
+            )
+        except Exception as evidence_exc:
+            # Still attempt the SQL attachment immediately. Either durable
+            # sink is sufficient; losing both is the only irrecoverable case.
+            logger.exception(
+                "[MiniMaxVideo] Provider identity evidence store failed"
+            )
+            try:
+                await _record_minimax_tool_product_issue(
+                    agent_id,
+                    "video",
+                    error=evidence_exc,
+                    model=model,
+                    tier=tier,
+                    user_id=user_id,
+                    category="provider_identity_recovery",
+                    severity="critical",
+                )
+            except Exception:
+                pass
         metadata = {
             "provider": "minimax",
             "task_record_id": str(record_id),
@@ -13559,6 +13390,7 @@ async def _minimax_tts_http(
     sample_rate: int,
     bitrate: int,
     language_boost: str,
+    on_provider_accepted: Callable[[bytes | None], Awaitable[None]] | None = None,
 ) -> bytes:
     payload = {
         "model": model,
@@ -13598,7 +13430,17 @@ async def _minimax_tts_http(
             )
             if resp.status_code != 200:
                 raise _minimax_http_error(resp)
-            return _minimax_audio_hex_to_bytes(resp.json(), "MiniMax TTS")
+            data = resp.json()
+            _raise_for_minimax_base_resp(data, "MiniMax TTS")
+            try:
+                audio_bytes = _minimax_audio_hex_to_bytes(data, "MiniMax TTS")
+            except Exception:
+                if on_provider_accepted:
+                    await on_provider_accepted(None)
+                raise
+            if on_provider_accepted:
+                await on_provider_accepted(audio_bytes)
+            return audio_bytes
 
 
 async def _minimax_music_http(
@@ -13610,6 +13452,7 @@ async def _minimax_music_http(
     audio_format: str,
     sample_rate: int,
     bitrate: int,
+    on_provider_accepted: Callable[[bytes | None], Awaitable[None]] | None = None,
 ) -> bytes:
     payload = {
         "model": model,
@@ -13636,7 +13479,17 @@ async def _minimax_music_http(
             )
             if resp.status_code != 200:
                 raise _minimax_http_error(resp)
-            return _minimax_audio_hex_to_bytes(resp.json(), "MiniMax Music")
+            data = resp.json()
+            _raise_for_minimax_base_resp(data, "MiniMax Music")
+            try:
+                audio_bytes = _minimax_audio_hex_to_bytes(data, "MiniMax Music")
+            except Exception:
+                if on_provider_accepted:
+                    await on_provider_accepted(None)
+                raise
+            if on_provider_accepted:
+                await on_provider_accepted(audio_bytes)
+            return audio_bytes
 
 
 async def _minimax_create_video_task(
@@ -14365,7 +14218,7 @@ async def _get_feishu_token(agent_id: uuid.UUID) -> tuple[str, str] | None:
             select(ChannelConfig).where(
                 ChannelConfig.agent_id == agent_id,
                 ChannelConfig.channel_type == "feishu",
-                ChannelConfig.is_configured == True,
+                ChannelConfig.is_configured,
             )
         )
         config = result.scalar_one_or_none()
@@ -18245,144 +18098,332 @@ async def _agentbay_computer_list_visible_apps(agent_id: Optional[uuid.UUID], ws
         return f"List applications failed: {str(e)[:200]}"
 
 
-async def _agentbay_file_transfer(agent_id: Optional[uuid.UUID], ws: Path, arguments: dict) -> str:
-    """Transfer a file between workspace and an AgentBay environment, or between two environments.
+@dataclass(frozen=True)
+class AgentBayFileTransferOutcome:
+    ok: bool
+    message: str
 
-    Supported transfer directions:
-      - workspace  → env:      upload_file(local_workspace_path, remote_path)   [single SDK call]
-      - env        → workspace: download_file(remote_path, local_workspace_path) [single SDK call]
-      - env A      → env B:    download to /tmp/<uuid>, upload to env B, cleanup /tmp [transparent]
 
-    The 'local' side of the SDK calls is always the Astra backend server,
-    which has access to the agent workspace directory.
+def _normalize_agentbay_workspace_transfer_path(value: object) -> str:
+    raw = str(value or "").strip().replace("\\", "/")
+    if not raw:
+        raise ValueError("Workspace transfer path is required")
+    if len(raw) > MAX_AGENTBAY_REMOTE_PATH_CHARS:
+        raise ValueError("Workspace transfer path is too long")
+    if any(ord(char) < 32 for char in raw):
+        raise ValueError("Workspace transfer path contains control characters")
+    if raw.startswith("/") or re.match(r"^[A-Za-z]:/", raw):
+        raise ValueError("Workspace transfer path must be relative")
+    parts = [part for part in raw.split("/") if part not in {"", "."}]
+    if not parts or any(part == ".." for part in parts):
+        raise ValueError("Workspace transfer path must stay inside this Agent workspace")
+    normalized = "/".join(parts)
+    if _is_enterprise_info_path(normalized):
+        raise ValueError("Shared company files cannot be transferred through AgentBay")
+    return normalize_workspace_path(normalized)
+
+
+def _normalize_agentbay_remote_transfer_path(endpoint: str, value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError(f"{endpoint} transfer path is required")
+    if len(raw) > MAX_AGENTBAY_REMOTE_PATH_CHARS:
+        raise ValueError(f"{endpoint} transfer path is too long")
+    if any(ord(char) < 32 for char in raw):
+        raise ValueError(f"{endpoint} transfer path contains control characters")
+    slash_path = raw.replace("\\", "/")
+    if any(part == ".." for part in slash_path.split("/")):
+        raise ValueError(f"{endpoint} transfer path cannot contain parent traversal")
+    is_windows_absolute = bool(re.match(r"^[A-Za-z]:/", slash_path))
+    if not slash_path.startswith("/") and not (
+        endpoint == "computer" and is_windows_absolute
+    ):
+        raise ValueError(f"{endpoint} transfer path must be absolute")
+    if slash_path.endswith("/"):
+        raise ValueError(f"{endpoint} transfer path must identify a file")
+    return raw
+
+
+def _normalize_agentbay_file_transfer_arguments(arguments: dict) -> dict:
+    normalized = dict(arguments)
+    from_type = str(normalized.get("from_type") or "").strip().lower()
+    to_type = str(normalized.get("to_type") or "").strip().lower()
+    valid_types = {"workspace", "browser", "computer", "code"}
+    if from_type not in valid_types or to_type not in valid_types:
+        raise ValueError("Transfer endpoints must be workspace, browser, computer, or code")
+    if from_type == "workspace" and to_type == "workspace":
+        raise ValueError("Workspace-to-workspace transfer is not supported")
+    if from_type == to_type:
+        raise ValueError("A transfer must use two different endpoints")
+    normalized["from_type"] = from_type
+    normalized["to_type"] = to_type
+    normalized["from_path"] = (
+        _normalize_agentbay_workspace_transfer_path(normalized.get("from_path"))
+        if from_type == "workspace"
+        else _normalize_agentbay_remote_transfer_path(
+            from_type,
+            normalized.get("from_path"),
+        )
+    )
+    normalized["to_path"] = (
+        _normalize_agentbay_workspace_transfer_path(normalized.get("to_path"))
+        if to_type == "workspace"
+        else _normalize_agentbay_remote_transfer_path(
+            to_type,
+            normalized.get("to_path"),
+        )
+    )
+    return normalized
+
+
+def _agentbay_temp_workspace_file(ws: Path, rel_path: str) -> Path:
+    root = ws.resolve()
+    target = (root / rel_path).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(
+            "Workspace transfer path must stay inside this Agent workspace"
+        ) from exc
+    return target
+
+
+async def _agentbay_transfer_code_denial_reason(
+    agent_id: uuid.UUID,
+    arguments: dict,
+) -> str | None:
+    if "code" not in {
+        str(arguments.get("from_type") or "").strip().lower(),
+        str(arguments.get("to_type") or "").strip().lower(),
+    }:
+        return None
+    from app.services.code_execution_policy import code_execution_denial_reason
+
+    tenant_id = await _get_agent_tenant_id(agent_id)
+    return code_execution_denial_reason(
+        get_settings(),
+        tenant_id,
+        tool_name="agentbay_file_transfer",
+        sandbox_type="agentbay",
+        allow_network=False,
+    )
+
+
+async def _run_agentbay_file_transfer(
+    agent_id: uuid.UUID,
+    tenant_id: str | None,
+    arguments: dict,
+) -> str:
+    try:
+        normalized = _normalize_agentbay_file_transfer_arguments(arguments)
+    except ValueError as exc:
+        return f"❌ {exc}"
+
+    code_denial = await _agentbay_transfer_code_denial_reason(agent_id, normalized)
+    if code_denial:
+        return f"❌ {code_denial}"
+
+    workspace_paths = [
+        normalized[path_key]
+        for endpoint_key, path_key in (
+            ("from_type", "from_path"),
+            ("to_type", "to_path"),
+        )
+        if normalized[endpoint_key] == "workspace"
+    ]
+    if normalized["from_type"] == "workspace":
+        storage = get_storage_backend()
+        storage_key, _, _ = _tool_storage_key(
+            agent_id,
+            normalized["from_path"],
+            tenant_id,
+        )
+        if not await storage.is_file(storage_key):
+            return f"❌ File not found in workspace: {normalized['from_path']}"
+        version = await storage.get_version(storage_key)
+        if version.size > MAX_AGENTBAY_TRANSFER_BYTES:
+            return (
+                "❌ AgentBay transfer file exceeds the "
+                f"{MAX_AGENTBAY_TRANSFER_BYTES // (1024 * 1024)} MB limit"
+            )
+
+    temp_workspace = await _prepare_temp_workspace(
+        agent_id,
+        tenant_id=tenant_id,
+        paths=workspace_paths,
+    )
+    try:
+        outcome = await _agentbay_file_transfer(
+            agent_id,
+            temp_workspace.root,
+            normalized,
+        )
+        if outcome.ok and normalized["to_type"] == "workspace":
+            flush_result = await flush_temp_workspace(
+                temp_workspace,
+                conflict_mode="fail",
+            )
+            if flush_result["conflicted"]:
+                conflict_list = ", ".join(flush_result["conflicted"][:5])
+                return f"❌ Workspace sync conflict for: {conflict_list}"
+        return outcome.message
+    finally:
+        temp_workspace.cleanup()
+
+
+async def _agentbay_file_transfer(
+    agent_id: Optional[uuid.UUID],
+    ws: Path,
+    arguments: dict,
+) -> AgentBayFileTransferOutcome:
+    """Transfer one bounded regular file through a managed AgentBay session.
+
+    ``ws`` must be a disposable workspace materialized from the canonical
+    storage backend. No persistent Agent directory or model-controlled shell
+    command is used here.
     """
     if not agent_id:
-        return "AgentBay tools require agent context"
+        return AgentBayFileTransferOutcome(
+            False,
+            "❌ AgentBay tools require Agent context",
+        )
 
     from app.services.agentbay_client import get_agentbay_client_for_agent
 
-    from_type = arguments.get("from_type", "")
-    from_path = arguments.get("from_path", "")
-    to_type   = arguments.get("to_type", "")
-    to_path   = arguments.get("to_path", "")
-    session_id = arguments.pop("_session_id", "")
+    try:
+        normalized = _normalize_agentbay_file_transfer_arguments(arguments)
+    except ValueError as exc:
+        return AgentBayFileTransferOutcome(False, f"❌ {exc}")
 
-    if not all([from_type, from_path, to_type, to_path]):
-        return "Missing required parameters: from_type, from_path, to_type, to_path"
-
-    # Reject no-op transfers
-    if from_type == "workspace" and to_type == "workspace":
-        return "Cannot transfer workspace → workspace. Use write_file or workspace tools instead."
-    if from_type == to_type and from_type != "workspace":
-        return f"Same environment ({from_type}) transfer: use agentbay_command_exec with 'cp' to copy files within the same environment."
-
+    from_type = normalized["from_type"]
+    from_path = normalized["from_path"]
+    to_type = normalized["to_type"]
+    to_path = normalized["to_path"]
+    session_id = str(normalized.get("_session_id") or "")
     env_types = {"browser", "computer", "code"}
 
-    # ── Helper: resolve and validate a workspace-relative path ──────────────
-    def resolve_workspace(rel_path: str) -> tuple[str | None, str]:
-        """Return (absolute_local_path_str, error_message). error_message is '' on success."""
-        local = (ws / rel_path).resolve()
-        if not str(local).startswith(str(ws.resolve())):
-            return None, "Permission denied: path must be inside the agent workspace"
-        return str(local), ""
-
     try:
-        # ── Case 1: workspace → env ──────────────────────────────────────────
         if from_type == "workspace" and to_type in env_types:
-            local_path, err = resolve_workspace(from_path)
-            if err:
-                return err
-            import os
-            if not os.path.exists(local_path):
-                return f"File not found in workspace: {from_path}"
-            client = await get_agentbay_client_for_agent(agent_id, to_type, session_id=session_id)
+            local_path = _agentbay_temp_workspace_file(ws, from_path)
+            if not local_path.is_file() or local_path.is_symlink():
+                return AgentBayFileTransferOutcome(
+                    False,
+                    f"❌ File not found in workspace: {from_path}",
+                )
+            size = local_path.stat().st_size
+            if size > MAX_AGENTBAY_TRANSFER_BYTES:
+                return AgentBayFileTransferOutcome(
+                    False,
+                    "❌ AgentBay transfer file exceeds the size limit",
+                )
+            client = await get_agentbay_client_for_agent(
+                agent_id,
+                to_type,
+                session_id=session_id,
+            )
             result = await asyncio.to_thread(
                 client._session.file_system.upload_file,
-                local_path, to_path
+                str(local_path),
+                to_path,
             )
-            if result.success:
-                msg = (
-                    f"Transferred workspace/{from_path} → [{to_type}]{to_path} "
-                    f"({result.bytes_sent} bytes)"
+            if not getattr(result, "success", False):
+                return AgentBayFileTransferOutcome(
+                    False,
+                    "❌ AgentBay file upload failed",
                 )
-                # After uploading to the computer desktop directory, notify the GNOME
-                # file manager so the file icon appears immediately without manual refresh.
-                desktop_dir = "/home/wuying/桌面"
-                if to_type == "computer" and to_path.startswith(desktop_dir):
-                    try:
-                        await asyncio.to_thread(
-                            client._session.command.exec,
-                            f"DISPLAY=:0 gio info '{to_path}' 2>/dev/null || true"
-                        )
-                    except Exception:
-                        pass  # Non-critical: desktop refresh failure doesn't affect transfer result
-                return msg
-            return f"Upload failed: {result.error_message}"
+            sent = int(getattr(result, "bytes_sent", size) or size)
+            return AgentBayFileTransferOutcome(
+                True,
+                f"Transferred workspace/{from_path} → [{to_type}]{to_path} ({sent} bytes)",
+            )
 
-        # ── Case 2: env → workspace ──────────────────────────────────────────
-        elif from_type in env_types and to_type == "workspace":
-            local_path, err = resolve_workspace(to_path)
-            if err:
-                return err
-            import os
-            os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
-            client = await get_agentbay_client_for_agent(agent_id, from_type, session_id=session_id)
+        if from_type in env_types and to_type == "workspace":
+            local_path = _agentbay_temp_workspace_file(ws, to_path)
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            client = await get_agentbay_client_for_agent(
+                agent_id,
+                from_type,
+                session_id=session_id,
+            )
             result = await asyncio.to_thread(
                 client._session.file_system.download_file,
-                from_path, local_path
+                from_path,
+                str(local_path),
             )
-            if result.success:
-                return (
-                    f"Transferred [{from_type}]{from_path} → workspace/{to_path} "
-                    f"({result.bytes_received} bytes). "
-                    f"File available in workspace at: {to_path}"
+            if not getattr(result, "success", False) or not local_path.is_file():
+                return AgentBayFileTransferOutcome(
+                    False,
+                    "❌ AgentBay file download failed",
                 )
-            return f"Download failed: {result.error_message}"
-
-        # ── Case 3: env A → env B (transparent /tmp/ intermediary) ──────────
-        elif from_type in env_types and to_type in env_types:
-            import uuid as _uuid
-            import os
-            tmp_path = f"/tmp/agentbay_transfer_{_uuid.uuid4().hex}"
-            try:
-                # Step 1: download from source env to backend /tmp/
-                src_client = await get_agentbay_client_for_agent(agent_id, from_type, session_id=session_id)
-                dl_result = await asyncio.to_thread(
-                    src_client._session.file_system.download_file,
-                    from_path, tmp_path
+            size = local_path.stat().st_size
+            if size > MAX_AGENTBAY_TRANSFER_BYTES:
+                local_path.unlink(missing_ok=True)
+                return AgentBayFileTransferOutcome(
+                    False,
+                    "❌ AgentBay transfer file exceeds the size limit",
                 )
-                if not dl_result.success:
-                    return f"Transfer failed (download from {from_type}): {dl_result.error_message}"
+            return AgentBayFileTransferOutcome(
+                True,
+                f"Transferred [{from_type}]{from_path} → workspace/{to_path} ({size} bytes)",
+            )
 
-                # Step 2: upload from backend /tmp/ to destination env
-                dst_client = await get_agentbay_client_for_agent(agent_id, to_type, session_id=session_id)
-                ul_result = await asyncio.to_thread(
-                    dst_client._session.file_system.upload_file,
-                    tmp_path, to_path
+        if from_type in env_types and to_type in env_types:
+            with tempfile.TemporaryDirectory(
+                prefix="clawith-agentbay-transfer-",
+            ) as temp_dir:
+                temp_path = Path(temp_dir) / "payload"
+                source_client = await get_agentbay_client_for_agent(
+                    agent_id,
+                    from_type,
+                    session_id=session_id,
                 )
-                if not ul_result.success:
-                    return f"Transfer failed (upload to {to_type}): {ul_result.error_message}"
-
-                return (
-                    f"Transferred [{from_type}]{from_path} → [{to_type}]{to_path} "
-                    f"({dl_result.bytes_received} bytes)"
+                download = await asyncio.to_thread(
+                    source_client._session.file_system.download_file,
+                    from_path,
+                    str(temp_path),
                 )
-            finally:
-                # Always clean up the temporary file regardless of success or failure
-                try:
-                    if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
-                except Exception:
-                    pass  # Non-critical: ignore cleanup errors
+                if not getattr(download, "success", False) or not temp_path.is_file():
+                    return AgentBayFileTransferOutcome(
+                        False,
+                        "❌ AgentBay source download failed",
+                    )
+                size = temp_path.stat().st_size
+                if size > MAX_AGENTBAY_TRANSFER_BYTES:
+                    return AgentBayFileTransferOutcome(
+                        False,
+                        "❌ AgentBay transfer file exceeds the size limit",
+                    )
+                destination_client = await get_agentbay_client_for_agent(
+                    agent_id,
+                    to_type,
+                    session_id=session_id,
+                )
+                upload = await asyncio.to_thread(
+                    destination_client._session.file_system.upload_file,
+                    str(temp_path),
+                    to_path,
+                )
+                if not getattr(upload, "success", False):
+                    return AgentBayFileTransferOutcome(
+                        False,
+                        "❌ AgentBay destination upload failed",
+                    )
+                return AgentBayFileTransferOutcome(
+                    True,
+                    f"Transferred [{from_type}]{from_path} → [{to_type}]{to_path} ({size} bytes)",
+                )
+    except Exception as exc:
+        logger.warning(
+            "[AgentBay] File transfer failed agent_id={} error_type={}",
+            agent_id,
+            type(exc).__name__,
+        )
+        return AgentBayFileTransferOutcome(
+            False,
+            "❌ AgentBay file transfer failed safely; no workspace file was committed",
+        )
 
-        else:
-            return f"Unsupported transfer: {from_type} → {to_type}"
-
-    except RuntimeError as e:
-        return f"{str(e)}"
-    except Exception as e:
-        logger.exception(f"[AgentBay] File transfer failed for agent {agent_id}")
-        return f"File transfer failed: {str(e)[:200]}"
+    return AgentBayFileTransferOutcome(False, "❌ Unsupported AgentBay transfer")
 
 
 # ─── OKR Tools ───────────────────────────────────────────────────────────────

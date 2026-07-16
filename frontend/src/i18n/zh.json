@@ -334,7 +334,7 @@
             "fired": "已触发 {{count}} 次",
             "disabled": "已禁用",
             "configuredPaused": "已配置 · 执行暂停",
-            "executionPausedDetail": "本版本已安全暂停自动触发和计划执行；配置会保留，且不会消耗 Credits。",
+            "executionPausedDetail": "此项自动化当前由平台安全开关关闭；配置会保留，关闭期间不会消耗 Credits。",
             "scheduleAccepted": "计划请求已接受",
             "disable": "禁用",
             "enable": "启用",

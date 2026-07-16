@@ -463,9 +463,15 @@ def is_retryable_error(result: str) -> bool:
     return classify_error(Exception(result)) != FailoverErrorType.NON_RETRYABLE
 
 
-def _is_llm_error_result(result: str) -> bool:
+def is_llm_error_result(result: str) -> bool:
     """Return whether a model result represents an error rather than content."""
     return result.startswith(("[LLM Error]", "[LLM call error]", "[Error]", "⚠️"))
+
+
+# Backward-compatible private alias for existing callers and tests. New
+# background workers should use the public predicate so error-shaped strings
+# are never mistaken for successful assistant content.
+_is_llm_error_result = is_llm_error_result
 
 
 def _get_model_timeout(model: "LLMModel") -> float:
@@ -552,21 +558,40 @@ def _convert_messages_for_vision(
                 continue
             
             content_str = msg.content
-            image_pattern = r'\[image_data:(data:image/[^;]+;base64,[A-Za-z0-9+/=]+)\]'
-            video_pattern = r'\[video_data:(data:video/[^;]+;base64,[A-Za-z0-9+/=]+)\]'
-            images = _re_v.findall(image_pattern, content_str)
-            videos = _re_v.findall(video_pattern, content_str)
-            
-            if not images and not videos:
+            media_pattern = _re_v.compile(
+                r'\[(?:'
+                r'image_data:(?P<image>data:image/[^;]+;base64,[A-Za-z0-9+/=]+)'
+                r'|video_data:(?P<video>data:video/[^;]+;base64,[A-Za-z0-9+/=]+)'
+                r')\]'
+            )
+            matches = list(media_pattern.finditer(content_str))
+
+            if not matches:
                 continue
 
-            text = _re_v.sub(image_pattern, '', content_str)
-            text = _re_v.sub(video_pattern, '', text).strip()
-            parts = [{"type": "image_url", "image_url": {"url": img}} for img in images]
-            parts.extend({"type": "video_url", "video_url": {"url": video}} for video in videos)
-            if text:
-                # Put text after media parts so the user's instruction is read with the media context.
-                parts.append({"type": "text", "text": text})
+            # Walk one combined marker stream. Keeping every text/media span in
+            # its original order is essential when one prompt assigns distinct
+            # instructions to several product and style references.
+            parts = []
+            cursor = 0
+            for match in matches:
+                text_segment = content_str[cursor:match.start()].strip()
+                if text_segment:
+                    parts.append({"type": "text", "text": text_segment})
+                image_data = match.group("image")
+                video_data = match.group("video")
+                if image_data:
+                    parts.append(
+                        {"type": "image_url", "image_url": {"url": image_data}}
+                    )
+                else:
+                    parts.append(
+                        {"type": "video_url", "video_url": {"url": video_data}}
+                    )
+                cursor = match.end()
+            trailing_text = content_str[cursor:].strip()
+            if trailing_text:
+                parts.append({"type": "text", "text": trailing_text})
             
             new_messages[i] = type(msg)(role=msg.role, content=parts, tool_calls=msg.tool_calls, tool_call_id=msg.tool_call_id)
     else:
@@ -2136,6 +2161,7 @@ async def call_agent_llm_with_tools(
     user_prompt: str,
     max_rounds: int = 50,
     session_id: str = "",
+    requester_user_id: uuid.UUID | None = None,
 ) -> str:
     """Call agent LLM with tool-calling loop (for background services)."""
     from app.models.agent import Agent
@@ -2145,6 +2171,18 @@ async def call_agent_llm_with_tools(
     agent: Agent | None = agent_result.scalar_one_or_none()
     if not agent:
         return "⚠️ Agent not found"
+
+    effective_user_id = requester_user_id or agent.creator_id
+    if requester_user_id is not None:
+        from app.core.permissions import get_agent_access_level_for_user_id
+
+        if (
+            await get_agent_access_level_for_user_id(
+                db, effective_user_id, agent
+            )
+            is None
+        ):
+            return "⚠️ Automation requester no longer has access to this Agent"
 
     # Resolve models via SaaS tier route or legacy model IDs
     try:
@@ -2195,7 +2233,7 @@ async def call_agent_llm_with_tools(
                             error=exc,
                             model=model,
                             agent_id=agent_id,
-                            user_id=agent.creator_id,
+                            user_id=effective_user_id,
                             tenant_id=tenant_id,
                             route_meta=route_meta,
                         )
@@ -2215,14 +2253,14 @@ async def call_agent_llm_with_tools(
                             error=exc,
                             model=model,
                             agent_id=agent_id,
-                            user_id=agent.creator_id,
+                            user_id=effective_user_id,
                             tenant_id=tenant_id,
                             route_meta=route_meta,
                         )
                 try:
                     await _record_llm_usage_and_charge(
                         agent_id=agent_id,
-                        user_id=agent.creator_id,
+                        user_id=effective_user_id,
                         tenant_id=tenant_id,
                         model=model,
                         usage=_accumulated_usage,
@@ -2235,7 +2273,7 @@ async def call_agent_llm_with_tools(
                         error=exc,
                         model=model,
                         agent_id=agent_id,
-                        user_id=agent.creator_id,
+                        user_id=effective_user_id,
                         tenant_id=tenant_id,
                         route_meta=route_meta,
                     )
@@ -2253,7 +2291,7 @@ async def call_agent_llm_with_tools(
                 error_code=exc.reason_code.value,
                 model=model,
                 agent_id=agent_id,
-                user_id=agent.creator_id,
+                user_id=effective_user_id,
                 tenant_id=tenant_id,
                 route_meta=route_meta,
                 severity=("critical" if exc.reason_code.value == "all_unhealthy" else "error"),
@@ -2293,7 +2331,7 @@ async def call_agent_llm_with_tools(
                                 error=exc,
                                 model=model,
                                 agent_id=agent_id,
-                                user_id=agent.creator_id,
+                                user_id=effective_user_id,
                                 tenant_id=tenant_id,
                                 route_meta=route_meta,
                             )
@@ -2317,7 +2355,7 @@ async def call_agent_llm_with_tools(
                 try:
                     _round_reservation_id = await reserve_llm_round_credits(
                         tenant_id=tenant_id,
-                        user_id=agent.creator_id,
+                        user_id=effective_user_id,
                         agent_id=agent_id,
                         model=model,
                         route_meta=route_meta,
@@ -2335,7 +2373,7 @@ async def call_agent_llm_with_tools(
                         error=e,
                         model=model,
                         agent_id=agent_id,
-                        user_id=agent.creator_id,
+                        user_id=effective_user_id,
                         tenant_id=tenant_id,
                         route_meta=route_meta,
                     )
@@ -2367,7 +2405,7 @@ async def call_agent_llm_with_tools(
                         model=model,
                         route_meta=route_meta,
                         agent_id=agent_id,
-                        user_id=agent.creator_id,
+                        user_id=effective_user_id,
                         tenant_id=tenant_id,
                         provider_failed=not _provider_may_have_accepted,
                     )
@@ -2383,7 +2421,7 @@ async def call_agent_llm_with_tools(
                         model=model,
                         route_meta=route_meta,
                         agent_id=agent_id,
-                        user_id=agent.creator_id,
+                        user_id=effective_user_id,
                         tenant_id=tenant_id,
                         provider_failed=not _provider_may_have_accepted,
                     )
@@ -2401,7 +2439,7 @@ async def call_agent_llm_with_tools(
                         error_code=extract_minimax_code(str(e)) or type(e).__name__,
                         model=model,
                         agent_id=agent_id,
-                        user_id=agent.creator_id,
+                        user_id=effective_user_id,
                         tenant_id=tenant_id,
                         route_meta=route_meta,
                     )
@@ -2429,7 +2467,7 @@ async def call_agent_llm_with_tools(
                         model=model,
                         route_meta=route_meta,
                         agent_id=agent_id,
-                        user_id=agent.creator_id,
+                        user_id=effective_user_id,
                         tenant_id=tenant_id,
                     )
                     _round_reservation_id = None
@@ -2511,7 +2549,7 @@ async def call_agent_llm_with_tools(
                             result = await execute_tool(
                                 tool_name, args,
                                 agent_id=agent_id,
-                                user_id=agent.creator_id,
+                                user_id=effective_user_id,
                                 session_id=session_id,
                                 saas_tier=route_meta.saas_tier if route_meta else None,
                             )

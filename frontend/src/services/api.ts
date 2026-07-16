@@ -476,6 +476,9 @@ export const enterpriseApi = {
         return request<any[]>(`/enterprise/llm-models${tid ? `?tenant_id=${tid}` : ''}`);
     },
 
+    platformLlmModels: () =>
+        request<any[]>('/enterprise/llm-models?platform_only=true'),
+
     setDefaultModel: (modelId: string) =>
         request<void>(`/enterprise/llm-models/${modelId}/set-default`, { method: 'POST' }),
     templates: () => request<any[]>('/agents/templates'),

@@ -9,19 +9,17 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import and_, cast, func, or_, select
+from sqlalchemy.dialects.postgresql import JSONB
 
 from app.database import async_session
+from app.models.llm import LLMModel
 from app.models.subscription import ModelRoute
 from app.services.entitlements import get_tenant_entitlements
 from app.services.modalities import canonicalize_modality, modality_match_values
 from app.services.quota_guard import QuotaExceeded
-
-if TYPE_CHECKING:
-    from app.models.llm import LLMModel
-
 
 # Internal tier mapping: user-facing SaaS tiers -> model tiers and quota weights
 SAAS_TIER_ORDER = ("lite", "pro", "ultra")
@@ -42,6 +40,47 @@ class ResolvedRoute:
     modality: str
     provider: str
     model_name: str
+
+
+def _model_modality_predicate(route_modality: str | Any):
+    """SQL predicate mirroring ``model_supports_modality`` for route lookup."""
+
+    model_modality = func.lower(func.coalesce(LLMModel.modality, ""))
+    model_modalities = cast(LLMModel.modalities, JSONB)
+    declared_count = func.coalesce(func.jsonb_array_length(model_modalities), 0)
+    if isinstance(route_modality, str):
+        values = modality_match_values(route_modality)
+        predicates = [
+            and_(
+                declared_count > 0,
+                or_(*(func.jsonb_exists(model_modalities, value) for value in values)),
+            ),
+            and_(declared_count == 0, model_modality.in_(values)),
+        ]
+        if canonicalize_modality(route_modality) == "image":
+            predicates.append(LLMModel.supports_vision == True)  # noqa: E712
+        return or_(*predicates)
+
+    route_value = func.lower(route_modality)
+    return or_(
+        and_(
+            declared_count > 0,
+            or_(
+                func.jsonb_exists(model_modalities, route_value),
+                func.jsonb_exists(model_modalities, "multimodal"),
+                and_(route_value == "image", func.jsonb_exists(model_modalities, "vision")),
+            ),
+        ),
+        and_(
+            declared_count == 0,
+            or_(
+                model_modality == route_value,
+                model_modality == "multimodal",
+                and_(route_value == "image", model_modality == "vision"),
+            ),
+        ),
+        and_(route_value == "image", LLMModel.supports_vision == True),  # noqa: E712
+    )
 
 
 async def resolve_route(
@@ -143,10 +182,14 @@ async def _pick_route(saas_tier: str, modality: str) -> ModelRoute | None:
     async with async_session() as db:
         result = await db.execute(
             select(ModelRoute)
+            .join(LLMModel, LLMModel.id == ModelRoute.llm_model_id)
             .where(
                 ModelRoute.saas_tier == saas_tier,
                 ModelRoute.modality == modality,
                 ModelRoute.enabled == True,  # noqa: E712
+                LLMModel.tenant_id.is_(None),
+                LLMModel.enabled == True,  # noqa: E712
+                _model_modality_predicate(modality),
             )
             .order_by(
                 ModelRoute.priority.desc(),
@@ -162,9 +205,15 @@ async def _pick_route_by_id(route_id: uuid.UUID) -> ModelRoute | None:
     """Load a route by ID."""
     async with async_session() as db:
         result = await db.execute(
-            select(ModelRoute).where(
+            select(ModelRoute).join(
+                LLMModel,
+                LLMModel.id == ModelRoute.llm_model_id,
+            ).where(
                 ModelRoute.id == route_id,
                 ModelRoute.enabled == True,  # noqa: E712
+                LLMModel.tenant_id.is_(None),
+                LLMModel.enabled == True,  # noqa: E712
+                _model_modality_predicate(ModelRoute.modality),
             )
         )
         return result.scalar_one_or_none()
@@ -176,10 +225,14 @@ async def _load_model(
     enabled_only: bool = False,
 ) -> "LLMModel | None":
     """Load an LLMModel by ID."""
-    from app.models.llm import LLMModel
-
     async with async_session() as db:
-        conditions = [LLMModel.id == model_id]
+        conditions = [
+            LLMModel.id == model_id,
+            # ModelRoute is a global SaaS control-plane object.  A tenant-owned
+            # model row contains that tenant's provider identity and must never
+            # become another company's primary or fallback model.
+            LLMModel.tenant_id.is_(None),
+        ]
         if enabled_only:
             conditions.append(LLMModel.enabled == True)  # noqa: E712
         result = await db.execute(select(LLMModel).where(*conditions))

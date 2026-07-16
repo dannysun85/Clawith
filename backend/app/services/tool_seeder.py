@@ -14,6 +14,7 @@ from app.services.tool_config import (
 )
 from app.services.code_execution_policy import CODE_EXECUTION_TOOL_NAMES
 from app.services.agent_tool_assignments import upsert_agent_tool
+from app.services.tool_release_policy import RELEASE_DISABLED_TOOL_NAMES
 
 SYNC_IS_DEFAULT_TOOL_NAMES = {
     "finish",
@@ -1400,7 +1401,7 @@ BUILTIN_TOOLS = [
             "properties": {
                 "text": {"type": "string", "description": "Text to synthesize."},
                 "voice_id": {"type": "string", "description": "MiniMax voice_id. Default: tool config."},
-                "format": {"type": "string", "description": "Audio format: mp3, wav, flac, or pcm. Default: mp3."},
+                "format": {"type": "string", "description": "Browser-playable audio format: mp3, wav, or flac. Default: mp3."},
                 "save_path": {"type": "string", "description": "Save path in workspace. Default: auto."},
             },
             "required": ["text"],
@@ -1413,7 +1414,7 @@ BUILTIN_TOOLS = [
         "config_schema": {
             "fields": [
                 {"key": "voice_id", "label": "Voice ID", "type": "text", "default": "English_expressive_narrator"},
-                {"key": "format", "label": "Format", "type": "select", "default": "mp3", "options": ["mp3", "wav", "flac", "pcm"]},
+                {"key": "format", "label": "Format", "type": "select", "default": "mp3", "options": ["mp3", "wav", "flac"]},
                 {"key": "language_boost", "label": "Language Boost", "type": "text", "default": "auto", "advanced": True},
             ]
         },
@@ -2945,18 +2946,11 @@ AGENTBAY_TOOLS = [
     {
         "name": "agentbay_browser_login",
         "display_name": "AgentBay: Browser Login",
-        "description": "[ENV: Browser] Use AgentBay's AI-driven login skill to automate complex login flows (CAPTCHAs, OTP, multi-step auth) in the headless browser. This browser is ISOLATED from the Cloud Desktop and Code Sandbox.",
+        "description": "Release-disabled legacy login tool. Credentials must never be supplied by the model.",
         "category": "agentbay",
         "icon": "🔐",
         "is_default": False,
-        "parameters_schema": {
-            "type": "object",
-            "properties": {
-                "url": {"type": "string", "description": "The login page URL to navigate to"},
-                "login_config": {"type": "string", "description": "JSON string with login config"},
-            },
-            "required": ["url", "login_config"],
-        },
+        "parameters_schema": {"type": "object", "properties": {}},
         "config": {},
         "config_schema": {},
     },
@@ -3294,40 +3288,11 @@ AGENTBAY_TOOLS = [
     {
         "name": "agentbay_file_transfer",
         "display_name": "AgentBay: File Transfer",
-        "description": (
-            "Transfer a file between any two endpoints: the agent workspace, "
-            "the AgentBay browser environment, the cloud desktop, or the code sandbox. "
-            "Workspace -> env: upload a workspace file into a cloud environment. "
-            "Env -> workspace: download a file from a cloud environment into the workspace. "
-            "Env -> env: transfer between environments transparently (no workspace involvement)."
-        ),
+        "description": "Release-disabled until bounded provider transfer and durable approval contracts are available.",
         "category": "agentbay",
         "icon": "🔄",
         "is_default": False,
-        "parameters_schema": {
-            "type": "object",
-            "properties": {
-                "from_type": {
-                    "type": "string",
-                    "enum": ["workspace", "browser", "computer", "code"],
-                    "description": "Source endpoint: 'workspace' for agent workspace, or the AgentBay environment name.",
-                },
-                "from_path": {
-                    "type": "string",
-                    "description": "Source path. Relative if workspace (e.g. 'workspace/data.csv'), absolute if env (e.g. '/root/data.csv').",
-                },
-                "to_type": {
-                    "type": "string",
-                    "enum": ["workspace", "browser", "computer", "code"],
-                    "description": "Destination endpoint: 'workspace' for agent workspace, or the AgentBay environment name.",
-                },
-                "to_path": {
-                    "type": "string",
-                    "description": "Destination path. Relative if workspace (e.g. 'workspace/output.csv'), absolute if env (e.g. '/root/output.csv').",
-                },
-            },
-            "required": ["from_type", "from_path", "to_type", "to_path"],
-        },
+        "parameters_schema": {"type": "object", "properties": {}},
         "config": {},
         "config_schema": {},
     },
@@ -3651,6 +3616,7 @@ async def seed_builtin_tools():
             logger.info(f"[ToolSeeder] Merged legacy builtin tool into {new_name}")
 
         new_tool_ids = []
+        release_disabled_tool_ids = []
         for t in BUILTIN_TOOLS:
             seed_config = _global_builtin_config(t)
             result = await db.execute(select(Tool).where(Tool.name == t["name"]))
@@ -3668,15 +3634,26 @@ async def seed_builtin_tools():
                     config=seed_config,
                     config_schema=t.get("config_schema", {}),
                     source="builtin",
+                    enabled=t["name"] not in RELEASE_DISABLED_TOOL_NAMES,
                 )
                 db.add(tool)
                 await db.flush()  # get tool.id
-                if t["is_default"]:
+                if t["name"] in RELEASE_DISABLED_TOOL_NAMES:
+                    release_disabled_tool_ids.append(tool.id)
+                if t["is_default"] and t["name"] not in RELEASE_DISABLED_TOOL_NAMES:
                     new_tool_ids.append(tool.id)
                 logger.info("[ToolSeeder] Created builtin tool")
             else:
                 # Sync fields that may evolve
                 updated_fields = []
+                if t["name"] in RELEASE_DISABLED_TOOL_NAMES:
+                    release_disabled_tool_ids.append(existing.id)
+                    if existing.enabled:
+                        existing.enabled = False
+                        updated_fields.append("enabled")
+                    if existing.is_default:
+                        existing.is_default = False
+                        updated_fields.append("is_default")
                 if existing.category != t["category"]:
                     existing.category = t["category"]
                     updated_fields.append("category")
@@ -3730,6 +3707,22 @@ async def seed_builtin_tools():
                         "[ToolSeeder] Updated builtin tool field_count={}",
                         len(updated_fields),
                     )
+
+        if release_disabled_tool_ids:
+            disabled_assignments_r = await db.execute(
+                select(AgentTool).where(
+                    AgentTool.tool_id.in_(release_disabled_tool_ids),
+                    AgentTool.enabled.is_(True),
+                )
+            )
+            disabled_assignments = list(disabled_assignments_r.scalars().all())
+            for assignment in disabled_assignments:
+                assignment.enabled = False
+            if disabled_assignments:
+                logger.warning(
+                    "[ToolSeeder] Disabled release-fenced tool assignments count={}",
+                    len(disabled_assignments),
+                )
 
         # Auto-assign new default tools to all existing agents
         if new_tool_ids:

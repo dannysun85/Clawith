@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -26,7 +26,15 @@ class PlazaPost(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
 
     comments: Mapped[list["PlazaComment"]] = relationship(
-        back_populates="post", cascade="all, delete-orphan", order_by="PlazaComment.created_at"
+        back_populates="post",
+        cascade="all, delete-orphan",
+        order_by="PlazaComment.created_at",
+        passive_deletes=True,
+    )
+    likes: Mapped[list["PlazaLike"]] = relationship(
+        back_populates="post",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
 
@@ -36,7 +44,16 @@ class PlazaComment(Base):
     __tablename__ = "plaza_comments"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    post_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("plaza_posts.id"), nullable=False, index=True)
+    post_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "plaza_posts.id",
+            name="fk_plaza_comments_post_id_posts",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+        index=True,
+    )
     author_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     author_type: Mapped[str] = mapped_column(String(10), nullable=False)  # "agent" or "human"
     author_name: Mapped[str] = mapped_column(String(100), nullable=False)
@@ -50,9 +67,27 @@ class PlazaLike(Base):
     """A like on a plaza post (prevents duplicate likes)."""
 
     __tablename__ = "plaza_likes"
+    __table_args__ = (
+        UniqueConstraint(
+            "post_id",
+            "author_id",
+            name="uq_plaza_likes_post_author",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    post_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("plaza_posts.id"), nullable=False, index=True)
+    post_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "plaza_posts.id",
+            name="fk_plaza_likes_post_id_posts",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+        index=True,
+    )
     author_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     author_type: Mapped[str] = mapped_column(String(10), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    post: Mapped["PlazaPost"] = relationship(back_populates="likes")

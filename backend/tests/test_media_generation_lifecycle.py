@@ -1,4 +1,6 @@
+import asyncio
 import hashlib
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -12,6 +14,7 @@ from app.models.activity_log import AgentActivityLog
 from app.models.audit import ChatMessage
 from app.models.media_generation import MediaGenerationTask
 from app.models.notification import Notification
+from app.models.subscription import CreditReservation
 from app.services import media_generation
 from app.services import tool_seeder
 from app.services.media_assets import OverlayReceipt, VideoInfo
@@ -31,6 +34,71 @@ def test_media_generation_task_has_durable_recovery_identity():
     assert "completion_delivery_status" in columns
     assert "realtime_next_attempt_at" in columns
     assert "realtime_published_at" in columns
+
+
+@pytest.mark.asyncio
+async def test_public_media_metadata_never_exposes_private_recovery_identity(monkeypatch):
+    class Storage:
+        def __init__(self):
+            self.payload = ""
+
+        async def exists(self, _key):
+            return True
+
+        async def read_text(self, _key, **_kwargs):
+            return json.dumps(
+                {
+                    "status": "Processing",
+                    "credential_id": "legacy-credential",
+                    "reservation_id": "legacy-reservation",
+                    "recovery_asset_storage_key": "_internal/legacy.bin",
+                }
+            )
+
+        async def write_text(self, _key, payload):
+            self.payload = payload
+
+    storage = Storage()
+    task = SimpleNamespace(
+        id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        provider="minimax",
+        provider_task_id="provider-task",
+        metadata_path="workspace/media_tasks/task.json",
+        output_path="workspace/images/task.png",
+        request_metadata={
+            "prompt": "public prompt",
+            "credential_id": "private-credential",
+            "reservation_id": "private-reservation",
+            "recovery_asset_storage_key": "_internal/private.bin",
+            "provider_identity_evidence_storage_key": "_internal/identity.json",
+            "processing_lease_token": "private-lease",
+        },
+    )
+    monkeypatch.setattr(media_generation, "get_storage_backend", lambda: storage)
+
+    await media_generation._write_task_metadata(
+        task,
+        {
+            "status": "Success",
+            "credential_id": "update-credential",
+            "reservation_id": "update-reservation",
+            "acceptance_evidence_storage_key": "_internal/acceptance.json",
+        },
+    )
+
+    payload = json.loads(storage.payload)
+    assert payload["status"] == "Success"
+    assert payload["prompt"] == "public prompt"
+    assert payload["task_id"] == "provider-task"
+    assert not {
+        "credential_id",
+        "reservation_id",
+        "recovery_asset_storage_key",
+        "provider_identity_evidence_storage_key",
+        "acceptance_evidence_storage_key",
+        "processing_lease_token",
+    } & payload.keys()
 
 
 def test_worker_registers_media_generation_reconciliation_daemon():
@@ -151,6 +219,152 @@ async def test_origin_session_must_match_agent_and_authenticated_user():
 
 
 @pytest.mark.asyncio
+async def test_video_provider_identity_recovers_from_private_evidence(monkeypatch):
+    record_id = uuid.uuid4()
+    tenant_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    credential_id = uuid.uuid4()
+    evidence_key = media_generation.minimax_video_provider_identity_evidence_key(
+        agent_id,
+        record_id,
+    )
+    task = SimpleNamespace(
+        id=record_id,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        credential_id=credential_id,
+        reservation_id=uuid.uuid4(),
+        provider="minimax",
+        modality="video",
+        model="MiniMax-Hailuo-2.3",
+        provider_task_id=None,
+        status="submission_ambiguous",
+        completed_at=datetime.now(timezone.utc),
+        next_poll_at=None,
+        last_error="database attachment failed",
+        consecutive_error_count=2,
+        output_path="workspace/videos/recovered.mp4",
+        metadata_path="workspace/videos/recovered.json",
+        request_metadata={
+            "provider_identity_evidence_storage_key": evidence_key,
+        },
+    )
+    objects: dict[str, bytes] = {}
+
+    class Storage:
+        async def exists(self, key):
+            return key in objects
+
+        async def write_bytes(self, key, data, content_type=None):
+            assert content_type == "application/json"
+            objects[key] = data
+
+        async def read_bytes(self, key):
+            return objects[key]
+
+        async def delete(self, key):
+            objects.pop(key, None)
+
+    class Result:
+        def scalar_one_or_none(self):
+            return None
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            return task
+
+        async def execute(self, _statement):
+            return Result()
+
+        async def commit(self):
+            return None
+
+    storage = Storage()
+    monkeypatch.setattr(media_generation, "get_storage_backend", lambda: storage)
+    await media_generation.store_minimax_video_provider_identity_evidence(
+        record_id=record_id,
+        agent_id=agent_id,
+        tenant_id=tenant_id,
+        credential_id=credential_id,
+        model=task.model,
+        provider_task_id="provider-task-recovered",
+    )
+    assert b"provider-task-recovered" not in objects[evidence_key]
+
+    monkeypatch.setattr(media_generation, "async_session", lambda: Session())
+    write_metadata = AsyncMock()
+    monkeypatch.setattr(media_generation, "_write_task_metadata", write_metadata)
+
+    recovered = await media_generation._recover_minimax_video_provider_identity(task)
+
+    assert recovered is task
+    assert task.provider_task_id == "provider-task-recovered"
+    assert task.status == "submitted"
+    assert task.completed_at is None
+    assert evidence_key not in objects
+    assert "provider_identity_evidence_storage_key" not in task.request_metadata
+    write_metadata.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_video_provider_identity_evidence_rejects_scope_change(monkeypatch):
+    record_id = uuid.uuid4()
+    tenant_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    original_credential_id = uuid.uuid4()
+    evidence_key = media_generation.minimax_video_provider_identity_evidence_key(
+        agent_id,
+        record_id,
+    )
+    objects: dict[str, bytes] = {}
+
+    class Storage:
+        async def exists(self, key):
+            return key in objects
+
+        async def write_bytes(self, key, data, content_type=None):
+            objects[key] = data
+
+        async def read_bytes(self, key):
+            return objects[key]
+
+    monkeypatch.setattr(
+        media_generation,
+        "get_storage_backend",
+        lambda: Storage(),
+    )
+    await media_generation.store_minimax_video_provider_identity_evidence(
+        record_id=record_id,
+        agent_id=agent_id,
+        tenant_id=tenant_id,
+        credential_id=original_credential_id,
+        model="MiniMax-Hailuo-2.3",
+        provider_task_id="provider-task-private",
+    )
+    task = SimpleNamespace(
+        id=record_id,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        credential_id=uuid.uuid4(),
+        provider_task_id=None,
+        model="MiniMax-Hailuo-2.3",
+        output_path="workspace/videos/private.mp4",
+        request_metadata={
+            "provider_identity_evidence_storage_key": evidence_key,
+        },
+    )
+
+    with pytest.raises(media_generation.MediaContractError, match="credential_id"):
+        await media_generation._recover_minimax_video_provider_identity(task)
+
+
+@pytest.mark.asyncio
 async def test_duplicate_provider_task_releases_new_reservation_and_returns_canonical(monkeypatch):
     reservation_id = uuid.uuid4()
     agent_id = uuid.uuid4()
@@ -268,6 +482,7 @@ async def test_reconciliation_stores_valid_mp4_before_settlement_and_is_idempote
             "overlay_position": "bottom",
         },
         last_error=None,
+        output_size=None,
         created_at=datetime.now(timezone.utc),
         completed_at=None,
     )
@@ -275,6 +490,12 @@ async def test_reconciliation_stores_valid_mp4_before_settlement_and_is_idempote
     class FakeStorage:
         async def exists(self, key: str) -> bool:
             return key in objects
+
+        async def is_file(self, key: str) -> bool:
+            return key in objects
+
+        async def read_bytes(self, key: str) -> bytes:
+            return objects[key]
 
         async def write_bytes(self, key: str, data: bytes, content_type: str | None = None) -> None:
             assert content_type == "video/mp4"
@@ -287,8 +508,12 @@ async def test_reconciliation_stores_valid_mp4_before_settlement_and_is_idempote
         task.completed_at = datetime.now(timezone.utc)
         return task
 
-    async def mark_settlement_ready(*_args, **_kwargs):
+    async def store_authoritative(_record_id, data, **_kwargs):
+        events.append("store")
+        objects[media_generation.agent_storage_key(task.agent_id, task.output_path)] = data
         task.status = "settlement_ready"
+        task.last_response = _kwargs["status_data"]
+        task.output_size = len(data)
         return task
 
     async def overlay(
@@ -315,8 +540,13 @@ async def test_reconciliation_stores_valid_mp4_before_settlement_and_is_idempote
     monkeypatch.setattr(media_generation, "_claim_success_download", AsyncMock(return_value=("claimed", task)))
     monkeypatch.setattr(
         media_generation,
-        "_mark_settlement_ready",
-        AsyncMock(side_effect=mark_settlement_ready),
+        "_store_authoritative_media_output",
+        AsyncMock(side_effect=store_authoritative),
+    )
+    monkeypatch.setattr(
+        media_generation,
+        "_stored_media_output_is_usable",
+        AsyncMock(return_value=True),
     )
     monkeypatch.setattr(media_generation, "_finalize_success", AsyncMock(side_effect=finalize))
     monkeypatch.setattr(media_generation, "_write_task_metadata", AsyncMock())
@@ -373,6 +603,7 @@ async def test_succeeded_task_with_missing_object_redownloads_without_duplicate_
         request_metadata={},
         last_response={"status": "Success", "file_id": "file-repair"},
         last_error=None,
+        output_size=None,
         created_at=datetime.now(timezone.utc),
         completed_at=datetime.now(timezone.utc),
     )
@@ -395,6 +626,9 @@ async def test_succeeded_task_with_missing_object_redownloads_without_duplicate_
         async def exists(self, key):
             return key in objects
 
+        async def is_file(self, key):
+            return key in objects
+
         async def write_bytes(self, key, data, content_type=None):
             assert content_type == "video/mp4"
             objects[key] = data
@@ -409,8 +643,11 @@ async def test_succeeded_task_with_missing_object_redownloads_without_duplicate_
         task.status = "asset_repairing"
         return task
 
-    async def mark_ready(*_args, **_kwargs):
+    async def store_authoritative(_record_id, data, **_kwargs):
+        objects[media_generation.agent_storage_key(task.agent_id, task.output_path)] = data
         task.status = "settlement_ready"
+        task.last_response = _kwargs["status_data"]
+        task.output_size = len(data)
         return task
 
     async def finalize(*_args, **_kwargs):
@@ -426,7 +663,16 @@ async def test_succeeded_task_with_missing_object_redownloads_without_duplicate_
         "_claim_success_download",
         AsyncMock(return_value=("claimed", task)),
     )
-    monkeypatch.setattr(media_generation, "_mark_settlement_ready", mark_ready)
+    monkeypatch.setattr(
+        media_generation,
+        "_store_authoritative_media_output",
+        store_authoritative,
+    )
+    monkeypatch.setattr(
+        media_generation,
+        "_stored_media_output_is_usable",
+        AsyncMock(side_effect=[False, True, True]),
+    )
     finalize_success = AsyncMock(side_effect=finalize)
     monkeypatch.setattr(media_generation, "_finalize_success", finalize_success)
     monkeypatch.setattr(media_generation, "_write_task_metadata", AsyncMock())
@@ -536,6 +782,7 @@ async def test_tampered_exact_copy_holds_provider_debt_for_asset_repair(monkeypa
         request_metadata={
             "overlay_text": "被篡改的文案",
             "overlay_text_sha256": hashlib.sha256("原始文案".encode("utf-8")).hexdigest(),
+            "processing_lease_token": "lease-a",
         },
         last_error=None,
         created_at=datetime.now(timezone.utc),
@@ -546,10 +793,10 @@ async def test_tampered_exact_copy_holds_provider_debt_for_asset_repair(monkeypa
         async def exists(self, _key):
             return False
 
-    async def record_asset_failure(_record_id, error, _status_data):
+    async def record_asset_failure(_record_id, error, _status_data, **_kwargs):
         task.status = "asset_repairing"
         task.last_error = str(error)
-        return task
+        return True, task
 
     asset_failure_mock = AsyncMock(side_effect=record_asset_failure)
     finalize_failure_mock = AsyncMock()
@@ -606,16 +853,25 @@ async def test_settlement_ready_retries_local_settlement_without_provider_call(m
         id=uuid.uuid4(),
         agent_id=uuid.uuid4(),
         reservation_id=uuid.uuid4(),
+        modality="video",
         status="settlement_ready",
         output_path="workspace/videos/result.mp4",
         output_size=123,
+        request_metadata={},
         last_response={"status": "Success", "file_id": "file-1"},
         completed_at=None,
     )
+    stored_video = b"v" * 123
 
     class Storage:
         async def exists(self, _key):
             return True
+
+        async def is_file(self, _key):
+            return True
+
+        async def read_bytes(self, _key):
+            return stored_video
 
     async def finalize(*_args, **_kwargs):
         task.status = "succeeded"
@@ -628,6 +884,11 @@ async def test_settlement_ready_retries_local_settlement_without_provider_call(m
     monkeypatch.setattr(media_generation, "get_storage_backend", lambda: Storage())
     monkeypatch.setattr(media_generation, "_finalize_success", finalize_success)
     monkeypatch.setattr(media_generation, "_write_task_metadata", AsyncMock())
+    monkeypatch.setattr(
+        media_generation,
+        "validate_generated_video",
+        AsyncMock(return_value=VideoInfo(640, 360, 1.0, "h264", "yuv420p", "aac", True)),
+    )
     monkeypatch.setattr(
         "app.services.agent_tools._load_minimax_tool_credential_by_id",
         provider_load,
@@ -646,12 +907,544 @@ async def test_settlement_ready_retries_local_settlement_without_provider_call(m
 
 
 @pytest.mark.asyncio
+async def test_operator_closed_task_never_reenters_provider_or_storage_pipeline(monkeypatch):
+    task = SimpleNamespace(
+        id=uuid.uuid4(),
+        agent_id=None,
+        status="closed_nonrefundable",
+        last_error="Operator resolution close_asset_loss",
+    )
+    provider_load = AsyncMock()
+    monkeypatch.setattr(media_generation, "_load_task", AsyncMock(return_value=task))
+    monkeypatch.setattr(
+        media_generation,
+        "get_storage_backend",
+        lambda: pytest.fail("closed task must not access storage"),
+    )
+    monkeypatch.setattr(
+        "app.services.agent_tools._load_minimax_tool_credential_by_id",
+        provider_load,
+    )
+
+    outcome = await media_generation.reconcile_minimax_video_task(task.id)
+
+    assert outcome.status == "failed"
+    assert outcome.error == task.last_error
+    assert task.status == "closed_nonrefundable"
+    provider_load.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_operator_closed_task_is_terminal_for_every_transition_helper(monkeypatch):
+    task = SimpleNamespace(
+        id=uuid.uuid4(),
+        status="closed_nonrefundable",
+        request_metadata={"processing_lease_token": "closed-token"},
+        completion_message_id=None,
+        realtime_published_at=None,
+    )
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            return task
+
+        async def commit(self):
+            pytest.fail("terminal task must not be committed by a transition helper")
+
+    monkeypatch.setattr(media_generation, "async_session", lambda: Session())
+    monkeypatch.setattr(
+        media_generation,
+        "get_settings",
+        lambda: SimpleNamespace(MEDIA_GENERATION_TASK_LEASE_SECONDS=1800),
+    )
+
+    claim, claimed_task = await media_generation._claim_success_download(task.id)
+    assert claim == "failed"
+    assert claimed_task is task
+    with pytest.raises(media_generation.MediaContractError, match="lease is stale"):
+        await media_generation._store_authoritative_media_output(
+            task.id,
+            b"never-written",
+            content_type="video/mp4",
+            status_data={
+                "status": "Success",
+                "_astra_output_sha256": hashlib.sha256(b"never-written").hexdigest(),
+            },
+            expected_working_status="downloading",
+            processing_lease_token="closed-token",
+        )
+    with pytest.raises(ValueError, match="Terminal media generation task"):
+        await media_generation._finalize_success(task.id, {"status": "Success"}, 10)
+    assert await media_generation._finalize_failure(task.id, "late failure", None) is task
+    assert task.status == "closed_nonrefundable"
+
+
+@pytest.mark.asyncio
+async def test_media_reconciliation_is_bounded_and_isolates_one_task_failure(monkeypatch):
+    task_ids = [uuid.uuid4() for _ in range(5)]
+    active = 0
+    max_active = 0
+    completed: list[uuid.UUID] = []
+
+    async def reconcile(task_id):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        try:
+            await asyncio.sleep(0.01)
+            if task_id == task_ids[1]:
+                raise RuntimeError("one task crashed")
+            completed.append(task_id)
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(
+        media_generation,
+        "_claim_due_task_ids",
+        AsyncMock(return_value=task_ids),
+    )
+    tasks = {
+        task_id: SimpleNamespace(id=task_id, modality="video")
+        for task_id in task_ids
+    }
+    monkeypatch.setattr(
+        media_generation,
+        "_load_task",
+        AsyncMock(side_effect=lambda task_id: tasks[task_id]),
+    )
+    monkeypatch.setattr(media_generation, "reconcile_minimax_video_task", reconcile)
+    monkeypatch.setattr(
+        media_generation,
+        "get_settings",
+        lambda: SimpleNamespace(MEDIA_GENERATION_RECONCILIATION_CONCURRENCY=2),
+    )
+
+    assert await media_generation.reconcile_pending_media_generation_tasks() == 5
+    assert max_active == 2
+    assert set(completed) == set(task_ids) - {task_ids[1]}
+
+
+@pytest.mark.asyncio
+async def test_claimed_media_task_uses_configured_long_lease(monkeypatch):
+    now = datetime.now(timezone.utc)
+    task = SimpleNamespace(
+        id=uuid.uuid4(),
+        status="processing",
+        next_poll_at=None,
+        last_checked_at=None,
+        request_metadata={},
+    )
+
+    class Session:
+        committed = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            return task
+
+        async def commit(self):
+            self.committed = True
+
+    session = Session()
+    monkeypatch.setattr(media_generation, "async_session", lambda: session)
+    monkeypatch.setattr(media_generation, "_utcnow", lambda: now)
+    monkeypatch.setattr(
+        media_generation,
+        "get_settings",
+        lambda: SimpleNamespace(MEDIA_GENERATION_TASK_LEASE_SECONDS=1800),
+    )
+
+    claim, _ = await media_generation._claim_success_download(task.id)
+
+    assert claim == "claimed"
+    assert task.next_poll_at == now + timedelta(seconds=1800)
+    assert session.committed is True
+
+
+@pytest.mark.asyncio
+async def test_daemon_reclaims_stale_downloading_task_without_renewing_busy_forever(monkeypatch):
+    now = datetime.now(timezone.utc)
+    task = SimpleNamespace(
+        id=uuid.uuid4(),
+        status="downloading",
+        attempt_count=2,
+        next_poll_at=now - timedelta(seconds=1),
+    )
+
+    class Result:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [task]
+
+    class Session:
+        committed = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def execute(self, _statement):
+            return Result()
+
+        async def commit(self):
+            self.committed = True
+
+    session = Session()
+    monkeypatch.setattr(media_generation, "async_session", lambda: session)
+    monkeypatch.setattr(media_generation, "_utcnow", lambda: now)
+    monkeypatch.setattr(
+        media_generation,
+        "get_settings",
+        lambda: SimpleNamespace(
+            MEDIA_GENERATION_BATCH_SIZE=20,
+            MEDIA_GENERATION_TASK_LEASE_SECONDS=1800,
+        ),
+    )
+
+    assert await media_generation._claim_due_task_ids() == [task.id]
+    assert task.status == "asset_repairing"
+    assert task.attempt_count == 3
+    assert task.next_poll_at == now + timedelta(seconds=1800)
+    assert session.committed is True
+
+
+@pytest.mark.asyncio
+async def test_agent_brand_asset_cleanup_deletes_every_private_object(monkeypatch):
+    agent_id = uuid.uuid4()
+    tasks = []
+    expected_keys = []
+    for suffix in ("png", "jpg"):
+        task_id = uuid.uuid4()
+        key = media_generation.minimax_video_brand_asset_key(
+            agent_id, task_id, suffix
+        )
+        tasks.append(
+            SimpleNamespace(
+                id=task_id,
+                agent_id=agent_id,
+                request_metadata={"brand_asset_storage_key": key},
+            )
+        )
+        expected_keys.append(key)
+
+    class Result:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return tasks
+
+    class IntentDB:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def execute(self, _statement):
+            return Result()
+
+        async def commit(self):
+            return None
+
+    class FinalizeDB:
+        def __init__(self, task):
+            self.task = task
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            return self.task
+
+        async def commit(self):
+            return None
+
+    deleted = []
+
+    class Storage:
+        async def delete(self, key):
+            deleted.append(key)
+
+    sessions = iter([IntentDB(), *(FinalizeDB(task) for task in tasks)])
+    monkeypatch.setattr(media_generation, "async_session", lambda: next(sessions))
+    monkeypatch.setattr(media_generation, "get_storage_backend", lambda: Storage())
+
+    count = await media_generation.delete_private_video_brand_assets_for_agent(agent_id)
+
+    assert count == 2
+    assert deleted == expected_keys
+    for task in tasks:
+        assert "brand_asset_storage_key" not in task.request_metadata
+        assert "brand_asset_deleted_with_agent_at" in task.request_metadata
+
+
+@pytest.mark.asyncio
+async def test_expired_private_brand_asset_cleanup_is_filtered_before_batch_limit(monkeypatch):
+    now = datetime.now(timezone.utc)
+    agent_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    key = media_generation.minimax_video_brand_asset_key(agent_id, task_id, "png")
+    task = SimpleNamespace(
+        id=task_id,
+        agent_id=agent_id,
+        status="succeeded",
+        completed_at=now - timedelta(days=31),
+        request_metadata={"brand_asset_storage_key": key},
+    )
+    statements = []
+
+    class Result:
+        def all(self):
+            return [(task.id,)]
+
+    class Session:
+        committed = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def execute(self, statement):
+            statements.append(statement)
+            return Result()
+
+        async def get(self, *_args, **_kwargs):
+            return task
+
+        async def commit(self):
+            self.committed = True
+
+    deleted = []
+
+    class Storage:
+        async def delete(self, storage_key):
+            deleted.append(storage_key)
+
+    session = Session()
+    monkeypatch.setattr(media_generation, "async_session", lambda: session)
+    monkeypatch.setattr(media_generation, "get_storage_backend", lambda: Storage())
+    monkeypatch.setattr(media_generation, "_load_task", AsyncMock(return_value=task))
+    monkeypatch.setattr(
+        media_generation,
+        "_stored_media_output_is_usable",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        media_generation,
+        "get_settings",
+        lambda: SimpleNamespace(
+            MEDIA_GENERATION_BRAND_RECOVERY_RETENTION_DAYS=30,
+            MEDIA_GENERATION_BATCH_SIZE=20,
+        ),
+    )
+
+    assert await media_generation.cleanup_expired_video_brand_assets(now=now) == 1
+    assert deleted == [key]
+    assert "brand_asset_storage_key" not in task.request_metadata
+    assert task.request_metadata["brand_asset_retention_expired_at"] == now.isoformat()
+    assert session.committed is True
+    compiled = statements[0].compile(dialect=postgresql.dialect())
+    sql = str(compiled)
+    assert "brand_asset_storage_key" in compiled.params.values()
+    assert "LIMIT" in sql
+
+
+@pytest.mark.asyncio
+async def test_expired_private_brand_asset_cleanup_retries_storage_failure(monkeypatch):
+    now = datetime.now(timezone.utc)
+    agent_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    key = media_generation.minimax_video_brand_asset_key(agent_id, task_id, "png")
+    task = SimpleNamespace(
+        id=task_id,
+        agent_id=agent_id,
+        status="failed",
+        completed_at=now,
+        request_metadata={"brand_asset_storage_key": key},
+    )
+
+    class Result:
+        def all(self):
+            return [(task.id,)]
+
+    class Session:
+        committed = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def execute(self, _statement):
+            return Result()
+
+        async def commit(self):
+            self.committed = True
+
+    class Storage:
+        async def delete(self, _storage_key):
+            raise OSError("object store unavailable")
+
+    session = Session()
+    monkeypatch.setattr(media_generation, "async_session", lambda: session)
+    monkeypatch.setattr(media_generation, "get_storage_backend", lambda: Storage())
+    monkeypatch.setattr(media_generation, "_load_task", AsyncMock(return_value=task))
+    monkeypatch.setattr(
+        media_generation,
+        "get_settings",
+        lambda: SimpleNamespace(
+            MEDIA_GENERATION_BRAND_RECOVERY_RETENTION_DAYS=30,
+            MEDIA_GENERATION_BATCH_SIZE=20,
+        ),
+    )
+
+    assert await media_generation.cleanup_expired_video_brand_assets(now=now) == 0
+    assert task.request_metadata == {"brand_asset_storage_key": key}
+    assert session.committed is False
+
+
+@pytest.mark.asyncio
+async def test_agent_brand_asset_delete_commits_intent_before_object_io(monkeypatch):
+    agent_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    key = media_generation.minimax_video_brand_asset_key(agent_id, task_id, "png")
+    task = SimpleNamespace(
+        id=task_id,
+        agent_id=agent_id,
+        request_metadata={"brand_asset_storage_key": key},
+    )
+    events: list[str] = []
+
+    class Result:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [task]
+
+    class IntentSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def execute(self, _statement):
+            return Result()
+
+        async def commit(self):
+            events.append("intent_committed")
+
+    class FinalizeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            return task
+
+        async def commit(self):
+            events.append("ack_committed")
+
+    class Storage:
+        async def delete(self, storage_key):
+            assert storage_key == key
+            assert events == ["intent_committed"]
+            assert task.request_metadata["brand_asset_delete_reason"] == "agent_deletion"
+            events.append("object_deleted")
+
+    sessions = iter((IntentSession(), FinalizeSession()))
+    monkeypatch.setattr(media_generation, "async_session", lambda: next(sessions))
+    monkeypatch.setattr(media_generation, "get_storage_backend", lambda: Storage())
+
+    assert await media_generation.delete_private_video_brand_assets_for_agent(agent_id) == 1
+    assert events == ["intent_committed", "object_deleted", "ack_committed"]
+    assert "brand_asset_storage_key" not in task.request_metadata
+    assert task.request_metadata["brand_asset_deleted_with_agent_at"]
+
+
+@pytest.mark.asyncio
+async def test_agent_brand_asset_delete_failure_keeps_durable_retry_intent(monkeypatch):
+    agent_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    key = media_generation.minimax_video_brand_asset_key(agent_id, task_id, "png")
+    task = SimpleNamespace(
+        id=task_id,
+        agent_id=agent_id,
+        request_metadata={"brand_asset_storage_key": key},
+    )
+    committed = False
+
+    class Result:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [task]
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def execute(self, _statement):
+            return Result()
+
+        async def commit(self):
+            nonlocal committed
+            committed = True
+
+    class Storage:
+        async def delete(self, _storage_key):
+            assert committed is True
+            raise OSError("object store unavailable")
+
+    monkeypatch.setattr(media_generation, "async_session", lambda: Session())
+    monkeypatch.setattr(media_generation, "get_storage_backend", lambda: Storage())
+
+    with pytest.raises(OSError, match="object store unavailable"):
+        await media_generation.delete_private_video_brand_assets_for_agent(agent_id)
+
+    assert task.request_metadata["brand_asset_storage_key"] == key
+    assert task.request_metadata["brand_asset_delete_request_id"]
+    assert task.request_metadata["brand_asset_delete_reason"] == "agent_deletion"
+
+
+@pytest.mark.asyncio
 async def test_success_completion_persists_one_message_and_exact_session_deep_link(monkeypatch):
+    tenant_id = uuid.uuid4()
     agent_id = uuid.uuid4()
     user_id = uuid.uuid4()
     session_id = uuid.uuid4()
     task = SimpleNamespace(
         id=uuid.uuid4(),
+        tenant_id=tenant_id,
         agent_id=agent_id,
         user_id=user_id,
         reservation_id=uuid.uuid4(),
@@ -671,6 +1464,14 @@ async def test_success_completion_persists_one_message_and_exact_session_deep_li
         consecutive_error_count=2,
         last_checked_at=None,
         next_poll_at=None,
+    )
+    reservation = SimpleNamespace(
+        id=task.reservation_id,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        user_id=user_id,
+        ref_type="media_task",
+        ref_id=task.id,
     )
     chat_session = SimpleNamespace(
         id=session_id,
@@ -696,6 +1497,8 @@ async def test_success_completion_persists_one_message_and_exact_session_deep_li
         async def get(self, model, _record_id, **_kwargs):
             if model is MediaGenerationTask:
                 return task
+            if model is CreditReservation:
+                return reservation
             return None
 
         async def execute(self, _statement):
@@ -891,8 +1694,10 @@ async def test_reconciliation_keeps_accepted_task_recoverable_on_quota_poll_erro
 
 @pytest.mark.asyncio
 async def test_transient_recovery_errors_are_bounded_and_release_once(monkeypatch):
+    tenant_id = uuid.uuid4()
     task = SimpleNamespace(
         id=uuid.uuid4(),
+        tenant_id=tenant_id,
         status="retrying",
         reservation_id=uuid.uuid4(),
         user_id=None,
@@ -905,6 +1710,15 @@ async def test_transient_recovery_errors_are_bounded_and_release_once(monkeypatc
         completed_at=None,
         next_poll_at=datetime.now(timezone.utc),
     )
+    reservation = SimpleNamespace(
+        id=task.reservation_id,
+        tenant_id=tenant_id,
+        agent_id=task.agent_id,
+        user_id=task.user_id,
+        ref_type="media_task",
+        ref_id=task.id,
+        status="reserved",
+    )
 
     class Session:
         async def __aenter__(self):
@@ -913,8 +1727,8 @@ async def test_transient_recovery_errors_are_bounded_and_release_once(monkeypatc
         async def __aexit__(self, *_args):
             return None
 
-        async def get(self, *_args, **_kwargs):
-            return task
+        async def get(self, model, *_args, **_kwargs):
+            return task if model is MediaGenerationTask else reservation
 
         async def commit(self):
             return None
@@ -952,8 +1766,10 @@ async def test_transient_recovery_errors_are_bounded_and_release_once(monkeypatc
 
 @pytest.mark.asyncio
 async def test_accepted_provider_task_is_not_refunded_after_retry_threshold(monkeypatch):
+    tenant_id = uuid.uuid4()
     task = SimpleNamespace(
         id=uuid.uuid4(),
+        tenant_id=tenant_id,
         status="retrying",
         provider_task_id="accepted-provider-task",
         reservation_id=uuid.uuid4(),
@@ -965,6 +1781,15 @@ async def test_accepted_provider_task_is_not_refunded_after_retry_threshold(monk
         last_checked_at=None,
         next_poll_at=datetime.now(timezone.utc),
     )
+    reservation = SimpleNamespace(
+        id=task.reservation_id,
+        tenant_id=tenant_id,
+        agent_id=task.agent_id,
+        user_id=task.user_id,
+        ref_type="media_task",
+        ref_id=task.id,
+        status="provider_inflight",
+    )
 
     class Session:
         async def __aenter__(self):
@@ -973,8 +1798,8 @@ async def test_accepted_provider_task_is_not_refunded_after_retry_threshold(monk
         async def __aexit__(self, *_args):
             return None
 
-        async def get(self, *_args, **_kwargs):
-            return task
+        async def get(self, model, *_args, **_kwargs):
+            return task if model is MediaGenerationTask else reservation
 
         async def commit(self):
             return None
@@ -1070,8 +1895,10 @@ async def test_stale_provider_inflight_submission_without_task_id_keeps_hold(mon
 
 @pytest.mark.asyncio
 async def test_retry_threshold_does_not_release_provider_inflight_without_task_id(monkeypatch):
+    tenant_id = uuid.uuid4()
     task = SimpleNamespace(
         id=uuid.uuid4(),
+        tenant_id=tenant_id,
         status="retrying",
         provider_task_id=None,
         reservation_id=uuid.uuid4(),
@@ -1084,7 +1911,15 @@ async def test_retry_threshold_does_not_release_provider_inflight_without_task_i
         completed_at=None,
         next_poll_at=datetime.now(timezone.utc),
     )
-    reservation = SimpleNamespace(status="provider_inflight")
+    reservation = SimpleNamespace(
+        id=task.reservation_id,
+        tenant_id=tenant_id,
+        agent_id=task.agent_id,
+        user_id=task.user_id,
+        ref_type="media_task",
+        ref_id=task.id,
+        status="provider_inflight",
+    )
 
     class Session:
         async def __aenter__(self):

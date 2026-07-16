@@ -93,9 +93,20 @@ async def create_task(
 
     task_out = await _enrich_task_out(task, db)
 
-    # Tasks are board records only in this release. Automatic execution is
-    # paused until a durable requester/session claim worker is available.
+    # Commit so the worker's independent session can see the durable task and
+    # requester identity before any model/tool call.
     await db.commit()
+
+    if data.type == "todo":
+        from app.services.task_executor import (
+            AUTOMATIC_TASK_EXECUTION_ENABLED,
+            execute_task,
+        )
+
+        if AUTOMATIC_TASK_EXECUTION_ENABLED:
+            import asyncio
+
+            asyncio.create_task(execute_task(task.id, agent_id))
 
     return task_out
 
@@ -114,6 +125,11 @@ async def update_task(
     task = result.scalar_one_or_none()
     if not task:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+    if task.created_by != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the task creator can change executable task content",
+        )
 
     update_data = data.model_dump(exclude_unset=True)
     if update_data.get("type") == "supervision" or any(
@@ -157,7 +173,7 @@ async def get_task_logs(
     result = await db.execute(
         select(TaskLog).where(TaskLog.task_id == task_id).order_by(TaskLog.created_at.asc())
     )
-    return [TaskLogOut.model_validate(l) for l in result.scalars().all()]
+    return [TaskLogOut.model_validate(log) for log in result.scalars().all()]
 
 
 @router.post("/{task_id}/logs", response_model=TaskLogOut, status_code=status.HTTP_201_CREATED)
@@ -200,10 +216,37 @@ async def trigger_task(
     task = result.scalar_one_or_none()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    raise HTTPException(
-        status_code=409,
-        detail=(
-            "Automatic task execution is paused in this release; the task "
-            "remains available as a task-board record"
-        ),
+    if task.created_by != current_user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the task creator can run this task",
+        )
+    if task.type == "supervision":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Supervision execution remains disabled until durable "
+                "exactly-once delivery is available"
+            ),
+        )
+    if task.status != "pending":
+        raise HTTPException(
+            status_code=409,
+            detail="Only a pending task can be started",
+        )
+
+    from app.services.task_executor import (
+        AUTOMATIC_TASK_EXECUTION_ENABLED,
+        execute_task,
     )
+
+    if not AUTOMATIC_TASK_EXECUTION_ENABLED:
+        raise HTTPException(
+            status_code=409,
+            detail="Task execution is disabled by the operator",
+        )
+
+    import asyncio
+
+    asyncio.create_task(execute_task(task.id, agent_id))
+    return {"status": "triggered", "task_id": str(task_id)}

@@ -432,16 +432,29 @@ async def assert_secured() -> None:
         ):
             raise SystemExit("MCP migration retained a shared cross-tenant grant")
 
-        file_transfer_enabled = (
+        file_transfer_state = (
             await db.execute(
-                select(AgentTool.__table__.c.enabled).where(
+                select(
+                    Tool.__table__.c.enabled.label("tool_enabled"),
+                    AgentTool.__table__.c.enabled.label("assignment_enabled"),
+                )
+                .join(
+                    AgentTool.__table__,
+                    AgentTool.__table__.c.tool_id == Tool.__table__.c.id,
+                )
+                .where(
                     AgentTool.__table__.c.agent_id == AGENT_ID,
-                    AgentTool.__table__.c.tool_id == FILE_TRANSFER_TOOL_ID,
+                    Tool.__table__.c.id == FILE_TRANSFER_TOOL_ID,
                 )
             )
-        ).scalar_one()
-        if file_transfer_enabled is not True:
-            raise SystemExit("Code migration changed a non-Code file-transfer grant")
+        ).one()
+        if (
+            file_transfer_state.tool_enabled is not False
+            or file_transfer_state.assignment_enabled is not False
+        ):
+            raise SystemExit(
+                "AgentBay file-transfer release policy did not converge"
+            )
 
         duplicate_rows = (
             await db.execute(

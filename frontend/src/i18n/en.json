@@ -327,7 +327,7 @@
       "fired": "Fired {{count}} times",
       "disabled": "Disabled",
       "configuredPaused": "Configured · execution paused",
-      "executionPausedDetail": "Automatic trigger and schedule execution is paused in this release. Configuration is retained and no Credits are consumed.",
+      "executionPausedDetail": "This automation is disabled by the platform safety switch. Configuration is retained and no Credits are consumed while it is disabled.",
       "scheduleAccepted": "Schedule request accepted",
       "disable": "Disable",
       "enable": "Enable",

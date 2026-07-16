@@ -4,6 +4,7 @@ import pytest
 
 from app.services.entitlements import Entitlements
 from app.services.media_capabilities import (
+    _credential_media_modalities,
     evaluate_media_capabilities,
     get_agent_media_capabilities,
 )
@@ -88,3 +89,27 @@ async def test_media_capability_pool_ignores_tenant_private_credentials():
 
     credential_query = str(db.statements[-1].compile())
     assert "llm_credentials.tenant_id IS NULL" in credential_query
+
+
+def test_media_capability_view_matches_pool_semantics_for_empty_capabilities():
+    empty = type("Credential", (), {"capabilities": []})()
+    legacy = type("Credential", (), {"capabilities": None})()
+    multimodal = type(
+        "Credential",
+        (),
+        {"capabilities": ["multimodal"]},
+    )()
+
+    assert _credential_media_modalities(empty) == set()
+    assert _credential_media_modalities(legacy) == {
+        "image",
+        "audio",
+        "music",
+        "video",
+    }
+    assert _credential_media_modalities(multimodal) == {
+        "image",
+        "audio",
+        "music",
+        "video",
+    }

@@ -334,6 +334,21 @@ async def _persist_validated_a2a_reply(
         await db.commit()
 
 
+class TriggerModelOutcomeError(RuntimeError):
+    """The LLM returned an error outcome encoded by the legacy string API."""
+
+
+def _successful_trigger_reply(reply: str | None, chunks: list[str]) -> str:
+    """Separate assistant content from the legacy LLM error-string contract."""
+
+    from app.services.llm import is_llm_error_result
+
+    final_reply = reply or "".join(chunks)
+    if is_llm_error_result(final_reply):
+        raise TriggerModelOutcomeError("Trigger LLM invocation did not produce content")
+    return final_reply
+
+
 async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTrigger]):
     from app.models.audit import ChatMessage
     from app.models.chat_session import ChatSession
@@ -692,6 +707,13 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
             skip_tools=True,
         )
 
+        # ``call_llm`` intentionally keeps a legacy string return contract for
+        # interactive chat. Background executions must classify those values
+        # before persisting, delivering, auditing, or marking a once-trigger
+        # complete. A failed/ambiguous provider or settlement outcome is not
+        # replayed here; the durable execution is terminally failed instead.
+        final_reply = _successful_trigger_reply(reply, collected_content)
+
         async with async_session() as db:
             from app.services.trigger_authorization import (
                 validate_active_trigger_principal,
@@ -712,13 +734,12 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
                 agent_id=agent_id,
                 conversation_id=str(session_id),
                 role="assistant",
-                content=reply or "".join(collected_content),
+                content=final_reply,
                 user_id=effective_user_id,
                 participant_id=agent_participant.id if agent_participant else None,
             ))
             await db.commit()
 
-        final_reply = reply or "".join(collected_content)
         if validated_a2a_target and final_reply:
             await _persist_validated_a2a_reply(
                 agent=agent,

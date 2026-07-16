@@ -12,6 +12,7 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.core.permissions import check_agent_access, is_agent_creator, is_agent_expired
 from app.core.security import get_current_user
 from app.database import async_session as _async_session, get_db
@@ -24,6 +25,7 @@ from app.services.media_message_content import sanitize_inline_media_content
 from app.services.storage import agent_upload_key, get_storage_backend, store_agent_upload
 
 router = APIRouter(tags=["feishu"])
+settings = get_settings()
 
 # Default LLM timeout for Feishu channel (fallback when model has no request_timeout set).
 # The per-model request_timeout field takes precedence — see _get_llm_timeout().
@@ -480,10 +482,19 @@ async def configure_channel(
     ))
     existing = result.scalar_one_or_none()
     if existing:
-        existing.app_id = data.app_id
-        existing.app_secret = data.app_secret
-        existing.encrypt_key = data.encrypt_key
-        existing.verification_token = data.verification_token
+        if data.app_id.strip():
+            existing.app_id = data.app_id.strip()
+        if data.app_secret.strip():
+            existing.app_secret = data.app_secret.strip()
+        if data.encrypt_key and data.encrypt_key.strip():
+            existing.encrypt_key = data.encrypt_key.strip()
+        if data.verification_token and data.verification_token.strip():
+            existing.verification_token = data.verification_token.strip()
+        if not existing.app_id or not existing.app_secret:
+            raise HTTPException(
+                status_code=422,
+                detail="app_id and app_secret are required",
+            )
         merged_extra_config = dict(existing.extra_config or {})
         if data.extra_config is not None:
             merged_extra_config.update(data.extra_config)
@@ -504,14 +515,19 @@ async def configure_channel(
 
     config = ChannelConfig(
         agent_id=agent_id,
-        channel_type=data.channel_type,
-        app_id=data.app_id,
-        app_secret=data.app_secret,
+        channel_type="feishu",
+        app_id=data.app_id.strip(),
+        app_secret=data.app_secret.strip(),
         encrypt_key=data.encrypt_key,
         verification_token=data.verification_token,
         extra_config=data.extra_config or {},
         is_configured=True,
     )
+    if not config.app_id or not config.app_secret:
+        raise HTTPException(
+            status_code=422,
+            detail="app_id and app_secret are required",
+        )
     db.add(config)
     await db.flush()
 
@@ -547,8 +563,14 @@ async def get_channel_config(
 
 
 @router.get("/agents/{agent_id}/channel/webhook-url")
-async def get_webhook_url(agent_id: uuid.UUID, request: Request, db: AsyncSession = Depends(get_db)):
+async def get_webhook_url(
+    agent_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """Get the webhook URL for this agent's Feishu bot."""
+    await check_agent_access(db, current_user, agent_id)
     from app.services.platform_service import platform_service
     public_base = await platform_service.get_public_base_url(db, request)
     return {"webhook_url": f"{public_base}/api/channel/feishu/{agent_id}/webhook"}
@@ -587,6 +609,11 @@ async def feishu_event_webhook(
     request: Request,
 ):
     """Handle Feishu event callback for a specific agent's bot."""
+    if not settings.FEISHU_WEBHOOK_ENABLED:
+        raise HTTPException(
+            status_code=503,
+            detail="Feishu webhook transport is disabled; use authenticated websocket mode",
+        )
     body = await request.json()
 
     # Handle verification challenge
@@ -1237,8 +1264,9 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
                     try:
                         from app.models.task import Task as TaskModel
                         from app.models.agent import Agent as AgentModel
-                        from app.services.task_executor import execute_task
-                        import asyncio as _asyncio
+                        from app.services.task_executor import (
+                            AUTOMATIC_TASK_EXECUTION_ENABLED,
+                        )
 
                         async with _async_session() as _task_db:
                             # Find the agent's creator to use as task creator
@@ -1257,8 +1285,9 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
                             await _task_db.commit()
                             await _task_db.refresh(task_obj)
                             _task_id = str(task_obj.id)
-                        _asyncio.create_task(execute_task(_task_id, agent_id))
                         reply_text += f"\n\n📋 已同步创建任务到任务面板：【{task_title}】"
+                        if not AUTOMATIC_TASK_EXECUTION_ENABLED:
+                            reply_text += "（已保存，自动执行暂时停用）"
                         logger.info(
                             "[Feishu] Created task title_chars={}",
                             len(task_title),

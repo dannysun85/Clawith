@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from app.config import get_settings
 
-# RC5 release policy: autonomous execution stays fail-closed until the
-# requester/session/generation intent worker has a durable authorization
-# protocol.  Keep this in the dependency-light config module so every entry
-# point (daemon, API tools, and the invoker itself) enforces the same gate.
-AUTOMATIC_TRIGGER_EXECUTION_ENABLED = False
+
+# Explicit user automation is operationally independent from platform-seeded
+# heartbeat/OKR work. Every entry point imports this same operator gate.
+AUTOMATIC_TRIGGER_EXECUTION_ENABLED = (
+    get_settings().USER_AUTOMATION_EXECUTION_ENABLED
+)
 
 
 SERVER_CONTEXT_VERSION_KEY = "_server_context_version"

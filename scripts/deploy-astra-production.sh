@@ -1,5 +1,69 @@
 #!/usr/bin/env bash
+{ set +x; } 2>/dev/null
 set -euo pipefail
+
+SMOKE_ENV_KEYS=(
+    SMOKE_TENANT_EMAIL
+    SMOKE_TENANT_PASSWORD
+    SMOKE_PLATFORM_ADMIN_EMAIL
+    SMOKE_PLATFORM_ADMIN_PASSWORD
+)
+SMOKE_ENV_VALUES=()
+
+capture_smoke_credentials() {
+    SMOKE_ENV_VALUES=(
+        "${SMOKE_TENANT_EMAIL-}"
+        "${SMOKE_TENANT_PASSWORD-}"
+        "${SMOKE_PLATFORM_ADMIN_EMAIL-}"
+        "${SMOKE_PLATFORM_ADMIN_PASSWORD-}"
+    )
+    unset SMOKE_TENANT_EMAIL SMOKE_TENANT_PASSWORD
+    unset SMOKE_PLATFORM_ADMIN_EMAIL SMOKE_PLATFORM_ADMIN_PASSWORD
+    export -n SMOKE_ENV_VALUES 2>/dev/null || true
+}
+
+assert_smoke_credentials_not_exported() {
+    python3 - "${SMOKE_ENV_KEYS[@]}" <<'PY_SMOKE_ENV_ISOLATION'
+import os
+import sys
+
+leaked = [key for key in sys.argv[1:] if key in os.environ]
+if leaked:
+    raise SystemExit("smoke credentials remained exported to local release gates")
+PY_SMOKE_ENV_ISOLATION
+}
+
+emit_smoke_credential_payload() {
+    python3 - "${SMOKE_ENV_KEYS[@]}" \
+        3< <(printf '%s\0' "${SMOKE_ENV_VALUES[@]}") <<'PY_SMOKE_CREDENTIAL_PAYLOAD'
+import json
+import os
+import sys
+
+keys = sys.argv[1:]
+raw = os.fdopen(3, "rb").read(65_537)
+if len(raw) > 65_536 or not raw.endswith(b"\0"):
+    raise SystemExit("invalid smoke credential input")
+encoded_values = raw[:-1].split(b"\0")
+if len(encoded_values) != len(keys):
+    raise SystemExit("invalid smoke credential count")
+values = [value.decode("utf-8") for value in encoded_values]
+payload = dict(zip(keys, values))
+data = (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+if len(data) > 16_384:
+    raise SystemExit("remote smoke credential payload is too large")
+sys.stdout.buffer.write(data)
+PY_SMOKE_CREDENTIAL_PAYLOAD
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || {
+        echo "missing required command: $1" >&2
+        exit 1
+    }
+}
+
+capture_smoke_credentials
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
@@ -17,13 +81,6 @@ RUN_REMOTE_SMOKE="${RUN_REMOTE_SMOKE:-1}"
 REMOTE_SMOKE_BREAK_GLASS_ARTIFACT="${REMOTE_SMOKE_BREAK_GLASS_ARTIFACT:-}"
 DRAIN_TIMEOUT_SECONDS="${DRAIN_TIMEOUT_SECONDS:-900}"
 
-SMOKE_ENV_KEYS=(
-    SMOKE_TENANT_EMAIL
-    SMOKE_TENANT_PASSWORD
-    SMOKE_PLATFORM_ADMIN_EMAIL
-    SMOKE_PLATFORM_ADMIN_PASSWORD
-)
-
 SSH_TARGET="${REMOTE_USER}@${REMOTE_HOST}"
 SSH_OPTS=(
     -i "$SSH_KEY"
@@ -32,13 +89,6 @@ SSH_OPTS=(
     -o ServerAliveInterval=15
     -o ServerAliveCountMax=6
 )
-
-require_cmd() {
-    command -v "$1" >/dev/null 2>&1 || {
-        echo "missing required command: $1" >&2
-        exit 1
-    }
-}
 
 require_cmd git
 require_cmd tar
@@ -52,6 +102,7 @@ require_cmd docker
 require_cmd createdb
 require_cmd dropdb
 require_cmd psql
+assert_smoke_credentials_not_exported
 
 if [ "$RUN_LOCAL_CHECKS" != "1" ]; then
     echo "production releases cannot disable local release gates" >&2
@@ -137,6 +188,7 @@ required = {
     "approval_id",
     "approval_nonce",
     "approved_by",
+    "bypassed_gates",
     "reason",
     "issued_at_utc",
     "expires_at_utc",
@@ -151,6 +203,11 @@ if fields["release_version"] != version:
     raise SystemExit("break-glass artifact targets a different release version")
 if fields["release_commit"] != commit:
     raise SystemExit("break-glass artifact targets a different release commit")
+if {item.strip() for item in fields["bypassed_gates"].split(",") if item.strip()} != {
+    "subscription_api",
+    "subscription_browser",
+}:
+    raise SystemExit("break-glass artifact must explicitly bypass subscription_api and subscription_browser")
 if not re.fullmatch(r"[A-Za-z0-9._-]{16,128}", fields["approval_nonce"]):
     raise SystemExit("break-glass approval_nonce has an invalid format")
 issued = datetime.fromisoformat(fields["issued_at_utc"].replace("Z", "+00:00"))
@@ -186,12 +243,14 @@ if [ "$DRAIN_TIMEOUT_SECONDS" -gt 86400 ]; then
 fi
 
 if [ "$RUN_REMOTE_SMOKE" = "1" ]; then
-    for key in "${SMOKE_ENV_KEYS[@]}"; do
-        if [ -z "${!key:-}" ]; then
-            echo "RUN_REMOTE_SMOKE=1 requires $key" >&2
+    for index in "${!SMOKE_ENV_KEYS[@]}"; do
+        if [ -z "${SMOKE_ENV_VALUES[$index]}" ]; then
+            echo "RUN_REMOTE_SMOKE=1 requires ${SMOKE_ENV_KEYS[$index]}" >&2
             exit 1
         fi
     done
+else
+    unset SMOKE_ENV_VALUES
 fi
 
 if [ ! -f "$SSH_KEY" ]; then
@@ -220,6 +279,9 @@ echo "[local] running full frontend suite and production build"
 (cd frontend && npm test)
 (cd frontend && npm run build)
 
+echo "[local] testing bounded browser assertions"
+(cd deploy/browser-smoke && npm test)
+
 echo "[local] running PostgreSQL upgrade/downgrade/re-upgrade smoke"
 bash scripts/postgres-migration-smoke.sh
 
@@ -229,6 +291,7 @@ SECRET_KEY=release-gate-secret \
 JWT_SECRET_KEY=release-gate-jwt \
 CORS_ORIGINS=https://release-gate.invalid \
 PUBLIC_BASE_URL=https://release-gate.invalid \
+ASTRA_ALERT_WORKER_ACTOR_ID=00000000-0000-4000-8000-000000000001 \
 docker compose -f deploy/astra-poc/docker-compose.prod.yml config --quiet
 
 STAMP="$(date -u +%Y%m%d-%H%M%S)"
@@ -237,15 +300,16 @@ RELEASE_ID="${STAMP}-${COMMIT:0:12}-${NONCE}-clawith-saas"
 PACKAGE_DIR="$ROOT_DIR/.tmp/releases"
 PACKAGE_TAR="$PACKAGE_DIR/${RELEASE_ID}.tar"
 PACKAGE="$PACKAGE_DIR/${RELEASE_ID}.tar.gz"
-SMOKE_ENV_FILE="$PACKAGE_DIR/${RELEASE_ID}.smoke.env"
-SMOKE_ENV_REMOTE="/tmp/${RELEASE_ID}.smoke.env"
+REMOTE_SMOKE_RUNTIME_ROOT="/dev/shm/astra-deploy-smoke"
+SMOKE_ENV_REMOTE="$REMOTE_SMOKE_RUNTIME_ROOT/${RELEASE_ID}.smoke-credentials.json"
+REMOTE_SMOKE_CREDENTIAL_DIGEST="none"
 BREAK_GLASS_FILE="$PACKAGE_DIR/${RELEASE_ID}.break-glass.approval"
 BREAK_GLASS_FILE_REMOTE="/tmp/${RELEASE_ID}.break-glass.approval"
 SMOKE_ENV_UPLOADED=0
 BREAK_GLASS_UPLOADED=0
 
 cleanup_local() {
-    rm -f "$PACKAGE_TAR" "$PACKAGE" "$SMOKE_ENV_FILE" "$BREAK_GLASS_FILE"
+    rm -f "$PACKAGE_TAR" "$PACKAGE" "$BREAK_GLASS_FILE"
     if [ "$SMOKE_ENV_UPLOADED" = "1" ]; then
         ssh "${SSH_OPTS[@]}" "$SSH_TARGET" rm -f "$SMOKE_ENV_REMOTE" >/dev/null 2>&1 || true
     fi
@@ -278,21 +342,84 @@ PY_PACKAGE_SHA256
 )"
 
 if [ "$RUN_REMOTE_SMOKE" = "1" ]; then
-    (
-        umask 077
-        : > "$SMOKE_ENV_FILE"
-        for key in "${SMOKE_ENV_KEYS[@]}"; do
-            printf '%s=%q\n' "$key" "${!key}" >> "$SMOKE_ENV_FILE"
-        done
-    )
+    REMOTE_SMOKE_CREDENTIAL_DIGEST="$(
+        emit_smoke_credential_payload | python3 -c '
+import hashlib
+import sys
+
+data = sys.stdin.buffer.read(16_385)
+if len(data) > 16_384:
+    raise SystemExit("remote smoke credential payload is too large")
+print(hashlib.sha256(data).hexdigest())
+'
+    )"
 fi
 
 echo "[remote] uploading package"
 scp "${SSH_OPTS[@]}" "$PACKAGE" "${SSH_TARGET}:/tmp/${RELEASE_ID}.tar.gz"
 if [ "$RUN_REMOTE_SMOKE" = "1" ]; then
-    scp "${SSH_OPTS[@]}" "$SMOKE_ENV_FILE" "${SSH_TARGET}:${SMOKE_ENV_REMOTE}"
+    ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
+        env -u BASH_ENV -u BASHOPTS -u SHELLOPTS bash -s -- \
+        "$REMOTE_SMOKE_RUNTIME_ROOT" <<'REMOTE_SMOKE_RUNTIME_ROOT'
+{ set +x; } 2>/dev/null
+set -euo pipefail
+runtime_root="$1"
+runtime_uid="$(id -u)"
+if [ -e "$runtime_root" ] || [ -L "$runtime_root" ]; then
+    [ -d "$runtime_root" ] && [ ! -L "$runtime_root" ] || exit 1
+    [ "$(stat -c '%u' "$runtime_root")" = "$runtime_uid" ] || exit 1
+    [ "$(stat -c '%a' "$runtime_root")" = "700" ] || exit 1
+else
+    install -d -m 0700 "$runtime_root"
+fi
+REMOTE_SMOKE_RUNTIME_ROOT
+    REMOTE_CREDENTIAL_WRITER_B64="$(python3 - <<'PY_REMOTE_CREDENTIAL_WRITER'
+import base64
+
+source = r'''
+import hashlib
+import os
+from pathlib import Path
+import stat
+import sys
+
+path = Path(sys.argv[1])
+expected_digest = sys.argv[2]
+root = path.parent
+root_stat = root.lstat()
+if (
+    not stat.S_ISDIR(root_stat.st_mode)
+    or root.is_symlink()
+    or root_stat.st_uid != os.getuid()
+    or stat.S_IMODE(root_stat.st_mode) != 0o700
+    or not path.name.endswith(".smoke-credentials.json")
+):
+    raise SystemExit(1)
+data = sys.stdin.buffer.read(16_385)
+if len(data) > 16_384 or hashlib.sha256(data).hexdigest() != expected_digest:
+    raise SystemExit(1)
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+if hasattr(os, "O_NOFOLLOW"):
+    flags |= os.O_NOFOLLOW
+fd = os.open(path, flags, 0o600)
+try:
+    os.fchmod(fd, 0o600)
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        view = view[written:]
+    os.fsync(fd)
+finally:
+    os.close(fd)
+'''
+print(base64.b64encode(source.encode("utf-8")).decode("ascii"))
+PY_REMOTE_CREDENTIAL_WRITER
+    )"
+    emit_smoke_credential_payload |
+        ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
+            "python3 -c \"import base64;exec(base64.b64decode('$REMOTE_CREDENTIAL_WRITER_B64'))\" '$SMOKE_ENV_REMOTE' '$REMOTE_SMOKE_CREDENTIAL_DIGEST'"
     SMOKE_ENV_UPLOADED=1
-    ssh "${SSH_OPTS[@]}" "$SSH_TARGET" chmod 600 "$SMOKE_ENV_REMOTE"
+    unset SMOKE_ENV_VALUES
 else
     scp "${SSH_OPTS[@]}" "$BREAK_GLASS_FILE" "${SSH_TARGET}:${BREAK_GLASS_FILE_REMOTE}"
     BREAK_GLASS_UPLOADED=1
@@ -300,13 +427,15 @@ else
 fi
 
 echo "[remote] deploying $RELEASE_ID"
-ssh "${SSH_OPTS[@]}" "$SSH_TARGET" bash -s -- \
+ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
+    env -u BASH_ENV -u BASHOPTS -u SHELLOPTS bash -s -- \
     "$APP_ROOT" "$RELEASE_ID" "$COMPOSE_PROJECT" "$COMPOSE_PROFILES_ARG" \
     "$VERSION" "$COMMIT" "$PUBLIC_URL" "$RUN_REMOTE_SMOKE" \
     "$SMOKE_ENV_REMOTE" "$DRAIN_TIMEOUT_SECONDS" \
     "$REMOTE_SMOKE_BREAK_GLASS_DIGEST" "$BREAK_GLASS_FILE_REMOTE" \
     "$RELEASE_BASE_COMMIT" "$REMOTE_SMOKE_BREAK_GLASS_NONCE_HASH" \
-    "$PACKAGE_SHA256" <<'REMOTE_SCRIPT'
+    "$PACKAGE_SHA256" "$REMOTE_SMOKE_CREDENTIAL_DIGEST" <<'REMOTE_SCRIPT'
+{ set +x; } 2>/dev/null
 set -euo pipefail
 
 APP_ROOT="$1"
@@ -327,6 +456,7 @@ REMOTE_SMOKE_BREAK_GLASS_FILE="${12}"
 RELEASE_BASE_COMMIT="${13}"
 REMOTE_SMOKE_BREAK_GLASS_NONCE_HASH="${14}"
 PACKAGE_SHA256="${15}"
+REMOTE_SMOKE_CREDENTIAL_DIGEST="${16}"
 
 CURRENT="$APP_ROOT/current"
 CURRENT_TARGET=""
@@ -345,10 +475,21 @@ MCP_QUARANTINE_SNAPSHOT_ID=""
 ROLLBACK_REQUIRES_MCP_QUARANTINE=0
 SCHEMA_FORWARD_ONLY=0
 MAINTENANCE_ENABLED=0
+BROWSER_SMOKE_IMAGE="astra-browser-smoke:${RELEASE_ID}"
+BROWSER_SMOKE_READY=0
+BROWSER_SMOKE_CONTAINER=""
+BROWSER_SMOKE_NETWORK=""
+BROWSER_SMOKE_FRONTEND_ID=""
+BROWSER_SMOKE_TEMP_DIR=""
+BROWSER_SMOKE_RUNTIME_ROOT="/dev/shm/astra-deploy-smoke"
 
 mkdir -p "$APP_ROOT"
 if ! command -v flock >/dev/null 2>&1; then
     echo "flock is required for production deployment serialization" >&2
+    exit 1
+fi
+if ! command -v timeout >/dev/null 2>&1; then
+    echo "timeout is required for bounded production deployment commands" >&2
     exit 1
 fi
 exec 9>"$APP_ROOT/deploy.lock"
@@ -406,6 +547,1136 @@ if path.exists():
     finally:
         os.close(directory_fd)
 PY_REMOVE_FILE
+}
+
+install_durable_file() {
+    local source="$1"
+    local destination="$2"
+    python3 - "$source" "$destination" <<'PY_INSTALL_DURABLE_FILE'
+import os
+from pathlib import Path
+import stat
+import sys
+import tempfile
+
+source = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+flags = os.O_RDONLY
+if hasattr(os, "O_NOFOLLOW"):
+    flags |= os.O_NOFOLLOW
+source_fd = os.open(source, flags)
+try:
+    metadata = os.fstat(source_fd)
+    if not stat.S_ISREG(metadata.st_mode) or not 0 < metadata.st_size <= 1_048_576:
+        raise SystemExit(1)
+    payload = bytearray()
+    while True:
+        chunk = os.read(source_fd, 65_536)
+        if not chunk:
+            break
+        payload.extend(chunk)
+        if len(payload) > 1_048_576:
+            raise SystemExit(1)
+finally:
+    os.close(source_fd)
+
+destination.parent.mkdir(parents=True, exist_ok=True)
+if destination.parent.is_symlink():
+    raise SystemExit(1)
+temporary_fd, temporary_name = tempfile.mkstemp(
+    prefix=f".{destination.name}.", dir=destination.parent
+)
+temporary = Path(temporary_name)
+try:
+    os.fchmod(temporary_fd, 0o600)
+    with os.fdopen(temporary_fd, "wb") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, destination)
+    directory_fd = os.open(destination.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+finally:
+    temporary.unlink(missing_ok=True)
+source.unlink(missing_ok=True)
+PY_INSTALL_DURABLE_FILE
+}
+
+browser_smoke_bundle_digest() {
+    local release="$1"
+    python3 - "$release/deploy/browser-smoke" <<'PY_BROWSER_BUNDLE_DIGEST'
+import hashlib
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+names = (
+    "Dockerfile",
+    "EVIDENCE_SCHEMA",
+    "browser_launch_selftest.mjs",
+    "browser_assertions.mjs",
+    "package-lock.json",
+    "package.json",
+    "seccomp_profile.json",
+    "subscription_browser_smoke.mjs",
+)
+digest = hashlib.sha256()
+for name in names:
+    path = root / name
+    if not path.is_file() or path.is_symlink():
+        raise SystemExit(1)
+    digest.update(name.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(path.read_bytes())
+    digest.update(b"\0")
+print(f"sha256:{digest.hexdigest()}")
+PY_BROWSER_BUNDLE_DIGEST
+}
+
+browser_smoke_requires_v2() {
+    local release="$1"
+    [ -f "$release/deploy/browser-smoke/EVIDENCE_SCHEMA" ] && \
+        [ ! -L "$release/deploy/browser-smoke/EVIDENCE_SCHEMA" ] && \
+        [ "$(tr -d '[:space:]' < "$release/deploy/browser-smoke/EVIDENCE_SCHEMA")" = "2" ]
+}
+
+prepare_browser_smoke_runtime_root() {
+    python3 - "$BROWSER_SMOKE_RUNTIME_ROOT" "$SMOKE_ENV_FILE" \
+        "$RUN_REMOTE_SMOKE" <<'PY_BROWSER_RUNTIME_CLEANUP'
+import os
+from pathlib import Path
+import shutil
+import stat
+import sys
+
+root = Path(sys.argv[1])
+credential_path = Path(sys.argv[2]) if sys.argv[3] == "1" else None
+try:
+    root_stat = root.lstat()
+except FileNotFoundError:
+    root.mkdir(mode=0o700)
+    root_stat = root.lstat()
+if (
+    not stat.S_ISDIR(root_stat.st_mode)
+    or root.is_symlink()
+    or root_stat.st_uid != os.getuid()
+    or stat.S_IMODE(root_stat.st_mode) != 0o700
+):
+    raise SystemExit(1)
+if credential_path is not None and (
+    credential_path.parent != root
+    or not credential_path.name.endswith(".smoke-credentials.json")
+):
+    raise SystemExit(1)
+current_credential_seen = False
+for child in root.iterdir():
+    if child.name.startswith(".candidate-smoke."):
+        child_stat = child.lstat()
+        if (
+            not stat.S_ISDIR(child_stat.st_mode)
+            or child.is_symlink()
+            or child_stat.st_uid != os.getuid()
+            or stat.S_IMODE(child_stat.st_mode) != 0o700
+        ):
+            raise SystemExit(1)
+        shutil.rmtree(child)
+        continue
+    if not child.name.endswith(".smoke-credentials.json"):
+        continue
+    child_stat = child.lstat()
+    if (
+        not stat.S_ISREG(child_stat.st_mode)
+        or child.is_symlink()
+        or child_stat.st_uid != os.getuid()
+        or stat.S_IMODE(child_stat.st_mode) != 0o600
+    ):
+        raise SystemExit(1)
+    if credential_path is not None and child == credential_path:
+        current_credential_seen = True
+        continue
+    child.unlink()
+if credential_path is not None and not current_credential_seen:
+    raise SystemExit(1)
+PY_BROWSER_RUNTIME_CLEANUP
+}
+
+cleanup_browser_smoke_runtime() {
+    local remove_temporary="${1:-1}"
+    if [ -n "$BROWSER_SMOKE_CONTAINER" ]; then
+        docker rm -f "$BROWSER_SMOKE_CONTAINER" >/dev/null 2>&1 || true
+    fi
+    if [ -n "$BROWSER_SMOKE_NETWORK" ] && [ -n "$BROWSER_SMOKE_FRONTEND_ID" ]; then
+        docker network disconnect -f \
+            "$BROWSER_SMOKE_NETWORK" "$BROWSER_SMOKE_FRONTEND_ID" \
+            >/dev/null 2>&1 || true
+    fi
+    if [ -n "$BROWSER_SMOKE_NETWORK" ]; then
+        docker network rm "$BROWSER_SMOKE_NETWORK" >/dev/null 2>&1 || true
+    fi
+    BROWSER_SMOKE_CONTAINER=""
+    BROWSER_SMOKE_NETWORK=""
+    BROWSER_SMOKE_FRONTEND_ID=""
+    if [ "$remove_temporary" = "1" ] && [ -n "${BROWSER_SMOKE_TEMP_DIR:-}" ]; then
+        case "$BROWSER_SMOKE_TEMP_DIR" in
+            "$BROWSER_SMOKE_RUNTIME_ROOT"/.candidate-smoke.*)
+                rm -rf "$BROWSER_SMOKE_TEMP_DIR"
+                ;;
+        esac
+        BROWSER_SMOKE_TEMP_DIR=""
+    fi
+}
+
+browser_smoke_preflight_signal() {
+    local signal_name="$1"
+    local signal_status="$2"
+    trap - HUP INT TERM
+    cleanup_browser_smoke_runtime 0
+    echo "browser smoke preflight interrupted by $signal_name" >&2
+    exit "$signal_status"
+}
+
+ensure_browser_smoke_image() {
+    local target_release="$1"
+    local target_release_id="$2"
+    local image="astra-browser-smoke:${target_release_id}"
+    local safe_id
+    local host_uid
+    local host_gid
+    local label
+
+    browser_smoke_requires_v2 "$target_release" || return 1
+    browser_smoke_bundle_digest "$target_release" >/dev/null || return 1
+    command -v timeout >/dev/null 2>&1 || return 1
+    host_uid="$(id -u)" || return 1
+    host_gid="$(id -g)" || return 1
+    [ "$host_uid" != "0" ] || {
+        echo "browser smoke must run under a non-root deployment account" >&2
+        return 1
+    }
+    docker build --pull --tag "$image" "$target_release/deploy/browser-smoke" || return 1
+    label="$(
+        docker image inspect \
+            --format '{{ index .Config.Labels "ai.reeftotem.astra.browser-smoke-schema" }}' \
+            "$image" 2>/dev/null
+    )" || return 1
+    [ "$label" = "2" ] || return 1
+
+    safe_id="$(printf '%s' "$target_release_id" | sha256sum | cut -c1-16)" || return 1
+    BROWSER_SMOKE_NETWORK="astra-browser-preflight-${safe_id}"
+    BROWSER_SMOKE_CONTAINER="astra-browser-preflight-${safe_id}"
+    BROWSER_SMOKE_FRONTEND_ID=""
+    cleanup_browser_smoke_runtime 0
+    BROWSER_SMOKE_NETWORK="astra-browser-preflight-${safe_id}"
+    BROWSER_SMOKE_CONTAINER="astra-browser-preflight-${safe_id}"
+    trap 'browser_smoke_preflight_signal HUP 129' HUP
+    trap 'browser_smoke_preflight_signal INT 130' INT
+    trap 'browser_smoke_preflight_signal TERM 143' TERM
+    docker network create \
+        --internal \
+        --label "ai.reeftotem.astra.browser-smoke-release=$target_release_id" \
+        "$BROWSER_SMOKE_NETWORK" >/dev/null || {
+        cleanup_browser_smoke_runtime 0
+        trap - HUP INT TERM
+        return 1
+    }
+    if ! timeout --signal=TERM --kill-after=5s 45s \
+        docker run --rm \
+        --name "$BROWSER_SMOKE_CONTAINER" \
+        --label "ai.reeftotem.astra.browser-smoke-release=$target_release_id" \
+        --init \
+        --user "${host_uid}:${host_gid}" \
+        --read-only \
+        --cap-drop ALL \
+        --security-opt no-new-privileges:true \
+        --security-opt "seccomp=$target_release/deploy/browser-smoke/seccomp_profile.json" \
+        --pids-limit 256 \
+        --ulimit nofile=1024:1024 \
+        --memory 1g \
+        --cpus 1.0 \
+        --shm-size 256m \
+        --tmpfs /tmp:rw,nosuid,nodev,size=256m \
+        --tmpfs /home/pwuser:rw,nosuid,nodev,size=64m \
+        --env HOME=/home/pwuser \
+        --network "$BROWSER_SMOKE_NETWORK" \
+        --entrypoint node \
+        "$image" \
+        /opt/astra-browser-smoke/browser_launch_selftest.mjs; then
+        cleanup_browser_smoke_runtime 0
+        trap - HUP INT TERM
+        return 1
+    fi
+    cleanup_browser_smoke_runtime 0
+    trap - HUP INT TERM
+    if [ "$target_release_id" = "$RELEASE_ID" ]; then
+        BROWSER_SMOKE_IMAGE="$image"
+        BROWSER_SMOKE_READY=1
+    fi
+}
+
+alert_canary_requires_v1() {
+    local release="$1"
+    [ -f "$release/backend/app/scripts/verify_production_issue_alerts.py" ] && \
+        [ ! -L "$release/backend/app/scripts/verify_production_issue_alerts.py" ]
+}
+
+alert_canary_runner_digest() {
+    local release="$1"
+    local runner="$release/backend/app/scripts/verify_production_issue_alerts.py"
+    [ -f "$runner" ] && [ ! -L "$runner" ] || return 1
+    printf 'sha256:%s' "$(sha256sum "$runner" | awk '{print $1}')"
+}
+
+run_alert_canary_preflight() {
+    local target_release="$1"
+    local target_project="$2"
+    local target_release_id="$3"
+    local output="$4"
+    local target_version
+    local target_commit
+
+    alert_canary_requires_v1 "$target_release" || return 1
+    target_version="$(tr -d '[:space:]' < "$target_release/VERSION")" || return 1
+    target_commit="$(tr -d '[:space:]' < "$target_release/COMMIT")" || return 1
+    if ! compose_project_timed 45 5 \
+        "$target_project" "$target_release/.env" "$target_release/$COMPOSE_FILE" \
+        run --rm --no-deps -T --entrypoint python backend \
+        -m app.scripts.verify_production_issue_alerts \
+        --release-id "$target_release_id" --preflight-only > "$output"; then
+        rm -f "$output"
+        return 1
+    fi
+    python3 - \
+        "$output" "$target_release_id" "$target_version" "$target_commit" \
+        <<'PY_ALERT_PREFLIGHT_VALIDATE'
+import json
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+if not path.is_file() or path.is_symlink() or not 0 < path.stat().st_size <= 1_048_576:
+    raise SystemExit(1)
+payload = json.loads(path.read_text(encoding="utf-8"))
+sinks = payload.get("configured_sinks")
+if (
+    payload.get("ok") is not True
+    or payload.get("schema_version") != 1
+    or payload.get("mode") != "preflight"
+    or payload.get("release_id") != sys.argv[2]
+    or payload.get("release_version") != sys.argv[3]
+    or payload.get("release_commit") != sys.argv[4]
+    or not isinstance(sinks, list)
+    or not sinks
+    or set(sinks) - {"notification", "webhook"}
+    or len(sinks) != len(set(sinks))
+    or re.fullmatch(
+        r"hmac-sha256:[0-9a-f]{64}",
+        str(payload.get("sink_config_fingerprint", "")),
+    )
+    is None
+):
+    raise SystemExit(1)
+PY_ALERT_PREFLIGHT_VALIDATE
+}
+
+inspect_worker_runtime_identity() {
+    local worker_id="$1"
+
+    # Docker stores the complete process environment in Config.Env. Filter in
+    # the Go template before any data reaches the shell, then validate exact
+    # cardinality and a non-secret character contract in a separate process.
+    docker inspect -f \
+        '{{range .Config.Env}}{{if eq (index (split . "=") 0) "ASTRA_RELEASE_ID"}}{{println .}}{{end}}{{if eq (index (split . "=") 0) "ASTRA_RELEASE_COMMIT"}}{{println .}}{{end}}{{if eq (index (split . "=") 0) "ASTRA_ALERT_WORKER_ACTOR_ID"}}{{println .}}{{end}}{{if eq (index (split . "=") 0) "PROCESS_ROLE"}}{{println .}}{{end}}{{end}}' \
+        "$worker_id" | python3 -c '
+import re
+import sys
+import uuid
+
+raw = sys.stdin.read(8_193)
+if len(raw) > 8_192:
+    raise SystemExit("worker runtime identity output is too large")
+values = {
+    "ASTRA_RELEASE_ID": [],
+    "ASTRA_RELEASE_COMMIT": [],
+    "ASTRA_ALERT_WORKER_ACTOR_ID": [],
+    "PROCESS_ROLE": [],
+}
+for line in raw.splitlines():
+    key, separator, value = line.partition("=")
+    if separator and key in values:
+        values[key].append(value)
+if any(len(items) != 1 for items in values.values()):
+    raise SystemExit("worker runtime identity is missing or duplicated")
+release_id = values["ASTRA_RELEASE_ID"][0]
+release_commit = values["ASTRA_RELEASE_COMMIT"][0]
+actor_id = values["ASTRA_ALERT_WORKER_ACTOR_ID"][0]
+process_role = values["PROCESS_ROLE"][0]
+if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}", release_id) is None:
+    raise SystemExit("worker release identity has an invalid format")
+if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*(?:,[A-Za-z][A-Za-z0-9_-]*)*", process_role) is None:
+    raise SystemExit("worker process role has an invalid format")
+if re.fullmatch(r"[0-9a-f]{40}", release_commit) is None:
+    raise SystemExit("worker release commit has an invalid format")
+try:
+    parsed_actor_id = uuid.UUID(actor_id)
+except ValueError:
+    raise SystemExit("worker actor identity has an invalid format") from None
+if str(parsed_actor_id) != actor_id.lower():
+    raise SystemExit("worker actor identity is not canonical")
+if len(process_role) > 128:
+    raise SystemExit("worker process role is too long")
+sys.stdout.write(f"{release_id}\n{release_commit}\n{actor_id.lower()}\n{process_role}\n")
+'
+}
+
+run_candidate_alert_canary() {
+    local target_release="$1"
+    local target_project="$2"
+    local target_release_id="$3"
+    local output="$4"
+    local target_backup="$APP_ROOT/backups/$target_release_id"
+    local target_commit
+    local raw_output="${output}.raw"
+    local worker_id_before
+    local worker_id_after
+    local worker_image_id
+    local worker_image_name
+    local worker_project
+    local worker_identity
+    local -a worker_identity_fields=()
+    local worker_identity_field
+    local worker_release_id
+    local worker_release_commit
+    local worker_actor_id
+    local worker_role
+    local runner_digest
+
+    alert_canary_requires_v1 "$target_release" || return 1
+    target_commit="$(tr -d '[:space:]' < "$target_release/COMMIT")" || return 1
+    assert_single_active_worker \
+        "$target_project" "$target_release/.env" \
+        "$target_release/$COMPOSE_FILE" "$target_release_id" || return 1
+    worker_id_before="$(
+        compose_project \
+            "$target_project" "$target_release/.env" \
+            "$target_release/$COMPOSE_FILE" ps -q worker
+    )" || return 1
+    [ -n "$worker_id_before" ] && [[ "$worker_id_before" != *$'\n'* ]] || return 1
+    worker_image_id="$(docker inspect -f '{{.Image}}' "$worker_id_before")" || return 1
+    worker_image_name="$(docker inspect -f '{{.Config.Image}}' "$worker_id_before")" || return 1
+    worker_project="$(
+        docker inspect \
+            -f '{{index .Config.Labels "com.docker.compose.project"}}' \
+            "$worker_id_before"
+    )" || return 1
+    worker_identity="$(inspect_worker_runtime_identity "$worker_id_before")" || return 1
+    while IFS= read -r worker_identity_field; do
+        worker_identity_fields+=("$worker_identity_field")
+    done <<< "$worker_identity"
+    [ "${#worker_identity_fields[@]}" = "4" ] || return 1
+    worker_release_id="${worker_identity_fields[0]}"
+    worker_release_commit="${worker_identity_fields[1]}"
+    worker_actor_id="${worker_identity_fields[2]}"
+    worker_role="${worker_identity_fields[3]}"
+    [ "$worker_project" = "$target_project" ] || return 1
+    [ "$worker_release_id" = "$target_release_id" ] || return 1
+    [ "$worker_release_commit" = "$target_commit" ] || return 1
+    case ",$worker_role," in *,worker,*) ;; *) return 1 ;; esac
+    case "$worker_image_id" in sha256:*) ;; *) return 1 ;; esac
+    case "$worker_image_name" in *":$target_release_id") ;; *) return 1 ;; esac
+    runner_digest="$(alert_canary_runner_digest "$target_release")" || return 1
+
+    if ! compose_project_timed 210 10 \
+        "$target_project" "$target_release/.env" "$target_release/$COMPOSE_FILE" \
+        run --rm --no-deps -T --entrypoint python backend \
+        -m app.scripts.verify_production_issue_alerts \
+        --release-id "$target_release_id" --timeout-seconds 180 \
+        > "$raw_output"; then
+        rm -f "$raw_output" "$output"
+        return 1
+    fi
+    assert_single_active_worker \
+        "$target_project" "$target_release/.env" \
+        "$target_release/$COMPOSE_FILE" "$target_release_id" || {
+        rm -f "$raw_output" "$output"
+        return 1
+    }
+    worker_id_after="$(
+        compose_project \
+            "$target_project" "$target_release/.env" \
+            "$target_release/$COMPOSE_FILE" ps -q worker
+    )" || return 1
+    if [ "$worker_id_after" != "$worker_id_before" ]; then
+        rm -f "$raw_output" "$output"
+        return 1
+    fi
+
+    if ! python3 - \
+        "$raw_output" "$target_backup/production-alert-preflight.json" \
+        "$output" "$worker_id_before" "$worker_image_id" \
+        "$worker_image_name" "$worker_project" "$runner_digest" \
+        "$worker_actor_id" "$worker_release_commit" \
+        <<'PY_ALERT_CANARY_MERGE'
+import json
+from pathlib import Path
+import re
+import sys
+
+raw_path = Path(sys.argv[1])
+preflight_path = Path(sys.argv[2])
+output_path = Path(sys.argv[3])
+raw = json.loads(raw_path.read_text(encoding="utf-8"))
+preflight = json.loads(preflight_path.read_text(encoding="utf-8"))
+deliveries = raw.get("deliveries")
+issue_id = str(raw.get("issue_id", ""))
+epoch = raw.get("alert_epoch")
+if (
+    raw.get("ok") is not True
+    or raw.get("schema_version") != 1
+    or raw.get("mode") != "delivery"
+    or raw.get("status") != "resolved"
+    or not raw.get("alerted_at")
+    or not raw.get("resolved_at")
+    or not isinstance(epoch, int)
+    or epoch < 1
+    or re.fullmatch(r"[0-9a-f-]{36}", issue_id) is None
+    or not isinstance(deliveries, dict)
+    or not deliveries
+    or set(deliveries) - {"notification", "webhook"}
+    or raw.get("sink_config_fingerprint")
+    != preflight.get("sink_config_fingerprint")
+    or set(deliveries) != set(preflight.get("configured_sinks") or [])
+):
+    raise SystemExit(1)
+for sink, delivery in deliveries.items():
+    delivered_by = delivery.get("delivered_by") if isinstance(delivery, dict) else None
+    if (
+        not isinstance(delivery, dict)
+        or delivery.get("status") != "delivered"
+        or delivery.get("attribution_version") != 1
+        or not isinstance(delivery.get("attempts"), int)
+        or delivery["attempts"] < 1
+        or delivery.get("error_code") is not None
+        or not delivery.get("delivered_at")
+        or delivery.get("idempotency_key")
+        != f"production-issue:{issue_id}:{epoch}:{sink}"
+        or not isinstance(delivered_by, dict)
+        or delivered_by.get("worker_actor_id") != sys.argv[9]
+        or delivered_by.get("release_id") != raw.get("release_id")
+        or delivered_by.get("release_commit") != raw.get("release_commit")
+    ):
+        raise SystemExit(1)
+if raw.get("release_id") != preflight.get("release_id") or raw.get(
+    "release_version"
+) != preflight.get("release_version") or raw.get("release_commit") != preflight.get(
+    "release_commit"
+):
+    raise SystemExit(1)
+worker_id, image_id, image_name, project, runner_digest, actor_id, worker_commit = sys.argv[4:11]
+if (
+    re.fullmatch(r"[0-9a-f]{64}", worker_id) is None
+    or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None
+    or not image_name.endswith(":" + raw["release_id"])
+    or not project
+    or re.fullmatch(r"sha256:[0-9a-f]{64}", runner_digest) is None
+    or re.fullmatch(r"[0-9a-f-]{36}", actor_id) is None
+    or worker_commit != raw["release_commit"]
+):
+    raise SystemExit(1)
+raw["worker_identity"] = {
+    "container_id": worker_id,
+    "image_id": image_id,
+    "image_name": image_name,
+    "compose_project": project,
+    "worker_actor_id": actor_id,
+    "release_id": raw["release_id"],
+    "release_commit": worker_commit,
+}
+raw["runner_sha256"] = runner_digest
+output_path.write_text(
+    json.dumps(raw, sort_keys=True, separators=(",", ":")) + "\n",
+    encoding="utf-8",
+)
+PY_ALERT_CANARY_MERGE
+    then
+        rm -f "$raw_output" "$output"
+        return 1
+    fi
+    chmod 0600 "$output"
+    rm -f "$raw_output"
+}
+
+publish_alert_canary_evidence() {
+    local source="$1"
+    local release_id="$2"
+    local backup="$APP_ROOT/backups/$release_id"
+    local evidence="$backup/production-alert-canary.json"
+    local digest
+
+    install_durable_file "$source" "$evidence" || return 1
+    digest="$(sha256sum "$evidence" | awk '{print $1}')" || return 1
+    write_atomic_line "$backup/production-alert-canary.sha256" "$digest"
+}
+
+candidate_alert_canary_evidence_valid() {
+    local target_release="$1"
+    local target_project="$2"
+    local target_release_id="$3"
+    local backup="$APP_ROOT/backups/$target_release_id"
+    local evidence="$backup/production-alert-canary.json"
+    local digest_file="$backup/production-alert-canary.sha256"
+    local worker_id
+    local worker_image_id
+    local worker_image_name
+    local worker_identity
+    local -a worker_identity_fields=()
+    local worker_identity_field
+    local worker_release_id
+    local worker_release_commit
+    local worker_actor_id
+    local worker_role
+    local runner_digest
+
+    alert_canary_requires_v1 "$target_release" || return 1
+    [ -f "$evidence" ] && [ ! -L "$evidence" ] || return 1
+    [ -f "$digest_file" ] && [ ! -L "$digest_file" ] || return 1
+    [ "$(sha256sum "$evidence" | awk '{print $1}')" = \
+        "$(tr -d '[:space:]' < "$digest_file")" ] || return 1
+    assert_single_active_worker \
+        "$target_project" "$target_release/.env" \
+        "$target_release/$COMPOSE_FILE" "$target_release_id" || return 1
+    worker_id="$(
+        compose_project \
+            "$target_project" "$target_release/.env" \
+            "$target_release/$COMPOSE_FILE" ps -q worker
+    )" || return 1
+    worker_image_id="$(docker inspect -f '{{.Image}}' "$worker_id")" || return 1
+    worker_image_name="$(docker inspect -f '{{.Config.Image}}' "$worker_id")" || return 1
+    worker_identity="$(inspect_worker_runtime_identity "$worker_id")" || return 1
+    while IFS= read -r worker_identity_field; do
+        worker_identity_fields+=("$worker_identity_field")
+    done <<< "$worker_identity"
+    [ "${#worker_identity_fields[@]}" = "4" ] || return 1
+    worker_release_id="${worker_identity_fields[0]}"
+    worker_release_commit="${worker_identity_fields[1]}"
+    worker_actor_id="${worker_identity_fields[2]}"
+    worker_role="${worker_identity_fields[3]}"
+    [ "$worker_release_id" = "$target_release_id" ] || return 1
+    case ",$worker_role," in *,worker,*) ;; *) return 1 ;; esac
+    runner_digest="$(alert_canary_runner_digest "$target_release")" || return 1
+    python3 - \
+        "$evidence" "$target_release/VERSION" "$target_release/COMMIT" \
+        "$target_release_id" "$target_project" "$worker_image_id" \
+        "$worker_image_name" "$runner_digest" \
+        "$worker_actor_id" "$worker_release_commit" \
+        "$backup/production-alert-preflight.json" \
+        <<'PY_ALERT_CANARY_VALIDATE'
+import json
+from pathlib import Path
+import re
+import sys
+
+evidence = Path(sys.argv[1])
+version = Path(sys.argv[2]).read_text(encoding="utf-8").strip()
+commit = Path(sys.argv[3]).read_text(encoding="utf-8").strip()
+payload = json.loads(evidence.read_text(encoding="utf-8"))
+preflight_path = Path(sys.argv[11])
+if not preflight_path.is_file() or preflight_path.is_symlink():
+    raise SystemExit(1)
+preflight = json.loads(preflight_path.read_text(encoding="utf-8"))
+worker = payload.get("worker_identity")
+deliveries = payload.get("deliveries")
+issue_id = str(payload.get("issue_id", ""))
+epoch = payload.get("alert_epoch")
+if (
+    payload.get("ok") is not True
+    or payload.get("schema_version") != 1
+    or payload.get("mode") != "delivery"
+    or payload.get("release_id") != sys.argv[4]
+    or payload.get("release_version") != version
+    or payload.get("release_commit") != commit
+    or preflight.get("ok") is not True
+    or preflight.get("schema_version") != 1
+    or preflight.get("mode") != "preflight"
+    or preflight.get("release_id") != sys.argv[4]
+    or preflight.get("release_version") != version
+    or preflight.get("release_commit") != commit
+    or payload.get("sink_config_fingerprint")
+    != preflight.get("sink_config_fingerprint")
+    or payload.get("status") != "resolved"
+    or not payload.get("alerted_at")
+    or not payload.get("resolved_at")
+    or re.fullmatch(
+        r"hmac-sha256:[0-9a-f]{64}",
+        str(payload.get("sink_config_fingerprint", "")),
+    )
+    is None
+    or re.fullmatch(
+        r"sha256:[0-9a-f]{64}", str(payload.get("runner_sha256", ""))
+    )
+    is None
+    or payload.get("runner_sha256") != sys.argv[8]
+    or not isinstance(worker, dict)
+    or worker.get("compose_project") != sys.argv[5]
+    or worker.get("image_id") != sys.argv[6]
+    or worker.get("image_name") != sys.argv[7]
+    or worker.get("worker_actor_id") != sys.argv[9]
+    or worker.get("release_id") != sys.argv[4]
+    or worker.get("release_commit") != sys.argv[10]
+    or sys.argv[10] != commit
+    or re.fullmatch(r"[0-9a-f-]{36}", sys.argv[9]) is None
+    or re.fullmatch(r"[0-9a-f]{64}", str(worker.get("container_id", ""))) is None
+    or not isinstance(epoch, int)
+    or epoch < 1
+    or re.fullmatch(r"[0-9a-f-]{36}", issue_id) is None
+    or not isinstance(deliveries, dict)
+    or not deliveries
+    or set(deliveries) - {"notification", "webhook"}
+    or set(deliveries) != set(preflight.get("configured_sinks") or [])
+):
+    raise SystemExit(1)
+for sink, delivery in deliveries.items():
+    delivered_by = delivery.get("delivered_by") if isinstance(delivery, dict) else None
+    if (
+        not isinstance(delivery, dict)
+        or delivery.get("status") != "delivered"
+        or delivery.get("attribution_version") != 1
+        or not isinstance(delivery.get("attempts"), int)
+        or delivery["attempts"] < 1
+        or delivery.get("error_code") is not None
+        or not delivery.get("delivered_at")
+        or delivery.get("idempotency_key")
+        != f"production-issue:{issue_id}:{epoch}:{sink}"
+        or not isinstance(delivered_by, dict)
+        or delivered_by.get("worker_actor_id") != sys.argv[9]
+        or delivered_by.get("release_id") != sys.argv[4]
+        or delivered_by.get("release_commit") != commit
+    ):
+        raise SystemExit(1)
+PY_ALERT_CANARY_VALIDATE
+}
+
+run_candidate_business_smoke() {
+    local target_release="$1"
+    local target_project="$2"
+    local target_release_id="$3"
+    local target_version="$4"
+    local target_commit="$5"
+    local target_port="$6"
+    local output="$7"
+    local target_backup="$APP_ROOT/backups/$target_release_id"
+    local image="astra-browser-smoke:${target_release_id}"
+    local frontend_id
+    local frontend_health=""
+    local api_evidence
+    local ui_evidence
+    local browser_credentials
+    local evidence_nonce
+    local runner_bundle_digest
+    local browser_image_id
+    local host_uid
+    local host_gid
+    local canonical_api_base="http://127.0.0.1:${target_port}/api"
+    local canonical_frontend_url="http://127.0.0.1:${target_port}"
+
+    [ "$RUN_REMOTE_SMOKE" = "1" ] || return 1
+    browser_smoke_requires_v2 "$target_release" || return 1
+    [ -f "$SMOKE_ENV_FILE" ] && [ ! -L "$SMOKE_ENV_FILE" ] || return 1
+    for runner in \
+        subscription_production_smoke.py merge_subscription_smoke_evidence.py; do
+        [ -f "$target_release/scripts/$runner" ] && \
+            [ ! -L "$target_release/scripts/$runner" ] || return 1
+    done
+    runner_bundle_digest="$(browser_smoke_bundle_digest "$target_release")" || return 1
+    browser_image_id="$(docker image inspect --format '{{.Id}}' "$image")" || return 1
+    case "$runner_bundle_digest" in sha256:*) ;; *) return 1 ;; esac
+    case "$browser_image_id" in sha256:*) ;; *) return 1 ;; esac
+    host_uid="$(id -u)" || return 1
+    host_gid="$(id -g)" || return 1
+    [ "$host_uid" != "0" ] || return 1
+
+    frontend_id="$(
+        compose_project \
+            "$target_project" "$target_release/.env" "$target_release/$COMPOSE_FILE" \
+            ps -q frontend
+    )" || return 1
+    if [ -z "$frontend_id" ] || [[ "$frontend_id" == *$'\n'* ]]; then
+        return 1
+    fi
+    for _ in $(seq 1 30); do
+        frontend_health="$(
+            docker inspect \
+                --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
+                "$frontend_id" 2>/dev/null || true
+        )"
+        [ "$frontend_health" = "healthy" ] && break
+        sleep 1
+    done
+    [ "$frontend_health" = "healthy" ] || return 1
+
+    mkdir -p "$target_backup"
+    [ -d "$target_backup" ] && [ ! -L "$target_backup" ] || return 1
+    prepare_browser_smoke_runtime_root || return 1
+    BROWSER_SMOKE_TEMP_DIR="$(
+        mktemp -d "$BROWSER_SMOKE_RUNTIME_ROOT/.candidate-smoke.XXXXXX"
+    )" || return 1
+    chmod 0700 "$BROWSER_SMOKE_TEMP_DIR"
+    api_evidence="$BROWSER_SMOKE_TEMP_DIR/api.json"
+    ui_evidence="$BROWSER_SMOKE_TEMP_DIR/ui.json"
+    browser_credentials="$BROWSER_SMOKE_TEMP_DIR/browser-credentials.json"
+    evidence_nonce="$(python3 -c 'import secrets; print(secrets.token_hex(16))')" || {
+        cleanup_browser_smoke_runtime
+        return 1
+    }
+    python3 - "$SMOKE_ENV_FILE" "$browser_credentials" <<'PY_BROWSER_CREDENTIALS'
+import json
+import os
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1])
+target = Path(sys.argv[2])
+payload = json.loads(source.read_text(encoding="utf-8"))
+keys = ("SMOKE_TENANT_EMAIL", "SMOKE_TENANT_PASSWORD")
+if set(payload) != {
+    "SMOKE_TENANT_EMAIL",
+    "SMOKE_TENANT_PASSWORD",
+    "SMOKE_PLATFORM_ADMIN_EMAIL",
+    "SMOKE_PLATFORM_ADMIN_PASSWORD",
+}:
+    raise SystemExit(1)
+browser_payload = {key: payload[key] for key in keys}
+if any(not isinstance(value, str) or not 0 < len(value) <= 4096 for value in browser_payload.values()):
+    raise SystemExit(1)
+fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
+with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    json.dump(browser_payload, handle, ensure_ascii=False, separators=(",", ":"))
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+PY_BROWSER_CREDENTIALS
+
+    if ! python3 "$target_release/scripts/subscription_production_smoke.py" \
+        --credentials-file "$SMOKE_ENV_FILE" \
+        --api-base "$canonical_api_base" \
+        --frontend-url "$canonical_frontend_url" \
+        --expected-version "$target_version" \
+        --expected-commit "$target_commit" \
+        --expected-release-id "$target_release_id" \
+        --evidence-nonce "$evidence_nonce" \
+        > "$api_evidence"; then
+        cleanup_browser_smoke_runtime
+        return 1
+    fi
+
+    BROWSER_SMOKE_NETWORK="astra-browser-smoke-${evidence_nonce}"
+    BROWSER_SMOKE_CONTAINER="astra-browser-smoke-${evidence_nonce}"
+    BROWSER_SMOKE_FRONTEND_ID="$frontend_id"
+    docker network create \
+        --internal \
+        --label "ai.reeftotem.astra.browser-smoke-release=$target_release_id" \
+        "$BROWSER_SMOKE_NETWORK" >/dev/null || {
+        cleanup_browser_smoke_runtime
+        return 1
+    }
+    docker network connect \
+        --alias candidate-frontend \
+        "$BROWSER_SMOKE_NETWORK" "$frontend_id" || {
+        cleanup_browser_smoke_runtime
+        return 1
+    }
+    if ! timeout --signal=TERM --kill-after=10s 150s \
+        docker run --rm \
+        --name "$BROWSER_SMOKE_CONTAINER" \
+        --label "ai.reeftotem.astra.browser-smoke-release=$target_release_id" \
+        --init \
+        --user "${host_uid}:${host_gid}" \
+        --read-only \
+        --cap-drop ALL \
+        --security-opt no-new-privileges:true \
+        --security-opt "seccomp=$target_release/deploy/browser-smoke/seccomp_profile.json" \
+        --pids-limit 256 \
+        --ulimit nofile=1024:1024 \
+        --memory 1g \
+        --cpus 1.0 \
+        --shm-size 256m \
+        --tmpfs /tmp:rw,nosuid,nodev,size=256m \
+        --tmpfs /home/pwuser:rw,nosuid,nodev,size=64m \
+        --env HOME=/home/pwuser \
+        --network "$BROWSER_SMOKE_NETWORK" \
+        --mount \
+            "type=bind,src=$browser_credentials,dst=/run/secrets/smoke-credentials.json,readonly" \
+        "$image" \
+        --frontend-url "http://candidate-frontend:3000" \
+        --evidence-frontend-url "$canonical_frontend_url" \
+        --credentials-file /run/secrets/smoke-credentials.json \
+        --expected-version "$target_version" \
+        --expected-commit "$target_commit" \
+        --expected-release-id "$target_release_id" \
+        --evidence-nonce "$evidence_nonce" \
+        > "$ui_evidence"; then
+        cleanup_browser_smoke_runtime
+        return 1
+    fi
+    cleanup_browser_smoke_runtime 0
+    if ! python3 "$target_release/scripts/merge_subscription_smoke_evidence.py" \
+        --api-evidence "$api_evidence" \
+        --ui-evidence "$ui_evidence" \
+        --api-base "$canonical_api_base" \
+        --frontend-url "$canonical_frontend_url" \
+        --expected-version "$target_version" \
+        --expected-commit "$target_commit" \
+        --expected-release-id "$target_release_id" \
+        --evidence-nonce "$evidence_nonce" \
+        --runner-bundle-sha256 "$runner_bundle_digest" \
+        --browser-image-id "$browser_image_id" \
+        > "$output"; then
+        cleanup_browser_smoke_runtime
+        rm -f "$output"
+        return 1
+    fi
+    chmod 0600 "$output"
+    cleanup_browser_smoke_runtime
+}
+
+candidate_business_evidence_valid() {
+    local release_id="$1"
+    local candidate_port="$2"
+    local target_release="$APP_ROOT/releases/$release_id"
+    local evidence_mode="legacy"
+    local runner_bundle_sha256="none"
+
+    [ -d "$target_release" ] && [ ! -L "$target_release" ] || return 1
+    if browser_smoke_requires_v2 "$target_release"; then
+        evidence_mode="v2"
+        runner_bundle_sha256="$(browser_smoke_bundle_digest "$target_release")" || return 1
+    fi
+    python3 - \
+        "$APP_ROOT" "$release_id" "$candidate_port" "$evidence_mode" \
+        "$runner_bundle_sha256" <<'PY_CANDIDATE_EVIDENCE'
+import hashlib
+import json
+from pathlib import Path
+import re
+import sys
+
+app_root = Path(sys.argv[1])
+release_id = sys.argv[2]
+candidate_port = sys.argv[3]
+evidence_mode = sys.argv[4]
+runner_bundle_sha256 = sys.argv[5]
+backup = app_root / "backups" / release_id
+release = app_root / "releases" / release_id
+marker = backup / "candidate-business-verification"
+
+if not release.is_dir() or release.is_symlink() or not backup.is_dir() or backup.is_symlink():
+    raise SystemExit(1)
+version_path = release / "VERSION"
+commit_path = release / "COMMIT"
+if (
+    not version_path.is_file()
+    or version_path.is_symlink()
+    or not commit_path.is_file()
+    or commit_path.is_symlink()
+    or not marker.is_file()
+    or marker.is_symlink()
+):
+    raise SystemExit(1)
+version = version_path.read_text(encoding="utf-8").strip()
+commit = commit_path.read_text(encoding="utf-8").strip()
+if not version or re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+    raise SystemExit(1)
+value = marker.read_text(encoding="utf-8").strip()
+kind, separator, digest = value.partition(":")
+if separator != ":" or not re.fullmatch(r"[0-9a-f]{64}", digest):
+    raise SystemExit(1)
+
+if kind in {"smoke", "smoke-v2"}:
+    evidence = backup / "subscription-smoke.candidate.json"
+    if not evidence.is_file() or evidence.is_symlink():
+        raise SystemExit(1)
+    raw = evidence.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != digest:
+        raise SystemExit(1)
+    payload = json.loads(raw)
+    if evidence_mode == "v2":
+        required_checks = {
+            "candidate_release_identity_ok",
+            "tenant_login_ok",
+            "tenant_me_ok",
+            "client_plans_ok",
+            "client_subscription_summary_ok",
+            "client_credit_transactions_ok",
+            "client_orders_ok",
+            "client_credit_packs_ok",
+            "platform_admin_login_ok",
+            "saas_ledger_reconciliation_ok",
+            "saas_payment_reconciliation_ok",
+            "orders_csv_export_ok",
+            "credit_transactions_csv_export_ok",
+            "ui_release_identity_ok",
+            "ui_tenant_login_ok",
+            "ui_subscription_summary_api_ok",
+            "ui_subscription_balance_rendered_ok",
+            "ui_subscription_page_ok",
+            "ui_no_server_error_ok",
+        }
+        expected_api_base = f"http://127.0.0.1:{candidate_port}/api"
+        expected_frontend_url = f"http://127.0.0.1:{candidate_port}"
+        if kind != "smoke-v2":
+            raise SystemExit(1)
+        if (
+            payload.get("evidence_schema_version") != 2
+            or payload.get("evidence_kind") != "subscription_composite"
+            or payload.get("ok") is not True
+            or payload.get("api_base") != expected_api_base
+            or payload.get("frontend_url") != expected_frontend_url
+            or payload.get("release_identity")
+            != {"version": version, "commit": commit, "release_id": release_id}
+            or re.fullmatch(r"[0-9a-f]{32}", str(payload.get("evidence_nonce", ""))) is None
+        ):
+            raise SystemExit(1)
+        browser_gate = payload.get("browser_gate")
+        if (
+            not isinstance(browser_gate, dict)
+            or browser_gate.get("runner_bundle_sha256") != runner_bundle_sha256
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", str(browser_gate.get("image_id", ""))) is None
+        ):
+            raise SystemExit(1)
+        ui = payload.get("ui")
+        if not isinstance(ui, dict) or ui.get("final_path") != "/account/subscription" or \
+                ui.get("browser_target") != "isolated_candidate_frontend_network":
+            raise SystemExit(1)
+        summary = payload.get("subscription_summary")
+        if not isinstance(summary, dict) or not {
+            "plan_code", "balance", "available_balance", "reserved"
+        }.issubset(summary):
+            raise SystemExit(1)
+        for field in ("balance", "available_balance", "reserved"):
+            value = summary.get(field)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise SystemExit(1)
+        for key, checked_field in (
+            ("saas_ledger_reconciliation", "checked_tenants"),
+            ("saas_payment_reconciliation", "checked_orders"),
+        ):
+            reconciliation = payload.get(key)
+            if (
+                not isinstance(reconciliation, dict)
+                or set(reconciliation) != {checked_field, "issue_count"}
+                or isinstance(reconciliation.get(checked_field), bool)
+                or not isinstance(reconciliation.get(checked_field), int)
+                or reconciliation[checked_field] < 0
+                or reconciliation.get("issue_count") != 0
+            ):
+                raise SystemExit(1)
+        if not required_checks.issubset(set(payload.get("checks") or [])):
+            raise SystemExit(1)
+    else:
+        required_checks = {
+            "tenant_login_ok",
+            "tenant_me_ok",
+            "client_subscription_summary_ok",
+            "client_credit_transactions_ok",
+            "client_orders_ok",
+            "platform_admin_login_ok",
+            "saas_ledger_reconciliation_ok",
+            "saas_payment_reconciliation_ok",
+            "orders_csv_export_ok",
+            "credit_transactions_csv_export_ok",
+        }
+        if kind != "smoke" or payload.get("ok") is not True:
+            raise SystemExit(1)
+        if payload.get("api_base") != f"http://127.0.0.1:{candidate_port}/api":
+            raise SystemExit(1)
+        if not required_checks.issubset(set(payload.get("checks") or [])):
+            raise SystemExit(1)
+elif kind == "break-glass":
+    approval = backup / "remote-smoke-break-glass.approval"
+    recorded_digest = backup / "remote-smoke-break-glass.sha256"
+    if (
+        not approval.is_file()
+        or approval.is_symlink()
+        or not recorded_digest.is_file()
+        or recorded_digest.is_symlink()
+    ):
+        raise SystemExit(1)
+    if recorded_digest.read_text(encoding="utf-8").strip() != digest:
+        raise SystemExit(1)
+    if hashlib.sha256(approval.read_bytes()).hexdigest() != digest:
+        raise SystemExit(1)
+    if evidence_mode == "v2":
+        fields = {}
+        for line in approval.read_text(encoding="utf-8").splitlines():
+            if line and not line.lstrip().startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                if key.strip() in fields:
+                    raise SystemExit(1)
+                fields[key.strip()] = value.strip()
+        if {item.strip() for item in fields.get("bypassed_gates", "").split(",") if item.strip()} != {
+            "subscription_api",
+            "subscription_browser",
+        }:
+            raise SystemExit(1)
+else:
+    raise SystemExit(1)
+PY_CANDIDATE_EVIDENCE
+}
+
+regenerate_candidate_business_evidence() {
+    local target_release="$1"
+    local target_release_id="$2"
+    local target_port="$3"
+    local target_project="$4"
+    local target_backup="$APP_ROOT/backups/$target_release_id"
+    local temporary_evidence
+    local evidence_sha256
+    local target_version
+    local target_commit
+
+    if [ "$RUN_REMOTE_SMOKE" != "1" ]; then
+        echo "cannot regenerate recovery evidence without authenticated remote smoke" >&2
+        return 1
+    fi
+    if [ ! -f "$SMOKE_ENV_FILE" ] || [ -L "$SMOKE_ENV_FILE" ]; then
+        echo "recovery smoke credential file is missing or unsafe" >&2
+        return 1
+    fi
+    if ! browser_smoke_requires_v2 "$target_release"; then
+        echo "legacy recovery evidence cannot be regenerated without its original verified artifact" >&2
+        return 1
+    fi
+    target_version="$(tr -d '[:space:]' < "$target_release/VERSION")" || return 1
+    target_commit="$(tr -d '[:space:]' < "$target_release/COMMIT")" || return 1
+    mkdir -p "$target_backup"
+    if [ ! -d "$target_backup" ] || [ -L "$target_backup" ]; then
+        echo "recovery evidence directory is unsafe" >&2
+        return 1
+    fi
+    temporary_evidence="$(
+        mktemp "$target_backup/.subscription-smoke.candidate.recovery.XXXXXX"
+    )" || return 1
+    umask 077
+    if ! run_candidate_business_smoke \
+        "$target_release" "$target_project" "$target_release_id" \
+        "$target_version" "$target_commit" "$target_port" \
+        "$temporary_evidence"; then
+        rm -f "$temporary_evidence"
+        echo "authenticated API/browser recovery smoke failed" >&2
+        return 1
+    fi
+    install_durable_file \
+        "$temporary_evidence" "$target_backup/subscription-smoke.candidate.json" || return 1
+    evidence_sha256="$(
+        sha256sum "$target_backup/subscription-smoke.candidate.json" | awk '{print $1}'
+    )" || return 1
+    write_atomic_line "$target_backup/candidate-business-verification" \
+        "smoke-v2:${evidence_sha256}" || return 1
+    echo "authenticated recovery API/browser smoke passed"
+    candidate_business_evidence_valid "$target_release_id" "$target_port"
 }
 
 write_atomic_symlink() {
@@ -603,6 +1874,27 @@ compose_project() {
     fi
 }
 
+compose_project_timed() {
+    local duration_seconds="$1"
+    local kill_after_seconds="$2"
+    local project="$3"
+    local env_file="$4"
+    local compose_file="$5"
+    shift 5
+    if [ -n "$COMPOSE_PROFILES" ]; then
+        timeout --signal=TERM --kill-after="${kill_after_seconds}s" \
+            "${duration_seconds}s" \
+            docker compose --env-file "$env_file" \
+            --profile "$COMPOSE_PROFILES" -p "$project" \
+            -f "$compose_file" "$@"
+    else
+        timeout --signal=TERM --kill-after="${kill_after_seconds}s" \
+            "${duration_seconds}s" \
+            docker compose --env-file "$env_file" -p "$project" \
+            -f "$compose_file" "$@"
+    fi
+}
+
 approval_schema_forward_state() {
     local release="$1"
     local postgres_user
@@ -658,7 +1950,7 @@ agentbay_unresolved_count() {
             "$COMPOSE_PROJECT" "$release/.env" "$release/$COMPOSE_FILE" \
             exec -T postgres psql -qAt -v ON_ERROR_STOP=1 \
             -U "$postgres_user" -d "$postgres_db" \
-            -c "SELECT count(*) FROM agentbay_session_ledger WHERE status IN ('active', 'cleanup_required');"
+            -c "SELECT count(*) FROM agentbay_session_ledger WHERE status IN ('active', 'cleanup_required', 'provider_identity_collision');"
     )" || return 1
     case "$result" in
         ''|*[!0-9]*) return 1 ;;
@@ -821,7 +2113,9 @@ model_route_credential_preflight() {
     local ambiguous_routes
     local disabled_models
     local invalid_fallbacks
+    local tenant_owned_route_models
     local missing_minimax_capabilities
+    local fallback_cycles
 
     postgres_user="$(read_release_env "$release" POSTGRES_USER astra)" || return 1
     postgres_db="$(read_release_env "$release" POSTGRES_DB astra)" || return 1
@@ -843,19 +2137,101 @@ WITH expected_minimax_capability(modality) AS (
     FROM model_routes AS route
     LEFT JOIN llm_models AS model ON model.id = route.llm_model_id
     WHERE route.enabled IS TRUE
-      AND (model.id IS NULL OR model.enabled IS NOT TRUE)
+      AND (
+          model.id IS NULL
+          OR model.enabled IS NOT TRUE
+          OR model.tenant_id IS NOT NULL
+          OR NOT (
+              (
+                  jsonb_array_length(
+                      COALESCE(model.modalities::jsonb, '[]'::jsonb)
+                  ) > 0
+                  AND (
+                      jsonb_exists(model.modalities::jsonb, lower(route.modality))
+                      OR jsonb_exists(model.modalities::jsonb, 'multimodal')
+                      OR (
+                          lower(route.modality) = 'image'
+                          AND jsonb_exists(model.modalities::jsonb, 'vision')
+                      )
+                  )
+              )
+              OR (
+                  jsonb_array_length(
+                      COALESCE(model.modalities::jsonb, '[]'::jsonb)
+                  ) = 0
+                  AND (
+                      lower(COALESCE(model.modality, '')) IN (
+                          lower(route.modality), 'multimodal'
+                      )
+                      OR (
+                          lower(route.modality) = 'image'
+                          AND lower(COALESCE(model.modality, '')) = 'vision'
+                      )
+                  )
+              )
+              OR (
+                  lower(route.modality) = 'image'
+                  AND model.supports_vision IS TRUE
+              )
+          )
+      )
 ), broken_fallback AS (
     SELECT 1
     FROM model_routes AS route
-    JOIN model_routes AS fallback ON fallback.id = route.fallback_route_id
+    LEFT JOIN model_routes AS fallback ON fallback.id = route.fallback_route_id
     LEFT JOIN llm_models AS fallback_model ON fallback_model.id = fallback.llm_model_id
     WHERE route.enabled IS TRUE
+      AND route.fallback_route_id IS NOT NULL
       AND (
-          fallback.enabled IS NOT TRUE
+          fallback.id IS NULL
+          OR fallback.enabled IS NOT TRUE
           OR fallback.saas_tier <> route.saas_tier
           OR fallback.modality <> route.modality
           OR fallback_model.id IS NULL
           OR fallback_model.enabled IS NOT TRUE
+          OR fallback_model.tenant_id IS NOT NULL
+          OR NOT (
+              (
+                  jsonb_array_length(
+                      COALESCE(fallback_model.modalities::jsonb, '[]'::jsonb)
+                  ) > 0
+                  AND (
+                      jsonb_exists(
+                          fallback_model.modalities::jsonb,
+                          lower(fallback.modality)
+                      )
+                      OR jsonb_exists(
+                          fallback_model.modalities::jsonb,
+                          'multimodal'
+                      )
+                      OR (
+                          lower(fallback.modality) = 'image'
+                          AND jsonb_exists(
+                              fallback_model.modalities::jsonb,
+                              'vision'
+                          )
+                      )
+                  )
+              )
+              OR (
+                  jsonb_array_length(
+                      COALESCE(fallback_model.modalities::jsonb, '[]'::jsonb)
+                  ) = 0
+                  AND (
+                      lower(COALESCE(fallback_model.modality, '')) IN (
+                          lower(fallback.modality), 'multimodal'
+                      )
+                      OR (
+                          lower(fallback.modality) = 'image'
+                          AND lower(COALESCE(fallback_model.modality, '')) = 'vision'
+                      )
+                  )
+              )
+              OR (
+                  lower(fallback.modality) = 'image'
+                  AND fallback_model.supports_vision IS TRUE
+              )
+          )
           OR fallback.id = route.id
           OR fallback.fallback_route_id = route.id
       )
@@ -874,21 +2250,55 @@ WITH expected_minimax_capability(modality) AS (
               credential.capabilities IS NULL
               OR cast(credential.capabilities AS jsonb) @> to_jsonb(ARRAY[expected.modality]::text[])
               OR cast(credential.capabilities AS jsonb) @> '["multimodal"]'::jsonb
+              OR (
+                  expected.modality = 'image'
+                  AND cast(credential.capabilities AS jsonb) @> '["vision"]'::jsonb
+              )
           )
           AND COALESCE(credential.modality_status::jsonb -> 'plan' ->> 'status', '') <> 'quota_exceeded'
     )
+), fallback_walk(start_id, id, fallback_route_id, path, cycle) AS (
+    SELECT route.id,
+           route.id,
+           route.fallback_route_id,
+           ARRAY[route.id]::uuid[],
+           false
+    FROM model_routes AS route
+    WHERE route.enabled IS TRUE
+    UNION ALL
+    SELECT fallback_walk.start_id,
+           fallback.id,
+           fallback.fallback_route_id,
+           fallback_walk.path || fallback.id,
+           fallback.id = ANY(fallback_walk.path)
+    FROM fallback_walk
+    JOIN model_routes AS fallback
+      ON fallback.id = fallback_walk.fallback_route_id
+     AND fallback.enabled IS TRUE
+    WHERE fallback_walk.cycle IS FALSE
+), fallback_cycle AS (
+    SELECT 1 FROM fallback_walk WHERE cycle IS TRUE
+), non_platform_route_model AS (
+    SELECT 1
+    FROM model_routes AS route
+    JOIN llm_models AS model ON model.id = route.llm_model_id
+    WHERE model.tenant_id IS NOT NULL
 )
 SELECT
     (SELECT COUNT(*) FROM route_duplicates),
     (SELECT COUNT(*) FROM broken_primary),
     (SELECT COUNT(*) FROM broken_fallback),
-    (SELECT COUNT(*) FROM missing_capability);
+    (SELECT COUNT(*) FROM non_platform_route_model),
+    (SELECT COUNT(*) FROM missing_capability),
+    (SELECT COUNT(*) FROM fallback_cycle);
 SQL_MODEL_ROUTE_PREFLIGHT
     )" || return 1
     IFS='|' read -r ambiguous_routes disabled_models invalid_fallbacks \
-        missing_minimax_capabilities <<< "$counts"
+        tenant_owned_route_models missing_minimax_capabilities \
+        fallback_cycles <<< "$counts"
     for count in "$ambiguous_routes" "$disabled_models" \
-        "$invalid_fallbacks" "$missing_minimax_capabilities"; do
+        "$invalid_fallbacks" "$tenant_owned_route_models" \
+        "$missing_minimax_capabilities" "$fallback_cycles"; do
         case "$count" in
             ''|*[!0-9]*)
                 echo "invalid model-route credential preflight result" >&2
@@ -897,9 +2307,81 @@ SQL_MODEL_ROUTE_PREFLIGHT
         esac
     done
     if [ "$ambiguous_routes" != "0" ] || [ "$disabled_models" != "0" ] || \
-        [ "$invalid_fallbacks" != "0" ] || [ "$missing_minimax_capabilities" != "0" ]; then
-        echo "model-route credential preflight failed: ambiguous_routes=$ambiguous_routes disabled_models=$disabled_models invalid_fallbacks=$invalid_fallbacks missing_minimax_capabilities=$missing_minimax_capabilities" >&2
+        [ "$invalid_fallbacks" != "0" ] || \
+        [ "$tenant_owned_route_models" != "0" ] || \
+        [ "$missing_minimax_capabilities" != "0" ] || \
+        [ "$fallback_cycles" != "0" ]; then
+        echo "model-route credential preflight failed: ambiguous_routes=$ambiguous_routes disabled_models=$disabled_models invalid_fallbacks=$invalid_fallbacks tenant_owned_route_models=$tenant_owned_route_models missing_minimax_capabilities=$missing_minimax_capabilities fallback_cycles=$fallback_cycles" >&2
         echo "Verify the platform MiniMax credential and explicitly enable text/image/video capabilities in the SaaS owner console before release." >&2
+        return 1
+    fi
+}
+
+m3_route_post_migration_preflight() {
+    local release="$1"
+    local postgres_user
+    local postgres_db
+    local invalid_count
+
+    postgres_user="$(read_release_env "$release" POSTGRES_USER astra)" || return 1
+    postgres_db="$(read_release_env "$release" POSTGRES_DB astra)" || return 1
+    invalid_count="$(
+        compose_project \
+            "$COMPOSE_PROJECT" "$release/.env" "$release/$COMPOSE_FILE" \
+            exec -T postgres psql -v ON_ERROR_STOP=1 -At \
+            -U "$postgres_user" -d "$postgres_db" <<'SQL_M3_ROUTE_POSTFLIGHT'
+WITH expected(tier, modality, route_id, model_id) AS (
+    VALUES
+      ('lite', 'text',  '09300000-0000-4000-8000-000000000101'::uuid, '09300000-0000-4000-8000-000000000001'::uuid),
+      ('lite', 'image', '09300000-0000-4000-8000-000000000102'::uuid, '09300000-0000-4000-8000-000000000001'::uuid),
+      ('lite', 'video', '09300000-0000-4000-8000-000000000103'::uuid, '09300000-0000-4000-8000-000000000001'::uuid),
+      ('pro', 'text',   '09300000-0000-4000-8000-000000000104'::uuid, '09300000-0000-4000-8000-000000000002'::uuid),
+      ('pro', 'image',  '09300000-0000-4000-8000-000000000105'::uuid, '09300000-0000-4000-8000-000000000002'::uuid),
+      ('pro', 'video',  '09300000-0000-4000-8000-000000000106'::uuid, '09300000-0000-4000-8000-000000000002'::uuid),
+      ('ultra', 'text', '09300000-0000-4000-8000-000000000107'::uuid, '09300000-0000-4000-8000-000000000003'::uuid),
+      ('ultra', 'image','09300000-0000-4000-8000-000000000108'::uuid, '09300000-0000-4000-8000-000000000003'::uuid),
+      ('ultra', 'video','09300000-0000-4000-8000-000000000109'::uuid, '09300000-0000-4000-8000-000000000003'::uuid)
+), ranked AS (
+    SELECT route.*,
+           row_number() OVER (
+               PARTITION BY route.saas_tier, route.modality
+               ORDER BY route.priority DESC, route.created_at ASC, route.id ASC
+           ) AS rank
+    FROM model_routes AS route
+    WHERE route.enabled IS TRUE
+), invalid AS (
+    SELECT expected.route_id
+    FROM expected
+    LEFT JOIN model_routes AS route ON route.id = expected.route_id
+    LEFT JOIN llm_models AS model ON model.id = route.llm_model_id
+    LEFT JOIN ranked AS top_route
+      ON top_route.saas_tier = expected.tier
+     AND top_route.modality = expected.modality
+     AND top_route.rank = 1
+    WHERE route.id IS NULL
+       OR route.enabled IS NOT TRUE
+       OR route.saas_tier <> expected.tier
+       OR route.modality <> expected.modality
+       OR route.llm_model_id <> expected.model_id
+       OR top_route.id <> expected.route_id
+       OR model.provider <> 'minimax'
+       OR model.model <> 'MiniMax-M3'
+       OR model.enabled IS NOT TRUE
+       OR model.tenant_id IS NOT NULL
+       OR model.supports_vision IS NOT TRUE
+       OR NOT (model.modalities::jsonb @> '["text","image","video"]'::jsonb)
+)
+SELECT COUNT(*) FROM invalid;
+SQL_M3_ROUTE_POSTFLIGHT
+    )" || return 1
+    case "$invalid_count" in
+        ''|*[!0-9]*)
+            echo "invalid M3 post-migration preflight result" >&2
+            return 1
+            ;;
+    esac
+    if [ "$invalid_count" != "0" ]; then
+        echo "M3 post-migration preflight failed: invalid_exact_top_routes=$invalid_count" >&2
         return 1
     fi
 }
@@ -1455,7 +2937,9 @@ wait_for_worker_release() {
     local worker_health
     local worker_image_id
     local worker_image_name
-    local worker_environment
+    local worker_identity
+    local -a worker_identity_fields=()
+    local worker_identity_field
     local worker_release_id
     local worker_role
 
@@ -1489,18 +2973,20 @@ wait_for_worker_release() {
             worker_image_name="$(
                 docker inspect -f '{{.Config.Image}}' "$worker_id" 2>/dev/null || true
             )"
-            worker_environment="$(
-                docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' \
-                    "$worker_id" 2>/dev/null || true
+            worker_identity="$(
+                inspect_worker_runtime_identity "$worker_id" 2>/dev/null || true
             )"
-            worker_release_id="$(
-                printf '%s\n' "$worker_environment" | \
-                    sed -n 's/^ASTRA_RELEASE_ID=//p' | tail -1
-            )"
-            worker_role="$(
-                printf '%s\n' "$worker_environment" | \
-                    sed -n 's/^PROCESS_ROLE=//p' | tail -1
-            )"
+            worker_identity_fields=()
+            while IFS= read -r worker_identity_field; do
+                worker_identity_fields+=("$worker_identity_field")
+            done <<< "$worker_identity"
+            if [ "${#worker_identity_fields[@]}" = "4" ]; then
+                worker_release_id="${worker_identity_fields[0]}"
+                worker_role="${worker_identity_fields[3]}"
+            else
+                worker_release_id=""
+                worker_role=""
+            fi
             case "$worker_image_name" in
                 *":$expected_release_id")
                     if [ "$backend_health" = "healthy" ] && \
@@ -1758,9 +3244,13 @@ parse_cutover_state() {
         complete|rollback_complete|recovery_complete)
             ;;
         maintenance_enabled|migration_started|schema_forward_only|candidate_services_ready|\
-        candidate_ready|nginx_reloaded|public_verified|traffic_and_worker_committed|\
+        candidate_alert_canary_verified|candidate_business_verified|candidate_ready|\
+        nginx_reloaded|public_verified|\
+        traffic_and_worker_committed|\
         rollback_started|rollback_incomplete|rollback_partial|\
-        rollback_recovering_candidate|recovery_started|recovery_incomplete)
+        rollback_recovering_candidate|recovery_started|recovery_incomplete|\
+        recovery_started_alert_proof|recovery_incomplete_alert_proof|\
+        recovery_started_business_proof|recovery_incomplete_business_proof)
             CUTOVER_NONTERMINAL=1
             ;;
         *)
@@ -1893,6 +3383,12 @@ recover_indeterminate_cutover() {
     local fallback_release
     local pre_schema_rollback=0
     local schema_state
+    local evidence_must_preexist=0
+    local alert_evidence_must_preexist=0
+    local recovery_started_phase=recovery_started
+    local recovery_incomplete_phase=recovery_incomplete
+    local alert_preflight_temp
+    local alert_canary_temp
 
     if ! target_release="$(release_for_slot "$target_slot")"; then
         echo "cannot recover cutover: target slot $target_slot has no valid release journal" >&2
@@ -1913,6 +3409,29 @@ recover_indeterminate_cutover() {
         *) return 1 ;;
     esac
 
+    case "${CUTOVER_PHASE:-}" in
+        candidate_business_verified|nginx_reloaded|public_verified|\
+        traffic_and_worker_committed|recovery_started_business_proof|\
+        recovery_incomplete_business_proof)
+            evidence_must_preexist=1
+            ;;
+    esac
+    case "${CUTOVER_PHASE:-}" in
+        candidate_alert_canary_verified|candidate_business_verified|\
+        nginx_reloaded|public_verified|traffic_and_worker_committed|\
+        recovery_started_alert_proof|recovery_incomplete_alert_proof|\
+        recovery_started_business_proof|recovery_incomplete_business_proof)
+            alert_evidence_must_preexist=1
+            ;;
+    esac
+    if [ "$evidence_must_preexist" = "1" ]; then
+        recovery_started_phase=recovery_started_business_proof
+        recovery_incomplete_phase=recovery_incomplete_business_proof
+    elif [ "$alert_evidence_must_preexist" = "1" ]; then
+        recovery_started_phase=recovery_started_alert_proof
+        recovery_incomplete_phase=recovery_incomplete_alert_proof
+    fi
+
     if [ "$recorded_slot" != "$target_slot" ]; then
         fallback_slot="$recorded_slot"
     else
@@ -1929,7 +3448,26 @@ recover_indeterminate_cutover() {
         return 1
     fi
 
-    write_cutover_state recovery_started "$target_slot" "$target_release_id" || return 1
+    if alert_canary_requires_v1 "$target_release"; then
+        mkdir -p "$APP_ROOT/backups/$target_release_id"
+        alert_preflight_temp="$(
+            mktemp \
+                "$APP_ROOT/backups/$target_release_id/.production-alert-preflight.recovery.XXXXXX"
+        )" || return 1
+        if ! run_alert_canary_preflight \
+            "$target_release" "$target_project" "$target_release_id" \
+            "$alert_preflight_temp" || \
+            ! install_durable_file \
+                "$alert_preflight_temp" \
+                "$APP_ROOT/backups/$target_release_id/production-alert-preflight.json"; then
+            rm -f "$alert_preflight_temp"
+            echo "cannot recover cutover: production alert preflight failed" >&2
+            return 1
+        fi
+    fi
+
+    write_cutover_state "$recovery_started_phase" \
+        "$target_slot" "$target_release_id" || return 1
 
     # Recovery first reconstructs the same explicit writer fence as a fresh
     # deployment. It never exposes either schema epoch while old writers can
@@ -1937,12 +3475,14 @@ recover_indeterminate_cutover() {
     if ! sudo python3 "$RELEASE/scripts/configure_production_nginx.py" \
         maintenance-on "$NGINX_SITE" "$NGINX_LOG_FORMAT" || \
         ! sudo nginx -t >/dev/null || ! audit_effective_nginx >/dev/null; then
-        write_cutover_state recovery_incomplete "$target_slot" "$target_release_id" || true
+        write_cutover_state "$recovery_incomplete_phase" \
+            "$target_slot" "$target_release_id" || true
         return 1
     fi
     if ! reload_nginx_with_worker_snapshot || \
         ! NGINX_WORKER_GRACE_SECONDS=60 retire_pre_reload_nginx_workers; then
-        write_cutover_state recovery_incomplete "$target_slot" "$target_release_id" || true
+        write_cutover_state "$recovery_incomplete_phase" \
+            "$target_slot" "$target_release_id" || true
         return 1
     fi
     if fallback_release="$(release_for_slot "$fallback_slot" 2>/dev/null)"; then
@@ -1954,7 +3494,8 @@ recover_indeterminate_cutover() {
     fi
     if ! quarantine_mcp_for_unsafe_release \
         "$target_release" "recovery-${RELEASE_ID}-${target_release_id}"; then
-        write_cutover_state recovery_incomplete "$target_slot" "$target_release_id" || true
+        write_cutover_state "$recovery_incomplete_phase" \
+            "$target_slot" "$target_release_id" || true
         return 1
     fi
     case "${CUTOVER_PHASE:-}" in
@@ -1967,7 +3508,8 @@ recover_indeterminate_cutover() {
             schema_state="unknown"
         if [ "$schema_state" != "0" ]; then
             echo "cannot recover pre-schema rollback after the forward-only schema appeared" >&2
-            write_cutover_state recovery_incomplete "$target_slot" "$target_release_id" || true
+            write_cutover_state "$recovery_incomplete_phase" \
+                "$target_slot" "$target_release_id" || true
             return 1
         fi
     else
@@ -1976,26 +3518,30 @@ recover_indeterminate_cutover() {
             run --rm --no-deps -T --entrypoint alembic backend upgrade head < /dev/null || \
             [ "$(approval_schema_forward_state "$target_release")" != "1" ]; then
             echo "cannot recover cutover: durable approval schema did not converge" >&2
-            write_cutover_state recovery_incomplete "$target_slot" "$target_release_id" || true
+            write_cutover_state "$recovery_incomplete_phase" \
+                "$target_slot" "$target_release_id" || true
             return 1
         fi
         if ! reconcile_agentbay_for_cutover "$target_project" "$target_release"; then
             echo "cannot recover cutover: AgentBay provider cleanup remains unverified" >&2
-            write_cutover_state recovery_incomplete "$target_slot" "$target_release_id" || true
+            write_cutover_state "$recovery_incomplete_phase" \
+                "$target_slot" "$target_release_id" || true
             return 1
         fi
     fi
     if ! compose_project \
         "$target_project" "$target_release/.env" "$target_release/$COMPOSE_FILE" \
         up -d --no-deps backend frontend; then
-        write_cutover_state recovery_incomplete "$target_slot" "$target_release_id" || true
+        write_cutover_state "$recovery_incomplete_phase" \
+            "$target_slot" "$target_release_id" || true
         return 1
     fi
     if ! wait_for_local_release \
         "$target_port" "$target_version" "$target_commit" \
         "recovery-local-$target_release_id" 30; then
         echo "cannot recover cutover: target slot identity is not healthy" >&2
-        write_cutover_state recovery_incomplete "$target_slot" "$target_release_id" || true
+        write_cutover_state "$recovery_incomplete_phase" \
+            "$target_slot" "$target_release_id" || true
         return 1
     fi
 
@@ -2004,9 +3550,68 @@ recover_indeterminate_cutover() {
         ! activate_worker_release \
             "$target_project" "$target_release/.env" "$target_release/$COMPOSE_FILE" \
             "$target_release_id" 90; then
-        write_cutover_state recovery_incomplete "$target_slot" "$target_release_id" || true
+        write_cutover_state "$recovery_incomplete_phase" \
+            "$target_slot" "$target_release_id" || true
         return 1
     fi
+
+    if alert_canary_requires_v1 "$target_release"; then
+        if ! candidate_alert_canary_evidence_valid \
+            "$target_release" "$target_project" "$target_release_id"; then
+            if [ "$alert_evidence_must_preexist" = "1" ]; then
+                echo "cannot recover cutover: verified alert canary evidence is missing or invalid" >&2
+                write_cutover_state "$recovery_incomplete_phase" \
+                    "$target_slot" "$target_release_id" || true
+                return 1
+            fi
+            alert_canary_temp="$(
+                mktemp \
+                    "$APP_ROOT/backups/$target_release_id/.production-alert-canary.recovery.XXXXXX"
+            )" || return 1
+            if ! run_candidate_alert_canary \
+                "$target_release" "$target_project" "$target_release_id" \
+                "$alert_canary_temp" || \
+                ! publish_alert_canary_evidence \
+                    "$alert_canary_temp" "$target_release_id" || \
+                ! candidate_alert_canary_evidence_valid \
+                    "$target_release" "$target_project" "$target_release_id"; then
+                rm -f "$alert_canary_temp"
+                echo "cannot recover cutover: production alert canary failed" >&2
+                write_cutover_state "$recovery_incomplete_phase" \
+                    "$target_slot" "$target_release_id" || true
+                return 1
+            fi
+        fi
+        write_cutover_state candidate_alert_canary_verified \
+            "$target_slot" "$target_release_id" || return 1
+        recovery_started_phase=recovery_started_alert_proof
+        recovery_incomplete_phase=recovery_incomplete_alert_proof
+        alert_evidence_must_preexist=1
+    fi
+
+    # Before the verified phase, an interruption may legitimately have no
+    # evidence yet. Re-run the authenticated money-surface smoke against the
+    # isolated candidate while public Nginx remains fenced. At and after the
+    # verified phase, missing/tampered evidence is a hard failure and is never
+    # silently replaced.
+    if ! candidate_business_evidence_valid \
+        "$target_release_id" "$target_port"; then
+        if [ "$evidence_must_preexist" = "1" ] || \
+            ! regenerate_candidate_business_evidence \
+                "$target_release" "$target_release_id" "$target_port" \
+                "$target_project"; then
+            echo "cannot recover cutover: candidate business verification is missing or invalid" >&2
+            write_cutover_state "$recovery_incomplete_phase" \
+                "$target_slot" "$target_release_id" || true
+            return 1
+        fi
+    fi
+    recovery_started_phase=recovery_started_business_proof
+    recovery_incomplete_phase=recovery_incomplete_business_proof
+    evidence_must_preexist=1
+    alert_evidence_must_preexist=1
+    write_cutover_state "$recovery_started_phase" \
+        "$target_slot" "$target_release_id" || return 1
 
     # A hard interruption may leave the site file updated but the log-format file
     # stale. Re-running install is idempotent and completes that intended pair
@@ -2014,28 +3619,33 @@ recover_indeterminate_cutover() {
     if ! sudo python3 "$RELEASE/scripts/configure_production_nginx.py" \
         install "$NGINX_SITE" "$source_port" "$target_port" \
         "$NGINX_LOG_FORMAT"; then
-        write_cutover_state recovery_incomplete "$target_slot" "$target_release_id" || true
+        write_cutover_state "$recovery_incomplete_phase" \
+            "$target_slot" "$target_release_id" || true
         return 1
     fi
     if ! sudo nginx -t >/dev/null || ! audit_effective_nginx >/dev/null; then
-        write_cutover_state recovery_incomplete "$target_slot" "$target_release_id" || true
+        write_cutover_state "$recovery_incomplete_phase" \
+            "$target_slot" "$target_release_id" || true
         return 1
     fi
     write_atomic_symlink "$CURRENT" "$target_release" || return 1
     if ! reload_nginx_with_worker_snapshot; then
-        write_cutover_state recovery_incomplete "$target_slot" "$target_release_id" || true
+        write_cutover_state "$recovery_incomplete_phase" \
+            "$target_slot" "$target_release_id" || true
         return 1
     fi
     if ! wait_for_public_release \
         "$target_version" "$target_commit" \
         "recovery-public-$target_release_id" 30; then
         echo "cannot recover cutover: public identity did not converge to target slot" >&2
-        write_cutover_state recovery_incomplete "$target_slot" "$target_release_id" || true
+        write_cutover_state "$recovery_incomplete_phase" \
+            "$target_slot" "$target_release_id" || true
         return 1
     fi
 
     if ! retire_pre_reload_nginx_workers; then
-        write_cutover_state recovery_incomplete "$target_slot" "$target_release_id" || true
+        write_cutover_state "$recovery_incomplete_phase" \
+            "$target_slot" "$target_release_id" || true
         return 1
     fi
 
@@ -2074,7 +3684,33 @@ ACTUAL_PACKAGE_SHA256="$(sha256sum "$PACKAGE" | awk '{print $1}')"
     exit 1
 }
 
-if [ "$RUN_REMOTE_SMOKE" = "0" ]; then
+if [ "$RUN_REMOTE_SMOKE" = "1" ]; then
+    case "$REMOTE_SMOKE_CREDENTIAL_DIGEST" in
+        ''|*[!0-9a-f]*)
+            echo "remote smoke credential digest is invalid" >&2
+            exit 1
+            ;;
+        *) ;;
+    esac
+    [ "${#REMOTE_SMOKE_CREDENTIAL_DIGEST}" = "64" ] || {
+        echo "remote smoke credential digest must contain 64 hexadecimal characters" >&2
+        exit 1
+    }
+    [ -f "$SMOKE_ENV_FILE" ] && [ ! -L "$SMOKE_ENV_FILE" ] || {
+        echo "remote smoke credential file is missing or unsafe" >&2
+        exit 1
+    }
+    [ "$(wc -c < "$SMOKE_ENV_FILE")" -le 16384 ] || {
+        echo "remote smoke credential file is too large" >&2
+        exit 1
+    }
+    [ "$(sha256sum "$SMOKE_ENV_FILE" | awk '{print $1}')" = \
+        "$REMOTE_SMOKE_CREDENTIAL_DIGEST" ] || {
+        echo "remote smoke credential digest mismatch" >&2
+        exit 1
+    }
+    chmod 0600 "$SMOKE_ENV_FILE"
+else
     [ -f "$REMOTE_SMOKE_BREAK_GLASS_FILE" ] && \
         [ ! -L "$REMOTE_SMOKE_BREAK_GLASS_FILE" ] || {
         echo "remote break-glass approval artifact is missing or unsafe" >&2
@@ -2098,9 +3734,24 @@ if [ "$RUN_REMOTE_SMOKE" = "0" ]; then
     }
 fi
 
+prepare_browser_smoke_runtime_root || {
+    echo "browser smoke runtime directory is unsafe" >&2
+    exit 1
+}
+
 mkdir -p "$RELEASE" "$BACKUP"
 tar -xzf "$PACKAGE" -C "$RELEASE"
 write_atomic_line "$RELEASE/PACKAGE_SHA256" "$PACKAGE_SHA256"
+
+# Build the digest-pinned browser gate before any recovery, service, Nginx,
+# database, or traffic mutation. A missing registry artifact or incompatible
+# Docker runtime therefore fails while the active release is untouched.
+if [ "$RUN_REMOTE_SMOKE" = "1" ]; then
+    if ! ensure_browser_smoke_image "$RELEASE" "$RELEASE_ID"; then
+        echo "isolated browser smoke image build or launch self-test failed" >&2
+        exit 1
+    fi
+fi
 
 # This must precede every cutover recovery, active-state rewrite, pending-drain
 # completion, service action, Nginx change, database backup, or migration.
@@ -2166,14 +3817,41 @@ select_recovery_target || {
     echo "cannot select a safe cutover recovery target" >&2
     exit 1
 }
+if [ "$RECOVERY_REQUIRED" = "1" ] && [ "$RUN_REMOTE_SMOKE" = "1" ]; then
+    RECOVERY_BROWSER_RELEASE="$(release_for_slot "$RECOVERY_TARGET_SLOT")" || {
+        echo "cannot resolve the browser-gated recovery release" >&2
+        exit 1
+    }
+    if browser_smoke_requires_v2 "$RECOVERY_BROWSER_RELEASE" && \
+        ! ensure_browser_smoke_image \
+            "$RECOVERY_BROWSER_RELEASE" "$RECOVERY_TARGET_RELEASE_ID"; then
+        echo "recovery release browser smoke image failed its launch preflight" >&2
+        exit 1
+    fi
+fi
+early_recovery_signal() {
+    local signal_name="$1"
+    local signal_status="$2"
+    trap - HUP INT TERM
+    set +e
+    cleanup_browser_smoke_runtime
+    write_cutover_state \
+        recovery_incomplete "$RECOVERY_TARGET_SLOT" "$RECOVERY_TARGET_RELEASE_ID" || true
+    echo "indeterminate cutover recovery interrupted by $signal_name" >&2
+    exit "$signal_status"
+}
 if [ "$RECOVERY_REQUIRED" = "1" ]; then
     echo "[remote] indeterminate cutover: recorded=$RECORDED_SLOT disk=$DISK_SLOT target=$RECOVERY_TARGET_SLOT; preserving both slots"
+    trap 'early_recovery_signal HUP 129' HUP
+    trap 'early_recovery_signal INT 130' INT
+    trap 'early_recovery_signal TERM 143' TERM
     if ! recover_indeterminate_cutover \
         "$RECORDED_SLOT" "$RECOVERY_TARGET_SLOT" "$RECOVERY_TARGET_PORT" \
         "$RECOVERY_TARGET_RELEASE_ID"; then
         echo "indeterminate cutover recovery failed; both slots were preserved" >&2
         exit 1
     fi
+    trap - HUP INT TERM
     DISK_SLOT="$RECOVERY_TARGET_SLOT"
     NGINX_ACTIVE_PORT="$RECOVERY_TARGET_PORT"
     CURRENT_TARGET="$(python3 -c \
@@ -2289,6 +3967,7 @@ python3 - "$RELEASE/.env" "$VERSION" "$COMMIT" "$RELEASE_ID" "$CANDIDATE_PORT" "
 from pathlib import Path
 import secrets
 import sys
+import uuid
 
 path = Path(sys.argv[1])
 updates = {
@@ -2296,11 +3975,20 @@ updates = {
     "ASTRA_RELEASE_COMMIT": sys.argv[3],
     "ASTRA_RELEASE_ID": sys.argv[4],
     "ASTRA_RELEASE": sys.argv[4],
+    "ASTRA_ALERT_WORKER_ACTOR_ID": str(uuid.uuid4()),
     "COMMIT": sys.argv[3],
     "ALLOW_MIGRATION_FAILURE": "false",
     "HEARTBEAT_ENABLED": "false",
     "TRIGGER_DAEMON_ENABLED": "true",
+    "USER_AUTOMATION_EXECUTION_ENABLED": "true",
+    "USER_SCHEDULE_EXECUTION_ENABLED": "false",
+    "USER_TASK_EXECUTION_ENABLED": "false",
+    "APPROVAL_EXECUTION_ENABLED": "true",
+    "SUPERVISION_EXECUTION_ENABLED": "false",
     "OKR_AUTOMATION_ENABLED": "false",
+    "FEISHU_WEBHOOK_ENABLED": "false",
+    "TEAMS_WEBHOOK_ENABLED": "false",
+    "PRODUCTION_ISSUE_MONITOR_ENABLED": "true",
     "TRIGGER_MAX_CONCURRENCY": "8",
     "TRIGGER_CLAIM_BATCH_SIZE": "16",
     "COMPANY_ASSIGNMENT_RUNNER_ENABLED": "false",
@@ -2475,6 +4163,7 @@ rollback() {
     echo "[remote] rollback to $PREVIOUS" >&2
     trap - ERR HUP INT TERM
     set +e
+    cleanup_browser_smoke_runtime
     rm -f "$SMOKE_ENV_FILE"
     # Once the durable approval consistency constraint exists, the old API and
     # worker are no longer schema-compatible. A failed/unknown probe is also
@@ -2625,6 +4314,23 @@ compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" rm
 echo "[remote] building candidate slot $CANDIDATE_SLOT"
 compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" build backend frontend
 
+# Fail before maintenance if the candidate cannot identify at least one real
+# alert sink or the configured in-app owner does not exist. This preflight is
+# read-only; the delivery canary runs only after the candidate worker is live.
+echo "[remote] validating production alert sink configuration"
+ALERT_PREFLIGHT_TEMP="$(
+    mktemp "$BACKUP/.production-alert-preflight.XXXXXX"
+)" || abort_release "cannot allocate production alert preflight evidence"
+if ! run_alert_canary_preflight \
+    "$RELEASE" "$CANDIDATE_PROJECT" "$RELEASE_ID" \
+    "$ALERT_PREFLIGHT_TEMP"; then
+    rm -f "$ALERT_PREFLIGHT_TEMP"
+    abort_release "production alert sink configuration preflight failed"
+fi
+install_durable_file \
+    "$ALERT_PREFLIGHT_TEMP" "$BACKUP/production-alert-preflight.json" || \
+    abort_release "production alert preflight evidence could not be published"
+
 # The candidate journal is durable before the first traffic mutation, so an
 # interrupted forward-only migration can only recover toward this exact code.
 write_atomic_line "$APP_ROOT/slot-${CANDIDATE_SLOT}-release" "$RELEASE"
@@ -2633,6 +4339,9 @@ echo "[remote] checking AgentBay session ledger before maintenance"
 AGENTBAY_UNRESOLVED_BEFORE_MAINTENANCE="$(agentbay_unresolved_count "$PREVIOUS")" || \
     abort_release "cannot verify the AgentBay ledger before maintenance"
 echo "[remote] AgentBay unresolved before maintenance: $AGENTBAY_UNRESOLVED_BEFORE_MAINTENANCE"
+if [ "$AGENTBAY_UNRESOLVED_BEFORE_MAINTENANCE" != "0" ]; then
+    abort_release "AgentBay has unresolved provider sessions; reconcile them out of band before starting maintenance"
+fi
 
 echo "[remote] enabling explicit Web/API/WebSocket maintenance fence"
 if ! enable_web_maintenance; then
@@ -2644,10 +4353,17 @@ echo "[remote] stopping every old application writer before quarantine/migration
 compose_project "$OLD_PROJECT" "$PREVIOUS/.env" "$PREVIOUS/$COMPOSE_FILE" \
     stop --timeout 90 worker frontend backend
 
-echo "[remote] deleting every retained AgentBay provider session before migration"
-if ! reconcile_agentbay_for_cutover "$CANDIDATE_PROJECT" "$RELEASE"; then
-    abort_release "AgentBay provider cleanup remains unverified before migration"
+echo "[remote] auditing all media Credits bindings before migration"
+if ! compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" \
+    run --rm --no-deps -T --entrypoint python backend \
+    -m app.scripts.inventory_legacy_media_reservations \
+    --fail-on-blocking \
+    > "$BACKUP/media-credit-inventory.pre-migration.json"; then
+    chmod 0600 "$BACKUP/media-credit-inventory.pre-migration.json" || true
+    abort_release "media Credits inventory found a blocking pre-migration inconsistency"
 fi
+chmod 0600 "$BACKUP/media-credit-inventory.pre-migration.json"
+test -s "$BACKUP/media-credit-inventory.pre-migration.json"
 
 if ! quarantine_mcp_for_unsafe_release \
     "$PREVIOUS" "migration-${RELEASE_ID}"; then
@@ -2661,8 +4377,30 @@ echo "[remote] applying migrations before candidate startup"
 write_cutover_state migration_started "$CANDIDATE_SLOT" "$RELEASE_ID"
 compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" \
     run --rm --no-deps -T --entrypoint alembic backend upgrade head < /dev/null
+echo "[remote] verifying all media Credits bindings after migration"
+if ! compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" \
+    run --rm --no-deps -T --entrypoint python backend \
+    -m app.scripts.inventory_legacy_media_reservations \
+    --fail-on-blocking --require-no-legacy \
+    > "$BACKUP/media-credit-inventory.post-migration.json"; then
+    chmod 0600 "$BACKUP/media-credit-inventory.post-migration.json" || true
+    abort_release "media Credits inventory is not canonical after migration"
+fi
+chmod 0600 "$BACKUP/media-credit-inventory.post-migration.json"
+test -s "$BACKUP/media-credit-inventory.post-migration.json"
 if [ "$(approval_schema_forward_state "$RELEASE")" != "1" ]; then
     abort_release "durable approval schema constraint is missing after migration"
+fi
+if ! model_route_credential_preflight "$RELEASE"; then
+    abort_release "model-route or MiniMax credential contract failed after migration"
+fi
+if ! m3_route_post_migration_preflight "$RELEASE"; then
+    abort_release "MiniMax-M3 exact 3x3 top-route contract failed after migration"
+fi
+if ! compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" \
+    run --rm --no-deps -T --entrypoint python backend \
+    -m app.scripts.verify_channel_secrets < /dev/null; then
+    abort_release "ChannelConfig secret encryption or authentication failed after migration"
 fi
 if ! reconcile_agentbay_for_cutover "$CANDIDATE_PROJECT" "$RELEASE"; then
     abort_release "AgentBay provider cleanup remains unverified after migration"
@@ -2701,6 +4439,64 @@ if ! activate_worker_release \
     abort_release "candidate worker did not become healthy on release $RELEASE_ID"
 fi
 write_cutover_state candidate_services_ready "$CANDIDATE_SLOT" "$RELEASE_ID"
+
+# Prove that the same durable outbox used by real production incidents can
+# reach every configured sink. The release-bound canary is resolved only after
+# all delivery rows are committed as delivered under the issue lock.
+echo "[remote] verifying production alert delivery pipeline"
+ALERT_CANARY_TEMP="$(
+    mktemp "$BACKUP/.production-alert-canary.XXXXXX"
+)" || abort_release "cannot allocate production alert canary evidence"
+if ! run_candidate_alert_canary \
+    "$RELEASE" "$CANDIDATE_PROJECT" "$RELEASE_ID" \
+    "$ALERT_CANARY_TEMP"; then
+    rm -f "$ALERT_CANARY_TEMP"
+    abort_release "production alert delivery canary failed"
+fi
+publish_alert_canary_evidence "$ALERT_CANARY_TEMP" "$RELEASE_ID" || \
+    abort_release "production alert canary evidence could not be published"
+if ! candidate_alert_canary_evidence_valid \
+    "$RELEASE" "$CANDIDATE_PROJECT" "$RELEASE_ID"; then
+    abort_release "production alert canary evidence is invalid"
+fi
+write_cutover_state candidate_alert_canary_verified \
+    "$CANDIDATE_SLOT" "$RELEASE_ID"
+
+# Exercise the authenticated money surface against the isolated candidate
+# before changing the public upstream. A failure here keeps the maintenance
+# fence in place and never exposes an unverified API/worker pair to customers.
+if [ "$RUN_REMOTE_SMOKE" = "1" ]; then
+    if [ "$BROWSER_SMOKE_READY" != "1" ]; then
+        abort_release "browser smoke image did not pass its pre-mutation launch self-test"
+    fi
+    CANDIDATE_SMOKE_TEMP="$(
+        mktemp "$BACKUP/.subscription-smoke.candidate.XXXXXX"
+    )" || abort_release "cannot allocate candidate smoke evidence"
+    if ! run_candidate_business_smoke \
+        "$RELEASE" "$CANDIDATE_PROJECT" "$RELEASE_ID" \
+        "$VERSION" "$COMMIT" "$CANDIDATE_PORT" "$CANDIDATE_SMOKE_TEMP"; then
+        rm -f "$CANDIDATE_SMOKE_TEMP"
+        abort_release "authenticated candidate API/browser smoke failed"
+    fi
+    if ! install_durable_file \
+        "$CANDIDATE_SMOKE_TEMP" "$BACKUP/subscription-smoke.candidate.json"; then
+        abort_release "candidate smoke evidence could not be durably published"
+    fi
+    rm -f "$SMOKE_ENV_FILE"
+    CANDIDATE_SMOKE_SHA256="$(
+        sha256sum "$BACKUP/subscription-smoke.candidate.json" | awk '{print $1}'
+    )"
+    write_atomic_line "$BACKUP/candidate-business-verification" \
+        "smoke-v2:${CANDIDATE_SMOKE_SHA256}"
+    echo "[remote] candidate API/browser smoke passed"
+else
+    write_atomic_line "$BACKUP/candidate-business-verification" \
+        "break-glass:${REMOTE_SMOKE_BREAK_GLASS_DIGEST}"
+fi
+if ! candidate_business_evidence_valid "$RELEASE_ID" "$CANDIDATE_PORT"; then
+    abort_release "candidate business verification evidence is invalid"
+fi
+write_cutover_state candidate_business_verified "$CANDIDATE_SLOT" "$RELEASE_ID"
 
 echo "[remote] switching the verified maintenance fence to candidate traffic"
 sudo python3 "$RELEASE/scripts/configure_production_nginx.py" \
@@ -2754,23 +4550,12 @@ fi
     compose_project "$COMPOSE_PROJECT" "$PREVIOUS/.env" "$PREVIOUS/$COMPOSE_FILE" ps postgres redis
 } > "$BACKUP/docker-ps.after.txt"
 
-if [ "$RUN_REMOTE_SMOKE" = "1" ]; then
-    if [ ! -f "$SMOKE_ENV_FILE" ]; then
-        abort_release "remote smoke environment file is missing"
-    fi
-    set -a
-    # This file is generated locally with bash-escaped values and mode 0600.
-    source "$SMOKE_ENV_FILE"
-    set +a
-    rm -f "$SMOKE_ENV_FILE"
-    scripts/subscription-production-smoke.sh --api-base "$PUBLIC_URL/api" --frontend-url "$PUBLIC_URL" | tee "$BACKUP/subscription-smoke.json"
-fi
-
 if [ "$ROTATE_JWT" = "1" ]; then
     touch "$JWT_ROTATION_MARKER"
 fi
 write_cutover_state complete "$CANDIDATE_SLOT" "$RELEASE_ID"
 
+cleanup_browser_smoke_runtime
 trap - ERR HUP INT TERM
 sudo find /var/log/nginx -maxdepth 1 -type f -name 'access.log.*' -exec chmod 600 {} + >/dev/null 2>&1 || true
 rm -f "$PACKAGE" "$SMOKE_ENV_FILE"

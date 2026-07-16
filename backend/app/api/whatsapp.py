@@ -111,9 +111,6 @@ async def configure_whatsapp_channel(
     app_secret = str(data.get("app_secret") or "").strip()
     api_version = str(data.get("api_version") or DEFAULT_WHATSAPP_API_VERSION).strip()
 
-    if not access_token or not phone_number_id or not verify_token:
-        raise HTTPException(status_code=422, detail="access_token, phone_number_id, and verify_token are required")
-
     extra_config = {"api_version": api_version}
     result = await db.execute(
         select(ChannelConfig).where(
@@ -123,15 +120,32 @@ async def configure_whatsapp_channel(
     )
     existing = result.scalar_one_or_none()
     if existing:
-        existing.app_id = phone_number_id
-        existing.app_secret = access_token
-        existing.verification_token = verify_token
-        existing.encrypt_key = app_secret or None
+        existing.app_id = phone_number_id or existing.app_id
+        existing.app_secret = access_token or existing.app_secret
+        existing.verification_token = verify_token or existing.verification_token
+        existing.encrypt_key = app_secret or existing.encrypt_key
+        if not all(
+            (
+                existing.app_id,
+                existing.app_secret,
+                existing.verification_token,
+                existing.encrypt_key,
+            )
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="access_token, phone_number_id, verify_token, and app_secret are required",
+            )
         existing.extra_config = extra_config
         existing.is_configured = True
         await db.flush()
         return ChannelConfigOut.model_validate(existing)
 
+    if not access_token or not phone_number_id or not verify_token or not app_secret:
+        raise HTTPException(
+            status_code=422,
+            detail="access_token, phone_number_id, verify_token, and app_secret are required",
+        )
     config = ChannelConfig(
         agent_id=agent_id,
         channel_type="whatsapp",
@@ -167,7 +181,13 @@ async def get_whatsapp_channel(
 
 
 @router.get("/agents/{agent_id}/whatsapp-channel/webhook-url")
-async def get_whatsapp_webhook_url(agent_id: uuid.UUID, request: Request, db: AsyncSession = Depends(get_db)):
+async def get_whatsapp_webhook_url(
+    agent_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await check_agent_access(db, current_user, agent_id)
     from app.services.platform_service import platform_service
 
     public_base = await platform_service.get_public_base_url(db, request)
@@ -238,7 +258,9 @@ async def whatsapp_event_webhook(
 
     app_secret = (config.encrypt_key or "").strip()
     signature = request.headers.get("x-hub-signature-256")
-    if app_secret and not _verify_signature(app_secret, body, signature):
+    if not app_secret:
+        return Response(status_code=503)
+    if not _verify_signature(app_secret, body, signature):
         return Response(status_code=401)
 
     payload = await request.json()

@@ -24,6 +24,11 @@ def test_trigger_runtime_defaults_keep_explicit_work_bounded_and_okr_off():
     settings = Settings(_env_file=None)
 
     assert settings.TRIGGER_DAEMON_ENABLED is True
+    assert settings.USER_AUTOMATION_EXECUTION_ENABLED is True
+    assert settings.USER_SCHEDULE_EXECUTION_ENABLED is False
+    assert settings.USER_TASK_EXECUTION_ENABLED is False
+    assert settings.APPROVAL_EXECUTION_ENABLED is True
+    assert settings.SUPERVISION_EXECUTION_ENABLED is False
     assert settings.OKR_AUTOMATION_ENABLED is False
     assert settings.TRIGGER_MAX_CONCURRENCY == 8
     assert settings.TRIGGER_CLAIM_BATCH_SIZE == 16
@@ -121,21 +126,53 @@ def test_production_compose_exposes_disabled_heartbeat_kill_switch():
 
     assert "HEARTBEAT_ENABLED: ${HEARTBEAT_ENABLED:-false}" in compose
     assert "TRIGGER_DAEMON_ENABLED: ${TRIGGER_DAEMON_ENABLED:-true}" in compose
+    assert (
+        "USER_AUTOMATION_EXECUTION_ENABLED: "
+        "${USER_AUTOMATION_EXECUTION_ENABLED:-true}" in compose
+    )
+    assert (
+        "USER_SCHEDULE_EXECUTION_ENABLED: "
+        "${USER_SCHEDULE_EXECUTION_ENABLED:-false}" in compose
+    )
+    assert (
+        "USER_TASK_EXECUTION_ENABLED: "
+        "${USER_TASK_EXECUTION_ENABLED:-false}" in compose
+    )
+    assert "APPROVAL_EXECUTION_ENABLED: ${APPROVAL_EXECUTION_ENABLED:-true}" in compose
+    assert "SUPERVISION_EXECUTION_ENABLED: ${SUPERVISION_EXECUTION_ENABLED:-false}" in compose
     assert "OKR_AUTOMATION_ENABLED: ${OKR_AUTOMATION_ENABLED:-false}" in compose
     assert "TRIGGER_MAX_CONCURRENCY: ${TRIGGER_MAX_CONCURRENCY:-8}" in compose
     assert "TRIGGER_CLAIM_BATCH_SIZE: ${TRIGGER_CLAIM_BATCH_SIZE:-16}" in compose
 
 
-def test_production_deploy_pins_autonomous_runners_off():
+def test_production_deploy_splits_system_and_user_automation_controls():
     repository_root = Path(__file__).parents[2]
     deploy_script = (repository_root / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
 
     assert '"HEARTBEAT_ENABLED": "false"' in deploy_script
     assert '"TRIGGER_DAEMON_ENABLED": "true"' in deploy_script
+    assert '"USER_AUTOMATION_EXECUTION_ENABLED": "true"' in deploy_script
+    assert '"USER_SCHEDULE_EXECUTION_ENABLED": "false"' in deploy_script
+    assert '"USER_TASK_EXECUTION_ENABLED": "false"' in deploy_script
+    assert '"APPROVAL_EXECUTION_ENABLED": "true"' in deploy_script
+    assert '"SUPERVISION_EXECUTION_ENABLED": "false"' in deploy_script
     assert '"OKR_AUTOMATION_ENABLED": "false"' in deploy_script
+    assert '"PRODUCTION_ISSUE_MONITOR_ENABLED": "true"' in deploy_script
     assert '"TRIGGER_MAX_CONCURRENCY": "8"' in deploy_script
     assert '"TRIGGER_CLAIM_BATCH_SIZE": "16"' in deploy_script
     assert '"COMPANY_ASSIGNMENT_RUNNER_ENABLED": "false"' in deploy_script
     assert 'git archive --format=tar --output="$PACKAGE_TAR" "$COMMIT"' in deploy_script
     assert 'git get-tar-commit-id < "$PACKAGE_TAR"' in deploy_script
     assert 'write_atomic_line "$RELEASE/PACKAGE_SHA256" "$PACKAGE_SHA256"' in deploy_script
+
+
+def test_agent_capabilities_distinguish_user_automation_from_supervision():
+    repository_root = Path(__file__).parents[2]
+    source = (repository_root / "backend/app/api/agents.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert '"task_execution": AUTOMATIC_TASK_EXECUTION_ENABLED' in source
+    assert '"schedule_execution": AUTOMATIC_SCHEDULE_EXECUTION_ENABLED' in source
+    assert '"trigger_execution": AUTOMATIC_TRIGGER_EXECUTION_ENABLED' in source
+    assert '"supervision_execution": SUPERVISION_EXECUTION_ENABLED' in source

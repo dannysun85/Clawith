@@ -409,17 +409,32 @@ def test_every_code_tool_is_mapped_to_l3_autonomy_action():
     } == set()
 
 
-def test_l3_approval_message_forbids_model_retry_and_points_to_terminal_status():
+def test_l3_approval_message_matches_enabled_execution_worker(monkeypatch):
     approval_id = uuid.uuid4()
+    monkeypatch.setattr(
+        "app.config.get_settings",
+        lambda: SimpleNamespace(APPROVAL_EXECUTION_ENABLED=True),
+    )
 
     message = agent_tools._queued_approval_message(approval_id)
 
-    assert "automatic execution is paused" in message
+    assert "secure worker will execute the signed action once" in message
     assert "Do not retry this tool call" in message
-    assert "No code, command, or side effect will run after approval" in message
-    assert "execute it automatically after approval" not in message
+    assert "No side effect has completed yet" in message
     assert str(approval_id) in message
     assert "Please wait for approval before retrying" not in message
+
+
+def test_l3_approval_message_reports_paused_worker(monkeypatch):
+    monkeypatch.setattr(
+        "app.config.get_settings",
+        lambda: SimpleNamespace(APPROVAL_EXECUTION_ENABLED=False),
+    )
+
+    message = agent_tools._queued_approval_message(uuid.uuid4())
+
+    assert "automatic execution is paused" in message
+    assert "No code, command, or side effect will run after approval" in message
 
 
 @pytest.mark.asyncio

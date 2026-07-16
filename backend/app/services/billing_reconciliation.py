@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import uuid
 import asyncio
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import func, select, union
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -19,6 +19,7 @@ from app.services.credit_service import (
     finalize_reserved_credits_in_session,
     release_reserved_credits_in_session,
 )
+from app.services.media_generation import UNRESOLVED_MEDIA_STATUSES
 
 
 @dataclass(slots=True)
@@ -62,58 +63,107 @@ async def check_credit_ledger_integrity(
         async with async_session() as session:
             return await check_credit_ledger_integrity(session, tenant_id=tenant_id)
 
-    balance_stmt = select(CreditBalance)
-    if tenant_id:
-        balance_stmt = balance_stmt.where(CreditBalance.tenant_id == tenant_id)
-    balances_result = await db.execute(balance_stmt)
-    balances = list(balances_result.scalars().all())
-
-    tx_stmt = select(CreditTransaction)
-    if tenant_id:
-        tx_stmt = tx_stmt.where(CreditTransaction.tenant_id == tenant_id)
-    tx_result = await db.execute(tx_stmt)
-    transactions = list(tx_result.scalars().all())
-
-    reservation_stmt = select(CreditReservation).where(
-        CreditReservation.status.in_(("reserved", "provider_inflight", "settlement_ready"))
+    open_reservation_statuses = ("reserved", "provider_inflight", "settlement_ready")
+    audited_tenants = union(
+        select(CreditBalance.tenant_id.label("tenant_id")),
+        select(CreditTransaction.tenant_id.label("tenant_id")),
+        select(CreditReservation.tenant_id.label("tenant_id")).where(
+            CreditReservation.status.in_(open_reservation_statuses)
+        ),
+    ).subquery("audited_credit_tenants")
+    transaction_totals = (
+        select(
+            CreditTransaction.tenant_id.label("tenant_id"),
+            func.sum(CreditTransaction.delta).label("expected_balance"),
+        )
+        .group_by(CreditTransaction.tenant_id)
+        .subquery("credit_transaction_totals")
+    )
+    reservation_totals = (
+        select(
+            CreditReservation.tenant_id.label("tenant_id"),
+            func.sum(CreditReservation.amount).label("expected_reserved"),
+        )
+        .where(CreditReservation.status.in_(open_reservation_statuses))
+        .group_by(CreditReservation.tenant_id)
+        .subquery("open_credit_reservation_totals")
+    )
+    integrity_stmt = (
+        select(
+            audited_tenants.c.tenant_id,
+            CreditBalance.balance.label("actual_balance"),
+            CreditBalance.reserved.label("actual_reserved"),
+            func.coalesce(transaction_totals.c.expected_balance, 0).label("expected_balance"),
+            func.coalesce(reservation_totals.c.expected_reserved, 0).label("expected_reserved"),
+        )
+        .select_from(audited_tenants)
+        .outerjoin(
+            CreditBalance,
+            CreditBalance.tenant_id == audited_tenants.c.tenant_id,
+        )
+        .outerjoin(
+            transaction_totals,
+            transaction_totals.c.tenant_id == audited_tenants.c.tenant_id,
+        )
+        .outerjoin(
+            reservation_totals,
+            reservation_totals.c.tenant_id == audited_tenants.c.tenant_id,
+        )
+        .order_by(audited_tenants.c.tenant_id)
     )
     if tenant_id:
-        reservation_stmt = reservation_stmt.where(CreditReservation.tenant_id == tenant_id)
-    reservation_result = await db.execute(reservation_stmt)
-    reservations = list(reservation_result.scalars().all())
+        integrity_stmt = integrity_stmt.where(audited_tenants.c.tenant_id == tenant_id)
+    integrity_result = await db.execute(integrity_stmt)
+    rows = list(integrity_result.all())
 
-    tx_totals: dict[uuid.UUID, int] = {}
-    for tx in transactions:
-        tx_totals[tx.tenant_id] = tx_totals.get(tx.tenant_id, 0) + tx.delta
+    report = LedgerIntegrityReport(checked_tenants=len(rows))
+    for row in rows:
+        audited_tenant_id = row.tenant_id
+        if row.actual_balance is None:
+            report.issues.append(
+                LedgerIntegrityIssue(
+                    code="missing_credit_balance",
+                    tenant_id=audited_tenant_id,
+                    expected=1,
+                    actual=0,
+                    message="credit activity exists without a credit_balances row",
+                )
+            )
+            continue
 
-    reserved_totals: dict[uuid.UUID, int] = {}
-    for reservation in reservations:
-        reserved_totals[reservation.tenant_id] = reserved_totals.get(reservation.tenant_id, 0) + reservation.amount
-
-    report = LedgerIntegrityReport(checked_tenants=len(balances))
-    for balance in balances:
-        expected_balance = tx_totals.get(balance.tenant_id, 0)
-        if balance.balance != expected_balance:
-            report.issues.append(LedgerIntegrityIssue(
-                code="balance_drift",
-                tenant_id=balance.tenant_id,
-                expected=expected_balance,
-                actual=balance.balance,
-                message="credit_balances.balance does not equal credit_transactions delta sum",
-            ))
-        expected_reserved = reserved_totals.get(balance.tenant_id, 0)
-        actual_reserved = balance.reserved or 0
+        expected_balance = int(row.expected_balance)
+        if row.actual_balance != expected_balance:
+            report.issues.append(
+                LedgerIntegrityIssue(
+                    code="balance_drift",
+                    tenant_id=audited_tenant_id,
+                    expected=expected_balance,
+                    actual=row.actual_balance,
+                    message="credit_balances.balance does not equal credit_transactions delta sum",
+                )
+            )
+        expected_reserved = int(row.expected_reserved)
+        actual_reserved = row.actual_reserved or 0
         if actual_reserved != expected_reserved:
-            report.issues.append(LedgerIntegrityIssue(
-                code="reserved_drift",
-                tenant_id=balance.tenant_id,
-                expected=expected_reserved,
-                actual=actual_reserved,
-                message="credit_balances.reserved does not equal open credit reservation amount",
-            ))
+            report.issues.append(
+                LedgerIntegrityIssue(
+                    code="reserved_drift",
+                    tenant_id=audited_tenant_id,
+                    expected=expected_reserved,
+                    actual=actual_reserved,
+                    message="credit_balances.reserved does not equal open credit reservation amount",
+                )
+            )
 
     if report.issues:
-        logger.warning("[billing] ledger integrity issues detected: {}", [asdict(issue) for issue in report.issues])
+        code_counts: dict[str, int] = {}
+        for issue in report.issues:
+            code_counts[issue.code] = code_counts.get(issue.code, 0) + 1
+        logger.warning(
+            "[billing] ledger integrity issues detected issue_count={} code_counts={}",
+            len(report.issues),
+            code_counts,
+        )
     return report
 
 
@@ -142,37 +192,44 @@ async def expire_stale_credit_reservations(
 
     now = now or datetime.now(timezone.utc)
     active_media_reservations = select(MediaGenerationTask.reservation_id).where(
-        MediaGenerationTask.status.in_((
-            "submitting",
-            "submitted",
-            "processing",
-            "retrying",
-            "downloading",
-            "asset_repairing",
-            "settlement_ready",
-            "backfill_scanning",
-        )),
+        MediaGenerationTask.status.in_(UNRESOLVED_MEDIA_STATUSES),
         MediaGenerationTask.reservation_id.is_not(None),
     )
     result = await db.execute(
-        select(CreditReservation).where(
+        select(CreditReservation.id).where(
             CreditReservation.status.in_(("reserved", "provider_inflight", "settlement_ready")),
             CreditReservation.expires_at.is_not(None),
             CreditReservation.expires_at <= now,
             CreditReservation.id.not_in(active_media_reservations),
         )
     )
-    reservations = list(result.scalars().all())
+    candidate_ids = list(result.scalars().all())
     recovered = 0
-    for reservation in reservations:
+    for reservation_id in candidate_ids:
+        # Re-read every candidate under a row lock and repeat every eligibility
+        # predicate. The initial query intentionally loads IDs only so an ORM
+        # identity-map snapshot cannot survive a concurrent sweeper's commit.
+        locked_result = await db.execute(
+            select(CreditReservation)
+            .where(
+                CreditReservation.id == reservation_id,
+                CreditReservation.status.in_(("reserved", "provider_inflight", "settlement_ready")),
+                CreditReservation.expires_at.is_not(None),
+                CreditReservation.expires_at <= now,
+                CreditReservation.id.not_in(active_media_reservations),
+            )
+            .with_for_update(skip_locked=True)
+        )
+        reservation = locked_result.scalar_one_or_none()
+        if reservation is None:
+            continue
         if reservation.status == "settlement_ready":
             try:
                 await finalize_reserved_credits_in_session(db, reservation.id)
             except Exception as exc:
                 # The durable debt stays held for the next sweep (or a top-up).
                 logger.error(
-                    "[billing] settlement-ready reservation recovery failed "
-                    "reservation_id={} error_type={}",
+                    "[billing] settlement-ready reservation recovery failed reservation_id={} error_type={}",
                     reservation.id,
                     type(exc).__name__,
                 )
@@ -205,10 +262,10 @@ async def expire_stale_credit_reservations(
         else:
             await release_reserved_credits_in_session(db, reservation.id, status="expired")
         recovered += 1
-    if reservations:
+    if candidate_ids:
         logger.info(
             "[billing] stale reservation sweep candidates={} recovered={}",
-            len(reservations),
+            len(candidate_ids),
             recovered,
         )
     return recovered
@@ -232,16 +289,25 @@ async def reconcile_pending_payment_orders(
     report = PaymentReconciliationReport(checked_orders=len(orders))
     for order in orders:
         if not order.provider_session_id:
-            report.issues.append(PaymentReconciliationIssue(
-                code="missing_provider_session",
-                order_id=order.id,
-                tenant_id=order.tenant_id,
-                provider=order.provider,
-                status=order.status,
-                message="non-manual pending order has no provider_session_id",
-            ))
+            report.issues.append(
+                PaymentReconciliationIssue(
+                    code="missing_provider_session",
+                    order_id=order.id,
+                    tenant_id=order.tenant_id,
+                    provider=order.provider,
+                    status=order.status,
+                    message="non-manual pending order has no provider_session_id",
+                )
+            )
     if report.issues:
-        logger.warning("[billing] payment reconciliation issues detected: {}", [asdict(issue) for issue in report.issues])
+        code_counts: dict[str, int] = {}
+        for issue in report.issues:
+            code_counts[issue.code] = code_counts.get(issue.code, 0) + 1
+        logger.warning(
+            "[billing] payment reconciliation issues detected issue_count={} code_counts={}",
+            len(report.issues),
+            code_counts,
+        )
     return report
 
 
