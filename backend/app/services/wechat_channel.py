@@ -312,8 +312,12 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
     await log_activity(
         agent_id,
         "chat_reply",
-        f"Replied to WeChat message: {reply_text[:80]}",
-        detail={"channel": "wechat", "user_text": user_text[:200], "reply": reply_text[:500]},
+        "Replied to WeChat message",
+        detail={
+            "channel": "wechat",
+            "request_chars": len(user_text),
+            "reply_chars": len(reply_text),
+        },
     )
 
 

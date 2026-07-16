@@ -43,6 +43,8 @@ from app.schemas.saas import (
     InitializeFreeSubscriptionsOut,
     MediaRouteOut,
     MediaRouteUpdateIn,
+    MediaFailureRemediationIn,
+    MediaProviderDebtResolutionIn,
     ModelRouteCreateIn,
     ModelRouteOut,
     ModelRouteUpdateIn,
@@ -56,6 +58,10 @@ from app.services.billing_reconciliation import (
     reconcile_pending_payment_orders,
 )
 from app.services.credit_service import grant_credits_in_session
+from app.services.media_incident_remediation import (
+    remediate_media_tasks,
+    resolve_media_provider_debt,
+)
 from app.services.entitlements import get_active_subscription, get_tenant_entitlements
 from app.services.agent_plan_selection import reconcile_tenant_agent_plan_selections
 from app.services.subscription_lifecycle import (
@@ -156,6 +162,79 @@ def _validate_model_route(model: LLMModel, modality: str) -> str:
     return canonical
 
 
+async def _ensure_model_route_slot_available(
+    db: AsyncSession,
+    *,
+    saas_tier: str,
+    modality: str,
+    priority: int,
+    enabled: bool,
+    exclude_route_id: uuid.UUID | None = None,
+) -> None:
+    """Reject ambiguous enabled routes before the DB uniqueness guard."""
+
+    if not enabled:
+        return
+    conditions = [
+        ModelRoute.saas_tier == saas_tier,
+        ModelRoute.modality == modality,
+        ModelRoute.priority == priority,
+        ModelRoute.enabled == True,  # noqa: E712
+    ]
+    if exclude_route_id:
+        conditions.append(ModelRoute.id != exclude_route_id)
+    result = await db.execute(select(ModelRoute.id).where(*conditions).limit(1))
+    if result.scalar_one_or_none() is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "An enabled model route already uses this SaaS tier, modality, "
+                "and priority. Choose a different priority or disable the other route."
+            ),
+        )
+
+
+async def _validate_fallback_route(
+    db: AsyncSession,
+    *,
+    fallback_route_id: uuid.UUID | None,
+    route_id: uuid.UUID | None,
+    saas_tier: str,
+    modality: str,
+) -> None:
+    if not fallback_route_id:
+        return
+    if route_id and fallback_route_id == route_id:
+        raise HTTPException(status_code=400, detail="A model route cannot fall back to itself")
+
+    fallback = await db.get(ModelRoute, fallback_route_id)
+    if not fallback:
+        raise HTTPException(status_code=404, detail="Fallback route not found")
+    if not fallback.enabled:
+        raise HTTPException(status_code=400, detail="Fallback route must be enabled")
+    if fallback.saas_tier != saas_tier or fallback.modality != modality:
+        raise HTTPException(
+            status_code=400,
+            detail="Fallback route must use the same SaaS tier and modality",
+        )
+    fallback_model = await db.get(LLMModel, fallback.llm_model_id)
+    if not fallback_model or not fallback_model.enabled:
+        raise HTTPException(status_code=400, detail="Fallback model must be enabled")
+    _validate_model_route(fallback_model, modality)
+
+    visited: set[uuid.UUID] = set()
+    cursor = fallback
+    while cursor.fallback_route_id:
+        if cursor.id in visited:
+            raise HTTPException(status_code=400, detail="Fallback route cycle detected")
+        visited.add(cursor.id)
+        if route_id and cursor.fallback_route_id == route_id:
+            raise HTTPException(status_code=400, detail="Fallback route cycle detected")
+        cursor = await db.get(ModelRoute, cursor.fallback_route_id)
+        if not cursor:
+            break
+
+
 @router.get("/model-routes", response_model=list[ModelRouteOut])
 async def list_model_routes(
     current_user: User = Depends(get_platform_admin),
@@ -176,11 +255,23 @@ async def create_model_route(
     model = await db.get(LLMModel, data.llm_model_id)
     if not model:
         raise HTTPException(status_code=404, detail="LLM model not found")
+    if data.enabled and not model.enabled:
+        raise HTTPException(status_code=400, detail="Enabled routes require an enabled LLM model")
     data.modality = _validate_model_route(model, data.modality)
-    if data.fallback_route_id:
-        fallback = await db.get(ModelRoute, data.fallback_route_id)
-        if not fallback:
-            raise HTTPException(status_code=404, detail="Fallback route not found")
+    await _ensure_model_route_slot_available(
+        db,
+        saas_tier=data.saas_tier,
+        modality=data.modality,
+        priority=data.priority,
+        enabled=data.enabled,
+    )
+    await _validate_fallback_route(
+        db,
+        fallback_route_id=data.fallback_route_id,
+        route_id=None,
+        saas_tier=data.saas_tier,
+        modality=data.modality,
+    )
 
     route = ModelRoute(**data.model_dump())
     db.add(route)
@@ -214,15 +305,32 @@ async def update_model_route(
             raise HTTPException(status_code=404, detail="LLM model not found")
     else:
         model = await db.get(LLMModel, route.llm_model_id)
-    if model and ("modality" in update or "llm_model_id" in update):
-        update["modality"] = _validate_model_route(
-            model,
-            update.get("modality", route.modality),
-        )
-    if "fallback_route_id" in update and update["fallback_route_id"]:
-        fallback = await db.get(ModelRoute, update["fallback_route_id"])
-        if not fallback:
-            raise HTTPException(status_code=404, detail="Fallback route not found")
+    prospective_tier = update.get("saas_tier", route.saas_tier)
+    prospective_modality = _validate_model_route(
+        model,
+        update.get("modality", route.modality),
+    )
+    prospective_enabled = update.get("enabled", route.enabled)
+    prospective_priority = update.get("priority", route.priority)
+    prospective_fallback_id = update.get("fallback_route_id", route.fallback_route_id)
+    update["modality"] = prospective_modality
+    if prospective_enabled and not model.enabled:
+        raise HTTPException(status_code=400, detail="Enabled routes require an enabled LLM model")
+    await _ensure_model_route_slot_available(
+        db,
+        saas_tier=prospective_tier,
+        modality=prospective_modality,
+        priority=prospective_priority,
+        enabled=prospective_enabled,
+        exclude_route_id=route_id,
+    )
+    await _validate_fallback_route(
+        db,
+        fallback_route_id=prospective_fallback_id,
+        route_id=route_id,
+        saas_tier=prospective_tier,
+        modality=prospective_modality,
+    )
 
     for k, v in update.items():
         setattr(route, k, v)
@@ -261,7 +369,7 @@ async def _minimax_pool_modalities(db: AsyncSession) -> set[str]:
     pool_modalities: set[str] = set()
     for credential in result.scalars().all():
         capabilities = canonicalize_modalities(credential.capabilities)
-        if not capabilities or "multimodal" in capabilities:
+        if credential.capabilities is None or "multimodal" in capabilities:
             supported = set(MINIMAX_MEDIA_TOOL_NAMES)
         else:
             supported = set(capabilities)
@@ -1082,6 +1190,45 @@ async def expire_stale_reservations(
     ))
     await db.commit()
     return {"expired": expired}
+
+
+@router.post("/media/remediate-failures")
+async def remediate_media_failures(
+    data: MediaFailureRemediationIn,
+    current_user: User = Depends(get_platform_admin),
+):
+    """Preview/apply refundable failure handling for exact tenant-fenced tasks."""
+    try:
+        result = await remediate_media_tasks(
+            task_ids=tuple(data.task_ids),
+            incident_key=data.incident_key,
+            expected_tenant_id=data.expected_tenant_id,
+            apply=data.apply,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return result.to_dict()
+
+
+@router.post("/media/resolve-provider-debt")
+async def resolve_provider_media_debt(
+    data: MediaProviderDebtResolutionIn,
+    current_user: User = Depends(get_platform_admin),
+):
+    """Preview/apply evidence-backed settlement or release for exact media debt."""
+    try:
+        result = await resolve_media_provider_debt(
+            task_ids=tuple(data.task_ids),
+            expected_tenant_id=data.expected_tenant_id,
+            incident_key=data.incident_key,
+            evidence_ref=data.evidence_ref,
+            resolution=data.resolution,
+            actor_user_id=current_user.id,
+            apply=data.apply,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return result.to_dict()
 
 
 @router.post("/orders/{order_id}/mark-paid", response_model=PaymentOrderOut)

@@ -1,32 +1,100 @@
-"""Safe reference-asset transport and deterministic media text rendering."""
+"""Validated media assets and deterministic brand-safe post-processing."""
 
 from __future__ import annotations
 
 import asyncio
 import base64
+from dataclasses import asdict, dataclass
+from functools import lru_cache
+import hashlib
 from io import BytesIO
+import json
+import os
 from pathlib import Path
 import tempfile
+import unicodedata
+import warnings
 
 
 MAX_REFERENCE_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_IMAGE_EDGE_PIXELS = 8192
+MAX_IMAGE_PIXELS = 40_000_000
 MAX_OVERLAY_TEXT_CHARS = 300
-SUPPORTED_REFERENCE_FORMATS = {"JPEG": "image/jpeg", "PNG": "image/png", "WEBP": "image/webp"}
+SUPPORTED_REFERENCE_FORMATS = {
+    "JPEG": "image/jpeg",
+    "PNG": "image/png",
+    "WEBP": "image/webp",
+}
 _FONT_CANDIDATES = (
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
     "/System/Library/Fonts/PingFang.ttc",
     "/System/Library/Fonts/STHeiti Medium.ttc",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
 )
+_TEXT_POSITIONS = {"top", "center", "bottom"}
+_BRAND_POSITIONS = {
+    "top_left",
+    "top_right",
+    "center",
+    "bottom_left",
+    "bottom_right",
+}
 
 
-def _font_path() -> str:
-    for candidate in _FONT_CANDIDATES:
-        if Path(candidate).is_file():
-            return candidate
-    raise ValueError("No CJK-capable font is installed for deterministic media text")
+class MediaContractError(ValueError):
+    """The requested media cannot meet the deterministic delivery contract."""
+
+
+@dataclass(frozen=True, slots=True)
+class ImageAsset:
+    raw: bytes
+    mime_type: str
+    width: int
+    height: int
+    sha256: str
+    source_path: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FontSelection:
+    path: str
+    face_index: int
+    family: str
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class OverlayReceipt:
+    rendered_text_sha256: str | None = None
+    brand_asset_sha256: str | None = None
+    font_sha256: str | None = None
+    font_family: str | None = None
+    font_face_index: int | None = None
+    line_count: int = 0
+
+    def as_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class VideoInfo:
+    width: int
+    height: int
+    duration_seconds: float
+    codec_name: str
+    pixel_format: str
+    audio_codec_name: str | None
+    fast_start: bool
+
+
+@dataclass(frozen=True, slots=True)
+class AudioInfo:
+    duration_seconds: float
+    codec_name: str
+    sample_rate: int
+    channels: int
+    container_format: str
 
 
 def _validate_image_bytes(
@@ -36,39 +104,164 @@ def _validate_image_bytes(
     require_video_dimensions: bool = False,
 ) -> tuple[str, int, int]:
     if not raw:
-        raise ValueError(f"{label} is empty")
+        raise MediaContractError(f"{label} is empty")
     if len(raw) >= MAX_REFERENCE_IMAGE_BYTES:
-        raise ValueError(f"{label} must be smaller than 20MB")
+        raise MediaContractError(f"{label} must be smaller than 20MB")
 
     from PIL import Image
 
     try:
-        with Image.open(BytesIO(raw)) as image:
-            image.verify()
-        with Image.open(BytesIO(raw)) as image:
-            image_format = str(image.format or "").upper()
-            width, height = image.size
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(BytesIO(raw)) as image:
+                image_format = str(image.format or "").upper()
+                encoded_width, encoded_height = image.size
+                getexif = getattr(image, "getexif", None)
+                orientation = int(getexif().get(274, 1) or 1) if getexif else 1
+    except (Image.DecompressionBombWarning, Image.DecompressionBombError) as exc:
+        raise MediaContractError(f"{label} exceeds the safe image dimensions") from exc
     except Exception as exc:
-        raise ValueError(f"{label} is not a valid JPG, PNG, or WebP image") from exc
+        raise MediaContractError(f"{label} is not a valid JPG, PNG, or WebP image") from exc
 
     if image_format not in SUPPORTED_REFERENCE_FORMATS:
-        raise ValueError(f"{label} format is not supported; use JPG, PNG, or WebP")
-    if width <= 0 or height <= 0:
-        raise ValueError(f"{label} has invalid dimensions")
+        raise MediaContractError(f"{label} format is not supported; use JPG, PNG, or WebP")
+    if encoded_width <= 0 or encoded_height <= 0:
+        raise MediaContractError(f"{label} has invalid dimensions")
+    if encoded_width > MAX_IMAGE_EDGE_PIXELS or encoded_height > MAX_IMAGE_EDGE_PIXELS:
+        raise MediaContractError(
+            f"{label} dimensions must not exceed {MAX_IMAGE_EDGE_PIXELS}px per edge"
+        )
+    if encoded_width * encoded_height > MAX_IMAGE_PIXELS:
+        raise MediaContractError(
+            f"{label} must not exceed {MAX_IMAGE_PIXELS:,} total pixels"
+        )
+    width, height = (
+        (encoded_height, encoded_width)
+        if orientation in {5, 6, 7, 8}
+        else (encoded_width, encoded_height)
+    )
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(BytesIO(raw)) as image:
+                image.verify()
+    except (Image.DecompressionBombWarning, Image.DecompressionBombError) as exc:
+        raise MediaContractError(f"{label} exceeds the safe image dimensions") from exc
+    except Exception as exc:
+        raise MediaContractError(f"{label} is not a valid JPG, PNG, or WebP image") from exc
     if require_video_dimensions:
         short_edge = min(width, height)
         aspect_ratio = width / height
         if short_edge <= 300 or not 0.4 <= aspect_ratio <= 2.5:
-            raise ValueError(
+            raise MediaContractError(
                 f"{label} must have a short edge over 300px and an aspect ratio between 2:5 and 5:2"
             )
     return SUPPORTED_REFERENCE_FORMATS[image_format], width, height
 
 
+def image_asset_from_bytes(
+    raw: bytes,
+    *,
+    label: str,
+    source_path: str | None = None,
+    require_video_dimensions: bool = False,
+) -> ImageAsset:
+    mime_type, width, height = _validate_image_bytes(
+        raw,
+        label=label,
+        require_video_dimensions=require_video_dimensions,
+    )
+    return ImageAsset(
+        raw=raw,
+        mime_type=mime_type,
+        width=width,
+        height=height,
+        sha256=hashlib.sha256(raw).hexdigest(),
+        source_path=source_path,
+    )
+
+
 def validate_generated_image(raw: bytes) -> tuple[int, int]:
-    """Reject empty/corrupt provider output before storage and settlement."""
-    _mime, width, height = _validate_image_bytes(raw, label="Generated image")
-    return width, height
+    """Reject empty or corrupt provider output before storage and settlement."""
+    asset = image_asset_from_bytes(raw, label="Generated image")
+    return asset.width, asset.height
+
+
+def _decode_image_data_url(value: str, *, label: str) -> bytes:
+    try:
+        header, encoded = value.split(",", 1)
+        if ";base64" not in header.lower():
+            raise ValueError
+        max_encoded_chars = ((MAX_REFERENCE_IMAGE_BYTES - 1 + 2) // 3) * 4
+        if len(encoded) > max_encoded_chars:
+            raise MediaContractError(f"{label} must be smaller than 20MB")
+        return base64.b64decode(encoded, validate=True)
+    except MediaContractError:
+        raise
+    except Exception as exc:
+        raise MediaContractError(f"{label} contains an invalid image data URL") from exc
+
+
+def _workspace_image_asset(
+    workspace: Path,
+    value: str,
+    *,
+    label: str,
+    require_video_dimensions: bool = False,
+) -> ImageAsset:
+    root = workspace.resolve()
+    path = (root / value.lstrip("/")).resolve()
+    try:
+        relative_path = path.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise MediaContractError(f"{label} is outside the workspace") from exc
+    if not path.is_file():
+        raise MediaContractError(f"{label} was not found in the workspace: {value}")
+    try:
+        if path.stat().st_size >= MAX_REFERENCE_IMAGE_BYTES:
+            raise MediaContractError(f"{label} must be smaller than 20MB")
+        with path.open("rb") as handle:
+            if os.fstat(handle.fileno()).st_size >= MAX_REFERENCE_IMAGE_BYTES:
+                raise MediaContractError(f"{label} must be smaller than 20MB")
+            raw = handle.read(MAX_REFERENCE_IMAGE_BYTES)
+            if len(raw) >= MAX_REFERENCE_IMAGE_BYTES:
+                raise MediaContractError(f"{label} must be smaller than 20MB")
+            if os.fstat(handle.fileno()).st_size >= MAX_REFERENCE_IMAGE_BYTES:
+                raise MediaContractError(f"{label} must be smaller than 20MB")
+    except MediaContractError:
+        raise
+    except OSError as exc:
+        raise MediaContractError(f"{label} could not be read from the workspace") from exc
+    return image_asset_from_bytes(
+        raw,
+        label=label,
+        source_path=relative_path,
+        require_video_dimensions=require_video_dimensions,
+    )
+
+
+def load_brand_asset(
+    workspace: Path,
+    value: str | None,
+    *,
+    label: str = "Brand asset",
+    require_workspace_path: bool = False,
+) -> ImageAsset | None:
+    """Load an immutable product/logo layer without fetching an untrusted URL."""
+    reference = str(value or "").strip()
+    if not reference:
+        return None
+    if reference.startswith(("https://", "http://")):
+        raise MediaContractError(
+            f"{label} must be uploaded to the Agent workspace before brand-safe composition"
+        )
+    if reference.startswith("data:image/"):
+        if require_workspace_path:
+            raise MediaContractError(
+                f"{label} must use a workspace path so an asynchronous video task can freeze it"
+            )
+        return image_asset_from_bytes(_decode_image_data_url(reference, label=label), label=label)
+    return _workspace_image_asset(workspace, reference, label=label)
 
 
 def image_reference_for_provider(
@@ -78,48 +271,123 @@ def image_reference_for_provider(
     label: str,
     require_video_dimensions: bool = False,
 ) -> str | None:
-    """Return a public URL or a validated Base64 data URL for MiniMax."""
+    """Return a validated Base64 data URL for MiniMax."""
     reference = str(value or "").strip()
     if not reference:
         return None
     if reference.startswith(("https://", "http://")):
-        return reference
-
+        raise MediaContractError(
+            f"{label} must be uploaded to the Agent workspace before provider submission"
+        )
     if reference.startswith("data:image/"):
-        try:
-            header, encoded = reference.split(",", 1)
-            if ";base64" not in header.lower():
-                raise ValueError
-            raw = base64.b64decode(encoded, validate=True)
-        except Exception as exc:
-            raise ValueError(f"{label} contains an invalid image data URL") from exc
-        mime, _width, _height = _validate_image_bytes(
-            raw,
+        asset = image_asset_from_bytes(
+            _decode_image_data_url(reference, label=label),
             label=label,
             require_video_dimensions=require_video_dimensions,
         )
-        return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+    else:
+        asset = _workspace_image_asset(
+            workspace,
+            reference,
+            label=label,
+            require_video_dimensions=require_video_dimensions,
+        )
+    return f"data:{asset.mime_type};base64,{base64.b64encode(asset.raw).decode('ascii')}"
 
-    root = workspace.resolve()
-    path = (root / reference.lstrip("/")).resolve()
+
+def normalize_overlay_text(text: str | None) -> str:
+    """Return the single canonical copy used for hashing and rendering."""
+    value = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not value.strip():
+        return ""
+    if len(value) > MAX_OVERLAY_TEXT_CHARS:
+        raise MediaContractError(f"overlay_text must be at most {MAX_OVERLAY_TEXT_CHARS} characters")
+    for character in value:
+        if character in {"\n", "\t"}:
+            continue
+        if unicodedata.category(character).startswith("C"):
+            raise MediaContractError("overlay_text contains unsupported control characters")
+    return value.replace("\t", "    ")
+
+
+@lru_cache(maxsize=32)
+def _font_faces(path: str) -> tuple[tuple[int, frozenset[int], str], ...]:
+    from fontTools.ttLib import TTCollection, TTFont
+
+    font_path = Path(path)
+    if font_path.suffix.lower() in {".ttc", ".otc"}:
+        collection = TTCollection(path, lazy=True)
+        try:
+            faces = []
+            for index, font in enumerate(collection.fonts):
+                family = font["name"].getDebugName(1) if "name" in font else None
+                faces.append((index, frozenset((font.getBestCmap() or {}).keys()), family or font_path.name))
+            return tuple(faces)
+        finally:
+            collection.close()
+
+    font = TTFont(path, lazy=True)
     try:
-        path.relative_to(root)
-    except ValueError as exc:
-        raise ValueError(f"{label} is outside the workspace") from exc
-    if not path.is_file():
-        raise ValueError(f"{label} was not found in the workspace: {reference}")
-    raw = path.read_bytes()
-    mime, _width, _height = _validate_image_bytes(
-        raw,
-        label=label,
-        require_video_dimensions=require_video_dimensions,
-    )
-    return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+        family = font["name"].getDebugName(1) if "name" in font else None
+        return ((0, frozenset((font.getBestCmap() or {}).keys()), family or font_path.name),)
+    finally:
+        font.close()
+
+
+@lru_cache(maxsize=16)
+def _file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _font_for_text(text: str) -> FontSelection:
+    required = {
+        ord(character)
+        for character in text
+        if not character.isspace() and not unicodedata.category(character).startswith("C")
+    }
+    missing_by_font: list[str] = []
+    for candidate in _FONT_CANDIDATES:
+        if not Path(candidate).is_file():
+            continue
+        for face_index, codepoints, family in _font_faces(candidate):
+            missing = required - codepoints
+            if not missing:
+                return FontSelection(
+                    path=candidate,
+                    face_index=face_index,
+                    family=family,
+                    sha256=_file_sha256(candidate),
+                )
+            missing_by_font.append(f"{family}:{len(missing)}")
+    detail = ", ".join(missing_by_font[:4]) or "no CJK font installed"
+    raise MediaContractError(f"No installed brand-safe font covers every requested character ({detail})")
+
+
+def _font_path() -> str:
+    """Compatibility helper for callers that only need a CJK-capable path."""
+    return _font_for_text("中文 English 123").path
+
+
+def validate_overlay_text(text: str | None) -> str | None:
+    """Fail before a paid provider call when exact copy cannot be rendered."""
+    normalized = normalize_overlay_text(text)
+    if not normalized:
+        return None
+    _font_for_text(normalized)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def _wrapped_lines(draw, text: str, font, max_width: int) -> list[str]:
+    """Wrap without ever dropping customer copy."""
     lines: list[str] = []
-    for paragraph in text.splitlines() or [text]:
+    for paragraph in text.split("\n"):
+        if not paragraph:
+            lines.append("")
+            continue
         current = ""
         for character in paragraph:
             candidate = current + character
@@ -129,8 +397,206 @@ def _wrapped_lines(draw, text: str, font, max_width: int) -> list[str]:
                 current = character
             else:
                 current = candidate
-        lines.append(current or " ")
-    return lines[:6]
+        lines.append(current)
+    return lines
+
+
+def _text_layout(draw, text: str, selection: FontSelection, width: int, height: int):
+    from PIL import ImageFont
+
+    max_width = max(int(width * 0.78), 1)
+    max_height = max(int(height * 0.46), 1)
+    largest_size = max(24, min(96, int(min(width, height) * 0.075)))
+    smallest_size = max(14, int(min(width, height) * 0.022))
+
+    for font_size in range(largest_size, smallest_size - 1, -2):
+        font = ImageFont.truetype(selection.path, font_size, index=selection.face_index)
+        lines = _wrapped_lines(draw, text, font, max_width)
+        spacing = max(5, font_size // 5)
+        sample_box = draw.textbbox((0, 0), "国Ag", font=font)
+        default_height = max(sample_box[3] - sample_box[1], 1)
+        boxes = [draw.textbbox((0, 0), line or " ", font=font) for line in lines]
+        widths = [box[2] - box[0] if line else 0 for line, box in zip(lines, boxes, strict=True)]
+        heights = [max(box[3] - box[1], default_height) for box in boxes]
+        text_width = max(widths, default=0)
+        text_height = sum(heights) + spacing * max(len(lines) - 1, 0)
+        if text_width <= max_width and text_height <= max_height:
+            return font, lines, boxes, widths, heights, spacing, text_width, text_height
+    raise MediaContractError(
+        "overlay_text cannot fit the safe text area without truncation; shorten the copy or use a larger canvas"
+    )
+
+
+def _render_brand_asset_layer(canvas, asset: ImageAsset, *, position: str, scale: float) -> None:
+    from PIL import Image, ImageOps
+
+    normalized_position = position if position in _BRAND_POSITIONS else "center"
+    if not 0.1 <= scale <= 0.8:
+        raise MediaContractError("brand_scale must be between 0.1 and 0.8")
+    with Image.open(BytesIO(asset.raw)) as source:
+        product = ImageOps.exif_transpose(source).convert("RGBA")
+    width, height = canvas.size
+    target_width = max(1, int(width * scale))
+    target_height = max(1, int(height * 0.72))
+    product.thumbnail((target_width, target_height), Image.Resampling.LANCZOS)
+    margin_x = max(12, int(width * 0.05))
+    margin_y = max(12, int(height * 0.06))
+    x = {
+        "top_left": margin_x,
+        "top_right": width - product.width - margin_x,
+        "center": (width - product.width) // 2,
+        "bottom_left": margin_x,
+        "bottom_right": width - product.width - margin_x,
+    }[normalized_position]
+    y = {
+        "top_left": margin_y,
+        "top_right": margin_y,
+        "center": (height - product.height) // 2,
+        "bottom_left": height - product.height - margin_y,
+        "bottom_right": height - product.height - margin_y,
+    }[normalized_position]
+    canvas.alpha_composite(product, (max(x, 0), max(y, 0)))
+
+
+def _render_text_layer(canvas, text: str, *, position: str) -> OverlayReceipt:
+    from PIL import ImageDraw
+
+    selection = _font_for_text(text)
+    draw = ImageDraw.Draw(canvas, "RGBA")
+    width, height = canvas.size
+    font, lines, boxes, widths, heights, spacing, text_width, text_height = _text_layout(
+        draw,
+        text,
+        selection,
+        width,
+        height,
+    )
+    font_size = int(getattr(font, "size", 24))
+    pad_x = max(18, font_size // 2)
+    pad_y = max(14, font_size // 3)
+    x = (width - text_width) // 2
+    normalized_position = position if position in _TEXT_POSITIONS else "bottom"
+    y = {
+        "top": int(height * 0.08),
+        "center": (height - text_height) // 2,
+        "bottom": height - text_height - int(height * 0.09),
+    }[normalized_position]
+    rect = (
+        max(0, x - pad_x),
+        max(0, y - pad_y),
+        min(width, x + text_width + pad_x),
+        min(height, y + text_height + pad_y),
+    )
+    draw.rounded_rectangle(
+        rect,
+        radius=max(12, font_size // 3),
+        fill=(0, 0, 0, 165),
+    )
+    cursor_y = y
+    for line, box, line_width, line_height in zip(lines, boxes, widths, heights, strict=True):
+        if line:
+            draw.text(
+                ((width - line_width) // 2 - box[0], cursor_y - box[1]),
+                line,
+                font=font,
+                fill=(255, 255, 255, 255),
+                stroke_width=max(1, font_size // 28),
+                stroke_fill=(0, 0, 0, 225),
+            )
+        cursor_y += line_height + spacing
+    return OverlayReceipt(
+        rendered_text_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        font_sha256=selection.sha256,
+        font_family=selection.family,
+        font_face_index=selection.face_index,
+        line_count=len(lines),
+    )
+
+
+def _compose_overlay_canvas(
+    size: tuple[int, int],
+    text: str | None,
+    *,
+    text_position: str,
+    brand_asset: ImageAsset | None,
+    brand_position: str,
+    brand_scale: float,
+):
+    from PIL import Image
+
+    canvas = Image.new("RGBA", size, (0, 0, 0, 0))
+    receipt = OverlayReceipt()
+    if brand_asset:
+        _render_brand_asset_layer(
+            canvas,
+            brand_asset,
+            position=brand_position,
+            scale=brand_scale,
+        )
+        receipt = OverlayReceipt(brand_asset_sha256=brand_asset.sha256)
+    normalized_text = normalize_overlay_text(text)
+    if normalized_text:
+        text_receipt = _render_text_layer(canvas, normalized_text, position=text_position)
+        receipt = OverlayReceipt(
+            rendered_text_sha256=text_receipt.rendered_text_sha256,
+            brand_asset_sha256=receipt.brand_asset_sha256,
+            font_sha256=text_receipt.font_sha256,
+            font_family=text_receipt.font_family,
+            font_face_index=text_receipt.font_face_index,
+            line_count=text_receipt.line_count,
+        )
+    return canvas, receipt
+
+
+def apply_image_brand_overlays(
+    raw: bytes,
+    text: str | None,
+    *,
+    text_position: str = "bottom",
+    brand_asset: ImageAsset | None = None,
+    brand_position: str = "center",
+    brand_scale: float = 0.42,
+    output_format: str | None = None,
+) -> tuple[bytes, OverlayReceipt]:
+    """Render exact copy and an immutable product/logo layer on one image."""
+    normalized_text = normalize_overlay_text(text)
+    if not normalized_text and not brand_asset and not output_format:
+        return raw, OverlayReceipt()
+
+    from PIL import Image, ImageOps
+
+    validate_generated_image(raw)
+    with Image.open(BytesIO(raw)) as source:
+        image = ImageOps.exif_transpose(source).convert("RGBA")
+    overlay, receipt = _compose_overlay_canvas(
+        image.size,
+        normalized_text,
+        text_position=text_position,
+        brand_asset=brand_asset,
+        brand_position=brand_position,
+        brand_scale=brand_scale,
+    )
+    image.alpha_composite(overlay)
+
+    output = BytesIO()
+    requested = str(output_format or "PNG").strip().upper().lstrip(".")
+    if requested == "WEBP":
+        # The supported production contract must not depend on an optional
+        # Pillow/libwebp encoder that is absent from some release runtimes.
+        raise MediaContractError("WebP output encoding is unavailable; use PNG or JPEG")
+    normalized_format = {"JPG": "JPEG", "JPEG": "JPEG"}.get(requested, "PNG")
+    save_kwargs = {"optimize": True}
+    if normalized_format == "JPEG":
+        save_kwargs["quality"] = 95
+    if normalized_format == "JPEG":
+        flattened = Image.new("RGB", image.size, (255, 255, 255))
+        flattened.paste(image, mask=image.getchannel("A"))
+        flattened.save(output, format=normalized_format, **save_kwargs)
+    else:
+        image.save(output, format=normalized_format, **save_kwargs)
+    result = output.getvalue()
+    validate_generated_image(result)
+    return result, receipt
 
 
 def apply_image_text_overlay(
@@ -140,68 +606,422 @@ def apply_image_text_overlay(
     position: str = "bottom",
     output_format: str | None = None,
 ) -> bytes:
-    """Normalize output and render exact copy with a real CJK-capable font."""
-    overlay_text = str(text or "").strip()
-    if not overlay_text and not output_format:
-        return raw
-    if len(overlay_text) > MAX_OVERLAY_TEXT_CHARS:
-        raise ValueError(f"overlay_text must be at most {MAX_OVERLAY_TEXT_CHARS} characters")
-
-    from PIL import Image, ImageDraw, ImageFont
-
-    with Image.open(BytesIO(raw)) as source:
-        image = source.convert("RGBA")
-    width, height = image.size
-    if overlay_text:
-        font_size = max(24, min(96, int(min(width, height) * 0.065)))
-        font = ImageFont.truetype(_font_path(), font_size)
-        draw = ImageDraw.Draw(image, "RGBA")
-        lines = _wrapped_lines(draw, overlay_text, font, int(width * 0.82))
-        spacing = max(6, font_size // 5)
-        boxes = [draw.textbbox((0, 0), line, font=font) for line in lines]
-        text_width = max(box[2] - box[0] for box in boxes)
-        text_height = sum(box[3] - box[1] for box in boxes) + spacing * (len(lines) - 1)
-        pad_x = max(18, font_size // 2)
-        pad_y = max(14, font_size // 3)
-        x = (width - text_width) // 2
-        normalized_position = position if position in {"top", "center", "bottom"} else "bottom"
-        y = {
-            "top": int(height * 0.08),
-            "center": (height - text_height) // 2,
-            "bottom": height - text_height - int(height * 0.09),
-        }[normalized_position]
-        draw.rounded_rectangle(
-            (x - pad_x, y - pad_y, x + text_width + pad_x, y + text_height + pad_y),
-            radius=max(12, font_size // 3),
-            fill=(0, 0, 0, 150),
-        )
-        cursor_y = y
-        for line, box in zip(lines, boxes, strict=True):
-            line_width = box[2] - box[0]
-            draw.text(
-                ((width - line_width) // 2, cursor_y),
-                line,
-                font=font,
-                fill=(255, 255, 255, 255),
-                stroke_width=max(1, font_size // 28),
-                stroke_fill=(0, 0, 0, 220),
-            )
-            cursor_y += box[3] - box[1] + spacing
-
-    output = BytesIO()
-    requested = str(output_format or "PNG").strip().upper().lstrip(".")
-    normalized_format = {"JPG": "JPEG", "JPEG": "JPEG", "WEBP": "WEBP"}.get(requested, "PNG")
-    save_kwargs = {"optimize": True}
-    if normalized_format in {"JPEG", "WEBP"}:
-        save_kwargs["quality"] = 95
-    image.convert("RGB").save(output, format=normalized_format, **save_kwargs)
-    result = output.getvalue()
-    validate_generated_image(result)
+    """Backward-compatible exact-copy wrapper."""
+    result, _receipt = apply_image_brand_overlays(
+        raw,
+        text,
+        text_position=position,
+        output_format=output_format,
+    )
     return result
 
 
 def valid_mp4(raw: bytes) -> bool:
     return len(raw) >= 12 and b"ftyp" in raw[:64]
+
+
+async def _run_process(*args: str, timeout: int, label: str) -> tuple[bytes, bytes]:
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        raise MediaContractError(f"{args[0]} is not installed for {label}") from exc
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except TimeoutError as exc:
+        if process.returncode is None:
+            process.kill()
+        await process.communicate()
+        raise MediaContractError(f"{label} timed out") from exc
+    except asyncio.CancelledError:
+        # A cancelled request must not leave ffmpeg/ffprobe running in the
+        # background. Reap the child before propagating cancellation.
+        if process.returncode is None:
+            process.kill()
+        cleanup = asyncio.create_task(process.communicate())
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            # A second cancellation must not orphan the child process.
+            await cleanup
+        raise
+    if process.returncode != 0:
+        detail = (stderr or b"").decode("utf-8", errors="replace")[-800:]
+        raise MediaContractError(f"{label} failed: {detail}")
+    return stdout, stderr
+
+
+def _browser_safe_video(info: VideoInfo) -> bool:
+    return (
+        info.codec_name == "h264"
+        and info.pixel_format in {"yuv420p", "yuvj420p"}
+        and info.audio_codec_name in {None, "aac", "mp3"}
+        and info.fast_start
+    )
+
+
+async def validate_generated_video(
+    raw: bytes,
+    *,
+    label: str = "Generated video",
+    require_browser_safe: bool = True,
+) -> VideoInfo:
+    """Probe a real MP4 and, by default, enforce the browser delivery codec."""
+    if not valid_mp4(raw):
+        raise MediaContractError(f"{label} is not a valid MP4 payload")
+    with tempfile.TemporaryDirectory(prefix="astra-media-probe-") as temp_dir:
+        input_path = Path(temp_dir) / "input.mp4"
+        input_path.write_bytes(raw)
+        stdout, _stderr = await _run_process(
+            "ffprobe",
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_streams",
+            "-show_format",
+            str(input_path),
+            timeout=45,
+            label="Video validation",
+        )
+    try:
+        payload = json.loads(stdout.decode("utf-8"))
+        stream = next(item for item in payload.get("streams", []) if item.get("codec_type") == "video")
+        audio_stream = next(
+            (
+                item
+                for item in payload.get("streams", [])
+                if item.get("codec_type") == "audio"
+            ),
+            None,
+        )
+        width = int(stream.get("width") or 0)
+        height = int(stream.get("height") or 0)
+        duration = float(stream.get("duration") or (payload.get("format") or {}).get("duration") or 0)
+        codec_name = str(stream.get("codec_name") or "")
+        pixel_format = str(stream.get("pix_fmt") or "")
+        audio_codec_name = (
+            str(audio_stream.get("codec_name") or "") or None
+            if audio_stream
+            else None
+        )
+    except Exception as exc:
+        raise MediaContractError(f"{label} has no readable video stream") from exc
+    if width <= 0 or height <= 0 or duration <= 0 or not codec_name:
+        raise MediaContractError(f"{label} has invalid video dimensions, duration, or codec")
+    info = VideoInfo(
+        width=width,
+        height=height,
+        duration_seconds=duration,
+        codec_name=codec_name,
+        pixel_format=pixel_format,
+        audio_codec_name=audio_codec_name,
+        fast_start=(
+            raw.find(b"moov") >= 0
+            and (raw.find(b"mdat") < 0 or raw.find(b"moov") < raw.find(b"mdat"))
+        ),
+    )
+    if require_browser_safe and not _browser_safe_video(info):
+        raise MediaContractError(
+            f"{label} is not browser-safe H.264/yuv420p with AAC-compatible audio and faststart"
+        )
+    return info
+
+
+async def validate_uploaded_video(
+    raw: bytes,
+    *,
+    extension: str,
+    label: str = "Uploaded video",
+) -> VideoInfo:
+    """Probe a chat video and require its bytes to match the claimed container."""
+    normalized_extension = str(extension or "").strip().lower().lstrip(".")
+    expected_containers = {
+        "mp4": {"mov", "mp4", "m4a", "3gp", "3g2", "mj2"},
+        "mov": {"mov", "mp4", "m4a", "3gp", "3g2", "mj2"},
+        "avi": {"avi"},
+        "mkv": {"matroska", "webm"},
+    }
+    if normalized_extension not in expected_containers:
+        raise MediaContractError(f"{label} format is unsupported")
+    if not raw:
+        raise MediaContractError(f"{label} is empty")
+
+    with tempfile.TemporaryDirectory(prefix="astra-media-upload-") as temp_dir:
+        input_path = Path(temp_dir) / f"input.{normalized_extension}"
+        input_path.write_bytes(raw)
+        stdout, _stderr = await _run_process(
+            "ffprobe",
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_streams",
+            "-show_format",
+            str(input_path),
+            timeout=45,
+            label="Uploaded video validation",
+        )
+    try:
+        payload = json.loads(stdout.decode("utf-8"))
+        stream = next(item for item in payload.get("streams", []) if item.get("codec_type") == "video")
+        audio_stream = next(
+            (item for item in payload.get("streams", []) if item.get("codec_type") == "audio"),
+            None,
+        )
+        format_names = {
+            value.strip().lower()
+            for value in str((payload.get("format") or {}).get("format_name") or "").split(",")
+            if value.strip()
+        }
+        width = int(stream.get("width") or 0)
+        height = int(stream.get("height") or 0)
+        duration = float(stream.get("duration") or (payload.get("format") or {}).get("duration") or 0)
+        codec_name = str(stream.get("codec_name") or "")
+        pixel_format = str(stream.get("pix_fmt") or "")
+        audio_codec_name = (
+            str(audio_stream.get("codec_name") or "") or None
+            if audio_stream
+            else None
+        )
+    except Exception as exc:
+        raise MediaContractError(f"{label} has no readable video stream") from exc
+    if not (format_names & expected_containers[normalized_extension]):
+        raise MediaContractError(
+            f"{label} bytes do not match the .{normalized_extension} container"
+        )
+    if width <= 0 or height <= 0 or duration <= 0 or not codec_name:
+        raise MediaContractError(f"{label} has invalid dimensions, duration, or codec")
+    return VideoInfo(
+        width=width,
+        height=height,
+        duration_seconds=duration,
+        codec_name=codec_name,
+        pixel_format=pixel_format,
+        audio_codec_name=audio_codec_name,
+        fast_start=(
+            normalized_extension == "mp4"
+            and raw.find(b"moov") >= 0
+            and (raw.find(b"mdat") < 0 or raw.find(b"moov") < raw.find(b"mdat"))
+        ),
+    )
+
+
+async def _transcode_browser_safe_video(raw: bytes, *, label: str) -> bytes:
+    with tempfile.TemporaryDirectory(prefix="astra-media-browser-") as temp_dir:
+        root = Path(temp_dir)
+        input_path = root / "input.mp4"
+        output_path = root / "output.mp4"
+        input_path.write_bytes(raw)
+        await _run_process(
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(input_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+            timeout=300,
+            label=label,
+        )
+        if not output_path.is_file():
+            raise MediaContractError(f"{label} did not create an output file")
+        result = output_path.read_bytes()
+    await validate_generated_video(result, label=label)
+    return result
+
+
+async def validate_generated_audio(
+    raw: bytes,
+    *,
+    audio_format: str,
+    sample_rate: int | None = None,
+    label: str = "Generated audio",
+) -> AudioInfo:
+    """Reject non-audio provider bytes before storage and successful delivery."""
+    normalized_format = str(audio_format or "").strip().lower().lstrip(".")
+    if normalized_format not in {"mp3", "wav", "flac", "pcm"}:
+        raise MediaContractError(f"{label} format is unsupported")
+    if not raw:
+        raise MediaContractError(f"{label} is empty")
+
+    if normalized_format == "pcm":
+        rate = int(sample_rate or 0)
+        if rate <= 0:
+            raise MediaContractError(f"{label} PCM sample rate is invalid")
+        # MiniMax PCM output is signed 16-bit mono.  Require complete samples
+        # and at least 50 ms so arbitrary non-empty bytes cannot be delivered.
+        minimum_bytes = max((rate * 2) // 20, 2)
+        if len(raw) < minimum_bytes or len(raw) % 2:
+            raise MediaContractError(f"{label} is not valid 16-bit PCM audio")
+        return AudioInfo(
+            duration_seconds=len(raw) / (rate * 2),
+            codec_name="pcm_s16le",
+            sample_rate=rate,
+            channels=1,
+            container_format="pcm",
+        )
+
+    with tempfile.TemporaryDirectory(prefix="astra-media-audio-probe-") as temp_dir:
+        input_path = Path(temp_dir) / f"input.{normalized_format}"
+        input_path.write_bytes(raw)
+        stdout, _stderr = await _run_process(
+            "ffprobe",
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_streams",
+            "-show_format",
+            str(input_path),
+            timeout=45,
+            label="Audio validation",
+        )
+    try:
+        payload = json.loads(stdout.decode("utf-8"))
+        stream = next(item for item in payload.get("streams", []) if item.get("codec_type") == "audio")
+        duration = float(stream.get("duration") or (payload.get("format") or {}).get("duration") or 0)
+        codec_name = str(stream.get("codec_name") or "")
+        detected_rate = int(stream.get("sample_rate") or 0)
+        channels = int(stream.get("channels") or 0)
+        container_format = str((payload.get("format") or {}).get("format_name") or "")
+    except Exception as exc:
+        raise MediaContractError(f"{label} has no readable audio stream") from exc
+    if duration <= 0 or not codec_name or detected_rate <= 0 or channels <= 0:
+        raise MediaContractError(
+            f"{label} has invalid duration, codec, sample rate, or channel count"
+        )
+    container_names = {
+        value.strip().lower()
+        for value in container_format.split(",")
+        if value.strip()
+    }
+    format_matches = {
+        "mp3": codec_name.startswith("mp3") and "mp3" in container_names,
+        "wav": codec_name.startswith("pcm_") and "wav" in container_names,
+        "flac": codec_name == "flac" and "flac" in container_names,
+    }
+    if not format_matches[normalized_format]:
+        raise MediaContractError(
+            f"{label} does not match requested {normalized_format} container and codec"
+        )
+    return AudioInfo(
+        duration_seconds=duration,
+        codec_name=codec_name,
+        sample_rate=detected_rate,
+        channels=channels,
+        container_format=container_format,
+    )
+
+
+async def apply_video_brand_overlays(
+    raw: bytes,
+    text: str | None,
+    *,
+    text_position: str = "bottom",
+    brand_asset: ImageAsset | None = None,
+    brand_position: str = "center",
+    brand_scale: float = 0.42,
+) -> tuple[bytes, OverlayReceipt]:
+    """Composite the same deterministic Pillow layer over every video frame."""
+    info = await validate_generated_video(
+        raw,
+        label="Video overlay input",
+        require_browser_safe=False,
+    )
+    normalized_text = normalize_overlay_text(text)
+    if not normalized_text and not brand_asset:
+        if _browser_safe_video(info):
+            return raw, OverlayReceipt()
+        return (
+            await _transcode_browser_safe_video(
+                raw,
+                label="Video browser compatibility transcode",
+            ),
+            OverlayReceipt(),
+        )
+
+    overlay, receipt = _compose_overlay_canvas(
+        (info.width, info.height),
+        normalized_text,
+        text_position=text_position,
+        brand_asset=brand_asset,
+        brand_position=brand_position,
+        brand_scale=brand_scale,
+    )
+    with tempfile.TemporaryDirectory(prefix="astra-media-overlay-") as temp_dir:
+        root = Path(temp_dir)
+        input_path = root / "input.mp4"
+        overlay_path = root / "overlay.png"
+        output_path = root / "output.mp4"
+        input_path.write_bytes(raw)
+        overlay.save(overlay_path, format="PNG", optimize=True)
+        await _run_process(
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(input_path),
+            "-loop",
+            "1",
+            "-framerate",
+            "1",
+            "-i",
+            str(overlay_path),
+            "-filter_complex",
+            "[0:v][1:v]overlay=0:0:format=auto:shortest=1[v]",
+            "-map",
+            "[v]",
+            "-map",
+            "0:a?",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-crf",
+            "16",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            "-shortest",
+            str(output_path),
+            timeout=300,
+            label="Video brand-safe overlay",
+        )
+        if not output_path.is_file():
+            raise MediaContractError("Video brand-safe overlay did not create an output file")
+        result = output_path.read_bytes()
+    await validate_generated_video(result, label="Video overlay output")
+    return result, receipt
 
 
 async def apply_video_text_overlay(
@@ -210,71 +1030,10 @@ async def apply_video_text_overlay(
     *,
     position: str = "bottom",
 ) -> bytes:
-    """Use ffmpeg+Noto to add deterministic text after provider generation."""
-    overlay_text = str(text or "").strip()
-    if not overlay_text:
-        return raw
-    if len(overlay_text) > MAX_OVERLAY_TEXT_CHARS:
-        raise ValueError(f"overlay_text must be at most {MAX_OVERLAY_TEXT_CHARS} characters")
-    if not valid_mp4(raw):
-        raise ValueError("Video text overlay input is not a valid MP4")
-
-    normalized_position = position if position in {"top", "center", "bottom"} else "bottom"
-    y_expr = {
-        "top": "h*0.08",
-        "center": "(h-text_h)/2",
-        "bottom": "h-text_h-h*0.09",
-    }[normalized_position]
-    with tempfile.TemporaryDirectory(prefix="astra-media-overlay-") as temp_dir:
-        root = Path(temp_dir)
-        input_path = root / "input.mp4"
-        output_path = root / "output.mp4"
-        text_path = root / "overlay.txt"
-        input_path.write_bytes(raw)
-        text_path.write_text(overlay_text, encoding="utf-8")
-        drawtext = (
-            f"drawtext=fontfile='{_font_path()}':textfile='{text_path}':"
-            "fontcolor=white:fontsize=h/18:line_spacing=12:"
-            "box=1:boxcolor=black@0.58:boxborderw=24:"
-            f"x=(w-text_w)/2:y={y_expr}"
-        )
-        try:
-            process = await asyncio.create_subprocess_exec(
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-i",
-                str(input_path),
-                "-vf",
-                drawtext,
-                "-c:v",
-                "libx264",
-                "-preset",
-                "fast",
-                "-crf",
-                "18",
-                "-c:a",
-                "copy",
-                "-movflags",
-                "+faststart",
-                str(output_path),
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        except FileNotFoundError as exc:
-            raise ValueError("ffmpeg is not installed for deterministic video text") from exc
-        try:
-            _stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=240)
-        except TimeoutError as exc:
-            process.kill()
-            await process.communicate()
-            raise ValueError("Video text overlay timed out") from exc
-        if process.returncode != 0 or not output_path.is_file():
-            detail = (stderr or b"").decode("utf-8", errors="replace")[-600:]
-            raise ValueError(f"Video text overlay failed: {detail}")
-        result = output_path.read_bytes()
-    if not valid_mp4(result):
-        raise ValueError("Video text overlay output is not a valid MP4")
+    """Backward-compatible exact-copy wrapper."""
+    result, _receipt = await apply_video_brand_overlays(
+        raw,
+        text,
+        text_position=position,
+    )
     return result

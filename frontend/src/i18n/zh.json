@@ -333,6 +333,9 @@
             "noTriggers": "无触发器",
             "fired": "已触发 {{count}} 次",
             "disabled": "已禁用",
+            "configuredPaused": "已配置 · 执行暂停",
+            "executionPausedDetail": "本版本已安全暂停自动触发和计划执行；配置会保留，且不会消耗 Credits。",
+            "scheduleAccepted": "计划请求已接受",
             "disable": "禁用",
             "enable": "启用",
             "deleteTriggerConfirm": "确定删除触发器 {{name}}？",
@@ -355,6 +358,11 @@
             "triggerUnknown": "未知对象",
             "today": "今天",
             "viewAll": "查看全部"
+        },
+        "deletion": {
+            "cleanupPendingTitle": "删除清理尚未完成。",
+            "cleanupPendingDetail": "外部运行环境清理尚未完成，启动、恢复、聊天和自动化均保持禁用；请联系平台管理员安全对账处理。",
+            "cleanupPendingPlaceholder": "删除清理中，暂不能聊天"
         },
         "soul": {
             "title": "Soul.md — 人格定义",
@@ -2200,9 +2208,10 @@
         "pressing": "正在按键：{{keys}}",
         "pressed": "已按键：{{keys}}",
         "pressFailed": "按键失败：{{message}}",
+        "finishingControl": "正在结束人工控制...",
         "exportingCookies": "正在导出 Cookies...",
         "loginComplete": "登录完成！已保存 {{count}} 个 Cookies。",
-        "sessionUnlocked": "会话已解锁（未导出 Cookies）。",
+        "sessionUnlocked": "会话已交还给 Agent。",
         "unlockFailed": "解锁失败：{{message}}",
         "canceling": "正在取消...",
         "lockFailed": "获取控制权失败：{{message}}",
@@ -2214,6 +2223,7 @@
         "saveLoginStateTo": "保存登录状态到",
         "exit": "退出",
         "saveLoginState": "保存登录状态",
+        "finishControl": "完成人工控制",
         "sendText": "发送文本"
     },
     "errorBoundary": {

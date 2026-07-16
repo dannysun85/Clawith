@@ -8,6 +8,8 @@ assets before settling Credits, and keeps settlement idempotent.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import uuid
 from dataclasses import dataclass
@@ -37,7 +39,15 @@ from app.services.llm.failover import (
     MINIMAX_QUOTA_CODES,
     extract_minimax_code,
 )
-from app.services.storage import agent_storage_key, get_storage_backend
+from app.services.media_assets import (
+    MediaContractError,
+    OverlayReceipt,
+    apply_video_brand_overlays,
+    image_asset_from_bytes,
+    valid_mp4,
+    validate_generated_video,
+)
+from app.services.storage import agent_storage_key, get_storage_backend, normalize_storage_key
 
 
 ACTIVE_MEDIA_STATUSES = (
@@ -49,11 +59,53 @@ ACTIVE_MEDIA_STATUSES = (
     "asset_repairing",
     "settlement_ready",
 )
-TERMINAL_MEDIA_STATUSES = ("succeeded", "failed")
+TERMINAL_MEDIA_STATUSES = ("succeeded", "failed", "closed_nonrefundable")
 
 
 class ProviderTaskIdentityCollision(RuntimeError):
     """A provider task identity was already owned by another security scope."""
+
+
+_PRIVATE_VIDEO_BRAND_PREFIX = "_internal/provider_recovery/minimax/video"
+
+
+def minimax_video_brand_asset_key(
+    agent_id: uuid.UUID,
+    record_id: uuid.UUID,
+    extension: str,
+) -> str:
+    """Return an Agent-inaccessible, task-bound brand-asset key."""
+
+    normalized_extension = str(extension or "").strip().lower().lstrip(".")
+    if normalized_extension not in {"jpg", "png", "webp"}:
+        raise ValueError("Unsupported private video brand asset extension")
+    return normalize_storage_key(
+        f"{_PRIVATE_VIDEO_BRAND_PREFIX}/{agent_id}/{record_id}/brand.{normalized_extension}"
+    )
+
+
+def _validated_video_brand_asset_key(task: MediaGenerationTask) -> str | None:
+    raw_key = str((getattr(task, "request_metadata", None) or {}).get("brand_asset_storage_key") or "")
+    if not raw_key:
+        return None
+    normalized_key = normalize_storage_key(raw_key)
+    expected_prefix = normalize_storage_key(
+        f"{_PRIVATE_VIDEO_BRAND_PREFIX}/{task.agent_id}/{task.id}/"
+    )
+    if not normalized_key.startswith(expected_prefix):
+        raise MediaContractError("Frozen video brand asset key is outside the task-private namespace")
+    return normalized_key
+
+
+async def _delete_private_video_brand_asset(task: MediaGenerationTask) -> None:
+    """Best-effort cleanup after irrecoverable failure or explicit operator closure."""
+
+    try:
+        key = _validated_video_brand_asset_key(task)
+        if key:
+            await get_storage_backend().delete(key)
+    except Exception:
+        logger.exception("[media] private video brand asset cleanup failed task_id={}", task.id)
 
 
 @dataclass(slots=True, frozen=True)
@@ -73,7 +125,7 @@ def _provider_status(data: dict) -> str:
 
 
 def _valid_mp4(data: bytes) -> bool:
-    return len(data) >= 12 and b"ftyp" in data[:64]
+    return valid_mp4(data)
 
 
 def _safe_error(exc: BaseException) -> str:
@@ -265,25 +317,17 @@ async def mark_minimax_video_task_submitted(
                         existing.agent_id == task.agent_id
                         and existing.tenant_id == task.tenant_id
                     )
-                    if task.reservation_id:
-                        await release_reserved_credits_in_session(
-                            db,
-                            task.reservation_id,
-                            release_provider_inflight=True,
-                        )
                     task.provider_task_id = None
-                    task.status = "failed"
+                    task.status = "submission_ambiguous"
                     task.completed_at = _utcnow()
                     task.next_poll_at = None
                     task.last_error = (
-                        f"Deduplicated provider task; canonical media task is {existing.id}"
+                        f"Provider returned an identity already owned by media task {existing.id}"
                         if same_scope
                         else "Provider task identity collision across security scopes"
                     )
                     await db.commit()
-                    if not same_scope:
-                        raise ProviderTaskIdentityCollision(task.last_error)
-                    attached_task = existing
+                    attached_task = task
                 else:
                     task.provider_task_id = normalized_provider_task_id
                     task.status = "submitted"
@@ -302,6 +346,14 @@ async def mark_minimax_video_task_submitted(
 
     if attached_task is None:
         raise RuntimeError("Unable to attach provider task identity")
+    if attached_task.status == "submission_ambiguous":
+        await _record_media_failure_issue(
+            attached_task,
+            attached_task.last_error or "Provider task identity collision",
+        )
+        raise ProviderTaskIdentityCollision(
+            attached_task.last_error or "Provider task identity collision"
+        )
     canonical_metadata = dict(metadata)
     canonical_metadata.update({
         "task_record_id": str(attached_task.id),
@@ -338,6 +390,7 @@ async def mark_media_generation_submission_failed(
         task.completed_at = _utcnow()
         task.next_poll_at = None
         await db.commit()
+    await _delete_private_video_brand_asset(task)
     await _record_media_failure_issue(task, task.last_error or "submission_failed")
     return True
 
@@ -385,12 +438,45 @@ async def record_media_generation_retry(record_id: uuid.UUID, error: BaseExcepti
         task.consecutive_error_count = (getattr(task, "consecutive_error_count", 0) or 0) + 1
         max_errors = max(int(settings.MEDIA_GENERATION_MAX_CONSECUTIVE_ERRORS), 1)
         provider_accepted = bool(getattr(task, "provider_task_id", None))
-        if task.consecutive_error_count >= max_errors and not provider_accepted:
+        reservation = None
+        if task.reservation_id:
+            reservation = await db.get(
+                CreditReservation,
+                task.reservation_id,
+                with_for_update=True,
+            )
+        provider_outcome_uncertain = bool(
+            reservation
+            and reservation.status in {"provider_inflight", "settlement_ready", "finalized"}
+        )
+        if (
+            task.consecutive_error_count >= max_errors
+            and not provider_accepted
+            and not provider_outcome_uncertain
+        ):
             issue_reason = (
                 f"Media generation stopped after {task.consecutive_error_count} "
                 "consecutive recovery errors"
             )
             await _finalize_failure_in_session(db, task, issue_reason, None)
+            await db.commit()
+            await _record_media_failure_issue(task, issue_reason)
+            return task
+        if (
+            task.consecutive_error_count >= max_errors
+            and not provider_accepted
+            and provider_outcome_uncertain
+        ):
+            should_record_issue = True
+            issue_reason = (
+                "Provider submission identity is unavailable while the Credits hold "
+                "still represents possible provider debt"
+            )
+            task.status = "submission_ambiguous"
+            task.last_error = _safe_error(error)
+            task.last_checked_at = _utcnow()
+            task.completed_at = task.completed_at or _utcnow()
+            task.next_poll_at = None
             await db.commit()
             await _record_media_failure_issue(task, issue_reason)
             return task
@@ -411,6 +497,65 @@ async def record_media_generation_retry(record_id: uuid.UUID, error: BaseExcepti
         await db.commit()
     if should_record_issue:
         await _record_media_failure_issue(task, issue_reason)
+    return task
+
+
+async def _record_provider_success_asset_failure(
+    record_id: uuid.UUID,
+    error: BaseException,
+    status_data: dict | None,
+) -> MediaGenerationTask:
+    """Hold provider debt while bounded local asset repair is attempted.
+
+    MiniMax has already completed successfully at this boundary.  A font,
+    overlay, validation, storage, or delivery error is therefore never grounds
+    for a Credits release and must never cause another generation submission.
+    """
+    settings = get_settings()
+    async with async_session() as db:
+        task = await db.get(MediaGenerationTask, record_id, with_for_update=True)
+        if not task:
+            raise ValueError("Media generation task not found")
+        if task.status == "succeeded":
+            return task
+
+        if task.reservation_id:
+            reservation = await db.get(
+                CreditReservation,
+                task.reservation_id,
+                with_for_update=True,
+            )
+            exact_amount = int(reservation.amount) if reservation else 0
+            await mark_credit_reservation_settlement_ready_in_session(
+                db,
+                task.reservation_id,
+                amount=exact_amount,
+            )
+
+        task.consecutive_error_count = (task.consecutive_error_count or 0) + 1
+        max_errors = max(int(settings.MEDIA_GENERATION_MAX_CONSECUTIVE_ERRORS), 1)
+        task.last_response = status_data
+        task.last_error = (
+            f"Provider succeeded; local asset delivery failed: {_safe_error(error)}"
+        )[:1000]
+        task.last_checked_at = _utcnow()
+        if task.consecutive_error_count >= max_errors:
+            # Durable manual-reconciliation state. It is intentionally neither
+            # terminal nor daemon-due: Credits remain held and Agent deletion
+            # is fenced until an operator repairs or settles the artifact.
+            task.status = "asset_delivery_failed"
+            task.next_poll_at = None
+        else:
+            task.status = "asset_repairing"
+            backoff = min(
+                max(int(settings.MEDIA_GENERATION_POLL_INTERVAL_SECONDS), 5)
+                * (2 ** min(task.consecutive_error_count, 6)),
+                600,
+            )
+            task.next_poll_at = _utcnow() + timedelta(seconds=backoff)
+        await db.commit()
+
+    await _record_media_failure_issue(task, task.last_error or "Asset delivery failed")
     return task
 
 
@@ -454,12 +599,18 @@ async def _record_unrepairable_asset(
         task = await db.get(MediaGenerationTask, record_id, with_for_update=True)
         if not task:
             return
-        task.status = "succeeded"
+        # The original provider cost and completion history remain settled,
+        # but the customer-visible object no longer exists and the provider
+        # has proven it cannot be downloaded again.  Never report success for
+        # a missing artifact; retain the non-refundable debt state for manual
+        # remediation and Agent-deletion fencing.
+        task.status = "asset_delivery_failed"
         task.last_response = status_data
         task.last_error = f"Asset repair failed: {reason}"[:1000]
         task.next_poll_at = None
         await db.commit()
     await _record_media_failure_issue(task, task.last_error)
+    await _delete_private_video_brand_asset(task)
 
 
 async def reconcile_minimax_video_task(
@@ -476,11 +627,18 @@ async def reconcile_minimax_video_task(
     storage = get_storage_backend()
     output_key = agent_storage_key(task.agent_id, task.output_path)
     if task.status == "succeeded" and await storage.exists(output_key):
+        # Retain the frozen brand asset for the missing-object recovery path.
+        # A later retention job or explicit operator closure owns deletion.
         return MediaGenerationOutcome(status="succeeded", output_path=task.output_path)
     if task.status == "succeeded":
         task = await _begin_missing_asset_repair(record_id)
     if task.status == "failed":
         return MediaGenerationOutcome(status="failed", error=task.last_error)
+    if task.status == "submission_ambiguous":
+        return MediaGenerationOutcome(
+            status="failed",
+            error=task.last_error or "Provider submission outcome requires operator reconciliation",
+        )
     if task.status == "settlement_ready":
         try:
             completed_task = await _finalize_success(
@@ -534,6 +692,26 @@ async def reconcile_minimax_video_task(
         submission_timeout = max(int(get_settings().MEDIA_GENERATION_SUBMISSION_TIMEOUT_SECONDS), 60)
         if _utcnow() - created_at > timedelta(seconds=submission_timeout):
             reason = "Provider submission did not produce a recoverable task identity"
+            reservation = None
+            if task.reservation_id:
+                async with async_session() as db:
+                    reservation = await db.get(CreditReservation, task.reservation_id)
+            if reservation and reservation.status in {
+                "provider_inflight",
+                "settlement_ready",
+                "finalized",
+            }:
+                await mark_media_generation_submission_ambiguous(
+                    record_id,
+                    RuntimeError(reason),
+                )
+                return MediaGenerationOutcome(
+                    status="failed",
+                    error=(
+                        "Provider submission outcome is ambiguous; Credits remain held "
+                        "for operator reconciliation"
+                    ),
+                )
             await _finalize_failure(record_id, reason, None)
             return MediaGenerationOutcome(status="failed", error=reason)
         error = ValueError("Provider task identity is not available yet")
@@ -549,6 +727,7 @@ async def reconcile_minimax_video_task(
         logger.error("[media] overdue accepted provider task task_id={}", record_id)
         await _record_media_failure_issue(task, expiry_reason)
 
+    provider_succeeded = False
     try:
         # Runtime import avoids a module cycle while keeping one MiniMax protocol implementation.
         from app.services.agent_tools import (
@@ -570,6 +749,7 @@ async def reconcile_minimax_video_task(
         provider_status = _provider_status(status_data)
 
         if provider_status == "Success":
+            provider_succeeded = True
             claim_status, claimed_task = await _claim_success_download(record_id)
             if claim_status == "succeeded":
                 return MediaGenerationOutcome(status="succeeded", output_path=claimed_task.output_path)
@@ -587,19 +767,58 @@ async def reconcile_minimax_video_task(
                 file_id,
             )
             video_bytes = await _minimax_download_file(download_url)
-            if not _valid_mp4(video_bytes):
-                raise ValueError("MiniMax video download is not a valid MP4 payload")
-            overlay_text = str((task.request_metadata or {}).get("overlay_text") or "").strip()
-            if overlay_text:
-                from app.services.media_assets import apply_video_text_overlay
+            await validate_generated_video(
+                video_bytes,
+                label="MiniMax video download",
+                require_browser_safe=False,
+            )
+            request_metadata = task.request_metadata or {}
+            overlay_text = str(request_metadata.get("overlay_text") or "")
+            expected_text_sha256 = str(request_metadata.get("overlay_text_sha256") or "")
+            if expected_text_sha256 and not hmac.compare_digest(
+                expected_text_sha256,
+                hashlib.sha256(overlay_text.encode("utf-8")).hexdigest(),
+            ):
+                raise MediaContractError("Frozen video copy hash does not match the submitted text")
 
-                video_bytes = await apply_video_text_overlay(
+            brand_asset = None
+            frozen_brand_key = str(request_metadata.get("brand_asset_storage_key") or "")
+            expected_brand_sha256 = str(request_metadata.get("brand_asset_sha256") or "")
+            if frozen_brand_key:
+                brand_key = _validated_video_brand_asset_key(task)
+                if not brand_key:
+                    raise MediaContractError("Frozen video brand asset key is missing")
+                try:
+                    brand_bytes = await storage.read_bytes(brand_key)
+                except Exception as exc:
+                    raise MediaContractError("Frozen video brand asset is unavailable") from exc
+                brand_asset = image_asset_from_bytes(
+                    brand_bytes,
+                    label="Frozen video brand asset",
+                    source_path=brand_key,
+                )
+                if not expected_brand_sha256 or not hmac.compare_digest(
+                    expected_brand_sha256,
+                    brand_asset.sha256,
+                ):
+                    raise MediaContractError("Frozen video brand asset hash does not match the submitted asset")
+
+            if overlay_text.strip() or brand_asset:
+                video_bytes, overlay_receipt = await apply_video_brand_overlays(
                     video_bytes,
                     overlay_text,
-                    position=str((task.request_metadata or {}).get("overlay_position") or "bottom"),
+                    text_position=str(request_metadata.get("overlay_position") or "bottom"),
+                    brand_asset=brand_asset,
+                    brand_position=str(request_metadata.get("brand_position") or "center"),
+                    brand_scale=float(request_metadata.get("brand_scale") or 0.42),
                 )
-                if not _valid_mp4(video_bytes):
-                    raise ValueError("Video text overlay did not produce a valid MP4 payload")
+                status_data = {
+                    **(status_data or {}),
+                    "_astra_media_contract": overlay_receipt.as_dict(),
+                }
+            else:
+                overlay_receipt = OverlayReceipt()
+            await validate_generated_video(video_bytes, label="Final brand-safe video")
 
             # Paid settlement is deliberately after durable storage. If storage
             # fails, Credits remain reserved and the daemon retries.
@@ -659,6 +878,7 @@ async def reconcile_minimax_video_task(
                 status_data,
                 provider_confirmed_failure=True,
             )
+            await _delete_private_video_brand_asset(failed_task)
             if failed_task.status == "succeeded":
                 return MediaGenerationOutcome(status="succeeded", output_path=failed_task.output_path)
             await _write_task_metadata(
@@ -687,9 +907,78 @@ async def reconcile_minimax_video_task(
             },
         )
         return MediaGenerationOutcome(status="processing", retryable=True)
+    except MediaContractError as exc:
+        reason = f"Brand-safe video contract failed: {_safe_error(exc)}"
+        repair_task = await _record_provider_success_asset_failure(
+            record_id,
+            exc,
+            status_data,
+        )
+        try:
+            await _write_task_metadata(
+                repair_task,
+                {
+                    "status": "AssetDeliveryFailed",
+                    "provider_status": "Success",
+                    "last_response": status_data,
+                    "reservation_status": (
+                        "settlement_ready"
+                        if repair_task.reservation_id
+                        else "not_required"
+                    ),
+                    "error": reason,
+                },
+            )
+        except Exception:
+            logger.exception("[media] contract failure metadata write failed task_id={}", record_id)
+        return MediaGenerationOutcome(
+            status=(
+                "retrying"
+                if repair_task.status == "asset_repairing"
+                else "failed"
+            ),
+            error=reason,
+            retryable=repair_task.status == "asset_repairing",
+        )
     except asyncio.CancelledError:
         raise
     except Exception as exc:
+        if provider_succeeded:
+            reason = f"Provider succeeded; local video delivery failed: {_safe_error(exc)}"
+            repair_task = await _record_provider_success_asset_failure(
+                record_id,
+                exc,
+                status_data,
+            )
+            try:
+                await _write_task_metadata(
+                    repair_task,
+                    {
+                        "status": "AssetDeliveryFailed",
+                        "provider_status": "Success",
+                        "last_response": status_data,
+                        "reservation_status": (
+                            "settlement_ready"
+                            if repair_task.reservation_id
+                            else "not_required"
+                        ),
+                        "error": reason,
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "[media] asset delivery failure metadata write failed task_id={}",
+                    record_id,
+                )
+            return MediaGenerationOutcome(
+                status=(
+                    "retrying"
+                    if repair_task.status == "asset_repairing"
+                    else "failed"
+                ),
+                error=reason,
+                retryable=repair_task.status == "asset_repairing",
+            )
         try:
             if task.credential_id:
                 await _mark_minimax_tool_credential_failure(

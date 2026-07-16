@@ -2,11 +2,14 @@
 
 import asyncio
 import uuid
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from app.models.trigger import AgentTrigger
+from app.models.trigger_execution import TriggerExecution
 from app.services.agent_tools import A2AContext
 
 
@@ -51,8 +54,37 @@ class RecordingDB:
     async def rollback(self):
         pass
 
+    async def get(self, _model, identity, **_kwargs):
+        return SimpleNamespace(id=identity, user_id=uuid.uuid4())
+
+    def get_bind(self):
+        return None
+
+    def begin_nested(self):
+        @asynccontextmanager
+        async def transaction():
+            yield self
+
+        return transaction()
+
     def expunge(self, _value):
         pass
+
+
+@pytest.fixture(autouse=True)
+def _authorized_a2a_behavior_contract(monkeypatch):
+    """Exercise A2A behavior with the release gate explicitly enabled."""
+    from app.services import a2a_authorization, agent_tools, trigger_daemon
+    from app.services.trigger_runtime import config as trigger_config
+
+    @asynccontextmanager
+    async def noop_session():
+        yield SimpleNamespace()
+
+    monkeypatch.setattr(trigger_config, "AUTOMATIC_TRIGGER_EXECUTION_ENABLED", True)
+    monkeypatch.setattr(trigger_daemon, "AUTOMATIC_TRIGGER_EXECUTION_ENABLED", True)
+    monkeypatch.setattr(a2a_authorization, "validate_active_a2a_lane", AsyncMock())
+    monkeypatch.setattr(agent_tools, "async_session", noop_session)
 
 
 def _context(*, source_message_id=None, message="Prepare the report") -> A2AContext:
@@ -384,13 +416,17 @@ def test_a2a_claim_head_includes_live_processing_execution():
     source = getsource(claim_pending_trigger_executions)
     assert 'status.in_(("pending", "processing"))' in source
     assert "earlier_is_unfinished" in source
+    assert "earlier_execution.source" not in source
+    assert "uq_trigger_executions_processing_agent" in str(
+        TriggerExecution.__table__.indexes
+    )
 
 
 @pytest.mark.asyncio
 async def test_default_execution_claim_sources_include_a2a():
     from app.services.trigger_runtime.executions import claim_pending_trigger_executions
 
-    db = RecordingDB(responses=[DummyResult(rows=[])])
+    db = RecordingDB(responses=[DummyResult(), DummyResult(rows=[])])
     with patch(
         "app.services.trigger_runtime.executions.async_session"
     ) as session_factory:
@@ -398,7 +434,7 @@ async def test_default_execution_claim_sources_include_a2a():
         session_factory.return_value.__aexit__ = AsyncMock(return_value=False)
         assert await claim_pending_trigger_executions() == []
 
-    compiled_params = db.statements[0].compile().params
+    compiled_params = db.statements[1].compile().params
     assert any(
         isinstance(value, list) and "a2a" in value
         for value in compiled_params.values()

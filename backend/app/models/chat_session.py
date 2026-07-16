@@ -31,6 +31,15 @@ class ChatSession(Base):
             unique=True,
             postgresql_where=text("is_primary = true AND source_channel = 'web' AND is_group = false"),
         ),
+        Index(
+            "uq_chat_sessions_a2a_owner",
+            "agent_id",
+            "peer_agent_id",
+            "user_id",
+            unique=True,
+            postgresql_where=text("source_channel = 'agent' AND peer_agent_id IS NOT NULL"),
+            sqlite_where=text("source_channel = 'agent' AND peer_agent_id IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

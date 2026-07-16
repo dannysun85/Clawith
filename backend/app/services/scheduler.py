@@ -14,6 +14,8 @@ from croniter import croniter
 from loguru import logger
 from sqlalchemy import select, update
 
+AUTOMATIC_SCHEDULE_EXECUTION_ENABLED = False
+
 
 def compute_next_run(cron_expr: str, after: datetime | None = None) -> datetime | None:
     """Compute the next run time from a cron expression."""
@@ -28,6 +30,13 @@ def compute_next_run(cron_expr: str, after: datetime | None = None) -> datetime 
 
 async def _execute_schedule(schedule_id: uuid.UUID, agent_id: uuid.UUID, instruction: str):
     """Execute a single schedule by calling the LLM with the instruction."""
+    if not AUTOMATIC_SCHEDULE_EXECUTION_ENABLED:
+        logger.warning(
+            "Schedule execution is paused schedule_id={} agent_id={}",
+            schedule_id,
+            agent_id,
+        )
+        return
     try:
         from app.database import async_session
         from app.models.agent import Agent
@@ -72,8 +81,12 @@ async def _execute_schedule(schedule_id: uuid.UUID, agent_id: uuid.UUID, instruc
             from app.services.activity_logger import log_activity
             await log_activity(
                 agent_id, "schedule_run",
-                f"定时任务执行: {instruction[:60]}",
-                detail={"schedule_id": str(schedule_id), "instruction": instruction, "reply": reply[:500]},
+                "定时任务执行完成",
+                detail={
+                    "schedule_id": str(schedule_id),
+                    "instruction_chars": len(instruction),
+                    "reply_chars": len(reply),
+                },
             )
 
             logger.info(
@@ -89,6 +102,8 @@ async def _execute_schedule(schedule_id: uuid.UUID, agent_id: uuid.UUID, instruc
 
 async def _tick():
     """One scheduler tick: find and execute due schedules."""
+    if not AUTOMATIC_SCHEDULE_EXECUTION_ENABLED:
+        return
     from app.database import async_session
     from app.models.schedule import AgentSchedule
     from app.services.audit_logger import write_audit_log
@@ -135,7 +150,7 @@ async def _tick():
 
 async def start_scheduler():
     """Start the background scheduler loop. Call from FastAPI startup."""
-    logger.info("🕐 Agent scheduler started (30s interval)")
+    logger.info("Agent schedule execution is paused by release policy")
     while True:
         await _tick()
         await asyncio.sleep(30)

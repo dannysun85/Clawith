@@ -27,14 +27,20 @@ from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.llm import LLMModel
 from app.models.task import Task
+from app.models.tenant import Tenant
 from app.models.user import User
 from app.services.activity_logger import log_activity
 from app.services.artifact_contract import append_authoritative_artifacts, verified_tool_artifacts
 from app.services.agentbay_live import detect_agentbay_env, get_browser_snapshot, get_desktop_screenshot
 from app.services.chat_session_service import ensure_primary_platform_session
+from app.services.chat_session_access import (
+    build_user_tool_authorization_context,
+    validate_active_user_chat_lane,
+)
 from app.services.llm import call_llm_with_failover
 from app.services.llm.caller import RouteMeta, validate_inline_media_payload
 from app.services.llm.utils import convert_chat_messages_to_llm_format, truncate_messages_with_pair_integrity
+from app.services.media_message_content import sanitize_inline_media_content
 from app.services.onboarding import is_onboarded, mark_onboarding_phase, resolve_onboarding_prompt
 from app.services.quota_guard import (
     AgentExpired,
@@ -46,7 +52,6 @@ from app.services.quota_guard import (
     quota_error_payload,
 )
 from app.services.realtime import PRESENCE_TTL_SECONDS, realtime_router
-from app.services.task_executor import execute_task
 
 router = APIRouter(tags=["websocket"])
 
@@ -388,15 +393,32 @@ class WebSocketChatHandler:
             async with async_session() as db:
                 result = await db.execute(select(User).where(User.id == user_id))
                 self.user = result.scalar_one_or_none()
-                if not self.user:
+                if not self.user or not self.user.is_active:
                     logger.error("[WS] User not found")
-                    await self.websocket.send_json({"type": "error", "content": "User not found"})
+                    await self.websocket.send_json({"type": "error", "content": "Account unavailable"})
                     await self.websocket.close(code=4001)
+                    return False
+
+                tenant = (
+                    await db.get(Tenant, self.user.tenant_id)
+                    if self.user.tenant_id
+                    else None
+                )
+                if tenant is None or not tenant.is_active:
+                    await self.websocket.send_json(
+                        {"type": "error", "content": "Company unavailable"}
+                    )
+                    await self.websocket.close(code=4003)
                     return False
 
                 logger.info(f"[WS] Checking agent access for {self.agent_id}")
                 self.agent, _ = await check_agent_access(db, self.user, self.agent_id)
-                if is_agent_expired(self.agent):
+                if (
+                    self.agent.tenant_id != self.user.tenant_id
+                    or getattr(self.agent, "status", None)
+                    in {"stopped", "paused", "error"}
+                    or is_agent_expired(self.agent)
+                ):
                     await self.websocket.send_json(
                         {
                             "type": "error",
@@ -424,6 +446,12 @@ class WebSocketChatHandler:
                 self.conv_id = await self._resolve_chat_session(db, user_id)
                 if not self.conv_id:
                     return False
+                await validate_active_user_chat_lane(
+                    db,
+                    agent_id=self.agent_id,
+                    owner_user_id=user_id,
+                    session_id=self.conv_id,
+                )
 
                 # Load history messages
                 await self._load_history(db)
@@ -601,7 +629,12 @@ class WebSocketChatHandler:
                 })
                 continue
 
-            self.current_user_text = content
+            persisted_user_content = sanitize_inline_media_content(
+                content,
+                display_content=display_content,
+                file_names=file_name,
+            )
+            self.current_user_text = persisted_user_content
 
             # Resolve effective model from SaaS tier/modality (legacy model_id no longer trusted)
             try:
@@ -632,7 +665,8 @@ class WebSocketChatHandler:
                 continue
 
             # Add user message to in-memory context
-            self.conversation.append({"role": "user", "content": content})
+            current_user_turn = {"role": "user", "content": content}
+            self.conversation.append(current_user_turn)
 
             # Save user message to DB
             await self._save_user_message(
@@ -645,30 +679,37 @@ class WebSocketChatHandler:
 
             # OpenClaw routing check
             if self.agent_type == "openclaw":
-                await self._route_openclaw(content)
+                current_user_turn["content"] = persisted_user_content
+                await self._route_openclaw(persisted_user_content)
                 continue
 
             # Detect task creation intent
             task_match = re.search(
                 r"(?:创建|新建|添加|建一个|帮我建|create|add)(?:一个|a )?(?:任务|待办|todo|task)[，,：：:\\s]*(.+)",
-                content,
+                persisted_user_content,
                 re.IGNORECASE,
             )
 
             # Invoke LLM and stream response
-            if effective_llm_model:
-                assistant_response, thinking_content, queued_messages = await self._run_llm_and_stream(
-                    effective_llm_model,
-                    is_onboarding_trigger,
-                    route_meta=self.current_route_meta,
-                )
-            else:
-                assistant_response = (
-                    f"⚠️ {self.agent_name} has no LLM model configured. "
-                    "Please select a tier in the agent's Settings tab or ask an admin to configure model routes."
-                )
-                thinking_content = []
-                queued_messages = []
+            try:
+                if effective_llm_model:
+                    assistant_response, thinking_content, queued_messages = await self._run_llm_and_stream(
+                        effective_llm_model,
+                        is_onboarding_trigger,
+                        route_meta=self.current_route_meta,
+                    )
+                else:
+                    assistant_response = (
+                        f"⚠️ {self.agent_name} has no LLM model configured. "
+                        "Please select a tier in the agent's Settings tab or ask an admin to configure model routes."
+                    )
+                    thinking_content = []
+                    queued_messages = []
+            finally:
+                # The binary data URL is needed only by the current provider
+                # request. Retaining it would resend the same image/video on
+                # every later turn and amplify memory, request size and cost.
+                current_user_turn["content"] = persisted_user_content
 
             # If task creation detected, create a real Task record
             if task_match:
@@ -826,26 +867,35 @@ class WebSocketChatHandler:
         message_id: uuid.UUID | None = None,
     ) -> str | None:
         """Saves user message to the database and updates session title/time."""
-        has_image_marker = "[image_data:" in content
-        if has_image_marker:
-            saved_content = f"[file:{file_name}]\n{content}" if file_name else content
-        else:
-            saved_content = display_content if display_content else content
-            if file_name:
-                saved_content = f"[file:{file_name}]\n{saved_content}"
-
+        saved_content = sanitize_inline_media_content(
+            content,
+            display_content=display_content,
+            file_names=file_name,
+        )
         if is_onboarding_trigger:
             logger.info("[WS] Onboarding trigger — skipping user-message persistence")
             async with async_session() as _sdb:
-                _sr = await _sdb.execute(select(ChatSession).where(ChatSession.id == uuid.UUID(self.conv_id)))
-                _s = _sr.scalar_one_or_none()
-                if _s and _s.title.startswith("Session "):
-                    _s.title = "Onboarding"
+                lane = await validate_active_user_chat_lane(
+                    _sdb,
+                    agent_id=self.agent_id,
+                    owner_user_id=self.user.id,
+                    session_id=self.conv_id,
+                    lock_authority=True,
+                )
+                if lane.session.title.startswith("Session "):
+                    lane.session.title = "Onboarding"
                     await _sdb.commit()
             return None
         else:
             persisted_message_id = message_id or uuid.uuid4()
             async with async_session() as db:
+                lane = await validate_active_user_chat_lane(
+                    db,
+                    agent_id=self.agent_id,
+                    owner_user_id=self.user.id,
+                    session_id=self.conv_id,
+                    lock_authority=True,
+                )
                 user_msg = ChatMessage(
                     id=persisted_message_id,
                     agent_id=self.agent_id,
@@ -857,16 +907,10 @@ class WebSocketChatHandler:
                 db.add(user_msg)
                 # Update session
                 _now = datetime.now(tz.utc)
-                _sess_r = await db.execute(select(ChatSession).where(ChatSession.id == uuid.UUID(self.conv_id)))
-                _sess = _sess_r.scalar_one_or_none()
-                if _sess:
-                    _sess.last_message_at = _now
-                    if not self.history_messages and _sess.title.startswith("Session "):
-                        title_src = display_content if display_content else content
-                        clean_title = title_src.replace("[图片] ", "📷 ").replace("[image_data:", "").strip()
-                        if file_name and not clean_title:
-                            clean_title = f"📎 {file_name}"
-                        _sess.title = clean_title[:40] if clean_title else content[:40]
+                lane.session.last_message_at = _now
+                if not self.history_messages and lane.session.title.startswith("Session "):
+                    clean_title = saved_content.replace("[图片] ", "📷 ").strip()
+                    lane.session.title = clean_title[:40] if clean_title else "New message"
                 await db.commit()
             logger.info("[WS] User message saved")
             return str(persisted_message_id)
@@ -876,6 +920,13 @@ class WebSocketChatHandler:
         from app.models.gateway_message import GatewayMessage as GwMsg
 
         async with async_session() as db:
+            await validate_active_user_chat_lane(
+                db,
+                agent_id=self.agent_id,
+                owner_user_id=self.user.id,
+                session_id=self.conv_id,
+                lock_authority=True,
+            )
             gw_msg = GwMsg(
                 agent_id=self.agent_id,
                 sender_user_id=self.user.id,
@@ -1102,6 +1153,16 @@ class WebSocketChatHandler:
                     except Exception:
                         pass
 
+                async with async_session() as authorization_db:
+                    await validate_active_user_chat_lane(
+                        authorization_db,
+                        agent_id=self.agent_id,
+                        owner_user_id=self.user.id,
+                        session_id=self.conv_id,
+                        lock_authority=True,
+                    )
+                    await authorization_db.commit()
+
                 return await call_llm_with_failover(
                     primary_model=effective_llm_model,
                     fallback_model=self.fallback_llm_model,
@@ -1120,6 +1181,13 @@ class WebSocketChatHandler:
                     skip_tools=skip_tools_for_greeting,
                     on_code_output=code_output_to_ws,
                     route_meta=route_meta,
+                    tool_authorization_context=(
+                        build_user_tool_authorization_context(
+                            agent_id=self.agent_id,
+                            owner_user_id=self.user.id,
+                            session_id=self.conv_id,
+                        )
+                    ),
                 )
 
             llm_task = asyncio.create_task(_call_with_failover())
@@ -1267,25 +1335,28 @@ class WebSocketChatHandler:
         """Persist completed tool calls in ChatMessage DB logs."""
         try:
             from app.services.chat_session_service import save_tool_call_log
-            message_id = await save_tool_call_log(
-                agent_id=self.agent_id,
-                user_id=self.user.id,
-                conversation_id=self.conv_id,
-                tool_name=data.get("name", ""),
-                arguments=data.get("args"),
-                result=(data.get("result") or "")[:500],
-                status="done",
-                tool_call_id=data.get("call_id"),
-                reasoning_content=data.get("reasoning_content"),
-            )
-            if not message_id:
-                return None
-        except Exception as _tc_err:
-            logger.warning(f"[WS] Failed to save tool_call: {_tc_err}")
-            return None
-
-        try:
             async with async_session() as _tc_db:
+                await validate_active_user_chat_lane(
+                    _tc_db,
+                    agent_id=self.agent_id,
+                    owner_user_id=self.user.id,
+                    session_id=self.conv_id,
+                    lock_authority=True,
+                )
+                message_id = await save_tool_call_log(
+                    agent_id=self.agent_id,
+                    user_id=self.user.id,
+                    conversation_id=self.conv_id,
+                    tool_name=data.get("name", ""),
+                    arguments=data.get("args"),
+                    result=(data.get("result") or "")[:500],
+                    status="done",
+                    tool_call_id=data.get("call_id"),
+                    reasoning_content=data.get("reasoning_content"),
+                    db=_tc_db,
+                )
+                if not message_id:
+                    return None
                 await maybe_mark_session_read_for_active_viewer(
                     _tc_db,
                     agent_id=self.agent_id,
@@ -1294,7 +1365,11 @@ class WebSocketChatHandler:
                 )
                 await _tc_db.commit()
         except Exception as _tc_err:
-            logger.warning(f"[WS] Failed to mark tool_call session read: {_tc_err}")
+            logger.warning(
+                "[WS] Failed to save tool_call error_type={}",
+                type(_tc_err).__name__,
+            )
+            return None
         return message_id
 
     async def _update_activity_and_quota(self, assistant_response: str):
@@ -1319,8 +1394,12 @@ class WebSocketChatHandler:
             await log_activity(
                 self.agent_id,
                 "chat_reply",
-                f"Replied to web chat: {assistant_response[:80]}",
-                detail={"channel": "web", "user_text": user_text[:200], "reply": assistant_response[:500]},
+                "Replied to web chat",
+                detail={
+                    "channel": "web",
+                    "request_chars": len(user_text),
+                    "reply_chars": len(assistant_response),
+                },
             )
         except Exception as e:
             logger.warning(f"[WS] Failed to log activity: {e}")
@@ -1331,6 +1410,13 @@ class WebSocketChatHandler:
             return assistant_response
         try:
             async with async_session() as db:
+                await validate_active_user_chat_lane(
+                    db,
+                    agent_id=self.agent_id,
+                    owner_user_id=self.user.id,
+                    session_id=self.conv_id,
+                    lock_authority=True,
+                )
                 task = Task(
                     agent_id=self.agent_id,
                     title=task_title,
@@ -1342,8 +1428,6 @@ class WebSocketChatHandler:
                 await db.commit()
                 await db.refresh(task)
                 logger.info(f"[WS] Task created: {task.id}")
-                task_id = task.id
-            asyncio.create_task(execute_task(task_id, self.agent_id))
             assistant_response += f"\n\n📋 Task synced to task board: [{task_title}]"
         except Exception as te:
             logger.error(f"[WS] Task creation failed: {te}")
@@ -1353,6 +1437,13 @@ class WebSocketChatHandler:
         """Saves assistant reply to DB."""
         message_id = uuid.uuid4()
         async with async_session() as db:
+            await validate_active_user_chat_lane(
+                db,
+                agent_id=self.agent_id,
+                owner_user_id=self.user.id,
+                session_id=self.conv_id,
+                lock_authority=True,
+            )
             assistant_msg = ChatMessage(
                 id=message_id,
                 agent_id=self.agent_id,

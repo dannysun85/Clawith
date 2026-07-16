@@ -66,7 +66,7 @@ class DouyinPublishJobCreate(BaseModel):
 class DouyinPublishJobOut(BaseModel):
     id: uuid.UUID
     tenant_id: uuid.UUID
-    agent_id: uuid.UUID
+    agent_id: uuid.UUID | None = None
     account_id: uuid.UUID | None = None
     approval_id: uuid.UUID | None = None
     content_type: str

@@ -414,9 +414,10 @@ def test_l3_approval_message_forbids_model_retry_and_points_to_terminal_status()
 
     message = agent_tools._queued_approval_message(approval_id)
 
-    assert "execute it automatically after approval" in message
+    assert "automatic execution is paused" in message
     assert "Do not retry this tool call" in message
-    assert "check Approvals for the final status" in message
+    assert "No code, command, or side effect will run after approval" in message
+    assert "execute it automatically after approval" not in message
     assert str(approval_id) in message
     assert "Please wait for approval before retrying" not in message
 

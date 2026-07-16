@@ -11,7 +11,10 @@ from app.core.permissions import check_agent_access
 from app.database import async_session
 from app.models.trigger import AgentTrigger
 from app.services.trigger_runtime.config import (
+    changes_on_message_binding,
+    on_message_source_binding_error,
     reserved_trigger_config_keys,
+    trusted_persisted_trigger_state,
     without_reserved_trigger_config,
 )
 
@@ -57,7 +60,9 @@ class TriggerUpdate(BaseModel):
 async def list_agent_triggers(agent_id: uuid.UUID, user=Depends(get_current_user)):
     """List all triggers for an agent."""
     async with async_session() as db:
-        await check_agent_access(db, user, agent_id)
+        _, access_level = await check_agent_access(db, user, agent_id)
+        if access_level != "manage":
+            raise HTTPException(403, "Manage access required")
         result = await db.execute(
             select(AgentTrigger)
             .where(
@@ -125,7 +130,11 @@ async def update_trigger(
             raise HTTPException(403, "System triggers only support enable/disable")
 
         if body.config is not None:
-            old_config = dict(trigger.config or {})
+            stored_config = dict(trigger.config or {})
+            old_config = {
+                **without_reserved_trigger_config(stored_config),
+                **trusted_persisted_trigger_state(stored_config),
+            }
             incoming_config = dict(body.config)
             reserved_keys = reserved_trigger_config_keys(incoming_config)
             if reserved_keys:
@@ -136,21 +145,41 @@ async def update_trigger(
                 )
             if incoming_config.get("secret") == REDACTED_TRIGGER_SECRET:
                 incoming_config.pop("secret")
+            if trigger.type == "on_message" and changes_on_message_binding(
+                stored_config,
+                incoming_config,
+            ):
+                raise HTTPException(
+                    400,
+                    "Message-watch identity cannot be retargeted in place; delete and recreate the trigger from the intended conversation",
+                )
             if trigger.type == "webhook":
                 for protected_key in ("token", "secret"):
                     if not str(incoming_config.get(protected_key) or "").strip():
                         if old_config.get(protected_key):
                             incoming_config[protected_key] = old_config[protected_key]
-            trigger.config = {**old_config, **incoming_config}
+            merged_config = {**old_config, **incoming_config}
+            if trigger.type == "on_message":
+                source_error = on_message_source_binding_error(merged_config)
+                if source_error:
+                    raise HTTPException(400, source_error)
+            trigger.config = merged_config
         if body.reason is not None:
             trigger.reason = body.reason
         if body.is_enabled is not None:
-            if (
-                body.is_enabled
-                and trigger.type == "webhook"
-                and not str((trigger.config or {}).get("secret") or "").strip()
-            ):
-                raise HTTPException(400, "Webhook triggers require an HMAC secret before they can be enabled")
+            if body.is_enabled:
+                if (
+                    trigger.type == "webhook"
+                    and not str((trigger.config or {}).get("secret") or "").strip()
+                ):
+                    raise HTTPException(
+                        400,
+                        "Webhook triggers require an HMAC secret before they can be enabled",
+                    )
+                raise HTTPException(
+                    409,
+                    "Automatic trigger execution is paused in this release",
+                )
             trigger.is_enabled = body.is_enabled
         if body.max_fires is not None:
             trigger.max_fires = body.max_fires

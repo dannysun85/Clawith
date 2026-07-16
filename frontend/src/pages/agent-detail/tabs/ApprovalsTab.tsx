@@ -30,6 +30,9 @@ export default function ApprovalsTab({ agentId, canManage }: { agentId: string; 
         refetchInterval: (query) => approvalNeedsPolling(normalizeApprovals(query.state.data)) ? 3000 : false,
     });
     const approvals = normalizeApprovals(approvalData);
+    const approvalExecutionAvailable = approvals.some(
+        (approval) => approval.execution_available === true,
+    );
 
     const resolveMut = useMutation({
         mutationFn: async ({ approvalId, action }: { approvalId: string; action: 'approve' | 'reject' }) => {
@@ -66,6 +69,13 @@ export default function ApprovalsTab({ agentId, canManage }: { agentId: string; 
 
     return (
         <div style={{ padding: '20px 24px' }}>
+            {!approvalExecutionAvailable && (
+                <div role="status" style={{ marginBottom: '12px', color: 'var(--warning)', fontSize: '13px' }}>
+                    {isChinese
+                        ? '本版本已暂停自动审批执行。你仍可拒绝请求，但批准按钮已停用，且不会产生任何副作用。'
+                        : 'Automatic approval execution is paused in this release. Requests may be rejected, but approval is disabled and no side effect will run.'}
+                </div>
+            )}
             {isError && (
                 <div style={{ marginBottom: '12px', color: 'var(--error)', fontSize: '13px' }}>
                     {isChinese ? '审批记录加载失败，请稍后重试。' : 'Failed to load approvals. Please try again.'}
@@ -109,8 +119,10 @@ export default function ApprovalsTab({ agentId, canManage }: { agentId: string; 
                                     onClick={() => {
                                         if (canManage) resolveMut.mutate({ approvalId: approval.id, action: 'approve' });
                                     }}
-                                    disabled={!canManage || resolveMut.isPending || !isApprovalApprovable(approval.details)}
-                                    title={!isApprovalApprovable(approval.details)
+                                    disabled={!canManage || !approvalExecutionAvailable || resolveMut.isPending || !isApprovalApprovable(approval.details)}
+                                    title={!approvalExecutionAvailable
+                                        ? (isChinese ? '本版本已暂停自动审批执行。' : 'Automatic approval execution is paused in this release.')
+                                        : !isApprovalApprovable(approval.details)
                                         ? (isChinese ? '审批内容未通过完整性校验，只能拒绝。' : 'Payload integrity is not verified; reject it.')
                                         : undefined}
                                 >

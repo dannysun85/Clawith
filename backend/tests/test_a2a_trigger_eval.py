@@ -61,18 +61,23 @@ async def test_check_new_agent_messages_matches_user_role():
     participant_id = uuid.uuid4()
     conversation_id = str(uuid.uuid4())
     tenant_id = uuid.uuid4()
+    owner_id = uuid.uuid4()
     
     # Mock source agent
     source_agent = MagicMock()
     source_agent.id = source_agent_id
     source_agent.name = "Ray"
     source_agent.tenant_id = tenant_id
+    target_agent = MagicMock()
+    target_agent.id = agent_id
+    target_agent.tenant_id = tenant_id
 
     # Mock chat message
     chat_message = MagicMock()
     chat_message.id = uuid.uuid4()
     chat_message.content = "Designed the logo"
     chat_message.role = "user"  # Role is user
+    chat_message.conversation_id = conversation_id
 
     trigger = AgentTrigger(
         id=uuid.uuid4(),
@@ -83,6 +88,8 @@ async def test_check_new_agent_messages_matches_user_role():
             "from_agent_name": "Ray",
             "from_agent_id": str(source_agent_id),
             "expected_conversation_id": conversation_id,
+            "_origin_user_id": str(owner_id),
+            "_server_context_version": 1,
         },
         is_enabled=True,
         created_at=datetime.now(UTC),
@@ -90,13 +97,26 @@ async def test_check_new_agent_messages_matches_user_role():
     )
 
     db = RecordingDB(responses=[
-        DummyResult(scalar_value=tenant_id),  # Target tenant lookup
+        DummyResult(scalar_value=target_agent),  # Target Agent lookup
         DummyResult(scalar_value=source_agent),  # AgentModel lookup by stable id
+        DummyResult(scalars_list=[MagicMock()]),  # Exact active relationship
         DummyResult(scalar_value=participant_id),  # Participant lookup
         DummyResult(scalar_value=chat_message),    # ChatMessage lookup
     ])
 
-    with patch("app.services.trigger_runtime.evaluator.async_session") as mock_session_ctx:
+    with (
+        patch("app.services.trigger_runtime.evaluator.async_session") as mock_session_ctx,
+        patch(
+            "app.core.permissions.get_agent_access_level_for_user_id",
+            new_callable=AsyncMock,
+            return_value="manage",
+        ),
+        patch(
+            "app.core.permissions.evaluate_agent_relationship_status",
+            new_callable=AsyncMock,
+            return_value={"access_status": "active"},
+        ),
+    ):
         mock_session_ctx.return_value.__aenter__ = AsyncMock(return_value=db)
         mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
 
@@ -109,3 +129,47 @@ async def test_check_new_agent_messages_matches_user_role():
     assert trigger.config["_matched_message_id"] == str(chat_message.id)
     assert tenant_id in db.statements[1].compile().params.values()
     assert conversation_id in db.statements[-1].compile().params.values()
+    assert agent_id in db.statements[-1].compile().params.values()
+    assert source_agent_id in db.statements[-1].compile().params.values()
+    assert owner_id in db.statements[-1].compile().params.values()
+    assert "agent" in db.statements[-1].compile().params.values()
+    assert trigger.config["_matched_conversation_id"] == conversation_id
+    assert trigger.config["_match_context_version"] == 1
+
+
+@pytest.mark.asyncio
+async def test_check_new_agent_messages_rejects_unbound_agent_watch():
+    agent_id = uuid.uuid4()
+    source_agent_id = uuid.uuid4()
+    tenant_id = uuid.uuid4()
+    target_agent = MagicMock()
+    target_agent.id = agent_id
+    target_agent.tenant_id = tenant_id
+    source_agent = MagicMock()
+    source_agent.id = source_agent_id
+    source_agent.name = "Ray"
+    source_agent.tenant_id = tenant_id
+    trigger = AgentTrigger(
+        id=uuid.uuid4(),
+        agent_id=agent_id,
+        name="legacy_unbound",
+        type="on_message",
+        config={"from_agent_id": str(source_agent_id)},
+        is_enabled=True,
+        created_at=datetime.now(UTC),
+        fire_count=0,
+    )
+    db = RecordingDB(
+        responses=[
+            DummyResult(scalar_value=target_agent),
+            DummyResult(scalar_value=source_agent),
+        ]
+    )
+
+    with patch("app.services.trigger_runtime.evaluator.async_session") as session:
+        session.return_value.__aenter__ = AsyncMock(return_value=db)
+        session.return_value.__aexit__ = AsyncMock(return_value=False)
+        assert await check_new_agent_messages(trigger) is False
+
+    assert len(db.statements) == 0
+    assert "_matched_message" not in trigger.config

@@ -252,7 +252,11 @@ async def test_douyin_publish_job_is_approval_first_and_persists_schedule():
     user_id = uuid.uuid4()
     account_id = uuid.uuid4()
     scheduled_at = datetime.now(timezone.utc) + timedelta(days=1)
-    agent = SimpleNamespace(id=agent_id, tenant_id=tenant_id)
+    agent = SimpleNamespace(
+        id=agent_id,
+        tenant_id=tenant_id,
+        deletion_requested_at=None,
+    )
     account = SimpleNamespace(id=account_id)
     db = RecordingDB(
         responses=[

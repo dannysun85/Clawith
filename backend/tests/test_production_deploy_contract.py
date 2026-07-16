@@ -69,6 +69,7 @@ def _recovery_shell_source(script: str) -> tuple[str, str, str]:
             # and persistence from those deployment-security side effects.
             "quarantine_mcp_for_unsafe_release() { :; }",
             "restore_mcp_quarantine_for_safe_release() { :; }",
+            "reconcile_agentbay_for_cutover() { :; }",
             "approval_schema_forward_state() { printf '%s' \"${SCHEMA_FORWARD_STATE:-1}\"; }",
             _shell_function_source(
                 script,
@@ -120,13 +121,17 @@ def test_production_code_execution_defaults_fail_closed():
 def test_polluted_parent_environment_cannot_activate_code_in_effective_compose():
     if shutil.which("docker") is None:
         pytest.skip("docker CLI is not installed")
-    version = subprocess.run(
-        ["docker", "compose", "version"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        version = subprocess.run(
+            ["docker", "compose", "version"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.skip("docker compose plugin probe timed out")
     if version.returncode != 0:
         pytest.skip("docker compose plugin is not installed")
 
@@ -160,6 +165,7 @@ def test_polluted_parent_environment_cannot_activate_code_in_effective_compose()
         capture_output=True,
         text=True,
         check=True,
+        timeout=30,
     )
     config = json.loads(rendered.stdout)
     for service_name in ("backend", "worker"):
@@ -183,6 +189,24 @@ def test_production_release_gate_covers_code_execution_security():
 
     assert '(cd backend && uv run pytest -q)' in script
     assert "production releases cannot disable local release gates" in script
+    assert "agentbay_unresolved_count" in script
+    assert "status IN ('active', 'cleanup_required')" in script
+    assert "AGENTBAY_RECONCILE_DEADLINE_SECONDS=120" in script
+    assert script.index(
+        'AGENTBAY_UNRESOLVED_BEFORE_MAINTENANCE="$(agentbay_unresolved_count'
+    ) < script.index(
+        'echo "[remote] enabling explicit Web/API/WebSocket maintenance fence"'
+    )
+    stop_old_writers = script.index(
+        'echo "[remote] stopping every old application writer before quarantine/migration"'
+    )
+    pre_migration_cleanup = script.index(
+        'echo "[remote] deleting every retained AgentBay provider session before migration"'
+    )
+    migration = script.index(
+        'echo "[remote] applying migrations before candidate startup"'
+    )
+    assert stop_old_writers < pre_migration_cleanup < migration
     assert "scripts/ruff_diff_gate.py" in script
     assert "git describe --tags --abbrev=0 HEAD^" in script
     assert '--base "$RELEASE_BASE_COMMIT" --target HEAD' in script

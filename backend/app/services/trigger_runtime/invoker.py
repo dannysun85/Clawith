@@ -21,7 +21,10 @@ from app.services.trigger_runtime import (
     mark_trigger_executions_failed,
     renew_trigger_execution_leases,
 )
-from app.services.trigger_runtime.config import trigger_delivery_identity
+from app.services.trigger_runtime.config import (
+    AUTOMATIC_TRIGGER_EXECUTION_ENABLED,
+    trigger_delivery_identity,
+)
 
 INTERNAL_A2A_TRIGGER_NAMES = {"a2a_wake", "__a2a_wake__"}
 
@@ -152,14 +155,10 @@ async def resolve_trigger_delivery_target(agent: Agent, triggers: list[AgentTrig
             ):
                 return None
             if actual_source_channel == "agent":
-                if not origin_session:
-                    return None
-                return {
-                    "kind": "session",
-                    "session_id": str(origin_session.id),
-                    "owner_user_id": str(origin_session.user_id),
-                    "source_channel": "agent",
-                }
+                # Ordinary trigger delivery is a first-party user-chat lane.
+                # A2A output is accepted only by the separately validated
+                # internal A2A wake path below.
+                return None
 
             if actual_source_channel == "trigger":
                 return None
@@ -240,17 +239,29 @@ async def _validated_internal_a2a_target(
     ):
         raise PermissionError("Untrusted A2A trigger")
     session_id = (trigger.config or {}).get("_a2a_session_id")
-    session = await _validated_delivery_session(
+    source_agent_id = (trigger.config or {}).get("_matched_from_agent_id")
+    if not source_agent_id:
+        raise PermissionError("A2A delivery source is not attested")
+    from app.services.a2a_authorization import validate_active_a2a_lane
+
+    try:
+        parsed_session_id = uuid.UUID(str(session_id))
+    except (TypeError, ValueError) as exc:
+        raise PermissionError("A2A delivery session is invalid") from exc
+    candidate_session = await db.get(ChatSession, parsed_session_id)
+    if candidate_session is None or not candidate_session.user_id:
+        raise PermissionError("A2A delivery session is unavailable")
+    lane = await validate_active_a2a_lane(
         db,
-        agent,
-        session_id,
-        require_agent_channel=True,
+        source_agent_id=source_agent_id,
+        target_agent_id=agent.id,
+        owner_user_id=candidate_session.user_id,
+        session_id=session_id,
     )
-    if not session:
-        raise PermissionError("A2A delivery session is not authorized")
     return {
-        "session_id": str(session.id),
-        "owner_user_id": str(session.user_id),
+        "session_id": str(lane.session.id),
+        "owner_user_id": str(lane.owner_user_id),
+        "source_agent_id": str(lane.source_agent.id),
     }
 
 
@@ -259,23 +270,37 @@ async def _persist_validated_a2a_reply(
     agent: Agent,
     target: dict,
     content: str,
+    execution_claims: list[tuple[uuid.UUID, str]],
 ) -> None:
     """Revalidate and persist an A2A reply without trusting runtime config."""
 
     from app.models.audit import ChatMessage
+    from app.models.gateway_message import GatewayMessage
     from app.models.participant import Participant
 
     async with async_session() as db:
-        validated_session = await _validated_delivery_session(
-            db,
-            agent,
-            target["session_id"],
-            require_agent_channel=True,
+        from app.services.a2a_authorization import validate_active_a2a_lane
+        from app.services.trigger_authorization import (
+            validate_active_trigger_principal,
         )
-        if not validated_session:
-            raise PermissionError(
-                "A2A delivery authorization changed before persistence"
-            )
+
+        await validate_active_trigger_principal(
+            db,
+            agent_id=agent.id,
+            owner_user_id=target["owner_user_id"],
+            execution_claims=execution_claims,
+            lock_authority=True,
+        )
+
+        lane = await validate_active_a2a_lane(
+            db,
+            source_agent_id=target["source_agent_id"],
+            target_agent_id=agent.id,
+            owner_user_id=target["owner_user_id"],
+            session_id=target["session_id"],
+            lock_relationship=True,
+        )
+        validated_session = lane.session
         participant_result = await db.execute(
             select(Participant).where(
                 Participant.type == "agent",
@@ -285,7 +310,7 @@ async def _persist_validated_a2a_reply(
         participant = participant_result.scalar_one_or_none()
         db.add(
             ChatMessage(
-                agent_id=agent.id,
+                agent_id=validated_session.agent_id,
                 conversation_id=str(validated_session.id),
                 role="assistant",
                 content=content,
@@ -293,6 +318,18 @@ async def _persist_validated_a2a_reply(
                 participant_id=participant.id if participant else None,
             )
         )
+        if lane.source_agent.agent_type == "openclaw":
+            db.add(
+                GatewayMessage(
+                    agent_id=lane.source_agent.id,
+                    sender_agent_id=agent.id,
+                    sender_user_id=validated_session.user_id,
+                    authorization_source_agent_id=lane.source_agent.id,
+                    content=content,
+                    status="pending",
+                    conversation_id=str(validated_session.id),
+                )
+            )
         validated_session.last_message_at = datetime.now(timezone.utc)
         await db.commit()
 
@@ -313,9 +350,21 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
         if (t.config or {}).get("_execution_id")
         and (t.config or {}).get("_execution_lease_token")
     ]
+    if not AUTOMATIC_TRIGGER_EXECUTION_ENABLED:
+        if execution_claims:
+            await mark_trigger_executions_failed(
+                execution_claims,
+                "Automatic trigger execution is paused by RC5 release policy",
+            )
+        logger.warning(
+            "Rejected trigger invocation while automatic execution is paused agent_id={}",
+            agent_id,
+        )
+        return
     invocation_task = asyncio.current_task()
     lease_renewal_task = None
     validated_a2a_target: dict | None = None
+    delivery_target: dict | None = None
 
     async def _renew_execution_claims() -> None:
         while True:
@@ -389,6 +438,41 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
                 agent,
                 triggers,
             )
+            if validated_a2a_target:
+                effective_user_id = uuid.UUID(
+                    str(validated_a2a_target["owner_user_id"])
+                )
+            else:
+                delivery_target = await resolve_trigger_delivery_target(
+                    agent,
+                    triggers,
+                )
+                has_bound_principal = any(
+                    any(trigger_delivery_identity(trigger.config))
+                    for trigger in triggers
+                    if trigger.type != "a2a"
+                    and trigger.name not in INTERNAL_A2A_TRIGGER_NAMES
+                )
+                if has_bound_principal and delivery_target is None:
+                    raise PermissionError(
+                        "Trigger delivery principal is no longer authorized"
+                    )
+                effective_user_id = (
+                    uuid.UUID(str(delivery_target["owner_user_id"]))
+                    if delivery_target
+                    else agent.creator_id
+                )
+
+            from app.services.trigger_authorization import (
+                validate_active_trigger_principal,
+            )
+
+            await validate_active_trigger_principal(
+                db,
+                agent_id=agent_id,
+                owner_user_id=effective_user_id,
+                execution_claims=execution_claims,
+            )
 
             primary_model, fallback_model, route_meta = await resolve_agent_model(agent)
             model = primary_model or fallback_model
@@ -441,49 +525,63 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
                     part += f"\n关联 Focus：{t.focus_ref}"
                 cfg = t.config or {}
                 if t.type in {"on_message", "a2a"} and cfg.get("_matched_message"):
-                    matched_message = str(cfg["_matched_message"])
+                    matched_message: str | None = None
                     source_message_id = cfg.get("_source_message_id") or cfg.get(
                         "_matched_message_id"
                     )
-                    if source_message_id:
+                    expected_conversation_id = (
+                        validated_a2a_target["session_id"]
+                        if t.type == "a2a" and validated_a2a_target
+                        else cfg.get("_matched_conversation_id")
+                        or cfg.get("expected_conversation_id")
+                    )
+                    if source_message_id and expected_conversation_id:
                         try:
-                            source_query = select(ChatMessage.content).where(
-                                ChatMessage.id == uuid.UUID(str(source_message_id))
+                            source_session = await _validated_delivery_session(
+                                db,
+                                agent,
+                                expected_conversation_id,
+                                require_agent_channel=(
+                                    t.type == "a2a"
+                                    or bool(cfg.get("_matched_from_agent_id"))
+                                ),
                             )
-                            expected_conversation_id = (
-                                validated_a2a_target["session_id"]
-                                if t.type == "a2a" and validated_a2a_target
-                                else cfg.get("expected_conversation_id")
-                            )
-                            if expected_conversation_id:
-                                source_query = source_query.where(
+                            if source_session:
+                                source_query = select(ChatMessage.content).where(
+                                    ChatMessage.id == uuid.UUID(str(source_message_id)),
                                     ChatMessage.conversation_id
                                     == str(expected_conversation_id)
                                 )
-                            persisted_message = (
-                                await db.execute(source_query)
-                            ).scalar_one_or_none()
-                            if persisted_message is not None:
-                                matched_message = persisted_message[:32000]
-                                if len(persisted_message) > 32000:
-                                    matched_message += "\n…(message truncated at 32,000 characters)"
+                                persisted_message = (
+                                    await db.execute(source_query)
+                                ).scalar_one_or_none()
+                                if persisted_message is not None:
+                                    matched_message = persisted_message[:32000]
+                                    if len(persisted_message) > 32000:
+                                        matched_message += "\n…(message truncated at 32,000 characters)"
                         except (TypeError, ValueError):
-                            logger.warning("Ignoring invalid A2A source message id")
-                    part += (
-                        f"\n收到来自 {cfg.get('_matched_from', '?')} 的消息："
-                        f"\n\"{matched_message}\""
-                    )
-                    if t.type == "a2a":
-                        if cfg.get("_a2a_kind") == "task_delegate":
-                            part += (
-                                "\n执行要求：这是明确委派给你的任务。请完成任务并给出可直接交付给"
-                                "发送方的最终结果；不要把它当作无需回复的通知。"
-                            )
-                        else:
-                            part += (
-                                "\n执行要求：这是另一位数字员工发送的通知。请确认其影响，更新必要的"
-                                "工作状态，并仅在确有后续行动时采取行动。"
-                            )
+                            logger.warning("Ignoring invalid trigger source message id")
+                    if matched_message is None:
+                        logger.warning(
+                            "Ignoring unverified trigger message context trigger={}",
+                            t.id,
+                        )
+                    else:
+                        part += (
+                            f"\n收到来自 {cfg.get('_matched_from', '?')} 的消息："
+                            f"\n\"{matched_message}\""
+                        )
+                        if t.type == "a2a":
+                            if cfg.get("_a2a_kind") == "task_delegate":
+                                part += (
+                                    "\n执行要求：这是明确委派给你的任务。请完成任务并给出可直接交付给"
+                                    "发送方的最终结果；不要把它当作无需回复的通知。"
+                                )
+                            else:
+                                part += (
+                                    "\n执行要求：这是另一位数字员工发送的通知。请确认其影响，更新必要的"
+                                    "工作状态，并仅在确有后续行动时采取行动。"
+                                )
                 if t.type == "on_message" and cfg.get("okr_member_id") and cfg.get("okr_report_date"):
                     part += (
                         "\n执行要求：这是一次日报回复入库事件。"
@@ -517,7 +615,7 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
 
             session = ChatSession(
                 agent_id=agent_id,
-                user_id=agent.creator_id,
+                user_id=effective_user_id,
                 participant_id=agent_participant.id if agent_participant else None,
                 source_channel="trigger",
                 title=title[:200],
@@ -531,28 +629,19 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
                 conversation_id=str(session_id),
                 role="user",
                 content=trigger_context,
-                user_id=agent.creator_id,
+                user_id=effective_user_id,
                 participant_id=agent_participant.id if agent_participant else None,
             ))
             await db.commit()
             agent_participant_id = agent_participant.id if agent_participant else None
 
         collected_content: list[str] = []
-        delivered_platform_message_via_tool = False
 
         async def on_chunk(text):
             collected_content.append(text)
 
         async def on_tool_call(data):
-            nonlocal delivered_platform_message_via_tool
             try:
-                tool_name = data.get("name")
-                tool_status = data.get("status")
-                if tool_status == "done" and tool_name == "send_platform_message":
-                    result_text = str(data.get("result", ""))
-                    if result_text.startswith("✅"):
-                        delivered_platform_message_via_tool = True
-
                 async with async_session() as _tc_db:
                     if data["status"] == "running":
                         _tc_db.add(ChatMessage(
@@ -560,7 +649,7 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
                             conversation_id=str(session_id),
                             role="tool_call",
                             content=_json.dumps({"name": data["name"], "args": data["args"]}, ensure_ascii=False, default=str),
-                            user_id=agent.creator_id,
+                            user_id=effective_user_id,
                             participant_id=agent_participant_id,
                         ))
                     elif data["status"] == "done":
@@ -570,7 +659,7 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
                             conversation_id=str(session_id),
                             role="tool_call",
                             content=_json.dumps({"name": data["name"], "result": result_str}, ensure_ascii=False, default=str),
-                            user_id=agent.creator_id,
+                            user_id=effective_user_id,
                             participant_id=agent_participant_id,
                         ))
                     await _tc_db.commit()
@@ -590,15 +679,31 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
             agent_name=agent.name,
             role_description=agent.role_description or "",
             agent_id=agent_id,
-            user_id=agent.creator_id,
+            user_id=effective_user_id,
             session_id=str(session_id),
             on_chunk=on_chunk,
             on_tool_call=on_tool_call,
             current_user_name_override=from_agent_name,
             route_meta=route_meta,
+            # Autonomous trigger tool side effects are intentionally disabled
+            # until exact requester/session/generation authorization can be
+            # durably claimed.  This remains true if the outer release gate is
+            # temporarily enabled for text-only validation.
+            skip_tools=True,
         )
 
         async with async_session() as db:
+            from app.services.trigger_authorization import (
+                validate_active_trigger_principal,
+            )
+
+            await validate_active_trigger_principal(
+                db,
+                agent_id=agent_id,
+                owner_user_id=effective_user_id,
+                execution_claims=execution_claims,
+                lock_authority=True,
+            )
             result = await db.execute(
                 select(Participant).where(Participant.type == "agent", Participant.ref_id == agent_id)
             )
@@ -608,7 +713,7 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
                 conversation_id=str(session_id),
                 role="assistant",
                 content=reply or "".join(collected_content),
-                user_id=agent.creator_id,
+                user_id=effective_user_id,
                 participant_id=agent_participant.id if agent_participant else None,
             ))
             await db.commit()
@@ -619,12 +724,14 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
                 agent=agent,
                 target=validated_a2a_target,
                 content=final_reply,
+                execution_claims=execution_claims,
             )
 
         is_a2a_internal = validated_a2a_target is not None
-        delivery_target = None if is_a2a_internal else await resolve_trigger_delivery_target(agent, triggers)
+        if is_a2a_internal:
+            delivery_target = None
 
-        if final_reply and delivery_target and not delivered_platform_message_via_tool:
+        if final_reply and delivery_target:
             try:
                 from app.api.websocket import manager as ws_manager
                 agent_id_str = str(agent_id)
@@ -653,11 +760,29 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
 
                 async with async_session() as db:
                     from app.api.websocket import maybe_mark_session_read_for_active_viewer
-                    from app.models.chat_session import ChatSession
+                    from app.services.chat_session_access import (
+                        validate_active_user_chat_lane,
+                    )
+                    from app.services.trigger_authorization import (
+                        validate_active_trigger_principal,
+                    )
+
+                    await validate_active_trigger_principal(
+                        db,
+                        agent_id=agent_id,
+                        owner_user_id=effective_user_id,
+                        execution_claims=execution_claims,
+                        lock_authority=True,
+                    )
+                    lane = await validate_active_user_chat_lane(
+                        db,
+                        agent_id=agent_id,
+                        owner_user_id=owner_user_id,
+                        session_id=target_session_id,
+                        lock_authority=True,
+                    )
                     db.add(message)
-                    session_row = await db.get(ChatSession, uuid.UUID(target_session_id))
-                    if session_row:
-                        session_row.last_message_at = datetime.now(timezone.utc)
+                    lane.session.last_message_at = datetime.now(timezone.utc)
                     if owner_user_id:
                         await maybe_mark_session_read_for_active_viewer(
                             db,
@@ -673,8 +798,12 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
                         owner_user_id,
                         notification_payload,
                     )
-            except Exception as e:
-                logger.error(f"Failed to push trigger result to WebSocket: {e}")
+            except Exception as exc:
+                logger.error(
+                    "Failed to push trigger result to WebSocket error_type={}",
+                    type(exc).__name__,
+                )
+                raise RuntimeError("Trigger result delivery failed") from exc
 
         await write_audit_log(
             "trigger_fired",
@@ -710,7 +839,10 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
         if execution_claims:
             try:
                 await _stop_lease_renewal()
-                await mark_trigger_executions_failed(execution_claims, str(e)[:2000])
+                await mark_trigger_executions_failed(
+                    execution_claims,
+                    f"TriggerInvocationFailed:{type(e).__name__}",
+                )
             except Exception as mark_error:
                 logger.error(
                     "Failed to mark trigger executions failed error_type={}",

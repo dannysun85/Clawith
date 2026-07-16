@@ -121,16 +121,22 @@ async def expire_stale_credit_reservations(
     db: AsyncSession | None = None,
     *,
     now: datetime | None = None,
+    _legacy_backfill_done: bool = False,
 ) -> int:
     """Recover expired reservations without discarding completed provider debt."""
-    if db is None:
-        # Import recoverable legacy tasks before an expiry sweep can release
-        # their reserved Credits during the first startup after migration.
+    if not _legacy_backfill_done:
+        # Do this for both scheduled and explicit SaaS-owner sweeps. Passing an
+        # existing DB session must not bypass legacy video debt import.
         from app.services.media_generation import backfill_legacy_minimax_video_tasks
 
         await backfill_legacy_minimax_video_tasks()
+    if db is None:
         async with async_session() as session:
-            count = await expire_stale_credit_reservations(session, now=now)
+            count = await expire_stale_credit_reservations(
+                session,
+                now=now,
+                _legacy_backfill_done=True,
+            )
             await session.commit()
             return count
 

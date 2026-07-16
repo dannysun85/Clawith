@@ -299,6 +299,9 @@ async def save_relationships(
     _agent, access_level = await check_agent_access(db, current_user, agent_id)
     if not _can_manage_relationships(current_user, access_level):
         raise HTTPException(status_code=403, detail="Only org admins or managers can modify relationships")
+    await db.execute(
+        select(Agent.id).where(Agent.id == agent_id).with_for_update()
+    )
 
     existing_result = await db.execute(select(AgentRelationship).where(AgentRelationship.agent_id == agent_id))
     existing_by_member = {r.member_id: r for r in existing_result.scalars().all()}
@@ -381,6 +384,9 @@ async def delete_relationship(
     _agent, access_level = await check_agent_access(db, current_user, agent_id)
     if not _can_manage_relationships(current_user, access_level):
         raise HTTPException(status_code=403, detail="Only org admins or managers can modify relationships")
+    await db.execute(
+        select(Agent.id).where(Agent.id == agent_id).with_for_update()
+    )
     result = await db.execute(
         select(AgentRelationship).where(AgentRelationship.id == rel_id, AgentRelationship.agent_id == agent_id)
     )
@@ -498,6 +504,9 @@ async def save_agent_relationships(
     source_agent, access_level = await check_agent_access(db, current_user, agent_id)
     if not _can_manage_relationships(current_user, access_level):
         raise HTTPException(status_code=403, detail="Only org admins or managers can modify relationships")
+    await db.execute(
+        select(Agent.id).where(Agent.id == agent_id).with_for_update()
+    )
 
     existing_result = await db.execute(select(AgentAgentRelationship).where(AgentAgentRelationship.agent_id == agent_id))
     existing_by_target = {r.target_agent_id: r for r in existing_result.scalars().all()}
@@ -543,6 +552,9 @@ async def delete_agent_relationship(
     _agent, access_level = await check_agent_access(db, current_user, agent_id)
     if not _can_manage_relationships(current_user, access_level):
         raise HTTPException(status_code=403, detail="Only org admins or managers can modify relationships")
+    await db.execute(
+        select(Agent.id).where(Agent.id == agent_id).with_for_update()
+    )
     result = await db.execute(
         select(AgentAgentRelationship).where(
             AgentAgentRelationship.id == rel_id,

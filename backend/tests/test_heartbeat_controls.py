@@ -62,6 +62,7 @@ async def test_explicit_trigger_tick_still_runs_when_heartbeat_is_disabled(monke
 
     monkeypatch.setattr(trigger_daemon.settings, "HEARTBEAT_ENABLED", False)
     monkeypatch.setattr(trigger_daemon.settings, "TRIGGER_DAEMON_ENABLED", True)
+    monkeypatch.setattr(trigger_daemon, "AUTOMATIC_TRIGGER_EXECUTION_ENABLED", True)
     monkeypatch.setattr(trigger_daemon, "_tick", trigger_tick)
     monkeypatch.setattr(trigger_daemon.asyncio, "sleep", stop_after_first_tick)
 
@@ -72,14 +73,44 @@ async def test_explicit_trigger_tick_still_runs_when_heartbeat_is_disabled(monke
 
 
 @pytest.mark.asyncio
-async def test_trigger_daemon_kill_switch_returns_without_ticking(monkeypatch):
+async def test_trigger_daemon_kill_switch_stays_idle_without_ticking(monkeypatch):
     from app.services import trigger_daemon
 
     trigger_tick = AsyncMock()
+    class StopIdleLoop(Exception):
+        pass
+
+    async def stop_idle_loop(_seconds):
+        raise StopIdleLoop
+
     monkeypatch.setattr(trigger_daemon.settings, "TRIGGER_DAEMON_ENABLED", False)
     monkeypatch.setattr(trigger_daemon, "_tick", trigger_tick)
+    monkeypatch.setattr(trigger_daemon.asyncio, "sleep", stop_idle_loop)
 
-    await trigger_daemon.start_trigger_daemon()
+    with pytest.raises(StopIdleLoop):
+        await trigger_daemon.start_trigger_daemon()
+
+    trigger_tick.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_release_policy_pause_stays_idle_without_starting_trigger_loop(monkeypatch):
+    from app.services import trigger_daemon
+
+    trigger_tick = AsyncMock()
+    class StopIdleLoop(Exception):
+        pass
+
+    async def stop_idle_loop(_seconds):
+        raise StopIdleLoop
+
+    monkeypatch.setattr(trigger_daemon.settings, "TRIGGER_DAEMON_ENABLED", True)
+    monkeypatch.setattr(trigger_daemon, "AUTOMATIC_TRIGGER_EXECUTION_ENABLED", False)
+    monkeypatch.setattr(trigger_daemon, "_tick", trigger_tick)
+    monkeypatch.setattr(trigger_daemon.asyncio, "sleep", stop_idle_loop)
+
+    with pytest.raises(StopIdleLoop):
+        await trigger_daemon.start_trigger_daemon()
 
     trigger_tick.assert_not_awaited()
 

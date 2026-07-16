@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from croniter import croniter
@@ -34,6 +35,20 @@ def build_scheduled_execution_key(trigger: AgentTrigger, now: datetime) -> str:
         return f"cron:{trigger.id}:{due_at.astimezone(timezone.utc).isoformat()}"
 
     if trigger_type == "on_message":
+        conversation_id = cfg.get("_matched_conversation_id")
+        message_id = cfg.get("_matched_message_id") or cfg.get(
+            "_source_message_id"
+        )
+        try:
+            if conversation_id and message_id:
+                conversation_uuid = uuid.UUID(str(conversation_id))
+                message_uuid = uuid.UUID(str(message_id))
+                return (
+                    f"on_message:{trigger.id}:"
+                    f"{conversation_uuid}:{message_uuid}"
+                )
+        except (TypeError, ValueError):
+            pass
         matched_from = str(cfg.get("_matched_from") or "")
         matched_message = str(cfg.get("_matched_message") or "")
         digest = hashlib.sha256(f"{matched_from}\n{matched_message}".encode("utf-8")).hexdigest()

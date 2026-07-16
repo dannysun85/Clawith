@@ -54,6 +54,7 @@ async def test_recover_agent_persists_redacted_failure(monkeypatch):
         status="error",
         last_error=None,
         last_error_at=None,
+        deletion_requested_at=None,
     )
 
     async def allow_manage(*_args, **_kwargs):

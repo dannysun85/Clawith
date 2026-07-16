@@ -624,6 +624,61 @@ approval_schema_forward_state() {
     esac
 }
 
+agentbay_cleanup_required_count() {
+    local release="$1"
+    local postgres_user
+    local postgres_db
+    local result
+
+    postgres_user="$(read_release_env "$release" POSTGRES_USER astra)" || return 1
+    postgres_db="$(read_release_env "$release" POSTGRES_DB astra)" || return 1
+    result="$(
+        compose_project \
+            "$COMPOSE_PROJECT" "$release/.env" "$release/$COMPOSE_FILE" \
+            exec -T postgres psql -qAt -v ON_ERROR_STOP=1 \
+            -U "$postgres_user" -d "$postgres_db" \
+            -c "SELECT count(*) FROM agentbay_session_ledger WHERE status = 'cleanup_required';"
+    )" || return 1
+    case "$result" in
+        ''|*[!0-9]*) return 1 ;;
+        *) printf '%s' "$result" ;;
+    esac
+}
+
+agentbay_unresolved_count() {
+    local release="$1"
+    local postgres_user
+    local postgres_db
+    local result
+
+    postgres_user="$(read_release_env "$release" POSTGRES_USER astra)" || return 1
+    postgres_db="$(read_release_env "$release" POSTGRES_DB astra)" || return 1
+    result="$(
+        compose_project \
+            "$COMPOSE_PROJECT" "$release/.env" "$release/$COMPOSE_FILE" \
+            exec -T postgres psql -qAt -v ON_ERROR_STOP=1 \
+            -U "$postgres_user" -d "$postgres_db" \
+            -c "SELECT count(*) FROM agentbay_session_ledger WHERE status IN ('active', 'cleanup_required');"
+    )" || return 1
+    case "$result" in
+        ''|*[!0-9]*) return 1 ;;
+        *) printf '%s' "$result" ;;
+    esac
+}
+
+reconcile_agentbay_for_cutover() {
+    local project="$1"
+    local release="$2"
+
+    compose_project \
+        "$project" "$release/.env" "$release/$COMPOSE_FILE" \
+        run --rm --no-deps -T \
+        -e AGENTBAY_RECONCILE_DEADLINE_SECONDS=120 \
+        --entrypoint python backend \
+        -m app.scripts.reconcile_agentbay_cleanup < /dev/null || return 1
+    [ "$(agentbay_unresolved_count "$release")" = "0" ]
+}
+
 verify_public_maintenance() {
     local headers
     headers="$(curl -sS -D - -o /dev/null "$PUBLIC_URL/api/health?maintenance=$RELEASE_ID" | tr -d '\r')" || return 1
@@ -754,6 +809,97 @@ SQL_MCP_PREFLIGHT
     if [ "$non_https" != "0" ] || [ "$userinfo" != "0" ] || \
         [ "$fragments" != "0" ] || [ "$query_secrets" != "0" ]; then
         echo "MCP endpoint preflight failed: non_https=$non_https userinfo=$userinfo fragments=$fragments query_secrets=$query_secrets" >&2
+        return 1
+    fi
+}
+
+model_route_credential_preflight() {
+    local release="$1"
+    local postgres_user
+    local postgres_db
+    local counts
+    local ambiguous_routes
+    local disabled_models
+    local invalid_fallbacks
+    local missing_minimax_capabilities
+
+    postgres_user="$(read_release_env "$release" POSTGRES_USER astra)" || return 1
+    postgres_db="$(read_release_env "$release" POSTGRES_DB astra)" || return 1
+    counts="$(
+        compose_project \
+            "$COMPOSE_PROJECT" "$release/.env" "$release/$COMPOSE_FILE" \
+            exec -T postgres psql -v ON_ERROR_STOP=1 -At \
+            -U "$postgres_user" -d "$postgres_db" <<'SQL_MODEL_ROUTE_PREFLIGHT'
+WITH expected_minimax_capability(modality) AS (
+    VALUES ('text'), ('image'), ('video')
+), route_duplicates AS (
+    SELECT 1
+    FROM model_routes
+    WHERE enabled IS TRUE
+    GROUP BY saas_tier, modality, priority
+    HAVING COUNT(*) > 1
+), broken_primary AS (
+    SELECT 1
+    FROM model_routes AS route
+    LEFT JOIN llm_models AS model ON model.id = route.llm_model_id
+    WHERE route.enabled IS TRUE
+      AND (model.id IS NULL OR model.enabled IS NOT TRUE)
+), broken_fallback AS (
+    SELECT 1
+    FROM model_routes AS route
+    JOIN model_routes AS fallback ON fallback.id = route.fallback_route_id
+    LEFT JOIN llm_models AS fallback_model ON fallback_model.id = fallback.llm_model_id
+    WHERE route.enabled IS TRUE
+      AND (
+          fallback.enabled IS NOT TRUE
+          OR fallback.saas_tier <> route.saas_tier
+          OR fallback.modality <> route.modality
+          OR fallback_model.id IS NULL
+          OR fallback_model.enabled IS NOT TRUE
+          OR fallback.id = route.id
+          OR fallback.fallback_route_id = route.id
+      )
+), missing_capability AS (
+    SELECT expected.modality
+    FROM expected_minimax_capability AS expected
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM llm_credentials AS credential
+        WHERE lower(credential.provider) = 'minimax'
+          AND credential.tenant_id IS NULL
+          AND credential.enabled IS TRUE
+          AND credential.status = 'healthy'
+          AND (credential.daily_quota IS NULL OR credential.used_today < credential.daily_quota)
+          AND (
+              credential.capabilities IS NULL
+              OR cast(credential.capabilities AS jsonb) @> to_jsonb(ARRAY[expected.modality]::text[])
+              OR cast(credential.capabilities AS jsonb) @> '["multimodal"]'::jsonb
+          )
+          AND COALESCE(credential.modality_status::jsonb -> 'plan' ->> 'status', '') <> 'quota_exceeded'
+    )
+)
+SELECT
+    (SELECT COUNT(*) FROM route_duplicates),
+    (SELECT COUNT(*) FROM broken_primary),
+    (SELECT COUNT(*) FROM broken_fallback),
+    (SELECT COUNT(*) FROM missing_capability);
+SQL_MODEL_ROUTE_PREFLIGHT
+    )" || return 1
+    IFS='|' read -r ambiguous_routes disabled_models invalid_fallbacks \
+        missing_minimax_capabilities <<< "$counts"
+    for count in "$ambiguous_routes" "$disabled_models" \
+        "$invalid_fallbacks" "$missing_minimax_capabilities"; do
+        case "$count" in
+            ''|*[!0-9]*)
+                echo "invalid model-route credential preflight result" >&2
+                return 1
+                ;;
+        esac
+    done
+    if [ "$ambiguous_routes" != "0" ] || [ "$disabled_models" != "0" ] || \
+        [ "$invalid_fallbacks" != "0" ] || [ "$missing_minimax_capabilities" != "0" ]; then
+        echo "model-route credential preflight failed: ambiguous_routes=$ambiguous_routes disabled_models=$disabled_models invalid_fallbacks=$invalid_fallbacks missing_minimax_capabilities=$missing_minimax_capabilities" >&2
+        echo "Verify the platform MiniMax credential and explicitly enable text/image/video capabilities in the SaaS owner console before release." >&2
         return 1
     fi
 }
@@ -1824,13 +1970,20 @@ recover_indeterminate_cutover() {
             write_cutover_state recovery_incomplete "$target_slot" "$target_release_id" || true
             return 1
         fi
-    elif ! compose_project \
-        "$target_project" "$target_release/.env" "$target_release/$COMPOSE_FILE" \
-        run --rm --no-deps -T --entrypoint alembic backend upgrade head < /dev/null || \
-        [ "$(approval_schema_forward_state "$target_release")" != "1" ]; then
-        echo "cannot recover cutover: durable approval schema did not converge" >&2
-        write_cutover_state recovery_incomplete "$target_slot" "$target_release_id" || true
-        return 1
+    else
+        if ! compose_project \
+            "$target_project" "$target_release/.env" "$target_release/$COMPOSE_FILE" \
+            run --rm --no-deps -T --entrypoint alembic backend upgrade head < /dev/null || \
+            [ "$(approval_schema_forward_state "$target_release")" != "1" ]; then
+            echo "cannot recover cutover: durable approval schema did not converge" >&2
+            write_cutover_state recovery_incomplete "$target_slot" "$target_release_id" || true
+            return 1
+        fi
+        if ! reconcile_agentbay_for_cutover "$target_project" "$target_release"; then
+            echo "cannot recover cutover: AgentBay provider cleanup remains unverified" >&2
+            write_cutover_state recovery_incomplete "$target_slot" "$target_release_id" || true
+            return 1
+        fi
     fi
     if ! compose_project \
         "$target_project" "$target_release/.env" "$target_release/$COMPOSE_FILE" \
@@ -2222,6 +2375,9 @@ compose_project "$COMPOSE_PROJECT" "$PREVIOUS/.env" "$PREVIOUS/$COMPOSE_FILE" \
 echo "[remote] validating persisted MCP endpoint policy"
 mcp_endpoint_preflight "$PREVIOUS"
 
+echo "[remote] validating deterministic model routes and MiniMax credential capabilities"
+model_route_credential_preflight "$PREVIOUS"
+
 printf '%s\n' "$VERSION" > "$RELEASE/VERSION"
 printf '%s\n' "$COMMIT" > "$RELEASE/COMMIT"
 printf '%s\n' "$RELEASE_BASE_COMMIT" > "$RELEASE/BASE_COMMIT"
@@ -2473,6 +2629,11 @@ compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" bu
 # interrupted forward-only migration can only recover toward this exact code.
 write_atomic_line "$APP_ROOT/slot-${CANDIDATE_SLOT}-release" "$RELEASE"
 
+echo "[remote] checking AgentBay session ledger before maintenance"
+AGENTBAY_UNRESOLVED_BEFORE_MAINTENANCE="$(agentbay_unresolved_count "$PREVIOUS")" || \
+    abort_release "cannot verify the AgentBay ledger before maintenance"
+echo "[remote] AgentBay unresolved before maintenance: $AGENTBAY_UNRESOLVED_BEFORE_MAINTENANCE"
+
 echo "[remote] enabling explicit Web/API/WebSocket maintenance fence"
 if ! enable_web_maintenance; then
     abort_release "cannot establish and verify the production maintenance fence"
@@ -2482,6 +2643,11 @@ write_cutover_state maintenance_enabled "$CANDIDATE_SLOT" "$RELEASE_ID"
 echo "[remote] stopping every old application writer before quarantine/migration"
 compose_project "$OLD_PROJECT" "$PREVIOUS/.env" "$PREVIOUS/$COMPOSE_FILE" \
     stop --timeout 90 worker frontend backend
+
+echo "[remote] deleting every retained AgentBay provider session before migration"
+if ! reconcile_agentbay_for_cutover "$CANDIDATE_PROJECT" "$RELEASE"; then
+    abort_release "AgentBay provider cleanup remains unverified before migration"
+fi
 
 if ! quarantine_mcp_for_unsafe_release \
     "$PREVIOUS" "migration-${RELEASE_ID}"; then
@@ -2497,6 +2663,9 @@ compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" \
     run --rm --no-deps -T --entrypoint alembic backend upgrade head < /dev/null
 if [ "$(approval_schema_forward_state "$RELEASE")" != "1" ]; then
     abort_release "durable approval schema constraint is missing after migration"
+fi
+if ! reconcile_agentbay_for_cutover "$CANDIDATE_PROJECT" "$RELEASE"; then
+    abort_release "AgentBay provider cleanup remains unverified after migration"
 fi
 SCHEMA_FORWARD_ONLY=1
 write_cutover_state schema_forward_only "$CANDIDATE_SLOT" "$RELEASE_ID"

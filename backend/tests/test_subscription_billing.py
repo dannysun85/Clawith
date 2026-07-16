@@ -944,10 +944,15 @@ async def test_stale_sweep_finalizes_provider_debt_and_releases_plain_hold():
             "app.services.production_issue_monitor.record_production_issue",
             AsyncMock(),
         ) as monitor,
+        patch(
+            "app.services.media_generation.backfill_legacy_minimax_video_tasks",
+            AsyncMock(return_value=0),
+        ) as backfill,
     ):
         recovered = await billing_reconciliation.expire_stale_credit_reservations(db, now=now)
 
     assert recovered == 2
+    backfill.assert_awaited_once()
     finalize.assert_awaited_once_with(db, settlement.id)
     release.assert_awaited_once_with(db, plain.id, status="expired")
     monitor.assert_awaited_once()

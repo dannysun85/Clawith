@@ -140,6 +140,10 @@ export default function AccountManagement() {
     };
 
     const submit = async () => {
+        if (form.capabilities.length === 0) {
+            setFormError(t('account.capabilitiesRequired', '至少选择一种能力；空能力不会参与任何模型调用。'));
+            return;
+        }
         const mutableFields: Record<string, unknown> = {
             label: form.label,
             base_url: form.base_url || null,
@@ -171,7 +175,19 @@ export default function AccountManagement() {
         }
     };
 
-    const toggleCap = (m: string) => setForm((f) => ({ ...f, capabilities: f.capabilities.includes(m) ? f.capabilities.filter((x) => x !== m) : [...f.capabilities, m] }));
+    const toggleCap = (m: string) => setForm((f) => {
+        if (f.capabilities.includes(m) && f.capabilities.length === 1) {
+            setFormError(t('account.capabilitiesRequired', '至少选择一种能力；空能力不会参与任何模型调用。'));
+            return f;
+        }
+        setFormError('');
+        return {
+            ...f,
+            capabilities: f.capabilities.includes(m)
+                ? f.capabilities.filter((x) => x !== m)
+                : [...f.capabilities, m],
+        };
+    });
 
     const fmtNum = (n: number) => n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(0)}K` : `${n}`;
 
@@ -263,7 +279,13 @@ export default function AccountManagement() {
                                     {c.label} <span style={{ fontSize: 10, padding: '2px 6px', borderRadius: 4, color: '#fff', background: STATUS_COLOR[c.status] || 'var(--text-tertiary)' }}>{c.status}</span>
                                 </div>
                                 <div style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>
-                                    {c.provider} · {c.api_key_masked} · {c.capabilities?.join('/') || 'all'}
+                                    {c.provider} · {c.api_key_masked} · {
+                                        c.capabilities === null || c.capabilities === undefined
+                                            ? 'all'
+                                            : c.capabilities.length > 0
+                                                ? c.capabilities.join('/')
+                                                : t('account.noCapabilities', '未配置能力')
+                                    }
                                     {c.base_url && ` · ${c.base_url}`}
                                 </div>
                                 <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 2, display: 'flex', flexWrap: 'wrap', gap: 10 }}>

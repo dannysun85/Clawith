@@ -372,56 +372,117 @@ async def check_new_agent_messages(trigger: AgentTrigger) -> bool:
             if from_agent_name or from_agent_id:
                 from app.models.participant import Participant
                 from app.models.agent import Agent as AgentModel
+                if not from_agent_name or not from_agent_id:
+                    logger.warning(
+                        "Refusing incompletely bound agent on_message trigger {}",
+                        trigger.id,
+                    )
+                    return False
                 target_r = await db.execute(
-                    select(AgentModel.tenant_id).where(
-                        AgentModel.id == trigger.agent_id
-                    )
+                    select(AgentModel).where(AgentModel.id == trigger.agent_id)
                 )
-                target_tenant_id = target_r.scalar_one_or_none()
-                source_agent = None
-                if from_agent_id:
-                    try:
-                        source_id = uuid.UUID(str(from_agent_id))
-                    except (TypeError, ValueError):
-                        logger.warning(
-                            "Invalid from_agent_id on trigger {}",
-                            trigger.id,
-                        )
-                        return False
-                    source_query = select(AgentModel).where(
-                        AgentModel.id == source_id
+                target_agent = target_r.scalar_one_or_none()
+                if not target_agent:
+                    return False
+                target_tenant_id = target_agent.tenant_id
+                try:
+                    source_id = uuid.UUID(str(from_agent_id))
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "Invalid from_agent_id on trigger {}",
+                        trigger.id,
                     )
-                    if target_tenant_id:
-                        source_query = source_query.where(
-                            AgentModel.tenant_id == target_tenant_id
-                        )
-                    else:
-                        source_query = source_query.where(
-                            AgentModel.tenant_id.is_(None)
-                        )
-                    agent_r = await db.execute(source_query)
-                    source_agent = agent_r.scalar_one_or_none()
+                    return False
+                source_query = select(AgentModel).where(
+                    AgentModel.id == source_id
+                )
+                if target_tenant_id:
+                    source_query = source_query.where(
+                        AgentModel.tenant_id == target_tenant_id
+                    )
                 else:
-                    if isinstance(from_agent_name, list):
-                        from_agent_name = from_agent_name[0] if from_agent_name else ""
-                    if not isinstance(from_agent_name, str):
-                        return False
-                    safe_agent_name = from_agent_name.replace("%", "").replace("_", r"\_")
-                    source_query = select(AgentModel).where(
-                        AgentModel.name.ilike(f"%{safe_agent_name}%")
+                    source_query = source_query.where(
+                        AgentModel.tenant_id.is_(None)
                     )
-                    if target_tenant_id:
-                        source_query = source_query.where(
-                            AgentModel.tenant_id == target_tenant_id
-                        )
-                    else:
-                        source_query = source_query.where(
-                            AgentModel.tenant_id.is_(None)
-                        )
-                    agent_r = await db.execute(source_query)
-                    source_agent = agent_r.scalars().first()
+                agent_r = await db.execute(source_query)
+                source_agent = agent_r.scalar_one_or_none()
                 if not source_agent:
                     return False
+                if source_agent.id == target_agent.id:
+                    return False
+
+                from app.services.trigger_runtime.config import (
+                    SERVER_CONTEXT_VERSION,
+                    SERVER_CONTEXT_VERSION_KEY,
+                )
+
+                expected_conversation_id = cfg.get("expected_conversation_id")
+                origin_user_id = (
+                    cfg.get("_origin_user_id")
+                    if cfg.get(SERVER_CONTEXT_VERSION_KEY) == SERVER_CONTEXT_VERSION
+                    else None
+                )
+                try:
+                    expected_session_id = (
+                        uuid.UUID(str(expected_conversation_id))
+                        if expected_conversation_id
+                        else None
+                    )
+                    expected_owner_id = (
+                        uuid.UUID(str(origin_user_id))
+                        if origin_user_id
+                        else None
+                    )
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "Invalid conversation/owner binding on trigger {}",
+                        trigger.id,
+                    )
+                    return False
+                if expected_owner_id is None or expected_session_id is None:
+                    logger.warning(
+                        "Refusing unbound agent on_message trigger {}",
+                        trigger.id,
+                    )
+                    return False
+
+                from app.core.permissions import (
+                    evaluate_agent_relationship_status,
+                    get_agent_access_level_for_user_id,
+                )
+                from app.models.org import AgentAgentRelationship
+
+                if not await get_agent_access_level_for_user_id(
+                    db, expected_owner_id, target_agent
+                ) or not await get_agent_access_level_for_user_id(
+                    db, expected_owner_id, source_agent
+                ):
+                    logger.warning(
+                        "Refusing revoked agent on_message trigger {}",
+                        trigger.id,
+                    )
+                    return False
+                relationship_result = await db.execute(
+                    select(AgentAgentRelationship).where(
+                        AgentAgentRelationship.agent_id == target_agent.id,
+                        AgentAgentRelationship.target_agent_id == source_agent.id,
+                    )
+                )
+                relationships = list(relationship_result.scalars().all())
+                if len(relationships) != 1:
+                    logger.warning(
+                        "Refusing ambiguous agent on_message relationship for {}",
+                        trigger.id,
+                    )
+                    return False
+                relationship_status = await evaluate_agent_relationship_status(
+                    db,
+                    relationships[0],
+                    current_user_id=expected_owner_id,
+                )
+                if relationship_status.get("access_status") != "active":
+                    return False
+
                 result = await db.execute(
                     select(Participant.id).where(Participant.type == "agent", Participant.ref_id == source_agent.id)
                 )
@@ -429,6 +490,8 @@ async def check_new_agent_messages(trigger: AgentTrigger) -> bool:
                 if not from_participant:
                     return False
                 from sqlalchemy import String as SaString, cast as sa_cast
+                session_agent_id = min(target_agent.id, source_agent.id, key=str)
+                session_peer_id = max(target_agent.id, source_agent.id, key=str)
                 message_query = (
                     select(ChatMessage)
                     .join(ChatSession, ChatMessage.conversation_id == sa_cast(ChatSession.id, SaString))
@@ -438,15 +501,21 @@ async def check_new_agent_messages(trigger: AgentTrigger) -> bool:
                         # Fix 1: Only match real conversational messages,
                         # not internal tool_call / system records.
                         ChatMessage.role.in_(["assistant", "user"]),
-                        # Fix 2: Exclude trigger internal "reflection"
-                        # sessions to avoid cross-trigger false matches.
-                        ChatSession.source_channel != "trigger",
+                        # A participant id alone is not an authorization
+                        # boundary. Match the exact private A2A lane.
+                        ChatSession.source_channel == "agent",
+                        ChatSession.agent_id == session_agent_id,
+                        ChatSession.peer_agent_id == session_peer_id,
                     )
                 )
-                expected_conversation_id = cfg.get("expected_conversation_id")
-                if expected_conversation_id:
+                if expected_session_id is not None:
                     message_query = message_query.where(
-                        ChatMessage.conversation_id == str(expected_conversation_id)
+                        ChatSession.id == expected_session_id,
+                        ChatMessage.conversation_id == str(expected_session_id),
+                    )
+                if expected_owner_id is not None:
+                    message_query = message_query.where(
+                        ChatSession.user_id == expected_owner_id
                     )
                 message_query = message_query.order_by(
                     ChatMessage.created_at.desc()
@@ -458,74 +527,91 @@ async def check_new_agent_messages(trigger: AgentTrigger) -> bool:
                 cfg["_matched_message"] = (msg.content or "")[:2000]
                 cfg["_matched_from"] = from_agent_name or source_agent.name
                 cfg["_matched_from_agent_id"] = str(source_agent.id)
+                cfg["_matched_conversation_id"] = str(msg.conversation_id)
                 cfg["_matched_message_id"] = str(msg.id)
+                from app.services.trigger_runtime.config import mark_verified_message_context
+                mark_verified_message_context(cfg)
                 return True
 
             if from_user_name:
-                from sqlalchemy import or_
                 from sqlalchemy import String as SaString, cast as sa_cast
-                from app.models.agent import Agent as AgentModel
-                from app.models.user import Identity, User
-
-                agent_r = await db.execute(select(AgentModel).where(AgentModel.id == trigger.agent_id))
-                agent = agent_r.scalar_one_or_none()
                 if isinstance(from_user_name, list):
                     from_user_name = from_user_name[0] if from_user_name else ""
-                if not isinstance(from_user_name, str):
+                if not isinstance(from_user_name, str) or not from_user_name.strip():
                     return False
-                safe_user_name = from_user_name.replace("%", "").replace("_", r"\_")
-                query = (
-                    select(User)
-                    .join(User.identity)
-                    .where(
-                        or_(
-                            User.display_name.ilike(f"%{safe_user_name}%"),
-                            Identity.username.ilike(f"%{safe_user_name}%"),
-                        )
-                    )
+                from app.services.trigger_runtime.config import (
+                    SERVER_CONTEXT_VERSION,
+                    SERVER_CONTEXT_VERSION_KEY,
                 )
-                if agent and agent.tenant_id:
-                    query = query.where(User.tenant_id == agent.tenant_id)
-                user_r = await db.execute(query)
-                target_user = user_r.scalars().first()
 
-                if target_user:
-                    result = await db.execute(
-                        select(ChatMessage)
-                        .join(ChatSession, ChatMessage.conversation_id == sa_cast(ChatSession.id, SaString))
-                        .where(
-                            ChatSession.agent_id == trigger.agent_id,
-                            ChatSession.user_id == target_user.id,
-                            ChatSession.source_channel.in_(["feishu", "slack", "discord", "web"]),
-                            ChatMessage.role == "user",
-                            ChatMessage.created_at > since,
-                        )
-                        .order_by(ChatMessage.created_at.desc())
-                        .limit(1)
+                # A human display name is not an authorization boundary.  The
+                # watched source is resolved to one exact P2P session when the
+                # trigger is created.  Origin metadata remains the separate
+                # destination that receives the trigger result.
+                if cfg.get(SERVER_CONTEXT_VERSION_KEY) != SERVER_CONTEXT_VERSION:
+                    logger.warning(
+                        "Refusing unattested human on_message trigger {}",
+                        trigger.id,
                     )
-                else:
-                    result = await db.execute(
-                        select(ChatMessage)
-                        .join(ChatSession, ChatMessage.conversation_id == sa_cast(ChatSession.id, SaString))
-                        .where(
-                            ChatSession.agent_id == trigger.agent_id,
-                            ChatSession.source_channel.in_(["feishu", "slack", "discord", "web"]),
-                            ChatMessage.role == "user",
-                            ChatMessage.created_at > since,
-                            or_(
-                                ChatSession.title.ilike(f"%{safe_user_name}%"),
-                                ChatMessage.content.ilike(f"%{safe_user_name}%"),
-                            ),
-                        )
-                        .order_by(ChatMessage.created_at.desc())
-                        .limit(1)
+                    return False
+                watched_session_id = cfg.get("_watched_session_id")
+                watched_user_id = cfg.get("_watched_user_id")
+                watched_source_channel = str(
+                    cfg.get("_watched_source_channel") or ""
+                )
+                if watched_source_channel not in {
+                    "web",
+                    "feishu",
+                    "slack",
+                    "discord",
+                    "wecom",
+                    "dingtalk",
+                    "wechat",
+                    "whatsapp",
+                    "teams",
+                }:
+                    return False
+                try:
+                    bound_session_id = uuid.UUID(str(watched_session_id))
+                    bound_owner_id = uuid.UUID(str(watched_user_id))
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "Invalid human conversation binding on trigger {}",
+                        trigger.id,
                     )
+                    return False
+
+                result = await db.execute(
+                    select(ChatMessage)
+                    .join(
+                        ChatSession,
+                        ChatMessage.conversation_id
+                        == sa_cast(ChatSession.id, SaString),
+                    )
+                    .where(
+                        ChatSession.id == bound_session_id,
+                        ChatSession.agent_id == trigger.agent_id,
+                        ChatSession.user_id == bound_owner_id,
+                        ChatSession.source_channel == watched_source_channel,
+                        ChatSession.is_group.is_(False),
+                        ChatMessage.conversation_id == str(bound_session_id),
+                        ChatMessage.user_id == bound_owner_id,
+                        ChatMessage.role == "user",
+                        ChatMessage.created_at > since,
+                    )
+                    .order_by(ChatMessage.created_at.desc())
+                    .limit(1)
+                )
 
                 msg = result.scalar_one_or_none()
                 if not msg:
                     return False
                 cfg["_matched_message"] = (msg.content or "")[:2000]
                 cfg["_matched_from"] = from_user_name
+                cfg["_matched_conversation_id"] = str(msg.conversation_id)
+                cfg["_matched_message_id"] = str(msg.id)
+                from app.services.trigger_runtime.config import mark_verified_message_context
+                mark_verified_message_context(cfg)
                 return True
     except Exception as e:
         logger.warning(f"on_message check failed for trigger {trigger.id}: {e}")

@@ -1,5 +1,6 @@
+import hashlib
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -13,6 +14,7 @@ from app.models.media_generation import MediaGenerationTask
 from app.models.notification import Notification
 from app.services import media_generation
 from app.services import tool_seeder
+from app.services.media_assets import OverlayReceipt, VideoInfo
 
 
 def test_media_generation_task_has_durable_recovery_identity():
@@ -203,18 +205,21 @@ async def test_duplicate_provider_task_releases_new_reservation_and_returns_cano
     monkeypatch.setattr(media_generation, "release_reserved_credits_in_session", release)
     monkeypatch.setattr(media_generation, "_write_task_metadata", write_metadata)
 
-    canonical_id = await media_generation.mark_minimax_video_task_submitted(
-        duplicate.id,
-        provider_task_id="provider-task-1",
-        metadata={"reservation_id": str(reservation_id)},
-    )
+    record_issue = AsyncMock()
+    monkeypatch.setattr(media_generation, "_record_media_failure_issue", record_issue)
 
-    assert canonical_id == canonical.id
-    assert duplicate.status == "failed"
+    with pytest.raises(media_generation.ProviderTaskIdentityCollision):
+        await media_generation.mark_minimax_video_task_submitted(
+            duplicate.id,
+            provider_task_id="provider-task-1",
+            metadata={"reservation_id": str(reservation_id)},
+        )
+
+    assert duplicate.status == "submission_ambiguous"
     assert duplicate.provider_task_id is None
-    assert release.await_args.args[1] == reservation_id
-    assert write_metadata.await_args.args[0] is canonical
-    assert write_metadata.await_args.args[1]["reservation_id"] == str(canonical.reservation_id)
+    release.assert_not_awaited()
+    write_metadata.assert_not_awaited()
+    record_issue.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -257,7 +262,11 @@ async def test_reconciliation_stores_valid_mp4_before_settlement_and_is_idempote
         status="submitted",
         metadata_path="workspace/videos/task.json",
         output_path="workspace/videos/result.mp4",
-        request_metadata={"overlay_text": "精确中文", "overlay_position": "bottom"},
+        request_metadata={
+            "overlay_text": "精确中文",
+            "overlay_text_sha256": hashlib.sha256("精确中文".encode("utf-8")).hexdigest(),
+            "overlay_position": "bottom",
+        },
         last_error=None,
         created_at=datetime.now(timezone.utc),
         completed_at=None,
@@ -282,11 +291,24 @@ async def test_reconciliation_stores_valid_mp4_before_settlement_and_is_idempote
         task.status = "settlement_ready"
         return task
 
-    async def overlay(data, text, *, position):
+    async def overlay(
+        data,
+        text,
+        *,
+        text_position,
+        brand_asset,
+        brand_position,
+        brand_scale,
+    ):
         events.append("overlay")
         assert text == "精确中文"
-        assert position == "bottom"
-        return data + b"overlay"
+        assert text_position == "bottom"
+        assert brand_asset is None
+        assert brand_position == "center"
+        assert brand_scale == 0.42
+        return data + b"overlay", OverlayReceipt(
+            rendered_text_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        )
 
     monkeypatch.setattr(media_generation, "get_storage_backend", lambda: FakeStorage())
     monkeypatch.setattr(media_generation, "_load_task", AsyncMock(return_value=task))
@@ -298,7 +320,12 @@ async def test_reconciliation_stores_valid_mp4_before_settlement_and_is_idempote
     )
     monkeypatch.setattr(media_generation, "_finalize_success", AsyncMock(side_effect=finalize))
     monkeypatch.setattr(media_generation, "_write_task_metadata", AsyncMock())
-    monkeypatch.setattr("app.services.media_assets.apply_video_text_overlay", overlay)
+    monkeypatch.setattr(media_generation, "apply_video_brand_overlays", overlay)
+    monkeypatch.setattr(
+        media_generation,
+        "validate_generated_video",
+        AsyncMock(return_value=VideoInfo(640, 360, 1.0, "h264", "yuv420p", "aac", True)),
+    )
     monkeypatch.setattr(
         "app.services.agent_tools._load_minimax_tool_credential_by_id",
         AsyncMock(return_value=SimpleNamespace(api_key="key", base_url="https://minimax.test")),
@@ -349,7 +376,20 @@ async def test_succeeded_task_with_missing_object_redownloads_without_duplicate_
         created_at=datetime.now(timezone.utc),
         completed_at=datetime.now(timezone.utc),
     )
-    objects: dict[str, bytes] = {}
+    brand_key = media_generation.minimax_video_brand_asset_key(
+        task.agent_id,
+        task.id,
+        "png",
+    )
+    brand_raw = b"frozen-brand"
+    brand_sha256 = hashlib.sha256(brand_raw).hexdigest()
+    task.request_metadata = {
+        "brand_asset_storage_key": brand_key,
+        "brand_asset_sha256": brand_sha256,
+        "brand_position": "center",
+        "brand_scale": 0.42,
+    }
+    objects: dict[str, bytes] = {brand_key: brand_raw}
 
     class Storage:
         async def exists(self, key):
@@ -358,6 +398,12 @@ async def test_succeeded_task_with_missing_object_redownloads_without_duplicate_
         async def write_bytes(self, key, data, content_type=None):
             assert content_type == "video/mp4"
             objects[key] = data
+
+        async def read_bytes(self, key):
+            return objects[key]
+
+        async def delete(self, key):
+            objects.pop(key, None)
 
     async def begin_repair(_record_id):
         task.status = "asset_repairing"
@@ -385,6 +431,23 @@ async def test_succeeded_task_with_missing_object_redownloads_without_duplicate_
     monkeypatch.setattr(media_generation, "_finalize_success", finalize_success)
     monkeypatch.setattr(media_generation, "_write_task_metadata", AsyncMock())
     monkeypatch.setattr(
+        media_generation,
+        "validate_generated_video",
+        AsyncMock(return_value=VideoInfo(640, 360, 1.0, "h264", "yuv420p", "aac", True)),
+    )
+    monkeypatch.setattr(
+        media_generation,
+        "image_asset_from_bytes",
+        lambda *_args, **_kwargs: SimpleNamespace(sha256=brand_sha256),
+    )
+    overlay = AsyncMock(
+        return_value=(
+            b"\x00\x00\x00\x18ftypmp42branded",
+            OverlayReceipt(brand_asset_sha256=brand_sha256),
+        )
+    )
+    monkeypatch.setattr(media_generation, "apply_video_brand_overlays", overlay)
+    monkeypatch.setattr(
         "app.services.agent_tools._load_minimax_tool_credential_by_id",
         AsyncMock(return_value=SimpleNamespace(api_key="key", base_url="https://minimax.test")),
     )
@@ -402,7 +465,139 @@ async def test_succeeded_task_with_missing_object_redownloads_without_duplicate_
     assert outcome.status == "succeeded"
     download.assert_awaited_once()
     finalize_success.assert_awaited_once()
-    assert len(objects) == 1
+    overlay.assert_awaited_once()
+    output_key = media_generation.agent_storage_key(task.agent_id, task.output_path)
+    assert output_key in objects
+    assert objects[brand_key] == brand_raw
+
+    second = await media_generation.reconcile_minimax_video_task(
+        task.id,
+        status_data=task.last_response,
+    )
+    assert second.status == "succeeded"
+    assert objects[brand_key] == brand_raw
+
+
+@pytest.mark.asyncio
+async def test_unrepairable_missing_asset_is_not_written_back_as_succeeded(monkeypatch):
+    task = SimpleNamespace(
+        id=uuid.uuid4(),
+        status="asset_repairing",
+        last_response=None,
+        last_error=None,
+        next_poll_at=datetime.now(timezone.utc),
+    )
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            return task
+
+        async def commit(self):
+            return None
+
+    record_issue = AsyncMock()
+    monkeypatch.setattr(media_generation, "async_session", lambda: Session())
+    monkeypatch.setattr(media_generation, "_record_media_failure_issue", record_issue)
+
+    await media_generation._record_unrepairable_asset(
+        task.id,
+        "provider no longer retains the file",
+        {"status": "Fail"},
+    )
+
+    assert task.status == "asset_delivery_failed"
+    assert task.next_poll_at is None
+    assert "provider no longer retains the file" in task.last_error
+    record_issue.assert_awaited_once_with(task, task.last_error)
+
+
+@pytest.mark.asyncio
+async def test_tampered_exact_copy_holds_provider_debt_for_asset_repair(monkeypatch):
+    task = SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+        credential_id=uuid.uuid4(),
+        reservation_id=uuid.uuid4(),
+        provider="minimax",
+        modality="video",
+        model="MiniMax-Hailuo-2.3",
+        provider_task_id="provider-task-tampered-copy",
+        status="submitted",
+        metadata_path="workspace/videos/task.json",
+        output_path="workspace/videos/result.mp4",
+        request_metadata={
+            "overlay_text": "被篡改的文案",
+            "overlay_text_sha256": hashlib.sha256("原始文案".encode("utf-8")).hexdigest(),
+        },
+        last_error=None,
+        created_at=datetime.now(timezone.utc),
+        completed_at=None,
+    )
+
+    class Storage:
+        async def exists(self, _key):
+            return False
+
+    async def record_asset_failure(_record_id, error, _status_data):
+        task.status = "asset_repairing"
+        task.last_error = str(error)
+        return task
+
+    asset_failure_mock = AsyncMock(side_effect=record_asset_failure)
+    finalize_failure_mock = AsyncMock()
+    overlay = AsyncMock()
+    monkeypatch.setattr(media_generation, "_load_task", AsyncMock(return_value=task))
+    monkeypatch.setattr(media_generation, "get_storage_backend", lambda: Storage())
+    monkeypatch.setattr(
+        media_generation,
+        "_claim_success_download",
+        AsyncMock(return_value=("claimed", task)),
+    )
+    monkeypatch.setattr(media_generation, "_finalize_failure", finalize_failure_mock)
+    monkeypatch.setattr(
+        media_generation,
+        "_record_provider_success_asset_failure",
+        asset_failure_mock,
+    )
+    monkeypatch.setattr(media_generation, "_write_task_metadata", AsyncMock())
+    monkeypatch.setattr(media_generation, "apply_video_brand_overlays", overlay)
+    monkeypatch.setattr(
+        media_generation,
+        "validate_generated_video",
+        AsyncMock(return_value=VideoInfo(640, 360, 1.0, "h264", "yuv420p", "aac", True)),
+    )
+    monkeypatch.setattr(
+        "app.services.agent_tools._load_minimax_tool_credential_by_id",
+        AsyncMock(return_value=SimpleNamespace(api_key="key", base_url="https://minimax.test")),
+    )
+    monkeypatch.setattr(
+        "app.services.agent_tools._minimax_retrieve_file_download_url",
+        AsyncMock(return_value="https://files.test/video"),
+    )
+    monkeypatch.setattr(
+        "app.services.agent_tools._minimax_download_file",
+        AsyncMock(return_value=b"\x00\x00\x00\x18ftypmp42video"),
+    )
+
+    outcome = await media_generation.reconcile_minimax_video_task(
+        task.id,
+        status_data={"status": "Success", "file_id": "file-1"},
+    )
+
+    assert outcome.status == "retrying"
+    assert outcome.retryable is True
+    assert "Frozen video copy hash" in (outcome.error or "")
+    asset_failure_mock.assert_awaited_once()
+    finalize_failure_mock.assert_not_awaited()
+    overlay.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -807,6 +1002,126 @@ async def test_accepted_provider_task_is_not_refunded_after_retry_threshold(monk
     assert task.status == "retrying"
     assert task.consecutive_error_count == 3
     assert task.next_poll_at is not None
+    release.assert_not_awaited()
+    record_issue.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_stale_provider_inflight_submission_without_task_id_keeps_hold(monkeypatch):
+    task = SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        user_id=None,
+        credential_id=uuid.uuid4(),
+        reservation_id=uuid.uuid4(),
+        provider="minimax",
+        model="MiniMax-Hailuo-2.3",
+        provider_task_id=None,
+        status="submitting",
+        metadata_path="workspace/videos/task.json",
+        output_path="workspace/videos/result.mp4",
+        request_metadata={},
+        last_response=None,
+        last_error=None,
+        created_at=datetime.now(timezone.utc) - timedelta(hours=1),
+        completed_at=None,
+    )
+    reservation = SimpleNamespace(status="provider_inflight")
+
+    class Storage:
+        async def exists(self, _key):
+            return False
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, _model, _object_id, **_kwargs):
+            return reservation
+
+    mark_ambiguous = AsyncMock()
+    finalize_failure = AsyncMock()
+    monkeypatch.setattr(media_generation, "_load_task", AsyncMock(return_value=task))
+    monkeypatch.setattr(media_generation, "get_storage_backend", lambda: Storage())
+    monkeypatch.setattr(media_generation, "async_session", lambda: Session())
+    monkeypatch.setattr(
+        media_generation,
+        "get_settings",
+        lambda: SimpleNamespace(MEDIA_GENERATION_SUBMISSION_TIMEOUT_SECONDS=60),
+    )
+    monkeypatch.setattr(
+        media_generation,
+        "mark_media_generation_submission_ambiguous",
+        mark_ambiguous,
+    )
+    monkeypatch.setattr(media_generation, "_finalize_failure", finalize_failure)
+
+    outcome = await media_generation.reconcile_minimax_video_task(task.id)
+
+    assert outcome.status == "failed"
+    assert "Credits remain held" in (outcome.error or "")
+    mark_ambiguous.assert_awaited_once()
+    finalize_failure.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_retry_threshold_does_not_release_provider_inflight_without_task_id(monkeypatch):
+    task = SimpleNamespace(
+        id=uuid.uuid4(),
+        status="retrying",
+        provider_task_id=None,
+        reservation_id=uuid.uuid4(),
+        user_id=None,
+        agent_id=uuid.uuid4(),
+        attempt_count=30,
+        consecutive_error_count=2,
+        last_error=None,
+        last_checked_at=None,
+        completed_at=None,
+        next_poll_at=datetime.now(timezone.utc),
+    )
+    reservation = SimpleNamespace(status="provider_inflight")
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, model, _object_id, **_kwargs):
+            if model is media_generation.MediaGenerationTask:
+                return task
+            return reservation
+
+        async def commit(self):
+            return None
+
+    release = AsyncMock()
+    record_issue = AsyncMock()
+    monkeypatch.setattr(media_generation, "async_session", lambda: Session())
+    monkeypatch.setattr(media_generation, "release_reserved_credits_in_session", release)
+    monkeypatch.setattr(media_generation, "_record_media_failure_issue", record_issue)
+    monkeypatch.setattr(
+        media_generation,
+        "get_settings",
+        lambda: SimpleNamespace(
+            MEDIA_GENERATION_MAX_CONSECUTIVE_ERRORS=3,
+            MEDIA_GENERATION_POLL_INTERVAL_SECONDS=5,
+        ),
+    )
+
+    result = await media_generation.record_media_generation_retry(
+        task.id,
+        TimeoutError("provider response lost"),
+    )
+
+    assert result is task
+    assert task.status == "submission_ambiguous"
     release.assert_not_awaited()
     record_issue.assert_awaited_once()
 

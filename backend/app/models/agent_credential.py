@@ -8,7 +8,7 @@ sessions without retaining third-party account passwords.
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, func
+from sqlalchemy import DateTime, ForeignKey, Index, String, Text, func, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -28,6 +28,17 @@ class AgentCredential(Base):
     """
 
     __tablename__ = "agent_credentials"
+    __table_args__ = (
+        Index(
+            "uq_agent_credentials_owned_platform",
+            "agent_id",
+            "owner_user_id",
+            "platform",
+            unique=True,
+            postgresql_where=text("owner_user_id IS NOT NULL"),
+            sqlite_where=text("owner_user_id IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
@@ -36,6 +47,12 @@ class AgentCredential(Base):
         UUID(as_uuid=True),
         ForeignKey("agents.id", ondelete="CASCADE"),
         nullable=False,
+        index=True,
+    )
+    owner_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=True,
         index=True,
     )
 

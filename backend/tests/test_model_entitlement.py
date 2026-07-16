@@ -7,6 +7,7 @@ versa) makes these tests fail.
 """
 
 import uuid
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -80,11 +81,27 @@ async def test_free_plan_generation_rejects_ultra_tier():
         assert exc.value.quota_type == "generation_tier"
 
 
-def _patch_env(tenant_id="t1", ent=None, status="active"):
-    """Patch async_session (returns (tenant_id, status) row) and get_tenant_entitlements (→ent)."""
+def _patch_env(
+    tenant_id="t1",
+    ent=None,
+    status="running",
+    *,
+    tenant_active=True,
+    creator_active=True,
+):
+    """Patch the shared Agent/company/account capability context and entitlements."""
     fake_db = MagicMock()
     fake_result = MagicMock()
-    fake_result.one_or_none.return_value = (tenant_id, status)
+    fake_result.one_or_none.return_value = (
+        SimpleNamespace(
+            tenant_id=tenant_id,
+            status=status,
+            is_expired=False,
+            expires_at=None,
+        ),
+        tenant_active,
+        creator_active,
+    )
     fake_db.execute = AsyncMock(return_value=fake_result)
 
     fake_session = MagicMock()
@@ -211,6 +228,33 @@ async def test_stopped_agent_denied():
             # even an allowed model is rejected because the agent is stopped
             await check_plan_inference_entitlement(uuid.uuid4(), modality="text", saas_tier="pro")
         assert exc.value.quota_type == "agent_stopped"
+
+
+@pytest.mark.asyncio
+async def test_inactive_company_denies_inference_and_media_generation():
+    ent = _ent(
+        modalities=["text"],
+        tiers=["lite"],
+        generation_modalities=["image"],
+        generation_tiers=["lite"],
+    )
+    session_patch, ent_patch = _patch_env(
+        tenant_id="t1",
+        ent=ent,
+        tenant_active=False,
+    )
+    with session_patch, ent_patch:
+        with pytest.raises(QuotaExceeded) as inference_exc:
+            await check_plan_inference_entitlement(
+                uuid.uuid4(), modality="text", saas_tier="lite"
+            )
+        assert inference_exc.value.quota_type == "company_inactive"
+
+        with pytest.raises(QuotaExceeded) as generation_exc:
+            await check_plan_generation_entitlement(
+                uuid.uuid4(), modality="image", saas_tier="lite"
+            )
+        assert generation_exc.value.quota_type == "company_inactive"
 
 
 @pytest.mark.asyncio

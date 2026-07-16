@@ -10,7 +10,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response, status
 from loguru import logger
-from sqlalchemy import cast, func, select, String
+from sqlalchemy import String, cast, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -20,8 +20,11 @@ from app.core.security import get_current_user
 from app.database import async_session, get_db
 from app.models.agent import Agent, AgentPermission, AgentTemplate
 from app.models.org import OrgMember
-from app.models.audit import ChatMessage
+from app.models.audit import ApprovalRequest, ChatMessage
 from app.models.chat_session import ChatSession
+from app.models.douyin import DouyinOperation, DouyinPublishJob
+from app.models.media_generation import MediaGenerationTask
+from app.models.subscription import CreditReservation
 from app.models.user import User
 from app.schemas.schemas import AgentCreate, AgentOut, AgentUpdate, ApprovalAction, ApprovalRequestOut
 from app.services.storage import get_storage_backend
@@ -159,6 +162,83 @@ async def _archive_agent_task_history(db: AsyncSession, agent_id: uuid.UUID, arc
     return archive_path
 
 
+async def _agent_deletion_blockers(
+    db: AsyncSession,
+    agent_id: uuid.UUID,
+) -> list[str]:
+    """Return in-flight work that makes physical Agent deletion unsafe."""
+
+    checks = (
+        (
+            "Credits reservation",
+            select(CreditReservation.id)
+            .where(
+                CreditReservation.agent_id == agent_id,
+                CreditReservation.status.in_(
+                    ("reserved", "provider_inflight", "settlement_ready")
+                ),
+            )
+            .limit(1),
+        ),
+        (
+            "media generation",
+            select(MediaGenerationTask.id)
+            .where(
+                MediaGenerationTask.agent_id == agent_id,
+                MediaGenerationTask.status.in_(
+                    (
+                        "submitting",
+                        "submitted",
+                        "processing",
+                        "retrying",
+                        "downloading",
+                        "asset_repairing",
+                        "asset_delivery_failed",
+                        "settlement_ready",
+                        "submission_ambiguous",
+                    )
+                ),
+            )
+            .limit(1),
+        ),
+        (
+            "approval execution",
+            select(ApprovalRequest.id)
+            .where(
+                ApprovalRequest.agent_id == agent_id,
+                ApprovalRequest.status == "approved",
+                ApprovalRequest.execution_status == "executing",
+            )
+            .limit(1),
+        ),
+        (
+            "Douyin publish",
+            select(DouyinPublishJob.id)
+            .where(
+                DouyinPublishJob.agent_id == agent_id,
+                DouyinPublishJob.status.in_(
+                    ("preparing_share_package", "creating")
+                ),
+            )
+            .limit(1),
+        ),
+        (
+            "Douyin operation",
+            select(DouyinOperation.id)
+            .where(
+                DouyinOperation.agent_id == agent_id,
+                DouyinOperation.status == "running",
+            )
+            .limit(1),
+        ),
+    )
+    blockers: list[str] = []
+    for label, statement in checks:
+        if (await db.execute(statement)).scalar_one_or_none() is not None:
+            blockers.append(label)
+    return blockers
+
+
 async def _lazy_reset_token_counters(agent: Agent, db: AsyncSession) -> bool:
     """Reset daily/monthly token counters if the day or month has changed.
 
@@ -226,7 +306,9 @@ async def _build_unread_count_by_agent(
 def _serialize_agent_out(agent: Agent, unread_count: int = 0) -> AgentOut:
     payload = AgentOut.model_validate(agent).model_dump()
     payload["unread_count"] = unread_count
-    return AgentOut.model_validate(payload)
+    model = AgentOut.model_validate(payload)
+    _apply_release_capabilities(model)
+    return model
 
 
 @router.get("/templates")
@@ -269,6 +351,7 @@ async def _agent_to_out(
 
     model = AgentOut.model_validate(agent)
     model.onboarded_for_me = await is_onboarded(db, agent.id, viewer_id)
+    _apply_release_capabilities(model)
     return model
 
 
@@ -285,8 +368,47 @@ async def _agents_to_out(
     for a in agents:
         model = AgentOut.model_validate(a)
         model.onboarded_for_me = a.id in onboarded
+        _apply_release_capabilities(model)
         out.append(model)
     return out
+
+
+def _apply_release_capabilities(model: AgentOut) -> None:
+    """Expose fail-closed RC5 execution gates to product surfaces."""
+
+    from app.services.autonomy_service import (
+        APPROVAL_AUTOMATIC_EXECUTION_ENABLED,
+    )
+    from app.services.scheduler import AUTOMATIC_SCHEDULE_EXECUTION_ENABLED
+    from app.services.task_executor import AUTOMATIC_TASK_EXECUTION_ENABLED
+    from app.services.trigger_runtime.config import (
+        AUTOMATIC_TRIGGER_EXECUTION_ENABLED,
+    )
+
+    model.automation_execution_enabled = all(
+        (
+            AUTOMATIC_SCHEDULE_EXECUTION_ENABLED,
+            AUTOMATIC_TASK_EXECUTION_ENABLED,
+            AUTOMATIC_TRIGGER_EXECUTION_ENABLED,
+        )
+    )
+    model.approval_execution_enabled = (
+        APPROVAL_AUTOMATIC_EXECUTION_ENABLED
+    )
+    model.execution_capabilities = {
+        "schedule_execution": AUTOMATIC_SCHEDULE_EXECUTION_ENABLED,
+        "task_execution": AUTOMATIC_TASK_EXECUTION_ENABLED,
+        "trigger_execution": AUTOMATIC_TRIGGER_EXECUTION_ENABLED,
+        "approval_dispatch": APPROVAL_AUTOMATIC_EXECUTION_ENABLED,
+        # Gateway-to-human delivery is fail-closed until a durable provider
+        # outbox identity makes timeout ambiguity non-replayable.
+        "gateway_human_delivery": False,
+    }
+    model.deletion_state = (
+        "cleanup_pending"
+        if model.deletion_requested_at is not None
+        else "active"
+    )
 
 
 def _format_agent_setup_error(stage: str, exc: Exception) -> str:
@@ -472,6 +594,11 @@ async def _background_agent_setup(
             agent = agent_result.scalar_one_or_none()
             if not agent:
                 logger.error(f"[background_agent_setup] Agent {agent_id} not found before starting container")
+                return
+            if agent.deletion_requested_at is not None:
+                logger.info(
+                    "[background_agent_setup] Agent deletion is pending; startup skipped"
+                )
                 return
 
             await agent_manager.start_container(db, agent)
@@ -881,6 +1008,17 @@ async def update_agent_permissions(
     if scope_type == "user":
         scope_type = "private"
 
+    # Serialize every ACL replacement with final-delivery authorization fences.
+    # Deleting/reinserting AgentPermission rows alone does not conflict with the
+    # Agent FOR SHARE locks used by A2A delivery and can otherwise cross a revoke.
+    locked_agent_result = await db.execute(
+        select(Agent).where(Agent.id == agent_id).with_for_update()
+    )
+    locked_agent = locked_agent_result.scalar_one_or_none()
+    if locked_agent is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
+    agent = locked_agent
+
     # Delete existing permissions
     from sqlalchemy import delete as sql_delete
 
@@ -1178,9 +1316,33 @@ async def delete_agent(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Delete a digital employee (creator only)."""
-    agent, _access = await check_agent_access(db, current_user, agent_id)
-    if not is_agent_creator(current_user, agent) and current_user.role not in (
+    """Delete an Agent only after runtime and provider cleanup is proven."""
+
+    # Phase 1 is the global execution fence. Acquire Agent first (the same
+    # order used by Gateway/chat/trigger authority paths), then persist a
+    # stopped + deletion-requested state before any slow external cleanup.
+    await check_agent_access(db, current_user, agent_id)
+    agent = (
+        await db.execute(
+            select(Agent)
+            .where(Agent.id == agent_id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    fresh_user = (
+        await db.execute(
+            select(User)
+            .where(User.id == current_user.id)
+            .execution_options(populate_existing=True)
+            .with_for_update(read=True)
+        )
+    ).scalar_one_or_none()
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if fresh_user is None or not fresh_user.is_active:
+        raise HTTPException(status_code=403, detail="User account is inactive")
+    if not is_agent_creator(fresh_user, agent) and fresh_user.role not in (
         "super_admin",
         "org_admin",
         "platform_admin",
@@ -1195,97 +1357,286 @@ async def delete_agent(
             detail="System agents cannot be deleted. Disable the related feature (e.g. OKR) in Company Settings instead.",
         )
 
-    # Stop container and archive files (best effort)
-    from app.services.agent_manager import agent_manager
+    blockers = await _agent_deletion_blockers(db, agent.id)
+    if blockers:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Agent has in-flight work that must be reconciled before "
+                f"deletion: {', '.join(blockers)}"
+            ),
+        )
 
+    agent.status = "stopped"
+    agent.heartbeat_enabled = False
+    agent.deletion_requested_at = (
+        agent.deletion_requested_at or datetime.now(timezone.utc)
+    )
+    await db.commit()
+
+    # Phase 2 performs strict external cleanup while every execution validator
+    # sees the durable stopped/deletion fence.
     archive_dir: Path | None = None
     try:
-        await agent_manager.remove_container(agent)
-    except Exception:
-        pass
+        container_removed = await agent_manager.remove_container(agent)
+    except Exception as exc:
+        logger.error(
+            "Agent container cleanup failed error_type={}",
+            type(exc).__name__,
+        )
+        container_removed = False
+    if not container_removed:
+        raise HTTPException(
+            status_code=409,
+            detail="Agent runtime cleanup could not be verified; deletion remains fenced",
+        )
     try:
         archive_dir = await agent_manager.archive_agent_files(agent.id)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.error(
+            "Agent workspace archive failed error_type={}",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="Agent workspace archive failed; deletion remains fenced",
+        ) from exc
     if archive_dir is not None:
         try:
             await _archive_agent_task_history(db, agent.id, archive_dir)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.error(
+                "Agent task-history archive failed error_type={}",
+                type(exc).__name__,
+            )
+            await db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="Agent task history archive failed; deletion remains fenced",
+            ) from exc
+    await db.rollback()
 
-    # Delete related records that reference this agent
-    # Use savepoints so a failure in one table doesn't poison the whole transaction
-    from sqlalchemy import text
+    from app.services.agentbay_client import agentbay_agent_deletion_fence
 
+    # Delete related records only after every provider sandbox has reached a
+    # confirmed terminal state. Any ambiguity leaves both Agent and ledger in
+    # place for the platform-admin reconcile workflow.
     cleanup_tables = [
         "agent_activity_logs",
-        "audit_logs",
-        "approval_requests",
-        "chat_messages",
-        "chat_sessions",
         "agent_schedules",
         "agent_triggers",
         "channel_configs",
         "agent_permissions",
         "agent_tools",
         "agent_relationships",
-        "gateway_messages",
         "published_pages",
         "notifications",
         "daily_token_usage",
     ]
 
-    for table in cleanup_tables:
-        try:
-            async with db.begin_nested():
-                await db.execute(text(f"DELETE FROM {table} WHERE agent_id = :aid"), {"aid": agent_id})
-        except Exception:
-            pass
-
-    # Clean up secondary FK columns that also reference agents table
     secondary_fk_cleanups = [
         "DELETE FROM task_logs WHERE task_id IN (SELECT id FROM tasks WHERE agent_id = :aid)",
         "DELETE FROM tasks WHERE agent_id = :aid",
-        "DELETE FROM chat_sessions WHERE peer_agent_id = :aid",
-        "DELETE FROM gateway_messages WHERE sender_agent_id = :aid",
-        "UPDATE chat_messages SET sender_agent_id = NULL WHERE sender_agent_id = :aid",
     ]
-    for sql in secondary_fk_cleanups:
-        try:
-            async with db.begin_nested():
-                await db.execute(text(sql), {"aid": agent_id})
-        except Exception:
-            pass
-
-    # Also clean agent_agent_relationships (has both agent_id and target_agent_id)
     try:
-        async with db.begin_nested():
+        async with agentbay_agent_deletion_fence(agent_id=agent_id):
+            # Re-lock the parent before child deletes. The durable phase-1
+            # fence must still exist; start/recover cannot clear it.
+            locked_agent = (
+                await db.execute(
+                    select(Agent)
+                    .where(Agent.id == agent_id)
+                    .execution_options(populate_existing=True)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if locked_agent is None:
+                return Response(status_code=status.HTTP_204_NO_CONTENT)
+            if (
+                locked_agent.deletion_requested_at is None
+                or locked_agent.status != "stopped"
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Agent deletion fence is no longer valid",
+                )
+
+            blockers = await _agent_deletion_blockers(db, locked_agent.id)
+            if blockers:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Agent acquired new in-flight work while deletion was "
+                        f"being fenced: {', '.join(blockers)}"
+                    ),
+                )
+
+            # Keep financial and external-side-effect ledgers.  Non-started
+            # Douyin work is explicitly cancelled by the delete request;
+            # completed/ambiguous rows retain their status for reconciliation.
+            await db.execute(
+                text("UPDATE audit_logs SET agent_id = NULL WHERE agent_id = :aid"),
+                {"aid": agent_id},
+            )
+            await db.execute(
+                text(
+                    "UPDATE credit_transactions SET agent_id = NULL "
+                    "WHERE agent_id = :aid"
+                ),
+                {"aid": agent_id},
+            )
+            await db.execute(
+                text(
+                    "UPDATE credit_reservations SET agent_id = NULL "
+                    "WHERE agent_id = :aid"
+                ),
+                {"aid": agent_id},
+            )
+            await db.execute(
+                text(
+                    "UPDATE media_generation_tasks SET agent_id = NULL "
+                    "WHERE agent_id = :aid"
+                ),
+                {"aid": agent_id},
+            )
+            await db.execute(
+                text(
+                    "UPDATE douyin_accounts SET primary_agent_id = NULL "
+                    "WHERE primary_agent_id = :aid"
+                ),
+                {"aid": agent_id},
+            )
+            await db.execute(
+                text(
+                    "UPDATE douyin_publish_jobs "
+                    "SET status = CASE WHEN status IN "
+                    "('approval_required', 'awaiting_user_publish', "
+                    "'user_confirmed_waiting_verification') "
+                    "THEN 'cancelled_agent_deleted' ELSE status END, "
+                    "approval_status = CASE WHEN status IN "
+                    "('approval_required', 'awaiting_user_publish', "
+                    "'user_confirmed_waiting_verification') "
+                    "THEN 'cancelled' ELSE approval_status END, "
+                    "agent_id = NULL "
+                    "WHERE agent_id = :aid"
+                ),
+                {"aid": agent_id},
+            )
+            await db.execute(
+                text(
+                    "UPDATE douyin_operations "
+                    "SET status = CASE WHEN status = 'pending_approval' "
+                    "THEN 'cancelled_agent_deleted' ELSE status END, "
+                    "approval_status = CASE WHEN status = 'pending_approval' "
+                    "THEN 'cancelled' ELSE approval_status END, "
+                    "agent_id = NULL "
+                    "WHERE agent_id = :aid"
+                ),
+                {"aid": agent_id},
+            )
+            await db.execute(
+                text(
+                    "UPDATE approval_requests "
+                    "SET status = 'rejected', resolved_at = now(), "
+                    "execution_status = 'not_required', "
+                    "execution_claim_token = NULL, "
+                    "execution_claimed_at = NULL, "
+                    "execution_finished_at = NULL, "
+                    "execution_attempts = 0, "
+                    "execution_result_summary = "
+                    "'{\"reason\":\"agent_deleted_before_approval\"}'::json, "
+                    "execution_error_code = NULL "
+                    "WHERE agent_id = :aid AND status = 'pending'"
+                ),
+                {"aid": agent_id},
+            )
+            await db.execute(
+                text(
+                    "UPDATE approval_requests "
+                    "SET execution_status = 'legacy', "
+                    "execution_claim_token = NULL, "
+                    "execution_claimed_at = NULL, "
+                    "execution_finished_at = NULL, "
+                    "execution_attempts = 0, "
+                    "execution_result_summary = "
+                    "'{\"reason\":\"agent_deleted_execution_cancelled\"}'::json, "
+                    "execution_error_code = NULL "
+                    "WHERE agent_id = :aid AND status = 'approved' "
+                    "AND execution_status = 'pending'"
+                ),
+                {"aid": agent_id},
+            )
+            await db.execute(
+                text(
+                    "UPDATE approval_requests SET agent_id = NULL "
+                    "WHERE agent_id = :aid"
+                ),
+                {"aid": agent_id},
+            )
+
+            # A2A sessions are canonicalized on the lower Agent UUID.  Deleting
+            # the peer must retire the entire conversation and every queued
+            # Gateway delivery before either session or participant is removed.
+            await db.execute(
+                text(
+                    "DELETE FROM gateway_messages "
+                    "WHERE agent_id = :aid OR sender_agent_id = :aid "
+                    "OR authorization_source_agent_id = :aid "
+                    "OR conversation_id IN ("
+                    "SELECT id::text FROM chat_sessions "
+                    "WHERE agent_id = :aid OR peer_agent_id = :aid)"
+                ),
+                {"aid": agent_id},
+            )
+            await db.execute(
+                text(
+                    "DELETE FROM chat_messages "
+                    "WHERE agent_id = :aid OR conversation_id IN ("
+                    "SELECT id::text FROM chat_sessions "
+                    "WHERE agent_id = :aid OR peer_agent_id = :aid)"
+                ),
+                {"aid": agent_id},
+            )
+            await db.execute(
+                text(
+                    "DELETE FROM chat_sessions "
+                    "WHERE agent_id = :aid OR peer_agent_id = :aid"
+                ),
+                {"aid": agent_id},
+            )
+
+            for table in cleanup_tables:
+                await db.execute(
+                    text(f"DELETE FROM {table} WHERE agent_id = :aid"),
+                    {"aid": agent_id},
+                )
+            for sql in secondary_fk_cleanups:
+                await db.execute(text(sql), {"aid": agent_id})
+
             await db.execute(
                 text("DELETE FROM agent_agent_relationships WHERE agent_id = :aid OR target_agent_id = :aid"),
                 {"aid": agent_id},
             )
-    except Exception:
-        pass
-
-    # Also clear plaza posts by this agent
-    try:
-        async with db.begin_nested():
             await db.execute(text("DELETE FROM plaza_posts WHERE author_id = :aid"), {"aid": str(agent_id)})
-    except Exception:
-        pass
-
-    # Clean up Participant identity
-    try:
-        async with db.begin_nested():
             await db.execute(
                 text("DELETE FROM participants WHERE type = 'agent' AND ref_id = :aid"),
                 {"aid": agent_id},
             )
-    except Exception:
-        pass
-
-    await db.delete(agent)
-    await db.commit()
+            await db.delete(locked_agent)
+            await db.commit()
+    except HTTPException:
+        await db.rollback()
+        raise
+    except Exception as exc:
+        await db.rollback()
+        logger.error(
+            "Agent deletion cleanup could not be verified error_type={}",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="Agent provider or database cleanup is incomplete; deletion remains fenced",
+        ) from exc
 
 
 @router.post("/{agent_id}/start", response_model=AgentOut)
@@ -1298,6 +1649,11 @@ async def start_agent(
     agent, access_level = await check_agent_access(db, current_user, agent_id)
     if access_level != "manage":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only manager can start agent")
+    if agent.deletion_requested_at is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Agent deletion is pending provider cleanup and cannot be started",
+        )
 
     from app.services.agent_manager import agent_manager
 
@@ -1319,10 +1675,19 @@ async def recover_agent(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only manager can recover agent",
         )
+    if agent.deletion_requested_at is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Agent deletion is pending provider cleanup and cannot be recovered",
+        )
 
     try:
         if agent.container_id:
-            await agent_manager.remove_container(agent)
+            container_removed = await agent_manager.remove_container(agent)
+            if not container_removed:
+                raise RuntimeError(
+                    "Existing Agent runtime cleanup could not be verified"
+                )
         await agent_manager.initialize_agent_files(db, agent)
         await agent_manager.start_container(db, agent)
         if agent.status == "error":
@@ -1457,10 +1822,13 @@ async def list_gateway_messages(
     agent, _access = await check_agent_access(db, current_user, agent_id)
 
     from app.models.gateway_message import GatewayMessage
+    from app.services.chat_session_access import can_audit_agent_chat_sessions
 
+    query = select(GatewayMessage).where(GatewayMessage.agent_id == agent_id)
+    if not can_audit_agent_chat_sessions(current_user):
+        query = query.where(GatewayMessage.sender_user_id == current_user.id)
     result = await db.execute(
-        select(GatewayMessage)
-        .where(GatewayMessage.agent_id == agent_id)
+        query
         .order_by(GatewayMessage.created_at.desc())
         .limit(50)
     )

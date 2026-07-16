@@ -26,7 +26,7 @@ cd "$repo_root/backend"
 DATABASE_URL="postgresql+asyncpg://${db_user}@${db_host}:${db_port}/${fresh_db_name}" \
   .venv/bin/alembic upgrade head
 DATABASE_URL="postgresql+asyncpg://${db_user}@${db_host}:${db_port}/${fresh_db_name}" \
-  .venv/bin/alembic current | grep -F "durable_media_completion (head)"
+  .venv/bin/alembic current | grep -F "model_route_integrity (head)"
 
 .venv/bin/alembic upgrade add_douyin_collab_publish_fields
 
@@ -197,6 +197,230 @@ DROP COLUMN IF EXISTS alert_epoch;
 SQL
 PYTHONPATH=. .venv/bin/python ../scripts/code-execution-migration-postgres-smoke.py seed
 
+# Pre-099 trigger metadata came through APIs that accepted arbitrary reserved
+# names. Neither a forged value equal to the new attestation version nor a
+# structurally valid owner can acquire provenance retroactively.
+psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+INSERT INTO agent_triggers (
+  id, agent_id, name, type, config, reason, is_enabled, is_system,
+  cooldown_seconds, fire_count
+) VALUES
+  (
+    '07500000-0000-4000-8000-000000000110',
+    '07500000-0000-4000-8000-000000000061',
+    'forged trigger context', 'interval',
+    '{"minutes":5,"_server_context_version":1,"_origin_user_id":"07500000-0000-4000-8000-000000000063","_matched_message":"forged"}'::jsonb,
+    'migration smoke', true, false, 60, 0
+  ),
+  (
+    '07500000-0000-4000-8000-000000000111',
+    '07500000-0000-4000-8000-000000000061',
+    'valid legacy trigger context', 'interval',
+    '{"minutes":10,"_origin_user_id":"07500000-0000-4000-8000-000000000060"}'::jsonb,
+    'migration smoke', true, false, 60, 0
+  );
+
+-- Reproduce cross-user A2A reuse, reversed duplicate pairs, and durable
+-- references that must survive consolidation. User 112 is deliberately in
+-- the same company as the original Agent owner.
+DROP INDEX IF EXISTS uq_chat_sessions_a2a_owner;
+DROP INDEX IF EXISTS uq_trigger_executions_processing_agent;
+INSERT INTO users (
+  id, tenant_id, display_name, role, is_active, registration_source,
+  quota_message_limit, quota_message_period, quota_messages_used,
+  quota_max_agents, quota_agent_ttl_hours
+) VALUES (
+  '07500000-0000-4000-8000-000000000112',
+  '07500000-0000-4000-8000-000000000002',
+  'Migration A2A Second User', 'member', true, 'migration-smoke',
+  50, 'permanent', 0, 2, 0
+);
+INSERT INTO agents (
+  id, name, role_description, creator_id, tenant_id, agent_type, status,
+  autonomy_policy, tokens_used_today, tokens_used_month, tokens_used_total,
+  cache_read_tokens_today, cache_read_tokens_month, cache_read_tokens_total,
+  cache_creation_tokens_today, cache_creation_tokens_month,
+  cache_creation_tokens_total,
+  context_window_size, max_tool_rounds, max_triggers,
+  min_poll_interval_min, webhook_rate_limit, is_expired, is_system,
+  llm_calls_today, max_llm_calls_per_day, heartbeat_enabled,
+  heartbeat_interval_minutes, heartbeat_active_hours,
+  access_mode, company_access_level
+) VALUES (
+  '07500000-0000-4000-8000-000000000113',
+  'Migration A2A Peer',
+  'Migration fixture for A2A ownership partitioning',
+  '07500000-0000-4000-8000-000000000060',
+  '07500000-0000-4000-8000-000000000002',
+  'native',
+  'idle',
+  '{}'::json, 0, 0, 0,
+  0, 0, 0,
+  0, 0, 0,
+  100, 50, 20,
+  5, 5, false, false,
+  0, 1000, false,
+  240, '09:00-18:00',
+  'company', 'use'
+);
+INSERT INTO chat_sessions (
+  id, agent_id, user_id, title, source_channel, peer_agent_id,
+  is_group, is_primary, created_at, last_message_at
+) VALUES
+  (
+    '07500000-0000-4000-8000-000000000120',
+    '07500000-0000-4000-8000-000000000061',
+    '07500000-0000-4000-8000-000000000060',
+    'Legacy mixed owner lane', 'agent',
+    '07500000-0000-4000-8000-000000000113', false, false,
+    now() - interval '10 minutes', now() - interval '5 minutes'
+  ),
+  (
+    '07500000-0000-4000-8000-000000000121',
+    '07500000-0000-4000-8000-000000000113',
+    '07500000-0000-4000-8000-000000000060',
+    'Legacy reversed duplicate', 'agent',
+    '07500000-0000-4000-8000-000000000061', false, false,
+    now() - interval '9 minutes', now() - interval '4 minutes'
+  );
+INSERT INTO chat_messages (
+  id, agent_id, user_id, role, content, conversation_id, created_at
+) VALUES
+  (
+    '07500000-0000-4000-8000-000000000130',
+    '07500000-0000-4000-8000-000000000061',
+    '07500000-0000-4000-8000-000000000060',
+    'user', 'owner one message',
+    '07500000-0000-4000-8000-000000000120', now() - interval '8 minutes'
+  ),
+  (
+    '07500000-0000-4000-8000-000000000131',
+    '07500000-0000-4000-8000-000000000061',
+    '07500000-0000-4000-8000-000000000112',
+    'user', 'owner two private message',
+    '07500000-0000-4000-8000-000000000120', now() - interval '7 minutes'
+  ),
+  (
+    '07500000-0000-4000-8000-000000000132',
+    '07500000-0000-4000-8000-000000000113',
+    '07500000-0000-4000-8000-000000000060',
+    'assistant', 'reversed duplicate message',
+    '07500000-0000-4000-8000-000000000121', now() - interval '6 minutes'
+  );
+INSERT INTO gateway_messages (
+  id, agent_id, sender_agent_id, sender_user_id, conversation_id, content, status
+) VALUES
+  (
+    '07500000-0000-4000-8000-000000000140',
+    '07500000-0000-4000-8000-000000000113',
+    '07500000-0000-4000-8000-000000000061',
+    '07500000-0000-4000-8000-000000000060',
+    '07500000-0000-4000-8000-000000000121', 'owner one gateway', 'pending'
+  ),
+  (
+    '07500000-0000-4000-8000-000000000141',
+    '07500000-0000-4000-8000-000000000113',
+    '07500000-0000-4000-8000-000000000061',
+    '07500000-0000-4000-8000-000000000112',
+    '07500000-0000-4000-8000-000000000120', 'owner two gateway', 'pending'
+  );
+INSERT INTO media_generation_tasks (
+  id, tenant_id, agent_id, user_id, origin_session_id,
+  provider, modality, provider_task_id, status,
+  metadata_path, output_path, request_metadata,
+  completion_delivery_status, realtime_attempt_count,
+  attempt_count, consecutive_error_count
+) VALUES (
+  '07500000-0000-4000-8000-000000000142',
+  '07500000-0000-4000-8000-000000000002',
+  '07500000-0000-4000-8000-000000000061',
+  '07500000-0000-4000-8000-000000000112',
+  '07500000-0000-4000-8000-000000000120',
+  'migration-smoke', 'video', 'migration-smoke-owner-two', 'polling',
+  'workspace/media/migration.json', 'workspace/videos/migration.mp4', '{}'::json,
+  'pending', 0, 0, 0
+);
+INSERT INTO workspace_file_revisions (
+  id, agent_id, path, operation, actor_type, actor_id, session_id,
+  content_hash
+) VALUES (
+  '07500000-0000-4000-8000-000000000143',
+  '07500000-0000-4000-8000-000000000061', 'workspace/report.md',
+  'write', 'user', '07500000-0000-4000-8000-000000000060',
+  '07500000-0000-4000-8000-000000000121', 'migration-smoke'
+);
+INSERT INTO workspace_edit_locks (
+  id, agent_id, path, user_id, session_id, expires_at, heartbeat_count
+) VALUES (
+  '07500000-0000-4000-8000-000000000144',
+  '07500000-0000-4000-8000-000000000061', 'workspace/private.md',
+  '07500000-0000-4000-8000-000000000112',
+  '07500000-0000-4000-8000-000000000120', now() + interval '1 hour', 0
+);
+INSERT INTO agent_triggers (
+  id, agent_id, name, type, config, reason, is_enabled, is_system,
+  cooldown_seconds, fire_count
+) VALUES
+  (
+    '07500000-0000-4000-8000-000000000114',
+    '07500000-0000-4000-8000-000000000061',
+    'legacy a2a reference', 'on_message',
+    '{"from_agent_name":"Migration A2A Peer","expected_conversation_id":"07500000-0000-4000-8000-000000000121","_origin_session_id":"07500000-0000-4000-8000-000000000121","_origin_user_id":"07500000-0000-4000-8000-000000000060"}'::jsonb,
+    'migration reference smoke', true, false, 60, 0
+  ),
+  (
+    '07500000-0000-4000-8000-000000000115',
+    '07500000-0000-4000-8000-000000000061',
+    'serialization ordering fixture', 'interval', '{"minutes":30}'::jsonb,
+    'migration queue smoke', true, false, 60, 0
+  );
+INSERT INTO agent_schedules (
+  id, agent_id, name, instruction, cron_expr, is_enabled,
+  next_run_at, run_count, created_by
+) VALUES (
+  '07500000-0000-4000-8000-000000000116',
+  '07500000-0000-4000-8000-000000000061',
+  'preserved schedule intent',
+  'Run only after a future safe worker is explicitly enabled',
+  '0 9 * * *', true, now() + interval '1 day', 0,
+  '07500000-0000-4000-8000-000000000060'
+);
+INSERT INTO trigger_executions (
+  id, trigger_id, agent_id, source, status, idempotency_key, payload,
+  payload_text, scheduled_at, started_at, lease_owner, lease_expires_at
+) VALUES
+  (
+    '07500000-0000-4000-8000-000000000150',
+    '07500000-0000-4000-8000-000000000114',
+    '07500000-0000-4000-8000-000000000061', 'a2a', 'succeeded',
+    'migration-a2a-owner-one',
+    '{"_a2a_session_id":"07500000-0000-4000-8000-000000000121","_origin_session_id":"07500000-0000-4000-8000-000000000121","_matched_conversation_id":"07500000-0000-4000-8000-000000000121","_origin_user_id":"07500000-0000-4000-8000-000000000060"}'::jsonb,
+    '', now() - interval '6 minutes', now() - interval '6 minutes', NULL, NULL
+  ),
+  (
+    '07500000-0000-4000-8000-000000000151',
+    '07500000-0000-4000-8000-000000000114',
+    '07500000-0000-4000-8000-000000000061', 'a2a', 'succeeded',
+    'migration-a2a-owner-two',
+    '{"_a2a_session_id":"07500000-0000-4000-8000-000000000120","_origin_session_id":"07500000-0000-4000-8000-000000000120","_matched_conversation_id":"07500000-0000-4000-8000-000000000120","_origin_user_id":"07500000-0000-4000-8000-000000000112"}'::jsonb,
+    '', now() - interval '5 minutes', now() - interval '5 minutes', NULL, NULL
+  ),
+  (
+    '07500000-0000-4000-8000-000000000152',
+    '07500000-0000-4000-8000-000000000115',
+    '07500000-0000-4000-8000-000000000061', 'interval', 'pending',
+    'migration-older-pending', '{}'::jsonb, '', now() - interval '4 minutes',
+    NULL, NULL, NULL
+  ),
+  (
+    '07500000-0000-4000-8000-000000000153',
+    '07500000-0000-4000-8000-000000000115',
+    '07500000-0000-4000-8000-000000000061', 'interval', 'processing',
+    'migration-newer-processing', '{}'::jsonb, '', now() - interval '3 minutes',
+    now() - interval '3 minutes', 'legacy-worker', now() + interval '1 hour'
+  );
+SQL
+
 # Install and execute the exact production rollback guard before 095. This
 # proves that an unsafe old process cannot resurrect MCP while migrations are
 # in flight, and that 095's narrowly scoped trusted GUC can still backfill the
@@ -282,7 +506,177 @@ SQL
 
 PYTHONPATH=. .venv/bin/python -m app.scripts.secure_mcp_quarantine migration-smoke
 .venv/bin/alembic upgrade head
-.venv/bin/alembic current | grep -F "durable_media_completion (head)"
+.venv/bin/alembic current | grep -F "model_route_integrity (head)"
+
+psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM agent_triggers
+    WHERE id = '07500000-0000-4000-8000-000000000110'
+      AND config = '{"minutes":5}'::jsonb
+      AND is_enabled = false
+  ) THEN
+    RAISE EXCEPTION '099 trusted a forged historical server-context marker';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1
+    FROM agent_triggers
+    WHERE id = '07500000-0000-4000-8000-000000000111'
+      AND config = '{"minutes":10}'::jsonb
+      AND is_enabled = false
+  ) THEN
+    RAISE EXCEPTION '099 retroactively trusted structurally valid legacy routing';
+  END IF;
+  IF (
+    SELECT count(*)
+    FROM notifications
+    WHERE ref_id IN (
+      '07500000-0000-4000-8000-000000000110'::uuid,
+      '07500000-0000-4000-8000-000000000111'::uuid,
+      '07500000-0000-4000-8000-000000000114'::uuid
+    )
+      AND type = 'system'
+  ) <> 3 THEN
+    RAISE EXCEPTION '099 did not make legacy trigger quarantine observable';
+  END IF;
+  IF (
+    SELECT count(*)
+    FROM chat_sessions
+    WHERE source_channel = 'agent'
+      AND agent_id = '07500000-0000-4000-8000-000000000061'
+      AND peer_agent_id = '07500000-0000-4000-8000-000000000113'
+      AND user_id IN (
+        '07500000-0000-4000-8000-000000000060'::uuid,
+        '07500000-0000-4000-8000-000000000112'::uuid
+      )
+  ) <> 2 THEN
+    RAISE EXCEPTION '099 did not partition legacy A2A sessions by owner';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM chat_messages AS message
+    JOIN chat_sessions AS session
+      ON message.conversation_id = session.id::text
+    WHERE message.id IN (
+      '07500000-0000-4000-8000-000000000130'::uuid,
+      '07500000-0000-4000-8000-000000000131'::uuid,
+      '07500000-0000-4000-8000-000000000132'::uuid
+    )
+      AND message.user_id <> session.user_id
+  ) THEN
+    RAISE EXCEPTION '099 left mixed-owner A2A messages readable together';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM chat_sessions
+    WHERE id = '07500000-0000-4000-8000-000000000121'
+  ) THEN
+    RAISE EXCEPTION '099 retained reversed duplicate A2A session';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1
+    FROM agent_triggers
+    WHERE id = '07500000-0000-4000-8000-000000000114'
+      AND config ->> 'expected_conversation_id' =
+          '07500000-0000-4000-8000-000000000120'
+      AND NOT (config ? '_origin_session_id')
+      AND is_enabled = false
+  ) THEN
+    RAISE EXCEPTION '099 stranded or trusted a legacy trigger session reference';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1
+    FROM agent_triggers
+    WHERE id = '07500000-0000-4000-8000-000000000115'
+      AND is_enabled = true
+  ) OR NOT EXISTS (
+    SELECT 1
+    FROM agent_schedules
+    WHERE id = '07500000-0000-4000-8000-000000000116'
+      AND is_enabled = true
+      AND next_run_at IS NOT NULL
+  ) THEN
+    RAISE EXCEPTION '099 destroyed trusted trigger or schedule desired state';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM gateway_messages AS message
+    JOIN chat_sessions AS session
+      ON message.conversation_id = session.id::text
+    WHERE message.id IN (
+      '07500000-0000-4000-8000-000000000140'::uuid,
+      '07500000-0000-4000-8000-000000000141'::uuid
+    )
+      AND message.sender_user_id <> session.user_id
+  ) THEN
+    RAISE EXCEPTION '099 stranded gateway messages in another owner lane';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1
+    FROM media_generation_tasks AS task
+    JOIN chat_sessions AS session ON session.id = task.origin_session_id
+    WHERE task.id = '07500000-0000-4000-8000-000000000142'
+      AND task.user_id = session.user_id
+  ) THEN
+    RAISE EXCEPTION '099 lost media completion session ownership';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1
+    FROM workspace_file_revisions AS revision
+    JOIN chat_sessions AS session ON revision.session_id = session.id::text
+    WHERE revision.id = '07500000-0000-4000-8000-000000000143'
+      AND revision.actor_id = session.user_id
+  ) OR NOT EXISTS (
+    SELECT 1
+    FROM workspace_edit_locks AS lock
+    JOIN chat_sessions AS session ON lock.session_id = session.id::text
+    WHERE lock.id = '07500000-0000-4000-8000-000000000144'
+      AND lock.user_id = session.user_id
+  ) THEN
+    RAISE EXCEPTION '099 stranded workspace session references';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM trigger_executions AS execution
+    JOIN chat_sessions AS session
+      ON execution.payload ->> '_a2a_session_id' = session.id::text
+    WHERE execution.id IN (
+      '07500000-0000-4000-8000-000000000150'::uuid,
+      '07500000-0000-4000-8000-000000000151'::uuid
+    )
+      AND execution.payload ->> '_origin_user_id' <> session.user_id::text
+  ) THEN
+    RAISE EXCEPTION '099 stranded trigger execution in another owner lane';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1
+    FROM trigger_executions
+    WHERE id = '07500000-0000-4000-8000-000000000153'
+      AND status = 'failed'
+      AND started_at IS NULL
+      AND lease_owner IS NULL
+      AND lease_expires_at IS NULL
+      AND last_error = 'Automatic trigger execution paused by RC5 release policy'
+  ) THEN
+    RAISE EXCEPTION '099 did not serialize newer processing before the global pause';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_indexes
+    WHERE schemaname = 'public'
+      AND tablename = 'chat_sessions'
+      AND indexname = 'uq_chat_sessions_a2a_owner'
+  ) OR NOT EXISTS (
+    SELECT 1 FROM pg_indexes
+    WHERE schemaname = 'public'
+      AND tablename = 'trigger_executions'
+      AND indexname = 'uq_trigger_executions_processing_agent'
+  ) THEN
+    RAISE EXCEPTION '099 did not recreate release serialization indexes';
+  END IF;
+END $$;
+SQL
 
 # 095 must turn its trusted bypass back off before commit; the still-pending
 # guard therefore continues to reject an ordinary writer after migration.
@@ -724,7 +1118,7 @@ BEGIN
 END $$;
 SQL
 .venv/bin/alembic upgrade head
-.venv/bin/alembic current | grep -F "durable_media_completion (head)"
+.venv/bin/alembic current | grep -F "model_route_integrity (head)"
 PYTHONPATH=. .venv/bin/python ../scripts/code-execution-migration-postgres-smoke.py assert-secured
 
 PYTHONPATH=. .venv/bin/python ../scripts/a2a-postgres-smoke.py
@@ -755,7 +1149,7 @@ FROM users
 WHERE id = '07500000-0000-4000-8000-000000000070';
 SQL
 .venv/bin/alembic upgrade head
-.venv/bin/alembic current | grep -F "durable_media_completion (head)"
+.venv/bin/alembic current | grep -F "model_route_integrity (head)"
 PYTHONPATH=. .venv/bin/python ../scripts/code-execution-migration-postgres-smoke.py assert-secured
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 --tuples-only --no-align <<'SQL' | grep -Fx 'ultra|7'
 SELECT preferred_chat_tier || '|' || preferred_chat_tier_revision

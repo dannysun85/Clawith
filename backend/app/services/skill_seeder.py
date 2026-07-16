@@ -560,6 +560,16 @@ Plan would be:
         "is_default": True,
         "files": [],  # populated at runtime from agent_template/skills/mcp-installer/SKILL.md
     },
+    # ─── Brand-safe media (mandatory default) ──────
+    {
+        "name": "Brand-safe Media",
+        "description": "Required workflow for customer-facing images or videos containing exact copy, logos, packaging, or reference products",
+        "category": "creation",
+        "icon": "🎬",
+        "folder_name": "brand-safe-media",
+        "is_default": True,
+        "files": [],  # populated from agent_template/skills/brand-safe-media/SKILL.md
+    },
     # ─── Market Data (trading agents) ──────────────
     {
         "name": "Market Data",
@@ -972,6 +982,12 @@ async def seed_skills():
                 s["files"] = [{"path": "SKILL.md", "content": mcp_file.read_text(encoding="utf-8")}]
             else:
                 logger.warning("[SkillSeeder] mcp-installer/SKILL.md not found in agent_template/skills/")
+        elif s["folder_name"] == "brand-safe-media" and not s["files"]:
+            media_file = _template_skills_dir / "brand-safe-media" / "SKILL.md"
+            if media_file.exists():
+                s["files"] = [{"path": "SKILL.md", "content": media_file.read_text(encoding="utf-8")}]
+            else:
+                logger.warning("[SkillSeeder] brand-safe-media/SKILL.md not found in agent_template/skills/")
 
     async with async_session() as db:
         for skill_data in BUILTIN_SKILLS:

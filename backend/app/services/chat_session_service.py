@@ -136,6 +136,7 @@ async def save_tool_call_log(
     status: str = "done",
     tool_call_id: str | None = None,
     reasoning_content: str | None = None,
+    db: AsyncSession | None = None,
 ) -> str | None:
     """Save a tool call execution log into chat history as a ChatMessage."""
     if not conversation_id:
@@ -154,9 +155,8 @@ async def save_tool_call_log(
     }
     message_id = uuid.uuid4()
 
-    try:
-        async with async_session() as db:
-            db.add(ChatMessage(
+    def _add(target_db: AsyncSession) -> None:
+        target_db.add(ChatMessage(
                 id=message_id,
                 agent_id=agent_id,
                 user_id=user_id,
@@ -164,7 +164,15 @@ async def save_tool_call_log(
                 content=json.dumps(payload, ensure_ascii=False, default=str),
                 conversation_id=conversation_id,
             ))
-            await db.commit()
+
+    try:
+        if db is not None:
+            _add(db)
+            await db.flush()
+        else:
+            async with async_session() as owned_db:
+                _add(owned_db)
+                await owned_db.commit()
         return str(message_id)
     except Exception as e:
         logger.warning(f"Failed to save tool call log: {e}")

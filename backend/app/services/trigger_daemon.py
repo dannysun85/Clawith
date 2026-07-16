@@ -9,13 +9,18 @@ import asyncio
 import uuid
 from datetime import datetime, timezone, timedelta
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.core.logging_config import new_trace_id
 from app.database import async_session
+from app.models.agent import Agent
+from app.models.tenant import Tenant
 from app.models.trigger import AgentTrigger
+from app.models.trigger_execution import TriggerExecution
+from app.models.user import User
 from app.services.trigger_runtime.evaluator import (
     evaluate_trigger as evaluate_trigger_runtime,
     handle_okr_collection_trigger as handle_okr_collection_trigger_runtime,
@@ -31,7 +36,10 @@ from app.services.trigger_runtime import (
     enqueue_trigger_execution,
     renew_trigger_execution_leases,
 )
-from app.services.trigger_runtime.config import trigger_delivery_identity
+from app.services.trigger_runtime.config import (
+    AUTOMATIC_TRIGGER_EXECUTION_ENABLED,
+    trigger_delivery_identity,
+)
 
 settings = get_settings()
 
@@ -47,6 +55,60 @@ _invocation_tasks: set[asyncio.Task[None]] = set()
 
 _A2A_WAKE_TRIGGER_NAME = "__a2a_wake__"
 _WAITING_BATCH_LEASE_RENEW_INTERVAL_SECONDS = 60
+
+
+def _record_new_on_message_execution(
+    agent_id: uuid.UUID,
+    now: datetime,
+    *,
+    created: bool,
+) -> bool:
+    """Count only durable new events; idempotent queue hits are free no-ops."""
+
+    if not created:
+        return True
+    cutoff = now - timedelta(seconds=_ON_MSG_RATE_WINDOW)
+    recent = [
+        timestamp
+        for timestamp in _on_msg_fire_log.get(agent_id, [])
+        if timestamp > cutoff
+    ]
+    if len(recent) >= _ON_MSG_RATE_LIMIT:
+        _on_msg_fire_log[agent_id] = recent
+        return False
+    recent.append(now)
+    _on_msg_fire_log[agent_id] = recent
+    return True
+
+
+async def _quarantine_rate_limited_execution(
+    trigger: AgentTrigger,
+    execution_id: uuid.UUID | None,
+    now: datetime,
+) -> None:
+    """Disable the trigger and retire the just-created over-limit event."""
+
+    async with async_session() as db:
+        trigger_result = await db.execute(
+            select(AgentTrigger).where(AgentTrigger.id == trigger.id)
+        )
+        stored_trigger = trigger_result.scalar_one_or_none()
+        if stored_trigger:
+            stored_trigger.is_enabled = False
+        if execution_id is not None:
+            await db.execute(
+                update(TriggerExecution)
+                .where(
+                    TriggerExecution.id == execution_id,
+                    TriggerExecution.status == "pending",
+                )
+                .values(
+                    status="failed",
+                    finished_at=now,
+                    last_error="on_message rate limit exceeded",
+                )
+            )
+        await db.commit()
 
 
 def _cleanup_stale_invoke_cache():
@@ -281,12 +343,25 @@ def _schedule_invocation_task(
 
 async def _tick():
     """One daemon tick: evaluate all triggers, group by agent, invoke."""
+    if not AUTOMATIC_TRIGGER_EXECUTION_ENABLED:
+        return
     new_trace_id()
     now = datetime.now(timezone.utc)
 
     async with async_session() as db:
         result = await db.execute(
-            select(AgentTrigger).where(AgentTrigger.is_enabled.is_(True))
+            select(AgentTrigger)
+            .join(Agent, Agent.id == AgentTrigger.agent_id)
+            .join(User, User.id == Agent.creator_id)
+            .join(Tenant, Tenant.id == Agent.tenant_id)
+            .where(
+                AgentTrigger.is_enabled.is_(True),
+                Agent.status.in_(("running", "idle")),
+                Agent.is_expired.is_(False),
+                (Agent.expires_at.is_(None) | (Agent.expires_at > now)),
+                User.is_active.is_(True),
+                Tenant.is_active.is_(True),
+            )
         )
         all_triggers = result.scalars().all()
         # Expunge each object before session.close() is called.
@@ -315,29 +390,25 @@ async def _tick():
                 if not handled:
                     handled = await _handle_okr_collection_trigger(trigger, now)
                 if not handled:
-                    # Fix 3: Rate limit on_message triggers per agent
-                    if trigger.type == "on_message":
-                        agent_fires = _on_msg_fire_log.get(trigger.agent_id, [])
-                        cutoff = now - timedelta(seconds=_ON_MSG_RATE_WINDOW)
-                        recent = [t for t in agent_fires if t > cutoff]
-                        if len(recent) >= _ON_MSG_RATE_LIMIT:
-                            logger.warning(
-                                f"[A2A Safety] Agent {trigger.agent_id} hit "
-                                f"on_message rate limit ({_ON_MSG_RATE_LIMIT}/hr). "
-                                f"Auto-disabling trigger {trigger.id}."
-                            )
-                            async with async_session() as db:
-                                result = await db.execute(
-                                    select(AgentTrigger).where(AgentTrigger.id == trigger.id)
-                                )
-                                t_obj = result.scalar_one_or_none()
-                                if t_obj:
-                                    t_obj.is_enabled = False
-                                    await db.commit()
-                            continue
-                        recent.append(now)
-                        _on_msg_fire_log[trigger.agent_id] = recent
-                    await enqueue_due_trigger(trigger, now)
+                    execution_id, created = await enqueue_due_trigger(
+                        trigger,
+                        now,
+                    )
+                    if trigger.type == "on_message" and not _record_new_on_message_execution(
+                        trigger.agent_id,
+                        now,
+                        created=created,
+                    ):
+                        logger.warning(
+                            f"[A2A Safety] Agent {trigger.agent_id} hit "
+                            f"on_message rate limit ({_ON_MSG_RATE_LIMIT}/hr). "
+                            f"Auto-disabling trigger {trigger.id}."
+                        )
+                        await _quarantine_rate_limited_execution(
+                            trigger,
+                            execution_id,
+                            now,
+                        )
         except Exception as e:
             logger.warning(
                 "Error evaluating trigger {} error_type={}",
@@ -430,6 +501,133 @@ async def _tick():
         )
 
 
+async def enqueue_agent_wake_with_context(
+    db: AsyncSession,
+    agent_id: uuid.UUID,
+    message_context: str,
+    *,
+    from_agent_id: uuid.UUID | None = None,
+    a2a_session_id: str | None = None,
+    message_kind: str = "notify",
+    idempotency_key: str | None = None,
+    source_message_id: uuid.UUID | None = None,
+) -> bool:
+    """Atomically enqueue A2A work in the caller's database transaction."""
+
+    if not AUTOMATIC_TRIGGER_EXECUTION_ENABLED:
+        logger.warning(
+            "A2A wake rejected while automatic trigger execution is paused "
+            "agent_id={}",
+            agent_id,
+        )
+        return False
+    if message_kind not in {"notify", "task_delegate"}:
+        raise ValueError(f"Unsupported A2A message kind: {message_kind}")
+
+    from app.models.agent import Agent as AgentModel
+
+    delivery_key = (idempotency_key or f"a2a:{uuid.uuid4()}")[:255]
+    if from_agent_id and a2a_session_id:
+        from app.models.chat_session import ChatSession
+        from app.services.a2a_authorization import validate_active_a2a_lane
+
+        try:
+            parsed_session_id = uuid.UUID(str(a2a_session_id))
+        except (TypeError, ValueError) as exc:
+            raise PermissionError("A2A queue session is invalid") from exc
+        queued_session = await db.get(ChatSession, parsed_session_id)
+        if queued_session is None or not queued_session.user_id:
+            raise PermissionError("A2A queue session is unavailable")
+        await validate_active_a2a_lane(
+            db,
+            source_agent_id=from_agent_id,
+            target_agent_id=agent_id,
+            owner_user_id=queued_session.user_id,
+            session_id=queued_session.id,
+            lock_relationship=True,
+        )
+
+    from_agent_name = ""
+    if from_agent_id:
+        sender_result = await db.execute(
+            select(AgentModel.name).where(AgentModel.id == from_agent_id)
+        )
+        from_agent_name = sender_result.scalar_one_or_none() or ""
+
+    bind = db.get_bind()
+    if bind is not None and bind.dialect.name == "postgresql":
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+            {"lock_key": f"clawith:a2a-trigger:v1:{agent_id}"},
+        )
+    trigger = (
+        await db.execute(
+            select(AgentTrigger).where(
+                AgentTrigger.agent_id == agent_id,
+                AgentTrigger.name == _A2A_WAKE_TRIGGER_NAME,
+            )
+        )
+    ).scalar_one_or_none()
+    if trigger is None:
+        trigger = AgentTrigger(
+            agent_id=agent_id,
+            name=_A2A_WAKE_TRIGGER_NAME,
+            type="a2a",
+            config={},
+            reason="Process a durably queued agent-to-agent message.",
+            is_enabled=True,
+            is_system=True,
+            cooldown_seconds=0,
+        )
+        try:
+            async with db.begin_nested():
+                db.add(trigger)
+                await db.flush()
+        except IntegrityError:
+            trigger = (
+                await db.execute(
+                    select(AgentTrigger).where(
+                        AgentTrigger.agent_id == agent_id,
+                        AgentTrigger.name == _A2A_WAKE_TRIGGER_NAME,
+                    )
+                )
+            ).scalar_one()
+
+    trigger.type = "a2a"
+    trigger.is_enabled = True
+    trigger.is_system = True
+    trigger.cooldown_seconds = 0
+
+    payload = {
+        "from_agent_name": from_agent_name,
+        "_matched_from": from_agent_name or "agent",
+        "_matched_message": message_context[:8000],
+        "_a2a_kind": message_kind,
+    }
+    if from_agent_id:
+        payload["_matched_from_agent_id"] = str(from_agent_id)
+    if a2a_session_id:
+        payload["_a2a_session_id"] = a2a_session_id
+    if source_message_id:
+        payload["_source_message_id"] = str(source_message_id)
+
+    trigger_id = trigger.id
+    _execution, created = await enqueue_trigger_execution(
+        db,
+        trigger=trigger,
+        source="a2a",
+        idempotency_key=delivery_key,
+        payload_obj=payload,
+    )
+    if not created:
+        logger.info(
+            "[A2A] Delivery already queued for agent {} trigger={}",
+            agent_id,
+            trigger_id,
+        )
+    return True
+
+
 async def wake_agent_with_context(
     agent_id: uuid.UUID,
     message_context: str,
@@ -441,114 +639,40 @@ async def wake_agent_with_context(
     idempotency_key: str | None = None,
     source_message_id: uuid.UUID | None = None,
 ) -> bool:
-    """Durably queue an A2A wake through the trigger execution ledger.
+    """Durably queue an A2A wake in an owned transaction."""
 
-    The queue record is committed before this function reports success. A
-    worker claims it with a DB lease, so a process restart cannot silently
-    discard the message. Reusing an idempotency key is treated as an already
-    accepted delivery.
-
-    Args:
-        agent_id: The agent to wake.
-        message_context: The message to deliver.
-        from_agent_id: The agent that initiated this wake.
-        skip_dedup: Retained for API compatibility; durable A2A events are
-            deduplicated by ``idempotency_key`` instead of an in-memory timer.
-        a2a_session_id: Optional A2A chat session ID to mirror the reply into.
-        message_kind: ``notify`` or ``task_delegate``.
-        idempotency_key: Stable key for safe retries.
-        source_message_id: Persisted chat message used to recover full content.
-    """
     del skip_dedup
-    if message_kind not in {"notify", "task_delegate"}:
-        raise ValueError(f"Unsupported A2A message kind: {message_kind}")
-
-    from app.models.agent import Agent as AgentModel
-
-    delivery_key = (idempotency_key or f"a2a:{uuid.uuid4()}")[:255]
     async with async_session() as db:
-        from_agent_name = ""
-        if from_agent_id:
-            sender_result = await db.execute(
-                select(AgentModel.name).where(AgentModel.id == from_agent_id)
-            )
-            from_agent_name = sender_result.scalar_one_or_none() or ""
-
-        trigger_result = await db.execute(
-            select(AgentTrigger).where(
-                AgentTrigger.agent_id == agent_id,
-                AgentTrigger.name == _A2A_WAKE_TRIGGER_NAME,
-            )
-        )
-        trigger = trigger_result.scalar_one_or_none()
-        if trigger is None:
-            trigger = AgentTrigger(
-                agent_id=agent_id,
-                name=_A2A_WAKE_TRIGGER_NAME,
-                type="a2a",
-                config={},
-                reason="Process a durably queued agent-to-agent message.",
-                is_enabled=True,
-                is_system=True,
-                cooldown_seconds=0,
-            )
-            db.add(trigger)
-            try:
-                await db.flush()
-            except IntegrityError:
-                # Another worker may have created the per-agent system trigger.
-                await db.rollback()
-                trigger_result = await db.execute(
-                    select(AgentTrigger).where(
-                        AgentTrigger.agent_id == agent_id,
-                        AgentTrigger.name == _A2A_WAKE_TRIGGER_NAME,
-                    )
-                )
-                trigger = trigger_result.scalar_one_or_none()
-                if trigger is None:
-                    raise
-
-        trigger.type = "a2a"
-        trigger.is_enabled = True
-        trigger.is_system = True
-        trigger.cooldown_seconds = 0
-        await db.commit()
-
-        payload = {
-            "from_agent_name": from_agent_name,
-            "_matched_from": from_agent_name or "agent",
-            "_matched_message": message_context[:8000],
-            "_a2a_kind": message_kind,
-        }
-        if from_agent_id:
-            payload["_matched_from_agent_id"] = str(from_agent_id)
-        if a2a_session_id:
-            payload["_a2a_session_id"] = a2a_session_id
-        if source_message_id:
-            payload["_source_message_id"] = str(source_message_id)
-
-        trigger_id = trigger.id
-        _execution, created = await enqueue_trigger_execution(
+        accepted = await enqueue_agent_wake_with_context(
             db,
-            trigger=trigger,
-            source="a2a",
-            idempotency_key=delivery_key,
-            payload_obj=payload,
+            agent_id,
+            message_context,
+            from_agent_id=from_agent_id,
+            a2a_session_id=a2a_session_id,
+            message_kind=message_kind,
+            idempotency_key=idempotency_key,
+            source_message_id=source_message_id,
         )
-        if not created:
-            logger.info(
-                "[A2A] Delivery already queued for agent {} trigger={}",
-                agent_id,
-                trigger_id,
-            )
-        return True
+        if accepted:
+            await db.commit()
+        return accepted
 
 
 async def start_trigger_daemon():
     """Start the background trigger daemon loop. Called from FastAPI startup."""
     if not settings.TRIGGER_DAEMON_ENABLED:
         logger.warning("Trigger Daemon disabled by TRIGGER_DAEMON_ENABLED=false")
-        return
+    elif not AUTOMATIC_TRIGGER_EXECUTION_ENABLED:
+        logger.info("Automatic trigger execution is paused by release policy")
+    if (
+        not settings.TRIGGER_DAEMON_ENABLED
+        or not AUTOMATIC_TRIGGER_EXECUTION_ENABLED
+    ):
+        # Dedicated workers treat every registered daemon as a critical
+        # long-lived task. Keep a cancellable idle coroutine alive while the
+        # lane is intentionally paused so health does not report a crash.
+        while True:
+            await asyncio.sleep(3600)
     heartbeat_state = "enabled (~60s check)" if settings.HEARTBEAT_ENABLED else "disabled"
     logger.info(
         "⚡ Trigger Daemon started ({}s tick, heartbeat {}, max_concurrency={}, claim_batch={})",

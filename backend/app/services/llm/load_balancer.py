@@ -86,8 +86,10 @@ def no_credential_user_message(error: NoCredentialAvailable) -> str:
 
 
 def _credential_supports_modality(credential: LLMCredential, modality: str | None) -> bool:
-    if not modality or not credential.capabilities:
+    if not modality or credential.capabilities is None:
         return True
+    if not credential.capabilities:
+        return False
     supported = {str(value).strip().lower() for value in credential.capabilities if str(value).strip()}
     return bool(supported.intersection(modality_match_values(modality)))
 

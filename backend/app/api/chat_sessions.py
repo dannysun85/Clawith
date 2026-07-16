@@ -2,12 +2,13 @@
 
 import uuid
 import re
+from contextlib import AsyncExitStack
 from datetime import datetime, timezone as tz
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from sqlalchemy import cast, select, func, String
+from sqlalchemy import String, and_, cast, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import check_agent_access
@@ -22,6 +23,10 @@ from app.services.agent_plan_selection import (
     resolve_agent_plan_selection,
 )
 from app.services.entitlements import get_tenant_entitlements
+from app.services.chat_session_access import (
+    can_audit_agent_chat_sessions,
+    require_authorized_agent_chat_session,
+)
 
 router = APIRouter(prefix="/api/agents", tags=["chat-sessions"])
 
@@ -29,16 +34,6 @@ router = APIRouter(prefix="/api/agents", tags=["chat-sessions"])
 # events and tool execution records must not make the counter climb while an
 # agent is working in the background.
 VISIBLE_MESSAGE_ROLES = ("user", "assistant")
-
-
-def _can_view_all_agent_chat_sessions(user: User) -> bool:
-    """Return whether a user may audit other users' chat sessions.
-
-    Agent ownership grants management of the shared Agent configuration, not
-    ownership of every user's private conversation with that Agent.  Only
-    explicit administrative roles may cross the session-owner boundary.
-    """
-    return user.role in ("platform_admin", "org_admin", "agent_admin")
 
 
 class SessionOut(BaseModel):
@@ -142,7 +137,7 @@ async def list_sessions(
     await check_agent_access(db, current_user, agent_id)
 
     if scope == "all":
-        if not _can_view_all_agent_chat_sessions(current_user):
+        if not can_audit_agent_chat_sessions(current_user):
             raise HTTPException(status_code=403, detail="Not authorized to view all sessions")
 
         # Fetch all sessions (including agent-to-agent where this agent is peer)
@@ -414,18 +409,17 @@ async def rename_session(
 ):
     """Update a session title or its first-party chat model selection."""
     agent, _ = await check_agent_access(db, current_user, agent_id)
-    result = await db.execute(
-        select(ChatSession).where(
-            ChatSession.id == session_id,
-            (ChatSession.agent_id == agent_id) | (ChatSession.peer_agent_id == agent_id),
-        )
+    session = await require_authorized_agent_chat_session(
+        db,
+        user=current_user,
+        agent_id=agent_id,
+        session_id=session_id,
     )
-    session = result.scalar_one_or_none()
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    if str(session.user_id) != str(current_user.id) and not _can_view_all_agent_chat_sessions(current_user):
-        raise HTTPException(status_code=403, detail="Not authorized")
+    if bool(getattr(session, "is_group", False)) or session.source_channel == "trigger":
+        raise HTTPException(
+            status_code=403,
+            detail="Managed channel and internal sessions cannot be modified here",
+        )
 
     selection_fields = {"model_tier", "model_modality"} & body.model_fields_set
     if selection_fields:
@@ -499,24 +493,83 @@ async def delete_session(
 ):
     """Delete a chat session and its messages as its owner or an administrator."""
     await check_agent_access(db, current_user, agent_id)
-    result = await db.execute(
-        select(ChatSession).where(
-            ChatSession.id == session_id,
-            (ChatSession.agent_id == agent_id) | (ChatSession.peer_agent_id == agent_id),
-        )
+    session = await require_authorized_agent_chat_session(
+        db,
+        user=current_user,
+        agent_id=agent_id,
+        session_id=session_id,
     )
-    session = result.scalar_one_or_none()
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+    if bool(getattr(session, "is_group", False)) or session.source_channel == "trigger":
+        raise HTTPException(
+            status_code=403,
+            detail="Managed channel and internal sessions cannot be deleted here",
+        )
 
-    if str(session.user_id) != str(current_user.id) and not _can_view_all_agent_chat_sessions(current_user):
-        raise HTTPException(status_code=403, detail="Not authorized")
-
-    # Delete associated messages first
     from sqlalchemy import delete as sql_delete
-    await db.execute(sql_delete(ChatMessage).where(ChatMessage.conversation_id == str(session_id)))
-    await db.delete(session)
-    await db.commit()
+    from app.models.gateway_message import GatewayMessage
+    from app.services.agentbay_client import agentbay_chat_session_deletion_fence
+
+    lane_agent_ids = sorted(
+        {
+            candidate
+            for candidate in (session.agent_id, session.peer_agent_id)
+            if candidate is not None
+        },
+        key=str,
+    )
+    try:
+        async with AsyncExitStack() as stack:
+            for lane_agent_id in lane_agent_ids:
+                await stack.enter_async_context(
+                    agentbay_chat_session_deletion_fence(
+                        agent_id=lane_agent_id,
+                        user_id=session.user_id,
+                        session_id=str(session_id),
+                    )
+                )
+
+            # Re-lock the exact row after all cross-process provider fences are
+            # held. A creator revalidates this same row after taking its Redis
+            # creation lock, so session deletion and sandbox creation cannot
+            # cross in flight.
+            locked_result = await db.execute(
+                select(ChatSession)
+                .where(
+                    ChatSession.id == session_id,
+                    ChatSession.user_id == session.user_id,
+                    or_(
+                        ChatSession.agent_id == agent_id,
+                        ChatSession.peer_agent_id == agent_id,
+                    ),
+                )
+                .with_for_update()
+            )
+            locked_session = locked_result.scalar_one_or_none()
+            if locked_session is None:
+                raise HTTPException(status_code=404, detail="Session not found")
+            await db.execute(
+                sql_delete(GatewayMessage).where(
+                    GatewayMessage.conversation_id == str(session_id)
+                )
+            )
+            await db.execute(
+                sql_delete(ChatMessage).where(
+                    ChatMessage.conversation_id == str(session_id)
+                )
+            )
+            await db.delete(locked_session)
+            await db.commit()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The session is still using an AgentBay sandbox or its cleanup "
+                "could not be verified; retry later or contact an administrator"
+            ),
+        ) from exc
     return None
 
 
@@ -524,8 +577,13 @@ async def delete_session(
 async def get_session_messages(
     agent_id: uuid.UUID,
     session_id: uuid.UUID,
+    response: Response,
     limit: int = Query(20, ge=1, le=500, description="Number of messages to return"),
     before: str = Query(None, description="Cursor: return messages created before this timestamp (ISO format)"),
+    before_id: uuid.UUID | None = Query(
+        None,
+        description="Stable cursor tie-breaker used with `before`",
+    ),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -534,42 +592,55 @@ async def get_session_messages(
         limit = 20
     if not isinstance(before, str):
         before = None
+    if not isinstance(before_id, uuid.UUID):
+        before_id = None
     await check_agent_access(db, current_user, agent_id)
-    # Allow looking up sessions where agent_id OR peer_agent_id matches
-    result = await db.execute(
-        select(ChatSession).where(
-            ChatSession.id == session_id,
-            (ChatSession.agent_id == agent_id) | (ChatSession.peer_agent_id == agent_id),
-        )
+    session = await require_authorized_agent_chat_session(
+        db,
+        user=current_user,
+        agent_id=agent_id,
+        session_id=session_id,
     )
-    session = result.scalar_one_or_none()
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    # Permission: session owner or an explicit administrator. Agent creators
-    # do not implicitly own conversations started by other users.
-    if str(session.user_id) != str(current_user.id) and not _can_view_all_agent_chat_sessions(current_user):
-        raise HTTPException(status_code=403, detail="Not authorized to view this session")
 
     # Query messages by conversation_id only (agent-to-agent uses session_agent_id)
     # Optimized: use a single query with ORDER BY and LIMIT instead of subquery
-    from sqlalchemy import desc
     query = (
         select(ChatMessage)
         .where(ChatMessage.conversation_id == str(session_id))
-        .order_by(desc(ChatMessage.created_at))
-        .limit(limit)
+        .order_by(desc(ChatMessage.created_at), desc(ChatMessage.id))
+        .limit(limit + 1)
     )
     # Apply cursor filter if `before` timestamp is provided
     if before:
         from datetime import datetime as dt
         try:
             before_dt = dt.fromisoformat(before.replace('Z', '+00:00'))
-            query = query.where(ChatMessage.created_at < before_dt)
+            if before_id is None:
+                query = query.where(ChatMessage.created_at < before_dt)
+            else:
+                query = query.where(
+                    or_(
+                        ChatMessage.created_at < before_dt,
+                        and_(
+                            ChatMessage.created_at == before_dt,
+                            ChatMessage.id < before_id,
+                        ),
+                    )
+                )
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid `before` timestamp format. Use ISO 8601.")
     msgs_result = await db.execute(query)
-    messages = list(reversed(msgs_result.scalars().all()))
+    rows_desc = list(msgs_result.scalars().all())
+    has_more = len(rows_desc) > limit
+    messages = list(reversed(rows_desc[:limit]))
+    response.headers["X-History-Has-More"] = "true" if has_more else "false"
+    if messages:
+        oldest_source = messages[0]
+        if oldest_source.created_at:
+            response.headers["X-History-Next-Before"] = (
+                oldest_source.created_at.isoformat()
+            )
+        response.headers["X-History-Next-Before-Id"] = str(oldest_source.id)
 
     # Reading your own first-party/channel session should clear its unread state.
     if str(session.user_id) == str(current_user.id) and not getattr(session, "is_group", False) and session.source_channel not in ("agent", "trigger"):
@@ -613,6 +684,10 @@ async def get_session_messages(
                 "role": m.role,
                 "content": m.content,
                 "created_at": m.created_at.isoformat() if m.created_at else None,
+                "source_message_id": str(m.id),
+                "source_created_at": (
+                    m.created_at.isoformat() if m.created_at else None
+                ),
             }
             try:
                 data = json.loads(m.content)
@@ -631,7 +706,15 @@ async def get_session_messages(
         # For agent sessions, parse inline tool_code blocks from assistant messages
         if session.source_channel == "agent" and m.role == "assistant" and "```tool_code" in (m.content or ""):
             parts = _split_inline_tools(m.content)
-            for part in parts:
+            for part_index, part in enumerate(parts):
+                part["id"] = f"{m.id}:part:{part_index}"
+                part["created_at"] = (
+                    m.created_at.isoformat() if m.created_at else None
+                )
+                part["source_message_id"] = str(m.id)
+                part["source_created_at"] = (
+                    m.created_at.isoformat() if m.created_at else None
+                )
                 add_sender_metadata(part)
                 out.append(part)
         else:
@@ -640,6 +723,10 @@ async def get_session_messages(
                 "role": m.role,
                 "content": m.content,
                 "created_at": m.created_at.isoformat() if m.created_at else None,
+                "source_message_id": str(m.id),
+                "source_created_at": (
+                    m.created_at.isoformat() if m.created_at else None
+                ),
             }
             if hasattr(m, 'thinking') and m.thinking:
                 entry["thinking"] = m.thinking

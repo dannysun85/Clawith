@@ -10,9 +10,15 @@ from sqlalchemy.orm import aliased
 
 from app.config import get_settings
 from app.database import async_session
+from app.models.agent import Agent
+from app.models.tenant import Tenant
 from app.models.trigger import AgentTrigger
 from app.models.trigger_execution import TriggerExecution
-from app.services.trigger_runtime.config import trusted_execution_runtime_payload
+from app.models.user import User
+from app.services.trigger_runtime.config import (
+    trusted_execution_runtime_payload,
+    without_reserved_trigger_config,
+)
 
 settings = get_settings()
 TRIGGER_EXECUTION_LEASE_SECONDS = 300
@@ -38,6 +44,25 @@ async def mark_trigger_executions_completed(claims: list[ExecutionClaim]) -> int
     if not claims:
         return 0
     async with async_session() as db:
+        claimed_ids = [execution_id for execution_id, _lease_owner in claims]
+        trigger_ids = set(
+            (
+                await db.execute(
+                    select(TriggerExecution.trigger_id).where(
+                        TriggerExecution.id.in_(claimed_ids)
+                    )
+                )
+            ).scalars().all()
+        )
+        triggers: list[AgentTrigger] = []
+        if trigger_ids:
+            trigger_result = await db.execute(
+                select(AgentTrigger)
+                .where(AgentTrigger.id.in_(trigger_ids))
+                .order_by(AgentTrigger.id)
+                .with_for_update()
+            )
+            triggers = list(trigger_result.scalars().all())
         result = await db.execute(
             update(TriggerExecution)
             .where(
@@ -51,9 +76,39 @@ async def mark_trigger_executions_completed(claims: list[ExecutionClaim]) -> int
                 lease_expires_at=None,
                 last_error=None,
             )
+            .returning(TriggerExecution.id, TriggerExecution.trigger_id)
         )
+        completed_rows = result.all()
+        completed_trigger_ids = {
+            trigger_id for _execution_id, trigger_id in completed_rows
+        }
+        if completed_trigger_ids:
+            unfinished_trigger_ids = set(
+                (
+                    await db.execute(
+                        select(TriggerExecution.trigger_id)
+                        .where(
+                            TriggerExecution.trigger_id.in_(
+                                completed_trigger_ids
+                            ),
+                            TriggerExecution.status.in_(("pending", "processing")),
+                        )
+                        .distinct()
+                    )
+                ).scalars().all()
+            )
+            for trigger in triggers:
+                if trigger.id not in completed_trigger_ids:
+                    continue
+                if trigger.id in unfinished_trigger_ids:
+                    continue
+                if trigger.type == "once" or (
+                    trigger.max_fires
+                    and (trigger.fire_count or 0) >= trigger.max_fires
+                ):
+                    trigger.is_enabled = False
         await db.commit()
-        return result.rowcount or 0
+        return len(completed_rows)
 
 
 async def mark_trigger_executions_failed(
@@ -64,6 +119,28 @@ async def mark_trigger_executions_failed(
     if not claims:
         return 0
     async with async_session() as db:
+        claimed_ids = [execution_id for execution_id, _lease_owner in claims]
+        trigger_ids = set(
+            (
+                await db.execute(
+                    select(TriggerExecution.trigger_id).where(
+                        TriggerExecution.id.in_(claimed_ids)
+                    )
+                )
+            ).scalars().all()
+        )
+        triggers: list[AgentTrigger] = []
+        if trigger_ids:
+            triggers = list(
+                (
+                    await db.execute(
+                        select(AgentTrigger)
+                        .where(AgentTrigger.id.in_(trigger_ids))
+                        .order_by(AgentTrigger.id)
+                        .with_for_update()
+                    )
+                ).scalars().all()
+            )
         result = await db.execute(
             update(TriggerExecution)
             .where(
@@ -77,9 +154,38 @@ async def mark_trigger_executions_failed(
                 lease_expires_at=None,
                 last_error=error_text[:2000],
             )
+            .returning(TriggerExecution.trigger_id)
         )
+        failed_rows = list(result.scalars().all())
+        failed_trigger_ids = set(failed_rows)
+        if failed_trigger_ids:
+            unfinished_trigger_ids = set(
+                (
+                    await db.execute(
+                        select(TriggerExecution.trigger_id)
+                        .where(
+                            TriggerExecution.trigger_id.in_(
+                                failed_trigger_ids
+                            ),
+                            TriggerExecution.status.in_(("pending", "processing")),
+                        )
+                        .distinct()
+                    )
+                ).scalars().all()
+            )
+            for trigger in triggers:
+                if (
+                    trigger.id not in failed_trigger_ids
+                    or trigger.id in unfinished_trigger_ids
+                ):
+                    continue
+                if trigger.type == "once" or (
+                    trigger.max_fires
+                    and (trigger.fire_count or 0) >= trigger.max_fires
+                ):
+                    trigger.is_enabled = False
         await db.commit()
-        return result.rowcount or 0
+        return len(failed_rows)
 
 
 async def renew_trigger_execution_leases(
@@ -121,44 +227,88 @@ async def claim_pending_trigger_executions(
             | (TriggerExecution.lease_expires_at < now)
         ),
     )
-    a2a_head_only = True
-    if "a2a" in sources:
-        earlier_execution = aliased(TriggerExecution)
-        # A live processing head still owns this Agent's A2A lane.  Limiting
-        # the subquery to executions that are eligible for a new claim would
-        # let the second message run concurrently until the first lease ends.
-        earlier_is_unfinished = earlier_execution.status.in_(("pending", "processing"))
-        a2a_head_only = or_(
-            TriggerExecution.source != "a2a",
-            ~exists(
-                select(1).where(
-                    earlier_execution.source == "a2a",
-                    earlier_execution.agent_id == TriggerExecution.agent_id,
-                    earlier_is_unfinished,
-                    or_(
-                        earlier_execution.scheduled_at
-                        < TriggerExecution.scheduled_at,
-                        and_(
-                            earlier_execution.scheduled_at
-                            == TriggerExecution.scheduled_at,
-                            earlier_execution.id < TriggerExecution.id,
-                        ),
-                    ),
-                )
+    earlier_execution = aliased(TriggerExecution)
+    earlier_trigger = aliased(AgentTrigger)
+    # One unfinished head owns the Agent lane across every source.  Because
+    # only the head row is eligible, concurrent workers contend on that same
+    # row and FOR UPDATE SKIP LOCKED cannot select a later execution for the
+    # same Agent. The partial unique index on processing Agent rows is the
+    # database-level invariant if a future query accidentally regresses.
+    earlier_is_unfinished = earlier_execution.status.in_(("pending", "processing"))
+    agent_head_only = ~exists(
+        select(1)
+        .select_from(earlier_execution)
+        .join(earlier_trigger, earlier_trigger.id == earlier_execution.trigger_id)
+        .where(
+            earlier_execution.agent_id == TriggerExecution.agent_id,
+            earlier_is_unfinished,
+            or_(
+                earlier_trigger.is_enabled.is_(True),
+                and_(
+                    earlier_execution.status == "processing",
+                    earlier_execution.lease_expires_at.is_not(None),
+                    earlier_execution.lease_expires_at >= now,
+                ),
+            ),
+            or_(
+                earlier_execution.scheduled_at < TriggerExecution.scheduled_at,
+                and_(
+                    earlier_execution.scheduled_at == TriggerExecution.scheduled_at,
+                    earlier_execution.id < TriggerExecution.id,
+                ),
             ),
         )
+    )
     async with async_session() as db:
+        # Operator-disabled triggers cannot retain a queue head indefinitely.
+        # Auto-disable for once/max_fires happens only after completion, so an
+        # abandoned execution remains enabled and reclaimable after a crash.
+        await db.execute(
+            update(TriggerExecution)
+            .where(
+                TriggerExecution.trigger_id.in_(
+                    select(AgentTrigger.id).where(
+                        AgentTrigger.is_enabled.is_(False)
+                    )
+                ),
+                or_(
+                    TriggerExecution.status == "pending",
+                    and_(
+                        TriggerExecution.status == "processing",
+                        or_(
+                            TriggerExecution.lease_expires_at.is_(None),
+                            TriggerExecution.lease_expires_at < now,
+                        ),
+                    ),
+                ),
+            )
+            .values(
+                status="failed",
+                finished_at=now,
+                lease_owner=None,
+                lease_expires_at=None,
+                last_error="Trigger disabled before queued execution could run",
+            )
+        )
         result = await db.execute(
             select(TriggerExecution, AgentTrigger)
             .join(AgentTrigger, AgentTrigger.id == TriggerExecution.trigger_id)
+            .join(Agent, Agent.id == AgentTrigger.agent_id)
+            .join(User, User.id == Agent.creator_id)
+            .join(Tenant, Tenant.id == Agent.tenant_id)
             .where(
                 TriggerExecution.source.in_(sources),
                 AgentTrigger.is_enabled.is_(True),
+                Agent.status.in_(("running", "idle")),
+                Agent.is_expired.is_(False),
+                or_(Agent.expires_at.is_(None), Agent.expires_at > now),
+                User.is_active.is_(True),
+                Tenant.is_active.is_(True),
                 eligible_execution,
-                a2a_head_only,
+                agent_head_only,
             )
             .order_by(TriggerExecution.scheduled_at.asc())
-            .with_for_update(skip_locked=True)
+            .with_for_update(of=TriggerExecution, skip_locked=True)
             .limit(limit)
         )
         rows = result.all()
@@ -182,7 +332,10 @@ async def claim_pending_trigger_executions(
 
 def build_execution_runtime_trigger(trigger: AgentTrigger, execution: TriggerExecution) -> AgentTrigger:
     runtime_cfg = {
-        **(trigger.config or {}),
+        # Stored underscore-prefixed values from pre-hardening releases are
+        # untrusted. Runtime metadata may enter only through the source-aware,
+        # service-owned execution payload below.
+        **without_reserved_trigger_config(trigger.config),
         "_execution_id": str(execution.id),
         "_execution_lease_token": execution.lease_owner,
     }
@@ -208,20 +361,3 @@ def build_execution_runtime_trigger(trigger: AgentTrigger, execution: TriggerExe
         created_at=trigger.created_at,
         expires_at=trigger.expires_at,
     )
-
-
-async def mark_base_triggers_fired(trigger_ids: list[uuid.UUID], now: datetime) -> None:
-    if not trigger_ids:
-        return
-    async with async_session() as db:
-        result = await db.execute(
-            select(AgentTrigger).where(AgentTrigger.id.in_(trigger_ids))
-        )
-        for trigger in result.scalars().all():
-            trigger.last_fired_at = now
-            trigger.fire_count += 1
-            if trigger.type == "once":
-                trigger.is_enabled = False
-            if trigger.max_fires and trigger.fire_count >= trigger.max_fires:
-                trigger.is_enabled = False
-        await db.commit()

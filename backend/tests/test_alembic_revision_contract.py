@@ -23,4 +23,4 @@ def test_revision_ids_fit_the_default_alembic_version_column() -> None:
 
 
 def test_release_migration_graph_has_one_expected_head() -> None:
-    assert _script_directory().get_heads() == ["durable_media_completion"]
+    assert _script_directory().get_heads() == ["model_route_integrity"]

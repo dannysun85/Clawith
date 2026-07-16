@@ -52,6 +52,8 @@ export interface Agent {
     context_window_size?: number;
     agent_type?: 'native' | 'openclaw';
     openclaw_last_seen?: string;
+    deletion_requested_at?: string;
+    deletion_state?: 'active' | 'cleanup_pending';
     access_mode?: 'company' | 'private' | 'custom';
     company_access_level?: 'use' | 'manage';
     is_system?: boolean;
@@ -60,6 +62,9 @@ export interface Agent {
     // True when the viewing user has already been onboarded to this agent.
     // Defaults to true on list endpoints that don't compute per-viewer state.
     onboarded_for_me?: boolean;
+    automation_execution_enabled?: boolean;
+    approval_execution_enabled?: boolean;
+    execution_capabilities?: Record<string, boolean>;
     created_at: string;
     last_active_at?: string;
 }

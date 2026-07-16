@@ -19,6 +19,7 @@ from app.models.llm import LLMModel
 from app.models.task import Task, TaskLog
 
 settings = get_settings()
+AUTOMATIC_TASK_EXECUTION_ENABLED = False
 
 
 async def execute_task(task_id: uuid.UUID, agent_id: uuid.UUID) -> None:
@@ -31,6 +32,14 @@ async def execute_task(task_id: uuid.UUID, agent_id: uuid.UUID) -> None:
       - todo tasks: pending → doing → done
       - supervision tasks: pending → doing → pending (stays active, just logs result)
     """
+    if not AUTOMATIC_TASK_EXECUTION_ENABLED:
+        logger.warning(
+            "Automatic task execution is paused task_id={} agent_id={}",
+            task_id,
+            agent_id,
+        )
+        return
+
     logger.info(f"[TaskExec] Starting task {task_id} for agent {agent_id}")
 
     # Step 1: Mark as doing
@@ -39,6 +48,22 @@ async def execute_task(task_id: uuid.UUID, agent_id: uuid.UUID) -> None:
         task = result.scalar_one_or_none()
         if not task:
             logger.warning(f"[TaskExec] Task {task_id} not found")
+            return
+
+        if task.type == "supervision":
+            db.add(
+                TaskLog(
+                    task_id=task_id,
+                    content=(
+                        "⏸️ 督办自动执行当前已关闭；该任务仍保留，可由管理员在后续安全版本中重新启用。"
+                    ),
+                )
+            )
+            await db.commit()
+            logger.info(
+                "[TaskExec] Supervision execution blocked by release policy task={}",
+                task_id,
+            )
             return
 
         task.status = "doing"
@@ -144,8 +169,13 @@ You are now in TASK EXECUTION MODE (not a conversation). A task has been assigne
     from app.services.activity_logger import log_activity
     await log_activity(
         agent_id, "task_updated",
-        f"{'督办' if task_type == 'supervision' else '任务'}执行: {task_title[:60]}",
-        detail={"task_id": str(task_id), "task_type": task_type, "title": task_title, "reply": reply[:500]},
+        f"{'督办' if task_type == 'supervision' else '任务'}执行完成",
+        detail={
+            "task_id": str(task_id),
+            "task_type": task_type,
+            "title_chars": len(task_title),
+            "reply_chars": len(reply),
+        },
         related_id=task_id,
     )
 

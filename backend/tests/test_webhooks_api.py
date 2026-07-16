@@ -76,6 +76,7 @@ def client():
 
 @pytest.mark.asyncio
 async def test_receive_webhook_success(monkeypatch, client):
+    monkeypatch.setattr(webhooks_api, "AUTOMATIC_TRIGGER_EXECUTION_ENABLED", True)
     # Setup test trigger and agent
     agent_id = uuid.uuid4()
     trigger = SimpleNamespace(
@@ -139,6 +140,7 @@ async def test_receive_webhook_fails_closed_without_valid_signature(
     headers,
     expected_status,
 ):
+    monkeypatch.setattr(webhooks_api, "AUTOMATIC_TRIGGER_EXECUTION_ENABLED", True)
     agent_id = uuid.uuid4()
     trigger = SimpleNamespace(
         id=uuid.uuid4(),
@@ -175,6 +177,7 @@ async def test_rate_limited_webhook_keeps_user_visible_trigger_context_without_t
     monkeypatch,
     client,
 ):
+    monkeypatch.setattr(webhooks_api, "AUTOMATIC_TRIGGER_EXECUTION_ENABLED", True)
     agent_id = uuid.uuid4()
     trigger = SimpleNamespace(
         id=uuid.uuid4(),
@@ -211,4 +214,32 @@ async def test_rate_limited_webhook_keeps_user_visible_trigger_context_without_t
         "limit": 5,
     }
     assert "token" not in audit.details
+    enqueue.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_maintenance_paused_webhook_rejects_before_side_effects(
+    monkeypatch,
+    client,
+):
+    rate_limit = AsyncMock()
+    enqueue = AsyncMock()
+    monkeypatch.setattr(webhooks_api, "AUTOMATIC_TRIGGER_EXECUTION_ENABLED", False)
+    monkeypatch.setattr(webhooks_api, "_record_and_count_hits", rate_limit)
+    monkeypatch.setattr(webhooks_api, "enqueue_webhook_execution", enqueue)
+
+    async with await client() as ac:
+        response = await ac.post(
+            "/api/webhooks/t/opaque_token",
+            content=b'{"event":"must-not-queue"}',
+            headers={"content-type": "application/json"},
+        )
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "3600"
+    assert response.json() == {
+        "ok": False,
+        "error": "automatic trigger execution is temporarily paused",
+    }
+    rate_limit.assert_not_awaited()
     enqueue.assert_not_awaited()

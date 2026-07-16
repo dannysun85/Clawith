@@ -5,9 +5,10 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from app.api import credentials as credentials_api
-from app.core.security import encrypt_data
+from app.core.security import encrypt_data, get_saas_admin
 from app.schemas.credentials import CredentialCreateIn, CredentialUpdateIn
 from app.services.credential_verification import (
     CredentialVerificationResult,
@@ -38,6 +39,72 @@ class _FakeCredentialDb:
         value.error_count = value.error_count or 0
         value.enabled = True if value.enabled is None else value.enabled
         value.status = value.status or "healthy"
+
+
+def test_credential_capabilities_reject_empty_and_unknown_values():
+    with pytest.raises(ValidationError, match="at least one modality"):
+        CredentialCreateIn(
+            provider="minimax",
+            label="empty",
+            api_key="sk-test",
+            capabilities=[],
+        )
+    with pytest.raises(ValidationError, match="unsupported credential capabilities"):
+        CredentialUpdateIn(capabilities=["telepathy"])
+
+
+def test_credential_capabilities_canonicalize_aliases_and_allow_null_all():
+    assert CredentialUpdateIn(capabilities=["vision", "voice"]).capabilities == ["image", "audio"]
+    assert CredentialUpdateIn(capabilities=None).capabilities is None
+
+
+def test_credential_schema_normalizes_provider_and_rejects_unroutable_values():
+    value = CredentialCreateIn(
+        provider=" MiniMax ",
+        label=" Primary pool ",
+        api_key=" sk-test ",
+        base_url="https://api.minimaxi.com/v1/",
+    )
+    assert value.provider == "minimax"
+    assert value.label == "Primary pool"
+    assert value.api_key == "sk-test"
+    assert value.base_url == "https://api.minimaxi.com/v1"
+
+    invalid_payloads = [
+        {"provider": "unknown", "label": "x", "api_key": "key"},
+        {"provider": "minimax", "label": " ", "api_key": "key"},
+        {"provider": "minimax", "label": "x", "api_key": " "},
+        {"provider": "minimax", "label": "x", "api_key": "key", "weight": 0},
+        {"provider": "minimax", "label": "x", "api_key": "key", "daily_quota": -1},
+        {
+            "provider": "minimax",
+            "label": "x",
+            "api_key": "key",
+            "base_url": "https://user:secret@example.com/v1",
+        },
+        {"provider": "custom", "label": "x", "api_key": "key"},
+    ]
+    for payload in invalid_payloads:
+        with pytest.raises(ValidationError):
+            CredentialCreateIn(**payload)
+
+
+def test_credential_patch_preserves_clearable_nulls_but_rejects_required_nulls():
+    update = CredentialUpdateIn(
+        base_url=None,
+        capabilities=None,
+        daily_quota=None,
+        rpm_limit=None,
+    )
+    assert update.model_dump(exclude_unset=True) == {
+        "base_url": None,
+        "capabilities": None,
+        "daily_quota": None,
+        "rpm_limit": None,
+    }
+    for field in ("api_key", "label", "weight", "priority", "enabled"):
+        with pytest.raises(ValidationError, match="explicit null"):
+            CredentialUpdateIn.model_validate({field: None})
 
 
 @pytest.mark.asyncio
@@ -73,6 +140,16 @@ def test_static_credential_health_route_precedes_uuid_route():
     paths = [route.path for route in credentials_api.router.routes]
 
     assert paths.index("/credentials/health") < paths.index("/credentials/{credential_id}")
+
+
+def test_every_global_credential_pool_route_requires_the_configured_saas_owner():
+    assert credentials_api.router.routes
+    for route in credentials_api.router.routes:
+        dependency_calls = {
+            dependency.call
+            for dependency in route.dependant.dependencies
+        }
+        assert get_saas_admin in dependency_calls, route.path
 
 
 @pytest.mark.asyncio

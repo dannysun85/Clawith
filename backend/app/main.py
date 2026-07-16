@@ -279,6 +279,7 @@ async def lifespan(app: FastAPI):
     from app.services.subscription_lifecycle import start_subscription_lifecycle_daemon
     from app.services.billing_reconciliation import start_billing_reconciliation_daemon
     from app.services.media_generation import start_media_generation_daemon
+    from app.services.agentbay_client import start_agentbay_session_cache_daemon
     from app.services.autonomy_service import start_approval_execution_daemon
     from app.services.production_issue_monitor import (
         record_production_issue,
@@ -491,6 +492,10 @@ async def lifespan(app: FastAPI):
         await write_audit_log("server_startup", {"pid": os.getpid()})
 
         task_specs = []
+        if _role_enabled("all", "api") or _role_enabled("all", "worker"):
+            task_specs.append(
+                ("agentbay_session_cache", start_agentbay_session_cache_daemon())
+            )
         if _role_enabled("all", "worker"):
             worker_task_specs = [
                 ("trigger_daemon", start_trigger_daemon()),

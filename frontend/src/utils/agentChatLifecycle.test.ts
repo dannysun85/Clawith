@@ -2,9 +2,12 @@ import { describe, expect, it } from 'vitest';
 
 import {
     activeSessionMatchesRequestedSession,
+    awaitCurrentChatPagination,
+    chatPaginationRequestIdentityIsCurrent,
     chatSessionRequestIdentityIsCurrent,
     chatHistoryIsReady,
     mergeLoadedHistoryWithLiveMessages,
+    resolveChatHistoryCursor,
     resolveRequestedChatSession,
     searchForSelectedChatSession,
     shouldRetrySessionHistoryResponse,
@@ -59,6 +62,89 @@ describe('agent chat lifecycle guards', () => {
         expect(chatSessionRequestIdentityIsCurrent('user-1', 'token-1', 'user-1', 'token-1')).toBe(true);
         expect(chatSessionRequestIdentityIsCurrent('user-1', 'token-1', 'user-2', 'token-1')).toBe(false);
         expect(chatSessionRequestIdentityIsCurrent('user-1', 'token-1', 'user-1', 'token-2')).toBe(false);
+    });
+
+    it('drops a delayed pagination response after account or session replacement', async () => {
+        let resolvePage: (value: string[]) => void = () => undefined;
+        const delayedPage = new Promise<string[]>((resolve) => {
+            resolvePage = resolve;
+        });
+        const request = {
+            userId: 'user-1', token: 'token-1', agentId: 'agent-1', sessionId: 'session-1',
+        };
+        let current = { ...request };
+        const accepted = awaitCurrentChatPagination(
+            () => delayedPage,
+            request,
+            () => current,
+        );
+
+        current = { ...current, userId: 'user-2', sessionId: 'session-2' };
+        resolvePage(['private-old-page']);
+
+        await expect(accepted).resolves.toBeNull();
+        expect(chatPaginationRequestIdentityIsCurrent(request, current)).toBe(false);
+    });
+
+    it('uses server history headers instead of synthetic inline-part cursors', () => {
+        const headers = new Headers({
+            'X-History-Next-Before': '2026-07-16T10:00:00+00:00',
+            'X-History-Next-Before-Id': 'source-10',
+            'X-History-Has-More': 'true',
+        });
+
+        expect(resolveChatHistoryCursor(headers, [{
+            id: 'source-10:part:0',
+            created_at: 'synthetic-time',
+            source_message_id: 'source-fallback',
+            source_created_at: 'fallback-time',
+        }], 20)).toEqual({
+            before: '2026-07-16T10:00:00+00:00',
+            beforeId: 'source-10',
+            hasMore: true,
+        });
+    });
+
+    it('falls back to source-message identity for expanded legacy responses', () => {
+        expect(resolveChatHistoryCursor(new Headers(), [{
+            id: 'message-20:part:0',
+            created_at: '2026-07-16T10:00:00+00:00',
+            source_message_id: 'message-20',
+            source_created_at: '2026-07-16T09:59:59+00:00',
+        }], 1)).toEqual({
+            before: '2026-07-16T09:59:59+00:00',
+            beforeId: 'message-20',
+            hasMore: true,
+        });
+    });
+
+    it('honors the raw-row has-more header when one row expands into many parts', () => {
+        const headers = new Headers({ 'X-History-Has-More': 'false' });
+        const expanded = Array.from({ length: 12 }, (_, index) => ({
+            id: `message-1:part:${index}`,
+            source_message_id: 'message-1',
+            source_created_at: '2026-07-16T10:00:00+00:00',
+        }));
+
+        expect(resolveChatHistoryCursor(headers, expanded, 10).hasMore).toBe(false);
+    });
+
+    it('preserves the id tie-breaker across pages with identical timestamps', () => {
+        const first = resolveChatHistoryCursor(new Headers({
+            'X-History-Next-Before': '2026-07-16T10:00:00+00:00',
+            'X-History-Next-Before-Id': 'message-b',
+            'X-History-Has-More': 'true',
+        }), [{ id: 'message-b' }], 1);
+        const second = resolveChatHistoryCursor(new Headers({
+            'X-History-Next-Before': '2026-07-16T10:00:00+00:00',
+            'X-History-Next-Before-Id': 'message-a',
+            'X-History-Has-More': 'false',
+        }), [{ id: 'message-a' }], 1);
+
+        expect(first.before).toBe(second.before);
+        expect(first.beforeId).toBe('message-b');
+        expect(second.beforeId).toBe('message-a');
+        expect(second.hasMore).toBe(false);
     });
 
     it('keeps realtime messages received while history is loading without duplicating ids', () => {

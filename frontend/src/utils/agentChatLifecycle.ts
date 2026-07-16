@@ -66,6 +66,73 @@ export function chatSessionRequestIdentityIsCurrent(
         && String(requestToken ?? '') === String(currentToken ?? '');
 }
 
+export type ChatPaginationRequestIdentity = {
+    userId: unknown;
+    token: unknown;
+    agentId: unknown;
+    sessionId: unknown;
+};
+
+export function chatPaginationRequestIdentityIsCurrent(
+    request: ChatPaginationRequestIdentity,
+    current: ChatPaginationRequestIdentity,
+): boolean {
+    return chatSessionRequestIdentityIsCurrent(
+        request.userId,
+        request.token,
+        current.userId,
+        current.token,
+    )
+        && String(request.agentId ?? '') === String(current.agentId ?? '')
+        && String(request.sessionId ?? '') === String(current.sessionId ?? '');
+}
+
+export async function awaitCurrentChatPagination<T>(
+    load: () => Promise<T>,
+    request: ChatPaginationRequestIdentity,
+    getCurrent: () => ChatPaginationRequestIdentity,
+    signal?: AbortSignal,
+): Promise<T | null> {
+    const value = await load();
+    if (signal?.aborted) return null;
+    return chatPaginationRequestIdentityIsCurrent(request, getCurrent())
+        ? value
+        : null;
+}
+
+export type ChatHistoryCursor = {
+    before: string | null;
+    beforeId: string | null;
+    hasMore: boolean;
+};
+
+export function resolveChatHistoryCursor(
+    headers: Pick<Headers, 'get'>,
+    messages: Array<{
+        id?: unknown;
+        created_at?: unknown;
+        source_message_id?: unknown;
+        source_created_at?: unknown;
+    }>,
+    legacyPageSize: number,
+): ChatHistoryCursor {
+    const oldest = messages[0];
+    const before = headers.get('X-History-Next-Before')
+        || (oldest?.source_created_at == null ? '' : String(oldest.source_created_at))
+        || (oldest?.created_at == null ? '' : String(oldest.created_at));
+    const beforeId = headers.get('X-History-Next-Before-Id')
+        || (oldest?.source_message_id == null ? '' : String(oldest.source_message_id))
+        || (oldest?.id == null ? '' : String(oldest.id));
+    const hasMoreHeader = headers.get('X-History-Has-More');
+    return {
+        before: before || null,
+        beforeId: beforeId || null,
+        hasMore: hasMoreHeader == null
+            ? messages.length >= legacyPageSize
+            : hasMoreHeader === 'true',
+    };
+}
+
 export function mergeLoadedHistoryWithLiveMessages<T extends { id?: unknown }>(
     historyMessages: T[],
     currentMessages: T[],

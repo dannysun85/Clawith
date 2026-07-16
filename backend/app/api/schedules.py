@@ -1,7 +1,7 @@
 """Schedule API — CRUD for agent cron jobs."""
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -22,7 +22,7 @@ class ScheduleCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     instruction: str = Field(default='', max_length=5000)
     cron_expr: str = Field(min_length=1, max_length=100)
-    is_enabled: bool = True
+    is_enabled: bool = False
 
 
 class ScheduleUpdate(BaseModel):
@@ -88,6 +88,11 @@ async def create_schedule(
     agent, _access = await check_agent_access(db, current_user, agent_id)
     if not is_agent_creator(current_user, agent):
         raise HTTPException(status_code=403, detail="Only creator can manage schedules")
+    if data.is_enabled:
+        raise HTTPException(
+            status_code=409,
+            detail="Schedule execution is paused in this release",
+        )
 
     # Validate cron expression
     next_run = compute_next_run(data.cron_expr)
@@ -99,8 +104,8 @@ async def create_schedule(
         name=data.name,
         instruction=data.instruction,
         cron_expr=data.cron_expr,
-        is_enabled=data.is_enabled,
-        next_run_at=next_run if data.is_enabled else None,
+        is_enabled=False,
+        next_run_at=None,
         created_by=current_user.id,
     )
     db.add(sched)
@@ -129,6 +134,11 @@ async def update_schedule(
         raise HTTPException(status_code=404, detail="Schedule not found")
 
     updates = data.model_dump(exclude_unset=True)
+    if updates.get("is_enabled"):
+        raise HTTPException(
+            status_code=409,
+            detail="Schedule execution is paused in this release",
+        )
     for field, value in updates.items():
         setattr(sched, field, value)
 
@@ -185,17 +195,13 @@ async def trigger_schedule(
     if not sched:
         raise HTTPException(status_code=404, detail="Schedule not found")
 
-    # Fire in background
-    import asyncio
-    from app.services.scheduler import _execute_schedule
-    asyncio.create_task(_execute_schedule(sched.id, sched.agent_id, sched.instruction))
-
-    # Update tracking
-    sched.last_run_at = datetime.now(timezone.utc)
-    sched.run_count = (sched.run_count or 0) + 1
-    await db.flush()
-
-    return {"status": "triggered", "schedule_id": str(schedule_id)}
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            "Schedule execution is paused in this release; configuration "
+            "remains available for review"
+        ),
+    )
 
 
 @router.get("/{schedule_id}/history")
@@ -232,4 +238,3 @@ async def get_schedule_history(
         if len(history) >= 20:
             break
     return history
-

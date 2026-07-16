@@ -126,7 +126,7 @@ class CreditTransaction(Base):
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
     )
     agent_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("agents.id"), nullable=True
+        UUID(as_uuid=True), ForeignKey("agents.id", ondelete="SET NULL"), nullable=True
     )
     action: Mapped[str | None] = mapped_column(String(50), nullable=True)
     modality: Mapped[str | None] = mapped_column(String(20), nullable=True)
@@ -150,7 +150,7 @@ class CreditReservation(Base):
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
     )
     agent_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("agents.id"), nullable=True
+        UUID(as_uuid=True), ForeignKey("agents.id", ondelete="SET NULL"), nullable=True
     )
     action: Mapped[str] = mapped_column(String(50), nullable=False)
     modality: Mapped[str | None] = mapped_column(String(20), nullable=True)

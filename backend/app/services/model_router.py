@@ -67,18 +67,25 @@ async def resolve_route(
             quota_type="no_route",
         )
 
-    model = await _load_model(route.llm_model_id)
+    model = await _load_model(route.llm_model_id, enabled_only=True)
     if not model:
         raise QuotaExceeded(
-            f"Model route points to a missing model: {route.llm_model_id}.",
+            f"Model route points to a missing or disabled model: {route.llm_model_id}.",
             quota_type="no_route",
         )
 
     fallback_model = None
     if allow_fallback and route.fallback_route_id:
         fallback_route = await _pick_route_by_id(route.fallback_route_id)
-        if fallback_route:
-            fallback_model = await _load_model(fallback_route.llm_model_id)
+        if (
+            fallback_route
+            and fallback_route.saas_tier == saas_tier
+            and fallback_route.modality == modality
+        ):
+            fallback_model = await _load_model(
+                fallback_route.llm_model_id,
+                enabled_only=True,
+            )
 
     return ResolvedRoute(
         model=model,
@@ -141,7 +148,11 @@ async def _pick_route(saas_tier: str, modality: str) -> ModelRoute | None:
                 ModelRoute.modality == modality,
                 ModelRoute.enabled == True,  # noqa: E712
             )
-            .order_by(ModelRoute.priority.desc())
+            .order_by(
+                ModelRoute.priority.desc(),
+                ModelRoute.created_at.asc(),
+                ModelRoute.id.asc(),
+            )
             .limit(1)
         )
         return result.scalar_one_or_none()
@@ -150,16 +161,28 @@ async def _pick_route(saas_tier: str, modality: str) -> ModelRoute | None:
 async def _pick_route_by_id(route_id: uuid.UUID) -> ModelRoute | None:
     """Load a route by ID."""
     async with async_session() as db:
-        result = await db.execute(select(ModelRoute).where(ModelRoute.id == route_id))
+        result = await db.execute(
+            select(ModelRoute).where(
+                ModelRoute.id == route_id,
+                ModelRoute.enabled == True,  # noqa: E712
+            )
+        )
         return result.scalar_one_or_none()
 
 
-async def _load_model(model_id: uuid.UUID) -> "LLMModel | None":
+async def _load_model(
+    model_id: uuid.UUID,
+    *,
+    enabled_only: bool = False,
+) -> "LLMModel | None":
     """Load an LLMModel by ID."""
     from app.models.llm import LLMModel
 
     async with async_session() as db:
-        result = await db.execute(select(LLMModel).where(LLMModel.id == model_id))
+        conditions = [LLMModel.id == model_id]
+        if enabled_only:
+            conditions.append(LLMModel.enabled == True)  # noqa: E712
+        result = await db.execute(select(LLMModel).where(*conditions))
         return result.scalar_one_or_none()
 
 

@@ -326,6 +326,9 @@
       "noTriggers": "No triggers",
       "fired": "Fired {{count}} times",
       "disabled": "Disabled",
+      "configuredPaused": "Configured · execution paused",
+      "executionPausedDetail": "Automatic trigger and schedule execution is paused in this release. Configuration is retained and no Credits are consumed.",
+      "scheduleAccepted": "Schedule request accepted",
       "disable": "Disable",
       "enable": "Enable",
       "deleteTriggerConfirm": "Delete trigger \"{{name}}\"?",
@@ -348,6 +351,11 @@
       "triggerUnknown": "unknown",
       "today": "Today",
       "viewAll": "View All"
+    },
+    "deletion": {
+      "cleanupPendingTitle": "Deletion cleanup pending.",
+      "cleanupPendingDetail": "Provider cleanup has not completed. Start, recovery, chat, and automation stay disabled; contact a platform administrator to reconcile safely.",
+      "cleanupPendingPlaceholder": "Deletion cleanup pending — chat is disabled"
     },
     "soul": {
       "title": "Soul.md — Personality Definition",
@@ -2030,9 +2038,10 @@
     "pressing": "Pressing: {{keys}}",
     "pressed": "Pressed: {{keys}}",
     "pressFailed": "Key press failed: {{message}}",
+    "finishingControl": "Finishing human control...",
     "exportingCookies": "Exporting cookies...",
     "loginComplete": "Login complete! {{count}} cookies saved.",
-    "sessionUnlocked": "Session unlocked (no cookies exported).",
+    "sessionUnlocked": "Session returned to the Agent.",
     "unlockFailed": "Unlock failed: {{message}}",
     "canceling": "Canceling...",
     "lockFailed": "Failed to acquire control: {{message}}",
@@ -2044,6 +2053,7 @@
     "saveLoginStateTo": "Save login state to",
     "exit": "Exit",
     "saveLoginState": "Save Login State",
+    "finishControl": "Finish Control",
     "sendText": "Send text"
   },
   "customAgentModal": {

@@ -8,7 +8,7 @@ export type PublicApprovalDetails = {
 
 export type ApprovalRecord = {
     id: string;
-    agent_id: string;
+    agent_id: string | null;
     agent_name?: string | null;
     action_type: string;
     details?: PublicApprovalDetails | null;
@@ -18,6 +18,8 @@ export type ApprovalRecord = {
     execution_status?: string | null;
     execution_error_code?: string | null;
     execution_result_summary?: { outcome_code?: string | null } | null;
+    execution_available?: boolean;
+    execution_paused_reason?: string | null;
 };
 
 export function isApprovalApprovable(details: PublicApprovalDetails | null | undefined): boolean {
@@ -30,7 +32,7 @@ export function approvalNeedsPolling(value: unknown): boolean {
         if (!approval || typeof approval !== 'object') return false;
         const record = approval as ApprovalRecord;
         return record.status === 'pending'
-            || record.execution_status === 'pending'
+            || (record.execution_available !== false && record.execution_status === 'pending')
             || record.execution_status === 'executing';
     });
 }
@@ -38,6 +40,14 @@ export function approvalNeedsPolling(value: unknown): boolean {
 export function approvalExecutionLabel(approval: ApprovalRecord, isChinese: boolean): string {
     if (approval.status === 'pending') return isChinese ? '等待审批' : 'Awaiting approval';
     if (approval.status === 'rejected') return isChinese ? '已拒绝，不会执行' : 'Rejected; will not execute';
+    if (
+        approval.execution_available === false
+        && approval.execution_status === 'pending'
+    ) {
+        return isChinese
+            ? '已批准，但本版本自动执行已暂停；没有副作用发生'
+            : 'Approved, but automatic execution is paused in this release; no side effect ran';
+    }
     const outcomeCode = approval.execution_result_summary?.outcome_code || '';
     const outcomeLabels: Record<string, [string, string]> = {
         DouyinUserActionRequired: ['抖音发布包已生成，仍需用户确认；不代表已公开发布', 'Douyin package ready; user confirmation required; not publicly published'],

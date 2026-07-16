@@ -18,7 +18,7 @@ import re
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, AsyncContextManager, Callable
 
 from loguru import logger
 from sqlalchemy import select
@@ -672,6 +672,9 @@ async def _process_tool_call(
     allowed_tool_names: set[str],
     route_meta: RouteMeta | None = None,
     on_code_output=None,
+    tool_authorization_context: (
+        Callable[[str, dict], AsyncContextManager[None]] | None
+    ) = None,
 ) -> str:
     """Process a single tool call and return result."""
     fn = tc["function"]
@@ -730,14 +733,21 @@ async def _process_tool_call(
 
     # Execute tool — pass on_output for execute_code streaming
     _on_output = on_code_output if tool_name in ("execute_code", "execute_code_e2b") else None
-    result = await execute_tool(
-        tool_name, args,
-        agent_id=agent_id,
-        user_id=user_id or agent_id,
-        session_id=session_id,
-        saas_tier=route_meta.saas_tier if route_meta else None,
-        on_output=_on_output,
-    )
+    async def _execute() -> str:
+        return await execute_tool(
+            tool_name, args,
+            agent_id=agent_id,
+            user_id=user_id or agent_id,
+            session_id=session_id,
+            saas_tier=route_meta.saas_tier if route_meta else None,
+            on_output=_on_output,
+        )
+
+    if tool_authorization_context is None:
+        result = await _execute()
+    else:
+        async with tool_authorization_context(tool_name, args):
+            result = await _execute()
     logger.debug(f"[LLM] Tool result chars={len(result)}")
 
     # ── Vision injection for screenshot tools ──
@@ -851,27 +861,52 @@ async def ensure_agent_billing_route(
     working, but automatically route any agent for which ``resolve_agent_model``
     returns SaaS metadata.
     """
-    if route_meta is not None or not agent_id or not _is_persisted_model(model):
+    if route_meta is not None or not _is_persisted_model(model):
         return model, route_meta
+
+    if not agent_id:
+        raise QuotaExceeded(
+            "Agent billing context is required for a persisted model.",
+            quota_type="billing_context",
+        )
 
     from app.models.agent import Agent
 
     try:
         normalized_agent_id = agent_id if isinstance(agent_id, uuid.UUID) else uuid.UUID(str(agent_id))
-    except (TypeError, ValueError, AttributeError):
-        return model, route_meta
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise QuotaExceeded(
+            "Agent billing context is invalid.",
+            quota_type="billing_context",
+        ) from exc
 
-    async with async_session() as db:
-        result = await db.execute(select(Agent).where(Agent.id == normalized_agent_id))
-        agent = result.scalar_one_or_none()
+    try:
+        async with async_session() as db:
+            result = await db.execute(select(Agent).where(Agent.id == normalized_agent_id))
+            agent = result.scalar_one_or_none()
+    except Exception as exc:
+        logger.error(
+            "[LLM Billing] route recovery failed error_type={}",
+            type(exc).__name__,
+        )
+        raise QuotaExceeded(
+            "Agent billing context is temporarily unavailable.",
+            quota_type="billing_context",
+        ) from exc
 
     if not agent:
-        return model, route_meta
+        raise QuotaExceeded(
+            "Agent billing context is unavailable.",
+            quota_type="billing_context",
+        )
 
     primary_model, fallback_model, resolved_meta = await resolve_agent_model(agent)
     routed_model = primary_model or fallback_model
     if not routed_model or not resolved_meta:
-        return model, route_meta
+        raise QuotaExceeded(
+            "Agent model route is unavailable for billing.",
+            quota_type="billing_context",
+        )
 
     logger.warning(
         "[LLM Billing] Recovered missing route metadata for agent {}: {}/{} -> {}",
@@ -890,19 +925,20 @@ async def _prepare_llm_billing_context(
 ) -> uuid.UUID | None:
     """Validate entitlements/credits and return the tenant to settle."""
     persisted_model = _is_persisted_model(model)
-    if persisted_model:
-        await check_plan_inference_entitlement(
-            agent_id,
-            modality=(
-                route_meta.modality
-                if route_meta is not None
-                else getattr(model, "modality", None)
-            ),
-            saas_tier=route_meta.saas_tier if route_meta is not None else None,
+    if not persisted_model:
+        return None
+
+    if not agent_id or route_meta is None:
+        raise QuotaExceeded(
+            "Agent billing route is unavailable.",
+            quota_type="billing_context",
         )
 
-    if not (agent_id and route_meta and persisted_model):
-        return None
+    await check_plan_inference_entitlement(
+        agent_id,
+        modality=route_meta.modality,
+        saas_tier=route_meta.saas_tier,
+    )
 
     from app.models.agent import Agent
 
@@ -1165,6 +1201,7 @@ async def call_llm(
     agent_id=None,
     user_id=None,
     session_id: str = "",
+    tool_session_id: str | None = None,
     on_chunk=None,
     on_tool_call=None,
     on_tool_delta=None,
@@ -1177,6 +1214,9 @@ async def call_llm(
     system_prompt_suffix: str | None = None,
     route_meta: RouteMeta | None = None,
     failover_guard: FailoverGuard | None = None,
+    tool_authorization_context: (
+        Callable[[str, dict], AsyncContextManager[None]] | None
+    ) = None,
 ) -> str:
     """Call LLM via unified client with function-calling tool loop."""
     # Get agent config for tool rounds
@@ -1660,13 +1700,14 @@ async def call_llm(
                     api_messages=api_messages,
                     agent_id=agent_id,
                     user_id=user_id,
-                    session_id=session_id,
+                    session_id=tool_session_id or session_id,
                     supports_vision=supports_vision,
                     on_tool_call=on_tool_call,
                     on_code_output=on_code_output,
                     full_reasoning_content=full_reasoning_content,
                     allowed_tool_names=allowed_tool_names,
                     route_meta=route_meta,
+                    tool_authorization_context=tool_authorization_context,
                 )
             except asyncio.CancelledError:
                 await _finalize_llm_usage()
@@ -1683,7 +1724,10 @@ async def call_llm(
             if tool_error:
                 api_messages.append(LLMMessage(
                     role="tool",
-                    content=tool_error,
+                    content=(
+                        "Tool execution was blocked because its authorization "
+                        "or completion could not be verified."
+                    ),
                     tool_call_id=tc.get("id", ""),
                 ))
 
@@ -1702,6 +1746,7 @@ async def call_llm_with_failover(
     agent_id=None,
     user_id=None,
     session_id: str = "",
+    tool_session_id: str | None = None,
     on_chunk=None,
     on_thinking=None,
     on_tool_call=None,
@@ -1713,6 +1758,9 @@ async def call_llm_with_failover(
     current_user_name_override: str | None = None,
     system_prompt_suffix: str | None = None,
     route_meta: RouteMeta | None = None,
+    tool_authorization_context: (
+        Callable[[str, dict], AsyncContextManager[None]] | None
+    ) = None,
 ) -> str:
     """Call LLM with automatic failover support."""
     guard = FailoverGuard()
@@ -1747,6 +1795,7 @@ async def call_llm_with_failover(
         agent_id=agent_id,
         user_id=user_id,
         session_id=session_id,
+        tool_session_id=tool_session_id,
         on_chunk=_wrapped_on_chunk,
         on_tool_call=_wrapped_on_tool_call,
         on_tool_delta=on_tool_delta,
@@ -1758,6 +1807,7 @@ async def call_llm_with_failover(
         system_prompt_suffix=system_prompt_suffix,
         route_meta=route_meta,
         failover_guard=guard,
+        tool_authorization_context=tool_authorization_context,
     )
 
     # Check if we need to failover
@@ -1825,6 +1875,7 @@ async def call_llm_with_failover(
         agent_id=agent_id,
         user_id=user_id,
         session_id=session_id,
+        tool_session_id=tool_session_id,
         on_chunk=_fallback_on_chunk,
         on_tool_call=_fallback_on_tool_call,
         on_tool_delta=on_tool_delta,
@@ -1836,6 +1887,7 @@ async def call_llm_with_failover(
         system_prompt_suffix=system_prompt_suffix,
         route_meta=route_meta,
         failover_guard=fallback_guard,
+        tool_authorization_context=tool_authorization_context,
     )
 
     # Combine error messages if fallback also failed

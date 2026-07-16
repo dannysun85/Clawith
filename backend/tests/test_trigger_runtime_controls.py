@@ -1,6 +1,7 @@
 import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -27,7 +28,7 @@ async def test_dispatch_forwards_bounded_claim_limit(monkeypatch):
     assert forced == set()
 
 
-def test_webhook_payload_cannot_override_runtime_routing_or_execution_fence():
+def test_stored_reserved_config_cannot_override_runtime_routing_or_execution_fence():
     from app.services.trigger_runtime.executions import build_execution_runtime_trigger
 
     agent_id = uuid.uuid4()
@@ -61,7 +62,7 @@ def test_webhook_payload_cannot_override_runtime_routing_or_execution_fence():
 
     runtime = build_execution_runtime_trigger(trigger, execution)
 
-    assert runtime.config["_origin_user_id"] == str(trusted_user_id)
+    assert "_origin_user_id" not in runtime.config
     assert "_a2a_session_id" not in runtime.config
     assert runtime.config["_execution_id"] == str(execution.id)
     assert runtime.config["_execution_lease_token"] == execution.lease_owner
@@ -106,6 +107,28 @@ def test_service_execution_payload_uses_an_explicit_allowlist():
     assert runtime.config["_execution_lease_token"] == execution.lease_owner
 
 
+def test_unmarked_stored_message_context_never_enters_execution_payload():
+    from app.services.trigger_runtime.dispatch import runtime_execution_payload
+
+    trigger = AgentTrigger(
+        id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        name="legacy",
+        type="on_message",
+        config={
+            "from_agent_name": "Ray",
+            "_matched_message": "legacy injected prompt",
+            "_matched_message_id": str(uuid.uuid4()),
+            "_origin_user_id": str(uuid.uuid4()),
+        },
+        reason="legacy",
+        is_enabled=True,
+        is_system=False,
+    )
+
+    assert runtime_execution_payload(trigger) == {}
+
+
 @pytest.mark.asyncio
 async def test_150_agent_backlog_cannot_exceed_worker_concurrency(monkeypatch):
     from app.services import trigger_daemon
@@ -135,7 +158,6 @@ async def test_150_agent_backlog_cannot_exceed_worker_concurrency(monkeypatch):
         return pairs[:limit]
 
     monkeypatch.setattr(dispatch, "claim_pending_trigger_executions", bounded_claim)
-    monkeypatch.setattr(dispatch, "mark_base_triggers_fired", AsyncMock())
     monkeypatch.setattr(
         dispatch,
         "build_execution_runtime_trigger",
@@ -323,10 +345,40 @@ async def test_execution_terminal_update_is_fenced_by_claim_generation(monkeypat
     from app.services.trigger_runtime import executions
 
     execution_id = uuid.uuid4()
+    trigger_id = uuid.uuid4()
     lease_token = "worker-a:generation-2"
-    result = MagicMock(rowcount=1)
+
+    class QueryResult:
+        def __init__(self, rows):
+            self.rows = list(rows)
+
+        def scalars(self):
+            return QueryResult(
+                [row[0] if isinstance(row, tuple) else row for row in self.rows]
+            )
+
+        def all(self):
+            return list(self.rows)
+
     db = MagicMock()
-    db.execute = AsyncMock(return_value=result)
+    db.execute = AsyncMock(
+        side_effect=[
+            QueryResult([(trigger_id,)]),
+            QueryResult(
+                [
+                    SimpleNamespace(
+                        id=trigger_id,
+                        type="cron",
+                        max_fires=None,
+                        fire_count=0,
+                        is_enabled=True,
+                    )
+                ]
+            ),
+            QueryResult([(execution_id, trigger_id)]),
+            QueryResult([]),
+        ]
+    )
     db.commit = AsyncMock()
     session = MagicMock()
     session.__aenter__ = AsyncMock(return_value=db)
@@ -337,7 +389,7 @@ async def test_execution_terminal_update_is_fenced_by_claim_generation(monkeypat
         [(execution_id, lease_token)]
     )
 
-    statement = db.execute.await_args.args[0]
+    statement = db.execute.await_args_list[2].args[0]
     params = statement.compile().params
     assert updated == 1
     assert execution_id in params.values()

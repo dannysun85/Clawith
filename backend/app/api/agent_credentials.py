@@ -28,6 +28,30 @@ from app.schemas.agent_credential import (
 router = APIRouter(prefix="/agents/{agent_id}/credentials", tags=["agent-credentials"])
 
 
+async def _require_self_credential_access(
+    db: AsyncSession,
+    current_user: User,
+    agent_id: uuid.UUID,
+) -> None:
+    """Allow an Agent user to manage only their own isolated browser login.
+
+    AgentBay injects these rows into an exact user/chat lane and every query
+    below is additionally filtered by ``owner_user_id``. Requiring Agent
+    management rights prevented ordinary authorized users from restoring the
+    private login that migration 099 deliberately stopped sharing.
+    """
+
+    _agent, access_level = await check_agent_access(db, current_user, agent_id)
+    if access_level not in ("use", "manage") and current_user.role not in (
+        "platform_admin",
+        "org_admin",
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Use access required to manage your private credentials",
+        )
+
+
 def _to_response(cred: AgentCredential) -> dict:
     """Convert an AgentCredential ORM object to a safe response dict.
 
@@ -56,17 +80,14 @@ async def list_credentials(
     db: AsyncSession = Depends(get_db),
 ):
     """List all credentials for an agent (sensitive data excluded)."""
-    # Verify the user has manage-level access to this agent
-    _agent, access_level = await check_agent_access(db, current_user, agent_id)
-    if access_level not in ("manage",) and current_user.role not in ("platform_admin", "org_admin"):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Manage access required to view credentials",
-        )
+    await _require_self_credential_access(db, current_user, agent_id)
 
     result = await db.execute(
         select(AgentCredential)
-        .where(AgentCredential.agent_id == agent_id)
+        .where(
+            AgentCredential.agent_id == agent_id,
+            AgentCredential.owner_user_id == current_user.id,
+        )
         .order_by(AgentCredential.created_at.desc())
     )
     credentials = result.scalars().all()
@@ -84,12 +105,7 @@ async def create_credential(
 
     Sensitive fields (cookies_json) are encrypted before storage.
     """
-    _agent, access_level = await check_agent_access(db, current_user, agent_id)
-    if access_level not in ("manage",) and current_user.role not in ("platform_admin", "org_admin"):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Manage access required to create credentials",
-        )
+    await _require_self_credential_access(db, current_user, agent_id)
 
     settings = get_settings()
 
@@ -107,6 +123,7 @@ async def create_credential(
 
     cred = AgentCredential(
         agent_id=agent_id,
+        owner_user_id=current_user.id,
         credential_type=data.credential_type,
         platform=data.platform,
         display_name=data.display_name or "",
@@ -138,17 +155,13 @@ async def update_credential(
     Only provided fields are updated. Sensitive fields are re-encrypted.
     If cookies_json is updated, status is reset to 'active'.
     """
-    _agent, access_level = await check_agent_access(db, current_user, agent_id)
-    if access_level not in ("manage",) and current_user.role not in ("platform_admin", "org_admin"):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Manage access required to update credentials",
-        )
+    await _require_self_credential_access(db, current_user, agent_id)
 
     result = await db.execute(
         select(AgentCredential).where(
             AgentCredential.id == credential_id,
             AgentCredential.agent_id == agent_id,
+            AgentCredential.owner_user_id == current_user.id,
         )
     )
     cred = result.scalar_one_or_none()
@@ -197,17 +210,13 @@ async def delete_credential(
     db: AsyncSession = Depends(get_db),
 ):
     """Delete a credential."""
-    _agent, access_level = await check_agent_access(db, current_user, agent_id)
-    if access_level not in ("manage",) and current_user.role not in ("platform_admin", "org_admin"):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Manage access required to delete credentials",
-        )
+    await _require_self_credential_access(db, current_user, agent_id)
 
     result = await db.execute(
         select(AgentCredential).where(
             AgentCredential.id == credential_id,
             AgentCredential.agent_id == agent_id,
+            AgentCredential.owner_user_id == current_user.id,
         )
     )
     cred = result.scalar_one_or_none()

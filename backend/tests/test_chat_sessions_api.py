@@ -1,9 +1,10 @@
 import uuid
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, Response
 
 from app.api import chat_sessions as chat_sessions_api
 
@@ -48,6 +49,9 @@ class RecordingDB:
 
     async def commit(self):
         self.committed = True
+
+    async def rollback(self):
+        return None
 
     async def refresh(self, value):
         self.refreshed.append(value)
@@ -165,9 +169,11 @@ async def test_org_admin_can_view_other_users_session_messages(monkeypatch):
 
     monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
 
+    response = Response()
     messages = await chat_sessions_api.get_session_messages(
         agent_id=agent_id,
         session_id=session_id,
+        response=response,
         current_user=current_user,
         db=db,
     )
@@ -178,8 +184,13 @@ async def test_org_admin_can_view_other_users_session_messages(monkeypatch):
             "role": "user",
             "content": "hello",
             "created_at": now.isoformat(),
+            "source_message_id": str(message_id),
+            "source_created_at": now.isoformat(),
         }
     ]
+    assert response.headers["X-History-Has-More"] == "false"
+    assert response.headers["X-History-Next-Before"] == now.isoformat()
+    assert response.headers["X-History-Next-Before-Id"] == str(message_id)
 
 
 @pytest.mark.asyncio
@@ -209,6 +220,7 @@ async def test_creator_cannot_view_other_users_session_messages(monkeypatch):
         await chat_sessions_api.get_session_messages(
             agent_id=agent_id,
             session_id=session_id,
+            response=Response(),
             current_user=current_user,
             db=db,
         )
@@ -263,9 +275,11 @@ async def test_a2a_messages_include_stable_sender_identity(monkeypatch):
 
     monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
 
+    response = Response()
     messages = await chat_sessions_api.get_session_messages(
         agent_id=current_agent_id,
         session_id=session_id,
+        response=response,
         current_user=SimpleNamespace(id=user_id, role="member"),
         db=db,
     )
@@ -276,6 +290,8 @@ async def test_a2a_messages_include_stable_sender_identity(monkeypatch):
     assert messages[1]["sender_agent_id"] == str(peer_agent_id)
     assert messages[1]["id"] == str(peer_message_id)
     assert messages[1]["is_current_agent"] is False
+    assert response.headers["X-History-Has-More"] == "false"
+    assert response.headers["X-History-Next-Before-Id"] == str(current_message_id)
 
 
 @pytest.mark.asyncio
@@ -632,6 +648,8 @@ async def test_peer_agent_can_rename_a2a_session(monkeypatch):
         peer_agent_id=peer_agent_id,
         user_id=user_id,
         title="Old title",
+        source_channel="agent",
+        is_group=False,
     )
     db = RecordingDB(responses=[DummyResult([session])])
 
@@ -664,13 +682,31 @@ async def test_peer_agent_can_delete_a2a_session_and_messages(monkeypatch):
         agent_id=owner_agent_id,
         peer_agent_id=peer_agent_id,
         user_id=user_id,
+        source_channel="agent",
+        is_group=False,
     )
-    db = RecordingDB(responses=[DummyResult([session]), DummyResult()])
+    db = RecordingDB(
+        responses=[
+            DummyResult([session]),
+            DummyResult([session]),
+            DummyResult(),
+            DummyResult(),
+        ]
+    )
 
     async def fake_check_agent_access(_db, _user, _agent_id):
         return SimpleNamespace(id=peer_agent_id, creator_id=user_id), "manage"
 
     monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
+
+    @asynccontextmanager
+    async def no_provider_sessions(**_kwargs):
+        yield
+
+    monkeypatch.setattr(
+        "app.services.agentbay_client.agentbay_chat_session_deletion_fence",
+        no_provider_sessions,
+    )
 
     result = await chat_sessions_api.delete_session(
         agent_id=peer_agent_id,

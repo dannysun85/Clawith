@@ -1,5 +1,6 @@
 import json
 import uuid
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -64,9 +65,12 @@ class RecordingDB:
     async def commit(self):
         self.committed = True
 
+    async def rollback(self):
+        return None
+
 
 class TaskCleanupDB(RecordingDB):
-    def __init__(self):
+    def __init__(self, agent, user):
         super().__init__(
             required_cleanup=[
                 "DELETE FROM task_logs WHERE task_id IN (SELECT id FROM tasks WHERE agent_id = :aid)",
@@ -77,10 +81,17 @@ class TaskCleanupDB(RecordingDB):
         )
         self.task_rows_remaining = 1
         self.task_logs_remaining = 1
+        self.agent = agent
+        self.user = user
 
     async def execute(self, statement, params=None):
         sql = getattr(statement, "text", str(statement))
         self.executed_sql.append(sql)
+
+        if sql.lstrip().startswith("SELECT") and "FROM agents" in sql:
+            return DummyResult([self.agent])
+        if sql.lstrip().startswith("SELECT") and "FROM users" in sql:
+            return DummyResult([self.user])
 
         if sql == "DELETE FROM task_logs WHERE task_id IN (SELECT id FROM tasks WHERE agent_id = :aid)":
             self.task_logs_remaining = 0
@@ -140,14 +151,14 @@ def make_agent(creator_id: uuid.UUID, **overrides):
 async def test_delete_agent_cleans_remaining_foreign_key_rows(monkeypatch):
     creator = make_user()
     agent = make_agent(creator.id)
-    db = TaskCleanupDB()
+    db = TaskCleanupDB(agent, creator)
 
     async def fake_check_agent_access(_db, _current_user, _agent_id):
         return agent, "manage"
 
     class FakeAgentManager:
         async def remove_container(self, _agent):
-            return None
+            return True
 
         async def archive_agent_files(self, _agent_id):
             return None
@@ -155,6 +166,15 @@ async def test_delete_agent_cleans_remaining_foreign_key_rows(monkeypatch):
     monkeypatch.setattr(agents_api, "check_agent_access", fake_check_agent_access)
     monkeypatch.setattr(agents_api, "is_agent_creator", lambda _user, _agent: True)
     monkeypatch.setattr("app.services.agent_manager.agent_manager", FakeAgentManager())
+
+    @asynccontextmanager
+    async def no_provider_sessions(**_kwargs):
+        yield
+
+    monkeypatch.setattr(
+        "app.services.agentbay_client.agentbay_agent_deletion_fence",
+        no_provider_sessions,
+    )
 
     await agents_api.delete_agent(
         agent_id=agent.id,

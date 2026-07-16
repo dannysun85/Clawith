@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+import tempfile
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 
 from sqlalchemy import func, select
@@ -21,6 +24,38 @@ from app.models.tenant import Tenant
 from app.models.user import User
 from app.services import agent_tools, media_generation
 from app.services.storage import StorageEntry
+
+
+def _valid_mp4_fixture() -> bytes:
+    """Build a decodable MP4 so the smoke exercises the real media contract."""
+    with tempfile.TemporaryDirectory(prefix="astra-media-smoke-") as temp_dir:
+        output_path = Path(temp_dir) / "fixture.mp4"
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=64x64:d=1",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                "-y",
+                str(output_path),
+            ],
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"Unable to create the MP4 smoke fixture: {detail}")
+        return output_path.read_bytes()
 
 
 class MemoryStorage:
@@ -53,6 +88,7 @@ class MemoryStorage:
 
 
 async def main() -> None:
+    video_bytes = _valid_mp4_fixture()
     tenant_id = uuid.uuid4()
     user_id = uuid.uuid4()
     agent_id = uuid.uuid4()
@@ -133,7 +169,7 @@ async def main() -> None:
         return "https://files.invalid/video"
 
     async def download_file(*_args, **_kwargs):
-        return b"\x00\x00\x00\x18ftypmp42durable-video"
+        return video_bytes
 
     agent_tools._load_minimax_tool_credential_by_id = load_credential
     agent_tools._minimax_retrieve_file_download_url = retrieve_url
@@ -171,7 +207,7 @@ async def main() -> None:
     assert ledger_total == balance.balance
     assert activity_count == 1
     assert notification_count == 1
-    assert storage.objects[f"{agent_id}/workspace/videos/smoke.mp4"].startswith(b"\x00\x00\x00\x18ftyp")
+    assert storage.objects[f"{agent_id}/workspace/videos/smoke.mp4"] == video_bytes
 
     # Editable legacy metadata cannot authorize a provider request or refund.
     # Prove that two concurrent scans create one durable attention record and
@@ -257,7 +293,7 @@ async def main() -> None:
     }).encode()
     storage.objects[
         f"{agent_id}/workspace/videos/legacy-finalized.mp4"
-    ] = b"\x00\x00\x00\x18ftypmp42legacy-video"
+    ] = video_bytes
     finalized_counts = await asyncio.gather(
         media_generation.backfill_legacy_minimax_video_tasks(),
         media_generation.backfill_legacy_minimax_video_tasks(),

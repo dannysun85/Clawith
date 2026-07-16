@@ -157,6 +157,30 @@ async def test_read_file_returns_version_token(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_read_file_returns_binary_placeholder_without_mojibake(monkeypatch):
+    agent_id = uuid.uuid4()
+    raw = b"\x89PNG\r\n\x1a\n\x00\xff\xfeimage-bytes"
+    storage = PrefixOnlyStorage({f"{agent_id}/workspace/product.png": raw})
+    monkeypatch.setattr(files, "get_storage_backend", lambda: storage)
+
+    async def allow_access(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(files, "check_agent_access", allow_access)
+    user = SimpleNamespace(tenant_id=None)
+
+    result = await files.read_file(
+        agent_id,
+        path="workspace/product.png",
+        current_user=user,
+        db=None,
+    )
+
+    assert result.content == f"[二进制文件: product.png, {len(raw)} bytes]"
+    assert "�" not in result.content
+
+
+@pytest.mark.asyncio
 async def test_agent_manager_repairs_partial_s3_prefix_without_overwriting(monkeypatch, tmp_path):
     agent_id = uuid.uuid4()
     storage = PrefixOnlyStorage({f"{agent_id}/soul.md": b"existing"})

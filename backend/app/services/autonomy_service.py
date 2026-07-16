@@ -37,6 +37,7 @@ HIGH_RISK_DEFAULT_L3_ACTIONS = {
 }
 
 APPROVAL_EXECUTION_STALE_AFTER = timedelta(minutes=20)
+APPROVAL_AUTOMATIC_EXECUTION_ENABLED = False
 APPROVAL_EXECUTION_HARD_TIMEOUT_SECONDS = 15 * 60
 APPROVAL_EXECUTION_POLL_SECONDS = 2.0
 APPROVAL_EXECUTION_CONCURRENCY = 4
@@ -166,13 +167,25 @@ def _tool_approval_signature(
     action_type: str,
     tool_name: str,
     arguments: dict,
+    *,
+    payload_version: int,
+    requested_by: uuid.UUID | None = None,
+    origin_session_id: str | None = None,
 ) -> str:
     from app.config import get_settings
 
-    payload = (
-        f"v2\n{agent_id}\n{action_type}\n{tool_name}\n"
-        f"{_canonical_tool_arguments(arguments)}"
-    )
+    if payload_version == 2:
+        payload = (
+            f"v2\n{agent_id}\n{action_type}\n{tool_name}\n"
+            f"{_canonical_tool_arguments(arguments)}"
+        )
+    elif payload_version == 3 and requested_by is not None:
+        payload = (
+            f"v3\n{agent_id}\n{action_type}\n{tool_name}\n{requested_by}\n"
+            f"{origin_session_id or ''}\n{_canonical_tool_arguments(arguments)}"
+        )
+    else:
+        raise ValueError("Approved tool execution context is incomplete")
     return hmac.new(
         get_settings().SECRET_KEY.encode("utf-8"),
         payload.encode("utf-8"),
@@ -186,6 +199,7 @@ def build_tool_approval_details(
     tool_name: str,
     arguments: dict,
     requested_by: uuid.UUID,
+    origin_session_id: str | None = None,
 ) -> dict:
     """Bind the complete immutable tool payload to an HMAC for approval."""
 
@@ -198,8 +212,13 @@ def build_tool_approval_details(
     if not _approval_preview_fits(arguments):
         raise ValueError("Approval payload is too complex to preview safely")
 
+    normalized_requested_by = uuid.UUID(str(requested_by))
+    normalized_origin_session_id = (
+        str(uuid.UUID(str(origin_session_id))) if origin_session_id else None
+    )
+
     return {
-        "payload_version": 2,
+        "payload_version": 3,
         "action_type": action_type,
         "tool": tool_name,
         "args_encrypted": encrypt_data(
@@ -214,9 +233,13 @@ def build_tool_approval_details(
             action_type,
             tool_name,
             arguments,
+            payload_version=3,
+            requested_by=normalized_requested_by,
+            origin_session_id=normalized_origin_session_id,
         ),
         "request_shape": privacy_safe_shape(arguments),
-        "requested_by": str(requested_by),
+        "requested_by": str(normalized_requested_by),
+        "origin_session_id": normalized_origin_session_id,
     }
 
 
@@ -229,7 +252,8 @@ def _verified_tool_arguments(
     from app.config import get_settings
     from app.core.security import decrypt_data
 
-    if details.get("payload_version") != 2:
+    payload_version = details.get("payload_version")
+    if payload_version not in {2, 3}:
         raise ValueError("Approved tool payload version is unsupported; request a new approval")
     action_type = details.get("action_type")
     tool_name = details.get("tool")
@@ -264,12 +288,61 @@ def _verified_tool_arguments(
         actual_hash,
     ):
         raise ValueError("Approved tool payload integrity check failed")
+    requested_by: uuid.UUID | None = None
+    origin_session_id: str | None = None
+    if payload_version == 3:
+        try:
+            requested_by = uuid.UUID(str(details.get("requested_by")))
+            origin_session_id = (
+                str(uuid.UUID(str(details["origin_session_id"])))
+                if details.get("origin_session_id")
+                else None
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Approved tool execution context is incomplete") from exc
+    expected_signature = _tool_approval_signature(
+        agent_id,
+        action_type,
+        tool_name,
+        arguments,
+        payload_version=payload_version,
+        requested_by=requested_by,
+        origin_session_id=origin_session_id,
+    )
     if not isinstance(signature, str) or not hmac.compare_digest(
         signature,
-        _tool_approval_signature(agent_id, action_type, tool_name, arguments),
+        expected_signature,
     ):
         raise ValueError("Approved tool payload integrity check failed")
     return tool_name, arguments
+
+
+def _verified_tool_execution_context(
+    agent_id: uuid.UUID,
+    details: dict,
+    *,
+    expected_action_type: str | None = None,
+) -> tuple[str, dict, uuid.UUID | None, str | None]:
+    """Verify the immutable action plus its effective platform principal."""
+
+    tool_name, arguments = _verified_tool_arguments(
+        agent_id,
+        details,
+        expected_action_type=expected_action_type,
+    )
+    if details.get("payload_version") != 3:
+        if tool_name in {"send_message_to_agent", "send_file_to_agent"}:
+            raise ValueError(
+                "Legacy A2A approval lacks a signed requester; request a new approval"
+            )
+        return tool_name, arguments, None, None
+    requested_by = uuid.UUID(str(details["requested_by"]))
+    origin_session_id = (
+        str(uuid.UUID(str(details["origin_session_id"])))
+        if details.get("origin_session_id")
+        else None
+    )
+    return tool_name, arguments, requested_by, origin_session_id
 
 
 def _approval_request_fingerprint(details: dict) -> str:
@@ -325,11 +398,21 @@ def public_approval_details(
 def approval_to_public_dict(approval: ApprovalRequest, *, agent_name: str | None = None) -> dict:
     """Serialize an approval without exposing encrypted payload internals."""
 
-    projected_details = public_approval_details(
-        approval.agent_id,
-        approval.action_type,
-        approval.details,
-    )
+    if approval.agent_id is None:
+        projected_details = {
+            "payload_state": "invalid",
+            "approvable": False,
+            "message": (
+                "The originating Agent was deleted. This audit record cannot "
+                "be executed."
+            ),
+        }
+    else:
+        projected_details = public_approval_details(
+            approval.agent_id,
+            approval.action_type,
+            approval.details,
+        )
     if approval.execution_status in {"legacy", "invalid"}:
         projected_details = {
             "payload_state": "invalid",
@@ -352,6 +435,12 @@ def approval_to_public_dict(approval: ApprovalRequest, *, agent_name: str | None
         "execution_attempts": approval.execution_attempts,
         "execution_result_summary": approval.execution_result_summary or {},
         "execution_error_code": approval.execution_error_code,
+        "execution_available": APPROVAL_AUTOMATIC_EXECUTION_ENABLED,
+        "execution_paused_reason": (
+            None
+            if APPROVAL_AUTOMATIC_EXECUTION_ENABLED
+            else "automatic_approval_execution_paused_by_release_policy"
+        ),
     }
 
 
@@ -566,6 +655,11 @@ class AutonomyService:
             raise ValueError("Only the agent creator or platform admin can resolve approvals")
 
         if action == "approve":
+            if not APPROVAL_AUTOMATIC_EXECUTION_ENABLED:
+                raise ValueError(
+                    "Automatic approval execution is paused in this release; "
+                    "the action has not been approved or executed"
+                )
             if approval.execution_status in {"legacy", "invalid"}:
                 raise ValueError("Approval payload is invalid; reject it and request a new approval")
             projection = public_approval_details(
@@ -605,9 +699,14 @@ class AutonomyService:
         # Web notification to agent creator about the result
         if agent:
             from app.services.notification_service import send_notification
-            status_label = "approved — queued for execution" if approval.status == "approved" else "rejected"
+            status_label = (
+                "approved — execution paused"
+                if approval.status == "approved"
+                else "rejected"
+            )
             body_text = (
-                "Approval recorded. The action is waiting for the background worker; approval is not execution success."
+                "Approval recorded. Automatic approval execution is paused in "
+                "this release; no side effect has run."
                 if approval.status == "approved"
                 else "Approval rejected. The action will not execute."
             )
@@ -652,6 +751,13 @@ class AutonomyService:
         automatic replay.
         """
 
+        if not APPROVAL_AUTOMATIC_EXECUTION_ENABLED:
+            logger.warning(
+                "Approval automatic execution is paused approval_id={}",
+                approval_id,
+            )
+            return False
+
         claim_token = uuid.uuid4()
         claimed_at = datetime.now(timezone.utc)
         async with async_session() as claim_db:
@@ -688,7 +794,12 @@ class AutonomyService:
         agent_id, action_type, details = claimed
         dispatched = False
         try:
-            tool_name, arguments = _verified_tool_arguments(
+            (
+                tool_name,
+                arguments,
+                requested_by,
+                origin_session_id,
+            ) = _verified_tool_execution_context(
                 agent_id,
                 details or {},
                 expected_action_type=action_type,
@@ -696,6 +807,12 @@ class AutonomyService:
             if not _approval_action_matches_tool(action_type, tool_name):
                 raise ValueError("Approval action does not match its signed tool payload")
             await self._assert_execution_permission(agent_id, tool_name)
+            if requested_by is not None:
+                await self._assert_requester_execution_scope(
+                    agent_id,
+                    requested_by,
+                    origin_session_id,
+                )
 
             from app.services.agent_tools import _execute_approved_tool
 
@@ -707,6 +824,8 @@ class AutonomyService:
                     agent_id,
                     approval_id=approval_id,
                     approval_claim_token=claim_token,
+                    user_id=requested_by,
+                    origin_session_id=origin_session_id,
                 )
         except asyncio.CancelledError:
             await asyncio.shield(
@@ -801,6 +920,47 @@ class AutonomyService:
         code_denial = await _code_tool_denial_reason(tool_name, agent_id)
         if code_denial:
             raise ValueError(code_denial)
+
+    async def _assert_requester_execution_scope(
+        self,
+        agent_id: uuid.UUID,
+        requested_by: uuid.UUID,
+        origin_session_id: str | None,
+    ) -> None:
+        """Revalidate the signed requester and optional originating session."""
+
+        from app.core.permissions import get_agent_access_level_for_user_id
+        from app.models.chat_session import ChatSession
+
+        async with async_session() as permission_db:
+            agent_result = await permission_db.execute(
+                select(Agent).where(Agent.id == agent_id)
+            )
+            agent = agent_result.scalar_one_or_none()
+            if agent is None:
+                raise ValueError("Approval Agent is no longer available")
+            if not await get_agent_access_level_for_user_id(
+                permission_db,
+                requested_by,
+                agent,
+            ):
+                raise ValueError("Approval requester no longer has Agent access")
+            if origin_session_id is None:
+                return
+            session_result = await permission_db.execute(
+                select(ChatSession).where(
+                    ChatSession.id == uuid.UUID(origin_session_id),
+                    ChatSession.user_id == requested_by,
+                    or_(
+                        ChatSession.agent_id == agent_id,
+                        ChatSession.peer_agent_id == agent_id,
+                    ),
+                )
+            )
+            if session_result.scalar_one_or_none() is None:
+                raise ValueError(
+                    "Approval origin session no longer belongs to its requester"
+                )
 
     async def _finish_approval_execution(
         self,
@@ -1331,6 +1491,11 @@ autonomy_service = AutonomyService()
 
 async def start_approval_execution_daemon() -> None:
     """Continuously execute durable approvals on the dedicated worker role."""
+
+    if not APPROVAL_AUTOMATIC_EXECUTION_ENABLED:
+        logger.info("Approval automatic execution is paused by release policy")
+        while True:
+            await asyncio.sleep(3600)
 
     logger.info(
         "Approval execution daemon started poll_interval={}s stale_after={}s",

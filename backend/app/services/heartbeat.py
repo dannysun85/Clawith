@@ -537,8 +537,8 @@ async def _execute_heartbeat(agent_id: uuid.UUID):
             from app.services.activity_logger import log_activity
             await log_activity(
                 agent_id, "heartbeat",
-                f"Heartbeat: {reply[:80]}",
-                detail={"reply": reply[:500]},
+                "Heartbeat completed with follow-up",
+                detail={"reply_chars": len(reply)},
             )
 
         logger.info(
@@ -1055,8 +1055,11 @@ async def run_agent_oneshot(
                 from app.services.activity_logger import log_activity
                 await log_activity(
                     agent_id, "oneshot_task",
-                    f"Oneshot task completed: {reply[:80]}",
-                    detail={"reply": reply[:500], "triggered_by": str(triggered_by_user_id)},
+                    "Oneshot task completed",
+                    detail={
+                        "reply_chars": len(reply),
+                        "triggered_by": str(triggered_by_user_id),
+                    },
                 )
             except Exception:
                 pass

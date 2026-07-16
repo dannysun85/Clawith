@@ -556,8 +556,12 @@ async def _process_wecom_stream_message(
     from app.services.activity_logger import log_activity
     await log_activity(
         agent_id, "chat_reply",
-        f"Replied to WeCom message: {reply_text[:80]}",
-        detail={"channel": "wecom", "user_text": user_text[:200], "reply": reply_text[:500]},
+        "Replied to WeCom message",
+        detail={
+            "channel": "wecom",
+            "request_chars": len(user_text),
+            "reply_chars": len(reply_text),
+        },
     )
 
     return reply_text

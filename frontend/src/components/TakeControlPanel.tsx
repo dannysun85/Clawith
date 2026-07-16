@@ -67,7 +67,6 @@ export default function TakeControlPanel({ agentId, sessionId, onClose, envType 
     const [statusText, setStatusText] = useState(t('takeControl.acquiringControl'));
     const [statusFlashKey, setStatusFlashKey] = useState(0);
     // Domain auto-populated from current page URL; user can still edit
-    const [platformHint, setPlatformHint] = useState('');
     const imgRef = useRef<HTMLImageElement>(null);
     const pollingRef = useRef<number | null>(null);
     const mountedRef = useRef(true);
@@ -85,7 +84,7 @@ export default function TakeControlPanel({ agentId, sessionId, onClose, envType 
     const lockedRef = useRef(false);
     useEffect(() => { lockedRef.current = locked; }, [locked]);
 
-    // Acquire lock on mount, then auto-fetch the current page URL to pre-fill domain
+    // Acquire the shared human-control lock on mount.
     useEffect(() => {
         mountedRef.current = true;
         (async () => {
@@ -95,18 +94,6 @@ export default function TakeControlPanel({ agentId, sessionId, onClose, envType 
                     setLocked(true);
                     setStatusText(t('takeControl.inControl'));
 
-                    // Auto-populate domain from the current active page URL
-                    try {
-                        const urlRes = await controlApi.currentUrl(agentId, { session_id: sessionId });
-                        if (urlRes.url) {
-                            const hostname = new URL(urlRes.url).hostname.replace(/^www\./, '');
-                            if (hostname && hostname !== 'about:blank' && hostname !== '') {
-                                setPlatformHint(hostname);
-                            }
-                        }
-                    } catch {
-                        // Non-fatal — user can type it manually
-                    }
                 }
             } catch (e: any) {
                 if (mountedRef.current) {
@@ -155,7 +142,7 @@ export default function TakeControlPanel({ agentId, sessionId, onClose, envType 
             }
             // Schedule next poll after this one completes (sequential, not interval)
             if (!cancelled) {
-                pollingRef.current = window.setTimeout(poll, 400);
+                pollingRef.current = window.setTimeout(poll, 1000);
             }
         };
 
@@ -299,12 +286,12 @@ export default function TakeControlPanel({ agentId, sessionId, onClose, envType 
         }
     }, [locked, agentId, sessionId, flashStatus]);
 
-    // Complete login — export cookies and close
+    // Complete human control and hand the existing sandbox back to the Agent.
     const handleComplete = useCallback(async () => {
         if (!locked) return;
         setLocked(false);
         lockedRef.current = false;  // Prevent unmount cleanup from double-unlocking
-        flashStatus(t('takeControl.exportingCookies'));
+        flashStatus(t('takeControl.finishingControl'));
         try {
             // Fetch one final high-quality screenshot to hand off to the live preview
             try {
@@ -320,14 +307,9 @@ export default function TakeControlPanel({ agentId, sessionId, onClose, envType 
             
             const res = await controlApi.unlock(agentId, {
                 session_id: sessionId,
-                export_cookies: true,
-                platform_hint: platformHint || undefined,
+                export_cookies: false,
             });
-            flashStatus(
-                res.cookies_exported
-                    ? t('takeControl.loginComplete', { count: res.cookie_count })
-                    : t('takeControl.sessionUnlocked')
-            );
+            flashStatus(t('takeControl.sessionUnlocked'));
             // Pass the last screenshot to the parent so live preview updates
             if (lastScreenshotRef.current && onLastScreenshot) {
                 console.log('[TakeControl] Passing last screenshot to parent on complete, size:', lastScreenshotRef.current.length);
@@ -342,7 +324,7 @@ export default function TakeControlPanel({ agentId, sessionId, onClose, envType 
             setLocked(true);
             lockedRef.current = true;
         }
-    }, [locked, agentId, sessionId, platformHint, onClose, onLastScreenshot, flashStatus]);
+    }, [locked, agentId, sessionId, onClose, onLastScreenshot, flashStatus]);
 
     // Handle cancel
     const handleCancel = useCallback(async () => {
@@ -498,16 +480,6 @@ export default function TakeControlPanel({ agentId, sessionId, onClose, envType 
 
                 {/* ── Action bar ── */}
                 <div className="tc-action-bar">
-                    <div className="tc-domain-row">
-                        <span className="tc-domain-label">{t('takeControl.saveLoginStateTo')}</span>
-                        <input
-                            className="tc-domain-input"
-                            type="text"
-                            value={platformHint}
-                            onChange={(e) => setPlatformHint(e.target.value)}
-                            placeholder="example.com"
-                        />
-                    </div>
                     <div className="tc-action-buttons">
                         <button className="tc-btn-cancel" onClick={handleCancel}>
                             {t('takeControl.exit')}
@@ -517,7 +489,7 @@ export default function TakeControlPanel({ agentId, sessionId, onClose, envType 
                             onClick={handleComplete}
                             disabled={!locked}
                         >
-                            {SaveIcon} {t('takeControl.saveLoginState')}
+                            {SaveIcon} {t('takeControl.finishControl')}
                         </button>
                     </div>
                 </div>
@@ -839,4 +811,3 @@ const takeControlStyles = `
 .tc-btn-save:hover { background: #4338ca; box-shadow: 0 2px 12px rgba(79,70,229,0.5); }
 .tc-btn-save:disabled { opacity: 0.35; cursor: not-allowed; box-shadow: none; }
 `;
-

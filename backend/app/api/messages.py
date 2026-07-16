@@ -46,6 +46,7 @@ async def get_inbox(
         select(ChatSession)
         .where(
             ChatSession.source_channel == "agent",
+            ChatSession.user_id == current_user.id,
             (ChatSession.agent_id.in_(my_agent_ids)) | (ChatSession.peer_agent_id.in_(my_agent_ids)),
         )
         .order_by(ChatSession.last_message_at.desc().nullslast())

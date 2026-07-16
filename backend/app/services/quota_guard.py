@@ -421,25 +421,42 @@ async def check_plan_inference_entitlement(
 
     Raises QuotaExceeded(quota_type="model_modality" | "model_tier") on denial.
     """
+    from app.core.permissions import is_agent_expired
     from app.models.agent import Agent
+    from app.models.tenant import Tenant
+    from app.models.user import User
 
     if not agent_id:
         return
 
     async with async_session() as db:
-        result = await db.execute(select(Agent.tenant_id, Agent.status).where(Agent.id == agent_id))
+        result = await db.execute(
+            select(Agent, Tenant.is_active, User.is_active)
+            .outerjoin(Tenant, Tenant.id == Agent.tenant_id)
+            .outerjoin(User, User.id == Agent.creator_id)
+            .where(Agent.id == agent_id)
+        )
         row = result.one_or_none()
     if not row:
         return
-    tenant_id, status = row
-    # Stopped agents (subscription downgrade/expiry) must not call LLM (3.6).
-    if status == "stopped":
+    agent, tenant_is_active, creator_is_active = row
+    tenant_id = agent.tenant_id
+    if (
+        agent.status not in {"running", "idle"}
+        or is_agent_expired(agent)
+        or not creator_is_active
+    ):
         raise QuotaExceeded(
-            subscription_action_message("该 Agent 已停止（订阅降级或套餐数量超限），无法继续执行。"),
+            subscription_action_message("该 Agent 或其账号当前不可用，无法继续执行。"),
             quota_type="agent_stopped",
         )
     if not tenant_id:
         return
+    if not tenant_is_active:
+        raise QuotaExceeded(
+            subscription_action_message("当前公司已停用，无法继续执行。"),
+            quota_type="company_inactive",
+        )
 
     ent = await get_tenant_entitlements(tenant_id)
     if not ent:
@@ -478,23 +495,41 @@ async def check_plan_generation_entitlement(
     and pooled credentials are routing infrastructure; authorization remains
     attached to the SaaS generation capability and Lite / Pro / Ultra tier.
     """
+    from app.core.permissions import is_agent_expired
     from app.models.agent import Agent
+    from app.models.tenant import Tenant
+    from app.models.user import User
 
     if not agent_id:
         return
     async with async_session() as db:
-        result = await db.execute(select(Agent.tenant_id, Agent.status).where(Agent.id == agent_id))
+        result = await db.execute(
+            select(Agent, Tenant.is_active, User.is_active)
+            .outerjoin(Tenant, Tenant.id == Agent.tenant_id)
+            .outerjoin(User, User.id == Agent.creator_id)
+            .where(Agent.id == agent_id)
+        )
         row = result.one_or_none()
     if not row:
         return
-    tenant_id, status = row
-    if status == "stopped":
+    agent, tenant_is_active, creator_is_active = row
+    tenant_id = agent.tenant_id
+    if (
+        agent.status not in {"running", "idle"}
+        or is_agent_expired(agent)
+        or not creator_is_active
+    ):
         raise QuotaExceeded(
-            subscription_action_message("该 Agent 已停止（订阅降级或套餐数量超限），无法继续执行。"),
+            subscription_action_message("该 Agent 或其账号当前不可用，无法继续执行。"),
             quota_type="agent_stopped",
         )
     if not tenant_id:
         return
+    if not tenant_is_active:
+        raise QuotaExceeded(
+            subscription_action_message("当前公司已停用，无法继续执行。"),
+            quota_type="company_inactive",
+        )
 
     ent = await get_tenant_entitlements(tenant_id)
     if not ent:

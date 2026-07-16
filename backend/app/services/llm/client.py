@@ -17,26 +17,10 @@ import httpx
 from loguru import logger
 
 from app.core.logging_config import privacy_safe_shape
+from app.services.llm.provider_acceptance import (
+    is_minimax_deterministic_rejection_code,
+)
 
-
-# MiniMax returns provider business failures inside HTTP 200 responses.  Only
-# codes that prove the request was rejected before generation may clear a
-# Credits provider-inflight hold.  Transient/internal codes intentionally stay
-# ambiguous because replaying them can duplicate accepted provider work.
-_MINIMAX_DETERMINISTIC_REJECTION_CODES = frozenset({
-    "1002",  # rate limit
-    "1004",  # authentication
-    "1008",  # insufficient balance
-    "1026",  # input policy
-    "1027",  # output policy
-    "1039",  # token limit / validation
-    "1041",  # concurrent request limit
-    "2013",  # invalid parameter
-    "2045",  # request growth limit
-    "2049",  # invalid API key
-    "2056",  # Token Plan resource exhausted
-    "2062",  # Token Plan high-traffic rejection
-})
 
 _DETERMINISTIC_PROVIDER_ERROR_TYPES = frozenset({
     "authentication_error",
@@ -294,7 +278,7 @@ class LLMClient(ABC):
         """Return whether an HTTP-200 error proves pre-generation rejection."""
 
         if provider_code is not None:
-            return str(provider_code) in _MINIMAX_DETERMINISTIC_REJECTION_CODES
+            return is_minimax_deterministic_rejection_code(provider_code)
 
         if not isinstance(error, dict):
             return False

@@ -20,6 +20,12 @@ from app.models.task import Task, TaskLog
 from app.models.agent import Agent
 from app.services.llm import LLMError
 
+# Fail closed for v1.10.12 RC5. The previous implementation held database
+# transactions across LLM/provider calls and had no durable exactly-once claim,
+# so enabling it could duplicate sends, token spend, and Credits settlement.
+# Re-enabling requires a separate durable-worker design and explicit release.
+SUPERVISION_EXECUTION_ENABLED = False
+
 # Schedule JSON format:
 # {"freq": "daily"|"weekly", "interval": N, "time": "HH:MM", "weekdays": [0-6]}
 # weekdays: 0=Sun, 1=Mon, ..., 6=Sat
@@ -99,7 +105,13 @@ def _is_reminder_due(remind_schedule: str, last_reminded_at: datetime | None, no
     return elapsed >= min_interval
 
 
-async def _get_agent_reply(target_agent, message: str, db) -> str | None:
+async def _get_agent_reply(
+    target_agent,
+    message: str,
+    db,
+    *,
+    owner_user_id,
+) -> str | None:
     """Call target agent's LLM to generate a reply to a supervision reminder.
 
     Returns the reply text, or None if the agent can't respond.
@@ -154,7 +166,7 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
     try:
         round_reservation_id = await reserve_llm_round_credits(
             tenant_id=invocation.tenant_id,
-            user_id=target_agent.creator_id,
+            user_id=owner_user_id,
             agent_id=target_agent.id,
             model=model,
             route_meta=invocation.route_meta,
@@ -181,7 +193,7 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
                 model=model,
                 route_meta=invocation.route_meta,
                 agent_id=target_agent.id,
-                user_id=target_agent.creator_id,
+                user_id=owner_user_id,
                 tenant_id=invocation.tenant_id,
             )
         except Exception:
@@ -195,7 +207,7 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
             model=model,
             route_meta=invocation.route_meta,
             agent_id=target_agent.id,
-            user_id=target_agent.creator_id,
+            user_id=owner_user_id,
             tenant_id=invocation.tenant_id,
             provider_failed=not llm_provider_may_have_accepted(client),
         )
@@ -206,7 +218,7 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
             model=model,
             route_meta=invocation.route_meta,
             agent_id=target_agent.id,
-            user_id=target_agent.creator_id,
+            user_id=owner_user_id,
             tenant_id=invocation.tenant_id,
             provider_failed=not llm_provider_may_have_accepted(client),
         )
@@ -217,7 +229,7 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
             model=model,
             route_meta=invocation.route_meta,
             agent_id=target_agent.id,
-            user_id=target_agent.creator_id,
+            user_id=owner_user_id,
             tenant_id=invocation.tenant_id,
             provider_failed=not llm_provider_may_have_accepted(client),
         )
@@ -242,7 +254,7 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
                 await settle_agent_llm_invocation(
                     invocation,
                     agent_id=target_agent.id,
-                    user_id=target_agent.creator_id,
+                    user_id=owner_user_id,
                     usage=usage,
                 )
             except Exception as e:
@@ -255,12 +267,18 @@ async def _get_agent_reply(target_agent, message: str, db) -> str | None:
 
 async def _send_supervision_reminder(task: Task, agent_name: str):
     """Send a single supervision reminder. Target can be an Agent or a Member."""
+    if not SUPERVISION_EXECUTION_ENABLED:
+        raise RuntimeError("Supervision execution is disabled by release policy")
     try:
         from app.models.agent import Agent
-        from app.models.org import AgentRelationship
+        from app.models.org import AgentAgentRelationship, AgentRelationship
         from app.models.channel_config import ChannelConfig
         from app.models.activity_log import AgentActivityLog
         from app.services.feishu_service import feishu_service
+        from app.core.permissions import (
+            evaluate_agent_relationship_status,
+            get_agent_access_level_for_user_id,
+        )
         from sqlalchemy.orm import selectinload
         import json as _json
 
@@ -284,12 +302,69 @@ async def _send_supervision_reminder(task: Task, agent_name: str):
         async with async_session() as db:
             sent = False
             send_method = ""
-
-            # 1. Try to find target as an Agent
-            agent_result = await db.execute(
-                select(Agent).where(Agent.name == target_name)
+            owner_id = task.created_by
+            src_agent_r = await db.execute(
+                select(Agent).where(Agent.id == task.agent_id)
             )
-            target_agent = agent_result.scalar_one_or_none()
+            src_agent = src_agent_r.scalar_one_or_none()
+            if src_agent is None or not await get_agent_access_level_for_user_id(
+                db,
+                owner_id,
+                src_agent,
+            ):
+                logger.warning(
+                    "Supervision requester lost source Agent access task={}",
+                    task.id,
+                )
+                return
+
+            # 1. Resolve an Agent only through the source Agent's exact,
+            # same-tenant relationship.  Names alone are not an identity.
+            agent_relation_result = await db.execute(
+                select(AgentAgentRelationship)
+                .join(
+                    Agent,
+                    Agent.id == AgentAgentRelationship.target_agent_id,
+                )
+                .where(
+                    AgentAgentRelationship.agent_id == task.agent_id,
+                    Agent.name == target_name,
+                    Agent.tenant_id == src_agent.tenant_id,
+                )
+                .options(selectinload(AgentAgentRelationship.target_agent))
+            )
+            agent_relations = agent_relation_result.scalars().all()
+            if len(agent_relations) > 1:
+                logger.warning(
+                    "Supervision target name is ambiguous task={} target={}",
+                    task.id,
+                    target_name,
+                )
+                return
+            target_relation = agent_relations[0] if agent_relations else None
+            target_agent = (
+                target_relation.target_agent if target_relation else None
+            )
+            if target_agent:
+                relationship_status = await evaluate_agent_relationship_status(
+                    db,
+                    target_relation,
+                    current_user_id=owner_id,
+                )
+                if (
+                    relationship_status["access_status"] != "active"
+                    or not await get_agent_access_level_for_user_id(
+                        db,
+                        owner_id,
+                        target_agent,
+                    )
+                ):
+                    logger.warning(
+                        "Supervision target access revoked task={} target={}",
+                        task.id,
+                        target_agent.id,
+                    )
+                    return
 
             if target_agent:
                 # Send agent-to-agent message via ChatSession + ChatMessage
@@ -314,15 +389,27 @@ async def _send_supervision_reminder(task: Task, agent_name: str):
                     select(ChatSession).where(
                         ChatSession.agent_id == session_agent_id,
                         ChatSession.peer_agent_id == session_peer_id,
+                        ChatSession.user_id == owner_id,
                         ChatSession.source_channel == "agent",
                     )
                 )
                 chat_session = sess_r.scalar_one_or_none()
                 if not chat_session:
-                    # Get creator for user_id
-                    src_agent_r = await db.execute(select(Agent).where(Agent.id == task.agent_id))
-                    src_agent = src_agent_r.scalar_one_or_none()
-                    owner_id = src_agent.creator_id if src_agent else task.agent_id
+                    await db.execute(
+                        select(Agent.id)
+                        .where(Agent.id == session_agent_id)
+                        .with_for_update()
+                    )
+                    sess_r = await db.execute(
+                        select(ChatSession).where(
+                            ChatSession.agent_id == session_agent_id,
+                            ChatSession.peer_agent_id == session_peer_id,
+                            ChatSession.user_id == owner_id,
+                            ChatSession.source_channel == "agent",
+                        )
+                    )
+                    chat_session = sess_r.scalar_one_or_none()
+                if not chat_session:
                     chat_session = ChatSession(
                         agent_id=session_agent_id,
                         user_id=owner_id,
@@ -335,9 +422,6 @@ async def _send_supervision_reminder(task: Task, agent_name: str):
                     await db.flush()
 
                 session_id = str(chat_session.id)
-                src_agent_r2 = await db.execute(select(Agent).where(Agent.id == task.agent_id))
-                src_agent2 = src_agent_r2.scalar_one_or_none()
-                owner_id = src_agent2.creator_id if src_agent2 else task.agent_id
 
                 # Save reminder message
                 db.add(ChatMessage(
@@ -353,7 +437,12 @@ async def _send_supervision_reminder(task: Task, agent_name: str):
 
                 # Trigger target agent's LLM to generate a reply
                 try:
-                    reply = await _get_agent_reply(target_agent, reminder_msg, db)
+                    reply = await _get_agent_reply(
+                        target_agent,
+                        reminder_msg,
+                        db,
+                        owner_user_id=owner_id,
+                    )
                     if reply:
                         db.add(ChatMessage(
                             agent_id=session_agent_id, user_id=owner_id,
@@ -361,7 +450,7 @@ async def _send_supervision_reminder(task: Task, agent_name: str):
                             conversation_id=session_id,
                             participant_id=tgt_part.id if tgt_part else None,
                         ))
-                        send_method = f"agent消息+回复({reply[:40]})"
+                        send_method = "agent消息+回复"
                         logger.info(
                             "📋 Target agent replied agent={} reply_chars={}",
                             target_agent.id,
@@ -446,6 +535,9 @@ async def _send_supervision_reminder(task: Task, agent_name: str):
 
 async def _supervision_tick():
     """One tick: check all supervision tasks and send due reminders."""
+    if not SUPERVISION_EXECUTION_ENABLED:
+        logger.info("[supervision] execution disabled by release policy")
+        return
     logger.info("[supervision] tick running...")
     from app.services.audit_logger import write_audit_log
 
@@ -501,6 +593,9 @@ async def _supervision_tick():
 
 async def start_supervision_reminder():
     """Start the background supervision reminder loop. Call from FastAPI startup."""
+    if not SUPERVISION_EXECUTION_ENABLED:
+        logger.info("[supervision] service not started: release policy is Code-off/automation-off")
+        return
     logger.info("📋 [supervision] Reminder service started (60s tick)")
     logger.info("📋 Supervision reminder service started (60s tick)")
     while True:

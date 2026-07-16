@@ -31,9 +31,12 @@ import { displaySessionTitle } from '../../utils/sessionDisplay';
 import { appendUniqueById, safeWorkspaceMediaPath } from '../../utils/mediaCompletion';
 import {
     activeSessionMatchesRequestedSession,
+    awaitCurrentChatPagination,
+    chatPaginationRequestIdentityIsCurrent,
     chatSessionRequestIdentityIsCurrent,
     chatHistoryIsReady,
     mergeLoadedHistoryWithLiveMessages,
+    resolveChatHistoryCursor,
     resolveRequestedChatSession,
     searchForSelectedChatSession,
     shouldRetrySessionHistoryResponse,
@@ -287,8 +290,10 @@ function synthesizeFocusForTrigger(trig: any): FocusItem {
         description: key === 'system:okr_reports'
             ? 'OKR 自动汇总、日报收集与周期报告'
             : trig.reason || trig.name || key,
-        done: !trig.is_enabled && !isSystem,
-        inProgress: false,
+        // Disabled trigger configuration is not evidence that the business
+        // objective completed.
+        done: false,
+        inProgress: !!trig.is_enabled,
         section: isSystem ? 'system' : 'active',
         synthetic: true,
         system: isSystem,
@@ -2094,13 +2099,15 @@ export default function AgentDetailPage() {
     const [sidePanelTab, setSidePanelTab] = useState<SidePanelTab>('workspace');
     const awarePanelVisible = activeTab === 'chat' && livePanelVisible && sidePanelTab === 'aware';
     const awareDataActive = activeTab === 'aware' || awarePanelVisible;
+    const awareAutomaticRefreshEnabled = awareDataActive
+        && agent?.execution_capabilities?.trigger_execution === true;
 
     // ── Aware tab data: triggers ──
     const { data: awareTriggers = [], refetch: refetchTriggers } = useQuery({
         queryKey: ['triggers', id],
         queryFn: () => triggerApi.list(id!),
         enabled: !!id && awareDataActive,
-        refetchInterval: awareDataActive ? 5000 : false,
+        refetchInterval: awareAutomaticRefreshEnabled ? 5000 : false,
     });
 
     // ── Aware tab data: structured Focus ──
@@ -2108,7 +2115,7 @@ export default function AgentDetailPage() {
         queryKey: ['focus', id],
         queryFn: () => focusApi.list(id!, true),
         enabled: !!id && awareDataActive,
-        refetchInterval: awareDataActive ? 5000 : false,
+        refetchInterval: awareAutomaticRefreshEnabled ? 5000 : false,
     });
 
     // ── Aware tab data: task_history.md ──
@@ -2129,7 +2136,7 @@ export default function AgentDetailPage() {
             return all.filter((s: any) => s.source_channel === 'trigger');
         },
         enabled: !!id && awareDataActive,
-        refetchInterval: awareDataActive ? 10000 : false,
+        refetchInterval: awareAutomaticRefreshEnabled ? 10000 : false,
     });
 
     // ── Aware tab state ──
@@ -2194,12 +2201,14 @@ export default function AgentDetailPage() {
     const scopeDropdownRef = useRef<HTMLDivElement>(null);
     const [historyMsgs, setHistoryMsgs] = useState<any[]>([]);
     const [historyOldestTimestamp, setHistoryOldestTimestamp] = useState<string | null>(null);
+    const [historyOldestMessageId, setHistoryOldestMessageId] = useState<string | null>(null);
     const [historyHasMore, setHistoryHasMore] = useState(true);
     const [historyLoadingMore, setHistoryLoadingMore] = useState(false);
     const HISTORY_PAGE_SIZE = 20;
     const SESSION_HISTORY_LOAD_ATTEMPTS = 3;
     // Chat history pagination state (for writable/live sessions)
     const [chatOldestTimestamp, setChatOldestTimestamp] = useState<string | null>(null);
+    const [chatOldestMessageId, setChatOldestMessageId] = useState<string | null>(null);
     const [chatHistoryHasMore, setChatHistoryHasMore] = useState(true);
     const [chatHistoryLoadingMore, setChatHistoryLoadingMore] = useState(false);
     const [chatHistoryReadyRuntimeKey, setChatHistoryReadyRuntimeKey] = useState<string | null>(null);
@@ -2224,6 +2233,8 @@ export default function AgentDetailPage() {
     const activeSessionIdRef = useRef<string | null>(null);
     const currentAgentIdRef = useRef<string | undefined>(id);
     const sessionMsgAbortRef = useRef<AbortController | null>(null);
+    const historyPaginationAbortRef = useRef<AbortController | null>(null);
+    const chatPaginationAbortRef = useRef<AbortController | null>(null);
     const sessionLoadSeqRef = useRef(0);
     const modelSelectionSaveSeqRef = useRef(0);
     const modelSelectionAbortControllersRef = useRef<Set<AbortController>>(new Set());
@@ -2493,10 +2504,15 @@ export default function AgentDetailPage() {
     }, [scopeDropdownOpen]);
 
     const clearChatSelection = () => {
+        historyPaginationAbortRef.current?.abort();
+        historyPaginationAbortRef.current = null;
+        chatPaginationAbortRef.current?.abort();
+        chatPaginationAbortRef.current = null;
         activeSessionIdRef.current = null;
         setActiveSession(null);
         setChatMessages([]);
         setChatOldestTimestamp(null);
+        setChatOldestMessageId(null);
         setChatHistoryHasMore(true);
         setChatHistoryLoadingMore(false);
         setChatHistoryReadyRuntimeKey(null);
@@ -2610,6 +2626,10 @@ export default function AgentDetailPage() {
         const targetAgentId = id;
         if (!targetAgentId) return;
         const sessionId = String(sess.id);
+        historyPaginationAbortRef.current?.abort();
+        historyPaginationAbortRef.current = null;
+        chatPaginationAbortRef.current?.abort();
+        chatPaginationAbortRef.current = null;
         activeSessionIdRef.current = sessionId;
         if (syncLocation) {
             navigate({
@@ -2627,11 +2647,13 @@ export default function AgentDetailPage() {
         pendingHistoryInitialScrollRef.current = !writable;
         setChatMessages([]);
         setChatOldestTimestamp(null);
+        setChatOldestMessageId(null);
         setChatHistoryHasMore(true);
         setChatHistoryLoadingMore(false);
         setChatHistoryReadyRuntimeKey(null);
         setHistoryMsgs([]);
         setHistoryOldestTimestamp(null);
+        setHistoryOldestMessageId(null);
         setHistoryHasMore(true);
         setHistoryLoadingMore(false);
         setIsStreaming(runtimeState.isStreaming);
@@ -2649,6 +2671,7 @@ export default function AgentDetailPage() {
         try {
             const tkn = localStorage.getItem('token');
             let msgs: any[] | null = null;
+            let responseHeaders: Headers | null = null;
             for (let attempt = 0; attempt < SESSION_HISTORY_LOAD_ATTEMPTS; attempt += 1) {
                 try {
                     const res = await fetch(`/api/agents/${targetAgentId}/sessions/${sess.id}/messages?limit=${HISTORY_PAGE_SIZE}`, {
@@ -2665,6 +2688,7 @@ export default function AgentDetailPage() {
                             return;
                         }
                     } else {
+                        responseHeaders = res.headers;
                         msgs = await res.json();
                         break;
                     }
@@ -2687,17 +2711,22 @@ export default function AgentDetailPage() {
                 ...(m.id && { id: m.id }),
             }));
 
-            // Set the oldest message timestamp for cursor-based pagination
-            const oldestTimestamp = msgs.length > 0 ? msgs[0].created_at : null;
+            const historyCursor = resolveChatHistoryCursor(
+                responseHeaders || new Headers(),
+                msgs,
+                HISTORY_PAGE_SIZE,
+            );
 
             if (writable) {
                 setChatMessages((current) => mergeLoadedHistoryWithLiveMessages(preParsed, current));
-                setChatOldestTimestamp(oldestTimestamp);
-                setChatHistoryHasMore(msgs.length >= HISTORY_PAGE_SIZE);
+                setChatOldestTimestamp(historyCursor.before);
+                setChatOldestMessageId(historyCursor.beforeId);
+                setChatHistoryHasMore(historyCursor.hasMore);
             } else {
                 setHistoryMsgs(preParsed);
-                setHistoryOldestTimestamp(oldestTimestamp);
-                setHistoryHasMore(msgs.length >= HISTORY_PAGE_SIZE);
+                setHistoryOldestTimestamp(historyCursor.before);
+                setHistoryOldestMessageId(historyCursor.beforeId);
+                setHistoryHasMore(historyCursor.hasMore);
             }
             setChatHistoryReadyRuntimeKey(runtimeKey);
             // The backend marks the session as read when the current user opens it. Mirror that
@@ -2752,17 +2781,7 @@ export default function AgentDetailPage() {
             if (id) closeSessionSocket(buildSessionRuntimeKey(id, sessionId), true);
             // If deleted the active session, clear it
             if (activeSession?.id === sessionId) {
-                activeSessionIdRef.current = null;
-                setActiveSession(null);
-                setChatMessages([]);
-                setChatOldestTimestamp(null);
-                setChatHistoryHasMore(true);
-                setChatHistoryLoadingMore(false);
-                setChatHistoryReadyRuntimeKey(null);
-                setHistoryMsgs([]);
-                setWsConnected(false);
-                setIsStreaming(false);
-                setIsWaiting(false);
+                clearChatSelection();
             }
             await fetchMySessions(false, id);
             if (canViewAllAgentChatSessions) await fetchAllSessions();
@@ -3167,10 +3186,15 @@ export default function AgentDetailPage() {
     // Existing background sockets keep running and will be cleaned up on unmount.
     useEffect(() => {
         sessionMsgAbortRef.current?.abort();
+        historyPaginationAbortRef.current?.abort();
+        historyPaginationAbortRef.current = null;
+        chatPaginationAbortRef.current?.abort();
+        chatPaginationAbortRef.current = null;
         activeSessionIdRef.current = null;
         setActiveSession(null);
         setChatMessages([]);
         setChatOldestTimestamp(null);
+        setChatOldestMessageId(null);
         setChatHistoryHasMore(true);
         setChatHistoryLoadingMore(false);
         setChatHistoryReadyRuntimeKey(null);
@@ -3202,10 +3226,15 @@ export default function AgentDetailPage() {
         setAllSessions([]);
         setChatScope('mine');
         sessionMsgAbortRef.current?.abort();
+        historyPaginationAbortRef.current?.abort();
+        historyPaginationAbortRef.current = null;
+        chatPaginationAbortRef.current?.abort();
+        chatPaginationAbortRef.current = null;
         activeSessionIdRef.current = null;
         setActiveSession(null);
         setChatMessages([]);
         setChatOldestTimestamp(null);
+        setChatOldestMessageId(null);
         setChatHistoryHasMore(true);
         setChatHistoryLoadingMore(false);
         setChatHistoryReadyRuntimeKey(null);
@@ -3775,6 +3804,8 @@ export default function AgentDetailPage() {
     useEffect(() => {
         return () => {
             sessionMsgAbortRef.current?.abort();
+            historyPaginationAbortRef.current?.abort();
+            chatPaginationAbortRef.current?.abort();
             Object.keys(reconnectDisabledRef.current).forEach((key) => { reconnectDisabledRef.current[key] = true; });
             Object.keys(reconnectTimerRef.current).forEach((key) => clearReconnectTimer(key));
             Object.values(wsMapRef.current).forEach((ws) => {
@@ -3865,23 +3896,54 @@ export default function AgentDetailPage() {
     }, []);
 
     const loadMoreHistoryMessages = useCallback(async () => {
-        if (historyLoadingMore || !historyHasMore || !activeSession || !id || !historyOldestTimestamp) return;
+        if (historyLoadingMore || !historyHasMore || !activeSession || !id || !historyOldestTimestamp || !historyOldestMessageId) return;
         const sess = activeSession;
         const targetAgentId = id;
+        const requestSessionId = String(sess.id);
+        const requestToken = token || '';
+        const requestIdentity = {
+            userId: currentUser?.id,
+            token: requestToken,
+            agentId: targetAgentId,
+            sessionId: requestSessionId,
+        };
+        const getCurrentIdentity = () => {
+            const auth = useAuthStore.getState();
+            return {
+                userId: auth.user?.id,
+                token: auth.token,
+                agentId: currentAgentIdRef.current,
+                sessionId: activeSessionIdRef.current,
+            };
+        };
+        if (!chatPaginationRequestIdentityIsCurrent(requestIdentity, getCurrentIdentity())) return;
+        historyPaginationAbortRef.current?.abort();
+        const controller = new AbortController();
+        historyPaginationAbortRef.current = controller;
         setHistoryLoadingMore(true);
         try {
-            const tkn = localStorage.getItem('token');
-            const res = await fetch(`/api/agents/${targetAgentId}/sessions/${sess.id}/messages?limit=${HISTORY_PAGE_SIZE}&before=${encodeURIComponent(historyOldestTimestamp)}`, {
-                headers: { Authorization: `Bearer ${tkn}` },
+            const res = await fetch(`/api/agents/${targetAgentId}/sessions/${requestSessionId}/messages?limit=${HISTORY_PAGE_SIZE}&before=${encodeURIComponent(historyOldestTimestamp)}&before_id=${encodeURIComponent(historyOldestMessageId)}`, {
+                headers: { Authorization: `Bearer ${requestToken}` },
+                signal: controller.signal,
             });
+            if (!chatPaginationRequestIdentityIsCurrent(requestIdentity, getCurrentIdentity())) return;
             if (!res.ok) return;
-            const msgs = await res.json();
-            // Validate session is still active after async fetch
-            if (activeSession?.id !== sess.id) return;
+            const msgs = await awaitCurrentChatPagination<any[]>(
+                () => res.json(),
+                requestIdentity,
+                getCurrentIdentity,
+                controller.signal,
+            );
+            if (msgs === null) return;
             if (msgs.length === 0) {
                 setHistoryHasMore(false);
                 return;
             }
+            const historyCursor = resolveChatHistoryCursor(
+                res.headers,
+                msgs,
+                HISTORY_PAGE_SIZE,
+            );
             const preParsed = msgs.map((m: any) => parseChatMsg({
                 role: m.role, content: m.content || '',
                 ...(m.toolName && { toolName: m.toolName, toolArgs: m.toolArgs, toolStatus: m.toolStatus, toolResult: m.toolResult, toolThinking: m.toolThinking }),
@@ -3894,40 +3956,81 @@ export default function AgentDetailPage() {
             const oldScrollHeight = el?.scrollHeight ?? 0;
             setHistoryMsgs(prev => [...preParsed, ...prev]);
             // Update the oldest timestamp (first message in the new batch, since messages are in chronological order)
-            setHistoryOldestTimestamp(msgs[0].created_at);
-            setHistoryHasMore(msgs.length >= HISTORY_PAGE_SIZE);
+            setHistoryOldestTimestamp(historyCursor.before);
+            setHistoryOldestMessageId(historyCursor.beforeId);
+            setHistoryHasMore(historyCursor.hasMore);
             // Restore scroll position after new messages are prepended
             requestAnimationFrame(() => {
-                if (el) {
+                if (
+                    el
+                    && chatPaginationRequestIdentityIsCurrent(requestIdentity, getCurrentIdentity())
+                ) {
                     const newScrollHeight = el.scrollHeight;
                     el.scrollTop = newScrollHeight - oldScrollHeight;
                 }
             });
         } catch (err: any) {
+            if (err?.name === 'AbortError') return;
             console.error('Failed to load more history messages:', err);
         } finally {
-            setHistoryLoadingMore(false);
+            if (historyPaginationAbortRef.current === controller) {
+                historyPaginationAbortRef.current = null;
+                if (chatPaginationRequestIdentityIsCurrent(requestIdentity, getCurrentIdentity())) {
+                    setHistoryLoadingMore(false);
+                }
+            }
         }
-    }, [historyLoadingMore, historyHasMore, activeSession, id, historyOldestTimestamp]);
+    }, [historyLoadingMore, historyHasMore, activeSession, id, historyOldestTimestamp, historyOldestMessageId, token, currentUser?.id]);
 
     const loadMoreChatHistoryMessages = useCallback(async () => {
-        if (chatHistoryLoadingMore || !chatHistoryHasMore || !activeSession || !id || !chatOldestTimestamp) return;
+        if (chatHistoryLoadingMore || !chatHistoryHasMore || !activeSession || !id || !chatOldestTimestamp || !chatOldestMessageId) return;
         const sess = activeSession;
         const targetAgentId = id;
+        const requestSessionId = String(sess.id);
+        const requestToken = token || '';
+        const requestIdentity = {
+            userId: currentUser?.id,
+            token: requestToken,
+            agentId: targetAgentId,
+            sessionId: requestSessionId,
+        };
+        const getCurrentIdentity = () => {
+            const auth = useAuthStore.getState();
+            return {
+                userId: auth.user?.id,
+                token: auth.token,
+                agentId: currentAgentIdRef.current,
+                sessionId: activeSessionIdRef.current,
+            };
+        };
+        if (!chatPaginationRequestIdentityIsCurrent(requestIdentity, getCurrentIdentity())) return;
+        chatPaginationAbortRef.current?.abort();
+        const controller = new AbortController();
+        chatPaginationAbortRef.current = controller;
         setChatHistoryLoadingMore(true);
         try {
-            const tkn = localStorage.getItem('token');
-            const res = await fetch(`/api/agents/${targetAgentId}/sessions/${sess.id}/messages?limit=${HISTORY_PAGE_SIZE}&before=${encodeURIComponent(chatOldestTimestamp)}`, {
-                headers: { Authorization: `Bearer ${tkn}` },
+            const res = await fetch(`/api/agents/${targetAgentId}/sessions/${requestSessionId}/messages?limit=${HISTORY_PAGE_SIZE}&before=${encodeURIComponent(chatOldestTimestamp)}&before_id=${encodeURIComponent(chatOldestMessageId)}`, {
+                headers: { Authorization: `Bearer ${requestToken}` },
+                signal: controller.signal,
             });
+            if (!chatPaginationRequestIdentityIsCurrent(requestIdentity, getCurrentIdentity())) return;
             if (!res.ok) return;
-            const msgs = await res.json();
-            // Validate session is still active after async fetch
-            if (activeSession?.id !== sess.id) return;
+            const msgs = await awaitCurrentChatPagination<any[]>(
+                () => res.json(),
+                requestIdentity,
+                getCurrentIdentity,
+                controller.signal,
+            );
+            if (msgs === null) return;
             if (msgs.length === 0) {
                 setChatHistoryHasMore(false);
                 return;
             }
+            const historyCursor = resolveChatHistoryCursor(
+                res.headers,
+                msgs,
+                HISTORY_PAGE_SIZE,
+            );
             const preParsed = msgs.map((m: any) => parseChatMsg({
                 role: m.role, content: m.content || '',
                 ...(m.toolName && { toolName: m.toolName, toolArgs: m.toolArgs, toolStatus: m.toolStatus, toolResult: m.toolResult, toolThinking: m.toolThinking }),
@@ -3940,21 +4043,31 @@ export default function AgentDetailPage() {
             const oldScrollHeight = el?.scrollHeight ?? 0;
             setChatMessages(prev => [...preParsed, ...prev]);
             // Update the oldest timestamp (first message in the new batch, since messages are in chronological order)
-            setChatOldestTimestamp(msgs[0].created_at);
-            setChatHistoryHasMore(msgs.length >= HISTORY_PAGE_SIZE);
+            setChatOldestTimestamp(historyCursor.before);
+            setChatOldestMessageId(historyCursor.beforeId);
+            setChatHistoryHasMore(historyCursor.hasMore);
             // Restore scroll position after new messages are prepended
             requestAnimationFrame(() => {
-                if (el) {
+                if (
+                    el
+                    && chatPaginationRequestIdentityIsCurrent(requestIdentity, getCurrentIdentity())
+                ) {
                     const newScrollHeight = el.scrollHeight;
                     el.scrollTop = newScrollHeight - oldScrollHeight;
                 }
             });
         } catch (err: any) {
+            if (err?.name === 'AbortError') return;
             console.error('Failed to load more chat history messages:', err);
         } finally {
-            setChatHistoryLoadingMore(false);
+            if (chatPaginationAbortRef.current === controller) {
+                chatPaginationAbortRef.current = null;
+                if (chatPaginationRequestIdentityIsCurrent(requestIdentity, getCurrentIdentity())) {
+                    setChatHistoryLoadingMore(false);
+                }
+            }
         }
-    }, [chatHistoryLoadingMore, chatHistoryHasMore, activeSession, id, chatOldestTimestamp]);
+    }, [chatHistoryLoadingMore, chatHistoryHasMore, activeSession, id, chatOldestTimestamp, chatOldestMessageId, token, currentUser?.id]);
 
     const handleHistoryScroll = () => {
         const el = historyContainerRef.current;
@@ -4215,6 +4328,10 @@ export default function AgentDetailPage() {
     const sendChatMsg = () => {
         if (!id || !activeSession?.id) return;
         if (showNoModelState) return;
+        if (agent?.deletion_state === 'cleanup_pending') {
+            toast.error(t('agent.deletion.cleanupPendingDetail'));
+            return;
+        }
         if (agent?.status === 'stopped') {
             setChatMessages(prev => [...prev, parseChatMsg({
                 role: 'assistant',
@@ -4553,6 +4670,9 @@ export default function AgentDetailPage() {
 
     const createScheduleMut = useMutation({
         mutationFn: () => {
+            if (agent?.execution_capabilities?.schedule_execution !== true) {
+                throw new Error(t('agent.aware.executionPausedDetail'));
+            }
             let sched: any;
             try { sched = JSON.parse(schedForm.schedule); } catch { sched = schedDefaults; }
             return scheduleApi.create(id!, { name: schedForm.name, instruction: schedForm.instruction, cron_expr: schedToCron(sched) });
@@ -4569,8 +4689,12 @@ export default function AgentDetailPage() {
     });
 
     const toggleScheduleMut = useMutation({
-        mutationFn: ({ sid, enabled }: { sid: string; enabled: boolean }) =>
-            scheduleApi.update(id!, sid, { is_enabled: enabled }),
+        mutationFn: ({ sid, enabled }: { sid: string; enabled: boolean }) => {
+            if (enabled && agent?.execution_capabilities?.schedule_execution !== true) {
+                throw new Error(t('agent.aware.executionPausedDetail'));
+            }
+            return scheduleApi.update(id!, sid, { is_enabled: enabled });
+        },
         onSuccess: () => queryClient.invalidateQueries({ queryKey: ['schedules', id] }),
     });
 
@@ -4581,12 +4705,15 @@ export default function AgentDetailPage() {
 
     const triggerScheduleMut = useMutation({
         mutationFn: async (sid: string) => {
+            if (agent?.execution_capabilities?.schedule_execution !== true) {
+                throw new Error(t('agent.aware.executionPausedDetail'));
+            }
             const res = await scheduleApi.trigger(id!, sid);
             return res;
         },
         onSuccess: () => {
             queryClient.invalidateQueries({ queryKey: ['schedules', id] });
-            showToast('Schedule triggered — executing in background', 'success');
+            showToast(t('agent.aware.scheduleAccepted'), 'success');
         },
         onError: (err: any) => {
             const msg = err?.response?.data?.detail || err?.message || 'Failed to trigger schedule';
@@ -4673,6 +4800,7 @@ export default function AgentDetailPage() {
     useEffect(() => {
         if (!wsConnected || !id || !activeSession?.id) return;
         if (!agent || agent.onboarded_for_me !== false) return;
+        if (agent.deletion_state === 'cleanup_pending') return;
         if (!effectiveTierReady || !effectiveChatTier) return;
         if (!chatHistoryIsReady(chatHistoryReadyRuntimeKey, id, activeSession.id)) return;
         if (chatMessages.length > 0) return;
@@ -4689,7 +4817,7 @@ export default function AgentDetailPage() {
             tier: effectiveChatTier,
             modality: effectiveChatModality,
         }));
-    }, [wsConnected, id, activeSession?.id, agent?.onboarded_for_me, effectiveTierReady, effectiveChatTier, effectiveChatModality, chatHistoryReadyRuntimeKey, chatMessages.length]);
+    }, [wsConnected, id, activeSession?.id, agent?.onboarded_for_me, agent?.deletion_state, effectiveTierReady, effectiveChatTier, effectiveChatModality, chatHistoryReadyRuntimeKey, chatMessages.length]);
 
     const { data: permData } = useQuery({
         queryKey: ['agent-permissions', id],
@@ -4773,8 +4901,18 @@ export default function AgentDetailPage() {
         try { return new Date(d).toLocaleDateString(tsLocale, { year: 'numeric', month: 'short', day: 'numeric' }); } catch { return d; }
     };
     const showNoModelState = (agent as any).agent_type !== 'openclaw' && !effectiveTierReady;
-    const agentStoppedByPlan = agent.status === 'stopped' && !(agent as any).is_expired;
-    const chatInputDisabled = showNoModelState || agentStoppedByPlan;
+    const deletionCleanupPending = agent.deletion_state === 'cleanup_pending';
+    const triggerExecutionEnabled = agent.execution_capabilities?.trigger_execution === true;
+    const triggerStatusLabel = (trig: any) => {
+        if (!trig.is_enabled) return t('agent.aware.disabled');
+        return triggerExecutionEnabled
+            ? t('agent.aware.inProgress')
+            : t('agent.aware.configuredPaused');
+    };
+    const agentStoppedByPlan = agent.status === 'stopped'
+        && !(agent as any).is_expired
+        && !deletionCleanupPending;
+    const chatInputDisabled = showNoModelState || agentStoppedByPlan || deletionCleanupPending;
     const canConfigureModels = canAccessSaasAdmin(currentUser);
     const renderNoModelGuide = (variant: 'empty' | 'floating' = 'empty') => (
         <div className={`chat-no-model-state${variant === 'floating' ? ' chat-no-model-state--floating' : ''}`}>
@@ -5044,7 +5182,7 @@ export default function AgentDetailPage() {
                                     <div className="aware-side-empty compact">{t('agent.aware.noTriggers')}</div>
                                 ) : itemTriggers.map((trig: any) => (
                                     <div key={trig.id} className={`aware-side-trigger ${trig.is_enabled ? '' : 'done'}`}>
-                                        {renderTriggerDot(!trig.is_enabled, trig.is_enabled ? t('agent.aware.inProgress') : t('agent.aware.completed'))}
+                                        {renderTriggerDot(!trig.is_enabled, triggerStatusLabel(trig))}
                                         <div className="aware-side-trigger-main">
                                             <div className="aware-side-item-title">{triggerTitle(trig)}</div>
                                             <div className="aware-side-item-meta">{triggerMeta(trig)}</div>
@@ -5054,9 +5192,13 @@ export default function AgentDetailPage() {
                                                 type="button"
                                                 className="btn btn-ghost"
                                                 style={{ padding: '2px 6px', fontSize: '11px', flexShrink: 0 }}
+                                                disabled={!trig.is_enabled && !triggerExecutionEnabled}
+                                                title={!trig.is_enabled && !triggerExecutionEnabled ? t('agent.aware.executionPausedDetail') : undefined}
                                                 aria-label={trig.is_enabled
                                                     ? t('agent.aware.disableTrigger', '停用触发器')
-                                                    : t('agent.aware.enableTrigger', '启用触发器')}
+                                                    : (!triggerExecutionEnabled
+                                                        ? t('agent.aware.configuredPaused')
+                                                        : t('agent.aware.enableTrigger', '启用触发器'))}
                                                 onClick={async (event) => {
                                                     event.stopPropagation();
                                                     try {
@@ -5212,7 +5354,7 @@ export default function AgentDetailPage() {
                                     <div className="aware-calendar-empty">-</div>
                                 ) : items.slice(0, 3).map((trig: any) => (
                                     <div key={trig.id} className="aware-calendar-event" data-tooltip={triggerTooltip(trig)} aria-label={triggerTooltip(trig)}>
-                                        {renderTriggerDot(!trig.is_enabled, trig.is_enabled ? t('agent.aware.inProgress') : t('agent.aware.completed'))}
+                                        {renderTriggerDot(!trig.is_enabled, triggerStatusLabel(trig))}
                                         <span className="aware-calendar-event-body">
                                             <span className="aware-calendar-event-title">{triggerTitle(trig)}</span>
                                             <span className="aware-calendar-event-meta">{triggerMeta(trig)}</span>
@@ -5229,7 +5371,7 @@ export default function AgentDetailPage() {
                         <div className="aware-side-subtitle">{isZh ? '重复计划' : 'Recurring'}</div>
                         {recurringTriggers.slice(0, 6).map((trig: any) => (
                             <div key={trig.id} className="aware-calendar-event recurring" data-tooltip={triggerTooltip(trig)} aria-label={triggerTooltip(trig)}>
-                                {renderTriggerDot(!trig.is_enabled, trig.is_enabled ? t('agent.aware.inProgress') : t('agent.aware.completed'))}
+                                {renderTriggerDot(!trig.is_enabled, triggerStatusLabel(trig))}
                                 <span className="aware-calendar-event-body">
                                     <span className="aware-calendar-event-title">{triggerTitle(trig)}</span>
                                     <span className="aware-calendar-event-meta">{triggerMeta(trig)}</span>
@@ -5254,6 +5396,14 @@ export default function AgentDetailPage() {
         };
         return (
             <div className="aware-side-preview">
+                {!triggerExecutionEnabled && (
+                    <div
+                        role="status"
+                        style={{ margin: '10px 12px 0', padding: '9px 10px', borderRadius: '7px', background: 'var(--warning-bg, rgba(245, 158, 11, 0.10))', color: 'var(--text-secondary)', fontSize: '11px', lineHeight: 1.5 }}
+                    >
+                        {t('agent.aware.executionPausedDetail')}
+                    </div>
+                )}
                 <div className="aware-side-section">
                     <div className="aware-side-title-row">
                         <div className="aware-side-section-title">{t('agent.aware.focus')}</div>
@@ -5413,6 +5563,15 @@ export default function AgentDetailPage() {
     return (
         <>
             <div className={`agent-detail-page ${activeTab === 'chat' ? 'agent-detail-page--chat' : 'agent-detail-page--settings'}`}>
+                {deletionCleanupPending && (
+                    <div
+                        role="alert"
+                        style={{ margin: '12px 16px 0', padding: '12px 14px', borderRadius: '8px', background: 'var(--warning-bg, rgba(245, 158, 11, 0.10))', color: 'var(--text-secondary)', fontSize: '12px', lineHeight: 1.5 }}
+                    >
+                        <strong>{t('agent.deletion.cleanupPendingTitle')}</strong>{' '}
+                        {t('agent.deletion.cleanupPendingDetail')}
+                    </div>
+                )}
                 {/* Header */}
                 {activeTab === 'chat' && (
                     <div className="page-header agent-detail-header">
@@ -5500,7 +5659,7 @@ export default function AgentDetailPage() {
                             </>
                             {(agent as any)?.agent_type !== 'openclaw' && (
                                 <>
-                                    {canManage && agent.status === 'error' && (
+                                    {canManage && !deletionCleanupPending && agent.status === 'error' && (
                                         <button
                                             className="btn btn-secondary"
                                             disabled={recoverAgentMut.isPending}
@@ -5511,10 +5670,10 @@ export default function AgentDetailPage() {
                                                 : t('agent.status.recover', 'Recover')}
                                         </button>
                                     )}
-                                    {canManage && agent.status === 'stopped' && (
+                                    {canManage && !deletionCleanupPending && agent.status === 'stopped' && (
                                         <button className="btn btn-secondary" onClick={async () => { await agentApi.start(id!); queryClient.invalidateQueries({ queryKey: ['agent', id] }); }}>{t('agent.actions.start')}</button>
                                     )}
-                                    {canManage && agent.status === 'running' && (
+                                    {canManage && !deletionCleanupPending && agent.status === 'running' && (
                                         <button className="btn btn-secondary" onClick={async () => { await agentApi.stop(id!); queryClient.invalidateQueries({ queryKey: ['agent', id] }); }}>{t('agent.actions.stop')}</button>
                                     )}
                                 </>
@@ -5983,7 +6142,7 @@ export default function AgentDetailPage() {
                                                         borderRadius: '6px', background: 'var(--bg-secondary)',
                                                         opacity: trig.is_enabled ? 1 : 0.5,
                                                     }}>
-                                                        {renderTriggerDot(!trig.is_enabled, trig.is_enabled ? t('agent.aware.inProgress') : t('agent.aware.completed'))}
+                                                        {renderTriggerDot(!trig.is_enabled, triggerStatusLabel(trig))}
                                                         <div style={{ flex: 1 }}>
                                                             <div style={{ fontSize: '12px', fontWeight: 500, color: 'var(--text-primary)' }}>
                                                                 {triggerToHuman(trig)}
@@ -5997,15 +6156,19 @@ export default function AgentDetailPage() {
                                                             {t('agent.aware.fired', { count: trig.fire_count })}
                                                         </span>
                                                         <span style={{ fontSize: '10px', color: trig.is_enabled ? 'var(--accent-primary)' : 'var(--success, #10b981)' }}>
-                                                            {trig.is_enabled ? t('agent.aware.inProgress') : t('agent.aware.completed')}
+                                                            {triggerStatusLabel(trig)}
                                                         </span>
                                                         <div style={{ display: 'flex', gap: '4px' }}>
                                                             {canManage && <button
                                                                 className="btn btn-ghost"
                                                                 style={{ padding: '2px 6px', fontSize: '11px' }}
+                                                                disabled={!trig.is_enabled && !triggerExecutionEnabled}
+                                                                title={!trig.is_enabled && !triggerExecutionEnabled ? t('agent.aware.executionPausedDetail') : undefined}
                                                                 aria-label={trig.is_enabled
                                                                     ? t('agent.aware.disableTrigger', '停用触发器')
-                                                                    : t('agent.aware.enableTrigger', '启用触发器')}
+                                                                    : (!triggerExecutionEnabled
+                                                                        ? t('agent.aware.configuredPaused')
+                                                                        : t('agent.aware.enableTrigger', '启用触发器'))}
                                                                 onClick={async (e) => {
                                                                     e.stopPropagation();
                                                                     try {
@@ -6087,6 +6250,15 @@ export default function AgentDetailPage() {
 
                     return (
                         <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
+                            {!triggerExecutionEnabled && (
+                                <div
+                                    role="status"
+                                    className="card"
+                                    style={{ marginBottom: '16px', padding: '12px 16px', background: 'var(--warning-bg, rgba(245, 158, 11, 0.10))', color: 'var(--text-secondary)', fontSize: '12px', lineHeight: 1.5 }}
+                                >
+                                    {t('agent.aware.executionPausedDetail')}
+                                </div>
+                            )}
                             {/* ── Focus Section ── */}
                             <div className="card" style={{ marginBottom: '16px', padding: '16px' }}>
                                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
@@ -7068,7 +7240,12 @@ export default function AgentDetailPage() {
                                                     <button onClick={() => setChatInfoMsg(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-tertiary)', fontSize: '14px', lineHeight: 1, padding: '0 2px' }}>✕</button>
                                                 </div>
                                             )}
-                                            {agentExpired ? (
+                                            {deletionCleanupPending ? (
+                                                <div style={{ padding: '8px 16px', borderTop: '1px solid rgba(245,158,11,0.3)', background: 'rgba(245,158,11,0.08)', display: 'flex', alignItems: 'center', gap: '10px', fontSize: '12px', color: 'rgb(180,100,0)' }}>
+                                                    <span>⏸</span>
+                                                    <span>{t('agent.deletion.cleanupPendingDetail')}</span>
+                                                </div>
+                                            ) : agentExpired ? (
                                                 <div style={{ padding: '7px 16px', borderTop: '1px solid rgba(245,158,11,0.3)', background: 'rgba(245,158,11,0.08)', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', color: 'rgb(180,100,0)' }}>
                                                     <span>⏸</span>
                                                     <span>This Agent has <strong>expired</strong> and is off duty. Contact your admin to extend its service.</span>
@@ -7171,7 +7348,13 @@ export default function AgentDetailPage() {
                                                                 }
                                                             }}
                                                             onPaste={handlePaste}
-                                                            placeholder={showNoModelState ? t('agent.chat.noModelPlaceholder', 'Configure model routes to start chatting') : (agentStoppedByPlan ? t('subscription.agentStoppedPlaceholder', '升级套餐后可继续聊天') : (!wsConnected && !!currentUser && sessionUserIdStr(activeSession) === viewerUserIdStr() ? 'Connecting...' : t('chat.placeholder')))}
+                                                            placeholder={deletionCleanupPending
+                                                                ? t('agent.deletion.cleanupPendingPlaceholder')
+                                                                : (showNoModelState
+                                                                    ? t('agent.chat.noModelPlaceholder', 'Configure model routes to start chatting')
+                                                                    : (agentStoppedByPlan
+                                                                        ? t('subscription.agentStoppedPlaceholder', '升级套餐后可继续聊天')
+                                                                        : (!wsConnected && !!currentUser && sessionUserIdStr(activeSession) === viewerUserIdStr() ? 'Connecting...' : t('chat.placeholder'))))}
                                                             rows={1}
                                                         />
                                                     </div>

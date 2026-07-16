@@ -20,6 +20,7 @@ from app.models.agent import Agent
 from app.models.audit import AuditLog
 from app.models.trigger import AgentTrigger
 from app.services.trigger_runtime import enqueue_webhook_execution
+from app.services.trigger_runtime.config import AUTOMATIC_TRIGGER_EXECUTION_ENABLED
 
 router = APIRouter(prefix="/api/webhooks", tags=["webhooks"])
 
@@ -53,6 +54,20 @@ async def receive_webhook(token: str, request: Request):
     - Rate limiting (5 requests/minute per token)
     - Payload size limit (64KB)
     """
+    # The RC5 automation worker is deliberately maintenance-off.  Reject at
+    # ingress before reading the body, touching Redis, looking up the token, or
+    # enqueueing work.  Preserved enabled flags represent user desired state;
+    # they must not create an unbounded pending queue while execution is paused.
+    if not AUTOMATIC_TRIGGER_EXECUTION_ENABLED:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "automatic trigger execution is temporarily paused",
+            },
+            status_code=503,
+            headers={"Retry-After": "3600"},
+        )
+
     # Rate limiting — use per-agent limit if available
     hit_count = await _record_and_count_hits(token)
 

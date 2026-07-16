@@ -68,6 +68,14 @@ async def create_task(
 ):
     """Create a new task for an agent."""
     await check_agent_access(db, current_user, agent_id)
+    if data.type == "supervision":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Supervision tasks are paused in this release pending "
+                "durable exactly-once delivery hardening"
+            ),
+        )
     task = Task(
         agent_id=agent_id,
         title=data.title,
@@ -85,14 +93,9 @@ async def create_task(
 
     task_out = await _enrich_task_out(task, db)
 
-    # Commit so the background executor can see the task in its own session
+    # Tasks are board records only in this release. Automatic execution is
+    # paused until a durable requester/session claim worker is available.
     await db.commit()
-
-    # Fire background execution for todo tasks
-    if data.type == "todo":
-        import asyncio
-        from app.services.task_executor import execute_task
-        asyncio.create_task(execute_task(task.id, agent_id))
 
     return task_out
 
@@ -112,7 +115,24 @@ async def update_task(
     if not task:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
 
-    for field, value in data.model_dump(exclude_unset=True).items():
+    update_data = data.model_dump(exclude_unset=True)
+    if update_data.get("type") == "supervision" or any(
+        field in update_data
+        for field in (
+            "supervision_target_name",
+            "supervision_channel",
+            "remind_schedule",
+        )
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Supervision configuration is paused in this release pending "
+                "durable exactly-once delivery hardening"
+            ),
+        )
+
+    for field, value in update_data.items():
         setattr(task, field, value)
     await db.flush()
     return await _enrich_task_out(task, db)
@@ -127,6 +147,13 @@ async def get_task_logs(
 ):
     """Get progress logs for a task."""
     await check_agent_access(db, current_user, agent_id)
+    task = (
+        await db.execute(
+            select(Task).where(Task.id == task_id, Task.agent_id == agent_id)
+        )
+    ).scalar_one_or_none()
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
     result = await db.execute(
         select(TaskLog).where(TaskLog.task_id == task_id).order_by(TaskLog.created_at.asc())
     )
@@ -143,6 +170,13 @@ async def add_task_log(
 ):
     """Add a progress log entry to a task."""
     await check_agent_access(db, current_user, agent_id)
+    task = (
+        await db.execute(
+            select(Task).where(Task.id == task_id, Task.agent_id == agent_id)
+        )
+    ).scalar_one_or_none()
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
     log = TaskLog(task_id=task_id, content=data.content)
     db.add(log)
     await db.flush()
@@ -166,9 +200,10 @@ async def trigger_task(
     task = result.scalar_one_or_none()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-
-    import asyncio
-    from app.services.task_executor import execute_task
-    asyncio.create_task(execute_task(task.id, agent_id))
-
-    return {"status": "triggered", "task_id": str(task_id)}
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            "Automatic task execution is paused in this release; the task "
+            "remains available as a task-board record"
+        ),
+    )

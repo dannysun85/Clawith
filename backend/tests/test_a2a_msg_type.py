@@ -9,9 +9,13 @@ Validates the branching logic in _send_message_to_agent:
 import json
 import uuid
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy import select
+
+from app.models.chat_session import ChatSession
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -48,10 +52,12 @@ class RecordingDB:
     def __init__(self, responses=None):
         self.responses = list(responses or [])
         self.added = []
+        self.statements = []
         self.committed = False
         self.flushed = False
 
     async def execute(self, _statement, _params=None):
+        self.statements.append(_statement)
         if not self.responses:
             raise AssertionError("unexpected execute() call")
         return self.responses.pop(0)
@@ -64,6 +70,51 @@ class RecordingDB:
 
     async def flush(self):
         self.flushed = True
+
+
+@pytest.fixture(autouse=True)
+def _authorized_a2a_behavior_contract(monkeypatch):
+    """Keep message-mode tests focused on behavior, not ACL/session internals."""
+    from app.core import permissions
+    from app.services import a2a_authorization, agent_tools
+    from app.services.trigger_runtime import config as trigger_config
+
+    async def ensure_test_session(db, _source_id, _target_id, _source_name, owner_id):
+        result = await db.execute(select(ChatSession).where(ChatSession.user_id == owner_id))
+        session = result.scalar_one_or_none()
+        return session, str(session.id)
+
+    monkeypatch.setattr(trigger_config, "AUTOMATIC_TRIGGER_EXECUTION_ENABLED", True)
+    monkeypatch.setattr(
+        permissions,
+        "get_agent_access_level_for_user_id",
+        AsyncMock(return_value="manage"),
+    )
+    monkeypatch.setattr(
+        agent_tools,
+        "get_agent_access_level_for_user_id",
+        AsyncMock(return_value="manage"),
+    )
+    monkeypatch.setattr(
+        permissions,
+        "evaluate_agent_relationship_status",
+        AsyncMock(return_value={"access_status": "active", "access_status_reason": None}),
+    )
+    monkeypatch.setattr(
+        agent_tools,
+        "evaluate_agent_relationship_status",
+        AsyncMock(return_value={"access_status": "active", "access_status_reason": None}),
+    )
+    monkeypatch.setattr(
+        a2a_authorization,
+        "validate_active_a2a_lane",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                session=SimpleNamespace(agent_id=uuid.uuid4()),
+            )
+        ),
+    )
+    monkeypatch.setattr(agent_tools, "_ensure_a2a_session", ensure_test_session)
 
 
 def _make_agent(
@@ -92,6 +143,14 @@ def _make_participant(part_id=None, ref_id=None):
     return p
 
 
+def _make_relationship(source_id, target_id):
+    relationship = MagicMock()
+    relationship.id = uuid.uuid4()
+    relationship.agent_id = source_id
+    relationship.target_agent_id = target_id
+    return relationship
+
+
 def _make_tenant(a2a_async_enabled=True):
     t = MagicMock()
     t.a2a_async_enabled = a2a_async_enabled
@@ -108,12 +167,13 @@ async def test_notify_returns_immediately():
 
     from_agent_id = uuid.uuid4()
     target_id = uuid.uuid4()
-    rel_id = uuid.uuid4()
+    relationship = _make_relationship(from_agent_id, target_id)
     session_id = uuid.uuid4()
     src_participant = _make_participant(ref_id=from_agent_id)
     tgt_participant = _make_participant(ref_id=target_id)
     source_agent = _make_agent(from_agent_id, name="Alice")
     target_agent = _make_agent(target_id, name="Bob")
+    owner_id = uuid.uuid4()
 
     session = MagicMock()
     session.id = session_id
@@ -123,7 +183,7 @@ async def test_notify_returns_immediately():
         responses=[
             DummyResult(scalar_value=source_agent),
             DummyResult(scalars_list=[target_agent]),
-            DummyResult(scalar_value=rel_id),
+            DummyResult(scalars_list=[relationship]),
             DummyResult(scalar_value=src_participant),
             DummyResult(scalar_value=tgt_participant),
             DummyResult(scalar_value=session),
@@ -145,11 +205,15 @@ async def test_notify_returns_immediately():
                 "message": "Please review the document",
                 "msg_type": "notify",
             },
+            user_id=owner_id,
         )
 
     assert "Notification sent to Bob" in result
     assert "asynchronously" in result
     mock_wake.assert_awaited_once()
+    assert owner_id in db.statements[5].compile().params.values()
+    source_message = next(item for item in db.added if hasattr(item, "conversation_id"))
+    assert source_message.user_id == owner_id
 
 
 @pytest.mark.asyncio
@@ -159,7 +223,7 @@ async def test_task_delegate_creates_focus_and_trigger():
 
     from_agent_id = uuid.uuid4()
     target_id = uuid.uuid4()
-    rel_id = uuid.uuid4()
+    relationship = _make_relationship(from_agent_id, target_id)
     session_id = uuid.uuid4()
     src_participant = _make_participant(ref_id=from_agent_id)
     tgt_participant = _make_participant(ref_id=target_id)
@@ -174,7 +238,7 @@ async def test_task_delegate_creates_focus_and_trigger():
         responses=[
             DummyResult(scalar_value=source_agent),
             DummyResult(scalars_list=[target_agent]),
-            DummyResult(scalar_value=rel_id),
+            DummyResult(scalars_list=[relationship]),
             DummyResult(scalar_value=src_participant),
             DummyResult(scalar_value=tgt_participant),
             DummyResult(scalar_value=session),
@@ -226,7 +290,7 @@ async def test_consult_calls_llm_synchronously():
 
     from_agent_id = uuid.uuid4()
     target_id = uuid.uuid4()
-    rel_id = uuid.uuid4()
+    relationship = _make_relationship(from_agent_id, target_id)
     session_id = uuid.uuid4()
     model_id = uuid.uuid4()
     src_participant = _make_participant(ref_id=from_agent_id)
@@ -269,7 +333,7 @@ async def test_consult_calls_llm_synchronously():
         responses=[
             DummyResult(scalar_value=source_agent),
             DummyResult(scalars_list=[target_agent]),
-            DummyResult(scalar_value=rel_id),
+            DummyResult(scalars_list=[relationship]),
             DummyResult(scalar_value=src_participant),
             DummyResult(scalar_value=tgt_participant),
             DummyResult(scalar_value=session),
@@ -309,6 +373,7 @@ async def test_consult_calls_llm_synchronously():
             side_effect=[
                 db,
                 db2,
+                db2,
             ]
         )
         mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
@@ -334,7 +399,7 @@ async def test_default_msg_type_is_notify():
 
     from_agent_id = uuid.uuid4()
     target_id = uuid.uuid4()
-    rel_id = uuid.uuid4()
+    relationship = _make_relationship(from_agent_id, target_id)
     session_id = uuid.uuid4()
     src_participant = _make_participant(ref_id=from_agent_id)
     tgt_participant = _make_participant(ref_id=target_id)
@@ -349,7 +414,7 @@ async def test_default_msg_type_is_notify():
         responses=[
             DummyResult(scalar_value=source_agent),
             DummyResult(scalars_list=[target_agent]),
-            DummyResult(scalar_value=rel_id),
+            DummyResult(scalars_list=[relationship]),
             DummyResult(scalar_value=src_participant),
             DummyResult(scalar_value=tgt_participant),
             DummyResult(scalar_value=session),
@@ -428,7 +493,7 @@ async def test_no_relationship_returns_error():
             },
         )
 
-    assert "do not have a relationship" in result
+    assert "missing or ambiguous" in result
 
 
 @pytest.mark.asyncio
@@ -591,7 +656,7 @@ async def test_openclaw_target_still_queues():
 
     from_agent_id = uuid.uuid4()
     target_id = uuid.uuid4()
-    rel_id = uuid.uuid4()
+    relationship = _make_relationship(from_agent_id, target_id)
     session_id = uuid.uuid4()
     src_participant = _make_participant(ref_id=from_agent_id)
     tgt_participant = _make_participant(ref_id=target_id)
@@ -607,7 +672,7 @@ async def test_openclaw_target_still_queues():
         responses=[
             DummyResult(scalar_value=source_agent),
             DummyResult(scalars_list=[target_agent]),
-            DummyResult(scalar_value=rel_id),
+            DummyResult(scalars_list=[relationship]),
             DummyResult(scalar_value=src_participant),
             DummyResult(scalar_value=tgt_participant),
             DummyResult(scalar_value=session),
@@ -642,7 +707,7 @@ async def test_feature_flag_off_falls_back_to_consult():
     from_agent_id = uuid.uuid4()
     target_id = uuid.uuid4()
     model_id = uuid.uuid4()
-    rel_id = uuid.uuid4()
+    relationship = _make_relationship(from_agent_id, target_id)
     session_id = uuid.uuid4()
     src_participant = _make_participant(ref_id=from_agent_id)
     tgt_participant = _make_participant(ref_id=target_id)
@@ -688,7 +753,7 @@ async def test_feature_flag_off_falls_back_to_consult():
         responses=[
             DummyResult(scalar_value=source_agent),
             DummyResult(scalars_list=[target_agent]),
-            DummyResult(scalar_value=rel_id),
+            DummyResult(scalars_list=[relationship]),
             DummyResult(scalar_value=src_participant),
             DummyResult(scalar_value=tgt_participant),
             DummyResult(scalar_value=session),
@@ -713,7 +778,7 @@ async def test_feature_flag_off_falls_back_to_consult():
         patch("app.services.token_tracker.record_token_usage", new_callable=AsyncMock),
         patch("app.services.activity_logger.log_activity", new_callable=AsyncMock),
     ):
-        mock_session_ctx.return_value.__aenter__ = AsyncMock(side_effect=[db, db2])
+        mock_session_ctx.return_value.__aenter__ = AsyncMock(side_effect=[db, db2, db2])
         mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
 
         result = await _send_message_to_agent(
@@ -736,7 +801,7 @@ async def test_feature_flag_on_uses_notify():
 
     from_agent_id = uuid.uuid4()
     target_id = uuid.uuid4()
-    rel_id = uuid.uuid4()
+    relationship = _make_relationship(from_agent_id, target_id)
     session_id = uuid.uuid4()
     src_participant = _make_participant(ref_id=from_agent_id)
     tgt_participant = _make_participant(ref_id=target_id)
@@ -755,7 +820,7 @@ async def test_feature_flag_on_uses_notify():
         responses=[
             DummyResult(scalar_value=source_agent),
             DummyResult(scalars_list=[target_agent]),
-            DummyResult(scalar_value=rel_id),
+            DummyResult(scalars_list=[relationship]),
             DummyResult(scalar_value=src_participant),
             DummyResult(scalar_value=tgt_participant),
             DummyResult(scalar_value=session),

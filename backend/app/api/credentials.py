@@ -1,4 +1,4 @@
-"""Credential pool API (账号池管理, platform_admin only).
+"""Credential pool API (账号池管理, configured SaaS owner only).
 
 Manages the platform API-key account pool: CRUD on credentials + real-time
 pool health monitoring. Credentials are provider-scoped (one key serves
@@ -12,7 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.core.security import encrypt_data, require_role
+from app.core.security import encrypt_data, get_saas_admin
 from app.database import get_db
 from app.models.llm import LLMCredential
 from app.schemas.credentials import (
@@ -29,7 +29,7 @@ from app.services.llm.utils import get_credential_api_key
 router = APIRouter(prefix="/credentials", tags=["credentials"])
 
 settings = get_settings()
-_PLATFORM_ADMIN = Depends(require_role("platform_admin"))
+_SAAS_OWNER = Depends(get_saas_admin)
 
 
 def _mask_key(cred: LLMCredential) -> str:
@@ -43,14 +43,14 @@ def _to_out(cred: LLMCredential) -> CredentialOut:
     return out
 
 
-@router.get("", response_model=list[CredentialOut], dependencies=[_PLATFORM_ADMIN])
+@router.get("", response_model=list[CredentialOut], dependencies=[_SAAS_OWNER])
 async def list_credentials(db: AsyncSession = Depends(get_db)):
     """List all credentials in the pool (platform admin)."""
     result = await db.execute(select(LLMCredential).order_by(LLMCredential.provider, LLMCredential.priority.desc()))
     return [_to_out(c) for c in result.scalars().all()]
 
 
-@router.get("/health", response_model=list[CredentialHealthOut], dependencies=[_PLATFORM_ADMIN])
+@router.get("/health", response_model=list[CredentialHealthOut], dependencies=[_SAAS_OWNER])
 async def credentials_health():
     """Real-time pool health: usage / status / rate-limit counters per credential."""
     entries = await get_credential_health()
@@ -78,7 +78,7 @@ async def credentials_health():
     return out
 
 
-@router.post("", response_model=CredentialOut, status_code=status.HTTP_201_CREATED, dependencies=[_PLATFORM_ADMIN])
+@router.post("", response_model=CredentialOut, status_code=status.HTTP_201_CREATED, dependencies=[_SAAS_OWNER])
 async def create_credential(data: CredentialCreateIn, db: AsyncSession = Depends(get_db)):
     """Add an API-key account to the pool."""
     cred = LLMCredential(
@@ -101,7 +101,7 @@ async def create_credential(data: CredentialCreateIn, db: AsyncSession = Depends
     return _to_out(cred)
 
 
-@router.patch("/{credential_id}", response_model=CredentialOut, dependencies=[_PLATFORM_ADMIN])
+@router.patch("/{credential_id}", response_model=CredentialOut, dependencies=[_SAAS_OWNER])
 async def update_credential(credential_id: uuid.UUID, data: CredentialUpdateIn, db: AsyncSession = Depends(get_db)):
     """Update a credential (label/quota/weight/priority/capabilities/enabled)."""
     cred = await db.get(LLMCredential, credential_id)
@@ -130,7 +130,7 @@ async def update_credential(credential_id: uuid.UUID, data: CredentialUpdateIn, 
     return _to_out(cred)
 
 
-@router.post("/{credential_id}/verify", response_model=CredentialVerificationOut, dependencies=[_PLATFORM_ADMIN])
+@router.post("/{credential_id}/verify", response_model=CredentialVerificationOut, dependencies=[_SAAS_OWNER])
 async def verify_credential(credential_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     """Run a read-only provider probe before admitting a credential to routing."""
     cred = await db.get(LLMCredential, credential_id)
@@ -157,7 +157,7 @@ async def verify_credential(credential_id: uuid.UUID, db: AsyncSession = Depends
     )
 
 
-@router.delete("/{credential_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[_PLATFORM_ADMIN])
+@router.delete("/{credential_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[_SAAS_OWNER])
 async def delete_credential(credential_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     """Remove a credential from the pool."""
     cred = await db.get(LLMCredential, credential_id)

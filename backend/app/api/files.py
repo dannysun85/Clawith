@@ -44,6 +44,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 settings = get_settings()
 router = APIRouter(prefix="/agents/{agent_id}/files", tags=["files"])
 
+_BINARY_CONTENT_SUFFIXES = {
+    ".7z", ".avi", ".bmp", ".doc", ".docx", ".flac", ".gif", ".gz",
+    ".jpeg", ".jpg", ".m4a", ".mkv", ".mov", ".mp3", ".mp4", ".ogg",
+    ".pdf", ".png", ".ppt", ".pptx", ".rar", ".tar", ".wav", ".webm",
+    ".webp", ".xls", ".xlsx", ".zip",
+}
+
+
+async def _read_text_or_binary_placeholder(storage, key: str, path: str) -> str:
+    """Read strict UTF-8 text without ever decoding known binary media."""
+    if Path(path).suffix.lower() in _BINARY_CONTENT_SUFFIXES:
+        stat = await storage.stat(key)
+        return f"[二进制文件: {Path(path).name}, {stat.size} bytes]"
+    try:
+        return await storage.read_text(key, encoding="utf-8", errors="strict")
+    except UnicodeDecodeError:
+        stat = await storage.stat(key)
+        return f"[二进制文件: {Path(path).name}, {stat.size} bytes]"
+
 
 class FileInfo(BaseModel):
     name: str
@@ -291,16 +310,8 @@ async def read_file(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
     version = await storage.get_version(key)
 
-    try:
-        content = await storage.read_text(key, encoding="utf-8", errors="replace")
-        return FileContent(path=path, content=content, version_token=version.token)
-    except UnicodeDecodeError:
-        stat = await storage.stat(key)
-        return FileContent(
-            path=path,
-            content=f"[二进制文件: {Path(path).name}, {stat.size} bytes]",
-            version_token=version.token,
-        )
+    content = await _read_text_or_binary_placeholder(storage, key, path)
+    return FileContent(path=path, content=content, version_token=version.token)
 
 
 def _entry_version_token(entry: StorageEntry) -> str | None:
@@ -1016,12 +1027,8 @@ async def read_enterprise_file(
     if not await storage.exists(storage_key) or not await storage.is_file(storage_key):
         raise HTTPException(status_code=404, detail="File not found")
 
-    try:
-        content = await storage.read_text(storage_key, encoding="utf-8", errors="replace")
-        return {"path": path, "content": content}
-    except Exception:
-        stat = await storage.stat(storage_key)
-        return {"path": path, "content": f"[二进制文件: {Path(path).name}, {stat.size} bytes]"}
+    content = await _read_text_or_binary_placeholder(storage, storage_key, path)
+    return {"path": path, "content": content}
 
 
 @enterprise_kb_router.put("/content")

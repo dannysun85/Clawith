@@ -977,6 +977,11 @@ class DouyinOperationsService:
         agent = await self._get_agent(db, agent_id)
         if not agent or agent.tenant_id != tenant_id:
             raise HTTPException(status_code=404, detail="Agent not found in current tenant")
+        if agent.deletion_requested_at is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="Agent deletion is in progress; new Douyin work is blocked",
+            )
         return agent
 
     async def _get_existing_publish_job(

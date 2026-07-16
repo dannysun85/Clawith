@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -65,6 +65,14 @@ class AgentRelationship(Base):
     """Relationship between an agent and an org member."""
 
     __tablename__ = "agent_relationships"
+    __table_args__ = (
+        Index(
+            "uq_agent_relationship_agent_member",
+            "agent_id",
+            "member_id",
+            unique=True,
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE"), nullable=False)
@@ -83,6 +91,14 @@ class AgentAgentRelationship(Base):
     """Relationship between two agents (digital employees)."""
 
     __tablename__ = "agent_agent_relationships"
+    __table_args__ = (
+        Index(
+            "uq_agent_agent_relationship_pair",
+            "agent_id",
+            "target_agent_id",
+            unique=True,
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE"), nullable=False)

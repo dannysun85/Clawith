@@ -13,7 +13,7 @@ from app.database import async_session
 from app.models.audit import ApprovalRequest, AuditLog
 from app.models.notification import Notification
 from app.models.user import User
-from app.services import agent_tools
+from app.services import agent_tools, autonomy_service
 from app.services.agent_tools import ApprovedToolExecutionOutcome
 from app.services.autonomy_service import (
     AutonomyService,
@@ -27,6 +27,11 @@ SECOND_AGENT_ID = uuid.UUID("07500000-0000-4000-8000-000000000064")
 
 
 async def main() -> None:
+    # Production deliberately defaults this release gate to False.  Enable the
+    # dormant execution path only inside this isolated smoke process so its
+    # claim/CAS/crash guarantees remain tested without changing runtime policy.
+    original_execution_gate = autonomy_service.APPROVAL_AUTOMATIC_EXECUTION_ENABLED
+    autonomy_service.APPROVAL_AUTOMATIC_EXECUTION_ENABLED = True
     service = AutonomyService()
     dispatch_count = 0
 
@@ -229,6 +234,7 @@ async def main() -> None:
             )
             assert stale_notifications == 1
     finally:
+        autonomy_service.APPROVAL_AUTOMATIC_EXECUTION_ENABLED = original_execution_gate
         agent_tools._execute_approved_tool = original_executor
         async with async_session() as db:
             await db.execute(

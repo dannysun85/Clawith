@@ -1,6 +1,7 @@
 """Tool management API — CRUD for tools and per-agent assignments."""
 
 import hashlib
+import json
 import uuid
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -44,6 +45,218 @@ router = APIRouter(prefix="/tools", tags=["tools"])
 CATEGORY_CONFIG_PRIMARY_TOOL = {
     "agentbay": "agentbay_browser_navigate",
 }
+
+_CREDENTIAL_BOUND_MEDIA_DESTINATION_KEYS: dict[str, frozenset[str]] = {
+    "generate_image_siliconflow": frozenset({"base_url"}),
+    "generate_image_openai": frozenset({"base_url"}),
+    "generate_image_google": frozenset({"base_url"}),
+    "generate_image_custom": frozenset(
+        {"base_url", "endpoint_path", "extra_headers_json"}
+    ),
+}
+_CUSTOM_MEDIA_EXTRA_HEADER_ALLOWLIST = frozenset({"http-referer", "x-title"})
+
+
+def _has_unmasked_secret(value: object) -> bool:
+    normalized = str(value or "").strip()
+    return bool(normalized and normalized not in {"****", "••••", "********"})
+
+
+def _changed_media_destination_keys(
+    tool: Tool,
+    incoming_config: dict,
+    existing_config: dict,
+) -> set[str]:
+    destination_keys = _CREDENTIAL_BOUND_MEDIA_DESTINATION_KEYS.get(tool.name)
+    if not destination_keys:
+        return set()
+    return {
+        key
+        for key in destination_keys
+        if key in incoming_config
+        and incoming_config.get(key) != existing_config.get(key)
+    }
+
+
+def _require_fresh_media_destination_bundle(
+    tool: Tool,
+    *,
+    incoming_config: dict,
+    existing_config: dict,
+    scope_label: str,
+) -> set[str]:
+    """Bind a freshly supplied secret to every destination rotation.
+
+    Preserving a masked or omitted password is convenient for ordinary config
+    edits, but it must never silently authorize a different outbound endpoint.
+    Requiring the complete bundle in one request also prevents a partially
+    applied custom endpoint/header update from inheriting stale fields.
+    """
+
+    destination_keys = _CREDENTIAL_BOUND_MEDIA_DESTINATION_KEYS.get(tool.name)
+    changed_destination_keys = _changed_media_destination_keys(
+        tool,
+        incoming_config,
+        existing_config,
+    )
+    if not destination_keys or not changed_destination_keys:
+        return changed_destination_keys
+    if not _has_unmasked_secret(incoming_config.get("api_key")):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Changing a {scope_label} media destination requires a fresh "
+                "unmasked API key in the same request"
+            ),
+        )
+    missing_bundle_keys = sorted(
+        key for key in destination_keys if key not in incoming_config
+    )
+    if missing_bundle_keys:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Changing a {scope_label} media destination requires the "
+                "complete destination bundle: " + ", ".join(missing_bundle_keys)
+            ),
+        )
+    return changed_destination_keys
+
+
+def _validate_media_destination_config(tool: Tool, config: dict) -> None:
+    """Reject credentials hidden in destinations or free-form headers.
+
+    Media credentials must live only in schema-declared password fields so
+    they are encrypted, masked, revocable, and provenance-bound.  URL query
+    strings may contain ordinary routing parameters, but credential-like
+    values, userinfo, and fragments are never accepted.
+    """
+
+    if tool.name not in _CREDENTIAL_BOUND_MEDIA_DESTINATION_KEYS:
+        return
+    for key in ("base_url", "endpoint_path"):
+        raw = str(config.get(key) or "").strip()
+        if not raw:
+            continue
+        try:
+            parsed = urlsplit(raw)
+            _ = parsed.port
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"{key} is invalid") from exc
+        if parsed.username is not None or parsed.password is not None or parsed.fragment:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{key} cannot contain URL credentials or fragments",
+            )
+        if any(
+            value and is_sensitive_mcp_query_key(query_key)
+            for query_key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=f"{key} cannot contain credential-like query parameters",
+            )
+
+    raw_headers = str(config.get("extra_headers_json") or "").strip()
+    if not raw_headers:
+        return
+    try:
+        headers = json.loads(raw_headers)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="extra_headers_json must be a valid JSON object",
+        ) from exc
+    if not isinstance(headers, dict):
+        raise HTTPException(
+            status_code=422,
+            detail="extra_headers_json must be a JSON object",
+        )
+    unsupported = sorted(
+        str(key)
+        for key in headers
+        if str(key).strip().lower() not in _CUSTOM_MEDIA_EXTRA_HEADER_ALLOWLIST
+    )
+    if unsupported:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Custom image headers are limited to non-secret HTTP-Referer "
+                "and X-Title values"
+            ),
+        )
+
+
+def _enforce_media_endpoint_bundle_update(
+    current_user: User,
+    tool: Tool,
+    *,
+    incoming_config: dict,
+    existing_agent_config: dict,
+    company_config: dict,
+) -> None:
+    """Keep media destination and Authorization within one config scope."""
+
+    destination_keys = _CREDENTIAL_BOUND_MEDIA_DESTINATION_KEYS.get(tool.name)
+    if not destination_keys:
+        return
+    changed_destination_keys = _changed_media_destination_keys(
+        tool,
+        incoming_config,
+        existing_agent_config,
+    )
+    if changed_destination_keys and current_user.role not in (
+        "platform_admin",
+        "org_admin",
+    ) and not _is_platform_admin(current_user):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Only platform or organization admins can modify a media "
+                "provider destination or outbound headers"
+            ),
+        )
+    _require_fresh_media_destination_bundle(
+        tool,
+        incoming_config=incoming_config,
+        existing_config=existing_agent_config,
+        scope_label="Agent-owned",
+    )
+
+    candidate_agent = merge_config_preserving_sensitive(
+        existing_agent_config,
+        incoming_config,
+        tool.config_schema,
+    )
+    _validate_media_destination_config(tool, candidate_agent)
+    if _has_unmasked_secret(candidate_agent.get("api_key")):
+        missing_bundle_keys = sorted(
+            key for key in destination_keys if key not in candidate_agent
+        )
+        if missing_bundle_keys:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "An Agent-owned media API key must be saved with the "
+                    "complete Agent endpoint bundle: "
+                    + ", ".join(missing_bundle_keys)
+                ),
+            )
+    destination_override = any(
+        key in candidate_agent
+        and candidate_agent.get(key) != company_config.get(key)
+        for key in destination_keys
+    )
+    if destination_override and not _has_unmasked_secret(
+        candidate_agent.get("api_key")
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "An Agent-specific media destination must be saved with an "
+                "Agent-owned API key; tenant credentials cannot cross scopes"
+            ),
+        )
 
 def _mask_mcp_server_url(server_url: str | None) -> str | None:
     """Keep an MCP endpoint useful to the UI without returning URL credentials."""
@@ -582,6 +795,12 @@ async def update_tool(
         existing_config = mcp_config_from_url
         if existing_config is None:
             existing_config = await get_tool_company_config(db, tool, target_tenant_id)
+        _require_fresh_media_destination_bundle(
+            tool,
+            incoming_config=incoming_config,
+            existing_config=existing_config,
+            scope_label="company-owned",
+        )
         if tool.source == "builtin":
             if not target_tenant_id:
                 raise HTTPException(status_code=400, detail="tenant_id is required to configure builtin tools")
@@ -590,6 +809,7 @@ async def update_tool(
                 incoming_config,
                 tool.config_schema,
             )
+            _validate_media_destination_config(tool, config_value)
             await set_tenant_tool_config(db, target_tenant_id, tool.name, config_value, tool.config_schema)
         else:
             config_value = merge_config_preserving_sensitive(
@@ -597,6 +817,7 @@ async def update_tool(
                 incoming_config,
                 tool.config_schema,
             )
+            _validate_media_destination_config(tool, config_value)
             tenant_tool_config_update = _encrypt_sensitive_fields(
                 config_value,
                 tool.config_schema,
@@ -1097,7 +1318,12 @@ async def get_agent_tool_config(
     Configs are decrypted only in memory; every sensitive field is masked in
     the response so the frontend can show that a value exists without exposing it.
     """
-    agent = await _require_agent_tool_access(db, current_user, agent_id)
+    agent = await _require_agent_tool_access(
+        db,
+        current_user,
+        agent_id,
+        manage=True,
+    )
     assignments = await _load_agent_tool_assignments(db, agent_id)
     tool_r = await db.execute(
         select(Tool).where(
@@ -1187,6 +1413,18 @@ async def update_agent_tool_config(
         (at.config if at else {}) or {},
         tool_for_schema.config_schema,
     )
+    company_plain = await get_tool_company_config(
+        db,
+        tool_for_schema,
+        agent.tenant_id,
+    )
+    _enforce_media_endpoint_bundle_update(
+        current_user,
+        tool_for_schema,
+        incoming_config=data.config,
+        existing_agent_config=existing_plain,
+        company_config=company_plain,
+    )
     merged_config = merge_config_preserving_sensitive(
         existing_plain,
         data.config,
@@ -1225,7 +1463,12 @@ async def get_agent_tools_with_config(
     rather than Tool.config. We resolve those as part of the global config so
     the agent-level UI can show the inherited key hint.
     """
-    agent_obj2 = await _require_agent_tool_access(db, current_user, agent_id)
+    agent_obj2 = await _require_agent_tool_access(
+        db,
+        current_user,
+        agent_id,
+        manage=True,
+    )
     from app.services.agent_tools import _agent_has_feishu
     has_feishu = await _agent_has_feishu(agent_id)
 

@@ -117,6 +117,35 @@ async def test_agent_file_tools_use_storage_paths(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_agent_file_tools_cannot_reach_service_private_recovery_evidence(monkeypatch):
+    agent_id = uuid.uuid4()
+    recovery_secret = b'{"ciphertext":"operator-only-secret"}'
+    storage = MemoryStorageBackend(
+        {
+            f"{agent_id}/workspace/notes.md": b"normal agent content\n",
+            "_internal/provider_recovery/minimax/image/other/evidence.json": recovery_secret,
+        }
+    )
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+
+    listing = await agent_tools._storage_list_dir(agent_id, "")
+    read = await agent_tools._storage_read_file(
+        agent_id,
+        "_internal/provider_recovery/minimax/image/other/evidence.json",
+    )
+    search = await agent_tools._storage_search_files(
+        agent_id,
+        "operator.*secret",
+        path=".",
+    )
+
+    assert "_internal" not in listing
+    assert "operator-only-secret" not in read
+    assert "operator-only-secret" not in search
+    assert "No matches found" in search
+
+
+@pytest.mark.asyncio
 async def test_temp_workspace_materializes_only_requested_paths(monkeypatch):
     agent_id = uuid.uuid4()
     storage = MemoryStorageBackend({

@@ -343,3 +343,40 @@ class MCPHTTPGuard:
                 "response": [self.validate_response],
             },
         }
+
+
+class PublicArtifactHTTPGuard:
+    """SSRF guard for credential-free public artifact downloads.
+
+    Provider APIs commonly return a short-lived URL which redirects to a
+    different public CDN origin.  Unlike MCP/API traffic, these GET requests
+    contain no credentials and may follow such redirects.  Every redirect hop
+    is still required to use HTTPS, resolve only to public addresses, and
+    connect to a public peer through :class:`PublicOnlyAsyncHTTPTransport`.
+    """
+
+    async def validate_request(self, request: httpx.Request) -> None:
+        await validate_public_mcp_url(str(request.url))
+
+    async def validate_response(self, response: httpx.Response) -> None:
+        network_stream = response.extensions.get("network_stream")
+        peer = (
+            network_stream.get_extra_info("server_addr")
+            if network_stream is not None
+            else None
+        )
+        if not peer:
+            raise MCPURLPolicyError("Artifact connection peer could not be verified")
+        _require_public_ip(str(peer[0]))
+
+    def client_kwargs(self) -> dict:
+        return {
+            "follow_redirects": True,
+            "max_redirects": 5,
+            "trust_env": False,
+            "transport": PublicOnlyAsyncHTTPTransport(),
+            "event_hooks": {
+                "request": [self.validate_request],
+                "response": [self.validate_response],
+            },
+        }

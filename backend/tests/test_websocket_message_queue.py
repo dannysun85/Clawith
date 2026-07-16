@@ -136,7 +136,7 @@ async def test_message_loop_uses_validated_client_id_and_emits_assistant_id():
 
 @pytest.mark.asyncio
 async def test_saved_chat_messages_return_their_database_ids(monkeypatch):
-    user_db = RecordingDB([None])
+    user_db = RecordingDB([])
     assistant_db = RecordingDB([])
     dbs = iter([user_db, assistant_db])
     monkeypatch.setattr(
@@ -146,6 +146,16 @@ async def test_saved_chat_messages_return_their_database_ids(monkeypatch):
     monkeypatch.setattr(
         "app.api.websocket.maybe_mark_session_read_for_active_viewer",
         AsyncMock(),
+    )
+
+    session = SimpleNamespace(
+        title="Session 1",
+        last_message_at=None,
+    )
+    validate_lane = AsyncMock(return_value=SimpleNamespace(session=session))
+    monkeypatch.setattr(
+        "app.api.websocket.validate_active_user_chat_lane",
+        validate_lane,
     )
 
     handler = WebSocketChatHandler(FakeWebSocket(), uuid.uuid4(), "token", str(uuid.uuid4()))
@@ -167,6 +177,7 @@ async def test_saved_chat_messages_return_their_database_ids(monkeypatch):
     assert assistant_message_id == str(assistant_db.added[0].id)
     assert user_db.committed is True
     assert assistant_db.committed is True
+    assert validate_lane.await_count == 2
 
 
 @pytest.mark.asyncio

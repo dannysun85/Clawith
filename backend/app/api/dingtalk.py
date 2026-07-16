@@ -5,7 +5,7 @@ Provides Config CRUD and message handling for DingTalk bots using Stream mode.
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,8 +17,22 @@ from app.database import get_db
 from app.models.channel_config import ChannelConfig
 from app.models.user import User
 from app.schemas.schemas import ChannelConfigOut
+from app.services.media_message_content import sanitize_inline_media_content
 
 router = APIRouter(tags=["dingtalk"])
+
+
+def _append_missing_image_markers(
+    user_text: str,
+    image_data_urls: list[str] | None,
+) -> str:
+    """Add each DingTalk image marker exactly once to the provider turn."""
+    result = user_text or ""
+    for data_url in image_data_urls or []:
+        marker = f"[image_data:{data_url}]"
+        if marker not in result:
+            result = f"{result}\n{marker}" if result else marker
+    return result
 
 
 # ─── Config CRUD ────────────────────────────────────────
@@ -232,20 +246,12 @@ async def process_dingtalk_message(
         from app.services.llm.utils import convert_chat_messages_to_llm_format as _conv
         history = _conv(reversed(history_r.scalars().all()))
 
-        # Build saved_content for DB (no base64 blobs, keep it display-friendly)
-        import re as _re_dt
-        _clean_text = _re_dt.sub(
-            r'\[image_data:data:image/[^;]+;base64,[A-Za-z0-9+/=]+\]',
-            "", user_text,
-        ).strip()
-        if saved_file_paths:
-            from pathlib import Path as _PathDT
-            _file_prefixes = "\n".join(
-                f"[file:{_PathDT(p).name}]" for p in saved_file_paths
-            )
-            saved_content = f"{_file_prefixes}\n{_clean_text}".strip() if _clean_text else _file_prefixes
-        else:
-            saved_content = _clean_text or user_text
+        # Persist only durable file references. Inline binary markers belong to
+        # the current provider call and must not enter conversation history.
+        saved_content = sanitize_inline_media_content(
+            user_text,
+            file_names=saved_file_paths,
+        )
 
         # Save user message
         db.add(ChatMessage(
@@ -278,12 +284,7 @@ async def process_dingtalk_message(
         await db.close()
 
         # Build LLM input text: for images, inject base64 markers so vision models can see them
-        llm_user_text = user_text
-        if image_base64_list:
-            image_markers = "\n".join(
-                f"[image_data:{uri}]" for uri in image_base64_list
-            )
-            llm_user_text = f"{user_text}\n{image_markers}" if user_text else image_markers
+        llm_user_text = _append_missing_image_markers(user_text, image_base64_list)
 
         # Register current-conversation file delivery only when the DingTalk
         # application credentials needed for a real media upload are present.
@@ -358,6 +359,7 @@ async def process_dingtalk_message(
                 _agent_model, _llm_model, _fallback_model, _route_meta,
                 agent_id, llm_user_text,
                 history=history, user_id=platform_user_id,
+                session_id=session_conv_id,
             )
         finally:
             if _cfs_token is not None:
@@ -423,8 +425,12 @@ async def process_dingtalk_message(
         from app.services.activity_logger import log_activity
         await log_activity(
             agent_id, "chat_reply",
-            f"Replied to DingTalk message: {reply_text[:80]}",
-            detail={"channel": "dingtalk", "user_text": user_text[:200], "reply": reply_text[:500]},
+            "Replied to DingTalk message",
+            detail={
+                "channel": "dingtalk",
+                "request_chars": len(user_text),
+                "reply_chars": len(reply_text),
+            },
         )
 
 
@@ -469,7 +475,7 @@ async def dingtalk_callback(
                 "DingTalk token exchange failed error_code={}",
                 token_data.get("errcode") or token_data.get("code") or "unknown",
             )
-            return HTMLResponse(f"Auth failed: Token exchange error")
+            return HTMLResponse("Auth failed: Token exchange error")
 
         # Step 2: Get user info using modern v1.0 API
         user_info = await auth_provider.get_user_info(access_token)

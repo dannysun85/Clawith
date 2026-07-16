@@ -42,6 +42,12 @@ class Agent(Base):
     # Last time OpenClaw polled the gateway (online status indicator)
     openclaw_last_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+    # Durable deletion fence. Once set, start/recover and all execution lanes
+    # must remain fail-closed until provider cleanup and final deletion finish.
+    deletion_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+
     # Runtime
     status: Mapped[str] = mapped_column(
         Enum("creating", "running", "idle", "stopped", "error", name="agent_status_enum", create_constraint=False),

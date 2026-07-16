@@ -8,7 +8,6 @@ from app.services.trigger_runtime.dispatch import (
 from app.services.trigger_runtime.executions import (
     build_execution_runtime_trigger,
     claim_pending_trigger_executions,
-    mark_base_triggers_fired,
     mark_trigger_executions_completed,
     mark_trigger_executions_failed,
     renew_trigger_execution_leases,
@@ -24,7 +23,6 @@ __all__ = [
     "enqueue_due_trigger",
     "enqueue_trigger_execution",
     "enqueue_webhook_execution",
-    "mark_base_triggers_fired",
     "mark_trigger_executions_completed",
     "mark_trigger_executions_failed",
     "renew_trigger_execution_leases",

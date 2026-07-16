@@ -391,6 +391,16 @@ def test_base_filter_failure_has_structured_reason(credentials, modality, expect
     assert load_balancer._diagnose_base_filter_failure(credentials, modality) is expected
 
 
+def test_empty_capabilities_mean_no_capability_not_all():
+    credential = _cred(capabilities=[])
+
+    assert load_balancer._credential_supports_modality(credential, "text") is False
+    assert (
+        load_balancer._diagnose_base_filter_failure([credential], "text")
+        is load_balancer.CredentialUnavailableReason.CAPABILITY_MISMATCH
+    )
+
+
 def test_no_credential_user_message_does_not_expose_pool_internals():
     error = load_balancer.NoCredentialAvailable(
         "minimax",

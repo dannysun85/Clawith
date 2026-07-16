@@ -20,6 +20,7 @@ from app.models.user import User
 from app.schemas.schemas import ChannelConfigCreate, ChannelConfigOut, TokenResponse, UserOut
 from app.services.feishu_service import FeishuResourceTooLargeError, feishu_service
 from app.services.llm.utils import convert_chat_messages_to_llm_format, truncate_messages_with_pair_integrity
+from app.services.media_message_content import sanitize_inline_media_content
 from app.services.storage import agent_upload_key, get_storage_backend, store_agent_upload
 
 router = APIRouter(tags=["feishu"])
@@ -664,6 +665,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
             return {"code": 0, "msg": "group message ignored by activation policy"}
 
         # ── Normalize post (rich text) → extract text + schedule image downloads ──
+        _post_saved_names: list[str] = []
         if msg_type == "post":
             import json as _json_post
             _post_body = _json_post.loads(message.get("content", "{}"))
@@ -711,6 +713,7 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
                             _img_bytes,
                             content_type="image/jpeg",
                         )
+                        _post_saved_names.append(_workspace_path.rsplit("/", 1)[-1])
                         logger.info(f"[Feishu] Saved post image bytes={len(_img_bytes)}")
                         # Embed as base64 marker for vision models
                         _b64_data = _b64.b64encode(_img_bytes).decode("ascii")
@@ -758,6 +761,10 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
 
             if not user_text:
                 return {"code": 0, "msg": "empty message after stripping mentions"}
+            persisted_user_text = sanitize_inline_media_content(
+                user_text,
+                file_names=_post_saved_names,
+            )
 
             # Detect task creation intent
             task_match = re.search(
@@ -936,14 +943,14 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
                 user_id=platform_user_id if not _is_group else creator_id,
                 external_conv_id=conv_id,
                 source_channel="feishu",
-                first_message_title=user_text,
+                first_message_title=persisted_user_text,
                 is_group=_is_group,
                 group_name=f"Feishu Group {chat_id[:8]}" if _is_group else None,
             )
             session_conv_id = str(_sess.id)
 
             # Save user message
-            db.add(ChatMessage(agent_id=agent_id, user_id=platform_user_id, role="user", content=user_text, conversation_id=session_conv_id))
+            db.add(ChatMessage(agent_id=agent_id, user_id=platform_user_id, role="user", content=persisted_user_text, conversation_id=session_conv_id))
             _sess.last_message_at = _dt.now(_tz.utc)
             await db.commit()
             # ── Phase 1 complete: release connection before slow LLM/HTTP work ──
@@ -1336,7 +1343,16 @@ async def process_feishu_event(agent_id: uuid.UUID, body: dict):
 
             # Log activity
             from app.services.activity_logger import log_activity
-            await log_activity(agent_id, "chat_reply", f"回复了飞书消息: {final_reply_text[:80]}", detail={"channel": "feishu", "user_text": user_text[:200], "reply": final_reply_text[:500]})
+            await log_activity(
+                agent_id,
+                "chat_reply",
+                "回复了飞书消息",
+                detail={
+                    "channel": "feishu",
+                    "request_chars": len(user_text),
+                    "reply_chars": len(final_reply_text),
+                },
+            )
 
             # Save assistant reply to history (new short transaction)
             async with _async_session() as _save_db:
@@ -1733,7 +1749,12 @@ async def _handle_feishu_file(
 
         # Log activity
         from app.services.activity_logger import log_activity
-        await log_activity(agent_id, "chat_reply", f"回复了飞书图片消息: {reply_text[:80]}", detail={"channel": "feishu", "type": "image"})
+        await log_activity(
+            agent_id,
+            "chat_reply",
+            "回复了飞书图片消息",
+            detail={"channel": "feishu", "type": "image", "reply_chars": len(reply_text)},
+        )
         return
 
     # For non-image files: send simple ack as before
@@ -1833,9 +1854,13 @@ async def _call_llm_with_config(
     on_thinking=None,
     on_tool_call=None,
 ) -> str:
-    """Call LLM with pre-loaded agent/model objects. No DB session needed.
+    """Call an externally-authenticated channel LLM without platform tools.
 
-    This is the hot path — all DB queries should be done before calling this.
+    Channel identities are not yet durably bound to a first-party Astra user
+    authorization context.  They may use the Agent for text and multimodal
+    understanding, but must not be allowed to invoke tools with the Agent
+    creator as a placeholder identity.  All DB queries should be done before
+    calling this hot path.
     """
     from app.services.llm import call_llm_with_failover
 
@@ -1878,6 +1903,7 @@ async def _call_llm_with_config(
                 on_thinking=on_thinking,
                 on_tool_call=on_tool_call,
                 route_meta=route_meta,
+                skip_tools=True,
             ),
             timeout=_timeout,
         )

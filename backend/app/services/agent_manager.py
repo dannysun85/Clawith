@@ -237,6 +237,9 @@ class AgentManager:
 
         Returns container_id or None if Docker not available.
         """
+        if getattr(agent, "deletion_requested_at", None) is not None:
+            raise RuntimeError("Agent deletion is pending; runtime start is blocked")
+
         # Native agents run in the platform backend and must never depend on an
         # OpenClaw image or Docker socket. This guard belongs at the lifecycle
         # boundary so creation, onboarding, start, and recovery callers cannot
@@ -332,8 +335,13 @@ class AgentManager:
 
     async def remove_container(self, agent: Agent) -> bool:
         """Stop and remove the agent's Docker container."""
-        if not self.docker_client or not agent.container_id:
+        if not agent.container_id:
             return True
+        if not self.docker_client:
+            logger.error(
+                "Cannot prove container removal without a Docker control plane"
+            )
+            return False
 
         try:
             container = self.docker_client.containers.get(agent.container_id)

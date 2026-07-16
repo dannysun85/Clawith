@@ -194,6 +194,49 @@ async def test_webhook_update_preserves_redacted_secret(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_trigger_update_drops_unattested_legacy_reserved_state(monkeypatch):
+    agent_id = uuid.uuid4()
+    trigger = SimpleNamespace(
+        id=uuid.uuid4(),
+        agent_id=agent_id,
+        name="legacy-trigger",
+        type="interval",
+        config={
+            "minutes": 30,
+            "_origin_user_id": str(uuid.uuid4()),
+            "_matched_message": "legacy injected prompt",
+            "_since_ts": "2026-07-16T00:00:00+00:00",
+        },
+        reason="old",
+        is_enabled=True,
+        is_system=False,
+        max_fires=None,
+        cooldown_seconds=0,
+        expires_at=None,
+    )
+    session = MutableTriggerSession(trigger)
+
+    async def grant_manage(*_args):
+        return SimpleNamespace(id=agent_id), "manage"
+
+    monkeypatch.setattr(triggers_api, "async_session", FakeSessionFactory(session))
+    monkeypatch.setattr(triggers_api, "check_agent_access", grant_manage)
+
+    await triggers_api.update_trigger(
+        agent_id,
+        trigger.id,
+        triggers_api.TriggerUpdate(config={"minutes": 45}),
+        SimpleNamespace(),
+    )
+
+    assert trigger.config == {
+        "minutes": 45,
+        "_since_ts": "2026-07-16T00:00:00+00:00",
+    }
+    assert session.committed is True
+
+
+@pytest.mark.asyncio
 async def test_legacy_unsigned_webhook_cannot_be_enabled(monkeypatch):
     agent_id = uuid.uuid4()
     trigger = SimpleNamespace(

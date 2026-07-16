@@ -71,3 +71,63 @@ def test_mcp_http_guard_installs_pinned_transport():
     kwargs = mcp_security.MCPHTTPGuard("https://mcp.example/mcp").client_kwargs()
 
     assert isinstance(kwargs["transport"], mcp_security.PublicOnlyAsyncHTTPTransport)
+
+
+@pytest.mark.asyncio
+async def test_public_artifact_guard_allows_cross_origin_redirects_but_validates_every_hop(
+    monkeypatch,
+):
+    validated: list[str] = []
+
+    async def validate(url: str):
+        validated.append(url)
+        return url
+
+    monkeypatch.setattr(mcp_security, "validate_public_mcp_url", validate)
+    guard = mcp_security.PublicArtifactHTTPGuard()
+
+    await guard.validate_request(
+        mcp_security.httpx.Request("GET", "https://provider.example/object")
+    )
+    await guard.validate_request(
+        mcp_security.httpx.Request("GET", "https://cdn.example/signed-object")
+    )
+
+    assert validated == [
+        "https://provider.example/object",
+        "https://cdn.example/signed-object",
+    ]
+    kwargs = guard.client_kwargs()
+    assert kwargs["follow_redirects"] is True
+    assert kwargs["max_redirects"] == 5
+    assert isinstance(kwargs["transport"], mcp_security.PublicOnlyAsyncHTTPTransport)
+
+
+@pytest.mark.asyncio
+async def test_public_artifact_guard_rejects_a_private_redirect_hop(monkeypatch):
+    async def validate(url: str):
+        if "private" in url:
+            raise mcp_security.MCPURLPolicyError("private destination")
+        return url
+
+    monkeypatch.setattr(mcp_security, "validate_public_mcp_url", validate)
+    guard = mcp_security.PublicArtifactHTTPGuard()
+
+    with pytest.raises(mcp_security.MCPURLPolicyError, match="private destination"):
+        await guard.validate_request(
+            mcp_security.httpx.Request("GET", "https://private.example/object")
+        )
+
+
+@pytest.mark.asyncio
+async def test_public_artifact_guard_rejects_private_connected_peer():
+    guard = mcp_security.PublicArtifactHTTPGuard()
+    stream = _Stream(("127.0.0.1", 443))
+    response = mcp_security.httpx.Response(
+        302,
+        request=mcp_security.httpx.Request("GET", "https://cdn.example/object"),
+        extensions={"network_stream": stream},
+    )
+
+    with pytest.raises(mcp_security.MCPURLPolicyError):
+        await guard.validate_response(response)

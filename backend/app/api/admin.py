@@ -4,9 +4,10 @@ Provides endpoints for platform admins to manage companies, view stats,
 and control platform-level settings.
 """
 
+import asyncio
 import secrets
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -47,6 +48,12 @@ class CompanyStats(BaseModel):
 
 class CompanyCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=200)
+
+
+class AgentBayCleanupReconcileRequest(BaseModel):
+    provider_session_id: str = Field(min_length=1, max_length=200)
+    provider_deleted_out_of_band: bool = False
+    verification_note: str = Field(default="", max_length=500)
 
 
 class CompanyCreateResponse(BaseModel):
@@ -226,7 +233,19 @@ async def toggle_company(
     db: AsyncSession = Depends(get_db),
 ):
     """Enable or disable a company."""
-    result = await db.execute(select(Tenant).where(Tenant.id == company_id))
+    # Authorization fences acquire Agent rows before Tenant.  Mutations must
+    # use the same global order so a disable operation cannot deadlock an
+    # in-flight chat, trigger, A2A, or AgentBay side effect.
+    agents_result = await db.execute(
+        select(Agent)
+        .where(Agent.tenant_id == company_id)
+        .order_by(Agent.id)
+        .with_for_update()
+    )
+    company_agents = list(agents_result.scalars().all())
+    result = await db.execute(
+        select(Tenant).where(Tenant.id == company_id).with_for_update()
+    )
     tenant = result.scalar_one_or_none()
     if not tenant:
         raise HTTPException(status_code=404, detail="Company not found")
@@ -236,14 +255,171 @@ async def toggle_company(
 
     # When disabling: pause all running agents
     if not new_state:
-        agents = await db.execute(
-            select(Agent).where(Agent.tenant_id == company_id, Agent.status == "running")
-        )
-        for agent in agents.scalars().all():
-            agent.status = "paused"
+        for agent in company_agents:
+            if agent.status in {"running", "idle"}:
+                agent.status = "paused"
 
     await db.flush()
     return {"ok": True, "is_active": new_state}
+
+
+@router.get("/agentbay/cleanup-required")
+async def list_agentbay_cleanup_required(
+    current_user: User = Depends(require_role("platform_admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Release preflight and operator queue for unconfirmed provider cleanup."""
+
+    from app.models.agentbay_session import AgentBaySessionLedger
+
+    result = await db.execute(
+        select(AgentBaySessionLedger)
+        .where(AgentBaySessionLedger.status == "cleanup_required")
+        .order_by(
+            AgentBaySessionLedger.agent_id,
+            AgentBaySessionLedger.image_type,
+            AgentBaySessionLedger.started_at,
+            AgentBaySessionLedger.id,
+        )
+    )
+    rows = list(result.scalars().all())
+    return {
+        "count": len(rows),
+        "release_blocked": bool(rows),
+        "items": [
+            {
+                "id": str(row.id),
+                "tenant_id": str(row.tenant_id) if row.tenant_id else None,
+                "agent_id": str(row.agent_id) if row.agent_id else None,
+                "user_id": str(row.user_id) if row.user_id else None,
+                "chat_session_id": row.chat_session_id,
+                "provider_session_id": row.provider_session_id,
+                "image_type": row.image_type,
+                "reason": row.close_reason,
+                "started_at": row.started_at,
+            }
+            for row in rows
+        ],
+    }
+
+
+@router.post("/agentbay/cleanup-required/{ledger_id}/reconcile")
+async def reconcile_agentbay_cleanup_required(
+    ledger_id: uuid.UUID,
+    body: AgentBayCleanupReconcileRequest,
+    current_user: User = Depends(require_role("platform_admin")),
+    db: AsyncSession = Depends(get_db),
+):
+    """Close a poison row only after provider deletion is proven explicitly."""
+
+    from app.models.agentbay_session import AgentBaySessionLedger
+    from app.models.audit import AuditLog
+    from app.services.agentbay_client import _configured_agentbay_client
+
+    # Snapshot the immutable provider identity, then release the transaction
+    # before any provider call. A final locked compare-and-set below prevents a
+    # stale operator request from closing a changed row.
+    result = await db.execute(
+        select(AgentBaySessionLedger).where(AgentBaySessionLedger.id == ledger_id)
+    )
+    ledger = result.scalar_one_or_none()
+    if ledger is None:
+        raise HTTPException(status_code=404, detail="Cleanup record not found")
+    if ledger.status != "cleanup_required":
+        raise HTTPException(status_code=409, detail="Cleanup record is not pending")
+    if not ledger.provider_session_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Cleanup record lacks a verifiable provider identity",
+        )
+    if body.provider_session_id != ledger.provider_session_id:
+        raise HTTPException(status_code=409, detail="Provider session confirmation mismatch")
+    snapshot_agent_id = ledger.agent_id
+    snapshot_provider_session_id = ledger.provider_session_id
+    snapshot_image_type = ledger.image_type
+    await db.rollback()
+
+    mode = "operator_confirmed_absent"
+    if not body.provider_deleted_out_of_band:
+        if not snapshot_agent_id:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "The owning Agent no longer exists; verify the exact provider "
+                    "session out of band and submit an operator note"
+                ),
+            )
+        mode = "provider_delete_confirmed"
+        try:
+            client, _tool_config = await _configured_agentbay_client(
+                snapshot_agent_id
+            )
+            await client.attach_session(
+                snapshot_provider_session_id,
+                snapshot_image_type,
+            )
+            await client.delete_session_strict()
+        except asyncio.CancelledError:
+            await db.rollback()
+            raise
+        except Exception as exc:
+            await db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Provider deletion was not confirmed; verify the exact "
+                    "session in the AgentBay console before using the explicit "
+                    "out-of-band confirmation"
+                ),
+            ) from exc
+    elif len(body.verification_note.strip()) < 20:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "An out-of-band provider verification note of at least 20 "
+                "characters is required"
+            ),
+        )
+
+    result = await db.execute(
+        select(AgentBaySessionLedger)
+        .where(AgentBaySessionLedger.id == ledger_id)
+        .with_for_update()
+    )
+    ledger = result.scalar_one_or_none()
+    if ledger is None:
+        raise HTTPException(status_code=409, detail="Cleanup record changed during reconciliation")
+    if ledger.status != "cleanup_required":
+        raise HTTPException(status_code=409, detail="Cleanup record changed during reconciliation")
+    if ledger.provider_session_id != snapshot_provider_session_id:
+        raise HTTPException(status_code=409, detail="Provider identity changed during reconciliation")
+
+    now = datetime.now(timezone.utc)
+    ledger.status = "closed"
+    ledger.close_reason = "operator_cleanup_verified"
+    ledger.error_message = None
+    ledger.closed_at = now
+    ledger.context = {
+        **(ledger.context if isinstance(ledger.context, dict) else {}),
+        "reconciled_at": now.isoformat(),
+        "reconciled_by_user_id": str(current_user.id),
+        "reconciliation_mode": mode,
+        "verification_note": body.verification_note.strip(),
+    }
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            agent_id=ledger.agent_id,
+            action="agentbay:provider_cleanup_reconciled",
+            details={
+                "ledger_id": str(ledger.id),
+                "image_type": ledger.image_type,
+                "mode": mode,
+            },
+        )
+    )
+    await db.commit()
+    return {"status": "closed", "ledger_id": str(ledger.id), "mode": mode}
 
 
 # ─── Platform Metrics Dashboard ─────────────────────────

@@ -262,6 +262,7 @@ Make an HTTP GET request:
 
 The response contains a \`messages\` array. Each message includes:
 - \`id\` — unique message ID (use this for reporting)
+- \`delivery_attempt\` — current delivery generation (return this unchanged when reporting)
 - \`content\` — the message text
 - \`sender_user_name\` — name of the Astra user who sent it
 - \`sender_user_id\` — unique ID of the sender
@@ -282,7 +283,7 @@ For each completed message, make an HTTP POST request:
 - URL: ${window.location.origin}/api/gateway/report
 - Header: X-Api-Key: ${createdApiKey}
 - Header: Content-Type: application/json
-- Body: {"message_id": "<id from the message>", "result": "<your response>"}
+- Body: {"message_id": "<id from the message>", "delivery_attempt": <delivery_attempt from the message>, "result": "<your response>"}
 
 ### 3. Send a message to someone
 To proactively contact a person or agent, make an HTTP POST request:

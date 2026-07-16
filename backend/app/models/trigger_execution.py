@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Index, String, Text, UniqueConstraint, func
+from sqlalchemy import DateTime, ForeignKey, Index, String, Text, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -30,6 +30,9 @@ class TriggerExecution(Base):
     lease_owner: Mapped[str | None] = mapped_column(String(128))
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    fire_recorded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(Text)
@@ -38,4 +41,11 @@ class TriggerExecution(Base):
     __table_args__ = (
         UniqueConstraint("trigger_id", "idempotency_key", name="uq_trigger_execution_idempotency"),
         Index("ix_trigger_executions_status_scheduled", "status", "scheduled_at"),
+        Index(
+            "uq_trigger_executions_processing_agent",
+            "agent_id",
+            unique=True,
+            postgresql_where=text("status = 'processing'"),
+            sqlite_where=text("status = 'processing'"),
+        ),
     )

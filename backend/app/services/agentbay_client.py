@@ -6,19 +6,25 @@ for browser and code execution operations.
 
 import asyncio
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+
+from agentbay import AgentBay, Config, CreateSessionParams
 from loguru import logger
 from pydantic import RootModel
+
+from app.core.logging_config import _disable_agentbay_logger_override, configure_logging
 
 
 class GenericExtractSchema(RootModel[Any]):
     pass
 
 
-from agentbay import AgentBay, CreateSessionParams
-from app.core.logging_config import _disable_agentbay_logger_override, configure_logging
+AGENTBAY_SDK_TIMEOUT_MS = 30_000
+_AGENTBAY_MANAGER_CREATION_TOKEN = object()
+
 
 _disable_agentbay_logger_override()
 configure_logging()
@@ -33,25 +39,68 @@ class AgentBaySession:
     expires_at: Optional[datetime] = None
 
 
+@dataclass(frozen=True, slots=True)
+class _AgentBayLaneSnapshot:
+    id: uuid.UUID
+    provider_session_id: str | None
+    image_type: str
+    chat_session_id: str | None
+
+
 class AgentBayClient:
     """Client for AgentBay SDK interactions."""
 
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self._sdk = AgentBay(api_key=api_key)
+        self._sdk = AgentBay(
+            api_key=api_key,
+            cfg=Config(timeout_ms=AGENTBAY_SDK_TIMEOUT_MS),
+        )
         self._session = None
         self._image_type = None
 
-    async def create_session(self, image: str = "linux_latest") -> AgentBaySession:
+    def _require_bound_session(
+        self,
+        operation: str,
+        *,
+        allowed_image_types: tuple[str, ...] | None = None,
+    ) -> None:
+        """Require the durable manager to have attached the exact sandbox.
+
+        Operation methods are intentionally unable to allocate provider
+        resources. Creation belongs to the tenant/user/chat-lane manager, which
+        owns the Redis fence and durable ledger write.
+        """
+
+        if self._session is None:
+            raise RuntimeError(
+                f"AgentBay {operation} requires an existing managed session"
+            )
+        if allowed_image_types and getattr(self, "_image_type", None) not in allowed_image_types:
+            raise RuntimeError(
+                f"AgentBay {operation} is not available for this managed session type"
+            )
+
+    async def create_session(
+        self,
+        image: str = "linux_latest",
+        *,
+        _manager_token: object | None = None,
+    ) -> AgentBaySession:
         """Create a new session using SDK.
 
         Closes any existing session first to prevent leaked sessions
         on the AgentBay API side.
         """
+        if _manager_token is not _AGENTBAY_MANAGER_CREATION_TOKEN:
+            raise RuntimeError(
+                "AgentBay sessions can only be created by the durable lane manager"
+            )
+
         # Close existing session to prevent leaking concurrent sessions
         if self._session:
             logger.info("[AgentBay] Closing existing session before creating new one")
-            await self.close_session()
+            await self.delete_session_strict()
 
         image_id_map = {
             "browser_latest": "browser_latest",
@@ -64,7 +113,7 @@ class AgentBayClient:
 
         result = await asyncio.to_thread(self._sdk.create, CreateSessionParams(image_id=image_id))
         if not result.success:
-            raise RuntimeError(f"Failed to create session: {result.error_message}")
+            raise RuntimeError("AgentBay provider rejected session creation")
 
         self._session = result.session
         self._browser_initialized = False
@@ -76,25 +125,63 @@ class AgentBayClient:
             expires_at=datetime.now() + timedelta(hours=1),
         )
 
-    async def close_session(self):
-        """Release the current session."""
+    async def attach_session(self, provider_session_id: str, image: str) -> None:
+        """Attach this process to an existing provider session by exact ID."""
+
+        result = await asyncio.to_thread(self._sdk.get, provider_session_id)
+        if not result.success or not result.session:
+            raise RuntimeError("AgentBay provider session is unavailable")
+        self._session = result.session
+        self._image_type = image
+        self._browser_initialized = False
+
+    async def delete_session_strict(self) -> str | None:
+        """Delete the provider sandbox, retaining its identity on ambiguity.
+
+        Callers that use deletion as a durability/security boundary must use
+        this method.  A provider failure leaves ``_session`` attached so the
+        exact provider session id remains available for operator cleanup.
+        """
         if not self._session:
-            return
+            return None
+        provider_session_id = str(self._session.session_id)
         try:
-            await asyncio.to_thread(self._session.delete)
-            logger.info("[AgentBay] Closed session")
-        except Exception as e:
-            logger.warning(f"[AgentBay] Failed to close session: {e}")
-        finally:
+            result = await asyncio.to_thread(self._session.delete)
+            if getattr(result, "success", True) is False:
+                raise RuntimeError("AgentBay provider did not confirm session deletion")
+        except BaseException as exc:
+            logger.warning(
+                "[AgentBay] Provider-session deletion unconfirmed error_type={}",
+                type(exc).__name__,
+            )
+            raise
+        else:
             self._session = None
             self._browser_initialized = False
+            logger.info("[AgentBay] Closed session")
+            return provider_session_id
+
+    async def close_session(self) -> bool:
+        """Best-effort compatibility cleanup; return whether deletion was proven."""
+
+        if not self._session:
+            return True
+        try:
+            await self.delete_session_strict()
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
 
     # ─── Browser Operations ──────────────────────────
 
     async def _ensure_browser_initialized(self):
         """Ensure the browser is initialized for the current session."""
-        if not self._session:
-            raise RuntimeError("No active browser session")
+        self._require_bound_session(
+            "browser operation",
+            allowed_image_types=("browser", "browser_latest"),
+        )
         if not getattr(self, "_browser_initialized", False):
             from agentbay import BrowserOption
             from agentbay._common.models.browser import BrowserViewport, BrowserScreen
@@ -118,9 +205,10 @@ class AgentBayClient:
         SDK thread may continue briefly in the background but its result is
         discarded — the browser will eventually settle on its own.
         """
-        if not self._session or self._image_type not in ("browser", "browser_latest"):
-            await self.create_session("browser_latest")
-
+        self._require_bound_session(
+            "browser navigation",
+            allowed_image_types=("browser", "browser_latest"),
+        )
         await self._ensure_browser_initialized()
 
         # Navigate to URL with a 40-second soft timeout.
@@ -221,8 +309,10 @@ class AgentBayClient:
             login_config: JSON string with login configuration, e.g.
                           '{"api_key": "xxx", "skill_id": "yyy"}'
         """
-        if not self._session or self._image_type != "browser":
-            await self.create_session("browser_latest")
+        self._require_bound_session(
+            "browser login",
+            allowed_image_types=("browser", "browser_latest"),
+        )
         await self._ensure_browser_initialized()
 
         # Navigate to the login page first
@@ -252,8 +342,10 @@ class AgentBayClient:
         }
         sdk_lang = lang_map.get(language.lower(), "python")
 
-        if not self._session or self._image_type not in ("code", "code_latest"):
-            await self.create_session("code_latest")
+        self._require_bound_session(
+            "code execution",
+            allowed_image_types=("code", "code_latest"),
+        )
 
         result = await asyncio.to_thread(self._session.code.run_code, code, sdk_lang)
 
@@ -313,8 +405,7 @@ class AgentBayClient:
 
     async def command_exec(self, command: str, timeout_ms: int = 50000, cwd: str = "") -> dict:
         """Execute a shell command in the AgentBay environment."""
-        if not self._session:
-            await self.create_session("linux_latest")
+        self._require_bound_session("command execution")
 
         result = await asyncio.to_thread(
             self._session.command.exec,
@@ -327,15 +418,17 @@ class AgentBayClient:
             "stdout": getattr(result, "stdout", "") or getattr(result, "output", "") or "",
             "stderr": getattr(result, "stderr", "") or "",
             "exit_code": getattr(result, "exit_code", -1),
-            "error_message": result.error_message or "",
+            "error_message": "" if result.success else "AgentBay command execution failed",
         }
 
     # ─── Computer Operations ──────────────────────────
 
     async def _ensure_computer_session(self):
         """Ensure a computer (linux or windows desktop) session is active."""
-        if not self._session or self._image_type not in ("computer", "linux_latest", "windows_latest"):
-            await self.create_session("linux_latest")
+        self._require_bound_session(
+            "computer operation",
+            allowed_image_types=("computer", "linux_latest", "windows_latest"),
+        )
 
     async def computer_screenshot(self) -> dict:
         """Take a screenshot of the desktop.
@@ -366,7 +459,7 @@ class AgentBayClient:
         return {
             "success": result.success,
             "data": getattr(result, "data", None),
-            "error_message": result.error_message or "",
+            "error_message": "" if result.success else "AgentBay screenshot failed",
         }
 
     async def computer_click(self, x: int, y: int, button: str = "left") -> dict:
@@ -425,7 +518,7 @@ class AgentBayClient:
         return {
             "success": result.success,
             "data": getattr(result, "data", None),
-            "error_message": result.error_message or "",
+            "error_message": "" if result.success else "AgentBay screen-size lookup failed",
         }
 
     async def computer_start_app(self, cmd: str, work_dir: str = "") -> dict:
@@ -437,7 +530,7 @@ class AgentBayClient:
         return {
             "success": result.success,
             "data": getattr(result, "data", None),
-            "error_message": result.error_message or "",
+            "error_message": "" if result.success else "AgentBay application start failed",
         }
 
     async def computer_get_installed_apps(
@@ -460,7 +553,7 @@ class AgentBayClient:
         return {
             "success": result.success,
             "apps": apps,
-            "error_message": result.error_message or "",
+            "error_message": "" if result.success else "AgentBay application list failed",
         }
 
     async def computer_get_cursor_position(self) -> dict:
@@ -470,7 +563,7 @@ class AgentBayClient:
         return {
             "success": result.success,
             "data": getattr(result, "data", None),
-            "error_message": result.error_message or "",
+            "error_message": "" if result.success else "AgentBay cursor lookup failed",
         }
 
     async def computer_get_active_window(self) -> dict:
@@ -481,7 +574,7 @@ class AgentBayClient:
         return {
             "success": result.success,
             "window": vars(window) if window and hasattr(window, "__dict__") else str(window),
-            "error_message": result.error_message or "",
+            "error_message": "" if result.success else "AgentBay active-window lookup failed",
         }
 
     async def computer_list_windows(self, timeout_ms: int = 3000) -> dict:
@@ -494,7 +587,7 @@ class AgentBayClient:
         return {
             "success": result.success,
             "windows": windows,
-            "error_message": result.error_message or "",
+            "error_message": "" if result.success else "AgentBay window list failed",
         }
 
     async def computer_activate_window(self, window_id: int) -> dict:
@@ -510,7 +603,7 @@ class AgentBayClient:
         return {
             "success": result.success,
             "window_id": window_id,
-            "error_message": result.error_message or "",
+            "error_message": "" if result.success else "AgentBay close-window failed",
         }
 
     async def computer_list_visible_apps(self) -> dict:
@@ -525,7 +618,7 @@ class AgentBayClient:
         return {
             "success": result.success,
             "apps": apps,
-            "error_message": result.error_message or "",
+            "error_message": "" if result.success else "AgentBay visible-application list failed",
         }
 
     # ─── Live Preview Support ──────────────────────────
@@ -546,8 +639,11 @@ class AgentBayClient:
                 return result.data
             logger.warning("[AgentBay] get_link() failed")
             return None
-        except Exception as e:
-            logger.warning(f"[AgentBay] Failed to get live URL: {e}")
+        except Exception as exc:
+            logger.warning(
+                "[AgentBay] Failed to get live URL error_type={}",
+                type(exc).__name__,
+            )
             return None
 
     async def get_desktop_snapshot_base64(self) -> str | None:
@@ -592,8 +688,11 @@ class AgentBayClient:
             img.save(buffer, format="JPEG", quality=80, optimize=True)
             b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
             return f"data:image/jpeg;base64,{b64}"
-        except Exception as e:
-            logger.warning(f"[AgentBay] Desktop snapshot failed: {e}")
+        except Exception as exc:
+            logger.warning(
+                "[AgentBay] Desktop snapshot failed error_type={}",
+                type(exc).__name__,
+            )
             return None
 
     async def get_browser_snapshot_base64(self) -> str | None:
@@ -648,8 +747,11 @@ class AgentBayClient:
             img.save(buffer, format="JPEG", quality=80, optimize=True)
             b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
             return f"data:image/jpeg;base64,{b64}"
-        except Exception as e:
-            logger.warning(f"[AgentBay] Browser snapshot failed: {e}")
+        except Exception as exc:
+            logger.warning(
+                "[AgentBay] Browser snapshot failed error_type={}",
+                type(exc).__name__,
+            )
             return None
 
     async def __aenter__(self):
@@ -668,6 +770,30 @@ class AgentBayClient:
 _agentbay_sessions: dict[tuple[uuid.UUID, str, str], tuple[AgentBayClient, datetime]] = {}
 _AGENTBAY_SESSION_TIMEOUT = timedelta(minutes=5)
 
+_SESSION_CREATE_LOCK_TTL_SECONDS = 180
+_AGENT_DELETION_LOCK_TTL_SECONDS = 1800
+_SESSION_CREATE_ACQUIRE_LUA = """
+if redis.call('exists', KEYS[2]) == 1 then
+  return -1
+end
+if redis.call('set', KEYS[1], ARGV[1], 'EX', ARGV[2], 'NX') then
+  return 1
+end
+return 0
+"""
+_SESSION_CREATE_REFRESH_LUA = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('expire', KEYS[1], ARGV[2])
+end
+return 0
+"""
+_SESSION_CREATE_RELEASE_LUA = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('del', KEYS[1])
+end
+return 0
+"""
+
 
 AGENTBAY_API_URL = "https://api.agentbay.ai/v1"
 
@@ -680,6 +806,15 @@ def _is_plausible_agentbay_api_key(value: str | None) -> bool:
     "invalid apiKey or token".
     """
     return bool(isinstance(value, str) and value.strip().startswith("akm-"))
+
+
+def _canonical_chat_session_id(session_id: object) -> str | None:
+    """Return one textual identity for every representation of a UUID."""
+
+    try:
+        return str(uuid.UUID(str(session_id)))
+    except (TypeError, ValueError):
+        return None
 
 
 async def get_agentbay_api_key_for_agent(agent_id: uuid.UUID, db=None) -> Optional[str]:
@@ -702,7 +837,7 @@ async def get_agentbay_api_key_for_agent(agent_id: uuid.UUID, db=None) -> Option
             select(ChannelConfig).where(
                 ChannelConfig.agent_id == agent_id,
                 ChannelConfig.channel_type == "agentbay",
-                ChannelConfig.is_configured == True,
+                ChannelConfig.is_configured,
             )
         )
         config = result.scalar_one_or_none()
@@ -728,7 +863,7 @@ async def get_agentbay_api_key_for_agent(agent_id: uuid.UUID, db=None) -> Option
         tool_result = await session.execute(
             select(Tool).where(
                 Tool.name == "agentbay_browser_navigate",
-                Tool.enabled == True,
+                Tool.enabled,
             ).limit(1)
         )
         tool = tool_result.scalar_one_or_none()
@@ -740,7 +875,7 @@ async def get_agentbay_api_key_for_agent(agent_id: uuid.UUID, db=None) -> Option
         all_result = await session.execute(
             select(Tool).where(
                 Tool.category == "agentbay",
-                Tool.enabled == True,
+                Tool.enabled,
             ).order_by(Tool.name)
         )
         candidate_tools.extend(
@@ -769,27 +904,975 @@ async def get_agentbay_api_key_for_agent(agent_id: uuid.UUID, db=None) -> Option
 
 
 async def test_agentbay_channel(agent_id: uuid.UUID, current_user, db) -> dict:
-    """Test AgentBay connectivity."""
+    """Validate effective configuration without creating billable provider sessions."""
     key = await get_agentbay_api_key_for_agent(agent_id, db)
     if not key:
         return {"ok": False, "error": "AgentBay not configured"}
+
+    from app.services.agent_tools import _get_tool_config
+
+    tool_config = await _get_tool_config(agent_id, "agentbay_browser_navigate")
+    os_type = (tool_config or {}).get("os_type", "windows")
+    computer_image = "windows_latest" if os_type == "windows" else "linux_latest"
+    capabilities = {
+        "browser": {
+            "configured": True,
+            "runtime_tested": False,
+            "image": "browser_latest",
+            "status": "configuration_validated",
+        },
+        "computer": {
+            "configured": True,
+            "runtime_tested": False,
+            "image": computer_image,
+            "status": "configuration_validated",
+        },
+        "code": {
+            "configured": True,
+            "runtime_tested": False,
+            "enabled": False,
+            "image": "linux_latest",
+            "status": "separate_production_authorization_required",
+            "reason": (
+                "Code is disabled in the normal production release and requires "
+                "a separate platform-authorized activation workflow"
+            ),
+        },
+    }
+    return {
+        "ok": True,
+        "runtime_tested": False,
+        "message": (
+            "✅ AgentBay credential is configured and locally well-formed. "
+            "Remote authorization and runtime were not tested; no provider session was "
+            "created. Code requires separate production authorization."
+        ),
+        "capabilities": capabilities,
+    }
+
+
+async def _configured_agentbay_client(
+    agent_id: uuid.UUID,
+) -> tuple[AgentBayClient, dict | None]:
+    """Build an AgentBay client from the effective, validated credential."""
+
+    from app.services.agent_tools import _get_tool_config
+
+    tool_config = await _get_tool_config(agent_id, "agentbay_browser_navigate")
+    api_key = None
+    if tool_config and tool_config.get("api_key"):
+        api_key = tool_config.get("api_key")
+        from app.config import get_settings
+        from app.core.security import decrypt_data
+
+        try:
+            api_key = decrypt_data(api_key, get_settings().SECRET_KEY)
+        except Exception:
+            pass
+        if not _is_plausible_agentbay_api_key(api_key):
+            api_key = None
+
+    if not api_key:
+        api_key = await get_agentbay_api_key_for_agent(agent_id)
+    if not api_key:
+        raise RuntimeError(
+            "AgentBay not configured for this agent. Please configure in Tools > AgentBay."
+        )
+    return AgentBayClient(api_key), tool_config
+
+
+async def _load_agentbay_lane(
+    agent_id: uuid.UUID,
+    session_id: str,
+) -> tuple[uuid.UUID | None, uuid.UUID, str] | None:
+    """Resolve and authorize an exact durable user/chat lane."""
+
+    canonical_session_id = _canonical_chat_session_id(session_id)
+    if canonical_session_id is None:
+        return None
+    chat_session_id = uuid.UUID(canonical_session_id)
+
+    from sqlalchemy import or_, select
+
+    from app.core.permissions import (
+        evaluate_agent_relationship_status,
+        get_agent_access_level_for_user_id,
+        is_agent_expired,
+    )
+    from app.database import async_session
+    from app.models.agent import Agent
+    from app.models.chat_session import ChatSession
+    from app.models.org import AgentAgentRelationship
+    from app.models.tenant import Tenant
+    from app.models.user import User
+    from app.services.chat_session_access import validate_active_user_chat_lane
+
+    async with async_session() as db:
+        session_result = await db.execute(
+            select(ChatSession).where(
+                ChatSession.id == chat_session_id,
+                or_(
+                    ChatSession.agent_id == agent_id,
+                    (
+                        (ChatSession.source_channel == "agent")
+                        & (ChatSession.peer_agent_id == agent_id)
+                    ),
+                ),
+            )
+        )
+        chat_session = session_result.scalar_one_or_none()
+        if chat_session is None:
+            raise RuntimeError("AgentBay chat session is not available")
+        if chat_session.user_id is None:
+            raise PermissionError("AgentBay chat session has no owner")
+        owner = await db.get(User, chat_session.user_id)
+        if owner is None or not owner.is_active:
+            raise PermissionError("AgentBay chat-session owner is unavailable")
+
+        if chat_session.source_channel != "agent":
+            lane = await validate_active_user_chat_lane(
+                db,
+                agent_id=agent_id,
+                owner_user_id=chat_session.user_id,
+                session_id=chat_session.id,
+            )
+            return lane.agent.tenant_id, lane.owner.id, canonical_session_id
+
+        participant_ids = {chat_session.agent_id, chat_session.peer_agent_id}
+        if None in participant_ids or agent_id not in participant_ids:
+            raise PermissionError("AgentBay A2A session participants are invalid")
+        agents = list(
+            (
+                await db.execute(
+                    select(Agent).where(Agent.id.in_(participant_ids))
+                )
+            ).scalars().all()
+        )
+        if len(agents) != 2:
+            raise PermissionError("AgentBay A2A Agent is unavailable")
+        if any(
+            agent.status not in {"running", "idle"} or is_agent_expired(agent)
+            for agent in agents
+        ):
+            raise PermissionError("AgentBay A2A Agent is unavailable")
+        tenant_ids = {agent.tenant_id for agent in agents}
+        if len(tenant_ids) != 1 or None in tenant_ids:
+            raise PermissionError("AgentBay A2A company boundary is invalid")
+        tenant_id = next(iter(tenant_ids))
+        tenant = await db.get(Tenant, tenant_id)
+        if tenant is None or not tenant.is_active:
+            raise PermissionError("AgentBay company is inactive")
+        if owner.tenant_id != tenant_id:
+            raise PermissionError("AgentBay A2A owner tenant is invalid")
+        for participant in agents:
+            if not await get_agent_access_level_for_user_id(
+                db,
+                owner.id,
+                participant,
+            ):
+                raise PermissionError(
+                    "AgentBay A2A owner no longer has Agent access"
+                )
+
+        first_id, second_id = tuple(participant_ids)
+        relationships = list(
+            (
+                await db.execute(
+                    select(AgentAgentRelationship).where(
+                        or_(
+                            (
+                                (AgentAgentRelationship.agent_id == first_id)
+                                & (
+                                    AgentAgentRelationship.target_agent_id
+                                    == second_id
+                                )
+                            ),
+                            (
+                                (AgentAgentRelationship.agent_id == second_id)
+                                & (
+                                    AgentAgentRelationship.target_agent_id
+                                    == first_id
+                                )
+                            ),
+                        )
+                    )
+                )
+            ).scalars().all()
+        )
+        active_relationship = False
+        for relationship in relationships:
+            status = await evaluate_agent_relationship_status(
+                db,
+                relationship,
+                current_user_id=owner.id,
+            )
+            if status.get("access_status") == "active":
+                active_relationship = True
+                break
+        if not active_relationship:
+            raise PermissionError("AgentBay A2A relationship is inactive")
+        return tenant_id, owner.id, canonical_session_id
+
+
+async def _get_active_agentbay_ledger(
+    *,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    session_id: str,
+    image_type: str,
+):
+    """Return the sole active ledger row, quarantining historical duplicates."""
+
+    from sqlalchemy import and_, or_, select
+
+    from app.database import async_session
+    from app.models.agentbay_session import AgentBaySessionLedger
+
+    async with async_session() as db:
+        result = await db.execute(
+            select(AgentBaySessionLedger)
+            .where(
+                AgentBaySessionLedger.agent_id == agent_id,
+                AgentBaySessionLedger.image_type == image_type,
+                or_(
+                    AgentBaySessionLedger.status == "cleanup_required",
+                    and_(
+                        AgentBaySessionLedger.status == "active",
+                        AgentBaySessionLedger.user_id == user_id,
+                        AgentBaySessionLedger.chat_session_id == str(session_id),
+                    ),
+                ),
+            )
+            .order_by(
+                AgentBaySessionLedger.last_used_at.desc().nullslast(),
+                AgentBaySessionLedger.started_at.desc(),
+                AgentBaySessionLedger.id,
+            )
+        )
+        rows = list(result.scalars().all())
+        if not rows:
+            return None
+        now = datetime.now(timezone.utc)
+        relevant_rows = []
+        ledger_changed = False
+        for row in rows:
+            context = row.context if isinstance(row.context, dict) else {}
+            if row.status == "cleanup_required":
+                # A v2 row has an exact owner/chat binding, so its ambiguous
+                # deletion poisons only that lane. Legacy/untrusted rows lack
+                # enough identity to narrow safely and remain Agent-wide.
+                if context.get("binding_version") != 2 or (
+                    row.user_id == user_id
+                    and row.chat_session_id == str(session_id)
+                ):
+                    relevant_rows.append(row)
+            elif context.get("binding_version") != 2:
+                row.status = "cleanup_required"
+                row.close_reason = "untrusted_legacy_binding"
+                row.error_message = "Operator provider cleanup required"
+                relevant_rows.append(row)
+                ledger_changed = True
+            else:
+                relevant_rows.append(row)
+        if ledger_changed:
+            await db.commit()
+        rows = relevant_rows
+        if not rows:
+            return None
+        cleanup_rows = [row for row in rows if row.status == "cleanup_required"]
+        if cleanup_rows:
+            # Never create/attach another sandbox while an unconfirmed provider
+            # deletion remains associated with this exact user/chat lane.
+            return cleanup_rows[0]
+        rows = [row for row in rows if row.status == "active"]
+        if not rows:
+            return None
+        keeper = rows[0]
+        if keeper.expires_at and keeper.expires_at <= now:
+            # The caller must attach and delete the remote sandbox before the
+            # durable lane is released for replacement.
+            return keeper
+        duplicates = rows[1:]
+        for duplicate in duplicates:
+            # Never hide a remote provider sandbox from reconciliation. A
+            # duplicate means its deletion has not been proved, so keep it in
+            # the release-blocking cleanup queue and stop this exact lane.
+            duplicate.status = "cleanup_required"
+            duplicate.close_reason = "duplicate_active_lane_cleanup_required"
+            duplicate.error_message = "Operator provider cleanup required"
+            duplicate.closed_at = None
+        if duplicates:
+            await db.commit()
+            return duplicates[0]
+        keeper.last_used_at = now
+        await db.commit()
+        return keeper
+
+
+async def _mark_agentbay_ledger_unavailable(
+    ledger_id: uuid.UUID,
+    error: BaseException | str,
+) -> None:
+    from sqlalchemy import select
+
+    from app.database import async_session
+    from app.models.agentbay_session import AgentBaySessionLedger
+
+    async with async_session() as db:
+        result = await db.execute(
+            select(AgentBaySessionLedger).where(
+                AgentBaySessionLedger.id == ledger_id
+            )
+        )
+        ledger = result.scalar_one_or_none()
+        if ledger is not None and ledger.status == "active":
+            ledger.status = "error"
+            ledger.close_reason = "provider_attach_failed"
+            ledger.error_message = (
+                type(error).__name__
+                if isinstance(error, BaseException)
+                else "provider_attach_failed"
+            )
+            ledger.closed_at = datetime.now(timezone.utc)
+            await db.commit()
+
+
+async def _mark_agentbay_ledger_cleanup_required(
+    ledger_id: uuid.UUID,
+    *,
+    reason: str,
+) -> None:
+    from sqlalchemy import select
+
+    from app.database import async_session
+    from app.models.agentbay_session import AgentBaySessionLedger
+
+    async with async_session() as db:
+        result = await db.execute(
+            select(AgentBaySessionLedger).where(
+                AgentBaySessionLedger.id == ledger_id
+            )
+        )
+        ledger = result.scalar_one_or_none()
+        if ledger is not None and ledger.status == "active":
+            ledger.status = "cleanup_required"
+            ledger.close_reason = reason
+            ledger.error_message = "Operator provider cleanup required"
+            ledger.closed_at = None
+            await db.commit()
+
+
+async def _record_agentbay_cleanup_required(
+    *,
+    tenant_id: uuid.UUID | None,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    session_id: str,
+    provider_session_id: str,
+    image_type: str,
+    reason: str,
+) -> None:
+    from app.database import async_session
+    from app.models.agentbay_session import AgentBaySessionLedger
+
+    now = datetime.now(timezone.utc)
+    async with async_session() as db:
+        db.add(
+            AgentBaySessionLedger(
+                id=uuid.uuid4(),
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                user_id=user_id,
+                chat_session_id=str(session_id),
+                provider_session_id=provider_session_id,
+                image_type=image_type,
+                purpose="operator_cleanup",
+                status="cleanup_required",
+                started_at=now,
+                last_used_at=now,
+                close_reason=reason,
+                error_message="Operator provider cleanup required",
+                context={"binding_version": 2},
+            )
+        )
+        await db.commit()
+
+
+async def _mark_agentbay_ledger_closed(
+    ledger_id: uuid.UUID,
+    *,
+    reason: str,
+) -> None:
+    from sqlalchemy import select
+
+    from app.database import async_session
+    from app.models.agentbay_session import AgentBaySessionLedger
+
+    async with async_session() as db:
+        result = await db.execute(
+            select(AgentBaySessionLedger).where(
+                AgentBaySessionLedger.id == ledger_id
+            )
+        )
+        ledger = result.scalar_one_or_none()
+        if ledger is not None and ledger.status == "active":
+            ledger.status = "closed"
+            ledger.close_reason = reason
+            ledger.closed_at = datetime.now(timezone.utc)
+            await db.commit()
+
+
+async def _record_agentbay_ledger(
+    *,
+    tenant_id: uuid.UUID | None,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    session_id: str,
+    provider_session_id: str,
+    image_type: str,
+) -> bool:
+    from sqlalchemy.exc import IntegrityError
+
+    from app.database import async_session
+    from app.models.agentbay_session import AgentBaySessionLedger
+
+    now = datetime.now(timezone.utc)
+    async with async_session() as db:
+        db.add(
+            AgentBaySessionLedger(
+                id=uuid.uuid4(),
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                user_id=user_id,
+                chat_session_id=str(session_id),
+                provider_session_id=provider_session_id,
+                image_type=image_type,
+                purpose="tool_execution",
+                status="active",
+                started_at=now,
+                last_used_at=now,
+                expires_at=now + timedelta(hours=1),
+                context={"binding_version": 2},
+            )
+        )
+        try:
+            await db.commit()
+            return True
+        except IntegrityError:
+            await db.rollback()
+            return False
+
+
+def _agentbay_creation_lock_key(
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    session_id: str,
+    image_type: str,
+) -> str:
+    return f"agentbay-session-create:{agent_id}:{user_id}:{session_id}:{image_type}"
+
+
+async def _agentbay_agent_has_live_fences(redis, agent_id: uuid.UUID) -> bool:
+    """Return whether any creation/control/tool lease can still touch the Agent."""
+
+    patterns = (
+        f"agentbay-session-create:{agent_id}:*",
+        f"agentbay-take-control:{agent_id}:*",
+        f"agentbay-tool-execution:{agent_id}:*",
+        f"agentbay-tool-verification:{agent_id}:*",
+        f"agentbay-control-interaction:{agent_id}:*",
+    )
+    for pattern in patterns:
+        async for _key in redis.scan_iter(match=pattern, count=100):
+            return True
+    return False
+
+
+async def _set_agentbay_lane_cleanup_required(
+    snapshot: _AgentBayLaneSnapshot,
+    *,
+    reason: str,
+) -> None:
+    """Persist an ambiguous provider deletion in a short CAS transaction."""
+
+    from sqlalchemy import select
+
+    from app.database import async_session
+    from app.models.agentbay_session import AgentBaySessionLedger
+
+    async with async_session() as db:
+        row = (
+            await db.execute(
+                select(AgentBaySessionLedger)
+                .where(AgentBaySessionLedger.id == snapshot.id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if row is None or row.status == "closed":
+            return
+        if (
+            row.status not in {"active", "cleanup_required"}
+            or row.provider_session_id != snapshot.provider_session_id
+        ):
+            raise RuntimeError("AgentBay cleanup ledger changed during provider deletion")
+        row.status = "cleanup_required"
+        row.close_reason = reason
+        row.error_message = "Operator provider cleanup required"
+        row.closed_at = None
+        await db.commit()
+
+
+async def _close_agentbay_lane_after_provider_delete(
+    snapshot: _AgentBayLaneSnapshot,
+    *,
+    reason: str,
+) -> None:
+    """Close one exact ledger row only after provider deletion was proven."""
+
+    from sqlalchemy import select
+
+    from app.database import async_session
+    from app.models.agentbay_session import AgentBaySessionLedger
+
+    async with async_session() as db:
+        row = (
+            await db.execute(
+                select(AgentBaySessionLedger)
+                .where(AgentBaySessionLedger.id == snapshot.id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            raise RuntimeError("AgentBay cleanup ledger disappeared")
+        if row.status == "closed" and row.provider_session_id == snapshot.provider_session_id:
+            return
+        if (
+            row.status not in {"active", "cleanup_required"}
+            or row.provider_session_id != snapshot.provider_session_id
+        ):
+            raise RuntimeError("AgentBay cleanup ledger changed during provider deletion")
+        row.status = "closed"
+        row.close_reason = reason
+        row.error_message = None
+        row.closed_at = datetime.now(timezone.utc)
+        await db.commit()
+
+
+async def _persist_agentbay_cleanup_under_cancellation(
+    snapshot: _AgentBayLaneSnapshot,
+    *,
+    reason: str,
+) -> None:
+    task = asyncio.create_task(
+        _set_agentbay_lane_cleanup_required(snapshot, reason=reason)
+    )
     try:
-        from agentbay import AgentBay, CreateSessionParams
-        sdk = AgentBay(api_key=key)
-        # Using linux_latest instead of browser_latest. AgentBay tokens may be
-        # scoped/bound to specific instance types, and requesting browser_latest
-        # might trigger an 'InvalidParameter.Authorization' error for this key.
-        result = await asyncio.to_thread(sdk.create, CreateSessionParams(image_id="linux_latest"))
-        if result.success:
-            if result.session:
-                await asyncio.to_thread(result.session.delete)
-            return {"ok": True, "message": "✅ Successfully connected to AgentBay API"}
-        return {"ok": False, "error": result.error_message}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await task
+        raise
 
 
-async def get_agentbay_client_for_agent(agent_id: uuid.UUID, image_type: str, session_id: str = "") -> AgentBayClient:
+async def _close_agentbay_lanes_for_agent(*, agent_id: uuid.UUID) -> None:
+    """Strictly delete every durable provider sandbox before Agent deletion."""
+
+    from sqlalchemy import select
+
+    from app.database import async_session
+    from app.models.agentbay_session import AgentBaySessionLedger
+
+    async with async_session() as db:
+        rows = list(
+            (
+                await db.execute(
+                    select(AgentBaySessionLedger)
+                    .where(
+                        AgentBaySessionLedger.agent_id == agent_id,
+                        AgentBaySessionLedger.status.in_(
+                            ["active", "cleanup_required"]
+                        ),
+                    )
+                    .order_by(
+                        AgentBaySessionLedger.chat_session_id,
+                        AgentBaySessionLedger.image_type,
+                        AgentBaySessionLedger.id,
+                    )
+                )
+            ).scalars().all()
+        )
+        snapshots = [
+            _AgentBayLaneSnapshot(
+                id=row.id,
+                provider_session_id=row.provider_session_id,
+                image_type=row.image_type,
+                chat_session_id=row.chat_session_id,
+            )
+            for row in rows
+        ]
+        await db.rollback()
+
+    if not snapshots:
+        return
+    client: AgentBayClient | None = None
+    for snapshot in snapshots:
+        if not snapshot.provider_session_id:
+            await _set_agentbay_lane_cleanup_required(
+                snapshot,
+                reason="agent_delete_missing_provider_identity",
+            )
+            raise RuntimeError(
+                "AgentBay provider cleanup must be verified before deleting this Agent"
+            )
+        if client is None:
+            client, _tool_config = await _configured_agentbay_client(agent_id)
+        try:
+            await client.attach_session(
+                snapshot.provider_session_id,
+                snapshot.image_type,
+            )
+            await client.delete_session_strict()
+        except BaseException:
+            await _persist_agentbay_cleanup_under_cancellation(
+                snapshot,
+                reason="agent_delete_provider_cleanup_unconfirmed",
+            )
+            raise
+
+        await _close_agentbay_lane_after_provider_delete(
+            snapshot,
+            reason="agent_deleted",
+        )
+        canonical_session_id = _canonical_chat_session_id(snapshot.chat_session_id)
+        if canonical_session_id is not None:
+            cached = _agentbay_sessions.pop(
+                (agent_id, canonical_session_id, snapshot.image_type),
+                None,
+            )
+            if cached is not None:
+                cached[0]._session = None
+                cached[0]._browser_initialized = False
+
+
+@asynccontextmanager
+async def agentbay_agent_deletion_fence(*, agent_id: uuid.UUID):
+    """Block new provider work and prove every sandbox deletion before DB delete."""
+
+    from app.core.events import get_redis
+    from app.services.agentbay_control_lock import agentbay_agent_deletion_key
+
+    redis = await get_redis()
+    key = agentbay_agent_deletion_key(agent_id)
+    token = str(uuid.uuid4())
+    acquired = bool(
+        await redis.set(
+            key,
+            token,
+            ex=_AGENT_DELETION_LOCK_TTL_SECONDS,
+            nx=True,
+        )
+    )
+    if not acquired:
+        raise RuntimeError("AgentBay Agent deletion is already in progress")
+
+    stop = asyncio.Event()
+    fence_lost = asyncio.Event()
+    owner_task = asyncio.current_task()
+
+    async def _renew() -> None:
+        while True:
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=60)
+                return
+            except TimeoutError:
+                pass
+            try:
+                refreshed = await redis.eval(
+                    _SESSION_CREATE_REFRESH_LUA,
+                    1,
+                    key,
+                    token,
+                    str(_AGENT_DELETION_LOCK_TTL_SECONDS),
+                )
+            except Exception:
+                refreshed = 0
+            if int(refreshed or 0) != 1:
+                fence_lost.set()
+                if owner_task is not None and not owner_task.done():
+                    owner_task.cancel(
+                        "AgentBay Agent-deletion fence could not be renewed"
+                    )
+                return
+
+    renewal_task = asyncio.create_task(_renew())
+    try:
+        if await _agentbay_agent_has_live_fences(redis, agent_id):
+            raise RuntimeError(
+                "AgentBay session is busy; retry Agent deletion after it settles"
+            )
+        await _close_agentbay_lanes_for_agent(agent_id=agent_id)
+        yield
+    finally:
+        stop.set()
+        renewal_task.cancel()
+        await asyncio.gather(renewal_task, return_exceptions=True)
+        if not fence_lost.is_set():
+            try:
+                await redis.eval(_SESSION_CREATE_RELEASE_LUA, 1, key, token)
+            except Exception as exc:
+                # The Agent is already durably stopped/deletion-requested; a
+                # failed Redis release must not turn a committed DB deletion
+                # into a misleading client failure. The lease expires by TTL.
+                logger.error(
+                    "[AgentBay] Agent-deletion lock release failed error_type={}",
+                    type(exc).__name__,
+                )
+
+
+async def _close_agentbay_lanes_for_chat_session(
+    *,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    session_id: str,
+) -> None:
+    """Prove provider deletion for every durable sandbox in one chat lane."""
+
+    from sqlalchemy import select
+
+    from app.database import async_session
+    from app.models.agentbay_session import AgentBaySessionLedger
+
+    async with async_session() as db:
+        result = await db.execute(
+            select(AgentBaySessionLedger)
+            .where(
+                AgentBaySessionLedger.agent_id == agent_id,
+                AgentBaySessionLedger.user_id == user_id,
+                AgentBaySessionLedger.chat_session_id == str(session_id),
+                AgentBaySessionLedger.status.in_(["active", "cleanup_required"]),
+            )
+            .order_by(AgentBaySessionLedger.image_type, AgentBaySessionLedger.id)
+        )
+        rows = list(result.scalars().all())
+        snapshots = [
+            _AgentBayLaneSnapshot(
+                id=row.id,
+                provider_session_id=row.provider_session_id,
+                image_type=row.image_type,
+                chat_session_id=row.chat_session_id,
+            )
+            for row in rows
+        ]
+        await db.rollback()
+
+    if not snapshots:
+        return
+    client: AgentBayClient | None = None
+    for snapshot in snapshots:
+        if not snapshot.provider_session_id:
+            await _set_agentbay_lane_cleanup_required(
+                snapshot,
+                reason="chat_delete_missing_provider_identity",
+            )
+            raise RuntimeError(
+                "AgentBay provider cleanup must be verified before deleting this chat"
+            )
+        if client is None:
+            client, _tool_config = await _configured_agentbay_client(agent_id)
+        try:
+            await client.attach_session(
+                snapshot.provider_session_id,
+                snapshot.image_type,
+            )
+            await client.delete_session_strict()
+        except BaseException:
+            await _persist_agentbay_cleanup_under_cancellation(
+                snapshot,
+                reason="chat_delete_provider_cleanup_unconfirmed",
+            )
+            raise
+        await _close_agentbay_lane_after_provider_delete(
+            snapshot,
+            reason="chat_session_deleted",
+        )
+        cached = _agentbay_sessions.pop(
+            (agent_id, str(session_id), snapshot.image_type),
+            None,
+        )
+        if cached is not None:
+            cached[0]._session = None
+            cached[0]._browser_initialized = False
+
+
+@asynccontextmanager
+async def agentbay_chat_session_deletion_fence(
+    *,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    session_id: str,
+):
+    """Block creation/control while a chat and all its sandboxes are deleted."""
+
+    from app.core.events import get_redis
+    from app.services.agentbay_control_lock import (
+        agentbay_agent_deletion_key,
+        agentbay_tool_execution_lease,
+    )
+
+    canonical_session_id = _canonical_chat_session_id(session_id)
+    if canonical_session_id is None:
+        raise RuntimeError("AgentBay chat deletion requires a canonical session UUID")
+
+    redis = await get_redis()
+    token = str(uuid.uuid4())
+    image_types = ("browser", "code", "computer")
+    keys = [
+        _agentbay_creation_lock_key(
+            agent_id,
+            user_id,
+            canonical_session_id,
+            image_type,
+        )
+        for image_type in image_types
+    ]
+    acquired: list[str] = []
+    renewal_task: asyncio.Task | None = None
+    owner_task = asyncio.current_task()
+
+    async def _renew() -> None:
+        while True:
+            await asyncio.sleep(max(1, _SESSION_CREATE_LOCK_TTL_SECONDS // 3))
+            for key in keys:
+                try:
+                    renewed = await redis.eval(
+                        _SESSION_CREATE_REFRESH_LUA,
+                        1,
+                        key,
+                        token,
+                        str(_SESSION_CREATE_LOCK_TTL_SECONDS),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    renewed = 0
+                if int(renewed or 0) != 1:
+                    if owner_task is not None and not owner_task.done():
+                        owner_task.cancel(
+                            "AgentBay chat-deletion fence could not be renewed"
+                        )
+                    return
+
+    try:
+        async with agentbay_tool_execution_lease(agent_id, canonical_session_id):
+            for key in keys:
+                acquire_result = int(
+                    await redis.eval(
+                        _SESSION_CREATE_ACQUIRE_LUA,
+                        2,
+                        key,
+                        agentbay_agent_deletion_key(agent_id),
+                        token,
+                        str(_SESSION_CREATE_LOCK_TTL_SECONDS),
+                    )
+                )
+                if acquire_result < 0:
+                    raise RuntimeError("AgentBay Agent deletion is in progress")
+                if acquire_result == 0:
+                    raise RuntimeError(
+                        "AgentBay session is busy; retry chat deletion later"
+                    )
+                acquired.append(key)
+            renewal_task = asyncio.create_task(_renew())
+            await _close_agentbay_lanes_for_chat_session(
+                agent_id=agent_id,
+                user_id=user_id,
+                session_id=canonical_session_id,
+            )
+            yield
+    finally:
+        if renewal_task is not None:
+            renewal_task.cancel()
+            await asyncio.gather(renewal_task, return_exceptions=True)
+        for key in reversed(acquired):
+            try:
+                await redis.eval(
+                    _SESSION_CREATE_RELEASE_LUA,
+                    1,
+                    key,
+                    token,
+                )
+            except Exception as exc:
+                logger.error(
+                    "[AgentBay] Chat-deletion lock release failed error_type={}",
+                    type(exc).__name__,
+                )
+
+
+async def _attach_from_ledger(
+    client: AgentBayClient,
+    ledger,
+    *,
+    image_type: str,
+) -> bool:
+    if not ledger or not ledger.provider_session_id:
+        return False
+    context = ledger.context if isinstance(ledger.context, dict) else {}
+    if ledger.status == "cleanup_required":
+        raise RuntimeError(
+            "AgentBay provider cleanup must be verified before this lane can resume"
+        )
+    if (
+        ledger.status != "active"
+        or context.get("binding_version") != 2
+        or not ledger.tenant_id
+        or not ledger.agent_id
+        or not ledger.user_id
+        or not ledger.chat_session_id
+    ):
+        return False
+    try:
+        await client.attach_session(ledger.provider_session_id, image_type)
+        if ledger.expires_at and ledger.expires_at <= datetime.now(timezone.utc):
+            try:
+                await client.delete_session_strict()
+            except asyncio.CancelledError:
+                cleanup_task = asyncio.create_task(
+                    _mark_agentbay_ledger_cleanup_required(
+                        ledger.id,
+                        reason="provider_session_expiry_cleanup_unconfirmed",
+                    )
+                )
+                await asyncio.shield(cleanup_task)
+                raise
+            except Exception:
+                await _mark_agentbay_ledger_cleanup_required(
+                    ledger.id,
+                    reason="provider_session_expiry_cleanup_unconfirmed",
+                )
+                return False
+            await _mark_agentbay_ledger_closed(
+                ledger.id,
+                reason="provider_session_expired",
+            )
+            return False
+        return True
+    except Exception as exc:
+        error_type = type(exc).__name__
+        logger.warning(
+            "[AgentBay] Durable provider-session attach failed error_type={}",
+            error_type,
+        )
+        await _mark_agentbay_ledger_cleanup_required(
+            ledger.id,
+            reason="provider_attach_unconfirmed",
+        )
+        return False
+
+
+async def get_agentbay_client_for_agent(
+    agent_id: uuid.UUID,
+    image_type: str,
+    session_id: str = "",
+) -> AgentBayClient:
     """Get or create AgentBay client for agent.
 
     Sessions are cached per (agent_id, session_id, image_type) so that each
@@ -804,64 +1887,356 @@ async def get_agentbay_client_for_agent(agent_id: uuid.UUID, image_type: str, se
                     (e.g. test_agentbay_channel, single-session callers).
     """
 
+    lane = await _load_agentbay_lane(agent_id, session_id)
+    canonical_session_id = lane[2] if lane else None
+    cache_session_id = canonical_session_id or str(session_id)
     now = datetime.now()
-    cache_key = (agent_id, session_id, image_type)
+    cache_key = (agent_id, cache_session_id, image_type)
+
+    if lane is None:
+        raise PermissionError(
+            "AgentBay requires an exact authorized ChatSession UUID"
+        )
+
+    tenant_id, user_id, canonical_session_id = lane
+    # The durable ledger, not process memory, is the reuse authority. Read it
+    # before every cache hit so cleanup/expiry/reconciliation in another worker
+    # takes effect immediately.
+    ledger = await _get_active_agentbay_ledger(
+        agent_id=agent_id,
+        user_id=user_id,
+        session_id=canonical_session_id,
+        image_type=image_type,
+    )
 
     if cache_key in _agentbay_sessions:
         client, last_used = _agentbay_sessions[cache_key]
-        if now - last_used < _AGENTBAY_SESSION_TIMEOUT:
+        cached_provider_id = (
+            str(client._session.session_id) if client._session is not None else None
+        )
+        ledger_context = (
+            ledger.context if ledger is not None and isinstance(ledger.context, dict) else {}
+        )
+        durable_cache_match = bool(
+            ledger is not None
+            and ledger.status == "active"
+            and ledger_context.get("binding_version") == 2
+            and ledger.provider_session_id
+            and str(ledger.provider_session_id) == cached_provider_id
+            and (ledger.expires_at is None or ledger.expires_at > datetime.now(timezone.utc))
+        )
+        if durable_cache_match and now - last_used < _AGENTBAY_SESSION_TIMEOUT:
             # Session still valid, refresh timestamp and reuse
             _agentbay_sessions[cache_key] = (client, now)
             return client
-        else:
-            # Session expired, close and remove
-            logger.info(f"[AgentBay] Session expired for {image_type}; closing")
-            await client.close_session()
-            del _agentbay_sessions[cache_key]
+        # Drop only this process-local handle. The exact durable row below will
+        # decide whether to attach, delete an expired provider, or fail closed.
+        logger.info(
+            "[AgentBay] Cache binding is stale for {}; detaching",
+            image_type,
+        )
+        client._session = None
+        del _agentbay_sessions[cache_key]
 
-    from app.services.agent_tools import _get_tool_config
+    client, tool_config = await _configured_agentbay_client(agent_id)
+    if await _attach_from_ledger(client, ledger, image_type=image_type):
+        _agentbay_sessions[cache_key] = (client, now)
+        return client
 
-    tool_config = await _get_tool_config(agent_id, "agentbay_browser_navigate")
-    api_key = None
+    from app.core.events import get_redis
+    from app.services.agentbay_control_lock import agentbay_agent_deletion_key
 
-    if tool_config and tool_config.get("api_key"):
-        api_key = tool_config.get("api_key")
-        from app.core.security import decrypt_data
-        from app.config import get_settings
+    lock_key = _agentbay_creation_lock_key(
+        agent_id, user_id, canonical_session_id, image_type
+    )
+    lock_token = str(uuid.uuid4())
+    redis = await get_redis()
+    acquired = False
+    renewal_task: asyncio.Task | None = None
+    owner_task = asyncio.current_task()
+
+    async def _renew_creation_lock() -> None:
+        while True:
+            await asyncio.sleep(max(1, _SESSION_CREATE_LOCK_TTL_SECONDS // 3))
+            try:
+                renewed = await redis.eval(
+                    _SESSION_CREATE_REFRESH_LUA,
+                    1,
+                    lock_key,
+                    lock_token,
+                    str(_SESSION_CREATE_LOCK_TTL_SECONDS),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "[AgentBay] Session creation-lock renewal failed error_type={}",
+                    type(exc).__name__,
+                )
+                renewed = 0
+            if int(renewed or 0) != 1:
+                logger.error("[AgentBay] Session creation-lock fence was lost")
+                if owner_task is not None:
+                    owner_task.cancel()
+                return
+    try:
+        # Wait for an in-flight creator while repeatedly checking the durable
+        # ledger. Redis failure propagates so creation fails closed.
+        for _attempt in range(120):
+            acquire_result = int(
+                await redis.eval(
+                    _SESSION_CREATE_ACQUIRE_LUA,
+                    2,
+                    lock_key,
+                    agentbay_agent_deletion_key(agent_id),
+                    lock_token,
+                    str(_SESSION_CREATE_LOCK_TTL_SECONDS),
+                )
+            )
+            if acquire_result < 0:
+                raise PermissionError("AgentBay Agent deletion is in progress")
+            acquired = acquire_result == 1
+            ledger = await _get_active_agentbay_ledger(
+                agent_id=agent_id,
+                user_id=user_id,
+                session_id=canonical_session_id,
+                image_type=image_type,
+            )
+            if await _attach_from_ledger(client, ledger, image_type=image_type):
+                _agentbay_sessions[cache_key] = (client, now)
+                return client
+            if acquired:
+                break
+            await asyncio.sleep(0.25)
+        if not acquired:
+            raise RuntimeError("Timed out waiting for the AgentBay session creator")
+
+        renewal_task = asyncio.create_task(_renew_creation_lock())
+
+        # The session may have been deleted or its ACL revoked while this
+        # creator waited for Redis. Re-resolve the exact lane only after the
+        # creation fence is ours, before any provider side effect.
+        locked_lane = await _load_agentbay_lane(agent_id, canonical_session_id)
+        if locked_lane != (tenant_id, user_id, canonical_session_id):
+            raise PermissionError("AgentBay chat lane changed while waiting")
+
+        provider_created = False
+        durable_registered = False
+        provider_session_id: str | None = None
         try:
-            api_key = decrypt_data(api_key, get_settings().SECRET_KEY)
-        except Exception:
-            pass  # Fallback if it's somehow plaintext
-        if not _is_plausible_agentbay_api_key(api_key):
-            api_key = None
+            creation_task = asyncio.create_task(
+                _create_agentbay_session(
+                    client,
+                    agent_id,
+                    user_id,
+                    image_type,
+                    tool_config,
+                )
+            )
+            try:
+                await asyncio.shield(creation_task)
+            except asyncio.CancelledError:
+                # asyncio.to_thread cannot be cancelled safely. Keep the Redis
+                # renewal alive and wait until the SDK call settles so a newly
+                # created remote sandbox can be deleted or durably poisoned.
+                await asyncio.gather(creation_task, return_exceptions=True)
+                raise
+            provider_created = client._session is not None
+            if not provider_created:
+                raise RuntimeError("AgentBay provider creation was not confirmed")
+            provider_session_id = str(client._session.session_id)
+            # A pause/deletion/ACL/company change may have committed while the
+            # provider SDK call was in flight. Do not make that sandbox durable;
+            # the outer cleanup path must delete it first.
+            post_creation_lane = await _load_agentbay_lane(
+                agent_id,
+                canonical_session_id,
+            )
+            if post_creation_lane != (tenant_id, user_id, canonical_session_id):
+                raise PermissionError(
+                    "AgentBay chat lane was revoked during provider creation"
+                )
+            recorded = await _record_agentbay_ledger(
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                user_id=user_id,
+                session_id=canonical_session_id,
+                provider_session_id=provider_session_id,
+                image_type=image_type,
+            )
+            if recorded:
+                durable_registered = True
+            else:
+                # A creator that lost the durable unique race must delete its
+                # untracked provider sandbox before attaching the winner.
+                try:
+                    await client.delete_session_strict()
+                except BaseException:
+                    cleanup_task = asyncio.create_task(
+                        _record_agentbay_cleanup_required(
+                            tenant_id=tenant_id,
+                            agent_id=agent_id,
+                            user_id=user_id,
+                            session_id=canonical_session_id,
+                            provider_session_id=provider_session_id,
+                            image_type=image_type,
+                            reason="duplicate_creator_cleanup_unconfirmed",
+                        )
+                    )
+                    await asyncio.shield(cleanup_task)
+                    durable_registered = True
+                    raise
+                else:
+                    provider_created = False
+                winner = await _get_active_agentbay_ledger(
+                    agent_id=agent_id,
+                    user_id=user_id,
+                    session_id=canonical_session_id,
+                    image_type=image_type,
+                )
+                if not await _attach_from_ledger(
+                    client, winner, image_type=image_type
+                ):
+                    raise RuntimeError(
+                        "AgentBay active-lane race could not attach the durable winner"
+                    )
+            _agentbay_sessions[cache_key] = (client, now)
+            return client
+        except BaseException:
+            provider_created = client._session is not None
+            if provider_created and provider_session_id is None:
+                provider_session_id = str(client._session.session_id)
+            if provider_created and not durable_registered:
+                async def _cleanup_untracked_provider() -> None:
+                    try:
+                        await client.delete_session_strict()
+                    except BaseException as cleanup_exc:
+                        await _record_agentbay_cleanup_required(
+                            tenant_id=tenant_id,
+                            agent_id=agent_id,
+                            user_id=user_id,
+                            session_id=canonical_session_id,
+                            provider_session_id=str(provider_session_id),
+                            image_type=image_type,
+                            reason="untracked_session_cleanup_unconfirmed",
+                        )
+                        logger.error(
+                            "[AgentBay] Untracked provider-session cleanup failed error_type={}",
+                            type(cleanup_exc).__name__,
+                        )
 
-    if not api_key:
-        api_key = await get_agentbay_api_key_for_agent(agent_id)
+                cleanup_task = asyncio.create_task(_cleanup_untracked_provider())
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    await asyncio.gather(cleanup_task, return_exceptions=True)
+            raise
+    finally:
+        if renewal_task is not None:
+            renewal_task.cancel()
+            await asyncio.gather(renewal_task, return_exceptions=True)
+        if acquired:
+            try:
+                await redis.eval(
+                    _SESSION_CREATE_RELEASE_LUA,
+                    1,
+                    lock_key,
+                    lock_token,
+                )
+            except Exception as exc:
+                logger.error(
+                    "[AgentBay] Session creation-lock release failed error_type={}",
+                    type(exc).__name__,
+                )
 
-    if not api_key:
-        raise RuntimeError("AgentBay not configured for this agent. Please configure in Tools > AgentBay.")
 
-    client = AgentBayClient(api_key)
-
+async def _create_agentbay_session(
+    client: AgentBayClient,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    image_type: str,
+    tool_config: dict | None,
+) -> None:
     if image_type == "browser":
-        await client.create_session("browser_latest")
-        # Inject stored cookies after browser initialization
-        await _inject_credentials(client, agent_id)
+        await client.create_session(
+            "browser_latest",
+            _manager_token=_AGENTBAY_MANAGER_CREATION_TOKEN,
+        )
+        await _inject_credentials(client, agent_id, user_id)
     elif image_type == "computer":
-        # Read OS preference from tool config (default: windows)
         os_type = (tool_config or {}).get("os_type", "windows")
-        computer_image = "windows_latest" if os_type == "windows" else "linux_latest"
-        logger.info(f"[AgentBay] Creating computer session OS={os_type} image={computer_image}")
-        await client.create_session(computer_image)
+        computer_image = (
+            "windows_latest" if os_type == "windows" else "linux_latest"
+        )
+        logger.info(
+            "[AgentBay] Creating computer session OS={} image={}",
+            os_type,
+            computer_image,
+        )
+        await client.create_session(
+            computer_image,
+            _manager_token=_AGENTBAY_MANAGER_CREATION_TOKEN,
+        )
     else:
-        await client.create_session("code_latest")
+        await client.create_session(
+            "code_latest",
+            _manager_token=_AGENTBAY_MANAGER_CREATION_TOKEN,
+        )
 
-    _agentbay_sessions[cache_key] = (client, now)
+
+async def get_existing_agentbay_client_for_agent(
+    agent_id: uuid.UUID,
+    image_type: str,
+    session_id: str,
+) -> AgentBayClient | None:
+    """Attach to an existing exact lane without ever creating a blank sandbox."""
+
+    lane = await _load_agentbay_lane(agent_id, session_id)
+    canonical_session_id = lane[2] if lane else None
+    cache_key = (agent_id, canonical_session_id or str(session_id), image_type)
+    if lane is None:
+        return None
+    _tenant_id, user_id, canonical_session_id = lane
+    ledger = await _get_active_agentbay_ledger(
+        agent_id=agent_id,
+        user_id=user_id,
+        session_id=canonical_session_id,
+        image_type=image_type,
+    )
+    cached = _agentbay_sessions.get(cache_key)
+    if cached is not None:
+        client, _last_used = cached
+        cached_provider_id = (
+            str(client._session.session_id) if client._session is not None else None
+        )
+        ledger_context = (
+            ledger.context if ledger is not None and isinstance(ledger.context, dict) else {}
+        )
+        if (
+            ledger is not None
+            and ledger.status == "active"
+            and ledger_context.get("binding_version") == 2
+            and str(ledger.provider_session_id or "") == cached_provider_id
+            and (
+                ledger.expires_at is None
+                or ledger.expires_at > datetime.now(timezone.utc)
+            )
+        ):
+            _agentbay_sessions[cache_key] = (client, datetime.now())
+            return client
+        client._session = None
+        del _agentbay_sessions[cache_key]
+    if ledger is None:
+        return None
+    client, _tool_config = await _configured_agentbay_client(agent_id)
+    if not await _attach_from_ledger(client, ledger, image_type=image_type):
+        return None
+    _agentbay_sessions[cache_key] = (client, datetime.now())
     return client
 
 
 async def cleanup_agentbay_sessions():
-    """Clean up expired AgentBay sessions."""
+    """Clean up process-local handles without deleting durable user sandboxes."""
     now = datetime.now()
     expired = [
         cache_key for cache_key, (client, last_used) in _agentbay_sessions.items()
@@ -871,10 +2246,39 @@ async def cleanup_agentbay_sessions():
         client, _ = _agentbay_sessions.pop(cache_key)
         agent_id, session_id, image_type = cache_key
         logger.info(f"[AgentBay] Cleaning up expired {image_type} session for agent {agent_id}")
-        await client.close_session()
+        try:
+            uuid.UUID(str(session_id))
+        except (TypeError, ValueError):
+            await client.close_session()
+        else:
+            # UUID chat lanes are shared through the durable ledger and may be
+            # attached by API and worker processes simultaneously. Provider
+            # expiry/failed re-attach closes the ledger; local idle cleanup must
+            # not delete the shared remote session.
+            client._session = None
+            client._browser_initialized = False
 
 
-async def _inject_credentials(client: AgentBayClient, agent_id: uuid.UUID):
+async def start_agentbay_session_cache_daemon() -> None:
+    """Continuously detach expired process-local AgentBay handles."""
+
+    interval = max(min(int(_AGENTBAY_SESSION_TIMEOUT.total_seconds() // 2), 60), 5)
+    logger.info("[AgentBay] local session-cache daemon started interval={}s", interval)
+    while True:
+        try:
+            await cleanup_agentbay_sessions()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[AgentBay] local session-cache cleanup failed")
+        await asyncio.sleep(interval)
+
+
+async def _inject_credentials(
+    client: AgentBayClient,
+    agent_id: uuid.UUID,
+    owner_user_id: uuid.UUID,
+):
     """Inject stored cookies into the browser via CDP after initialization.
 
     Reads all 'active' credentials with cookies from the agent_credentials table,
@@ -899,13 +2303,17 @@ async def _inject_credentials(client: AgentBayClient, agent_id: uuid.UUID):
             result = await db.execute(
                 select(AgentCredential).where(
                     AgentCredential.agent_id == agent_id,
+                    AgentCredential.owner_user_id == owner_user_id,
                     AgentCredential.status == "active",
                     AgentCredential.cookies_json.isnot(None),
                 )
             )
             credentials = result.scalars().all()
-    except Exception as e:
-        logger.warning(f"[AgentBay] Failed to query credentials for injection: {e}")
+    except Exception as exc:
+        logger.warning(
+            "[AgentBay] Failed to query credentials for injection error_type={}",
+            type(exc).__name__,
+        )
         return
 
     if not credentials:
@@ -919,8 +2327,12 @@ async def _inject_credentials(client: AgentBayClient, agent_id: uuid.UUID):
             cookies = json.loads(raw)
             if isinstance(cookies, list):
                 all_cookies.extend(cookies)
-        except Exception as e:
-            logger.warning(f"[AgentBay] Failed to decrypt cookies for {cred.platform}: {e}")
+        except Exception as exc:
+            logger.warning(
+                "[AgentBay] Failed to decrypt cookies platform_present={} error_type={}",
+                bool(cred.platform),
+                type(exc).__name__,
+            )
 
     if not all_cookies:
         return
@@ -928,26 +2340,33 @@ async def _inject_credentials(client: AgentBayClient, agent_id: uuid.UUID):
     # Ensure browser is initialized before injection (Chrome must be running)
     try:
         await client._ensure_browser_initialized()
-    except Exception as e:
-        logger.warning(f"[AgentBay] Cannot inject cookies — browser not initialized: {e}")
+    except Exception as exc:
+        logger.warning(
+            "[AgentBay] Cannot inject cookies; browser not initialized error_type={}",
+            type(exc).__name__,
+        )
         return
 
-    # Build Node.js injection script.
-    # Use base64 encoding to write the script to the current working dir (not /tmp,
-    # which may lack write permissions in the Wuying browser sandbox).
+    # Build a credential-free Node.js program. Cookie bytes are supplied only
+    # through the one-shot process environment; they are never embedded in a
+    # command string or persisted in the remote sandbox filesystem.
     #
     # Cookies stored in DB were already sanitized at export time (sameSite title-cased,
     # expires:-1 removed, domain without leading dot), so we only do a defensive
     # re-sanitize here in case older records were stored before the fix.
     import base64 as _base64
-    cookies_json_str = json.dumps(all_cookies)
+    cookies_payload_b64 = _base64.b64encode(
+        json.dumps(all_cookies, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
     inject_script = r"""
 const { chromium } = require('/usr/local/lib/node_modules/playwright');
 (async () => {
     try {
+        const encodedCookies = process.env.ASTRA_COOKIES_B64 || '';
+        delete process.env.ASTRA_COOKIES_B64;
+        const rawCookies = JSON.parse(Buffer.from(encodedCookies, 'base64').toString('utf8'));
         const browser = await chromium.connectOverCDP('http://localhost:9222');
         const context = browser.contexts()[0];
-        const rawCookies = """ + cookies_json_str + r""";
 
         // Defensive sanitize: normalize sameSite casing and strip invalid expires
         const sameSiteMap = { none: 'None', lax: 'Lax', strict: 'Strict' };
@@ -976,8 +2395,9 @@ const { chromium } = require('/usr/local/lib/node_modules/playwright');
             } catch (e) {
                 failed++;
                 if (failed <= 3) {
-                    // Log first few failures to aid debugging
-                    console.error('INJECT_SKIP:' + e.message + ' cookie=' + JSON.stringify(cookie).slice(0, 200));
+                    // Cookie validation errors may echo secret values. Emit
+                    // only a bounded content-free signal.
+                    console.error('INJECT_SKIP');
                 }
             }
         }
@@ -989,26 +2409,20 @@ const { chromium } = require('/usr/local/lib/node_modules/playwright');
     }
 })();
 """
-
-
     try:
-        # Write script via base64 decode to avoid shell quoting issues and /tmp permission errors
+        # The command contains only the credential-free program. The SDK's
+        # per-process envs channel is ephemeral and avoids shell interpolation,
+        # process arguments, and sandbox file residue.
         script_b64 = _base64.b64encode(inject_script.encode('utf-8')).decode('ascii')
-        write_result = await asyncio.to_thread(
-            client._session.command.exec,
-            f"echo '{script_b64}' | /usr/bin/base64 -d > tc_inject_cookies.js",
-        )
-        write_ok = getattr(write_result, 'success', False)
-        logger.info(
-            "[AgentBay] Cookie inject script write success={}",
-            bool(write_ok),
-        )
-
-        # Execute the injection script
         exec_result = await asyncio.to_thread(
             client._session.command.exec,
-            "node tc_inject_cookies.js",
+            (
+                "node -e \"eval(Buffer.from('"
+                + script_b64
+                + "','base64').toString('utf8'))\""
+            ),
             timeout_ms=15000,
+            envs={"ASTRA_COOKIES_B64": cookies_payload_b64},
         )
         stdout = getattr(exec_result, 'stdout', '') or getattr(exec_result, 'output', '') or ''
         stderr = getattr(exec_result, 'stderr', '') or ''
@@ -1024,13 +2438,19 @@ const { chromium } = require('/usr/local/lib/node_modules/playwright');
                         cred.last_injected_at = now
                         db.add(cred)
                     await db.commit()
-            except Exception as e:
-                logger.warning(f"[AgentBay] Failed to update last_injected_at: {e}")
+            except Exception as exc:
+                logger.warning(
+                    "[AgentBay] Failed to update last_injected_at error_type={}",
+                    type(exc).__name__,
+                )
         else:
             logger.warning(
                 "[AgentBay] Cookie injection may have failed stdout_chars={} stderr_chars={}",
                 len(stdout),
                 len(stderr),
             )
-    except Exception as e:
-        logger.warning(f"[AgentBay] Cookie injection error: {e}")
+    except Exception as exc:
+        logger.warning(
+            "[AgentBay] Cookie injection error_type={}",
+            type(exc).__name__,
+        )

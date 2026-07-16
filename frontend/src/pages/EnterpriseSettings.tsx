@@ -718,6 +718,13 @@ export default function EnterpriseSettings() {
                 {/* ── Approvals ── */}
                 {activeTab === 'approvals' && (
                     <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                        {approvals.length > 0 && approvals.every((a) => a.execution_available !== true) && (
+                            <div role="status" style={{ color: 'var(--warning)', fontSize: 13 }}>
+                                {isChinese
+                                    ? '本版本已暂停自动审批执行。批准按钮已停用，且不会产生任何副作用。'
+                                    : 'Automatic approval execution is paused in this release. Approval is disabled and no side effect will run.'}
+                            </div>
+                        )}
                         {resolveApproval.isError && (
                             <div role="alert" style={{ color: 'var(--error)', fontSize: 13 }}>
                                 {isChinese ? '审批操作失败：' : 'Approval action failed: '}
@@ -729,7 +736,7 @@ export default function EnterpriseSettings() {
                                 <div>
                                     <div style={{ fontWeight: 500 }}>{a.action_type}</div>
                                     <div style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>
-                                        {a.agent_name || `Agent ${a.agent_id.slice(0, 8)}`} · {a.created_at ? new Date(a.created_at).toLocaleString() : ''}
+                                        {a.agent_name || (a.agent_id ? `Agent ${a.agent_id.slice(0, 8)}` : (isChinese ? '已删除 Agent' : 'Deleted Agent'))} · {a.created_at ? new Date(a.created_at).toLocaleString() : ''}
                                     </div>
                                 </div>
                                 <ApprovalPreview details={a.details} isChinese={isChinese} />
@@ -737,8 +744,10 @@ export default function EnterpriseSettings() {
                                     <div style={{ display: 'flex', gap: '8px' }}>
                                         <button
                                             className="btn btn-primary"
-                                            disabled={resolveApproval.isPending || !isApprovalApprovable(a.details)}
-                                            title={!isApprovalApprovable(a.details)
+                                            disabled={resolveApproval.isPending || a.execution_available !== true || !isApprovalApprovable(a.details)}
+                                            title={a.execution_available !== true
+                                                ? (isChinese ? '本版本已暂停自动审批执行。' : 'Automatic approval execution is paused in this release.')
+                                                : !isApprovalApprovable(a.details)
                                                 ? (isChinese ? '审批内容未通过完整性校验，只能拒绝。' : 'Payload integrity is not verified; reject it.')
                                                 : undefined}
                                             onClick={() => resolveApproval.mutate({ id: a.id, action: 'approve' })}

@@ -424,6 +424,61 @@ async def test_call_llm_auto_resolves_missing_route_metadata_before_provider_use
 
 
 @pytest.mark.asyncio
+async def test_persisted_agent_model_without_route_fails_before_provider_resolution():
+    agent_id = uuid.uuid4()
+    persisted_model = SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        provider="minimax",
+        model="MiniMax-M3",
+        modality="text",
+        tier="standard",
+    )
+    resolve_key = AsyncMock()
+
+    with (
+        patch.object(llm_caller, "_get_agent_config", AsyncMock(return_value=(5, None))),
+        patch.object(
+            llm_caller,
+            "ensure_agent_billing_route",
+            AsyncMock(return_value=(persisted_model, None)),
+        ),
+        patch.object(llm_caller, "resolve_model_key", resolve_key),
+    ):
+        result = await llm_caller.call_llm(
+            model=persisted_model,
+            messages=[{"role": "user", "content": "run"}],
+            agent_name="Autonomous agent",
+            role_description="worker",
+            agent_id=agent_id,
+        )
+
+    assert result == "⚠️ Agent billing route is unavailable."
+    resolve_key.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_missing_agent_cannot_recover_to_an_unbilled_persisted_model():
+    persisted_model = SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        provider="minimax",
+        model="MiniMax-M3",
+        modality="text",
+        tier="standard",
+    )
+    db = FakeSessionContext(None)
+
+    with patch.object(llm_caller, "async_session", return_value=db):
+        with pytest.raises(QuotaExceeded, match="billing context is unavailable"):
+            await llm_caller.ensure_agent_billing_route(
+                uuid.uuid4(),
+                persisted_model,
+                None,
+            )
+
+
+@pytest.mark.asyncio
 async def test_call_llm_settles_each_provider_round_even_at_tool_round_limit():
     agent_id = uuid.uuid4()
     tenant_id = uuid.uuid4()

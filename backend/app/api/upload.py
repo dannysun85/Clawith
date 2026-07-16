@@ -12,6 +12,11 @@ from app.core.permissions import check_agent_access
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.user import User
+from app.services.media_assets import (
+    MediaContractError,
+    image_asset_from_bytes,
+    validate_uploaded_video,
+)
 from app.services.storage import ensure_local_path, get_storage_backend, guess_content_type, normalize_storage_key
 
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -116,6 +121,17 @@ async def upload_file(
     is_video = ext in VIDEO_EXTENSIONS
     if is_image and len(content) > 10 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Image too large (max 10MB)")
+    try:
+        if is_image:
+            image_asset_from_bytes(content, label="Uploaded image")
+        elif is_video:
+            await validate_uploaded_video(
+                content,
+                extension=ext,
+                label="Uploaded video",
+            )
+    except MediaContractError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # Determine save directory
     workspace_path = ""

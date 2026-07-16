@@ -266,6 +266,7 @@ async def test_invalid_a2a_production_path_stops_before_model_or_llm(monkeypatch
     call_llm = AsyncMock()
     capture_failure = AsyncMock()
     monkeypatch.setattr(invoker, "async_session", FakeSessionFactory(db))
+    monkeypatch.setattr(invoker, "AUTOMATIC_TRIGGER_EXECUTION_ENABLED", True)
     monkeypatch.setattr(invoker, "get_agent_access_level_for_user_id", AsyncMock())
     monkeypatch.setattr("app.services.llm.resolve_agent_model", resolve_model)
     monkeypatch.setattr("app.services.llm.call_llm", call_llm)
@@ -302,7 +303,11 @@ async def test_a2a_reply_sink_revalidates_and_uses_session_owner(monkeypatch):
         source_channel="agent",
         last_message_at=None,
     )
-    peer_agent = SimpleNamespace(id=peer_agent_id, tenant_id=tenant_id)
+    peer_agent = SimpleNamespace(
+        id=peer_agent_id,
+        tenant_id=tenant_id,
+        agent_type="native",
+    )
     db = FakeSession(
         {
             (ChatSession, session_id): a2a_session,
@@ -316,14 +321,33 @@ async def test_a2a_reply_sink_revalidates_and_uses_session_owner(monkeypatch):
         "get_agent_access_level_for_user_id",
         AsyncMock(return_value="use"),
     )
+    validate_principal = AsyncMock()
+    validate_lane = AsyncMock(
+        return_value=SimpleNamespace(
+            session=a2a_session,
+            source_agent=peer_agent,
+        )
+    )
+    monkeypatch.setattr(
+        "app.services.trigger_authorization.validate_active_trigger_principal",
+        validate_principal,
+    )
+    monkeypatch.setattr(
+        "app.services.a2a_authorization.validate_active_a2a_lane",
+        validate_lane,
+    )
+
+    execution_claim = (uuid.uuid4(), "worker-a:generation-1")
 
     await invoker._persist_validated_a2a_reply(
         agent=current_agent,
         target={
             "session_id": str(session_id),
             "owner_user_id": str(session_owner_id),
+            "source_agent_id": str(peer_agent_id),
         },
         content="completed task",
+        execution_claims=[execution_claim],
     )
 
     assert creator_id != session_owner_id
@@ -333,3 +357,5 @@ async def test_a2a_reply_sink_revalidates_and_uses_session_owner(monkeypatch):
     assert db.added[0].content == "completed task"
     assert db.committed is True
     assert a2a_session.last_message_at is not None
+    validate_principal.assert_awaited_once()
+    validate_lane.assert_awaited_once()

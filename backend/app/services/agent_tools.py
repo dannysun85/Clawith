@@ -25,8 +25,8 @@ import unicodedata
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, Any
-from urllib.parse import urlencode
+from typing import TYPE_CHECKING, Optional, Any, Awaitable, Callable
+from urllib.parse import parse_qsl, urlencode, urlsplit
 import re
 
 from loguru import logger
@@ -66,9 +66,15 @@ from app.services.storage import agent_storage_key, get_storage_backend, normali
 from app.services.storage_runtime.base import WriteCondition, content_hash_bytes
 from app.services.workspace_locking import workspace_locks
 from app.services.workspace_paths import WorkspacePathError, resolve_path_within_root
-from app.core.permissions import evaluate_agent_relationship_status, evaluate_human_relationship_status
+from app.core.permissions import (
+    evaluate_agent_relationship_status,
+    evaluate_human_relationship_status,
+    get_agent_access_level_for_user_id,
+)
 from app.services.access_relationships import ensure_access_granted_platform_relationships
 from app.config import get_settings
+from app.core.logging_config import privacy_safe_shape
+from app.core.security import decrypt_data, encrypt_data
 from app.services.llm.finish import (
     FINISH_PROTOCOL_REMINDER,
     FINISH_TOOL_DEFINITION,
@@ -89,6 +95,13 @@ TOOL_MATERIALIZE_MAX_TOTAL_BYTES = 100 * 1024 * 1024
 TEMP_WORKSPACE_DEFAULT_PATHS = ["workspace", "memory", "skills", "focus.md", "soul.md", "HEARTBEAT.md"]
 MAX_EXEC_STDOUT_CAPTURE_BYTES = 1_000_000
 MAX_EXEC_STDERR_CAPTURE_BYTES = 500_000
+MAX_GENERATED_IMAGE_BYTES = 20 * 1024 * 1024 - 1
+MAX_GENERATED_AUDIO_BYTES = 16 * 1024 * 1024
+MAX_PROVIDER_IMAGE_JSON_BYTES = 30 * 1024 * 1024
+MAX_PROVIDER_AUDIO_JSON_BYTES = 33 * 1024 * 1024
+MAX_PROVIDER_CONTROL_JSON_BYTES = 1024 * 1024
+MAX_MINIMAX_VIDEO_DOWNLOAD_BYTES = 256 * 1024 * 1024
+_MINIMAX_AUDIO_RESPONSE_SEMAPHORE = asyncio.Semaphore(1)
 DOUYIN_AGENT_TEMPLATE_NAME = "Douyin Operations Manager"
 
 DOUYIN_AGENT_TOOLS = [
@@ -226,6 +239,76 @@ def _set_cached_tool_config(agent_id: Optional[uuid.UUID], tool_name: str, confi
     _tool_config_cache[cache_key] = (config, expiry)
 
 
+_CREDENTIAL_BOUND_MEDIA_DESTINATION_KEYS: dict[str, frozenset[str]] = {
+    "generate_image_siliconflow": frozenset({"base_url"}),
+    "generate_image_openai": frozenset({"base_url"}),
+    "generate_image_google": frozenset({"base_url"}),
+    "generate_image_custom": frozenset(
+        {"base_url", "endpoint_path", "extra_headers_json"}
+    ),
+}
+
+
+def _has_usable_agent_secret(value: object) -> bool:
+    normalized = str(value or "").strip()
+    return bool(normalized and normalized not in {"****", "••••", "********"})
+
+
+def _merge_runtime_tool_config(
+    tool_name: str,
+    *,
+    base_config: dict,
+    tenant_config: dict,
+    agent_config: dict,
+    config_schema: dict | None,
+) -> dict:
+    """Merge config without crossing a credential/destination trust boundary.
+
+    Media endpoints and their Authorization credential form one provenance
+    bundle. An Agent may inherit the company bundle unchanged, or an
+    organization/platform admin may supply an Agent-owned destination plus an
+    Agent-owned key. A field-wise merge must never send the tenant key to an
+    Agent-controlled host/header/path.
+    """
+
+    base_plain = _decrypt_sensitive_fields(base_config or {}, config_schema)
+    tenant_plain = _decrypt_sensitive_fields(tenant_config or {}, config_schema)
+    agent_plain = _decrypt_sensitive_fields(agent_config or {}, config_schema)
+    company = {**base_plain, **tenant_plain}
+    destination_keys = _CREDENTIAL_BOUND_MEDIA_DESTINATION_KEYS.get(tool_name)
+    if not destination_keys:
+        return {**company, **agent_plain}
+
+    agent_has_secret = _has_usable_agent_secret(agent_plain.get("api_key"))
+    if agent_has_secret:
+        missing_bundle_keys = sorted(
+            key for key in destination_keys if key not in agent_plain
+        )
+        if missing_bundle_keys:
+            raise ValueError(
+                f"{tool_name} Agent-owned API key requires a complete Agent "
+                f"endpoint bundle ({', '.join(missing_bundle_keys)})"
+            )
+        # A complete Agent-owned bundle is immutable with respect to future
+        # company endpoint edits.  Even when its destination currently equals
+        # the company value, it remains explicitly bound to the Agent key.
+        merged = {**company, **agent_plain}
+        for key in destination_keys:
+            merged[key] = agent_plain[key]
+        merged["api_key"] = agent_plain["api_key"]
+        return merged
+
+    destination_override = any(
+        key in agent_plain and agent_plain.get(key) != company.get(key)
+        for key in destination_keys
+    )
+    if not destination_override:
+        return {**company, **agent_plain}
+    raise ValueError(
+        f"{tool_name} Agent endpoint override requires an Agent-owned API key"
+    )
+
+
 async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Optional[dict]:
     """Get merged tool config (with caching).
 
@@ -238,10 +321,16 @@ async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Opt
     schema-aware field detection (e.g. smithery_api_key with type=password).
     """
     # Code authorization/config revocation must take effect before a pending
-    # approval can execute, so Code never uses the 60-second general cache.
+    # approval can execute. Credential-bound media destinations have the same
+    # requirement: a revoked key or endpoint bundle must not remain usable for
+    # another 60 seconds, and endpoint/key provenance must be re-evaluated on
+    # every invocation.
     from app.services.code_execution_policy import is_code_execution_tool
 
-    bypass_cache = is_code_execution_tool(tool_name)
+    bypass_cache = (
+        is_code_execution_tool(tool_name)
+        or tool_name in _CREDENTIAL_BOUND_MEDIA_DESTINATION_KEYS
+    )
     if not bypass_cache:
         cached = _get_cached_tool_config(agent_id, tool_name)
         if cached is not None:
@@ -272,11 +361,14 @@ async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Opt
                 tenant_config = {}
                 if tool_source == "builtin":
                     tenant_config = await get_tenant_tool_config(db, agent_tenant_id, db_tool_name, config_schema)
-                # Merge: agent overrides global
-                merged = {**base_config, **tenant_config, **(agent_config or {})}
+                merged = _merge_runtime_tool_config(
+                    tool_name,
+                    base_config=base_config,
+                    tenant_config=tenant_config,
+                    agent_config=agent_config or {},
+                    config_schema=config_schema,
+                )
                 if merged:
-                    # Decrypt with schema awareness
-                    merged = _decrypt_sensitive_fields(merged, config_schema)
                     logger.info(f"[ToolConfig] DB merged config for {tool_name}, agent_id={agent_id}")
                     if not bypass_cache:
                         _set_cached_tool_config(agent_id, tool_name, merged)
@@ -1023,6 +1115,11 @@ AGENT_TOOLS = [
                         "type": "string",
                         "description": "Image size. Default: 1024x1024. Options: 1024x1024, 1024x768, 768x1024",
                     },
+                    "overlay_text": {"type": "string", "description": "Exact visible copy rendered by Astra after generation. Keep it out of prompt."},
+                    "overlay_position": {"type": "string", "enum": ["top", "center", "bottom"]},
+                    "brand_asset": {"type": "string", "description": "Optional workspace image path or data URL composited as an immutable product/logo layer."},
+                    "brand_position": {"type": "string", "enum": ["top_left", "top_right", "center", "bottom_left", "bottom_right"]},
+                    "brand_scale": {"type": "number", "description": "Canvas width fraction from 0.1 to 0.8. Default: 0.42."},
                     "save_path": {
                         "type": "string",
                         "description": "Workspace path to save the image (e.g. workspace/images/sunset.png).",
@@ -1048,6 +1145,11 @@ AGENT_TOOLS = [
                         "type": "string",
                         "description": "Image size. Default: 1024x1024.",
                     },
+                    "overlay_text": {"type": "string", "description": "Exact visible copy rendered by Astra after generation. Keep it out of prompt."},
+                    "overlay_position": {"type": "string", "enum": ["top", "center", "bottom"]},
+                    "brand_asset": {"type": "string", "description": "Optional workspace image path or data URL composited as an immutable product/logo layer."},
+                    "brand_position": {"type": "string", "enum": ["top_left", "top_right", "center", "bottom_left", "bottom_right"]},
+                    "brand_scale": {"type": "number", "description": "Canvas width fraction from 0.1 to 0.8. Default: 0.42."},
                     "save_path": {
                         "type": "string",
                         "description": "Workspace path to save the image.",
@@ -1073,6 +1175,11 @@ AGENT_TOOLS = [
                         "type": "string",
                         "description": "Image size. Default: 1024x1024.",
                     },
+                    "overlay_text": {"type": "string", "description": "Exact visible copy rendered by Astra after generation. Keep it out of prompt."},
+                    "overlay_position": {"type": "string", "enum": ["top", "center", "bottom"]},
+                    "brand_asset": {"type": "string", "description": "Optional workspace image path or data URL composited as an immutable product/logo layer."},
+                    "brand_position": {"type": "string", "enum": ["top_left", "top_right", "center", "bottom_left", "bottom_right"]},
+                    "brand_scale": {"type": "number", "description": "Canvas width fraction from 0.1 to 0.8. Default: 0.42."},
                     "save_path": {
                         "type": "string",
                         "description": "Workspace path to save the image.",
@@ -1098,6 +1205,11 @@ AGENT_TOOLS = [
                         "type": "string",
                         "description": "Image size. Default: 1024x1024.",
                     },
+                    "overlay_text": {"type": "string", "description": "Exact visible copy rendered by Astra after generation. Keep it out of prompt."},
+                    "overlay_position": {"type": "string", "enum": ["top", "center", "bottom"]},
+                    "brand_asset": {"type": "string", "description": "Optional workspace image path or data URL composited as an immutable product/logo layer."},
+                    "brand_position": {"type": "string", "enum": ["top_left", "top_right", "center", "bottom_left", "bottom_right"]},
+                    "brand_scale": {"type": "number", "description": "Canvas width fraction from 0.1 to 0.8. Default: 0.42."},
                     "save_path": {
                         "type": "string",
                         "description": "Workspace path to save the image.",
@@ -1125,7 +1237,7 @@ AGENT_TOOLS = [
                     },
                     "reference_image": {
                         "type": "string",
-                        "description": "Optional workspace image path, public URL, or image data URL. MiniMax subject reference is best for a person/character; use video first_frame_image to preserve a product exactly.",
+                        "description": "Optional workspace image path or image data URL for creative subject guidance. The model may redraw text, logos, packaging, and geometry; use brand_asset for an unchanged product/logo layer.",
                     },
                     "overlay_text": {
                         "type": "string",
@@ -1135,6 +1247,18 @@ AGENT_TOOLS = [
                         "type": "string",
                         "enum": ["top", "center", "bottom"],
                         "description": "Position for overlay_text. Default: bottom.",
+                    },
+                    "brand_asset": {
+                        "type": "string",
+                        "description": "Optional workspace image path or data URL composited unchanged as a product/logo layer. Do not combine with reference_image.",
+                    },
+                    "brand_position": {
+                        "type": "string",
+                        "enum": ["top_left", "top_right", "center", "bottom_left", "bottom_right"],
+                    },
+                    "brand_scale": {
+                        "type": "number",
+                        "description": "Canvas width fraction from 0.1 to 0.8. Default: 0.42.",
                     },
                     "save_path": {
                         "type": "string",
@@ -1190,11 +1314,14 @@ AGENT_TOOLS = [
                     "prompt": {"type": "string", "description": "Text description of the video."},
                     "duration": {"type": "integer", "description": "Video duration in seconds. Default: 6."},
                     "resolution": {"type": "string", "description": "Video resolution, e.g. 1080P or 768P. Default: 1080P."},
-                    "first_frame_image": {"type": "string", "description": "Optional workspace image path, public URL, or image data URL used as the video's first frame. Use this to preserve an uploaded product or visual subject."},
-                    "last_frame_image": {"type": "string", "description": "Optional workspace image path, public URL, or image data URL used as the last frame. Requires first_frame_image."},
+                    "first_frame_image": {"type": "string", "description": "Optional workspace image path or image data URL for creative image-to-video guidance. The model may redraw text, logos, packaging, and geometry; use brand_asset for an unchanged static product/logo layer."},
+                    "last_frame_image": {"type": "string", "description": "Optional workspace image path or image data URL for creative last-frame guidance. The model may redraw text, logos, packaging, and geometry. Requires first_frame_image."},
                     "prompt_optimizer": {"type": "boolean", "description": "Whether MiniMax may optimize the motion prompt. Default: true."},
                     "overlay_text": {"type": "string", "description": "Optional exact Chinese/English copy rendered deterministically after the video is downloaded."},
                     "overlay_position": {"type": "string", "enum": ["top", "center", "bottom"], "description": "Position for overlay_text. Default: bottom."},
+                    "brand_asset": {"type": "string", "description": "Optional workspace image path frozen and composited over every frame as the protected product/logo layer. Do not combine with first_frame_image or last_frame_image."},
+                    "brand_position": {"type": "string", "enum": ["top_left", "top_right", "center", "bottom_left", "bottom_right"]},
+                    "brand_scale": {"type": "number", "description": "Video width fraction from 0.1 to 0.8. Default: 0.42."},
                     "wait_for_completion": {"type": "boolean", "description": "Poll and download if completed before timeout. Default: false."},
                     "poll_timeout_seconds": {"type": "integer", "description": "Maximum wait time when wait_for_completion=true. Default: 180."},
                     "save_path": {"type": "string", "description": "Workspace path to save the video if completed."},
@@ -2337,6 +2464,39 @@ async def _agent_has_any_channel(agent_id: uuid.UUID) -> bool:
 # ─── Dynamic Tool Loading from DB ──────────────────────────────
 
 
+def _a2a_global_async_enabled() -> bool:
+    """Return the release-wide gate for all automatic Agent delivery."""
+    from app.services.trigger_runtime.config import (
+        AUTOMATIC_TRIGGER_EXECUTION_ENABLED,
+    )
+
+    return bool(AUTOMATIC_TRIGGER_EXECUTION_ENABLED)
+
+
+def _a2a_async_available(
+    tenant_enabled: bool,
+    *,
+    force_async: bool = False,
+) -> bool:
+    """Compose tenant preference with the non-bypassable release gate."""
+    return _a2a_global_async_enabled() and (bool(tenant_enabled) or force_async)
+
+
+def _resolve_a2a_message_mode(
+    requested: str,
+    *,
+    tenant_enabled: bool,
+    force_async: bool = False,
+) -> str:
+    normalized = (requested or "notify").strip().lower()
+    if normalized in {"notify", "task_delegate"} and not _a2a_async_available(
+        tenant_enabled,
+        force_async=force_async,
+    ):
+        return "consult"
+    return normalized
+
+
 def _strip_a2a_msg_type(tools: list[dict]) -> list[dict]:
     """Remove the msg_type parameter from send_message_to_agent when async A2A is disabled.
 
@@ -2364,6 +2524,45 @@ def _strip_a2a_msg_type(tools: list[dict]) -> list[dict]:
             if "msg_type" in req:
                 params["required"] = [r for r in req if r != "msg_type"]
         result.append(t)
+    return result
+
+
+def _apply_trigger_execution_contract(tools: list[dict]) -> list[dict]:
+    """Keep the LLM tool surface aligned with the release execution gate."""
+    from app.services.trigger_runtime.config import (
+        AUTOMATIC_TRIGGER_EXECUTION_ENABLED,
+    )
+
+    if AUTOMATIC_TRIGGER_EXECUTION_ENABLED:
+        return tools
+
+    import copy
+
+    descriptions = {
+        "update_trigger": (
+            "Edit configuration for an existing trigger. Automatic trigger "
+            "execution is paused in this release; editing does not schedule "
+            "or run work and does not consume Credits."
+        ),
+        "cancel_trigger": (
+            "Disable an existing trigger configuration. Automatic trigger "
+            "execution is paused in this release."
+        ),
+        "list_triggers": (
+            "List retained trigger configuration and status. Automatic "
+            "trigger execution is paused in this release."
+        ),
+    }
+    result: list[dict] = []
+    for tool in tools:
+        name = tool.get("function", {}).get("name")
+        # Do not invite the model to plan a future wake-up that cannot occur.
+        if name == "set_trigger":
+            continue
+        if name in descriptions:
+            tool = copy.deepcopy(tool)
+            tool["function"]["description"] = descriptions[name]
+        result.append(tool)
     return result
 
 
@@ -2432,6 +2631,11 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                     _a2a_async = getattr(_tenant, "a2a_async_enabled", False)
     except Exception:
         pass
+
+    # Tenant settings cannot opt into a capability paused by release policy.
+    # This keeps the LLM schema aligned with the runtime and avoids wasted
+    # tokens on notify/task_delegate calls that the worker must reject.
+    _a2a_async = _a2a_async_available(_a2a_async)
 
     from app.config import get_settings
     from app.services.code_execution_policy import (
@@ -2604,6 +2808,7 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                 # Strip msg_type from send_message_to_agent when async A2A is disabled
                 if not _a2a_async:
                     result = _strip_a2a_msg_type(result)
+                result = _apply_trigger_execution_contract(result)
                 # Final diagnostic: log the complete tool list and assignment stats
                 logger.info(
                     f"[Tools] agent={agent_id} FINAL {len(result)} tools "
@@ -2627,7 +2832,7 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
     fallback = _patch_computer_tool_descriptions(fallback, computer_os_type)
     if not _a2a_async:
         fallback = _strip_a2a_msg_type(fallback)
-    return fallback
+    return _apply_trigger_execution_contract(fallback)
 
 
 # ─── Workspace initialization ──────────────────────────────────
@@ -2924,12 +3129,13 @@ _TOOL_AUTONOMY_MAP = {
 
 
 def _queued_approval_message(approval_id: object) -> str:
-    """Tell the model that durable approval execution owns the retry."""
+    """Tell the model that the approved side effect remains paused."""
 
     return (
         "⏳ This action requires approval. The approval request has been queued "
-        "and the system will execute it automatically after approval. Do not "
-        "retry this tool call; check Approvals for the final status. "
+        "but automatic execution is paused in this release. Do not retry this "
+        "tool call. No code, command, or side effect will run after approval "
+        "until the secure worker is re-enabled. "
         f"(Approval ID: {approval_id or 'N/A'})"
     )
 
@@ -2998,7 +3204,11 @@ def _is_enterprise_info_path(path: str | None) -> bool:
     return normalized == "enterprise_info" or normalized.startswith("enterprise_info/")
 
 
-async def _get_agent_tenant_id(agent_id: uuid.UUID) -> str | None:
+async def _get_agent_tenant_id(
+    agent_id: uuid.UUID,
+    *,
+    strict: bool = False,
+) -> str | None:
     """Get the agent tenant ID for tenant-scoped shared paths."""
     try:
         async with async_session() as db:
@@ -3009,7 +3219,10 @@ async def _get_agent_tenant_id(agent_id: uuid.UUID) -> str | None:
             if tenant_id:
                 return str(tenant_id)
     except Exception:
-        pass
+        if strict:
+            raise
+    if strict:
+        raise LookupError("Agent tenant was not found")
     return None
 
 
@@ -3246,6 +3459,8 @@ async def _execute_tool_direct(
     *,
     approval_id: uuid.UUID | None = None,
     approval_claim_token: uuid.UUID | None = None,
+    user_id: uuid.UUID | None = None,
+    origin_session_id: str | None = None,
     raise_exceptions: bool = False,
 ) -> str:
     """Execute a tool directly, bypassing autonomy checks.
@@ -3259,14 +3474,33 @@ async def _execute_tool_direct(
         if raise_exceptions:
             raise PermissionError(denial)
         return f"❌ {denial}"
+    agentbay_lease = None
+    agentbay_lease_exc: BaseException | None = None
     if tool_name.startswith("agentbay_"):
-        from app.api.agentbay_control import is_session_locked
+        from app.services.agentbay_control_lock import (
+            AgentBayTakeControlActive,
+            AgentBayToolExecutionActive,
+            agentbay_tool_execution_lease,
+        )
 
         session_id = str(arguments.get("_session_id") or "")
-        if is_session_locked(str(agent_id), session_id):
+        agentbay_lease = agentbay_tool_execution_lease(agent_id, session_id)
+        try:
+            await agentbay_lease.__aenter__()
+        except (AgentBayTakeControlActive, AgentBayToolExecutionActive) as exc:
             if raise_exceptions:
-                raise PermissionError("AgentBay session is under human control")
-            return "❌ AgentBay session is under human control; approved execution was blocked"
+                raise PermissionError(str(exc)) from exc
+            return f"❌ {exc}; approved execution was blocked"
+        except Exception as exc:
+            logger.error(
+                "[AgentBay] Shared tool-lease acquire failed error_type={}",
+                type(exc).__name__,
+            )
+            if raise_exceptions:
+                raise PermissionError(
+                    "AgentBay control-lock service is unavailable"
+                ) from exc
+            return "❌ AgentBay control-lock service is unavailable; execution was blocked"
     ws = _agent_workspace_root(agent_id)
     try:
         if tool_name in {"delete_file", "write_file", "move_file", "edit_file"}:
@@ -3290,15 +3524,15 @@ async def _execute_tool_direct(
                 sync_back=True,
             )
         elif tool_name == "agentbay_code_execute":
-            return await _agentbay_code_execute(agent_id, ws, arguments)
+            direct_result = await _agentbay_code_execute(agent_id, ws, arguments)
         elif tool_name == "agentbay_code_write_file":
-            return await _agentbay_code_write_file(agent_id, ws, arguments)
+            direct_result = await _agentbay_code_write_file(agent_id, ws, arguments)
         elif tool_name == "agentbay_code_read_file":
-            return await _agentbay_code_read_file(agent_id, ws, arguments)
+            direct_result = await _agentbay_code_read_file(agent_id, ws, arguments)
         elif tool_name == "agentbay_code_edit_file":
-            return await _agentbay_code_edit_file(agent_id, ws, arguments)
+            direct_result = await _agentbay_code_edit_file(agent_id, ws, arguments)
         elif tool_name == "agentbay_command_exec":
-            return await _agentbay_command_exec(agent_id, ws, arguments)
+            direct_result = await _agentbay_command_exec(agent_id, ws, arguments)
         elif tool_name == "web_search":
             return await _web_search(arguments, agent_id)
         elif tool_name == "jina_search":
@@ -3321,11 +3555,16 @@ async def _execute_tool_direct(
             return await _send_message_to_agent(
                 agent_id,
                 arguments,
-                user_id=None,
-                origin_session_id=None,
+                user_id=user_id,
+                origin_session_id=origin_session_id,
             )
         elif tool_name == "send_file_to_agent":
-            return await _send_file_to_agent(agent_id, arguments)
+            return await _send_file_to_agent(
+                agent_id,
+                arguments,
+                user_id=user_id,
+                origin_session_id=origin_session_id,
+            )
         elif tool_name == "douyin_run_publish_job":
             from app.services.douyin.operations import douyin_operations_service
             job_id = uuid.UUID(str(arguments.get("job_id")))
@@ -3375,11 +3614,37 @@ async def _execute_tool_direct(
             if raise_exceptions:
                 raise ValueError(f"Tool {tool_name} does not support post-approval execution")
             return f"Tool {tool_name} does not support post-approval execution"
+        if tool_name.startswith("agentbay_"):
+            if (
+                isinstance(direct_result, str)
+                and direct_result.lstrip().startswith(("❌", "Failed", "Error"))
+            ):
+                agentbay_lease_exc = RuntimeError(
+                    "AgentBay provider operation completion is unverified"
+                )
+            return direct_result
+    except asyncio.CancelledError as exc:
+        agentbay_lease_exc = exc
+        raise
     except Exception as e:
+        agentbay_lease_exc = e
         logger.exception(f"[DirectTool] Error executing {tool_name}: {e}")
         if raise_exceptions:
             raise
         return f"Error executing {tool_name}: {e}"
+    finally:
+        if agentbay_lease is not None:
+            try:
+                await agentbay_lease.__aexit__(
+                    type(agentbay_lease_exc) if agentbay_lease_exc else None,
+                    agentbay_lease_exc,
+                    agentbay_lease_exc.__traceback__ if agentbay_lease_exc else None,
+                )
+            except Exception as exc:
+                logger.error(
+                    "[AgentBay] Shared tool-lease release failed error_type={}",
+                    type(exc).__name__,
+                )
 
 
 async def _execute_approved_tool(
@@ -3389,6 +3654,8 @@ async def _execute_approved_tool(
     *,
     approval_id: uuid.UUID,
     approval_claim_token: uuid.UUID,
+    user_id: uuid.UUID | None = None,
+    origin_session_id: str | None = None,
 ) -> ApprovedToolExecutionOutcome:
     """Execute through the durable approval contract with a typed outcome.
 
@@ -3423,8 +3690,8 @@ async def _execute_approved_tool(
         outcome = await _send_message_to_agent(
             agent_id,
             arguments,
-            user_id=None,
-            origin_session_id=None,
+            user_id=user_id,
+            origin_session_id=origin_session_id,
             structured=True,
         )
         if not isinstance(outcome, ApprovedToolExecutionOutcome):
@@ -3434,6 +3701,8 @@ async def _execute_approved_tool(
         outcome = await _send_file_to_agent(
             agent_id,
             arguments,
+            user_id=user_id,
+            origin_session_id=origin_session_id,
             structured=True,
         )
         if not isinstance(outcome, ApprovedToolExecutionOutcome):
@@ -3446,6 +3715,8 @@ async def _execute_approved_tool(
         agent_id,
         approval_id=approval_id,
         approval_claim_token=approval_claim_token,
+        user_id=user_id,
+        origin_session_id=origin_session_id,
         raise_exceptions=True,
     )
     if tool_name in {"douyin_run_publish_job", "douyin_reply_comment"}:
@@ -3534,6 +3805,29 @@ async def execute_tool(
         .replace("\ufeff", "")
         .strip()
     )
+    if tool_name in {
+        "set_trigger",
+        "update_trigger",
+        "cancel_trigger",
+        "list_triggers",
+    }:
+        async with async_session() as permission_db:
+            agent_result = await permission_db.execute(
+                select(AgentModel).where(AgentModel.id == agent_id)
+            )
+            managed_agent = agent_result.scalar_one_or_none()
+            if managed_agent is None:
+                return "❌ Agent not found"
+            access_level = await get_agent_access_level_for_user_id(
+                permission_db,
+                user_id,
+                managed_agent,
+            )
+            if access_level != "manage":
+                return (
+                    "❌ Trigger management requires manage access to this Agent. "
+                    "Ask an Agent manager to create or change automations."
+                )
     denial = await _code_tool_denial_reason(tool_name, agent_id)
     if denial:
         return f"❌ {denial}"
@@ -3550,9 +3844,20 @@ async def execute_tool(
     # blocks approval creation while the session is locked.
     if tool_name.startswith("agentbay_"):
         arguments = {**arguments, "_session_id": session_id}
-        from app.api.agentbay_control import is_session_locked
+        from app.services.agentbay_control_lock import is_take_control_locked
 
-        if is_session_locked(str(agent_id), session_id):
+        try:
+            locked = await is_take_control_locked(str(agent_id), session_id)
+        except Exception as exc:
+            logger.error(
+                "[AgentBay] Shared control-lock lookup failed error_type={}",
+                type(exc).__name__,
+            )
+            return (
+                "⏸️ AgentBay control-lock service is unavailable. "
+                "Browser/computer execution is blocked until lock state can be verified."
+            )
+        if locked:
             return (
                 "⏸️ A human operator is currently controlling this browser session "
                 "(Take Control mode). Please wait for them to finish before retrying "
@@ -3567,7 +3872,6 @@ async def execute_tool(
                 autonomy_service,
                 build_tool_approval_details,
             )
-            from app.models.agent import Agent as AgentModel
             async with async_session() as _adb:
                 _ar = await _adb.execute(select(AgentModel).where(AgentModel.id == agent_id))
                 _agent = _ar.scalar_one_or_none()
@@ -3582,6 +3886,7 @@ async def execute_tool(
                             tool_name,
                             arguments,
                             user_id,
+                            session_id or None,
                         ),
                     )
                     await _adb.commit()
@@ -3596,6 +3901,30 @@ async def execute_tool(
         except Exception as e:
             logger.exception(f"[Autonomy] Check failed: {e}")
             return f"⚠️ Autonomy check failed ({e}). Operation blocked for safety. Please retry or contact admin."
+
+    agentbay_lease = None
+    agentbay_lease_exc: BaseException | None = None
+    if tool_name.startswith("agentbay_"):
+        from app.services.agentbay_control_lock import (
+            AgentBayTakeControlActive,
+            AgentBayToolExecutionActive,
+            agentbay_tool_execution_lease,
+        )
+
+        agentbay_lease = agentbay_tool_execution_lease(agent_id, session_id)
+        try:
+            await agentbay_lease.__aenter__()
+        except (AgentBayTakeControlActive, AgentBayToolExecutionActive) as exc:
+            return f"⏸️ {exc}. Please retry after the active operation finishes."
+        except Exception as exc:
+            logger.error(
+                "[AgentBay] Shared tool-lease acquire failed error_type={}",
+                type(exc).__name__,
+            )
+            return (
+                "⏸️ AgentBay control-lock service is unavailable. "
+                "Browser/computer execution is blocked until lock state can be verified."
+            )
 
     try:
         if tool_name == "list_files":
@@ -3755,7 +4084,12 @@ async def execute_tool(
                 origin_session_id=session_id,
             )
         elif tool_name == "send_file_to_agent":
-            result = await _send_file_to_agent(agent_id, arguments)
+            result = await _send_file_to_agent(
+                agent_id,
+                arguments,
+                user_id=user_id,
+                origin_session_id=session_id or None,
+            )
         elif tool_name == "send_channel_file":
             file_path = (arguments.get("file_path") or "").strip()
             if not file_path:
@@ -4223,8 +4557,12 @@ async def execute_tool(
             from app.services.activity_logger import log_activity
             await log_activity(
                 agent_id, "tool_call",
-                f"Called tool {tool_name}: {result[:80]}",
-                detail={"tool": tool_name, "args": {k: str(v)[:100] for k, v in arguments.items()}, "result": result[:300]},
+                f"Called tool {tool_name}",
+                detail={
+                    "tool": tool_name,
+                    "args_shape": privacy_safe_shape(arguments),
+                    "result_shape": privacy_safe_shape(result),
+                },
             )
         # Save error message to current session if a messaging tool fails, so the user is notified
         if session_id and tool_name in ("send_channel_message", "send_feishu_message", "send_platform_message", "send_message_to_agent") and isinstance(result, str) and result.startswith("❌"):
@@ -4242,10 +4580,35 @@ async def execute_tool(
             except Exception as _e:
                 logger.warning(f"Failed to save tool error message to session: {_e}")
 
+        if (
+            agentbay_lease is not None
+            and isinstance(result, str)
+            and result.lstrip().startswith(("❌", "Failed", "Error"))
+        ):
+            agentbay_lease_exc = RuntimeError(
+                "AgentBay provider operation completion is unverified"
+            )
         return result
+    except asyncio.CancelledError as exc:
+        agentbay_lease_exc = exc
+        raise
     except Exception as e:
+        agentbay_lease_exc = e
         logger.exception(f"[Tool] Execution failed: {tool_name}")
         return f"Tool execution error ({tool_name}): {type(e).__name__}: {str(e)[:200]}"
+    finally:
+        if agentbay_lease is not None:
+            try:
+                await agentbay_lease.__aexit__(
+                    type(agentbay_lease_exc) if agentbay_lease_exc else None,
+                    agentbay_lease_exc,
+                    agentbay_lease_exc.__traceback__ if agentbay_lease_exc else None,
+                )
+            except Exception as exc:
+                logger.error(
+                    "[AgentBay] Shared tool-lease release failed error_type={}",
+                    type(exc).__name__,
+                )
 
 
 async def _web_search(arguments: dict, agent_id: uuid.UUID | None = None) -> str:
@@ -6840,6 +7203,11 @@ async def _manage_tasks(
     async with async_session() as db:
         if action == "create":
             task_type = args.get("task_type", "todo")
+            if task_type == "supervision":
+                return (
+                    "❌ Supervision automation is paused in this release; "
+                    "create a todo board record instead."
+                )
             task = Task(
                 agent_id=agent_id,
                 title=title,
@@ -6856,19 +7224,11 @@ async def _manage_tasks(
             await db.commit()
             await db.refresh(task)
 
-            if task_type == "todo":
-                # Trigger auto-execution for todo tasks
-                import asyncio
-                from app.services.task_executor import execute_task
-                asyncio.create_task(execute_task(task.id, agent_id))
-                await _sync_tasks_to_file(agent_id, ws)
-                return f"✅ Task created: {title} — auto-execution started"
-            else:
-                # Supervision task — reminder engine will pick it up
-                target = args.get('supervision_target_name', 'someone')
-                schedule = args.get('remind_schedule', 'not set')
-                await _sync_tasks_to_file(agent_id, ws)
-                return f"✅ Supervision task created: '{title}' — will remind {target} on schedule ({schedule})"
+            await _sync_tasks_to_file(agent_id, ws)
+            return (
+                f"✅ Task created on the task board: {title}. "
+                "Automatic execution is paused in this release."
+            )
 
         elif action == "update_status":
             result = await db.execute(
@@ -7870,6 +8230,8 @@ async def _send_file_to_agent(
     from_agent_id: uuid.UUID,
     args: dict,
     *,
+    user_id: uuid.UUID | None = None,
+    origin_session_id: str | None = None,
     structured: bool = False,
 ) -> str | ApprovedToolExecutionOutcome:
     """Send a workspace file to another digital employee (agent)."""
@@ -7926,41 +8288,60 @@ async def _send_file_to_agent(
         async with async_session() as db:
             src_result = await db.execute(select(AgentModel).where(AgentModel.id == from_agent_id))
             source_agent = src_result.scalar_one_or_none()
-            source_agent_name = source_agent.name if source_agent else "Unknown agent"
-            source_tenant_id = source_agent.tenant_id if source_agent else None
-            source_creator_id = source_agent.creator_id if source_agent else from_agent_id
-
-            # Build base filter: same tenant + not self
-            base_filter = [AgentModel.id != from_agent_id]
-            if source_tenant_id:
-                base_filter.append(AgentModel.tenant_id == source_tenant_id)
-
-            # Try exact name match first, then fuzzy
-            target_agent = None
-            exact_result = await db.execute(
-                select(AgentModel).where(AgentModel.name == agent_name, *base_filter)
-            )
-            target_agent = exact_result.scalars().first()
-            if not target_agent:
-                # Sanitize SQL wildcards in user input
-                safe_name = agent_name.replace("%", "").replace("_", r"\_")
-                fuzzy_result = await db.execute(
-                    select(AgentModel).where(AgentModel.name.ilike(f"%{safe_name}%"), *base_filter)
-                )
-                target_agent = fuzzy_result.scalars().first()
-
-            if not target_agent:
-                # Only show agents from relationships, not all agents
-                # (AgentAgentRelationship is imported at module level — no local import needed)
-                rel_r = await db.execute(
-                    select(AgentModel.name).join(
-                        AgentAgentRelationship,
-                        (AgentAgentRelationship.target_agent_id == AgentModel.id) & (AgentAgentRelationship.agent_id == from_agent_id)
-                    )
-                )
-                rel_names = [n for (n,) in rel_r.all()]
+            if source_agent is None:
                 return _delivery_execution_result(
-                    f"❌ No agent found matching '{agent_name}'. Your connected colleagues: {', '.join(rel_names) if rel_names else 'none — ask your administrator to set up relationships'}",
+                    "❌ Source Agent no longer exists",
+                    structured=structured,
+                    status="failed",
+                    error_code="SourceAgentMissing",
+                )
+            source_agent_name = source_agent.name
+            owner_id = user_id or source_agent.creator_id
+            origin_session = None
+            if owner_id is None or not await get_agent_access_level_for_user_id(
+                db,
+                owner_id,
+                source_agent,
+            ):
+                return _delivery_execution_result(
+                    "❌ The requesting user no longer has access to the source Agent",
+                    structured=structured,
+                    status="failed",
+                    error_code="SourceAgentAccessRevoked",
+                )
+            if origin_session_id:
+                try:
+                    origin_uuid = uuid.UUID(str(origin_session_id))
+                except (TypeError, ValueError):
+                    return _delivery_execution_result(
+                        "❌ Origin session is invalid",
+                        structured=structured,
+                        status="failed",
+                        error_code="InvalidOriginSession",
+                    )
+                origin_result = await db.execute(
+                    select(ChatSession).where(ChatSession.id == origin_uuid)
+                )
+                origin_session = origin_result.scalar_one_or_none()
+                if (
+                    origin_session is None
+                    or origin_session.user_id != owner_id
+                    or from_agent_id
+                    not in {origin_session.agent_id, origin_session.peer_agent_id}
+                ):
+                    return _delivery_execution_result(
+                        "❌ Origin session does not belong to the current user and Agent",
+                        structured=structured,
+                        status="failed",
+                        error_code="OriginSessionScopeRejected",
+                    )
+
+            target_agent, target_error = await _resolve_a2a_target(
+                db, from_agent_id, agent_name
+            )
+            if target_agent is None:
+                return _delivery_execution_result(
+                    target_error or "❌ Recipient Agent could not be resolved",
                     structured=structured,
                     status="failed",
                     error_code="RecipientAgentMissing",
@@ -7973,24 +8354,67 @@ async def _send_file_to_agent(
                     status="failed",
                     error_code="RecipientAgentExpired",
                 )
+            if not await get_agent_access_level_for_user_id(
+                db,
+                owner_id,
+                target_agent,
+            ):
+                return _delivery_execution_result(
+                    f"❌ You do not have access to {target_agent.name}",
+                    structured=structured,
+                    status="failed",
+                    error_code="RecipientAgentAccessDenied",
+                )
 
-            # Enforce relationship: only allow file transfer with agents in relationships
+            # Prefer the caller's directed relationship. In an existing A→B
+            # conversation, B may also return a file to A under the original
+            # A→B authority; requiring a second implicit B→A relationship made
+            # the documented consult protocol impossible.
+            authorization_source_id = from_agent_id
+            authorization_target_id = target_agent.id
+            reverse_reply = False
             rel_check = await db.execute(
                 select(AgentAgentRelationship).where(
-                    AgentAgentRelationship.agent_id == from_agent_id,
-                    AgentAgentRelationship.target_agent_id == target_agent.id,
-                ).limit(1)
+                    AgentAgentRelationship.agent_id == authorization_source_id,
+                    AgentAgentRelationship.target_agent_id
+                    == authorization_target_id,
+                )
             )
-            rel = rel_check.scalar_one_or_none()
-            if not rel:
+            relationships = list(rel_check.scalars().all())
+            if len(relationships) != 1:
+                can_reply_on_original_lane = (
+                    origin_session is not None
+                    and origin_session.source_channel == "agent"
+                    and {from_agent_id, target_agent.id}
+                    == {origin_session.agent_id, origin_session.peer_agent_id}
+                )
+                if can_reply_on_original_lane:
+                    reverse_check = await db.execute(
+                        select(AgentAgentRelationship).where(
+                            AgentAgentRelationship.agent_id == target_agent.id,
+                            AgentAgentRelationship.target_agent_id == from_agent_id,
+                        )
+                    )
+                    reverse_relationships = list(reverse_check.scalars().all())
+                    if len(reverse_relationships) == 1:
+                        relationships = reverse_relationships
+                        authorization_source_id = target_agent.id
+                        authorization_target_id = from_agent_id
+                        reverse_reply = True
+            if len(relationships) != 1:
                 return _delivery_execution_result(
-                    f"❌ You do not have a relationship with {target_agent.name}. Only agents in your relationship list can receive files. Ask your administrator to add a relationship if needed.",
+                    f"❌ Relationship to {target_agent.name} is missing or ambiguous. Ask an administrator to repair Relationships before retrying.",
                     structured=structured,
                     status="failed",
                     error_code="RecipientRelationshipMissing",
                 )
+            rel = relationships[0]
             if hasattr(rel, "agent_id"):
-                status_info = await evaluate_agent_relationship_status(db, rel)
+                status_info = await evaluate_agent_relationship_status(
+                    db,
+                    rel,
+                    current_user_id=owner_id,
+                )
                 if status_info["access_status"] != "active":
                     return _delivery_execution_result(
                         f"❌ Relationship to {target_agent.name} is not active ({status_info['access_status_reason'] or 'restricted'}). Ask a manager of both agents to review Relationships.",
@@ -8001,43 +8425,71 @@ async def _send_file_to_agent(
 
             target_name = target_agent.name
             target_id = target_agent.id
+            _chat_session, a2a_session_id = await _ensure_a2a_session(
+                db,
+                from_agent_id,
+                target_id,
+                source_agent_name,
+                owner_id,
+            )
+            if reverse_reply and str(origin_session.id) != str(a2a_session_id):
+                return _delivery_execution_result(
+                    "❌ File reply must remain in the original A2A conversation",
+                    structured=structured,
+                    status="failed",
+                    error_code="OriginSessionScopeRejected",
+                )
+            await db.commit()
 
         ts = datetime.now(timezone.utc)
         stamp = ts.strftime("%Y%m%d_%H%M%S_%f")
         delivered_name = source_name
         target_rel_path = f"workspace/inbox/files/{delivered_name}"
-        target_key = normalize_storage_key(f"{target_id}/{target_rel_path}")
-        while await storage.exists(target_key):
-            delivered_name = f"{stamp}_{source_name}"
-            target_rel_path = f"workspace/inbox/files/{delivered_name}"
-            target_key = normalize_storage_key(f"{target_id}/{target_rel_path}")
-
-        side_effect_started = True
-        await storage.write_bytes(target_key, source_bytes)
-
-        sender_short = str(from_agent_id)[:8]
-        note_rel_path = f"workspace/inbox/{stamp}_{sender_short}_file_delivery.md"
-        note_key = normalize_storage_key(f"{target_id}/{note_rel_path}")
-        note_lines = [
-            f"# File delivery from {source_agent_name}",
-            "",
-            f"- Time (UTC): {ts.isoformat()}",
-            f"- Sender: {source_agent_name}",
-            f"- Source path: {rel_path}",
-            f"- Delivered file: {target_rel_path}",
-            "",
-        ]
-        if delivery_note:
-            note_lines.append("## Note")
-            note_lines.append(delivery_note)
-            note_lines.append("")
-        note_lines.append("## Action")
-        note_lines.append(f"- Read the file via `read_file(path=\"{target_rel_path}\")`")
-        await storage.write_text(note_key, "\n".join(note_lines), encoding="utf-8")
-
         from app.models.audit import AuditLog
-        async with async_session() as db:
-            db.add(AuditLog(
+        from app.services.a2a_authorization import validate_active_a2a_lane
+
+        # Hold the relationship/ACL authority fence through the workspace write.
+        # This is intentionally a short transaction around bounded local/object
+        # storage operations so a concurrent revoke cannot cross the side effect.
+        async with async_session() as delivery_db:
+            await validate_active_a2a_lane(
+                delivery_db,
+                source_agent_id=authorization_source_id,
+                target_agent_id=authorization_target_id,
+                owner_user_id=owner_id,
+                session_id=a2a_session_id,
+                lock_relationship=True,
+            )
+            target_key = normalize_storage_key(f"{target_id}/{target_rel_path}")
+            while await storage.exists(target_key):
+                delivered_name = f"{stamp}_{source_name}"
+                target_rel_path = f"workspace/inbox/files/{delivered_name}"
+                target_key = normalize_storage_key(f"{target_id}/{target_rel_path}")
+
+            side_effect_started = True
+            await storage.write_bytes(target_key, source_bytes)
+
+            sender_short = str(from_agent_id)[:8]
+            note_rel_path = f"workspace/inbox/{stamp}_{sender_short}_file_delivery.md"
+            note_key = normalize_storage_key(f"{target_id}/{note_rel_path}")
+            note_lines = [
+                f"# File delivery from {source_agent_name}",
+                "",
+                f"- Time (UTC): {ts.isoformat()}",
+                f"- Sender: {source_agent_name}",
+                f"- Source path: {rel_path}",
+                f"- Delivered file: {target_rel_path}",
+                "",
+            ]
+            if delivery_note:
+                note_lines.append("## Note")
+                note_lines.append(delivery_note)
+                note_lines.append("")
+            note_lines.append("## Action")
+            note_lines.append(f"- Read the file via `read_file(path=\"{target_rel_path}\")`")
+            await storage.write_text(note_key, "\n".join(note_lines), encoding="utf-8")
+
+            delivery_db.add(AuditLog(
                 agent_id=from_agent_id,
                 action="collaboration:file_send",
                 details={
@@ -8047,7 +8499,7 @@ async def _send_file_to_agent(
                     "delivered_file": target_rel_path,
                 },
             ))
-            db.add(AuditLog(
+            delivery_db.add(AuditLog(
                 agent_id=target_id,
                 action="collaboration:file_receive",
                 details={
@@ -8057,7 +8509,7 @@ async def _send_file_to_agent(
                     "delivered_file": target_rel_path,
                 },
             ))
-            await db.commit()
+            await delivery_db.commit()
 
         await log_activity(
             from_agent_id,
@@ -8080,37 +8532,17 @@ async def _send_file_to_agent(
             from_agent_id,
             target_id,
         )
-        try:
-            from app.models.audit import ChatMessage
-            from app.models.chat_session import ChatSession
-            from app.models.participant import Participant
-            async with async_session() as db2:
-                # Find or create A2A session (same ordering as send_message_to_agent)
-                session_agent_id = min(from_agent_id, target_id, key=str)
-                session_peer_id = max(from_agent_id, target_id, key=str)
-                sess_r = await db2.execute(
-                    select(ChatSession).where(
-                        ChatSession.agent_id == session_agent_id,
-                        ChatSession.peer_agent_id == session_peer_id,
-                        ChatSession.source_channel == "agent",
-                    )
+        from app.models.audit import ChatMessage
+        from app.models.participant import Participant
+        async with async_session() as db2:
+                lane = await validate_active_a2a_lane(
+                    db2,
+                    source_agent_id=authorization_source_id,
+                    target_agent_id=authorization_target_id,
+                    owner_user_id=owner_id,
+                    session_id=a2a_session_id,
+                    lock_relationship=True,
                 )
-                chat_session = sess_r.scalar_one_or_none()
-                if not chat_session:
-                    src_part_r = await db2.execute(
-                        select(Participant).where(Participant.type == "agent", Participant.ref_id == from_agent_id)
-                    )
-                    src_participant = src_part_r.scalar_one_or_none()
-                    chat_session = ChatSession(
-                        agent_id=session_agent_id,
-                        user_id=source_creator_id,
-                        title=f"{source_name} ↔ {target_name}",
-                        source_channel="agent",
-                        participant_id=src_participant.id if src_participant else None,
-                        peer_agent_id=session_peer_id,
-                    )
-                    db2.add(chat_session)
-                    await db2.flush()
 
                 file_msg_content = (
                     f"[File delivery from {source_name}]\n"
@@ -8128,22 +8560,20 @@ async def _send_file_to_agent(
                 src_part2 = src_part_r2.scalar_one_or_none()
 
                 db2.add(ChatMessage(
-                    agent_id=session_agent_id,
-                    user_id=source_creator_id,
+                    agent_id=lane.session.agent_id,
+                    user_id=owner_id,
                     role="user",
                     content=file_msg_content,
-                    conversation_id=str(chat_session.id),
+                    conversation_id=str(lane.session.id),
                     participant_id=src_part2.id if src_part2 else None,
                 ))
-                chat_session.last_message_at = ts
+                lane.session.last_message_at = ts
                 await db2.commit()
                 logger.info(
                     "[A2A-File] Injected file delivery message into session {} for agent {}",
-                    chat_session.id,
+                    lane.session.id,
                     target_id,
                 )
-        except Exception as e:
-            logger.error(f"[A2A-File] FAILED to inject file delivery message: {e}")
 
         return _delivery_execution_result(
             (
@@ -8154,9 +8584,14 @@ async def _send_file_to_agent(
             structured=structured,
             status="succeeded",
         )
-    except Exception as e:
+    except Exception as exc:
+        logger.warning(
+            "[A2A-File] Delivery failed side_effect_started={} error_type={}",
+            side_effect_started,
+            type(exc).__name__,
+        )
         return _delivery_execution_result(
-            f"❌ Agent file send error: {str(e)[:200]}",
+            "❌ Agent file delivery could not be confirmed",
             structured=structured,
             status="ambiguous" if side_effect_started else "failed",
             error_code=(
@@ -8175,37 +8610,39 @@ async def _resolve_a2a_target(
     Returns (target_agent, error_message). If target is None, error_message
     explains why.  Caller is responsible for relationship / expiry checks.
     """
-    src_result = await db.execute(select(AgentModel).where(AgentModel.id == from_agent_id))
-    source_agent = src_result.scalar_one_or_none()
-    source_tenant_id = source_agent.tenant_id if source_agent else None
-
-    base_filter = [AgentModel.id != from_agent_id]
-    if source_tenant_id:
-        base_filter.append(AgentModel.tenant_id == source_tenant_id)
-    else:
-        base_filter.append(AgentModel.tenant_id.is_(None))
-
-    exact_result = await db.execute(
-        select(AgentModel).where(AgentModel.name == agent_name, *base_filter)
+    related_query = (
+        select(AgentModel)
+        .join(
+            AgentAgentRelationship,
+            AgentAgentRelationship.target_agent_id == AgentModel.id,
+        )
+        .where(AgentAgentRelationship.agent_id == from_agent_id)
     )
-    target = exact_result.scalars().first()
-    if not target:
-        safe_name = agent_name.replace("%", "").replace("_", r"\_")
-        fuzzy_result = await db.execute(
-            select(AgentModel).where(AgentModel.name.ilike(f"%{safe_name}%"), *base_filter)
+    exact_result = await db.execute(
+        related_query.where(AgentModel.name == agent_name)
+    )
+    exact = list(exact_result.scalars().all())
+    if len(exact) == 1:
+        return exact[0], None
+    if len(exact) > 1:
+        return (
+            None,
+            f"❌ Connected Agent name '{agent_name}' is ambiguous; rename or remove duplicate relationships before retrying.",
         )
-        target = fuzzy_result.scalars().first()
-    if not target:
-        rel_r = await db.execute(
-            select(AgentModel.name).join(
-                AgentAgentRelationship,
-                (AgentAgentRelationship.target_agent_id == AgentModel.id) & (AgentAgentRelationship.agent_id == from_agent_id)
-            )
-        )
-        rel_names = [n for (n,) in rel_r.all()]
-        return None, f"❌ No agent found matching '{agent_name}'. Your connected colleagues: {', '.join(rel_names) if rel_names else 'none — ask your administrator to set up relationships'}"
 
-    return target, None
+    safe_name = agent_name.replace("%", "").replace("_", r"\_")
+    fuzzy_result = await db.execute(
+        related_query.where(AgentModel.name.ilike(f"%{safe_name}%"))
+    )
+    suggestions = sorted({agent.name for agent in fuzzy_result.scalars().all()})
+    all_result = await db.execute(related_query.order_by(AgentModel.name))
+    all_names = sorted({agent.name for agent in all_result.scalars().all()})
+    hint = suggestions or all_names
+    return (
+        None,
+        f"❌ No exact connected Agent named '{agent_name}' was found. "
+        f"Available exact names: {', '.join(hint) if hint else 'none — ask an administrator to configure Relationships'}",
+    )
 
 
 async def _ensure_a2a_session(
@@ -8216,31 +8653,26 @@ async def _ensure_a2a_session(
     Returns (chat_session, session_id_str).
     """
     from app.models.participant import Participant
+    from app.services.a2a_authorization import ensure_private_a2a_session
 
-    session_agent_id = min(from_agent_id, target_id, key=str)
-    session_peer_id = max(from_agent_id, target_id, key=str)
-    sess_r = await db.execute(
-        select(ChatSession).where(
-            ChatSession.agent_id == session_agent_id,
-            ChatSession.peer_agent_id == session_peer_id,
-            ChatSession.source_channel == "agent",
+    source_agent = await db.get(AgentModel, from_agent_id)
+    target_agent = await db.get(AgentModel, target_id)
+    if source_agent is None or target_agent is None:
+        raise ValueError("A2A Agent is unavailable")
+    src_part_r = await db.execute(
+        select(Participant).where(
+            Participant.type == "agent",
+            Participant.ref_id == from_agent_id,
         )
     )
-    chat_session = sess_r.scalar_one_or_none()
-    if not chat_session:
-        src_part_r = await db.execute(select(Participant).where(Participant.type == "agent", Participant.ref_id == from_agent_id))
-        src_participant = src_part_r.scalar_one_or_none()
-        src_part_id = src_participant.id if src_participant else None
-        chat_session = ChatSession(
-            agent_id=session_agent_id,
-            user_id=owner_id,
-            title=f"{source_name} ↔ {(await db.execute(select(AgentModel.name).where(AgentModel.id == target_id))).scalar() or 'Unknown'}",
-            source_channel="agent",
-            participant_id=src_part_id,
-            peer_agent_id=session_peer_id,
-        )
-        db.add(chat_session)
-        await db.flush()
+    src_participant = src_part_r.scalar_one_or_none()
+    chat_session = await ensure_private_a2a_session(
+        db,
+        source_agent=source_agent,
+        target_agent=target_agent,
+        owner_user_id=owner_id,
+        participant_id=src_participant.id if src_participant else None,
+    )
     return chat_session, str(chat_session.id)
 
 
@@ -8259,6 +8691,11 @@ async def _create_on_message_trigger(
 ) -> None:
     """Programmatically create an on_message trigger for an agent."""
     from app.models.trigger import AgentTrigger
+    from app.services.trigger_runtime.config import (
+        mark_server_owned_trigger_context,
+        trusted_persisted_trigger_state,
+        without_reserved_trigger_config,
+    )
 
     focus_ref = await ensure_focus_item(
         agent_id,
@@ -8279,6 +8716,7 @@ async def _create_on_message_trigger(
         config["_origin_user_id"] = origin_user_id
     if origin_source_channel:
         config["_origin_source_channel"] = origin_source_channel
+    mark_server_owned_trigger_context(config)
 
     try:
         from app.models.audit import ChatMessage as _CM
@@ -8308,7 +8746,12 @@ async def _create_on_message_trigger(
         existing = result.scalar_one_or_none()
         if existing:
             if existing.is_enabled:
-                existing.config = {**(existing.config or {}), **config}
+                old_config = existing.config or {}
+                existing.config = {
+                    **without_reserved_trigger_config(old_config),
+                    **trusted_persisted_trigger_state(old_config),
+                    **config,
+                }
                 existing.reason = reason
                 existing.fire_count = 0
                 if focus_ref:
@@ -8440,16 +8883,21 @@ async def _build_a2a_context(
         from app.models.participant import Participant
         from app.models.llm import LLMModel
         origin_source_channel = "web"
+        origin_sess = None
         
         async with async_session() as db:
             if origin_session_id:
                 try:
-                    origin_sess_r = await db.execute(select(ChatSession).where(ChatSession.id == uuid.UUID(origin_session_id)))
-                    origin_sess = origin_sess_r.scalar_one_or_none()
-                    if origin_sess:
-                        origin_source_channel = origin_sess.source_channel
-                except Exception:
-                    pass
+                    origin_uuid = uuid.UUID(str(origin_session_id))
+                except (TypeError, ValueError):
+                    return "❌ Origin session is invalid"
+                origin_sess_r = await db.execute(
+                    select(ChatSession).where(ChatSession.id == origin_uuid)
+                )
+                origin_sess = origin_sess_r.scalar_one_or_none()
+                if origin_sess is None:
+                    return "❌ Origin session no longer exists"
+                origin_source_channel = origin_sess.source_channel
 
             # Look up source agent
             src_result = await db.execute(select(AgentModel).where(AgentModel.id == from_agent_id))
@@ -8459,53 +8907,53 @@ async def _build_a2a_context(
             source_name = source_agent.name
             source_tenant_id = source_agent.tenant_id
             owner_id = user_id or source_agent.creator_id
+            if owner_id is None or not await get_agent_access_level_for_user_id(
+                db,
+                owner_id,
+                source_agent,
+            ):
+                return "❌ The requesting user no longer has access to the source Agent"
+            if origin_sess:
+                if origin_sess.user_id != owner_id:
+                    return "❌ Origin session does not belong to the current user"
+                if origin_sess.source_channel == "agent":
+                    if from_agent_id not in {
+                        origin_sess.agent_id,
+                        origin_sess.peer_agent_id,
+                    }:
+                        return "❌ Origin session does not involve the source agent"
+                elif origin_sess.agent_id != from_agent_id:
+                    return "❌ Origin session does not belong to the source agent"
 
-            # Build base filter: same tenant + not self
-            base_filter = [AgentModel.id != from_agent_id]
-            if source_tenant_id:
-                base_filter.append(AgentModel.tenant_id == source_tenant_id)
-            else:
-                base_filter.append(AgentModel.tenant_id.is_(None))
-
-            # Find target agent by name — exact match first, then fuzzy
-            target = None
-            exact_result = await db.execute(
-                select(AgentModel).where(AgentModel.name == agent_name, *base_filter)
+            target, target_error = await _resolve_a2a_target(
+                db, from_agent_id, agent_name
             )
-            target = exact_result.scalars().first()
-            if not target:
-                safe_name = agent_name.replace("%", "").replace("_", r"\_")
-                fuzzy_result = await db.execute(
-                    select(AgentModel).where(AgentModel.name.ilike(f"%{safe_name}%"), *base_filter)
-                )
-                target = fuzzy_result.scalars().first()
-            if not target:
-                # Only show agents from relationships, not all agents
-                rel_r = await db.execute(
-                    select(AgentModel.name).join(
-                        AgentAgentRelationship,
-                        (AgentAgentRelationship.target_agent_id == AgentModel.id) & (AgentAgentRelationship.agent_id == from_agent_id)
-                    )
-                )
-                rel_names = [n for (n,) in rel_r.all()]
-                return f"❌ No agent found matching '{agent_name}'. Your connected colleagues: {', '.join(rel_names) if rel_names else 'none — ask your administrator to set up relationships'}"
+            if target is None:
+                return target_error or "❌ Recipient Agent could not be resolved"
 
             # Check if target agent has expired
             if target.is_expired or (target.expires_at and datetime.now(timezone.utc) >= target.expires_at):
                 return f"⚠️ {target.name} is currently unavailable — their service period has ended. Please contact the platform administrator."
+            if not await get_agent_access_level_for_user_id(db, owner_id, target):
+                return f"❌ You do not have access to {target.name}"
 
             # Enforce relationship
             rel_check = await db.execute(
                 select(AgentAgentRelationship).where(
                     AgentAgentRelationship.agent_id == from_agent_id,
                     AgentAgentRelationship.target_agent_id == target.id,
-                ).limit(1)
+                )
             )
-            rel = rel_check.scalar_one_or_none()
-            if not rel:
-                return f"❌ You do not have a relationship with {target.name}. Only agents in your relationship list can be contacted. Ask your administrator to add a relationship if needed."
+            relationships = list(rel_check.scalars().all())
+            if len(relationships) != 1:
+                return f"❌ Relationship to {target.name} is missing or ambiguous. Ask an administrator to repair Relationships before retrying."
+            rel = relationships[0]
             if hasattr(rel, "agent_id"):
-                status_info = await evaluate_agent_relationship_status(db, rel)
+                status_info = await evaluate_agent_relationship_status(
+                    db,
+                    rel,
+                    current_user_id=owner_id,
+                )
                 if status_info["access_status"] != "active":
                     return f"❌ Relationship to {target.name} is not active ({status_info['access_status_reason'] or 'restricted'}). Ask a manager of both agents to review Relationships."
 
@@ -8517,33 +8965,60 @@ async def _build_a2a_context(
             tgt_participant = tgt_part_r.scalar_one_or_none()
             tgt_participant_id = tgt_participant.id if tgt_participant else None
 
-            # Find or create ChatSession for this agent pair (ordered consistently)
-            session_agent_id = min(from_agent_id, target.id, key=str)
-            session_peer_id = max(from_agent_id, target.id, key=str)
-            sess_r = await db.execute(
-                select(ChatSession).where(
-                    ChatSession.agent_id == session_agent_id,
-                    ChatSession.peer_agent_id == session_peer_id,
-                    ChatSession.source_channel == "agent",
-                )
+            chat_session, session_id = await _ensure_a2a_session(
+                db,
+                from_agent_id,
+                target.id,
+                source_name,
+                owner_id,
             )
-            chat_session = sess_r.scalar_one_or_none()
-            if not chat_session:
-                chat_session = ChatSession(
-                    agent_id=session_agent_id,
-                    user_id=owner_id,
-                    title=f"{source_name} ↔ {target.name}",
-                    source_channel="agent",
-                    participant_id=src_participant_id,
-                    peer_agent_id=session_peer_id,
-                )
-                db.add(chat_session)
-                await db.flush()
+            session_agent_id = min(from_agent_id, target.id, key=str)
 
-            session_id = str(chat_session.id)
+            # Compose the tenant preference with the release-wide execution
+            # gate before persisting or dispatching any asynchronous mode.
+            tenant_a2a_async = False
+            if source_tenant_id:
+                try:
+                    from app.models.tenant import Tenant
+
+                    tenant_result = await db.execute(
+                        select(Tenant).where(Tenant.id == source_tenant_id)
+                    )
+                    tenant = tenant_result.scalar_one_or_none()
+                    if tenant:
+                        tenant_a2a_async = bool(
+                            getattr(tenant, "a2a_async_enabled", False)
+                        )
+                except Exception:
+                    pass
+
+            global_a2a_async = _a2a_global_async_enabled()
+            msg_type = _resolve_a2a_message_mode(
+                msg_type,
+                tenant_enabled=tenant_a2a_async,
+                force_async=force_async,
+            )
+            if (
+                getattr(target, "agent_type", "native") == "openclaw"
+                and not global_a2a_async
+            ):
+                return (
+                    "❌ OpenClaw asynchronous Agent delivery is paused in this "
+                    "release. Use a native Agent consult instead."
+                )
 
             # Save source message (common to all paths)
             source_message_id = uuid.uuid4()
+            from app.services.a2a_authorization import validate_active_a2a_lane
+
+            await validate_active_a2a_lane(
+                db,
+                source_agent_id=from_agent_id,
+                target_agent_id=target.id,
+                owner_user_id=owner_id,
+                session_id=session_id,
+                lock_relationship=True,
+            )
             db.add(ChatMessage(
                 id=source_message_id,
                 agent_id=session_agent_id,
@@ -8571,21 +9046,6 @@ async def _build_a2a_context(
                     origin_source_channel=origin_source_channel,
                     origin_session_id=origin_session_id,
                 )
-
-            # ── Feature flag: async A2A (tenant-level) ──
-            _a2a_async = False
-            if source_tenant_id:
-                try:
-                    from app.models.tenant import Tenant
-                    _t_r = await db.execute(select(Tenant).where(Tenant.id == source_tenant_id))
-                    _tenant = _t_r.scalar_one_or_none()
-                    if _tenant:
-                        _a2a_async = getattr(_tenant, "a2a_async_enabled", False)
-                except Exception:
-                    pass
-            if not _a2a_async and not force_async:
-                if msg_type in ("notify", "task_delegate"):
-                    msg_type = "consult"
 
             primary_model = None
             fallback_model = None
@@ -8652,12 +9112,23 @@ async def _a2a_handle_openclaw(
     dispatch_started = False
     try:
         async with async_session() as db:
+            from app.services.a2a_authorization import validate_active_a2a_lane
+
+            await validate_active_a2a_lane(
+                db,
+                source_agent_id=ctx.source_agent.id,
+                target_agent_id=ctx.target_agent.id,
+                owner_user_id=ctx.owner_id,
+                session_id=ctx.chat_session_id,
+                lock_relationship=True,
+            )
             # 2. Queue for Gateway
             from app.models.gateway_message import GatewayMessage as GMsg
             gw_msg = GMsg(
                 agent_id=ctx.target_agent.id,
                 sender_agent_id=ctx.source_agent.id,
                 sender_user_id=ctx.owner_id,
+                authorization_source_agent_id=ctx.source_agent.id,
                 content=f"[From {ctx.source_agent.name}] {ctx.message_text}",
                 status="pending",
                 conversation_id=ctx.chat_session_id,
@@ -8673,7 +9144,10 @@ async def _a2a_handle_openclaw(
                 await log_activity(
                     ctx.source_agent.id, "agent_msg_sent",
                     f"Sent message to {ctx.target_agent.name} (queued)",
-                    detail={"partner": ctx.target_agent.name, "message": ctx.message_text[:200]},
+                    detail={
+                        "partner": ctx.target_agent.name,
+                        "message_shape": privacy_safe_shape(ctx.message_text),
+                    },
                 )
             except Exception:
                 logger.warning("[A2A] OpenClaw queue activity log failed")
@@ -8703,17 +9177,28 @@ async def _a2a_handle_notify(
     dispatch_started = False
     try:
         try:
-            dispatch_started = True
-            accepted = await _wake_agent_async(
-                ctx.target_agent.id,
-                f"[From {ctx.source_agent.name}] {ctx.message_text}",
-                from_agent_id=ctx.source_agent.id,
-                skip_dedup=True,
-                a2a_session_id=ctx.chat_session_id,
-                message_kind="notify",
-                idempotency_key=f"a2a:{ctx.source_message_id}",
-                source_message_id=ctx.source_message_id,
-            )
+            async with async_session() as db:
+                from app.services.a2a_authorization import validate_active_a2a_lane
+
+                await validate_active_a2a_lane(
+                    db,
+                    source_agent_id=ctx.source_agent.id,
+                    target_agent_id=ctx.target_agent.id,
+                    owner_user_id=ctx.owner_id,
+                    session_id=ctx.chat_session_id,
+                    lock_relationship=True,
+                )
+                dispatch_started = True
+                accepted = await _wake_agent_async(
+                    ctx.target_agent.id,
+                    f"[From {ctx.source_agent.name}] {ctx.message_text}",
+                    from_agent_id=ctx.source_agent.id,
+                    skip_dedup=True,
+                    a2a_session_id=ctx.chat_session_id,
+                    message_kind="notify",
+                    idempotency_key=f"a2a:{ctx.source_message_id}",
+                    source_message_id=ctx.source_message_id,
+                )
         except Exception as e:
             logger.exception(f"[A2A] Failed to queue notify for {ctx.target_agent.id}: {e}")
             return _delivery_execution_result(
@@ -8735,7 +9220,11 @@ async def _a2a_handle_notify(
             await log_activity(
                 ctx.source_agent.id, "agent_msg_sent",
                 f"Sent notification to {ctx.target_agent.name}",
-                detail={"partner": ctx.target_agent.name, "message": ctx.message_text[:200], "msg_type": "notify"},
+                detail={
+                    "partner": ctx.target_agent.name,
+                    "message_shape": privacy_safe_shape(ctx.message_text),
+                    "msg_type": "notify",
+                },
             )
         except Exception:
             pass
@@ -8766,6 +9255,17 @@ async def _a2a_handle_task_delegate(
 ) -> str | ApprovedToolExecutionOutcome:
     dispatch_started = False
     try:
+        async with async_session() as db:
+            from app.services.a2a_authorization import validate_active_a2a_lane
+
+            await validate_active_a2a_lane(
+                db,
+                source_agent_id=ctx.source_agent.id,
+                target_agent_id=ctx.target_agent.id,
+                owner_user_id=ctx.owner_id,
+                session_id=ctx.chat_session_id,
+                lock_relationship=True,
+            )
         target_slug = re.sub(r"[^a-z0-9]+", "_", ctx.target_agent.name.lower()).strip("_")[:32] or "agent"
         task_suffix = ctx.source_message_id.hex
         focus_id = f"wait_{target_slug}_{task_suffix}"
@@ -8809,17 +9309,28 @@ async def _a2a_handle_task_delegate(
             )
 
         try:
-            dispatch_started = True
-            accepted = await _wake_agent_async(
-                ctx.target_agent.id,
-                f"[From {ctx.source_agent.name}] {ctx.message_text}",
-                from_agent_id=ctx.source_agent.id,
-                skip_dedup=True,
-                a2a_session_id=ctx.chat_session_id,
-                message_kind="task_delegate",
-                idempotency_key=f"a2a:{ctx.source_message_id}",
-                source_message_id=ctx.source_message_id,
-            )
+            async with async_session() as dispatch_db:
+                from app.services.a2a_authorization import validate_active_a2a_lane
+
+                await validate_active_a2a_lane(
+                    dispatch_db,
+                    source_agent_id=ctx.source_agent.id,
+                    target_agent_id=ctx.target_agent.id,
+                    owner_user_id=ctx.owner_id,
+                    session_id=ctx.chat_session_id,
+                    lock_relationship=True,
+                )
+                dispatch_started = True
+                accepted = await _wake_agent_async(
+                    ctx.target_agent.id,
+                    f"[From {ctx.source_agent.name}] {ctx.message_text}",
+                    from_agent_id=ctx.source_agent.id,
+                    skip_dedup=True,
+                    a2a_session_id=ctx.chat_session_id,
+                    message_kind="task_delegate",
+                    idempotency_key=f"a2a:{ctx.source_message_id}",
+                    source_message_id=ctx.source_message_id,
+                )
         except Exception as e:
             logger.exception(f"[A2A] Failed to queue delegate for {ctx.target_agent.id}: {e}")
             await _cleanup_failed_delegate(ctx.source_agent.id, trigger_name, focus_id)
@@ -8848,7 +9359,11 @@ async def _a2a_handle_task_delegate(
             await log_activity(
                 ctx.source_agent.id, "agent_msg_sent",
                 f"Delegated task to {ctx.target_agent.name}",
-                detail={"partner": ctx.target_agent.name, "message": ctx.message_text[:200], "msg_type": "task_delegate"},
+                detail={
+                    "partner": ctx.target_agent.name,
+                    "message_shape": privacy_safe_shape(ctx.message_text),
+                    "msg_type": "task_delegate",
+                },
             )
         except Exception:
             pass
@@ -8899,6 +9414,22 @@ async def _a2a_handle_consult(
 
         from app.services.llm.caller import call_llm_with_failover
 
+        from app.services.a2a_authorization import (
+            build_a2a_tool_authorization_context,
+            validate_active_a2a_lane,
+        )
+
+        async with async_session() as authorization_db:
+            await validate_active_a2a_lane(
+                authorization_db,
+                source_agent_id=ctx.source_agent.id,
+                target_agent_id=ctx.target_agent.id,
+                owner_user_id=ctx.owner_id,
+                session_id=ctx.chat_session_id,
+                lock_relationship=True,
+            )
+            await authorization_db.commit()
+
         target_reply = await call_llm_with_failover(
             primary_model=ctx.primary_model,
             fallback_model=ctx.fallback_model,
@@ -8910,23 +9441,46 @@ async def _a2a_handle_consult(
             session_id=ctx.chat_session_id,
             current_user_name_override=ctx.source_agent.name,
             system_prompt_suffix=suffix,
+            tool_authorization_context=(
+                build_a2a_tool_authorization_context(
+                    source_agent_id=ctx.source_agent.id,
+                    target_agent_id=ctx.target_agent.id,
+                    owner_user_id=ctx.owner_id,
+                    session_id=ctx.chat_session_id,
+                )
+            ),
         )
 
-        if not target_reply or target_reply.startswith("⚠️") or target_reply.startswith("[Error]") or target_reply.startswith("[LLM Error]") or target_reply.startswith("[LLM call error]"):
+        if (
+            not target_reply
+            or target_reply.startswith("⚠️")
+            or target_reply.startswith("[Error]")
+            or target_reply.startswith("[LLM Error]")
+            or target_reply.startswith("[LLM call error]")
+        ):
             return _delivery_execution_result(
-                target_reply or f"⚠️ {ctx.target_agent.name} did not respond (LLM returned empty)",
+                target_reply
+                or f"⚠️ {ctx.target_agent.name} did not respond (LLM returned empty)",
                 structured=structured,
                 status="failed",
                 error_code="AgentConsultNoResponse",
             )
 
-        # Save target reply
         async with async_session() as db2:
             from app.models.participant import Participant
+
+            lane = await validate_active_a2a_lane(
+                db2,
+                source_agent_id=ctx.source_agent.id,
+                target_agent_id=ctx.target_agent.id,
+                owner_user_id=ctx.owner_id,
+                session_id=ctx.chat_session_id,
+                lock_relationship=True,
+            )
             part_r = await db2.execute(select(Participant).where(Participant.type == "agent", Participant.ref_id == ctx.target_agent.id))
             tgt_part = part_r.scalar_one_or_none()
             db2.add(ChatMessage(
-                agent_id=ctx.session_agent_id,
+                agent_id=lane.session.agent_id,
                 user_id=ctx.owner_id,
                 role="assistant",
                 content=target_reply,
@@ -8943,12 +9497,20 @@ async def _a2a_handle_consult(
             await log_activity(
                 ctx.target_agent.id, "agent_msg_sent",
                 f"Replied to message from {ctx.source_agent.name}",
-                detail={"partner": ctx.source_agent.name, "message": ctx.message_text[:200], "reply": target_reply[:200]},
+                detail={
+                    "partner": ctx.source_agent.name,
+                    "message_shape": privacy_safe_shape(ctx.message_text),
+                    "reply_shape": privacy_safe_shape(target_reply),
+                },
             )
             await log_activity(
                 ctx.source_agent.id, "agent_msg_sent",
                 f"Sent message to {ctx.target_agent.name} and received reply",
-                detail={"partner": ctx.target_agent.name, "message": ctx.message_text[:200], "reply": target_reply[:200]},
+                detail={
+                    "partner": ctx.target_agent.name,
+                    "message_shape": privacy_safe_shape(ctx.message_text),
+                    "reply_shape": privacy_safe_shape(target_reply),
+                },
             )
         except Exception:
             logger.warning("[A2A] Consult activity log failed after reply commit")
@@ -9631,6 +10193,263 @@ MAX_TRIGGERS_PER_AGENT = 20
 VALID_TRIGGER_TYPES = {"cron", "once", "interval", "poll", "on_message", "webhook"}
 
 
+async def _resolve_human_on_message_binding(
+    agent_id: uuid.UUID,
+    requester_user_id: uuid.UUID | None,
+    config: dict,
+) -> tuple[dict | None, str | None, datetime | None]:
+    """Resolve a human name to one authorized, exact P2P source session."""
+
+    from app.services.chat_session_access import can_audit_agent_chat_sessions
+
+    name = str(config.get("from_user_name") or "").strip()
+    if not name:
+        return None, None, None
+    if requester_user_id is None:
+        return None, "Human message watches require an authenticated requester", None
+
+    supported_channels = {
+        "web",
+        "feishu",
+        "slack",
+        "discord",
+        "wecom",
+        "dingtalk",
+        "wechat",
+        "whatsapp",
+        "teams",
+    }
+    requested_channel = str(config.get("source_channel") or "").strip().lower()
+    if requested_channel and requested_channel not in supported_channels:
+        return (
+            None,
+            f"Unsupported human watch source_channel '{requested_channel}'",
+            None,
+        )
+
+    requested_session_id = config.get("source_session_id")
+    try:
+        requested_session_uuid = (
+            uuid.UUID(str(requested_session_id)) if requested_session_id else None
+        )
+    except (TypeError, ValueError):
+        return None, "source_session_id must be a valid conversation UUID", None
+
+    async with async_session() as db:
+        agent_result = await db.execute(
+            select(AgentModel).where(AgentModel.id == agent_id)
+        )
+        agent = agent_result.scalar_one_or_none()
+        requester_result = await db.execute(
+            select(UserModel).where(UserModel.id == requester_user_id)
+        )
+        requester = requester_result.scalar_one_or_none()
+        if not agent or not requester or not requester.is_active:
+            return None, "Human message watch requester is no longer active", None
+        if requester.tenant_id != agent.tenant_id:
+            return None, "Human message watch requester is outside this company", None
+
+        users_result = await db.execute(
+            select(UserModel).where(
+                UserModel.tenant_id == agent.tenant_id,
+                UserModel.is_active.is_(True),
+                UserModel.display_name == name,
+            )
+        )
+        users = users_result.scalars().all()
+        if not users:
+            return None, f"No active company user named '{name}' was found", None
+        if len(users) != 1:
+            return (
+                None,
+                f"The name '{name}' is ambiguous; use a unique display name before creating this watch",
+                None,
+            )
+        watched_user = users[0]
+        if (
+            watched_user.id != requester.id
+            and not can_audit_agent_chat_sessions(requester)
+        ):
+            return (
+                None,
+                "Watching another user's messages requires an Agent chat audit role",
+                None,
+            )
+
+        session_query = select(ChatSession).where(
+            ChatSession.agent_id == agent_id,
+            ChatSession.user_id == watched_user.id,
+            ChatSession.is_group.is_(False),
+            ChatSession.source_channel.in_(supported_channels),
+        )
+        if requested_channel:
+            session_query = session_query.where(
+                ChatSession.source_channel == requested_channel
+            )
+        if requested_session_uuid:
+            session_query = session_query.where(
+                ChatSession.id == requested_session_uuid
+            )
+        sessions_result = await db.execute(session_query)
+        sessions = sessions_result.scalars().all()
+        if not sessions:
+            return (
+                None,
+                f"No existing private conversation with '{name}' matches this watch",
+                None,
+            )
+        if len(sessions) != 1:
+            channels = ", ".join(
+                sorted({session.source_channel for session in sessions})
+            )
+            return (
+                None,
+                "Multiple conversations match this user"
+                + (f" ({channels})" if channels else "")
+                + "; specify config.source_channel or config.source_session_id",
+                None,
+            )
+        watched_session = sessions[0]
+
+        latest_result = await db.execute(
+            select(ChatMessage.created_at)
+            .where(
+                ChatMessage.agent_id == agent_id,
+                ChatMessage.user_id == watched_user.id,
+                ChatMessage.conversation_id == str(watched_session.id),
+                ChatMessage.role == "user",
+                ChatMessage.created_at.isnot(None),
+            )
+            .order_by(ChatMessage.created_at.desc())
+            .limit(1)
+        )
+        return (
+            {
+                "_watched_session_id": str(watched_session.id),
+                "_watched_user_id": str(watched_user.id),
+                "_watched_source_channel": watched_session.source_channel,
+            },
+            None,
+            latest_result.scalar_one_or_none(),
+        )
+
+
+async def _resolve_agent_on_message_binding(
+    agent_id: uuid.UUID,
+    requester_user_id: uuid.UUID | None,
+    config: dict,
+) -> tuple[dict | None, str | None, datetime | None]:
+    """Resolve one exact, active relationship and its private A2A lane."""
+
+    name = str(config.get("from_agent_name") or "").strip()
+    if not name:
+        return None, None, None
+    if requester_user_id is None:
+        return None, "Agent message watches require an authenticated requester", None
+
+    async with async_session() as db:
+        watcher_result = await db.execute(
+            select(AgentModel).where(AgentModel.id == agent_id)
+        )
+        watcher = watcher_result.scalar_one_or_none()
+        requester_result = await db.execute(
+            select(UserModel).where(UserModel.id == requester_user_id)
+        )
+        requester = requester_result.scalar_one_or_none()
+        if not watcher or not requester or not requester.is_active:
+            return None, "Agent message watch requester is no longer active", None
+        if requester.tenant_id != watcher.tenant_id:
+            return None, "Agent message watch requester is outside this company", None
+        if not await get_agent_access_level_for_user_id(
+            db, requester.id, watcher
+        ):
+            return None, "Requester no longer has access to this Agent", None
+
+        relation_result = await db.execute(
+            select(AgentAgentRelationship, AgentModel)
+            .join(
+                AgentModel,
+                AgentModel.id == AgentAgentRelationship.target_agent_id,
+            )
+            .where(
+                AgentAgentRelationship.agent_id == watcher.id,
+                AgentModel.tenant_id == watcher.tenant_id,
+                AgentModel.name == name,
+            )
+        )
+        relations = list(relation_result.all())
+        if not relations:
+            return None, f"No connected Agent named '{name}' was found", None
+        if len(relations) != 1:
+            return (
+                None,
+                f"The connected Agent name '{name}' is ambiguous; rename or remove duplicate relationships first",
+                None,
+            )
+        relationship, watched_agent = relations[0]
+        if not await get_agent_access_level_for_user_id(
+            db, requester.id, watched_agent
+        ):
+            return None, f"Requester does not have access to '{name}'", None
+        relationship_status = await evaluate_agent_relationship_status(
+            db,
+            relationship,
+            current_user_id=requester.id,
+        )
+        if relationship_status.get("access_status") != "active":
+            return (
+                None,
+                "Relationship to "
+                + name
+                + " is not active ("
+                + str(
+                    relationship_status.get("access_status_reason")
+                    or "restricted"
+                )
+                + ")",
+                None,
+            )
+
+        chat_session, conversation_id = await _ensure_a2a_session(
+            db,
+            watcher.id,
+            watched_agent.id,
+            watcher.name,
+            requester.id,
+        )
+        from app.models.participant import Participant
+
+        participant_result = await db.execute(
+            select(Participant.id).where(
+                Participant.type == "agent",
+                Participant.ref_id == watched_agent.id,
+            )
+        )
+        watched_participant_id = participant_result.scalar_one_or_none()
+        latest_message_at = None
+        if watched_participant_id:
+            latest_result = await db.execute(
+                select(ChatMessage.created_at)
+                .where(
+                    ChatMessage.conversation_id == conversation_id,
+                    ChatMessage.participant_id == watched_participant_id,
+                    ChatMessage.created_at.isnot(None),
+                )
+                .order_by(ChatMessage.created_at.desc())
+                .limit(1)
+            )
+            latest_message_at = latest_result.scalar_one_or_none()
+        await db.commit()
+        return (
+            {
+                "from_agent_id": str(watched_agent.id),
+                "expected_conversation_id": str(chat_session.id),
+            },
+            None,
+            latest_message_at,
+        )
+
+
 async def _handle_set_trigger(
     agent_id: uuid.UUID,
     arguments: dict,
@@ -9639,6 +10458,16 @@ async def _handle_set_trigger(
     user_id: uuid.UUID | None = None,
 ) -> str:
     """Create a new trigger for the agent."""
+    from app.services.trigger_runtime.config import (
+        AUTOMATIC_TRIGGER_EXECUTION_ENABLED,
+    )
+
+    if not AUTOMATIC_TRIGGER_EXECUTION_ENABLED:
+        return (
+            "❌ Automatic trigger execution is paused in this release. "
+            "Existing trigger configurations can be reviewed or cancelled, "
+            "but new active triggers cannot be created."
+        )
     from app.models.trigger import AgentTrigger
     from app.models.chat_session import ChatSession
 
@@ -9673,17 +10502,6 @@ async def _handle_set_trigger(
     if not reason:
         return "❌ Missing required argument 'reason'"
 
-    try:
-        focus_ref = await ensure_focus_item(
-            agent_id,
-            focus_ref=focus_ref,
-            description=reason or name,
-            system=False,
-        )
-    except Exception as e:
-        logger.warning(f"[Trigger] Failed to ensure Focus item for agent {agent_id}: {e}")
-        focus_ref = focus_ref or name
-
     # Validate type-specific config
     if ttype == "cron":
         expr = config.get("expr", "")
@@ -9704,27 +10522,56 @@ async def _handle_set_trigger(
         if not config.get("url"):
             return "❌ poll trigger requires config.url"
     elif ttype == "on_message":
-        if not config.get("from_agent_name") and not config.get("from_user_name"):
-            return "❌ on_message trigger requires config.from_agent_name (for agents) or config.from_user_name (for human users on Feishu/Slack/Discord)"
-        # Snapshot the latest message timestamp so we only detect NEW messages after this point
-        # This prevents false positives from already-processed messages
-        try:
-            from app.models.audit import ChatMessage
-            from app.models.chat_session import ChatSession
-            from sqlalchemy import cast as sa_cast, String as SaString
-            async with async_session() as _snap_db:
-                _snap_q = select(ChatMessage.created_at).join(
-                    ChatSession, ChatMessage.conversation_id == sa_cast(ChatSession.id, SaString)
-                ).where(
-                    ChatSession.agent_id == agent_id,
-                    ChatMessage.created_at.isnot(None),
-                ).order_by(ChatMessage.created_at.desc()).limit(1)
-                _snap_r = await _snap_db.execute(_snap_q)
-                _latest_ts = _snap_r.scalar_one_or_none()
-                if _latest_ts:
-                    config["_since_ts"] = _latest_ts.isoformat()
-        except Exception:
-            pass  # Fallback to trigger.created_at in the daemon
+        from app.services.trigger_runtime.config import (
+            on_message_source_binding_error,
+        )
+
+        source_error = on_message_source_binding_error(config)
+        if source_error:
+            return f"❌ {source_error}"
+        supplied_attested = sorted(
+            key
+            for key in ("from_agent_id", "expected_conversation_id")
+            if key in config
+        )
+        if supplied_attested:
+            return (
+                "❌ Agent message identity fields are assigned by the server: "
+                + ", ".join(supplied_attested)
+            )
+        if config.get("from_user_name"):
+            binding, binding_error, latest_message_at = (
+                await _resolve_human_on_message_binding(
+                    agent_id,
+                    user_id,
+                    config,
+                )
+            )
+            if binding_error:
+                return f"❌ {binding_error}"
+            if binding:
+                config.update(binding)
+            if latest_message_at:
+                config["_since_ts"] = latest_message_at.isoformat()
+        else:
+            if config.get("source_channel") or config.get("source_session_id"):
+                return (
+                    "❌ source_channel/source_session_id apply only to human "
+                    "message watches"
+                )
+            binding, binding_error, latest_message_at = (
+                await _resolve_agent_on_message_binding(
+                    agent_id,
+                    user_id,
+                    config,
+                )
+            )
+            if binding_error:
+                return f"❌ {binding_error}"
+            if binding:
+                config.update(binding)
+            if latest_message_at:
+                config["_since_ts"] = latest_message_at.isoformat()
     elif ttype == "webhook":
         # URL possession alone is not authentication. Generate a strong URL
         # token plus an independent HMAC secret for every webhook trigger.
@@ -9735,25 +10582,55 @@ async def _handle_set_trigger(
 
     # Record the session that created this trigger so trigger results can later be routed to
     # the correct destination instead of being broadcast to every live web session.
+    server_context_added = False
     if session_id:
         try:
             async with async_session() as _ctx_db:
                 _session_result = await _ctx_db.execute(
-                    select(ChatSession).where(ChatSession.id == uuid.UUID(session_id))
+                    select(ChatSession).where(
+                        ChatSession.id == uuid.UUID(session_id),
+                        ChatSession.user_id == user_id,
+                        (
+                            (ChatSession.agent_id == agent_id)
+                            | (ChatSession.peer_agent_id == agent_id)
+                        ),
+                    )
                 )
                 origin_session = _session_result.scalar_one_or_none()
-                if origin_session:
+                if origin_session and origin_session.source_channel != "trigger":
                     config["_origin_session_id"] = str(origin_session.id)
                     config["_origin_source_channel"] = origin_session.source_channel
-                    if origin_session.source_channel == "agent" and origin_session.peer_agent_id:
-                        config["_origin_peer_agent_id"] = str(origin_session.peer_agent_id)
-                    elif origin_session.source_channel != "trigger":
+                    if origin_session.user_id:
                         config["_origin_user_id"] = str(origin_session.user_id)
+                    server_context_added = True
                 elif user_id:
                     config["_origin_user_id"] = str(user_id)
+                    server_context_added = True
         except Exception:
             if user_id:
                 config["_origin_user_id"] = str(user_id)
+                server_context_added = True
+    elif user_id:
+        config["_origin_user_id"] = str(user_id)
+        server_context_added = True
+
+    if server_context_added:
+        from app.services.trigger_runtime.config import mark_server_owned_trigger_context
+        mark_server_owned_trigger_context(config)
+
+    try:
+        focus_ref = await ensure_focus_item(
+            agent_id,
+            focus_ref=focus_ref,
+            description=reason or name,
+            system=False,
+        )
+    except Exception as e:
+        logger.warning(
+            "[Trigger] Failed to ensure Focus item error_type={}",
+            type(e).__name__,
+        )
+        focus_ref = focus_ref or name
 
     try:
         async with async_session() as db:
@@ -9901,7 +10778,13 @@ async def _handle_update_trigger(agent_id: uuid.UUID, arguments: dict) -> str:
             return "❌ Invalid trigger config: expected a JSON object"
     if new_config is not None and not isinstance(new_config, dict):
         return "❌ Invalid trigger config: expected a JSON object"
-    from app.services.trigger_runtime.config import reserved_trigger_config_keys
+    from app.services.trigger_runtime.config import (
+        changes_on_message_binding,
+        on_message_source_binding_error,
+        reserved_trigger_config_keys,
+        trusted_persisted_trigger_state,
+        without_reserved_trigger_config,
+    )
 
     reserved_keys = reserved_trigger_config_keys(new_config)
     if reserved_keys:
@@ -9929,8 +10812,24 @@ async def _handle_update_trigger(agent_id: uuid.UUID, arguments: dict) -> str:
 
             changes = []
             if new_config is not None:
-                old_config = dict(trigger.config or {})
+                stored_config = dict(trigger.config or {})
+                if trigger.type == "on_message" and changes_on_message_binding(
+                    stored_config,
+                    new_config,
+                ):
+                    return (
+                        "❌ Message-watch identity cannot be retargeted in place. "
+                        "Cancel it and create a new trigger from the intended conversation."
+                    )
+                old_config = {
+                    **without_reserved_trigger_config(stored_config),
+                    **trusted_persisted_trigger_state(stored_config),
+                }
                 merged_config = {**old_config, **new_config}
+                if trigger.type == "on_message":
+                    source_error = on_message_source_binding_error(merged_config)
+                    if source_error:
+                        return f"❌ {source_error}"
                 if trigger.type == "webhook":
                     # Never remove the stable URL token or required signing
                     # secret through a partial settings update.
@@ -10043,7 +10942,6 @@ async def _upload_image(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
     2. Per-agent tool config override (agent-specific)
     """
     import httpx
-    import base64
 
     file_path = arguments.get("file_path")
     url = arguments.get("url")
@@ -10179,14 +11077,61 @@ async def _generate_image(
 
     size = arguments.get("size", "1024x1024")
     save_path = arguments.get("save_path", "")
-    overlay_text = (arguments.get("overlay_text") or "").strip()
+    overlay_text = str(arguments.get("overlay_text") or "")
     overlay_position = (arguments.get("overlay_position") or "bottom").strip().lower()
-    from app.services.media_assets import MAX_OVERLAY_TEXT_CHARS
+    brand_position = (arguments.get("brand_position") or "center").strip().lower()
+    try:
+        brand_scale = float(arguments.get("brand_scale") or 0.42)
+    except (TypeError, ValueError):
+        return "❌ brand_scale must be a number between 0.1 and 0.8"
+    from app.services.media_assets import (
+        MAX_OVERLAY_TEXT_CHARS,
+        MediaContractError,
+        load_brand_asset,
+        normalize_overlay_text,
+        validate_overlay_text,
+    )
 
     if len(overlay_text) > MAX_OVERLAY_TEXT_CHARS:
         return f"❌ overlay_text must be at most {MAX_OVERLAY_TEXT_CHARS} characters"
     if overlay_position not in {"top", "center", "bottom"}:
         return "❌ overlay_position must be top, center, or bottom"
+    if brand_position not in {"top_left", "top_right", "center", "bottom_left", "bottom_right"}:
+        return "❌ brand_position is invalid"
+    if not 0.1 <= brand_scale <= 0.8:
+        return "❌ brand_scale must be between 0.1 and 0.8"
+    try:
+        overlay_text = normalize_overlay_text(overlay_text)
+        validate_overlay_text(overlay_text)
+        brand_asset = load_brand_asset(ws, arguments.get("brand_asset"))
+    except MediaContractError as exc:
+        return f"❌ Brand-safe media contract is invalid: {exc}"
+    if brand_asset and provider == "minimax" and arguments.get("reference_image"):
+        return (
+            "❌ brand_asset cannot be combined with reference_image. Use brand_asset for an unchanged product/logo "
+            "or reference_image for creative model redraw."
+        )
+    if not save_path:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        slug = "_".join(prompt.split()[:4]).lower()
+        slug = "".join(c for c in slug if c.isalnum() or c == "_")[:40]
+        save_path = f"workspace/images/{slug}_{ts}.png"
+    full_save_path = (ws / save_path).resolve()
+    try:
+        full_save_path.relative_to(ws.resolve())
+    except ValueError:
+        return "❌ Access denied: save path is outside the workspace"
+    if full_save_path.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
+        return "❌ Unsupported image output format. Use .png, .jpg, or .jpeg."
+    full_save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    provider_prompt = str(prompt)
+    if overlay_text.strip() or brand_asset:
+        provider_prompt = (
+            f"{prompt}\nCreate only a clean visual background. Do not render words, letters, captions, logos, "
+            "watermarks, product packaging, or product replicas. Leave clear negative space for Astra to add "
+            "the exact copy and protected brand asset after generation."
+        )
 
     # Load tool config (global -> per-agent override)
     tool_key = f"generate_image_{provider}"
@@ -10200,6 +11145,16 @@ async def _generate_image(
     minimax_credit_cost = 0
     minimax_reservation_id: uuid.UUID | None = None
     minimax_reservation_finalized = False
+    minimax_provider_succeeded = False
+    minimax_provider_request_started = False
+    minimax_provider_rejected = False
+    minimax_final_object_stored = False
+    minimax_recovery_path: str | None = None
+    minimax_evidence_key: str | None = None
+    minimax_recovery_id = uuid.uuid4()
+    minimax_accepted_url: str | None = None
+    minimax_settlement_ready = False
+    image_bytes = b""
 
     # MiniMax uses the central credential pool (账号池) instead of per-tool config
     if provider == "minimax":
@@ -10220,15 +11175,16 @@ async def _generate_image(
         if quota_error:
             return quota_error
         minimax_credit_cost = minimax_image_credits(model or "image-01", images=1)
-        minimax_tenant_id = await _get_minimax_tenant_uuid(agent_id)
-        if minimax_tenant_id:
-            try:
-                await _check_minimax_credit_amount(minimax_tenant_id, minimax_credit_cost)
-            except Exception as exc:
-                from app.services.quota_guard import QuotaExceeded
-                if isinstance(exc, QuotaExceeded):
-                    return f"⚠️ {exc.message}"
-                raise
+        try:
+            minimax_tenant_id = await _get_minimax_tenant_uuid(agent_id)
+            await _check_minimax_credit_amount(minimax_tenant_id, minimax_credit_cost)
+        except MinimaxBillingContextError as exc:
+            return f"❌ {exc}"
+        except Exception as exc:
+            from app.services.quota_guard import QuotaExceeded
+            if isinstance(exc, QuotaExceeded):
+                return f"⚠️ {exc.message}"
+            raise
         try:
             cred = await pick_credential(
                 "minimax",
@@ -10257,26 +11213,9 @@ async def _generate_image(
             "Ask your admin to configure it in Enterprise Settings → Tools → Generate Image."
         )
 
-    # Generate the save path if not provided
-    if not save_path:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # Derive a short slug from the prompt for a more descriptive filename
-        slug = "_".join(prompt.split()[:4]).lower()
-        slug = "".join(c for c in slug if c.isalnum() or c == "_")[:40]
-        save_path = f"workspace/images/{slug}_{ts}.png"
-
-    # Ensure the target directory exists and path is within workspace
-    full_save_path = (ws / save_path).resolve()
     try:
-        full_save_path.relative_to(ws.resolve())
-    except ValueError:
-        return "❌ Access denied: save path is outside the workspace"
-    if full_save_path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
-        return "❌ Unsupported image output format. Use .png, .jpg, .jpeg, or .webp."
-    full_save_path.parent.mkdir(parents=True, exist_ok=True)
-
-    try:
-        if provider == "minimax" and minimax_tenant_id and minimax_credit_cost > 0:
+        if provider == "minimax" and minimax_credit_cost > 0:
+            assert minimax_tenant_id is not None
             reservation = await _reserve_minimax_tool_credits(
                 tenant_id=minimax_tenant_id,
                 user_id=user_id,
@@ -10286,6 +11225,7 @@ async def _generate_image(
                 tier=minimax_tier or "lite",
                 model=model or "image-01",
                 credits=minimax_credit_cost,
+                initial_status="provider_inflight",
             )
             minimax_reservation_id = reservation.id
 
@@ -10294,21 +11234,21 @@ async def _generate_image(
                 api_key,
                 model or "black-forest-labs/FLUX.1-schnell",
                 base_url or "https://api.siliconflow.cn/v1",
-                prompt, size,
+                provider_prompt, size,
             )
         elif provider == "openai":
             image_bytes = await _generate_image_openai(
                 api_key,
                 model or "gpt-image-1",
                 base_url or "https://api.openai.com/v1",
-                prompt, size,
+                provider_prompt, size,
             )
         elif provider == "google":
             image_bytes = await _generate_image_google(
                 api_key,
                 model or "gemini-2.5-flash-image",
                 base_url or "https://generativelanguage.googleapis.com/v1beta",
-                prompt, size,
+                provider_prompt, size,
             )
         elif provider == "custom":
             image_bytes = await _generate_image_custom_api(
@@ -10320,7 +11260,7 @@ async def _generate_image(
                 response_image_path=config.get("response_image_path") or "choices.0.message.images.0.image_url.url",
                 extra_headers_json=config.get("extra_headers_json") or "",
                 timeout_seconds=config.get("timeout_seconds") or 120,
-                prompt=prompt,
+                prompt=provider_prompt,
                 size=size,
             )
         elif provider == "minimax":
@@ -10331,13 +11271,76 @@ async def _generate_image(
                 arguments.get("reference_image"),
                 label="Reference image",
             )
-            provider_prompt = prompt
-            if overlay_text:
-                provider_prompt = (
-                    f"{prompt}\nCreate only the visual scene. Do not render words, letters, captions, "
-                    "logos, or watermarks; exact copy will be added after generation."
-                )
+            async def record_provider_acceptance(image_url: str | None) -> None:
+                nonlocal minimax_provider_succeeded, minimax_recovery_path
+                nonlocal minimax_evidence_key
+                nonlocal minimax_accepted_url, minimax_settlement_ready
+                minimax_provider_succeeded = True
+                minimax_accepted_url = image_url
+                # MiniMax URLs expire. Keep the accepted provider identity in
+                # private Agent storage until the final object is durable.
+                try:
+                    evidence_key, recovery_ref = (
+                        await _store_minimax_image_acceptance_evidence(
+                            agent_id=agent_id,
+                            recovery_id=(
+                                minimax_reservation_id or minimax_recovery_id
+                            ),
+                            model=model,
+                            image_url=image_url,
+                            save_path=save_path,
+                        )
+                    )
+                    # Publish the pointer only after the object exists.
+                    minimax_evidence_key = evidence_key
+                    minimax_recovery_path = recovery_ref
+                except Exception as evidence_exc:
+                    logger.exception(
+                        "[GenerateImage] Accepted-response evidence store failed"
+                    )
+                    try:
+                        await _record_minimax_tool_product_issue(
+                            agent_id,
+                            "image",
+                            error=evidence_exc,
+                            model=model,
+                            tier=minimax_tier,
+                            user_id=user_id,
+                            category="asset_recovery",
+                            severity="critical",
+                        )
+                    except Exception:
+                        pass
+                if minimax_reservation_id:
+                    try:
+                        await _mark_minimax_tool_reservation_settlement_ready(
+                            minimax_reservation_id,
+                            amount=minimax_credit_cost,
+                        )
+                        minimax_settlement_ready = True
+                    except Exception as settlement_exc:
+                        # Continue the immediate download while the signed URL
+                        # is still valid; retry settlement before finalization.
+                        logger.exception(
+                            "[GenerateImage] Provider debt outbox mark failed"
+                        )
+                        try:
+                            await _record_minimax_tool_product_issue(
+                                agent_id,
+                                "image",
+                                error=settlement_exc,
+                                model=model,
+                                tier=minimax_tier,
+                                user_id=user_id,
+                                category="billing_settlement",
+                                severity="critical",
+                                recovery_path=minimax_recovery_path,
+                            )
+                        except Exception:
+                            pass
+
             try:
+                minimax_provider_request_started = True
                 image_bytes = await _generate_image_minimax(
                     api_key=api_key,
                     base_url=base_url,
@@ -10345,9 +11348,11 @@ async def _generate_image(
                     prompt=provider_prompt,
                     aspect_ratio=arguments.get("aspect_ratio", "1:1"),
                     reference_image=reference_image,
+                    on_provider_accepted=record_provider_acceptance,
                 )
             except Exception as e:
-                if minimax_cred_id:
+                minimax_provider_rejected = _is_minimax_deterministic_rejection(e)
+                if minimax_cred_id and not minimax_provider_succeeded:
                     await _mark_minimax_tool_credential_failure(
                         minimax_cred_id,
                         e,
@@ -10361,25 +11366,47 @@ async def _generate_image(
         if not image_bytes:
             return "❌ Image generation returned empty result. Please try a different prompt."
 
-        from app.services.media_assets import apply_image_text_overlay, validate_generated_image
+        if provider == "minimax":
+            # Provider cost is now irreversible. Persist that debt before any
+            # local validation/overlay/storage step that can still fail.
+            if not minimax_provider_succeeded:
+                await record_provider_acceptance(None)
+
+        from app.services.media_assets import apply_image_brand_overlays, validate_generated_image
 
         validate_generated_image(image_bytes)
-        image_bytes = apply_image_text_overlay(
+        image_bytes, overlay_receipt = apply_image_brand_overlays(
             image_bytes,
             overlay_text,
-            position=overlay_position,
+            text_position=overlay_position,
+            brand_asset=brand_asset,
+            brand_position=brand_position,
+            brand_scale=brand_scale,
             output_format=full_save_path.suffix,
         )
         validate_generated_image(image_bytes)
 
-        # Persist before usage/credit settlement. A valid provider response is
-        # not a billable product result until the workspace artifact exists.
-        full_save_path.write_bytes(image_bytes)
-
-        # Settle only after provider validation, deterministic post-process,
-        # and local workspace persistence have all succeeded.
         if provider == "minimax":
+            from app.services.storage import store_agent_bytes
+
+            final_content_type = {
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+            }.get(full_save_path.suffix.lower(), "image/png")
+            await store_agent_bytes(
+                agent_id,
+                save_path,
+                image_bytes,
+                content_type=final_content_type,
+            )
+            minimax_final_object_stored = True
             if minimax_reservation_id:
+                if not minimax_settlement_ready:
+                    await _mark_minimax_tool_reservation_settlement_ready(
+                        minimax_reservation_id,
+                        amount=minimax_credit_cost,
+                    )
+                    minimax_settlement_ready = True
                 await _finalize_minimax_tool_reservation_for_delivery(
                     minimax_reservation_id,
                     agent_id=agent_id,
@@ -10389,6 +11416,32 @@ async def _generate_image(
                     user_id=user_id,
                 )
                 minimax_reservation_finalized = True
+            if minimax_evidence_key:
+                try:
+                    await _delete_minimax_image_acceptance_evidence(
+                        minimax_evidence_key
+                    )
+                    minimax_evidence_key = None
+                    minimax_recovery_path = None
+                except Exception:
+                    logger.warning(
+                        "[GenerateImage] Accepted-response evidence cleanup deferred"
+                    )
+            try:
+                full_save_path.write_bytes(image_bytes)
+            except OSError:
+                # The shared object is authoritative; a disposable local
+                # workspace cache must not turn successful delivery into a
+                # duplicate provider request.
+                logger.warning(
+                    "[GenerateImage] Local cache write failed after durable store"
+                )
+        else:
+            full_save_path.write_bytes(image_bytes)
+
+        # Non-MiniMax providers have no Credits reservation. MiniMax was
+        # settled at the provider-success boundary above and is not replayed.
+        if provider == "minimax":
             if minimax_cred_id:
                 await _record_minimax_tool_success(
                     agent_id,
@@ -10403,30 +11456,120 @@ async def _generate_image(
         # Build the same-origin API path for inline display in chat. Browser
         # media requests authenticate through the HttpOnly session cookie.
         api_image_path = f"/api/agents/{agent_id}/files/download?path={save_path}"
+        contract_bits = []
+        if overlay_receipt.rendered_text_sha256:
+            contract_bits.append(f"copy={overlay_receipt.rendered_text_sha256[:12]}")
+        if overlay_receipt.brand_asset_sha256:
+            contract_bits.append(f"brand={overlay_receipt.brand_asset_sha256[:12]}")
+        contract_line = f"Brand-safe receipt: {', '.join(contract_bits)}\n" if contract_bits else ""
 
         return (
             f"✅ Image generated and saved to: {save_path}\n"
             f"Size: {size_kb:.1f} KB | Provider: {provider} | Model: {model or '(default)'}\n\n"
+            f"{contract_line}"
             f"Display this image to the user using this exact markdown:\n"
             f"![generated image]({api_image_path})"
         )
-    except httpx.TimeoutException as exc:
-        if provider == "minimax":
-            await _record_minimax_tool_product_issue(
-                agent_id,
-                "image",
-                error=exc,
-                model=model,
-                tier=minimax_tier,
-                user_id=user_id,
-            )
-        logger.error(f"[GenerateImage] Timeout ({provider}): took longer than 120 seconds or network unreachable.")
-        return (
-            f"❌ Image generation failed ({provider}): API request timed out after 120 seconds. "
-            f"This is usually caused by network issues or the model taking too long to generate."
-        )
     except Exception as e:
         if provider == "minimax":
+            recovery_path: str | None = (
+                save_path if minimax_final_object_stored else minimax_recovery_path
+            )
+            if minimax_provider_succeeded and image_bytes and not minimax_final_object_stored:
+                # A paid provider result that cannot be post-processed or
+                # delivered must remain recoverable, but successful requests
+                # must not accumulate a second orphaned raw object.
+                recovery_path = (
+                    "workspace/media_inputs/"
+                    f"{minimax_reservation_id or uuid.uuid4()}_provider_image.bin"
+                )
+                try:
+                    from app.services.storage import store_agent_bytes
+
+                    await store_agent_bytes(
+                        agent_id,
+                        recovery_path,
+                        image_bytes,
+                        content_type="application/octet-stream",
+                    )
+                    if minimax_evidence_key:
+                        try:
+                            await _delete_minimax_image_acceptance_evidence(
+                                minimax_evidence_key
+                            )
+                            minimax_evidence_key = None
+                        except Exception:
+                            logger.warning(
+                                "[GenerateImage] URL evidence cleanup deferred after raw recovery"
+                            )
+                    minimax_recovery_path = recovery_path
+                except Exception as recovery_exc:
+                    logger.error(
+                        "[GenerateImage] Provider result recovery failed "
+                        "error_type={}",
+                        type(recovery_exc).__name__,
+                    )
+                    recovery_path = None
+            if (
+                minimax_provider_succeeded
+                and not recovery_path
+                and minimax_accepted_url
+            ):
+                try:
+                    evidence_key, recovery_ref = (
+                        await _store_minimax_image_acceptance_evidence(
+                            agent_id=agent_id,
+                            recovery_id=(
+                                minimax_reservation_id or minimax_recovery_id
+                            ),
+                            model=model,
+                            image_url=minimax_accepted_url,
+                            save_path=save_path,
+                        )
+                    )
+                    minimax_evidence_key = evidence_key
+                    recovery_path = recovery_ref
+                    minimax_recovery_path = recovery_ref
+                except Exception:
+                    logger.exception(
+                        "[GenerateImage] Accepted-response evidence retry failed"
+                    )
+            if (
+                minimax_provider_succeeded
+                and minimax_reservation_id
+                and not minimax_settlement_ready
+            ):
+                try:
+                    await _mark_minimax_tool_reservation_settlement_ready(
+                        minimax_reservation_id,
+                        amount=minimax_credit_cost,
+                    )
+                    minimax_settlement_ready = True
+                except Exception:
+                    logger.exception(
+                        "[GenerateImage] Provider debt outbox retry failed"
+                    )
+            if (
+                minimax_provider_succeeded
+                and recovery_path
+                and minimax_reservation_id
+                and minimax_settlement_ready
+                and not minimax_reservation_finalized
+            ):
+                try:
+                    await _finalize_minimax_tool_reservation_for_delivery(
+                        minimax_reservation_id,
+                        agent_id=agent_id,
+                        modality="image",
+                        model=model,
+                        tier=minimax_tier,
+                        user_id=user_id,
+                    )
+                    minimax_reservation_finalized = True
+                except Exception:
+                    # The reservation remains settlement-ready for operator or
+                    # background reconciliation; never refund provider debt.
+                    pass
             await _record_minimax_tool_product_issue(
                 agent_id,
                 "image",
@@ -10434,12 +11577,50 @@ async def _generate_image(
                 model=model,
                 tier=minimax_tier,
                 user_id=user_id,
+                recovery_path=recovery_path,
             )
-        err_msg = str(e) or type(e).__name__
-        logger.error(f"[GenerateImage] Error ({provider}): {err_msg}")
-        return f"❌ Image generation failed ({provider}): {err_msg[:400]}"
+        if isinstance(e, httpx.TimeoutException):
+            logger.error(
+                f"[GenerateImage] Timeout ({provider}): request or storage operation timed out."
+            )
+            if provider != "minimax":
+                return (
+                    f"❌ Image generation failed ({provider}): API request timed out "
+                    "after 120 seconds."
+                )
+            return (
+                f"❌ Image generation failed ({provider}): the request outcome is "
+                "being held for safe reconciliation. Please do not retry immediately."
+            )
+        if (
+            provider == "minimax"
+            and minimax_provider_request_started
+            and not minimax_provider_rejected
+            and not minimax_provider_succeeded
+        ):
+            logger.error(
+                "[GenerateImage] MiniMax response was incomplete; reservation retained"
+            )
+            return (
+                "❌ Image generation failed (minimax): the provider response was "
+                "incomplete and the request is being held for safe reconciliation. "
+                "Please do not retry immediately."
+            )
+        logger.error(
+            "[GenerateImage] Generation failed provider={} error_type={}",
+            provider,
+            type(e).__name__,
+        )
+        return _safe_media_failure_message("Image generation", provider, e)
     finally:
-        if minimax_reservation_id and not minimax_reservation_finalized:
+        if (
+            minimax_reservation_id
+            and not minimax_reservation_finalized
+            and (
+                not minimax_provider_request_started
+                or minimax_provider_rejected
+            )
+        ):
             await _release_minimax_tool_reservation_safely(
                 minimax_reservation_id,
                 agent_id=agent_id,
@@ -10447,6 +11628,7 @@ async def _generate_image(
                 model=model,
                 tier=minimax_tier,
                 user_id=user_id,
+                release_provider_inflight=True,
             )
 
 
@@ -10521,14 +11703,35 @@ async def _resolve_minimax_tool_tier(
     return "lite"
 
 
-async def _get_minimax_tenant_uuid(agent_id: uuid.UUID) -> uuid.UUID | None:
-    tenant_id = await _get_agent_tenant_id(agent_id)
-    if not tenant_id:
-        return None
+class MinimaxBillingContextError(RuntimeError):
+    """A paid MiniMax call cannot be bound to one billable tenant."""
+
+
+async def _get_minimax_tenant_uuid(agent_id: uuid.UUID) -> uuid.UUID:
+    """Resolve the Agent tenant or fail before selecting/calling a provider.
+
+    Media generation is always a paid, tenant-scoped product operation.  A
+    missing Agent, a missing tenant, an invalid identifier, or a database
+    failure must never be interpreted as an unbilled/internal invocation.
+    """
+    try:
+        tenant_id = await _get_agent_tenant_id(agent_id, strict=True)
+    except Exception as exc:
+        logger.error(
+            "[MiniMax Billing] tenant resolution failed error_type={}",
+            type(exc).__name__,
+        )
+        raise MinimaxBillingContextError(
+            "Media billing is temporarily unavailable. No provider request was made."
+        ) from exc
+
+    assert tenant_id is not None
     try:
         return uuid.UUID(str(tenant_id))
-    except (TypeError, ValueError):
-        return None
+    except (TypeError, ValueError) as exc:
+        raise MinimaxBillingContextError(
+            "Media billing context is invalid. No provider request was made."
+        ) from exc
 
 
 async def _check_minimax_credit_amount(tenant_id: uuid.UUID, credits: int) -> None:
@@ -10570,6 +11773,88 @@ async def _finalize_minimax_tool_reservation(reservation_id: uuid.UUID) -> None:
     from app.services.credit_service import finalize_reserved_credits
 
     await finalize_reserved_credits(reservation_id)
+
+
+async def _mark_minimax_tool_reservation_settlement_ready(
+    reservation_id: uuid.UUID,
+    *,
+    amount: int,
+) -> None:
+    """Persist MiniMax provider debt before local asset post-processing."""
+    from app.services.credit_service import mark_credit_reservation_settlement_ready
+
+    await mark_credit_reservation_settlement_ready(
+        reservation_id,
+        amount=amount,
+    )
+
+
+def _minimax_image_acceptance_evidence_key(
+    agent_id: uuid.UUID,
+    recovery_id: uuid.UUID,
+) -> str:
+    """Build a service-private key that Agent workspace tools cannot address."""
+    return normalize_storage_key(
+        f"_internal/provider_recovery/minimax/image/{agent_id}/{recovery_id}.json"
+    )
+
+
+async def _store_minimax_image_acceptance_evidence(
+    *,
+    agent_id: uuid.UUID,
+    recovery_id: uuid.UUID,
+    model: str,
+    image_url: str | None,
+    save_path: str,
+) -> tuple[str, str]:
+    """Persist encrypted provider recovery evidence outside Agent-visible storage."""
+    key = _minimax_image_acceptance_evidence_key(agent_id, recovery_id)
+    storage = get_storage_backend()
+    plaintext = json.dumps(
+        {
+            "provider": "minimax",
+            "model": model,
+            "image_url": image_url,
+            "save_path": save_path,
+        },
+        ensure_ascii=False,
+    )
+    ciphertext = encrypt_data(plaintext, get_settings().SECRET_KEY)
+    await storage.write_bytes(
+        key,
+        json.dumps(
+            {
+                "version": 1,
+                "ciphertext": ciphertext,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8"),
+        content_type="application/json",
+    )
+    return key, f"minimax-image-recovery:{recovery_id}"
+
+
+async def _load_minimax_image_acceptance_evidence(key: str) -> dict[str, object]:
+    """Load recovery evidence for an operator-only reconciliation workflow."""
+    normalized_key = normalize_storage_key(key)
+    if not normalized_key.startswith("_internal/provider_recovery/minimax/image/"):
+        raise ValueError("MiniMax recovery evidence key is outside the private namespace")
+    storage = get_storage_backend()
+    envelope = json.loads((await storage.read_bytes(normalized_key)).decode("utf-8"))
+    if envelope.get("version") != 1 or not isinstance(envelope.get("ciphertext"), str):
+        raise ValueError("MiniMax recovery evidence envelope is invalid")
+    plaintext = decrypt_data(envelope["ciphertext"], get_settings().SECRET_KEY)
+    payload = json.loads(plaintext)
+    if not isinstance(payload, dict) or payload.get("provider") != "minimax":
+        raise ValueError("MiniMax recovery evidence payload is invalid")
+    return payload
+
+
+async def _delete_minimax_image_acceptance_evidence(key: str | None) -> None:
+    if not key:
+        return
+    storage = get_storage_backend()
+    await storage.delete(key)
 
 
 async def _release_minimax_tool_reservation(
@@ -10626,10 +11911,14 @@ async def _release_minimax_tool_reservation_safely(
     model: str | None,
     tier: str | None,
     user_id: uuid.UUID | None,
+    release_provider_inflight: bool = False,
 ) -> None:
     """Release an unfinished reservation without hiding the original result."""
     try:
-        await _release_minimax_tool_reservation(reservation_id)
+        await _release_minimax_tool_reservation(
+            reservation_id,
+            release_provider_inflight=release_provider_inflight,
+        )
     except Exception as exc:
         logger.error(
             "[MiniMaxTool] Credit reservation release failed error_type={}",
@@ -10772,6 +12061,7 @@ async def _record_minimax_tool_product_issue(
     user_id: uuid.UUID | None = None,
     category: str = "media",
     severity: str = "error",
+    recovery_path: str | None = None,
 ) -> None:
     """Capture a failed media operation without storing prompt or response data."""
 
@@ -10816,6 +12106,7 @@ async def _record_minimax_tool_product_issue(
             "modality": modality,
             "saas_tier": tier,
             "error_type": type(error).__name__ if error is not None else None,
+            "recovery_path": recovery_path,
         },
     )
 
@@ -10839,6 +12130,24 @@ def _log_minimax_operation_failure(component: str, error: Exception) -> None:
         component,
         type(error).__name__,
         error_code,
+    )
+
+
+def _safe_media_failure_message(
+    operation: str,
+    provider: str,
+    error: Exception | str | None = None,
+) -> str:
+    """Return a stable customer message without provider bodies or secrets."""
+    error_code = None
+    if provider == "minimax" and error is not None:
+        from app.services.llm.failover import extract_minimax_code
+
+        error_code = extract_minimax_code(str(error))
+    code_suffix = f" Provider code: {error_code}." if error_code else ""
+    return (
+        f"❌ {operation} failed ({provider}).{code_suffix} "
+        "No usable asset was delivered. Please retry later or contact the administrator."
     )
 
 
@@ -10874,6 +12183,11 @@ def _resolve_workspace_output_path(
         save_path = f"{default_dir.rstrip('/')}/{prefix}_{slug}_{ts}.{extension.lstrip('.')}"
 
     rel_path = str(save_path).strip()
+    required_suffix = f".{extension.lstrip('.').lower()}"
+    if Path(rel_path).suffix.lower() != required_suffix:
+        raise ValueError(
+            f"save_path must end with {required_suffix} so the file name matches its media format"
+        )
     full_path = (ws / rel_path).resolve()
     try:
         full_path.relative_to(ws.resolve())
@@ -10975,12 +12289,30 @@ async def _load_minimax_tool_credential_by_id(credential_id: uuid.UUID) -> _Mini
         )
 
 
+class MiniMaxProviderRejected(ValueError):
+    """The provider explicitly rejected a request before producing an asset."""
+
+
+def _is_minimax_deterministic_rejection(error: BaseException) -> bool:
+    """Return true only when MiniMax explicitly proved no paid work started."""
+    return isinstance(error, MiniMaxProviderRejected)
+
+
 def _raise_for_minimax_base_resp(data: dict, default_label: str = "MiniMax API") -> None:
     base_resp = data.get("base_resp") or {}
     status_code = base_resp.get("status_code", 0)
     if status_code not in (0, "0", None):
         status_msg = base_resp.get("status_msg") or "unknown error"
-        raise ValueError(f"{default_label} error ({status_code}): {status_msg}")
+        from app.services.llm.provider_acceptance import (
+            is_minimax_deterministic_rejection_code,
+        )
+
+        error_type = (
+            MiniMaxProviderRejected
+            if is_minimax_deterministic_rejection_code(status_code)
+            else ValueError
+        )
+        raise error_type(f"{default_label} error ({status_code}): {status_msg}")
 
 
 def _minimax_http_error(resp) -> ValueError:
@@ -10996,7 +12328,160 @@ def _minimax_http_error(resp) -> ValueError:
     except Exception:
         code = resp.status_code
         msg = resp.text[:300]
-    return ValueError(f"MiniMax API error ({code}): {msg}")
+    error_type = (
+        MiniMaxProviderRejected
+        if 400 <= int(resp.status_code) < 500 and int(resp.status_code) != 408
+        else ValueError
+    )
+    return error_type(f"MiniMax API error ({code}): {msg}")
+
+
+@dataclass(frozen=True, slots=True)
+class _BoundedJSONResponse:
+    status_code: int
+    data: Any | None
+    text: str
+
+    def json(self) -> Any:
+        if self.data is None:
+            raise ValueError("Provider returned non-JSON data")
+        return self.data
+
+
+def _bounded_content_length(response, *, max_bytes: int, label: str) -> None:
+    raw_length = (getattr(response, "headers", None) or {}).get("content-length")
+    if raw_length is None:
+        return
+    try:
+        declared_bytes = int(raw_length)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} returned an invalid Content-Length") from exc
+    if declared_bytes < 0 or declared_bytes > max_bytes:
+        raise ValueError(f"{label} exceeds its {max_bytes}-byte safety limit")
+
+
+async def _read_bounded_http_body(
+    response,
+    *,
+    max_bytes: int,
+    label: str,
+) -> bytes:
+    _bounded_content_length(response, max_bytes=max_bytes, label=label)
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        if len(body) + len(chunk) > max_bytes:
+            raise ValueError(f"{label} exceeds its {max_bytes}-byte safety limit")
+        body.extend(chunk)
+    return bytes(body)
+
+
+async def _bounded_json_request(
+    client,
+    method: str,
+    url: str,
+    *,
+    max_bytes: int,
+    label: str,
+    **kwargs,
+) -> _BoundedJSONResponse:
+    async with client.stream(method, url, **kwargs) as response:
+        body = await _read_bounded_http_body(
+            response,
+            max_bytes=max_bytes,
+            label=label,
+        )
+        try:
+            data = json.loads(body)
+        except (TypeError, ValueError):
+            data = None
+        return _BoundedJSONResponse(
+            status_code=int(response.status_code),
+            data=data,
+            # Error reporting only needs a short preview. Retaining a second
+            # decoded copy of a legal audio JSON response can otherwise add
+            # tens of megabytes to the live request after ``json.loads``.
+            text=body[:1000].decode("utf-8", errors="replace"),
+        )
+
+
+async def _bounded_http_download(
+    client,
+    url: str,
+    *,
+    max_bytes: int,
+    label: str,
+    timeout: int,
+) -> bytes:
+    async with client.stream("GET", url, timeout=timeout) as response:
+        response.raise_for_status()
+        return await _read_bounded_http_body(
+            response,
+            max_bytes=max_bytes,
+            label=label,
+        )
+
+
+def _public_only_async_client(url: str, *, timeout: int):
+    """Build a same-origin client for credentialed provider API requests."""
+
+    import httpx
+
+    from app.services.mcp_security import MCPHTTPGuard
+
+    guard = MCPHTTPGuard(url)
+    return httpx.AsyncClient(timeout=timeout, **guard.client_kwargs())
+
+
+def _public_artifact_async_client(*, timeout: int):
+    """Build a credential-free public client for bounded artifact downloads."""
+
+    import httpx
+
+    from app.services.mcp_security import PublicArtifactHTTPGuard
+
+    guard = PublicArtifactHTTPGuard()
+    return httpx.AsyncClient(timeout=timeout, **guard.client_kwargs())
+
+
+async def _bounded_public_http_download(
+    url: str,
+    *,
+    max_bytes: int,
+    label: str,
+    timeout: int,
+) -> bytes:
+    async with _public_artifact_async_client(timeout=timeout) as client:
+        return await _bounded_http_download(
+            client,
+            url,
+            max_bytes=max_bytes,
+            label=label,
+            timeout=timeout,
+        )
+
+
+def _bounded_base64_decode(
+    encoded: str,
+    *,
+    max_bytes: int,
+    label: str,
+) -> bytes:
+    import base64
+    import binascii
+
+    if not isinstance(encoded, str) or not encoded:
+        raise ValueError(f"{label} is empty")
+    max_encoded_chars = ((max_bytes + 2) // 3) * 4 + 4
+    if len(encoded) > max_encoded_chars:
+        raise ValueError(f"{label} exceeds its {max_bytes}-byte safety limit")
+    compact = "".join(encoded.split())
+    try:
+        decoded = base64.b64decode(compact, validate=True)
+    except (binascii.Error, ValueError, TypeError) as exc:
+        raise ValueError(f"{label} is not valid base64") from exc
+    if len(decoded) > max_bytes:
+        raise ValueError(f"{label} exceeds its {max_bytes}-byte safety limit")
+    return decoded
 
 
 def _minimax_audio_hex_to_bytes(data: dict, label: str) -> bytes:
@@ -11005,6 +12490,12 @@ def _minimax_audio_hex_to_bytes(data: dict, label: str) -> bytes:
     audio_hex = payload.get("audio")
     if not isinstance(audio_hex, str) or not audio_hex:
         raise ValueError(f"No audio hex payload in {label} response")
+    if len(audio_hex) > MAX_GENERATED_AUDIO_BYTES * 2:
+        raise ValueError(
+            f"{label} audio exceeds its {MAX_GENERATED_AUDIO_BYTES}-byte safety limit"
+        )
+    if len(audio_hex) % 2 or re.fullmatch(r"[0-9a-fA-F]+", audio_hex) is None:
+        raise ValueError(f"Invalid audio hex payload in {label} response")
     try:
         return bytes.fromhex(audio_hex)
     except ValueError as exc:
@@ -11029,6 +12520,10 @@ async def _generate_speech_minimax(
     if not profile.enabled:
         return f"❌ MiniMax speech generation is disabled for the {tier} tier."
     model = profile.model
+    try:
+        tenant_id = await _get_minimax_tenant_uuid(agent_id)
+    except MinimaxBillingContextError as exc:
+        return f"❌ {exc}"
     credential, error = await _prepare_minimax_tool_credential(
         agent_id,
         modality="audio",
@@ -11045,13 +12540,24 @@ async def _generate_speech_minimax(
 
     reservation_id: uuid.UUID | None = None
     reservation_finalized = False
+    provider_request_started = False
+    provider_succeeded = False
+    provider_rejected = False
+    final_object_stored = False
+    settlement_ready = False
+    recovery_path: str | None = None
+    audio_bytes = b""
+    content_type = {
+        "mp3": "audio/mpeg",
+        "wav": "audio/wav",
+        "flac": "audio/flac",
+        "pcm": "application/octet-stream",
+    }[audio_format]
     try:
         from app.services.provider_pricing import minimax_tts_credits
         credit_cost = minimax_tts_credits(model, characters=len(text))
-        tenant_id = await _get_minimax_tenant_uuid(agent_id)
-        if tenant_id:
-            await _check_minimax_credit_amount(tenant_id, credit_cost)
-        if tenant_id and credit_cost > 0:
+        await _check_minimax_credit_amount(tenant_id, credit_cost)
+        if credit_cost > 0:
             reservation = await _reserve_minimax_tool_credits(
                 tenant_id=tenant_id,
                 user_id=user_id,
@@ -11061,6 +12567,7 @@ async def _generate_speech_minimax(
                 tier=tier,
                 model=model,
                 credits=credit_cost,
+                initial_status="provider_inflight",
             )
             reservation_id = reservation.id
         save_path, full_save_path = _resolve_workspace_output_path(
@@ -11071,6 +12578,7 @@ async def _generate_speech_minimax(
             audio_format,
             text,
         )
+        provider_request_started = True
         audio_bytes = await _minimax_tts_http(
             api_key=credential.api_key,
             base_url=credential.base_url,
@@ -11085,7 +12593,30 @@ async def _generate_speech_minimax(
             bitrate=int(profile.bitrate or 128000),
             language_boost=config.get("language_boost") or "auto",
         )
-        full_save_path.write_bytes(audio_bytes)
+        provider_succeeded = True
+        if reservation_id:
+            await _mark_minimax_tool_reservation_settlement_ready(
+                reservation_id,
+                amount=credit_cost,
+            )
+            settlement_ready = True
+        from app.services.media_assets import validate_generated_audio
+
+        await validate_generated_audio(
+            audio_bytes,
+            audio_format=audio_format,
+            sample_rate=int(profile.sample_rate or 32000),
+            label="MiniMax speech output",
+        )
+        from app.services.storage import store_agent_bytes
+
+        await store_agent_bytes(
+            agent_id,
+            save_path,
+            audio_bytes,
+            content_type=content_type,
+        )
+        final_object_stored = True
         if reservation_id:
             await _finalize_minimax_tool_reservation_for_delivery(
                 reservation_id,
@@ -11096,6 +12627,12 @@ async def _generate_speech_minimax(
                 user_id=user_id,
             )
             reservation_finalized = True
+        try:
+            full_save_path.write_bytes(audio_bytes)
+        except OSError:
+            logger.warning(
+                "[MiniMaxSpeech] Local cache write failed after durable store"
+            )
         await _record_minimax_tool_success(
             agent_id,
             credential.id,
@@ -11107,12 +12644,61 @@ async def _generate_speech_minimax(
         from app.services.quota_guard import QuotaExceeded
         if isinstance(exc, QuotaExceeded):
             return f"⚠️ {exc.message}"
-        await _mark_minimax_tool_credential_failure(
-            credential.id,
-            exc,
-            modality="audio",
-            model=model,
-        )
+        provider_rejected = _is_minimax_deterministic_rejection(exc)
+        if provider_succeeded and audio_bytes and not final_object_stored:
+            recovery_path = (
+                "workspace/media_inputs/"
+                f"{reservation_id or uuid.uuid4()}_provider_audio.{audio_format}"
+            )
+            try:
+                from app.services.storage import store_agent_bytes
+
+                await store_agent_bytes(
+                    agent_id,
+                    recovery_path,
+                    audio_bytes,
+                    content_type=content_type,
+                )
+            except Exception:
+                recovery_path = None
+                logger.exception("[MiniMaxSpeech] Provider result recovery failed")
+        elif final_object_stored:
+            recovery_path = save_path
+        if provider_succeeded and reservation_id and not settlement_ready:
+            try:
+                await _mark_minimax_tool_reservation_settlement_ready(
+                    reservation_id,
+                    amount=credit_cost,
+                )
+                settlement_ready = True
+            except Exception:
+                logger.exception("[MiniMaxSpeech] Provider debt outbox retry failed")
+        if (
+            provider_succeeded
+            and recovery_path
+            and reservation_id
+            and settlement_ready
+            and not reservation_finalized
+        ):
+            try:
+                await _finalize_minimax_tool_reservation_for_delivery(
+                    reservation_id,
+                    agent_id=agent_id,
+                    modality="audio",
+                    model=model,
+                    tier=tier,
+                    user_id=user_id,
+                )
+                reservation_finalized = True
+            except Exception:
+                pass
+        if not provider_succeeded:
+            await _mark_minimax_tool_credential_failure(
+                credential.id,
+                exc,
+                modality="audio",
+                model=model,
+            )
         await _record_minimax_tool_product_issue(
             agent_id,
             "audio",
@@ -11120,11 +12706,16 @@ async def _generate_speech_minimax(
             model=model,
             tier=tier,
             user_id=user_id,
+            recovery_path=recovery_path,
         )
         _log_minimax_operation_failure("MiniMaxSpeech", exc)
-        return f"❌ Speech generation failed (minimax): {str(exc)[:400]}"
+        return _safe_media_failure_message("Speech generation", "minimax", exc)
     finally:
-        if reservation_id and not reservation_finalized:
+        if (
+            reservation_id
+            and not reservation_finalized
+            and (not provider_request_started or provider_rejected)
+        ):
             await _release_minimax_tool_reservation_safely(
                 reservation_id,
                 agent_id=agent_id,
@@ -11132,6 +12723,7 @@ async def _generate_speech_minimax(
                 model=model,
                 tier=tier,
                 user_id=user_id,
+                release_provider_inflight=True,
             )
 
     size_kb = len(audio_bytes) / 1024
@@ -11163,6 +12755,10 @@ async def _generate_music_minimax(
     if not profile.enabled:
         return f"❌ MiniMax music generation is disabled for the {tier} tier."
     model = profile.model
+    try:
+        tenant_id = await _get_minimax_tenant_uuid(agent_id)
+    except MinimaxBillingContextError as exc:
+        return f"❌ {exc}"
     credential, error = await _prepare_minimax_tool_credential(
         agent_id,
         modality="music",
@@ -11179,13 +12775,19 @@ async def _generate_music_minimax(
 
     reservation_id: uuid.UUID | None = None
     reservation_finalized = False
+    provider_request_started = False
+    provider_succeeded = False
+    provider_rejected = False
+    final_object_stored = False
+    settlement_ready = False
+    recovery_path: str | None = None
+    audio_bytes = b""
+    content_type = "audio/mpeg" if audio_format == "mp3" else "audio/wav"
     try:
         from app.services.provider_pricing import minimax_music_credits
         credit_cost = minimax_music_credits(model)
-        tenant_id = await _get_minimax_tenant_uuid(agent_id)
-        if tenant_id:
-            await _check_minimax_credit_amount(tenant_id, credit_cost)
-        if tenant_id and credit_cost > 0:
+        await _check_minimax_credit_amount(tenant_id, credit_cost)
+        if credit_cost > 0:
             reservation = await _reserve_minimax_tool_credits(
                 tenant_id=tenant_id,
                 user_id=user_id,
@@ -11195,6 +12797,7 @@ async def _generate_music_minimax(
                 tier=tier,
                 model=model,
                 credits=credit_cost,
+                initial_status="provider_inflight",
             )
             reservation_id = reservation.id
         save_path, full_save_path = _resolve_workspace_output_path(
@@ -11205,6 +12808,7 @@ async def _generate_music_minimax(
             audio_format,
             prompt,
         )
+        provider_request_started = True
         audio_bytes = await _minimax_music_http(
             api_key=credential.api_key,
             base_url=credential.base_url,
@@ -11215,7 +12819,30 @@ async def _generate_music_minimax(
             sample_rate=int(profile.sample_rate or 44100),
             bitrate=int(profile.bitrate or 256000),
         )
-        full_save_path.write_bytes(audio_bytes)
+        provider_succeeded = True
+        if reservation_id:
+            await _mark_minimax_tool_reservation_settlement_ready(
+                reservation_id,
+                amount=credit_cost,
+            )
+            settlement_ready = True
+        from app.services.media_assets import validate_generated_audio
+
+        await validate_generated_audio(
+            audio_bytes,
+            audio_format=audio_format,
+            sample_rate=int(profile.sample_rate or 44100),
+            label="MiniMax music output",
+        )
+        from app.services.storage import store_agent_bytes
+
+        await store_agent_bytes(
+            agent_id,
+            save_path,
+            audio_bytes,
+            content_type=content_type,
+        )
+        final_object_stored = True
         if reservation_id:
             await _finalize_minimax_tool_reservation_for_delivery(
                 reservation_id,
@@ -11226,6 +12853,12 @@ async def _generate_music_minimax(
                 user_id=user_id,
             )
             reservation_finalized = True
+        try:
+            full_save_path.write_bytes(audio_bytes)
+        except OSError:
+            logger.warning(
+                "[MiniMaxMusic] Local cache write failed after durable store"
+            )
         await _record_minimax_tool_success(
             agent_id,
             credential.id,
@@ -11237,12 +12870,61 @@ async def _generate_music_minimax(
         from app.services.quota_guard import QuotaExceeded
         if isinstance(exc, QuotaExceeded):
             return f"⚠️ {exc.message}"
-        await _mark_minimax_tool_credential_failure(
-            credential.id,
-            exc,
-            modality="music",
-            model=model,
-        )
+        provider_rejected = _is_minimax_deterministic_rejection(exc)
+        if provider_succeeded and audio_bytes and not final_object_stored:
+            recovery_path = (
+                "workspace/media_inputs/"
+                f"{reservation_id or uuid.uuid4()}_provider_music.{audio_format}"
+            )
+            try:
+                from app.services.storage import store_agent_bytes
+
+                await store_agent_bytes(
+                    agent_id,
+                    recovery_path,
+                    audio_bytes,
+                    content_type=content_type,
+                )
+            except Exception:
+                recovery_path = None
+                logger.exception("[MiniMaxMusic] Provider result recovery failed")
+        elif final_object_stored:
+            recovery_path = save_path
+        if provider_succeeded and reservation_id and not settlement_ready:
+            try:
+                await _mark_minimax_tool_reservation_settlement_ready(
+                    reservation_id,
+                    amount=credit_cost,
+                )
+                settlement_ready = True
+            except Exception:
+                logger.exception("[MiniMaxMusic] Provider debt outbox retry failed")
+        if (
+            provider_succeeded
+            and recovery_path
+            and reservation_id
+            and settlement_ready
+            and not reservation_finalized
+        ):
+            try:
+                await _finalize_minimax_tool_reservation_for_delivery(
+                    reservation_id,
+                    agent_id=agent_id,
+                    modality="music",
+                    model=model,
+                    tier=tier,
+                    user_id=user_id,
+                )
+                reservation_finalized = True
+            except Exception:
+                pass
+        if not provider_succeeded:
+            await _mark_minimax_tool_credential_failure(
+                credential.id,
+                exc,
+                modality="music",
+                model=model,
+            )
         await _record_minimax_tool_product_issue(
             agent_id,
             "music",
@@ -11250,11 +12932,16 @@ async def _generate_music_minimax(
             model=model,
             tier=tier,
             user_id=user_id,
+            recovery_path=recovery_path,
         )
         _log_minimax_operation_failure("MiniMaxMusic", exc)
-        return f"❌ Music generation failed (minimax): {str(exc)[:400]}"
+        return _safe_media_failure_message("Music generation", "minimax", exc)
     finally:
-        if reservation_id and not reservation_finalized:
+        if (
+            reservation_id
+            and not reservation_finalized
+            and (not provider_request_started or provider_rejected)
+        ):
             await _release_minimax_tool_reservation_safely(
                 reservation_id,
                 agent_id=agent_id,
@@ -11262,6 +12949,7 @@ async def _generate_music_minimax(
                 model=model,
                 tier=tier,
                 user_id=user_id,
+                release_provider_inflight=True,
             )
 
     size_kb = len(audio_bytes) / 1024
@@ -11315,7 +13003,11 @@ async def _generate_video_minimax(
 
     from app.services.media_assets import (
         MAX_OVERLAY_TEXT_CHARS,
+        MediaContractError,
         image_reference_for_provider,
+        load_brand_asset,
+        normalize_overlay_text,
+        validate_overlay_text,
     )
 
     try:
@@ -11331,25 +13023,56 @@ async def _generate_video_minimax(
             label="Last-frame image",
             require_video_dimensions=True,
         )
-    except ValueError as exc:
-        return f"❌ Video reference image is invalid: {exc}"
+        brand_asset = load_brand_asset(
+            ws,
+            arguments.get("brand_asset"),
+            label="Video brand asset",
+            require_workspace_path=True,
+        )
+    except MediaContractError as exc:
+        return f"❌ Video media contract is invalid: {exc}"
     if last_frame_image and not first_frame_image:
         return "❌ last_frame_image requires first_frame_image"
+    if brand_asset and (first_frame_image or last_frame_image):
+        return (
+            "❌ brand_asset cannot be combined with first_frame_image or last_frame_image. Use brand_asset for a "
+            "protected product layer, or frame references for creative model motion."
+        )
 
-    overlay_text = (arguments.get("overlay_text") or "").strip()
+    overlay_text = str(arguments.get("overlay_text") or "")
     if len(overlay_text) > MAX_OVERLAY_TEXT_CHARS:
         return f"❌ overlay_text must be at most {MAX_OVERLAY_TEXT_CHARS} characters"
     overlay_position = (arguments.get("overlay_position") or "bottom").strip().lower()
     if overlay_position not in {"top", "center", "bottom"}:
         return "❌ overlay_position must be top, center, or bottom"
+    brand_position = (arguments.get("brand_position") or "center").strip().lower()
+    if brand_position not in {"top_left", "top_right", "center", "bottom_left", "bottom_right"}:
+        return "❌ brand_position is invalid"
+    try:
+        brand_scale = float(arguments.get("brand_scale") or 0.42)
+    except (TypeError, ValueError):
+        return "❌ brand_scale must be a number between 0.1 and 0.8"
+    if not 0.1 <= brand_scale <= 0.8:
+        return "❌ brand_scale must be between 0.1 and 0.8"
+    try:
+        overlay_text = normalize_overlay_text(overlay_text)
+        overlay_text_sha256 = validate_overlay_text(overlay_text)
+    except MediaContractError as exc:
+        return f"❌ Video exact copy is invalid: {exc}"
     prompt_optimizer = arguments.get("prompt_optimizer")
     if prompt_optimizer is None:
         prompt_optimizer = True
+    if overlay_text.strip() or brand_asset:
+        prompt_optimizer = False
 
     # MiniMax documents first+last frame mode only for Hailuo-02. Resolve the
     # concrete model before account selection so one exhausted video model does
     # not unnecessarily block another.
     model = "MiniMax-Hailuo-02" if last_frame_image else profile.model
+    try:
+        tenant_id = await _get_minimax_tenant_uuid(agent_id)
+    except MinimaxBillingContextError as exc:
+        return f"❌ {exc}"
     credential, error = await _prepare_minimax_tool_credential(
         agent_id,
         modality="video",
@@ -11369,42 +13092,60 @@ async def _generate_video_minimax(
     wait_for_completion = bool(arguments.get("wait_for_completion") or config.get("wait_for_completion") or False)
     poll_timeout_seconds = int(arguments.get("poll_timeout_seconds") or config.get("poll_timeout_seconds") or 180)
     provider_prompt = prompt
-    if overlay_text:
+    if overlay_text.strip() or brand_asset:
         provider_prompt = (
-            f"{prompt}\nCreate only the moving visual scene. Do not render words, letters, captions, "
-            "logos, or watermarks; exact copy will be added after generation."
+            f"{prompt}\nCreate only a clean moving background. Do not render words, letters, captions, logos, "
+            "watermarks, product packaging, or product replicas. Leave clear negative space for Astra to add "
+            "the exact copy and protected brand asset after generation."
         )
 
     reservation_id: uuid.UUID | None = None
     record_id: uuid.UUID | None = None
     provider_task_id: str | None = None
     provider_request_started = False
+    provider_rejected = False
     meta_path = ""
     full_meta_path: Path | None = None
     metadata: dict[str, Any] = {}
     metadata_persisted = False
+    frozen_brand_key: str | None = None
     try:
         from app.services.media_generation import (
             ProviderTaskIdentityCollision,
             create_minimax_video_task_record,
             find_media_generation_task,
             mark_minimax_video_task_submitted,
+            minimax_video_brand_asset_key,
             reconcile_minimax_video_task,
             validate_media_origin_session,
         )
         from app.services.provider_pricing import minimax_video_credits
 
         credit_cost = minimax_video_credits(model, duration=duration, resolution=resolution)
-        tenant_id = await _get_minimax_tenant_uuid(agent_id)
         await validate_media_origin_session(
             origin_session_id=session_id,
             agent_id=agent_id,
             user_id=user_id,
         )
-        if tenant_id:
-            await _check_minimax_credit_amount(tenant_id, credit_cost)
+        await _check_minimax_credit_amount(tenant_id, credit_cost)
 
         record_id = uuid.uuid4()
+        if brand_asset:
+            extension = {
+                "image/jpeg": "jpg",
+                "image/png": "png",
+                "image/webp": "webp",
+            }[brand_asset.mime_type]
+            frozen_brand_key = minimax_video_brand_asset_key(
+                agent_id,
+                record_id,
+                extension,
+            )
+            await get_storage_backend().write_bytes(
+                frozen_brand_key,
+                brand_asset.raw,
+                content_type=brand_asset.mime_type,
+            )
         output_path, _ = _resolve_workspace_output_path(
             ws,
             arguments.get("save_path"),
@@ -11434,9 +13175,14 @@ async def _generate_video_minimax(
             "has_last_frame": bool(last_frame_image),
             "prompt_optimizer": bool(prompt_optimizer),
             "overlay_text": overlay_text,
+            "overlay_text_sha256": overlay_text_sha256,
             "overlay_position": overlay_position,
+            "brand_asset_storage_key": frozen_brand_key,
+            "brand_asset_sha256": brand_asset.sha256 if brand_asset else None,
+            "brand_position": brand_position,
+            "brand_scale": brand_scale,
         }
-        if tenant_id and credit_cost > 0:
+        if credit_cost > 0:
             reservation = await _reserve_minimax_tool_credits(
                 tenant_id=tenant_id,
                 user_id=user_id,
@@ -11562,11 +13308,15 @@ async def _generate_video_minimax(
             user_id=user_id,
             severity="critical",
         )
-        return "❌ Video task could not be recorded safely. No new Credits were charged. Please retry."
+        return (
+            "⚠️ Video provider task identity could not be bound safely. The Credits hold was retained "
+            "and an operator incident was opened; do not retry this request yet."
+        )
     except Exception as exc:
         from app.services.quota_guard import QuotaExceeded
         if isinstance(exc, QuotaExceeded):
             return f"⚠️ {exc.message}"
+        provider_rejected = _is_minimax_deterministic_rejection(exc)
 
         # Once the provider returned a task id, never release the reservation
         # on a transient poll/storage error. The durable worker owns recovery.
@@ -11620,7 +13370,7 @@ async def _generate_video_minimax(
         incident_recorded = False
         if record_id:
             try:
-                if provider_request_started:
+                if provider_request_started and not provider_rejected:
                     from app.services.media_generation import (
                         mark_media_generation_submission_ambiguous,
                     )
@@ -11646,7 +13396,9 @@ async def _generate_video_minimax(
                     try:
                         await _release_minimax_tool_reservation(
                             reservation_id,
-                            release_provider_inflight=not provider_request_started,
+                            release_provider_inflight=(
+                                not provider_request_started or provider_rejected
+                            ),
                         )
                     except Exception:
                         pass
@@ -11654,7 +13406,9 @@ async def _generate_video_minimax(
             try:
                 await _release_minimax_tool_reservation(
                     reservation_id,
-                    release_provider_inflight=not provider_request_started,
+                    release_provider_inflight=(
+                        not provider_request_started or provider_rejected
+                    ),
                 )
             except Exception:
                 pass
@@ -11680,7 +13434,13 @@ async def _generate_video_minimax(
                 "the Credits hold and opened an operator alert to prevent duplicate generation. "
                 "Please do not retry this request yet."
             )
-        return f"❌ Video generation failed (minimax): {str(exc)[:400]}"
+        return _safe_media_failure_message("Video generation", "minimax", exc)
+    finally:
+        if frozen_brand_key and (not provider_request_started or provider_rejected):
+            try:
+                await get_storage_backend().delete(frozen_brand_key)
+            except Exception:
+                logger.exception("[MiniMaxVideo] Private brand asset cleanup failed")
 
     metadata_notice = (
         f"Task metadata: {meta_path}"
@@ -11761,12 +13521,12 @@ async def _check_video_minimax(agent_id: uuid.UUID, ws: Path, arguments: dict) -
             )
         if outcome.status == "failed":
             metadata["status"] = "Fail"
-            metadata["error"] = outcome.error or "unknown"
+            metadata["error"] = "Video generation failed; see production issue log"
             full_meta_path.write_text(
                 json.dumps(metadata, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            return f"❌ MiniMax video task failed: {outcome.error or 'unknown'}"
+            return _safe_media_failure_message("Video task", "minimax", outcome.error)
 
         metadata["status"] = outcome.status
         full_meta_path.write_text(
@@ -11783,7 +13543,7 @@ async def _check_video_minimax(agent_id: uuid.UUID, ws: Path, arguments: dict) -
             tier=(str(metadata.get("tier") or "") or None) if "metadata" in locals() else None,
         )
         _log_minimax_operation_failure("MiniMaxVideoCheck", exc)
-        return f"❌ MiniMax video check failed: {str(exc)[:400]}"
+        return _safe_media_failure_message("Video status check", "minimax", exc)
 
 
 async def _minimax_tts_http(
@@ -11800,8 +13560,6 @@ async def _minimax_tts_http(
     bitrate: int,
     language_boost: str,
 ) -> bytes:
-    import httpx
-
     payload = {
         "model": model,
         "text": text,
@@ -11823,15 +13581,24 @@ async def _minimax_tts_http(
     if language_boost:
         payload["language_boost"] = language_boost
 
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(
-            f"{base_url.rstrip('/')}/v1/t2a_v2",
-            json=payload,
-            headers=_minimax_headers(api_key),
-        )
-        if resp.status_code != 200:
-            raise _minimax_http_error(resp)
-        return _minimax_audio_hex_to_bytes(resp.json(), "MiniMax TTS")
+    # MiniMax embeds audio as hex inside JSON. Serialize the bounded parse and
+    # decode window so concurrent requests cannot multiply its temporary
+    # byte/string/object footprint within one worker process.
+    async with _MINIMAX_AUDIO_RESPONSE_SEMAPHORE:
+        url = f"{base_url.rstrip('/')}/v1/t2a_v2"
+        async with _public_only_async_client(url, timeout=120) as client:
+            resp = await _bounded_json_request(
+                client,
+                "POST",
+                url,
+                max_bytes=MAX_PROVIDER_AUDIO_JSON_BYTES,
+                label="MiniMax TTS response",
+                json=payload,
+                headers=_minimax_headers(api_key),
+            )
+            if resp.status_code != 200:
+                raise _minimax_http_error(resp)
+            return _minimax_audio_hex_to_bytes(resp.json(), "MiniMax TTS")
 
 
 async def _minimax_music_http(
@@ -11844,8 +13611,6 @@ async def _minimax_music_http(
     sample_rate: int,
     bitrate: int,
 ) -> bytes:
-    import httpx
-
     payload = {
         "model": model,
         "prompt": prompt,
@@ -11857,15 +13622,21 @@ async def _minimax_music_http(
         },
     }
 
-    async with httpx.AsyncClient(timeout=180) as client:
-        resp = await client.post(
-            f"{base_url.rstrip('/')}/v1/music_generation",
-            json=payload,
-            headers=_minimax_headers(api_key),
-        )
-        if resp.status_code != 200:
-            raise _minimax_http_error(resp)
-        return _minimax_audio_hex_to_bytes(resp.json(), "MiniMax Music")
+    async with _MINIMAX_AUDIO_RESPONSE_SEMAPHORE:
+        url = f"{base_url.rstrip('/')}/v1/music_generation"
+        async with _public_only_async_client(url, timeout=180) as client:
+            resp = await _bounded_json_request(
+                client,
+                "POST",
+                url,
+                max_bytes=MAX_PROVIDER_AUDIO_JSON_BYTES,
+                label="MiniMax Music response",
+                json=payload,
+                headers=_minimax_headers(api_key),
+            )
+            if resp.status_code != 200:
+                raise _minimax_http_error(resp)
+            return _minimax_audio_hex_to_bytes(resp.json(), "MiniMax Music")
 
 
 async def _minimax_create_video_task(
@@ -11879,8 +13650,6 @@ async def _minimax_create_video_task(
     last_frame_image: str | None = None,
     prompt_optimizer: bool = True,
 ) -> str:
-    import httpx
-
     payload = {
         "model": model,
         "prompt": prompt,
@@ -11893,9 +13662,14 @@ async def _minimax_create_video_task(
     if last_frame_image:
         payload["last_frame_image"] = last_frame_image
 
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(
-            f"{base_url.rstrip('/')}/v1/video_generation",
+    url = f"{base_url.rstrip('/')}/v1/video_generation"
+    async with _public_only_async_client(url, timeout=120) as client:
+        resp = await _bounded_json_request(
+            client,
+            "POST",
+            url,
+            max_bytes=MAX_PROVIDER_CONTROL_JSON_BYTES,
+            label="MiniMax video creation response",
             json=payload,
             headers=_minimax_headers(api_key),
         )
@@ -11910,11 +13684,14 @@ async def _minimax_create_video_task(
 
 
 async def _minimax_query_video_task(api_key: str, base_url: str, task_id: str) -> dict:
-    import httpx
-
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.get(
-            f"{base_url.rstrip('/')}/v1/query/video_generation",
+    url = f"{base_url.rstrip('/')}/v1/query/video_generation"
+    async with _public_only_async_client(url, timeout=60) as client:
+        resp = await _bounded_json_request(
+            client,
+            "GET",
+            url,
+            max_bytes=MAX_PROVIDER_CONTROL_JSON_BYTES,
+            label="MiniMax video status response",
             params={"task_id": task_id},
             headers=_minimax_headers(api_key),
         )
@@ -11976,11 +13753,14 @@ async def _download_minimax_video_from_status(
 
 
 async def _minimax_retrieve_file_download_url(api_key: str, base_url: str, file_id: str) -> str:
-    import httpx
-
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.get(
-            f"{base_url.rstrip('/')}/v1/files/retrieve",
+    url = f"{base_url.rstrip('/')}/v1/files/retrieve"
+    async with _public_only_async_client(url, timeout=60) as client:
+        resp = await _bounded_json_request(
+            client,
+            "GET",
+            url,
+            max_bytes=MAX_PROVIDER_CONTROL_JSON_BYTES,
+            label="MiniMax file metadata response",
             params={"file_id": file_id},
             headers=_minimax_headers(api_key),
         )
@@ -11996,12 +13776,19 @@ async def _minimax_retrieve_file_download_url(api_key: str, base_url: str, file_
 
 
 async def _minimax_download_file(download_url: str) -> bytes:
-    import httpx
-
-    async with httpx.AsyncClient(timeout=180) as client:
-        resp = await client.get(download_url)
-        resp.raise_for_status()
-        return resp.content
+    try:
+        return await _bounded_public_http_download(
+            download_url,
+            max_bytes=MAX_MINIMAX_VIDEO_DOWNLOAD_BYTES,
+            label="MiniMax video download",
+            timeout=180,
+        )
+    except ValueError as exc:
+        if "safety limit" in str(exc):
+            raise ValueError(
+                "MiniMax video download exceeds the 256MB safety limit"
+            ) from exc
+        raise
 
 
 async def _generate_image_siliconflow(
@@ -12012,9 +13799,6 @@ async def _generate_image_siliconflow(
     SiliconFlow returns a temporary URL (expires in ~1 hour), so we download
     the image bytes immediately after generation.
     """
-    import httpx
-    import base64
-
     url = f"{base_url.rstrip('/')}/images/generations"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
@@ -12024,8 +13808,16 @@ async def _generate_image_siliconflow(
         "n": 1,
     }
 
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(url, json=payload, headers=headers)
+    async with _public_only_async_client(url, timeout=120) as client:
+        resp = await _bounded_json_request(
+            client,
+            "POST",
+            url,
+            max_bytes=MAX_PROVIDER_IMAGE_JSON_BYTES,
+            label="SiliconFlow image response",
+            json=payload,
+            headers=headers,
+        )
         if resp.status_code != 200:
             # Extract API error message for better diagnostics
             try:
@@ -12041,13 +13833,20 @@ async def _generate_image_siliconflow(
         image_url = image_data.get("url")
         if image_url:
             # Download the temporary URL immediately
-            img_resp = await client.get(image_url, timeout=60)
-            img_resp.raise_for_status()
-            return img_resp.content
+            return await _bounded_public_http_download(
+                image_url,
+                max_bytes=MAX_GENERATED_IMAGE_BYTES,
+                label="SiliconFlow image download",
+                timeout=60,
+            )
 
         b64 = image_data.get("b64_json")
         if b64:
-            return base64.b64decode(b64)
+            return _bounded_base64_decode(
+                b64,
+                max_bytes=MAX_GENERATED_IMAGE_BYTES,
+                label="SiliconFlow image payload",
+            )
 
         raise ValueError(f"No image URL or b64_json in SiliconFlow response: {data}")
 
@@ -12059,9 +13858,6 @@ async def _generate_image_openai(
 
     Requests b64_json format to avoid dealing with URL expiry.
     """
-    import httpx
-    import base64
-
     url = f"{base_url.rstrip('/')}/images/generations"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
@@ -12072,8 +13868,16 @@ async def _generate_image_openai(
         "response_format": "b64_json",
     }
 
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(url, json=payload, headers=headers)
+    async with _public_only_async_client(url, timeout=120) as client:
+        resp = await _bounded_json_request(
+            client,
+            "POST",
+            url,
+            max_bytes=MAX_PROVIDER_IMAGE_JSON_BYTES,
+            label="OpenAI image response",
+            json=payload,
+            headers=headers,
+        )
         if resp.status_code != 200:
             try:
                 err_body = resp.json()
@@ -12086,14 +13890,21 @@ async def _generate_image_openai(
         image_data = data.get("data", [{}])[0]
         b64 = image_data.get("b64_json")
         if b64:
-            return base64.b64decode(b64)
+            return _bounded_base64_decode(
+                b64,
+                max_bytes=MAX_GENERATED_IMAGE_BYTES,
+                label="OpenAI image payload",
+            )
 
         # Fallback: try URL
         image_url = image_data.get("url")
         if image_url:
-            img_resp = await client.get(image_url, timeout=60)
-            img_resp.raise_for_status()
-            return img_resp.content
+            return await _bounded_public_http_download(
+                image_url,
+                max_bytes=MAX_GENERATED_IMAGE_BYTES,
+                label="OpenAI image download",
+                timeout=60,
+            )
 
         raise ValueError(f"No b64_json or URL in OpenAI response: {data}")
 
@@ -12245,9 +14056,7 @@ def _find_first_image_reference(data: Any) -> Any:
     return walk(data)
 
 
-async def _custom_image_reference_to_bytes(image_ref: Any, client: Any) -> bytes:
-    import base64
-
+async def _custom_image_reference_to_bytes(image_ref: Any, client: Any = None) -> bytes:
     if isinstance(image_ref, dict):
         image_ref = image_ref.get("url") or image_ref.get("b64_json") or image_ref.get("image_base64")
 
@@ -12258,14 +14067,25 @@ async def _custom_image_reference_to_bytes(image_ref: Any, client: Any) -> bytes
         _, _, encoded = image_ref.partition(",")
         if not encoded:
             raise ValueError("Image data URL did not contain base64 payload.")
-        return base64.b64decode(encoded)
+        return _bounded_base64_decode(
+            encoded,
+            max_bytes=MAX_GENERATED_IMAGE_BYTES,
+            label="Custom image data URL",
+        )
 
     if image_ref.startswith("http://") or image_ref.startswith("https://"):
-        img_resp = await client.get(image_ref, timeout=60)
-        img_resp.raise_for_status()
-        return img_resp.content
+        return await _bounded_public_http_download(
+            image_ref,
+            max_bytes=MAX_GENERATED_IMAGE_BYTES,
+            label="Custom image download",
+            timeout=60,
+        )
 
-    return base64.b64decode(image_ref)
+    return _bounded_base64_decode(
+        image_ref,
+        max_bytes=MAX_GENERATED_IMAGE_BYTES,
+        label="Custom image payload",
+    )
 
 
 async def _generate_image_custom_api(
@@ -12286,12 +14106,36 @@ async def _generate_image_custom_api(
     POST /chat/completions with image/text modalities, image returned in
     choices.0.message.images.0.image_url.url as a data URL.
     """
-    import httpx
-
     if not base_url:
         raise ValueError("Custom image API base_url is not configured.")
     if not model:
         raise ValueError("Custom image API model is not configured.")
+
+    from app.services.mcp_security import is_sensitive_mcp_query_key
+
+    for key, raw in (("base_url", base_url), ("endpoint_path", endpoint_path)):
+        value = str(raw or "").strip()
+        if not value:
+            continue
+        try:
+            parsed = urlsplit(value)
+            _ = parsed.port
+        except ValueError as exc:
+            raise ValueError(f"Custom image {key} is invalid.") from exc
+        if parsed.username is not None or parsed.password is not None or parsed.fragment:
+            raise ValueError(
+                f"Custom image {key} cannot contain URL credentials or fragments."
+            )
+        if any(
+            query_value and is_sensitive_mcp_query_key(query_key)
+            for query_key, query_value in parse_qsl(
+                parsed.query,
+                keep_blank_values=True,
+            )
+        ):
+            raise ValueError(
+                f"Custom image {key} cannot contain credential-like query parameters."
+            )
 
     timeout = int(timeout_seconds or 120)
     endpoint = endpoint_path or "/chat/completions"
@@ -12325,10 +14169,23 @@ async def _generate_image_custom_api(
             raise ValueError(f"Invalid extra_headers_json: {e}")
         if not isinstance(extra_headers, dict):
             raise ValueError("extra_headers_json must be a JSON object.")
+        allowed_headers = {"http-referer", "x-title"}
+        if any(str(key).strip().lower() not in allowed_headers for key in extra_headers):
+            raise ValueError(
+                "extra_headers_json is limited to non-secret HTTP-Referer and X-Title headers"
+            )
         headers.update({str(k): str(v) for k, v in extra_headers.items() if v is not None})
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(url, json=payload, headers=headers)
+    async with _public_only_async_client(url, timeout=timeout) as client:
+        resp = await _bounded_json_request(
+            client,
+            "POST",
+            url,
+            max_bytes=MAX_PROVIDER_IMAGE_JSON_BYTES,
+            label="Custom image API response",
+            json=payload,
+            headers=headers,
+        )
         if resp.status_code < 200 or resp.status_code >= 300:
             try:
                 err_body = resp.json()
@@ -12368,9 +14225,6 @@ async def _generate_image_google(
     Converts WxH size to aspect ratio format (e.g. 1024x1024 -> 1:1).
     Extracts the generated image from inlineData in the response parts.
     """
-    import httpx
-    import base64
-
     url = f"{base_url.rstrip('/')}/models/{model}:generateContent"
 
     # Convert WxH size to aspect ratio for Gemini API
@@ -12396,9 +14250,13 @@ async def _generate_image_google(
         },
     }
 
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(
+    async with _public_only_async_client(url, timeout=120) as client:
+        resp = await _bounded_json_request(
+            client,
+            "POST",
             url,
+            max_bytes=MAX_PROVIDER_IMAGE_JSON_BYTES,
+            label="Google image response",
             json=payload,
             headers={
                 "Content-Type": "application/json",
@@ -12423,7 +14281,11 @@ async def _generate_image_google(
         for part in parts:
             if "inlineData" in part:
                 b64 = part["inlineData"]["data"]
-                return base64.b64decode(b64)
+                return _bounded_base64_decode(
+                    b64,
+                    max_bytes=MAX_GENERATED_IMAGE_BYTES,
+                    label="Google image payload",
+                )
 
         raise ValueError(
             f"No image (inlineData) found in Gemini response parts. "
@@ -12438,14 +14300,13 @@ async def _generate_image_minimax(
     prompt: str,
     aspect_ratio: str,
     reference_image: str | None = None,
+    on_provider_accepted: Callable[[str | None], Awaitable[None]] | None = None,
 ) -> bytes:
     """Generate image via MiniMax image-01 API.
 
     MiniMax returns a temporary URL (expires in ~24 hours), so we download
     the image bytes immediately after generation.
     """
-    import httpx
-
     url = f"{base_url.rstrip('/')}/v1/image_generation"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
@@ -12460,34 +14321,36 @@ async def _generate_image_minimax(
             {"type": "character", "image_file": reference_image}
         ]
 
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(url, json=payload, headers=headers)
+    async with _public_only_async_client(url, timeout=120) as client:
+        resp = await _bounded_json_request(
+            client,
+            "POST",
+            url,
+            max_bytes=MAX_PROVIDER_IMAGE_JSON_BYTES,
+            label="MiniMax image response",
+            json=payload,
+            headers=headers,
+        )
         if resp.status_code != 200:
-            try:
-                err_body = resp.json()
-                br = err_body.get("base_resp", {})
-                err_msg = br.get("status_msg") or err_body.get("message", resp.text[:300])
-                err_code = br.get("status_code", resp.status_code)
-            except Exception:
-                err_msg = resp.text[:300]
-                err_code = resp.status_code
-            raise ValueError(f"MiniMax API error ({err_code}): {err_msg}")
+            raise _minimax_http_error(resp)
         data = resp.json()
 
-        base_resp = data.get("base_resp", {})
-        if base_resp.get("status_code", 0) != 0:
-            raise ValueError(
-                f"MiniMax API error ({base_resp.get('status_code')}): {base_resp.get('status_msg')}"
-            )
+        _raise_for_minimax_base_resp(data)
 
         image_data = data.get("data", {})
         image_urls = image_data.get("image_urls", [])
-        if not image_urls:
+        if not image_urls or not str(image_urls[0]).strip():
             raise ValueError(f"No image URL in MiniMax response: {data}")
+        image_url = str(image_urls[0]).strip()
+        if on_provider_accepted:
+            await on_provider_accepted(image_url)
 
-        img_resp = await client.get(image_urls[0], timeout=60)
-        img_resp.raise_for_status()
-        return img_resp.content
+        return await _bounded_public_http_download(
+            image_url,
+            max_bytes=MAX_GENERATED_IMAGE_BYTES,
+            label="MiniMax image download",
+            timeout=60,
+        )
 
 
 # ─── Feishu Helper ────────────────────────────────────────────────────────────

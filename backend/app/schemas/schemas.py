@@ -294,6 +294,8 @@ class AgentOut(BaseModel):
     max_llm_calls_per_day: int = 1000
     agent_type: str = "native"
     openclaw_last_seen: datetime | None = None
+    deletion_requested_at: datetime | None = None
+    deletion_state: str = "active"
     unread_count: int = 0
     has_api_key: bool = False
     api_key_hash: str | None = None
@@ -303,6 +305,11 @@ class AgentOut(BaseModel):
     # True so list endpoints that don't care about onboarding don't leak
     # stale "needs onboarding" UI to users they shouldn't prompt.
     onboarded_for_me: bool = True
+    # Release capabilities are server-authored and let the UI distinguish an
+    # intentionally paused platform lane from an authorization error.
+    automation_execution_enabled: bool = False
+    approval_execution_enabled: bool = False
+    execution_capabilities: dict[str, bool] = Field(default_factory=dict)
     created_at: datetime
     last_active_at: datetime | None = None
 
@@ -489,7 +496,7 @@ class ChannelConfigOut(BaseModel):
 
 class ApprovalRequestOut(BaseModel):
     id: uuid.UUID
-    agent_id: uuid.UUID
+    agent_id: uuid.UUID | None = None
     agent_name: str | None = None
     action_type: str
     details: dict
@@ -503,6 +510,8 @@ class ApprovalRequestOut(BaseModel):
     execution_attempts: int = 0
     execution_result_summary: dict = Field(default_factory=dict)
     execution_error_code: str | None = None
+    execution_available: bool = False
+    execution_paused_reason: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -603,6 +612,7 @@ class GatewayMessageOut(BaseModel):
     sender_user_id: str | None = None
     content: str
     created_at: datetime
+    delivery_attempt: int = 1
     history: list[GatewayHistoryItem] = []
 
 
@@ -614,6 +624,10 @@ class GatewayPollResponse(BaseModel):
 
 class GatewayReportRequest(BaseModel):
     message_id: uuid.UUID
+    # Compatibility for already-installed OpenClaw skills: omission is valid
+    # only for the first, still-live lease. Reclaimed work must always carry
+    # the exact generation returned by poll.
+    delivery_attempt: int | None = Field(default=None, ge=1)
     result: str = Field(min_length=1)
 
 
@@ -621,3 +635,8 @@ class GatewaySendMessageRequest(BaseModel):
     target: str  # Name of target person or agent
     content: str = Field(min_length=1)
     channel: str | None = None  # Optional: "feishu", "agent", etc. Auto-detected if omitted.
+    idempotency_key: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+    )

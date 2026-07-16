@@ -3,10 +3,11 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 ALLOWED_SAAS_TIERS = {"lite", "pro", "ultra"}
+ALLOWED_MODEL_ROUTE_MODALITIES = {"text", "image", "video"}
 ALLOWED_BILLING_ACTIONS = {"chat", "heartbeat", "image", "audio", "music", "video", "tool", "browser", "search", "trigger"}
 ALLOWED_BILLING_MODALITIES = {"text", "image", "audio", "music", "video", "multimodal"}
 
@@ -40,9 +41,27 @@ class ModelRouteCreateIn(BaseModel):
     saas_tier: str
     modality: str
     llm_model_id: uuid.UUID
-    priority: int = 0
+    priority: int = Field(default=0, ge=-1_000_000, le=1_000_000)
     fallback_route_id: uuid.UUID | None = None
     enabled: bool = True
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("saas_tier")
+    @classmethod
+    def validate_saas_tier(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in ALLOWED_SAAS_TIERS:
+            raise ValueError("saas_tier must be lite, pro, or ultra")
+        return normalized
+
+    @field_validator("modality")
+    @classmethod
+    def validate_modality(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in ALLOWED_MODEL_ROUTE_MODALITIES:
+            raise ValueError("modality must be text, image, or video")
+        return normalized
 
 
 class ModelRouteUpdateIn(BaseModel):
@@ -51,9 +70,47 @@ class ModelRouteUpdateIn(BaseModel):
     saas_tier: str | None = None
     modality: str | None = None
     llm_model_id: uuid.UUID | None = None
-    priority: int | None = None
+    priority: int | None = Field(default=None, ge=-1_000_000, le=1_000_000)
     fallback_route_id: uuid.UUID | None = None
     enabled: bool | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_explicit_nulls(cls, value):
+        if isinstance(value, dict):
+            nullable_only = {"fallback_route_id"}
+            invalid = sorted(
+                key
+                for key, item in value.items()
+                if item is None and key not in nullable_only
+            )
+            if invalid:
+                raise ValueError(
+                    f"explicit null is not allowed for: {', '.join(invalid)}"
+                )
+        return value
+
+    @field_validator("saas_tier")
+    @classmethod
+    def validate_saas_tier(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if normalized not in ALLOWED_SAAS_TIERS:
+            raise ValueError("saas_tier must be lite, pro, or ultra")
+        return normalized
+
+    @field_validator("modality")
+    @classmethod
+    def validate_modality(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if normalized not in ALLOWED_MODEL_ROUTE_MODALITIES:
+            raise ValueError("modality must be text, image, or video")
+        return normalized
 
 
 class MediaRouteOut(BaseModel):
@@ -270,6 +327,40 @@ class GrantCreditsIn(BaseModel):
     reason: str
     confirm: bool = False
     audit_reason: str | None = None
+
+
+class MediaFailureRemediationIn(BaseModel):
+    """Dry-run or apply an exact refundable media-task remediation."""
+
+    task_ids: list[uuid.UUID] = Field(min_length=1, max_length=100)
+    expected_tenant_id: uuid.UUID
+    incident_key: str = Field(min_length=1, max_length=200)
+    apply: bool = False
+
+
+class MediaProviderDebtResolutionIn(BaseModel):
+    """Evidence-backed resolution for ambiguous or non-refundable media debt."""
+
+    task_ids: list[uuid.UUID] = Field(min_length=1, max_length=100)
+    expected_tenant_id: uuid.UUID
+    incident_key: str = Field(min_length=1, max_length=200)
+    evidence_ref: str = Field(min_length=1, max_length=500)
+    resolution: str
+    apply: bool = False
+
+    @field_validator("resolution")
+    @classmethod
+    def validate_resolution(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {
+            "provider_rejected",
+            "provider_accepted",
+            "close_asset_loss",
+        }:
+            raise ValueError(
+                "resolution must be provider_rejected, provider_accepted, or close_asset_loss"
+            )
+        return normalized
 
 
 class MarkOrderPaidIn(BaseModel):

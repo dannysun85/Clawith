@@ -32,6 +32,7 @@ from app.models.tenant_setting import TenantSetting  # noqa: F401
 from app.models.tool import Tool  # noqa: F401
 from app.models.trigger import AgentTrigger  # noqa: F401
 from app.models.trigger_execution import TriggerExecution  # noqa: F401
+from app.models.gateway_message import GatewayMessage  # noqa: F401
 from app.models.agent_credential import AgentCredential  # noqa: F401
 from app.models.onboarding import UserTenantOnboarding  # noqa: F401
 from app.models.douyin import (  # noqa: F401
@@ -59,6 +60,7 @@ from app.models.subscription import (  # noqa: F401
 )
 from app.models.media_generation import MediaGenerationTask  # noqa: F401
 from app.models.notification import Notification  # noqa: F401
+from app.models.agentbay_session import AgentBaySessionLedger  # noqa: F401
 
 config = context.config
 settings = get_settings()
