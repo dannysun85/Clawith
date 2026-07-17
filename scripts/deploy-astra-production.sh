@@ -3184,6 +3184,35 @@ complete_pending_drain() {
     remove_durable_file "$PENDING_DRAIN_FILE"
 }
 
+canonical_managed_release() {
+    python3 - "$1" "$APP_ROOT" "$COMPOSE_FILE" <<'PY_CANONICAL_RELEASE'
+import os
+from pathlib import Path
+import re
+import sys
+
+try:
+    release = Path(sys.argv[1]).resolve(strict=True)
+    releases_root = (Path(sys.argv[2]) / "releases").resolve(strict=True)
+except (OSError, RuntimeError):
+    raise SystemExit(1)
+
+serialized = os.fspath(release)
+if (
+    not serialized.isascii()
+    or release.parent != releases_root
+    or not release.is_dir()
+    or re.fullmatch(r"[A-Za-z0-9._-]+", release.name) is None
+):
+    raise SystemExit(1)
+for name in ("VERSION", "COMMIT", ".env", sys.argv[3]):
+    candidate = release / name
+    if candidate.is_symlink() or not candidate.is_file() or candidate.stat().st_size == 0:
+        raise SystemExit(1)
+sys.stdout.write(serialized)
+PY_CANONICAL_RELEASE
+}
+
 release_for_slot() {
     local slot="$1"
     local journal="$APP_ROOT/slot-${slot}-release"
@@ -3196,6 +3225,7 @@ release_for_slot() {
 import os
 import stat
 import sys
+import unicodedata
 
 path = sys.argv[1]
 flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -3223,26 +3253,12 @@ try:
     value = payload[:-1].decode("utf-8")
 except UnicodeDecodeError:
     raise SystemExit(1)
-if not value or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+if not value or any(unicodedata.category(character).startswith("C") for character in value):
     raise SystemExit(1)
 sys.stdout.write(value)
 PY_STRICT_SLOT_JOURNAL
 )" || return 1
-    if [ -z "$release" ] || [ ! -d "$release" ]; then
-        return 1
-    fi
-    release="$(python3 -c \
-        'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' \
-        "$release" 2>/dev/null)" || return 1
-    case "$release" in
-        "$APP_ROOT"/releases/*) ;;
-        *) return 1 ;;
-    esac
-    if [ ! -s "$release/VERSION" ] || [ ! -s "$release/COMMIT" ] || \
-        [ ! -s "$release/.env" ] || [ ! -s "$release/$COMPOSE_FILE" ]; then
-        return 1
-    fi
-    printf '%s' "$release"
+    canonical_managed_release "$release"
 }
 
 wait_for_worker_release() {
@@ -3644,19 +3660,8 @@ validate_stable_state() {
         # Pre-v1.10.12 production stored only active-slot/active-release.
         # Accept that format for one migration only when current is a complete
         # managed release whose basename and live Nginx slot both agree.
-        recorded_release="$canonical_current"
-        case "$recorded_release" in
-            "$APP_ROOT"/releases/*) ;;
-            *)
-                echo "legacy active release is outside the managed release directory" >&2
-                return 1
-                ;;
-        esac
-        if [ ! -s "$recorded_release/VERSION" ] || \
-            [ ! -s "$recorded_release/COMMIT" ] || \
-            [ ! -s "$recorded_release/.env" ] || \
-            [ ! -s "$recorded_release/$COMPOSE_FILE" ]; then
-            echo "legacy active release is incomplete" >&2
+        if ! recorded_release="$(canonical_managed_release "$canonical_current")"; then
+            echo "legacy active release is not a complete direct managed release" >&2
             return 1
         fi
         expected_port="$(port_for_slot "$RECORDED_SLOT")" || return 1
@@ -4242,19 +4247,8 @@ if [ ! -L "$CURRENT" ] || [ -z "$PREVIOUS" ] || [ ! -d "$PREVIOUS" ]; then
     echo "previous release not found from $CURRENT" >&2
     exit 1
 fi
-PREVIOUS="$(python3 -c \
-    'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' \
-    "$PREVIOUS" 2>/dev/null)"
-case "$PREVIOUS" in
-    "$APP_ROOT"/releases/*) ;;
-    *)
-        echo "previous release is outside the managed release directory" >&2
-        exit 1
-        ;;
-esac
-if [ ! -s "$PREVIOUS/VERSION" ] || [ ! -s "$PREVIOUS/COMMIT" ] || \
-    [ ! -s "$PREVIOUS/.env" ] || [ ! -s "$PREVIOUS/$COMPOSE_FILE" ]; then
-    echo "previous release is incomplete" >&2
+if ! PREVIOUS="$(canonical_managed_release "$PREVIOUS")"; then
+    echo "previous release is not a complete direct managed release" >&2
     exit 1
 fi
 PREVIOUS_RELEASE_ID="$(basename "$PREVIOUS")"

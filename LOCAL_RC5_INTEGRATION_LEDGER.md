@@ -34,6 +34,15 @@ frontend attachment route, and the SaaS understanding-model administration
 surface. RC5 must preserve these changes and must not reintroduce model-object
 authorization.
 
+The registered `codex/production-privacy-v1.10.12` worktree is not a separate
+repository and is not a branch to copy over this candidate. Patch-equivalence
+inspection found its logging change already integrated and its Nginx map and
+full-container-ID contracts present in the candidate. Its strict canonical
+release-path validation was not fully represented, so that behavior and its
+Unicode-control regression cases were semantically integrated into the RC5
+working tree before freeze. The old branch remains registered until the final
+candidate is committed and all worktrees are cleaned through Git.
+
 At the time this ledger was created, every registered secondary worktree was
 clean. The canonical worktree had only the unrelated untracked
 `CUSTOMER_PRODUCT_BUSINESS_VALUATION.md`; it must remain untouched. No local
@@ -141,6 +150,10 @@ or an uncommitted temporary tree.
     outbox delivery by default. Realtime external alerting is a separate
     production configuration gate: a secret webhook must be configured and its
     exact release canary must be delivered before that capability is claimed.
+20. Deployment slot journals and `current` accept only complete ASCII-named
+    direct children of the managed `releases/` directory. Nested paths, Unicode
+    control characters, symlinked metadata and malformed journals fail closed
+    before recovery or traffic mutation.
 
 ## Read-only production compatibility evidence
 

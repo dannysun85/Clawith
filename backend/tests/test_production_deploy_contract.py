@@ -83,7 +83,7 @@ def _recovery_shell_source(script: str) -> tuple[str, str, str]:
             ),
             _shell_function_source(
                 script,
-                "release_for_slot",
+                "canonical_managed_release",
                 "wait_for_worker_release",
             ),
         ]
@@ -3161,6 +3161,8 @@ exit $status
         ("dangling_symlink_journal", 1),
         ("invalid_journal", 1),
         ("multiline_journal", 1),
+        ("unicode_control_journal", 1),
+        ("unicode_control_current_without_journal", 1),
         ("empty_journal", 1),
         ("directory_journal", 1),
     ],
@@ -3184,6 +3186,7 @@ def test_legacy_active_pair_slot_journal_is_strictly_migrated(
     )
     slot_journal = app_root / "slot-b-release"
     external_journal = tmp_path / "external-slot-journal"
+    unicode_control_release = app_root / "releases" / "\u0085" / "release-b"
     if mutation == "existing_valid_journal":
         slot_journal.write_text(f"{release_b}\n", encoding="utf-8")
     elif mutation == "symlink_journal":
@@ -3198,6 +3201,15 @@ def test_legacy_active_pair_slot_journal_is_strictly_migrated(
             f"{str(release_b)[:-1]}\n{str(release_b)[-1:]}\n",
             encoding="utf-8",
         )
+    elif mutation in {
+        "unicode_control_journal",
+        "unicode_control_current_without_journal",
+    }:
+        unicode_control_release = _write_test_release(app_root, "\u0085/release-b")
+        current.unlink()
+        current.symlink_to(unicode_control_release)
+        if mutation == "unicode_control_journal":
+            slot_journal.write_text(f"{unicode_control_release}\n", encoding="utf-8")
     elif mutation == "empty_journal":
         slot_journal.touch()
     elif mutation == "directory_journal":
@@ -3214,7 +3226,7 @@ def test_legacy_active_pair_slot_journal_is_strictly_migrated(
     )
     release_function = _shell_function_source(
         script,
-        "release_for_slot",
+        "canonical_managed_release",
         "wait_for_worker_release",
     )
     validate_function = _shell_function_source(
@@ -3284,6 +3296,10 @@ exit "$status"
             assert slot_journal.read_text(encoding="utf-8") == "not-a-release\n"
         elif mutation == "multiline_journal":
             assert slot_journal.read_text(encoding="utf-8") == (f"{str(release_b)[:-1]}\n{str(release_b)[-1:]}\n")
+        elif mutation == "unicode_control_journal":
+            assert slot_journal.read_text(encoding="utf-8") == (
+                f"{unicode_control_release}\n"
+            )
         elif mutation == "empty_journal":
             assert slot_journal.read_bytes() == b""
         elif mutation == "directory_journal":
@@ -3329,7 +3345,7 @@ def test_terminal_state_semantics_are_cross_validated(tmp_path, mutation, expect
     )
     release_function = _shell_function_source(
         script,
-        "release_for_slot",
+        "canonical_managed_release",
         "wait_for_worker_release",
     )
     validate_start = script.index("validate_stable_state() {")
@@ -3678,7 +3694,7 @@ def test_pending_drain_blocks_live_connections_and_clears_only_after_zero(
     pending_functions = _shell_function_source(
         script,
         "count_established_connections",
-        "release_for_slot",
+        "canonical_managed_release",
     )
     app_root = tmp_path / "app"
     previous = _write_test_release(app_root, "release-b")
@@ -3737,7 +3753,7 @@ def test_pending_drain_marker_is_cancelled_after_exact_rollback(tmp_path):
     pending_functions = _shell_function_source(
         script,
         "count_established_connections",
-        "release_for_slot",
+        "canonical_managed_release",
     )
     app_root = tmp_path / "app"
     previous = _write_test_release(app_root, "release-b")
@@ -3832,7 +3848,7 @@ def test_pending_drain_treats_command_substitution_text_as_data(tmp_path):
     pending_functions = _shell_function_source(
         script,
         "count_established_connections",
-        "release_for_slot",
+        "canonical_managed_release",
     )
     app_root = tmp_path / "app"
     previous = _write_test_release(app_root, "release-b")
