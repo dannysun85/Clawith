@@ -40,65 +40,76 @@ clean. The canonical worktree had only the unrelated untracked
 branch contained a committed change newer than RC4 that needed to be merged
 into this candidate.
 
-## Current candidate scope
+## Candidate closure scope
 
-The accumulated RC5 working tree spans the following reviewed domains. This is
-a scope inventory, not a completion claim:
+The accumulated RC5 branch spans the following reviewed domains. `Closed locally`
+means implementation, regression coverage, and the named local release gates
+passed. It does not mean a provider or production deployment was tested.
 
-| Domain | Intended closure | Current gate |
+| Domain | Local closure | Gate result |
 | --- | --- | --- |
-| Tenant/auth/chat privacy | Tenant and session authorization, Agent credential ownership, privacy-safe logs and realtime delivery | Full backend and browser gates pending |
-| Credits and provider acceptance | Reservation ownership, provider acceptance fencing, exact settlement and compensation | Sync media recovery P0 open |
-| MiniMax media | Brand-safe image/video output, media validation, durable video lifecycle | Image/audio/music durable recovery P0 open |
-| Automation | CEO/OKR/Heartbeat and automatic trigger execution paused without erasing user desired state | PostgreSQL migration smoke pending |
-| AgentBay | Owner-scoped credentials, durable session binding, Take Control authorization and cleanup | Cached control authority P0 open |
-| Code and MCP | Production Code-off contract, approval binding, tenant MCP isolation and network policy | Deploy contract and legacy config migration pending |
-| Agent deletion | Active media/AgentBay/seat lifecycle fences and frontend refresh | Full regression pending |
-| SaaS/model routing | M3 route integrity and shared Token Plan semantics | Migration and full route tests pending |
-| Deployment | Clean-tree packaging, release identity, rollback, Code-off and egress preflight | Full deploy contract pending |
-| Release communication | Truthful automation, Code, legacy credential and deployment boundaries | Final evidence rewrite pending |
+| Tenant/auth/chat privacy | Tenant and session authorization, Agent credential ownership, fail-closed signup verification policy, privacy-safe logs and realtime delivery | Closed locally |
+| Credits and provider acceptance | Reservation ownership, provider-acceptance fencing, exact settlement and idempotent compensation for every tenant | Closed locally |
+| MiniMax media | Brand-safe image/video output, artifact validation, and durable image/audio/music/video recovery | Closed locally |
+| Automation | CEO/OKR/Heartbeat and automatic trigger execution paused without erasing desired state | Closed locally; intentionally unavailable |
+| AgentBay | Owner-scoped credentials, durable session binding, per-access Take Control revalidation and cleanup | Closed locally |
+| Code and MCP | Production Code-off contract, approval binding, tenant MCP isolation and network policy | Closed locally; Code intentionally unavailable |
+| Agent deletion | Active media/AgentBay/seat lifecycle fences and immediate frontend refresh | Closed locally |
+| SaaS/model routing | Shared-pool MiniMax M3 Lite/Pro/Ultra `text`/`image`/`video` understanding routes | Closed locally |
+| Deployment | Clean-tree packaging, release identity, rollback, Nginx runtime, Code-off and egress preflight | Closed locally |
+| Release communication | Automation, Code, legacy credential and deployment boundaries plus exact local evidence | Closed locally |
 
-Because these edits accumulated before the first shared checkpoint commit, Git
-cannot attribute every line in that checkpoint to a particular development
-session. No author-level provenance is inferred. The checkpoint is deliberately
-non-release and may contain open blockers. The final review is performed on the
-complete diff from RC4, and no completion statement is valid until the diff is
-frozen and all gates run on that exact state.
+Because the initial RC5 checkpoint accumulated edits from multiple sessions,
+Git cannot infer author-level provenance for each line. The release branch keeps
+that checkpoint and every subsequent correction as local Git commits. Review
+and validation apply to the complete diff from RC4, not to a copied directory
+or an uncommitted temporary tree.
 
-## Current release blockers
+## Closed release blockers
 
-1. Changing any credential-bound media endpoint/header/path must require a
-   fresh, unmasked key and complete destination bundle in the same request.
-   Legacy partial or credential-in-destination configurations need a measured,
-   fail-closed migration and administrator remediation notice.
-2. MiniMax image, audio, and music provider success must create a durable,
-   restart-safe recovery task. Credits may finalize only after the final asset
-   is durably stored. Unrecoverable accepted work must settle provider debt and
-   grant an idempotent customer compensation.
-3. AgentBay Take Control must revalidate the durable session ledger on every
-   access; an in-process cache is not reuse authority. Closed, expired,
-   mismatched, or cleanup-required sessions must fail closed.
-4. Release notes contain provisional RC5 evidence and outdated automation
-   availability statements. They must be rewritten from the final gate output.
+1. Credential-bound media destination changes require a fresh, unmasked key and
+   a complete endpoint/header/path bundle; unsafe legacy partial configurations
+   fail closed and surface administrator remediation.
+2. Provider-accepted image, audio, music, and video work is represented by a
+   durable recovery task before settlement. Unrecoverable accepted work records
+   provider debt and grants one idempotent customer compensation.
+3. AgentBay Take Control revalidates the durable session ledger on every access;
+   cache state is not reuse authority.
+4. Both Nginx templates quote the bounded webhook regular expression, and the
+   built frontend container passes a real `nginx -t` plus isolated browser boot.
+5. Password and SSO registration plus unverified login resolve one strict SMTP
+   policy snapshot. Lookup failure returns `503` and cannot be mistaken for a
+   no-SMTP installation that permits automatic verification.
+6. Release notes and this ledger distinguish local proof from production proof
+   and retain the intentional Code-off and automation-paused boundaries.
+
+Independent architect and code-reviewer passes found no remaining local P0/P1
+release blocker after these corrections. Any later code change invalidates that
+conclusion and requires the full sequence below again.
 
 ## Required local integration sequence
 
-1. Close every blocker above and add adversarial regressions.
+1. Freeze the complete RC4-to-RC5 diff in this local branch.
 2. Verify exactly one Alembic head and run fresh upgrade plus
    downgrade/re-upgrade PostgreSQL smoke tests.
-3. Run the complete backend suite, frontend suite and production build.
-4. Run the Ruff Git-baseline gate, `git diff --check`, shell/deployment contract,
-   effective Compose and packaging identity checks.
-5. Freeze the exact diff and obtain independent architect and code-reviewer
-   approval on that frozen tree.
-6. Create the local RC5 candidate commit.
-7. Rescan every local worktree and branch. If a newer local commit exists,
-   integrate it explicitly and repeat steps 2 through 5.
-8. Merge the reviewed candidate into the designated local release branch and
-   rerun the release gates on the post-merge commit before creating an RC5 tag.
-9. Remove this worktree only after the candidate is integrated, the worktree is
-   clean, and the user approves cleanup. Removing the worktree does not remove
-   its committed branch or tag.
+3. Run the complete backend suite, frontend suite, browser assertions and
+   production frontend build.
+4. Run the Ruff Git-baseline gate, `git diff --check`, Python compilation,
+   shell/deployment contracts and effective Compose rendering.
+5. Build images from the exact Git state, then run credential-bound API and
+   real-browser product flows on an isolated PostgreSQL/Redis/network topology.
+6. Verify the Git archive embeds the exact candidate commit and record its
+   deterministic package digest.
+7. Obtain independent architect and code-reviewer approval on the frozen diff.
+8. Rescan the canonical worktree and all local branches before integration. If
+   a newer local change must be included, integrate it explicitly and repeat
+   steps 2 through 7.
+9. Merge into the user-designated local release branch and rerun the release
+   gates on the post-merge commit before creating an RC5 tag.
+10. Deploy only after separate explicit production approval, remote preflight,
+    provider/credential checks, cutover verification, and observation gates.
+11. Remove this worktree only after integration and explicit cleanup approval;
+    removing it does not remove its committed branch or tag.
 
 ## Proof-state vocabulary
 
@@ -109,5 +120,7 @@ frozen and all gates run on that exact state.
 - `production_verified`: the exact candidate was deployed and verified against
   production data and providers.
 
-RC5 is currently below `local_rc_candidate`. It is not deployed and must not be
-described as production verified.
+The frozen branch may be described as `local_rc_candidate` and
+`business_flow_proven` only while every gate above remains green on its exact
+commit. It is not merged, tagged, deployed, provider-verified, or
+`production_verified`; those states require separate evidence and approval.
