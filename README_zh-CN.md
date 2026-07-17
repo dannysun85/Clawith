@@ -139,11 +139,12 @@ docker compose up -d --build
 > export CLAWITH_PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
 > ```
 >
-> **Debian apt 源加速（构建失败时）：** 如果 `docker compose up -d --build` 在 `apt-get update` 步骤报错（无法访问 `deb.debian.org`），在 `backend/Dockerfile` 中每个 `WORKDIR /app` 之后、`apt-get` 之前，加一行换源命令：
-> ```dockerfile
-> RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources
+> **Debian apt 源加速（可选）：** 后端镜像默认使用 `deb.debian.org`。如果该地址不可达，可以通过环境变量选择镜像主机，无需修改 Dockerfile：
+> ```bash
+> export CLAWITH_APT_MIRROR=mirrors.aliyun.com
+> docker compose up -d --build
 > ```
-> 需要在 `deps` 和 `production` 两个阶段都加（Dockerfile 中有两处 `WORKDIR /app`，分别在其后加上这行）。
+> 该值只能填写主机名（不能包含协议、端口、路径、凭据或 Shell 字符），并会同时应用于后端镜像的两个构建阶段。
 
 ### 首次登录
 

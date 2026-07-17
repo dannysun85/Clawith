@@ -155,11 +155,12 @@ Agent workspace files (soul.md, memory, skills, workspace files) are stored in `
 > export CLAWITH_PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
 > ```
 >
-> **Debian apt mirror (build failure fix):** If `docker compose up -d --build` fails at `apt-get update` (cannot reach `deb.debian.org`), add the following line at the beginning of `backend/Dockerfile`, right after each `WORKDIR /app`:
-> ```dockerfile
-> RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources
+> **Optional Debian apt mirror:** Backend image builds use `deb.debian.org` by default. If it is unreachable, select a mirror host without editing the Dockerfile:
+> ```bash
+> export CLAWITH_APT_MIRROR=mirrors.aliyun.com
+> docker compose up -d --build
 > ```
-> This replaces the default Debian package source with Alibaba Cloud's mirror. You need to add this line in **both** the `deps` and `production` stages (there are two `WORKDIR /app` lines, add it after each one, before `apt-get`).
+> The value must be a hostname only (no scheme, port, path, credentials, or shell characters) and is applied to both backend image stages.
 
 ### First Login
 

@@ -1385,6 +1385,14 @@ def test_backend_image_uses_resilient_configurable_debian_package_source():
     for compose_file in compose_files:
         compose = compose_file.read_text(encoding="utf-8")
         assert "CLAWITH_APT_MIRROR: ${CLAWITH_APT_MIRROR:-deb.debian.org}" in compose
+    for env_example in (ROOT / ".env.example", ROOT / "deploy/.env.example"):
+        assert "# CLAWITH_APT_MIRROR=mirrors.aliyun.com" in env_example.read_text(
+            encoding="utf-8"
+        )
+    for readme in (ROOT / "README.md", ROOT / "README_zh-CN.md"):
+        documentation = readme.read_text(encoding="utf-8")
+        assert "export CLAWITH_APT_MIRROR=mirrors.aliyun.com" in documentation
+        assert "RUN sed -i 's|deb.debian.org" not in documentation
 
 
 def test_nginx_cutover_is_idempotent_and_can_switch_back():
