@@ -35,6 +35,10 @@ class SystemEmailConfig:
     smtp_timeout_seconds: int
 
 
+class SystemEmailConfigResolutionError(RuntimeError):
+    """Raised when the verification policy cannot be read safely."""
+
+
 @dataclass(slots=True)
 class BroadcastEmailRecipient:
     """Prepared broadcast recipient payload."""
@@ -47,7 +51,12 @@ class BroadcastEmailRecipient:
 
 
 
-async def resolve_email_config_async(db=None, *, include_disabled: bool = False) -> SystemEmailConfig | None:
+async def resolve_email_config_async(
+    db=None,
+    *,
+    include_disabled: bool = False,
+    raise_on_error: bool = False,
+) -> SystemEmailConfig | None:
     """Resolve email configuration from the 'system_email_platform' system setting.
 
     ``db`` is accepted for call-site compatibility but ignored — the lookup
@@ -73,8 +82,15 @@ async def resolve_email_config_async(db=None, *, include_disabled: bool = False)
                     smtp_ssl=bool(v.get("SYSTEM_SMTP_SSL", True)),
                     smtp_timeout_seconds=max(1, int(v.get("SYSTEM_SMTP_TIMEOUT_SECONDS", 15))),
                 )
-    except Exception as e:
-        logger.warning(f"Error resolving platform email config: {e}")
+    except Exception as exc:
+        logger.warning(
+            "Error resolving platform email config error_type={}",
+            type(exc).__name__,
+        )
+        if raise_on_error:
+            raise SystemEmailConfigResolutionError(
+                "system email verification policy is temporarily unavailable"
+            ) from exc
 
     return None
 

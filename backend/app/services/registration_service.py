@@ -10,7 +10,6 @@ import re
 import uuid
 from typing import Any
 
-from app.config import get_settings
 from app.core.security import hash_password_async
 from app.dao import (
     identity_dao,
@@ -25,8 +24,14 @@ from app.models.identity import IdentityProvider
 from app.models.tenant import Tenant
 from app.models.user import User, Identity
 from app.services.sso_service import sso_service
-from app.services.system_email_service import resolve_email_config_async
+from app.services.system_email_service import (
+    SystemEmailConfigResolutionError,
+    resolve_email_config_async,
+)
 from loguru import logger
+
+
+_EMAIL_CONFIG_UNRESOLVED = object()
 
 
 class RegistrationService:
@@ -100,7 +105,7 @@ class RegistrationService:
         username: str | None = None,
         password: str | None = None,
         is_platform_admin: bool = False,
-        email_config: Any = None,
+        email_config: Any = _EMAIL_CONFIG_UNRESOLVED,
         password_hash: str | None = None,
     ) -> Identity:
         """Find an existing identity or create a new one.
@@ -119,14 +124,14 @@ class RegistrationService:
 
         if identity:
             # Auto-verify if SMTP is not configured
-            if not email_config:
+            if email_config is _EMAIL_CONFIG_UNRESOLVED:
                 email_config = await resolve_email_config_async()
             if not email_config and not identity.email_verified:
                 await identity_dao.update(db_obj=identity, obj_in={"email_verified": True})
             return identity
 
         # Determine verified status
-        if not email_config:
+        if email_config is _EMAIL_CONFIG_UNRESOLVED:
             email_config = await resolve_email_config_async()
         is_verified = not email_config  # Auto-verify only when no SMTP configured
 
@@ -158,12 +163,12 @@ class RegistrationService:
         role: str = "member",
         tenant_id: uuid.UUID | None = None,
         registration_source: str = "web",
-        email_config: Any = None,
+        email_config: Any = _EMAIL_CONFIG_UNRESOLVED,
     ) -> User:
         """Create a new tenant-specific user linked to an identity."""
         name = display_name or identity.username or "User"
 
-        if not email_config:
+        if email_config is _EMAIL_CONFIG_UNRESOLVED:
             email_config = await resolve_email_config_async()
 
         is_active = identity.email_verified
@@ -200,8 +205,12 @@ class RegistrationService:
         provider_user_id: str,
         user_info: dict,
         existing_user: User | None = None,
+        email_config: Any = _EMAIL_CONFIG_UNRESOLVED,
     ) -> tuple[User, bool]:
         """Handle SSO-based registration flow."""
+        if email_config is _EMAIL_CONFIG_UNRESOLVED:
+            email_config = await resolve_email_config_async(raise_on_error=True)
+
         email = user_info.get("email", "")
         tenant_id = None
         if email:
@@ -247,6 +256,7 @@ class RegistrationService:
             phone=user_info.get("mobile") or user_info.get("phone"),
             username=username,
             password=effective_id,
+            email_config=email_config,
         )
 
         user = await self.create_user_with_identity(
@@ -254,6 +264,7 @@ class RegistrationService:
             display_name=user_info.get("name", username),
             registration_source=provider_type,
             tenant_id=tenant_id,
+            email_config=email_config,
         )
 
         return user, True
@@ -263,15 +274,18 @@ class RegistrationService:
         provider_type: str,
         code: str,
         auth_provider,
+        email_config: Any = _EMAIL_CONFIG_UNRESOLVED,
     ) -> tuple[User, bool, str | None]:
         """Register or login user via SSO."""
+        if email_config is _EMAIL_CONFIG_UNRESOLVED:
+            email_config = await resolve_email_config_async(raise_on_error=True)
+
         try:
             token_data = await auth_provider.exchange_code_for_token(code)
             access_token = token_data.get("access_token")
             if not access_token:
                 return None, False, "Failed to get access token from provider"
 
-            from app.services.auth_provider import ExternalUserInfo
             user_info_obj = await auth_provider.get_user_info(access_token)
 
             user_info = {
@@ -325,14 +339,17 @@ class RegistrationService:
                 provider_type,
                 lookup_provider_user_id,
                 user_info,
+                email_config=email_config,
             )
 
             await self.bind_org_member(user)
             return user, is_new, None
 
+        except SystemEmailConfigResolutionError:
+            raise
         except Exception:
             logger.exception("SSO registration failed provider={}", provider_type)
-            return None, False, f"SSO registration failed"
+            return None, False, "SSO registration failed"
 
     # ── Tenant for registration ──────────────────────────────────────────────
 

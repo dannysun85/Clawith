@@ -2,6 +2,7 @@ import contextlib
 import uuid
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
@@ -13,12 +14,24 @@ from app.core.security import verify_password, hash_password
 from app.models.user import User
 from app.schemas.schemas import ForgotPasswordRequest, ResetPasswordRequest
 from app.services import password_reset_service, system_email_service
+from app.dao import system_setting_dao
 from app.database import transaction
 
 
 async def run_with_db(db, func, *args, **kwargs):
     async with transaction(db):
         return await func(*args, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_strict_email_policy_resolution_distinguishes_lookup_failure(monkeypatch):
+    lookup = AsyncMock(side_effect=RuntimeError("database unavailable"))
+    monkeypatch.setattr(system_setting_dao, "get_value", lookup)
+
+    with pytest.raises(system_email_service.SystemEmailConfigResolutionError):
+        await system_email_service.resolve_email_config_async(raise_on_error=True)
+
+    lookup.assert_awaited_once_with("system_email_platform", {})
 
 
 class DummyScalars:

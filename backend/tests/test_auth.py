@@ -11,6 +11,8 @@ from fastapi import HTTPException
 from app.api import auth as auth_api
 from app.core.security import hash_password
 from app.database import _session_ctx
+from app.services import registration_service as registration_service_module
+from app.services.system_email_service import SystemEmailConfigResolutionError
 
 
 async def run_with_db(db, func, *args, **kwargs):
@@ -110,14 +112,18 @@ def _make_login_data(login_identifier="test@example.com", password="correctpassw
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("identity_verified", "service_active"),
-    [(True, True), (False, False)],
+    ("identity_verified", "service_active", "email_config"),
+    [
+        (True, True, None),
+        (False, False, SimpleNamespace(smtp_host="smtp.example.com")),
+    ],
     ids=["no-smtp-auto-verified", "smtp-verification-required"],
 )
 async def test_register_init_preserves_service_activation_decision(
     monkeypatch,
     identity_verified,
     service_active,
+    email_config,
 ):
     """The API must not overwrite the registration service's activation policy."""
 
@@ -184,7 +190,7 @@ async def test_register_init_preserves_service_activation_decision(
     )
     with patch(
         "app.services.system_email_service.resolve_email_config_async",
-        new=AsyncMock(return_value=None),
+        new=AsyncMock(return_value=email_config),
     ), patch(
         "app.services.registration_service.registration_service",
         new=registration_service,
@@ -193,6 +199,198 @@ async def test_register_init_preserves_service_activation_decision(
 
     assert result.access_token == "access-token"
     assert user.is_active is service_active
+    assert registration_service.find_or_create_identity.await_args.kwargs["email_config"] is email_config
+    assert registration_service.create_user_with_identity.await_args.kwargs["email_config"] is email_config
+
+
+@pytest.mark.asyncio
+async def test_auth_email_policy_lookup_failure_is_service_unavailable():
+    resolver = AsyncMock(
+        side_effect=SystemEmailConfigResolutionError("temporary settings failure")
+    )
+
+    with patch(
+        "app.services.system_email_service.resolve_email_config_async",
+        new=resolver,
+    ), pytest.raises(HTTPException) as exc:
+        await auth_api._resolve_auth_email_config()
+
+    assert exc.value.status_code == 503
+    assert "temporarily unavailable" in str(exc.value.detail).lower()
+    resolver.assert_awaited_once_with(raise_on_error=True)
+
+
+@pytest.mark.asyncio
+async def test_register_init_fails_before_mutation_when_email_policy_is_unavailable(monkeypatch):
+    resolver = AsyncMock(
+        side_effect=SystemEmailConfigResolutionError("temporary settings failure")
+    )
+    hash_password_call = AsyncMock(return_value="password-hash")
+    is_empty = AsyncMock(return_value=False)
+    monkeypatch.setattr(auth_api, "hash_password_async", hash_password_call)
+    monkeypatch.setattr(auth_api.identity_dao, "is_empty", is_empty)
+
+    with patch(
+        "app.services.system_email_service.resolve_email_config_async",
+        new=resolver,
+    ), pytest.raises(HTTPException) as exc:
+        await auth_api.register_init(SimpleNamespace(), AsyncMock())
+
+    assert exc.value.status_code == 503
+    hash_password_call.assert_not_awaited()
+    is_empty.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_registration_service_does_not_reread_confirmed_no_smtp_policy(monkeypatch):
+    identity = SimpleNamespace(
+        id=uuid.uuid4(),
+        username="no-smtp-user",
+        email_verified=True,
+        is_platform_admin=False,
+    )
+    user = SimpleNamespace(
+        id=uuid.uuid4(),
+        identity_id=identity.id,
+        display_name="No SMTP User",
+        avatar_url=None,
+        is_active=True,
+    )
+    resolver = AsyncMock(side_effect=AssertionError("email policy was read twice"))
+    create_user = AsyncMock(return_value=user)
+    bind_org_member = AsyncMock()
+    create_participant = AsyncMock()
+
+    monkeypatch.setattr(registration_service_module, "resolve_email_config_async", resolver)
+    monkeypatch.setattr(registration_service_module.user_dao, "create", create_user)
+    monkeypatch.setattr(
+        registration_service_module.participant_dao,
+        "create_for_user",
+        create_participant,
+    )
+    service = registration_service_module.RegistrationService()
+    monkeypatch.setattr(service, "bind_org_member", bind_org_member)
+
+    result = await service.create_user_with_identity(
+        identity=identity,
+        display_name=user.display_name,
+        email_config=None,
+    )
+
+    assert result is user
+    assert create_user.await_args.kwargs["obj_in"]["is_active"] is True
+    resolver.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_entrypoint", [False, True], ids=["register-sso", "legacy-register"])
+async def test_sso_registration_entrypoints_fail_closed_when_policy_is_unavailable(
+    monkeypatch,
+    legacy_entrypoint,
+):
+    resolver = AsyncMock(
+        side_effect=SystemEmailConfigResolutionError("temporary settings failure")
+    )
+    is_empty = AsyncMock(return_value=False)
+    provider_lookup = AsyncMock()
+    monkeypatch.setattr(auth_api.user_dao, "is_empty", is_empty)
+
+    with patch(
+        "app.services.system_email_service.resolve_email_config_async",
+        new=resolver,
+    ), patch(
+        "app.services.auth_registry.auth_provider_registry.get_provider",
+        new=provider_lookup,
+    ), pytest.raises(HTTPException) as exc:
+        if legacy_entrypoint:
+            await auth_api.register(
+                SimpleNamespace(
+                    provider="google",
+                    provider_code="provider-code",
+                    invitation_code=None,
+                ),
+                AsyncMock(),
+            )
+        else:
+            await auth_api.register_sso(
+                SimpleNamespace(
+                    provider="google",
+                    code="provider-code",
+                    invitation_code=None,
+                )
+            )
+
+    assert exc.value.status_code == 503
+    is_empty.assert_not_awaited()
+    provider_lookup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sso_service_propagates_one_email_policy_snapshot(monkeypatch):
+    service = registration_service_module.RegistrationService()
+    email_config = SimpleNamespace(smtp_host="smtp.example.com")
+    provider_user = SimpleNamespace(
+        name="SSO User",
+        email="sso@example.com",
+        avatar_url=None,
+        mobile=None,
+        raw_data={},
+        provider_union_id="provider-union-id",
+        provider_user_id="provider-user-id",
+    )
+    provider = SimpleNamespace(
+        exchange_code_for_token=AsyncMock(return_value={"access_token": "provider-token"}),
+        get_user_info=AsyncMock(return_value=provider_user),
+    )
+    user = _make_user(uuid.uuid4())
+    handle_registration = AsyncMock(return_value=(user, True))
+
+    @asynccontextmanager
+    async def identity_session():
+        yield RecordingDB()
+
+    monkeypatch.setattr(service, "detect_tenant_by_email", AsyncMock(return_value=None))
+    monkeypatch.setattr(service, "handle_sso_registration", handle_registration)
+    monkeypatch.setattr(service, "bind_org_member", AsyncMock())
+    monkeypatch.setattr(registration_service_module.identity_dao, "session", identity_session)
+    monkeypatch.setattr(
+        registration_service_module.sso_service,
+        "resolve_user_identity",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        registration_service_module.sso_service,
+        "match_user_by_email",
+        AsyncMock(return_value=None),
+    )
+
+    result = await service.register_with_sso(
+        "google",
+        "provider-code",
+        provider,
+        email_config=email_config,
+    )
+
+    assert result == (user, True, None)
+    assert handle_registration.await_args.kwargs["email_config"] is email_config
+
+
+@pytest.mark.asyncio
+async def test_sso_service_does_not_collapse_policy_resolution_error(monkeypatch):
+    service = registration_service_module.RegistrationService()
+    resolver = AsyncMock(
+        side_effect=SystemEmailConfigResolutionError("temporary settings failure")
+    )
+    provider = SimpleNamespace(
+        exchange_code_for_token=AsyncMock(),
+        get_user_info=AsyncMock(),
+    )
+    monkeypatch.setattr(registration_service_module, "resolve_email_config_async", resolver)
+
+    with pytest.raises(SystemEmailConfigResolutionError):
+        await service.register_with_sso("google", "provider-code", provider)
+
+    provider.exchange_code_for_token.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +455,25 @@ async def test_login_unverified_email():
                 await run_with_db(db, auth_api.login, data, bg)
     assert exc.value.status_code == 403
     assert exc.value.detail["needs_verification"] is True
+
+
+@pytest.mark.asyncio
+async def test_login_unverified_email_fails_closed_when_policy_is_unavailable():
+    identity = _make_identity(email_verified=False)
+    db = RecordingDB(responses=[DummyResult(values=[identity])])
+    resolver = AsyncMock(
+        side_effect=SystemEmailConfigResolutionError("temporary settings failure")
+    )
+
+    with patch(
+        "app.services.system_email_service.resolve_email_config_async",
+        new=resolver,
+    ), pytest.raises(HTTPException) as exc:
+        await run_with_db(db, auth_api.login, _make_login_data(), AsyncMock())
+
+    assert exc.value.status_code == 503
+    assert identity.email_verified is False
+    resolver.assert_awaited_once_with(raise_on_error=True)
 
 
 # ---------------------------------------------------------------------------

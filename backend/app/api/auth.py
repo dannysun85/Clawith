@@ -48,6 +48,23 @@ from app.services.subscription_lifecycle import ensure_free_subscription_for_ten
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
+async def _resolve_auth_email_config():
+    """Resolve one authoritative verification-policy snapshot or fail closed."""
+    from app.services.system_email_service import (
+        SystemEmailConfigResolutionError,
+        resolve_email_config_async,
+    )
+
+    try:
+        return await resolve_email_config_async(raise_on_error=True)
+    except SystemEmailConfigResolutionError as exc:
+        logger.error("[AUTH] Email verification policy is temporarily unavailable")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication is temporarily unavailable. Please try again later.",
+        ) from exc
+
+
 def serialize_user(user: User | None) -> UserOut | None:
     if user is None:
         return None
@@ -218,14 +235,13 @@ async def register_init(
     Creates/finds a global Identity and a tenant-scoped User.
     """
     from app.config import get_settings
-    from app.services.system_email_service import resolve_email_config_async
     from app.services.registration_service import registration_service
 
     settings = get_settings()
     logger.info("[REGISTER_INIT] Starting registration")
 
     # 1. Resolve email config outside transaction
-    email_config = await resolve_email_config_async()
+    email_config = await _resolve_auth_email_config()
 
     # 2. Compute hash first (without DB connection checked out)
     password_hash = None
@@ -304,6 +320,7 @@ async def register_init(
                 display_name=data.display_name or data.username,
                 role="platform_admin" if is_first_user else "member",
                 tenant_id=tenant_uuid,
+                email_config=email_config,
             )
             user.email_verified = identity.email_verified
             await session.flush()
@@ -346,6 +363,7 @@ async def register_sso(
     from app.services.registration_service import registration_service
 
     logger.info(f"[REGISTER_SSO] Starting SSO registration: provider={data.provider}")
+    email_config = await _resolve_auth_email_config()
     is_first_user = await user_dao.is_empty()
 
     # Move provider lookup outside transaction
@@ -362,7 +380,10 @@ async def register_sso(
 
         # Perform SSO registration
         user, is_new, error = await registration_service.register_with_sso(
-            data.provider, data.code, auth_provider
+            data.provider,
+            data.code,
+            auth_provider,
+            email_config=email_config,
         )
 
         if error:
@@ -383,7 +404,7 @@ async def register_sso(
     # Move token generation outside transaction
     token = create_access_token(str(user.id), user.role)
 
-    logger.info(f"[REGISTER_SSO] SSO successful: user_id={user.id}, is_new={is_new}")
+    logger.info("[REGISTER_SSO] SSO registration completed")
 
     return TokenResponse(
         access_token=token,
@@ -397,7 +418,6 @@ async def _handle_normal_register(data: UserRegister, background_tasks: Backgrou
     logger.info("[REGISTER_LEGACY] Starting registration")
 
     from app.services.registration_service import registration_service
-    from app.services.system_email_service import resolve_email_config_async
 
     # 1. Compute hash first (without DB connection checked out)
     password_hash = None
@@ -405,7 +425,7 @@ async def _handle_normal_register(data: UserRegister, background_tasks: Backgrou
         password_hash = await hash_password_async(data.password)
 
     # 2. Resolve email config once outside transaction
-    email_config = await resolve_email_config_async()
+    email_config = await _resolve_auth_email_config()
 
     # 3. Check if first user outside transaction
     is_first_user = await user_dao.is_empty()
@@ -536,9 +556,7 @@ async def login(data: UserLogin, background_tasks: BackgroundTasks):
 
     if not identity.email_verified:
         from app.config import get_settings
-        from app.services.system_email_service import resolve_email_config_async
-
-        email_config = await resolve_email_config_async()
+        email_config = await _resolve_auth_email_config()
 
         if not email_config:
             # SMTP missing: auto-verify users under a transaction
