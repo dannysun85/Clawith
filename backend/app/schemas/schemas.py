@@ -5,7 +5,20 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, EmailStr, Field, model_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
+
+from app.core.identity_canonicalization import normalize_username, username_looks_like_contact
+
+
+def _validated_username(value: str | None) -> str | None:
+    if value is None:
+        return None
+    username = normalize_username(value)
+    if not username:
+        raise ValueError("Username is required")
+    if username_looks_like_contact(username):
+        raise ValueError("Username cannot be an email address or phone number")
+    return username
 
 
 # ─── Auth ───────────────────────────────────────────────
@@ -21,6 +34,11 @@ class UserRegister(BaseModel):
     provider: str | None = Field(None, description="Provider type for SSO registration (feishu, dingtalk, etc.)")
     provider_code: str | None = Field(None, description="OAuth code for SSO registration")
 
+    @field_validator("username")
+    @classmethod
+    def validate_username(cls, value: str) -> str:
+        return _validated_username(value) or ""
+
 
 class RegisterInitRequest(BaseModel):
     """Step 1: Initialize registration with account credentials."""
@@ -30,6 +48,11 @@ class RegisterInitRequest(BaseModel):
     display_name: str | None = None
     invitation_code: str | None = None
     target_tenant_id: uuid.UUID | None = None
+
+    @field_validator("username")
+    @classmethod
+    def validate_username(cls, value: str) -> str:
+        return _validated_username(value) or ""
 
 
 class RegisterInitResponse(BaseModel):
@@ -45,7 +68,7 @@ class RegisterInitResponse(BaseModel):
 
 class RegisterCompleteRequest(BaseModel):
     """Step 3: Complete registration after email verification."""
-    token: str = Field(min_length=6, max_length=512, description="Email verification code")
+    token: str = Field(min_length=6, max_length=512, description="Email verification token")
 
 
 class RegisterCompleteResponse(BaseModel):
@@ -57,9 +80,9 @@ class RegisterCompleteResponse(BaseModel):
 
 
 class SSORegisterRequest(BaseModel):
-    """SSO registration - completely separate from normal registration."""
-    provider: str = Field(description="Provider type (feishu, dingtalk, etc.)")
-    code: str = Field(description="OAuth authorization code from provider")
+    """Legacy payload retained only for the retired /register/sso contract."""
+    provider: str = Field(description="Legacy public social provider type")
+    code: str = Field(description="Legacy OAuth authorization code")
     invitation_code: str | None = None
 
 
@@ -90,7 +113,7 @@ class NeedsVerificationResponse(BaseModel):
     """Response when user needs to verify email before continuing."""
     needs_verification: bool = True
     email: str
-    message: str = "Email already registered but not verified. Please enter the verification code."
+    message: str = "Email already registered but not verified. Please enter the verification token."
 
 
 class TokenResponse(BaseModel):
@@ -200,10 +223,12 @@ class OAuthCallbackRequest(BaseModel):
 class IdentityBindRequest(BaseModel):
     provider_type: str
     code: str  # OAuth code for binding
+    current_password: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class IdentityUnbindRequest(BaseModel):
     provider_type: str
+    current_password: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class UserUpdate(BaseModel):
@@ -213,6 +238,17 @@ class UserUpdate(BaseModel):
     avatar_url: str | None = None
     title: str | None = None
     primary_mobile: str | None = None
+
+    @field_validator("username")
+    @classmethod
+    def validate_username(cls, value: str | None) -> str | None:
+        return _validated_username(value)
+
+
+class SelfUserUpdate(UserUpdate):
+    """Profile update plus password proof for global recovery/login fields."""
+
+    current_password: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 # ─── Agent ──────────────────────────────────────────────

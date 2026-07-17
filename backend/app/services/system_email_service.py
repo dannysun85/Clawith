@@ -204,9 +204,9 @@ DEFAULT_EMAIL_TEMPLATES: dict[str, dict[str, str]] = {
         "subject": "Verify your Astra email address",
         "body": (
             "Hello {{display_name}},\n\n"
-            "Welcome to Astra! Please use the following 6-digit code to verify your email address:\n\n"
-            "Verification code: {{verification_code}}\n\n"
-            "This code expires in {{expiry_minutes}} minutes. "
+            "Welcome to Astra! Please use the following secure token to verify your email address:\n\n"
+            "Verification token: {{verification_code}}\n\n"
+            "This token expires in {{expiry_minutes}} minutes. "
             "If you did not create an account, you can ignore this email."
         ),
     },
@@ -246,7 +246,10 @@ async def get_email_templates() -> dict[str, dict[str, str]]:
     Returns:
         A dict mapping scenario_key -> {"subject": str, "body": str}
     """
-    templates = dict(DEFAULT_EMAIL_TEMPLATES)  # start with defaults
+    templates = {
+        key: dict(template)
+        for key, template in DEFAULT_EMAIL_TEMPLATES.items()
+    }
     return await _load_templates_from_db(templates)
 
 

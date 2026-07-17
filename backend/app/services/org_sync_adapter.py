@@ -11,16 +11,14 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, delete, func, or_, select, update
+from sqlalchemy import func, or_, select, update
 
 import httpx
 from loguru import logger
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.identity import IdentityProvider
 from app.models.org import OrgDepartment, OrgMember
-from app.models.user import User, Identity
 
 try:
     from anyascii import anyascii as _anyascii
@@ -45,7 +43,7 @@ except ImportError:  # pragma: no cover - lightweight fallback for minimal test 
         return [[ascii_value]]
 
 from app.config import get_settings
-from app.core.security import decrypt_data, hash_password
+from app.core.security import decrypt_data
 from app.services.auth_provider import GoogleWorkspaceAuthProvider
 from app.services.google_workspace_oauth import GOOGLE_HTTP_PROXY
 from jose import jwt
@@ -352,8 +350,6 @@ class BaseOrgSyncAdapter(ABC):
 
     async def _update_member_counts(self, db: AsyncSession, provider_id: uuid.UUID):
         """Update member_count for all departments to include all their recursive sub-department members."""
-        from sqlalchemy import update, select, func
-
         # 1. Update all departments to show their DIRECT member counts
         direct_subquery = (
             select(func.count(OrgMember.id))
@@ -579,29 +575,11 @@ class BaseOrgSyncAdapter(ABC):
         # Note: Platform user creation is disabled - just sync OrgMember
         # Users will be linked to platform users manually or via SSO login
         
-        # Search for existing platform user by email/phone to associate with this member
-        user_id = None
-        platform_user = None
+        # Preserve an explicit/stable provider link, but never infer a global
+        # Identity from directory email or phone claims.
+        user_id = existing_member.user_id if existing_member else None
         email = _normalize_contact(user.email)
         mobile = _normalize_contact(user.mobile)
-
-        if email:
-            user_query = select(User).join(User.identity).where(Identity.email == email)
-            if self.tenant_id:
-                user_query = user_query.where(User.tenant_id == self.tenant_id)
-            user_res = await db.execute(user_query)
-            platform_user = user_res.scalars().first()
-            if platform_user:
-                user_id = platform_user.id
-
-        if not user_id and mobile:
-            user_query = select(User).join(User.identity).where(Identity.phone == mobile)
-            if self.tenant_id:
-                user_query = user_query.where(User.tenant_id == self.tenant_id)
-            user_res = await db.execute(user_query)
-            platform_user = user_res.scalars().first()
-            if platform_user:
-                user_id = platform_user.id
 
         # Update/Create OrgMember
         if existing_member:
@@ -661,19 +639,6 @@ class BaseOrgSyncAdapter(ABC):
             )
             db.add(new_member)
             stats["profile_synced"] = True
-
-        # Sync email/phone from OrgMember to User (if linked)
-        target_user = platform_user
-        if not target_user and (user_id or (existing_member and existing_member.user_id)):
-            target_id = user_id or existing_member.user_id
-            user_res = await db.execute(select(User).where(User.id == target_id))
-            target_user = user_res.scalars().first()
-
-        if target_user:
-            if email and target_user.email != email:
-                target_user.email = email
-            if mobile and target_user.primary_mobile != mobile:
-                target_user.primary_mobile = mobile
 
         await db.flush()
         return stats
@@ -741,29 +706,6 @@ class BaseOrgSyncAdapter(ABC):
 
         result = await db.execute(fallback_query)
         return result.scalars().first()
-
-    async def _resolve_platform_user(self, db: AsyncSession, user: ExternalUser) -> User | None:
-        """Resolve platform user from external user info."""
-        # 1. Try by Email matching (primary way now)
-        email = _normalize_contact(user.email)
-        if email:
-            result = await db.execute(
-                select(User).join(User.identity).where(Identity.email == email)
-            )
-            u = result.scalars().first()
-            if u: return u
-
-        # 2. Try by mobile matching
-        mobile = _normalize_contact(user.mobile)
-        if mobile:
-            result = await db.execute(
-                select(User).join(User.identity).where(Identity.phone == mobile)
-            )
-            u = result.scalars().first()
-            if u: return u
-
-        return None
-
 
 class FeishuOrgSyncAdapter(BaseOrgSyncAdapter):
     """Feishu organization sync adapter."""
@@ -841,7 +783,8 @@ class FeishuOrgSyncAdapter(BaseOrgSyncAdapter):
                     items = res_data.get("items", []) or []
                     for item in items:
                         dept_id = item.get("open_department_id")
-                        if not dept_id: continue
+                        if not dept_id:
+                            continue
                         
                         # Since we fetched using parent_id, we intrinsically know the parent!
                         parent_external = parent_id if parent_id and parent_id != "0" else "0"
@@ -1101,8 +1044,6 @@ class DingTalkOrgSyncAdapter(BaseOrgSyncAdapter):
         users: list[ExternalUser] = []
         cursor = 0
         dept_id = int(department_external_id)
-        dept_path = self._dept_path_map.get(department_external_id, "")
-
         async with httpx.AsyncClient() as client:
             while True:
                 # DingTalk rate limit: ~20 QPS per app per interface.

@@ -228,38 +228,48 @@ export default function App() {
     const [loading, setLoading] = useState(true);
 
     useEffect(() => {
-        // Initialize theme on app mount (ensures login page gets correct theme)
-        const savedTheme = localStorage.getItem('theme') || 'light';
-        document.documentElement.setAttribute('data-theme', savedTheme);
+        let cancelled = false;
+        const initializeAuth = async () => {
+            // Initialize theme on app mount (ensures login page gets correct theme)
+            const savedTheme = localStorage.getItem('theme') || 'light';
+            document.documentElement.setAttribute('data-theme', savedTheme);
 
-        // Cross-domain tenant switching transports the scoped JWT in a URL
-        // fragment, which browsers do not send to the server or access logs.
-        // Legacy query links are consumed once for backward compatibility.
-        const pathsWithOwnToken = ['/reset-password', '/verify-email'];
-        const currentUrl = new URL(window.location.href);
-        const urlToken = consumeSessionTokenFromUrl(currentUrl, pathsWithOwnToken);
-        let effectiveToken = token;
+            // Cross-domain tenant switching transports the scoped JWT in a URL
+            // fragment, which browsers do not send to the server or access logs.
+            // Legacy query links are consumed once for backward compatibility.
+            const pathsWithOwnToken = ['/reset-password', '/verify-email'];
+            const currentUrl = new URL(window.location.href);
+            const urlToken = consumeSessionTokenFromUrl(currentUrl, pathsWithOwnToken);
+            let effectiveToken = token;
 
-        if (urlToken) {
-            // Persist the new token and update the zustand store's in-memory value
-            localStorage.setItem('token', urlToken);
-            useAuthStore.setState({ token: urlToken, user: null });
-            effectiveToken = urlToken;
+            if (urlToken) {
+                // /auth/me reads its bearer credential from localStorage. The
+                // authenticated tree remains behind loading until setAuth has
+                // also confirmed the HttpOnly browser session.
+                localStorage.setItem('token', urlToken);
+                useAuthStore.setState({ token: urlToken, user: null });
+                effectiveToken = urlToken;
 
-            // Remove the one-time transport fragment/query before auth calls.
-            const cleanUrl = currentUrl.pathname + currentUrl.search + currentUrl.hash;
-            window.history.replaceState({}, '', cleanUrl);
-        }
+                // Remove the one-time transport fragment/query before auth calls.
+                const cleanUrl = currentUrl.pathname + currentUrl.search + currentUrl.hash;
+                window.history.replaceState({}, '', cleanUrl);
+            }
 
+            if (effectiveToken && !user) {
+                try {
+                    const authenticatedUser = await authApi.me();
+                    await setAuth(authenticatedUser, effectiveToken);
+                } catch {
+                    useAuthStore.getState().logout();
+                }
+            }
+            if (!cancelled) setLoading(false);
+        };
 
-        if (effectiveToken && !user) {
-            authApi.me()
-                .then((u) => setAuth(u, effectiveToken!))
-                .catch(() => useAuthStore.getState().logout())
-                .finally(() => setLoading(false));
-        } else {
-            setLoading(false);
-        }
+        void initializeAuth();
+        return () => {
+            cancelled = true;
+        };
     }, []);
 
 

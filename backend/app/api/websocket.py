@@ -13,10 +13,12 @@ from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.logging_config import get_trace_id, set_trace_id
 from app.core.permissions import check_agent_access, is_agent_expired
 from app.core.security import (
+    access_token_matches_identity,
     decode_access_token,
     extract_websocket_access_token,
     websocket_response_subprotocol,
@@ -34,6 +36,7 @@ from app.services.artifact_contract import append_authoritative_artifacts, verif
 from app.services.agentbay_live import detect_agentbay_env, get_browser_snapshot, get_desktop_screenshot
 from app.services.chat_session_service import ensure_primary_platform_session
 from app.services.chat_session_access import (
+    ChatSessionAuthorizationError,
     build_user_tool_authorization_context,
     validate_active_user_chat_lane,
 )
@@ -391,13 +394,24 @@ class WebSocketChatHandler:
 
         try:
             async with async_session() as db:
-                result = await db.execute(select(User).where(User.id == user_id))
+                result = await db.execute(
+                    select(User)
+                    .where(User.id == user_id)
+                    .options(selectinload(User.identity))
+                )
                 self.user = result.scalar_one_or_none()
-                if not self.user or not self.user.is_active:
+                if (
+                    not self.user
+                    or not self.user.is_active
+                    or not self.user.identity
+                    or not self.user.identity.is_active
+                    or not access_token_matches_identity(payload, self.user.identity)
+                ):
                     logger.error("[WS] User not found")
                     await self.websocket.send_json({"type": "error", "content": "Account unavailable"})
                     await self.websocket.close(code=4001)
                     return False
+                self.auth_version = int(payload["av"])
 
                 tenant = (
                     await db.get(Tenant, self.user.tenant_id)
@@ -451,6 +465,7 @@ class WebSocketChatHandler:
                     agent_id=self.agent_id,
                     owner_user_id=user_id,
                     session_id=self.conv_id,
+                    expected_auth_version=self.auth_version,
                 )
 
                 # Load history messages
@@ -581,6 +596,8 @@ class WebSocketChatHandler:
 
         while True:
             data = await self._receive_next_message()
+            if not await self._ensure_access_token_current():
+                return
 
             # Set a unique trace ID for this specific message processing.
             set_trace_id(uuid.uuid4().hex[:12])
@@ -669,6 +686,8 @@ class WebSocketChatHandler:
             self.conversation.append(current_user_turn)
 
             # Save user message to DB
+            if not await self._ensure_access_token_current():
+                return
             await self._save_user_message(
                 content,
                 display_content,
@@ -680,6 +699,8 @@ class WebSocketChatHandler:
             # OpenClaw routing check
             if self.agent_type == "openclaw":
                 current_user_turn["content"] = persisted_user_content
+                if not await self._ensure_access_token_current():
+                    return
                 await self._route_openclaw(persisted_user_content)
                 continue
 
@@ -713,12 +734,16 @@ class WebSocketChatHandler:
 
             # If task creation detected, create a real Task record
             if task_match:
+                if not await self._ensure_access_token_current():
+                    return
                 assistant_response = await self._create_task_record(task_match.group(1).strip(), assistant_response)
 
             # Add assistant response to in-memory conversation
             self.conversation.append({"role": "assistant", "content": assistant_response})
 
             # Save assistant reply
+            if not await self._ensure_access_token_current():
+                return
             assistant_message_id = await self._save_assistant_reply(assistant_response, thinking_content)
 
             # Final 'done' packet
@@ -740,6 +765,28 @@ class WebSocketChatHandler:
         if self.pending_messages:
             return self.pending_messages.popleft()
         return await self.websocket.receive_json()
+
+    async def _ensure_access_token_current(self) -> bool:
+        """Fence every message and side effect against Identity revocation."""
+
+        try:
+            async with async_session() as db:
+                await validate_active_user_chat_lane(
+                    db,
+                    agent_id=self.agent_id,
+                    owner_user_id=self.user.id,
+                    session_id=self.conv_id,
+                    lock_authority=True,
+                    expected_auth_version=self.auth_version,
+                )
+                await db.commit()
+            return True
+        except ChatSessionAuthorizationError:
+            await self.websocket.send_json(
+                {"type": "error", "content": "Session expired. Please sign in again."}
+            )
+            await self.websocket.close(code=4001)
+            return False
 
     async def _handle_onboarding_trigger_guard(self) -> bool:
         """Returns True if the onboarding trigger was ignored (already onboarded)."""
@@ -881,6 +928,7 @@ class WebSocketChatHandler:
                     owner_user_id=self.user.id,
                     session_id=self.conv_id,
                     lock_authority=True,
+                    expected_auth_version=self.auth_version,
                 )
                 if lane.session.title.startswith("Session "):
                     lane.session.title = "Onboarding"
@@ -895,6 +943,7 @@ class WebSocketChatHandler:
                     owner_user_id=self.user.id,
                     session_id=self.conv_id,
                     lock_authority=True,
+                    expected_auth_version=self.auth_version,
                 )
                 user_msg = ChatMessage(
                     id=persisted_message_id,
@@ -926,6 +975,7 @@ class WebSocketChatHandler:
                 owner_user_id=self.user.id,
                 session_id=self.conv_id,
                 lock_authority=True,
+                expected_auth_version=self.auth_version,
             )
             gw_msg = GwMsg(
                 agent_id=self.agent_id,
@@ -1160,6 +1210,7 @@ class WebSocketChatHandler:
                         owner_user_id=self.user.id,
                         session_id=self.conv_id,
                         lock_authority=True,
+                        expected_auth_version=self.auth_version,
                     )
                     await authorization_db.commit()
 
@@ -1186,6 +1237,7 @@ class WebSocketChatHandler:
                             agent_id=self.agent_id,
                             owner_user_id=self.user.id,
                             session_id=self.conv_id,
+                            expected_auth_version=self.auth_version,
                         )
                     ),
                 )
@@ -1342,6 +1394,7 @@ class WebSocketChatHandler:
                     owner_user_id=self.user.id,
                     session_id=self.conv_id,
                     lock_authority=True,
+                    expected_auth_version=self.auth_version,
                 )
                 message_id = await save_tool_call_log(
                     agent_id=self.agent_id,
@@ -1416,6 +1469,7 @@ class WebSocketChatHandler:
                     owner_user_id=self.user.id,
                     session_id=self.conv_id,
                     lock_authority=True,
+                    expected_auth_version=self.auth_version,
                 )
                 task = Task(
                     agent_id=self.agent_id,
@@ -1443,6 +1497,7 @@ class WebSocketChatHandler:
                 owner_user_id=self.user.id,
                 session_id=self.conv_id,
                 lock_authority=True,
+                expected_auth_version=self.auth_version,
             )
             assistant_msg = ChatMessage(
                 id=message_id,

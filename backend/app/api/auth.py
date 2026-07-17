@@ -1,21 +1,46 @@
 """Authentication API routes."""
 
+import hashlib
+import hmac
+import secrets
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response, status
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import IntegrityError
 from app.core.security import (
+    _request_is_secure,
     clear_browser_session_cookie,
     create_access_token,
     get_authenticated_user,
     get_current_user,
+    get_verification_user,
     hash_password_async,
+    identity_auth_version,
     set_browser_session_cookie,
     verify_password_async,
+)
+from app.core.auth_rate_limit import (
+    discovery_rate_limit_policy,
+    email_action_rate_limit_policy,
+    enforce_auth_rate_limit,
+    login_lookup_rate_limit_policy,
+    login_rate_limit_policy,
+    oauth_exchange_rate_limit_policy,
+    oauth_start_rate_limit_policy,
+    password_change_rate_limit_policy,
+    password_reauth_rate_limit_policy,
+    password_registration_rate_limit_policy,
+)
+from app.core.identity_canonicalization import (
+    canonicalize_email,
+    canonicalize_phone,
+    normalize_username,
+    username_looks_like_contact,
 )
 from app.dao import identity_dao, system_setting_dao, tenant_dao, user_dao
 from app.database import transaction
@@ -40,12 +65,26 @@ from app.schemas.schemas import (
     UserLogin,
     UserOut,
     UserRegister,
-    UserUpdate,
+    SelfUserUpdate,
     VerifyEmailRequest,
 )
 from app.services.subscription_lifecycle import ensure_free_subscription_for_tenant
+from app.services.external_identity_policy import (
+    external_user_can_authenticate,
+    require_stable_external_subject,
+)
+from app.services.identity_login_namespace import (
+    acquire_identity_login_namespace_lock,
+    normalize_safe_username,
+    validate_identity_login_namespace,
+)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+async def _acquire_registration_bootstrap_lock(db: AsyncSession) -> None:
+    """Serialize bootstrap and login-namespace decisions across workers."""
+    await acquire_identity_login_namespace_lock(db)
 
 
 async def _resolve_auth_email_config():
@@ -65,6 +104,20 @@ async def _resolve_auth_email_config():
         ) from exc
 
 
+async def _resolve_password_registration_email_config():
+    """Resolve mail policy and reject unsafe production password signup."""
+    from app.config import unverified_local_signup_allowed
+
+    email_config = await _resolve_auth_email_config()
+    if email_config or unverified_local_signup_allowed():
+        return email_config
+    logger.error("[AUTH] Password registration refused because email delivery is unavailable")
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Password registration is temporarily unavailable. Please try again later.",
+    )
+
+
 def serialize_user(user: User | None) -> UserOut | None:
     if user is None:
         return None
@@ -77,6 +130,43 @@ def serialize_user(user: User | None) -> UserOut | None:
     return data
 
 
+async def _reauthenticate_sensitive_identity_action(
+    request: Request,
+    current_user: User,
+    current_password: str | None,
+) -> tuple[uuid.UUID, str]:
+    """Require a bounded password proof without holding a DB connection."""
+
+    user = await user_dao.get_with_identity(current_user.id)
+    identity = getattr(user, "identity", None) if user else None
+    if not user or not identity or user.identity_id != current_user.identity_id:
+        raise HTTPException(status_code=403, detail="Account is unavailable")
+    if not identity.password_login_enabled or not identity.password_hash:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Password reauthentication is required for this action. "
+                "SSO-only accounts must contact an administrator."
+            ),
+        )
+    if not current_password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="current_password is required for this action",
+        )
+    await enforce_auth_rate_limit(
+        request,
+        identity=f"identity:{identity.id}",
+        policy=password_reauth_rate_limit_policy(),
+    )
+    if not await verify_password_async(current_password, identity.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Current password is incorrect",
+        )
+    return identity.id, identity.password_hash
+
+
 def _normalize_invitation_code(code: str | None) -> str:
     """Normalize human-entered registration/invitation codes."""
     return (code or "").strip().upper()
@@ -85,6 +175,8 @@ def _normalize_invitation_code(code: str | None) -> str:
 async def _get_valid_signup_code(
     db: AsyncSession,
     invitation_code: str | None,
+    *,
+    allow_exhausted: bool = False,
 ):
     """Return a valid active code for signup gating.
 
@@ -102,12 +194,12 @@ async def _get_valid_signup_code(
         select(InvitationCode).where(
             InvitationCode.code == code,
             InvitationCode.is_active == True,  # noqa: E712
-        )
+        ).with_for_update()
     )
     code_obj = result.scalar_one_or_none()
     if not code_obj:
         raise HTTPException(status_code=400, detail="Invalid registration code")
-    if code_obj.used_count >= code_obj.max_uses:
+    if not allow_exhausted and code_obj.used_count >= code_obj.max_uses:
         raise HTTPException(status_code=400, detail="Registration code has reached its usage limit")
     return code_obj
 
@@ -130,6 +222,87 @@ def _consume_signup_code_if_needed(code_obj) -> None:
         code_obj.used_count += 1
 
 
+async def _resolve_signup_tenant(
+    db: AsyncSession,
+    code_obj,
+    *,
+    requested_tenant_id: uuid.UUID | None = None,
+):
+    """Resolve and lock a tenant invitation for one atomic registration."""
+    if code_obj is None or code_obj.tenant_id is None:
+        if requested_tenant_id is not None:
+            raise HTTPException(
+                status_code=403,
+                detail="The registration code does not belong to the required organization.",
+            )
+        return None, "member"
+
+    from app.models.tenant import Tenant
+
+    if requested_tenant_id is not None and requested_tenant_id != code_obj.tenant_id:
+        raise HTTPException(
+            status_code=403,
+            detail="The registration code does not belong to the required organization.",
+        )
+    tenant_result = await db.execute(
+        select(Tenant).where(Tenant.id == code_obj.tenant_id).with_for_update()
+    )
+    tenant = tenant_result.scalar_one_or_none()
+    if not tenant or not tenant.is_active:
+        raise HTTPException(status_code=400, detail="Company not found or is disabled")
+    admin_result = await db.execute(
+        select(func.count()).select_from(User).where(
+            User.tenant_id == tenant.id,
+            User.role.in_(["org_admin", "platform_admin"]),
+            User.is_active.is_(True),
+        )
+    )
+    role = "member" if admin_result.scalar() > 0 else "org_admin"
+    return tenant, role
+
+
+async def _require_password_registration_ownership(identity, email: str, password: str) -> None:
+    """Revalidate local credential ownership inside the registration transaction.
+
+    The public preflight lookup is only an early error path.  An SSO or sync
+    worker can create the Identity between that lookup and the transactional
+    find-or-create call, so no tenant User or JWT may be created until the
+    returned Identity proves the submitted local password.
+    """
+    if identity.email and canonicalize_email(identity.email) != canonicalize_email(email):
+        logger.warning("[REGISTER] Identity email mismatch identity={}", identity.id)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Username already taken. Please choose a different username.",
+        )
+    if not identity.password_hash or not identity.password_login_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Email already registered via SSO/sync. Please use password reset "
+                "to set a password, or log in via SSO."
+            ),
+        )
+    if not await verify_password_async(password, identity.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Email already registered. Incorrect password.",
+        )
+
+
+async def _activate_email_verification_pending_memberships(identity_id) -> User | None:
+    """Activate explicit email-pending memberships and return one activated row."""
+    users = await user_dao.get_by_identity_id(identity_id)
+    activated_user = None
+    for user in users:
+        if getattr(user, "activation_pending_email_verification", False):
+            user.activation_pending_email_verification = False
+            user.is_active = True
+            if activated_user is None:
+                activated_user = user
+    return activated_user
+
+
 @router.get("/registration-config")
 async def get_registration_config():
     """Public endpoint — returns registration requirements (no auth needed)."""
@@ -142,10 +315,20 @@ async def get_registration_config():
 
 @router.get("/check-duplicate")
 async def check_duplicate(
+    request: Request,
     email: str | None = Query(None, description="Email to check"),
     username: str | None = Query(None, description="Username to check"),
 ):
     """Check if email or username already exists."""
+    normalized_username = normalize_username(username)
+    await enforce_auth_rate_limit(
+        request,
+        identity=(
+            f"email:{canonicalize_email(email) or ''}|"
+            f"username:{(username or '').strip().lower()}"
+        ),
+        policy=discovery_rate_limit_policy(),
+    )
     result = {"email_exists": False, "username_exists": False, "conflicts": []}
 
     if email:
@@ -154,8 +337,15 @@ async def check_duplicate(
             result["email_exists"] = True
             result["conflicts"].append({"type": "email", "scope": "global", "message": "Email already registered"})
 
-    if username:
-        if await identity_dao.get_by_username(username):
+    if normalized_username:
+        username_conflict = username_looks_like_contact(normalized_username) or any(
+            (
+                await identity_dao.get_by_username(normalized_username),
+                await identity_dao.get_by_email(normalized_username),
+                await identity_dao.get_by_phone(normalized_username),
+            )
+        )
+        if username_conflict:
             result["username_exists"] = True
             result["conflicts"].append({"type": "username", "scope": "global", "message": "Username already taken"})
 
@@ -197,31 +387,51 @@ async def _send_verification_email_task(
             expiry_minutes,
         )
     except Exception as exc:
-        logger.error(f"Failed to create verification token for user {user.id}: {exc}")
-        logger.warning(f"Failed to send verification email for user {user.id}: {exc}")
+        logger.warning(
+            "Failed to create verification email user={} error_type={}",
+            user.id,
+            type(exc).__name__,
+        )
 
 
 @router.post("/register", response_model=Any, status_code=status.HTTP_201_CREATED)
 async def register(
     data: UserRegister,
     background_tasks: BackgroundTasks,
+    request: Request,
 ):
     """Legacy registration endpoint - kept for backward compatibility.
 
     For new implementations, use:
-    - /register/init - Step 1: Initialize registration
-    - /register/sso - SSO registration
+    - /register/init - Step 1: Initialize password registration
     - /verify-email - Step 3: Verify email
+
+    Public social OAuth is sign-in-only in this release. Organization-managed
+    SSO account creation remains available through the tenant SSO callbacks.
     """
     from app.config import get_settings
 
     settings = get_settings()
 
-    # Handle SSO registration if provider info provided
-    if data.provider and data.provider_code:
-        return await _handle_sso_register(data)
+    # The legacy payload advertised a social-signup branch that cannot safely
+    # complete the provider redirect binding (Google requires the exact
+    # redirect_uri and browser-bound state). Fail explicitly before provider,
+    # SMTP, bcrypt, or database I/O instead of exposing a half-working flow.
+    if data.provider or data.provider_code:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail=(
+                "Public social registration is not available. Register with "
+                "email and password, or use organization-managed SSO."
+            ),
+        )
 
     # Regular username/password registration - delegate to new flow
+    await enforce_auth_rate_limit(
+        request,
+        identity=str(data.email),
+        policy=password_registration_rate_limit_policy(),
+    )
     return await _handle_normal_register(data, background_tasks, settings)
 
 
@@ -229,6 +439,7 @@ async def register(
 async def register_init(
     data: RegisterInitRequest,
     background_tasks: BackgroundTasks,
+    request: Request,
 ):
     """Step 1: Initialize registration with account credentials.
 
@@ -239,23 +450,29 @@ async def register_init(
 
     settings = get_settings()
     logger.info("[REGISTER_INIT] Starting registration")
+    email = canonicalize_email(data.email)
+    username = normalize_safe_username(data.username)
+    if email is None:
+        raise HTTPException(status_code=400, detail="A valid email is required")
+    await enforce_auth_rate_limit(
+        request,
+        identity=email,
+        policy=password_registration_rate_limit_policy(),
+    )
 
     # 1. Resolve email config outside transaction
-    email_config = await _resolve_auth_email_config()
+    email_config = await _resolve_password_registration_email_config()
 
     # 2. Compute hash first (without DB connection checked out)
     password_hash = None
     if data.password:
         password_hash = await hash_password_async(data.password)
 
-    # 3. Check if this is the first user (platform admin setup)
-    is_first_user = await identity_dao.is_empty()
-
-    # 4. Check duplicate/existing identity first (outside transaction)
-    identity = await identity_dao.get_by_email(data.email)
+    # 3. Check duplicate/existing identity first (outside transaction)
+    identity = await identity_dao.get_by_email(email)
     if identity:
         # Defense-in-depth: verify the returned identity actually belongs to the submitted email.
-        if identity.email and identity.email != data.email:
+        if canonicalize_email(identity.email) != email:
             logger.warning(f"[REGISTER_INIT] Identity email mismatch identity={identity.id} — rejecting")
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -263,7 +480,7 @@ async def register_init(
             )
 
         # Reject registration if the identity exists but has no password set (SSO/synced users)
-        if identity.password_hash is None:
+        if identity.password_hash is None or not identity.password_login_enabled:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Email already registered via SSO/sync. Please use password reset to set a password, or log in via SSO.",
@@ -276,24 +493,46 @@ async def register_init(
             )
 
     async with transaction() as session:
+        await _acquire_registration_bootstrap_lock(session)
+        is_first_user = await identity_dao.is_empty()
         signup_code = await _prepare_signup_code_if_required(
             session,
             data.invitation_code,
             is_first_user=is_first_user,
         )
+        namespace_owner = await identity_dao.get_by_email(email)
+        await validate_identity_login_namespace(
+            username=username,
+            email=email,
+            owned_identity_id=(namespace_owner.id if namespace_owner else None),
+        )
+
+        tenant_uuid = None
+        membership_role = "member"
+        if not is_first_user:
+            invited_tenant, membership_role = await _resolve_signup_tenant(
+                session,
+                signup_code,
+                requested_tenant_id=data.target_tenant_id,
+            )
+            tenant_uuid = invited_tenant.id if invited_tenant else None
 
         # Find or Create Identity inside transaction (handles concurrent creation safely)
         identity = await registration_service.find_or_create_identity(
-            email=data.email,
-            username=data.username,
+            email=email,
+            username=username,
             password=data.password,
             is_platform_admin=is_first_user,
             email_config=email_config,
             password_hash=password_hash,
         )
+        await _require_password_registration_ownership(
+            identity,
+            email,
+            data.password,
+        )
 
         # For first user: auto-create/get default tenant
-        tenant_uuid = None
         if is_first_user:
             tenant = await tenant_dao.get_by_slug("default")
             if not tenant:
@@ -318,7 +557,7 @@ async def register_init(
             user = await registration_service.create_user_with_identity(
                 identity=identity,
                 display_name=data.display_name or data.username,
-                role="platform_admin" if is_first_user else "member",
+                role="platform_admin" if is_first_user else membership_role,
                 tenant_id=tenant_uuid,
                 email_config=email_config,
             )
@@ -332,7 +571,9 @@ async def register_init(
             _consume_signup_code_if_needed(signup_code)
 
     # 5. Generate token outside transaction
-    token = create_access_token(str(user.id), user.role)
+    token = create_access_token(
+        str(user.id), user.role, auth_version=identity_auth_version(identity)
+    )
 
     # 6. Send verification email if not verified (outside transaction)
     if not identity.email_verified:
@@ -347,69 +588,28 @@ async def register_init(
         if not identity.email_verified
         else "Registration successful.",
         needs_company_setup=user.tenant_id is None,
-        target_tenant_id=data.target_tenant_id,
+        target_tenant_id=user.tenant_id or data.target_tenant_id,
     )
 
 
-@router.post("/register/sso", response_model=TokenResponse)
+@router.post("/register/sso", response_model=TokenResponse, deprecated=True)
 async def register_sso(
     data: SSORegisterRequest,
+    request: Request,
 ):
-    """SSO registration - completely separate from normal registration flow.
+    """Retired incomplete public social-registration compatibility route.
 
-    This endpoint handles OAuth-based registration/login via external providers.
+    Public Google/GitHub OAuth remains a sign-in path for already-linked
+    identities. New users must use password registration or a tenant-managed
+    SSO callback, both of which have a complete ownership and tenant-binding
+    contract.
     """
-    from app.services.auth_registry import auth_provider_registry
-    from app.services.registration_service import registration_service
-
-    logger.info(f"[REGISTER_SSO] Starting SSO registration: provider={data.provider}")
-    email_config = await _resolve_auth_email_config()
-    is_first_user = await user_dao.is_empty()
-
-    # Move provider lookup outside transaction
-    auth_provider = await auth_provider_registry.get_provider(data.provider)
-    if not auth_provider:
-        raise HTTPException(status_code=400, detail=f"Provider '{data.provider}' not supported")
-
-    async with transaction() as session:
-        signup_code = await _prepare_signup_code_if_required(
-            session,
-            data.invitation_code,
-            is_first_user=is_first_user,
-        )
-
-        # Perform SSO registration
-        user, is_new, error = await registration_service.register_with_sso(
-            data.provider,
-            data.code,
-            auth_provider,
-            email_config=email_config,
-        )
-
-        if error:
-            raise HTTPException(status_code=400, detail=error)
-
-        # If no tenant, check for email domain match
-        if not user.tenant_id and user.email:
-            tenant, _ = await registration_service.get_tenant_for_registration(
-                email=user.email, invitation_code=data.invitation_code
-            )
-            if tenant:
-                user.tenant_id = tenant.id
-                await session.flush()
-
-        if is_new:
-            _consume_signup_code_if_needed(signup_code)
-
-    # Move token generation outside transaction
-    token = create_access_token(str(user.id), user.role)
-
-    logger.info("[REGISTER_SSO] SSO registration completed")
-
-    return TokenResponse(
-        access_token=token,
-        user=serialize_user(user),
-        needs_company_setup=user.tenant_id is None,
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail=(
+            "Public social registration is not available. Register with email "
+            "and password, or use organization-managed SSO."
+        ),
     )
 
 
@@ -418,30 +618,38 @@ async def _handle_normal_register(data: UserRegister, background_tasks: Backgrou
     logger.info("[REGISTER_LEGACY] Starting registration")
 
     from app.services.registration_service import registration_service
+    email = canonicalize_email(data.email)
+    username = normalize_safe_username(data.username)
+    if email is None:
+        raise HTTPException(status_code=400, detail="A valid email is required")
 
-    # 1. Compute hash first (without DB connection checked out)
+    # 1. Resolve policy before hashing or touching persistent state.  A
+    # production instance without email delivery must fail closed.
+    email_config = await _resolve_password_registration_email_config()
+
+    # 2. Compute hash without a DB connection checked out.
     password_hash = None
     if data.password:
         password_hash = await hash_password_async(data.password)
 
-    # 2. Resolve email config once outside transaction
-    email_config = await _resolve_auth_email_config()
-
-    # 3. Check if first user outside transaction
-    is_first_user = await user_dao.is_empty()
-
-    # 4. Check if this email is already registered globally outside transaction
-    identity = await identity_dao.get_by_email(data.email)
+    # 3. Check if this email is already registered globally outside transaction
+    identity = await identity_dao.get_by_email(email)
     if identity:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="Email already registered, please login directly."
         )
 
     async with transaction() as session:
+        await _acquire_registration_bootstrap_lock(session)
+        is_first_user = await user_dao.is_empty()
         signup_code = await _prepare_signup_code_if_required(
             session,
             data.invitation_code,
             is_first_user=is_first_user,
+        )
+        await validate_identity_login_namespace(
+            username=username,
+            email=email,
         )
 
         # Resolve tenant
@@ -460,30 +668,24 @@ async def _handle_normal_register(data: UserRegister, background_tasks: Backgrou
             await ensure_free_subscription_for_tenant(session, tenant.id)
             role = "platform_admin"
         else:
-            tenant, _ = await registration_service.get_tenant_for_registration(
-                email=data.email, invitation_code=data.invitation_code
-            )
+            tenant, role = await _resolve_signup_tenant(session, signup_code)
             if tenant:
                 tenant_uuid = tenant.id
-            role = "member"
 
         # Resolve or create Identity inside transaction
         identity = await registration_service.find_or_create_identity(
-            email=data.email,
-            username=data.username,
+            email=email,
+            username=username,
             password=data.password,
             is_platform_admin=is_first_user,
             email_config=email_config,
             password_hash=password_hash,
         )
-
-        # Defense-in-depth: verify the returned identity actually belongs to the submitted email.
-        if identity.email and identity.email != data.email:
-            logger.warning(f"[REGISTER_LEGACY] Identity email mismatch identity={identity.id} — rejecting")
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Username already taken. Please choose a different username.",
-            )
+        await _require_password_registration_ownership(
+            identity,
+            email,
+            data.password,
+        )
 
         if is_first_user:
             identity.email_verified = True
@@ -506,15 +708,20 @@ async def _handle_normal_register(data: UserRegister, background_tasks: Backgrou
         try:
             from app.services.agent_seeder import seed_default_agents
             await seed_default_agents()
-        except Exception as e:
-            logger.warning(f"Failed to seed default agents: {e}")
+        except Exception as exc:
+            logger.warning(
+                "Failed to seed default agents error_type={}",
+                type(exc).__name__,
+            )
 
     # 6. Send verification email only when the identity still needs it (outside transaction)
     if not identity.email_verified:
         await _send_verification_email_task(user, background_tasks, settings)
 
     # 7. Generate access token and build response payload outside transaction
-    token = create_access_token(str(user.id), user.role)
+    token = create_access_token(
+        str(user.id), user.role, auth_version=identity_auth_version(identity)
+    )
     response_data = RegisterInitResponse(
         user_id=user.id,
         email=user.email,
@@ -529,21 +736,33 @@ async def _handle_normal_register(data: UserRegister, background_tasks: Backgrou
     return response_data
 
 
-async def _handle_sso_register(data: UserRegister):
-    """Legacy SSO registration handler - delegates to new SSO endpoint logic."""
-    # Redirect to new SSO flow
-    sso_data = SSORegisterRequest(provider=data.provider, code=data.provider_code, invitation_code=data.invitation_code)
-    return await register_sso(sso_data)
-
-
 @router.post("/login", response_model=Any)
-async def login(data: UserLogin, background_tasks: BackgroundTasks):
+async def login(data: UserLogin, background_tasks: BackgroundTasks, request: Request):
     """Login with email/phone/username and password. Supports multi-tenant selection."""
+    # Protect unresolved namespace probes before database work. The later
+    # Identity/bcrypt limiter remains separate so aliases for one account share
+    # one credential-work bucket after resolution.
+    await enforce_auth_rate_limit(
+        request,
+        identity=f"raw:{data.login_identifier}",
+        policy=login_lookup_rate_limit_policy(),
+    )
+
     # 1. Query Identity
     identity = await identity_dao.get_by_login_identifier(data.login_identifier)
+    await enforce_auth_rate_limit(
+        request,
+        identity=(
+            f"identity:{identity.id}"
+            if identity is not None
+            else f"unknown:{data.login_identifier}"
+        ),
+        policy=login_rate_limit_policy(),
+    )
 
     if (
         not identity
+        or not identity.password_login_enabled
         or not identity.password_hash
         or not await verify_password_async(data.password, identity.password_hash)
     ):
@@ -555,21 +774,31 @@ async def login(data: UserLogin, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Your account has been disabled.")
 
     if not identity.email_verified:
-        from app.config import get_settings
+        from app.config import get_settings, unverified_local_signup_allowed
         email_config = await _resolve_auth_email_config()
 
         if not email_config:
-            # SMTP missing: auto-verify users under a transaction
+            if not unverified_local_signup_allowed():
+                logger.error(
+                    "[LOGIN] Unverified password login refused because email delivery is unavailable"
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Authentication is temporarily unavailable. Please try again later.",
+                )
+
+            # Explicit development/test escape hatch: auto-verify under a
+            # transaction so local instances without SMTP remain usable.
             async with transaction():
-                tx_identity = await identity_dao.get(identity.id)
-                if tx_identity:
-                    tx_identity.email_verified = True
-                    tx_identity.is_active = True
-                    identity.email_verified = True
-                    identity.is_active = True
-                    users = await user_dao.get_by_identity_id(tx_identity.id)
-                    for u in users:
-                        u.is_active = True
+                tx_identity = await identity_dao.get_for_update(identity.id)
+                if not tx_identity or not tx_identity.is_active:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Your account has been disabled.",
+                    )
+                tx_identity.email_verified = True
+                identity.email_verified = True
+                await _activate_email_verification_pending_memberships(tx_identity.id)
         else:
             # Find any user record (just for the task)
             user = await user_dao.get_representative_user_for_identity(identity.id)
@@ -589,11 +818,25 @@ async def login(data: UserLogin, background_tasks: BackgroundTasks):
             )
 
     # 3. Find all User records (tenants)
-    valid_users = await user_dao.get_by_identity_id(identity.id, include_identity=True)
+    identity_users = await user_dao.get_by_identity_id(identity.id, include_identity=True)
+    active_users = [candidate for candidate in identity_users if candidate.is_active]
+    tenant_ids = [candidate.tenant_id for candidate in active_users if candidate.tenant_id]
+    active_tenants = await tenant_dao.get_by_ids(tenant_ids) if tenant_ids else []
+    tenants_map = {
+        str(tenant.id): tenant
+        for tenant in active_tenants
+        if tenant.is_active
+    }
+    valid_users = [
+        candidate
+        for candidate in active_users
+        if candidate.tenant_id is None or str(candidate.tenant_id) in tenants_map
+    ]
 
     if not valid_users:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="No organization associated with this account."
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No active organization membership is available.",
         )
 
     # 4. Handle Tenant Selection. A global platform administrator must remain
@@ -614,12 +857,6 @@ async def login(data: UserLogin, background_tasks: BackgroundTasks):
             user = platform_user
         # If multiple tenants, return choice
         elif len(valid_users) > 1:
-            tenant_ids = [u.tenant_id for u in valid_users if u.tenant_id]
-            tenants_map = {}
-            if tenant_ids:
-                tenants_result = await tenant_dao.get_by_ids(tenant_ids)
-                tenants_map = {str(t.id): t for t in tenants_result}
-
             tenant_choices = []
             for u in valid_users:
                 tenant = tenants_map.get(str(u.tenant_id)) if u.tenant_id else None
@@ -653,15 +890,17 @@ async def login(data: UserLogin, background_tasks: BackgroundTasks):
             )
 
     if user.tenant_id:
-        tenant = await tenant_dao.get(user.tenant_id)
-        if tenant and not tenant.is_active:
+        tenant = tenants_map.get(str(user.tenant_id))
+        if not tenant:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Your organization has been disabled.",
             )
 
     # 6. Generate Token
-    token = create_access_token(str(user.id), user.role)
+    token = create_access_token(
+        str(user.id), user.role, auth_version=identity_auth_version(identity)
+    )
     return TokenResponse(
         access_token=token,
         user=serialize_user(user),
@@ -671,8 +910,13 @@ async def login(data: UserLogin, background_tasks: BackgroundTasks):
 
 
 @router.get("/email-hint")
-async def get_email_hint(username: str):
+async def get_email_hint(request: Request, username: str):
     """Return a hinted email address for a given username."""
+    await enforce_auth_rate_limit(
+        request,
+        identity=username,
+        policy=discovery_rate_limit_policy(),
+    )
     identity = await identity_dao.get_by_username(username)
 
     if not identity or not identity.email:
@@ -711,10 +955,16 @@ async def get_email_hint(username: str):
 async def forgot_password(
     data: ForgotPasswordRequest,
     background_tasks: BackgroundTasks,
+    request: Request,
 ):
     """Request a password reset link for a global Identity."""
     from app.services.system_email_service import resolve_email_config_async
 
+    await enforce_auth_rate_limit(
+        request,
+        identity=str(data.email),
+        policy=email_action_rate_limit_policy(),
+    )
     email_config = await resolve_email_config_async()
 
     if not email_config:
@@ -728,17 +978,31 @@ async def forgot_password(
         "message": "If an account with that email exists, a password reset email has been sent.",
     }
 
-    # Find Identity by email
-    identity = await identity_dao.get_by_email(data.email)
-
-    if not identity or not identity.is_active:
-        return generic_response
-
+    identity = None
     try:
         from app.services.password_reset_service import build_password_reset_url, create_password_reset_token
         from app.services.system_email_service import send_password_reset_email
 
-        raw_token, expires_at = await create_password_reset_token(identity.id)
+        # Serialize reset issuance with email changes.  The second lookup under
+        # the row lock closes the read/issue race on the old address.
+        async with transaction():
+            requested_email = canonicalize_email(data.email)
+            identity = await identity_dao.get_by_email(data.email)
+            if not identity:
+                return generic_response
+            identity = await identity_dao.get_for_update(identity.id)
+            if (
+                not identity
+                or not identity.is_active
+                or not identity.email_verified
+                or canonicalize_email(identity.email) != requested_email
+            ):
+                return generic_response
+            raw_token, expires_at = await create_password_reset_token(
+                identity.id,
+                str(identity.email),
+                identity_auth_version(identity),
+            )
 
         reset_url = await build_password_reset_url(raw_token)
         expiry_minutes = int((expires_at - datetime.now(timezone.utc)).total_seconds() // 60)
@@ -750,7 +1014,10 @@ async def forgot_password(
             expiry_minutes,
         )
     except Exception as exc:
-        logger.warning(f"Failed to process password reset email identity={identity.id}: {exc}")
+        logger.warning(
+            "Failed to process password reset email error_type={}",
+            type(exc).__name__,
+        )
 
     return generic_response
 
@@ -766,22 +1033,44 @@ async def reset_password(data: ResetPasswordRequest):
         raise HTTPException(status_code=400, detail="Invalid or expired reset token")
 
     identity_id = token_data["identity_id"]
+    token_email = canonicalize_email(token_data.get("email"))
+    try:
+        token_auth_version = int(token_data["auth_version"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid or expired reset token",
+        ) from exc
 
     # Hash new password outside transaction (CPU intensive)
     new_hash = await hash_password_async(data.new_password)
 
     # Perform DB update in a brief transaction (single select and update)
     async with transaction():
-        identity = await identity_dao.get(identity_id)
-        if not identity or not identity.is_active:
+        identity = await identity_dao.get_for_update(identity_id)
+        if (
+            not identity
+            or not identity.is_active
+            or not identity.email_verified
+            or token_auth_version != identity_auth_version(identity)
+            or not token_email
+            or token_email != canonicalize_email(identity.email)
+        ):
             raise HTTPException(status_code=400, detail="Invalid or expired reset token")
         identity.password_hash = new_hash
+        identity.password_login_enabled = True
+        identity.auth_version = int(getattr(identity, "auth_version", 0) or 0) + 1
+        # Password recovery changes only the global password capability.  It
+        # must not silently complete the separate email-verification workflow
+        # or reactivate any tenant membership.  In particular, a Web signup
+        # that is still pending verification must remain eligible for resend +
+        # verify-email instead of becoming verified-but-permanently-inactive.
 
     return {"ok": True}
 
 
 @router.get("/me", response_model=UserOut)
-async def get_me(current_user: User = Depends(get_authenticated_user)):
+async def get_me(current_user: User = Depends(get_verification_user)):
     """Get current user profile."""
     return serialize_user(current_user)
 
@@ -790,7 +1079,7 @@ async def get_me(current_user: User = Depends(get_authenticated_user)):
 async def create_browser_session(
     request: Request,
     response: Response,
-    current_user: User = Depends(get_authenticated_user),
+    current_user: User = Depends(get_verification_user),
 ):
     """Mirror a validated bearer token into a same-origin HttpOnly cookie."""
     authorization = request.headers.get("authorization") or ""
@@ -815,69 +1104,207 @@ async def delete_browser_session(request: Request, response: Response):
 
 @router.patch("/me", response_model=UserOut)
 async def update_me(
-    data: UserUpdate,
+    data: SelfUserUpdate,
+    request: Request,
+    response: Response,
     current_user: User = Depends(get_current_user),
 ):
-    """Update current user profile."""
-    update_data = data.model_dump(exclude_unset=True)
+    """Update a profile; global login/recovery fields require password proof."""
+    update_data = data.model_dump(exclude_unset=True, exclude={"current_password"})
+    if "email" in update_data and update_data["email"] is not None:
+        update_data["email"] = canonicalize_email(update_data["email"])
+    if "username" in update_data and update_data["username"] is not None:
+        update_data["username"] = normalize_safe_username(update_data["username"])
+    if "primary_mobile" in update_data and update_data["primary_mobile"]:
+        update_data["primary_mobile"] = canonicalize_phone(
+            update_data["primary_mobile"]
+        )
 
+    # Verify the current password without holding a pooled database connection.
+    # A password hash snapshot is rechecked under the row lock below so a
+    # concurrent password reset/change cannot authorize this mutation.
+    preflight_user = await user_dao.get_with_identity(current_user.id)
+    if not preflight_user or not preflight_user.identity:
+        raise HTTPException(status_code=404, detail="User not found")
+    preflight_identity = preflight_user.identity
+    requested_global_fields = {"email", "username", "primary_mobile"} & set(
+        update_data
+    )
+    preflight_values = {
+        "email": preflight_identity.email,
+        "username": preflight_identity.username,
+        "primary_mobile": preflight_identity.phone,
+    }
+    preflight_changed_fields = {
+        field
+        for field in requested_global_fields
+        if update_data[field] != preflight_values[field]
+    }
+    verified_password_hash: str | None = None
+    if preflight_changed_fields:
+        if (
+            not preflight_identity.password_login_enabled
+            or not preflight_identity.password_hash
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "Password reauthentication is required for login or recovery "
+                    "field changes. SSO-only accounts must contact an administrator."
+                ),
+            )
+        if not data.current_password:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="current_password is required for login or recovery field changes",
+            )
+        await enforce_auth_rate_limit(
+            request,
+            identity=f"identity:{preflight_identity.id}",
+            policy=password_reauth_rate_limit_policy(),
+        )
+        if not await verify_password_async(
+            data.current_password,
+            preflight_identity.password_hash,
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Current password is incorrect",
+            )
+        verified_password_hash = preflight_identity.password_hash
+
+    refreshed_token: str | None = None
     async with transaction() as session:
+        await acquire_identity_login_namespace_lock(session)
         # Fetch current user in the transaction session
         user = await user_dao.get_with_identity(current_user.id)
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
 
-        # Validate username uniqueness if changing
-        if "username" in update_data and update_data["username"] != user.identity.username:
-            existing = await user_dao.get_by_identity_username(update_data["username"])
-            if existing:
-                raise HTTPException(status_code=409, detail="Username already taken")
+        # Lock the global Identity before changing login or recovery fields.
+        global_fields = {"email", "username", "primary_mobile"} & set(update_data)
+        locked_identity = None
+        changed_global_fields: set[str] = set()
+        if global_fields:
+            locked_identity = await identity_dao.get_for_update(user.identity_id)
+            if not locked_identity:
+                raise HTTPException(status_code=404, detail="Identity not found")
+            current_values = {
+                "email": locked_identity.email,
+                "username": locked_identity.username,
+                "primary_mobile": locked_identity.phone,
+            }
+            changed_global_fields = {
+                field
+                for field in global_fields
+                if update_data[field] != current_values[field]
+            }
 
-        # Validate email uniqueness within tenant if changing
-        if "email" in update_data and update_data["email"] != user.identity.email:
-            existing = await user_dao.get_by_email_and_tenant(
-                email=update_data["email"],
-                tenant_id=user.tenant_id,
-                exclude_user_id=user.id,
-            )
-            if existing:
-                raise HTTPException(status_code=409, detail="Email already registered")
+        email_changed = "email" in changed_global_fields
+        username_changed = "username" in changed_global_fields
+        phone_changed = "primary_mobile" in changed_global_fields
 
-        # Validate mobile uniqueness within tenant if changing
-        if "primary_mobile" in update_data and update_data["primary_mobile"] != user.identity.phone:
-            existing = await user_dao.get_by_phone_and_tenant(
-                phone=update_data["primary_mobile"],
-                tenant_id=user.tenant_id,
-                exclude_user_id=user.id,
+        if changed_global_fields and (
+            verified_password_hash is None
+            or not locked_identity
+            or not locked_identity.password_login_enabled
+            or not locked_identity.password_hash
+            or not hmac.compare_digest(
+                locked_identity.password_hash,
+                verified_password_hash,
             )
-            if existing:
-                raise HTTPException(status_code=409, detail="Mobile already registered")
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Credentials changed. Please sign in again.",
+            )
+
+        if email_changed and update_data["email"] is None:
+            raise HTTPException(status_code=400, detail="Email cannot be cleared")
+        if username_changed and update_data["username"] is None:
+            raise HTTPException(status_code=400, detail="Username cannot be cleared")
+
+        if changed_global_fields:
+            await validate_identity_login_namespace(
+                username=update_data.get("username", locked_identity.username),
+                email=update_data.get("email", locked_identity.email),
+                phone=update_data.get("primary_mobile", locked_identity.phone),
+                owned_identity_id=user.identity_id,
+            )
 
         for field, value in update_data.items():
+            if field in global_fields:
+                continue
             setattr(user, field, value)
 
-        await session.flush()
+        if email_changed:
+            # A token issued to the old address must never verify the new one.
+            # Redis invalidation is fail-closed: if it cannot complete, the DB
+            # transaction is rolled back and the email remains unchanged.
+            from app.services.email_verification_service import email_verification_service
+            from app.services.password_reset_service import invalidate_password_reset_tokens
+
+            await email_verification_service.invalidate_email_verification_tokens(
+                user.identity_id
+            )
+            await invalidate_password_reset_tokens(user.identity_id)
+            locked_identity.email = update_data["email"]
+            locked_identity.email_verified = False
+        if locked_identity is not None:
+            try:
+                if username_changed:
+                    locked_identity.username = update_data["username"]
+                if phone_changed:
+                    locked_identity.phone = update_data["primary_mobile"]
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if changed_global_fields:
+                locked_identity.auth_version = int(locked_identity.auth_version or 0) + 1
+            user.identity = locked_identity
+
+        try:
+            await session.flush()
+        except IntegrityError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Login or recovery field is already in use",
+            ) from exc
 
         # Sync email/phone to OrgMember if changed
-        if "email" in update_data or "primary_mobile" in update_data:
+        if email_changed or phone_changed:
             from app.services.registration_service import registration_service
 
             await registration_service.sync_org_member_contact_from_user(
                 user,
-                sync_email="email" in update_data,
-                sync_phone="primary_mobile" in update_data,
+                sync_email=email_changed,
+                sync_phone=phone_changed,
             )
 
-        return serialize_user(user)
+        result = serialize_user(user)
+        if changed_global_fields:
+            refreshed_token = create_access_token(
+                str(user.id),
+                user.role,
+                auth_version=identity_auth_version(locked_identity),
+            )
+
+    if refreshed_token:
+        response.headers["X-Astra-Access-Token"] = refreshed_token
+        set_browser_session_cookie(response, refreshed_token, request)
+    return result
 
 
 @router.get("/my-tenants", response_model=list[TenantChoice])
 async def get_my_tenants(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_authenticated_user),
 ):
     """Get all tenants associated with the current user's identity."""
     # 1. Get all user records for this identity
-    users = await user_dao.get_by_identity_id(current_user.identity_id)
+    users = [
+        user
+        for user in await user_dao.get_by_identity_id(current_user.identity_id)
+        if user.is_active
+    ]
 
     # 2. Extract tenant IDs
     tenant_ids = [u.tenant_id for u in users if u.tenant_id]
@@ -885,7 +1312,7 @@ async def get_my_tenants(
         return []
 
     # 3. Get tenant details
-    tenants = await tenant_dao.get_by_ids(tenant_ids)
+    tenants = [tenant for tenant in await tenant_dao.get_by_ids(tenant_ids) if tenant.is_active]
 
     return [
         TenantChoice(
@@ -902,13 +1329,13 @@ async def get_my_tenants(
 async def switch_tenant(
     data: TenantSwitchRequest,
     request: Request,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_authenticated_user),
 ):
     """Switch to a different tenant and return a new token and redirect URL."""
     # 1. Verify membership
     target_user = await user_dao.get_by_identity_and_tenant(current_user.identity_id, data.tenant_id)
 
-    if not target_user:
+    if not target_user or not target_user.is_active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="You do not have access to this organization."
         )
@@ -922,7 +1349,11 @@ async def switch_tenant(
         )
 
     # 3. Generate new token
-    token = create_access_token(str(target_user.id), target_user.role)
+    token = create_access_token(
+        str(target_user.id),
+        target_user.role,
+        auth_version=identity_auth_version(current_user),
+    )
 
     # 4. Determine redirect URL
     from app.services.platform_service import platform_service
@@ -948,6 +1379,7 @@ async def switch_tenant(
 @router.put("/me/password")
 async def change_password(
     data: dict,
+    request: Request,
     current_user: User = Depends(get_authenticated_user),
 ):
     """Change current user's password. Updates the global identity password."""
@@ -965,26 +1397,51 @@ async def change_password(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     identity = user.identity
+    await enforce_auth_rate_limit(
+        request,
+        identity=f"identity:{identity.id if identity else current_user.identity_id}",
+        policy=password_change_rate_limit_policy(),
+    )
 
     # Verify old password outside transaction (CPU intensive)
     if (
         not identity
+        or not identity.password_login_enabled
         or not identity.password_hash
         or not await verify_password_async(old_password, identity.password_hash)
     ):
         raise HTTPException(status_code=400, detail="Current password is incorrect")
+    verified_password_hash = identity.password_hash
 
     # Compute new hash outside transaction (CPU intensive)
     new_hash = await hash_password_async(new_password)
 
     # Perform DB update in a brief transaction
     async with transaction():
-        tx_identity = await identity_dao.get(identity.id)
-        if not tx_identity:
-            raise HTTPException(status_code=404, detail="Identity not found")
+        tx_identity = await identity_dao.get_for_update(identity.id)
+        if (
+            not tx_identity
+            or not tx_identity.is_active
+            or not tx_identity.password_login_enabled
+            or not tx_identity.password_hash
+            or not hmac.compare_digest(tx_identity.password_hash, verified_password_hash)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Credentials changed. Please sign in again.",
+            )
         tx_identity.password_hash = new_hash
+        tx_identity.password_login_enabled = True
+        tx_identity.auth_version = int(
+            getattr(tx_identity, "auth_version", 0) or 0
+        ) + 1
 
-    return {"ok": True}
+    token = create_access_token(
+        str(current_user.id),
+        current_user.role,
+        auth_version=tx_identity.auth_version,
+    )
+    return {"ok": True, "access_token": token}
 
 
 # ─── SSO/OAuth Endpoints ─────────────────────────────────────────────
@@ -1004,69 +1461,192 @@ async def list_providers(
     ]
 
 
-# Redis keys for OAuth two-step tenant selection
+# Redis keys for OAuth CSRF and two-step tenant selection
+_OAUTH_STATE_PREFIX = "oauth_state:"
 _OAUTH_PENDING_PREFIX = "oauth_pending:"
 _OAUTH_PENDING_TTL = 600  # 10 minutes
+_OAUTH_BROWSER_NONCE_COOKIE = "astra_oauth_nonce"
+_OAUTH_DELETE_IF_UNCHANGED_SCRIPT = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
+
+async def _cache_oauth_payload(prefix: str, token: str, payload: dict) -> None:
+    """Store a short-lived OAuth control payload without provider secrets."""
+    import json
+    from app.core.events import get_redis
+
+    r = await get_redis()
+    await r.set(
+        f"{prefix}{token}",
+        json.dumps(payload, separators=(",", ":")),
+        ex=_OAUTH_PENDING_TTL,
+    )
+
+
+async def _consume_oauth_payload(prefix: str, token: str) -> dict | None:
+    """Atomically consume a short-lived OAuth control payload exactly once."""
+    import json
+    from app.core.events import get_redis
+
+    r = await get_redis()
+    raw = await r.getdel(f"{prefix}{token}")
+    if not raw:
+        return None
+    return json.loads(raw)
+
+
+async def _cache_oauth_state(state_token: str, payload: dict) -> None:
+    await _cache_oauth_payload(_OAUTH_STATE_PREFIX, state_token, payload)
+
+
+async def _consume_oauth_state(
+    state_token: str,
+    *,
+    provider_type: str,
+    redirect_uri: str,
+    browser_nonce: str,
+) -> dict | None:
+    """Consume state only after every browser-bound callback field validates."""
+    import json
+    from app.core.events import get_redis
+
+    if not state_token or not browser_nonce:
+        return None
+
+    redis = await get_redis()
+    key = f"{_OAUTH_STATE_PREFIX}{state_token}"
+    raw = await redis.get(key)
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    expected_provider = str(payload.get("provider_type") or "")
+    expected_redirect_uri = str(payload.get("redirect_uri") or "")
+    expected_nonce_hash = str(payload.get("browser_nonce_hash") or "")
+    actual_nonce_hash = hashlib.sha256(browser_nonce.encode("utf-8")).hexdigest()
+    legacy_expected_nonce = str(payload.get("browser_nonce") or "")
+    nonce_matches = (
+        bool(expected_nonce_hash)
+        and hmac.compare_digest(actual_nonce_hash, expected_nonce_hash)
+    ) or (
+        bool(legacy_expected_nonce)
+        and hmac.compare_digest(browser_nonce, legacy_expected_nonce)
+    )
+    if (
+        not expected_provider
+        or not hmac.compare_digest(provider_type, expected_provider)
+        or not expected_redirect_uri
+        or not hmac.compare_digest(redirect_uri, expected_redirect_uri)
+        or not nonce_matches
+    ):
+        return None
+
+    consumed = await redis.eval(
+        _OAUTH_DELETE_IF_UNCHANGED_SCRIPT,
+        1,
+        key,
+        raw,
+    )
+    return payload if int(consumed or 0) == 1 else None
 
 
 async def _cache_oauth_pending(
     pending_token: str,
-    provider_type: str,
-    user_info_dict: dict,
-    token_data: dict,
+    payload: dict,
+    browser_nonce: str,
 ) -> None:
-    """Store OAuth intermediate data in Redis for the two-step tenant-selection flow."""
-    import json
-    from app.core.events import get_redis
-
-    r = await get_redis()
-    payload = json.dumps(
-        {
-            "provider_type": provider_type,
-            "user_info": user_info_dict,
-            "token_data": token_data,
-        }
+    """Store an allowlist under a key bound to the initiating browser."""
+    nonce_hash = hashlib.sha256(browser_nonce.encode("utf-8")).hexdigest()
+    await _cache_oauth_payload(
+        _OAUTH_PENDING_PREFIX,
+        f"{pending_token}:{nonce_hash}",
+        payload,
     )
-    await r.set(f"{_OAUTH_PENDING_PREFIX}{pending_token}", payload, ex=_OAUTH_PENDING_TTL)
 
 
-async def _get_oauth_pending(pending_token: str) -> dict | None:
-    """Retrieve (and delete) cached OAuth data from Redis. Returns None if expired/missing."""
-    import json
-    from app.core.events import get_redis
-
-    r = await get_redis()
-    raw = await r.get(f"{_OAUTH_PENDING_PREFIX}{pending_token}")
-    if not raw:
+async def _get_oauth_pending(
+    pending_token: str,
+    browser_nonce: str,
+) -> dict | None:
+    """Consume an allowlist only from the browser that started OAuth."""
+    if not browser_nonce:
         return None
-    # Single-use: delete immediately after retrieval
-    await r.delete(f"{_OAUTH_PENDING_PREFIX}{pending_token}")
-    return json.loads(raw)
+    nonce_hash = hashlib.sha256(browser_nonce.encode("utf-8")).hexdigest()
+    return await _consume_oauth_payload(
+        _OAUTH_PENDING_PREFIX,
+        f"{pending_token}:{nonce_hash}",
+    )
 
 
 @router.get("/{provider}/authorize", response_model=OAuthAuthorizeResponse)
 async def authorize(
     provider: str,
+    request: Request,
+    response: Response,
     redirect_uri: str = Query(..., description="OAuth callback URI"),
-    state: str = Query("", description="CSRF state parameter"),
 ):
-    """Start OAuth authorization flow for a provider."""
+    """Start a global social OAuth flow with server-owned CSRF state."""
     from app.services.auth_registry import auth_provider_registry
 
-    # Get provider
-    auth_provider = await auth_provider_registry.get_provider(provider)
+    if provider not in {"google", "github"}:
+        raise HTTPException(status_code=404, detail="OAuth provider not supported")
+    await enforce_auth_rate_limit(
+        request,
+        identity=provider,
+        policy=oauth_start_rate_limit_policy(),
+    )
+
+    auth_provider = await auth_provider_registry.get_provider(
+        provider,
+        require_sso_login=True,
+        allow_global_fallback=False,
+    )
     if not auth_provider:
         raise HTTPException(status_code=404, detail=f"Provider '{provider}' not supported")
 
-    # Generate authorization URL
-    try:
-        auth_url = await auth_provider.get_authorization_url(redirect_uri, state)
-    except NotImplementedError as e:
-        raise HTTPException(status_code=501, detail=str(e))
-    except Exception as e:
-        logger.error(f"Failed to generate authorization URL for {provider}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to generate authorization URL")
+    state_token = secrets.token_urlsafe(32)
+    browser_nonce = request.cookies.get(_OAUTH_BROWSER_NONCE_COOKIE) or secrets.token_urlsafe(32)
+    await _cache_oauth_state(
+        state_token,
+        {
+            "provider_type": provider,
+            "redirect_uri": redirect_uri,
+            "browser_nonce_hash": hashlib.sha256(
+                browser_nonce.encode("utf-8")
+            ).hexdigest(),
+        },
+    )
 
+    try:
+        auth_url = await auth_provider.get_authorization_url(redirect_uri, state_token)
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=501, detail="OAuth provider is not implemented") from exc
+    except Exception as exc:
+        logger.error(
+            "Failed to generate authorization URL provider={} error_type={}",
+            provider,
+            type(exc).__name__,
+        )
+        raise HTTPException(status_code=500, detail="Failed to generate authorization URL") from exc
+
+    response.set_cookie(
+        key=_OAUTH_BROWSER_NONCE_COOKIE,
+        value=browser_nonce,
+        max_age=_OAUTH_PENDING_TTL,
+        path="/",
+        secure=_request_is_secure(request),
+        httponly=True,
+        samesite="lax",
+    )
     return OAuthAuthorizeResponse(authorization_url=auth_url)
 
 
@@ -1074,62 +1654,157 @@ async def authorize(
 async def oauth_callback(
     provider: str,
     data: OAuthCallbackRequest,
+    request: Request,
 ):
-    """Handle OAuth callback — supports a two-step flow for multi-tenant selection.
-
-    Step 1 (code provided): exchange code with provider, detect multiple tenants,
-    cache user_info in Redis, return MultiTenantResponse with opaque pending_token.
-
-    Step 2 (pending_token + tenant_id provided): retrieve cached user_info from Redis,
-    call find_or_create_user with the chosen tenant_id, return TokenResponse.
-    """
+    """Handle global social OAuth with single-use CSRF and tenant allowlists."""
     import uuid as _uuid
-    from app.services.auth_registry import auth_provider_registry
+    from sqlalchemy import or_
+    from sqlalchemy.orm import selectinload
 
-    # ── Step 2: User has selected a tenant ───────────────────────────────────
+    from app.models.identity import IdentityProvider
+    from app.models.org import OrgMember
+    from app.models.tenant import Tenant
+    from app.services.auth_registry import auth_provider_registry
+    from app.services.external_identity_policy import acquire_external_subject_lock
+    from app.services.identity_provider_lookup import get_login_identity_provider_by_id
+    from app.services.sso_service import sso_service
+
+    if provider not in {"google", "github"}:
+        raise HTTPException(status_code=404, detail="OAuth provider not supported")
+    await enforce_auth_rate_limit(
+        request,
+        identity=provider,
+        policy=oauth_exchange_rate_limit_policy(),
+    )
+
+    # ── Step 2: consume the exact tenant allowlist ─────────────────────
     if data.pending_token and data.tenant_id:
-        pending = await _get_oauth_pending(data.pending_token)
+        browser_nonce = request.cookies.get(_OAUTH_BROWSER_NONCE_COOKIE) or ""
+        pending = await _get_oauth_pending(data.pending_token, browser_nonce)
         if not pending:
             raise HTTPException(
                 status_code=400,
                 detail="OAuth session expired or invalid. Please sign in again.",
             )
 
-        auth_provider = await auth_provider_registry.get_provider(pending["provider_type"])
-        if not auth_provider:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Provider '{pending['provider_type']}' not supported",
-            )
+        if pending.get("provider_type") != provider:
+            raise HTTPException(status_code=400, detail="OAuth session is invalid")
 
-        from app.services.auth_provider import ExternalUserInfo
+        selected = next(
+            (
+                item
+                for item in pending.get("memberships", [])
+                if str(item.get("tenant_id")) == str(data.tenant_id)
+            ),
+            None,
+        )
+        if not selected:
+            raise HTTPException(status_code=403, detail="Tenant selection is not allowed")
 
-        user_info = ExternalUserInfo(**pending["user_info"])
+        try:
+            provider_id = _uuid.UUID(str(pending["provider_id"]))
+            linked_user_id = _uuid.UUID(str(pending["linked_user_id"]))
+            identity_id = _uuid.UUID(str(pending["identity_id"]))
+            selected_user_id = _uuid.UUID(str(selected["user_id"]))
+            selected_tenant_id = _uuid.UUID(str(selected["tenant_id"]))
+            requested_tenant_id = _uuid.UUID(str(data.tenant_id))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="OAuth session is invalid") from exc
+
+        lookup = pending.get("identity_lookup") or {}
+        lookup_conditions = [
+            getattr(OrgMember, field) == value
+            for field in ("unionid", "external_id", "open_id")
+            if (value := str(lookup.get(field) or "").strip())
+        ]
+        if not lookup_conditions:
+            raise HTTPException(status_code=400, detail="OAuth session is invalid")
 
         async with transaction() as session:
-            user, _ = await auth_provider.find_or_create_user(session, user_info, tenant_id=data.tenant_id)
-            if not user:
-                raise HTTPException(status_code=500, detail="Failed to create user")
-            if not user.is_active:
+            provider_result = await session.execute(
+                select(IdentityProvider)
+                .where(IdentityProvider.id == provider_id)
+                .with_for_update()
+            )
+            provider_record = provider_result.scalar_one_or_none()
+            if (
+                not provider_record
+                or not provider_record.is_active
+                or not provider_record.sso_login_enabled
+                or provider_record.provider_type != provider
+                or provider_record.tenant_id is not None
+            ):
+                raise HTTPException(status_code=403, detail="OAuth provider is disabled")
+
+            link_result = await session.execute(
+                select(OrgMember).where(
+                    OrgMember.provider_id == provider_id,
+                    OrgMember.tenant_id.is_(None),
+                    OrgMember.user_id == linked_user_id,
+                    OrgMember.status == "active",
+                    or_(*lookup_conditions),
+                )
+            )
+            if not link_result.scalars().first():
+                raise HTTPException(status_code=403, detail="OAuth identity link changed")
+
+            linked_user = await user_dao.get_with_identity(linked_user_id)
+            if (
+                not linked_user
+                or linked_user.identity_id != identity_id
+                or not getattr(getattr(linked_user, "identity", None), "is_active", False)
+            ):
                 raise HTTPException(status_code=403, detail="Account is disabled")
 
-        jwt_token = create_access_token(str(user.id), user.role)
+            user = await user_dao.get_with_identity(selected_user_id)
+            if (
+                not external_user_can_authenticate(user)
+                or user.identity_id != identity_id
+                or user.tenant_id != selected_tenant_id
+                or selected_tenant_id != requested_tenant_id
+            ):
+                raise HTTPException(status_code=403, detail="Tenant selection is not allowed")
+
+            tenant = await session.get(Tenant, selected_tenant_id)
+            if not tenant or not tenant.is_active:
+                raise HTTPException(status_code=403, detail="Tenant is disabled")
+
+        jwt_token = create_access_token(
+            str(user.id), user.role, auth_version=identity_auth_version(user)
+        )
         return TokenResponse(
             access_token=jwt_token,
             user=serialize_user(user),
-            needs_company_setup=user.tenant_id is None,
+            needs_company_setup=False,
         )
 
-    # ── Step 1: Exchange code, detect multi-tenant ────────────────────────────
-    if not data.code:
-        raise HTTPException(status_code=400, detail="Missing authorization code")
+    if data.pending_token or data.tenant_id:
+        raise HTTPException(status_code=400, detail="Incomplete tenant selection")
 
-    auth_provider = await auth_provider_registry.get_provider(provider)
-    if not auth_provider:
+    # ── Step 1: Exchange code, detect multi-tenant ────────────────────────────
+    if not data.code or not data.state or not data.redirect_uri:
+        raise HTTPException(status_code=400, detail="Missing OAuth callback parameters")
+
+    browser_nonce = request.cookies.get(_OAUTH_BROWSER_NONCE_COOKIE) or ""
+    state_payload = await _consume_oauth_state(
+        data.state,
+        provider_type=provider,
+        redirect_uri=data.redirect_uri,
+        browser_nonce=browser_nonce,
+    )
+    if not state_payload:
+        raise HTTPException(status_code=400, detail="OAuth state is invalid or expired")
+
+    auth_provider = await auth_provider_registry.get_provider(
+        provider,
+        require_sso_login=True,
+        allow_global_fallback=False,
+    )
+    provider_record = getattr(auth_provider, "provider", None) if auth_provider else None
+    if not auth_provider or not provider_record:
         raise HTTPException(status_code=404, detail=f"Provider '{provider}' not supported")
 
     try:
-        # Perform external network requests outside transaction
         token_data = await auth_provider.exchange_code_for_token(data.code, data.redirect_uri)
         access_token = token_data.get("access_token")
         if not access_token:
@@ -1138,61 +1813,155 @@ async def oauth_callback(
         user_info = await auth_provider.get_user_info(access_token)
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"OAuth callback failed for {provider}: {e}")
-        raise HTTPException(status_code=500, detail="OAuth authentication failed")
+    except Exception as exc:
+        logger.error(
+            "OAuth callback failed provider={} error_type={}",
+            provider,
+            type(exc).__name__,
+        )
+        raise HTTPException(status_code=500, detail="OAuth authentication failed") from exc
 
-    tenant_users = []
-    tenants_map = {}
+    provider_subject = require_stable_external_subject(
+        provider,
+        user_info.provider_user_id or user_info.provider_union_id,
+    )
+    identity_data = auth_provider._identity_payload(user_info)
+    raw_union_id, raw_open_id, raw_external_id = sso_service._extract_identity_ids(
+        provider,
+        provider_subject,
+        identity_data,
+    )
+    identity_lookup = {
+        "unionid": raw_union_id,
+        "open_id": raw_open_id,
+        "external_id": raw_external_id,
+    }
+
+    selected_user = None
+    tenant_choices: list[TenantChoice] = []
+    pending_payload = None
+    provider_tenant_id = provider_record.tenant_id
 
     async with transaction() as session:
-        user, is_new = await auth_provider.find_or_create_user(session, user_info)
-
-        if not user:
-            raise HTTPException(status_code=500, detail="Failed to create user")
-        if not user.is_active:
-            raise HTTPException(status_code=403, detail="Account is disabled")
-
-        # Check if this identity has multiple tenant memberships
-        if user.identity_id:
-            all_users = await user_dao.get_by_identity_id(user.identity_id)
-            tenant_users = [u for u in all_users if u.tenant_id is not None]
-
-            if len(tenant_users) > 1:
-                tenant_ids = [u.tenant_id for u in tenant_users]
-                tenants_result = await tenant_dao.get_by_ids(tenant_ids)
-                tenants_map = {str(t.id): t for t in tenants_result}
-
-    if len(tenant_users) > 1:
-        # Cache the full user_info in Redis so Step 2 can reconstruct it (outside transaction)
-        pending_token = _uuid.uuid4().hex
-        await _cache_oauth_pending(
-            pending_token,
+        current_provider = await get_login_identity_provider_by_id(
+            session,
+            provider_id=provider_record.id,
+            provider_type=provider,
+            tenant_id=provider_tenant_id,
+            for_update=True,
+        )
+        if not current_provider:
+            raise HTTPException(status_code=403, detail="OAuth provider is disabled")
+        await acquire_external_subject_lock(
+            session,
+            provider_type=provider,
+            tenant_id=provider_tenant_id,
+            provider_subject=provider_subject,
+        )
+        linked_user = await sso_service.resolve_user_identity(
+            session,
+            provider_subject,
             provider,
-            {
-                "provider_type": user_info.provider_type,
-                "provider_union_id": user_info.provider_union_id,
-                "provider_user_id": user_info.provider_user_id,
-                "name": user_info.name,
-                "email": user_info.email,
-                "avatar_url": user_info.avatar_url,
-                "mobile": user_info.mobile,
-                "raw_data": user_info.raw_data,
-            },
-            token_data,
+            tenant_id=str(provider_tenant_id) if provider_tenant_id else None,
+            identity_data=identity_data,
+            provider_id=provider_record.id,
         )
 
-        tenant_choices = [
-            TenantChoice(
-                tenant_id=u.tenant_id,
-                tenant_name=tenants_map[str(u.tenant_id)].name
-                if str(u.tenant_id) in tenants_map
-                else "Unknown",
-                tenant_slug=tenants_map[str(u.tenant_id)].slug if str(u.tenant_id) in tenants_map else "",
-                logo_url=tenants_map[str(u.tenant_id)].logo_url if str(u.tenant_id) in tenants_map else None,
+        if linked_user:
+            # A global provider link is anchored by one historical User row,
+            # while authorization is tenant-membership specific. Disabling the
+            # anchor membership must not revoke other active memberships; only
+            # disabling the global Identity has that effect.
+            if not getattr(getattr(linked_user, "identity", None), "is_active", False):
+                raise HTTPException(status_code=403, detail="Account is disabled")
+
+            users_result = await session.execute(
+                select(User)
+                .where(User.identity_id == linked_user.identity_id)
+                .options(selectinload(User.identity))
+                .order_by(User.created_at.asc(), User.id.asc())
             )
-            for u in tenant_users
-        ]
+            identity_users = [
+                item
+                for item in users_result.scalars().all()
+                if external_user_can_authenticate(item)
+            ]
+            tenant_users = [item for item in identity_users if item.tenant_id is not None]
+            tenantless_users = [item for item in identity_users if item.tenant_id is None]
+
+            tenants_result = (
+                await session.execute(
+                    select(Tenant).where(
+                        Tenant.id.in_([item.tenant_id for item in tenant_users]),
+                        Tenant.is_active.is_(True),
+                    )
+                )
+                if tenant_users
+                else None
+            )
+            tenants = list(tenants_result.scalars().all()) if tenants_result else []
+            tenants_map = {str(item.id): item for item in tenants}
+            tenant_users = [
+                item for item in tenant_users if str(item.tenant_id) in tenants_map
+            ]
+
+            memberships_by_tenant: dict[str, User] = {}
+            for membership in tenant_users:
+                tenant_key = str(membership.tenant_id)
+                if tenant_key in memberships_by_tenant:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Duplicate tenant memberships require administrator review",
+                    )
+                memberships_by_tenant[tenant_key] = membership
+
+            is_platform_admin = bool(
+                getattr(getattr(linked_user, "identity", None), "is_platform_admin", False)
+            )
+            if is_platform_admin:
+                if len(tenantless_users) != 1:
+                    raise HTTPException(status_code=409, detail="Platform account state is ambiguous")
+                selected_user = tenantless_users[0]
+            elif len(memberships_by_tenant) > 1:
+                tenant_choices = [
+                    TenantChoice(
+                        tenant_id=membership.tenant_id,
+                        tenant_name=tenants_map[tenant_key].name,
+                        tenant_slug=tenants_map[tenant_key].slug,
+                        logo_url=tenants_map[tenant_key].logo_url,
+                    )
+                    for tenant_key, membership in memberships_by_tenant.items()
+                ]
+                pending_payload = {
+                    "provider_type": provider,
+                    "provider_id": str(provider_record.id),
+                    "linked_user_id": str(linked_user.id),
+                    "identity_id": str(linked_user.identity_id),
+                    "identity_lookup": identity_lookup,
+                    "memberships": [
+                        {"tenant_id": key, "user_id": str(membership.id)}
+                        for key, membership in memberships_by_tenant.items()
+                    ],
+                }
+            elif len(memberships_by_tenant) == 1:
+                selected_user = next(iter(memberships_by_tenant.values()))
+            elif len(tenantless_users) == 1:
+                selected_user = tenantless_users[0]
+            else:
+                raise HTTPException(status_code=403, detail="No active account membership")
+        else:
+            # The public OAuth button is intentionally sign-in-only. Account
+            # creation uses password registration or organization-managed SSO;
+            # the retired public social-signup route never had a complete
+            # browser-bound redirect and tenant-ownership contract.
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No linked account exists for this OAuth identity.",
+            )
+
+    if pending_payload:
+        pending_token = _uuid.uuid4().hex
+        await _cache_oauth_pending(pending_token, pending_payload, browser_nonce)
 
         return MultiTenantResponse(
             requires_tenant_selection=True,
@@ -1201,12 +1970,18 @@ async def oauth_callback(
             pending_token=pending_token,
         )
 
-    # Single tenant (or new user with no tenant yet) — issue token directly
-    jwt_token = create_access_token(str(user.id), user.role)
+    if not selected_user:
+        raise HTTPException(status_code=500, detail="Failed to resolve account")
+
+    jwt_token = create_access_token(
+        str(selected_user.id),
+        selected_user.role,
+        auth_version=identity_auth_version(selected_user),
+    )
     return TokenResponse(
         access_token=jwt_token,
-        user=serialize_user(user),
-        needs_company_setup=user.tenant_id is None,
+        user=serialize_user(selected_user),
+        needs_company_setup=selected_user.tenant_id is None,
     )
 
 
@@ -1214,16 +1989,44 @@ async def oauth_callback(
 async def bind_identity(
     provider: str,
     data: IdentityBindRequest,
+    request: Request,
+    response: Response,
     current_user: User = Depends(get_current_user),
 ):
     """Bind an external identity to the current user."""
-    from app.services.auth_registry import auth_provider_registry
-    from app.services.sso_service import sso_service
+    from sqlalchemy.orm import selectinload
 
-    # Get provider outside transaction
-    auth_provider = await auth_provider_registry.get_provider(provider)
+    from app.models.tenant import Tenant
+    from app.services.auth_registry import auth_provider_registry
+    from app.services.identity_provider_lookup import get_login_identity_provider_by_id
+    from app.services.sso_service import (
+        ExternalIdentityAlreadyLinkedError,
+        ExternalIdentityAmbiguousError,
+        sso_service,
+    )
+
+    reauthenticated_identity_id, verified_password_hash = (
+        await _reauthenticate_sensitive_identity_action(
+            request,
+            current_user,
+            data.current_password,
+        )
+    )
+    tenant_scope = str(current_user.tenant_id) if current_user.tenant_id else None
+    auth_provider = await auth_provider_registry.get_provider(
+        provider,
+        tenant_scope,
+        require_sso_login=True,
+        allow_global_fallback=provider in {"google", "github"},
+    )
     if not auth_provider:
         raise HTTPException(status_code=404, detail=f"Provider '{provider}' not supported")
+    provider_record = auth_provider.provider
+    if not provider_record:
+        raise HTTPException(status_code=404, detail=f"Provider '{provider}' not supported")
+    if provider_record.tenant_id not in {None, current_user.tenant_id}:
+        raise HTTPException(status_code=403, detail="Provider belongs to a different tenant")
+    provider_tenant_id = provider_record.tenant_id
 
     try:
         # Exchange code for token (network call) outside transaction
@@ -1236,15 +2039,78 @@ async def bind_identity(
         user_info = await auth_provider.get_user_info(access_token)
 
         async with transaction() as session:
+            # The provider, tenant membership, and global Identity may all be
+            # disabled while the external network calls are in flight.  Lock
+            # and revalidate the exact objects before persisting the link.
+            current_provider = await get_login_identity_provider_by_id(
+                session,
+                provider_id=provider_record.id,
+                provider_type=provider,
+                tenant_id=provider_tenant_id,
+                for_update=True,
+            )
+            if not current_provider:
+                raise HTTPException(status_code=403, detail="Provider is disabled")
+
+            locked_user_tenant = None
+            if current_user.tenant_id is not None:
+                tenant_result = await session.execute(
+                    select(Tenant)
+                    .where(Tenant.id == current_user.tenant_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+                locked_user_tenant = tenant_result.scalar_one_or_none()
+                if not locked_user_tenant or not locked_user_tenant.is_active:
+                    raise HTTPException(status_code=403, detail="Tenant is disabled")
+
+            user_result = await session.execute(
+                select(User)
+                .where(User.id == current_user.id)
+                .options(selectinload(User.identity))
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            fresh_user = user_result.scalar_one_or_none()
+            identity = await identity_dao.get_for_update(current_user.identity_id)
+            if (
+                not fresh_user
+                or fresh_user.identity_id != current_user.identity_id
+                or fresh_user.tenant_id != current_user.tenant_id
+                or not identity
+                or identity.id != reauthenticated_identity_id
+                or not identity.password_login_enabled
+                or not identity.password_hash
+                or not hmac.compare_digest(
+                    identity.password_hash,
+                    verified_password_hash,
+                )
+                or not external_user_can_authenticate(fresh_user)
+            ):
+                raise HTTPException(status_code=403, detail="Account is disabled")
+            fresh_user.identity = identity
+
+            if current_provider.tenant_id not in {None, fresh_user.tenant_id}:
+                raise HTTPException(status_code=403, detail="Provider belongs to a different tenant")
+
+            auth_provider.provider = current_provider
+            auth_provider.config = dict(current_provider.config or {})
+
             # Check if identity is already linked to another user
-            lookup_provider_user_id = user_info.provider_user_id
+            lookup_provider_user_id = require_stable_external_subject(
+                provider,
+                user_info.provider_user_id or user_info.provider_union_id,
+            )
+            identity_data = auth_provider._identity_payload(user_info)
             existing_user = await sso_service.check_duplicate_identity(
                 session,
                 provider,
                 lookup_provider_user_id,
-                identity_data=user_info.raw_data,
+                tenant_id=str(provider_tenant_id) if provider_tenant_id else None,
+                identity_data=identity_data,
+                provider_id=current_provider.id,
             )
-            if existing_user and existing_user.id != current_user.id:
+            if existing_user and existing_user.id != fresh_user.id:
                 raise HTTPException(
                     status_code=409,
                     detail="This identity is already linked to another account",
@@ -1253,38 +2119,146 @@ async def bind_identity(
             # Link identity to current user
             await sso_service.link_identity(
                 session,
-                str(current_user.id),
+                str(fresh_user.id),
                 provider,
                 lookup_provider_user_id,
-                user_info.raw_data,
+                identity_data,
+                tenant_id=str(provider_tenant_id) if provider_tenant_id else None,
+                provider_id=current_provider.id,
             )
+            identity.auth_version = int(
+                getattr(identity, "auth_version", 0) or 0
+            ) + 1
 
+    except (ExternalIdentityAlreadyLinkedError, ExternalIdentityAmbiguousError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This identity cannot be linked because its ownership is ambiguous",
+        ) from exc
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Identity bind failed for {provider}: {e}")
+        logger.error(
+            "Identity bind failed provider={} error_type={}",
+            provider,
+            type(e).__name__,
+        )
         raise HTTPException(status_code=500, detail="Failed to bind identity")
 
-    user = await user_dao.get(current_user.id)
-    return serialize_user(user)
+    refreshed_token = create_access_token(
+        str(fresh_user.id),
+        fresh_user.role,
+        auth_version=identity_auth_version(identity),
+    )
+    response.headers["X-Astra-Access-Token"] = refreshed_token
+    set_browser_session_cookie(response, refreshed_token, request)
+    return serialize_user(fresh_user)
 
 
 @router.post("/{provider}/unbind", response_model=UserOut)
 async def unbind_identity(
     provider: str,
     data: IdentityUnbindRequest,
+    request: Request,
+    response: Response,
     current_user: User = Depends(get_current_user),
 ):
     """Unlink an external identity from the current user."""
+    from app.services.auth_registry import auth_provider_registry
     from app.services.sso_service import sso_service
+    from app.models.identity import IdentityProvider
+    from app.models.org import OrgMember
+    from app.models.tenant import Tenant
+
+    reauthenticated_identity_id, verified_password_hash = (
+        await _reauthenticate_sensitive_identity_action(
+            request,
+            current_user,
+            data.current_password,
+        )
+    )
+    tenant_scope = str(current_user.tenant_id) if current_user.tenant_id else None
+    auth_provider = await auth_provider_registry.get_provider(
+        provider,
+        tenant_scope,
+        require_sso_login=True,
+        allow_global_fallback=provider in {"google", "github"},
+    )
+    provider_record = getattr(auth_provider, "provider", None) if auth_provider else None
+    if not provider_record or provider_record.tenant_id not in {None, current_user.tenant_id}:
+        raise HTTPException(status_code=404, detail=f"Provider '{provider}' not supported")
 
     async with transaction() as session:
-        success = await sso_service.unlink_identity(session, str(current_user.id), provider)
+        identity = await identity_dao.get_for_update(current_user.identity_id)
+        if (
+            not identity
+            or identity.id != reauthenticated_identity_id
+            or not identity.is_active
+            or not identity.password_login_enabled
+            or not identity.password_hash
+            or not hmac.compare_digest(
+                identity.password_hash,
+                verified_password_hash,
+            )
+        ):
+            raise HTTPException(status_code=403, detail="Account is disabled")
+        has_local_login = bool(
+            identity.password_login_enabled
+            and identity.password_hash
+            and identity.email
+            and identity.email_verified
+        )
+        if not has_local_login:
+            alternative_result = await session.execute(
+                select(OrgMember.id)
+                .join(User, User.id == OrgMember.user_id)
+                .join(IdentityProvider, IdentityProvider.id == OrgMember.provider_id)
+                .outerjoin(Tenant, Tenant.id == IdentityProvider.tenant_id)
+                .where(
+                    User.identity_id == current_user.identity_id,
+                    User.is_active.is_(True),
+                    OrgMember.status == "active",
+                    IdentityProvider.id != provider_record.id,
+                    IdentityProvider.is_active.is_(True),
+                    IdentityProvider.sso_login_enabled.is_(True),
+                    or_(
+                        IdentityProvider.tenant_id.is_(None),
+                        and_(Tenant.is_active.is_(True), Tenant.sso_enabled.is_(True)),
+                    ),
+                )
+                .limit(1)
+            )
+            if alternative_result.scalar_one_or_none() is None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        "Set and verify a recovery email and local password, or bind "
+                        "another active login provider, before unlinking this identity."
+                    ),
+                )
+        success = await sso_service.unlink_identity(
+            session,
+            str(current_user.id),
+            provider,
+            tenant_id=str(provider_record.tenant_id) if provider_record.tenant_id else None,
+            provider_id=provider_record.id,
+        )
         if not success:
             raise HTTPException(status_code=404, detail=f"No linked identity found for provider '{provider}'")
 
-        user = await user_dao.get(current_user.id)
-        return serialize_user(user)
+        identity.auth_version = int(getattr(identity, "auth_version", 0) or 0) + 1
+        user = await user_dao.get_with_identity(current_user.id)
+        if not user:
+            raise HTTPException(status_code=403, detail="Account is unavailable")
+
+    refreshed_token = create_access_token(
+        str(user.id),
+        user.role,
+        auth_version=identity_auth_version(identity),
+    )
+    response.headers["X-Astra-Access-Token"] = refreshed_token
+    set_browser_session_cookie(response, refreshed_token, request)
+    return serialize_user(user)
 
 
 # ─── Email Verification Endpoints ──────────────────────────────────────
@@ -1309,35 +2283,45 @@ async def verify_email(data: VerifyEmailRequest):
 
     async with transaction() as session:
         # 1. Update Identity
-        identity = await identity_dao.get(identity_id)
-        if not identity:
-            raise HTTPException(status_code=400, detail="Identity not found")
+        identity = await identity_dao.get_for_update(identity_id)
+        if not identity or not identity.is_active:
+            raise HTTPException(status_code=400, detail="Invalid or expired verification token")
+
+        token_email = canonicalize_email(token_data.get("email"))
+        current_email = canonicalize_email(identity.email)
+        if not token_email or token_email != current_email:
+            raise HTTPException(status_code=400, detail="Invalid or expired verification token")
 
         identity.email_verified = True
-        identity.is_active = True
 
-        # 2. Activate all linked User accounts
-        users = await user_dao.get_by_identity_id(identity.id)
-        for u in users:
-            u.is_active = True
+        # 2. Activate only memberships created in the explicit
+        # email-verification-pending state.  Administrative disables remain
+        # authoritative even when the Identity proves email ownership.
+        user = await _activate_email_verification_pending_memberships(identity.id)
+
+        # If no membership was activated by this verification, select only an
+        # already-active membership.  A disabled representative must never be
+        # used as the subject of a newly issued JWT.
+        if user is None:
+            user = await user_dao.get_active_representative_user_for_identity(identity.id)
 
         await session.flush()
         # Refresh inside transaction to ensure we have the committed model state
         await session.refresh(identity)
 
-    # 3. Find a representative user outside transaction (read-only)
-    user = await user_dao.get_representative_user_for_identity(identity.id)
+    if user is None:
+        raise HTTPException(status_code=403, detail="No active organization membership is available")
 
-    # 4. Generate token and return full response outside transaction
-    effective_id = str(user.id) if user else str(identity.id)
-    effective_role = user.role if user else "user"
-    token = create_access_token(effective_id, effective_role)
+    # 3. Generate a token only for the active membership selected above.
+    token = create_access_token(
+        str(user.id), user.role, auth_version=identity_auth_version(identity)
+    )
 
     return TokenResponse(
         access_token=token,
         user=serialize_user(user),
         identity=IdentityOut.model_validate(identity),
-        needs_company_setup=user.tenant_id is None if user else True,
+        needs_company_setup=user.tenant_id is None,
     )
 
 
@@ -1345,6 +2329,7 @@ async def verify_email(data: VerifyEmailRequest):
 async def resend_verification(
     data: ResendVerificationRequest,
     background_tasks: BackgroundTasks,
+    request: Request,
 ):
     """Resend email verification link."""
     from app.config import get_settings
@@ -1356,6 +2341,11 @@ async def resend_verification(
         "message": "If an account with that email exists, a verification email has been sent.",
     }
     settings = get_settings()
+    await enforce_auth_rate_limit(
+        request,
+        identity=str(data.email),
+        policy=email_action_rate_limit_policy(),
+    )
 
     # Check if email is configured (DB-only, no env fallback) outside transaction (read-only)
     email_config = await resolve_email_config_async()
@@ -1366,7 +2356,7 @@ async def resend_verification(
     identity = await identity_dao.get_by_email(data.email)
 
     # Don't reveal if user exists or already verified
-    if not identity or identity.email_verified:
+    if not identity or not identity.is_active or identity.email_verified:
         return generic_response
 
     # Pick a representative user context (e.g. latest one)

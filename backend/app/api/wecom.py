@@ -23,18 +23,27 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import check_agent_access, is_agent_creator
-from app.core.security import create_access_token, get_current_user
-from app.database import async_session, get_db
+from app.core.security import create_access_token, get_current_user, identity_auth_version
+from app.database import async_session, get_db, transaction
 from app.models.agent import Agent as AgentModel
 from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
 from app.models.audit import ChatMessage
 from app.models.channel_config import ChannelConfig
-from app.models.identity import IdentityProvider, SSOScanSession
+from app.models.identity import IdentityProvider
 from app.models.user import User
 from app.services.activity_logger import log_activity
-from app.services.auth_registry import auth_provider_registry
+from app.services.auth_provider import WeComAuthProvider
 from app.services.channel_session import find_or_create_channel_session
 from app.services.channel_user_service import channel_user_service
+from app.services.external_identity_policy import external_user_can_authenticate
+from app.services.identity_provider_lookup import get_login_identity_provider_by_id
+from app.services.sso_service import ExternalIdentityProvisioningDeniedError
+from app.services.sso_scan_session_service import (
+    authorize_sso_session,
+    get_pending_sso_session,
+    parse_sso_scan_state,
+    verify_sso_callback_initiator,
+)
 from app.services.platform_service import platform_service
 from app.services.wecom_service import normalize_wecom_agent_id, send_wecom_message
 from app.schemas.schemas import ChannelConfigOut
@@ -326,6 +335,10 @@ async def configure_wecom_channel(
         db.add(config)
         await db.flush()
         config_out = ChannelConfigOut.model_validate(config)
+
+    await channel_user_service.provision_provider_for_config(
+        db, channel_type="wecom", tenant_id=agent.tenant_id
+    )
 
     try:
         if connection_mode == "websocket":
@@ -816,88 +829,96 @@ async def _process_wecom_text(
 @router.get("/auth/wecom/callback")
 async def wecom_callback(
     code: str,
-    state: str = None,
+    request: Request,
+    state: str | None = None,
     db: AsyncSession = Depends(get_db),
 ):
-    # 1. Resolve session to get tenant context
-    tenant_id = None
-    if state:
-        try:
-            sid = uuid.UUID(state)
-            s_res = await db.execute(select(SSOScanSession).where(SSOScanSession.id == sid))
-            session = s_res.scalar_one_or_none()
-            if session:
-                tenant_id = session.tenant_id
-        except (ValueError, AttributeError):
-            pass
+    """Authorize one valid WeCom SSO relay session."""
+    parsed_state = parse_sso_scan_state(state, provider_type="wecom")
+    if not parsed_state:
+        raise HTTPException(status_code=400, detail="SSO session is invalid")
+    sid, provider_id = parsed_state
+    scan_session = await get_pending_sso_session(db, sid)
+    verify_sso_callback_initiator(scan_session, request)
+    tenant_id = scan_session.tenant_id
 
-    # 1. Get WeCom provider config
-    provider_query = select(IdentityProvider).where(IdentityProvider.provider_type == "wecom")
-    if tenant_id:
-        # Strict scope
-        provider_query = provider_query.where(IdentityProvider.tenant_id == tenant_id)
-    else:
-        # Fallback to unscoped
-        provider_query = provider_query.where(IdentityProvider.tenant_id.is_(None))
-
-    provider_result = await db.execute(provider_query)
-    provider = provider_result.scalar_one_or_none()
+    provider = await get_login_identity_provider_by_id(
+        db,
+        provider_id=provider_id,
+        provider_type="wecom",
+        tenant_id=tenant_id,
+    )
     if not provider:
-        raise HTTPException(status_code=404, detail="WeCom provider not configured for this tenant")
+        raise HTTPException(status_code=403, detail="WeCom SSO is disabled")
+    auth_provider = WeComAuthProvider(provider=provider, config=provider.config or {})
+    # Release the preflight connection before calling WeCom.
+    await db.commit()
 
-    # 2. Extract user info and login/register via RegistrationService
     try:
-        auth_provider = await auth_provider_registry.get_provider(
-            "wecom",
-            str(tenant_id) if tenant_id else (str(provider.tenant_id) if provider.tenant_id else None),
-        )
-        if not auth_provider:
-            return HTMLResponse("Auth failed: WeCom provider unavailable")
-        
         token_data = await auth_provider.exchange_code_for_token(code)
         access_token_str = token_data.get("access_token")
         if not access_token_str:
-            return HTMLResponse("Auth failed: Token error")
+            raise ValueError("WeCom token exchange returned no access token")
             
         user_info = await auth_provider.get_user_info(access_token_str)
         if not user_info.provider_user_id:
-            return HTMLResponse("Auth failed: No UserId returned")
+            raise ValueError("WeCom user info returned no stable subject")
             
-        # Find or Create User (handles Identity and OrgMember linking)
-        user, _is_new = await auth_provider.find_or_create_user(
-            db, user_info, tenant_id=tenant_id or provider.tenant_id
-        )
-    except Exception as e:
-        logger.exception(f"WeCom login/register error: {e}")
-        return HTMLResponse(f"Auth failed: {str(e)}")
-
-
-    # Standard login
-    token = create_access_token(str(user.id), user.role)
-
-    if state:
-        try:
-            sid = uuid.UUID(state)
-            s_res = await db.execute(select(SSOScanSession).where(SSOScanSession.id == sid))
-            session = s_res.scalar_one_or_none()
-            if session:
-                session.status = "authorized"
-                session.provider_type = "wecom"
-                session.user_id = user.id
-                session.access_token = token
-                session.error_msg = None
-                await db.commit()
-                return HTMLResponse(
-                    f"""<html><head><meta charset="utf-8" /></head>
-                    <body style="font-family: sans-serif; padding: 24px;">
-                        <div>SSO login successful. Redirecting...</div>
-                        <script>window.location.href = "/sso/entry?sid={sid}&complete=1";</script>
-                    </body></html>"""
-                )
-        except Exception as e:
-            logger.exception(
-                "Failed to update SSO session (wecom) error_type={}",
-                type(e).__name__,
+        async with transaction(db):
+            current_scan_session = await get_pending_sso_session(
+                db,
+                sid,
+                for_update=True,
             )
+            if current_scan_session.tenant_id != tenant_id:
+                raise HTTPException(status_code=400, detail="SSO session is invalid")
+            current_provider = await get_login_identity_provider_by_id(
+                db,
+                provider_id=provider_id,
+                provider_type="wecom",
+                tenant_id=tenant_id,
+                for_update=True,
+            )
+            if not current_provider:
+                raise HTTPException(status_code=403, detail="WeCom SSO is disabled")
+            current_auth_provider = WeComAuthProvider(
+                provider=current_provider,
+                config=current_provider.config or {},
+            )
+            user, _is_new = await current_auth_provider.find_or_create_user(
+                db,
+                user_info,
+                tenant_id=tenant_id,
+            )
+            if not external_user_can_authenticate(user):
+                raise HTTPException(status_code=403, detail="Account is disabled")
+            token = create_access_token(
+                str(user.id),
+                user.role,
+                auth_version=identity_auth_version(user),
+            )
+            await authorize_sso_session(
+                db,
+                sid=sid,
+                provider_type="wecom",
+                user_id=user.id,
+                access_token=token,
+            )
+    except ExternalIdentityProvisioningDeniedError as exc:
+        raise HTTPException(
+            status_code=403,
+            detail="This account is not provisioned for the organization.",
+        ) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("WeCom login/register failed error_type={}", type(exc).__name__)
+        return HTMLResponse("Auth failed: WeCom authentication failed", status_code=400)
 
-    return HTMLResponse(f"Logged in. Token: {token}")
+    return HTMLResponse(
+        f"""<html><head><meta charset="utf-8" /></head>
+        <body style="font-family: sans-serif; padding: 24px;">
+            <div>SSO login successful. Redirecting...</div>
+            <script>window.location.href = "/sso/entry?sid={sid}&complete=1";</script>
+        </body></html>"""
+    )

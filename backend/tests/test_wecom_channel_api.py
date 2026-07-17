@@ -1,6 +1,7 @@
 import uuid
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -146,9 +147,11 @@ async def test_configure_wecom_explicit_webhook_mode_clears_stale_websocket_cred
     config = make_channel(agent_id, connection_mode="websocket")
     db = RecordingDB([DummyResult(config)])
     scheduled = []
+    tenant_id = uuid.uuid4()
+    provision_provider = AsyncMock()
 
     async def fake_check_agent_access(_db, _user, _agent_id):
-        return SimpleNamespace(creator_id=creator.id), None
+        return SimpleNamespace(creator_id=creator.id, tenant_id=tenant_id), None
 
     def fake_create_task(coroutine):
         scheduled.append(coroutine)
@@ -158,6 +161,11 @@ async def test_configure_wecom_explicit_webhook_mode_clears_stale_websocket_cred
     monkeypatch.setattr(wecom_api, "check_agent_access", fake_check_agent_access)
     monkeypatch.setattr(wecom_api, "is_agent_creator", lambda _user, _agent: True)
     monkeypatch.setattr(wecom_api.asyncio, "create_task", fake_create_task)
+    monkeypatch.setattr(
+        wecom_api.channel_user_service,
+        "provision_provider_for_config",
+        provision_provider,
+    )
 
     await wecom_api.configure_wecom_channel(
         agent_id,
@@ -186,6 +194,11 @@ async def test_configure_wecom_explicit_webhook_mode_clears_stale_websocket_cred
         "connection_mode": "webhook",
     }
     assert len(scheduled) == 1
+    provision_provider.assert_awaited_once_with(
+        db,
+        channel_type="wecom",
+        tenant_id=tenant_id,
+    )
 
 
 @pytest.mark.asyncio
@@ -195,9 +208,11 @@ async def test_configure_wecom_explicit_websocket_mode_clears_stale_webhook_cred
     config = make_channel(agent_id, connection_mode="webhook")
     db = RecordingDB([DummyResult(config)])
     scheduled = []
+    tenant_id = uuid.uuid4()
+    provision_provider = AsyncMock()
 
     async def fake_check_agent_access(_db, _user, _agent_id):
-        return SimpleNamespace(creator_id=creator.id), None
+        return SimpleNamespace(creator_id=creator.id, tenant_id=tenant_id), None
 
     def fake_create_task(coroutine):
         scheduled.append(coroutine)
@@ -207,6 +222,11 @@ async def test_configure_wecom_explicit_websocket_mode_clears_stale_webhook_cred
     monkeypatch.setattr(wecom_api, "check_agent_access", fake_check_agent_access)
     monkeypatch.setattr(wecom_api, "is_agent_creator", lambda _user, _agent: True)
     monkeypatch.setattr(wecom_api.asyncio, "create_task", fake_create_task)
+    monkeypatch.setattr(
+        wecom_api.channel_user_service,
+        "provision_provider_for_config",
+        provision_provider,
+    )
 
     await wecom_api.configure_wecom_channel(
         agent_id,
@@ -234,4 +254,9 @@ async def test_configure_wecom_explicit_websocket_mode_clears_stale_webhook_cred
         "bot_secret": "bot-secret-current",
         "connection_mode": "websocket",
     }
+    provision_provider.assert_awaited_once_with(
+        db,
+        channel_type="wecom",
+        tenant_id=tenant_id,
+    )
     assert len(scheduled) == 1

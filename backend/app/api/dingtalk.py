@@ -5,7 +5,8 @@ Provides Config CRUD and message handling for DingTalk bots using Stream mode.
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Request
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,13 +14,107 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.logging_config import privacy_safe_shape
 from app.core.permissions import check_agent_access, is_agent_creator
 from app.core.security import get_current_user
-from app.database import get_db
+from app.database import get_db, transaction
 from app.models.channel_config import ChannelConfig
 from app.models.user import User
 from app.schemas.schemas import ChannelConfigOut
 from app.services.media_message_content import sanitize_inline_media_content
+from app.services.auth_provider import DingTalkAuthProvider
+from app.services.external_identity_policy import external_user_can_authenticate
+from app.services.identity_provider_lookup import get_login_identity_provider_by_id
+from app.services.sso_service import ExternalIdentityProvisioningDeniedError
+from app.services.sso_scan_session_service import (
+    authorize_sso_session,
+    get_pending_sso_session,
+    parse_sso_scan_state,
+    verify_sso_callback_initiator,
+)
 
 router = APIRouter(tags=["dingtalk"])
+
+
+class DingTalkWebhookDeliveryError(RuntimeError):
+    """A session webhook returned a transport or provider-level failure."""
+
+
+async def _post_dingtalk_session_webhook(url: str, payload: dict) -> None:
+    """Deliver once and validate both HTTP and DingTalk business status."""
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.post(url, json=payload)
+        response.raise_for_status()
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        return
+    if body.get("success") is False:
+        raise DingTalkWebhookDeliveryError("DingTalk rejected the webhook payload")
+    for key in ("errcode", "code"):
+        if key in body and body[key] not in (None, 0, "0", "ok", "success"):
+            raise DingTalkWebhookDeliveryError("DingTalk rejected the webhook payload")
+
+
+async def _deliver_dingtalk_session_reply(
+    *,
+    session_webhook: str,
+    title: str,
+    reply_text: str,
+    agent_id: uuid.UUID,
+    tenant_id: uuid.UUID | None,
+    user_id: uuid.UUID,
+) -> bool:
+    """Try markdown then text without ever logging the secret-bearing URL."""
+
+    try:
+        await _post_dingtalk_session_webhook(
+            session_webhook,
+            {
+                "msgtype": "markdown",
+                "markdown": {"title": title, "text": reply_text},
+            },
+        )
+        return True
+    except Exception as exc:
+        logger.error(
+            "[DingTalk] Session webhook markdown delivery failed error_type={}",
+            type(exc).__name__,
+        )
+
+    try:
+        await _post_dingtalk_session_webhook(
+            session_webhook,
+            {"msgtype": "text", "text": {"content": reply_text}},
+        )
+        return True
+    except Exception as exc:
+        logger.error(
+            "[DingTalk] Session webhook text fallback failed error_type={}",
+            type(exc).__name__,
+        )
+        try:
+            from app.services.production_issue_monitor import record_production_issue
+
+            await record_production_issue(
+                source="dingtalk",
+                category="channel_delivery",
+                summary="DingTalk reply delivery failed after text fallback",
+                severity="error",
+                error_code=type(exc).__name__,
+                route="/dingtalk/session-webhook",
+                operation="reply",
+                tenant_id=tenant_id,
+                user_id=user_id,
+                agent_id=agent_id,
+                metadata={"fallback_attempted": True},
+            )
+        except Exception as monitor_exc:
+            logger.error(
+                "[DingTalk] Delivery issue capture failed error_type={}",
+                type(monitor_exc).__name__,
+            )
+        return False
 
 
 def _append_missing_image_markers(
@@ -79,6 +174,10 @@ async def configure_dingtalk_channel(
             "agent_id": dingtalk_agent_id,
         }
         await db.flush()
+        from app.services.channel_user_service import channel_user_service
+        await channel_user_service.provision_provider_for_config(
+            db, channel_type="dingtalk", tenant_id=agent.tenant_id
+        )
 
         # Restart Stream client if in websocket mode
         if conn_mode == "websocket":
@@ -106,6 +205,10 @@ async def configure_dingtalk_channel(
     )
     db.add(config)
     await db.flush()
+    from app.services.channel_user_service import channel_user_service
+    await channel_user_service.provision_provider_for_config(
+        db, channel_type="dingtalk", tenant_id=agent.tenant_id
+    )
 
     # Start Stream client if in websocket mode
     if conn_mode == "websocket":
@@ -186,7 +289,6 @@ async def process_dingtalk_message(
         sender_nick: Display name of the sender from DingTalk.
         message_id: DingTalk message ID (used for reactions).
     """
-    import httpx
     from datetime import datetime, timezone
     from sqlalchemy import select as _select
     from app.database import async_session
@@ -341,16 +443,15 @@ async def process_dingtalk_message(
 
                 if msg:
                     try:
-                        async with httpx.AsyncClient(timeout=10) as client:
-                            await client.post(
-                                session_webhook,
-                                json={
-                                    "msgtype": "text",
-                                    "text": {"content": msg},
-                                },
-                            )
-                    except Exception:
-                        pass
+                        await _post_dingtalk_session_webhook(
+                            session_webhook,
+                            {"msgtype": "text", "text": {"content": msg}},
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[DingTalk] Media caption delivery failed error_type={}",
+                            type(exc).__name__,
+                        )
                 return True
 
             _cfs_token = _cfs.set(_dingtalk_file_sender)
@@ -376,7 +477,10 @@ async def process_dingtalk_message(
                         message_id, conversation_id,
                     )
                 except Exception as _recall_err:
-                    logger.warning(f"[DingTalk] Failed to recall thinking reaction: {_recall_err}")
+                    logger.warning(
+                        "[DingTalk] Failed to recall thinking reaction error_type={}",
+                        type(_recall_err).__name__,
+                    )
 
         has_media = bool(image_base64_list or saved_file_paths)
         logger.info(
@@ -385,27 +489,18 @@ async def process_dingtalk_message(
             len(reply_text),
         )
 
-        # Reply via session webhook (markdown)
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                await client.post(session_webhook, json={
-                    "msgtype": "markdown",
-                    "markdown": {
-                        "title": _agent_name or "AI Reply",
-                        "text": reply_text,
-                    },
-                })
-        except Exception as e:
-            logger.error(f"[DingTalk] Failed to reply via webhook: {e}")
-            # Fallback: try plain text
-            try:
-                async with httpx.AsyncClient(timeout=10) as client:
-                    await client.post(session_webhook, json={
-                        "msgtype": "text",
-                        "text": {"content": reply_text},
-                    })
-            except Exception as e2:
-                logger.error(f"[DingTalk] Fallback text reply also failed: {e2}")
+        delivered = await _deliver_dingtalk_session_reply(
+            session_webhook=session_webhook,
+            title=_agent_name or "AI Reply",
+            reply_text=reply_text,
+            agent_id=agent_id,
+            tenant_id=agent_obj.tenant_id,
+            user_id=platform_user_id,
+        )
+        if not delivered:
+            # The user never received this assistant turn. Do not persist a
+            # false delivery receipt into conversation history.
+            return
 
         # Save assistant reply (new short transaction)
         async with async_session() as _save_db:
@@ -441,36 +536,35 @@ async def process_dingtalk_message(
 
 @router.get("/auth/dingtalk/callback")
 async def dingtalk_callback(
-    authCode: str, # DingTalk uses authCode parameter
-    state: str = None,
+    authCode: str,  # DingTalk uses authCode parameter
+    request: Request,
+    state: str | None = None,
     db: AsyncSession = Depends(get_db),
 ):
-    """Callback for DingTalk OAuth2 login."""
-    from app.models.identity import SSOScanSession
-    from app.core.security import create_access_token
+    """Authorize one valid DingTalk SSO relay session."""
+    from app.core.security import create_access_token, identity_auth_version
     from fastapi.responses import HTMLResponse
-    from app.services.auth_registry import auth_provider_registry
+    parsed_state = parse_sso_scan_state(state, provider_type="dingtalk")
+    if not parsed_state:
+        raise HTTPException(status_code=400, detail="SSO session is invalid")
+    sid, provider_id = parsed_state
+    scan_session = await get_pending_sso_session(db, sid)
+    verify_sso_callback_initiator(scan_session, request)
+    tenant_id = scan_session.tenant_id
 
-    # 1. Resolve session to get tenant context
-    tenant_id = None
-    if state:
-        try:
-            sid = uuid.UUID(state)
-            s_res = await db.execute(select(SSOScanSession).where(SSOScanSession.id == sid))
-            session = s_res.scalar_one_or_none()
-            if session:
-                tenant_id = session.tenant_id
-        except (ValueError, AttributeError):
-            pass
+    provider = await get_login_identity_provider_by_id(
+        db,
+        provider_id=provider_id,
+        provider_type="dingtalk",
+        tenant_id=tenant_id,
+    )
+    if not provider:
+        raise HTTPException(status_code=403, detail="DingTalk SSO is disabled")
+    auth_provider = DingTalkAuthProvider(provider=provider, config=provider.config or {})
+    # Release the preflight connection before calling DingTalk.
+    await db.commit()
 
-    # 2. Get DingTalk provider config
-    auth_provider = await auth_provider_registry.get_provider("dingtalk", str(tenant_id) if tenant_id else None)
-    if not auth_provider:
-        return HTMLResponse("Auth failed: DingTalk provider not configured for this tenant")
-
-    # 3. Exchange code for token and get user info
     try:
-        # Step 1: Exchange authCode for userAccessToken
         token_data = await auth_provider.exchange_code_for_token(authCode)
         access_token = token_data.get("access_token")
         if not access_token:
@@ -478,54 +572,71 @@ async def dingtalk_callback(
                 "DingTalk token exchange failed error_code={}",
                 token_data.get("errcode") or token_data.get("code") or "unknown",
             )
-            return HTMLResponse("Auth failed: Token exchange error")
+            raise ValueError("DingTalk token exchange returned no access token")
 
-        # Step 2: Get user info using modern v1.0 API
         user_info = await auth_provider.get_user_info(access_token)
         if not user_info.provider_union_id:
             logger.error(
                 "DingTalk user info missing unionId response_shape={}",
                 privacy_safe_shape(user_info.raw_data),
             )
-            return HTMLResponse("Auth failed: No unionid returned")
+            raise ValueError("DingTalk user info returned no stable subject")
 
-        # Step 3: Find or create user (handles OrgMember linking)
-        user, is_new = await auth_provider.find_or_create_user(
-            db, user_info, tenant_id=str(tenant_id) if tenant_id else None
-        )
-        if not user:
-            return HTMLResponse("Auth failed: User resolution failed")
-
-    except Exception as e:
-        logger.error(f"DingTalk login error: {e}")
-        return HTMLResponse(f"Auth failed: {str(e)}")
-
-    # 4. Standard login
-    token = create_access_token(str(user.id), user.role)
-
-    if state:
-        try:
-            sid = uuid.UUID(state)
-            s_res = await db.execute(select(SSOScanSession).where(SSOScanSession.id == sid))
-            session = s_res.scalar_one_or_none()
-            if session:
-                session.status = "authorized"
-                session.provider_type = "dingtalk"
-                session.user_id = user.id
-                session.access_token = token
-                session.error_msg = None
-                await db.commit()
-                return HTMLResponse(
-                    f"""<html><head><meta charset="utf-8" /></head>
-                    <body style="font-family: sans-serif; padding: 24px;">
-                        <div>SSO login successful. Redirecting...</div>
-                        <script>window.location.href = "/sso/entry?sid={sid}&complete=1";</script>
-                    </body></html>"""
-                )
-        except Exception as e:
-            logger.exception(
-                "Failed to update SSO session (dingtalk) error_type={}",
-                type(e).__name__,
+        async with transaction(db):
+            current_scan_session = await get_pending_sso_session(
+                db,
+                sid,
+                for_update=True,
             )
+            if current_scan_session.tenant_id != tenant_id:
+                raise HTTPException(status_code=400, detail="SSO session is invalid")
+            current_provider = await get_login_identity_provider_by_id(
+                db,
+                provider_id=provider_id,
+                provider_type="dingtalk",
+                tenant_id=tenant_id,
+                for_update=True,
+            )
+            if not current_provider:
+                raise HTTPException(status_code=403, detail="DingTalk SSO is disabled")
+            current_auth_provider = DingTalkAuthProvider(
+                provider=current_provider,
+                config=current_provider.config or {},
+            )
+            user, _is_new = await current_auth_provider.find_or_create_user(
+                db,
+                user_info,
+                tenant_id=str(tenant_id) if tenant_id else None,
+            )
+            if not external_user_can_authenticate(user):
+                raise HTTPException(status_code=403, detail="Account is disabled")
+            token = create_access_token(
+                str(user.id),
+                user.role,
+                auth_version=identity_auth_version(user),
+            )
+            await authorize_sso_session(
+                db,
+                sid=sid,
+                provider_type="dingtalk",
+                user_id=user.id,
+                access_token=token,
+            )
+    except ExternalIdentityProvisioningDeniedError as exc:
+        raise HTTPException(
+            status_code=403,
+            detail="This account is not provisioned for the organization.",
+        ) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("DingTalk login failed error_type={}", type(exc).__name__)
+        return HTMLResponse("Auth failed: DingTalk authentication failed", status_code=400)
 
-    return HTMLResponse(f"Logged in. Token: {token}")
+    return HTMLResponse(
+        f"""<html><head><meta charset="utf-8" /></head>
+        <body style="font-family: sans-serif; padding: 24px;">
+            <div>SSO login successful. Redirecting...</div>
+            <script>window.location.href = "/sso/entry?sid={sid}&complete=1";</script>
+        </body></html>"""
+    )

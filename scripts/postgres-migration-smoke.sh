@@ -39,6 +39,149 @@ END $$;
 SQL
 }
 
+assert_sso_password_security_downgraded() {
+  psql --host "$db_host" --port "$db_port" --username "$db_user" \
+    --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'identities'
+      AND column_name = 'auth_version'
+  ) OR EXISTS (
+    SELECT 1
+    FROM pg_indexes
+    WHERE schemaname = 'public'
+      AND tablename = 'users'
+      AND indexname = 'uq_users_identity_tenantless'
+  ) THEN
+    RAISE EXCEPTION '106 downgrade left identity revocation state behind';
+  END IF;
+END $$;
+SQL
+}
+
+assert_sso_password_security() {
+  psql --host "$db_host" --port "$db_port" --username "$db_user" \
+    --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'identities'
+      AND column_name = 'auth_version'
+      AND is_nullable = 'NO'
+      AND column_default IS NOT NULL
+  ) OR EXISTS (
+    SELECT 1
+    FROM identities
+    WHERE auth_version <> 0
+  ) THEN
+    RAISE EXCEPTION '106 did not add a fail-closed zeroed identity auth version';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_class AS index_relation
+    JOIN pg_index AS index_metadata
+      ON index_metadata.indexrelid = index_relation.oid
+    JOIN pg_class AS table_relation
+      ON table_relation.oid = index_metadata.indrelid
+    JOIN pg_namespace AS table_namespace
+      ON table_namespace.oid = table_relation.relnamespace
+    WHERE table_namespace.nspname = 'public'
+      AND table_relation.relname = 'users'
+      AND index_relation.relname = 'uq_users_identity_tenantless'
+      AND index_metadata.indisunique = true
+      AND index_metadata.indpred IS NOT NULL
+  ) THEN
+    RAISE EXCEPTION '106 did not enforce one tenantless membership per identity';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'users'
+      AND column_name = 'activation_pending_email_verification'
+      AND is_nullable = 'NO'
+  ) THEN
+    RAISE EXCEPTION '106 did not add the explicit email-verification activation provenance';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM users
+    WHERE id = '07500000-0000-4000-8000-000000000215'
+      AND is_active = false
+      AND activation_pending_email_verification = false
+  ) THEN
+    RAISE EXCEPTION '106 guessed that a historical disabled member was verification-pending';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM users
+    WHERE id = '07500000-0000-4000-8000-000000000216'
+      AND is_active = false
+      AND activation_pending_email_verification = false
+  ) THEN
+    RAISE EXCEPTION '106 inferred a privileged disabled membership as verification-pending';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM users
+    WHERE activation_pending_email_verification = true
+  ) THEN
+    RAISE EXCEPTION '106 marked an unrelated historical membership as verification-pending';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM identities
+    WHERE id = '07500000-0000-4000-8000-000000000201'
+      AND password_hash = '$2b$04$oIaUgIZ72SRhjByY./rb1ObilDkrdgd6nnAFu3rxTokIqqu5x8kRK'
+      AND password_login_enabled = false
+  ) THEN
+    RAISE EXCEPTION '106 destructively changed or enabled an ambiguous SSO-origin password';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM identities
+    WHERE id = '07500000-0000-4000-8000-000000000202'
+      AND password_hash = '$2b$04$wou6LFMDWc07CNoJC4jzI.MJFWyZCOARm97B4syMJpisI2EwlNEpy'
+      AND password_login_enabled = true
+  ) THEN
+    RAISE EXCEPTION '106 changed an unrelated Web password';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM identities
+    WHERE id = '07500000-0000-4000-8000-000000000205'
+      AND password_login_enabled = true
+  ) THEN
+    RAISE EXCEPTION '106 disabled an inactive Web password because of its Platform membership';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM identities
+    WHERE id = '07500000-0000-4000-8000-000000000206'
+      AND password_login_enabled = true
+  ) THEN
+    RAISE EXCEPTION '106 disabled an administrator-disabled Web password because of its Platform membership';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM identities
+    WHERE id = '07500000-0000-4000-8000-000000000203'
+      AND password_hash = '$2b$04$oIaUgIZ72SRhjByY./rb1ObilDkrdgd6nnAFu3rxTokIqqu5x8kRK'
+      AND password_login_enabled = false
+  ) THEN
+    RAISE EXCEPTION '106 destructively changed or enabled a provider-linked password';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM identities
+    WHERE id = '07500000-0000-4000-8000-000000000204'
+      AND password_hash = '$2b$04$wou6LFMDWc07CNoJC4jzI.MJFWyZCOARm97B4syMJpisI2EwlNEpy'
+      AND password_login_enabled = false
+  ) THEN
+    RAISE EXCEPTION '106 destructively changed or enabled an ambiguous linked Web password';
+  END IF;
+END $$;
+SQL
+}
+
 createdb --host "$db_host" --port "$db_port" --username "$db_user" "$db_name"
 createdb --host "$db_host" --port "$db_port" --username "$db_user" "$fresh_db_name"
 export DATABASE_URL="postgresql+asyncpg://${db_user}@${db_host}:${db_port}/${db_name}"
@@ -51,7 +194,9 @@ cd "$repo_root/backend"
 DATABASE_URL="postgresql+asyncpg://${db_user}@${db_host}:${db_port}/${fresh_db_name}" \
   .venv/bin/alembic upgrade head
 DATABASE_URL="postgresql+asyncpg://${db_user}@${db_host}:${db_port}/${fresh_db_name}" \
-  .venv/bin/alembic current | grep -F "alert_worker_attribution (head)"
+  .venv/bin/alembic current | grep -F "sso_password_login (head)"
+DATABASE_URL="postgresql+asyncpg://${db_user}@${db_host}:${db_port}/${fresh_db_name}" \
+  PYTHONPATH=. .venv/bin/python -m app.scripts.verify_identity_provider_secrets
 
 .venv/bin/alembic upgrade add_douyin_collab_publish_fields
 
@@ -623,8 +768,370 @@ END $$;
 SQL
 
 PYTHONPATH=. .venv/bin/python -m app.scripts.secure_mcp_quarantine migration-smoke
+
+psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+-- ``initial_schema`` follows current ORM metadata, but this lane reconstructs
+-- the production schema before revision 106, where provider config was JSON.
+ALTER TABLE identity_providers
+ALTER COLUMN config TYPE JSON USING config::json;
+
+INSERT INTO identity_providers (
+  id, provider_type, name, is_active, sso_login_enabled, config, tenant_id
+) VALUES
+  (
+    '07500000-0000-4000-8000-000000000199', 'web', 'Platform',
+    true, false, '{}'::json,
+    '07500000-0000-4000-8000-000000000002'
+  ),
+  (
+    '07500000-0000-4000-8000-000000000200', 'github', 'Migration SSO',
+    true, true,
+    '{"client_id":"migration-client","client_secret":"migration-secret"}'::json,
+    NULL
+  );
+
+-- Historical ``config`` was nullable JSON and application code did not
+-- enforce an object shape.  Production preflight and revision 106 must both
+-- reject every non-object JSON form without logging the stored value.
+INSERT INTO identity_providers (
+  id, provider_type, name, is_active, sso_login_enabled, config, tenant_id
+) VALUES
+  (
+    '07500000-0000-4000-8000-000000000230', 'invalid_json_null',
+    'Invalid JSON Null', false, false, 'null'::json, NULL
+  ),
+  (
+    '07500000-0000-4000-8000-000000000231', 'invalid_json_array',
+    'Invalid JSON Array', false, false, '[]'::json, NULL
+  ),
+  (
+    '07500000-0000-4000-8000-000000000232', 'invalid_json_string',
+    'Invalid JSON String', false, false, '"value"'::json, NULL
+  ),
+  (
+    '07500000-0000-4000-8000-000000000233', 'invalid_json_number',
+    'Invalid JSON Number', false, false, '1'::json, NULL
+  );
+
+INSERT INTO identities (
+  id, email, username, password_hash,
+  is_active, is_platform_admin, email_verified
+) VALUES
+  (
+    '07500000-0000-4000-8000-000000000201',
+    'sso-origin@example.com', 'sso-origin',
+    '$2b$04$oIaUgIZ72SRhjByY./rb1ObilDkrdgd6nnAFu3rxTokIqqu5x8kRK',
+    true, false, true
+  ),
+  (
+    '07500000-0000-4000-8000-000000000202',
+    'web-only@example.com', 'web-only',
+    '$2b$04$wou6LFMDWc07CNoJC4jzI.MJFWyZCOARm97B4syMJpisI2EwlNEpy',
+    true, false, true
+  ),
+  (
+    '07500000-0000-4000-8000-000000000203',
+    'web-provider-password@example.com', 'web-provider-password',
+    '$2b$04$oIaUgIZ72SRhjByY./rb1ObilDkrdgd6nnAFu3rxTokIqqu5x8kRK',
+    true, false, true
+  ),
+  (
+    '07500000-0000-4000-8000-000000000204',
+    'web-sso-linked@example.com', 'web-sso-linked',
+    '$2b$04$wou6LFMDWc07CNoJC4jzI.MJFWyZCOARm97B4syMJpisI2EwlNEpy',
+    true, false, true
+  ),
+  (
+    '07500000-0000-4000-8000-000000000205',
+    'web-pending@example.com', 'web-pending',
+    '$2b$04$wou6LFMDWc07CNoJC4jzI.MJFWyZCOARm97B4syMJpisI2EwlNEpy',
+    true, false, false
+  ),
+  (
+    '07500000-0000-4000-8000-000000000206',
+    'web-disabled-admin@example.com', 'web-disabled-admin',
+    '$2b$04$wou6LFMDWc07CNoJC4jzI.MJFWyZCOARm97B4syMJpisI2EwlNEpy',
+    true, false, false
+  );
+
+INSERT INTO users (
+  id, identity_id, tenant_id, display_name, role, is_active,
+  registration_source, preferred_chat_tier_revision,
+  quota_message_limit, quota_message_period, quota_messages_used,
+  quota_max_agents, quota_agent_ttl_hours
+) VALUES
+  (
+    '07500000-0000-4000-8000-000000000211',
+    '07500000-0000-4000-8000-000000000201',
+    '07500000-0000-4000-8000-000000000002',
+    'SSO Origin', 'member', true, 'github', 0, 50, 'permanent', 0, 2, 0
+  ),
+  (
+    '07500000-0000-4000-8000-000000000212',
+    '07500000-0000-4000-8000-000000000202',
+    '07500000-0000-4000-8000-000000000002',
+    'Web Only', 'member', true, 'web', 0, 50, 'permanent', 0, 2, 0
+  ),
+  (
+    '07500000-0000-4000-8000-000000000213',
+    '07500000-0000-4000-8000-000000000203',
+    '07500000-0000-4000-8000-000000000002',
+    'Web Provider Password', 'member', true, 'web', 0, 50, 'permanent', 0, 2, 0
+  ),
+  (
+    '07500000-0000-4000-8000-000000000214',
+    '07500000-0000-4000-8000-000000000204',
+    '07500000-0000-4000-8000-000000000002',
+    'Web SSO Linked', 'member', true, 'web', 0, 50, 'permanent', 0, 2, 0
+  ),
+  (
+    '07500000-0000-4000-8000-000000000215',
+    '07500000-0000-4000-8000-000000000205',
+    '07500000-0000-4000-8000-000000000002',
+    'Web Pending', 'member', false, 'web', 0, 50, 'permanent', 0, 2, 0
+  ),
+  (
+    '07500000-0000-4000-8000-000000000216',
+    '07500000-0000-4000-8000-000000000206',
+    '07500000-0000-4000-8000-000000000002',
+    'Web Disabled Admin', 'org_admin', false, 'web', 0, 50, 'permanent', 0, 2, 0
+  );
+
+INSERT INTO org_members (
+  id, open_id, provider_id, name, title, department_path, status,
+  tenant_id, user_id
+) VALUES
+  (
+    '07500000-0000-4000-8000-000000000223', NULL,
+    '07500000-0000-4000-8000-000000000199', 'Web Only', 'Platform User', '', 'active',
+    '07500000-0000-4000-8000-000000000002',
+    '07500000-0000-4000-8000-000000000212'
+  ),
+  (
+    '07500000-0000-4000-8000-000000000224', NULL,
+    '07500000-0000-4000-8000-000000000199', 'Web Provider Password', 'Platform User', '', 'active',
+    '07500000-0000-4000-8000-000000000002',
+    '07500000-0000-4000-8000-000000000213'
+  ),
+  (
+    '07500000-0000-4000-8000-000000000225', NULL,
+    '07500000-0000-4000-8000-000000000199', 'Web SSO Linked', 'Platform User', '', 'active',
+    '07500000-0000-4000-8000-000000000002',
+    '07500000-0000-4000-8000-000000000214'
+  ),
+  (
+    '07500000-0000-4000-8000-000000000226', NULL,
+    '07500000-0000-4000-8000-000000000199', 'Web Pending', 'Platform User', '', 'active',
+    '07500000-0000-4000-8000-000000000002',
+    '07500000-0000-4000-8000-000000000215'
+  ),
+  (
+    '07500000-0000-4000-8000-000000000227', NULL,
+    '07500000-0000-4000-8000-000000000199', 'Web Disabled Admin', 'Platform User', '', 'active',
+    '07500000-0000-4000-8000-000000000002',
+    '07500000-0000-4000-8000-000000000216'
+  ),
+  (
+    '07500000-0000-4000-8000-000000000221', 'public-provider-id',
+    '07500000-0000-4000-8000-000000000200', 'Provider Password', '', '', 'active',
+    NULL,
+    '07500000-0000-4000-8000-000000000213'
+  ),
+  (
+    '07500000-0000-4000-8000-000000000222', 'linked-web-provider-id',
+    '07500000-0000-4000-8000-000000000200', 'Linked Web Password', '', '', 'active',
+    NULL,
+    '07500000-0000-4000-8000-000000000214'
+  );
+SQL
+
+psql --host "$db_host" --port "$db_port" --username "$db_user" \
+  --dbname "$db_name" --set ON_ERROR_STOP=1 --tuples-only --no-align <<'SQL' | grep -Fx '4'
+SELECT count(*)
+FROM identity_providers
+WHERE config IS NOT NULL
+  AND pg_typeof(config)::text IN ('json', 'jsonb')
+  AND jsonb_typeof(to_jsonb(config)) IS DISTINCT FROM 'object';
+SQL
+
+set +e
+invalid_provider_upgrade_output="$(.venv/bin/alembic upgrade head 2>&1)"
+invalid_provider_upgrade_status=$?
+set -e
+if [ "$invalid_provider_upgrade_status" -eq 0 ]; then
+  echo "revision 106 accepted non-object identity provider config" >&2
+  exit 1
+fi
+case "$invalid_provider_upgrade_output" in
+  *'Non-object identity provider configs require operator cleanup before upgrade: count=4'*) ;;
+  *)
+    echo "revision 106 did not report the sanitized provider-config blocker" >&2
+    exit 1
+    ;;
+esac
+unset invalid_provider_upgrade_output invalid_provider_upgrade_status
+.venv/bin/alembic current | grep -F "disable_system_okr_automation"
+psql --host "$db_host" --port "$db_port" --username "$db_user" \
+  --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+DELETE FROM identity_providers
+WHERE id IN (
+  '07500000-0000-4000-8000-000000000230',
+  '07500000-0000-4000-8000-000000000231',
+  '07500000-0000-4000-8000-000000000232',
+  '07500000-0000-4000-8000-000000000233'
+);
+
+INSERT INTO users (
+  id, identity_id, tenant_id, display_name, role, is_active,
+  registration_source, preferred_chat_tier_revision,
+  quota_message_limit, quota_message_period, quota_messages_used,
+  quota_max_agents, quota_agent_ttl_hours
+) VALUES
+  (
+    '07500000-0000-4000-8000-000000000228',
+    '07500000-0000-4000-8000-000000000202', NULL,
+    'Tenantless Duplicate One', 'member', true, 'migration-smoke',
+    0, 50, 'permanent', 0, 2, 0
+  ),
+  (
+    '07500000-0000-4000-8000-000000000229',
+    '07500000-0000-4000-8000-000000000202', NULL,
+    'Tenantless Duplicate Two', 'member', true, 'migration-smoke',
+    0, 50, 'permanent', 0, 2, 0
+  );
+SQL
+
+set +e
+duplicate_tenantless_upgrade_output="$(.venv/bin/alembic upgrade head 2>&1)"
+duplicate_tenantless_upgrade_status=$?
+set -e
+if [ "$duplicate_tenantless_upgrade_status" -eq 0 ]; then
+  echo "revision 106 accepted duplicate tenantless memberships" >&2
+  exit 1
+fi
+case "$duplicate_tenantless_upgrade_output" in
+  *'Duplicate tenantless users(identity_id) rows must be audited before upgrade: sample_group_count=1'*) ;;
+  *)
+    echo "revision 106 did not report the sanitized tenantless-membership blocker" >&2
+    exit 1
+    ;;
+esac
+unset duplicate_tenantless_upgrade_output duplicate_tenantless_upgrade_status
+.venv/bin/alembic current | grep -F "disable_system_okr_automation"
+psql --host "$db_host" --port "$db_port" --username "$db_user" \
+  --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+DELETE FROM users
+WHERE id IN (
+  '07500000-0000-4000-8000-000000000228',
+  '07500000-0000-4000-8000-000000000229'
+);
+SQL
+
 .venv/bin/alembic upgrade head
-.venv/bin/alembic current | grep -F "alert_worker_attribution (head)"
+.venv/bin/alembic current | grep -F "sso_password_login (head)"
+assert_sso_password_security
+
+# Historical rows can contain a username that shadows another Identity's
+# email. The runtime must resolve the ownership-bearing email deterministically
+# instead of raising MultipleResultsFound or authenticating the alias owner.
+psql --host "$db_host" --port "$db_port" --username "$db_user" \
+  --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+INSERT INTO identities (
+  id, email, username, password_hash, password_login_enabled,
+  auth_version, is_active, is_platform_admin, email_verified
+) VALUES
+  (
+    '07500000-0000-4000-8000-000000000230',
+    'namespace-owner@example.test', 'namespace-owner', NULL, false,
+    0, true, false, true
+  ),
+  (
+    '07500000-0000-4000-8000-000000000231',
+    'namespace-shadow@example.test', 'namespace-owner@example.test', NULL, false,
+    0, true, false, true
+  );
+SQL
+PYTHONPATH=. .venv/bin/python - <<'PY'
+import asyncio
+
+from app.dao.identity_dao import identity_dao
+
+
+async def main() -> None:
+    identity = await identity_dao.get_by_login_identifier(
+        "namespace-owner@example.test"
+    )
+    assert identity is not None
+    assert str(identity.id) == "07500000-0000-4000-8000-000000000230"
+
+
+asyncio.run(main())
+PY
+psql --host "$db_host" --port "$db_port" --username "$db_user" \
+  --dbname "$db_name" --set ON_ERROR_STOP=1 --tuples-only --no-align <<'SQL' | grep -Fx '0|0'
+SELECT
+  (
+    SELECT count(*)
+    FROM identity_providers
+    WHERE config IS NOT NULL
+      AND pg_typeof(config)::text IN ('json', 'jsonb')
+      AND jsonb_typeof(to_jsonb(config)) IS DISTINCT FROM 'object'
+  )::text
+  || '|'
+  || (
+    SELECT count(*)
+    FROM identity_providers
+    WHERE config IS NOT NULL
+      AND pg_typeof(config)::text IN ('text', 'character varying')
+      AND CAST(config AS text) NOT LIKE 'enc:idp:v1:%'
+  )::text;
+SQL
+PYTHONPATH=. .venv/bin/python -m app.scripts.verify_identity_provider_secrets
+
+# A same-schema redeploy must authenticate existing Text envelopes before
+# maintenance. Prefix-only checks are insufficient: corrupt one copied
+# envelope, prove the candidate verifier rejects it, then restore the fixture.
+psql --host "$db_host" --port "$db_port" --username "$db_user" \
+  --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+INSERT INTO identity_providers (
+  id, provider_type, name, is_active, sso_login_enabled, config, tenant_id
+)
+SELECT
+  '07500000-0000-4000-8000-000000000234', 'tampered_envelope_probe',
+  'Tampered Envelope Probe', false, false, config || 'x', NULL
+FROM identity_providers
+WHERE id = '07500000-0000-4000-8000-000000000200';
+SQL
+set +e
+tampered_envelope_output="$(
+  PYTHONPATH=. .venv/bin/python -m app.scripts.verify_identity_provider_secrets 2>&1
+)"
+tampered_envelope_status=$?
+set -e
+if [ "$tampered_envelope_status" -eq 0 ]; then
+  echo "identity provider verifier accepted a tampered envelope" >&2
+  exit 1
+fi
+case "$tampered_envelope_output" in
+  *'identity provider secret envelope authentication or decoding failed'*) ;;
+  *)
+    echo "identity provider verifier did not report a sanitized authentication failure" >&2
+    exit 1
+    ;;
+esac
+case "$tampered_envelope_output" in
+  *'migration-secret'*)
+    echo "identity provider verifier exposed a stored credential" >&2
+    exit 1
+    ;;
+esac
+unset tampered_envelope_output tampered_envelope_status
+psql --host "$db_host" --port "$db_port" --username "$db_user" \
+  --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+DELETE FROM identity_providers
+WHERE id = '07500000-0000-4000-8000-000000000234';
+SQL
+PYTHONPATH=. .venv/bin/python -m app.scripts.verify_identity_provider_secrets
 
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
 DO $$
@@ -886,6 +1393,7 @@ SQL
 # 093 M3 route. 100 must not select it as M3's fallback and create a 2-cycle.
 .venv/bin/alembic downgrade trigger_privacy_serial
 assert_legacy_channel_config_downgraded
+assert_sso_password_security_downgraded
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
 UPDATE llm_models
 SET supports_vision = true
@@ -899,7 +1407,8 @@ INSERT INTO model_routes (
 );
 SQL
 .venv/bin/alembic upgrade head
-.venv/bin/alembic current | grep -F "alert_worker_attribution (head)"
+.venv/bin/alembic current | grep -F "sso_password_login (head)"
+assert_sso_password_security
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
 INSERT INTO llm_models (
   id, provider, model, api_key_encrypted, label, enabled, supports_vision,
@@ -1086,6 +1595,7 @@ PYTHONPATH=. .venv/bin/python ../scripts/plaza-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/channel-config-encryption-postgres-smoke.py \
   --require-legacy-fixture
 PYTHONPATH=. .venv/bin/python -m app.scripts.verify_channel_secrets
+PYTHONPATH=. .venv/bin/python -m app.scripts.verify_identity_provider_secrets
 
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
 DO $$
@@ -1429,6 +1939,7 @@ SQL
 .venv/bin/alembic downgrade add_user_chat_tier_preference
 .venv/bin/alembic current | grep -F "add_user_chat_tier_preference"
 assert_legacy_channel_config_downgraded
+assert_sso_password_security_downgraded
 PYTHONPATH=. .venv/bin/python ../scripts/code-execution-migration-postgres-smoke.py assert-secured
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
 DO $$
@@ -1520,11 +2031,13 @@ BEGIN
 END $$;
 SQL
 .venv/bin/alembic upgrade head
-.venv/bin/alembic current | grep -F "alert_worker_attribution (head)"
+.venv/bin/alembic current | grep -F "sso_password_login (head)"
+assert_sso_password_security
 PYTHONPATH=. .venv/bin/python ../scripts/code-execution-migration-postgres-smoke.py assert-secured
 PYTHONPATH=. .venv/bin/python ../scripts/channel-config-encryption-postgres-smoke.py \
   --require-legacy-fixture --legacy-only
 PYTHONPATH=. .venv/bin/python -m app.scripts.verify_channel_secrets
+PYTHONPATH=. .venv/bin/python -m app.scripts.verify_identity_provider_secrets
 
 PYTHONPATH=. .venv/bin/python ../scripts/a2a-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/media-generation-postgres-smoke.py
@@ -1549,17 +2062,20 @@ SQL
 .venv/bin/alembic downgrade seed_saas_mvp_catalog
 .venv/bin/alembic current | grep -F "seed_saas_mvp_catalog"
 assert_legacy_channel_config_downgraded
+assert_sso_password_security_downgraded
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 --tuples-only --no-align <<'SQL' | grep -Fx 'ultra|7'
 SELECT preferred_chat_tier || '|' || preferred_chat_tier_revision
 FROM users
 WHERE id = '07500000-0000-4000-8000-000000000070';
 SQL
 .venv/bin/alembic upgrade head
-.venv/bin/alembic current | grep -F "alert_worker_attribution (head)"
+.venv/bin/alembic current | grep -F "sso_password_login (head)"
+assert_sso_password_security
 PYTHONPATH=. .venv/bin/python ../scripts/code-execution-migration-postgres-smoke.py assert-secured
 PYTHONPATH=. .venv/bin/python ../scripts/channel-config-encryption-postgres-smoke.py \
   --require-legacy-fixture --legacy-only
 PYTHONPATH=. .venv/bin/python -m app.scripts.verify_channel_secrets
+PYTHONPATH=. .venv/bin/python -m app.scripts.verify_identity_provider_secrets
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 --tuples-only --no-align <<'SQL' | grep -Fx 'ultra|7'
 SELECT preferred_chat_tier || '|' || preferred_chat_tier_revision
 FROM users

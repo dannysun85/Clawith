@@ -1,16 +1,38 @@
 from types import SimpleNamespace
 
 import pytest
-from fastapi import Response
+from fastapi import HTTPException, Response
 
 from app.api import auth as auth_api
+from app.core import security as security_module
 from app.core.security import (
     BROWSER_SESSION_COOKIE,
     WEBSOCKET_APP_PROTOCOL,
+    access_token_matches_identity,
     extract_websocket_access_token,
+    identity_auth_version,
     set_browser_session_cookie,
     websocket_response_subprotocol,
 )
+
+
+class _ScalarResult:
+    def __init__(self, value):
+        self.value = value
+
+    def scalar_one_or_none(self):
+        return self.value
+
+
+class _DB:
+    def __init__(self, value):
+        self.value = value
+
+    async def execute(self, _statement):
+        return _ScalarResult(self.value)
+
+    async def commit(self):
+        return None
 
 
 def _websocket(protocols: str = "", cookie: str | None = None):
@@ -71,3 +93,98 @@ async def test_browser_session_endpoints_return_explicit_204_responses():
     deleted = await auth_api.delete_browser_session(request=request, response=Response())
     assert deleted.status_code == 204
     assert f"{BROWSER_SESSION_COOKIE}=\"\"" in deleted.headers["set-cookie"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "dependency",
+    [security_module.get_current_user, security_module.get_authenticated_user],
+)
+async def test_bearer_dependencies_reject_globally_disabled_identity(
+    monkeypatch,
+    dependency,
+):
+    user = SimpleNamespace(
+        id="00000000-0000-0000-0000-000000000001",
+        is_active=True,
+        identity=SimpleNamespace(is_active=False, auth_version=0),
+    )
+    monkeypatch.setattr(
+        security_module,
+        "decode_access_token",
+        lambda _token: {"sub": user.id, "av": 0},
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await dependency(
+            credentials=SimpleNamespace(credentials="opaque-jwt"),
+            db=_DB(user),
+        )
+
+    assert exc.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_verification_user_allows_explicit_email_pending_membership(monkeypatch):
+    user = SimpleNamespace(
+        id="00000000-0000-0000-0000-000000000002",
+        is_active=False,
+        activation_pending_email_verification=True,
+        identity=SimpleNamespace(is_active=True, auth_version=0),
+    )
+    monkeypatch.setattr(
+        security_module,
+        "decode_access_token",
+        lambda _token: {"sub": user.id, "av": 0},
+    )
+
+    result = await security_module.get_verification_user(
+        credentials=SimpleNamespace(credentials="opaque-jwt"),
+        db=_DB(user),
+    )
+
+    assert result is user
+
+
+@pytest.mark.asyncio
+async def test_authenticated_user_rejects_email_pending_membership(monkeypatch):
+    user = SimpleNamespace(
+        id="00000000-0000-0000-0000-000000000003",
+        is_active=False,
+        activation_pending_email_verification=True,
+        identity=SimpleNamespace(is_active=True, auth_version=0),
+    )
+    monkeypatch.setattr(
+        security_module,
+        "decode_access_token",
+        lambda _token: {"sub": user.id, "av": 0},
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await security_module.get_authenticated_user(
+            credentials=SimpleNamespace(credentials="opaque-jwt"),
+            db=_DB(user),
+        )
+
+    assert exc.value.status_code == 401
+
+
+@pytest.mark.parametrize(
+    ("payload", "identity"),
+    [
+        ({"sub": "user-id"}, SimpleNamespace(auth_version=0)),
+        ({"sub": "user-id", "av": 0}, SimpleNamespace()),
+        ({"sub": "user-id", "av": 0}, SimpleNamespace(auth_version=1)),
+        ({"sub": "user-id", "av": -1}, SimpleNamespace(auth_version=-1)),
+    ],
+)
+def test_access_token_requires_an_exact_explicit_non_negative_auth_version(
+    payload,
+    identity,
+):
+    assert access_token_matches_identity(payload, identity) is False
+
+
+def test_token_issuance_rejects_identity_without_auth_version():
+    with pytest.raises(ValueError, match="auth_version"):
+        identity_auth_version(SimpleNamespace())

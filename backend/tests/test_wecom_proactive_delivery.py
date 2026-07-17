@@ -80,7 +80,9 @@ async def test_wecom_customer_service_webhook_configuration_allows_empty_agent_i
     monkeypatch,
 ):
     agent_id = uuid.uuid4()
-    agent = SimpleNamespace()
+    tenant_id = uuid.uuid4()
+    agent = SimpleNamespace(tenant_id=tenant_id)
+    provision_provider = AsyncMock()
     monkeypatch.setattr(
         wecom,
         "check_agent_access",
@@ -88,6 +90,11 @@ async def test_wecom_customer_service_webhook_configuration_allows_empty_agent_i
     )
     monkeypatch.setattr(wecom, "is_agent_creator", lambda _user, _agent: True)
     monkeypatch.setattr(wecom.asyncio, "create_task", lambda coroutine: coroutine.close())
+    monkeypatch.setattr(
+        wecom.channel_user_service,
+        "provision_provider_for_config",
+        provision_provider,
+    )
     db = AsyncMock()
     existing = SimpleNamespace(
         id=uuid.uuid4(),
@@ -123,6 +130,11 @@ async def test_wecom_customer_service_webhook_configuration_allows_empty_agent_i
 
     assert result.extra_config["connection_mode"] == "webhook"
     assert result.extra_config["wecom_agent_id"] == ""
+    provision_provider.assert_awaited_once_with(
+        db,
+        channel_type="wecom",
+        tenant_id=tenant_id,
+    )
 
 
 @pytest.mark.asyncio

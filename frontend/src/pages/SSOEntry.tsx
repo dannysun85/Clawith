@@ -73,9 +73,15 @@ export default function SSOEntry() {
             if (cancelled) return;
             try {
                 setPolling(true);
-                const res = await fetchJson<any>(`/sso/session/${sid}/status`);
+                let res = await fetchJson<any>(`/sso/session/${sid}/status`);
+                if (res?.status === 'authorized') {
+                    res = await fetchJson<any>(`/sso/session/${sid}/consume`, {
+                        method: 'POST',
+                        headers: { 'X-Astra-SSO-Session': sid },
+                    });
+                }
                 if (res?.access_token && res?.user) {
-                    setAuth(res.user, res.access_token);
+                    await setAuth(res.user, res.access_token);
                     if (res.user && !res.user.tenant_id) {
                         navigate('/setup-company');
                     } else {

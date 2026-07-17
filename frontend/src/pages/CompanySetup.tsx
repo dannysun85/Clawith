@@ -51,7 +51,7 @@ export default function CompanySetup() {
         try {
             const me = await authApi.me();
             const token = useAuthStore.getState().token;
-            if (token) setAuth(me, token);
+            if (token) await setAuth(me, token);
             return me;
         } catch { return null; }
     };
@@ -65,7 +65,7 @@ export default function CompanySetup() {
                 window.dispatchEvent(new StorageEvent('storage', { key: 'current_tenant_id', newValue: nextTenantId }));
             }
             const me = await authApi.me();
-            setAuth(me, result.access_token);
+            await setAuth(me, result.access_token);
             return me;
         }
         if (nextTenantId) {

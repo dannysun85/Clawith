@@ -23,7 +23,26 @@ def test_revision_ids_fit_the_default_alembic_version_column() -> None:
 
 
 def test_release_migration_graph_has_one_expected_head() -> None:
-    assert _script_directory().get_heads() == ["alert_worker_attribution"]
+    assert _script_directory().get_heads() == ["sso_password_login"]
+
+
+def test_sso_password_migration_is_fail_closed_and_non_destructive() -> None:
+    migration = (
+        BACKEND_ROOT / "alembic/versions/106_secure_sso_password_login.py"
+    ).read_text(encoding="utf-8")
+
+    assert "password_login_enabled" in migration
+    assert "auth_version" in migration
+    assert "activation_pending_email_verification" in migration
+    assert "bcrypt.checkpw" not in migration
+    assert "registration_source" in migration
+    assert "SET password_hash = NULL" not in migration
+    assert "No password hashes are destroyed by upgrade" in migration
+    assert "om.provider_id IS NOT NULL" in migration
+    assert "ck_identities_email_canonical" in migration
+    assert "uq_users_identity_tenant" in migration
+    assert "uq_users_identity_tenantless" in migration
+    assert "Duplicate tenantless users(identity_id) rows must be audited" in migration
 
 
 def test_model_route_migration_guards_live_model_ownership_and_capability() -> None:

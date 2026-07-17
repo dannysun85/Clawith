@@ -120,9 +120,12 @@ async def test_switch_tenant_sso_toggle():
     import uuid
 
     target_tenant_id = uuid.uuid4()
-    target_user = SimpleNamespace(id=uuid.uuid4(), role="member")
+    target_user = SimpleNamespace(id=uuid.uuid4(), role="member", is_active=True)
     tenant = SimpleNamespace(id=target_tenant_id, slug="acme", sso_domain="https://acme.com", is_active=True)
-    current_user = SimpleNamespace(identity_id=uuid.uuid4())
+    current_user = SimpleNamespace(
+        identity_id=uuid.uuid4(),
+        identity=SimpleNamespace(auth_version=0),
+    )
     data = TenantSwitchRequest(tenant_id=target_tenant_id)
     request = MagicMock()
 

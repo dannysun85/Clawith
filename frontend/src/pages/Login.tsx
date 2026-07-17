@@ -3,6 +3,10 @@ import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useAuthStore } from '../stores';
 import { authApi, tenantApi, fetchJson } from '../services/api';
+import {
+    createTenantSsoAuthorization,
+    loadTenantSsoProviders,
+} from '../services/ssoLogin';
 import type { TokenResponse } from '../types';
 import {
     IconAlertTriangle,
@@ -23,7 +27,6 @@ export default function Login() {
     const [error, setError] = useState('');
     const [successMessage, setSuccessMessage] = useState('');
     const [loading, setLoading] = useState(false);
-    const [checkingEmail, setCheckingEmail] = useState(!!invitationCode && !!invitedEmail);
     const [tenant, setTenant] = useState<any>(null);
     const [resolving, setResolving] = useState(true);
     const [ssoProviders, setSsoProviders] = useState<any[]>([]);
@@ -52,27 +55,6 @@ export default function Login() {
         authApi.registrationConfig()
             .then(config => setRegistrationCodeRequired(!!config.invitation_code_required))
             .catch(() => setRegistrationCodeRequired(true));
-
-        // If arriving via invitation link with email, check whether the email is already registered
-        // to decide whether to show login or register form.
-        if (invitationCode && invitedEmail) {
-            setCheckingEmail(true);
-            fetch('/api/enterprise/check-email-exists', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ email: invitedEmail }),
-            })
-                .then(r => r.json())
-                .then((res: { exists: boolean }) => {
-                    // If email already registered → show login form; otherwise show register form
-                    setIsRegister(!res.exists);
-                })
-                .catch(() => {
-                    // On error, fall back to register form (safe default)
-                    setIsRegister(true);
-                })
-                .finally(() => setCheckingEmail(false));
-        }
 
         // Resolve tenant by domain (for SSO detection only, not for login form)
         const domain = window.location.host;
@@ -131,8 +113,7 @@ export default function Login() {
         setSsoLoading(true);
         setSsoError('');
 
-        fetchJson<{ session_id: string }>(`/sso/session?tenant_id=${tenant.id}`, { method: 'POST' })
-            .then(res => fetchJson<any[]>(`/sso/config?sid=${res.session_id}`))
+        loadTenantSsoProviders(tenant.id)
             .then(providers => {
                 if (cancelled) return;
                 setSsoProviders(providers || []);
@@ -176,7 +157,7 @@ export default function Login() {
         try {
             const res = await authApi.verifyEmail(token);
             if (res.access_token && res.user) {
-                setAuth(res.user, res.access_token);
+                await setAuth(res.user, res.access_token);
             }
 
             if (res.needs_company_setup) {
@@ -196,7 +177,7 @@ export default function Login() {
 
             navigate('/');
         } catch (err: any) {
-            setError(err.message || (isZh ? '验证码无效或已过期' : 'The verification code is invalid or expired.'));
+            setError(err.message || (isZh ? '验证凭证无效或已过期' : 'The verification token is invalid or expired.'));
         } finally {
             setLoading(false);
         }
@@ -212,9 +193,9 @@ export default function Login() {
 
         try {
             await authApi.resendVerification(email);
-            setSuccessMessage(isZh ? `新的验证码已发送到 ${email}` : `A new code has been sent to ${email}.`);
+            setSuccessMessage(isZh ? `新的验证凭证已发送到 ${email}` : `A new verification token has been sent to ${email}.`);
         } catch (err: any) {
-            setError(err.message || (isZh ? '发送验证码失败' : 'Failed to resend the verification code.'));
+            setError(err.message || (isZh ? '发送验证凭证失败' : 'Failed to resend the verification token.'));
         } finally {
             setLoading(false);
         }
@@ -243,7 +224,7 @@ export default function Login() {
                 });
                 // Save authentication state for company selection (user not active yet)
                 if (regRes.access_token && regRes.user) {
-                    setAuth(regRes.user, regRes.access_token);
+                    await setAuth(regRes.user, regRes.access_token);
                 }
                 if (regRes.user?.email_verified || regRes.user?.is_active) {
                     if (invitationCode) {
@@ -260,8 +241,8 @@ export default function Login() {
                 enterVerificationStep(regRes.email || form.login_identifier, invitationCode ? 'join' : 'create');
                 setSuccessMessage(
                     i18n.language.startsWith('zh')
-                        ? `验证码已发送到 ${regRes.email || form.login_identifier}`
-                        : `A verification code has been sent to ${regRes.email || form.login_identifier}.`
+                        ? `验证凭证已发送到 ${regRes.email || form.login_identifier}`
+                        : `A verification token has been sent to ${regRes.email || form.login_identifier}.`
                 );
                 return;
             } else {
@@ -285,7 +266,7 @@ export default function Login() {
                 }
 
                 const tokenRes = res as TokenResponse;
-                setAuth(tokenRes.user, tokenRes.access_token);
+                await setAuth(tokenRes.user, tokenRes.access_token);
 
                 // If the user arrived via an invitation link, join the invited company
                 // before redirecting. The /tenants/join endpoint handles:
@@ -300,7 +281,7 @@ export default function Login() {
                             // the subsequent /auth/me call uses the correct context.
                             localStorage.setItem('token', joinRes.access_token);
                             const meRes = await authApi.me();
-                            setAuth(meRes, joinRes.access_token);
+                            await setAuth(meRes, joinRes.access_token);
                         }
                         navigate('/onboarding?mode=join');
                         return;
@@ -325,8 +306,8 @@ export default function Login() {
                 enterVerificationStep(err.detail.email || form.login_identifier, 'home');
                 setSuccessMessage(
                     i18n.language.startsWith('zh')
-                        ? `请先输入发送到 ${err.detail.email || form.login_identifier} 的验证码。`
-                        : `Enter the verification code sent to ${err.detail.email || form.login_identifier}.`
+                        ? `请先输入发送到 ${err.detail.email || form.login_identifier} 的验证凭证。`
+                        : `Enter the verification token sent to ${err.detail.email || form.login_identifier}.`
                 );
                 return;
             }
@@ -377,7 +358,7 @@ export default function Login() {
             }
 
             const tokenRes = res as TokenResponse;
-            setAuth(tokenRes.user, tokenRes.access_token);
+            await setAuth(tokenRes.user, tokenRes.access_token);
             if (tokenRes.user?.role === 'platform_admin' || tokenRes.user?.is_platform_admin) {
                 navigate('/admin/platform-settings');
             } else if (tokenRes.user && !tokenRes.user.tenant_id) {
@@ -415,6 +396,25 @@ export default function Login() {
         }
     };
 
+    const startSsoLogin = async (providerType: string) => {
+        if (!tenant?.id) return;
+        setSsoLoading(true);
+        setSsoError('');
+        try {
+            const authorizationUrl = await createTenantSsoAuthorization(
+                tenant.id,
+                providerType,
+            );
+            window.location.href = authorizationUrl;
+        } catch (err: any) {
+            setSsoError(
+                err.message || t('auth.ssoLoadFailed', 'Failed to start SSO login.'),
+            );
+        } finally {
+            setSsoLoading(false);
+        }
+    };
+
     const shouldShowGlobalOAuth = !tenant?.sso_enabled && !isRegister && !showVerification;
 
     return (
@@ -438,16 +438,6 @@ export default function Login() {
                 {/* ── Right: Form Panel ── */}
                 <div className="atlas-screen-form atlas-login-form-pane">
                     <div className="atlas-login-form-wrapper">
-                    {checkingEmail ? (
-                        // While resolving invitation email, show a minimal loading indicator
-                        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: '200px', gap: '16px' }}>
-                            <span className="login-spinner" style={{ width: 24, height: 24 }} />
-                            <span style={{ fontSize: '13px', color: 'var(--text-tertiary)' }}>
-                                {t('auth.checkingInvitation', 'Checking invitation...')}
-                            </span>
-                        </div>
-                    ) : (
-                    <>
                     <div className="login-form-header">
                         <h2 className="login-form-title">
                             {showVerification
@@ -457,8 +447,8 @@ export default function Login() {
                         <p className="login-form-subtitle">
                             {showVerification
                                 ? (isZh
-                                    ? `输入发送到 ${verificationEmail || form.login_identifier} 的验证码。`
-                                    : `Enter the verification code sent to ${verificationEmail || form.login_identifier}.`)
+                                    ? `输入发送到 ${verificationEmail || form.login_identifier} 的验证凭证。`
+                                    : `Enter the verification token sent to ${verificationEmail || form.login_identifier}.`)
                                 : (isRegister ? t('auth.subtitleRegister') : t('auth.subtitleLogin'))}
                         </p>
                     </div>
@@ -515,6 +505,8 @@ export default function Login() {
                                             <button
                                                 key={p.provider_type}
                                                 className="login-submit"
+                                                type="button"
+                                                disabled={ssoLoading}
                                                 style={{
                                                     background: 'var(--bg-secondary)',
                                                     color: 'var(--text-primary)',
@@ -524,7 +516,7 @@ export default function Login() {
                                                     gap: '10px',
                                                     border: '1px solid var(--border-subtle)',
                                                 }}
-                                                onClick={() => window.location.href = p.url}
+                                                onClick={() => startSsoLogin(p.provider_type)}
                                             >
                                                 {meta.icon ? (
                                                     <img src={meta.icon} alt={meta.label} width={18} height={18} />
@@ -627,16 +619,17 @@ export default function Login() {
                     {showVerification ? (
                         <form onSubmit={handleVerifyEmail} className="login-form">
                             <div className="login-field">
-                                <label>{isZh ? '邮箱验证码' : 'Verification code'}</label>
+                                <label>{isZh ? '邮箱验证凭证' : 'Verification token'}</label>
                                 <input
                                     type="text"
                                     value={verificationCode}
                                     onChange={(e) => setVerificationCode(e.target.value)}
                                     required
                                     autoFocus
-                                    inputMode="numeric"
+                                    inputMode="text"
                                     autoComplete="one-time-code"
-                                    placeholder={isZh ? '输入验证码' : 'Enter code'}
+                                    maxLength={512}
+                                    placeholder={isZh ? '粘贴邮件中的验证凭证' : 'Paste the token from your email'}
                                 />
                             </div>
 
@@ -653,7 +646,7 @@ export default function Login() {
 
                             <div className="login-verification-actions">
                                 <button type="button" onClick={handleResendVerification} disabled={loading}>
-                                    {isZh ? '重新发送验证码' : 'Resend code'}
+                                    {isZh ? '重新发送验证凭证' : 'Resend token'}
                                 </button>
                                 <button
                                     type="button"
@@ -819,7 +812,7 @@ export default function Login() {
                                                 tenant_id: firstTenant.tenant_id,
                                             });
                                             const tokenRes = res as TokenResponse;
-                                            setAuth(tokenRes.user, tokenRes.access_token);
+                                            await setAuth(tokenRes.user, tokenRes.access_token);
                                             setTenantSelection(null);
                                             navigate('/setup-company?from=tenant-selection');
                                         } catch (err: any) {
@@ -889,8 +882,6 @@ export default function Login() {
                             {isRegister ? t('auth.goLogin') : t('auth.goRegister')}
                         </a>
                     </div>
-                    )}
-                    </>
                     )}
                     </div>
                 </div>

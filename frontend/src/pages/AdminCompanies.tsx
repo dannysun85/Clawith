@@ -479,6 +479,7 @@ function PlatformTab() {
             })
             .catch(() => { });
 
+        const configuredSecretPlaceholder = '••••••••';
         fetchJson<any[]>('/enterprise/identity-providers?global_only=true')
             .then(items => {
                 const mapped = items.reduce((acc, item) => {
@@ -490,7 +491,9 @@ function PlatformTab() {
                             is_active: !!item.is_active,
                             config: item.config || {},
                             client_id: item.config?.client_id || item.config?.app_id || '',
-                            client_secret: item.config?.client_secret || item.config?.app_secret || '',
+                            client_secret: (item.config?._configured_secret_fields || []).some(
+                                (key: string) => ['client_secret', 'app_secret'].includes(key)
+                            ) ? configuredSecretPlaceholder : '',
                             scope: item.config?.scope || socialProviderMeta[item.provider_type as 'google' | 'github'].scope,
                         };
                     }
@@ -652,7 +655,12 @@ function PlatformTab() {
 
     const saveOauthProvider = async (providerType: 'google' | 'github') => {
         const provider = oauthProviders[providerType];
-        if (!provider?.client_id?.trim() || !provider?.client_secret?.trim()) {
+        const configuredSecretPlaceholder = '••••••••';
+        const keepsStoredSecret = provider?.client_secret === configuredSecretPlaceholder;
+        if (
+            !provider?.client_id?.trim()
+            || (!keepsStoredSecret && !provider?.client_secret?.trim())
+        ) {
             showToast(`${socialProviderMeta[providerType].name} Client ID and Client Secret are required`, 'error');
             return;
         }
@@ -662,11 +670,14 @@ function PlatformTab() {
             provider_type: providerType,
             name: socialProviderMeta[providerType].name,
             is_active: !!provider.is_active,
+            sso_login_enabled: !!provider.is_active,
             config: {
                 app_id: provider.client_id.trim(),
                 client_id: provider.client_id.trim(),
-                app_secret: provider.client_secret.trim(),
-                client_secret: provider.client_secret.trim(),
+                ...(!keepsStoredSecret ? {
+                    app_secret: provider.client_secret.trim(),
+                    client_secret: provider.client_secret.trim(),
+                } : {}),
                 scope: provider.scope?.trim() || socialProviderMeta[providerType].scope,
             },
         };
@@ -678,6 +689,7 @@ function PlatformTab() {
                     body: JSON.stringify({
                         name: payload.name,
                         is_active: payload.is_active,
+                        sso_login_enabled: payload.sso_login_enabled,
                         config: payload.config,
                     }),
                 })

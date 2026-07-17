@@ -129,7 +129,13 @@ def decrypt_data(ciphertext: str, key: str) -> str:
 
 
 
-def create_access_token(user_id: str, role: str, expires_delta: timedelta | None = None) -> str:
+def create_access_token(
+    user_id: str,
+    role: str,
+    expires_delta: timedelta | None = None,
+    *,
+    auth_version: int,
+) -> str:
     """Create a JWT access token."""
     expire = datetime.now(timezone.utc) + (
         expires_delta or timedelta(minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -137,6 +143,7 @@ def create_access_token(user_id: str, role: str, expires_delta: timedelta | None
     to_encode = {
         "sub": user_id,
         "role": role,
+        "av": max(0, int(auth_version)),
         "exp": expire,
     }
     return jwt.encode(to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
@@ -152,6 +159,34 @@ def decode_access_token(token: str) -> dict:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired token",
         )
+
+
+def access_token_matches_identity(payload: dict, identity: object) -> bool:
+    """Return whether a JWT predates the Identity's latest revocation event."""
+
+    try:
+        if "av" not in payload or not hasattr(identity, "auth_version"):
+            return False
+        token_version = int(payload["av"])
+        identity_version = int(identity.auth_version)
+    except (TypeError, ValueError):
+        return False
+    return token_version >= 0 and identity_version >= 0 and token_version == identity_version
+
+
+def identity_auth_version(user_or_identity: object) -> int:
+    """Read an Identity revocation version from an Identity or loaded User."""
+
+    identity = getattr(user_or_identity, "identity", None) or user_or_identity
+    if not hasattr(identity, "auth_version"):
+        raise ValueError("Identity auth_version is required before issuing an access token")
+    try:
+        version = int(identity.auth_version)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Identity auth_version must be a non-negative integer") from exc
+    if version < 0:
+        raise ValueError("Identity auth_version must be a non-negative integer")
+    return version
 
 
 def _request_is_secure(request: Request | None) -> bool:
@@ -221,7 +256,8 @@ async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: AsyncSession = Depends(get_db),
 ):
-    """Dependency to get the current authenticated and active user."""
+    """Require an active account in an active tenant for business APIs."""
+    from app.models.tenant import Tenant
     from app.models.user import User
 
     payload = decode_access_token(credentials.credentials)
@@ -229,14 +265,35 @@ async def get_current_user(
     if not user_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
+    try:
+        parsed_user_id = uuid.UUID(user_id)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token") from exc
+
     result = await db.execute(
         select(User)
-        .where(User.id == uuid.UUID(user_id))
+        .where(User.id == parsed_user_id)
         .options(selectinload(User.identity))
     )
     user = result.scalar_one_or_none()
-    if not user or not user.is_active:
+    if (
+        not user
+        or not user.is_active
+        or not user.identity
+        or not user.identity.is_active
+        or not access_token_matches_identity(payload, user.identity)
+    ):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
+    if user.tenant_id is not None:
+        tenant = await db.get(Tenant, user.tenant_id)
+        if not tenant or not tenant.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Organization is unavailable",
+            )
+    # Authentication is a read-only preflight. Release the pooled connection
+    # before the endpoint performs CPU work or external network I/O.
+    await db.commit()
     return user
 
 
@@ -244,7 +301,12 @@ async def get_authenticated_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: AsyncSession = Depends(get_db),
 ):
-    """Dependency to get the current authenticated user (even if not active yet)."""
+    """Require an active account, without requiring the current tenant to be active.
+
+    This narrow dependency exists for account recovery operations such as
+    listing and switching memberships. Business APIs must use
+    ``get_current_user`` so tenant suspension remains authoritative.
+    """
     from app.models.user import User
 
     payload = decode_access_token(credentials.credentials)
@@ -252,14 +314,58 @@ async def get_authenticated_user(
     if not user_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
+    try:
+        parsed_user_id = uuid.UUID(user_id)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token") from exc
+
     result = await db.execute(
         select(User)
-        .where(User.id == uuid.UUID(user_id))
+        .where(User.id == parsed_user_id)
         .options(selectinload(User.identity))
     )
     user = result.scalar_one_or_none()
-    if not user:
+    if (
+        not user
+        or not user.is_active
+        or not user.identity
+        or not user.identity.is_active
+        or not access_token_matches_identity(payload, user.identity)
+    ):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+    await db.commit()
+    return user
+
+
+async def get_verification_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: AsyncSession = Depends(get_db),
+):
+    """Allow only active users or explicit email-verification-pending users."""
+    from app.models.user import User
+
+    payload = decode_access_token(credentials.credentials)
+    user_id = payload.get("sub")
+    try:
+        parsed_user_id = uuid.UUID(user_id)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token") from exc
+
+    result = await db.execute(
+        select(User)
+        .where(User.id == parsed_user_id)
+        .options(selectinload(User.identity))
+    )
+    user = result.scalar_one_or_none()
+    if (
+        not user
+        or not user.identity
+        or not user.identity.is_active
+        or not access_token_matches_identity(payload, user.identity)
+        or not (user.is_active or user.activation_pending_email_verification)
+    ):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+    await db.commit()
     return user
 
 

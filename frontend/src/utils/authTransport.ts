@@ -17,15 +17,15 @@ export function buildWorkspaceDownloadUrl(
     return `${API_BASE}/agents/${agentId}/files/download?${params.toString()}`;
 }
 
-export function establishBrowserSession(token: string): void {
-    void fetch(`${API_BASE}/auth/browser-session`, {
+export async function establishBrowserSession(token: string): Promise<void> {
+    const response = await fetch(`${API_BASE}/auth/browser-session`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` },
         credentials: 'same-origin',
-    }).catch(() => {
-        // API Bearer auth and the WebSocket subprotocol remain available. A
-        // later setAuth call retries cookie establishment.
     });
+    if (!response.ok) {
+        throw new Error(`Browser session could not be established (HTTP ${response.status})`);
+    }
 }
 
 export function clearBrowserSession(): void {
@@ -54,4 +54,17 @@ export function consumeSessionTokenFromUrl(url: URL, pathsWithOwnToken: string[]
         if (token) url.searchParams.delete('token');
     }
     return token;
+}
+
+export function normalizeTenantRedirectUrl(redirectUrl: string, currentHref: string): string {
+    const currentUrl = new URL(currentHref);
+    const targetUrl = new URL(redirectUrl, currentUrl.origin);
+    if (targetUrl.hostname === currentUrl.hostname) {
+        targetUrl.protocol = currentUrl.protocol;
+        targetUrl.port = currentUrl.port;
+    }
+    targetUrl.pathname = '/';
+    // Deliberately preserve #session_token: it is the only credential transport
+    // available to a different origin and is consumed before protected UI renders.
+    return targetUrl.toString();
 }

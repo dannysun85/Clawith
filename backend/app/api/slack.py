@@ -6,7 +6,7 @@ import time
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -54,6 +54,10 @@ async def configure_slack_channel(
             raise HTTPException(status_code=422, detail="bot_token and signing_secret are required")
         existing.is_configured = True
         await db.flush()
+        from app.services.channel_user_service import channel_user_service
+        await channel_user_service.provision_provider_for_config(
+            db, channel_type="slack", tenant_id=agent.tenant_id
+        )
         return ChannelConfigOut.model_validate(existing)
 
     if not bot_token or not signing_secret:
@@ -68,6 +72,10 @@ async def configure_slack_channel(
     )
     db.add(config)
     await db.flush()
+    from app.services.channel_user_service import channel_user_service
+    await channel_user_service.provision_provider_for_config(
+        db, channel_type="slack", tenant_id=agent.tenant_id
+    )
     return ChannelConfigOut.model_validate(config)
 
 

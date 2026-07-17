@@ -4,8 +4,16 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from sqlalchemy import inspect
+from sqlalchemy.ext.mutable import MutableDict
+from sqlalchemy.orm import attributes
 
-from app.services.auth_provider import DingTalkAuthProvider, FeishuAuthProvider
+from app.models.identity import IdentityProvider
+from app.services.auth_provider import (
+    DingTalkAuthProvider,
+    FeishuAuthProvider,
+    GoogleWorkspaceAuthProvider,
+)
 from app.services.auth_registry import AuthProviderRegistry
 from app.services.identity_provider_lookup import get_preferred_identity_provider
 from app.services.google_workspace_oauth import (
@@ -115,7 +123,7 @@ async def test_dingtalk_user_info_rejects_null_payload_with_clear_error():
 
 
 @pytest.mark.asyncio
-async def test_identity_provider_lookup_tolerates_duplicate_rows():
+async def test_identity_provider_lookup_fails_closed_on_duplicate_rows():
     older = SimpleNamespace(
         id=uuid.uuid4(),
         provider_type="google_workspace",
@@ -143,7 +151,8 @@ async def test_identity_provider_lookup_tolerates_duplicate_rows():
         is_active=True,
     )
 
-    assert provider is newer
+    assert provider is None
+    assert db._responses == []
 
 
 @pytest.mark.asyncio
@@ -198,3 +207,49 @@ def test_google_workspace_legacy_sso_state_still_parses():
     parsed = parse_google_oauth_state(state)
 
     assert parsed == (GOOGLE_SSO_STATE_KIND, (sid,))
+
+
+@pytest.mark.asyncio
+async def test_google_authorization_url_never_mutates_orm_provider_config():
+    provider = IdentityProvider(
+        provider_type="google_workspace",
+        name="Google Workspace",
+        is_active=True,
+        config={"client_id": "client-id", "client_secret": "old-secret"},
+    )
+    attributes.set_committed_value(
+        provider,
+        "config",
+        MutableDict({"client_id": "client-id", "client_secret": "old-secret"}),
+    )
+    auth_provider = GoogleWorkspaceAuthProvider(provider=provider)
+
+    await auth_provider.get_authorization_url("https://astra.example/callback", "state")
+
+    assert auth_provider.config is not provider.config
+    assert "redirect_uri" not in auth_provider.config
+    assert "redirect_uri" not in provider.config
+    assert inspect(provider).attrs.config.history.has_changes() is False
+
+
+@pytest.mark.asyncio
+async def test_stale_google_authorization_request_cannot_roll_back_new_secret():
+    provider = IdentityProvider(
+        provider_type="google_workspace",
+        name="Google Workspace",
+        is_active=True,
+        config={"client_id": "client-id", "client_secret": "old-secret"},
+    )
+    stale_request = GoogleWorkspaceAuthProvider(provider=provider)
+    provider.config = {"client_id": "client-id", "client_secret": "new-secret"}
+
+    await stale_request.get_admin_authorization_url(
+        "https://astra.example/callback",
+        "state",
+    )
+
+    assert provider.config == {
+        "client_id": "client-id",
+        "client_secret": "new-secret",
+    }
+    assert "redirect_uri" not in provider.config

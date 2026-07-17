@@ -1,4 +1,6 @@
 import contextlib
+import asyncio
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -13,7 +15,11 @@ from app.api.notification import BroadcastRequest, broadcast_notification
 from app.core.security import verify_password, hash_password
 from app.models.user import User
 from app.schemas.schemas import ForgotPasswordRequest, ResetPasswordRequest
-from app.services import password_reset_service, system_email_service
+from app.services import (
+    email_verification_service,
+    password_reset_service,
+    system_email_service,
+)
 from app.dao import system_setting_dao
 from app.database import transaction
 
@@ -21,6 +27,11 @@ from app.database import transaction
 async def run_with_db(db, func, *args, **kwargs):
     async with transaction(db):
         return await func(*args, **kwargs)
+
+
+@pytest.fixture(autouse=True)
+def _stub_auth_rate_limit(monkeypatch):
+    monkeypatch.setattr(auth_api, "enforce_auth_rate_limit", AsyncMock())
 
 
 @pytest.mark.asyncio
@@ -103,6 +114,95 @@ class MockRedis:
         self.setex_calls.append((key, ttl, value))
         self._data[key] = value
 
+    async def eval(self, script, numkeys, *values):
+        if script == email_verification_service._CREATE_TOKEN_SCRIPT:
+            assert numkeys == 2
+            user_key, token_key, token_prefix, ttl, token_data, token_hash = values
+            old_token_hash = self._data.get(user_key)
+            if old_token_hash:
+                old_token_key = f"{token_prefix}{old_token_hash}"
+                self.deleted.append(old_token_key)
+                self._data.pop(old_token_key, None)
+            self.setex_calls.extend(
+                [
+                    (token_key, ttl, token_data),
+                    (user_key, ttl, token_hash),
+                ]
+            )
+            self._data[token_key] = token_data
+            self._data[user_key] = token_hash
+            return 1
+
+        if script == email_verification_service._CONSUME_TOKEN_SCRIPT:
+            assert numkeys == 1
+            token_key, user_prefix, token_hash = values
+            token_data = self._data.pop(token_key, None)
+            if token_data is None:
+                return None
+            self.deleted.append(token_key)
+            identity_id = json.loads(token_data)["identity_id"]
+            user_key = f"{user_prefix}{identity_id}"
+            if self._data.get(user_key) == token_hash:
+                self._data.pop(user_key, None)
+                self.deleted.append(user_key)
+            return token_data
+
+        if script == email_verification_service._INVALIDATE_TOKEN_SCRIPT:
+            assert numkeys == 1
+            user_key, token_prefix = values
+            token_hash = self._data.pop(user_key, None)
+            self.deleted.append(user_key)
+            if token_hash:
+                token_key = f"{token_prefix}{token_hash}"
+                self._data.pop(token_key, None)
+                self.deleted.append(token_key)
+            return 1
+
+        if script == password_reset_service._CREATE_TOKEN_SCRIPT:
+            assert numkeys == 2
+            user_key, token_key, token_prefix, ttl, token_data, token_hash = values
+            old_token_hash = self._data.get(user_key)
+            if old_token_hash:
+                old_token_key = f"{token_prefix}{old_token_hash}"
+                self.deleted.append(old_token_key)
+                self._data.pop(old_token_key, None)
+            self.setex_calls.extend(
+                [
+                    (token_key, ttl, token_data),
+                    (user_key, ttl, token_hash),
+                ]
+            )
+            self._data[token_key] = token_data
+            self._data[user_key] = token_hash
+            return 1
+
+        if script == password_reset_service._CONSUME_TOKEN_SCRIPT:
+            assert numkeys == 1
+            token_key, user_prefix, token_hash = values
+            token_data = self._data.pop(token_key, None)
+            if token_data is None:
+                return None
+            self.deleted.append(token_key)
+            identity_id = json.loads(token_data)["identity_id"]
+            user_key = f"{user_prefix}{identity_id}"
+            if self._data.get(user_key) == token_hash:
+                self._data.pop(user_key, None)
+                self.deleted.append(user_key)
+            return token_data
+
+        if script == password_reset_service._INVALIDATE_TOKEN_SCRIPT:
+            assert numkeys == 1
+            user_key, token_prefix = values
+            token_hash = self._data.pop(user_key, None)
+            self.deleted.append(user_key)
+            if token_hash:
+                token_key = f"{token_prefix}{token_hash}"
+                self._data.pop(token_key, None)
+                self.deleted.append(token_key)
+            return 1
+
+        raise AssertionError("unexpected Redis script")
+
     def pipeline(self, transaction=True):
         return MockPipeline(self)
 
@@ -133,18 +233,197 @@ class RecordingDB:
 
 
 def make_user(**overrides):
+    auth_version = overrides.pop("auth_version", 0)
     values = {
         "id": uuid.uuid4(),
         "username": "alice",
         "email": "alice@example.com",
         "password_hash": "old-hash",
+        "password_login_enabled": True,
         "display_name": "Alice",
         "role": "member",
         "tenant_id": uuid.uuid4(),
         "is_active": True,
     }
     values.update(overrides)
-    return User(**values)
+    user = User(**values)
+    user.identity.auth_version = auth_version
+    # SQLAlchemy column defaults are applied on flush; this factory is used
+    # without a database round-trip, so model the persisted global state.
+    user.identity.is_active = True
+    return user
+
+
+@pytest.mark.asyncio
+async def test_email_verification_resend_invalidates_older_code_atomically(monkeypatch):
+    identity_id = uuid.uuid4()
+    old_hash = "old-email-code-hash"
+    mock_redis = MockRedis(
+        initial_data={
+            f"email_verify:user:{identity_id}": old_hash,
+            f"email_verify:token:{old_hash}": "old-token-data",
+        }
+    )
+
+    async def fake_get_redis():
+        return mock_redis
+
+    monkeypatch.setattr(email_verification_service, "get_redis", fake_get_redis)
+    monkeypatch.setattr(
+        email_verification_service.secrets,
+        "token_urlsafe",
+        lambda _length: "secure-email-verification-nonce-1234567890",
+    )
+    monkeypatch.setattr(
+        email_verification_service,
+        "get_settings",
+        lambda: SimpleNamespace(EMAIL_VERIFICATION_TOKEN_EXPIRE_MINUTES=15),
+    )
+
+    raw_token, _expires_at = (
+        await email_verification_service.email_verification_service.create_email_verification_token(
+            identity_id,
+            "alice@example.com",
+        )
+    )
+
+    assert raw_token == (
+        f"{identity_id}.secure-email-verification-nonce-1234567890"
+    )
+    assert f"email_verify:token:{old_hash}" in mock_redis.deleted
+    current_hash = mock_redis._data[f"email_verify:user:{identity_id}"]
+    assert set(key for key in mock_redis._data if key.startswith("email_verify:token:")) == {
+        f"email_verify:token:{current_hash}"
+    }
+
+
+@pytest.mark.asyncio
+async def test_email_verification_code_is_exactly_once_under_concurrency(monkeypatch):
+    identity_id = uuid.uuid4()
+    raw_token = f"{identity_id}.secure-email-verification-nonce-1234567890"
+    token_hash = email_verification_service.email_verification_service._hash_token(raw_token)
+    token_data = json.dumps(
+        {"identity_id": str(identity_id), "email": "alice@example.com"}
+    )
+    mock_redis = MockRedis(
+        initial_data={
+            f"email_verify:token:{token_hash}": token_data,
+            f"email_verify:user:{identity_id}": token_hash,
+        }
+    )
+
+    async def fake_get_redis():
+        return mock_redis
+
+    monkeypatch.setattr(email_verification_service, "get_redis", fake_get_redis)
+
+    results = await asyncio.gather(
+        email_verification_service.email_verification_service.consume_email_verification_token(
+            raw_token
+        ),
+        email_verification_service.email_verification_service.consume_email_verification_token(
+            raw_token
+        ),
+    )
+
+    assert sum(result is not None for result in results) == 1
+    consumed = next(result for result in results if result is not None)
+    assert consumed == {"identity_id": identity_id, "email": "alice@example.com"}
+
+
+@pytest.mark.asyncio
+async def test_same_email_nonce_is_isolated_by_identity_namespace(monkeypatch):
+    first_identity = uuid.uuid4()
+    second_identity = uuid.uuid4()
+    mock_redis = MockRedis()
+
+    async def fake_get_redis():
+        return mock_redis
+
+    monkeypatch.setattr(email_verification_service, "get_redis", fake_get_redis)
+    monkeypatch.setattr(
+        email_verification_service.secrets,
+        "token_urlsafe",
+        lambda _length: "same-secure-nonce-with-at-least-32-characters",
+    )
+    monkeypatch.setattr(
+        email_verification_service,
+        "get_settings",
+        lambda: SimpleNamespace(EMAIL_VERIFICATION_TOKEN_EXPIRE_MINUTES=15),
+    )
+
+    first_token, _ = (
+        await email_verification_service.email_verification_service.create_email_verification_token(
+            first_identity,
+            "first@example.com",
+        )
+    )
+    second_token, _ = (
+        await email_verification_service.email_verification_service.create_email_verification_token(
+            second_identity,
+            "second@example.com",
+        )
+    )
+
+    assert first_token != second_token
+    first_result, second_result = await asyncio.gather(
+        email_verification_service.email_verification_service.consume_email_verification_token(
+            first_token
+        ),
+        email_verification_service.email_verification_service.consume_email_verification_token(
+            second_token
+        ),
+    )
+    assert first_result == {
+        "identity_id": first_identity,
+        "email": "first@example.com",
+    }
+    assert second_result == {
+        "identity_id": second_identity,
+        "email": "second@example.com",
+    }
+
+
+@pytest.mark.asyncio
+async def test_legacy_six_digit_email_code_is_rejected_without_redis_lookup(monkeypatch):
+    redis_lookup = AsyncMock()
+    monkeypatch.setattr(email_verification_service, "get_redis", redis_lookup)
+
+    result = (
+        await email_verification_service.email_verification_service.consume_email_verification_token(
+            "123456"
+        )
+    )
+
+    assert result is None
+    redis_lookup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_email_change_invalidates_current_verification_token(monkeypatch):
+    identity_id = uuid.uuid4()
+    token_hash = "issued-to-old-address"
+    user_key = f"email_verify:user:{identity_id}"
+    token_key = f"email_verify:token:{token_hash}"
+    mock_redis = MockRedis(
+        initial_data={
+            user_key: token_hash,
+            token_key: "old-address-token-data",
+        }
+    )
+
+    async def fake_get_redis():
+        return mock_redis
+
+    monkeypatch.setattr(email_verification_service, "get_redis", fake_get_redis)
+
+    await email_verification_service.email_verification_service.invalidate_email_verification_tokens(
+        identity_id
+    )
+
+    assert user_key not in mock_redis._data
+    assert token_key not in mock_redis._data
+    assert set(mock_redis.deleted) == {user_key, token_key}
 
 
 @pytest.mark.asyncio
@@ -159,7 +438,11 @@ async def test_create_password_reset_token_invalidates_older_tokens(monkeypatch)
     async def fake_get_redis(): return mock_redis
     monkeypatch.setattr(password_reset_service, "get_redis", fake_get_redis)
 
-    raw_token, expires_at = await password_reset_service.create_password_reset_token(user_id)
+    raw_token, expires_at = await password_reset_service.create_password_reset_token(
+        user_id,
+        "alice@example.com",
+        3,
+    )
 
     # Verify old token invalidation
     assert "pwd_reset:token:old-token-hash" in mock_redis.deleted
@@ -169,6 +452,54 @@ async def test_create_password_reset_token_invalidates_older_tokens(monkeypatch)
     # Verify raw token is long
     assert len(raw_token) >= 20
     assert expires_at > datetime.now(timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_password_reset_issuance_leaves_one_valid_token(monkeypatch):
+    monkeypatch.setattr(
+        password_reset_service,
+        "get_settings",
+        lambda: SimpleNamespace(PASSWORD_RESET_TOKEN_EXPIRE_MINUTES=15),
+    )
+    identity_id = uuid.uuid4()
+    mock_redis = MockRedis()
+    issued_tokens = iter(("first-reset-token", "second-reset-token"))
+
+    async def fake_get_redis():
+        return mock_redis
+
+    monkeypatch.setattr(password_reset_service, "get_redis", fake_get_redis)
+    monkeypatch.setattr(
+        password_reset_service.secrets,
+        "token_urlsafe",
+        lambda _length: next(issued_tokens),
+    )
+
+    results = await asyncio.gather(
+        password_reset_service.create_password_reset_token(
+            identity_id,
+            "alice@example.com",
+            7,
+        ),
+        password_reset_service.create_password_reset_token(
+            identity_id,
+            "alice@example.com",
+            7,
+        ),
+    )
+
+    user_key = f"pwd_reset:user:{identity_id}"
+    current_hash = mock_redis._data[user_key]
+    live_token_keys = {
+        key
+        for key in mock_redis._data
+        if key.startswith(password_reset_service.TOKEN_PREFIX)
+    }
+    assert {raw_token for raw_token, _expires_at in results} == {
+        "first-reset-token",
+        "second-reset-token",
+    }
+    assert live_token_keys == {f"pwd_reset:token:{current_hash}"}
 
 
 @pytest.mark.asyncio
@@ -210,7 +541,13 @@ async def test_consume_password_reset_token_works_correctly(monkeypatch):
     token_hash = password_reset_service._hash_token(raw_token)
     
     initial_data = {
-        f"pwd_reset:token:{token_hash}": str(user_id),
+        f"pwd_reset:token:{token_hash}": json.dumps(
+            {
+                "identity_id": str(user_id),
+                "email": "alice@example.com",
+                "auth_version": 3,
+            }
+        ),
         f"pwd_reset:user:{user_id}": token_hash,
     }
     mock_redis = MockRedis(initial_data=initial_data)
@@ -221,9 +558,69 @@ async def test_consume_password_reset_token_works_correctly(monkeypatch):
 
     assert result is not None
     assert result["identity_id"] == user_id
+    assert result["email"] == "alice@example.com"
+    assert result["auth_version"] == 3
     # Should be deleted after consumption
     assert f"pwd_reset:token:{token_hash}" in mock_redis.deleted
     assert f"pwd_reset:user:{user_id}" in mock_redis.deleted
+
+
+@pytest.mark.asyncio
+async def test_consume_legacy_password_reset_token_without_auth_version_fails_closed(
+    monkeypatch,
+):
+    identity_id = uuid.uuid4()
+    raw_token = "legacy-raw-token"
+    token_hash = password_reset_service._hash_token(raw_token)
+    mock_redis = MockRedis(
+        initial_data={
+            f"pwd_reset:token:{token_hash}": json.dumps(
+                {"identity_id": str(identity_id), "email": "alice@example.com"}
+            ),
+            f"pwd_reset:user:{identity_id}": token_hash,
+        }
+    )
+
+    async def fake_get_redis():
+        return mock_redis
+
+    monkeypatch.setattr(password_reset_service, "get_redis", fake_get_redis)
+
+    assert await password_reset_service.consume_password_reset_token(raw_token) is None
+
+
+@pytest.mark.asyncio
+async def test_consume_password_reset_token_is_exactly_once_under_concurrency(monkeypatch):
+    user_id = uuid.uuid4()
+    raw_token = "concurrent-raw-token"
+    token_hash = password_reset_service._hash_token(raw_token)
+    mock_redis = MockRedis(
+        initial_data={
+            f"pwd_reset:token:{token_hash}": json.dumps(
+                {
+                    "identity_id": str(user_id),
+                    "email": "alice@example.com",
+                    "auth_version": 4,
+                }
+            ),
+            f"pwd_reset:user:{user_id}": token_hash,
+        }
+    )
+
+    async def fake_get_redis():
+        return mock_redis
+
+    monkeypatch.setattr(password_reset_service, "get_redis", fake_get_redis)
+
+    results = await asyncio.gather(
+        password_reset_service.consume_password_reset_token(raw_token),
+        password_reset_service.consume_password_reset_token(raw_token),
+    )
+
+    assert sum(result is not None for result in results) == 1
+    assert {result["identity_id"] for result in results if result} == {user_id}
+    assert {result["email"] for result in results if result} == {"alice@example.com"}
+    assert {result["auth_version"] for result in results if result} == {4}
 
 
 @pytest.mark.asyncio
@@ -256,6 +653,7 @@ async def test_forgot_password_returns_generic_response_for_unknown_email(monkey
     response = await auth_api.forgot_password(
         ForgotPasswordRequest(email="missing@example.com"),
         background_tasks,
+        SimpleNamespace(client=SimpleNamespace(host="203.0.113.10"), headers={}),
     )
 
     assert response == {
@@ -286,7 +684,8 @@ async def test_forgot_password_queues_background_email(monkeypatch):
         fake_resolve_email_config_async,
     )
 
-    user = make_user()
+    user = make_user(email_verified=True)
+    identity = user.identity
     background_tasks = BackgroundTasks()
 
     async def fake_create_password_reset_token(*_args, **_kwargs):
@@ -302,11 +701,20 @@ async def test_forgot_password_queues_background_email(monkeypatch):
     from app.dao import identity_dao
 
     async def fake_get_by_email(email):
-        return user
+        return identity
 
     monkeypatch.setattr(identity_dao, "get_by_email", fake_get_by_email)
+    monkeypatch.setattr(
+        identity_dao,
+        "get_for_update",
+        AsyncMock(return_value=identity),
+    )
 
-    response = await auth_api.forgot_password(ForgotPasswordRequest(email=user.email), background_tasks)
+    response = await auth_api.forgot_password(
+        ForgotPasswordRequest(email=identity.email),
+        background_tasks,
+        SimpleNamespace(client=SimpleNamespace(host="203.0.113.10"), headers={}),
+    )
 
     assert response["ok"] is True
     assert len(background_tasks.tasks) == 1
@@ -360,11 +768,22 @@ def test_send_system_email_uses_configured_timeout(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_reset_password_updates_user(monkeypatch):
-    user = make_user(password_hash=hash_password("old-password"))
-    db = RecordingDB([DummyResult(user)])
+    user = make_user(
+        password_hash=hash_password("old-password"),
+        password_login_enabled=False,
+        email_verified=True,
+        auth_version=5,
+        is_active=True,
+    )
+    identity = user.identity
+    db = RecordingDB([DummyResult(identity)])
 
     async def fake_consume_password_reset_token(*_args, **_kwargs):
-        return {"identity_id": user.id}
+        return {
+            "identity_id": identity.id,
+            "email": identity.email,
+            "auth_version": 5,
+        }
 
     monkeypatch.setattr(password_reset_service, "consume_password_reset_token", fake_consume_password_reset_token)
 
@@ -376,6 +795,10 @@ async def test_reset_password_updates_user(monkeypatch):
 
     assert response == {"ok": True}
     assert verify_password("new-password", user.password_hash)
+    assert user.password_login_enabled is True
+    assert user.email_verified is True
+    assert user.identity.auth_version == 6
+    assert user.is_active is True
     assert db.flushed is True
 
 

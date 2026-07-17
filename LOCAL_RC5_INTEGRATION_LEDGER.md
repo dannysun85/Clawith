@@ -42,22 +42,23 @@ into this candidate.
 
 ## Candidate closure scope
 
-The accumulated RC5 branch spans the following reviewed domains. `Closed locally`
-means implementation, regression coverage, and the named local release gates
-passed. It does not mean a provider or production deployment was tested.
+The accumulated RC5 branch spans the following reviewed domains. The table
+records implementation scope only. The current tree remains uncommitted and
+must not be described as `local_rc_candidate` or `business_flow_proven` until
+all named gates pass again on one frozen local Git commit.
 
 | Domain | Local closure | Gate result |
 | --- | --- | --- |
-| Tenant/auth/chat privacy | Tenant and session authorization, Agent credential ownership, fail-closed signup verification policy, privacy-safe logs and realtime delivery | Closed locally |
-| Credits and provider acceptance | Reservation ownership, provider-acceptance fencing, exact settlement and idempotent compensation for every tenant | Closed locally |
-| MiniMax media | Brand-safe image/video output, artifact validation, and durable image/audio/music/video recovery | Closed locally |
-| Automation | CEO/OKR/Heartbeat and automatic trigger execution paused without erasing desired state | Closed locally; intentionally unavailable |
-| AgentBay | Owner-scoped credentials, durable session binding, per-access Take Control revalidation and cleanup | Closed locally |
-| Code and MCP | Production Code-off contract, approval binding, tenant MCP isolation and network policy | Closed locally; Code intentionally unavailable |
-| Agent deletion | Active media/AgentBay/seat lifecycle fences and immediate frontend refresh | Closed locally |
-| SaaS/model routing | Shared-pool MiniMax M3 Lite/Pro/Ultra `text`/`image`/`video` understanding routes | Closed locally |
-| Deployment | Clean-tree packaging, release identity, rollback, Nginx runtime, Code-off and egress preflight | Closed locally |
-| Release communication | Automation, Code, legacy credential and deployment boundaries plus exact local evidence | Closed locally |
+| Tenant/auth/chat privacy | Tenant and session authorization, SSO/local-password separation and non-destructive legacy remediation, same-browser OAuth binding, Agent credential ownership, privacy-safe logs and realtime delivery | Implemented; final SHA gates pending |
+| Credits and provider acceptance | Reservation ownership, provider-acceptance fencing, exact settlement and idempotent compensation for every tenant | Prior proof retained; final SHA gates pending |
+| MiniMax media | Brand-safe image/video output, artifact validation, and durable image/audio/music/video recovery | Prior proof retained; final SHA gates pending |
+| Automation | CEO/OKR/Heartbeat and automatic trigger execution paused without erasing desired state | Implemented; intentionally unavailable |
+| AgentBay | Owner-scoped credentials, durable session binding, per-access Take Control revalidation and cleanup | Prior proof retained; final SHA gates pending |
+| Code and MCP | Production Code-off contract, approval binding, tenant MCP isolation and network policy | Implemented; Code intentionally unavailable |
+| Agent deletion | Active media/AgentBay/seat lifecycle fences and immediate frontend refresh | Prior proof retained; final SHA gates pending |
+| SaaS/model routing | Shared-pool MiniMax M3 Lite/Pro/Ultra `text`/`image`/`video` understanding routes | Prior proof retained; final SHA gates pending |
+| Deployment | Clean-tree packaging, release identity, durable deferred drain, incident JWT rotation, secret-envelope continuity, rollback, Nginx runtime, Code-off and egress preflight | Implemented; final SHA gates pending |
+| Release communication | Automation, Code, legacy credential and deployment boundaries plus exact local evidence | Updated; final evidence pending |
 
 Because the initial RC5 checkpoint accumulated edits from multiple sessions,
 Git cannot infer author-level provenance for each line. The release branch keeps
@@ -65,7 +66,7 @@ that checkpoint and every subsequent correction as local Git commits. Review
 and validation apply to the complete diff from RC4, not to a copied directory
 or an uncommitted temporary tree.
 
-## Closed release blockers
+## Implemented blocker closures (final validation pending)
 
 1. Credential-bound media destination changes require a fresh, unmasked key and
    a complete endpoint/header/path bundle; unsafe legacy partial configurations
@@ -77,14 +78,86 @@ or an uncommitted temporary tree.
    cache state is not reuse authority.
 4. Both Nginx templates quote the bounded webhook regular expression, and the
    built frontend container passes a real `nginx -t` plus isolated browser boot.
-5. Password and SSO registration plus unverified login resolve one strict SMTP
-   policy snapshot. Lookup failure returns `503` and cannot be mistaken for a
-   no-SMTP installation that permits automatic verification.
-6. Release notes and this ledger distinguish local proof from production proof
+5. Password registration resolves one strict SMTP policy snapshot and fails
+   with `503` when lookup or delivery is unavailable. No-SMTP production
+   registration cannot auto-verify; only the explicit non-production override
+   permits local use. SSO callbacks are deliberately independent of SMTP.
+6. SSO-only identities never receive a provider-derived local password.
+   Migration `106_secure_sso_password_login.py` preserves every historical hash
+   but enables local login only for a pure, unlinked Web identity; mixed and
+   provider-linked identities remain disabled until a verified reset. The
+   first production deployment rotates JWT signing under a new incident marker.
+7. SSO provider callback, status and one-time POST consumption require the same
+   per-session HttpOnly browser proof. A relay URL opened in another browser is
+   rejected before provider exchange or JIT account creation; this is not a
+   cross-device QR flow. Login-page provider discovery allocates no relay,
+   relay creation occurs only after a concrete provider selection, and one
+   atomic client/tenant/global Redis decision prevents a rejected client from
+   exhausting broader SSO availability. Signed Google login state is resolved
+   before Redis, while administrator sync state is browser-bound before atomic
+   consumption. Global Google/GitHub OAuth validates the browser nonce hash,
+   provider and exact redirect URI before compare-deleting state, so an invalid
+   callback cannot consume the legitimate browser's one-time login.
+8. Complete `IdentityProvider.config` objects are encrypted/authenticated at
+   rest and recursively redacted on every response. Production preflight blocks
+   non-object legacy JSON before maintenance, deploy requires `SECRET_KEY`
+   continuity, and half-built Generic OAuth2 create/update paths are disabled.
+   Authentication providers receive request-local config snapshots, so URL
+   generation cannot mark the encrypted ORM object dirty or overwrite a
+   concurrent administrator credential update.
+9. Deferred drain ownership is persisted before Nginx traffic mutation and is
+   removed only after zero connections plus a successful stop, or an exact
+   successful rollback. A later release cannot reuse a live inactive slot.
+10. Dedicated OAuth callbacks return fixed error text rather than provider
+   exception bodies.
+11. Release notes and this ledger distinguish local proof from production proof
    and retain the intentional Code-off and automation-paused boundaries.
+12. Sensitive self-service identity changes require current-password proof;
+    password and recovery mutations increment Identity `auth_version`, revoking
+    older HTTP, file and WebSocket credentials. Platform-admin identity edits
+    use the same normalized cross-column namespace lock, and production
+    preflight blocks historical username/email or username/phone ambiguity.
+13. Public social OAuth is sign-in-only in this release. The incomplete
+    `/auth/register/sso` surface fails with `410` before external or persistent
+    side effects, while tenant-managed SSO provisioning remains available.
+14. DingTalk webhook failures redact secret-bearing URLs, expose delivery
+    failure through the production issue monitor, and never persist an
+    assistant response that was not delivered.
+15. Login claims a separate raw-identifier/client/global query budget before
+    any Identity namespace lookup, then retains the resolved-Identity bcrypt
+    budget. A rejected pre-lookup request performs no database query.
+16. Every protected frontend transition awaits establishment of the HttpOnly
+    browser-session cookie before exposing authenticated state. Same-origin
+    tenant changes refresh the selected membership; cross-domain changes retain
+    the server-issued one-time fragment until the destination consumes it.
+17. The public email-existence oracle and incomplete social registration route
+    both return `410` without lookup or provider side effects. Password and
+    organization-managed SSO remain the supported registration contracts.
+18. First-admin ownership and last-admin protection count only active
+    administrators. Tenant membership creation is serialized, and migration
+    106 refuses duplicate tenantless memberships before adding its partial
+    unique index.
+19. Production monitoring persists database rollups and in-product notification
+    outbox delivery by default. Realtime external alerting is a separate
+    production configuration gate: a secret webhook must be configured and its
+    exact release canary must be delivered before that capability is claimed.
 
-Independent architect and code-reviewer passes found no remaining local P0/P1
-release blocker after these corrections. Any later code change invalidates that
+## Read-only production compatibility evidence
+
+On 2026-07-18, read-only checks against `opc.reeftotem.ai` reported public
+version `1.10.12` at commit `53b7cbd`, with the active database stamped at
+`add_user_chat_tier_preference`. The production `identities` table has neither
+`auth_version` nor `password_login_enabled`, and `identity_providers.config`
+remains legacy JSON. Revision 106 has therefore not been applied to production;
+the candidate may keep the current 106 instead of creating a post-applied 107.
+
+The production issue monitor is enabled, but the active Worker reported no
+configured `PRODUCTION_ISSUE_ALERT_WEBHOOK_URL`. Database aggregation and
+in-product notification remain available; external realtime alerting is not
+production-verified and is a deployment/operations gate, not a code claim.
+
+Independent architect and code-reviewer passes are required on the exact frozen
+candidate after these corrections. Any later code change invalidates their
 conclusion and requires the full sequence below again.
 
 ## Required local integration sequence

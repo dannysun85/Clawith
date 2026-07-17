@@ -421,12 +421,17 @@ export default function OrgTab({ tenant }: { tenant: any }) {
         onError: () => setSavingProvider(false),
     });
 
+    const configuredSecretPlaceholder = '••••••••';
     const updateProvider = useMutation({
         mutationFn: ({ id, data }: { id: string; data: any }) => {
             if (data.provider_type === 'oauth2' && useOAuth2Form) {
+                const payload = { ...data };
+                if (payload.app_secret === configuredSecretPlaceholder) {
+                    delete payload.app_secret;
+                }
                 return fetchJson(`/enterprise/identity-providers/${id}/oauth2`, {
                     method: 'PATCH',
-                    body: JSON.stringify(data)
+                    body: JSON.stringify(payload)
                 });
             }
             return fetchJson(`/enterprise/identity-providers/${id}`, { method: 'PUT', body: JSON.stringify(data) });
@@ -464,7 +469,9 @@ export default function OrgTab({ tenant }: { tenant: any }) {
 
     const initOAuth2FromConfig = (config: any) => ({
         app_id: config?.app_id || config?.client_id || '',
-        app_secret: config?.app_secret || config?.client_secret || '',
+        app_secret: (config?._configured_secret_fields || []).some(
+            (key: string) => ['app_secret', 'client_secret'].includes(key)
+        ) ? configuredSecretPlaceholder : '',
         authorize_url: config?.authorize_url || '',
         token_url: config?.token_url || '',
         user_info_url: config?.user_info_url || '',
@@ -503,7 +510,9 @@ export default function OrgTab({ tenant }: { tenant: any }) {
         { type: 'wecom', name: 'WeCom', desc: 'WeChat Work Integration', icon: <img src="/wecom.png" width="20" height="20" style={{ borderRadius: '4px' }} alt="WeCom" /> },
         { type: 'dingtalk', name: 'DingTalk', desc: 'DingTalk App Integration', icon: <img src="/dingtalk.png" width="20" height="20" style={{ borderRadius: '4px' }} alt="DingTalk" /> },
         { type: 'google_workspace', name: 'Google', desc: 'Google Admin Directory Sync', icon: <img src="/google.svg" width="20" height="20" alt="Google" /> },
-        { type: 'oauth2', name: 'OAuth2', desc: 'Generic OIDC Provider', icon: <div style={{ width: 20, height: 20, background: 'var(--accent-primary)', borderRadius: 4, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 10, fontWeight: 700 }}>O</div> }
+        // Generic OAuth2/OIDC remains hidden until a complete runtime provider,
+        // callback, and tenant-membership proof flow exists.  Stored legacy
+        // configuration stays readable but cannot be advertised as working SSO.
     ];
 
     const handleExpand = (type: string, existingProvider?: any) => {
@@ -1011,4 +1020,3 @@ export default function OrgTab({ tenant }: { tenant: any }) {
         </div>
     );
 }
-

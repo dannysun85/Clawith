@@ -3,7 +3,7 @@
 import os
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -79,6 +79,11 @@ async def configure_discord_channel(
         )
         db.add(existing)
         await db.flush()
+
+    from app.services.channel_user_service import channel_user_service
+    await channel_user_service.provision_provider_for_config(
+        db, channel_type="discord", tenant_id=agent.tenant_id
+    )
 
     # Mode-specific post-configuration
     if connection_mode == "gateway":
@@ -193,7 +198,6 @@ def _verify_discord_signature(public_key: str, body: bytes, headers: dict) -> bo
     """Verify Discord ed25519 signature."""
     try:
         from nacl.signing import VerifyKey
-        from nacl.exceptions import BadSignatureError
 
         timestamp = headers.get("x-signature-timestamp", "")
         signature = headers.get("x-signature-ed25519", "")
@@ -281,7 +285,6 @@ async def discord_interaction_webhook(
             return {"type": 4, "data": {"content": "⚠️ 请提供消息内容。Usage: `/ask message:<你的问题>`"}}
 
         interaction_token = body.get("token", "")
-        application_id = config.app_id or ""
         sender_id = body.get("member", {}).get("user", {}).get("id") or body.get("user", {}).get("id", "")
         channel_id = body.get("channel_id", "")
         # Discord: guild interactions are group chats, DM interactions are P2P

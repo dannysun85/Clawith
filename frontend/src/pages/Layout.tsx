@@ -43,6 +43,7 @@ import {
 import { useAppStore } from '../stores';
 import TalentMarketModal from '../components/TalentMarketModal';
 import { AstraWordmark } from '../components/atlas';
+import { normalizeTenantRedirectUrl } from '../utils/authTransport';
 
 const MOBILE_NAV_MEDIA_QUERY = '(max-width: 768px)';
 
@@ -103,10 +104,11 @@ const getWorkspaceAvatarTone = (name: string): number => {
 
 /* ────── Account Settings Modal ────── */
 function AccountSettingsModal({ user, onClose, isChinese }: { user: any; onClose: () => void; isChinese: boolean }) {
-    const { setUser } = useAuthStore();
+    const { setAuth, setUser } = useAuthStore();
     const [username, setUsername] = useState(user?.username || '');
     const [email, setEmail] = useState(user?.email || '');
     const [displayName, setDisplayName] = useState(user?.display_name || '');
+    const [profilePassword, setProfilePassword] = useState('');
     const [oldPassword, setOldPassword] = useState('');
     const [newPassword, setNewPassword] = useState('');
     const [confirmPassword, setConfirmPassword] = useState('');
@@ -128,6 +130,12 @@ function AccountSettingsModal({ user, onClose, isChinese }: { user: any; onClose
             if (email !== user?.email) body.email = email;
             if (displayName !== user?.display_name) body.display_name = displayName;
             if (Object.keys(body).length === 0) { showMsg(isChinese ? '没有变更' : 'No changes', 'error'); setSaving(false); return; }
+            if ((body.username || body.email) && !profilePassword) {
+                showMsg(isChinese ? '修改用户名或邮箱需要输入当前密码' : 'Enter your current password to change username or email', 'error');
+                setSaving(false);
+                return;
+            }
+            if (body.username || body.email) body.current_password = profilePassword;
             const res = await fetch('/api/auth/me', {
                 method: 'PATCH',
                 headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
@@ -135,7 +143,13 @@ function AccountSettingsModal({ user, onClose, isChinese }: { user: any; onClose
             });
             if (!res.ok) { const err = await res.json().catch(() => ({ detail: 'Failed' })); throw new Error(err.detail); }
             const updated = await res.json();
-            setUser(updated);
+            const refreshedToken = res.headers.get('X-Astra-Access-Token');
+            if (refreshedToken) {
+                await setAuth(updated, refreshedToken);
+            } else {
+                setUser(updated);
+            }
+            setProfilePassword('');
             showMsg(isChinese ? '个人信息已更新' : 'Profile updated');
         } catch (e: any) { showMsg(e.message || 'Failed', 'error'); }
         setSaving(false);
@@ -169,6 +183,10 @@ function AccountSettingsModal({ user, onClose, isChinese }: { user: any; onClose
                 body: JSON.stringify({ old_password: oldPassword, new_password: newPassword }),
             });
             if (!res.ok) { const err = await res.json().catch(() => ({ detail: 'Failed' })); throw new Error(err.detail); }
+            const result = await res.json();
+            if (result.access_token) {
+                await setAuth(user, result.access_token);
+            }
             showMsg(isChinese ? '密码已修改' : 'Password changed');
             setOldPassword(''); setNewPassword(''); setConfirmPassword('');
         } catch (e: any) { showMsg(e.message || 'Failed', 'error'); }
@@ -221,6 +239,12 @@ function AccountSettingsModal({ user, onClose, isChinese }: { user: any; onClose
                             </div>
                         )}
                     </div>
+                    {(username !== user?.username || email !== user?.email) && (
+                        <div>
+                            <label style={labelStyle}>{isChinese ? '当前密码（身份确认）' : 'Current password (verification)'}</label>
+                            <input className="form-input" type="password" value={profilePassword} onChange={e => setProfilePassword(e.target.value)} autoComplete="current-password" style={inputStyle} />
+                        </div>
+                    )}
                     <div><label style={labelStyle}>{isChinese ? '显示名称' : 'Display Name'}</label><input className="form-input" value={displayName} onChange={e => setDisplayName(e.target.value)} style={inputStyle} /></div>
                     <div style={{ display: 'flex', justifyContent: 'flex-end' }}><button className="btn btn-primary" onClick={handleSaveProfile} disabled={saving} style={{ padding: '6px 16px', fontSize: '12px' }}>{saving ? '...' : (isChinese ? '保存' : 'Save')}</button></div>
                 </div>
@@ -514,31 +538,35 @@ export default function Layout() {
     });
 
     const handleSwitchTenant = async (tenantId: string) => {
-        const token = localStorage.getItem('token');
-        const res = await fetch('/api/auth/switch-tenant', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-            body: JSON.stringify({ tenant_id: tenantId }),
-        });
-        if (!res.ok) {
-            const err = await res.json().catch(() => ({ detail: 'Failed to switch tenant' }));
-            toast.error(t('common.error.companySwitchFailed'), { details: String(err.detail || `HTTP ${res.status}`) });
-            return;
-        }
-        const data = await res.json();
-        if (data.redirect_url) {
-            localStorage.setItem('token', data.access_token);
-            const targetUrl = new URL(data.redirect_url, window.location.origin);
-            if (targetUrl.hostname === window.location.hostname) {
-                targetUrl.protocol = window.location.protocol;
-                targetUrl.port = window.location.port;
+        try {
+            const token = localStorage.getItem('token');
+            const res = await fetch('/api/auth/switch-tenant', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+                body: JSON.stringify({ tenant_id: tenantId }),
+            });
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({ detail: 'Failed to switch tenant' }));
+                throw new Error(String(err.detail || `HTTP ${res.status}`));
             }
-            targetUrl.pathname = '/';
-            targetUrl.hash = '';
-            window.location.href = targetUrl.toString();
-        } else if (data.access_token) {
-            localStorage.setItem('token', data.access_token);
-            window.location.href = '/';
+            const data = await res.json();
+            if (data.redirect_url) {
+                // Preserve the server-issued #session_token for the target
+                // origin. App consumes it before rendering authenticated UI.
+                window.location.href = normalizeTenantRedirectUrl(
+                    data.redirect_url,
+                    window.location.href,
+                );
+            } else if (data.access_token) {
+                localStorage.setItem('token', data.access_token);
+                const me = await authApi.me();
+                await setAuth(me, data.access_token);
+                window.location.href = '/';
+            }
+        } catch (error) {
+            toast.error(t('common.error.companySwitchFailed'), {
+                details: error instanceof Error ? error.message : 'Failed to switch tenant',
+            });
         }
     };
 
@@ -567,13 +595,15 @@ export default function Layout() {
         try {
             const result = await tenantApi.join(joinInviteCode);
             if (result.access_token) {
-                // Multi-tenant: backend created a new User record, switch context
+                // Multi-tenant: backend created a new User record, switch context.
                 localStorage.setItem('token', result.access_token);
+                const me = await authApi.me();
+                await setAuth(me, result.access_token);
             } else {
                 // Registration flow: same user updated, refresh store
                 const me = await authApi.me();
                 const token = localStorage.getItem('token');
-                if (token) setAuth(me, token);
+                if (token) await setAuth(me, token);
             }
             setShowTenantMenu(false);
             setShowTenantSetupModal(false);
@@ -593,13 +623,15 @@ export default function Layout() {
         try {
             const result = await tenantApi.selfCreate({ name: createCompanyName });
             if (result.access_token) {
-                // Multi-tenant: backend created a new User record, switch context
+                // Multi-tenant: backend created a new User record, switch context.
                 localStorage.setItem('token', result.access_token);
+                const me = await authApi.me();
+                await setAuth(me, result.access_token);
             } else {
                 // Registration flow: same user updated, refresh store
                 const me = await authApi.me();
                 const token = localStorage.getItem('token');
-                if (token) setAuth(me, token);
+                if (token) await setAuth(me, token);
             }
             setShowTenantMenu(false);
             setShowTenantSetupModal(false);

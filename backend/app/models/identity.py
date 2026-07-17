@@ -4,10 +4,12 @@ from enum import Enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, func
-from sqlalchemy.dialects.postgresql import JSON, UUID
+from sqlalchemy import Boolean, DateTime, String, Text, func
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import Mapped, mapped_column
 
+from app.core.identity_provider_secrets import EncryptedIdentityProviderJSON
 from app.database import Base
 
 
@@ -36,7 +38,13 @@ class IdentityProvider(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     # When True, this provider can be used for SSO login (not just directory sync)
     sso_login_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
-    config: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Encrypt the complete object so nested and future provider credentials do
+    # not appear in the primary table, WAL, replicas, or ordinary backups.
+    config: Mapped[dict | None] = mapped_column(
+        MutableDict.as_mutable(EncryptedIdentityProviderJSON()),
+        default=dict,
+        nullable=True,
+    )
 
     # Optional tenant_id for enterprise-specific providers (no FK - soft coupling)
     tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
@@ -48,7 +56,7 @@ class IdentityProvider(Base):
 
 
 class SSOScanSession(Base):
-    """Temporary session for SSO QR code scanning/login."""
+    """Temporary same-browser SSO authorization relay session."""
 
     __tablename__ = "sso_scan_sessions"
 
@@ -61,6 +69,14 @@ class SSOScanSession(Base):
     tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     access_token: Mapped[str | None] = mapped_column(Text)
+    # HMAC of the high-entropy cookie held only by the browser that created
+    # this session. Provider callback authorization and final JWT consumption
+    # both require that same browser proof.
+    initiator_nonce_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        index=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

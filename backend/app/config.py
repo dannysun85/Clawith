@@ -99,6 +99,52 @@ class Settings(BaseSettings):
     PASSWORD_RESET_TOKEN_EXPIRE_MINUTES: int = 60
     EMAIL_VERIFICATION_TOKEN_EXPIRE_MINUTES: int = 60  # 1 hour
     EMAIL_VERIFICATION_REQUIRED: bool = False  # Require email verification for login
+    # Password signup must never turn a missing production mail transport into
+    # proof of mailbox ownership.  This escape hatch is intentionally limited
+    # to development/test by ``unverified_local_signup_allowed`` below.
+    ALLOW_UNVERIFIED_LOCAL_SIGNUP: bool = False
+    SSO_SESSION_CREATE_IP_LIMIT_PER_MINUTE: int = 30
+    SSO_SESSION_CREATE_TENANT_LIMIT_PER_MINUTE: int = 120
+    SSO_SESSION_CREATE_GLOBAL_LIMIT_PER_MINUTE: int = 300
+    SSO_SESSION_CLEANUP_INTERVAL_SECONDS: int = 60
+    SSO_SESSION_RETENTION_MINUTES: int = 60
+    # Anonymous auth work is protected in the application so every deployment
+    # shape receives the same client + target + global quotas. Global bcrypt
+    # limits use short windows to bound bursts into the four-worker pool.
+    # Client quotas are deliberately NAT-tolerant: enterprise users commonly
+    # share one public address. Per-identity and global work buckets remain the
+    # primary credential/provider abuse controls.
+    # Login lookup has a separate, wider pre-query budget because unresolved
+    # identifiers can require up to three indexed namespace probes before an
+    # Identity is known.  The global value is expressed in worst-case query
+    # units; each admitted request reserves three units.
+    AUTH_LOGIN_LOOKUP_CLIENT_LIMIT_PER_MINUTE: int = 120
+    AUTH_LOGIN_LOOKUP_IDENTIFIER_LIMIT_PER_MINUTE: int = 20
+    AUTH_LOGIN_LOOKUP_GLOBAL_QUERY_UNITS_PER_MINUTE: int = 1800
+    AUTH_LOGIN_CLIENT_LIMIT_PER_MINUTE: int = 60
+    AUTH_LOGIN_IDENTITY_LIMIT_PER_MINUTE: int = 8
+    AUTH_PASSWORD_REGISTER_CLIENT_LIMIT_PER_MINUTE: int = 30
+    AUTH_PASSWORD_REGISTER_IDENTITY_LIMIT_PER_MINUTE: int = 3
+    AUTH_PASSWORD_CHANGE_CLIENT_LIMIT_PER_MINUTE: int = 30
+    AUTH_PASSWORD_CHANGE_IDENTITY_LIMIT_PER_MINUTE: int = 8
+    AUTH_PASSWORD_REAUTH_CLIENT_LIMIT_PER_MINUTE: int = 30
+    AUTH_PASSWORD_REAUTH_IDENTITY_LIMIT_PER_MINUTE: int = 8
+    # One unit is one worst-case bcrypt operation. Registration and password
+    # change reserve two units per request; login reserves one. At the default
+    # bcrypt cost this keeps admitted work below half of the measured pool rate.
+    AUTH_BCRYPT_GLOBAL_WORK_UNITS_PER_10_SECONDS: int = 80
+    AUTH_EMAIL_ACTION_CLIENT_LIMIT_PER_15_MINUTES: int = 30
+    AUTH_EMAIL_ACTION_IDENTITY_LIMIT_PER_15_MINUTES: int = 3
+    AUTH_EMAIL_ACTION_GLOBAL_LIMIT_PER_MINUTE: int = 120
+    AUTH_DISCOVERY_CLIENT_LIMIT_PER_MINUTE: int = 120
+    AUTH_DISCOVERY_IDENTITY_LIMIT_PER_MINUTE: int = 10
+    AUTH_DISCOVERY_GLOBAL_LIMIT_PER_MINUTE: int = 300
+    AUTH_OAUTH_START_CLIENT_LIMIT_PER_MINUTE: int = 60
+    AUTH_OAUTH_START_PROVIDER_LIMIT_PER_MINUTE: int = 120
+    AUTH_OAUTH_START_GLOBAL_LIMIT_PER_MINUTE: int = 300
+    AUTH_OAUTH_EXCHANGE_CLIENT_LIMIT_PER_MINUTE: int = 60
+    AUTH_OAUTH_EXCHANGE_PROVIDER_LIMIT_PER_MINUTE: int = 60
+    AUTH_OAUTH_EXCHANGE_GLOBAL_LIMIT_PER_MINUTE: int = 120
 
     # File Storage
     STORAGE_BACKEND: str = "local"
@@ -266,6 +312,21 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Get cached application settings."""
     return Settings()
+
+
+def unverified_local_signup_allowed(settings: Settings | None = None) -> bool:
+    """Return whether a local-only no-SMTP password flow may auto-verify.
+
+    The environment check is deliberately part of the decision instead of
+    relying on deployment configuration alone.  Setting the flag in production
+    therefore remains fail-closed.
+    """
+    effective = settings or get_settings()
+    environment = effective.ENVIRONMENT.strip().lower()
+    return bool(
+        effective.ALLOW_UNVERIFIED_LOCAL_SIGNUP
+        and environment in {"development", "test", "testing"}
+    )
 
 
 def get_sandbox_config() -> SandboxConfig:

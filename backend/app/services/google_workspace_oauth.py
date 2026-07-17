@@ -2,6 +2,8 @@
 
 import hashlib
 import hmac
+import json
+import secrets
 import uuid
 
 import httpx
@@ -20,6 +22,15 @@ GOOGLE_SSO_STATE_KIND = "google_sso"
 GOOGLE_SYNC_STATE_KIND = "google_sync"
 GOOGLE_CALLBACK_PATH = "/auth/google_workspace/callback"
 GOOGLE_HTTP_PROXY = settings.HTTP_PROXY or None
+GOOGLE_SYNC_STATE_PREFIX = "google_workspace_sync_state:"
+GOOGLE_SYNC_STATE_TTL_SECONDS = 600
+GOOGLE_SYNC_BROWSER_NONCE_COOKIE = "astra_google_workspace_sync_nonce"
+_DELETE_SYNC_STATE_IF_UNCHANGED_SCRIPT = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
 
 
 def _sign_google_oauth_payload(payload: str) -> str:
@@ -59,6 +70,69 @@ def parse_google_oauth_state(state: str) -> tuple[str, tuple[uuid.UUID, ...]] | 
     if kind == GOOGLE_SSO_STATE_KIND and len(values) not in {1, 2}:
         return None
     return kind, values
+
+
+async def create_google_sync_state(
+    *,
+    provider_id: uuid.UUID,
+    admin_user_id: uuid.UUID,
+    tenant_id: uuid.UUID | None,
+    redirect_uri: str,
+    browser_nonce: str,
+) -> str:
+    """Create a random, short-lived, server-owned admin OAuth state."""
+    from app.core.events import get_redis
+
+    state = secrets.token_urlsafe(32)
+    payload = {
+        "provider_id": str(provider_id),
+        "admin_user_id": str(admin_user_id),
+        "tenant_id": str(tenant_id) if tenant_id else None,
+        "redirect_uri": redirect_uri,
+        "browser_nonce": browser_nonce,
+    }
+    redis_client = await get_redis()
+    await redis_client.set(
+        f"{GOOGLE_SYNC_STATE_PREFIX}{state}",
+        json.dumps(payload, separators=(",", ":")),
+        ex=GOOGLE_SYNC_STATE_TTL_SECONDS,
+    )
+    return state
+
+
+async def consume_google_sync_state(state: str, browser_nonce: str) -> dict | None:
+    """Consume an admin OAuth state only from the browser that created it."""
+    from app.core.events import get_redis
+
+    if not state or not browser_nonce:
+        return None
+
+    redis_client = await get_redis()
+    key = f"{GOOGLE_SYNC_STATE_PREFIX}{state}"
+    raw = await redis_client.get(key)
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    expected_nonce = str(payload.get("browser_nonce") or "")
+    if (
+        not expected_nonce
+        or not hmac.compare_digest(browser_nonce, expected_nonce)
+    ):
+        return None
+
+    consumed = await redis_client.eval(
+        _DELETE_SYNC_STATE_IF_UNCHANGED_SCRIPT,
+        1,
+        key,
+        raw,
+    )
+    return payload if int(consumed or 0) == 1 else None
 
 
 async def get_google_provider(db: AsyncSession, provider_id: uuid.UUID) -> IdentityProvider:

@@ -139,6 +139,10 @@ async def configure_whatsapp_channel(
         existing.extra_config = extra_config
         existing.is_configured = True
         await db.flush()
+        from app.services.channel_user_service import channel_user_service
+        await channel_user_service.provision_provider_for_config(
+            db, channel_type="whatsapp", tenant_id=agent.tenant_id
+        )
         return ChannelConfigOut.model_validate(existing)
 
     if not access_token or not phone_number_id or not verify_token or not app_secret:
@@ -158,6 +162,10 @@ async def configure_whatsapp_channel(
     )
     db.add(config)
     await db.flush()
+    from app.services.channel_user_service import channel_user_service
+    await channel_user_service.provision_provider_for_config(
+        db, channel_type="whatsapp", tenant_id=agent.tenant_id
+    )
     return ChannelConfigOut.model_validate(config)
 
 

@@ -5,10 +5,16 @@ from datetime import datetime
 
 from sqlalchemy import Boolean, CheckConstraint, DateTime, Enum, ForeignKey, Integer, String, func
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 from sqlalchemy.ext.associationproxy import association_proxy
 
 from app.database import Base
+from app.core.identity_canonicalization import (
+    canonicalize_email,
+    canonicalize_phone,
+    normalize_username,
+    username_looks_like_contact,
+)
 
 
 
@@ -19,6 +25,12 @@ class Identity(Base):
     """
 
     __tablename__ = "identities"
+    __table_args__ = (
+        CheckConstraint(
+            "email IS NULL OR (email = lower(trim(email)) AND email <> '')",
+            name="ck_identities_email_canonical",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     
@@ -29,6 +41,24 @@ class Identity(Base):
     
     # Global authentication
     password_hash: Mapped[str | None] = mapped_column(String(255))
+    # Password authentication is an explicit capability.  SSO/channel-created
+    # identities stay disabled until a user proves ownership through the
+    # password-reset flow; this prevents provider identifiers from ever acting
+    # as implicit local credentials.
+    password_login_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default="false",
+        nullable=False,
+    )
+    # Incrementing this value revokes every previously issued access token for
+    # all tenant memberships belonging to the Identity.
+    auth_version: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        server_default="0",
+        nullable=False,
+    )
     
     # Global status
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -46,6 +76,22 @@ class Identity(Base):
 
     # Relationships
     tenant_users: Mapped[list["User"]] = relationship(back_populates="identity")
+
+    @validates("email")
+    def _canonicalize_email(self, _key: str, value: str | None) -> str | None:
+        """Apply the same canonical form enforced by the database schema."""
+        return canonicalize_email(value)
+
+    @validates("phone")
+    def _canonicalize_phone(self, _key: str, value: str | None) -> str | None:
+        return canonicalize_phone(value)
+
+    @validates("username")
+    def _validate_username(self, _key: str, value: str | None) -> str | None:
+        username = normalize_username(value)
+        if username_looks_like_contact(username):
+            raise ValueError("Username cannot be an email address or phone number")
+        return username
 
 
 class User(Base):
@@ -83,6 +129,16 @@ class User(Base):
     )
 
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    # Distinguish a membership paused only until email ownership is proven
+    # from one disabled for an administrative or security reason.  Verification
+    # flows may activate only rows carrying this explicit provenance marker.
+    activation_pending_email_verification: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default="false",
+        nullable=False,
+    )
 
     registration_source: Mapped[str | None] = mapped_column(String(50), default="web")
 
@@ -122,6 +178,11 @@ class User(Base):
     email = association_proxy("identity", "email", creator=lambda val: Identity(email=val))
     username = association_proxy("identity", "username", creator=lambda val: Identity(username=val))
     password_hash = association_proxy("identity", "password_hash", creator=lambda val: Identity(password_hash=val))
+    password_login_enabled = association_proxy(
+        "identity",
+        "password_login_enabled",
+        creator=lambda val: Identity(password_login_enabled=val),
+    )
     email_verified = association_proxy("identity", "email_verified", creator=lambda val: Identity(email_verified=val))
     primary_mobile = association_proxy("identity", "phone", creator=lambda val: Identity(phone=val))
 

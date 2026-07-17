@@ -10,10 +10,9 @@ const API_BASE = '/api';
 
 async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
     const token = localStorage.getItem('token');
-    const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    };
+    const headers = new Headers(options.headers);
+    if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+    if (token && !headers.has('Authorization')) headers.set('Authorization', `Bearer ${token}`);
 
     let res: Response;
     try {
@@ -207,7 +206,7 @@ export const authApi = {
 
     me: () => request<User>('/auth/me'),
 
-    updateMe: (data: Partial<User>) =>
+    updateMe: (data: Partial<User> & { current_password?: string }) =>
         request<User>('/auth/me', { method: 'PATCH', body: JSON.stringify(data) }),
 
     verifyEmail: (token: string) =>

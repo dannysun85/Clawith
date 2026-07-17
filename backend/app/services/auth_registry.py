@@ -13,15 +13,11 @@ from app.models.identity import IdentityProvider
 from app.services.auth_provider import (
     PROVIDER_CLASSES,
     BaseAuthProvider,
-    DingTalkAuthProvider,
-    FeishuAuthProvider,
-    GitHubAuthProvider,
-    GoogleAuthProvider,
-    GoogleWorkspaceAuthProvider,
-    MicrosoftTeamsAuthProvider,
-    WeComAuthProvider,
 )
-from app.services.identity_provider_lookup import get_preferred_identity_provider
+from app.services.identity_provider_lookup import (
+    get_login_identity_provider,
+    get_preferred_identity_provider,
+)
 
 
 class AuthProviderRegistry:
@@ -35,7 +31,12 @@ class AuthProviderRegistry:
         self._cache: dict[str, BaseAuthProvider] = {}
 
     async def get_provider(
-        self, provider_type: str, tenant_id: str | None = None
+        self,
+        provider_type: str,
+        tenant_id: str | None = None,
+        *,
+        require_sso_login: bool = False,
+        allow_global_fallback: bool = True,
     ) -> BaseAuthProvider | None:
         """Get or create an authentication provider instance.
 
@@ -46,23 +47,40 @@ class AuthProviderRegistry:
         Returns:
             Provider instance or None if provider type is not supported
         """
-        # Check cache first
-        cache_key = f"{provider_type}:{tenant_id or 'global'}"
-        if cache_key in self._cache:
+        # Login authorization is a revocation boundary. Never reuse a cached
+        # allow decision: provider and tenant switches must take effect across
+        # every worker on the very next request.
+        cache_key = (
+            f"{provider_type}:{tenant_id or 'global'}:"
+            f"login={int(require_sso_login)}:fallback={int(allow_global_fallback)}"
+        )
+        if not require_sso_login and cache_key in self._cache:
             return self._cache[cache_key]
 
         # Try to get provider config from database
         async with identity_provider_dao.session() as db:
-            provider_model = await get_preferred_identity_provider(
-                db,
-                provider_type,
-                tenant_id,
-                is_active=True,
-            )
+            if require_sso_login:
+                provider_model = await get_login_identity_provider(
+                    db,
+                    provider_type,
+                    tenant_id,
+                    allow_global_fallback=allow_global_fallback,
+                )
+            else:
+                provider_model = await get_preferred_identity_provider(
+                    db,
+                    provider_type,
+                    tenant_id,
+                    is_active=True,
+                    allow_global_fallback=allow_global_fallback,
+                )
+
+        if require_sso_login and provider_model is None:
+            return None
 
         # Create provider instance
         provider = self._create_provider(provider_type, provider_model)
-        if provider:
+        if provider and not require_sso_login:
             self._cache[cache_key] = provider
 
         return provider
@@ -98,7 +116,8 @@ class AuthProviderRegistry:
             List of IdentityProvider records
         """
         async with identity_provider_dao.session() as db:
-            query = select(IdentityProvider).where(IdentityProvider.is_active == True)
+            query = select(IdentityProvider).where(IdentityProvider.is_active.is_(True))
+            query = query.where(IdentityProvider.sso_login_enabled.is_(True))
 
             if tenant_id:
                 # Only include tenant-specific ones

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from fastapi import HTTPException
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.models.chat_session import ChatSession
 from app.models.agent import Agent
@@ -38,6 +39,7 @@ def build_user_tool_authorization_context(
     agent_id: object,
     owner_user_id: object,
     session_id: object,
+    expected_auth_version: int | None = None,
 ):
     """Return short pre/post exact-lane fences for one tool call.
 
@@ -57,6 +59,7 @@ def build_user_tool_authorization_context(
                     owner_user_id=owner_user_id,
                     session_id=session_id,
                     lock_authority=True,
+                    expected_auth_version=expected_auth_version,
                 )
                 await db.commit()
             except BaseException:
@@ -86,6 +89,7 @@ async def validate_active_user_chat_lane(
     owner_user_id: object,
     session_id: object,
     lock_authority: bool = False,
+    expected_auth_version: int | None = None,
 ) -> AuthorizedUserChatLane:
     """Validate an exact non-A2A user conversation at the side-effect fence.
 
@@ -101,6 +105,8 @@ async def validate_active_user_chat_lane(
 
     agent_query = select(Agent).where(Agent.id == parsed_agent_id)
     owner_query = select(User).where(User.id == parsed_owner_id)
+    if expected_auth_version is not None:
+        owner_query = owner_query.options(selectinload(User.identity))
     session_query = select(ChatSession).where(ChatSession.id == parsed_session_id)
     if lock_authority:
         agent_query = agent_query.execution_options(
@@ -117,6 +123,13 @@ async def validate_active_user_chat_lane(
     owner = (await db.execute(owner_query)).scalar_one_or_none()
     if agent is None or owner is None or not owner.is_active:
         raise ChatSessionAuthorizationError("Chat principal is unavailable")
+    if expected_auth_version is not None and (
+        not owner.identity
+        or not owner.identity.is_active
+        or int(getattr(owner.identity, "auth_version", -1))
+        != int(expected_auth_version)
+    ):
+        raise ChatSessionAuthorizationError("Chat credential has been revoked")
     if agent.tenant_id is None or owner.tenant_id != agent.tenant_id:
         raise ChatSessionAuthorizationError("Chat principal tenant is invalid")
     if getattr(agent, "status", None) in {"stopped", "paused", "error"}:

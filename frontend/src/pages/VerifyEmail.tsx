@@ -47,7 +47,7 @@ export default function VerifyEmail() {
 
             // Auto-login with the returned token
             if (res.access_token && res.user) {
-                setAuth(res.user, res.access_token);
+                await setAuth(res.user, res.access_token);
 
                 // Redirect based on needs_company_setup
                 setTimeout(() => {
@@ -60,7 +60,7 @@ export default function VerifyEmail() {
             }
         } catch (err: any) {
             setStatus('error');
-            setMessage(err.message || (isChinese ? '验证失败，请检查验证码是否正确' : 'Verification failed, please check the code'));
+            setMessage(err.message || (isChinese ? '验证失败，请检查验证凭证是否正确' : 'Verification failed, please check the token'));
         } finally {
             setLoading(false);
         }
@@ -82,7 +82,7 @@ export default function VerifyEmail() {
         setLoading(true);
         try {
             await authApi.resendVerification(email);
-            toast.success(isChinese ? '验证码已重发，请检查您的邮箱' : 'Verification code resent. Please check your email.');
+            toast.success(isChinese ? '验证凭证已重发，请检查您的邮箱' : 'Verification token resent. Please check your email.');
         } catch (err: any) {
             toast.error(isChinese ? '重发失败' : 'Failed to resend verification', { details: String(err?.message || err) });
         } finally {
@@ -118,8 +118,8 @@ export default function VerifyEmail() {
                     <h1>{isChinese ? '邮箱验证' : 'Email Verification'}</h1>
                     <p className="company-setup-subtitle">
                         {email
-                            ? (isChinese ? `验证码已发送至 ${email}` : `A 6-digit verification code has been sent to ${email}`)
-                            : (isChinese ? '请输入您收到的 6 位验证码' : 'Please enter the 6-digit verification code sent to your email')}
+                            ? (isChinese ? `安全验证凭证已发送至 ${email}` : `A secure verification token has been sent to ${email}`)
+                            : (isChinese ? '请输入您收到的安全验证凭证' : 'Please enter the secure verification token sent to your email')}
                     </p>
                 </div>
 
@@ -133,16 +133,18 @@ export default function VerifyEmail() {
                     <div className="company-setup-panel" style={{ padding: '32px' }}>
                         <div className="login-field" style={{ marginBottom: 24 }}>
                             <label style={{ textAlign: 'center', display: 'block', marginBottom: 16 }}>
-                                {isChinese ? '6 位数字验证码' : '6-Digit Verification Code'}
+                                {isChinese ? '安全验证凭证' : 'Secure Verification Token'}
                             </label>
                             <input
                                 value={code}
-                                onChange={(e) => setCode(e.target.value.replace(/[^0-9]/g, '').slice(0, 6))}
-                                placeholder="000000"
+                                onChange={(e) => setCode(e.target.value.trim().slice(0, 128))}
+                                placeholder={isChinese ? '粘贴邮件中的验证凭证' : 'Paste the token from your email'}
+                                autoComplete="one-time-code"
+                                spellCheck={false}
                                 style={{
-                                    fontSize: '32px',
+                                    fontSize: '16px',
                                     textAlign: 'center',
-                                    letterSpacing: '8px',
+                                    letterSpacing: '1px',
                                     fontWeight: 'bold',
                                     height: '64px',
                                     fontFamily: 'monospace'

@@ -17,10 +17,11 @@ from PIL import Image
 from pydantic import BaseModel, Field
 from sqlalchemy import func as sqla_func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.config import get_settings
 from app.core.secret_detection import looks_like_secret
-from app.core.security import get_current_user, require_role, get_authenticated_user
+from app.core.security import get_current_user, require_role
 from app.database import get_db
 from app.models.agent import Agent
 from app.models.tenant import Tenant
@@ -162,10 +163,40 @@ class SelfCreateResponse(BaseModel):
     access_token: str | None = None  # Non-null when a new User record was created (multi-tenant switch)
 
 
+async def _lock_current_membership(
+    db: AsyncSession,
+    current_user: User,
+) -> tuple[User, object]:
+    """Refresh the membership and serialize tenant transitions per Identity."""
+
+    user_result = await db.execute(
+        select(User)
+        .where(User.id == current_user.id)
+        .options(selectinload(User.identity))
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    locked_user = user_result.scalar_one_or_none()
+    if (
+        not locked_user
+        or not locked_user.is_active
+        or locked_user.identity_id != current_user.identity_id
+    ):
+        raise HTTPException(status_code=403, detail="Account is unavailable")
+
+    from app.dao import identity_dao
+
+    locked_identity = await identity_dao.get_for_update(locked_user.identity_id)
+    if not locked_identity or not locked_identity.is_active:
+        raise HTTPException(status_code=403, detail="Account is unavailable")
+    locked_user.identity = locked_identity
+    return locked_user, locked_identity
+
+
 @router.post("/self-create", response_model=SelfCreateResponse, status_code=status.HTTP_201_CREATED)
 async def self_create_company(
     data: TenantCreate,
-    current_user: User = Depends(get_authenticated_user),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Create a new company (self-service). The creator becomes org_admin.
@@ -177,6 +208,11 @@ async def self_create_company(
     # Block self-creation if locked to a specific tenant (Dedicated Link flow)
     if data.target_tenant_id is not None:
         raise HTTPException(status_code=403, detail="Company creation is not allowed via this link. Please join your assigned organization.")
+
+    # Dependency state can be stale by the time two requests reach this route.
+    # Lock and refresh before creating a Tenant/subscription or choosing
+    # between moving the tenantless anchor and adding a new membership.
+    current_user, locked_identity = await _lock_current_membership(db, current_user)
 
     # Check if self-creation is allowed
     from app.models.system_settings import SystemSetting
@@ -202,7 +238,7 @@ async def self_create_company(
     if current_user.tenant_id is not None:
         # Multi-tenant: user already belongs to a company.
         # Create a NEW User record for the new tenant instead of overwriting.
-        from app.core.security import create_access_token
+        from app.core.security import create_access_token, identity_auth_version
         from app.models.participant import Participant
 
         new_user = User(
@@ -231,7 +267,11 @@ async def self_create_company(
         await registration_service.bind_org_member(new_user)
 
         # Generate token scoped to the new user so frontend can switch context
-        access_token = create_access_token(str(new_user.id), new_user.role)
+        access_token = create_access_token(
+            str(new_user.id),
+            new_user.role,
+            auth_version=identity_auth_version(locked_identity),
+        )
     else:
         # Registration flow: user has no tenant yet, assign directly
         current_user.tenant_id = tenant.id
@@ -268,7 +308,7 @@ class JoinResponse(BaseModel):
 @router.post("/join", response_model=JoinResponse)
 async def join_company(
     data: JoinRequest,
-    current_user: User = Depends(get_authenticated_user),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Join an existing company using an invitation code.
@@ -277,12 +317,14 @@ async def join_company(
     - Registration flow (user has no tenant yet): assigns tenant directly
     - Switch-org flow (user already has a tenant): creates a new User record"""
     from app.models.invitation_code import InvitationCode
+    current_user, locked_identity = await _lock_current_membership(db, current_user)
+    invitation_code = data.invitation_code.strip().upper()
     ic_result = await db.execute(
         select(InvitationCode).where(
-            InvitationCode.code == data.invitation_code,
-            InvitationCode.is_active == True,
+            InvitationCode.code == invitation_code,
+            InvitationCode.is_active.is_(True),
             InvitationCode.tenant_id.is_not(None),
-        )
+        ).with_for_update()
     )
     code_obj = ic_result.scalar_one_or_none()
     if not code_obj:
@@ -292,11 +334,14 @@ async def join_company(
     if data.target_tenant_id and str(code_obj.tenant_id) != str(data.target_tenant_id):
         raise HTTPException(status_code=403, detail="This invitation code does not belong to the required organization.")
 
-    if code_obj.used_count >= code_obj.max_uses:
-        raise HTTPException(status_code=400, detail="Invitation code has reached its usage limit")
-
     # Find the company
-    t_result = await db.execute(select(Tenant).where(Tenant.id == code_obj.tenant_id))
+    # Lock the tenant as well so different invitation codes cannot race the
+    # first-org-admin decision for the same company.
+    t_result = await db.execute(
+        select(Tenant)
+        .where(Tenant.id == code_obj.tenant_id)
+        .with_for_update()
+    )
     tenant = t_result.scalar_one_or_none()
     if not tenant or not tenant.is_active:
         raise HTTPException(status_code=400, detail="Company not found or is disabled")
@@ -308,14 +353,31 @@ async def join_company(
             User.tenant_id == tenant.id,
         )
     )
-    if existing_membership.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="You already belong to this company")
+    existing_user = existing_membership.scalar_one_or_none()
+    if existing_user:
+        if not existing_user.is_active:
+            raise HTTPException(status_code=403, detail="Organization membership is disabled")
+        from app.core.security import create_access_token, identity_auth_version
+
+        return JoinResponse(
+            tenant=TenantOut.model_validate(tenant),
+            role=existing_user.role,
+            access_token=create_access_token(
+                str(existing_user.id),
+                existing_user.role,
+                auth_version=identity_auth_version(locked_identity),
+            ),
+        )
+
+    if code_obj.used_count >= code_obj.max_uses:
+        raise HTTPException(status_code=400, detail="Invitation code has reached its usage limit")
 
     # Check if this company has an org_admin already
     admin_check = await db.execute(
         select(sqla_func.count()).select_from(User).where(
             User.tenant_id == tenant.id,
             User.role.in_(["org_admin", "platform_admin"]),
+            User.is_active.is_(True),
         )
     )
     has_admin = admin_check.scalar() > 0
@@ -330,7 +392,7 @@ async def join_company(
     if current_user.tenant_id is not None:
         # Multi-tenant: user already belongs to a company.
         # Create a NEW User record for the new tenant.
-        from app.core.security import create_access_token
+        from app.core.security import create_access_token, identity_auth_version
         from app.models.participant import Participant
 
         new_user = User(
@@ -359,7 +421,11 @@ async def join_company(
         await registration_service.bind_org_member(new_user)
 
         # Generate token scoped to the new user so frontend can switch context
-        access_token = create_access_token(str(new_user.id), new_user.role)
+        access_token = create_access_token(
+            str(new_user.id),
+            new_user.role,
+            auth_version=identity_auth_version(locked_identity),
+        )
         final_role = new_user.role
     else:
         # Registration flow: user has no tenant yet, assign directly

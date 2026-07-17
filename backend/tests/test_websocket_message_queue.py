@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.api.websocket import WebSocketChatHandler, generic_llm_failure_user_message
+from app.services.chat_session_access import ChatSessionAuthorizationError
 from app.services.llm import caller as llm_caller
 from app.services.llm.caller import RouteMeta
 
@@ -93,6 +94,7 @@ async def test_message_loop_uses_validated_client_id_and_emits_assistant_id():
     client_message_id = uuid.uuid4()
     handler = WebSocketChatHandler(websocket, uuid.uuid4(), "token", str(uuid.uuid4()))
     handler.user = SimpleNamespace(id=uuid.uuid4())
+    handler.auth_version = 0
     handler.agent_name = "Test Agent"
     handler.agent_type = ""
     handler.conv_id = handler.session_id_param
@@ -108,12 +110,16 @@ async def test_message_loop_uses_validated_client_id_and_emits_assistant_id():
     )
     handler._resolve_route = AsyncMock(return_value=(None, None))
     handler._check_quotas = AsyncMock(return_value=True)
+    handler._ensure_access_token_current = AsyncMock(return_value=True)
     handler._save_user_message = AsyncMock(return_value="user-message-1")
     handler._save_assistant_reply = AsyncMock(return_value="assistant-message-1")
 
     with pytest.raises(StopAsyncIteration):
         await handler.message_loop()
 
+    # One fence admits the message, and the two persistence/response boundaries
+    # are revalidated before customer-visible completion.
+    assert handler._ensure_access_token_current.await_count == 3
     handler._save_user_message.assert_awaited_once_with(
         "hello",
         "hello",
@@ -160,6 +166,7 @@ async def test_saved_chat_messages_return_their_database_ids(monkeypatch):
 
     handler = WebSocketChatHandler(FakeWebSocket(), uuid.uuid4(), "token", str(uuid.uuid4()))
     handler.user = SimpleNamespace(id=uuid.uuid4())
+    handler.auth_version = 0
     handler.conv_id = handler.session_id_param
 
     requested_user_message_id = uuid.uuid4()
@@ -178,6 +185,53 @@ async def test_saved_chat_messages_return_their_database_ids(monkeypatch):
     assert user_db.committed is True
     assert assistant_db.committed is True
     assert validate_lane.await_count == 2
+    assert all(
+        call.kwargs["expected_auth_version"] == 0
+        for call in validate_lane.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_websocket_closes_revoked_identity_before_processing_next_message(
+    monkeypatch,
+):
+    websocket = FakeWebSocket()
+    db = RecordingDB([])
+    validate_lane = AsyncMock(
+        side_effect=ChatSessionAuthorizationError("Chat credential has been revoked")
+    )
+    monkeypatch.setattr(
+        "app.api.websocket.async_session",
+        lambda: RecordingDBContext(db),
+    )
+    monkeypatch.setattr(
+        "app.api.websocket.validate_active_user_chat_lane",
+        validate_lane,
+    )
+
+    handler = WebSocketChatHandler(
+        websocket,
+        uuid.uuid4(),
+        "token",
+        str(uuid.uuid4()),
+    )
+    handler.user = SimpleNamespace(id=uuid.uuid4())
+    handler.auth_version = 7
+    handler.conv_id = handler.session_id_param
+
+    assert await handler._ensure_access_token_current() is False
+    validate_lane.assert_awaited_once_with(
+        db,
+        agent_id=handler.agent_id,
+        owner_user_id=handler.user.id,
+        session_id=handler.conv_id,
+        lock_authority=True,
+        expected_auth_version=7,
+    )
+    assert websocket.sent == [
+        {"type": "error", "content": "Session expired. Please sign in again."}
+    ]
+    assert websocket.close_code == 4001
 
 
 @pytest.mark.asyncio

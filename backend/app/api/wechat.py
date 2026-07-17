@@ -144,6 +144,11 @@ async def get_wechat_qrcode_status(
             db.add(config)
             await db.flush()
 
+        from app.services.channel_user_service import channel_user_service
+        await channel_user_service.provision_provider_for_config(
+            db, channel_type="wechat", tenant_id=agent.tenant_id
+        )
+
         await db.commit()
         if _role_enabled("connector"):
             asyncio.create_task(wechat_poll_manager.start_client(agent_id))

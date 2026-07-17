@@ -1971,6 +1971,327 @@ reconcile_agentbay_for_cutover() {
     [ "$(agentbay_unresolved_count "$release")" = "0" ]
 }
 
+identity_provider_config_storage_type() {
+    local release="$1"
+    local result
+    result="$(
+        compose_project \
+            "$COMPOSE_PROJECT" "$release/.env" "$release/$COMPOSE_FILE" \
+            exec -T postgres psql -qAt -v ON_ERROR_STOP=1 \
+            -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+            -c "SELECT data_type
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'identity_providers'
+                  AND column_name = 'config';"
+    )" || return 1
+    case "$result" in
+        json|jsonb|text|'character varying') printf '%s' "$result" ;;
+        *) return 1 ;;
+    esac
+}
+
+verify_preexisting_identity_provider_secrets() {
+    local previous_release="$1"
+    local candidate_release="$2"
+    local candidate_project="$3"
+    local evidence_path="$4"
+    local storage_type
+    local raw_path
+
+    storage_type="$(
+        identity_provider_config_storage_type "$previous_release"
+    )" || return 1
+    case "$storage_type" in
+        json|jsonb)
+            # Revision 106 has not run yet. The shape-only SQL preflight above
+            # covers legacy JSON; authenticated envelopes are verified after
+            # the migration converts that column to Text.
+            return 0
+            ;;
+        text|'character varying') ;;
+        *) return 1 ;;
+    esac
+
+    raw_path="$(mktemp "${evidence_path}.raw.XXXXXX")" || return 1
+    chmod 0600 "$raw_path"
+    if ! compose_project \
+        "$candidate_project" "$candidate_release/.env" \
+        "$candidate_release/$COMPOSE_FILE" \
+        run --rm --no-deps -T --entrypoint python backend \
+        -m app.scripts.verify_identity_provider_secrets \
+        > "$raw_path" < /dev/null; then
+        rm -f "$raw_path"
+        return 1
+    fi
+    if ! grep -Eq '^identity_provider_secret_envelopes_verified=[0-9]+$' "$raw_path"; then
+        rm -f "$raw_path"
+        return 1
+    fi
+    install_durable_file "$raw_path" "$evidence_path"
+}
+
+identity_integrity_preflight() {
+    local release="$1"
+    local evidence_path="$2"
+    local raw_path
+    raw_path="$(mktemp "${evidence_path}.raw.XXXXXX")" || return 1
+    chmod 0600 "$raw_path"
+
+    if ! compose_project "$COMPOSE_PROJECT" "$release/.env" "$release/$COMPOSE_FILE" \
+        exec -T postgres psql \
+            -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At \
+            -v ON_ERROR_STOP=1 \
+            -c "
+WITH
+duplicate_email_groups AS (
+    SELECT count(*) AS value
+    FROM (
+        SELECT lower(btrim(email))
+        FROM identities
+        WHERE email IS NOT NULL
+        GROUP BY lower(btrim(email))
+        HAVING count(*) > 1
+    ) AS groups
+),
+cross_namespace_username_email_conflicts AS (
+    SELECT count(*) AS value
+    FROM identities AS username_owner
+    JOIN identities AS email_owner
+      ON email_owner.id <> username_owner.id
+     AND email_owner.email IS NOT NULL
+     AND lower(btrim(email_owner.email)) = lower(btrim(username_owner.username))
+    WHERE username_owner.username IS NOT NULL
+),
+cross_namespace_username_phone_conflicts AS (
+    SELECT count(*) AS value
+    FROM identities AS username_owner
+    JOIN identities AS phone_owner
+      ON phone_owner.id <> username_owner.id
+     AND phone_owner.phone IS NOT NULL
+     AND phone_owner.phone = username_owner.username
+    WHERE username_owner.username IS NOT NULL
+),
+duplicate_provider_scopes AS (
+    SELECT count(*) AS value
+    FROM (
+        SELECT tenant_id, provider_type
+        FROM identity_providers
+        GROUP BY tenant_id, provider_type
+        HAVING count(*) > 1
+    ) AS groups
+),
+duplicate_open_ids AS (
+    SELECT count(*) AS value
+    FROM (
+        SELECT provider_id, open_id
+        FROM org_members
+        WHERE provider_id IS NOT NULL AND open_id IS NOT NULL
+        GROUP BY provider_id, open_id
+        HAVING count(*) > 1
+    ) AS groups
+),
+duplicate_unionids AS (
+    SELECT count(*) AS value
+    FROM (
+        SELECT provider_id, unionid
+        FROM org_members
+        WHERE provider_id IS NOT NULL AND unionid IS NOT NULL
+        GROUP BY provider_id, unionid
+        HAVING count(*) > 1
+    ) AS groups
+),
+duplicate_external_ids AS (
+    SELECT count(*) AS value
+    FROM (
+        SELECT provider_id, external_id
+        FROM org_members
+        WHERE provider_id IS NOT NULL AND external_id IS NOT NULL
+        GROUP BY provider_id, external_id
+        HAVING count(*) > 1
+    ) AS groups
+),
+duplicate_memberships AS (
+    SELECT count(*) AS value
+    FROM (
+        SELECT identity_id, tenant_id
+        FROM users
+        WHERE identity_id IS NOT NULL AND tenant_id IS NOT NULL
+        GROUP BY identity_id, tenant_id
+        HAVING count(*) > 1
+    ) AS groups
+),
+duplicate_tenantless_memberships AS (
+    SELECT count(*) AS value
+    FROM (
+        SELECT identity_id
+        FROM users
+        WHERE identity_id IS NOT NULL AND tenant_id IS NULL
+        GROUP BY identity_id
+        HAVING count(*) > 1
+    ) AS groups
+),
+password_candidates AS (
+    SELECT count(*) AS value
+    FROM identities AS i
+    WHERE i.password_hash IS NOT NULL
+      AND EXISTS (
+          SELECT 1 FROM users AS u
+          WHERE u.identity_id = i.id AND u.registration_source = 'web'
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM users AS u
+          WHERE u.identity_id = i.id
+            AND COALESCE(u.registration_source, '') <> 'web'
+      )
+      AND NOT EXISTS (
+          SELECT 1
+          FROM users AS u
+          JOIN org_members AS om ON om.user_id = u.id
+          LEFT JOIN identity_providers AS ip ON ip.id = om.provider_id
+          WHERE u.identity_id = i.id
+            AND om.provider_id IS NOT NULL
+            AND (
+                ip.id IS NULL
+                OR lower(btrim(ip.provider_type)) NOT IN ('web', 'platform')
+            )
+      )
+)
+SELECT json_build_object(
+    'blank_emails', (
+        SELECT count(*) FROM identities
+        WHERE email IS NOT NULL AND btrim(email) = ''
+    ),
+    'duplicate_email_groups', (SELECT value FROM duplicate_email_groups),
+    'cross_namespace_username_email_conflicts', (SELECT value FROM cross_namespace_username_email_conflicts),
+    'cross_namespace_username_phone_conflicts', (SELECT value FROM cross_namespace_username_phone_conflicts),
+    'duplicate_provider_scopes', (SELECT value FROM duplicate_provider_scopes),
+    'duplicate_provider_open_id_groups', (SELECT value FROM duplicate_open_ids),
+    'duplicate_provider_unionid_groups', (SELECT value FROM duplicate_unionids),
+    'duplicate_provider_external_id_groups', (SELECT value FROM duplicate_external_ids),
+    'duplicate_membership_groups', (SELECT value FROM duplicate_memberships),
+    'duplicate_tenantless_membership_groups', (SELECT value FROM duplicate_tenantless_memberships),
+    'invalid_identity_provider_config_shapes', (
+        SELECT count(*)
+        FROM identity_providers
+        WHERE config IS NOT NULL
+          AND pg_typeof(config)::text IN ('json', 'jsonb')
+          AND jsonb_typeof(to_jsonb(config)) IS DISTINCT FROM 'object'
+    ),
+    'unencrypted_identity_provider_text_configs', (
+        SELECT count(*)
+        FROM identity_providers
+        WHERE config IS NOT NULL
+          AND pg_typeof(config)::text IN ('text', 'character varying')
+          AND CAST(config AS text) NOT LIKE 'enc:idp:v1:%'
+    ),
+    'provider_member_tenant_mismatches', (
+        SELECT count(*)
+        FROM org_members AS om
+        JOIN identity_providers AS ip ON ip.id = om.provider_id
+        WHERE om.tenant_id IS DISTINCT FROM ip.tenant_id
+    ),
+    'tenant_provider_member_user_mismatches', (
+        SELECT count(*)
+        FROM org_members AS om
+        JOIN identity_providers AS ip ON ip.id = om.provider_id
+        JOIN users AS u ON u.id = om.user_id
+        WHERE ip.tenant_id IS NOT NULL
+          AND (
+              om.tenant_id IS DISTINCT FROM u.tenant_id
+              OR ip.tenant_id IS DISTINCT FROM u.tenant_id
+          )
+    ),
+    'agent_member_provider_tenant_mismatches', (
+        SELECT count(*)
+        FROM agent_relationships AS ar
+        JOIN agents AS a ON a.id = ar.agent_id
+        JOIN org_members AS om ON om.id = ar.member_id
+        LEFT JOIN identity_providers AS ip ON ip.id = om.provider_id
+        WHERE a.tenant_id IS NULL
+           OR om.tenant_id IS NULL
+           OR ip.id IS NULL
+           OR ip.tenant_id IS NULL
+           OR a.tenant_id IS DISTINCT FROM om.tenant_id
+           OR a.tenant_id IS DISTINCT FROM ip.tenant_id
+    ),
+    'password_hash_total', (
+        SELECT count(*) FROM identities WHERE password_hash IS NOT NULL
+    ),
+    'password_login_candidates', (SELECT value FROM password_candidates),
+    'password_hashes_disabled_for_audit', (
+        SELECT count(*) FROM identities WHERE password_hash IS NOT NULL
+    ) - (SELECT value FROM password_candidates)
+)::text;
+" > "$raw_path"; then
+        rm -f "$raw_path"
+        return 1
+    fi
+
+    python3 - "$raw_path" "$evidence_path" <<'PY'
+import json
+import os
+from pathlib import Path
+import sys
+from tempfile import NamedTemporaryFile
+
+raw_path = Path(sys.argv[1])
+evidence_path = Path(sys.argv[2])
+try:
+    counts = json.loads(raw_path.read_text(encoding="utf-8").strip())
+finally:
+    raw_path.unlink(missing_ok=True)
+
+blocker_keys = (
+    "blank_emails",
+    "duplicate_email_groups",
+    "cross_namespace_username_email_conflicts",
+    "cross_namespace_username_phone_conflicts",
+    "duplicate_provider_scopes",
+    "duplicate_provider_open_id_groups",
+    "duplicate_provider_unionid_groups",
+    "duplicate_provider_external_id_groups",
+    "duplicate_membership_groups",
+    "duplicate_tenantless_membership_groups",
+    "invalid_identity_provider_config_shapes",
+    "unencrypted_identity_provider_text_configs",
+    "provider_member_tenant_mismatches",
+    "tenant_provider_member_user_mismatches",
+    "agent_member_provider_tenant_mismatches",
+)
+if not isinstance(counts, dict) or any(
+    not isinstance(counts.get(key), int) or counts[key] < 0
+    for key in (*blocker_keys, "password_hash_total", "password_login_candidates", "password_hashes_disabled_for_audit")
+):
+    raise SystemExit("invalid identity-integrity preflight result")
+
+blockers = {key: counts[key] for key in blocker_keys if counts[key]}
+payload = {
+    "schema_version": 1,
+    "ok": not blockers,
+    "blockers": blockers,
+    "counts": counts,
+}
+evidence_path.parent.mkdir(parents=True, exist_ok=True)
+with NamedTemporaryFile(
+    mode="w",
+    encoding="utf-8",
+    dir=evidence_path.parent,
+    prefix=f".{evidence_path.name}.",
+    delete=False,
+) as handle:
+    json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+    temp_path = Path(handle.name)
+os.chmod(temp_path, 0o600)
+temp_path.replace(evidence_path)
+if blockers:
+    raise SystemExit("production identity-integrity preflight found blockers")
+PY
+}
+
 verify_public_maintenance() {
     local headers
     headers="$(curl -sS -D - -o /dev/null "$PUBLIC_URL/api/health?maintenance=$RELEASE_ID" | tr -d '\r')" || return 1
@@ -3910,8 +4231,10 @@ else
     fi
 fi
 JWT_ROTATION_MARKER="$APP_ROOT/.jwt-url-leak-rotation-v1"
+SSO_PASSWORD_ROTATION_MARKER="$APP_ROOT/.sso-derived-password-rotation-v1"
 ROTATE_JWT=0
-if [ ! -f "$JWT_ROTATION_MARKER" ]; then
+if [ ! -f "$JWT_ROTATION_MARKER" ] || [ -L "$JWT_ROTATION_MARKER" ] || \
+    [ ! -f "$SSO_PASSWORD_ROTATION_MARKER" ] || [ -L "$SSO_PASSWORD_ROTATION_MARKER" ]; then
     ROTATE_JWT=1
 fi
 
@@ -3978,6 +4301,7 @@ updates = {
     "ASTRA_ALERT_WORKER_ACTOR_ID": str(uuid.uuid4()),
     "COMMIT": sys.argv[3],
     "ALLOW_MIGRATION_FAILURE": "false",
+    "ALLOW_UNVERIFIED_LOCAL_SIGNUP": "false",
     "HEARTBEAT_ENABLED": "false",
     "TRIGGER_DAEMON_ENABLED": "true",
     "USER_AUTOMATION_EXECUTION_ENABLED": "true",
@@ -4033,6 +4357,39 @@ for key, value in updates.items():
 path.write_text("\n".join(out) + "\n", encoding="utf-8")
 PY
 
+# IdentityProvider and ChannelConfig envelopes are tied to SECRET_KEY.  A
+# normal release must preserve it byte-for-byte; rotation requires a separate
+# decrypt/re-encrypt workflow and may never happen implicitly during cutover.
+python3 - "$PREVIOUS/.env" "$RELEASE/.env" <<'PY'
+from hmac import compare_digest
+from pathlib import Path
+import sys
+
+
+def read_secret(path: str) -> str:
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        if line.lstrip().startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip() != "SECRET_KEY":
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        return value
+    return ""
+
+
+previous = read_secret(sys.argv[1])
+candidate = read_secret(sys.argv[2])
+if not previous or not candidate or not compare_digest(previous, candidate):
+    raise SystemExit(
+        "SECRET_KEY continuity check failed; use the explicit envelope-key "
+        "rotation workflow instead of a version deployment"
+    )
+print("SECRET_KEY continuity verified")
+PY
+
 cp "$PREVIOUS/VERSION" "$BACKUP/VERSION.previous" 2>/dev/null || true
 cp "$PREVIOUS/COMMIT" "$BACKUP/COMMIT.previous" 2>/dev/null || true
 test -s "$PREVIOUS/VERSION"
@@ -4065,6 +4422,12 @@ mcp_endpoint_preflight "$PREVIOUS"
 
 echo "[remote] validating deterministic model routes and MiniMax credential capabilities"
 model_route_credential_preflight "$PREVIOUS"
+
+echo "[remote] validating identity and tenant integrity before maintenance"
+if ! identity_integrity_preflight \
+    "$PREVIOUS" "$BACKUP/identity-integrity-preflight.json"; then
+    abort_release "production identity integrity preflight failed before maintenance"
+fi
 
 printf '%s\n' "$VERSION" > "$RELEASE/VERSION"
 printf '%s\n' "$COMMIT" > "$RELEASE/COMMIT"
@@ -4314,6 +4677,16 @@ compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" rm
 echo "[remote] building candidate slot $CANDIDATE_SLOT"
 compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" build backend frontend
 
+# A previous release that already ran revision 106 stores authenticated Text
+# envelopes. Validate them with the just-built candidate before maintenance so
+# a damaged row cannot make the next deployment self-lock after writers stop.
+echo "[remote] validating pre-existing IdentityProvider secret envelopes"
+if ! verify_preexisting_identity_provider_secrets \
+    "$PREVIOUS" "$RELEASE" "$CANDIDATE_PROJECT" \
+    "$BACKUP/identity-provider-secret-preflight.txt"; then
+    abort_release "IdentityProvider secret preflight failed before maintenance"
+fi
+
 # Fail before maintenance if the candidate cannot identify at least one real
 # alert sink or the configured in-app owner does not exist. This preflight is
 # read-only; the delivery canary runs only after the candidate worker is live.
@@ -4401,6 +4774,11 @@ if ! compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FIL
     run --rm --no-deps -T --entrypoint python backend \
     -m app.scripts.verify_channel_secrets < /dev/null; then
     abort_release "ChannelConfig secret encryption or authentication failed after migration"
+fi
+if ! compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" \
+    run --rm --no-deps -T --entrypoint python backend \
+    -m app.scripts.verify_identity_provider_secrets < /dev/null; then
+    abort_release "IdentityProvider secret encryption or authentication failed after migration"
 fi
 if ! reconcile_agentbay_for_cutover "$CANDIDATE_PROJECT" "$RELEASE"; then
     abort_release "AgentBay provider cleanup remains unverified after migration"
@@ -4498,6 +4876,12 @@ if ! candidate_business_evidence_valid "$RELEASE_ID" "$CANDIDATE_PORT"; then
 fi
 write_cutover_state candidate_business_verified "$CANDIDATE_SLOT" "$RELEASE_ID"
 
+# Own the source release's drain before the first traffic mutation.  A crash or
+# bounded drain timeout must never make this slot appear reusable to the next
+# deployment.  Successful rollback cancels this exact marker only after the
+# source release is authoritative again.
+write_atomic_line "$PENDING_DRAIN_FILE" "$OLD_PROJECT $OLD_PORT $PREVIOUS"
+
 echo "[remote] switching the verified maintenance fence to candidate traffic"
 sudo python3 "$RELEASE/scripts/configure_production_nginx.py" \
     install "$NGINX_SITE" "$OLD_PORT" "$CANDIDATE_PORT" \
@@ -4551,7 +4935,8 @@ fi
 } > "$BACKUP/docker-ps.after.txt"
 
 if [ "$ROTATE_JWT" = "1" ]; then
-    touch "$JWT_ROTATION_MARKER"
+    write_atomic_line "$JWT_ROTATION_MARKER" "$RELEASE_ID"
+    write_atomic_line "$SSO_PASSWORD_ROTATION_MARKER" "$RELEASE_ID"
 fi
 write_cutover_state complete "$CANDIDATE_SLOT" "$RELEASE_ID"
 

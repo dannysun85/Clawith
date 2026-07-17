@@ -36,6 +36,10 @@ MAINTENANCE_DIRECTIVES = (
     'add_header Cache-Control "no-store" always;',
     "return 503;",
 )
+CLIENT_IP_PROXY_HEADERS = (
+    ("X-Real-IP", "$remote_addr"),
+    ("X-Forwarded-For", "$remote_addr"),
+)
 
 
 @dataclass(frozen=True)
@@ -291,6 +295,40 @@ def _audit_parsed_config(text: str, parsed: _ParsedConfig) -> tuple[int, int]:
             )
         safe_logs += 1
 
+    # The public host is the only trust boundary allowed to derive the end-user
+    # address.  It must overwrite both headers before forwarding into the
+    # loopback-bound blue/green frontend; otherwise a client can spoof buckets,
+    # or the inner Docker hop can collapse every user into one shared bucket.
+    astra_proxies = [
+        directive
+        for directive in parsed.directives
+        if directive.name == "proxy_pass"
+        and len(directive.arguments) == 1
+        and re.fullmatch(
+            r"http://127\.0\.0\.1:(3008|3009)",
+            directive.arguments[0].value,
+        )
+    ]
+    for proxy in astra_proxies:
+        direct_headers = [
+            directive
+            for directive in parsed.directives
+            if directive.name == "proxy_set_header"
+            and directive.blocks == proxy.blocks
+            and len(directive.arguments) == 2
+        ]
+        for header_name, header_value in CLIENT_IP_PROXY_HEADERS:
+            matches = [
+                directive
+                for directive in direct_headers
+                if directive.arguments[0].value.casefold()
+                == header_name.casefold()
+            ]
+            if len(matches) != 1 or matches[0].arguments[1].value != header_value:
+                raise ValueError(
+                    "Astra public upstream must overwrite trusted client-IP headers"
+                )
+
     formats = [
         directive
         for directive in parsed.directives
@@ -400,6 +438,67 @@ def _directive_removal_span(text: str, directive: _Directive) -> tuple[int, int]
     if not before.strip() and not after.strip():
         return line_start, line_end
     return directive.start, directive.end
+
+
+def _astra_proxy_directive(parsed: _ParsedConfig) -> _Directive:
+    matches = [
+        directive
+        for directive in parsed.directives
+        if directive.name == "proxy_pass"
+        and len(directive.arguments) == 1
+        and re.fullmatch(
+            r"http://127\.0\.0\.1:(3008|3009)",
+            directive.arguments[0].value,
+        )
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            "expected exactly one Astra proxy scope for client-IP headers"
+        )
+    return matches[0]
+
+
+def _client_ip_header_insertion(text: str, proxy: _Directive) -> tuple[int, str]:
+    line_start = text.rfind("\n", 0, proxy.start) + 1
+    prefix = text[line_start : proxy.start]
+    if not prefix.strip():
+        indent = prefix
+        content = (
+            f"proxy_set_header X-Real-IP $remote_addr;\n{indent}"
+            f"proxy_set_header X-Forwarded-For $remote_addr;\n{indent}"
+        )
+    else:
+        base_indent = re.match(r"[ \t]*", prefix)
+        indent = (base_indent.group(0) if base_indent else "") + "    "
+        content = (
+            f"\n{indent}proxy_set_header X-Real-IP $remote_addr;"
+            f"\n{indent}proxy_set_header X-Forwarded-For $remote_addr;"
+            f"\n{indent}"
+        )
+    return proxy.start, content
+
+
+def _install_client_ip_proxy_headers(text: str) -> str:
+    parsed = _parse_nginx(text)
+    proxy = _astra_proxy_directive(parsed)
+    removable = [
+        directive
+        for directive in parsed.directives
+        if directive.name == "proxy_set_header"
+        and directive.blocks == proxy.blocks
+        and directive.arguments
+        and directive.arguments[0].value.casefold()
+        in {"x-real-ip", "x-forwarded-for"}
+    ]
+    for start, end in sorted(
+        (_directive_removal_span(text, directive) for directive in removable),
+        reverse=True,
+    ):
+        text = text[:start] + text[end:]
+
+    proxy = _astra_proxy_directive(_parse_nginx(text))
+    offset, content = _client_ip_header_insertion(text, proxy)
+    return text[:offset] + content + text[offset:]
 
 
 def _remove_maintenance_blocks(text: str) -> str:
@@ -518,6 +617,8 @@ def configure_site(text: str, old_port: str, candidate_port: str) -> tuple[str, 
             "expected exactly one old or already-installed candidate upstream; "
             f"found old={len(old_matches)} candidate={len(candidate_matches)}"
         )
+
+    text = _install_client_ip_proxy_headers(text)
 
     parsed = _parse_nginx(text)
     access_logs = [

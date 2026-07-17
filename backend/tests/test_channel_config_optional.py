@@ -84,6 +84,7 @@ async def test_missing_channel_config_still_defaults_to_not_found(module, getter
 @pytest.mark.asyncio
 async def test_new_dingtalk_channel_preserves_optional_agent_id(monkeypatch):
     agent_id = uuid.uuid4()
+    tenant_id = uuid.uuid4()
     user = SimpleNamespace(id=uuid.uuid4())
     db = NewConfigDB()
     start_client = AsyncMock()
@@ -91,7 +92,12 @@ async def test_new_dingtalk_channel_preserves_optional_agent_id(monkeypatch):
     monkeypatch.setattr(
         dingtalk,
         "check_agent_access",
-        AsyncMock(return_value=(SimpleNamespace(id=agent_id), "manage")),
+        AsyncMock(
+            return_value=(
+                SimpleNamespace(id=agent_id, tenant_id=tenant_id),
+                "manage",
+            )
+        ),
     )
     monkeypatch.setattr(dingtalk, "is_agent_creator", lambda _user, _agent: True)
     monkeypatch.setattr(
@@ -102,6 +108,11 @@ async def test_new_dingtalk_channel_preserves_optional_agent_id(monkeypatch):
     monkeypatch.setattr(
         "app.services.dingtalk_stream.dingtalk_stream_manager.start_client",
         start_client,
+    )
+    provision_provider = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.channel_user_service.channel_user_service.provision_provider_for_config",
+        provision_provider,
     )
 
     await dingtalk.configure_dingtalk_channel(
@@ -125,6 +136,11 @@ async def test_new_dingtalk_channel_preserves_optional_agent_id(monkeypatch):
         "agent_id": "123456",
     }
     start_client.assert_awaited_once_with(agent_id, "ding-key", "ding-secret")
+    provision_provider.assert_awaited_once_with(
+        db,
+        channel_type="dingtalk",
+        tenant_id=tenant_id,
+    )
 
 
 @pytest.mark.asyncio

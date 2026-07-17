@@ -14,12 +14,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.core.permissions import check_agent_access, is_agent_creator, is_agent_expired
-from app.core.security import get_current_user
-from app.database import async_session as _async_session, get_db
+from app.core.security import create_access_token, get_current_user, identity_auth_version
+from app.database import async_session as _async_session, get_db, transaction
 from app.models.channel_config import ChannelConfig
 from app.models.user import User
-from app.schemas.schemas import ChannelConfigCreate, ChannelConfigOut, TokenResponse, UserOut
+from app.schemas.schemas import ChannelConfigCreate, ChannelConfigOut
+from app.services.auth_provider import FeishuAuthProvider
 from app.services.feishu_service import FeishuResourceTooLargeError, feishu_service
+from app.services.external_identity_policy import external_user_can_authenticate
+from app.services.identity_provider_lookup import get_login_identity_provider_by_id
+from app.services.sso_service import ExternalIdentityProvisioningDeniedError
+from app.services.sso_scan_session_service import (
+    authorize_sso_session,
+    get_pending_sso_session,
+    parse_sso_scan_state,
+    verify_sso_callback_initiator,
+)
 from app.services.llm.utils import convert_chat_messages_to_llm_format, truncate_messages_with_pair_integrity
 from app.services.media_message_content import sanitize_inline_media_content
 from app.services.storage import agent_upload_key, get_storage_backend, store_agent_upload
@@ -363,102 +373,102 @@ async def _save_feishu_tool_call(
 # ─── OAuth ──────────────────────────────────────────────
 
 @router.get("/auth/feishu/callback")
-@router.post("/auth/feishu/callback", response_model=TokenResponse)
 async def feishu_oauth_callback(
-    code: str, 
-    state: str = None, 
-    db: AsyncSession = Depends(get_db)
+    code: str,
+    request: Request,
+    state: str | None = None,
+    db: AsyncSession = Depends(get_db),
 ):
-    """Handle Feishu OAuth callback — exchange code for user session."""
-    # Parse state if it's a UUID (session ID) or other context
-    from app.models.identity import SSOScanSession
-    tenant_id = None
-    if state:
-        try:
-            sid = uuid.UUID(state)
-            s_res = await db.execute(select(SSOScanSession).where(SSOScanSession.id == sid))
-            session = s_res.scalar_one_or_none()
-            if session:
-                tenant_id = session.tenant_id
-        except (ValueError, AttributeError):
-            pass
+    """Authorize one valid SSO relay session; never return a JWT in HTML/JSON."""
+    parsed_state = parse_sso_scan_state(state, provider_type="feishu")
+    if not parsed_state:
+        raise HTTPException(status_code=400, detail="SSO session is invalid")
+    sid, provider_id = parsed_state
+
+    scan_session = await get_pending_sso_session(db, sid)
+    verify_sso_callback_initiator(scan_session, request)
+    tenant_id = scan_session.tenant_id
+    provider = await get_login_identity_provider_by_id(
+        db,
+        provider_id=provider_id,
+        provider_type="feishu",
+        tenant_id=tenant_id,
+    )
+    if not provider:
+        raise HTTPException(status_code=403, detail="Feishu SSO is disabled")
+    auth_provider = FeishuAuthProvider(provider=provider, config=provider.config or {})
+
+    # End the read-only preflight transaction before any provider network I/O.
+    await db.commit()
 
     try:
-        # Use FeishuAuthProvider instead of legacy feishu_service
-        from app.services.auth_provider import FeishuAuthProvider
-        from app.models.identity import IdentityProvider
-        from app.config import get_settings
-
-        # Get Feishu credentials from settings
-        settings = get_settings()
-        feishu_config = {
-            "app_id": settings.FEISHU_APP_ID,
-            "app_secret": settings.FEISHU_APP_SECRET,
-        }
-
-        # Get or create provider via auth provider
-        provider = None
-        if tenant_id:
-            result = await db.execute(
-                select(IdentityProvider).where(
-                    IdentityProvider.provider_type == "feishu",
-                    IdentityProvider.tenant_id == tenant_id
-                )
-            )
-            provider = result.scalar_one_or_none()
-
-        auth_provider = FeishuAuthProvider(provider=provider, config=feishu_config)
-
-        # Ensure provider exists (will create if not)
-        await auth_provider._ensure_provider(db, tenant_id)
-        provider = auth_provider.provider
-
-        # Exchange code for user info
         token_data = await auth_provider.exchange_code_for_token(code)
         access_token = token_data.get("access_token", "")
+        if not access_token:
+            raise ValueError("Feishu token exchange returned no access token")
         user_info = await auth_provider.get_user_info(access_token)
 
-        # Find or create user
-        user, is_new = await auth_provider.find_or_create_user(db, user_info, tenant_id=tenant_id)
-
-        # Generate JWT token
-        from app.core.security import create_access_token
-        token = create_access_token(str(user.id), user.role)
-
-    except Exception as e:
-        logger.warning("[Feishu] OAuth callback failed error_type={}", type(e).__name__)
+        async with transaction(db):
+            current_scan_session = await get_pending_sso_session(
+                db,
+                sid,
+                for_update=True,
+            )
+            if current_scan_session.tenant_id != tenant_id:
+                raise HTTPException(status_code=400, detail="SSO session is invalid")
+            current_provider = await get_login_identity_provider_by_id(
+                db,
+                provider_id=provider_id,
+                provider_type="feishu",
+                tenant_id=tenant_id,
+                for_update=True,
+            )
+            if not current_provider:
+                raise HTTPException(status_code=403, detail="Feishu SSO is disabled")
+            current_auth_provider = FeishuAuthProvider(
+                provider=current_provider,
+                config=current_provider.config or {},
+            )
+            user, _is_new = await current_auth_provider.find_or_create_user(
+                db,
+                user_info,
+                tenant_id=tenant_id,
+            )
+            if not external_user_can_authenticate(user):
+                raise HTTPException(status_code=403, detail="Account is disabled")
+            token = create_access_token(
+                str(user.id),
+                user.role,
+                auth_version=identity_auth_version(user),
+            )
+            await authorize_sso_session(
+                db,
+                sid=sid,
+                provider_type="feishu",
+                user_id=user.id,
+                access_token=token,
+            )
+    except ExternalIdentityProvisioningDeniedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This account is not provisioned for the organization.",
+        ) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("[Feishu] OAuth callback failed error_type={}", type(exc).__name__)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Feishu authentication failed. Please retry.",
-        )
+        ) from exc
 
-    # If this is an SSO session, store result and redirect to frontend completion
-    if state:
-        try:
-            sid = uuid.UUID(state)
-            s_res = await db.execute(select(SSOScanSession).where(SSOScanSession.id == sid))
-            session = s_res.scalar_one_or_none()
-            if session:
-                session.status = "authorized"
-                session.provider_type = "feishu"
-                session.user_id = user.id
-                session.access_token = token
-                session.error_msg = None
-                await db.commit()
-                return HTMLResponse(
-                    f"""<html><head><meta charset="utf-8" /></head>
-                    <body style="font-family: sans-serif; padding: 24px;">
-                        <div>SSO login successful. Redirecting...</div>
-                        <script>window.location.href = "/sso/entry?sid={sid}&complete=1";</script>
-                    </body></html>"""
-                )
-        except Exception as e:
-            logger.exception(
-                "Failed to update SSO session (feishu) error_type={}",
-                type(e).__name__,
-            )
-
-    return TokenResponse(access_token=token, user=UserOut.model_validate(user))
+    return HTMLResponse(
+        f"""<html><head><meta charset="utf-8" /></head>
+        <body style="font-family: sans-serif; padding: 24px;">
+            <div>SSO login successful. Redirecting...</div>
+            <script>window.location.href = "/sso/entry?sid={sid}&complete=1";</script>
+        </body></html>"""
+    )
 
 
 # ─── Channel Config (per-agent Feishu bot) ──────────────
@@ -501,6 +511,10 @@ async def configure_channel(
         existing.extra_config = merged_extra_config
         existing.is_configured = True
         await db.flush()
+        from app.services.channel_user_service import channel_user_service
+        await channel_user_service.provision_provider_for_config(
+            db, channel_type="feishu", tenant_id=agent.tenant_id
+        )
         
         # Start/Stop WS client in background
         from app.services.feishu_ws import feishu_ws_manager
@@ -530,6 +544,10 @@ async def configure_channel(
         )
     db.add(config)
     await db.flush()
+    from app.services.channel_user_service import channel_user_service
+    await channel_user_service.provision_provider_for_config(
+        db, channel_type="feishu", tenant_id=agent.tenant_id
+    )
 
     # Start WS client in background
     from app.services.feishu_ws import feishu_ws_manager

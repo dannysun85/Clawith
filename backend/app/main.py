@@ -287,6 +287,9 @@ async def lifespan(app: FastAPI):
         record_production_issue,
         start_production_issue_monitor_daemon,
     )
+    from app.services.sso_scan_session_service import (
+        start_sso_session_cleanup_daemon,
+    )
     from app.services.tool_seeder import seed_builtin_tools
     from app.services.template_seeder import seed_agent_templates
     from app.services.feishu_ws import feishu_ws_manager
@@ -507,6 +510,7 @@ async def lifespan(app: FastAPI):
                 ("media_generation", start_media_generation_daemon()),
                 ("billing_reconciliation", start_billing_reconciliation_daemon()),
                 ("approval_execution", start_approval_execution_daemon()),
+                ("sso_session_cleanup", start_sso_session_cleanup_daemon()),
             ]
             if settings.PRODUCTION_ISSUE_MONITOR_ENABLED:
                 worker_task_specs.append(

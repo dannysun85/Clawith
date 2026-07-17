@@ -8,7 +8,7 @@ import { clearBrowserSession, establishBrowserSession } from '../utils/authTrans
 interface AuthStore {
     user: User | null;
     token: string | null;
-    setAuth: (user: User, token: string) => void;
+    setAuth: (user: User, token: string) => Promise<void>;
     setUser: (user: User) => void;
     logout: () => void;
     isAuthenticated: () => boolean;
@@ -18,9 +18,12 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
     user: null,
     token: localStorage.getItem('token'),
 
-    setAuth: (user, token) => {
+    setAuth: async (user, token) => {
+        // Workspace media URLs intentionally carry no bearer token. Do not
+        // expose authenticated UI until the HttpOnly browser credential is
+        // confirmed, otherwise initial <img>/<video> requests can race it.
+        await establishBrowserSession(token);
         localStorage.setItem('token', token);
-        establishBrowserSession(token);
         set({ user, token });
     },
 

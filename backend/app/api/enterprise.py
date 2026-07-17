@@ -1,20 +1,25 @@
 """Enterprise management API routes: LLM pool, enterprise info, approvals, audit logs."""
 
+import json
 import uuid
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response, status
 from loguru import logger
 from pydantic import BaseModel
-from sqlalchemy import select, func, update, or_
+from sqlalchemy import exists, select, func, update, or_, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.config import get_settings
 from app.core.security import encrypt_data, get_current_admin, get_current_user
 from app.database import async_session, get_db
 from app.models.org import OrgDepartment, OrgMember
 from app.models.identity import IdentityProvider
-from app.models.user import User
+from app.models.invitation_code import InvitationCode
+from app.models.system_settings import SystemSetting
+from app.models.tenant import Tenant
+from app.models.user import Identity, User
 from app.services.org_sync_adapter import derive_member_department_paths
 from app.models.agent import Agent
 from app.models.llm import LLMModel
@@ -140,28 +145,16 @@ def _validate_routed_model_update(
         )
 
 
-# ─── Public: Check Email Exists ────────────────────────
+# ─── Retired public identity oracle ────────────────────
 
-class CheckEmailRequest(BaseModel):
-    email: str
+@router.post("/check-email-exists", deprecated=True)
+async def check_email_exists():
+    """Reject the legacy global account-enumeration endpoint."""
 
-
-@router.post("/check-email-exists")
-async def check_email_exists(
-    data: CheckEmailRequest,
-    db: AsyncSession = Depends(get_db),
-):
-    """Public endpoint — check if an email address is already registered on this platform.
-
-    Used by the invitation flow to decide whether to show the login or register form.
-    Only returns a boolean; does not expose any user data.
-    """
-    from app.models.user import Identity
-    result = await db.execute(
-        select(Identity).where(Identity.email == data.email.strip().lower())
+    raise HTTPException(
+        status_code=410,
+        detail="Email preflight is no longer available. Continue with login or registration.",
     )
-    exists = result.scalar_one_or_none() is not None
-    return {"exists": exists}
 
 
 
@@ -644,7 +637,7 @@ async def get_enterprise_stats(
 
     # Base queries
     agent_q = select(func.count(Agent.id))
-    user_q = select(func.count(User.id)).where(User.is_active == True)
+    user_q = select(func.count(User.id)).where(User.is_active.is_(True))
     approval_q = select(func.count(ApprovalRequest.id))
 
     if tid:
@@ -673,8 +666,6 @@ async def get_enterprise_stats(
 
 
 # ─── Tenant Quota Settings ──────────────────────────────
-
-from app.models.tenant import Tenant
 
 
 class TenantQuotaUpdate(BaseModel):
@@ -864,8 +855,6 @@ async def update_email_templates_endpoint(
 
 # ─── System Settings ───────────────────────────────────
 
-from app.models.system_settings import SystemSetting
-
 
 class SettingUpdate(BaseModel):
     value: dict
@@ -945,7 +934,22 @@ async def update_system_setting(
 
 # ─── SSO Derived State Helper ───────────────────────────
 
-async def _sync_tenant_sso_state(db: AsyncSession, tenant_id: uuid.UUID):
+async def _acquire_sso_admin_lock(db: AsyncSession) -> None:
+    """Serialize provider-derived tenant SSO state across concurrent admins."""
+    bind = db.get_bind() if hasattr(db, "get_bind") else None
+    if getattr(getattr(bind, "dialect", None), "name", None) == "postgresql":
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(:lock_key)"),
+            {"lock_key": 0x415354524153534F},
+        )
+
+
+async def _sync_tenant_sso_state(
+    db: AsyncSession,
+    tenant_id: uuid.UUID,
+    *,
+    commit: bool = True,
+):
     """Recompute tenant.sso_enabled based on channel-level sso_login_enabled flags.
 
     When any identity provider has sso_login_enabled=True, the tenant's
@@ -959,13 +963,15 @@ async def _sync_tenant_sso_state(db: AsyncSession, tenant_id: uuid.UUID):
     count_result = await db.execute(
         select(func.count(IdentityProvider.id)).where(
             IdentityProvider.tenant_id == tenant_id,
-            IdentityProvider.sso_login_enabled == True,
-            IdentityProvider.is_active == True,
+            IdentityProvider.sso_login_enabled.is_(True),
+            IdentityProvider.is_active.is_(True),
         )
     )
     active_sso_count = count_result.scalar() or 0
 
-    tenant_result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
+    tenant_result = await db.execute(
+        select(Tenant).where(Tenant.id == tenant_id).with_for_update()
+    )
     tenant = tenant_result.scalar_one_or_none()
     if not tenant:
         return
@@ -990,7 +996,55 @@ async def _sync_tenant_sso_state(db: AsyncSession, tenant_id: uuid.UUID):
 
         tenant.sso_domain = sso_base
 
-    await db.commit()
+    if commit:
+        await db.commit()
+    return tenant
+
+
+async def _count_provider_users_without_local_recovery(
+    db: AsyncSession,
+    provider_id: uuid.UUID,
+) -> int:
+    """Count active linked identities that would lose their only safe fallback."""
+    linked_user = aliased(User, name="linked_user")
+    active_user = aliased(User, name="active_user")
+    active_tenant = aliased(Tenant, name="active_tenant")
+    active_membership_exists = exists(
+        select(active_user.id)
+        .select_from(active_user)
+        .outerjoin(active_tenant, active_tenant.id == active_user.tenant_id)
+        .where(
+            active_user.identity_id == Identity.id,
+            active_user.is_active.is_(True),
+            or_(
+                active_user.tenant_id.is_(None),
+                active_tenant.is_active.is_(True),
+            ),
+        )
+    )
+    result = await db.execute(
+        select(func.count(func.distinct(Identity.id)))
+        .select_from(OrgMember)
+        # OrgMember.user_id identifies the provider-linked anchor membership,
+        # but that row may have been disabled after the same person joined a
+        # different active tenant.  Resolve its Identity first, then consider
+        # every current membership for the account-lockout decision.
+        .join(linked_user, linked_user.id == OrgMember.user_id)
+        .join(Identity, Identity.id == linked_user.identity_id)
+        .where(
+            OrgMember.provider_id == provider_id,
+            OrgMember.status == "active",
+            Identity.is_active.is_(True),
+            active_membership_exists,
+            or_(
+                Identity.password_login_enabled.is_(False),
+                Identity.password_hash.is_(None),
+                Identity.email.is_(None),
+                Identity.email_verified.is_(False),
+            ),
+        )
+    )
+    return int(result.scalar() or 0)
 
 
 async def _regenerate_all_sso_domains(db: AsyncSession):
@@ -1155,25 +1209,186 @@ def normalize_oauth2_config(config: dict) -> dict:
         return normalized
     return config
 
-def validate_provider_config(provider_type: str, config: dict):
-    """Validate identity provider config. Specific field checks are handled by the frontend."""
+def _clean_identity_provider_config(config: dict | None) -> dict:
+    """Remove response-only metadata before persisting provider configuration."""
+    cleaned = dict(config or {})
+    cleaned.pop("_configured_secret_fields", None)
+    return cleaned
+
+
+def _merge_identity_provider_config(
+    existing: dict | None,
+    incoming: dict | None,
+) -> dict:
+    """Merge write-only form updates without erasing stored credentials."""
+    merged = dict(existing or {})
+    if incoming is not None:
+        merged.update(_clean_identity_provider_config(incoming))
+    return merged
+
+
+def _compact_config_key(key: object) -> str:
+    return "".join(character for character in str(key).casefold() if character.isalnum())
+
+
+def _identity_provider_config_key_is_sensitive(key: object) -> bool:
+    """Recognize provider secrets across legacy aliases and nested payloads."""
+    compact = _compact_config_key(key)
+    exact = {
+        "appsecret",
+        "appsecretkey",
+        "authorization",
+        "botsecret",
+        "clientsecret",
+        "corpsecret",
+        "credentials",
+        "encryptionkey",
+        "googleadminrefreshtoken",
+        "googleadminrefreshtokenencrypted",
+        "privatekey",
+        "serviceaccount",
+        "serviceaccountjson",
+        "ssoclientsecret",
+        "verifyaeskey",
+        "verifytoken",
+        "webhooksecret",
+    }
+    suffixes = (
+        "apikey",
+        "credential",
+        "password",
+        "privatekey",
+        "secret",
+        "token",
+    )
+    return compact in exact or compact.endswith(suffixes)
+
+
+def _sanitize_identity_provider_value(
+    value,
+    *,
+    path: tuple[str, ...],
+    configured_secret_fields: set[str],
+):
+    if isinstance(value, dict):
+        sanitized = {}
+        for raw_key, child in value.items():
+            key = str(raw_key)
+            child_path = (*path, key)
+            if _identity_provider_config_key_is_sensitive(key):
+                if child not in (None, "", {}, []):
+                    configured_secret_fields.add(".".join(child_path))
+                continue
+            sanitized[key] = _sanitize_identity_provider_value(
+                child,
+                path=child_path,
+                configured_secret_fields=configured_secret_fields,
+            )
+        return sanitized
+    if isinstance(value, list):
+        return [
+            _sanitize_identity_provider_value(
+                child,
+                path=(*path, str(index)),
+                configured_secret_fields=configured_secret_fields,
+            )
+            for index, child in enumerate(value)
+        ]
+    if isinstance(value, str) and value.lstrip().startswith(("{", "[")):
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError):
+            return value
+        if isinstance(decoded, (dict, list)):
+            sanitized = _sanitize_identity_provider_value(
+                decoded,
+                path=path,
+                configured_secret_fields=configured_secret_fields,
+            )
+            return json.dumps(
+                sanitized,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+    return value
+
+
+def validate_provider_config(
+    provider_type: str,
+    config: dict,
+    *,
+    sso_login_enabled: bool = False,
+):
+    """Validate persisted config and credentials required for live SSO."""
     if not isinstance(config, dict):
         raise HTTPException(status_code=422, detail="Configuration must be a JSON object")
+    jit_enabled = config.get("jit_provisioning_enabled", False)
+    if not isinstance(jit_enabled, bool):
+        raise HTTPException(
+            status_code=422,
+            detail="jit_provisioning_enabled must be a boolean",
+        )
+    if jit_enabled and provider_type in {"google_workspace", "dingtalk"}:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{provider_type} JIT provisioning is unavailable without an "
+                "organization-membership proof; sync the directory first"
+            ),
+        )
+    if not sso_login_enabled:
+        return
+
+    required: dict[str, tuple[tuple[str, ...], ...]] = {
+        "google": (("client_id", "app_id"), ("client_secret", "app_secret")),
+        "github": (("client_id", "app_id"), ("client_secret", "app_secret")),
+        "feishu": (("app_id",), ("app_secret",)),
+        "dingtalk": (("app_key",), ("app_secret",)),
+        "wecom": (("corp_id", "app_id"), ("secret", "app_secret"), ("agent_id",)),
+        "google_workspace": (
+            ("client_id", "sso_client_id", "app_id"),
+            ("client_secret", "sso_client_secret", "app_secret"),
+        ),
+    }
+    field_groups = required.get(provider_type)
+    if field_groups is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{provider_type} does not implement an SSO login flow",
+        )
+    missing_groups = [
+        "/".join(group)
+        for group in field_groups
+        if not any(str(config.get(key) or "").strip() for key in group)
+    ]
+    if missing_groups:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{provider_type} cannot enable SSO login until these credentials "
+                f"are configured: {', '.join(missing_groups)}"
+            ),
+        )
+
     if provider_type in {"google", "github"}:
         client_id = config.get("client_id") or config.get("app_id")
         client_secret = config.get("client_secret") or config.get("app_secret")
         if not client_id or not client_secret:
             raise HTTPException(status_code=422, detail=f"{provider_type} requires client_id and client_secret")
-    return
 
 
 def _sanitize_identity_provider_config(provider_type: str, config: dict | None) -> dict | None:
     if config is None:
         return None
-    sanitized = dict(config)
-    if provider_type == "google_workspace":
-        sanitized.pop("google_admin_refresh_token", None)
-        sanitized.pop("google_admin_refresh_token_encrypted", None)
+    configured_secret_fields: set[str] = set()
+    sanitized = _sanitize_identity_provider_value(
+        _clean_identity_provider_config(config),
+        path=(),
+        configured_secret_fields=configured_secret_fields,
+    )
+    if configured_secret_fields:
+        sanitized["_configured_secret_fields"] = sorted(configured_secret_fields)
     return sanitized
 
 
@@ -1195,9 +1410,12 @@ async def create_identity_provider(
     """Create a new identity provider (Admin only)."""
     from app.services.auth_registry import auth_provider_registry
 
-    # Validate config
-    validate_provider_config(data.provider_type, data.config)
-    
+    if data.provider_type == "oauth2":
+        raise HTTPException(
+            status_code=422,
+            detail="Generic OAuth2/OIDC is not implemented in this release",
+        )
+
     # Validate and determine tenant_id
     tid = data.tenant_id
     is_platform_admin = _is_platform_admin_user(current_user)
@@ -1214,27 +1432,54 @@ async def create_identity_provider(
 
     if not tid and not (is_platform_admin and data.provider_type in {"google", "github"}):
         raise HTTPException(status_code=400, detail="tenant_id is required to create an identity provider")
-        
-    if data.sso_login_enabled:
-        if not await sso_service.validate_sso_enablement(db, tid):
-             raise HTTPException(
-                status_code=400,
-                detail="IP address does not support multi-tenant SSO. Another tenant already has SSO enabled."
-            )
 
-    provider = IdentityProvider(
-        provider_type=data.provider_type,
-        name=data.name,
-        is_active=data.is_active,
-        sso_login_enabled=data.sso_login_enabled,
-        config=data.config,
-        tenant_id=tid
+    config = _clean_identity_provider_config(data.config)
+    validate_provider_config(
+        data.provider_type,
+        config,
+        sso_login_enabled=bool(data.sso_login_enabled and data.is_active),
     )
-    db.add(provider)
-    await db.commit()
-    await db.refresh(provider)
+
+    try:
+        if tid:
+            await _acquire_sso_admin_lock(db)
+            tenant_result = await db.execute(
+                select(Tenant).where(Tenant.id == tid).with_for_update()
+            )
+            if tenant_result.scalar_one_or_none() is None:
+                raise HTTPException(status_code=404, detail="Tenant not found")
+        if data.sso_login_enabled and data.is_active and tid:
+            if not await sso_service.validate_sso_enablement(db, tid):
+                raise HTTPException(
+                    status_code=400,
+                    detail="IP address does not support multi-tenant SSO. Another tenant already has SSO enabled.",
+                )
+
+        provider = IdentityProvider(
+            provider_type=data.provider_type,
+            name=data.name,
+            is_active=data.is_active,
+            sso_login_enabled=data.sso_login_enabled,
+            config=config,
+            tenant_id=tid,
+        )
+        db.add(provider)
+        await db.flush()
+        tenant = (
+            await _sync_tenant_sso_state(db, tid, commit=False)
+            if tid
+            else None
+        )
+        await db.commit()
+        await db.refresh(provider)
+    except Exception:
+        await db.rollback()
+        raise
     auth_provider_registry._clear_cache(provider.provider_type)
-    return _identity_provider_response(provider)
+    return _identity_provider_response(
+        provider,
+        sso_domain=tenant.sso_domain if tenant is not None else None,
+    )
 
 
 @router.post("/identity-providers/oauth2", response_model=IdentityProviderOut)
@@ -1244,50 +1489,10 @@ async def create_oauth2_provider(
     db: AsyncSession = Depends(get_db),
 ):
     """Create a new OAuth2 identity provider with simplified fields (app_id, app_secret, authorize_url, etc.)."""
-    from app.services.auth_registry import auth_provider_registry
-
-    # Convert to config dict
-    oauth_config = OAuth2Config(
-        app_id=data.app_id,
-        app_secret=data.app_secret,
-        authorize_url=data.authorize_url,
-        token_url=data.token_url,
-        user_info_url=data.user_info_url,
-        scope=data.scope,
+    raise HTTPException(
+        status_code=410,
+        detail="Generic OAuth2/OIDC is not implemented in this release",
     )
-    config = oauth_config.to_config_dict()
-
-    # Validate
-    validate_provider_config("oauth2", config)
-
-    # Validate and determine tenant_id
-    tid = data.tenant_id
-    if _is_platform_admin_user(current_user):
-        # Platform admins can use any tenant_id (including None for global providers)
-        pass
-    else:
-        # Non-platform admins: use request tenant_id if provided, else fall back to user's tenant
-        if tid is None:
-            tid = current_user.tenant_id
-        elif str(tid) != str(current_user.tenant_id):
-            # Validate they can only manage their own tenant
-            raise HTTPException(status_code=403, detail="Can only create providers for your own tenant")
-
-    if not tid:
-        raise HTTPException(status_code=400, detail="tenant_id is required to create an identity provider")
-
-    provider = IdentityProvider(
-        provider_type="oauth2",
-        name=data.name,
-        is_active=data.is_active,
-        config=config,
-        tenant_id=tid
-    )
-    db.add(provider)
-    await db.commit()
-    await db.refresh(provider)
-    auth_provider_registry._clear_cache(provider.provider_type)
-    return _identity_provider_response(provider)
 
 
 class OAuth2ConfigUpdate(BaseModel):
@@ -1310,57 +1515,10 @@ async def update_oauth2_provider(
     db: AsyncSession = Depends(get_db),
 ):
     """Update an OAuth2 identity provider with simplified fields."""
-    from app.services.auth_registry import auth_provider_registry
-
-    result = await db.execute(select(IdentityProvider).where(IdentityProvider.id == provider_id))
-    provider = result.scalar_one_or_none()
-    if not provider:
-        raise HTTPException(status_code=404, detail="Provider not found")
-
-    if provider.provider_type != "oauth2":
-        raise HTTPException(status_code=400, detail="Provider is not an OAuth2 provider")
-
-    if not _is_platform_admin_user(current_user) and provider.tenant_id != current_user.tenant_id:
-        raise HTTPException(status_code=403, detail="Not authorized to update this provider")
-
-    # Update name and is_active
-    if data.name is not None:
-        provider.name = data.name
-    if data.is_active is not None:
-        provider.is_active = data.is_active
-
-    # Update config fields
-    if any([data.app_id, data.app_secret is not None, data.authorize_url, data.token_url, data.user_info_url, data.scope]):
-        current_config = provider.config.copy()
-
-        if data.app_id is not None:
-            current_config["app_id"] = data.app_id
-            current_config["client_id"] = data.app_id
-        if data.app_secret is not None:
-            # Only update if explicitly set (not None) - allows clearing
-            if data.app_secret:
-                current_config["app_secret"] = data.app_secret
-                current_config["client_secret"] = data.app_secret
-            else:
-                current_config.pop("app_secret", None)
-                current_config.pop("client_secret", None)
-        if data.authorize_url is not None:
-            current_config["authorize_url"] = data.authorize_url
-        if data.token_url is not None:
-            current_config["token_url"] = data.token_url
-        if data.user_info_url is not None:
-            current_config["user_info_url"] = data.user_info_url
-        if data.scope is not None:
-            current_config["scope"] = data.scope
-
-        # Validate the updated config
-        validate_provider_config("oauth2", current_config)
-        provider.config = current_config
-
-    await db.commit()
-    await db.refresh(provider)
-    auth_provider_registry._clear_cache(provider.provider_type)
-    return _identity_provider_response(provider)
+    raise HTTPException(
+        status_code=410,
+        detail="Generic OAuth2/OIDC is not implemented in this release",
+    )
 
 
 class IdentityProviderUpdate(BaseModel):
@@ -1380,52 +1538,107 @@ async def update_identity_provider(
     """Update an existing identity provider."""
     from app.services.auth_registry import auth_provider_registry
 
-    result = await db.execute(select(IdentityProvider).where(IdentityProvider.id == provider_id))
+    result = await db.execute(
+        select(IdentityProvider)
+        .where(IdentityProvider.id == provider_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
     provider = result.scalar_one_or_none()
     if not provider:
         raise HTTPException(status_code=404, detail="Provider not found")
-        
+
+    if provider.provider_type == "oauth2":
+        raise HTTPException(
+            status_code=410,
+            detail=(
+                "Legacy generic OAuth2/OIDC providers are read-only in this "
+                "release; delete the unused configuration or migrate it to a "
+                "supported provider"
+            ),
+        )
+
     if not _is_platform_admin_user(current_user) and provider.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=403, detail="Not authorized to update this provider")
-        
-    if data.name is not None:
-        provider.name = data.name
-    if data.is_active is not None:
-        provider.is_active = data.is_active
-    if data.sso_login_enabled is not None:
-        if data.sso_login_enabled is True and not provider.sso_login_enabled:
-            # Pre-check IP restriction before writing anything
-            if not await sso_service.validate_sso_enablement(db, provider.tenant_id):
-                raise HTTPException(
-                    status_code=400,
-                    detail="IP address does not support multi-tenant SSO. Another tenant already has SSO enabled."
-                )
-        provider.sso_login_enabled = data.sso_login_enabled
-    if data.config is not None:
-        # Merge config
-        new_config = provider.config.copy()
-        new_config.update(data.config)
-        
-        # Validate merged config
-        validate_provider_config(provider.provider_type, new_config)
-        
-        provider.config = new_config
-        
-    await db.commit()
-    await db.refresh(provider)
+
+    if provider.tenant_id:
+        await _acquire_sso_admin_lock(db)
+        tenant_result = await db.execute(
+            select(Tenant).where(Tenant.id == provider.tenant_id).with_for_update()
+        )
+        if tenant_result.scalar_one_or_none() is None:
+            await db.rollback()
+            raise HTTPException(status_code=404, detail="Tenant not found")
+
+    disables_login = bool(
+        provider.sso_login_enabled
+        and (data.is_active is False or data.sso_login_enabled is False)
+    )
+    if disables_login:
+        unrecoverable_count = await _count_provider_users_without_local_recovery(
+            db,
+            provider.id,
+        )
+        if unrecoverable_count:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Cannot disable this login provider: {unrecoverable_count} active "
+                    "linked account(s) do not yet have a verified local recovery "
+                    "email and password. Complete recovery setup first."
+                ),
+            )
+
+    prospective_active = data.is_active if data.is_active is not None else provider.is_active
+    prospective_login = (
+        data.sso_login_enabled
+        if data.sso_login_enabled is not None
+        else provider.sso_login_enabled
+    )
+    new_config = _merge_identity_provider_config(provider.config, data.config)
+    validate_provider_config(
+        provider.provider_type,
+        new_config,
+        sso_login_enabled=bool(prospective_active and prospective_login),
+    )
+    if (
+        prospective_active
+        and prospective_login
+        and not (provider.is_active and provider.sso_login_enabled)
+        and provider.tenant_id
+        and not await sso_service.validate_sso_enablement(db, provider.tenant_id)
+    ):
+        await db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail="IP address does not support multi-tenant SSO. Another tenant already has SSO enabled.",
+        )
+
+    try:
+        if data.name is not None:
+            provider.name = data.name
+        if data.is_active is not None:
+            provider.is_active = data.is_active
+        if data.sso_login_enabled is not None:
+            provider.sso_login_enabled = data.sso_login_enabled
+        if data.config is not None:
+            provider.config = new_config
+        await db.flush()
+        tenant = (
+            await _sync_tenant_sso_state(db, provider.tenant_id, commit=False)
+            if provider.tenant_id
+            else None
+        )
+        await db.commit()
+        await db.refresh(provider)
+    except Exception:
+        await db.rollback()
+        raise
     auth_provider_registry._clear_cache(provider.provider_type)
-
-    # Recompute tenant.sso_enabled derived state whenever sso_login_enabled changes
-    sso_domain = None
-    if data.sso_login_enabled is not None and provider.tenant_id:
-        await _sync_tenant_sso_state(db, provider.tenant_id)
-        from app.models.tenant import Tenant
-        tenant_result = await db.execute(select(Tenant).where(Tenant.id == provider.tenant_id))
-        t = tenant_result.scalar_one_or_none()
-        if t:
-            sso_domain = t.sso_domain
-
-    return _identity_provider_response(provider, sso_domain=sso_domain)
+    return _identity_provider_response(
+        provider,
+        sso_domain=tenant.sso_domain if tenant is not None else None,
+    )
 
 
 @router.delete("/identity-providers/{provider_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -1435,13 +1648,39 @@ async def delete_identity_provider(
     db: AsyncSession = Depends(get_db),
 ):
     """Delete an identity provider."""
-    result = await db.execute(select(IdentityProvider).where(IdentityProvider.id == provider_id))
+    result = await db.execute(
+        select(IdentityProvider)
+        .where(IdentityProvider.id == provider_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
     provider = result.scalar_one_or_none()
     if not provider:
         raise HTTPException(status_code=404, detail="Provider not found")
         
     if not _is_platform_admin_user(current_user) and provider.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=403, detail="Not authorized to delete this provider")
+
+    if provider.tenant_id:
+        await _acquire_sso_admin_lock(db)
+        tenant_result = await db.execute(
+            select(Tenant).where(Tenant.id == provider.tenant_id).with_for_update()
+        )
+        if tenant_result.scalar_one_or_none() is None:
+            await db.rollback()
+            raise HTTPException(status_code=404, detail="Tenant not found")
+
+    linked_result = await db.execute(
+        select(func.count(OrgMember.id)).where(OrgMember.provider_id == provider_id)
+    )
+    if int(linked_result.scalar() or 0):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Cannot delete a provider that still owns organization identity links. "
+                "Migrate or explicitly unlink those records first."
+            ),
+        )
         
     try:
         # Nullify references in synced org data before deleting the provider
@@ -1453,12 +1692,20 @@ async def delete_identity_provider(
             update(OrgDepartment).where(OrgDepartment.provider_id == provider_id).values(provider_id=None)
         )
         
+        provider_type = provider.provider_type
+        tenant_id = provider.tenant_id
         await db.delete(provider)
+        await db.flush()
+        if tenant_id:
+            await _sync_tenant_sso_state(db, tenant_id, commit=False)
         await db.commit()
     except SQLAlchemyError as e:
         await db.rollback()
         logger.error(f"Failed to delete identity provider {provider_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to delete identity provider due to database constraints")
+    from app.services.auth_registry import auth_provider_registry
+
+    auth_provider_registry._clear_cache(provider_type)
 
 
 # ─── Org Structure ──────────────────────────────────────
@@ -1756,8 +2003,6 @@ async def wecom_callback_verify_universal(
 
 # ─── Invitation Codes ───────────────────────────────────
 
-from app.models.invitation_code import InvitationCode
-
 
 class InvitationCodeCreate(BaseModel):
     count: int = 1       # how many codes to generate
@@ -1847,8 +2092,10 @@ async def invite_users(
     invited_count = 0
     codes = []
     
+    from app.core.identity_canonicalization import canonicalize_email
+
     for email in data.emails:
-        email = email.lower().strip()
+        email = canonicalize_email(email)
         if not email:
             continue
             

@@ -1,11 +1,17 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
     buildWorkspaceDownloadUrl,
     consumeSessionTokenFromUrl,
+    establishBrowserSession,
+    normalizeTenantRedirectUrl,
     websocketAuthProtocols,
 } from './authTransport';
 
 describe('credential-safe browser transports', () => {
+    afterEach(() => {
+        vi.unstubAllGlobals();
+    });
+
     it('keeps workspace download credentials out of URLs', () => {
         const url = buildWorkspaceDownloadUrl('agent-id', 'workspace/videos/demo.mp4', { inline: true });
 
@@ -33,5 +39,45 @@ describe('credential-safe browser transports', () => {
 
         expect(consumeSessionTokenFromUrl(url, ['/reset-password', '/verify-email'])).toBeNull();
         expect(url.searchParams.get('token')).toBe('one-time');
+    });
+
+    it('preserves the fragment credential during cross-origin tenant switching', () => {
+        const redirect = normalizeTenantRedirectUrl(
+            'https://tenant.example/base#session_token=target.jwt.token',
+            'https://platform.example/current',
+        );
+
+        expect(redirect).toBe('https://tenant.example/#session_token=target.jwt.token');
+    });
+
+    it('does not complete browser-session establishment before the cookie response', async () => {
+        let resolveResponse!: (response: Pick<Response, 'ok' | 'status'>) => void;
+        const response = new Promise<Pick<Response, 'ok' | 'status'>>((resolve) => {
+            resolveResponse = resolve;
+        });
+        const fetchMock = vi.fn(() => response);
+        vi.stubGlobal('fetch', fetchMock);
+
+        let established = false;
+        const pending = establishBrowserSession('header.payload.signature').then(() => {
+            established = true;
+        });
+        await Promise.resolve();
+
+        expect(established).toBe(false);
+        resolveResponse({ ok: true, status: 204 });
+        await pending;
+        expect(established).toBe(true);
+        expect(fetchMock).toHaveBeenCalledWith('/api/auth/browser-session', {
+            method: 'POST',
+            headers: { Authorization: 'Bearer header.payload.signature' },
+            credentials: 'same-origin',
+        });
+    });
+
+    it('fails closed when the browser-session cookie endpoint rejects the token', async () => {
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 401 }));
+
+        await expect(establishBrowserSession('expired-token')).rejects.toThrow('HTTP 401');
     });
 });

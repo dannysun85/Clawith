@@ -8,15 +8,29 @@ import uuid
 from typing import Any
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models.identity import AuthProviderType, IdentityProvider
 from app.models.tenant import Tenant
 from app.models.user import Identity, User
+from app.core.identity_canonicalization import canonicalize_email
+from app.services.external_identity_policy import acquire_external_subject_lock
 from app.services.identity_provider_lookup import get_preferred_identity_provider
 from app.services.platform_service import platform_service
+
+
+class ExternalIdentityAlreadyLinkedError(ValueError):
+    """Raised when a provider subject is owned by a different account."""
+
+
+class ExternalIdentityAmbiguousError(ValueError):
+    """Raised when provider identifiers resolve to different member rows."""
+
+
+class ExternalIdentityProvisioningDeniedError(ValueError):
+    """Raised when a tenant has not pre-authorized an external subject."""
 
 
 class SSOService:
@@ -38,13 +52,14 @@ class SSOService:
         Returns:
             User if found, None otherwise
         """
+        email = canonicalize_email(email) or ""
         # 1. Try direct match via Identity join
         query = (
             select(User)
             .join(User.identity)
             .where(
-                Identity.email == email,
-                User.is_active == True,
+                func.lower(Identity.email) == email,
+                User.is_active.is_(True),
             )
             .options(selectinload(User.identity))
         )
@@ -61,7 +76,7 @@ class SSOService:
 
         # 2. If not found, try to find an Identity and match within the tenant scope
         if email:
-            id_query = select(Identity).where(Identity.email == email)
+            id_query = select(Identity).where(func.lower(Identity.email) == email)
             id_result = await db.execute(id_query)
             identity = id_result.scalar_one_or_none()
             if identity:
@@ -70,7 +85,7 @@ class SSOService:
                     select(User)
                     .where(
                         User.identity_id == identity.id,
-                        User.is_active == True,
+                        User.is_active.is_(True),
                     )
                     .options(selectinload(User.identity))
                     .limit(1)
@@ -106,7 +121,7 @@ class SSOService:
             .join(User.identity)
             .where(
                 Identity.phone == normalized_mobile,
-                User.is_active == True,
+                User.is_active.is_(True),
             )
             .options(selectinload(User.identity))
         )
@@ -127,7 +142,7 @@ class SSOService:
                 select(User)
                 .where(
                     User.identity_id == identity.id,
-                    User.is_active == True,
+                    User.is_active.is_(True),
                 )
                 .options(selectinload(User.identity))
                 .limit(1)
@@ -187,6 +202,7 @@ class SSOService:
         provider_type: AuthProviderType | str,
         tenant_id: str | None = None,
         identity_data: dict[str, Any] | None = None,
+        provider_id: uuid.UUID | None = None,
     ) -> User | None:
         """Resolve user from external identity via OrgMember.
 
@@ -200,8 +216,21 @@ class SSOService:
             User if found via OrgMember, None otherwise
         """
 
-        # Get provider
-        provider = await get_preferred_identity_provider(db, provider_type, tenant_id)
+        # Login entry points pass the exact provider selected when the flow was
+        # started. Compatibility callers may still use deterministic lookup.
+        try:
+            expected_tenant_id = uuid.UUID(str(tenant_id)) if tenant_id is not None else None
+        except (TypeError, ValueError):
+            return None
+
+        provider = await db.get(IdentityProvider, provider_id) if provider_id else None
+        if provider is not None and (
+            str(provider.provider_type) != str(getattr(provider_type, "value", provider_type))
+            or provider.tenant_id != expected_tenant_id
+        ):
+            return None
+        if provider is None and provider_id is None:
+            provider = await get_preferred_identity_provider(db, provider_type, tenant_id)
 
         if not provider:
             return None
@@ -216,13 +245,26 @@ class SSOService:
 
         if not member or not member.user_id:
             return None
+        if member.tenant_id != provider.tenant_id:
+            raise ExternalIdentityAmbiguousError(
+                "Provider member belongs to an inconsistent tenant scope"
+            )
 
         # Get user
         from sqlalchemy.orm import selectinload
         user_result = await db.execute(
             select(User).where(User.id == member.user_id).options(selectinload(User.identity))
         )
-        return user_result.scalar_one_or_none()
+        user = user_result.scalar_one_or_none()
+        if (
+            user is not None
+            and expected_tenant_id is not None
+            and user.tenant_id != expected_tenant_id
+        ):
+            raise ExternalIdentityAmbiguousError(
+                "Provider member resolves to a user in another tenant"
+            )
+        return user
 
     def _get_identity_payload(self, identity_data: dict[str, Any] | None) -> dict[str, Any]:
         if not identity_data:
@@ -254,18 +296,32 @@ class SSOService:
             or identity_data.get("unionId")
         )
 
+        provider_key = str(getattr(provider_type, "value", provider_type)).strip().lower()
         external_id = None
-        if provider_type == "feishu":
+        if provider_key == "feishu":
             # payload.get() only works when provider_user_id is a JSON string.
             # For SSO path, provider_user_id=None so payload={}, but identity_data
             # (raw SSO response) always contains the stable user_id.
-            external_id = payload.get("user_id") or (identity_data or {}).get("user_id")
-        elif provider_type == "dingtalk":
             external_id = (
-                payload.get("userid") or payload.get("staffId")
-                or (identity_data or {}).get("userid") or (identity_data or {}).get("staffId")
+                payload.get("user_id")
+                or (identity_data or {}).get("user_id")
+                or (identity_data or {}).get("external_id")
             )
-        elif provider_type == "wecom":
+        elif provider_key == "dingtalk":
+            external_id = (
+                payload.get("userid")
+                or payload.get("staffId")
+                or (identity_data or {}).get("userid")
+                or (identity_data or {}).get("staffId")
+                or (identity_data or {}).get("external_id")
+            )
+        elif provider_key == "wecom":
+            external_id = provider_user_id
+        else:
+            # Google/Google Workspace ``sub``, GitHub numeric IDs, and other
+            # provider subjects are stable only inside the provider scope.
+            # Persist them as provider-scoped external_id so subsequent logins
+            # never need an email/phone fallback.
             external_id = provider_user_id
 
         open_id = (raw_open_id or "").strip() or None
@@ -307,23 +363,49 @@ class SSOService:
         provider_type: AuthProviderType | str,
         provider_user_id: str,
         identity_data: dict[str, Any] | None = None,
+        *,
+        active_only: bool = True,
     ):
         from app.models.org import OrgMember
 
+        matches: dict[uuid.UUID, Any] = {}
         for field, lookup_value in self._identity_lookup_chain(provider_type, provider_user_id, identity_data):
             column = getattr(OrgMember, field)
-            member_result = await db.execute(
-                select(OrgMember).where(
-                    OrgMember.provider_id == provider_id,
-                    OrgMember.status == "active",
-                    column == lookup_value,
-                )
-            )
-            member = member_result.scalar_one_or_none()
-            if member:
-                return member
+            conditions = [
+                OrgMember.provider_id == provider_id,
+                column == lookup_value,
+            ]
+            if active_only:
+                conditions.append(OrgMember.status == "active")
+            member_result = await db.execute(select(OrgMember).where(*conditions))
+            for member in member_result.scalars().all():
+                matches[member.id] = member
 
-        return None
+        if len(matches) > 1:
+            raise ExternalIdentityAmbiguousError(
+                "Provider identifiers resolve to multiple organization members"
+            )
+        return next(iter(matches.values()), None)
+
+    async def find_identity_member(
+        self,
+        db: AsyncSession,
+        provider_id: uuid.UUID,
+        provider_type: AuthProviderType | str,
+        provider_user_id: str,
+        identity_data: dict[str, Any] | None = None,
+        *,
+        active_only: bool = True,
+    ):
+        """Return the exact provider member used to authorize provisioning."""
+        return await self._find_identity_member(
+            db,
+            provider_id,
+            provider_type,
+            provider_user_id,
+            identity_data,
+            active_only=active_only,
+        )
 
     async def link_identity(
         self,
@@ -333,6 +415,7 @@ class SSOService:
         provider_user_id: str,
         identity_data: dict[str, Any] | None = None,
         tenant_id: str | None = None,
+        provider_id: uuid.UUID | None = None,
     ) -> Any:
         """Link an external identity to an existing user via OrgMember.
 
@@ -354,13 +437,42 @@ class SSOService:
         """
         from app.models.org import OrgMember
 
+        await acquire_external_subject_lock(
+            db,
+            provider_type=str(getattr(provider_type, "value", provider_type)),
+            tenant_id=tenant_id,
+            provider_subject=provider_user_id,
+        )
+
         # Get or create provider
-        provider = await get_preferred_identity_provider(db, provider_type, tenant_id)
+        try:
+            expected_tenant_id = uuid.UUID(str(tenant_id)) if tenant_id is not None else None
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Invalid provider tenant scope") from exc
+
+        provider = await db.get(IdentityProvider, provider_id) if provider_id else None
+        if provider is not None and (
+            str(provider.provider_type) != str(getattr(provider_type, "value", provider_type))
+            or provider.tenant_id != expected_tenant_id
+        ):
+            raise ValueError("Provider scope does not match the identity link request")
+        if provider is None and provider_id is None:
+            provider = await get_preferred_identity_provider(db, provider_type, tenant_id)
 
         if not provider:
             raise ValueError(f"Provider {provider_type} not found for tenant {tenant_id}")
 
         uid = uuid.UUID(user_id) if isinstance(user_id, str) else user_id
+        target_user_result = await db.execute(
+            select(User).where(User.id == uid).with_for_update()
+        )
+        target_user = target_user_result.scalar_one_or_none()
+        if not target_user:
+            raise ValueError("Identity link target user does not exist")
+        if expected_tenant_id is not None and target_user.tenant_id != expected_tenant_id:
+            raise ExternalIdentityAlreadyLinkedError(
+                "Identity link target belongs to another tenant"
+            )
 
         raw_union_id, raw_open_id, raw_external_id = self._extract_identity_ids(
             provider_type, provider_user_id, identity_data
@@ -374,7 +486,14 @@ class SSOService:
         )
 
         if member:
-            # Always link user
+            if member.tenant_id != provider.tenant_id:
+                raise ExternalIdentityAmbiguousError(
+                    "Provider member belongs to an inconsistent tenant scope"
+                )
+            if member.user_id is not None and member.user_id != uid:
+                raise ExternalIdentityAlreadyLinkedError(
+                    "External identity is already linked to another account"
+                )
             member.user_id = uid
 
             if raw_external_id and not member.external_id:
@@ -434,7 +553,7 @@ class SSOService:
                 phone=identity_data.get("mobile") if identity_data else None,
                 provider_id=provider.id,
                 user_id=uid,
-                tenant_id=tenant_id,
+                tenant_id=provider.tenant_id,
                 external_id=raw_external_id,
                 unionid=raw_union_id if provider_type != "wecom" else None,
                 open_id=raw_open_id,
@@ -445,7 +564,12 @@ class SSOService:
         return member
 
     async def unlink_identity(
-        self, db: AsyncSession, user_id: str, provider_type: AuthProviderType | str, tenant_id: str | None = None
+        self,
+        db: AsyncSession,
+        user_id: str,
+        provider_type: AuthProviderType | str,
+        tenant_id: str | None = None,
+        provider_id: uuid.UUID | None = None,
     ) -> bool:
         """Unlink an external identity (OrgMember) from a user.
 
@@ -461,9 +585,16 @@ class SSOService:
         from app.models.org import OrgMember
 
         # Get provider
-        provider = await get_preferred_identity_provider(db, provider_type, tenant_id)
+        provider = (
+            await db.get(IdentityProvider, provider_id, with_for_update=True)
+            if provider_id
+            else await get_preferred_identity_provider(db, provider_type, tenant_id)
+        )
 
-        if not provider:
+        if not provider or (
+            str(provider.provider_type) != str(getattr(provider_type, "value", provider_type))
+            or str(provider.tenant_id or "") != str(tenant_id or "")
+        ):
             return False
 
         # Find OrgMember
@@ -491,6 +622,7 @@ class SSOService:
         provider_user_id: str,
         tenant_id: str | None = None,
         identity_data: dict[str, Any] | None = None,
+        provider_id: uuid.UUID | None = None,
     ) -> User | None:
         """Check if an external identity is already linked to another user.
 
@@ -509,6 +641,7 @@ class SSOService:
             provider_type,
             tenant_id,
             identity_data=identity_data,
+            provider_id=provider_id,
         )
 
     async def validate_sso_enablement(self, db: AsyncSession, tenant_id: uuid.UUID) -> bool:

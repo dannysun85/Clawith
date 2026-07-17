@@ -10,7 +10,9 @@ import re
 import uuid
 from typing import Any
 
+from app.config import unverified_local_signup_allowed
 from app.core.security import hash_password_async
+from app.core.identity_canonicalization import canonicalize_email
 from app.dao import (
     identity_dao,
     identity_provider_dao,
@@ -23,11 +25,16 @@ from app.dao import (
 from app.models.identity import IdentityProvider
 from app.models.tenant import Tenant
 from app.models.user import User, Identity
-from app.services.sso_service import sso_service
-from app.services.system_email_service import (
-    SystemEmailConfigResolutionError,
-    resolve_email_config_async,
+from app.services.external_identity_policy import (
+    create_isolated_external_identity,
+    require_stable_external_subject,
 )
+from app.services.identity_provider_lookup import (
+    get_login_identity_provider,
+    get_login_identity_provider_by_id,
+)
+from app.services.sso_service import ExternalIdentityProvisioningDeniedError, sso_service
+from app.services.system_email_service import resolve_email_config_async
 from loguru import logger
 
 
@@ -59,6 +66,7 @@ class RegistrationService:
 
     async def detect_tenant_by_email(self, email: str) -> Tenant | None:
         """Detect tenant based on email domain."""
+        email = canonicalize_email(email) or ""
         if not email or "@" not in email:
             return None
         domain = email.split("@")[1].lower()
@@ -78,6 +86,7 @@ class RegistrationService:
         """
         conflicts = []
 
+        email = canonicalize_email(email)
         if email and await identity_dao.get_by_email(email):
             conflicts.append({
                 "type": "email",
@@ -113,6 +122,7 @@ class RegistrationService:
         Security note: only email and phone are authoritative identity claims.
         """
         identity: Identity | None = None
+        email = canonicalize_email(email)
 
         # Match by email (primary ownership claim)
         if email:
@@ -123,17 +133,25 @@ class RegistrationService:
             identity = await identity_dao.get_by_phone(phone)
 
         if identity:
-            # Auto-verify if SMTP is not configured
+            # Missing SMTP is not proof of mailbox ownership.  Only an
+            # explicit local development/test escape hatch may preserve the
+            # historical auto-verify behavior.
             if email_config is _EMAIL_CONFIG_UNRESOLVED:
                 email_config = await resolve_email_config_async()
-            if not email_config and not identity.email_verified:
+            if (
+                not email_config
+                and not identity.email_verified
+                and unverified_local_signup_allowed()
+            ):
                 await identity_dao.update(db_obj=identity, obj_in={"email_verified": True})
             return identity
 
         # Determine verified status
         if email_config is _EMAIL_CONFIG_UNRESOLVED:
             email_config = await resolve_email_config_async()
-        is_verified = not email_config  # Auto-verify only when no SMTP configured
+        is_verified = bool(
+            not email_config and unverified_local_signup_allowed()
+        )
 
         # Resolve a safe, unique username
         final_username = username
@@ -164,16 +182,22 @@ class RegistrationService:
         tenant_id: uuid.UUID | None = None,
         registration_source: str = "web",
         email_config: Any = _EMAIL_CONFIG_UNRESOLVED,
+        require_email_verification_for_activation: bool = True,
     ) -> User:
         """Create a new tenant-specific user linked to an identity."""
         name = display_name or identity.username or "User"
 
-        if email_config is _EMAIL_CONFIG_UNRESOLVED:
+        if (
+            require_email_verification_for_activation
+            and email_config is _EMAIL_CONFIG_UNRESOLVED
+        ):
             email_config = await resolve_email_config_async()
 
-        is_active = identity.email_verified
-        if not email_config:
-            is_active = True  # Auto-activate when no SMTP configured
+        activation_pending_email_verification = bool(
+            require_email_verification_for_activation
+            and not identity.email_verified
+            and not identity.is_platform_admin
+        )
 
         user = await user_dao.create(obj_in={
             "identity_id": identity.id,
@@ -181,7 +205,8 @@ class RegistrationService:
             "display_name": name,
             "role": role,
             "registration_source": registration_source,
-            "is_active": is_active or identity.is_platform_admin,
+            "is_active": not activation_pending_email_verification,
+            "activation_pending_email_verification": activation_pending_email_verification,
         })
         user.identity = identity
 
@@ -205,151 +230,163 @@ class RegistrationService:
         provider_user_id: str,
         user_info: dict,
         existing_user: User | None = None,
-        email_config: Any = _EMAIL_CONFIG_UNRESOLVED,
     ) -> tuple[User, bool]:
-        """Handle SSO-based registration flow."""
-        if email_config is _EMAIL_CONFIG_UNRESOLVED:
-            email_config = await resolve_email_config_async(raise_on_error=True)
+        """Compatibility SSO creation path using stable provider identity only."""
+        # Tenant membership must come from an explicitly tenant-scoped
+        # provider/callback context, never from an email-domain guess.
+        tenant_id = user_info.get("tenant_id")
+        if tenant_id is None:
+            raise ExternalIdentityProvisioningDeniedError(
+                "Compatibility SSO registration requires an exact tenant"
+            )
 
-        email = user_info.get("email", "")
-        tenant_id = None
-        if email:
-            tenant = await self.detect_tenant_by_email(email)
-            tenant_id = tenant.id if tenant else None
-
-        lookup_provider_user_id = (
-            user_info.get("union_id") or user_info.get("unionId") or provider_user_id
+        lookup_provider_user_id = require_stable_external_subject(
+            provider_type,
+            user_info.get("union_id") or user_info.get("unionId") or provider_user_id,
         )
         async with identity_dao.session() as db:
+            provider = await get_login_identity_provider(
+                db,
+                provider_type,
+                str(tenant_id),
+                allow_global_fallback=False,
+            )
+            if not provider:
+                raise ExternalIdentityProvisioningDeniedError(
+                    "SSO provider is disabled"
+                )
             existing = await sso_service.resolve_user_identity(
                 db,
                 lookup_provider_user_id,
                 provider_type,
                 tenant_id=tenant_id,
                 identity_data=user_info,
+                provider_id=provider.id,
             )
             if existing:
                 return existing, False
 
             if existing_user:
-                await sso_service.link_identity(
-                    db,
-                    str(existing_user.id),
-                    provider_type,
-                    lookup_provider_user_id,
-                    user_info,
-                    tenant_id=str(existing_user.tenant_id) if existing_user.tenant_id else tenant_id,
+                raise ValueError(
+                    "Implicit SSO account merging is disabled; use authenticated identity bind"
                 )
-                return existing_user, False
 
-        # Create new Identity + User
-        effective_id = (
-            provider_user_id
-            or user_info.get("open_id")
-            or user_info.get("union_id")
-            or uuid.uuid4().hex[:8]
-        )
-        username = email.split("@")[0] if email else f"{provider_type}_{effective_id[:8]}"
-
-        identity = await self.find_or_create_identity(
-            email=email,
-            phone=user_info.get("mobile") or user_info.get("phone"),
-            username=username,
-            password=effective_id,
-            email_config=email_config,
-        )
-
-        user = await self.create_user_with_identity(
-            identity=identity,
-            display_name=user_info.get("name", username),
-            registration_source=provider_type,
-            tenant_id=tenant_id,
-            email_config=email_config,
-        )
-
-        return user, True
-
-    async def register_with_sso(
-        self,
-        provider_type: str,
-        code: str,
-        auth_provider,
-        email_config: Any = _EMAIL_CONFIG_UNRESOLVED,
-    ) -> tuple[User, bool, str | None]:
-        """Register or login user via SSO."""
-        if email_config is _EMAIL_CONFIG_UNRESOLVED:
-            email_config = await resolve_email_config_async(raise_on_error=True)
-
-        try:
-            token_data = await auth_provider.exchange_code_for_token(code)
-            access_token = token_data.get("access_token")
-            if not access_token:
-                return None, False, "Failed to get access token from provider"
-
-            user_info_obj = await auth_provider.get_user_info(access_token)
-
-            user_info = {
-                "name": user_info_obj.name,
-                "email": user_info_obj.email,
-                "avatar_url": user_info_obj.avatar_url,
-                "mobile": user_info_obj.mobile,
-                "raw_data": user_info_obj.raw_data,
-            }
-
-            email_addr = user_info_obj.email
-            tenant_id = None
-            if email_addr:
-                tenant = await self.detect_tenant_by_email(email_addr)
-                tenant_id = tenant.id if tenant else None
-
-            lookup_provider_user_id = (
-                user_info_obj.provider_union_id or user_info_obj.provider_user_id
-            )
-            async with identity_dao.session() as db:
-                existing_user = await sso_service.resolve_user_identity(
-                    db,
-                    lookup_provider_user_id,
-                    provider_type,
-                    tenant_id=tenant_id,
-                    identity_data=user_info,
-                )
-                if existing_user:
-                    return existing_user, False, None
-
-                if user_info_obj.email:
-                    existing_by_email = await sso_service.match_user_by_email(
-                        db, user_info_obj.email, tenant_id=tenant_id
-                    )
-                    if existing_by_email:
-                        await sso_service.link_identity(
-                            db,
-                            str(existing_by_email.id),
-                            provider_type,
-                            lookup_provider_user_id,
-                            user_info,
-                            tenant_id=(
-                                str(existing_by_email.tenant_id)
-                                if existing_by_email.tenant_id
-                                else tenant_id
-                            ),
-                        )
-                        return existing_by_email, False, None
-
-            user, is_new = await self.handle_sso_registration(
+            provisioned_member = await sso_service.find_identity_member(
+                db,
+                provider.id,
                 provider_type,
                 lookup_provider_user_id,
                 user_info,
-                email_config=email_config,
+                active_only=False,
             )
+            if not provisioned_member or provisioned_member.status != "active":
+                raise ExternalIdentityProvisioningDeniedError(
+                    "The external subject is not provisioned for this tenant"
+                )
 
-            await self.bind_org_member(user)
-            return user, is_new, None
+            identity = await create_isolated_external_identity(
+                db,
+                provider_type=provider_type,
+                provider_subject=lookup_provider_user_id,
+            )
+            user = await self.create_user_with_identity(
+                identity=identity,
+                display_name=user_info.get("name") or identity.username,
+                registration_source=provider_type,
+                tenant_id=tenant_id,
+                # Provider authentication activates the membership; it does
+                # not promote provider contact claims to global ownership.
+                require_email_verification_for_activation=False,
+            )
+            await sso_service.link_identity(
+                db,
+                str(user.id),
+                provider_type,
+                lookup_provider_user_id,
+                user_info,
+                tenant_id=str(tenant_id) if tenant_id else None,
+                provider_id=provider.id,
+            )
+            return user, True
 
-        except SystemEmailConfigResolutionError:
-            raise
-        except Exception:
-            logger.exception("SSO registration failed provider={}", provider_type)
-            return None, False, "SSO registration failed"
+    async def register_with_sso(
+        self,
+        db,
+        provider_type: str,
+        auth_provider,
+        user_info_obj,
+        *,
+        membership_tenant_id: uuid.UUID | None,
+        membership_role: str,
+        signup_capacity_available: bool,
+    ) -> tuple[User, bool, str | None]:
+        """Persist provider-authenticated user info in one short transaction."""
+        provider_record = getattr(auth_provider, "provider", None)
+        tenant_id = getattr(provider_record, "tenant_id", None)
+        if not provider_record:
+            return None, False, "SSO provider is disabled"
+        current_provider = await get_login_identity_provider_by_id(
+            db,
+            provider_id=provider_record.id,
+            provider_type=provider_type,
+            tenant_id=tenant_id,
+            for_update=True,
+        )
+        if not current_provider:
+            return None, False, "SSO provider is disabled"
+        current_auth_provider = type(auth_provider)(
+            provider=current_provider,
+            config=current_provider.config or {},
+        )
+        provider_subject = require_stable_external_subject(
+            provider_type,
+            user_info_obj.provider_user_id or user_info_obj.provider_union_id,
+        )
+        identity_data = current_auth_provider._identity_payload(user_info_obj)
+        linked_user = await sso_service.resolve_user_identity(
+            db,
+            provider_subject,
+            provider_type,
+            tenant_id=str(tenant_id) if tenant_id else None,
+            identity_data=identity_data,
+            provider_id=current_provider.id,
+        )
+        if linked_user is not None:
+            if membership_tenant_id is None:
+                return linked_user, False, None
+            existing_membership = await user_dao.get_by_identity_and_tenant(
+                linked_user.identity_id,
+                membership_tenant_id,
+            )
+            if existing_membership is not None:
+                existing_membership.identity = linked_user.identity
+                return existing_membership, False, None
+            if not signup_capacity_available:
+                return None, False, "Registration code has reached its usage limit"
+            user = await self.create_user_with_identity(
+                identity=linked_user.identity,
+                display_name=linked_user.display_name,
+                role=membership_role,
+                tenant_id=membership_tenant_id,
+                registration_source=provider_type,
+                require_email_verification_for_activation=False,
+            )
+            return user, True, None
+
+        if not signup_capacity_available:
+            return None, False, "Registration code has reached its usage limit"
+        user, is_new = await current_auth_provider.find_or_create_user(
+            db,
+            user_info_obj,
+            tenant_id=str(tenant_id) if tenant_id else None,
+            membership_tenant_id=(
+                str(membership_tenant_id)
+                if membership_tenant_id is not None
+                else None
+            ),
+        )
+        user.role = membership_role
+        return user, is_new, None
 
     # ── Tenant for registration ──────────────────────────────────────────────
 
@@ -377,39 +414,14 @@ class RegistrationService:
     # ── OrgMember binding ────────────────────────────────────────────────────
 
     async def bind_org_member(self, user: User) -> None:
-        """Find and bind OrgMember to User based on email/phone and tenant_id."""
-        if not user.tenant_id:
-            return
+        """Ensure the platform-owned Web membership only.
 
-        member = await self._find_unbound_org_member_by_contact(user)
-        if member:
-            member.user_id = user.id
-            if user.email and member.email != user.email:
-                member.email = user.email
-            elif not user.email and member.email:
-                user.email = member.email
-            if user.primary_mobile and member.phone != user.primary_mobile:
-                member.phone = user.primary_mobile
-            elif not user.primary_mobile and member.phone:
-                user.primary_mobile = member.phone
-
-            async with org_member_dao.session() as db:
-                await db.flush()
-
-            from app.services.okr_agent_hook import hook_new_org_member
-            async with org_member_dao.session() as db:
-                await hook_new_org_member(db, member.id, user.tenant_id)
-
+        Directory and SSO contact fields are untrusted profile metadata.  An
+        unbound provider member may be linked only by an authenticated provider
+        bind/login flow using its stable provider subject, never implicitly by
+        matching email or phone during Web registration or tenant joining.
+        """
         await self.ensure_web_org_member(user)
-
-    async def _find_unbound_org_member_by_contact(self, user: User):
-        if user.email:
-            member = await org_member_dao.find_unbound_by_email(user.email, user.tenant_id)
-            if member:
-                return member
-        if user.primary_mobile:
-            return await org_member_dao.find_unbound_by_phone(user.primary_mobile, user.tenant_id)
-        return None
 
     async def ensure_web_org_member(self, user: User):
         """Ensure the user has a dedicated platform OrgMember record in their tenant."""

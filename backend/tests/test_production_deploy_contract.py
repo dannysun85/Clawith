@@ -106,6 +106,7 @@ def test_production_code_execution_defaults_fail_closed():
     compose = (ROOT / "deploy/astra-poc/docker-compose.prod.yml").read_text(encoding="utf-8")
 
     assert 'CODE_EXECUTION_ENABLED: "false"' in compose
+    assert 'ALLOW_UNVERIFIED_LOCAL_SIGNUP: "false"' in compose
     assert 'CODE_EXECUTION_ALLOWED_TENANT_IDS: ""' in compose
     assert 'CODE_EXECUTION_ALLOWED_TOOL_NAMES: ""' in compose
     assert 'CODE_EXECUTION_ALLOWED_SANDBOX_TYPES: ""' in compose
@@ -195,7 +196,6 @@ def test_polluted_parent_environment_cannot_activate_code_in_effective_compose()
 
 def test_production_release_gate_covers_code_execution_security():
     script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
-    workflow = (ROOT / ".agents/workflows/deploy-production.md").read_text(encoding="utf-8")
 
     assert "(cd backend && uv run pytest -q)" in script
     assert "production releases cannot disable local release gates" in script
@@ -218,7 +218,75 @@ def test_production_release_gate_covers_code_execution_security():
     assert '--base "$RELEASE_BASE_COMMIT" --target HEAD' in script
     assert '"$RELEASE/BASE_COMMIT"' in script
     assert "bash scripts/postgres-migration-smoke.sh" in script
+    assert '"ALLOW_UNVERIFIED_LOCAL_SIGNUP": "false"' in script
+
+
+def test_production_identity_preflight_runs_before_maintenance_and_redacts_values():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    workflow = (ROOT / ".agents/workflows/deploy-production.md").read_text(encoding="utf-8")
+    migration = script.index('echo "[remote] applying migrations before candidate startup"')
+
+    function = _shell_function_source(
+        script,
+        "identity_integrity_preflight",
+        "verify_public_maintenance",
+    )
+    assert "duplicate_email_groups" in function
+    assert "cross_namespace_username_email_conflicts" in function
+    assert "cross_namespace_username_phone_conflicts" in function
+    assert "duplicate_provider_open_id_groups" in function
+    assert "duplicate_tenantless_membership_groups" in function
+    assert "WHERE identity_id IS NOT NULL AND tenant_id IS NULL" in function
+    assert "invalid_identity_provider_config_shapes" in function
+    assert "pg_typeof(config)::text IN ('json', 'jsonb')" in function
+    assert "jsonb_typeof(to_jsonb(config)) IS DISTINCT FROM 'object'" in function
+    assert "unencrypted_identity_provider_text_configs" in function
+    assert "CAST(config AS text) NOT LIKE 'enc:idp:v1:%'" in function
+    assert "NOT IN ('web', 'platform')" in function
+    assert "provider_member_tenant_mismatches" in function
+    assert "tenant_provider_member_user_mismatches" in function
+    assert "agent_member_provider_tenant_mismatches" in function
+    assert "password_hashes_disabled_for_audit" in function
+    assert "os.chmod(temp_path, 0o600)" in function
+    assert "SELECT email" not in function
+    assert "SELECT open_id" not in function
+    assert function.count('"duplicate_tenantless_membership_groups"') >= 1
+
+    preflight_call = script.index(
+        "identity_integrity_preflight \\" +
+        '\n    "$PREVIOUS" "$BACKUP/identity-integrity-preflight.json"'
+    )
+    maintenance = script.index(
+        'echo "[remote] enabling explicit Web/API/WebSocket maintenance fence"'
+    )
+    assert preflight_call < maintenance
+    candidate_build = script.index(
+        'compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" build backend frontend'
+    )
+    preexisting_secret_gate = script.index(
+        "if ! verify_preexisting_identity_provider_secrets \\",
+        candidate_build,
+    )
+    assert candidate_build < preexisting_secret_gate < maintenance
+    storage_type_function = _shell_function_source(
+        script,
+        "identity_provider_config_storage_type",
+        "verify_preexisting_identity_provider_secrets",
+    )
+    assert "information_schema.columns" in storage_type_function
+    assert "json|jsonb|text|'character varying'" in storage_type_function
+    preexisting_secret_function = _shell_function_source(
+        script,
+        "verify_preexisting_identity_provider_secrets",
+        "identity_integrity_preflight",
+    )
+    assert "json|jsonb)" in preexisting_secret_function
+    assert "-m app.scripts.verify_identity_provider_secrets" in preexisting_secret_function
+    assert "identity_provider_secret_envelopes_verified=[0-9]+" in preexisting_secret_function
     assert "-m app.scripts.verify_channel_secrets" in script
+    assert "-m app.scripts.verify_identity_provider_secrets" in script
+    assert "SECRET_KEY continuity verified" in script
+    assert "explicit envelope-key" in script
     assert "docker compose -f deploy/astra-poc/docker-compose.prod.yml config --quiet" in script
     assert 'git archive --format=tar --output="$PACKAGE_TAR" "$COMMIT"' in script
     assert 'git get-tar-commit-id < "$PACKAGE_TAR"' in script
@@ -236,11 +304,20 @@ def test_production_release_gate_covers_code_execution_security():
         "-m app.scripts.verify_channel_secrets",
         migration,
     )
-    schema_forward = script.index(
-        'write_cutover_state schema_forward_only "$CANDIDATE_SLOT" "$RELEASE_ID"',
+    identity_provider_secret_gate = script.index(
+        "-m app.scripts.verify_identity_provider_secrets",
         channel_secret_gate,
     )
-    assert migration < channel_secret_gate < schema_forward
+    schema_forward = script.index(
+        'write_cutover_state schema_forward_only "$CANDIDATE_SLOT" "$RELEASE_ID"',
+        identity_provider_secret_gate,
+    )
+    assert (
+        migration
+        < channel_secret_gate
+        < identity_provider_secret_gate
+        < schema_forward
+    )
     assert "Code 激活状态为\n`BLOCKED`" in workflow
     assert "精确 tenant UUID" in workflow
     assert "生产禁止 `subprocess`、`docker`" in workflow
@@ -1203,6 +1280,8 @@ def test_production_deploy_health_checks_candidate_before_nginx_cutover():
     assert "DRAIN_TIMEOUT_SECONDS" in script
     assert "(cd backend && uv run pytest -q)" in script
     assert "JWT_ROTATION_MARKER" in script
+    assert "SSO_PASSWORD_ROTATION_MARKER" in script
+    assert 'write_atomic_line "$SSO_PASSWORD_ROTATION_MARKER" "$RELEASE_ID"' in script
     assert 'install "$NGINX_SITE" "$OLD_PORT" "$CANDIDATE_PORT"' in script
     assert '"$RELEASE/scripts/configure_production_nginx.py"' in script
     configurator = NGINX_CONFIGURATOR.read_text(encoding="utf-8")
@@ -1210,6 +1289,9 @@ def test_production_deploy_health_checks_candidate_before_nginx_cutover():
     assert "if len(old_matches) == 1 and not candidate_matches:" in configurator
     assert "audit_effective_config" in configurator
     assert "active_upstream_port" in configurator
+    assert "CLIENT_IP_PROXY_HEADERS" in configurator
+    assert "X-Real-IP" in configurator
+    assert "X-Forwarded-For" in configurator
     assert "run --rm --no-deps -T --entrypoint alembic backend upgrade head < /dev/null" in script
 
 
@@ -1246,6 +1328,46 @@ server {
     assert "proxy_pass http://127.0.0.1:3008;" not in configured
     assert "combined" not in configured
     assert "/tmp/raw-request.log" not in configured
+    assert configured.count("proxy_set_header X-Real-IP $remote_addr;") == 1
+    assert configured.count("proxy_set_header X-Forwarded-For $remote_addr;") == 1
+
+
+def test_nginx_cutover_overwrites_spoofable_client_ip_headers_in_proxy_scope():
+    configurator = _load_nginx_configurator()
+    original = """server {
+    listen 443 ssl;
+    location / {
+        proxy_set_header X-Real-IP $http_x_real_ip;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_pass http://127.0.0.1:3008;
+    }
+}
+"""
+
+    configured, _ = configurator.configure_site(original, "3008", "3009")
+
+    assert "$http_x_real_ip" not in configured
+    assert "$proxy_add_x_forwarded_for" not in configured
+    assert configured.count("proxy_set_header X-Real-IP $remote_addr;") == 1
+    assert configured.count("proxy_set_header X-Forwarded-For $remote_addr;") == 1
+
+
+def test_inner_nginx_preserves_host_verified_client_ip_with_peer_fallback():
+    compose = (ROOT / "deploy/astra-poc/docker-compose.prod.yml").read_text(
+        encoding="utf-8"
+    )
+    dockerfile = (ROOT / "frontend/Dockerfile").read_text(encoding="utf-8")
+    source = (ROOT / "frontend/nginx.conf.template").read_text(encoding="utf-8")
+
+    assert "context: ./frontend" in compose
+    assert (
+        "COPY nginx.conf.template /etc/nginx/templates/default.conf.template"
+        in dockerfile
+    )
+    assert "map $http_x_real_ip $astra_client_ip" in source
+    assert '"" $remote_addr;' in source
+    assert source.count("proxy_set_header X-Real-IP $astra_client_ip;") >= 4
+    assert source.count("proxy_set_header X-Forwarded-For $astra_client_ip;") >= 4
 
 
 def test_nginx_cutover_is_idempotent_and_can_switch_back():
@@ -1388,10 +1510,14 @@ map $http_upgrade $connection_upgrade {{
     '' close;
 }}
 server {{ {configurator.REDACTED_ACCESS_LOG} listen 80; }}
-server {{
-    {configurator.REDACTED_ACCESS_LOG}
-    location / {{ proxy_pass http://127.0.0.1:3009; }}
-}}
+    server {{
+        {configurator.REDACTED_ACCESS_LOG}
+        location / {{
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $remote_addr;
+            proxy_pass http://127.0.0.1:3009;
+        }}
+    }}
 }}
 """
     assert configurator.audit_effective_config(effective) == (2, 2)
@@ -1570,7 +1696,11 @@ def test_nginx_effective_config_audit_covers_all_server_blocks():
     server {{ # TLS
         {configurator.REDACTED_ACCESS_LOG}
         listen 443 ssl;
-        location / {{ proxy_pass http://127.0.0.1:3009; }}
+        location / {{
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $remote_addr;
+            proxy_pass http://127.0.0.1:3009;
+        }}
     }}
 }}
 """
@@ -1626,7 +1756,11 @@ server {{
 server {{
     {configurator.REDACTED_ACCESS_LOG}
     listen 443 ssl;
-    location / {{ proxy_pass http://127.0.0.1:3009; }}
+    location / {{
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_pass http://127.0.0.1:3009;
+    }}
 }}
 """
 
@@ -2903,11 +3037,13 @@ def test_maintenance_writer_fence_is_durable_before_schema_migration():
         'write_cutover_state schema_forward_only "$CANDIDATE_SLOT" "$RELEASE_ID"',
         migration,
     )
+    pending_drain = script.index(
+        'write_atomic_line "$PENDING_DRAIN_FILE" "$OLD_PROJECT $OLD_PORT $PREVIOUS"',
+        schema_state,
+    )
 
     assert candidate_journal < maintenance < maintenance_state < old_stop < migration_state < migration < schema_state
-    assert ('write_atomic_line "$PENDING_DRAIN_FILE" "$OLD_PROJECT $OLD_PORT $PREVIOUS"') not in script[
-        candidate_journal:
-    ]
+    assert schema_state < pending_drain
 
 
 def test_production_deploy_does_not_rebuild_the_live_project_in_place():
@@ -3754,6 +3890,27 @@ def test_candidate_journal_precedes_writer_fence_and_identity_gate():
     )
 
     assert journal < maintenance < schema_fence < identity < fallback < candidate_state
+
+
+def test_pending_drain_intent_is_durable_before_nginx_traffic_mutation():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    business_verified = script.index(
+        'write_cutover_state candidate_business_verified "$CANDIDATE_SLOT" "$RELEASE_ID"'
+    )
+    pending_drain = script.index(
+        'write_atomic_line "$PENDING_DRAIN_FILE" "$OLD_PROJECT $OLD_PORT $PREVIOUS"',
+        business_verified,
+    )
+    nginx_install = script.index(
+        'install "$NGINX_SITE" "$OLD_PORT" "$CANDIDATE_PORT"',
+        pending_drain,
+    )
+    nginx_reload = script.index("reload_nginx_with_worker_snapshot", nginx_install)
+
+    assert script.count(
+        'write_atomic_line "$PENDING_DRAIN_FILE" "$OLD_PROJECT $OLD_PORT $PREVIOUS"'
+    ) == 1
+    assert business_verified < pending_drain < nginx_install < nginx_reload
 
 
 @pytest.mark.parametrize("failure_point", ["old_application", "nginx_rollback"])

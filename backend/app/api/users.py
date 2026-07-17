@@ -212,11 +212,16 @@ async def update_user_role(
         return {"status": "ok", "user_id": str(user_id), "role": data.role}
 
     # Last-admin protection: if demoting an org_admin, check they are not the only one
-    if target_user.role in ("org_admin", "platform_admin") and data.role not in ("org_admin", "platform_admin"):
+    if (
+        target_user.is_active
+        and target_user.role in ("org_admin", "platform_admin")
+        and data.role not in ("org_admin", "platform_admin")
+    ):
         admin_count_result = await db.execute(
             select(func.count()).select_from(User).where(
                 User.tenant_id == target_user.tenant_id,
                 User.role.in_(["org_admin", "platform_admin"]),
+                User.is_active.is_(True),
             )
         )
         admin_count = admin_count_result.scalar() or 0

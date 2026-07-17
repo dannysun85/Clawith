@@ -45,7 +45,7 @@ export default function OAuthCallback() {
                 redirect_uri: `${window.location.origin}/oauth/callback/${provider}`,
             }),
         })
-            .then((res) => {
+            .then(async (res) => {
                 // Step 1 result: multi-tenant selection needed
                 if (res.requires_tenant_selection) {
                     setTenants(res.tenants);
@@ -53,7 +53,7 @@ export default function OAuthCallback() {
                     return;
                 }
                 // Normal single-tenant login
-                setAuth(res.user, res.access_token);
+                await setAuth(res.user, res.access_token);
                 if (res.needs_company_setup || !res.user?.tenant_id) {
                     navigate('/setup-company', { replace: true });
                     return;
@@ -79,7 +79,7 @@ export default function OAuthCallback() {
                     tenant_id: tenantId,
                 }),
             });
-            setAuth(res.user, res.access_token);
+            await setAuth(res.user, res.access_token);
             if (res.needs_company_setup || !res.user?.tenant_id) {
                 navigate('/setup-company', { replace: true });
                 return;

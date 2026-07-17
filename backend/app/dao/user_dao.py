@@ -1,9 +1,10 @@
 from typing import Any, Sequence
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from app.dao.base import BaseDAO
+from app.core.identity_canonicalization import canonicalize_email
 from app.models.user import Identity, User
 
 
@@ -44,12 +45,15 @@ class UserDAO(BaseDAO[User]):
         self, email: str, tenant_id: Any | None, exclude_user_id: Any | None = None
     ) -> User | None:
         """Find user by identity email in a specific tenant, optionally excluding a user ID."""
+        email = canonicalize_email(email)
+        if email is None:
+            return None
         async with self.session() as db:
             query = (
                 select(User)
                 .join(Identity, User.identity_id == Identity.id)
                 .where(
-                    Identity.email == email,
+                    func.lower(Identity.email) == email,
                     User.tenant_id == tenant_id,
                 )
             )
@@ -87,6 +91,21 @@ class UserDAO(BaseDAO[User]):
         """Find a representative user (e.g. latest created) associated with an identity ID."""
         async with self.session() as db:
             query = select(User).where(User.identity_id == identity_id).order_by(User.created_at.desc()).limit(1)
+            result = await db.execute(query)
+            return result.scalar_one_or_none()
+
+    async def get_active_representative_user_for_identity(self, identity_id: Any) -> User | None:
+        """Find the latest active membership associated with an Identity."""
+        async with self.session() as db:
+            query = (
+                select(User)
+                .where(
+                    User.identity_id == identity_id,
+                    User.is_active.is_(True),
+                )
+                .order_by(User.created_at.desc())
+                .limit(1)
+            )
             result = await db.execute(query)
             return result.scalar_one_or_none()
 

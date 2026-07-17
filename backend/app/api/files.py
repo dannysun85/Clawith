@@ -16,7 +16,11 @@ from pydantic import BaseModel
 
 from app.config import get_settings
 from app.core.permissions import check_agent_access
-from app.core.security import BROWSER_SESSION_COOKIE, get_current_user
+from app.core.security import (
+    BROWSER_SESSION_COOKIE,
+    access_token_matches_identity,
+    get_current_user,
+)
 from app.database import get_db
 from app.models.user import User
 from app.models.workspace import WorkspaceFileRevision
@@ -40,6 +44,7 @@ from app.services.storage_runtime.base import StorageEntry
 from app.services.workspace_paths import WorkspacePathError, resolve_agent_visible_path
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 settings = get_settings()
 router = APIRouter(prefix="/agents/{agent_id}/files", tags=["files"])
@@ -590,10 +595,34 @@ async def download_file(
     if not user_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
-    result = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
+    try:
+        parsed_user_id = uuid.UUID(str(user_id))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token") from exc
+
+    result = await db.execute(
+        select(User)
+        .where(User.id == parsed_user_id)
+        .options(selectinload(User.identity))
+    )
     user = result.scalar_one_or_none()
-    if not user or not user.is_active:
+    if (
+        not user
+        or not user.is_active
+        or not user.identity
+        or not user.identity.is_active
+        or not access_token_matches_identity(payload, user.identity)
+    ):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
+    if user.tenant_id is not None:
+        from app.models.tenant import Tenant
+
+        tenant = await db.get(Tenant, user.tenant_id)
+        if not tenant or not tenant.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Organization is unavailable",
+            )
 
     await check_agent_access(db, user, agent_id)
     storage = get_storage_backend()
@@ -831,7 +860,6 @@ async def import_skill_to_agent(
     """
     agent, _ = await check_agent_access(db, current_user, agent_id)
 
-    from sqlalchemy.orm import selectinload
     from app.models.skill import Skill
     from app.services.skill_scope import scope_skill_query
 

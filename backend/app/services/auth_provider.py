@@ -4,20 +4,30 @@ This module provides a base class for all identity providers (Feishu, DingTalk, 
 and concrete implementations for each supported provider.
 """
 
+import hmac
 from urllib.parse import quote, urlencode
 
 import httpx
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Any
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.identity import IdentityProvider
-from app.models.user import User, Identity
+from app.models.user import User
+from app.services.external_identity_policy import (
+    acquire_external_subject_lock,
+    create_isolated_external_identity,
+    external_user_can_authenticate,
+    require_stable_external_subject,
+)
 from app.services.google_workspace_oauth import GOOGLE_HTTP_PROXY
 from app.services.identity_provider_lookup import get_preferred_identity_provider
 from loguru import logger
+
+
+_MEMBERSHIP_TENANT_UNSET = object()
 
 
 @dataclass
@@ -29,6 +39,10 @@ class ExternalUserInfo:
     provider_user_id: str | None = None
     name: str = ""
     email: str = ""
+    # Provider-attested email ownership metadata.  This flag is intentionally
+    # not sufficient for implicit account linking; the authenticated bind flow
+    # is the only automatic merge boundary.
+    email_verified: bool = False
     avatar_url: str = ""
     mobile: str = ""
     raw_data: dict = None
@@ -51,9 +65,12 @@ class BaseAuthProvider(ABC):
             config: Configuration dict (fallback if no provider record)
         """
         self.provider = provider
-        self.config = config or {}
-        if provider and provider.config:
-            self.config = provider.config
+        # Provider configuration is ORM-managed mutable state.  Authentication
+        # requests may add request-local values such as redirect URIs, so every
+        # provider receives an isolated snapshot instead of a live reference
+        # that could dirty (and later overwrite) encrypted credentials.
+        source_config = provider.config if provider and provider.config else config
+        self.config = dict(source_config or {})
 
     @abstractmethod
     async def get_authorization_url(self, redirect_uri: str, state: str) -> str:
@@ -93,7 +110,11 @@ class BaseAuthProvider(ABC):
         pass
 
     async def find_or_create_user(
-        self, db: AsyncSession, user_info: ExternalUserInfo, tenant_id: str | None = None
+        self,
+        db: AsyncSession,
+        user_info: ExternalUserInfo,
+        tenant_id: str | None = None,
+        membership_tenant_id: str | None | object = _MEMBERSHIP_TENANT_UNSET,
     ) -> tuple[User, bool]:
         """Find existing user or create new one via Identity/OrgMember.
 
@@ -102,46 +123,96 @@ class BaseAuthProvider(ABC):
             user_info: User info from provider
             tenant_id: Optional tenant ID for association
         """
-        from app.services.sso_service import sso_service
+        from app.services.sso_service import (
+            ExternalIdentityProvisioningDeniedError,
+            sso_service,
+        )
 
-        # Ensure provider exists
-        await self._ensure_provider(db, tenant_id)
+        effective_membership_tenant_id = (
+            tenant_id
+            if membership_tenant_id is _MEMBERSHIP_TENANT_UNSET
+            else membership_tenant_id
+        )
 
-        # 1. Try lookup via sso_service (which now uses OrgMember)
-        provider_user_id = user_info.provider_user_id
+        # 1. Resolve only through a provider-scoped stable subject.  Email and
+        # mobile are profile claims, not account-link credentials.
+        provider_user_id = require_stable_external_subject(
+            self.provider_type,
+            user_info.provider_user_id or user_info.provider_union_id,
+        )
+        await acquire_external_subject_lock(
+            db,
+            provider_type=self.provider_type,
+            tenant_id=tenant_id,
+            provider_subject=provider_user_id,
+        )
+
+        # Lock before provider creation so concurrent first login cannot create
+        # duplicate provider or member shells.
+        provider = await self._ensure_provider(db, tenant_id)
+        identity_data = self._identity_payload(user_info)
         user = await sso_service.resolve_user_identity(
             db,
             provider_user_id,
             self.provider_type,
             tenant_id=tenant_id,
-            identity_data=user_info.raw_data,
+            identity_data=identity_data,
+            provider_id=provider.id,
         )
 
-        is_new = False
-        if not user:
-            # 2. Try matching by email/mobile (which now checks Identity too)
-            if user_info.email:
-                user = await sso_service.match_user_by_email(db, user_info.email, tenant_id)
-            if not user and user_info.mobile:
-                user = await sso_service.match_user_by_mobile(db, user_info.mobile, tenant_id)
-            
-            if user:
-                # If we found a user via email/mobile matching, it might be in a different tenant
-                if tenant_id and str(user.tenant_id) != tenant_id:
-                    # Identity exists but no user in this tenant
-                    user = None 
+        # Tenant SSO is an authentication path, not an implicit invitation.
+        # A subject must already exist in the exact provider's synchronized
+        # directory unless an explicit, provider-verifiable JIT policy allows
+        # creation.  Global OAuth registration remains governed by its signup
+        # code and therefore does not pass a tenant scope here.
+        if user is None and tenant_id is not None:
+            provisioned_member = await sso_service.find_identity_member(
+                db,
+                provider.id,
+                self.provider_type,
+                provider_user_id,
+                identity_data,
+                active_only=False,
+            )
+            if provisioned_member is not None and provisioned_member.status != "active":
+                raise ExternalIdentityProvisioningDeniedError(
+                    "The directory member is disabled or deleted"
+                )
+            if provisioned_member is None and not self._tenant_jit_provisioning_allowed(user_info):
+                raise ExternalIdentityProvisioningDeniedError(
+                    "The external subject is not provisioned for this tenant"
+                )
 
+        is_new = False
         if user:
+            # Disabled global identities and memberships remain authoritative;
+            # do not mutate or relink them before the callback rejects login.
+            if not getattr(user, "is_active", False):
+                return user, False
+            if user.identity_id and not external_user_can_authenticate(user):
+                return user, False
+
             # Update user info and ensure identity is loaded
             if not user.identity_id:
-                 from app.services.registration_service import registration_service
-                 identity = await registration_service.find_or_create_identity(email=user_info.email, phone=user_info.mobile)
-                 user.identity_id = identity.id
+                identity = await create_isolated_external_identity(
+                    db,
+                    provider_type=self.provider_type,
+                    provider_subject=provider_user_id,
+                )
+                user.identity_id = identity.id
+                # Keep the relationship and foreign key in sync before any
+                # association-proxy reads/writes below.  Otherwise assigning
+                # ``user.email`` can synthesize a second Identity object.
+                user.identity = identity
             
             await self._update_existing_user(db, user, user_info)
         else:
             # 3. Create new user (and Identity if needed)
-            user = await self._create_new_user(db, user_info, tenant_id)
+            user = await self._create_new_user(
+                db,
+                user_info,
+                effective_membership_tenant_id,
+            )
             is_new = True
             
         # Ensure OrgMember linkage
@@ -150,8 +221,9 @@ class BaseAuthProvider(ABC):
             str(user.id),
             self.provider_type,
             provider_user_id,
-            user_info.raw_data,
+            identity_data,
             tenant_id=tenant_id,
+            provider_id=provider.id,
         )
 
         # SSO users should also appear as Web members for tenant-side user management.
@@ -159,6 +231,26 @@ class BaseAuthProvider(ABC):
         await registration_service.ensure_web_org_member(user)
 
         return user, is_new
+
+    def _tenant_jit_provisioning_allowed(self, user_info: ExternalUserInfo) -> bool:
+        """Return whether this exact provider proves safe tenant-side JIT.
+
+        The default is deliberately false.  Provider subclasses may opt in
+        only when an administrator enabled the policy and the callback proves
+        organization ownership from provider-bound data.
+        """
+        return False
+
+    def _identity_payload(self, user_info: ExternalUserInfo) -> dict[str, Any]:
+        """Build provider metadata without promoting contacts to Identity."""
+        return {
+            "name": user_info.name,
+            "email": user_info.email,
+            "email_verified": user_info.email_verified,
+            "mobile": user_info.mobile,
+            "avatar": user_info.avatar_url,
+            "raw_data": user_info.raw_data,
+        }
 
     async def _ensure_provider(self, db: AsyncSession, tenant_id: str | None = None) -> IdentityProvider:
         """Get or create IdentityProvider record."""
@@ -197,54 +289,37 @@ class BaseAuthProvider(ABC):
             user.display_name = user_info.name
         if user_info.avatar_url and not user.avatar_url:
             user.avatar_url = user_info.avatar_url
-        if user_info.email and not user.email:
-            user.email = user_info.email
-        if user_info.mobile and not user.primary_mobile:
-            user.primary_mobile = user_info.mobile
-
         # Update legacy fields if applicable
         await self._update_legacy_user_fields(user, user_info)
 
     async def _create_new_user(
-        self, db: AsyncSession, user_info: ExternalUserInfo, tenant_id: str | None
+        self,
+        db: AsyncSession,
+        user_info: ExternalUserInfo,
+        tenant_id: str | None,
     ) -> User:
         """Create new user from external identity."""
-        from app.services.registration_service import registration_service
-        import uuid
-        
-        # 1. Prepare user fields and resolve global identity
-        effective_id = user_info.provider_user_id or user_info.provider_union_id or "unknown"
-        
-        identity = await registration_service.find_or_create_identity(
-            email=user_info.email,
-            phone=user_info.mobile,
-            username=user_info.email.split("@")[0] if user_info.email else None,
-            password=effective_id,
+        provider_subject = require_stable_external_subject(
+            self.provider_type,
+            user_info.provider_user_id or user_info.provider_union_id,
+        )
+        identity = await create_isolated_external_identity(
+            db,
+            provider_type=self.provider_type,
+            provider_subject=provider_subject,
         )
 
-        # 2. Prepare Tenant user fields
-        username = user_info.email.split("@")[0] if user_info.email else f"{self.provider_type}_{effective_id[:8]}"
-
-        # Ensure unique username within tenant
-        query = (
-            select(User)
-            .join(User.identity)
-            .where(Identity.username == username)
-        )
-        if tenant_id:
-            query = query.where(User.tenant_id == tenant_id)
-        existing = await db.execute(query)
-        if existing.scalar_one_or_none():
-            username = f"{username}_{uuid.uuid4().hex[:6]}"
-
-        # 3. Create TenantUser record
+        # 2. Create a tenant membership.  Successful provider authentication
+        # activates the membership, while the global Identity remains
+        # passwordless and carries no unproven contact ownership.
         user = User(
             identity_id=identity.id,
-            display_name=user_info.name or username,
+            display_name=user_info.name or identity.username,
             avatar_url=user_info.avatar_url,
             registration_source=self.provider_type,
             tenant_id=tenant_id,
             is_active=True,
+            activation_pending_email_verification=False,
         )
 
 
@@ -281,6 +356,14 @@ class FeishuAuthProvider(BaseAuthProvider):
         self.app_id = self.config.get("app_id")
         self.app_secret = self.config.get("app_secret")
         self._app_access_token: str | None = None
+
+    def _tenant_jit_provisioning_allowed(self, user_info: ExternalUserInfo) -> bool:
+        return bool(
+            self.config.get("jit_provisioning_enabled") is True
+            and self.app_id
+            and self.app_secret
+            and user_info.provider_union_id
+        )
 
     async def get_authorization_url(self, redirect_uri: str, state: str) -> str:
         app_id = self.app_id or ""
@@ -357,6 +440,19 @@ class DingTalkAuthProvider(BaseAuthProvider):
         self.app_key = self.config.get("app_key")
         self.app_secret = self.config.get("app_secret")
         self.corp_id = self.config.get("corp_id")
+
+    def _tenant_jit_provisioning_allowed(self, user_info: ExternalUserInfo) -> bool:
+        returned_corp_id = (
+            user_info.raw_data.get("corpId")
+            or user_info.raw_data.get("corp_id")
+            or user_info.raw_data.get("corpid")
+        )
+        return bool(
+            self.config.get("jit_provisioning_enabled") is True
+            and self.corp_id
+            and returned_corp_id
+            and hmac.compare_digest(str(self.corp_id), str(returned_corp_id))
+        )
 
     async def get_authorization_url(self, redirect_uri: str, state: str) -> str:
         app_id = self.app_key or ""
@@ -477,6 +573,20 @@ class WeComAuthProvider(BaseAuthProvider):
         self.secret = self.config.get("secret") or self.config.get("app_secret")
         self.agent_id = self.config.get("agent_id")
 
+    def _tenant_jit_provisioning_allowed(self, user_info: ExternalUserInfo) -> bool:
+        returned_user_id = str(user_info.raw_data.get("userid") or "").strip()
+        return bool(
+            self.config.get("jit_provisioning_enabled") is True
+            and self.corp_id
+            and self.secret
+            and self.agent_id
+            and returned_user_id
+            and hmac.compare_digest(
+                returned_user_id,
+                str(user_info.provider_user_id or "").strip(),
+            )
+        )
+
     async def get_authorization_url(self, redirect_uri: str, state: str) -> str:
         """Construct the WeCom web-login SSO redirect URL.
 
@@ -563,8 +673,11 @@ class WeComAuthProvider(BaseAuthProvider):
                             "[WeCom SSO] getuserdetail failed error_code={}",
                             detail_json.get("errcode", "unknown"),
                         )
-                except Exception as e:
-                    logger.warning(f"[WeCom SSO] getuserdetail error: {e}")
+                except Exception as exc:
+                    logger.warning(
+                        "[WeCom SSO] getuserdetail error_type={}",
+                        type(exc).__name__,
+                    )
             else:
                 logger.info(
                     "[WeCom SSO] No user_ticket; "
@@ -590,8 +703,11 @@ class WeComAuthProvider(BaseAuthProvider):
                         "[WeCom SSO] user/get failed error_code={}",
                         get_json.get("errcode", "unknown"),
                     )
-            except Exception as e:
-                logger.warning(f"[WeCom SSO] user/get error: {e}")
+            except Exception as exc:
+                logger.warning(
+                    "[WeCom SSO] user/get error_type={}",
+                    type(exc).__name__,
+                )
 
             # Pack all data for get_user_info() to consume
             packed_token = json.dumps({
@@ -647,13 +763,16 @@ class WeComAuthProvider(BaseAuthProvider):
                 mobile=mobile,
                 raw_data=raw,
             )
-        except Exception as e:
-            logger.error(f"[WeCom SSO] get_user_info parse error: {e}")
+        except Exception as exc:
+            logger.error(
+                "[WeCom SSO] get_user_info parse error_type={}",
+                type(exc).__name__,
+            )
             return ExternalUserInfo(
                 provider_type=self.provider_type,
                 provider_user_id="",
                 name="",
-                raw_data={"error": str(e)},
+                raw_data={"error_type": type(exc).__name__},
             )
 
 
@@ -694,7 +813,6 @@ class GoogleWorkspaceAuthProvider(BaseAuthProvider):
         if isinstance(scope_value, list):
             scope_value = " ".join(scope_value)
 
-        self.config["redirect_uri"] = redirect_uri
         params = (
             f"client_id={quote(self.client_id or '')}"
             f"&redirect_uri={quote(redirect_uri)}"
@@ -772,6 +890,7 @@ class GoogleWorkspaceAuthProvider(BaseAuthProvider):
             provider_user_id=info.get("sub", ""),
             name=info.get("name", "") or info.get("email", ""),
             email=info.get("email", ""),
+            email_verified=bool(info.get("email_verified")),
             avatar_url=info.get("picture", ""),
             raw_data=info,
         )
@@ -858,6 +977,7 @@ class GoogleAuthProvider(BaseAuthProvider):
                 provider_user_id=data.get("sub", ""),
                 name=data.get("name", ""),
                 email=data.get("email", ""),
+                email_verified=bool(data.get("email_verified")),
                 avatar_url=data.get("picture", ""),
                 raw_data=data,
             )
@@ -921,21 +1041,30 @@ class GitHubAuthProvider(BaseAuthProvider):
             if user_resp.status_code != 200:
                 raise Exception(user_data.get("message") or "Failed to fetch GitHub user info")
 
-            email = user_data.get("email") or ""
-            if not email:
-                emails_resp = await client.get(self.GITHUB_EMAILS_URL, headers=headers)
-                emails_data = emails_resp.json()
-                if emails_resp.status_code == 200 and isinstance(emails_data, list):
-                    primary = next((item for item in emails_data if item.get("primary")), None)
-                    verified = next((item for item in emails_data if item.get("verified")), None)
-                    fallback = primary or verified or (emails_data[0] if emails_data else {})
-                    email = fallback.get("email", "")
+            # ``GET /user`` does not attest that its public email is verified.
+            # Only the authenticated email endpoint's verified entries may be
+            # exposed as an ownership-verified provider claim.
+            email = ""
+            emails_resp = await client.get(self.GITHUB_EMAILS_URL, headers=headers)
+            emails_data = emails_resp.json()
+            if emails_resp.status_code == 200 and isinstance(emails_data, list):
+                verified_emails = [
+                    item
+                    for item in emails_data
+                    if item.get("verified") and item.get("email")
+                ]
+                preferred = next(
+                    (item for item in verified_emails if item.get("primary")),
+                    None,
+                )
+                email = str((preferred or (verified_emails[0] if verified_emails else {})).get("email", ""))
 
             return ExternalUserInfo(
                 provider_type=self.provider_type,
                 provider_user_id=str(user_data.get("id", "")),
                 name=user_data.get("name") or user_data.get("login") or "",
                 email=email,
+                email_verified=bool(email),
                 avatar_url=user_data.get("avatar_url", ""),
                 raw_data=user_data,
             )

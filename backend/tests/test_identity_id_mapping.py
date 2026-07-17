@@ -105,13 +105,14 @@ async def test_channel_user_service_uses_feishu_open_id_for_existing_member_look
     service = ChannelUserService()
     db = AsyncMock()
     expected_member = SimpleNamespace(id="member-1")
-    db.execute = AsyncMock(
-        return_value=Mock(scalar_one_or_none=Mock(return_value=expected_member))
-    )
+    result = Mock()
+    result.scalars.return_value.all.return_value = [expected_member]
+    db.execute = AsyncMock(return_value=result)
 
     member = await service._find_org_member(
         db,
         provider_id="provider-1",
+        tenant_id="tenant-1",
         channel_type="feishu",
         external_user_id=None,
         extra_info={"open_id": "ou_open_123"},
@@ -125,7 +126,7 @@ async def test_channel_user_service_uses_feishu_open_id_for_existing_member_look
 async def test_channel_user_service_rejects_feishu_open_id_only_lazy_registration():
     service = ChannelUserService()
     db = AsyncMock()
-    db.get.return_value = None
+    db.get.return_value = SimpleNamespace(is_active=True)
     agent = SimpleNamespace(tenant_id="tenant-1")
 
     service._ensure_provider = AsyncMock(return_value=SimpleNamespace(id="provider-1"))
@@ -149,6 +150,7 @@ async def test_channel_user_service_skips_dingtalk_lookup_when_ids_missing():
     member = await service._find_org_member(
         db,
         provider_id="provider-1",
+        tenant_id="tenant-1",
         channel_type="dingtalk",
         external_user_id=None,
         extra_info={},
@@ -163,13 +165,14 @@ async def test_channel_user_service_uses_wechat_external_id_for_existing_member_
     service = ChannelUserService()
     db = AsyncMock()
     expected_member = SimpleNamespace(id="member-wechat-1")
-    db.execute = AsyncMock(
-        return_value=Mock(scalar_one_or_none=Mock(return_value=expected_member))
-    )
+    result = Mock()
+    result.scalars.return_value.all.return_value = [expected_member]
+    db.execute = AsyncMock(return_value=result)
 
     member = await service._find_org_member(
         db,
         provider_id="provider-1",
+        tenant_id="tenant-1",
         channel_type="wechat",
         external_user_id="wx_user_123",
         extra_info={"external_id": "wx_user_123"},
@@ -183,9 +186,12 @@ async def test_channel_user_service_uses_wechat_external_id_for_existing_member_
 async def test_channel_user_service_creates_wechat_org_member_shell_for_lazy_registration():
     service = ChannelUserService()
     db = AsyncMock()
-    db.get.return_value = None
+    db.get_bind = Mock(
+        return_value=SimpleNamespace(dialect=SimpleNamespace(name="sqlite"))
+    )
+    db.get.return_value = SimpleNamespace(is_active=True)
     agent = SimpleNamespace(tenant_id="tenant-1")
-    provider = SimpleNamespace(id="provider-1")
+    provider = SimpleNamespace(id="provider-1", tenant_id="tenant-1")
     created_user = SimpleNamespace(id="user-1")
 
     service._ensure_provider = AsyncMock(return_value=provider)
