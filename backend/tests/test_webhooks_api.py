@@ -283,11 +283,14 @@ async def test_maintenance_paused_webhook_rejects_before_side_effects(
 def test_frontend_proxy_bounds_public_webhook_ingress():
     root = Path(__file__).parents[2]
     template = (root / "frontend/nginx.conf.template").read_text(encoding="utf-8")
+    production_template = (root / "deploy/nginx/nginx.conf").read_text(encoding="utf-8")
     zone = (root / "frontend/webhook-rate-limit.conf").read_text(encoding="utf-8")
     dockerfile = (root / "frontend/Dockerfile").read_text(encoding="utf-8")
 
     assert "limit_req_zone $binary_remote_addr zone=webhook_ingress:10m" in zone
-    assert "location ~ ^/api/webhooks/t/[A-Za-z0-9_-]{32}$" in template
+    webhook_location = 'location ~ "^/api/webhooks/t/[A-Za-z0-9_-]{32}$"'
+    assert webhook_location in template
+    assert webhook_location in production_template
     assert "limit_req zone=webhook_ingress burst=20 nodelay" in template
     assert "client_max_body_size 64k" in template
     assert "webhook-rate-limit.conf" in dockerfile

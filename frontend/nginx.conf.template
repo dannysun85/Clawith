@@ -24,7 +24,7 @@ server {
     }
 
     # API proxy
-    location ~ ^/api/webhooks/t/[A-Za-z0-9_-]{32}$ {
+    location ~ "^/api/webhooks/t/[A-Za-z0-9_-]{32}$" {
         limit_req zone=webhook_ingress burst=20 nodelay;
         limit_req_status 429;
         client_max_body_size 64k;
