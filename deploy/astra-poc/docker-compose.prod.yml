@@ -34,6 +34,7 @@ services:
     build:
       context: ./backend
       args:
+        CLAWITH_APT_MIRROR: ${CLAWITH_APT_MIRROR:-deb.debian.org}
         ASTRA_PIP_INDEX_URL: ${ASTRA_PIP_INDEX_URL:-}
         ASTRA_PIP_TRUSTED_HOST: ${ASTRA_PIP_TRUSTED_HOST:-}
         CLAWITH_PIP_INDEX_URL: ${CLAWITH_PIP_INDEX_URL:-}

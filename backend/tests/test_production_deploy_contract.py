@@ -1370,6 +1370,23 @@ def test_inner_nginx_preserves_host_verified_client_ip_with_peer_fallback():
     assert source.count("proxy_set_header X-Forwarded-For $astra_client_ip;") >= 4
 
 
+def test_backend_image_uses_resilient_configurable_debian_package_source():
+    dockerfile = (ROOT / "backend/Dockerfile").read_text(encoding="utf-8")
+    compose_files = (
+        ROOT / "docker-compose.yml",
+        ROOT / "deploy/docker-compose.yml",
+        ROOT / "deploy/docker-compose-multi.yml",
+        ROOT / "deploy/astra-poc/docker-compose.prod.yml",
+    )
+
+    assert dockerfile.count("ARG CLAWITH_APT_MIRROR=deb.debian.org") == 2
+    assert "mirrors.ustc.edu.cn" not in dockerfile
+    assert dockerfile.count("invalid CLAWITH_APT_MIRROR host") == 2
+    for compose_file in compose_files:
+        compose = compose_file.read_text(encoding="utf-8")
+        assert "CLAWITH_APT_MIRROR: ${CLAWITH_APT_MIRROR:-deb.debian.org}" in compose
+
+
 def test_nginx_cutover_is_idempotent_and_can_switch_back():
     configurator = _load_nginx_configurator()
     original = """server {

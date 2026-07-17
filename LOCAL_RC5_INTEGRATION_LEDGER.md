@@ -162,6 +162,11 @@ or an uncommitted temporary tree.
     script's own pre-restore rollback crash window. Deferred drain cleanup
     reuses the same release validator before it can stop a Compose project or
     remove its marker.
+21. Backend image builds default to `deb.debian.org` instead of a hard-coded
+    regional Debian mirror. `CLAWITH_APT_MIRROR` remains available as a
+    hostname-only build argument across every supported Compose entrypoint;
+    malformed values fail closed before `apt-get`, and the production image
+    gate verifies Python imports, Chromium, FFmpeg, and the CJK font runtime.
 
 ## Read-only production compatibility evidence
 

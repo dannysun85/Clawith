@@ -33,6 +33,7 @@ services:
     build:
       context: ./backend
       args:
+        CLAWITH_APT_MIRROR: ${CLAWITH_APT_MIRROR:-deb.debian.org}
         CLAWITH_PIP_INDEX_URL: ${CLAWITH_PIP_INDEX_URL:-}
         CLAWITH_PIP_TRUSTED_HOST: ${CLAWITH_PIP_TRUSTED_HOST:-}
     restart: unless-stopped
