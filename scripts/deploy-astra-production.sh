@@ -3654,13 +3654,13 @@ validate_nonterminal_recovery_state() {
         # Admit only that exact journal-proven slot, never an arbitrary third
         # managed release.
         case "$CUTOVER_PHASE:$RECORDED_SLOT:$CUTOVER_SLOT" in
-            rollback_started:a:a|rollback_incomplete:a:a|rollback_partial:a:a)
+            rollback_started:a:a|rollback_incomplete:a:a)
                 rollback_source_slot=b
                 ;;
-            rollback_started:b:b|rollback_incomplete:b:b|rollback_partial:b:b)
+            rollback_started:b:b|rollback_incomplete:b:b)
                 rollback_source_slot=a
                 ;;
-            rollback_started:legacy:legacy|rollback_incomplete:legacy:legacy|rollback_partial:legacy:legacy)
+            rollback_started:legacy:legacy|rollback_incomplete:legacy:legacy)
                 rollback_source_slot=b
                 ;;
         esac

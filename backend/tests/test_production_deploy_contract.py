@@ -1382,6 +1382,8 @@ def test_backend_image_uses_resilient_configurable_debian_package_source():
     assert dockerfile.count("ARG CLAWITH_APT_MIRROR=deb.debian.org") == 2
     assert "mirrors.ustc.edu.cn" not in dockerfile
     assert dockerfile.count("invalid CLAWITH_APT_MIRROR host") == 2
+    assert dockerfile.count("0 < len(host) <= 253") == 2
+    assert dockerfile.count("label_pattern.fullmatch(label)") == 2
     for compose_file in compose_files:
         compose = compose_file.read_text(encoding="utf-8")
         assert "CLAWITH_APT_MIRROR: ${CLAWITH_APT_MIRROR:-deb.debian.org}" in compose
@@ -2947,6 +2949,7 @@ exit "$status"
         ("current_recorded", 0),
         ("current_target", 0),
         ("rollback_current_candidate", 0),
+        ("rollback_partial_current_candidate", 1),
         ("rollback_current_unjournaled", 1),
         ("rollback_missing_source_journal", 1),
         ("current_unrelated", 1),
@@ -2988,6 +2991,7 @@ def test_nonterminal_recovery_accepts_only_the_atomic_recorded_release_pair(
         in {
             "current_target",
             "rollback_current_candidate",
+            "rollback_partial_current_candidate",
             "rollback_missing_source_journal",
         }
         else recorded_release
@@ -3012,7 +3016,11 @@ def test_nonterminal_recovery_accepts_only_the_atomic_recorded_release_pair(
     cutover_phase = "candidate_ready"
     cutover_slot = "a"
     if mutation.startswith("rollback_"):
-        cutover_phase = "rollback_started"
+        cutover_phase = (
+            "rollback_partial"
+            if mutation == "rollback_partial_current_candidate"
+            else "rollback_started"
+        )
         cutover_slot = "b"
         target_release_id = "recorded-release"
     active_state_source = "legacy-pair" if mutation == "legacy_state_source" else "atomic"

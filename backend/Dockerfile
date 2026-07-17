@@ -4,9 +4,9 @@ FROM python:3.12-slim AS deps
 
 WORKDIR /app
 ARG CLAWITH_APT_MIRROR=deb.debian.org
-RUN case "$CLAWITH_APT_MIRROR" in \
-        ''|*[!A-Za-z0-9.-]*) echo "invalid CLAWITH_APT_MIRROR host" >&2; exit 1 ;; \
-    esac && \
+RUN if ! python -c 'import re, sys; host = sys.argv[1]; label_pattern = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"); raise SystemExit(0 if 0 < len(host) <= 253 and all(label_pattern.fullmatch(label) for label in host.split(".")) else 1)' "$CLAWITH_APT_MIRROR"; then \
+        echo "invalid CLAWITH_APT_MIRROR host" >&2; exit 1; \
+    fi && \
     if [ "$CLAWITH_APT_MIRROR" != "deb.debian.org" ]; then \
         if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
             sed -i "s|deb.debian.org|$CLAWITH_APT_MIRROR|g" /etc/apt/sources.list.d/debian.sources; \
@@ -39,9 +39,9 @@ FROM python:3.12-slim AS production
 
 WORKDIR /app
 ARG CLAWITH_APT_MIRROR=deb.debian.org
-RUN case "$CLAWITH_APT_MIRROR" in \
-        ''|*[!A-Za-z0-9.-]*) echo "invalid CLAWITH_APT_MIRROR host" >&2; exit 1 ;; \
-    esac && \
+RUN if ! python -c 'import re, sys; host = sys.argv[1]; label_pattern = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"); raise SystemExit(0 if 0 < len(host) <= 253 and all(label_pattern.fullmatch(label) for label in host.split(".")) else 1)' "$CLAWITH_APT_MIRROR"; then \
+        echo "invalid CLAWITH_APT_MIRROR host" >&2; exit 1; \
+    fi && \
     if [ "$CLAWITH_APT_MIRROR" != "deb.debian.org" ]; then \
         if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
             sed -i "s|deb.debian.org|$CLAWITH_APT_MIRROR|g" /etc/apt/sources.list.d/debian.sources; \

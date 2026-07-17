@@ -160,7 +160,7 @@ Agent workspace files (soul.md, memory, skills, workspace files) are stored in `
 > export CLAWITH_APT_MIRROR=mirrors.aliyun.com
 > docker compose up -d --build
 > ```
-> The value must be a hostname only (no scheme, port, path, credentials, or shell characters) and is applied to both backend image stages.
+> The value must be a valid DNS hostname only (no scheme, port, path, credentials, or shell characters) and is applied to both backend image stages.
 
 ### First Login
 

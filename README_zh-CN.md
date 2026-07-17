@@ -144,7 +144,7 @@ docker compose up -d --build
 > export CLAWITH_APT_MIRROR=mirrors.aliyun.com
 > docker compose up -d --build
 > ```
-> 该值只能填写主机名（不能包含协议、端口、路径、凭据或 Shell 字符），并会同时应用于后端镜像的两个构建阶段。
+> 该值只能填写有效的 DNS 主机名（不能包含协议、端口、路径、凭据或 Shell 字符），并会同时应用于后端镜像的两个构建阶段。
 
 ### 首次登录
 
