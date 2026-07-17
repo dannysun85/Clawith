@@ -158,8 +158,10 @@ or an uncommitted temporary tree.
     Nonterminal recovery additionally requires an atomic active-state record,
     rejects regular and dangling `cutover-state` symlinks, and permits
     `current` to name only the journal-proven committed or cutover-target
-    release. Deferred drain cleanup reuses the same release validator before
-    it can stop a Compose project or remove its marker.
+    release, except for the journal-proven opposite candidate slot during the
+    script's own pre-restore rollback crash window. Deferred drain cleanup
+    reuses the same release validator before it can stop a Compose project or
+    remove its marker.
 
 ## Read-only production compatibility evidence
 

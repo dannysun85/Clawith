@@ -2921,6 +2921,9 @@ exit "$status"
     [
         ("current_recorded", 0),
         ("current_target", 0),
+        ("rollback_current_candidate", 0),
+        ("rollback_current_unjournaled", 1),
+        ("rollback_missing_source_journal", 1),
         ("current_unrelated", 1),
         ("active_release_mismatch", 1),
         ("target_release_mismatch", 1),
@@ -2954,13 +2957,22 @@ def test_nonterminal_recovery_accepts_only_the_atomic_recorded_release_pair(
     recorded_journal.write_text(f"{recorded_release}\n", encoding="utf-8")
     target_journal.write_text(f"{target_release}\n", encoding="utf-8")
     current = app_root / "current"
-    current_release = target_release if mutation == "current_target" else recorded_release
-    if mutation == "current_unrelated":
+    current_release = (
+        target_release
+        if mutation
+        in {
+            "current_target",
+            "rollback_current_candidate",
+            "rollback_missing_source_journal",
+        }
+        else recorded_release
+    )
+    if mutation in {"current_unrelated", "rollback_current_unjournaled"}:
         current_release = unrelated_release
     current.symlink_to(current_release)
     if mutation == "missing_recorded_journal":
         recorded_journal.unlink()
-    elif mutation == "missing_target_journal":
+    elif mutation in {"missing_target_journal", "rollback_missing_source_journal"}:
         target_journal.unlink()
     active_release_id = (
         "wrong-recorded-release"
@@ -2972,13 +2984,20 @@ def test_nonterminal_recovery_accepts_only_the_atomic_recorded_release_pair(
         if mutation == "target_release_mismatch"
         else "target-release"
     )
+    cutover_phase = "candidate_ready"
+    cutover_slot = "a"
+    if mutation.startswith("rollback_"):
+        cutover_phase = "rollback_started"
+        cutover_slot = "b"
+        target_release_id = "recorded-release"
     active_state_source = "legacy-pair" if mutation == "legacy_state_source" else "atomic"
     harness = f"""set +e
 APP_ROOT={shlex.quote(str(app_root))}
 COMPOSE_FILE=docker-compose.prod.yml
 CURRENT={shlex.quote(str(current))}
 CUTOVER_NONTERMINAL=1
-CUTOVER_SLOT=a
+CUTOVER_PHASE={cutover_phase}
+CUTOVER_SLOT={cutover_slot}
 CUTOVER_RELEASE_ID={target_release_id}
 ACTIVE_STATE_PRESENT=1
 ACTIVE_STATE_SOURCE={active_state_source}

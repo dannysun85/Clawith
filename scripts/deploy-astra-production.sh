@@ -3608,6 +3608,8 @@ validate_nonterminal_recovery_state() {
     local current_release
     local recorded_release
     local recorded_release_id
+    local rollback_source_release=""
+    local rollback_source_slot=""
     local target_release
     local target_release_id
 
@@ -3646,8 +3648,28 @@ validate_nonterminal_recovery_state() {
     fi
     if [ "$current_release" != "$recorded_release" ] && \
         [ "$current_release" != "$target_release" ]; then
-        echo "nonterminal cutover current is outside the recorded recovery pair" >&2
-        return 1
+        # rollback_started is durable before current is restored. If the
+        # recorded release is already the rollback target, a crash in that
+        # interval legitimately leaves current on the opposite candidate slot.
+        # Admit only that exact journal-proven slot, never an arbitrary third
+        # managed release.
+        case "$CUTOVER_PHASE:$RECORDED_SLOT:$CUTOVER_SLOT" in
+            rollback_started:a:a|rollback_incomplete:a:a|rollback_partial:a:a)
+                rollback_source_slot=b
+                ;;
+            rollback_started:b:b|rollback_incomplete:b:b|rollback_partial:b:b)
+                rollback_source_slot=a
+                ;;
+            rollback_started:legacy:legacy|rollback_incomplete:legacy:legacy|rollback_partial:legacy:legacy)
+                rollback_source_slot=b
+                ;;
+        esac
+        if [ -z "$rollback_source_slot" ] || \
+            ! rollback_source_release="$(release_for_slot "$rollback_source_slot")" || \
+            [ "$current_release" != "$rollback_source_release" ]; then
+            echo "nonterminal cutover current is outside the journal-proven recovery set" >&2
+            return 1
+        fi
     fi
     CURRENT_TARGET="$current_release"
 }
