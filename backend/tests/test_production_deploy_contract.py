@@ -3151,6 +3151,100 @@ exit $status
 
 
 @pytest.mark.parametrize(
+    "mutation",
+    [
+        "valid",
+        "outside_root",
+        "nested_release",
+        "relative_path",
+        "dotdot_path",
+        "duplicate_slash",
+        "shell_metacharacters",
+        "unicode_name",
+        "release_symlink",
+        "metadata_symlink",
+        "missing_metadata",
+        "empty_metadata",
+        "directory_metadata",
+    ],
+)
+def test_canonical_managed_release_accepts_only_exact_complete_direct_children(
+    tmp_path,
+    mutation,
+):
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    canonical_function = _shell_function_source(
+        script,
+        "canonical_managed_release",
+        "release_for_slot",
+    )
+    app_root = tmp_path / "app"
+    valid_release = _write_test_release(app_root, "release-a")
+    candidate = str(valid_release)
+    sentinel = tmp_path / "shell-metacharacters-executed"
+
+    if mutation == "outside_root":
+        candidate = str(_write_test_release(tmp_path / "outside-app", "release-a"))
+    elif mutation == "nested_release":
+        candidate = str(_write_test_release(app_root, "nested/release-a"))
+    elif mutation == "relative_path":
+        candidate = "releases/release-a"
+    elif mutation == "dotdot_path":
+        (app_root / "releases" / "nested").mkdir()
+        candidate = f"{app_root}/releases/nested/../release-a"
+    elif mutation == "duplicate_slash":
+        candidate = f"{app_root}/releases//release-a"
+    elif mutation == "shell_metacharacters":
+        candidate = str(
+            _write_test_release(
+                app_root,
+                f"release-$(touch${{IFS}}{sentinel})",
+            )
+        )
+    elif mutation == "unicode_name":
+        candidate = str(_write_test_release(app_root, "发布候选"))
+    elif mutation == "release_symlink":
+        release_link = app_root / "releases" / "release-link"
+        release_link.symlink_to(valid_release, target_is_directory=True)
+        candidate = str(release_link)
+    elif mutation == "metadata_symlink":
+        external_metadata = tmp_path / "external-version"
+        external_metadata.write_text("1.10.12\n", encoding="utf-8")
+        (valid_release / "VERSION").unlink()
+        (valid_release / "VERSION").symlink_to(external_metadata)
+    elif mutation == "missing_metadata":
+        (valid_release / "COMMIT").unlink()
+    elif mutation == "empty_metadata":
+        (valid_release / ".env").write_bytes(b"")
+    elif mutation == "directory_metadata":
+        compose_file = valid_release / "docker-compose.prod.yml"
+        compose_file.unlink()
+        compose_file.mkdir()
+
+    harness = f"""set +e
+APP_ROOT="$1"
+COMPOSE_FILE=docker-compose.prod.yml
+{canonical_function}
+canonical_managed_release "$2"
+"""
+    result = subprocess.run(
+        ["bash", "-c", harness, "canonical-release-test", str(app_root), candidate],
+        cwd=app_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    expected_status = 0 if mutation == "valid" else 1
+    assert result.returncode == expected_status, result.stderr
+    if mutation == "valid":
+        assert result.stdout == str(valid_release.resolve())
+    else:
+        assert result.stdout == ""
+    assert not sentinel.exists()
+
+
+@pytest.mark.parametrize(
     ("mutation", "expected_status"),
     [
         ("valid", 0),

@@ -38,10 +38,10 @@ The registered `codex/production-privacy-v1.10.12` worktree is not a separate
 repository and is not a branch to copy over this candidate. Patch-equivalence
 inspection found its logging change already integrated and its Nginx map and
 full-container-ID contracts present in the candidate. Its strict canonical
-release-path validation was not fully represented, so that behavior and its
-Unicode-control regression cases were semantically integrated into the RC5
-working tree before freeze. The old branch remains registered until the final
-candidate is committed and all worktrees are cleaned through Git.
+release-path validation was not fully represented, so that behavior and an
+expanded canonical-path regression matrix were semantically integrated into
+the RC5 branch. The old worktree remains registered pending explicit cleanup
+approval; it is not copied over or merged wholesale into this candidate.
 
 At the time this ledger was created, every registered secondary worktree was
 clean. The canonical worktree had only the unrelated untracked
@@ -52,9 +52,9 @@ into this candidate.
 ## Candidate closure scope
 
 The accumulated RC5 branch spans the following reviewed domains. The table
-records implementation scope only. The current tree remains uncommitted and
-must not be described as `local_rc_candidate` or `business_flow_proven` until
-all named gates pass again on one frozen local Git commit.
+records implementation scope only. The branch is frozen in local Git commits,
+but must not be described as `local_rc_candidate` or `business_flow_proven`
+until all named gates pass again on one exact candidate commit.
 
 | Domain | Local closure | Gate result |
 | --- | --- | --- |
@@ -150,10 +150,11 @@ or an uncommitted temporary tree.
     outbox delivery by default. Realtime external alerting is a separate
     production configuration gate: a secret webhook must be configured and its
     exact release canary must be delivered before that capability is claimed.
-20. Deployment slot journals and `current` accept only complete ASCII-named
-    direct children of the managed `releases/` directory. Nested paths, Unicode
-    control characters, symlinked metadata and malformed journals fail closed
-    before recovery or traffic mutation.
+20. Deployment slot journals and `current` accept only exact canonical absolute
+    paths to complete ASCII-named direct children of the managed `releases/`
+    directory. Relative, `..`, duplicate-slash, nested, Unicode/control,
+    shell-metacharacter and release-symlink paths, plus unsafe metadata and
+    malformed journals, fail closed before recovery or traffic mutation.
 
 ## Read-only production compatibility evidence
 

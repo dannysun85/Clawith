@@ -3192,14 +3192,16 @@ import re
 import sys
 
 try:
-    release = Path(sys.argv[1]).resolve(strict=True)
+    supplied_release = sys.argv[1]
+    release = Path(supplied_release).resolve(strict=True)
     releases_root = (Path(sys.argv[2]) / "releases").resolve(strict=True)
 except (OSError, RuntimeError):
     raise SystemExit(1)
 
 serialized = os.fspath(release)
 if (
-    not serialized.isascii()
+    supplied_release != serialized
+    or not serialized.isascii()
     or release.parent != releases_root
     or not release.is_dir()
     or re.fullmatch(r"[A-Za-z0-9._-]+", release.name) is None
