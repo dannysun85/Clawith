@@ -155,6 +155,11 @@ or an uncommitted temporary tree.
     directory. Relative, `..`, duplicate-slash, nested, Unicode/control,
     shell-metacharacter and release-symlink paths, plus unsafe metadata and
     malformed journals, fail closed before recovery or traffic mutation.
+    Nonterminal recovery additionally requires an atomic active-state record,
+    rejects regular and dangling `cutover-state` symlinks, and permits
+    `current` to name only the journal-proven committed or cutover-target
+    release. Deferred drain cleanup reuses the same release validator before
+    it can stop a Compose project or remove its marker.
 
 ## Read-only production compatibility evidence
 

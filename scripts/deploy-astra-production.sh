@@ -498,10 +498,6 @@ if ! flock -n 9; then
     rm -f "$PACKAGE" "$SMOKE_ENV_FILE"
     exit 1
 fi
-CURRENT_TARGET="$(python3 -c \
-    'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' \
-    "$CURRENT" 2>/dev/null)"
-
 write_atomic_line() {
     local path="$1"
     local value="$2"
@@ -3122,23 +3118,8 @@ complete_pending_drain() {
         echo "pending-drain project and port do not match" >&2
         return 1
     fi
-    if [ ! -d "$pending_release" ]; then
-        echo "pending-drain release directory is missing" >&2
-        return 1
-    fi
-    pending_release="$(python3 -c \
-        'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' \
-        "$pending_release" 2>/dev/null)" || return 1
-    case "$pending_release" in
-        "$APP_ROOT"/releases/*) ;;
-        *)
-            echo "pending-drain release is outside the managed release directory" >&2
-            return 1
-            ;;
-    esac
-    if [ ! -s "$pending_release/.env" ] || \
-        [ ! -s "$pending_release/$COMPOSE_FILE" ]; then
-        echo "pending-drain release is incomplete" >&2
+    if ! pending_release="$(canonical_managed_release "$pending_release")"; then
+        echo "pending-drain release is not a complete direct managed release" >&2
         return 1
     fi
     pending_release_id="$(basename "$pending_release")"
@@ -3213,6 +3194,29 @@ for name in ("VERSION", "COMMIT", ".env", sys.argv[3]):
         raise SystemExit(1)
 sys.stdout.write(serialized)
 PY_CANONICAL_RELEASE
+}
+
+canonical_current_release() {
+    local canonical_target
+    canonical_target="$(python3 - "$1" <<'PY_CANONICAL_CURRENT'
+import os
+from pathlib import Path
+import sys
+
+current = Path(sys.argv[1])
+try:
+    if not current.is_symlink():
+        raise SystemExit(1)
+    supplied_target = os.readlink(current)
+    resolved_target = os.fspath(current.resolve(strict=True))
+except (OSError, RuntimeError):
+    raise SystemExit(1)
+if supplied_target != resolved_target:
+    raise SystemExit(1)
+sys.stdout.write(resolved_target)
+PY_CANONICAL_CURRENT
+)" || return 1
+    canonical_managed_release "$canonical_target"
 }
 
 release_for_slot() {
@@ -3560,10 +3564,11 @@ parse_cutover_state() {
     CUTOVER_SLOT=""
     CUTOVER_RELEASE_ID=""
     CUTOVER_NONTERMINAL=0
-    if [ ! -e "$CUTOVER_STATE_FILE" ]; then
+    if [ ! -e "$CUTOVER_STATE_FILE" ] && [ ! -L "$CUTOVER_STATE_FILE" ]; then
         return 0
     fi
-    if [ ! -f "$CUTOVER_STATE_FILE" ] || [ ! -s "$CUTOVER_STATE_FILE" ]; then
+    if [ ! -f "$CUTOVER_STATE_FILE" ] || [ -L "$CUTOVER_STATE_FILE" ] || \
+        [ ! -s "$CUTOVER_STATE_FILE" ]; then
         echo "invalid empty or non-regular cutover state" >&2
         return 1
     fi
@@ -3597,6 +3602,54 @@ parse_cutover_state() {
             return 1
             ;;
     esac
+}
+
+validate_nonterminal_recovery_state() {
+    local current_release
+    local recorded_release
+    local recorded_release_id
+    local target_release
+    local target_release_id
+
+    if [ "$CUTOVER_NONTERMINAL" != "1" ]; then
+        return 0
+    fi
+    # A cutover intent is written only after the legacy state has been
+    # canonicalized. Recovery must never infer authority from compatibility
+    # mirrors or an incomplete bootstrap state.
+    if [ "$ACTIVE_STATE_PRESENT" != "1" ] || \
+        [ "$ACTIVE_STATE_SOURCE" != "atomic" ]; then
+        echo "nonterminal cutover has no atomic committed active state" >&2
+        return 1
+    fi
+    if ! current_release="$(canonical_current_release "$CURRENT")"; then
+        echo "nonterminal cutover current is not an exact canonical managed symlink" >&2
+        return 1
+    fi
+    if ! recorded_release="$(release_for_slot "$RECORDED_SLOT")"; then
+        echo "nonterminal cutover committed slot has no valid release journal" >&2
+        return 1
+    fi
+    recorded_release_id="$(basename "$recorded_release")"
+    if [ "$recorded_release_id" != "$ACTIVE_RELEASE_ID" ]; then
+        echo "nonterminal cutover committed release does not match its slot journal" >&2
+        return 1
+    fi
+    if ! target_release="$(release_for_slot "$CUTOVER_SLOT")"; then
+        echo "nonterminal cutover target slot has no valid release journal" >&2
+        return 1
+    fi
+    target_release_id="$(basename "$target_release")"
+    if [ "$target_release_id" != "$CUTOVER_RELEASE_ID" ]; then
+        echo "nonterminal cutover target release does not match its slot journal" >&2
+        return 1
+    fi
+    if [ "$current_release" != "$recorded_release" ] && \
+        [ "$current_release" != "$target_release" ]; then
+        echo "nonterminal cutover current is outside the recorded recovery pair" >&2
+        return 1
+    fi
+    CURRENT_TARGET="$current_release"
 }
 
 select_recovery_target() {
@@ -3642,11 +3695,8 @@ validate_stable_state() {
         return 0
     fi
 
-    canonical_current="$(python3 -c \
-        'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' \
-        "$CURRENT" 2>/dev/null)" || return 1
-    if [ ! -L "$CURRENT" ]; then
-        echo "current release is not an atomic symlink" >&2
+    if ! canonical_current="$(canonical_current_release "$CURRENT")"; then
+        echo "current release is not an exact canonical managed symlink" >&2
         return 1
     fi
     if ! recorded_release="$(release_for_slot "$RECORDED_SLOT")"; then
@@ -3982,12 +4032,20 @@ recover_indeterminate_cutover() {
     RECORDED_SLOT="$target_slot"
 }
 
+if ! CURRENT_TARGET="$(canonical_current_release "$CURRENT")"; then
+    echo "current release is not an exact canonical managed symlink" >&2
+    exit 1
+fi
 if ! load_active_state; then
     echo "refusing deployment with invalid committed active state" >&2
     exit 1
 fi
 if ! parse_cutover_state; then
     echo "refusing deployment with an invalid cutover journal" >&2
+    exit 1
+fi
+if ! validate_nonterminal_recovery_state; then
+    echo "refusing deployment with an inconsistent nonterminal cutover state" >&2
     exit 1
 fi
 
@@ -4182,9 +4240,10 @@ if [ "$RECOVERY_REQUIRED" = "1" ]; then
     trap - HUP INT TERM
     DISK_SLOT="$RECOVERY_TARGET_SLOT"
     NGINX_ACTIVE_PORT="$RECOVERY_TARGET_PORT"
-    CURRENT_TARGET="$(python3 -c \
-        'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' \
-        "$CURRENT" 2>/dev/null)"
+    CURRENT_TARGET="$(canonical_current_release "$CURRENT")" || {
+        echo "recovered current release is not an exact canonical managed symlink" >&2
+        exit 1
+    }
     if ! load_active_state || ! parse_cutover_state || ! validate_stable_state; then
         echo "cutover recovery did not produce a consistent terminal state" >&2
         exit 1

@@ -89,7 +89,7 @@ def _recovery_shell_source(script: str) -> tuple[str, str, str]:
         ]
     )
     recovery_start = script.index("recover_indeterminate_cutover() {")
-    recovery_end = script.index("\nif ! load_active_state", recovery_start)
+    recovery_end = script.index("\nif ! CURRENT_TARGET=", recovery_start)
     return port_function, recovery_helpers, script[recovery_start:recovery_end]
 
 
@@ -2729,7 +2729,7 @@ def test_production_deploy_reconciles_live_nginx_before_clearing_inactive_slot()
     pending_drain = script.index("if ! complete_pending_drain", recovery_call)
     clear_candidate = script.index('echo "[remote] clearing inactive slot')
     recovery_start = script.index("recover_indeterminate_cutover() {")
-    recovery_end = script.index("\nif ! load_active_state", recovery_start)
+    recovery_end = script.index("\nif ! CURRENT_TARGET=", recovery_start)
     recovery = script[recovery_start:recovery_end]
     assert active_port < recovery_call < pending_drain < clear_candidate
     recovery_maintenance = recovery.index("maintenance-on")
@@ -2876,6 +2876,136 @@ exit "$status"
 
     assert result.returncode == 1
     assert "status=1" in result.stdout
+
+
+@pytest.mark.parametrize("link_kind", ["regular", "dangling"])
+def test_cutover_state_symlinks_are_rejected_before_recovery(tmp_path, link_kind):
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    parse_function = _shell_function_source(
+        script,
+        "parse_cutover_state",
+        "validate_nonterminal_recovery_state",
+    )
+    cutover_state = tmp_path / "cutover-state"
+    if link_kind == "regular":
+        external_state = tmp_path / "external-cutover-state"
+        external_state.write_text(
+            "rollback_started slot=a release=release-a\n",
+            encoding="utf-8",
+        )
+        cutover_state.symlink_to(external_state)
+    else:
+        cutover_state.symlink_to(tmp_path / "missing-cutover-state")
+    harness = f"""set +e
+CUTOVER_STATE_FILE={shlex.quote(str(cutover_state))}
+{parse_function}
+parse_cutover_state
+status=$?
+echo "status=$status"
+exit "$status"
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    assert "status=1" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_status"),
+    [
+        ("current_recorded", 0),
+        ("current_target", 0),
+        ("current_unrelated", 1),
+        ("active_release_mismatch", 1),
+        ("target_release_mismatch", 1),
+        ("missing_recorded_journal", 1),
+        ("missing_target_journal", 1),
+        ("legacy_state_source", 1),
+    ],
+)
+def test_nonterminal_recovery_accepts_only_the_atomic_recorded_release_pair(
+    tmp_path,
+    mutation,
+    expected_status,
+):
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    release_functions = _shell_function_source(
+        script,
+        "canonical_managed_release",
+        "wait_for_worker_release",
+    )
+    validation_function = _shell_function_source(
+        script,
+        "validate_nonterminal_recovery_state",
+        "select_recovery_target",
+    )
+    app_root = tmp_path / "app"
+    recorded_release = _write_test_release(app_root, "recorded-release")
+    target_release = _write_test_release(app_root, "target-release")
+    unrelated_release = _write_test_release(app_root, "unrelated-release")
+    recorded_journal = app_root / "slot-b-release"
+    target_journal = app_root / "slot-a-release"
+    recorded_journal.write_text(f"{recorded_release}\n", encoding="utf-8")
+    target_journal.write_text(f"{target_release}\n", encoding="utf-8")
+    current = app_root / "current"
+    current_release = target_release if mutation == "current_target" else recorded_release
+    if mutation == "current_unrelated":
+        current_release = unrelated_release
+    current.symlink_to(current_release)
+    if mutation == "missing_recorded_journal":
+        recorded_journal.unlink()
+    elif mutation == "missing_target_journal":
+        target_journal.unlink()
+    active_release_id = (
+        "wrong-recorded-release"
+        if mutation == "active_release_mismatch"
+        else "recorded-release"
+    )
+    target_release_id = (
+        "wrong-target-release"
+        if mutation == "target_release_mismatch"
+        else "target-release"
+    )
+    active_state_source = "legacy-pair" if mutation == "legacy_state_source" else "atomic"
+    harness = f"""set +e
+APP_ROOT={shlex.quote(str(app_root))}
+COMPOSE_FILE=docker-compose.prod.yml
+CURRENT={shlex.quote(str(current))}
+CUTOVER_NONTERMINAL=1
+CUTOVER_SLOT=a
+CUTOVER_RELEASE_ID={target_release_id}
+ACTIVE_STATE_PRESENT=1
+ACTIVE_STATE_SOURCE={active_state_source}
+RECORDED_SLOT=b
+ACTIVE_RELEASE_ID={active_release_id}
+CURRENT_TARGET=unchanged
+{release_functions}
+{validation_function}
+validate_nonterminal_recovery_state
+status=$?
+echo "status=$status current_target=$CURRENT_TARGET"
+exit "$status"
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == expected_status, result.stderr
+    assert f"status={expected_status}" in result.stdout
+    if expected_status == 0:
+        assert f"current_target={current_release}" in result.stdout
+    else:
+        assert "current_target=unchanged" in result.stdout
 
 
 def test_production_deploy_rollback_converges_public_and_worker_before_state():
@@ -3066,9 +3196,23 @@ def test_deploy_state_is_serialized_and_durably_committed_before_legacy_mirrors(
 
     lock = script.index('exec 9>"$APP_ROOT/deploy.lock"')
     lock_acquired = script.index("flock -n 9", lock)
-    current_read = script.index('CURRENT_TARGET="$(python3 -c')
+    current_read = script.index('CURRENT_TARGET="$(canonical_current_release "$CURRENT")"')
+    state_read = script.index("if ! load_active_state", current_read)
+    cutover_read = script.index("if ! parse_cutover_state", state_read)
+    recovery_state_validation = script.index(
+        "if ! validate_nonterminal_recovery_state",
+        cutover_read,
+    )
     release_create = script.index('mkdir -p "$RELEASE" "$BACKUP"')
-    assert lock < lock_acquired < current_read < release_create
+    assert (
+        lock
+        < lock_acquired
+        < current_read
+        < state_read
+        < cutover_read
+        < recovery_state_validation
+        < release_create
+    )
     assert 'NONCE="$(python3 -c' in script
     assert "os.fsync(handle.fileno())" in atomic_line
     assert "os.fsync(directory_fd)" in atomic_line
@@ -3259,6 +3403,14 @@ canonical_managed_release "$2"
         ("unicode_control_current_without_journal", 1),
         ("empty_journal", 1),
         ("directory_journal", 1),
+        ("current_relative", 1),
+        ("current_dotdot", 1),
+        ("current_duplicate_slash", 1),
+        ("current_nested_release", 1),
+        ("current_release_symlink", 1),
+        ("current_outside_root", 1),
+        ("current_regular_file", 1),
+        ("current_dangling_symlink", 1),
     ],
 )
 def test_legacy_active_pair_slot_journal_is_strictly_migrated(
@@ -3308,6 +3460,35 @@ def test_legacy_active_pair_slot_journal_is_strictly_migrated(
         slot_journal.touch()
     elif mutation == "directory_journal":
         slot_journal.mkdir()
+    elif mutation == "current_relative":
+        current.unlink()
+        current.symlink_to("releases/release-b")
+    elif mutation == "current_dotdot":
+        (app_root / "releases" / "nested").mkdir()
+        current.unlink()
+        current.symlink_to(f"{app_root}/releases/nested/../release-b")
+    elif mutation == "current_duplicate_slash":
+        current.unlink()
+        current.symlink_to(f"{app_root}/releases//release-b")
+    elif mutation == "current_nested_release":
+        nested_release = _write_test_release(app_root, "nested/release-b")
+        current.unlink()
+        current.symlink_to(nested_release)
+    elif mutation == "current_release_symlink":
+        release_link = app_root / "releases" / "release-link"
+        release_link.symlink_to(release_b, target_is_directory=True)
+        current.unlink()
+        current.symlink_to(release_link)
+    elif mutation == "current_outside_root":
+        outside_release = _write_test_release(tmp_path / "outside-app", "release-b")
+        current.unlink()
+        current.symlink_to(outside_release)
+    elif mutation == "current_regular_file":
+        current.unlink()
+        current.write_text(str(release_b), encoding="utf-8")
+    elif mutation == "current_dangling_symlink":
+        current.unlink()
+        current.symlink_to(app_root / "releases" / "missing-release")
     state_helpers = _shell_function_source(
         script,
         "write_atomic_line",
@@ -3788,7 +3969,7 @@ def test_pending_drain_blocks_live_connections_and_clears_only_after_zero(
     pending_functions = _shell_function_source(
         script,
         "count_established_connections",
-        "canonical_managed_release",
+        "release_for_slot",
     )
     app_root = tmp_path / "app"
     previous = _write_test_release(app_root, "release-b")
@@ -3847,7 +4028,7 @@ def test_pending_drain_marker_is_cancelled_after_exact_rollback(tmp_path):
     pending_functions = _shell_function_source(
         script,
         "count_established_connections",
-        "canonical_managed_release",
+        "release_for_slot",
     )
     app_root = tmp_path / "app"
     previous = _write_test_release(app_root, "release-b")
@@ -3942,7 +4123,7 @@ def test_pending_drain_treats_command_substitution_text_as_data(tmp_path):
     pending_functions = _shell_function_source(
         script,
         "count_established_connections",
-        "canonical_managed_release",
+        "release_for_slot",
     )
     app_root = tmp_path / "app"
     previous = _write_test_release(app_root, "release-b")
@@ -3980,6 +4161,113 @@ exit $status
     assert result.returncode == 1
     assert not sentinel.exists()
     assert "unexpected_" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "outside_root",
+        "nested_release",
+        "relative_path",
+        "dotdot_path",
+        "duplicate_slash",
+        "shell_metacharacters",
+        "unicode_name",
+        "release_symlink",
+        "metadata_symlink",
+        "missing_metadata",
+        "empty_metadata",
+        "directory_metadata",
+    ],
+)
+def test_pending_drain_rejects_every_noncanonical_release_before_mutation(
+    tmp_path,
+    mutation,
+):
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    pending_functions = _shell_function_source(
+        script,
+        "count_established_connections",
+        "release_for_slot",
+    )
+    app_root = tmp_path / "app"
+    previous = _write_test_release(app_root, "release-b")
+    valid_pending = _write_test_release(app_root, "release-a")
+    candidate = str(valid_pending)
+    sentinel = tmp_path / "shell-metacharacters-executed"
+
+    if mutation == "outside_root":
+        candidate = str(_write_test_release(tmp_path / "outside-app", "release-a"))
+    elif mutation == "nested_release":
+        candidate = str(_write_test_release(app_root, "nested/release-a"))
+    elif mutation == "relative_path":
+        candidate = "releases/release-a"
+    elif mutation == "dotdot_path":
+        (app_root / "releases" / "nested").mkdir()
+        candidate = f"{app_root}/releases/nested/../release-a"
+    elif mutation == "duplicate_slash":
+        candidate = f"{app_root}/releases//release-a"
+    elif mutation == "shell_metacharacters":
+        candidate = str(
+            _write_test_release(
+                app_root,
+                f"release-$(touch${{IFS}}{sentinel})",
+            )
+        )
+    elif mutation == "unicode_name":
+        candidate = str(_write_test_release(app_root, "发布候选"))
+    elif mutation == "release_symlink":
+        release_link = app_root / "releases" / "release-link"
+        release_link.symlink_to(valid_pending, target_is_directory=True)
+        candidate = str(release_link)
+    elif mutation == "metadata_symlink":
+        external_metadata = tmp_path / "external-version"
+        external_metadata.write_text("1.10.12\n", encoding="utf-8")
+        (valid_pending / "VERSION").unlink()
+        (valid_pending / "VERSION").symlink_to(external_metadata)
+    elif mutation == "missing_metadata":
+        (valid_pending / "COMMIT").unlink()
+    elif mutation == "empty_metadata":
+        (valid_pending / ".env").write_bytes(b"")
+    elif mutation == "directory_metadata":
+        compose_file = valid_pending / "docker-compose.prod.yml"
+        compose_file.unlink()
+        compose_file.mkdir()
+
+    marker = app_root / "pending-drain"
+    marker.write_text(f"astra-app-a 3008 {candidate}\n", encoding="utf-8")
+    harness = f"""set +e
+APP_ROOT={shlex.quote(str(app_root))}
+PENDING_DRAIN_FILE={shlex.quote(str(marker))}
+COMPOSE_PROJECT=astra
+COMPOSE_FILE=docker-compose.prod.yml
+OLD_PROJECT=astra-app-b
+OLD_PORT=3009
+CANDIDATE_PORT=3008
+PREVIOUS={shlex.quote(str(previous))}
+compose_project() {{ echo unexpected_compose; return 1; }}
+remove_durable_file() {{ echo unexpected_removal; return 1; }}
+ss() {{ echo unexpected_socket_probe; return 1; }}
+{pending_functions}
+complete_pending_drain
+status=$?
+if [ -e "$PENDING_DRAIN_FILE" ]; then marker=present; else marker=removed; fi
+echo "status=$status marker=$marker"
+exit "$status"
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", harness],
+        cwd=app_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    assert "status=1 marker=present" in result.stdout
+    assert "unexpected_" not in result.stdout
+    assert not sentinel.exists()
 
 
 def test_candidate_journal_precedes_writer_fence_and_identity_gate():
@@ -4097,7 +4385,7 @@ def test_remote_preflight_requires_timeout_before_deploy_lock_mutation():
 def test_recovery_persists_existing_proof_requirements_across_interruptions():
     script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
     recovery_start = script.index("recover_indeterminate_cutover() {")
-    recovery_end = script.index("\nif ! load_active_state", recovery_start)
+    recovery_end = script.index("\nif ! CURRENT_TARGET=", recovery_start)
     recovery = script[recovery_start:recovery_end]
 
     for phase in (
