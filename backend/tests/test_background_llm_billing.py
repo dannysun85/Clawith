@@ -942,115 +942,42 @@ async def test_call_llm_settles_completed_round_when_tool_execution_is_cancelled
 
 @pytest.mark.asyncio
 async def test_oneshot_finally_settles_usage_when_tool_execution_is_cancelled():
+    """The entrypoint only registers work; provider billing lives in Runtime."""
     from app.services import heartbeat
 
     agent_id = uuid.uuid4()
-    creator_id = uuid.uuid4()
-    tenant_id = uuid.uuid4()
     agent = SimpleNamespace(
         id=agent_id,
         name="Autonomous agent",
-        role_description="worker",
-        creator_id=creator_id,
+        creator_id=uuid.uuid4(),
     )
-    model = SimpleNamespace(
-        provider="minimax",
-        model="MiniMax-M3",
-        temperature=0.2,
-        max_output_tokens=256,
-        request_timeout=120,
-    )
-    invocation = llm_caller.AgentLLMInvocation(
-        model=model,
-        fallback_model=None,
-        route_meta=llm_caller.RouteMeta(
-            saas_tier="lite",
-            modality="text",
-            action="chat",
-        ),
-        tenant_id=tenant_id,
-        api_key="pool-key",
-        base_url=None,
-        credential_id=None,
-    )
-    response = SimpleNamespace(
-        content="",
-        tool_calls=[{
-            "id": "tool-1",
-            "type": "function",
-            "function": {"name": "test_tool", "arguments": "{}"},
-        }],
-        reasoning_content=None,
-        usage={"prompt_tokens": 80, "completion_tokens": 20, "total_tokens": 100},
-    )
-    client = FakeCompleteLLMClient(response)
-
+    run_id = uuid.uuid4()
+    session = FakeSessionContext(agent)
+    enqueue = AsyncMock(return_value=SimpleNamespace(run_id=run_id))
     with (
-        patch("app.database.async_session", return_value=FakeSessionContext(agent)),
-        patch(
-            "app.services.llm.prepare_agent_llm_invocation",
-            AsyncMock(return_value=invocation),
-        ),
-        patch(
-            "app.services.agent_context.build_agent_context",
-            AsyncMock(return_value=("system", "dynamic")),
-        ),
-        patch("app.services.llm.create_llm_client", return_value=client),
-        patch(
-            "app.services.llm.reserve_llm_round_credits",
-            AsyncMock(return_value=uuid.uuid4()),
-        ),
-        patch(
-            "app.services.llm.settle_llm_round_credits",
-            AsyncMock(),
-        ) as settle_round,
-        patch(
-            "app.services.agent_tools.get_agent_tools_for_llm",
-            AsyncMock(return_value=[]),
-        ),
-        patch(
-            "app.services.agent_tools.execute_tool",
-            AsyncMock(side_effect=asyncio.CancelledError()),
-        ),
-        patch("app.services.token_tracker.record_token_usage", AsyncMock()) as record_tokens,
-        patch(
-            "app.services.llm.settle_agent_llm_invocation",
-            AsyncMock(),
-        ) as settle_credits,
+        patch("app.database.async_session", return_value=session),
+        patch.object(heartbeat, "enqueue_oneshot_runtime", enqueue),
     ):
-        with pytest.raises(asyncio.CancelledError):
-            await heartbeat.run_agent_oneshot(agent_id, "run", max_rounds=2)
+        result = await heartbeat.run_agent_oneshot(agent_id, "run", max_rounds=2)
 
-    record_tokens.assert_awaited_once()
-    assert record_tokens.await_args.args[1].total_tokens == 100
-    settle_credits.assert_awaited_once_with(
-        invocation,
-        agent_id=agent_id,
-        user_id=creator_id,
-        usage=settle_credits.await_args.kwargs["usage"],
-    )
-    assert settle_credits.await_args.kwargs["usage"].total_tokens == 100
-    settle_round.assert_awaited_once()
-    client.close.assert_awaited_once()
+    assert result == str(run_id)
+    session.commit.assert_awaited_once()
+    enqueue.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_heartbeat_finally_settles_usage_when_tool_execution_is_cancelled():
-    from app.services import heartbeat
+    """Runtime settles the provider call before a later tool step can cancel."""
+    from app.services.llm import single_step
+    from app.services.llm.client import LLMResponse, LLMMessage
 
     agent_id = uuid.uuid4()
     creator_id = uuid.uuid4()
     tenant_id = uuid.uuid4()
-    agent = SimpleNamespace(
-        id=agent_id,
-        name="Autonomous agent",
-        role_description="worker",
-        creator_id=creator_id,
-        access_mode="company",
-    )
     model = SimpleNamespace(
         provider="minimax",
         model="MiniMax-M3",
+        base_url=None,
         temperature=0.2,
         max_output_tokens=256,
         request_timeout=120,
@@ -1068,7 +995,7 @@ async def test_heartbeat_finally_settles_usage_when_tool_execution_is_cancelled(
         base_url=None,
         credential_id=None,
     )
-    response = SimpleNamespace(
+    response = LLMResponse(
         content="",
         tool_calls=[{
             "id": "tool-1",
@@ -1079,50 +1006,35 @@ async def test_heartbeat_finally_settles_usage_when_tool_execution_is_cancelled(
         usage={"prompt_tokens": 80, "completion_tokens": 20, "total_tokens": 100},
     )
     client = FakeCompleteLLMClient(response)
-    session = FakeSequenceSessionContext(
-        FakeQueryResult(scalar=agent),
-        FakeQueryResult(values=[]),
-        FakeQueryResult(values=[]),
-    )
-    storage = SimpleNamespace(exists=AsyncMock(return_value=False))
-
     with (
-        patch("app.database.async_session", return_value=session),
-        patch.object(heartbeat, "get_storage_backend", return_value=storage),
-        patch(
-            "app.services.llm.prepare_agent_llm_invocation",
-            AsyncMock(return_value=invocation),
-        ),
-        patch(
-            "app.services.agent_context.build_agent_context",
-            AsyncMock(return_value=("system", "dynamic")),
-        ),
-        patch("app.services.llm.create_llm_client", return_value=client),
-        patch(
-            "app.services.llm.reserve_llm_round_credits",
+        patch.object(single_step, "create_llm_client", return_value=client),
+        patch.object(single_step, "get_max_tokens", return_value=256),
+        patch.object(
+            single_step,
+            "reserve_llm_round_credits",
             AsyncMock(return_value=uuid.uuid4()),
         ),
-        patch(
-            "app.services.llm.settle_llm_round_credits",
+        patch.object(
+            single_step,
+            "settle_llm_round_credits",
             AsyncMock(),
         ) as settle_round,
-        patch(
-            "app.services.agent_tools.get_agent_tools_for_llm",
-            AsyncMock(return_value=[]),
-        ),
-        patch(
-            "app.services.agent_tools.execute_tool",
-            AsyncMock(side_effect=asyncio.CancelledError()),
-        ),
-        patch("app.services.token_tracker.record_token_usage", AsyncMock()) as record_tokens,
-        patch(
-            "app.services.llm.settle_agent_llm_invocation",
+        patch.object(single_step, "record_token_usage", AsyncMock()) as record_tokens,
+        patch.object(
+            single_step,
+            "settle_agent_llm_invocation",
             AsyncMock(),
         ) as settle_credits,
     ):
-        with pytest.raises(asyncio.CancelledError):
-            await heartbeat._execute_heartbeat(agent_id)
+        completion = await single_step.complete_llm_once(
+            model,
+            [LLMMessage(role="user", content="run")],
+            agent_id=agent_id,
+            user_id=creator_id,
+            invocation=invocation,
+        )
 
+    assert completion.usage.total_tokens == 100
     record_tokens.assert_awaited_once()
     assert record_tokens.await_args.args[1].total_tokens == 100
     settle_credits.assert_awaited_once()
@@ -1219,59 +1131,21 @@ async def test_background_llm_blocks_fallback_when_primary_outcome_is_ambiguous(
 
 
 def test_autonomous_entrypoints_keep_routing_and_settlement_hooks():
-    from app.api import feishu, gateway
-    from app.services import heartbeat, supervision_reminder
-    from app.services.trigger_runtime import invoker
+    from app.services import heartbeat
+    from app.services.agent_runtime import model_step_service
+    from app.services.llm import single_step
 
-    heartbeat_source = inspect.getsource(heartbeat._execute_heartbeat)
     oneshot_source = inspect.getsource(heartbeat.run_agent_oneshot)
-    trigger_source = inspect.getsource(invoker.invoke_agent_for_triggers)
-    supervision_source = inspect.getsource(supervision_reminder._get_agent_reply)
-    feishu_loader_source = inspect.getsource(feishu._load_agent_and_model)
-    feishu_call_source = inspect.getsource(feishu._call_llm_with_config)
-    gateway_source = inspect.getsource(gateway._send_to_agent_background)
-    foreground_tools_source = inspect.getsource(llm_caller.call_llm)
-    background_tools_source = inspect.getsource(llm_caller.call_agent_llm_with_tools)
+    model_step_source = inspect.getsource(model_step_service.RuntimeModelStepService._call_prepared)
+    provider_source = inspect.getsource(single_step.complete_llm_once)
 
-    assert "prepare_agent_llm_invocation" in heartbeat_source
-    assert "settle_agent_llm_invocation" in heartbeat_source
-    assert "get_llm_request_options" in heartbeat_source
-    assert "llm_provider_may_have_accepted" in heartbeat_source
-    assert heartbeat_source.count("**request_options") == 1
-    assert "prepare_agent_llm_invocation" in oneshot_source
-    assert "settle_agent_llm_invocation" in oneshot_source
-    assert "get_llm_request_options" in oneshot_source
-    assert "llm_provider_may_have_accepted" in oneshot_source
-    assert oneshot_source.count("**request_options") == 1
-    assert "resolve_agent_model" in trigger_source
-    assert "route_meta=route_meta" in trigger_source
-    assert "prepare_agent_llm_invocation" in supervision_source
-    assert "settle_agent_llm_invocation" in supervision_source
-    assert "get_llm_request_options" in supervision_source
-    assert "llm_provider_may_have_accepted" in supervision_source
-    assert supervision_source.count("**request_options") == 1
-    assert "resolve_agent_model" in feishu_loader_source
-    assert "call_llm_with_failover" in feishu_call_source
-    assert "call_llm(" not in feishu_call_source
-    assert "route_meta=route_meta" in feishu_call_source
-    assert "resolve_agent_model" in gateway_source
-    assert "route_meta=route_meta" in gateway_source
-    assert "_prepare_llm_billing_context" in background_tools_source
-    assert "_finalize_background_usage" in background_tools_source
-    assert "llm_provider_may_have_accepted" in background_tools_source
-    assert "reasoning_details=getattr(response" in foreground_tools_source
-    assert "reasoning_details=getattr(response" in background_tools_source
-    assert "reasoning_details=getattr(response" in heartbeat_source
-    assert "reasoning_details=getattr(response" in oneshot_source
-
-    # Provider error bodies may contain prompts or credentials.  Autonomous
-    # entrypoints log only stable error types and notify users with generic
-    # messages, never raw exception interpolation.
-    for source in (
-        heartbeat_source,
-        oneshot_source,
-        supervision_source,
-        feishu_call_source,
-    ):
-        assert ": {e}" not in source
-        assert "str(e)" not in source
+    assert not hasattr(heartbeat, "_execute_heartbeat")
+    assert "enqueue_oneshot_runtime" in oneshot_source
+    assert "prepare_agent_llm_invocation" not in oneshot_source
+    assert "complete_llm_once" in model_step_source
+    assert "prepare_pinned_agent_llm_invocation" in model_step_source
+    assert "reserve_llm_round_credits" in provider_source
+    assert "settle_llm_round_credits" in provider_source
+    assert "settle_agent_llm_invocation" in provider_source
+    assert "record_token_usage" in provider_source
+    assert "llm_provider_may_have_accepted" in provider_source

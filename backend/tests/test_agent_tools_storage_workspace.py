@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 import uuid
 from unittest.mock import AsyncMock, Mock
 
@@ -10,6 +11,22 @@ from app.services import workspace_collaboration
 from app.services.storage_runtime.base import StorageBackend, StorageEntry, StorageVersion, WriteCondition, ConditionalWriteResult
 from app.services.storage_runtime.agent_files import agent_storage_key
 from app.services.storage_runtime.local import LocalStorageBackend
+
+
+@asynccontextmanager
+async def _noop_workspace_locks(*_args, **_kwargs):
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_storage_semantics_from_distributed_locking(monkeypatch):
+    """These in-memory storage tests do not exercise the Redis lock backend."""
+    monkeypatch.setattr(agent_tools, "workspace_locks", _noop_workspace_locks)
+    monkeypatch.setattr(
+        workspace_collaboration,
+        "workspace_locks",
+        _noop_workspace_locks,
+    )
 
 
 class MemoryStorageBackend(StorageBackend):

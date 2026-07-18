@@ -30,6 +30,28 @@ _disable_agentbay_logger_override()
 configure_logging()
 
 
+def _sdk_result_mapping(result: object) -> dict[str, Any]:
+    """Preserve provider facts instead of replacing them with guessed success."""
+    mapped: dict[str, Any] = {}
+    for field in (
+        "success",
+        "request_id",
+        "error",
+        "error_message",
+        "data",
+        "exit",
+        "exit_code",
+        "session",
+        "stdout",
+        "stderr",
+        "output",
+        "message",
+    ):
+        if hasattr(result, field):
+            mapped[field] = getattr(result, field)
+    return mapped
+
+
 @dataclass
 class AgentBaySession:
     """AgentBay session info."""
@@ -88,6 +110,7 @@ class AgentBayClient:
         self,
         image: str = "linux_latest",
         *,
+        labels: dict[str, str] | None = None,
         _manager_token: object | None = None,
     ) -> AgentBaySession:
         """Create a new session using SDK.
@@ -114,7 +137,10 @@ class AgentBayClient:
         image_id = image_id_map.get(image, image)
         self._image_type = image
 
-        result = await asyncio.to_thread(self._sdk.create, CreateSessionParams(image_id=image_id))
+        result = await asyncio.to_thread(
+            self._sdk.create,
+            CreateSessionParams(image_id=image_id, labels=labels or {}),
+        )
         if not result.success:
             raise RuntimeError("AgentBay provider rejected session creation")
 
@@ -359,6 +385,15 @@ class AgentBayClient:
             "success": result.success,
         }
 
+    async def code_read_file(self, remote_path: str):
+        """Read a code-sandbox file while preserving the SDK result facts."""
+        if not self._session or self._image_type not in ("code", "code_latest"):
+            await self.create_session("code_latest")
+        return await asyncio.to_thread(
+            self._session.file_system.read_file,
+            remote_path,
+        )
+
     # ─── Browser: Extract & Observe ───────────────────
 
     async def browser_extract(self, instruction: str, selector: str = "") -> dict:
@@ -416,13 +451,18 @@ class AgentBayClient:
             timeout_ms=timeout_ms,
             cwd=cwd or None,
         )
-        return {
-            "success": result.success,
-            "stdout": getattr(result, "stdout", "") or getattr(result, "output", "") or "",
-            "stderr": getattr(result, "stderr", "") or "",
-            "exit_code": getattr(result, "exit_code", -1),
-            "error_message": "" if result.success else "AgentBay command execution failed",
-        }
+        mapped = _sdk_result_mapping(result)
+        mapped.setdefault("success", getattr(result, "success", None))
+        mapped.setdefault(
+            "stdout",
+            getattr(result, "stdout", "") or getattr(result, "output", "") or "",
+        )
+        mapped.setdefault("stderr", getattr(result, "stderr", "") or "")
+        mapped.setdefault("exit_code", getattr(result, "exit_code", -1))
+        mapped["error_message"] = (
+            "" if getattr(result, "success", None) is True else "AgentBay command execution failed"
+        )
+        return mapped
 
     # ─── Computer Operations ──────────────────────────
 
@@ -530,11 +570,13 @@ class AgentBayClient:
         result = await asyncio.to_thread(
             self._session.computer.start_app, cmd, work_directory=work_dir
         )
-        return {
-            "success": result.success,
-            "data": getattr(result, "data", None),
-            "error_message": "" if result.success else "AgentBay application start failed",
-        }
+        mapped = _sdk_result_mapping(result)
+        mapped.setdefault("success", getattr(result, "success", None))
+        mapped.setdefault("data", getattr(result, "data", None))
+        mapped["error_message"] = (
+            "" if getattr(result, "success", None) is True else "AgentBay application start failed"
+        )
+        return mapped
 
     async def computer_get_installed_apps(
         self,
@@ -772,6 +814,10 @@ class AgentBayClient:
 
 _agentbay_sessions: dict[tuple[uuid.UUID, str, str], tuple[AgentBayClient, datetime]] = {}
 _AGENTBAY_SESSION_TIMEOUT = timedelta(minutes=5)
+_agentbay_session_locks: dict[tuple[uuid.UUID, str, str], asyncio.Lock] = {}
+# Compatibility name used by older diagnostics. Both names intentionally point
+# at the same per-scope lock registry.
+_agentbay_cold_start_locks = _agentbay_session_locks
 
 _SESSION_CREATE_LOCK_TTL_SECONDS = 180
 _AGENT_DELETION_LOCK_TTL_SECONDS = 1800
@@ -2307,10 +2353,128 @@ async def _attach_from_ledger(
         return False
 
 
+def _agentbay_session_labels(
+    *,
+    agent_id: uuid.UUID,
+    scope_kind: str,
+    scope_id: str,
+    environment: str,
+) -> dict[str, str]:
+    """Build the exact provider label set for an ephemeral Runtime lane."""
+
+    return {
+        "clawith_agent_id": str(agent_id),
+        "clawith_scope_kind": scope_kind,
+        "clawith_scope_id": scope_id,
+        "clawith_environment": environment,
+    }
+
+
+async def _restore_exact_remote_session(
+    client: AgentBayClient,
+    *,
+    image: str,
+    labels: dict[str, str],
+) -> bool:
+    """Restore exactly one labelled session; ambiguity fails closed."""
+
+    listed = await asyncio.to_thread(client._sdk.list, labels=labels)
+    if getattr(listed, "success", None) is not True:
+        raise RuntimeError("AgentBay exact session lookup did not succeed")
+    session_ids = getattr(listed, "session_ids", None)
+    if not isinstance(session_ids, (list, tuple)):
+        raise RuntimeError("AgentBay exact session lookup returned an invalid payload")
+    normalized_ids = [value for value in session_ids if isinstance(value, str) and value]
+    if len(normalized_ids) != len(session_ids) or len(normalized_ids) > 1:
+        raise RuntimeError("AgentBay exact session lookup was ambiguous")
+    if not normalized_ids:
+        return False
+
+    fetched = await asyncio.to_thread(client._sdk.get, normalized_ids[0])
+    if (
+        getattr(fetched, "success", None) is not True
+        or getattr(fetched, "session", None) is None
+    ):
+        raise RuntimeError("AgentBay exact session restore did not succeed")
+    client._session = fetched.session
+    client._image_type = image
+    client._browser_initialized = False
+    return True
+
+
+async def _get_agentbay_run_scoped_client(
+    agent_id: uuid.UUID,
+    image_type: str,
+    run_id: str,
+) -> AgentBayClient:
+    """Resolve an ephemeral AgentBay lane for a Runtime run without user cookies.
+
+    ChatSession lanes remain governed by the durable tenant/user ledger below.
+    A run-only lane has no authenticated human owner, so its provider identity is
+    the exact four-label tuple and browser credentials are intentionally not
+    injected.
+    """
+
+    exact_run_id = str(run_id or "").strip()
+    if not exact_run_id:
+        raise PermissionError(
+            "AgentBay requires an exact authorized ChatSession UUID or Runtime Run ID"
+        )
+    if image_type not in {"browser", "computer", "code"}:
+        raise RuntimeError(f"Unsupported AgentBay environment: {image_type}")
+
+    cache_scope_id = f"run:{exact_run_id}"
+    cache_key = (agent_id, cache_scope_id, image_type)
+    lock = _agentbay_session_locks.setdefault(cache_key, asyncio.Lock())
+    async with lock:
+        now = datetime.now()
+        cached = _agentbay_sessions.get(cache_key)
+        if cached is not None:
+            client, last_used = cached
+            if now - last_used < _AGENTBAY_SESSION_TIMEOUT:
+                _agentbay_sessions[cache_key] = (client, now)
+                return client
+            await client.close_session()
+            _agentbay_sessions.pop(cache_key, None)
+
+        client, tool_config = await _configured_agentbay_client(agent_id)
+        if image_type == "browser":
+            image = "browser_latest"
+        elif image_type == "computer":
+            os_type = str((tool_config or {}).get("os_type") or "windows").strip()
+            if os_type not in {"linux", "windows"}:
+                raise RuntimeError("AgentBay computer OS configuration is invalid")
+            image = "windows_latest" if os_type == "windows" else "linux_latest"
+        else:
+            image = "code_latest"
+
+        labels = _agentbay_session_labels(
+            agent_id=agent_id,
+            scope_kind="run",
+            scope_id=exact_run_id,
+            environment=image_type,
+        )
+        restored = await _restore_exact_remote_session(
+            client,
+            image=image,
+            labels=labels,
+        )
+        if not restored:
+            await client.create_session(
+                image,
+                labels=labels,
+                _manager_token=_AGENTBAY_MANAGER_CREATION_TOKEN,
+            )
+        _agentbay_sessions[cache_key] = (client, datetime.now())
+        return client
+
+
 async def get_agentbay_client_for_agent(
     agent_id: uuid.UUID,
     image_type: str,
     session_id: str = "",
+    *,
+    run_id: str = "",
 ) -> AgentBayClient:
     """Get or create AgentBay client for agent.
 
@@ -2322,9 +2486,12 @@ async def get_agentbay_client_for_agent(
     Args:
         agent_id: The agent UUID.
         image_type: One of 'browser', 'computer', 'code'.
-        session_id: The ChatSession ID. Defaults to '' for backward compat
-                    (e.g. test_agentbay_channel, single-session callers).
+        session_id: Exact ChatSession ID when one exists.
+        run_id: Exact Run ID used only when there is no ChatSession.
     """
+
+    if not str(session_id or "").strip():
+        return await _get_agentbay_run_scoped_client(agent_id, image_type, run_id)
 
     lane = await _load_agentbay_lane(agent_id, session_id)
     canonical_session_id = lane[2] if lane else None

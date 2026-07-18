@@ -9,11 +9,13 @@ import { useToast } from '../../components/Toast/ToastProvider';
 import type { FileBrowserApi } from '../../components/FileBrowser';
 import FileBrowser from '../../components/FileBrowser';
 import MarkdownRenderer from '../../components/MarkdownRenderer';
+import { DraftEditor as ExperienceDraftEditor, bodyExcerpt, type Draft as ExperienceDraft } from '../../components/ExperienceDraftEditor';
+import { EntryDrawer } from '../../components/ExperienceDetailDrawer';
 import PromptModal from '../../components/PromptModal';
 import { appendLiveCodeOutput, type LivePreviewState } from '../../components/AgentBayLivePanel';
 import AgentSidePanel, { SidePanelTab } from '../../components/AgentSidePanel';
 import type { WorkspaceActivity, WorkspaceLiveDraft } from '../../components/WorkspaceOperationPanel';
-import { activityApi, agentApi, channelApi, fileApi, focusApi, scheduleApi, skillApi, taskApi, triggerApi, uploadFileWithProgress } from '../../services/api';
+import { activityApi, agentApi, channelApi, experienceApi, fileApi, focusApi, scheduleApi, skillApi, taskApi, triggerApi, uploadFileWithProgress } from '../../services/api';
 import { websocketAuthProtocols } from '../../utils/authTransport';
 import { reportClientIssue, shouldReportWebSocketClose } from '../../services/productionIssueReporter';
 import type { FocusApiItem } from '../../services/api';
@@ -100,7 +102,19 @@ import MindTab from './tabs/MindTab';
 import SettingsTab from './tabs/SettingsTab';
 import SkillsTab from './tabs/SkillsTab';
 import ToolsTab from './tabs/ToolsTab';
+import AgentDirectory from './AgentDirectory';
 import { useAgentDetailRoute } from './hooks/useAgentDetailRoute';
+import {
+    failClosedSessionActiveRun,
+    runtimeCompletionNeedsMessageRefresh,
+    sessionActiveRunFromResponse,
+    sessionRuntimeStateResponseIsValid,
+    terminalAssistantMessageAlreadyPresent,
+    type SessionActiveRun,
+    type ToolReconciliation,
+    waitingSessionActiveRunHint,
+} from './sessionRuntimeState';
+import { onboardingKickoffKey, shouldKickoffOnboarding } from './onboardingKickoff';
 import { fetchAuth } from './utils/fetchAuth';
 
 const closeWebSocketIntentionally = (ws: WebSocket) => {
@@ -432,6 +446,209 @@ function CopyMessageButton({ text }: { text: string }) {
     );
 }
 
+/** "沉淀为经验" — distill this message into a structured draft, then open review (P0-2). */
+function DistillButton({ text, sessionId }: { text: string; sessionId?: string | null }) {
+    const { id: agentId } = useParams<{ id: string }>();
+    const qc = useQueryClient();
+    const toast = useToast();
+    const [busy, setBusy] = React.useState(false);
+    const [draft, setDraft] = React.useState<ExperienceDraft | null>(null);
+    const handle = async (e: React.MouseEvent) => {
+        e.stopPropagation();
+        if (!agentId || busy) return;
+        setBusy(true);
+        try {
+            // Distill only — nothing persists until the human confirms in the drawer below.
+            const f = await experienceApi.distill({ agent_id: agentId, content: text, session_id: sessionId || undefined });
+            setDraft({ ...f, origin_agent_id: agentId, origin_session_id: sessionId || null });
+        } catch (err) {
+            console.error('Distill failed', err);
+            toast.error('生成草稿失败，请重试');
+        } finally {
+            setBusy(false);
+        }
+    };
+    return (
+        <>
+            <button
+                onClick={handle}
+                title={busy ? '正在提炼草稿…' : '沉淀为经验'}
+                disabled={busy}
+                style={{
+                    // No cursor:wait — that only rendered a spinner while the pointer happened to
+                    // rest on the button, so moving away made a running distill look dead.
+                    background: 'none', border: 'none', cursor: busy ? 'default' : 'pointer', padding: '2px',
+                    color: 'var(--text-tertiary)', opacity: busy ? 1 : 0.5, transition: 'opacity .15s, color .15s',
+                    display: 'inline-flex', alignItems: 'center', verticalAlign: 'middle', marginLeft: '6px', flexShrink: 0,
+                }}
+                onMouseEnter={e => { if (!busy) e.currentTarget.style.opacity = '1'; }}
+                onMouseLeave={e => { if (!busy) e.currentTarget.style.opacity = '0.5'; }}
+            >
+                {busy ? (
+                    // Same 13px footprint as the icon it replaces, so the message row doesn't shift.
+                    <svg className="distill-spinner" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                        <path d="M12 3a9 9 0 1 0 9 9" />
+                    </svg>
+                ) : (
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" /><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" /><path d="M9 7h6M9 11h4" />
+                    </svg>
+                )}
+            </button>
+            {draft && (
+                <ExperienceDraftEditor
+                    draft={draft}
+                    docked
+                    autoExtractFailed={(draft as any).extracted === false}
+                    onClose={() => setDraft(null)}
+                    onSaved={() => { setDraft(null); qc.invalidateQueries({ queryKey: ['experience'] }); toast.success('沉淀成功'); }}
+                />
+            )}
+        </>
+    );
+}
+
+/** Renders a [[exp:<uuid>]] citation as a green inline pill: 「经验:<title 8>…」→ /plaza detail. */
+function ExperienceCitation({ id }: { id: string }) {
+    const qc = useQueryClient();
+    const {
+        data,
+        isPending: citationPending,
+        isError: citationError,
+    } = useQuery({ queryKey: ['exp-cite', id], queryFn: () => experienceApi.get(id), staleTime: 300000, retry: false });
+    // Opens the entry in a docked drawer over the conversation. Navigating to /plaza would
+    // tear the user out of the chat they're reading — the citation is a footnote, not an exit.
+    const [detail, setDetail] = React.useState(false);
+    const [editing, setEditing] = React.useState<ExperienceDraft | null>(null);
+    const title = data?.title || '';
+    const label = citationPending
+        ? '经验加载中'
+        : citationError
+            ? '经验已删除或不可访问'
+            : title
+                ? `经验:${title.slice(0, 8)}${title.length > 8 ? '…' : ''}`
+                : '经验（未命名）';
+    const unavailable = citationPending || citationError;
+    const refresh = () => {
+        qc.invalidateQueries({ queryKey: ['experience'] });
+        qc.invalidateQueries({ queryKey: ['exp-cite', id] });
+    };
+    return (
+        <>
+            <button
+                onClick={(e) => { e.stopPropagation(); if (data) setDetail(true); }}
+                title={citationError ? '该经验已删除、下架或你无权查看' : (title || label)}
+                disabled={!data}
+                style={{
+                    display: 'inline-flex', alignItems: 'center', gap: 4, padding: '1px 8px', borderRadius: 999,
+                    fontSize: 12, lineHeight: '18px',
+                    border: `1px solid ${unavailable ? 'var(--border-subtle)' : 'var(--success)'}`,
+                    color: unavailable ? 'var(--text-tertiary)' : 'var(--success)',
+                    background: unavailable ? 'var(--bg-tertiary)' : 'var(--success-subtle)',
+                    cursor: data ? 'pointer' : 'default', verticalAlign: 'middle', opacity: 1,
+                }}
+            >{label}</button>
+            {detail && (
+                <EntryDrawer
+                    entryId={id}
+                    docked
+                    onClose={() => setDetail(false)}
+                    onEdit={(entry) => { setDetail(false); setEditing(entry); }}
+                    onChanged={refresh}
+                />
+            )}
+            {editing && (
+                <ExperienceDraftEditor
+                    draft={editing}
+                    docked
+                    onClose={() => setEditing(null)}
+                    onSaved={() => { setEditing(null); refresh(); }}
+                    onDeleted={() => { setEditing(null); refresh(); }}
+                />
+            )}
+        </>
+    );
+}
+
+function ExperienceCitations({ ids }: { ids: string[] }) {
+    if (!ids.length) return null;
+    return (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 6 }}>
+            {ids.map(id => <ExperienceCitation key={id} id={id} />)}
+        </div>
+    );
+}
+
+/**
+ * Renders a propose_experience_draft tool call as a review card. The agent writes
+ * nothing — clicking 编辑后沉淀为经验 opens the shared human-gated DraftEditor prefilled;
+ * a row is created only when the human confirms there.
+ */
+function ExperienceDraftCard({ args, sessionId }: { args: any; sessionId?: string | null }) {
+    const { id: agentId } = useParams<{ id: string }>();
+    const qc = useQueryClient();
+    const toast = useToast();
+    const [open, setOpen] = React.useState(false);
+    // tool args may arrive as an object or a JSON string.
+    const a = React.useMemo(() => {
+        if (args && typeof args === 'object') return args;
+        try { return JSON.parse(args || '{}'); } catch { return {}; }
+    }, [args]);
+    const toArr = (v: any) => Array.isArray(v) ? v : (typeof v === 'string' && v ? v.split(/[,，]/).map((s: string) => s.trim()).filter(Boolean) : []);
+    const prefill: ExperienceDraft = {
+        title: a.title || '', body: a.body || '', applicability: a.applicability || '', tags: toArr(a.tags),
+        origin_agent_id: agentId, origin_session_id: sessionId || null,
+    };
+    // The card is a summary — flatten the markdown body so section markers don't show up
+    // literally; the drawer renders it properly. `key` marks 适用与失效: required, and the
+    // part a reader's eye slides off.
+    const parts: { label: string; val: string; key?: boolean }[] = [
+        { label: '正文', val: bodyExcerpt(a.body) },
+        { label: '适用与失效', val: a.applicability, key: true },
+    ];
+    const tags = toArr(a.tags);
+    return (
+        <div className="exp-draft">
+            <div className="exp-draft-head">
+                <div className="exp-draft-head-l">
+                    <div className="exp-draft-tagrow">
+                        <span className="exp-draft-state">草稿</span>
+                    </div>
+                    <div className="exp-draft-title">{a.title || '未命名经验'}</div>
+                </div>
+                <div className="exp-draft-pending">待你确认 · 不自动入库</div>
+            </div>
+            <div className="exp-draft-divider" />
+            <div className="exp-draft-fields">
+                <div className="exp-draft-grid">
+                    {parts.map(p => (p.val ? (
+                        <React.Fragment key={p.label}>
+                            <div className={p.key ? 'exp-draft-lab-key' : 'exp-draft-lab'}>{p.label}</div>
+                            <div className="exp-draft-val">{p.val}</div>
+                        </React.Fragment>
+                    ) : null))}
+                </div>
+            </div>
+            {tags.length > 0 && (
+                <div className="exp-draft-tags">
+                    {tags.map((tg: string) => <span key={tg} className="exp-draft-tag">{tg}</span>)}
+                </div>
+            )}
+            <div className="exp-draft-foot">
+                <button className="exp-draft-btn" onClick={() => setOpen(true)}>编辑后沉淀为经验</button>
+            </div>
+            {open && (
+                <ExperienceDraftEditor
+                    draft={prefill}
+                    docked
+                    onClose={() => setOpen(false)}
+                    onSaved={() => { setOpen(false); qc.invalidateQueries({ queryKey: ['experience'] }); toast.success('沉淀成功'); }}
+                />
+            )}
+        </div>
+    );
+}
+
 type AccessUser = {
     id: string;
     name: string;
@@ -497,6 +714,7 @@ function AccessPermissionsPanel({
             body: JSON.stringify(payload),
         });
         queryClient.invalidateQueries({ queryKey: ['agent-permissions', agentId] });
+        queryClient.invalidateQueries({ queryKey: ['agent-directory', agentId] });
         queryClient.invalidateQueries({ queryKey: ['agent', agentId] });
         queryClient.invalidateQueries({ queryKey: ['agents'] });
     };
@@ -518,13 +736,13 @@ function AccessPermissionsPanel({
             value: 'custom',
             icon: <IconLock size={14} stroke={1.8} />,
             label: isChinese ? '指定访问' : 'Custom',
-            desc: isChinese ? '指定可访问的平台用户；不可参与 Plaza。Agent 关系请在“关系”里配置。' : 'Choose platform users explicitly; Plaza is disabled. Agent relationships are configured in Relationships.',
+            desc: isChinese ? '指定成员和数字员工可见、可用；不可参与 Plaza。' : 'Only selected members and agents can see and use it; Plaza is disabled.',
         },
     ] as const;
 
     const accessLevels = [
         { val: 'use', label: <><IconEye size={13} stroke={1.8} /> {t('agent.settings.perm.useAccess', 'Use')}</>, desc: t('agent.settings.perm.useAccessDesc', 'Task, Chat, Tools, Skills, Workspace') },
-        { val: 'manage', label: <><IconSettings size={13} stroke={1.8} /> {t('agent.settings.perm.manageAccess', 'Manage')}</>, desc: t('agent.settings.perm.manageAccessDesc', 'Full access including Settings, Mind, Relationships') },
+        { val: 'manage', label: <><IconSettings size={13} stroke={1.8} /> {t('agent.settings.perm.manageAccess', 'Manage')}</>, desc: t('agent.settings.perm.manageAccessDesc', 'Full access including Settings, Mind, and Directory') },
     ];
 
     const setScope = async (scope: string) => {
@@ -1022,7 +1240,7 @@ function describeAnalysis(items: AnalysisItem[], t: (k: string, opts?: any) => s
 }
 
 function AnalysisCard({
-    items, t, expanded, onToggle, isGroupRunning,
+    items, t, expanded, onToggle, isGroupRunning, chatActive, sessionId,
 }: {
     items: AnalysisItem[];
     t: (k: string, opts?: any) => string;
@@ -1030,16 +1248,26 @@ function AnalysisCard({
     onToggle: () => void;
     /** True when parent isWaiting/isStreaming AND this is the last active group */
     isGroupRunning: boolean;
+    /** True while the chat is actively streaming/waiting (any turn in flight) */
+    chatActive?: boolean;
+    sessionId?: string | null;
 }) {
+    // propose_experience_draft is a human-facing proposal, not a reasoning step —
+    // render it as an always-visible card outside the collapsible trace.
+    const proposeItems = items.filter(
+        (i): i is Extract<AnalysisItem, { type: 'tool' }> => i.type === 'tool' && (i as any).name === 'propose_experience_draft'
+    );
     const toolItems = items.filter(i => i.type === 'tool') as Extract<AnalysisItem, { type: 'tool' }>[];
     const hasTools = toolItems.length > 0;
     const hasRunningTool = toolItems.some(tc => tc.status === 'running');
-    const isRunning = hasRunningTool || (!hasTools && isGroupRunning);
+    // Stopped responding: a tool is still marked running but the chat is no longer streaming.
+    const stopped = hasRunningTool && chatActive === false;
+    const isRunning = !stopped && (hasRunningTool || (!hasTools && isGroupRunning));
     const runningTool = [...toolItems].reverse().find(tc => tc.status === 'running') ?? null;
     const headerTitle = isRunning && runningTool ? getToolMeta(runningTool).title : describeAnalysis(items, t);
 
     return (
-        <div className={`analysis-trace${expanded ? ' analysis-trace--open' : ''}${isRunning ? ' analysis-trace--running' : ''}`}>
+        <div className={`analysis-trace${expanded ? ' analysis-trace--open' : ''}${isRunning ? ' analysis-trace--running' : ''}${stopped ? ' analysis-trace--stopped' : ''}`}>
             <div className="analysis-trace-shell">
                 <button
                     className="analysis-trace-header"
@@ -1059,10 +1287,14 @@ function AnalysisCard({
                         stroke={1.8}
                     />
                 </button>
+                {proposeItems.map((it, i) => (
+                    <ExperienceDraftCard key={`propose-${i}`} args={(it as any).args} sessionId={sessionId} />
+                ))}
                 {expanded && (
                     <div className="analysis-trace-body">
                         {items.map((item, idx) => {
                             const isLast = idx === items.length - 1;
+                            if (item.type === 'tool' && (item as any).name === 'propose_experience_draft') return null;
                             if (item.type === 'thinking') {
                                 const itemPreview = item.content.length > 360 ? item.content.slice(0, 360).trimEnd() + '...' : item.content;
                                 return (
@@ -2095,9 +2327,8 @@ export default function AgentDetailPage() {
     const [chatModality, setChatModality] = useState<string>('text');
     const allowedTiers = useAllowedTiers();
 
-    // Track onboarding kickoff per (agent, session) so the agent only greets
-    // once per session. The agent opens the conversation itself — no visible
-    // user message — by sending a tagged trigger the backend filters out.
+    // The visible guard is pair-scoped; durable deduplication is enforced by
+    // the backend so reconnects and other sessions cannot create another Run.
     const onboardingKickoffRef = useRef<Set<string>>(new Set());
     const [livePanelVisible, setLivePanelVisible] = useState(false);
     const [sidePanelTab, setSidePanelTab] = useState<SidePanelTab>('workspace');
@@ -2125,7 +2356,13 @@ export default function AgentDetailPage() {
     // ── Aware tab data: task_history.md ──
     const { data: taskHistoryFile } = useQuery({
         queryKey: ['file', id, 'task_history.md'],
-        queryFn: () => fileApi.read(id!, 'task_history.md').catch(() => null),
+        queryFn: async () => {
+            const rootFiles = await fileApi.list(id!);
+            if (!rootFiles.some((entry) => entry.path === 'task_history.md')) {
+                return null;
+            }
+            return fileApi.read(id!, 'task_history.md');
+        },
         enabled: !!id && awareDataActive,
     });
 
@@ -2234,6 +2471,12 @@ export default function AgentDetailPage() {
     const reconnectTimerRef = useRef<Record<SessionRuntimeKey, ReturnType<typeof setTimeout> | null>>({});
     const reconnectDisabledRef = useRef<Record<SessionRuntimeKey, boolean>>({});
     const sessionUiStateRef = useRef<Record<SessionRuntimeKey, { isWaiting: boolean; isStreaming: boolean }>>({});
+    const sessionActiveRunRef = useRef<Record<SessionRuntimeKey, SessionActiveRun | null>>({});
+    const runtimeEventCursorRef = useRef<Record<SessionRuntimeKey, string>>({});
+    const [activeRun, setActiveRun] = useState<SessionActiveRun | null>(null);
+    const [reconcilingExecutionId, setReconcilingExecutionId] = useState<string | null>(null);
+    const [messagesLoadedRuntimeKey, setMessagesLoadedRuntimeKey] = useState<string | null>(null);
+    const [runtimeStateLoadedRuntimeKey, setRuntimeStateLoadedRuntimeKey] = useState<string | null>(null);
     const activeSessionIdRef = useRef<string | null>(null);
     const currentAgentIdRef = useRef<string | undefined>(id);
     const sessionMsgAbortRef = useRef<AbortController | null>(null);
@@ -2244,6 +2487,45 @@ export default function AgentDetailPage() {
     const modelSelectionAbortControllersRef = useRef<Set<AbortController>>(new Set());
 
     const buildSessionRuntimeKey = (agentId: string, sessionId: string) => `${agentId}:${sessionId}`;
+
+    const refreshSessionMessages = async (agentId: string, sessionId: string) => {
+        try {
+            const tkn = localStorage.getItem('token');
+            const response = await fetch(
+                `/api/agents/${agentId}/sessions/${sessionId}/messages?limit=${HISTORY_PAGE_SIZE}`,
+                { headers: { Authorization: `Bearer ${tkn}` } },
+            );
+            if (!response.ok) return;
+            const messages = await response.json();
+            if (
+                currentAgentIdRef.current !== agentId
+                || activeSessionIdRef.current !== sessionId
+            ) return;
+            const parsed = messages.map((message: any) => parseChatMsg({
+                role: message.role,
+                content: message.content || '',
+                ...(message.toolName && {
+                    toolName: message.toolName,
+                    toolCallId: message.toolCallId,
+                    toolArgs: message.toolArgs,
+                    toolStatus: message.toolStatus,
+                    toolResult: message.toolResult,
+                    toolThinking: message.toolThinking,
+                }),
+                ...(message.thinking && { thinking: message.thinking }),
+                ...(message.created_at && { timestamp: message.created_at }),
+                ...(message.id && { id: message.id }),
+            }));
+            setChatMessages(parsed);
+            setChatOldestTimestamp(
+                messages.length > 0 ? messages[0].created_at : null,
+            );
+            setChatHistoryHasMore(messages.length >= HISTORY_PAGE_SIZE);
+            setMessagesLoadedRuntimeKey(buildSessionRuntimeKey(agentId, sessionId));
+        } catch {
+            // Runtime-state polling will retry; keep the current local messages.
+        }
+    };
 
     const clearReconnectTimer = (key: SessionRuntimeKey) => {
         const timer = reconnectTimerRef.current[key];
@@ -2260,11 +2542,82 @@ export default function AgentDetailPage() {
         if (ws) closeWebSocketIntentionally(ws);
         delete wsMapRef.current[key];
         delete sessionUiStateRef.current[key];
+        delete sessionActiveRunRef.current[key];
     };
 
     const setSessionUiState = (key: SessionRuntimeKey, next: Partial<{ isWaiting: boolean; isStreaming: boolean }>) => {
         const prev = sessionUiStateRef.current[key] || { isWaiting: false, isStreaming: false };
         sessionUiStateRef.current[key] = { ...prev, ...next };
+    };
+
+    const applySessionActiveRun = (
+        agentId: string,
+        sessionId: string,
+        next: SessionActiveRun | null,
+    ) => {
+        const key = buildSessionRuntimeKey(agentId, sessionId);
+        sessionActiveRunRef.current[key] = next;
+        if (
+            currentAgentIdRef.current === agentId
+            && activeSessionIdRef.current === sessionId
+        ) {
+            setActiveRun(next);
+        }
+    };
+
+    const fetchSessionRuntimeState = async (agentId: string, sessionId: string) => {
+        try {
+            const tkn = localStorage.getItem('token');
+            const response = await fetch(
+                `/api/agents/${agentId}/sessions/${sessionId}/runtime-state`,
+                { headers: { Authorization: `Bearer ${tkn}` } },
+            );
+            if (!response.ok) {
+                applySessionActiveRun(
+                    agentId,
+                    sessionId,
+                    failClosedSessionActiveRun(
+                        sessionActiveRunRef.current[buildSessionRuntimeKey(agentId, sessionId)] || null,
+                    ),
+                );
+                return null;
+            }
+            const payload = await response.json();
+            const next = sessionActiveRunFromResponse(payload);
+            if (!sessionRuntimeStateResponseIsValid(payload, next)) {
+                applySessionActiveRun(
+                    agentId,
+                    sessionId,
+                    failClosedSessionActiveRun(
+                        sessionActiveRunRef.current[buildSessionRuntimeKey(agentId, sessionId)] || null,
+                    ),
+                );
+                return null;
+            }
+            const previous = sessionActiveRunRef.current[
+                buildSessionRuntimeKey(agentId, sessionId)
+            ] || null;
+            applySessionActiveRun(agentId, sessionId, next);
+            if (runtimeCompletionNeedsMessageRefresh(previous, next)) {
+                void refreshSessionMessages(agentId, sessionId);
+            }
+            if (
+                currentAgentIdRef.current === agentId
+                && activeSessionIdRef.current === sessionId
+            ) {
+                setRuntimeStateLoadedRuntimeKey(buildSessionRuntimeKey(agentId, sessionId));
+            }
+            return next;
+        } catch {
+            applySessionActiveRun(
+                agentId,
+                sessionId,
+                failClosedSessionActiveRun(
+                    sessionActiveRunRef.current[buildSessionRuntimeKey(agentId, sessionId)] || null,
+                ),
+            );
+            return null;
+        }
     };
 
     /** Normalize IDs — API/JSON may use number vs string; loose equality was breaking "own session" detection. */
@@ -2524,6 +2877,7 @@ export default function AgentDetailPage() {
         setWsConnected(false);
         setIsStreaming(false);
         setIsWaiting(false);
+        setActiveRun(null);
     };
 
     const onAdminTabMine = () => {
@@ -2643,6 +2997,7 @@ export default function AgentDetailPage() {
         }
         const runtimeKey = buildSessionRuntimeKey(targetAgentId, sessionId);
         const runtimeState = sessionUiStateRef.current[runtimeKey] || { isWaiting: false, isStreaming: false };
+        const cachedActiveRun = sessionActiveRunRef.current[runtimeKey] || null;
         const writable = isWritableSession(sess, scopeOverride);
         isFirstLoad.current = true;
         isNearBottom.current = true;
@@ -2662,10 +3017,14 @@ export default function AgentDetailPage() {
         setHistoryLoadingMore(false);
         setIsStreaming(runtimeState.isStreaming);
         setIsWaiting(runtimeState.isWaiting);
+        setActiveRun(cachedActiveRun);
+        setMessagesLoadedRuntimeKey(null);
+        setRuntimeStateLoadedRuntimeKey(null);
         setActiveSession(sess);
         setAgentExpired(false);
         syncActiveSocketState(sess, targetAgentId);
         if (writable) scheduleComposerFocus();
+        if (writable) void fetchSessionRuntimeState(targetAgentId, String(sess.id));
 
         // Abort any pending message load and increment sequence
         sessionMsgAbortRef.current?.abort();
@@ -2709,7 +3068,7 @@ export default function AgentDetailPage() {
             if (activeSessionIdRef.current !== sess.id) return;
             const preParsed = msgs.map((m: any) => parseChatMsg({
                 role: m.role, content: m.content || '',
-                ...(m.toolName && { toolName: m.toolName, toolArgs: m.toolArgs, toolStatus: m.toolStatus, toolResult: m.toolResult, toolThinking: m.toolThinking }),
+                ...(m.toolName && { toolName: m.toolName, toolCallId: m.toolCallId, toolArgs: m.toolArgs, toolStatus: m.toolStatus, toolResult: m.toolResult, toolThinking: m.toolThinking }),
                 ...(m.thinking && { thinking: m.thinking }),
                 ...(m.created_at && { timestamp: m.created_at }),
                 ...(m.id && { id: m.id }),
@@ -2854,13 +3213,28 @@ export default function AgentDetailPage() {
     const upsertToolCallMessage = (toolMsg: ChatMsg) => {
         setChatMessages(prev => {
             const incomingTarget = getToolTargetKey(toolMsg.toolArgs);
+            if (toolMsg.toolCallId) {
+                const exactIdx = prev.findIndex(
+                    (msg) => msg.role === 'tool_call' && msg.toolCallId === toolMsg.toolCallId,
+                );
+                if (exactIdx >= 0) {
+                    const existing = prev[exactIdx];
+                    // A replay can start at the beginning of a Run after page reload.
+                    // Never downgrade the settled canonical history row back to running.
+                    if (existing.toolStatus === 'done' && toolMsg.toolStatus === 'running') return prev;
+                    return [
+                        ...prev.slice(0, exactIdx),
+                        { ...existing, ...toolMsg },
+                        ...prev.slice(exactIdx + 1),
+                    ];
+                }
+            }
             const sameTool = (msg: ChatMsg) => (
                 msg.role === 'tool_call'
                 && msg.toolName === toolMsg.toolName
                 && msg.toolStatus === 'running'
                 && (
-                    (!!toolMsg.toolCallId && !!msg.toolCallId && msg.toolCallId === toolMsg.toolCallId)
-                    || (!!incomingTarget && getToolTargetKey(msg.toolArgs) === incomingTarget)
+                    (!!incomingTarget && getToolTargetKey(msg.toolArgs) === incomingTarget)
                     || (!toolMsg.toolCallId && !incomingTarget)
                 )
             );
@@ -2902,6 +3276,20 @@ export default function AgentDetailPage() {
     const [wsConnected, setWsConnected] = useState(false);
     const [isWaiting, setIsWaiting] = useState(false);
     const [isStreaming, setIsStreaming] = useState(false);
+    // Runtime state is authoritative across reloads, while thinking/chunk events are
+    // transient. Keep a visible placeholder until replay supplies a richer progress
+    // row so refreshing an active Direct Chat never makes the Run look idle.
+    const lastChatMessage = chatMessages[chatMessages.length - 1] as (ChatMsg & { _streaming?: boolean }) | undefined;
+    const hasVisibleLiveProgress = Boolean(
+        (lastChatMessage?.role === 'assistant' && lastChatMessage._streaming)
+        || (lastChatMessage?.role === 'tool_call' && lastChatMessage.toolStatus === 'running'),
+    );
+    const showDirectRunThinking = isWaiting || Boolean(
+        activeRun
+        && ['queued', 'running'].includes(activeRun.status)
+        && !isStreaming
+        && !hasVisibleLiveProgress
+    );
     const [chatUploadDrafts, setChatUploadDrafts] = useState<{ id: string; name: string; percent: number; previewUrl?: string; sizeBytes: number }[]>([]);
     const chatUploadAbortRef = useRef<Map<string, () => void>>(new Map());
     type AttachedFileRef = {
@@ -2924,6 +3312,8 @@ export default function AgentDetailPage() {
         tier?: SaasTier | null;
         modality?: string;
         ephemeralModality?: boolean;
+        resumeRunId?: string;
+        resumeCorrelationId?: string;
     };
     const [attachedFiles, setAttachedFiles] = useState<AttachedFileRef[]>([]);
     const dismissedWorkspaceRefPath = useRef<string | null>(null);
@@ -3216,6 +3606,9 @@ export default function AgentDetailPage() {
         setHistoryMsgs([]);
         setIsStreaming(false);
         setIsWaiting(false);
+        setActiveRun(null);
+        setMessagesLoadedRuntimeKey(null);
+        setRuntimeStateLoadedRuntimeKey(null);
         setWsConnected(false);
         wsRef.current = null;
         setWorkspaceLockedPath(null);
@@ -3257,6 +3650,9 @@ export default function AgentDetailPage() {
         setWsConnected(false);
         setIsStreaming(false);
         setIsWaiting(false);
+        setActiveRun(null);
+        setMessagesLoadedRuntimeKey(null);
+        setRuntimeStateLoadedRuntimeKey(null);
         setSessionsLoading(false);
         setAllSessionsLoading(false);
         Object.keys(reconnectDisabledRef.current).forEach((k) => {
@@ -3267,6 +3663,7 @@ export default function AgentDetailPage() {
             if (ws) closeWebSocketIntentionally(ws);
         });
         wsMapRef.current = {};
+        sessionActiveRunRef.current = {};
         wsRef.current = null;
         return () => {
             modelSelectionSaveSeqRef.current += 1;
@@ -3354,6 +3751,15 @@ export default function AgentDetailPage() {
                 wsRef.current = ws;
                 setWsConnected(true);
             }
+            void fetchSessionRuntimeState(agentId, sessionId).then((active) => {
+                if (!active?.canCancel || ws.readyState !== WebSocket.OPEN) return;
+                const cursor = runtimeEventCursorRef.current[`${key}:${active.runId}`];
+                ws.send(JSON.stringify({
+                    type: 'attach_run',
+                    run_id: active.runId,
+                    ...(cursor ? { cursor } : {}),
+                }));
+            });
             if (pendingChatSendRef.current?.runtimeKey === key) {
                 const pending = pendingChatSendRef.current;
                 pendingChatSendRef.current = null;
@@ -3412,12 +3818,22 @@ export default function AgentDetailPage() {
         };
         ws.onmessage = (e) => {
             const d = JSON.parse(e.data);
-            // Onboarding lock fired (or trigger was rejected because the pair
-            // was already onboarded). Either way, invalidate the cached agent
-            // record so the kickoff effect stops thinking a new session needs
-            // onboarding. Fire early and unconditionally — the event is cheap.
-            if (d.type === 'onboarded') {
-                queryClient.invalidateQueries({ queryKey: ['agent', agentId] });
+            if (typeof d.event_cursor === 'string' && d.event_cursor && d.run_id) {
+                runtimeEventCursorRef.current[`${key}:${String(d.run_id)}`] = d.event_cursor;
+            }
+            // A completed or already-running pair-scoped onboarding attempt
+            // releases the local waiting indicator and refreshes Runtime truth.
+            if (d.type === 'onboarded' || d.type === 'onboarding_pending') {
+                setSessionUiState(key, { isWaiting: false, isStreaming: false });
+                const isActiveRuntime = currentAgentIdRef.current === agentId && activeSessionIdRef.current === sessionId;
+                if (isActiveRuntime) {
+                    setIsWaiting(false);
+                    setIsStreaming(false);
+                }
+                void fetchSessionRuntimeState(agentId, sessionId);
+                if (d.type === 'onboarded') {
+                    queryClient.invalidateQueries({ queryKey: ['agent', agentId] });
+                }
                 return;
             }
             const isActiveRuntime = currentAgentIdRef.current === agentId && activeSessionIdRef.current === sessionId;
@@ -3429,12 +3845,30 @@ export default function AgentDetailPage() {
                     isStreaming: endStreaming ? false : nextStreaming,
                 });
             }
+            if (d.type === 'runtime_status') {
+                // A queued Run is not the Session lane holder. Re-read the
+                // authoritative holder instead of promoting an event locally.
+                void fetchSessionRuntimeState(agentId, sessionId);
+                return;
+            }
+            if (d.type === 'done' && d.runtime_status === 'waiting_user' && d.run_id && d.correlation_id) {
+                applySessionActiveRun(agentId, sessionId, waitingSessionActiveRunHint({
+                    runId: String(d.run_id),
+                    sessionId,
+                    correlationId: String(d.correlation_id),
+                    current: sessionActiveRunRef.current[key] || null,
+                }));
+                void fetchSessionRuntimeState(agentId, sessionId);
+            }
             if (!isActiveRuntime) {
                 if (['done', 'error', 'quota_exceeded', 'trigger_notification', 'media_generation_result'].includes(d.type)) {
                     fetchMySessions(true, agentId);
                     queryClient.invalidateQueries({ queryKey: ['agents'] });
                 }
-                if (['done', 'error', 'quota_exceeded'].includes(d.type)) {
+                if (
+                    ['done', 'error', 'quota_exceeded'].includes(d.type)
+                    && d.runtime_status !== 'waiting_user'
+                ) {
                     closeSessionSocket(key, true);
                 }
                 return;
@@ -3449,6 +3883,7 @@ export default function AgentDetailPage() {
             // Capture session_id from the 'connected' message for Take Control
             if (d.type === 'connected' && d.session_id) {
                 if (isActiveRuntime) setWsSessionId(d.session_id);
+                void fetchSessionRuntimeState(agentId, sessionId);
                 return;
             }
 
@@ -3612,6 +4047,18 @@ export default function AgentDetailPage() {
                     return [...prev, { role: 'assistant', content: d.content, _streaming: true } as any];
                 });
             } else if (d.type === 'done') {
+                if (['completed', 'failed', 'cancelled'].includes(String(d.runtime_status))) {
+                    const existingRun = sessionActiveRunRef.current[key];
+                    if (existingRun && d.run_id && existingRun.runId === String(d.run_id)) {
+                        applySessionActiveRun(agentId, sessionId, {
+                            ...existingRun,
+                            status: String(d.runtime_status),
+                            canResume: false,
+                            canCancel: false,
+                        });
+                    }
+                    void fetchSessionRuntimeState(agentId, sessionId);
+                }
                 // Add end marker to code output if there was any code activity
                 setLiveState(prev => {
                     if (prev.code?.output) {
@@ -3745,6 +4192,14 @@ export default function AgentDetailPage() {
         setIsWaiting(true);
         setIsStreaming(false);
         setSessionUiState(runtimeKey, { isWaiting: true, isStreaming: false });
+        if (payload.resumeRunId) {
+            const current = sessionActiveRunRef.current[runtimeKey];
+            if (current?.runId === payload.resumeRunId) {
+                const next = { ...current, canResume: false };
+                sessionActiveRunRef.current[runtimeKey] = next;
+                setActiveRun(next);
+            }
+        }
         setChatMessages(prev => [...prev, parseChatMsg({
             id: clientMessageId,
             role: 'user',
@@ -3765,7 +4220,86 @@ export default function AgentDetailPage() {
             modality: payload.modality,
             ephemeral_modality: payload.ephemeralModality === true,
             client_message_id: clientMessageId,
+            ...(payload.resumeRunId ? { run_id: payload.resumeRunId } : {}),
+            ...(payload.resumeCorrelationId ? { correlation_id: payload.resumeCorrelationId } : {}),
         }));
+        const [runtimeAgentId, runtimeSessionId] = runtimeKey.split(':');
+        window.setTimeout(() => {
+            void fetchSessionRuntimeState(runtimeAgentId, runtimeSessionId);
+        }, 250);
+        window.setTimeout(() => {
+            void fetchSessionRuntimeState(runtimeAgentId, runtimeSessionId);
+        }, 1000);
+    };
+
+    const handleToolReconciliation = async (
+        reconciliation: ToolReconciliation,
+        outcome: 'applied' | 'not_applied',
+    ) => {
+        if (!id || !activeSession?.id || !activeRun?.correlationId) return;
+        const correlationId = activeRun.correlationId;
+        const applied = outcome === 'applied';
+        const confirmation = applied
+            ? t('agent.chat.reconcileAppliedConfirm', '确认该操作已经生效，并且不得重复执行？')
+            : t('agent.chat.reconcileNotAppliedConfirm', '确认该操作没有生效，可以让 Agent 重新决定是否重试？');
+        if (!window.confirm(confirmation)) return;
+
+        const run = activeRun;
+        const sessionId = String(activeSession.id);
+        const runtimeKey = buildSessionRuntimeKey(id, sessionId);
+        setReconcilingExecutionId(reconciliation.executionId);
+        try {
+            const response = await fetch(
+                `/api/agents/${id}/sessions/${sessionId}/runs/${run.runId}/tool-executions/${reconciliation.executionId}/reconcile`,
+                {
+                    method: 'POST',
+                    headers: {
+                        Authorization: `Bearer ${localStorage.getItem('token')}`,
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        outcome,
+                        correlation_id: correlationId,
+                        note: applied
+                            ? 'User confirmed in Direct Chat that the operation took effect.'
+                            : 'User confirmed in Direct Chat that the operation did not take effect.',
+                    }),
+                },
+            );
+            if (!response.ok) {
+                const body = await response.json().catch(() => ({}));
+                throw new Error(body?.detail || `HTTP ${response.status}`);
+            }
+
+            const userMsg = applied
+                ? t('agent.chat.reconcileAppliedMessage', '我确认这次工具操作已经生效，请继续，且不要重复执行该操作。')
+                : t('agent.chat.reconcileNotAppliedMessage', '我确认这次工具操作没有生效，请消费失败结果后继续，并重新决定是否需要新的工具调用。');
+            const pending: PendingChatMessage = {
+                runtimeKey,
+                contentForLLM: userMsg,
+                userMsg,
+                displayFileName: '',
+                storageFileNames: [],
+                tier: effectiveChatTier,
+                modality: effectiveChatModality,
+                resumeRunId: run.runId,
+                resumeCorrelationId: correlationId,
+            };
+            const socket = wsMapRef.current[runtimeKey];
+            if (socket?.readyState === WebSocket.OPEN) {
+                dispatchChatMessage(socket, runtimeKey, pending);
+            } else {
+                pendingChatSendRef.current = pending;
+                if (token) ensureSessionSocket(activeSession, id, token);
+            }
+        } catch (error) {
+            toast.error(t('agent.chat.reconcileFailed', '工具结果确认失败'), {
+                details: error instanceof Error ? error.message : String(error),
+            });
+            void fetchSessionRuntimeState(id, sessionId);
+        } finally {
+            setReconcilingExecutionId(null);
+        }
     };
 
     useEffect(() => {
@@ -3782,6 +4316,21 @@ export default function AgentDetailPage() {
         ensureSessionSocket(activeSession, id, token);
         syncActiveSocketState(activeSession, id);
     }, [id, token, activeTab, activeSession?.id, chatScope, canViewAllAgentChatSessions]);
+
+    useEffect(() => {
+        if (
+            !id
+            || !activeSession?.id
+            || activeTab !== 'chat'
+            || !isWritableSession(activeSession)
+            || !activeRun
+        ) return;
+        const sessionId = String(activeSession.id);
+        const timer = window.setInterval(() => {
+            void fetchSessionRuntimeState(id, sessionId);
+        }, 1500);
+        return () => window.clearInterval(timer);
+    }, [id, activeTab, activeSession?.id, activeRun?.runId, activeRun?.status]);
 
     const handleWorkspacePathDeleted = useCallback((path: string) => {
         let removedName = '';
@@ -3965,7 +4514,7 @@ export default function AgentDetailPage() {
             );
             const preParsed = msgs.map((m: any) => parseChatMsg({
                 role: m.role, content: m.content || '',
-                ...(m.toolName && { toolName: m.toolName, toolArgs: m.toolArgs, toolStatus: m.toolStatus, toolResult: m.toolResult, toolThinking: m.toolThinking }),
+                ...(m.toolName && { toolName: m.toolName, toolCallId: m.toolCallId, toolArgs: m.toolArgs, toolStatus: m.toolStatus, toolResult: m.toolResult, toolThinking: m.toolThinking }),
                 ...(m.thinking && { thinking: m.thinking }),
                 ...(m.created_at && { timestamp: m.created_at }),
                 ...(m.id && { id: m.id }),
@@ -4052,7 +4601,7 @@ export default function AgentDetailPage() {
             );
             const preParsed = msgs.map((m: any) => parseChatMsg({
                 role: m.role, content: m.content || '',
-                ...(m.toolName && { toolName: m.toolName, toolArgs: m.toolArgs, toolStatus: m.toolStatus, toolResult: m.toolResult, toolThinking: m.toolThinking }),
+                ...(m.toolName && { toolName: m.toolName, toolCallId: m.toolCallId, toolArgs: m.toolArgs, toolStatus: m.toolStatus, toolResult: m.toolResult, toolThinking: m.toolThinking }),
                 ...(m.thinking && { thinking: m.thinking }),
                 ...(m.created_at && { timestamp: m.created_at }),
                 ...(m.id && { id: m.id }),
@@ -4124,7 +4673,7 @@ export default function AgentDetailPage() {
     }, [historyMsgs, activeSession?.id, scheduleHistoryScrollToBottom]);
     // Memoized component for each chat message to avoid re-renders while typing
     const ChatMessageItem = React.useMemo(() => React.memo(({
-        msg, i, isLeft, t, senderLabel, avatarText, forceSenderLabel = false, hideAvatar = false,
+        msg, i, isLeft, t, senderLabel, avatarText, forceSenderLabel = false, hideAvatar = false, hideDistill = false,
     }: {
         msg: any;
         i: number;
@@ -4134,6 +4683,9 @@ export default function AgentDetailPage() {
         avatarText?: string;
         forceSenderLabel?: boolean;
         hideAvatar?: boolean;
+        // True when this message's turn already renders a propose_experience_draft card,
+        // which is itself the review entry point — the manual 沉淀 button would be redundant.
+        hideDistill?: boolean;
     }) => {
         const fe = (msg.storageFileName || msg.fileName)?.split('.').pop()?.toLowerCase() ?? '';
         const isImage = msg.imageUrl && ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'].includes(fe);
@@ -4177,6 +4729,7 @@ export default function AgentDetailPage() {
                 <div className="chat-msg-timestamp">
                     {timeStr}
                     {msg.content && <CopyMessageButton text={msg.content} />}
+                    {msg.content && isLeft && !hideDistill && <DistillButton text={msg.content} sessionId={activeSessionIdRef.current} />}
                 </div>
             );
         })() : null;
@@ -4364,6 +4917,15 @@ export default function AgentDetailPage() {
         }
         const activeRuntimeKey = buildSessionRuntimeKey(id, String(activeSession.id));
         const activeSocket = wsMapRef.current[activeRuntimeKey];
+        const currentRun = sessionActiveRunRef.current[activeRuntimeKey];
+        const resumesWaitingRun = currentRun?.status === 'waiting_user';
+        if (
+            resumesWaitingRun
+            && (!currentRun?.canResume || !currentRun.correlationId)
+        ) {
+            toast.warning(t('agent.chat.waitingReplyPending', 'Your previous reply is still being processed.'));
+            return;
+        }
         if (!chatInput.trim() && attachedFiles.length === 0) return;
 
         let userMsg = chatInput.trim();
@@ -4617,7 +5179,7 @@ export default function AgentDetailPage() {
 
     // ── Drag-and-drop chat file upload ──
     const handleDroppedChatFiles = useCallback(async (files: File[]) => {
-        if (!wsConnected || chatUploadDrafts.length > 0 || isWaiting || isStreaming || attachedFiles.length >= 10) return;
+        if (!wsConnected || chatUploadDrafts.length > 0 || attachedFiles.length >= 10) return;
         const availableSlots = Math.max(0, 10 - attachedFiles.length);
         const filesToProcess = files.slice(0, availableSlots);
 
@@ -4653,11 +5215,11 @@ export default function AgentDetailPage() {
                 setChatUploadDrafts(prev => prev.filter(d => d.id !== draftId));
             }
         }
-    }, [id, wsConnected, chatUploadDrafts.length, isWaiting, isStreaming, attachedFiles.length, isWritableSession, t]);
+    }, [id, wsConnected, chatUploadDrafts.length, attachedFiles.length, isWritableSession, t]);
 
     const { isDragging: isChatDragging, dropZoneProps: chatDropProps } = useDropZone({
         onDrop: handleDroppedChatFiles,
-        disabled: !wsConnected || chatUploadDrafts.length > 0 || isWaiting || isStreaming || attachedFiles.length >= 10 || !activeSession || !isWritableSession(activeSession),
+        disabled: !wsConnected || chatUploadDrafts.length > 0 || attachedFiles.length >= 10 || !activeSession || !isWritableSession(activeSession),
     });
 
     // Expandable activity log
@@ -4823,17 +5385,25 @@ export default function AgentDetailPage() {
     // Onboarding kickoff: wait until a tier is available before sending the
     // invisible trigger. The backend resolves tier+modality to a real model.
     useEffect(() => {
-        if (!wsConnected || !id || !activeSession?.id) return;
+        if (!id || !currentUser?.id || !activeSession?.id) return;
         if (!agent || agent.onboarded_for_me !== false) return;
         if (agent.deletion_state === 'cleanup_pending') return;
         if (!effectiveTierReady || !effectiveChatTier) return;
         if (!chatHistoryIsReady(chatHistoryReadyRuntimeKey, id, activeSession.id)) return;
         if (chatMessages.length > 0) return;
         const runtimeKey = buildSessionRuntimeKey(id, String(activeSession.id));
-        if (onboardingKickoffRef.current.has(runtimeKey)) return;
+        if (!shouldKickoffOnboarding({
+            websocketReady: wsConnected,
+            messagesLoaded: messagesLoadedRuntimeKey === runtimeKey,
+            runtimeStateLoaded: runtimeStateLoadedRuntimeKey === runtimeKey,
+            messageCount: chatMessages.length,
+            hasActiveRun: activeRun !== null,
+        })) return;
+        const pairKey = onboardingKickoffKey(id, String(currentUser.id));
+        if (onboardingKickoffRef.current.has(pairKey)) return;
         const socket = wsMapRef.current[runtimeKey];
         if (!socket || socket.readyState !== WebSocket.OPEN) return;
-        onboardingKickoffRef.current.add(runtimeKey);
+        onboardingKickoffRef.current.add(pairKey);
         setIsWaiting(true);
         setIsStreaming(false);
         socket.send(JSON.stringify({
@@ -6438,6 +7008,10 @@ export default function AgentDetailPage() {
                                                                             if (msg.role === 'tool_call') {
                                                                                 const tName = msg.toolName || (() => { try { return JSON.parse(msg.content || '{}').name; } catch { return ''; } })() || 'tool';
                                                                                 const tArgs = msg.toolArgs || (() => { try { return JSON.parse(msg.content || '{}').args; } catch { return {}; } })();
+                                                                                // Experience draft proposal renders as a human-gated review card, not a raw tool blob.
+                                                                                if (tName === 'propose_experience_draft') {
+                                                                                    return <ExperienceDraftCard key={mi} args={tArgs} sessionId={activeSessionIdRef.current} />;
+                                                                                }
                                                                                 const tResult = msg.toolResult || '';
                                                                                 const argsStr = typeof tArgs === 'string' ? tArgs : JSON.stringify(tArgs || {}, null, 2);
                                                                                 const resultStr = typeof tResult === 'string' ? tResult : JSON.stringify(tResult, null, 2);
@@ -6641,10 +7215,14 @@ export default function AgentDetailPage() {
                     )
                 }
 
-                {/* ── Relationships Tab ── */}
+                {/* ── Directory Tab ── */}
                 {
                     activeTab === 'relationships' && (
-                        <RelationshipEditor agentId={id!} readOnly={!canManage} />
+                        <AgentDirectory
+                            agentId={id!}
+                            accessMode={(agent as any)?.access_mode}
+                            canManage={canManage}
+                        />
                     )
                 }
 
@@ -6961,6 +7539,32 @@ export default function AgentDetailPage() {
                                                     // API.  Display names are mutable and can collide.
                                                     const isA2A = activeSession.source_channel === 'agent' || activeSession.participant_type === 'agent';
                                                     const isHumanReadonly = !isA2A && !activeSession.is_group;
+                                                    const proposeTurnIdx = new Set<number>();
+                                                    {
+                                                        const toolNameOf = (message: any) => message.toolName || (() => {
+                                                            try { return JSON.parse(message.content || '{}').name; } catch { return ''; }
+                                                        })();
+                                                        let turnStart = 0;
+                                                        for (let turnEnd = 0; turnEnd <= historyMsgs.length; turnEnd += 1) {
+                                                            if (turnEnd === historyMsgs.length || historyMsgs[turnEnd].role === 'user') {
+                                                                let hasProposal = false;
+                                                                for (let index = turnStart; index < turnEnd; index += 1) {
+                                                                    if (historyMsgs[index].role === 'tool_call' && toolNameOf(historyMsgs[index]) === 'propose_experience_draft') {
+                                                                        hasProposal = true;
+                                                                        break;
+                                                                    }
+                                                                }
+                                                                if (hasProposal) {
+                                                                    for (let index = turnStart; index < turnEnd; index += 1) {
+                                                                        if (historyMsgs[index].role === 'assistant' && historyMsgs[index].content?.trim()) {
+                                                                            proposeTurnIdx.add(index);
+                                                                        }
+                                                                    }
+                                                                }
+                                                                turnStart = turnEnd + 1;
+                                                            }
+                                                        }
+                                                    }
                                                     return historyMsgs.map((m: any, i: number) => {
                                                         const isLeft = isA2A
                                                             ? isA2AMessageLeft(m, agent.id, agent.name)
@@ -6968,6 +7572,9 @@ export default function AgentDetailPage() {
                                                         if (m.role === 'tool_call') {
                                                             const tName = m.toolName || (() => { try { return JSON.parse(m.content || '{}').name; } catch { return 'tool'; } })();
                                                             const tArgs = m.toolArgs || (() => { try { return JSON.parse(m.content || '{}').args; } catch { return {}; } })();
+                                                            if (tName === 'propose_experience_draft') {
+                                                                return <ExperienceDraftCard key={i} args={tArgs} sessionId={activeSessionIdRef.current} />;
+                                                            }
                                                             const tResult = m.toolResult ?? (() => { try { return JSON.parse(m.content || '{}').result; } catch { return ''; } })();
                                                             return (
                                                                 <div key={i} style={{ display: 'flex', gap: '8px', marginBottom: '6px', paddingLeft: '36px', minWidth: 0 }}>
@@ -7005,6 +7612,7 @@ export default function AgentDetailPage() {
                                                                     senderLabel={isHumanReadonly ? (isLeft ? ((agent as any)?.name || 'Agent') : (activeSession.username || 'User')) : undefined}
                                                                     avatarText={isHumanReadonly ? (isLeft ? (((agent as any)?.name || 'Agent')[0]) : ((activeSession.username || 'User')[0])) : undefined}
                                                                     forceSenderLabel={isHumanReadonly}
+                                                                    hideDistill={proposeTurnIdx.has(i)}
                                                                 />
                                                             </React.Fragment>
                                                         );
@@ -7177,6 +7785,10 @@ export default function AgentDetailPage() {
                                                         const hideAssistantAvatar = entry.type === 'msg'
                                                             && entry.msg.role === 'assistant'
                                                             && previousEntry?.type === 'analysis_group';
+                                                        // The assistant text that follows a propose_experience_draft group
+                                                        // already has the review card above it — suppress its 沉淀 button.
+                                                        const prevGroupHasPropose = previousEntry?.type === 'analysis_group'
+                                                            && previousEntry.items.some((it: any) => it.type === 'tool' && it.name === 'propose_experience_draft');
                                                         if (entry.type === 'analysis_group') {
                                                             // Group is considered running if it has a running tool,
                                                             // or if it's the very last entry and the agent is still active
@@ -7195,6 +7807,8 @@ export default function AgentDetailPage() {
                                                                         expanded={toolGroupExpandedRef.current.has(entry.key) ? !!toolGroupExpandedRef.current.get(entry.key) : false}
                                                                         onToggle={() => toggleToolGroup(entry.key)}
                                                                         isGroupRunning={groupIsRunning}
+                                                                        chatActive={isWaiting || isStreaming}
+                                                                        sessionId={activeSessionIdRef.current}
                                                                     />
                                                                 </div>
                                                             );
@@ -7219,6 +7833,7 @@ export default function AgentDetailPage() {
                                                                             senderLabel={(agent as any)?.name || 'Agent'}
                                                                             avatarText={((agent as any)?.name || 'Agent')[0]}
                                                                             hideAvatar={hideAssistantAvatar}
+                                                                            hideDistill={prevGroupHasPropose}
                                                                         />
                                                                     )}
                                                                 </React.Fragment>
@@ -7234,12 +7849,13 @@ export default function AgentDetailPage() {
                                                                 senderLabel={msg.role === 'assistant' ? ((agent as any)?.name || 'Agent') : (currentUser?.display_name || undefined)}
                                                                 avatarText={msg.role === 'assistant' ? (((agent as any)?.name || 'Agent')[0]) : (currentUser?.display_name?.[0] || undefined)}
                                                                 hideAvatar={hideAssistantAvatar}
+                                                                hideDistill={prevGroupHasPropose}
                                                             />
                                                         );
                                                     });
                                                 })()
                                                 }
-                                                {isWaiting && (
+                                                {showDirectRunThinking && (
                                                     <div className="chat-msg-row">
                                                         <div className="chat-msg-avatar">A</div>
                                                         <div className="chat-msg-bubble chat-msg-bubble--thinking">
@@ -7291,6 +7907,42 @@ export default function AgentDetailPage() {
                                             ) : null}
                                             <div ref={chatInputAreaRef} className="chat-input-area" style={{ flexShrink: 0 }}>
                                                 <div className="chat-composer">
+                                                    {activeRun?.pendingToolReconciliations.map((reconciliation) => (
+                                                        <div className="chat-tool-reconciliation" key={reconciliation.executionId}>
+                                                            <div className="chat-tool-reconciliation__title">
+                                                                <IconAlertTriangle size={16} />
+                                                                {t('agent.chat.reconcileTitle', '工具执行结果需要确认')}
+                                                            </div>
+                                                            <div className="chat-tool-reconciliation__detail">
+                                                                <code>{reconciliation.toolName}</code>
+                                                                <span>{reconciliation.resultSummary || reconciliation.errorCode || t('agent.chat.reconcileUnknown', '该操作可能已生效，也可能未生效。')}</span>
+                                                            </div>
+                                                            {reconciliation.canReconcile ? (
+                                                                <div className="chat-tool-reconciliation__actions">
+                                                                    <button
+                                                                        type="button"
+                                                                        className="btn btn-secondary"
+                                                                        disabled={reconcilingExecutionId !== null}
+                                                                        onClick={() => void handleToolReconciliation(reconciliation, 'not_applied')}
+                                                                    >
+                                                                        {t('agent.chat.reconcileNotApplied', '确认未生效，可继续')}
+                                                                    </button>
+                                                                    <button
+                                                                        type="button"
+                                                                        className="btn btn-primary"
+                                                                        disabled={reconcilingExecutionId !== null}
+                                                                        onClick={() => void handleToolReconciliation(reconciliation, 'applied')}
+                                                                    >
+                                                                        {t('agent.chat.reconcileApplied', '确认已生效，继续')}
+                                                                    </button>
+                                                                </div>
+                                                            ) : (
+                                                                <div className="chat-tool-reconciliation__unsupported">
+                                                                    {t('agent.chat.reconcileUnsupported', '此工具暂不支持在前端安全结算，请联系管理员。')}
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    ))}
                                                     {(chatUploadDrafts.length > 0 || attachedFiles.length > 0) && (
                                                         <div className="chat-composer-attachments">
                                                             {chatUploadDrafts.map((draft) => (
@@ -7367,7 +8019,12 @@ export default function AgentDetailPage() {
                                                             }}
                                                             onKeyDown={e => {
                                                                 // Enter sends the message; Shift+Enter inserts a newline
-                                                                if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && !isWaiting && !isStreaming) {
+                                                                if (
+                                                                    e.key === 'Enter'
+                                                                    && !e.shiftKey
+                                                                    && !e.nativeEvent.isComposing
+                                                                    && !(activeRun?.status === 'waiting_user' && !activeRun.canResume)
+                                                                ) {
                                                                     e.preventDefault();
                                                                     sendChatMsg();
                                                                 }
@@ -7434,19 +8091,16 @@ export default function AgentDetailPage() {
                                                             size="sm"
                                                         />
                                                         <div style={{ flex: 1 }} />
-                                                        {(isStreaming || isWaiting) ? (
+                                                        {activeRun?.canCancel ? (
                                                             <button
                                                                 type="button"
                                                                 className="btn btn-stop-generation"
                                                                 onClick={() => {
-                                                                    if (!id || !activeSession?.id) return;
+                                                                    if (!id || !activeSession?.id || !activeRun?.runId) return;
                                                                     const activeRuntimeKey = buildSessionRuntimeKey(id, String(activeSession.id));
                                                                     const activeSocket = wsMapRef.current[activeRuntimeKey];
                                                                     if (activeSocket?.readyState === WebSocket.OPEN) {
-                                                                        activeSocket.send(JSON.stringify({ type: 'abort' }));
-                                                                        setIsStreaming(false);
-                                                                        setIsWaiting(false);
-                                                                        setSessionUiState(activeRuntimeKey, { isWaiting: false, isStreaming: false });
+                                                                        activeSocket.send(JSON.stringify({ type: 'abort', run_id: activeRun.runId }));
                                                                     }
                                                                 }}
                                                                 title={t('chat.stop', 'Stop')}
@@ -7458,7 +8112,12 @@ export default function AgentDetailPage() {
                                                                 type="button"
                                                                 className="btn btn-primary chat-composer-send"
                                                                 onClick={sendChatMsg}
-                                                                disabled={chatInputDisabled || !wsConnected || (!chatInput.trim() && attachedFiles.length === 0)}
+                                                                disabled={
+                                                                    chatInputDisabled
+                                                                    || !wsConnected
+                                                                    || (!chatInput.trim() && attachedFiles.length === 0)
+                                                                    || (activeRun?.status === 'waiting_user' && !activeRun.canResume)
+                                                                }
                                                                 title={t('chat.send')}
                                                             >
                                                                 <IconSend size={16} stroke={1.75} />

@@ -677,8 +677,17 @@ async def test_mcp_runtime_uses_only_own_assigned_tool(monkeypatch):
         def __init__(self, url, api_key=None):
             calls.append((url, api_key))
 
-        async def call_tool(self, name, arguments):
-            return f"called:{name}:{arguments['q']}"
+        async def call_tool_result(self, name, arguments):
+            return {
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"called:{name}:{arguments['q']}",
+                        }
+                    ]
+                }
+            }
 
     monkeypatch.setattr(mcp_client, "MCPClient", _Client)
     monkeypatch.setattr(
@@ -696,7 +705,7 @@ async def test_mcp_runtime_uses_only_own_assigned_tool(monkeypatch):
         agent_id=uuid.uuid4(),
     )
 
-    assert result == "called:search:hello"
+    assert result == "✅ called:search:hello"
     assert calls == [(own_tool.mcp_server_url, "own-key")]
 
 
@@ -713,8 +722,17 @@ async def test_global_mcp_runtime_ignores_legacy_shared_credential(monkeypatch):
         def __init__(self, url, api_key=None):
             calls.append((url, api_key))
 
-        async def call_tool(self, name, arguments):
-            return f"called:{name}:{arguments['q']}"
+        async def call_tool_result(self, name, arguments):
+            return {
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"called:{name}:{arguments['q']}",
+                        }
+                    ]
+                }
+            }
 
     monkeypatch.setattr(mcp_client, "MCPClient", _Client)
     monkeypatch.setattr(
@@ -732,7 +750,7 @@ async def test_global_mcp_runtime_ignores_legacy_shared_credential(monkeypatch):
         agent_id=uuid.uuid4(),
     )
 
-    assert result == "called:search:hello"
+    assert result == "✅ called:search:hello"
     assert calls == [(shared_tool.mcp_server_url, "own-agent-key")]
 
 

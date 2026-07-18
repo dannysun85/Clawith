@@ -6,6 +6,7 @@ import pytest
 from app.services.wecom_stream import (
     _build_wecom_conv_id,
     _extract_wecom_chat_id,
+    _extract_wecom_message_id,
     _extract_wecom_chat_type,
     _extract_wecom_sender_id,
     _WeComIssueLogger,
@@ -28,6 +29,7 @@ def test_extract_wecom_context_from_official_sdk_shape():
     assert _extract_wecom_sender_id(body) == "zhangsan"
     assert _extract_wecom_chat_type(body) == "group"
     assert _extract_wecom_chat_id(body) == "chat_001"
+    assert _extract_wecom_message_id(body) == "msg_123"
     assert _build_wecom_conv_id("zhangsan", "chat_001", "group") == "wecom_group_chat_001"
 
 

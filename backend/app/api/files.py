@@ -1,5 +1,6 @@
 """File management API routes for agent workspaces."""
 
+import asyncio
 import base64
 import csv
 import io
@@ -95,6 +96,24 @@ class FileWrite(BaseModel):
 class FileLockBody(BaseModel):
     path: str
     session_id: str | None = None
+
+
+async def _directory_total_size(storage, storage_key: str) -> int:
+    """Return the recursive byte size of all files below a storage directory."""
+    total = 0
+    pending = [normalize_storage_key(storage_key)]
+    visited: set[str] = set()
+    while pending:
+        current = pending.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        for entry in await storage.list_dir(current):
+            if entry.is_dir:
+                pending.append(normalize_storage_key(entry.key))
+            else:
+                total += max(0, entry.size)
+    return total
 
 
 class RestoreRevisionBody(BaseModel):
@@ -246,7 +265,7 @@ async def list_files(
     path_is_dir = await storage.is_dir(storage_key)
     if not path_exists and not path_is_dir:
         if not (
-            normalized_path == ""
+            normalized_path in {"", "workspace"}
             or (is_enterprise and normalized_path == "enterprise_info")
         ):
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Path not found")
@@ -265,11 +284,20 @@ async def list_files(
             url=None,
         ))
     entries = await storage.list_dir(storage_key) if path_exists or path_is_dir else []
+    is_skills_path = normalized_path == "skills" or normalized_path.startswith("skills/")
+    directory_entries = [entry for entry in entries if entry.is_dir] if is_skills_path else []
+    directory_sizes = dict(zip(
+        (entry.key for entry in directory_entries),
+        await asyncio.gather(*(_directory_total_size(storage, entry.key) for entry in directory_entries)),
+        strict=True,
+    ))
     for entry in entries:
         if entry.name == '.gitkeep':
             continue
-        # focus.md is no longer the primary Focus store, but keep legacy files
-        # visible/readable so migrated workspaces do not look empty.
+        # Focus is database-backed. Legacy focus.md must stay hidden so users
+        # do not edit a stale second source of truth.
+        if not path and entry.name.lower() == "focus.md":
+            continue
         if not path and entry.name.lower() == "agenda.md":
             continue
         if not path and entry.name == "enterprise_info":
@@ -287,7 +315,7 @@ async def list_files(
             name=entry.name,
             path=rel_path,
             is_dir=entry.is_dir,
-            size=entry.size,
+            size=directory_sizes.get(entry.key, entry.size),
             modified_at=entry.modified_at,
             version_token=version_token,
             url=f"/api/agents/{agent_id}/files/download?path={rel_path}" if not entry.is_dir else None
@@ -306,7 +334,7 @@ async def read_file(
     storage = get_storage_backend()
     key, _ = _visible_storage_key(agent_id, path, current_user.tenant_id)
     await check_agent_access(db, current_user, agent_id)
-    if is_focus_file_path(path) and not (await storage.exists(key) and await storage.is_file(key)):
+    if is_focus_file_path(path):
         raise HTTPException(
             status_code=status.HTTP_410_GONE,
             detail="Focus is stored in the system database. Use the Focus API.",

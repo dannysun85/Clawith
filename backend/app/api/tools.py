@@ -7,12 +7,13 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from loguru import logger
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
 from sqlalchemy import String, cast, select, delete, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import get_current_admin, get_current_user
+from app.core.permissions import can_manage_agent
 from app.database import get_db
 from app.models.tool import Tool, AgentTool
 from app.models.user import User
@@ -38,6 +39,10 @@ from app.services.agent_tool_assignments import (
     lock_agent_tool_owner,
     upsert_agent_tool,
 )
+from app.services.resource_discovery import (
+    _get_smithery_api_key,
+    get_smithery_connection_status,
+)
 
 router = APIRouter(prefix="/tools", tags=["tools"])
 
@@ -55,6 +60,17 @@ _CREDENTIAL_BOUND_MEDIA_DESTINATION_KEYS: dict[str, frozenset[str]] = {
     ),
 }
 _CUSTOM_MEDIA_EXTRA_HEADER_ALLOWLIST = frozenset({"http-referer", "x-title"})
+
+
+async def _load_agent_for_tool_scope(db: AsyncSession, agent_id: uuid.UUID):
+    """Load the Agent whose company boundary determines tool visibility."""
+    from app.models.agent import Agent as AgentModel
+
+    agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
+    agent = agent_r.scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return agent
 
 
 def _has_unmasked_secret(value: object) -> bool:
@@ -449,6 +465,46 @@ def _tool_record_visible_to_agent(
             and str(tool.id) in assignments
         )
     return False
+
+
+def _smithery_authorization_provider(
+    tool: Tool,
+    assignment: AgentTool | None,
+) -> str | None:
+    if tool.type != "mcp" or not assignment:
+        return None
+    config = assignment.config or {}
+    if config.get("smithery_namespace") and config.get("smithery_connection_id"):
+        return "smithery"
+    return None
+
+
+async def _load_assigned_smithery_connection(
+    db: AsyncSession,
+    agent_id: uuid.UUID,
+    tool_id: uuid.UUID,
+) -> dict[str, str] | None:
+    assignment_r = await db.execute(
+        select(AgentTool).where(
+            AgentTool.agent_id == agent_id,
+            AgentTool.tool_id == tool_id,
+        )
+    )
+    assignment = assignment_r.scalar_one_or_none()
+    if not assignment:
+        return None
+
+    tool_r = await db.execute(select(Tool).where(Tool.id == tool_id))
+    tool = tool_r.scalar_one_or_none()
+    if not tool or _smithery_authorization_provider(tool, assignment) != "smithery":
+        return None
+
+    config = assignment.config or {}
+    namespace = str(config.get("smithery_namespace") or "").strip()
+    connection_id = str(config.get("smithery_connection_id") or "").strip()
+    if not namespace or not connection_id:
+        return None
+    return {"namespace": namespace, "connection_id": connection_id}
 
 
 def _resolve_target_tenant_id(current_user: User, tenant_id: str | None = None) -> uuid.UUID | None:
@@ -1028,6 +1084,88 @@ async def update_agent_tools(
         )
     await db.commit()
     return {"ok": True}
+
+
+# ─── Smithery MCP Authorization Status ─────────────────────
+@router.get(
+    "/agents/{agent_id}/mcp-tools/{tool_id}/authorization-status",
+)
+async def get_mcp_authorization_status(
+    agent_id: uuid.UUID,
+    tool_id: uuid.UUID,
+    response: Response,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Read one assigned Smithery connection for an authorized manager."""
+    response.headers["Cache-Control"] = "no-store"
+    no_store_headers = {"Cache-Control": "no-store"}
+
+    try:
+        agent = await _load_agent_for_tool_scope(db, agent_id)
+        if not await can_manage_agent(db, current_user, agent):
+            raise HTTPException(
+                status_code=403,
+                detail="Agent manage permission required",
+            )
+
+        connection = await _load_assigned_smithery_connection(
+            db,
+            agent_id,
+            tool_id,
+        )
+        if not connection:
+            raise HTTPException(
+                status_code=404,
+                detail="Assigned Smithery tool not found",
+            )
+
+        api_key = await _get_smithery_api_key(agent_id)
+        if not api_key:
+            return {
+                "provider": "smithery",
+                "state": "unavailable",
+                "connected": False,
+            }
+
+        provider_status = await get_smithery_connection_status(
+            api_key,
+            connection["namespace"],
+            connection["connection_id"],
+        )
+        state = provider_status.get("state")
+        if state == "connected":
+            return {
+                "provider": "smithery",
+                "state": "connected",
+                "connected": True,
+            }
+        if state == "auth_required" and provider_status.get("authorization_url"):
+            return {
+                "provider": "smithery",
+                "state": "auth_required",
+                "connected": False,
+                "authorization_url": provider_status["authorization_url"],
+            }
+        return {
+            "provider": "smithery",
+            "state": "unavailable",
+            "connected": False,
+        }
+    except HTTPException as error:
+        raise HTTPException(
+            status_code=error.status_code,
+            detail=error.detail,
+            headers={**(error.headers or {}), **no_store_headers},
+        ) from error
+    except Exception:
+        # Fail closed without exposing Provider URLs, credentials, or internal
+        # exception details through an error response that a browser may cache.
+        raise HTTPException(
+            status_code=503,
+            detail="MCP authorization status unavailable",
+            headers=no_store_headers,
+        ) from None
 
 
 # ─── MCP Server Testing ────────────────────────────────────

@@ -1,3 +1,42 @@
+# v1.11.0 — Durable Runtime, Group Collaboration, and Experience Library
+
+## What's New
+
+- Integrated the upstream v1.11 durable Agent Runtime, including persisted Runs, commands, events, tool-execution reconciliation, cancellation, replay, checkpointing, scheduling lanes, and shared Group execution.
+- Added Group collaboration with stable participant identities, mentions, realtime message delivery, unread state, shared workspace, memory, planning, and bounded context compaction.
+- Replaced the legacy social Plaza with the Team Experience Library: draft, review, publish, revision, citation, retirement, and Agent-assisted experience extraction flows.
+- Added the organization directory and permission-safe roster queries for human and Agent recipients, plus Smithery-managed MCP authorization controls.
+
+## Astra Compatibility and Stability
+
+- Preserved the centrally funded `lite/pro/ultra` routing policy and the MiniMax-M3 `text/image/video` understanding matrix. The upgrade does not introduce tenant-level or LLM-model-object-level authorization.
+- Preserved brand-safe image/video generation, reference-asset handling, exact-copy overlays, workspace media delivery, and exactly-once Credits reservation, settlement, and refund behavior.
+- Preserved default-off heartbeat/CEO automation, bounded trigger execution, production issue monitoring, channel-secret encryption, secure blue/green deployment, durable attachment history, and explicit Code capability authorization.
+- Unified legacy A2A, trigger, task, channel, and supervision entry points onto tenant-scoped Runtime sessions and stable scheduling lanes without allowing cross-tenant reuse.
+- Restored OpenClaw gateway instructions through one localized implementation while retaining the `delivery_attempt` idempotency contract required for safe report acknowledgement.
+
+## Upgrade and Deployment Fixes
+
+- The all-in-one container entrypoint now installs the pinned LangGraph checkpoint schema after Alembic and before application startup. The production blue/green workflow performs the same explicit setup before the candidate backend starts, preventing `RuntimeSchemaNotReady` restart loops.
+- Runtime rollout configuration now reaches every supported Docker, CI, multi-process, production, and Helm backend. The v1.11 environment example, CI, Helm chart, and blue/green production workflow enable the complete durable path; lower-level application and Compose defaults remain fail-closed for intentional staged rollout.
+- The migration graph has one merged head and supports fresh install, v1.10.13 production-schema upgrade, downgrade, and re-upgrade validation.
+- Frontend merge conflicts in Direct Chat, model routing, runtime settings, MCP authorization, Markdown mentions, and the Experience Library were resolved without restoring deprecated object-level model selection.
+- Short Group sessions now skip model-budget resolution until an old message actually exists outside the recent raw-message window. An empty or provider-unconfigured local model pool can no longer create a repeating Session Compact error loop for ordinary new conversations.
+- The optional Agent `task_history.md` view now discovers the file before requesting its contents. A new Agent with no history renders the intended empty state without producing a browser 404 or polluting production issue monitoring.
+
+## Validation
+
+- Complete backend suite: 3,453 tests passed. Production deployment/checkpoint contract suite: 189 tests passed.
+- Complete frontend suite: 65 Node contract tests and 112 Vitest tests passed; the production Vite build completed with 7,028 transformed modules.
+- PostgreSQL migration, A2A serialization, trigger-lane serialization, media Credits exactly-once settlement, production issue aggregation, approval CAS, and chat-tier preference smokes passed.
+- Isolated real-browser acceptance covered login, logout, local registration, account recovery screens, 12 core authenticated routes, all 12 Enterprise tabs, all 9 SaaS tabs, all 4 platform-admin tabs, all 8 Agent settings tabs, Group creation/session/member/message/mention/side-panel flows, Experience draft save-and-reopen, and Agent workspace/self-awareness empty states. The final post-fix window had no browser Console errors, HTTP 4xx/5xx responses, or backend ERROR events.
+
+## Upgrade Notes
+
+- Run both Alembic and the pinned checkpoint setup before starting any v1.11 worker. Supported container and production deployment paths now enforce this automatically.
+- Native Web Chat deliberately has no legacy fallback. A custom deployment that overrides `AGENT_RUNTIME_V2_ENABLED=false` must explicitly allow the required source types or Agent IDs; otherwise Chat and Group intake fail closed by design.
+- Existing local Astra capabilities remain code-owned and are not replaced by similarly named upstream implementations. Production deployment and provider-funded media/LLM verification remain separate approval-gated steps.
+
 # v1.10.13 — Durable Chat Attachment History
 
 ## Bug Fixes

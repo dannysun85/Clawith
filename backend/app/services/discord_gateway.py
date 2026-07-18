@@ -9,7 +9,6 @@ Requires:  pip install discord.py>=2.3.0
 """
 
 import asyncio
-import os
 import uuid
 from typing import Dict, Optional
 
@@ -72,7 +71,11 @@ class DiscordGatewayManager:
 
         @client.event
         async def on_ready():
-            logger.info(f"[Discord GW] Bot connected for agent {agent_id}")
+            logger.info(
+                "[Discord GW] Bot connected agent_id={} user_present={}",
+                agent_id,
+                client.user is not None,
+            )
 
         @client.event
         async def on_message(message: discord.Message):
@@ -97,10 +100,9 @@ class DiscordGatewayManager:
                 return
 
             logger.info(
-                "[Discord GW] Message received agent={} content_chars={} group={}",
+                "[Discord GW] Message accepted agent_id={} input_chars={}",
                 agent_id,
                 len(user_text),
-                message.guild is not None,
             )
 
             # Show typing indicator while processing
@@ -112,9 +114,6 @@ class DiscordGatewayManager:
                 chunks = [reply[i:i + DISCORD_MSG_LIMIT] for i in range(0, len(reply), DISCORD_MSG_LIMIT)]
                 for chunk in chunks:
                     await message.reply(chunk, mention_author=False)
-
-        # Run the bot in a background task
-        proxy = os.environ.get("DISCORD_PROXY") or os.environ.get("HTTPS_PROXY") or None
 
         async def _run_bot():
             try:
@@ -141,16 +140,16 @@ class DiscordGatewayManager:
         message: "discord.Message",
         user_text: str,
     ) -> Optional[str]:
-        """Process an incoming Discord message through the agent LLM."""
+        """Attach an incoming Discord message to the durable Agent Runtime."""
         try:
-            from app.models.audit import ChatMessage
+            from app.api.feishu import _load_agent_and_model
             from app.models.agent import Agent as AgentModel
-            from app.api.feishu import _call_llm_with_config, _load_agent_and_model
+            from app.services.agent_runtime.channel_chat import (
+                channel_message_id,
+                enqueue_channel_chat_runtime,
+            )
             from app.services.channel_session import find_or_create_channel_session
-            from app.models.user import User as _User
-            from app.core.security import hash_password as _hp
-            from datetime import datetime, timezone
-            import uuid as _uuid
+            from app.services.channel_user_service import channel_user_service
 
             sender_id = str(message.author.id)
             channel_id = str(message.channel.id)
@@ -168,17 +167,10 @@ class DiscordGatewayManager:
                 agent_obj = agent_r.scalar_one_or_none()
                 if not agent_obj:
                     return "Agent not found."
-                creator_id = agent_obj.creator_id
-                from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
-                ctx_size = agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE
 
-                # Find or create platform user for this Discord sender via unified service
-                from app.services.channel_user_service import channel_user_service
-                
                 _discord_display_name = message.author.display_name or message.author.name
                 _display = _discord_display_name or f"Discord User {sender_id[:8]}"
                 _extra_info = {"name": _display}
-                
                 _platform_user = await channel_user_service.resolve_channel_user(
                     db=db,
                     agent=agent_obj,
@@ -186,14 +178,17 @@ class DiscordGatewayManager:
                     external_user_id=sender_id,
                     extra_info=_extra_info,
                 )
-                
-                # Update display_name if we now have a better name
-                if _discord_display_name and _platform_user.display_name and _platform_user.display_name.startswith("Discord User ") and _platform_user.display_name != _discord_display_name:
+
+                if (
+                    _discord_display_name
+                    and _platform_user.display_name
+                    and _platform_user.display_name.startswith("Discord User ")
+                    and _platform_user.display_name != _discord_display_name
+                ):
                     _platform_user.display_name = _discord_display_name
                     await db.flush()
                 platform_user_id = _platform_user.id
 
-                # Find or create session
                 sess = await find_or_create_channel_session(
                     db=db,
                     agent_id=agent_id,
@@ -201,72 +196,30 @@ class DiscordGatewayManager:
                     external_conv_id=conv_id,
                     source_channel="discord",
                     first_message_title=user_text,
+                    created_by_user_id=platform_user_id,
                 )
-                session_conv_id = str(sess.id)
-
-                # Load history
-                history_r = await db.execute(
-                    select(ChatMessage)
-                    .where(
-                        ChatMessage.agent_id == agent_id,
-                        ChatMessage.conversation_id == session_conv_id,
-                    )
-                    .order_by(ChatMessage.created_at.desc())
-                    .limit(ctx_size)
-                )
-                from app.services.llm.utils import convert_chat_messages_to_llm_format as _conv
-                history = _conv(reversed(history_r.scalars().all()))
-
-                # Save user message
-                db.add(ChatMessage(
-                    agent_id=agent_id,
-                    user_id=platform_user_id,
-                    role="user",
+                _, model, _, _ = await _load_agent_and_model(db, agent_id)
+                await enqueue_channel_chat_runtime(
+                    db,
+                    agent=agent_obj,
+                    user=_platform_user,
+                    session=sess,
+                    model=model,
                     content=user_text,
-                    conversation_id=session_conv_id,
-                ))
-                sess.last_message_at = datetime.now(timezone.utc)
-
-                # Pre-load agent/model before releasing connection
-                _agent_model, _llm_model, _fallback_model, _route_meta = await _load_agent_and_model(db, agent_id)
+                    source_channel="discord",
+                    channel_delivery_target={
+                        "channel_id": channel_id,
+                        "reply_to_message_id": str(message.id),
+                    },
+                    message_id=channel_message_id(
+                        agent_id,
+                        "discord",
+                        str(message.id),
+                    ),
+                )
 
                 await db.commit()
-                # ── Phase 1 complete: release connection before slow LLM call ──
-
-            # ── Phase 2: LLM call (no DB session) ──
-            reply_text = await _call_llm_with_config(
-                _agent_model, _llm_model, _fallback_model, _route_meta,
-                agent_id,
-                user_text,
-                history=history,
-                user_id=platform_user_id,
-                session_id=session_conv_id,
-            )
-            logger.info(
-                "[Discord GW] LLM reply generated agent={} reply_chars={}",
-                agent_id,
-                len(reply_text),
-            )
-
-            # ── Phase 3: Save reply (new short transaction) ──
-            async with async_session() as _save_db:
-                _save_db.add(ChatMessage(
-                    agent_id=agent_id,
-                    user_id=platform_user_id,
-                    role="assistant",
-                    content=reply_text,
-                    conversation_id=session_conv_id,
-                ))
-                from app.models.chat_session import ChatSession
-                _sess_r = await _save_db.execute(
-                    select(ChatSession).where(ChatSession.id == _uuid.UUID(session_conv_id))
-                )
-                _sess_fresh = _sess_r.scalar_one_or_none()
-                if _sess_fresh:
-                    _sess_fresh.last_message_at = datetime.now(timezone.utc)
-                await _save_db.commit()
-
-            return reply_text
+            return None
 
         except Exception as e:
             logger.exception(
@@ -298,7 +251,7 @@ class DiscordGatewayManager:
         async with async_session() as db:
             result = await db.execute(
                 select(ChannelConfig).where(
-                    ChannelConfig.is_configured == True,
+                    ChannelConfig.is_configured.is_(True),
                     ChannelConfig.channel_type == "discord",
                 )
             )

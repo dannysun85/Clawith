@@ -102,6 +102,56 @@ def test_production_compose_splits_api_and_worker_roles_and_shares_durable_volum
     assert "BACKEND_NETWORK_ALIAS" in compose
 
 
+def test_runtime_rollout_policy_reaches_every_supported_deployment_path():
+    compose_contracts = {
+        "docker-compose.yml": 1,
+        "deploy/docker-compose.yml": 1,
+        "deploy/docker-compose-multi.yml": 2,
+        "docker-compose.ci.yml": 1,
+        # The worker inherits the anchored backend environment.
+        "deploy/astra-poc/docker-compose.prod.yml": 1,
+    }
+    variables = (
+        "AGENT_RUNTIME_COMMAND_CONCURRENCY",
+        "AGENT_RUNTIME_V2_ENABLED",
+        "AGENT_RUNTIME_V2_AGENT_IDS",
+        "AGENT_RUNTIME_V2_SOURCE_TYPES",
+    )
+
+    for relative_path, expected_count in compose_contracts.items():
+        compose = (ROOT / relative_path).read_text(encoding="utf-8")
+        for variable in variables:
+            actual_count = len(
+                re.findall(rf"^\s+{re.escape(variable)}:", compose, re.MULTILINE)
+            )
+            assert actual_count == expected_count, (
+                relative_path,
+                variable,
+            )
+
+    values = (ROOT / "helm/clawith/values.yaml").read_text(encoding="utf-8")
+    deployment = (ROOT / "helm/clawith/templates/backend.yaml").read_text(
+        encoding="utf-8"
+    )
+    assert "runtimeV2Enabled: true" in values
+    assert "runtimeV2AgentIds:" in values
+    assert "runtimeV2SourceTypes: task" in values
+    assert "runtimeCommandConcurrency: 10" in values
+    for variable in variables:
+        assert f"name: {variable}" in deployment
+
+    # Generic low-level defaults stay fail closed for staged rollout. The
+    # reviewed v1.11 production workflow opts the complete product path in.
+    root_compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "AGENT_RUNTIME_V2_ENABLED: ${AGENT_RUNTIME_V2_ENABLED:-false}" in root_compose
+    deploy_script = (ROOT / "scripts/deploy-astra-production.sh").read_text(
+        encoding="utf-8"
+    )
+    assert '"AGENT_RUNTIME_V2_ENABLED": "true"' in deploy_script
+    assert '"AGENT_RUNTIME_V2_AGENT_IDS": ""' in deploy_script
+    assert '"AGENT_RUNTIME_V2_SOURCE_TYPES": "task"' in deploy_script
+
+
 def test_production_code_execution_defaults_fail_closed():
     compose = (ROOT / "deploy/astra-poc/docker-compose.prod.yml").read_text(encoding="utf-8")
 
@@ -1308,6 +1358,15 @@ def test_production_deploy_health_checks_candidate_before_nginx_cutover():
     assert "X-Real-IP" in configurator
     assert "X-Forwarded-For" in configurator
     assert "run --rm --no-deps -T --entrypoint alembic backend upgrade head < /dev/null" in script
+    alembic_upgrade = script.index(
+        "run --rm --no-deps -T --entrypoint alembic backend upgrade head < /dev/null"
+    )
+    checkpoint_setup = script.index("-m app.scripts.setup_langgraph_checkpoints", alembic_upgrade)
+    candidate_start = script.index(
+        'compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" up -d --no-deps backend',
+        checkpoint_setup,
+    )
+    assert alembic_upgrade < checkpoint_setup < candidate_start
 
 
 def test_douyin_ui_cannot_bypass_immutable_approval_preview():

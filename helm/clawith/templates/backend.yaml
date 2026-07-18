@@ -72,6 +72,14 @@ spec:
           value: {{ .Values.backend.env.agentDataDir | quote }}
         - name: AGENT_TEMPLATE_DIR
           value: {{ .Values.backend.env.agentTemplateDir | quote }}
+        - name: AGENT_RUNTIME_COMMAND_CONCURRENCY
+          value: {{ .Values.backend.env.runtimeCommandConcurrency | quote }}
+        - name: AGENT_RUNTIME_V2_ENABLED
+          value: {{ .Values.backend.env.runtimeV2Enabled | quote }}
+        - name: AGENT_RUNTIME_V2_AGENT_IDS
+          value: {{ .Values.backend.env.runtimeV2AgentIds | quote }}
+        - name: AGENT_RUNTIME_V2_SOURCE_TYPES
+          value: {{ .Values.backend.env.runtimeV2SourceTypes | quote }}
         - name: HEARTBEAT_ENABLED
           value: {{ .Values.backend.env.heartbeatEnabled | quote }}
         {{- if .Values.backend.hostCerts.enabled }}

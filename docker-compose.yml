@@ -47,9 +47,16 @@ services:
       AGENT_TEMPLATE_DIR: /app/agent_template
       STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
       STORAGE_LOCAL_ROOT: /data/agents
+      DOCKER_NETWORK: ${CLAWITH_DOCKER_NETWORK:-clawith_network}
       SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-me-jwt-secret}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      ALLOW_UNVERIFIED_LOCAL_SIGNUP: ${ALLOW_UNVERIFIED_LOCAL_SIGNUP:-false}
       PROCESS_ROLE: all
+      AGENT_RUNTIME_COMMAND_CONCURRENCY: ${AGENT_RUNTIME_COMMAND_CONCURRENCY:-10}
+      AGENT_RUNTIME_V2_ENABLED: ${AGENT_RUNTIME_V2_ENABLED:-false}
+      AGENT_RUNTIME_V2_AGENT_IDS: ${AGENT_RUNTIME_V2_AGENT_IDS:-}
+      AGENT_RUNTIME_V2_SOURCE_TYPES: ${AGENT_RUNTIME_V2_SOURCE_TYPES:-task}
       HEARTBEAT_ENABLED: ${HEARTBEAT_ENABLED:-false}
       TRIGGER_DAEMON_ENABLED: ${TRIGGER_DAEMON_ENABLED:-true}
       OKR_AUTOMATION_ENABLED: ${OKR_AUTOMATION_ENABLED:-false}
@@ -63,6 +70,10 @@ services:
       # Required when deployed behind a reverse proxy (e.g. Nginx, Cloudflare).
       # If not set, the server infers the URL from the incoming request host.
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      # Platform-scoped models used by native Group planning and threshold-only
+      # shared Session Context compaction.
+      MULTI_AGENT_PLANNING_MODEL_ID: ${MULTI_AGENT_PLANNING_MODEL_ID:-}
+      MULTI_AGENT_COMPACT_MODEL_ID: ${MULTI_AGENT_COMPACT_MODEL_ID:-}
       # Password reset token lifetime in minutes (default: 30)
       PASSWORD_RESET_TOKEN_EXPIRE_MINUTES: ${PASSWORD_RESET_TOKEN_EXPIRE_MINUTES:-30}
     volumes:
@@ -111,4 +122,4 @@ volumes:
 
 networks:
   default:
-    name: clawith_network
+    name: ${CLAWITH_DOCKER_NETWORK:-clawith_network}

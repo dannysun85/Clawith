@@ -7,6 +7,11 @@ fresh_db_name="${db_name}_fresh"
 db_user="${PGUSER:-$USER}"
 db_host="${PGHOST:-127.0.0.1}"
 db_port="${PGPORT:-5432}"
+release_head="${MIGRATION_SMOKE_EXPECTED_HEAD:-merge_v111_astra_heads}"
+
+assert_at_release_head() {
+  .venv/bin/alembic current | grep -F "${release_head} (head)"
+}
 
 cleanup() {
   dropdb --if-exists --host "$db_host" --port "$db_port" --username "$db_user" "$db_name"
@@ -194,7 +199,7 @@ cd "$repo_root/backend"
 DATABASE_URL="postgresql+asyncpg://${db_user}@${db_host}:${db_port}/${fresh_db_name}" \
   .venv/bin/alembic upgrade head
 DATABASE_URL="postgresql+asyncpg://${db_user}@${db_host}:${db_port}/${fresh_db_name}" \
-  .venv/bin/alembic current | grep -F "sso_password_login (head)"
+  bash -c '.venv/bin/alembic current' | grep -F "${release_head} (head)"
 DATABASE_URL="postgresql+asyncpg://${db_user}@${db_host}:${db_port}/${fresh_db_name}" \
   PYTHONPATH=. .venv/bin/python -m app.scripts.verify_identity_provider_secrets
 
@@ -327,11 +332,40 @@ INSERT INTO billing_rules (
 SQL
 
 .venv/bin/alembic upgrade disable_system_okr_automation
-# The bootstrap migration creates tables from current ORM metadata, while this
-# smoke deliberately reconstructs the pre-096 production epoch. Remove the
-# future constraint so duplicate historical grants can be seeded and 096 is
-# proven to quarantine them before recreating uniqueness.
+# The bootstrap migration creates tables from current ORM metadata. This lane
+# deliberately reconstructs the v1.10.13 production schema so the upstream
+# unified-chat revision must perform its real backfill instead of taking the
+# metadata-precreated shortcut.
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+ALTER TABLE chat_sessions
+DROP CONSTRAINT IF EXISTS fk_chat_sessions_tenant_id_tenants,
+DROP CONSTRAINT IF EXISTS fk_chat_sessions_group_id_groups,
+DROP CONSTRAINT IF EXISTS fk_chat_sessions_created_by_participant_id_participants,
+DROP CONSTRAINT IF EXISTS uq_chat_sessions_tenant_id_id,
+DROP CONSTRAINT IF EXISTS ck_chat_sessions_session_type;
+DROP INDEX IF EXISTS ix_chat_sessions_tenant_id;
+DROP INDEX IF EXISTS ix_chat_sessions_group_id;
+DROP INDEX IF EXISTS uq_chat_sessions_primary_direct;
+DROP INDEX IF EXISTS uq_chat_sessions_primary_group;
+ALTER TABLE chat_sessions
+ALTER COLUMN agent_id SET NOT NULL,
+ALTER COLUMN user_id SET NOT NULL,
+DROP COLUMN IF EXISTS tenant_id,
+DROP COLUMN IF EXISTS session_type,
+DROP COLUMN IF EXISTS group_id,
+DROP COLUMN IF EXISTS created_by_participant_id,
+DROP COLUMN IF EXISTS deleted_at,
+DROP COLUMN IF EXISTS updated_at;
+ALTER TABLE chat_messages
+ALTER COLUMN agent_id SET NOT NULL,
+ALTER COLUMN user_id SET NOT NULL,
+DROP COLUMN IF EXISTS mentions;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_chat_sessions_primary_platform
+ON chat_sessions (agent_id, user_id)
+WHERE is_primary = true AND source_channel = 'web' AND is_group = false;
+
+-- Remove post-095 objects so duplicate historical grants can be seeded and
+-- 096 is proven to quarantine them before recreating uniqueness.
 ALTER TABLE agent_tools
 DROP CONSTRAINT IF EXISTS uq_agent_tools_agent_tool;
 ALTER TABLE approval_requests
@@ -966,6 +1000,7 @@ case "$invalid_provider_upgrade_output" in
   *'Non-object identity provider configs require operator cleanup before upgrade: count=4'*) ;;
   *)
     echo "revision 106 did not report the sanitized provider-config blocker" >&2
+    printf '%s\n' "$invalid_provider_upgrade_output" >&2
     exit 1
     ;;
 esac
@@ -1013,6 +1048,7 @@ case "$duplicate_tenantless_upgrade_output" in
   *'Duplicate tenantless users(identity_id) rows must be audited before upgrade: sample_group_count=1'*) ;;
   *)
     echo "revision 106 did not report the sanitized tenantless-membership blocker" >&2
+    printf '%s\n' "$duplicate_tenantless_upgrade_output" >&2
     exit 1
     ;;
 esac
@@ -1028,7 +1064,7 @@ WHERE id IN (
 SQL
 
 .venv/bin/alembic upgrade head
-.venv/bin/alembic current | grep -F "sso_password_login (head)"
+assert_at_release_head
 assert_sso_password_security
 
 # Historical rows can contain a username that shadows another Identity's
@@ -1407,7 +1443,7 @@ INSERT INTO model_routes (
 );
 SQL
 .venv/bin/alembic upgrade head
-.venv/bin/alembic current | grep -F "sso_password_login (head)"
+assert_at_release_head
 assert_sso_password_security
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
 INSERT INTO llm_models (
@@ -2031,7 +2067,7 @@ BEGIN
 END $$;
 SQL
 .venv/bin/alembic upgrade head
-.venv/bin/alembic current | grep -F "sso_password_login (head)"
+assert_at_release_head
 assert_sso_password_security
 PYTHONPATH=. .venv/bin/python ../scripts/code-execution-migration-postgres-smoke.py assert-secured
 PYTHONPATH=. .venv/bin/python ../scripts/channel-config-encryption-postgres-smoke.py \
@@ -2039,7 +2075,8 @@ PYTHONPATH=. .venv/bin/python ../scripts/channel-config-encryption-postgres-smok
 PYTHONPATH=. .venv/bin/python -m app.scripts.verify_channel_secrets
 PYTHONPATH=. .venv/bin/python -m app.scripts.verify_identity_provider_secrets
 
-PYTHONPATH=. .venv/bin/python ../scripts/a2a-postgres-smoke.py
+AGENT_RUNTIME_V2_SOURCE_TYPES=trigger \
+  PYTHONPATH=. .venv/bin/python ../scripts/a2a-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/media-generation-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/production-issue-postgres-smoke.py
 PYTHONPATH=. .venv/bin/python ../scripts/approval-execution-postgres-smoke.py
@@ -2069,7 +2106,7 @@ FROM users
 WHERE id = '07500000-0000-4000-8000-000000000070';
 SQL
 .venv/bin/alembic upgrade head
-.venv/bin/alembic current | grep -F "sso_password_login (head)"
+assert_at_release_head
 assert_sso_password_security
 PYTHONPATH=. .venv/bin/python ../scripts/code-execution-migration-postgres-smoke.py assert-secured
 PYTHONPATH=. .venv/bin/python ../scripts/channel-config-encryption-postgres-smoke.py \

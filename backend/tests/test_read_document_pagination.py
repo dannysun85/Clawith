@@ -24,9 +24,10 @@ def test_read_document_can_reach_later_pdf_pages(tmp_path):
         max_chars=2000,
     )
 
-    assert "--- Page 3 ---" in result
-    assert "THIRD-PAGE" in result
-    assert "FIRST-PAGE" not in result
+    assert result.ok is True
+    assert "--- Page 3 ---" in result.content
+    assert "THIRD-PAGE" in result.content
+    assert "FIRST-PAGE" not in result.content
 
 
 def test_pdf_fallback_respects_page_window(tmp_path):
@@ -41,7 +42,8 @@ def test_pdf_fallback_respects_page_window(tmp_path):
         max_chars=2000,
     )
 
-    assert "--- Page 2 ---" in result
-    assert "SECOND-PAGE" in result
-    assert "FIRST-PAGE" not in result
-    assert "THIRD-PAGE" not in result
+    assert result.ok is True
+    assert "--- Page 2 ---" in result.content
+    assert "SECOND-PAGE" in result.content
+    assert "FIRST-PAGE" not in result.content
+    assert "THIRD-PAGE" not in result.content

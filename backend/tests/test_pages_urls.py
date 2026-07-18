@@ -158,7 +158,7 @@ async def test_publish_page_rejects_cross_agent_source_before_storage_read(
         {"path": f"../{uuid.uuid4()}/workspace/private.html"},
     )
 
-    assert result == "File path must stay within the Agent workspace"
+    assert "File path must stay within the Agent workspace" in result
     storage_factory.assert_not_called()
     storage.exists.assert_not_awaited()
     storage.is_file.assert_not_awaited()

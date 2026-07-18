@@ -107,55 +107,77 @@ async def test_messages_received_during_generation_are_not_dropped():
 
 
 @pytest.mark.asyncio
-async def test_message_loop_uses_validated_client_id_and_emits_assistant_id():
+async def test_runtime_intake_uses_validated_client_message_id():
     websocket = FakeWebSocket()
     client_message_id = uuid.uuid4()
     handler = WebSocketChatHandler(websocket, uuid.uuid4(), "token", str(uuid.uuid4()))
     handler.user = SimpleNamespace(id=uuid.uuid4())
-    handler.auth_version = 0
     handler.agent_name = "Test Agent"
     handler.agent_type = ""
     handler.conv_id = handler.session_id_param
-    handler._receive_next_message = AsyncMock(
-        side_effect=[
-            {
-                "content": "hello",
-                "display_content": "hello",
-                "client_message_id": str(client_message_id),
-            },
-            StopAsyncIteration,
-        ]
-    )
-    handler._resolve_route = AsyncMock(return_value=(None, None))
+    model = SimpleNamespace(id=uuid.uuid4())
+    handler._resolve_effective_model = AsyncMock(return_value=model)
     handler._check_quotas = AsyncMock(return_value=True)
-    handler._ensure_access_token_current = AsyncMock(return_value=True)
-    handler._save_user_message = AsyncMock(return_value="user-message-1")
-    handler._save_assistant_reply = AsyncMock(return_value="assistant-message-1")
+    handler._enqueue_runtime_chat = AsyncMock(return_value=None)
+    handler._save_user_message = AsyncMock()
+    handler._save_assistant_reply = AsyncMock()
 
-    with pytest.raises(StopAsyncIteration):
-        await handler.message_loop()
-
-    # One fence admits the message, and the two persistence/response boundaries
-    # are revalidated before customer-visible completion.
-    assert handler._ensure_access_token_current.await_count == 3
-    handler._save_user_message.assert_awaited_once_with(
-        "hello",
-        "hello",
-        "",
-        False,
-        message_id=client_message_id,
+    accepted = await handler._accept_client_message(
+        {
+            "content": "hello",
+            "display_content": "hello",
+            "client_message_id": str(client_message_id),
+        }
     )
+
+    assert accepted is None
+    assert handler._enqueue_runtime_chat.await_args.kwargs["message_id"] == client_message_id
+    handler._save_user_message.assert_not_awaited()
+    handler._save_assistant_reply.assert_not_awaited()
     assert websocket.sent == [
         {
-            "type": "done",
-            "role": "assistant",
-            "content": (
-                "⚠️ Test Agent has no LLM model configured. "
-                "Please select a tier in the agent's Settings tab or ask an admin to configure model routes."
-            ),
-            "message_id": "assistant-message-1",
+            "type": "error",
+            "content": "Durable Runtime is not enabled for native Web Chat.",
+            "code": "runtime_disabled",
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_intake_preserves_selected_tier_and_ephemeral_media_route():
+    handler = WebSocketChatHandler(FakeWebSocket(), uuid.uuid4(), "token", str(uuid.uuid4()))
+    handler.user = SimpleNamespace(id=uuid.uuid4(), preferred_chat_tier="lite")
+    handler.agent_name = "Test Agent"
+    handler.agent_type = ""
+    handler.conv_id = handler.session_id_param
+    handler.session_model_tier = "lite"
+    handler.session_model_modality = "text"
+    model = SimpleNamespace(id=uuid.uuid4())
+
+    async def resolve_model(_override, *, tier, modality):
+        assert tier == "ultra"
+        assert modality == "video"
+        handler.current_route_meta = RouteMeta(saas_tier="ultra", modality="video")
+        return model
+
+    handler._resolve_effective_model = AsyncMock(side_effect=resolve_model)
+    handler._persist_session_model_selection = AsyncMock()
+    handler._check_quotas = AsyncMock(return_value=True)
+    handler._enqueue_runtime_chat = AsyncMock(return_value=None)
+
+    await handler._accept_client_message(
+        {
+            "content": "[video_data:data:video/mp4;base64,abc] Analyze this",
+            "display_content": "Analyze this",
+            "tier": "ultra",
+            "modality": "video",
+            "ephemeral_modality": True,
+        }
+    )
+
+    handler._persist_session_model_selection.assert_awaited_once_with("ultra", None)
+    assert handler._enqueue_runtime_chat.await_args.kwargs["saas_tier"] == "ultra"
+    assert handler._enqueue_runtime_chat.await_args.kwargs["model_modality"] == "video"
 
 
 @pytest.mark.asyncio
@@ -278,19 +300,31 @@ async def test_websocket_rejects_non_private_web_session(
         "token",
         str(session_id),
     )
+    tenant_id = uuid.uuid4()
+    handler.agent = SimpleNamespace(id=requested_agent_id, tenant_id=tenant_id)
     session = SimpleNamespace(
         id=session_id,
+        tenant_id=tenant_id,
         agent_id=requested_agent_id if same_agent else uuid.uuid4(),
         user_id=requested_user_id if same_user else uuid.uuid4(),
+        session_type="direct",
+        group_id=None,
         source_channel=source_channel,
         is_group=is_group,
+        deleted_at=None,
     )
 
     resolved = await handler._resolve_chat_session(RecordingDB([session]), requested_user_id)
 
     assert resolved is None
-    assert websocket.sent == [{"type": "error", "content": "Not authorized for this session"}]
-    assert websocket.close_code == 4003
+    assert websocket.sent == [
+        {
+            "type": "error",
+            "content": "Not authorized for this session",
+            "code": "chat_session_scope_mismatch",
+        }
+    ]
+    assert websocket.close_code == 4002
 
 
 @pytest.mark.asyncio
@@ -300,12 +334,18 @@ async def test_websocket_accepts_owners_private_web_session():
     user_id = uuid.uuid4()
     session_id = uuid.uuid4()
     handler = WebSocketChatHandler(websocket, agent_id, "token", str(session_id))
+    tenant_id = uuid.uuid4()
+    handler.agent = SimpleNamespace(id=agent_id, tenant_id=tenant_id)
     session = SimpleNamespace(
         id=session_id,
+        tenant_id=tenant_id,
         agent_id=agent_id,
         user_id=user_id,
+        session_type="direct",
+        group_id=None,
         source_channel="web",
         is_group=False,
+        deleted_at=None,
         model_tier="ultra",
         model_modality="image",
     )

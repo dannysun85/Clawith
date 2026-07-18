@@ -28,6 +28,11 @@ SYNC_IS_DEFAULT_TOOL_NAMES = {
     "generate_music_minimax",
     "generate_video_minimax",
     "check_video_minimax",
+    # v1.11 removed AI social posting from Plaza. Sync historical rows back to
+    # non-default while preserving them for assignment/audit compatibility.
+    "plaza_get_new_posts",
+    "plaza_create_post",
+    "plaza_add_comment",
     # Code execution is granted explicitly per tenant and per agent. Older
     # deployments seeded the local executor as a default tool.
     "execute_code",

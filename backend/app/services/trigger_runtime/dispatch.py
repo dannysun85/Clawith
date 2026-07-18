@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import uuid
 from datetime import datetime
+import uuid
 
 from app.database import async_session
 from app.models.trigger import AgentTrigger

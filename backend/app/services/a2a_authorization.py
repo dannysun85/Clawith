@@ -58,21 +58,24 @@ async def ensure_private_a2a_session(
     target_id = _uuid(target_agent.id, "target Agent")
     if source_id == target_id:
         raise A2AAuthorizationError("A2A source and target must differ")
+    tenant_id = source_agent.tenant_id
+    if tenant_id is None or tenant_id != target_agent.tenant_id:
+        raise A2AAuthorizationError("A2A Agents are not in one tenant")
     session_agent_id = min(source_id, target_id, key=str)
     session_peer_id = max(source_id, target_id, key=str)
     query = select(ChatSession).where(
+        ChatSession.tenant_id == tenant_id,
+        ChatSession.session_type == "a2a",
         ChatSession.agent_id == session_agent_id,
         ChatSession.peer_agent_id == session_peer_id,
         ChatSession.user_id == owner_id,
         ChatSession.source_channel == "agent",
+        ChatSession.deleted_at.is_(None),
     )
 
     bind = db.get_bind()
     if bind is not None and bind.dialect.name == "postgresql":
-        lock_key = (
-            "clawith:a2a-session:v1:"
-            f"{session_agent_id}:{session_peer_id}:{owner_id}"
-        )
+        lock_key = f"clawith:a2a-session:v1:{session_agent_id}:{session_peer_id}:{owner_id}"
         await db.execute(
             text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
             {"lock_key": lock_key},
@@ -83,12 +86,19 @@ async def ensure_private_a2a_session(
         return session
 
     candidate = ChatSession(
+        tenant_id=tenant_id,
+        session_type="a2a",
+        group_id=None,
         agent_id=session_agent_id,
         peer_agent_id=session_peer_id,
         user_id=owner_id,
+        created_by_participant_id=participant_id,
         title=f"{source_agent.name} ↔ {target_agent.name}",
         source_channel="agent",
+        is_group=False,
         participant_id=participant_id,
+        is_primary=False,
+        deleted_at=None,
     )
     try:
         async with db.begin_nested():
@@ -184,10 +194,7 @@ async def validate_active_a2a_lane(
         source_agent = agents.get(source_id)
         target_agent = agents.get(target_id)
         owner_result = await db.execute(
-            select(User)
-            .where(User.id == owner_id)
-            .execution_options(populate_existing=True)
-            .with_for_update(read=True)
+            select(User).where(User.id == owner_id).execution_options(populate_existing=True).with_for_update(read=True)
         )
         if owner_result.scalar_one_or_none() is None:
             raise A2AAuthorizationError("A2A owner is unavailable")
@@ -202,30 +209,27 @@ async def validate_active_a2a_lane(
     ):
         raise A2AAuthorizationError("A2A Agents are not in one tenant")
     if any(
-        getattr(agent, "status", None) in {"stopped", "paused", "error"}
-        or is_agent_expired(agent)
+        getattr(agent, "status", None) in {"stopped", "paused", "error"} or is_agent_expired(agent)
         for agent in (source_agent, target_agent)
     ):
         raise A2AAuthorizationError("A2A Agent is unavailable")
     tenant_query = select(Tenant).where(Tenant.id == source_agent.tenant_id)
     if lock_relationship:
-        tenant_query = tenant_query.execution_options(
-            populate_existing=True
-        ).with_for_update(read=True)
+        tenant_query = tenant_query.execution_options(populate_existing=True).with_for_update(read=True)
     tenant = (await db.execute(tenant_query)).scalar_one_or_none()
     if tenant is None or not tenant.is_active:
         raise A2AAuthorizationError("A2A company is inactive")
 
     session_query = select(ChatSession).where(ChatSession.id == parsed_session_id)
     if lock_relationship:
-        session_query = session_query.execution_options(
-            populate_existing=True
-        ).with_for_update(read=True)
+        session_query = session_query.execution_options(populate_existing=True).with_for_update(read=True)
     session = (await db.execute(session_query)).scalar_one_or_none()
     canonical_agent_id = min(source_id, target_id, key=str)
     canonical_peer_id = max(source_id, target_id, key=str)
     if (
         session is None
+        or session.tenant_id != source_agent.tenant_id
+        or session.session_type != "a2a"
         or session.source_channel != "agent"
         or session.user_id != owner_id
         or session.agent_id != canonical_agent_id
@@ -243,9 +247,7 @@ async def validate_active_a2a_lane(
         AgentAgentRelationship.target_agent_id == target_id,
     )
     if lock_relationship:
-        relationship_query = relationship_query.execution_options(
-            populate_existing=True
-        ).with_for_update(read=True)
+        relationship_query = relationship_query.execution_options(populate_existing=True).with_for_update(read=True)
     relationship_result = await db.execute(relationship_query)
     relationships = list(relationship_result.scalars().all())
     if len(relationships) != 1:

@@ -15,10 +15,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db, async_session
 from app.core.permissions import (
+    can_auto_contact_company_agent,
     evaluate_agent_relationship_status,
     evaluate_human_relationship_status,
     get_agent_access_level_for_user_id,
     is_agent_expired,
+)
+from app.services.agent_runtime.a2a_runtime import (
+    A2ARuntimeError,
+    complete_gateway_a2a_runtime,
+    enqueue_gateway_a2a_runtime,
 )
 from app.models.agent import Agent
 from app.models.gateway_message import GatewayMessage
@@ -26,7 +32,6 @@ from app.models.user import User
 from app.models.tenant import Tenant
 from app.services.a2a_authorization import (
     A2AAuthorizationError,
-    build_a2a_tool_authorization_context,
     ensure_private_a2a_session,
     validate_active_a2a_lane,
 )
@@ -445,13 +450,13 @@ async def poll_messages(
             history=history,
         ))
 
-    # Fetch agent relationships for context
+    # Fetch legacy relationships for the gateway compatibility payload
     from app.models.org import AgentRelationship, AgentAgentRelationship
     from sqlalchemy.orm import selectinload
 
     rel_items = []
 
-    # Human relationships (with available channels)
+    # Legacy human relationships (with available channels)
     h_result = await db.execute(
         select(AgentRelationship)
         .where(AgentRelationship.agent_id == agent.id)
@@ -473,12 +478,13 @@ async def poll_messages(
                 channels=channels,
             ))
 
-    # Agent-to-agent relationships
+    # Legacy agent-to-agent relationships
     a_result = await db.execute(
         select(AgentAgentRelationship)
         .where(AgentAgentRelationship.agent_id == agent.id)
         .options(selectinload(AgentAgentRelationship.target_agent))
     )
+    related_agent_ids = set()
     for r in a_result.scalars().all():
         status_info = await evaluate_agent_relationship_status(
             db,
@@ -504,6 +510,28 @@ async def poll_messages(
                 type="agent",
                 role=r.relation,
                 description=r.description or None,
+                channels=["agent"],
+            ))
+
+    c_result = await db.execute(
+        select(Agent)
+        .where(
+            Agent.tenant_id == agent.tenant_id,
+            Agent.id != agent.id,
+            Agent.access_mode == "company",
+            Agent.status.in_(["running", "idle"]),
+        )
+        .order_by(Agent.name.asc(), Agent.created_at.asc())
+    )
+    for candidate in c_result.scalars().all():
+        if candidate.id in related_agent_ids:
+            continue
+        if can_auto_contact_company_agent(agent, candidate):
+            rel_items.append(GatewayRelationshipItem(
+                name=candidate.name,
+                type="agent",
+                role="company",
+                description=candidate.role_description or None,
                 channels=["agent"],
             ))
 
@@ -614,6 +642,17 @@ async def report_result(
             detail="Message delivery lease is stale or no longer active",
         )
 
+    if msg.status == "completed":
+        if msg.result != body.result:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "gateway_result_mismatch",
+                    "message": "Message already completed with a different result.",
+                },
+            )
+        return {"status": "ok"}
+
     msg.status = "completed"
     msg.result = body.result
     msg.delivery_lease_expires_at = None
@@ -634,6 +673,7 @@ async def report_result(
         participant = part_r.scalar_one_or_none()
         
         assistant_msg = ChatMessage(
+            id=uuid.uuid5(msg.id, "gateway-report-result"),
             agent_id=session.agent_id,
             user_id=msg.sender_user_id,
             role="assistant",
@@ -643,19 +683,35 @@ async def report_result(
         )
         db.add(assistant_msg)
 
-    # If the original message came from another Agent, enqueue its reply in
-    # the same transaction and retain the original directed authorization.
+    runtime_completion = None
     if body.result and msg.sender_agent_id:
-        gw_reply = GatewayMessage(
-            agent_id=msg.sender_agent_id,
-            sender_agent_id=agent.id,
-            sender_user_id=msg.sender_user_id,
-            authorization_source_agent_id=msg.authorization_source_agent_id,
-            content=body.result,
-            status="pending",
-            conversation_id=msg.conversation_id,
-        )
-        db.add(gw_reply)
+        try:
+            runtime_completion = await complete_gateway_a2a_runtime(
+                db,
+                gateway_message=msg,
+                target_agent=agent,
+                result=body.result,
+            )
+        except A2ARuntimeError as exc:
+            await db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail={"code": exc.code, "message": str(exc)},
+            ) from exc
+
+        # A missing Runtime receipt identifies an ordinary OpenClaw-to-
+        # OpenClaw conversation. Preserve its queue reply behavior.
+        if runtime_completion is None:
+            gw_reply = GatewayMessage(
+                agent_id=msg.sender_agent_id,
+                sender_agent_id=agent.id,
+                sender_user_id=msg.sender_user_id,
+                authorization_source_agent_id=msg.authorization_source_agent_id,
+                content=body.result,
+                status="pending",
+                conversation_id=msg.conversation_id,
+            )
+            db.add(gw_reply)
 
     await db.commit()
 
@@ -715,204 +771,6 @@ async def _ensure_gateway_a2a_session(
     )
 
 
-async def _send_to_agent_background(
-    source_agent_id: str,
-    source_agent_name: str,
-    target_agent_id: str,
-    target_agent_name: str,
-    target_role_description: str,
-    owner_user_id: str,
-    conversation_id: str,
-    content: str,
-):
-    """Background task: invoke target agent LLM and write reply to gateway_messages.
-    
-    Accepts plain values (not ORM objects) to avoid stale session references
-    since this runs after the request's DB session has closed.
-    """
-    logger.info(f"[Gateway] Background send started source={source_agent_id} target={target_agent_id}")
-    try:
-        from app.services.llm import call_llm, resolve_agent_model
-        from app.models.audit import ChatMessage
-
-        async with async_session() as db:
-            owner_id = uuid.UUID(str(owner_user_id))
-            lane = await validate_active_a2a_lane(
-                db,
-                source_agent_id=source_agent_id,
-                target_agent_id=target_agent_id,
-                owner_user_id=owner_id,
-                session_id=conversation_id,
-            )
-            target_agent = lane.target_agent
-
-            model, fallback_model, route_meta = await resolve_agent_model(target_agent)
-            model = model or fallback_model
-            if not model:
-                logger.warning(f"Target agent {target_agent_id} has no LLM model")
-                return
-            # Skip if model is disabled by admin
-            if not model.enabled:
-                logger.warning(f"Target agent {target_agent_id} model {model.model} is disabled, skipping")
-                return
-
-            session = lane.session
-            conv_id = str(session.id)
-
-            # Migrate any existing messages from the old gateway-only format.
-            old_conv_id = f"gw_agent_{source_agent_id}_{target_agent_id}"
-            from sqlalchemy import update
-            await db.execute(
-                update(ChatMessage)
-                .where(
-                    ChatMessage.conversation_id == old_conv_id,
-                    ChatMessage.user_id == owner_id,
-                )
-                .values(conversation_id=conv_id)
-            )
-            await db.commit()
-
-            # Update last_message_at
-            from datetime import datetime, timezone
-            session.last_message_at = datetime.now(timezone.utc)
-
-
-            # Agent-to-agent communication context (injected as prefix to user message
-            # since call_llm builds the full system prompt internally)
-            agent_comm_alert = (
-                "--- Agent-to-Agent Communication Alert ---\n"
-                f"You are receiving a direct message from another digital employee ({source_agent_name}). "
-                "CRITICAL INSTRUCTION: Your direct text reply will automatically be delivered back to them. "
-                "DO NOT use the `send_message_to_agent` tool to reply to this conversation. Just reply naturally in text.\n"
-                "If they are asking you to create or analyze a file, deliver the file using `send_file_to_agent` after writing it."
-            )
-
-            # Load recent conversation history for context
-            hist_result = await db.execute(
-                select(ChatMessage)
-                .where(ChatMessage.conversation_id == conv_id)
-                .order_by(ChatMessage.created_at.desc())
-                .limit(10)
-            )
-            hist_msgs = list(reversed(hist_result.scalars().all()))
-
-            from app.services.llm.utils import convert_chat_messages_to_llm_format as _conv
-            messages = _conv(hist_msgs)
-
-            # Add the new message with agent communication context
-            user_msg = f"{agent_comm_alert}\n\n[Message from agent: {source_agent_name}]\n{content}"
-            messages.append({"role": "user", "content": user_msg})
-
-            from app.models.participant import Participant
-            
-            # Lookup participants for both agents
-            src_part_r = await db.execute(select(Participant).where(Participant.type == "agent", Participant.ref_id == source_agent_id))
-            tgt_part_r = await db.execute(select(Participant).where(Participant.type == "agent", Participant.ref_id == target_agent_id))
-            src_participant = src_part_r.scalar_one_or_none()
-            tgt_participant = tgt_part_r.scalar_one_or_none()
-
-            write_lane = await validate_active_a2a_lane(
-                db,
-                source_agent_id=source_agent_id,
-                target_agent_id=target_agent_id,
-                owner_user_id=owner_id,
-                session_id=conv_id,
-                lock_relationship=True,
-            )
-            # Save user message to conversation
-            db.add(ChatMessage(
-                agent_id=write_lane.session.agent_id,
-                conversation_id=conv_id,
-                role="user",
-                content=user_msg,
-                user_id=owner_id,
-                participant_id=src_participant.id if src_participant else None,
-            ))
-            await db.commit()
-
-        # Short provider preflight; no database connection is retained across
-        # network/model latency. Each tool and final write has its own fresh,
-        # transaction-scoped authority fence.
-        async with async_session() as authorization_db:
-            await validate_active_a2a_lane(
-                authorization_db,
-                source_agent_id=source_agent_id,
-                target_agent_id=target_agent_id,
-                owner_user_id=owner_id,
-                session_id=conv_id,
-                lock_relationship=True,
-            )
-            await authorization_db.commit()
-        collected = []
-
-        async def on_chunk(text):
-            collected.append(text)
-
-        reply = await call_llm(
-            model=model,
-            messages=messages,
-            agent_name=target_agent_name,
-            role_description=target_role_description,
-            agent_id=target_agent_id,
-            user_id=owner_id,
-            session_id=conv_id,
-            on_chunk=on_chunk,
-            route_meta=route_meta,
-            tool_authorization_context=(
-                build_a2a_tool_authorization_context(
-                    source_agent_id=source_agent_id,
-                    target_agent_id=target_agent_id,
-                    owner_user_id=owner_id,
-                    session_id=conv_id,
-                )
-            ),
-        )
-        final_reply = reply or "".join(collected)
-
-        async with async_session() as db:
-            from app.models.participant import Participant
-            final_lane = await validate_active_a2a_lane(
-                db,
-                source_agent_id=source_agent_id,
-                target_agent_id=target_agent_id,
-                owner_user_id=owner_id,
-                session_id=conv_id,
-                lock_relationship=True,
-            )
-            tgt_part_r = await db.execute(select(Participant).where(Participant.type == "agent", Participant.ref_id == target_agent_id))
-            tgt_participant = tgt_part_r.scalar_one_or_none()
-            
-            db.add(ChatMessage(
-                agent_id=final_lane.session.agent_id,
-                conversation_id=conv_id,
-                role="assistant",
-                content=final_reply,
-                user_id=owner_id,
-                participant_id=tgt_participant.id if tgt_participant else None,
-            ))
-
-            # Write reply to gateway_messages for source (OpenClaw) to poll
-            gw_reply = GatewayMessage(
-                agent_id=source_agent_id,
-                sender_agent_id=target_agent_id,
-                sender_user_id=owner_id,
-                authorization_source_agent_id=source_agent_id,
-                content=final_reply,
-                status="pending",
-                conversation_id=conv_id,
-            )
-            db.add(gw_reply)
-            await db.commit()
-
-        logger.info(f"[Gateway] Background send completed source={source_agent_id} target={target_agent_id}")
-
-    except Exception as e:
-        logger.error(
-            "[Gateway] send_to_agent_background failed error_type={}",
-            type(e).__name__,
-        )
-
-
 @router.post("/send-message")
 async def send_message(
     body: GatewaySendMessageRequest,
@@ -936,9 +794,23 @@ async def send_message(
     content = body.content.strip()
     channel_hint = (body.channel or "").strip().lower()
 
-    # 1. Try to find target as another Agent, limited to active relationships.
+    # 1. Try to find target as another Agent.
     from app.models.org import AgentAgentRelationship
     from sqlalchemy.orm import selectinload
+
+    target_agent = None
+    if not channel_hint or channel_hint == "agent":
+        company_result = await db.execute(
+            select(Agent).where(
+                Agent.name == target_name,
+                Agent.tenant_id == agent.tenant_id,
+                Agent.id != agent.id,
+                Agent.access_mode == "company",
+            )
+        )
+        company_candidate = company_result.scalars().first()
+        if company_candidate and can_auto_contact_company_agent(agent, company_candidate):
+            target_agent = company_candidate
 
     rel_result = await db.execute(
         select(AgentAgentRelationship)
@@ -971,7 +843,8 @@ async def send_message(
             status_code=409,
             detail="Agent target name is ambiguous; use a unique relationship name",
         )
-    target_agent = exact_agent_matches[0] if exact_agent_matches else None
+    if exact_agent_matches:
+        target_agent = exact_agent_matches[0]
 
     logger.info(
         "[Gateway] send_message target_found={} target_agent={} agent_type={} channel_hint_present={}",
@@ -982,6 +855,40 @@ async def send_message(
     )
 
     if target_agent and (not channel_hint or channel_hint == "agent"):
+        if getattr(target_agent, "agent_type", None) != "openclaw":
+            try:
+                intake = await enqueue_gateway_a2a_runtime(
+                    db,
+                    source_agent=agent,
+                    target_agent=target_agent,
+                    content=content,
+                    message_id=body.message_id,
+                )
+            except A2ARuntimeError as exc:
+                await db.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": exc.code, "message": str(exc)},
+                ) from exc
+            if intake is None:
+                await db.rollback()
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "runtime_disabled",
+                        "message": "Durable Runtime is not enabled for native A2A.",
+                    },
+                )
+            await db.commit()
+            return {
+                "status": "accepted",
+                "target": target_agent.name,
+                "type": "agent",
+                "message": f"Message sent to {target_agent.name}. Reply will appear in your next poll.",
+                "message_id": str(intake.gateway_message_id),
+                "run_id": str(intake.target_run_id),
+            }
+
         chat_session = await _ensure_gateway_a2a_session(
             db,
             source_agent=agent,
@@ -1077,39 +984,8 @@ async def send_message(
                 "type": "openclaw_agent",
                 "message": f"Message sent to {target_agent.name}. Reply will appear in your next poll.",
             }
-        else:
-            # Native Agent: source history and durable execution are committed
-            # atomically. A failed enqueue therefore cannot leave a visible
-            # half-delivery, and a caller-supplied key makes retries safe.
-            from app.services.trigger_daemon import (
-                enqueue_agent_wake_with_context,
-            )
 
-            accepted = await enqueue_agent_wake_with_context(
-                db,
-                target_agent.id,
-                f"[From {agent.name}] {content}",
-                from_agent_id=agent.id,
-                a2a_session_id=conv_id,
-                message_kind="notify",
-                idempotency_key=(
-                    f"gateway-a2a:{source_message_id}"
-                ),
-                source_message_id=source_message_id,
-            )
-            if not accepted:
-                raise HTTPException(
-                    status_code=503,
-                    detail="Native Agent delivery could not be queued",
-                )
-            return {
-                "status": "accepted",
-                "target": target_agent.name,
-                "type": "agent",
-                "message": f"Message sent to {target_agent.name}. Reply will appear in your next poll.",
-            }
-
-    # 2. Try to find target as a human (via relationships)
+    # 2. Try to find target as a human via the legacy gateway directory payload
     from app.models.org import AgentRelationship
     from sqlalchemy.orm import selectinload
 
@@ -1141,7 +1017,7 @@ async def send_message(
         await db.commit()
         raise HTTPException(
             status_code=404,
-            detail=f"Target '{target_name}' not found. Check your relationships list."
+            detail=f"Target '{target_name}' not found. Check the gateway directory payload returned by poll."
         )
 
     # A direct provider call cannot make retries idempotent: a timeout can mean
@@ -1165,6 +1041,7 @@ async def get_setup_guide(
     agent_id: uuid.UUID,
     request: Request,
     x_api_key: str = Header(..., alias="X-Api-Key"),
+    accept_language: str | None = Header(None, alias="Accept-Language"),
     db: AsyncSession = Depends(get_db),
 ):
     """Return the pre-filled Skill file and Heartbeat instruction for this agent."""
@@ -1176,8 +1053,64 @@ async def get_setup_guide(
     from app.services.platform_service import platform_service
 
     base_url = await platform_service.get_public_base_url(db, request)
+    is_zh = (
+        accept_language.lower().startswith("zh")
+        if isinstance(accept_language, str)
+        else False
+    )
 
-    skill_content = f"""---
+    skill_content = f"""请在 OpenClaw Agent 中创建技能文件 skills/clawith_sync.md，内容如下；然后把「使用 clawith_sync 技能检查 Clawith inbox 并处理待办消息」加入 HEARTBEAT.md：
+
+---
+name: clawith_sync
+description: Sync with Clawith platform — check inbox, submit results, and send messages.
+---
+
+# Clawith Sync
+
+## 使用场景
+在每次 heartbeat 时检查 Clawith 平台是否有新消息。
+你也可以主动给 gateway 通讯录 payload 中返回的精确目标发送消息。
+
+## 操作说明
+
+### 1. 检查 inbox
+发起 HTTP GET 请求：
+- URL: {base_url}/api/gateway/poll
+- Header: X-Api-Key: {x_api_key}
+
+响应中包含 messages 数组。每条消息包括：
+- id：消息 ID，回报结果时使用
+- content：消息内容
+- sender_user_name：发送消息的 Clawith 用户名
+- sender_user_id：发送者 ID
+- conversation_id：消息所属会话
+- history：该会话的历史消息，用于理解上下文
+
+为了兼容旧协议，响应中还包含 relationships 数组。请把它当作 gateway 通讯录 payload，用其中的精确 name 作为发送目标：
+- name：人或 Agent 的名称
+- type："human" 或 "agent"
+- role：旧关系标签，不要把它当作访问规则
+- channels：可用通信渠道，例如 ["feishu"] 或 ["agent"]
+
+重要：回复前先阅读 history 理解上下文。不同 sender_user_name 代表不同用户，请按对应用户回复。
+
+### 2. 回报处理结果
+每处理完一条消息，发起 HTTP POST 请求：
+- URL: {base_url}/api/gateway/report
+- Header: X-Api-Key: {x_api_key}
+- Header: Content-Type: application/json
+- Body: {{"message_id": "<messages 中的 id>", "result": "<你的回复>"}}
+
+### 3. 主动发送消息
+如果需要主动联系某个人或 Agent，发起 HTTP POST 请求：
+- URL: {base_url}/api/gateway/send-message
+- Header: X-Api-Key: {x_api_key}
+- Header: Content-Type: application/json
+- Body: {{"target": "<gateway 通讯录 payload 中的精确 name>", "content": "<消息内容>"}}
+
+系统会自动选择合适渠道。发给 Agent 时，回复会出现在下一次 poll 中；发给人类成员时，会通过可用渠道投递，例如飞书。
+""" if is_zh else f"""---
 name: clawith_sync
 description: Sync with Astra platform — check inbox, submit results, and send messages.
 ---
@@ -1204,10 +1137,10 @@ The response contains a `messages` array. Each message includes:
 - `conversation_id` — the conversation this message belongs to
 - `history` — array of previous messages in this conversation for context
 
-The response also contains a `relationships` array describing your colleagues:
+For compatibility, the response also contains a `relationships` array. Treat it as a gateway directory payload for exact target names:
 - `name` — the person or agent name
 - `type` — "human" or "agent"
-- `role` — relationship type (e.g. collaborator, supervisor)
+- `role` — legacy relationship label; do not use it as an access rule
 - `channels` — available communication channels (e.g. ["feishu"], ["agent"])
 
 **IMPORTANT**: Use the `history` array to understand conversation context before replying.
@@ -1225,7 +1158,7 @@ To proactively contact a person or agent, make an HTTP POST request:
 - URL: {base_url}/api/gateway/send-message
 - Header: X-Api-Key: {x_api_key}
 - Header: Content-Type: application/json
-- Body: {{"target": "<name of person or agent>", "content": "<your message>"}}
+- Body: {{"target": "<exact name from the gateway directory payload>", "content": "<your message>"}}
 
 The system auto-detects the best channel. For agents, the reply appears in your next poll.
 For humans, the message is delivered via their available channel (e.g. Feishu).

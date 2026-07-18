@@ -78,16 +78,26 @@ def test_external_channels_forward_routed_model_metadata():
     checked = 0
     for relative_path in CHANNEL_FILES:
         arg_counts = _load_llm_call_positional_arg_counts(backend_root / relative_path)
-        checked += len(arg_counts)
-        assert arg_counts, f"No routed LLM call found in {relative_path}"
-        assert min(arg_counts) >= 6, f"{relative_path} drops routed model metadata"
+        called_functions = _load_called_function_names(backend_root / relative_path)
+        checked += 1
+        if arg_counts:
+            assert min(arg_counts) >= 6, f"{relative_path} drops routed model metadata"
+        else:
+            # v1.11 channel adapters hand the resolved model to Durable Runtime;
+            # the Runtime snapshot then carries the tier/modality to the model
+            # step.  Requiring a legacy direct LLM call here would defeat that
+            # architecture and risk executing a message twice.
+            assert "enqueue_channel_chat_runtime" in called_functions, (
+                f"No routed Runtime or LLM call found in {relative_path}"
+            )
     assert checked >= len(CHANNEL_FILES)
 
 
-def test_wechat_history_converts_internal_tool_call_records():
+def test_wechat_uses_durable_runtime_instead_of_a_second_history_loop():
     backend_root = Path(__file__).parents[1]
     called_functions = _load_called_function_names(
         backend_root / "app/services/wechat_channel.py"
     )
 
-    assert "convert_chat_messages_to_llm_format" in called_functions
+    assert "enqueue_channel_chat_runtime" in called_functions
+    assert "convert_chat_messages_to_llm_format" not in called_functions

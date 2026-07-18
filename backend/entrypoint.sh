@@ -62,6 +62,10 @@ if role_contains "bootstrap"; then
     else
         echo "[entrypoint] Alembic migrations completed successfully."
     fi
+
+    echo "[entrypoint] Step 1b: Installing LangGraph checkpoint schema..."
+    python -m app.scripts.setup_langgraph_checkpoints
+    echo "[entrypoint] LangGraph checkpoint schema is ready."
 else
     echo "[entrypoint] Step 1: Skipping alembic for PROCESS_ROLE=${PROCESS_ROLE}"
 fi

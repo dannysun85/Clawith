@@ -33,6 +33,10 @@ class _DB:
     async def execute(self, _statement):
         return _Result(next(self.values))
 
+    @asynccontextmanager
+    async def begin(self):
+        yield self
+
     def add(self, value):
         self.added.append(value)
 

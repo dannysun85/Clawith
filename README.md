@@ -166,6 +166,11 @@ Agent workspace files (soul.md, memory, skills, workspace files) are stored in `
 
 The first user to register automatically becomes the **platform admin**. Open the app, click "Register", and create your account.
 
+Local installations without SMTP must explicitly set
+`ENVIRONMENT=development` and `ALLOW_UNVERIFIED_LOCAL_SIGNUP=true` in `.env`
+before registration. This override is ignored in `production`/`prod`; production
+password registration still requires a deliverable system email configuration.
+
 ### System Email and Password Reset
 
 Clawith can send platform-owned emails for password reset, email verification, and optional broadcast delivery.

@@ -324,7 +324,6 @@ async def list_templates(
             "default_skills": t.default_skills,
             "default_autonomy_policy": t.default_autonomy_policy,
             "capability_bullets": t.capability_bullets or [],
-            "has_bootstrap": bool(t.bootstrap_content),
         }
         for t in templates
     ]
@@ -1576,6 +1575,36 @@ async def delete_agent(
                 {"aid": agent_id},
             )
 
+            # Preserve conversation and Group history as tombstones.  Agent
+            # deletion removes future routing authority, not the user's
+            # historical messages or collaboration audit trail.
+            await db.execute(
+                text("UPDATE chat_messages SET agent_id = NULL WHERE agent_id = :aid"),
+                {"aid": agent_id},
+            )
+            await db.execute(
+                text(
+                    "UPDATE chat_sessions SET agent_id = NULL, is_primary = false, "
+                    "deleted_at = COALESCE(deleted_at, now()) WHERE agent_id = :aid"
+                ),
+                {"aid": agent_id},
+            )
+            await db.execute(
+                text(
+                    "UPDATE chat_sessions SET peer_agent_id = NULL, is_primary = false, "
+                    "deleted_at = COALESCE(deleted_at, now()) WHERE peer_agent_id = :aid"
+                ),
+                {"aid": agent_id},
+            )
+            await db.execute(
+                text(
+                    "UPDATE group_members SET removed_at = COALESCE(removed_at, now()) "
+                    "WHERE participant_id IN (SELECT id FROM participants "
+                    "WHERE type = 'agent' AND ref_id = :aid)"
+                ),
+                {"aid": agent_id},
+            )
+
             # A2A sessions are canonicalized on the lower Agent UUID.  Deleting
             # the peer must retire the entire conversation and every queued
             # Gateway delivery before either session or participant is removed.
@@ -1620,10 +1649,6 @@ async def delete_agent(
                 {"aid": agent_id},
             )
             await db.execute(text("DELETE FROM plaza_posts WHERE author_id = :aid"), {"aid": str(agent_id)})
-            await db.execute(
-                text("DELETE FROM participants WHERE type = 'agent' AND ref_id = :aid"),
-                {"aid": agent_id},
-            )
             await db.delete(locked_agent)
             await db.commit()
     except HTTPException:

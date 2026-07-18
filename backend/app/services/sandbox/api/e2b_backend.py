@@ -124,13 +124,16 @@ class E2bBackend(BaseSandboxBackend):
                     _build_e2b_command(e2b_language, code)
                 )
 
+            exit_code = result.exit_code
+            if not isinstance(exit_code, int):
+                raise RuntimeError("E2B response did not include an exit code")
             duration_ms = int((time.time() - start_time) * 1000)
 
             return ExecutionResult(
-                success=result.exit_code == 0,
+                success=exit_code == 0,
                 stdout=result.stdout or "",
                 stderr=result.stderr or "",
-                exit_code=result.exit_code or 0,
+                exit_code=exit_code,
                 duration_ms=duration_ms,
                 error=None
             )
@@ -140,15 +143,29 @@ class E2bBackend(BaseSandboxBackend):
             error_msg = str(e)
             logger.exception("[E2B] Execution error")
 
-            # Handle timeout
-            if "timeout" in error_msg.lower():
+            # A timeout may happen after the remote command was accepted.  Its
+            # outcome is therefore unknown, not a confirmed failure, and must
+            # remain visible to Durable Runtime so it is never retried locally.
+            if isinstance(e, TimeoutError) or "timeout" in error_msg.lower():
+                raise
+            response = getattr(e, "response", None)
+            status_code = getattr(e, "status_code", None) or getattr(
+                response,
+                "status_code",
+                None,
+            )
+            if (
+                isinstance(status_code, int)
+                and 400 <= status_code < 500
+                and status_code != 408
+            ):
                 return ExecutionResult(
                     success=False,
                     stdout="",
                     stderr="",
-                    exit_code=124,
+                    exit_code=1,
                     duration_ms=duration_ms,
-                    error=f"Code execution timed out after {timeout}s"
+                    error=f"E2B rejected the request (HTTP {status_code})",
                 )
 
             return ExecutionResult(

@@ -15,14 +15,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.core.permissions import check_agent_access, is_agent_creator
 from app.core.security import get_current_user
-from app.database import async_session as _async_session, get_db
+from app.database import get_db
 from app.models.agent import Agent as AgentModel
-from app.models.audit import ChatMessage
 from app.models.channel_config import ChannelConfig
 from app.models.user import User
 from app.schemas.schemas import ChannelConfigOut
+from app.services.agent_runtime.channel_chat import (
+    channel_message_id,
+    enqueue_channel_chat_runtime,
+)
 from app.services.channel_session import find_or_create_channel_session
-from app.api.feishu import _call_llm_with_config, _load_agent_and_model
+from app.api.feishu import _load_agent_and_model
 
 settings = get_settings()
 
@@ -406,7 +409,9 @@ async def teams_event_webhook(
         service_url = activity.get("serviceUrl")
         if service_url:
             if config.extra_config.get("service_url") != service_url:
-                config.extra_config["service_url"] = service_url
+                updated_extra_config = dict(config.extra_config or {})
+                updated_extra_config["service_url"] = service_url
+                config.extra_config = updated_extra_config
                 config.is_connected = True
                 await db.flush()
                 await db.commit()
@@ -458,8 +463,8 @@ async def teams_event_webhook(
         # Load agent (must happen before user resolution for tenant_id)
         agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
         agent_obj = agent_r.scalar_one_or_none()
-        from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
-        ctx_size = (agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE) if agent_obj else DEFAULT_CONTEXT_WINDOW_SIZE
+        if agent_obj is None:
+            return Response(status_code=404)
 
         # Find-or-create platform user for this Teams sender via unified service
         from app.services.channel_user_service import channel_user_service
@@ -492,99 +497,31 @@ async def teams_event_webhook(
             first_message_title=user_text,
             is_group=_is_group_teams,
             group_name=activity.get("conversation", {}).get("name") or (f"Teams Group {conversation_id[:8]}" if _is_group_teams else None),
+            created_by_user_id=platform_user_id,
         )
-        session_conv_id = str(sess.id)
-        history_r = await db.execute(
-            select(ChatMessage)
-            .where(ChatMessage.agent_id == agent_id, ChatMessage.conversation_id == session_conv_id)
-            .order_by(ChatMessage.created_at.desc())
-            .limit(ctx_size)
+        _, model, _, _ = await _load_agent_and_model(db, agent_id)
+        await enqueue_channel_chat_runtime(
+            db,
+            agent=agent_obj,
+            user=platform_user,
+            session=sess,
+            model=model,
+            content=user_text,
+            source_channel="microsoft_teams",
+            channel_delivery_target={
+                "conversation_id": conversation_id,
+                "reply_to_id": reply_to_id,
+                "bot_account": dict(activity.get("recipient") or {}),
+                "recipient": dict(activity.get("from") or {}),
+            },
+            message_id=channel_message_id(
+                agent_id,
+                "microsoft_teams",
+                activity_id,
+            ),
         )
-        from app.services.llm.utils import convert_chat_messages_to_llm_format as _conv
-        history = _conv(reversed(history_r.scalars().all()))
-
-        # Save user message
-        db.add(ChatMessage(agent_id=agent_id, user_id=platform_user_id, role="user", content=user_text, conversation_id=session_conv_id))
-        sess.last_message_at = datetime.now(timezone.utc)
-
-        # Pre-load agent/model for LLM call before releasing DB connection
-        _agent_model, _llm_model, _fallback_model, _route_meta = await _load_agent_and_model(db, agent_id)
-
         await db.commit()
-        # ── Phase 1 complete: release connection before slow LLM call ──
         await db.close()
-
-        # Call LLM (no DB session needed)
-        try:
-            reply_text = await _call_llm_with_config(
-                _agent_model, _llm_model, _fallback_model, _route_meta,
-                agent_id,
-                user_text,
-                history=history,
-                user_id=platform_user_id,
-                session_id=session_conv_id,
-            )
-            logger.info(
-                "Teams: LLM reply generated agent={} reply_chars={}",
-                agent_id,
-                len(reply_text),
-            )
-        except Exception as e:
-            logger.exception(f"Teams: Failed to call LLM for agent {agent_id}: {e}")
-            reply_text = "Sorry, I encountered an error processing your message."
-        # Save reply (new short transaction)
-        try:
-            async with _async_session() as _save_db:
-                _save_db.add(ChatMessage(agent_id=agent_id, user_id=platform_user_id, role="assistant", content=reply_text, conversation_id=session_conv_id))
-                from app.models.chat_session import ChatSession
-                _sess_r = await _save_db.execute(
-                    select(ChatSession).where(ChatSession.id == uuid.UUID(session_conv_id))
-                )
-                _sess_fresh = _sess_r.scalar_one_or_none()
-                if _sess_fresh:
-                    _sess_fresh.last_message_at = datetime.now(timezone.utc)
-                await _save_db.commit()
-            logger.info(f"Teams: Saved reply to database for agent {agent_id}")
-        except Exception as e:
-            logger.exception(f"Teams: Failed to save reply to database: {e}")
-
-        # Send to Teams
-        use_managed_identity = config.extra_config.get("use_managed_identity", False)
-        has_credentials = (config.app_id and config.app_secret) or use_managed_identity
-        if has_credentials and conversation_id:
-            try:
-                # Get bot's channel account ID from the incoming activity's recipient field
-                # The recipient in the incoming message is the bot itself
-                bot_channel_account = activity.get("recipient", {})
-                if not bot_channel_account.get("id"):
-                    # Fallback: use app_id if recipient not available
-                    if config.app_id:
-                        bot_channel_account = {"id": config.app_id}
-                    else:
-                        logger.error("Teams: Cannot determine bot channel account ID - no recipient in activity and no app_id configured")
-                        raise ValueError("Cannot determine bot channel account ID")
-                
-                # Get the user (sender) from the incoming activity's from field
-                user_account = activity.get("from", {})
-                if not user_account.get("id"):
-                    user_account = {"id": sender_id, "name": sender_name}
-                
-                reply_activity = {
-                    "type": "message",
-                    "from": bot_channel_account,  # Required: Bot's channel account ID (from incoming activity's recipient)
-                    "conversation": {"id": conversation_id},
-                    "recipient": user_account,  # The user who sent the message (from incoming activity's from)
-                    "replyToId": reply_to_id,  # Reply to the specific incoming message
-                    "text": reply_text,
-                }
-                logger.info(f"Teams: Attempting to send reply for agent {agent_id}")
-                await _send_teams_message(config, conversation_id, reply_activity)
-                logger.info("Teams: Successfully sent reply to Teams")
-            except Exception as e:
-                logger.exception(f"Teams: Failed to send message to Teams: {e}")
-        else:
-            use_mi = config.extra_config.get("use_managed_identity", False)
-            logger.warning(f"Teams: Cannot send reply - missing credentials (managed_identity={use_mi}, app_id={bool(config.app_id)}, app_secret={bool(config.app_secret)}), conversation_id={bool(conversation_id)}")
 
         return {"ok": True}
     except Exception as e:

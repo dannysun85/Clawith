@@ -13,18 +13,26 @@ from app.services.trigger_runtime.executions import (
     renew_trigger_execution_leases,
 )
 from app.services.trigger_runtime.keys import build_scheduled_execution_key
+from app.services.trigger_runtime.intake import (
+    TriggerRuntimeIntakeError,
+    build_trigger_context,
+    enqueue_trigger_runtime,
+)
 from app.services.trigger_runtime.queue import enqueue_trigger_execution, enqueue_webhook_execution
 
 __all__ = [
     "build_execution_runtime_trigger",
+    "build_trigger_context",
     "build_scheduled_execution_key",
-    "claim_ready_trigger_invocations",
     "claim_pending_trigger_executions",
+    "claim_ready_trigger_invocations",
     "enqueue_due_trigger",
     "enqueue_trigger_execution",
+    "enqueue_trigger_runtime",
     "enqueue_webhook_execution",
     "mark_trigger_executions_completed",
     "mark_trigger_executions_failed",
     "renew_trigger_execution_leases",
     "runtime_execution_payload",
+    "TriggerRuntimeIntakeError",
 ]

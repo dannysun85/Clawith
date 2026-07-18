@@ -9,7 +9,7 @@ import asyncio
 import uuid
 from datetime import datetime, timezone, timedelta
 from loguru import logger
-from sqlalchemy import select, text, update
+from sqlalchemy import delete, select, text, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,6 +17,7 @@ from app.config import get_settings
 from app.core.logging_config import new_trace_id
 from app.database import async_session
 from app.models.agent import Agent
+from app.models.experience import ExperienceEntry
 from app.models.tenant import Tenant
 from app.models.trigger import AgentTrigger
 from app.models.trigger_execution import TriggerExecution
@@ -113,9 +114,6 @@ async def _quarantine_rate_limited_execution(
 
 def _cleanup_stale_invoke_cache():
     now = datetime.now(timezone.utc)
-    stale = [k for k, v in _last_invoke.items() if (now - v).total_seconds() > DEDUP_WINDOW * 2]
-    for k in stale:
-        del _last_invoke[k]
     # Clean up old on_message rate limiter entries
     cutoff = now - timedelta(seconds=_ON_MSG_RATE_WINDOW)
     stale_agents = []
@@ -125,6 +123,40 @@ def _cleanup_stale_invoke_cache():
             stale_agents.append(aid)
     for aid in stale_agents:
         del _on_msg_fire_log[aid]
+
+
+_RETIRED_EXPERIENCE_TTL_DAYS = 30
+_last_exp_purge_day = None  # date of the last purge; runs at most once per UTC day
+
+
+async def _purge_expired_retired_experiences():
+    """Hard-delete experience entries retired more than 30 days ago and not re-published.
+
+    Re-publishing clears `retired_at`, so only entries still sitting in the 已下架 bin
+    past the TTL are removed. experience_references cascade at the DB level. Runs once
+    per day off the daemon tick.
+    """
+    global _last_exp_purge_day
+    today = datetime.now(timezone.utc).date()
+    if _last_exp_purge_day == today:
+        return
+    _last_exp_purge_day = today
+    cutoff = datetime.now(timezone.utc) - timedelta(days=_RETIRED_EXPERIENCE_TTL_DAYS)
+    async with async_session() as db:
+        ids = (
+            await db.execute(
+                select(ExperienceEntry.id).where(
+                    ExperienceEntry.status == "retired",
+                    ExperienceEntry.retired_at.is_not(None),
+                    ExperienceEntry.retired_at < cutoff,
+                )
+            )
+        ).scalars().all()
+        if not ids:
+            return
+        await db.execute(delete(ExperienceEntry).where(ExperienceEntry.id.in_(ids)))
+        await db.commit()
+        logger.info(f"🧹 Purged {len(ids)} retired experience entries older than {_RETIRED_EXPERIENCE_TTL_DAYS}d")
 
 
 async def _should_skip_non_workday(trigger: AgentTrigger, local_now: datetime) -> bool:

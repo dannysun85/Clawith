@@ -11,7 +11,6 @@ import struct
 import time
 import uuid
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
 
 import asyncio
 import httpx
@@ -26,12 +25,13 @@ from app.core.permissions import check_agent_access, is_agent_creator
 from app.core.security import create_access_token, get_current_user, identity_auth_version
 from app.database import async_session, get_db, transaction
 from app.models.agent import Agent as AgentModel
-from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
-from app.models.audit import ChatMessage
 from app.models.channel_config import ChannelConfig
 from app.models.identity import IdentityProvider
 from app.models.user import User
-from app.services.activity_logger import log_activity
+from app.services.agent_runtime.channel_chat import (
+    channel_message_id,
+    enqueue_channel_chat_runtime,
+)
 from app.services.auth_provider import WeComAuthProvider
 from app.services.channel_session import find_or_create_channel_session
 from app.services.channel_user_service import channel_user_service
@@ -45,7 +45,7 @@ from app.services.sso_scan_session_service import (
     verify_sso_callback_initiator,
 )
 from app.services.platform_service import platform_service
-from app.services.wecom_service import normalize_wecom_agent_id, send_wecom_message
+from app.services.wecom_service import normalize_wecom_agent_id
 from app.schemas.schemas import ChannelConfigOut
 from app.services.wecom_stream import wecom_stream_manager
 
@@ -377,8 +377,7 @@ async def get_wecom_channel(
 
     config_out = ChannelConfigOut.model_validate(config)
     if (config.extra_config or {}).get("connection_mode") == "websocket":
-        from app.services import wecom_stream
-        config_out.is_connected = wecom_stream.wecom_stream_manager.status().get(str(agent_id), False)
+        config_out.is_connected = wecom_stream_manager.status().get(str(agent_id), False)
     else:
         config_out.is_connected = False
     return config_out
@@ -524,14 +523,9 @@ async def wecom_event_webhook(
     # Group chat ID — present when message comes from a WeCom group
     chat_id = msg_root.findtext("ChatId", "")
 
-    # Dedup
     dedup_key = msg_id if msg_id else token
     if dedup_key and dedup_key in _processed_wecom_events:
         return Response(content="success", media_type="text/plain")
-    if dedup_key:
-        _processed_wecom_events.add(dedup_key)
-        if len(_processed_wecom_events) > 1000:
-            _processed_wecom_events.clear()
 
     logger.info(
         "[WeCom] Message received type={} group={} message_id_present={}",
@@ -545,10 +539,21 @@ async def wecom_event_webhook(
         if not user_text:
             return Response(content="success", media_type="text/plain")
 
-        # Process in background task (manages its own sessions)
-        asyncio.create_task(
-            _process_wecom_text(agent_id, config, from_user, user_text, chat_id=chat_id)
-        )
+        try:
+            await _accept_wecom_text(
+                agent_id=agent_id,
+                from_user=from_user,
+                user_text=user_text,
+                chat_id=chat_id,
+                external_event_id=dedup_key or None,
+            )
+        except Exception as exc:
+            logger.exception(f"[WeCom] Runtime intake failed for agent {agent_id}: {exc}")
+            return Response(status_code=500, content="runtime intake failed")
+        if dedup_key:
+            _processed_wecom_events.add(dedup_key)
+            if len(_processed_wecom_events) > 1000:
+                _processed_wecom_events.clear()
 
     elif msg_type == "event":
         event = msg_root.findtext("Event", "")
@@ -628,16 +633,80 @@ async def _process_wecom_kf_event(agent_id: uuid.UUID, config_obj: ChannelConfig
                         text = msg.get("text", {}).get("content", "").strip()
                         if text:
                             logger.info(f"[WeCom KF] Found text message chars={len(text)}")
-                            # _process_wecom_text manages its own sessions internally
-                            await _process_wecom_text(
-                                agent_id, config,
-                                msg.get("external_userid"), text,
-                                is_kf=True, open_kfid=msg.get("open_kfid"), kf_msg_id=mid
+                            await _accept_wecom_text(
+                                agent_id=agent_id,
+                                from_user=msg.get("external_userid"),
+                                user_text=text,
+                                is_kf=True,
+                                open_kfid=msg.get("open_kfid"),
+                                external_event_id=mid,
                             )
                 if not has_more:
                     break
     except Exception as e:
         logger.error(f"[WeCom KF] Error in background task: {e}")
+
+
+async def _accept_wecom_text(
+    *,
+    agent_id: uuid.UUID,
+    from_user: str,
+    user_text: str,
+    chat_id: str = "",
+    is_kf: bool = False,
+    open_kfid: str | None = None,
+    external_event_id: str | None = None,
+) -> None:
+    """Persist one WeCom input and Runtime Command before provider acknowledgement."""
+    from app.api.feishu import _load_agent_and_model
+
+    async with async_session() as db:
+        agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
+        agent_obj = agent_r.scalar_one_or_none()
+        if not agent_obj:
+            raise RuntimeError(f"WeCom Agent {agent_id} not found")
+
+        is_group = bool(chat_id)
+        conv_id = f"wecom_group_{chat_id}" if is_group else f"wecom_p2p_{from_user}"
+        platform_user = await channel_user_service.resolve_channel_user(
+            db=db,
+            agent=agent_obj,
+            channel_type="wecom",
+            external_user_id=from_user,
+            extra_info={"unionid": from_user},
+        )
+        session = await find_or_create_channel_session(
+            db=db,
+            agent_id=agent_id,
+            user_id=agent_obj.creator_id if is_group else platform_user.id,
+            external_conv_id=conv_id,
+            source_channel="wecom",
+            first_message_title=user_text,
+            is_group=is_group,
+            group_name=f"WeCom Group {chat_id[:8]}" if is_group else None,
+            created_by_user_id=platform_user.id,
+        )
+        _, model, _, _ = await _load_agent_and_model(db, agent_id)
+        await enqueue_channel_chat_runtime(
+            db,
+            agent=agent_obj,
+            user=platform_user,
+            session=session,
+            model=model,
+            content=user_text,
+            source_channel="wecom",
+            channel_delivery_target={
+                "user_id": from_user,
+                "is_kf": is_kf,
+                "open_kfid": open_kfid,
+            },
+            message_id=channel_message_id(
+                agent_id,
+                "wecom",
+                external_event_id,
+            ),
+        )
+        await db.commit()
 
 
 async def _process_wecom_text(
@@ -650,12 +719,7 @@ async def _process_wecom_text(
     kf_msg_id: str = None,
     chat_id: str = "",
 ):
-    """Process an incoming WeCom text message and reply.
-
-    Manages its own short-lived database transactions.
-    """
-
-    standard_agent_id: int | None = None
+    """Compatibility ingress that delegates exactly once to Agent Runtime."""
     if not (is_kf and open_kfid):
         standard_agent_id = normalize_wecom_agent_id(
             (config.extra_config or {}).get("wecom_agent_id")
@@ -668,160 +732,15 @@ async def _process_wecom_text(
                 agent_id,
             )
             return
-
-    async with async_session() as db:
-        # Load agent
-        agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
-        agent_obj = agent_r.scalar_one_or_none()
-        if not agent_obj:
-            logger.warning(f"[WeCom] Agent {agent_id} not found")
-            return
-        creator_id = agent_obj.creator_id
-        ctx_size = (agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE) if agent_obj else DEFAULT_CONTEXT_WINDOW_SIZE
-
-        # Distinguish group chat from P2P by chat_id presence
-        _is_group = bool(chat_id)
-        if _is_group:
-            conv_id = f"wecom_group_{chat_id}"
-        else:
-            conv_id = f"wecom_p2p_{from_user}"
-
-        # The channel_user_service resolves display names from OrgMember records
-        # (populated by org-sync or enriched on first SSO login). No need to
-        # make an extra API call here — it fails with 48009 when IP is not whitelisted.
-        extra_info = {"unionid": from_user}
-
-        # Resolve channel user via unified service (uses OrgMember + SSO patterns)
-        platform_user = await channel_user_service.resolve_channel_user(
-            db=db,
-            agent=agent_obj,
-            channel_type="wecom",
-            external_user_id=from_user,
-            extra_info=extra_info,
-        )
-        platform_user_id = platform_user.id
-
-        # Find or create session
-        sess = await find_or_create_channel_session(
-            db=db,
-            agent_id=agent_id,
-            user_id=creator_id if _is_group else platform_user_id,
-            external_conv_id=conv_id,
-            source_channel="wecom",
-            first_message_title=user_text,
-            is_group=_is_group,
-            group_name=f"WeCom Group {chat_id[:8]}" if _is_group else None,
-        )
-        session_conv_id = str(sess.id)
-
-        # Load history
-        history_r = await db.execute(
-            select(ChatMessage)
-            .where(ChatMessage.agent_id == agent_id, ChatMessage.conversation_id == session_conv_id)
-            .order_by(ChatMessage.created_at.desc())
-            .limit(ctx_size)
-        )
-        from app.services.llm.utils import convert_chat_messages_to_llm_format as _conv
-        history = _conv(reversed(history_r.scalars().all()))
-
-        # Save user message
-        db.add(ChatMessage(
-            agent_id=agent_id, user_id=platform_user_id,
-            role="user", content=user_text,
-            conversation_id=session_conv_id,
-        ))
-        sess.last_message_at = datetime.now(timezone.utc)
-
-        # Pre-load agent/model for LLM call
-        from app.api.feishu import _load_agent_and_model
-        _agent_model, _llm_model, _fallback_model, _route_meta = await _load_agent_and_model(db, agent_id)
-
-        await db.commit()
-        # ── Phase 1 complete: release connection before slow LLM/HTTP work ──
-        await db.close()
-
-        # Call LLM (no DB session needed)
-        from app.api.feishu import _call_llm_with_config
-        reply_text = await _call_llm_with_config(
-            _agent_model, _llm_model, _fallback_model, _route_meta,
-            agent_id, user_text,
-            history=history, user_id=platform_user_id,
-            session_id=session_conv_id,
-        )
-        logger.info(
-            "[WeCom] LLM reply generated agent={} reply_chars={}",
-            agent_id,
-            len(reply_text),
-        )
-
-        # Send reply via WeCom API
-        try:
-            if is_kf and open_kfid:
-                async with httpx.AsyncClient(timeout=10) as client:
-                    tok_resp = await client.get(
-                        "https://qyapi.weixin.qq.com/cgi-bin/gettoken",
-                        params={"corpid": config.app_id, "corpsecret": config.app_secret},
-                    )
-                    access_token = tok_resp.json().get("access_token", "")
-                    if access_token:
-                        # For KF messages, bridge/trans state first, then use
-                        # the dedicated customer-service send endpoint.
-                        res_state = await client.post(
-                            f"https://qyapi.weixin.qq.com/cgi-bin/kf/service_state/trans?access_token={access_token}",
-                            json={"open_kfid": open_kfid, "external_userid": from_user, "service_state": 1}
-                        )
-                        logger.info(f"[WeCom KF] Transition response status={res_state.status_code}")
-                        res_send = await client.post(
-                            f"https://qyapi.weixin.qq.com/cgi-bin/kf/send_msg?access_token={access_token}",
-                            json={"touser": from_user, "open_kfid": open_kfid, "msgtype": "text", "text": {"content": reply_text}}
-                        )
-                        logger.info(f"[WeCom KF] Send response status={res_send.status_code}")
-            else:
-                send_result = await send_wecom_message(
-                    config.app_id,
-                    config.app_secret,
-                    from_user,
-                    reply_text,
-                    agent_id=standard_agent_id,
-                )
-                if send_result.get("errcode") != 0:
-                    logger.error(
-                        "[WeCom] Failed to send reply error_code={}",
-                        send_result.get("errcode", "unknown"),
-                    )
-        except Exception as exc:
-            logger.error(
-                "[WeCom] Failed to send reply error_type={}",
-                type(exc).__name__,
-            )
-
-        # Save assistant reply (new short transaction)
-        async with async_session() as _save_db:
-            _save_db.add(ChatMessage(
-                agent_id=agent_id, user_id=platform_user_id,
-                role="assistant", content=reply_text,
-                conversation_id=session_conv_id,
-            ))
-            # Reload session object to update last_message_at
-            from app.models.chat_session import ChatSession
-            _sess_r = await _save_db.execute(
-                select(ChatSession).where(ChatSession.id == uuid.UUID(session_conv_id))
-            )
-            _sess_fresh = _sess_r.scalar_one_or_none()
-            if _sess_fresh:
-                _sess_fresh.last_message_at = datetime.now(timezone.utc)
-            await _save_db.commit()
-
-        # Log activity
-        await log_activity(
-            agent_id, "chat_reply",
-            "Replied to WeCom message",
-            detail={
-                "channel": "wecom",
-                "request_chars": len(user_text),
-                "reply_chars": len(reply_text),
-            },
-        )
+    await _accept_wecom_text(
+        agent_id=agent_id,
+        from_user=from_user,
+        user_text=user_text,
+        chat_id=chat_id,
+        is_kf=is_kf,
+        open_kfid=open_kfid,
+        external_event_id=kf_msg_id,
+    )
 
 
 # ─── OAuth Callback (SSO) ──────────────────────────────

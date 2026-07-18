@@ -74,6 +74,22 @@ type TenantSummary = {
     credits_balance: number;
 };
 
+type RuntimeModelCandidate = {
+    id: string;
+    label: string;
+    provider: string;
+    model: string;
+};
+
+type RuntimeModelSettings = {
+    tenant_id: string;
+    planning_model_id: string | null;
+    compact_model_id: string | null;
+    planning_source: 'database' | 'environment';
+    compact_source: 'database' | 'environment';
+    candidates: RuntimeModelCandidate[];
+};
+
 type Plan = {
     id: string;
     code: string;
@@ -202,6 +218,7 @@ function ModelRoutesTab() {
             <div className="card" style={{ marginBottom: 16, padding: 14, color: 'var(--text-secondary)', fontSize: 12, lineHeight: 1.7 }}>
                 这里配置对话输入理解路由：text、image、video。语音、音乐以及图片/视频“生成模型”请到“媒体路由”配置；系统会拒绝把不支持该输入类型的模型绑定到对应路由。
             </div>
+            <RuntimeModelSettingsCard />
             <div className="card" style={{ marginBottom: 16, display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 10, alignItems: 'end' }}>
                 <Field label="Tier">
                     <select className="form-input" value={form.saas_tier} onChange={(e) => setForm({ ...form, saas_tier: e.target.value })}>
@@ -251,6 +268,145 @@ function ModelRoutesTab() {
                     );
                 }}
             />
+        </div>
+    );
+}
+
+function RuntimeModelSettingsCard() {
+    const qc = useQueryClient();
+    const [selectedTenantId, setSelectedTenantId] = useState(
+        () => localStorage.getItem('current_tenant_id') || '',
+    );
+    const [form, setForm] = useState({ planning_model_id: '', compact_model_id: '' });
+
+    const { data: tenants = [], isLoading: tenantsLoading } = useQuery({
+        queryKey: ['saas-tenants-runtime-models'],
+        queryFn: () => fetchJson<TenantSummary[]>('/saas/tenants'),
+    });
+
+    useEffect(() => {
+        if (tenants.length === 0) return;
+        if (!tenants.some((tenant) => tenant.tenant_id === selectedTenantId)) {
+            setSelectedTenantId(tenants[0].tenant_id);
+        }
+    }, [selectedTenantId, tenants]);
+
+    const settingsUrl = selectedTenantId
+        ? `/enterprise/runtime-model-settings?tenant_id=${encodeURIComponent(selectedTenantId)}`
+        : '';
+    const settingsQuery = useQuery({
+        queryKey: ['runtime-model-settings', selectedTenantId],
+        queryFn: () => fetchJson<RuntimeModelSettings>(settingsUrl),
+        enabled: Boolean(selectedTenantId),
+    });
+
+    useEffect(() => {
+        if (!settingsQuery.data) return;
+        setForm({
+            planning_model_id: settingsQuery.data.planning_model_id || '',
+            compact_model_id: settingsQuery.data.compact_model_id || '',
+        });
+    }, [settingsQuery.data]);
+
+    const save = useMutation({
+        mutationFn: () => fetchJson<RuntimeModelSettings>(settingsUrl, {
+            method: 'PUT',
+            body: JSON.stringify(form),
+        }),
+        onSuccess: (data) => {
+            qc.setQueryData(['runtime-model-settings', selectedTenantId], data);
+        },
+    });
+
+    const changeTenant = (tenantId: string) => {
+        save.reset();
+        setSelectedTenantId(tenantId);
+        setForm({ planning_model_id: '', compact_model_id: '' });
+    };
+    const candidates = settingsQuery.data?.candidates || [];
+    const error = settingsQuery.error || save.error;
+
+    return (
+        <div className="card" style={{ marginBottom: 16, padding: 16 }}>
+            <div style={{ fontSize: 14, fontWeight: 650 }}>多智能体运行时模型（按租户）</div>
+            <div style={{ marginTop: 6, color: 'var(--text-secondary)', fontSize: 12, lineHeight: 1.7 }}>
+                仅选择 Groups 的规划和上下文压缩模型；模型、API Key 与 Credits 仍由平台理解路由和账号池统一管理，不向租户下放模型对象或密钥。
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(180px, 0.8fr) repeat(2, minmax(240px, 1fr)) auto', gap: 10, alignItems: 'end', marginTop: 14 }}>
+                <Field label="租户">
+                    <select
+                        className="form-input"
+                        value={selectedTenantId}
+                        disabled={tenantsLoading || tenants.length === 0}
+                        onChange={(event) => changeTenant(event.target.value)}
+                    >
+                        {tenants.length === 0 && <option value="">暂无租户</option>}
+                        {tenants.map((tenant) => (
+                            <option key={tenant.tenant_id} value={tenant.tenant_id}>
+                                {tenant.tenant_name || tenant.tenant_id}
+                            </option>
+                        ))}
+                    </select>
+                </Field>
+                <Field label="群聊规划模型">
+                    <select
+                        className="form-input"
+                        value={form.planning_model_id}
+                        disabled={settingsQuery.isLoading || candidates.length === 0}
+                        onChange={(event) => setForm((current) => ({ ...current, planning_model_id: event.target.value }))}
+                    >
+                        <option value="" disabled>请选择模型</option>
+                        {candidates.map((model) => (
+                            <option key={model.id} value={model.id}>{model.label} · {model.provider}/{model.model}</option>
+                        ))}
+                    </select>
+                </Field>
+                <Field label="群聊上下文模型">
+                    <select
+                        className="form-input"
+                        value={form.compact_model_id}
+                        disabled={settingsQuery.isLoading || candidates.length === 0}
+                        onChange={(event) => setForm((current) => ({ ...current, compact_model_id: event.target.value }))}
+                    >
+                        <option value="" disabled>请选择模型</option>
+                        {candidates.map((model) => (
+                            <option key={model.id} value={model.id}>{model.label} · {model.provider}/{model.model}</option>
+                        ))}
+                    </select>
+                </Field>
+                <button
+                    className="btn btn-primary"
+                    disabled={
+                        save.isPending
+                        || !form.planning_model_id
+                        || !form.compact_model_id
+                    }
+                    onClick={() => save.mutate()}
+                >
+                    {save.isPending ? '保存中...' : '保存'}
+                </button>
+            </div>
+            {settingsQuery.isLoading && (
+                <div style={{ marginTop: 10, color: 'var(--text-tertiary)', fontSize: 12 }}>正在加载运行时模型...</div>
+            )}
+            {!settingsQuery.isLoading && selectedTenantId && candidates.length === 0 && !error && (
+                <div style={{ marginTop: 10, color: 'var(--warning)', fontSize: 12 }}>
+                    暂无可用候选模型。候选模型必须已启用并通过原生工具调用测试。
+                </div>
+            )}
+            {settingsQuery.data && (
+                <div style={{ marginTop: 10, color: 'var(--text-tertiary)', fontSize: 11 }}>
+                    当前来源：规划 {settingsQuery.data.planning_source} · 上下文 {settingsQuery.data.compact_source}
+                </div>
+            )}
+            {save.isSuccess && (
+                <div style={{ marginTop: 10, color: 'var(--success)', fontSize: 12 }}>运行时模型配置已更新并立即生效。</div>
+            )}
+            {error && (
+                <div style={{ marginTop: 10, color: 'var(--error)', fontSize: 12 }}>
+                    运行时模型配置失败：{error instanceof Error ? error.message : String(error)}
+                </div>
+            )}
         </div>
     );
 }

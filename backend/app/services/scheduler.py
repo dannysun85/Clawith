@@ -1,8 +1,8 @@
-"""Lightweight asyncio scheduler for agent cron jobs.
+"""Lightweight asyncio scheduler for durable Agent Runtime cron jobs.
 
 Runs as a background task inside the FastAPI process.
 Every 30 seconds, checks for schedules whose next_run_at <= now
-and executes them by calling the LLM with the schedule's instruction.
+and registers each occurrence on the shared Runtime.
 """
 
 import asyncio

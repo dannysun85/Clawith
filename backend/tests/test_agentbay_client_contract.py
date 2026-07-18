@@ -792,12 +792,9 @@ async def test_release_disabled_browser_login_rejects_before_provider_use():
 
     assert "disabled by the release safety policy" in result
     provider_login.assert_not_awaited()
-    login_schema = next(
-        tool["function"]
-        for tool in agent_tools.AGENT_TOOLS
-        if tool["function"]["name"] == "agentbay_browser_login"
-    )
-    assert "login_config" not in str(login_schema)
+    assert "agentbay_browser_login" not in {
+        tool["function"]["name"] for tool in agent_tools.AGENT_TOOLS
+    }
 
 
 @pytest.mark.asyncio
@@ -819,12 +816,9 @@ async def test_release_disabled_file_transfer_rejects_before_provider_use():
 
     assert "disabled by the release safety policy" in result
     transfer.assert_not_awaited()
-    transfer_schema = next(
-        tool["function"]
-        for tool in agent_tools.AGENT_TOOLS
-        if tool["function"]["name"] == "agentbay_file_transfer"
-    )
-    assert transfer_schema["parameters"]["properties"] == {}
+    assert "agentbay_file_transfer" not in {
+        tool["function"]["name"] for tool in agent_tools.AGENT_TOOLS
+    }
 
 
 def test_agentbay_workspace_transfer_rejects_sibling_prefix_escape(tmp_path):

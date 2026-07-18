@@ -112,7 +112,7 @@ async def test_receive_webhook_success(monkeypatch, client):
 
     # Mock enqueue_webhook_execution
     async def fake_enqueue_webhook_execution(db, trigger, body, payload_text, payload_obj, request_headers):
-        return SimpleNamespace(id=uuid.uuid4()), True
+        return SimpleNamespace(id=uuid.uuid4(), status="processing"), True
 
     monkeypatch.setattr(webhooks_api, "enqueue_webhook_execution", fake_enqueue_webhook_execution)
 

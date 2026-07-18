@@ -1,76 +1,151 @@
-"""Chat session management API endpoints."""
+"""Tenant-scoped Direct Chat session management endpoints."""
 
-import uuid
+from __future__ import annotations
+
+import json
 import re
-from contextlib import AsyncExitStack
-from datetime import datetime, timezone as tz
-from typing import Optional
+import uuid
+from datetime import UTC, datetime
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from sqlalchemy import String, and_, cast, desc, func, or_, select
+from sqlalchemy import String, and_, cast, func, or_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import check_agent_access
 from app.core.security import get_current_user
 from app.database import get_db
-from app.models.audit import ChatMessage
-from app.models.chat_session import ChatSession
 from app.models.agent import Agent
-from app.models.user import User
+from app.models.agent_run import AgentRun
+from app.models.agent_run_command import AgentRunCommand
+from app.models.agent_tool_execution import AgentToolExecution
+from app.models.audit import AuditLog, ChatMessage
+from app.models.chat_session import ChatSession
+from app.models.participant import Participant
+from app.models.user import Identity, User
+from app.services.chat_session_service import (
+    create_direct_session,
+    soft_delete_direct_session,
+)
+from app.services.agent_runtime.run_state_reader import (
+    RunStateReadError,
+    open_run_state_reader as _open_run_state_reader,
+)
+from app.services.agent_runtime.tool_execution import (
+    ToolExecutionError,
+    reconcile_unknown_tool_execution,
+)
+from app.services.participant_identity import get_or_create_user_participant
 from app.services.agent_plan_selection import (
     InvalidAgentPlanSelection,
     resolve_agent_plan_selection,
 )
-from app.services.artifact_contract import sanitize_response_artifacts_batch
 from app.services.entitlements import get_tenant_entitlements
-from app.services.chat_session_access import (
-    can_audit_agent_chat_sessions,
-    require_authorized_agent_chat_session,
-)
 
 router = APIRouter(prefix="/api/agents", tags=["chat-sessions"])
 
-# Session counters represent user-visible conversation turns. Internal system
-# events and tool execution records must not make the counter climb while an
-# agent is working in the background.
-VISIBLE_MESSAGE_ROLES = ("user", "assistant")
+
+def _can_view_all_agent_chat_sessions(user: User, agent: Agent) -> bool:
+    """Admins and the agent creator may inspect other users' direct sessions."""
+    return user.role in ("platform_admin", "org_admin", "agent_admin") or str(agent.creator_id) == str(user.id)
+
+
+def _require_tenant_id(user: User) -> uuid.UUID:
+    tenant_id = getattr(user, "tenant_id", None)
+    if tenant_id is None:
+        raise HTTPException(status_code=403, detail="A tenant is required for chat sessions")
+    return tenant_id
+
+
+def _active_direct_filters(
+    tenant_id: uuid.UUID,
+    agent_id: uuid.UUID,
+):
+    return (
+        ChatSession.tenant_id == tenant_id,
+        ChatSession.agent_id == agent_id,
+        ChatSession.session_type == "direct",
+        ChatSession.deleted_at.is_(None),
+    )
+
+
+def _active_agent_session_filters(
+    tenant_id: uuid.UUID,
+    agent_id: uuid.UUID,
+):
+    """Scope the legacy Agent session surface to active associated sessions."""
+    return (
+        ChatSession.tenant_id == tenant_id,
+        ChatSession.deleted_at.is_(None),
+        or_(
+            ChatSession.agent_id == agent_id,
+            and_(
+                ChatSession.session_type == "a2a",
+                ChatSession.peer_agent_id == agent_id,
+            ),
+        ),
+    )
+
+
+def _is_a2a_session(session: ChatSession) -> bool:
+    return session.session_type == "a2a"
+
+
+def _is_group_session(session: ChatSession) -> bool:
+    return session.session_type == "group"
+
+
+async def _check_direct_agent_access(
+    db: AsyncSession,
+    current_user: User,
+    agent_id: uuid.UUID,
+) -> tuple[Agent, uuid.UUID]:
+    tenant_id = _require_tenant_id(current_user)
+    agent, _ = await check_agent_access(db, current_user, agent_id)
+    if agent.tenant_id != tenant_id:
+        raise HTTPException(status_code=403, detail="No access to this agent")
+    return agent, tenant_id
+
+
+def _authorize_session_owner(current_user: User, agent: Agent, session: ChatSession) -> None:
+    if str(session.user_id) != str(current_user.id) and not _can_view_all_agent_chat_sessions(current_user, agent):
+        raise HTTPException(status_code=403, detail="Not authorized")
 
 
 class SessionOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
-    agent_id: str
-    user_id: str
-    username: Optional[str] = None      # display_name ?? username
-    source_channel: str = "web"         # web / feishu / discord / slack / agent
+    agent_id: str | None = None
+    user_id: str | None = None
+    username: str | None = None
+    source_channel: str = "web"
     title: str
     created_at: str
-    last_message_at: Optional[str] = None
+    last_message_at: str | None = None
     message_count: int = 0
     unread_count: int = 0
     is_primary: bool = False
-    model_tier: Optional[str] = None
-    model_modality: Optional[str] = None
-    # Agent-to-agent session fields
-    peer_agent_id: Optional[str] = None
-    peer_agent_name: Optional[str] = None
-    participant_type: str = "user"       # 'user' | 'agent'
-    # Group chat session fields
+    model_tier: str | None = None
+    model_modality: str | None = None
+    peer_agent_id: str | None = None
+    peer_agent_name: str | None = None
+    participant_type: str = "user"
     is_group: bool = False
-    group_name: Optional[str] = None
+    group_name: str | None = None
+
 
 class CreateSessionIn(BaseModel):
-    title: Optional[str] = None
-    model_tier: Optional[str] = None
-    model_modality: Optional[str] = None
+    title: str | None = None
+    model_tier: str | None = None
+    model_modality: str | None = None
 
 
 class PatchSessionIn(BaseModel):
-    title: Optional[str] = None
-    model_tier: Optional[str] = None
-    model_modality: Optional[str] = None
+    title: str | None = None
+    model_tier: str | None = None
+    model_modality: str | None = None
     preference_revision: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
@@ -79,7 +154,10 @@ class PatchSessionIn(BaseModel):
             raise ValueError("At least one session field must be provided")
         if "title" in self.model_fields_set and self.title is None:
             raise ValueError("Session title cannot be null")
-        if "preference_revision" in self.model_fields_set and "model_tier" not in self.model_fields_set:
+        if (
+            "preference_revision" in self.model_fields_set
+            and "model_tier" not in self.model_fields_set
+        ):
             raise ValueError("preference_revision requires model_tier")
         return self
 
@@ -91,8 +169,7 @@ async def _resolve_session_model_selection(
     *,
     strict: bool,
 ) -> tuple[str, str]:
-    tenant_id = getattr(agent, "tenant_id", None)
-    entitlements = await get_tenant_entitlements(tenant_id) if tenant_id else None
+    entitlements = await get_tenant_entitlements(agent.tenant_id)
     return resolve_agent_plan_selection(
         entitlements,
         requested_tier,
@@ -105,235 +182,232 @@ async def _lock_user_chat_preference(
     db: AsyncSession,
     user_id: uuid.UUID,
 ) -> User | None:
-    """Lock and refresh the tenant User used by chat-tier compare-and-set.
-
-    Authentication loads the same User into this session's identity map before
-    this endpoint runs. ``populate_existing`` is therefore required: a second
-    request may wait on the row lock after another transaction has incremented
-    the revision, and CAS must compare against that newly committed value.
-    """
-
     result = await db.execute(
         select(User)
-        .where(User.id == user_id)
+        .where(User.id == user_id, User.is_active.is_(True))
         .with_for_update()
         .execution_options(populate_existing=True)
     )
     return result.scalar_one_or_none()
 
 
+class ActiveRunOut(BaseModel):
+    """Minimal persisted runtime identity needed to resume or cancel safely."""
+
+    run_id: str
+    thread_id: str
+    session_id: str
+    status: str
+    waiting_type: str | None = None
+    waiting_reason: str | None = None
+    correlation_id: str | None = None
+    model_step_count: int = 0
+    can_resume: bool = False
+    can_cancel: bool = False
+    pending_tool_reconciliations: list["PendingToolReconciliationOut"] = Field(
+        default_factory=list
+    )
+
+
+class PendingToolReconciliationOut(BaseModel):
+    execution_id: str
+    tool_call_id: str
+    tool_name: str
+    result_summary: str | None = None
+    error_code: str | None = None
+    can_reconcile: bool = False
+
+
+class ReconcileToolExecutionIn(BaseModel):
+    outcome: Literal["applied", "not_applied"]
+    correlation_id: str
+    note: str
+
+
+class ReconcileToolExecutionOut(BaseModel):
+    execution_id: str
+    status: Literal["succeeded", "failed"]
+    result_summary: str
+
+
+class SessionRuntimeStateOut(BaseModel):
+    active_run: ActiveRunOut | None = None
+
+
+def _session_out(
+    session: ChatSession,
+    *,
+    username: str | None = None,
+    message_count: int = 0,
+    unread_count: int = 0,
+    peer_agent_id: uuid.UUID | None = None,
+    peer_agent_name: str | None = None,
+    participant_type: str = "user",
+    is_group: bool = False,
+    group_name: str | None = None,
+) -> SessionOut:
+    return SessionOut(
+        id=str(session.id),
+        agent_id=str(session.agent_id) if session.agent_id else None,
+        user_id=str(session.user_id) if session.user_id else None,
+        username=username,
+        source_channel=session.source_channel,
+        title=session.title,
+        created_at=session.created_at.isoformat(),
+        last_message_at=session.last_message_at.isoformat() if session.last_message_at else None,
+        message_count=message_count,
+        unread_count=unread_count,
+        is_primary=bool(session.is_primary),
+        model_tier=getattr(session, "model_tier", None),
+        model_modality=getattr(session, "model_modality", None),
+        peer_agent_id=str(peer_agent_id) if peer_agent_id else None,
+        peer_agent_name=peer_agent_name,
+        participant_type=participant_type,
+        is_group=is_group,
+        group_name=group_name,
+    )
+
+
 @router.get("/{agent_id}/sessions")
 async def list_sessions(
     agent_id: uuid.UUID,
-    scope: str = Query("mine", description="'mine' or 'all'"),
+    scope: Annotated[str, Query(description="'mine' or 'all'")] = "mine",
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """List chat sessions for an agent. scope=all for org/platform admins and agent_admin."""
-    # Verify agent exists
-    agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
-    agent = agent_result.scalar_one_or_none()
-    if not agent:
-        raise HTTPException(status_code=404, detail="Agent not found")
-    await check_agent_access(db, current_user, agent_id)
+    """List active sessions on the legacy Agent session surface."""
+    agent, tenant_id = await _check_direct_agent_access(db, current_user, agent_id)
+    if scope not in {"mine", "all"}:
+        raise HTTPException(status_code=400, detail="scope must be 'mine' or 'all'")
+    if scope == "all" and not _can_view_all_agent_chat_sessions(current_user, agent):
+        raise HTTPException(status_code=403, detail="Not authorized to view all sessions")
 
-    if scope == "all":
-        if not can_audit_agent_chat_sessions(current_user):
-            raise HTTPException(status_code=403, detail="Not authorized to view all sessions")
-
-        # Fetch all sessions (including agent-to-agent where this agent is peer)
-        result = await db.execute(
-            select(ChatSession)
-            .where(
-                (ChatSession.agent_id == agent_id)
-                | ((ChatSession.peer_agent_id == agent_id) & (ChatSession.source_channel == "agent"))
-            )
-            .order_by(ChatSession.last_message_at.desc().nulls_last(), ChatSession.created_at.desc())
+    if scope == "mine":
+        session_filters = _active_direct_filters(tenant_id, agent_id)
+        session_query = select(ChatSession).where(
+            *session_filters,
+            ChatSession.user_id == current_user.id,
         )
-        sessions = result.scalars().all()
-        out = []
+    else:
+        session_filters = _active_agent_session_filters(tenant_id, agent_id)
+        session_query = select(ChatSession).where(*session_filters)
+    result = await db.execute(
+        session_query.order_by(
+            ChatSession.last_message_at.desc().nulls_last(),
+            ChatSession.created_at.desc(),
+            ChatSession.id.desc(),
+        )
+    )
+    sessions = list(result.scalars().all())
+    if not sessions:
+        return []
 
-        # --- BULK FETCH: message counts, user names, agent names in 3 queries total ---
-        session_ids = [str(s.id) for s in sessions]
-        session_uuid_ids = [s.id for s in sessions]
+    session_ids = [session.id for session in sessions]
+    conversation_ids = [str(session_id) for session_id in session_ids]
+    count_result = await db.execute(
+        select(ChatMessage.conversation_id, func.count(ChatMessage.id))
+        .join(ChatSession, ChatMessage.conversation_id == cast(ChatSession.id, String))
+        .where(
+            *session_filters,
+            ChatSession.id.in_(session_ids),
+            ChatMessage.conversation_id.in_(conversation_ids),
+        )
+        .group_by(ChatMessage.conversation_id)
+    )
+    message_counts = {row[0]: int(row[1] or 0) for row in count_result.all()}
 
-        message_counts: dict[str, int] = {}
-        unread_counts: dict[str, int] = {}
-        if session_ids:
-            count_res = await db.execute(
-                select(ChatMessage.conversation_id, func.count(ChatMessage.id))
-                .where(
-                    ChatMessage.conversation_id.in_(session_ids),
-                    ChatMessage.role.in_(VISIBLE_MESSAGE_ROLES),
-                )
-                .group_by(ChatMessage.conversation_id)
-            )
-            for row in count_res.all():
-                message_counts[row[0]] = row[1]
+    unread_result = await db.execute(
+        select(ChatSession.id, func.count(ChatMessage.id))
+        .join(ChatMessage, ChatMessage.conversation_id == cast(ChatSession.id, String))
+        .where(
+            *_active_direct_filters(tenant_id, agent_id),
+            ChatSession.id.in_(session_ids),
+            ChatSession.user_id == current_user.id,
+            ChatMessage.role.in_(("assistant", "system", "tool_call")),
+            ChatMessage.created_at
+            > func.coalesce(
+                ChatSession.last_read_at_by_user,
+                datetime(1970, 1, 1, tzinfo=UTC),
+            ),
+        )
+        .group_by(ChatSession.id)
+    )
+    unread_counts = {str(row[0]): int(row[1] or 0) for row in unread_result.all()}
 
-            own_session_ids = [s.id for s in sessions if str(s.user_id) == str(current_user.id)]
-            if own_session_ids:
-                unread_res = await db.execute(
-                    select(ChatSession.id, func.count(ChatMessage.id))
-                    .join(ChatMessage, ChatMessage.conversation_id == cast(ChatSession.id, String))
-                    .where(
-                        ChatSession.id.in_(own_session_ids),
-                        ChatSession.source_channel.notin_(["agent", "trigger"]),
-                        ChatSession.is_group.is_(False),
-                        ChatMessage.role == "assistant",
-                        ChatMessage.created_at > func.coalesce(
-                            ChatSession.last_read_at_by_user,
-                            datetime(1970, 1, 1, tzinfo=tz.utc),
-                        ),
-                    )
-                    .group_by(ChatSession.id)
-                )
-                for row in unread_res.all():
-                    unread_counts[str(row[0])] = int(row[1] or 0)
-
-        # Collect IDs to resolve in bulk
-        from app.models.user import Identity
-        user_ids = list({s.user_id for s in sessions
-                         if not s.is_group and s.source_channel != "agent" and s.user_id})
-        user_names: dict[str, str] = {}
+    user_names: dict[str, str] = {}
+    agent_names: dict[str, str] = {}
+    if scope == "all":
+        user_ids = list(
+            {
+                session.user_id
+                for session in sessions
+                if session.user_id and not _is_a2a_session(session) and not _is_group_session(session)
+            }
+        )
         if user_ids:
-            user_r = await db.execute(
+            user_result = await db.execute(
                 select(User.id, func.coalesce(User.display_name, Identity.username))
                 .join(Identity, User.identity_id == Identity.id)
-                .where(User.id.in_(user_ids))
+                .where(User.tenant_id == tenant_id, User.id.in_(user_ids))
             )
-            for row in user_r.all():
-                user_names[str(row[0])] = row[1] or "Unknown"
+            user_names = {str(row[0]): row[1] or "Unknown" for row in user_result.all()}
 
-        agent_ids_to_fetch: set = set()
-        for s in sessions:
-            if s.source_channel == "agent" and s.peer_agent_id:
-                agent_ids_to_fetch.add(s.agent_id)
-                agent_ids_to_fetch.add(s.peer_agent_id)
-        agent_names: dict[str, str] = {}
-        if agent_ids_to_fetch:
-            agent_r = await db.execute(
-                select(Agent.id, Agent.name).where(Agent.id.in_(list(agent_ids_to_fetch)))
+        a2a_agent_ids = {
+            candidate_id
+            for session in sessions
+            if _is_a2a_session(session)
+            for candidate_id in (session.agent_id, session.peer_agent_id)
+            if candidate_id is not None
+        }
+        if a2a_agent_ids:
+            agent_result = await db.execute(
+                select(Agent.id, Agent.name).where(
+                    Agent.tenant_id == tenant_id,
+                    Agent.id.in_(a2a_agent_ids),
+                )
             )
-            for row in agent_r.all():
-                agent_names[str(row[0])] = row[1] or "Agent"
+            agent_names = {str(row[0]): row[1] or "Agent" for row in agent_result.all()}
 
-        for session in sessions:
-            count = message_counts.get(str(session.id), 0)
-            if count == 0:
-                continue  # hide empty sessions
+    output = []
+    for session in sessions:
+        count = message_counts.get(str(session.id), 0)
+        if count == 0:
+            continue
+        username = None
+        peer_agent_id = None
+        peer_agent_name = None
+        participant_type = "user"
+        is_group = False
+        group_name = None
+        if scope == "all" and _is_a2a_session(session):
+            participant_type = "agent"
+            peer_agent_id = session.peer_agent_id if session.agent_id == agent_id else session.agent_id
+            peer_agent_name = agent_names.get(str(peer_agent_id), "Agent")
+            primary_name = agent_names.get(str(session.agent_id), "Agent")
+            stored_peer_name = agent_names.get(str(session.peer_agent_id), "Agent")
+            username = f"Agent {primary_name} - {stored_peer_name}"
+        elif scope == "all" and _is_group_session(session):
+            participant_type = "group"
+            is_group = True
+            group_name = session.group_name
+            username = session.group_name or session.title or "Group Chat"
+        elif scope == "all":
+            username = user_names.get(str(session.user_id), "Unknown")
 
-            display = None
-            peer_agent_id = None
-            peer_agent_name = None
-            participant_type = "user"
-
-            if session.source_channel == "agent" and session.peer_agent_id:
-                participant_type = "agent"
-                peer_agent_id = str(session.peer_agent_id)
-                a1_name = agent_names.get(str(session.agent_id), "Agent")
-                a2_name = agent_names.get(str(session.peer_agent_id), "Agent")
-                peer_agent_name = a2_name
-                display = f"Agent {a1_name} - {a2_name}"
-            elif session.is_group:
-                display = session.group_name or session.title or "Group Chat"
-            else:
-                display = user_names.get(str(session.user_id), "Unknown")
-
-            out.append(SessionOut(
-                id=str(session.id),
-                agent_id=str(session.agent_id),
-                user_id=str(session.user_id),
-                username=display,
-                source_channel=session.source_channel,
-                title=session.title,
-                created_at=session.created_at.isoformat(),
-                last_message_at=session.last_message_at.isoformat() if session.last_message_at else None,
+        output.append(
+            _session_out(
+                session,
+                username=username,
                 message_count=count,
                 unread_count=unread_counts.get(str(session.id), 0),
-                is_primary=bool(getattr(session, "is_primary", False)),
-                model_tier=getattr(session, "model_tier", None),
-                model_modality=getattr(session, "model_modality", None),
                 peer_agent_id=peer_agent_id,
                 peer_agent_name=peer_agent_name,
-                participant_type="group" if session.is_group else participant_type,
-                is_group=session.is_group,
-                group_name=session.group_name,
-            ))
-        return out
-
-    else:  # scope == "mine"
-        result = await db.execute(
-            select(ChatSession)
-            .where(
-                ChatSession.agent_id == agent_id,
-                ChatSession.user_id == current_user.id,
-                ChatSession.is_group.is_(False),  # Group sessions are not "mine"
-                ChatSession.source_channel.notin_(["agent", "trigger"]),  # Exclude agent-to-agent and reflection sessions
+                participant_type=participant_type,
+                is_group=is_group,
+                group_name=group_name,
             )
-            .order_by(ChatSession.last_message_at.desc().nulls_last(), ChatSession.created_at.desc())
         )
-        sessions = result.scalars().all()
-        out = []
-
-        # --- BULK FETCH: count total messages and unread messages in two compact queries ---
-        session_ids = [str(s.id) for s in sessions]
-        session_uuid_ids = [s.id for s in sessions]
-
-        total_counts: dict[str, int] = {}
-        unread_counts: dict[str, int] = {}
-        if session_ids:
-            counts_res = await db.execute(
-                select(
-                    ChatMessage.conversation_id,
-                    func.count(ChatMessage.id)
-                ).where(
-                    ChatMessage.conversation_id.in_(session_ids),
-                    ChatMessage.agent_id == agent_id,
-                    ChatMessage.role.in_(VISIBLE_MESSAGE_ROLES),
-                ).group_by(ChatMessage.conversation_id)
-            )
-            for row in counts_res.all():
-                total_counts[row[0]] = int(row[1] or 0)
-
-            unread_res = await db.execute(
-                select(ChatSession.id, func.count(ChatMessage.id))
-                .join(ChatMessage, ChatMessage.conversation_id == cast(ChatSession.id, String))
-                .where(
-                    ChatSession.id.in_(session_uuid_ids),
-                    ChatMessage.role == "assistant",
-                    ChatMessage.created_at > func.coalesce(
-                        ChatSession.last_read_at_by_user,
-                        datetime(1970, 1, 1, tzinfo=tz.utc),
-                    ),
-                )
-                .group_by(ChatSession.id)
-            )
-            for row in unread_res.all():
-                unread_counts[str(row[0])] = int(row[1] or 0)
-
-        for session in sessions:
-            # Hide truly empty / orphan sessions. Onboarding sessions have zero
-            # user messages (the agent greets first) but do have assistant
-            # turns, so count ALL messages here — not just user ones.
-            count = total_counts.get(str(session.id), 0)
-            if count == 0:
-                continue
-            out.append(SessionOut(
-                id=str(session.id),
-                agent_id=str(session.agent_id),
-                user_id=str(session.user_id),
-                source_channel=session.source_channel,
-                title=session.title,
-                created_at=session.created_at.isoformat(),
-                last_message_at=session.last_message_at.isoformat() if session.last_message_at else None,
-                message_count=count,
-                unread_count=unread_counts.get(str(session.id), 0),
-                is_primary=bool(session.is_primary),
-                model_tier=getattr(session, "model_tier", None),
-                model_modality=getattr(session, "model_modality", None),
-            ))
-        return out
+    return output
 
 
 @router.post("/{agent_id}/sessions", status_code=201)
@@ -343,15 +417,26 @@ async def create_session(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Create a new chat session for the current user."""
-    agent, _ = await check_agent_access(db, current_user, agent_id)
+    """Create a direct session for the active current-tenant User."""
+    agent, tenant_id = await _check_direct_agent_access(db, current_user, agent_id)
+    user_result = await db.execute(
+        select(User).where(
+            User.id == current_user.id,
+            User.tenant_id == tenant_id,
+            User.is_active.is_(True),
+        )
+    )
+    user = user_result.scalar_one_or_none()
+    if user is None:
+        raise HTTPException(status_code=403, detail="Current user is not active in this tenant")
 
-    explicit_selection = bool({"model_tier", "model_modality"} & body.model_fields_set)
-    # A user's latest explicit chat choice follows them across Agents. Agent
-    # preferences remain the fallback and still drive background automation.
-    default_tier = (
-        getattr(current_user, "preferred_chat_tier", None)
-        or getattr(agent, "preferred_tier", None)
+    explicit_selection = bool(
+        {"model_tier", "model_modality"} & body.model_fields_set
+    )
+    default_tier = getattr(user, "preferred_chat_tier", None) or getattr(
+        agent,
+        "preferred_tier",
+        None,
     )
     default_modality = getattr(agent, "preferred_modality", None)
     model_tier: str | None = None
@@ -361,42 +446,309 @@ async def create_session(
             model_tier, model_modality = await _resolve_session_model_selection(
                 agent,
                 body.model_tier if body.model_tier is not None else default_tier,
-                body.model_modality if body.model_modality is not None else default_modality,
+                (
+                    body.model_modality
+                    if body.model_modality is not None
+                    else default_modality
+                ),
                 strict=explicit_selection,
             )
         except InvalidAgentPlanSelection as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
-    now = datetime.now(tz.utc)
-    new_id = uuid.uuid4()
-    session = ChatSession(
-        id=new_id,
-        agent_id=agent_id,
-        user_id=current_user.id,
-        title=body.title or f"Session {now.strftime('%m-%d %H:%M')}",
-        source_channel="web",
-        is_primary=False,
-        model_tier=model_tier,
-        model_modality=model_modality,
-        created_at=now,
+
+    participant = await get_or_create_user_participant(
+        db,
+        user.id,
+        user.display_name,
+        user.avatar_url,
     )
-    db.add(session)
+    create_kwargs = {
+        "tenant_id": tenant_id,
+        "agent_id": agent_id,
+        "user_id": user.id,
+        "created_by_participant_id": participant.id,
+        "title": body.title,
+    }
+    if model_tier is not None:
+        create_kwargs["model_tier"] = model_tier
+    if model_modality is not None:
+        create_kwargs["model_modality"] = model_modality
+    session = await create_direct_session(db, **create_kwargs)
     await db.commit()
     await db.refresh(session)
-    return SessionOut(
-        id=str(session.id),
-        agent_id=str(session.agent_id),
-        user_id=str(session.user_id),
-        source_channel=session.source_channel,
-        title=session.title,
-        created_at=session.created_at.isoformat(),
-        last_message_at=None,
-        message_count=0,
-        unread_count=0,
-        is_primary=False,
-        model_tier=getattr(session, "model_tier", None),
-        model_modality=getattr(session, "model_modality", None),
-        participant_type="user",
-        is_group=False,
+    return _session_out(session)
+
+
+@router.get(
+    "/{agent_id}/sessions/{session_id}/runtime-state",
+    response_model=SessionRuntimeStateOut,
+)
+async def get_session_runtime_state(
+    agent_id: uuid.UUID,
+    session_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> SessionRuntimeStateOut:
+    """Return the one exact Direct Chat lane holder, if one exists."""
+    _agent, tenant_id = await _check_direct_agent_access(
+        db,
+        current_user,
+        agent_id,
+    )
+    session_result = await db.execute(
+        select(ChatSession).where(
+            ChatSession.id == session_id,
+            ChatSession.tenant_id == tenant_id,
+            ChatSession.agent_id == agent_id,
+            ChatSession.user_id == current_user.id,
+            ChatSession.session_type == "direct",
+            ChatSession.group_id.is_(None),
+            ChatSession.source_channel == "web",
+            ChatSession.deleted_at.is_(None),
+        )
+    )
+    session = session_result.scalar_one_or_none()
+    if session is None:
+        raise HTTPException(status_code=404, detail="Chat session not found")
+
+    lane_key = f"direct_chat_thread:{tenant_id}:{session.id}"
+    holders_result = await db.execute(
+        select(AgentRun)
+        .where(
+            AgentRun.tenant_id == tenant_id,
+            AgentRun.agent_id == agent_id,
+            AgentRun.session_id == session.id,
+            AgentRun.origin_user_id == current_user.id,
+            AgentRun.source_type == "chat",
+            AgentRun.run_kind == "foreground",
+            AgentRun.runtime_type == "langgraph",
+            AgentRun.runtime_thread_id == str(session.id),
+            AgentRun.scheduling_lane_key == lane_key,
+            AgentRun.lane_held.is_(True),
+        )
+        .order_by(AgentRun.created_at, AgentRun.id)
+        .limit(2)
+    )
+    holders = list(holders_result.scalars().all())
+    if not holders:
+        return SessionRuntimeStateOut(active_run=None)
+    if len(holders) != 1:
+        raise HTTPException(
+            status_code=409,
+            detail="multiple_direct_session_lane_holders",
+        )
+    run = holders[0]
+
+    try:
+        async with _open_run_state_reader(db) as reader:
+            view = await reader.get_run_state(tenant_id, run.id)
+    except RunStateReadError as exc:
+        raise HTTPException(status_code=409, detail=exc.code) from exc
+
+    if (
+        view.tenant_id != tenant_id
+        or view.run_id != run.id
+        or view.thread_id != str(session.id)
+        or view.session_id != session.id
+        or view.source_type != "chat"
+        or view.run_kind != "foreground"
+        or view.runtime_type != "langgraph"
+        or view.execution_status is None
+    ):
+        raise HTTPException(status_code=409, detail="runtime_state_scope_mismatch")
+
+    waiting_type = view.waiting_type
+    correlation_id = view.waiting_correlation_id
+    if view.execution_status == "waiting_user":
+        if waiting_type not in {"user", "waiting_user"} or correlation_id is None:
+            raise HTTPException(
+                status_code=409,
+                detail="invalid_waiting_user_runtime_state",
+            )
+        inflight_resume_result = await db.execute(
+            select(AgentRunCommand.id)
+            .where(
+                AgentRunCommand.tenant_id == tenant_id,
+                AgentRunCommand.run_id == run.id,
+                AgentRunCommand.command_type == "resume",
+                AgentRunCommand.status.in_(("pending", "claimed")),
+            )
+            .limit(1)
+        )
+        resume_inflight = inflight_resume_result.scalar_one_or_none() is not None
+        reconciliation_result = await db.execute(
+            select(AgentToolExecution)
+            .where(
+                AgentToolExecution.tenant_id == tenant_id,
+                AgentToolExecution.run_id == run.id,
+                AgentToolExecution.status == "unknown",
+            )
+            .order_by(AgentToolExecution.started_at, AgentToolExecution.id)
+        )
+        pending_reconciliations = list(reconciliation_result.scalars().all())
+    else:
+        resume_inflight = False
+        pending_reconciliations = []
+
+    inflight_cancel_result = await db.execute(
+        select(AgentRunCommand.id)
+        .where(
+            AgentRunCommand.tenant_id == tenant_id,
+            AgentRunCommand.run_id == run.id,
+            AgentRunCommand.command_type == "cancel",
+            AgentRunCommand.status.in_(("pending", "claimed")),
+        )
+        .limit(1)
+    )
+    cancel_inflight = inflight_cancel_result.scalar_one_or_none() is not None
+
+    terminal = view.execution_status in {"completed", "failed", "cancelled"}
+    return SessionRuntimeStateOut(
+        active_run=ActiveRunOut(
+            run_id=str(view.run_id),
+            thread_id=view.thread_id,
+            session_id=str(view.session_id),
+            status=view.execution_status,
+            waiting_type=waiting_type,
+            waiting_reason=view.waiting_reason,
+            correlation_id=correlation_id,
+            model_step_count=view.model_step_count,
+            can_resume=(
+                view.execution_status == "waiting_user"
+                and not resume_inflight
+                and not cancel_inflight
+                and not pending_reconciliations
+            ),
+            can_cancel=not terminal and not cancel_inflight,
+            pending_tool_reconciliations=[
+                PendingToolReconciliationOut(
+                    execution_id=str(execution.id),
+                    tool_call_id=execution.tool_call_id,
+                    tool_name=execution.tool_name,
+                    result_summary=execution.result_summary,
+                    error_code=(
+                        execution.result_metadata.get("error_code")
+                        if isinstance(execution.result_metadata, dict)
+                        and isinstance(execution.result_metadata.get("error_code"), str)
+                        else None
+                    ),
+                    can_reconcile=(
+                        execution.tool_name == "write_file"
+                        and execution.effect == "write"
+                        and execution.retry_policy == "conditional"
+                    ),
+                )
+                for execution in pending_reconciliations
+            ],
+        )
+    )
+
+
+@router.post(
+    "/{agent_id}/sessions/{session_id}/runs/{run_id}/tool-executions/{execution_id}/reconcile",
+    response_model=ReconcileToolExecutionOut,
+)
+async def reconcile_direct_tool_execution(
+    agent_id: uuid.UUID,
+    session_id: uuid.UUID,
+    run_id: uuid.UUID,
+    execution_id: uuid.UUID,
+    body: ReconcileToolExecutionIn,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ReconcileToolExecutionOut:
+    """Settle a Direct Chat unknown receipt before the user resumes its Run."""
+    agent, tenant_id = await _check_direct_agent_access(db, current_user, agent_id)
+    session_result = await db.execute(
+        select(ChatSession).where(
+            ChatSession.id == session_id,
+            ChatSession.tenant_id == tenant_id,
+            ChatSession.agent_id == agent_id,
+            ChatSession.user_id == current_user.id,
+            ChatSession.session_type == "direct",
+            ChatSession.group_id.is_(None),
+            ChatSession.source_channel == "web",
+            ChatSession.deleted_at.is_(None),
+        )
+    )
+    if session_result.scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="Chat session not found")
+
+    run_result = await db.execute(
+        select(AgentRun).where(
+            AgentRun.id == run_id,
+            AgentRun.tenant_id == tenant_id,
+            AgentRun.agent_id == agent_id,
+            AgentRun.session_id == session_id,
+            AgentRun.origin_user_id == current_user.id,
+            AgentRun.source_type == "chat",
+            AgentRun.run_kind == "foreground",
+            AgentRun.runtime_type == "langgraph",
+            AgentRun.runtime_thread_id == str(session_id),
+            AgentRun.lane_held.is_(True),
+        )
+    )
+    run = run_result.scalar_one_or_none()
+    if run is None:
+        raise HTTPException(status_code=404, detail="Active Run not found")
+
+    try:
+        async with _open_run_state_reader(db) as reader:
+            view = await reader.get_run_state(tenant_id, run_id)
+    except RunStateReadError as exc:
+        raise HTTPException(status_code=409, detail=exc.code) from exc
+    if view.execution_status != "waiting_user":
+        raise HTTPException(status_code=409, detail="run_is_not_waiting_for_user")
+    if (
+        view.waiting_correlation_id is None
+        or view.waiting_correlation_id != body.correlation_id.strip()
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="tool_reconciliation_correlation_mismatch",
+        )
+
+    note = body.note.strip()
+    if not note:
+        raise HTTPException(status_code=422, detail="reconciliation_note_required")
+    try:
+        execution = await reconcile_unknown_tool_execution(
+            db,
+            tenant_id=tenant_id,
+            run_id=run_id,
+            execution_id=execution_id,
+            confirmed_status=(
+                "succeeded" if body.outcome == "applied" else "failed"
+            ),
+            confirmed_by_user_id=current_user.id,
+            note=note,
+        )
+    except ToolExecutionError as exc:
+        status_code = 404 if exc.code == "tool_execution_not_found" else 409
+        raise HTTPException(status_code=status_code, detail=exc.code) from exc
+
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            agent_id=agent.id,
+            action="runtime_tool_execution_reconciled",
+            details={
+                "tenant_id": str(tenant_id),
+                "session_id": str(session_id),
+                "run_id": str(run_id),
+                "execution_id": str(execution_id),
+                "tool_name": execution.tool_name,
+                "confirmed_outcome": body.outcome,
+                "status": execution.status,
+                "note": note[:2_000],
+            },
+        )
+    )
+    await db.commit()
+    return ReconcileToolExecutionOut(
+        execution_id=str(execution.id),
+        status=execution.status,  # type: ignore[arg-type]
+        result_summary=execution.result_summary or "",
     )
 
 
@@ -408,47 +760,60 @@ async def rename_session(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Update a session title or its first-party chat model selection."""
-    agent, _ = await check_agent_access(db, current_user, agent_id)
-    session = await require_authorized_agent_chat_session(
-        db,
-        user=current_user,
-        agent_id=agent_id,
-        session_id=session_id,
-    )
-    if bool(getattr(session, "is_group", False)) or session.source_channel == "trigger":
-        raise HTTPException(
-            status_code=403,
-            detail="Managed channel and internal sessions cannot be modified here",
+    """Rename one active direct session."""
+    agent, tenant_id = await _check_direct_agent_access(db, current_user, agent_id)
+    result = await db.execute(
+        select(ChatSession).where(
+            *_active_direct_filters(tenant_id, agent_id),
+            ChatSession.id == session_id,
         )
+    )
+    session = result.scalar_one_or_none()
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    _authorize_session_owner(current_user, agent, session)
 
     selection_fields = {"model_tier", "model_modality"} & body.model_fields_set
     if selection_fields:
         if str(session.user_id) != str(current_user.id):
-            raise HTTPException(status_code=403, detail="Only the session owner can change its model selection")
-        if session.source_channel != "web" or bool(getattr(session, "is_group", False)):
-            raise HTTPException(status_code=400, detail="Model selection is only available for first-party web chats")
-
+            raise HTTPException(
+                status_code=403,
+                detail="Only the session owner can change its model selection",
+            )
+        if session.source_channel != "web" or _is_group_session(session):
+            raise HTTPException(
+                status_code=400,
+                detail="Model selection is only available for first-party web chats",
+            )
         try:
             current_tier, current_modality = await _resolve_session_model_selection(
                 agent,
-                getattr(session, "model_tier", None) or getattr(agent, "preferred_tier", None),
-                getattr(session, "model_modality", None) or getattr(agent, "preferred_modality", None),
+                session.model_tier or agent.preferred_tier,
+                session.model_modality or agent.preferred_modality,
                 strict=False,
             )
             model_tier, model_modality = await _resolve_session_model_selection(
                 agent,
-                body.model_tier if "model_tier" in body.model_fields_set else current_tier,
-                body.model_modality if "model_modality" in body.model_fields_set else current_modality,
+                (
+                    body.model_tier
+                    if "model_tier" in body.model_fields_set
+                    else current_tier
+                ),
+                (
+                    body.model_modality
+                    if "model_modality" in body.model_fields_set
+                    else current_modality
+                ),
                 strict=True,
             )
         except InvalidAgentPlanSelection as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
+
         if "model_tier" in selection_fields:
             owner = await _lock_user_chat_preference(db, current_user.id)
-            if owner is None:
+            if owner is None or owner.tenant_id != tenant_id:
                 raise HTTPException(status_code=401, detail="User not found or inactive")
-            current_revision = int(getattr(owner, "preferred_chat_tier_revision", 0) or 0)
+            current_revision = int(owner.preferred_chat_tier_revision or 0)
             if (
                 body.preference_revision is not None
                 and body.preference_revision != current_revision
@@ -458,7 +823,7 @@ async def rename_session(
                     detail={
                         "code": "chat_tier_preference_conflict",
                         "message": "Model tier changed in another session; refresh and try again",
-                        "preferred_chat_tier": getattr(owner, "preferred_chat_tier", None),
+                        "preferred_chat_tier": owner.preferred_chat_tier,
                         "preferred_chat_tier_revision": current_revision,
                     },
                 )
@@ -471,17 +836,20 @@ async def rename_session(
 
     if "title" in body.model_fields_set:
         session.title = body.title
+    session.updated_at = datetime.now(UTC)
     await db.commit()
     response = {"id": str(session.id), "title": session.title}
     if selection_fields:
-        response.update({
-            "model_tier": session.model_tier,
-            "model_modality": session.model_modality,
-            "preferred_chat_tier": getattr(current_user, "preferred_chat_tier", None),
-            "preferred_chat_tier_revision": int(
-                getattr(current_user, "preferred_chat_tier_revision", 0) or 0
-            ),
-        })
+        response.update(
+            {
+                "model_tier": session.model_tier,
+                "model_modality": session.model_modality,
+                "preferred_chat_tier": current_user.preferred_chat_tier,
+                "preferred_chat_tier_revision": int(
+                    current_user.preferred_chat_tier_revision or 0
+                ),
+            }
+        )
     return response
 
 
@@ -492,308 +860,217 @@ async def delete_session(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Delete a chat session and its messages as its owner or an administrator."""
-    await check_agent_access(db, current_user, agent_id)
-    session = await require_authorized_agent_chat_session(
-        db,
-        user=current_user,
-        agent_id=agent_id,
-        session_id=session_id,
-    )
-    if bool(getattr(session, "is_group", False)) or session.source_channel == "trigger":
-        raise HTTPException(
-            status_code=403,
-            detail="Managed channel and internal sessions cannot be deleted here",
+    """Soft-delete a direct session and cancel only its foreground collaboration."""
+    agent, tenant_id = await _check_direct_agent_access(db, current_user, agent_id)
+    result = await db.execute(
+        select(ChatSession).where(
+            *_active_direct_filters(tenant_id, agent_id),
+            ChatSession.id == session_id,
         )
-
-    from sqlalchemy import delete as sql_delete
-    from app.models.gateway_message import GatewayMessage
-    from app.services.agentbay_client import agentbay_chat_session_deletion_fence
-
-    lane_agent_ids = sorted(
-        {
-            candidate
-            for candidate in (session.agent_id, session.peer_agent_id)
-            if candidate is not None
-        },
-        key=str,
     )
-    try:
-        async with AsyncExitStack() as stack:
-            for lane_agent_id in lane_agent_ids:
-                await stack.enter_async_context(
-                    agentbay_chat_session_deletion_fence(
-                        agent_id=lane_agent_id,
-                        user_id=session.user_id,
-                        session_id=str(session_id),
-                    )
-                )
+    session = result.scalar_one_or_none()
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    _authorize_session_owner(current_user, agent, session)
+    if session.user_id is None:
+        raise HTTPException(status_code=404, detail="Session not found")
 
-            # Re-lock the exact row after all cross-process provider fences are
-            # held. A creator revalidates this same row after taking its Redis
-            # creation lock, so session deletion and sandbox creation cannot
-            # cross in flight.
-            locked_result = await db.execute(
-                select(ChatSession)
-                .where(
-                    ChatSession.id == session_id,
-                    ChatSession.user_id == session.user_id,
-                    or_(
-                        ChatSession.agent_id == agent_id,
-                        ChatSession.peer_agent_id == agent_id,
-                    ),
-                )
-                .with_for_update()
-            )
-            locked_session = locked_result.scalar_one_or_none()
-            if locked_session is None:
-                raise HTTPException(status_code=404, detail="Session not found")
-            await db.execute(
-                sql_delete(GatewayMessage).where(
-                    GatewayMessage.conversation_id == str(session_id)
-                )
-            )
-            await db.execute(
-                sql_delete(ChatMessage).where(
-                    ChatMessage.conversation_id == str(session_id)
-                )
-            )
-            await db.delete(locked_session)
-            await db.commit()
-    except HTTPException:
-        raise
-    except Exception as exc:
-        await db.rollback()
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "The session is still using an AgentBay sandbox or its cleanup "
-                "could not be verified; retry later or contact an administrator"
-            ),
-        ) from exc
+    deleted = await soft_delete_direct_session(
+        db,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        user_id=session.user_id,
+        session_id=session_id,
+        actor_user_id=current_user.id,
+    )
+    if deleted is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    await db.commit()
     return None
+
+
+def _parse_message_cursor(cursor: str) -> tuple[datetime, uuid.UUID]:
+    timestamp_text, separator, message_id_text = cursor.rpartition("|")
+    try:
+        if separator:
+            message_id = uuid.UUID(message_id_text)
+        else:
+            timestamp_text = cursor
+            # Legacy timestamp-only cursors may duplicate equal-timestamp messages,
+            # but never skip them. New clients should round-trip the emitted cursor.
+            message_id = uuid.UUID(int=(1 << 128) - 1)
+        created_at = datetime.fromisoformat(timestamp_text.replace("Z", "+00:00"))
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=UTC)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid `before` cursor. Use '<ISO 8601>|<message UUID>'.",
+        ) from None
+    return created_at, message_id
+
+
+def _message_cursor(message: ChatMessage) -> str:
+    return f"{message.created_at.isoformat()}|{message.id}"
+
+
+def _base_message_entry(message: ChatMessage) -> dict:
+    return {
+        "id": str(message.id),
+        "role": message.role,
+        "content": message.content,
+        "created_at": message.created_at.isoformat() if message.created_at else None,
+        "cursor": _message_cursor(message),
+    }
 
 
 @router.get("/{agent_id}/sessions/{session_id}/messages")
 async def get_session_messages(
     agent_id: uuid.UUID,
     session_id: uuid.UUID,
-    response: Response,
-    limit: int = Query(20, ge=1, le=500, description="Number of messages to return"),
-    before: str = Query(None, description="Cursor: return messages created before this timestamp (ISO format)"),
-    before_id: uuid.UUID | None = Query(
-        None,
-        description="Stable cursor tie-breaker used with `before`",
-    ),
+    limit: Annotated[int, Query(ge=1, le=500, description="Messages to return")] = 20,
+    before: Annotated[
+        str | None,
+        Query(description="Cursor '<created_at>|<id>' for the first excluded position"),
+    ] = None,
+    response: Response = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get chat messages for a specific session."""
-    if not isinstance(limit, int):
-        limit = 20
-    if not isinstance(before, str):
-        before = None
-    if not isinstance(before_id, uuid.UUID):
-        before_id = None
-    await check_agent_access(db, current_user, agent_id)
-    session = await require_authorized_agent_chat_session(
-        db,
-        user=current_user,
-        agent_id=agent_id,
-        session_id=session_id,
+    """Return associated session messages by authoritative `(created_at, id)` position."""
+    agent, tenant_id = await _check_direct_agent_access(db, current_user, agent_id)
+    result = await db.execute(
+        select(ChatSession).where(
+            *_active_agent_session_filters(tenant_id, agent_id),
+            ChatSession.id == session_id,
+        )
     )
+    session = result.scalar_one_or_none()
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    _authorize_session_owner(current_user, agent, session)
 
-    # Query messages by conversation_id only (agent-to-agent uses session_agent_id)
-    # Optimized: use a single query with ORDER BY and LIMIT instead of subquery
     query = (
         select(ChatMessage)
-        .where(ChatMessage.conversation_id == str(session_id))
-        .order_by(desc(ChatMessage.created_at), desc(ChatMessage.id))
-        .limit(limit + 1)
+        .join(ChatSession, ChatMessage.conversation_id == cast(ChatSession.id, String))
+        .where(
+            *_active_agent_session_filters(tenant_id, agent_id),
+            ChatSession.id == session_id,
+            ChatMessage.conversation_id == str(session_id),
+        )
+        .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
+        .limit(limit)
     )
-    # Apply cursor filter if `before` timestamp is provided
     if before:
-        from datetime import datetime as dt
-        try:
-            before_dt = dt.fromisoformat(before.replace('Z', '+00:00'))
-            if before_id is None:
-                query = query.where(ChatMessage.created_at < before_dt)
-            else:
-                query = query.where(
-                    or_(
-                        ChatMessage.created_at < before_dt,
-                        and_(
-                            ChatMessage.created_at == before_dt,
-                            ChatMessage.id < before_id,
-                        ),
-                    )
-                )
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid `before` timestamp format. Use ISO 8601.")
-    msgs_result = await db.execute(query)
-    rows_desc = list(msgs_result.scalars().all())
-    has_more = len(rows_desc) > limit
-    messages = list(reversed(rows_desc[:limit]))
-    response.headers["X-History-Has-More"] = "true" if has_more else "false"
-    if messages:
-        oldest_source = messages[0]
-        if oldest_source.created_at:
-            response.headers["X-History-Next-Before"] = (
-                oldest_source.created_at.isoformat()
-            )
-        response.headers["X-History-Next-Before-Id"] = str(oldest_source.id)
+        before_created_at, before_id = _parse_message_cursor(before)
+        query = query.where(tuple_(ChatMessage.created_at, ChatMessage.id) < tuple_(before_created_at, before_id))
+    message_result = await db.execute(query)
+    messages = list(reversed(message_result.scalars().all()))
 
-    # Reading your own first-party/channel session should clear its unread state.
-    if str(session.user_id) == str(current_user.id) and not getattr(session, "is_group", False) and session.source_channel not in ("agent", "trigger"):
-        session.last_read_at_by_user = datetime.now(tz.utc)
+    if response is not None:
+        response.headers["X-History-Has-More"] = "false"
+        if messages:
+            response.headers["X-History-Next-Before"] = (
+                messages[0].created_at.isoformat()
+            )
+            response.headers["X-History-Next-Before-Id"] = str(messages[0].id)
+
+    if session.session_type == "direct" and str(session.user_id) == str(current_user.id):
+        read_at = datetime.now(UTC)
+        session.last_read_at_by_user = read_at
+        session.updated_at = read_at
         await db.commit()
 
-    # Batch fetch participant identity to avoid N+1 queries.  A2A alignment
-    # must use the stable Agent id rather than a display-name comparison:
-    # names are mutable and are not guaranteed to be unique.
-    sender_cache: dict[str, tuple[str, str]] = {}
-    if session.source_channel == "agent":
-        from app.models.participant import Participant
-        participant_ids = list({m.participant_id for m in messages if m.participant_id})
+    sender_names: dict[str, str] = {}
+    if _is_a2a_session(session):
+        participant_ids = {message.participant_id for message in messages if message.participant_id}
         if participant_ids:
-            p_result = await db.execute(
-                select(Participant.id, Participant.display_name, Participant.ref_id)
-                .where(Participant.id.in_(participant_ids))
+            participant_result = await db.execute(
+                select(Participant.id, Participant.display_name)
+                .join(
+                    Agent,
+                    and_(
+                        Participant.type == "agent",
+                        Participant.ref_id == Agent.id,
+                    ),
+                )
+                .where(
+                    Participant.id.in_(participant_ids),
+                    Agent.tenant_id == tenant_id,
+                )
             )
-            for row in p_result.all():
-                sender_cache[str(row[0])] = (row[1] or "Unknown", str(row[2]))
+            sender_names = {str(row[0]): row[1] or "Unknown" for row in participant_result.all()}
 
-    assistant_contents = await sanitize_response_artifacts_batch(
-        agent_id,
-        [m.content for m in messages if m.role == "assistant"],
-    )
-    sanitized_assistant_contents = iter(assistant_contents)
-    out = []
-    for m in messages:
-        message_content = m.content
-        if m.role == "assistant":
-            message_content = next(sanitized_assistant_contents)
-        sender_info = sender_cache.get(str(m.participant_id)) if m.participant_id else None
-        sender_name = sender_info[0] if sender_info else None
-        sender_agent_id = sender_info[1] if sender_info else None
-
-        def add_sender_metadata(entry: dict) -> None:
-            if sender_name:
-                entry["sender_name"] = sender_name
-            if m.participant_id:
-                entry["participant_id"] = str(m.participant_id)
-            if sender_agent_id:
-                entry["sender_agent_id"] = sender_agent_id
-                entry["is_current_agent"] = sender_agent_id == str(agent_id)
-
-        if m.role == "tool_call":
-            import json
-            entry: dict = {
-                "id": str(m.id),
-                "role": m.role,
-                "content": message_content,
-                "created_at": m.created_at.isoformat() if m.created_at else None,
-                "source_message_id": str(m.id),
-                "source_created_at": (
-                    m.created_at.isoformat() if m.created_at else None
-                ),
-            }
+    output = []
+    for message in messages:
+        sender_name = sender_names.get(str(message.participant_id)) if message.participant_id else None
+        entry = _base_message_entry(message)
+        if message.role == "tool_call":
             try:
-                data = json.loads(m.content)
+                data = json.loads(message.content)
+            except (TypeError, ValueError):
+                data = None
+            if isinstance(data, dict):
                 entry["content"] = ""
                 entry["toolName"] = data.get("name") or data.get("tool_name") or ""
                 entry["toolArgs"] = data.get("args") or data.get("arguments")
                 entry["toolStatus"] = data.get("status", "done")
                 entry["toolResult"] = data.get("result", "")
                 entry["toolThinking"] = data.get("reasoning_content", "")
-            except Exception:
-                pass
-            add_sender_metadata(entry)
-            out.append(entry)
-            continue
-
-        # For agent sessions, parse inline tool_code blocks from assistant messages
-        if session.source_channel == "agent" and m.role == "assistant" and "```tool_code" in (message_content or ""):
-            parts = _split_inline_tools(message_content)
-            for part_index, part in enumerate(parts):
-                part["id"] = f"{m.id}:part:{part_index}"
-                part["created_at"] = (
-                    m.created_at.isoformat() if m.created_at else None
-                )
-                part["source_message_id"] = str(m.id)
-                part["source_created_at"] = (
-                    m.created_at.isoformat() if m.created_at else None
-                )
-                add_sender_metadata(part)
-                out.append(part)
+                entry["toolCallId"] = data.get("tool_call_id") or ""
+        if getattr(message, "thinking", None):
+            entry["thinking"] = message.thinking
+        if sender_name:
+            entry["sender_name"] = sender_name
+        if message.participant_id:
+            entry["participant_id"] = str(message.participant_id)
+        if _is_a2a_session(session) and message.role == "assistant" and "```tool_code" in (message.content or ""):
+            for part in _split_inline_tools(message.content):
+                part["id"] = str(message.id)
+                part["created_at"] = message.created_at.isoformat() if message.created_at else None
+                part["cursor"] = _message_cursor(message)
+                if sender_name:
+                    part["sender_name"] = sender_name
+                if message.participant_id:
+                    part["participant_id"] = str(message.participant_id)
+                output.append(part)
         else:
-            entry = {
-                "id": str(m.id),
-                "role": m.role,
-                "content": message_content,
-                "created_at": m.created_at.isoformat() if m.created_at else None,
-                "source_message_id": str(m.id),
-                "source_created_at": (
-                    m.created_at.isoformat() if m.created_at else None
-                ),
-            }
-            if hasattr(m, 'thinking') and m.thinking:
-                entry["thinking"] = m.thinking
-            add_sender_metadata(entry)
-            out.append(entry)
-
-    return out
+            output.append(entry)
+    return output
 
 
 def _split_inline_tools(content: str) -> list[dict]:
-    """Parse assistant content containing inline ```tool_code blocks.
-
-    Splits into alternating text segments and tool_call entries.
-    Format: ```tool_code\ntool_name\n``` ```json\n{args}\n```
-    """
-    # Pattern: ```tool_code\n<name>\n``` optionally followed by ```json\n<args>\n```
+    """Legacy parser retained for clients rendering archived inline tool blocks."""
     pattern = re.compile(
-        r'```tool_code\s*\n\s*(\w+)\s*\n```'        # tool name
-        r'(?:\s*```json\s*\n(.*?)\n```)?',            # optional JSON args
-        re.DOTALL
+        r"```tool_code\s*\n\s*(\w+)\s*\n```"
+        r"(?:\s*```json\s*\n(.*?)\n```)?",
+        re.DOTALL,
     )
-
     parts: list[dict] = []
     last_end = 0
-
     for match in pattern.finditer(content):
-        # Text before this tool call
-        text_before = content[last_end:match.start()].strip()
+        text_before = content[last_end : match.start()].strip()
         if text_before:
             parts.append({"role": "assistant", "content": text_before})
-
-        tool_name = match.group(1)
         args_str = match.group(2)
         tool_args = None
         if args_str:
             try:
-                import json
                 tool_args = json.loads(args_str.strip())
-            except Exception:
+            except (TypeError, ValueError):
                 tool_args = {"raw": args_str.strip()}
-
-        parts.append({
-            "role": "tool_call",
-            "content": "",
-            "toolName": tool_name,
-            "toolArgs": tool_args,
-            "toolStatus": "done",
-            "toolResult": "",
-        })
+        parts.append(
+            {
+                "role": "tool_call",
+                "content": "",
+                "toolName": match.group(1),
+                "toolArgs": tool_args,
+                "toolStatus": "done",
+                "toolResult": "",
+            }
+        )
         last_end = match.end()
-
-    # Trailing text after last tool
     trailing = content[last_end:].strip()
     if trailing:
         parts.append({"role": "assistant", "content": trailing})
-
-    # If no matches found, return the whole content as-is
-    if not parts:
-        parts.append({"role": "assistant", "content": content})
-
-    return parts
+    return parts or [{"role": "assistant", "content": content}]

@@ -18,6 +18,7 @@ import {
     findIncompleteAgentChannels,
     shouldConfigureAgentChannels,
 } from '../utils/agentChannelSetup';
+import { buildOpenClawInstruction } from '../utils/openClawInstruction';
 const STEPS = ['basicInfo', 'personality', 'skills', 'permissions', 'channel'] as const;
 const OPENCLAW_STEPS = ['basicInfo', 'permissions'] as const;
 
@@ -213,6 +214,7 @@ export default function AgentCreate() {
     // If OpenClaw agent just created, show success page with API key
     if (createdApiKey && createMutation.data) {
         const agent = createMutation.data;
+        const setupInstruction = buildOpenClawInstruction(createdApiKey, !!i18n.language?.startsWith('zh'));
         return (
             <div>
                 <div className="page-header">
@@ -457,7 +459,7 @@ For humans, the message is delivered via their available channel (e.g. Feishu).`
                             {[
                                 { value: 'company', label: t('wizard.step4.companyWide'), desc: t('wizard.step4.companyWideDesc') },
                                 { value: 'user', label: t('wizard.step4.selfOnly'), desc: t('wizard.step4.selfOnlyDesc') },
-                                { value: 'custom', label: t('agent.settings.perm.custom', 'Custom'), desc: t('agent.settings.perm.customDesc', 'Start private, then choose platform users in Settings') },
+                                { value: 'custom', label: t('agent.settings.perm.custom', 'Custom'), desc: t('agent.settings.perm.customDesc', 'Only selected members and agents can see and use it. Plaza is disabled') },
                             ].map((scope) => (
                                 <label key={scope.value} style={{
                                     flex: 1, display: 'flex', alignItems: 'center', gap: '10px', padding: '12px',
@@ -651,7 +653,7 @@ For humans, the message is delivered via their available channel (e.g. Feishu).`
                             {[
                                 { value: 'company', label: t('wizard.step4.companyWide'), desc: t('wizard.step4.companyWideDesc') },
                                 { value: 'user', label: t('wizard.step4.selfOnly'), desc: t('wizard.step4.selfOnlyDesc') },
-                                { value: 'custom', label: t('agent.settings.perm.custom', 'Custom'), desc: t('agent.settings.perm.customDesc', 'Start private, then choose platform users in Settings') },
+                                { value: 'custom', label: t('agent.settings.perm.custom', 'Custom'), desc: t('agent.settings.perm.customDesc', 'Only selected members and agents can see and use it. Plaza is disabled') },
                             ].map((scope) => (
                                 <label key={scope.value} style={{
                                     display: 'flex', alignItems: 'center', gap: '12px', padding: '14px',
@@ -679,7 +681,7 @@ For humans, the message is delivered via their available channel (e.g. Feishu).`
                                 <div style={{ display: 'flex', gap: '8px' }}>
                                     {[
                                         { value: 'use', icon: <IconEye size={14} stroke={1.8} />, label: t('wizard.step4.useLevel', 'Use'), desc: t('wizard.step4.useDesc', 'Can use Task, Chat, Tools, Skills, Workspace') },
-                                        { value: 'manage', icon: <IconSettings size={14} stroke={1.8} />, label: t('wizard.step4.manageLevel', 'Manage'), desc: t('wizard.step4.manageDesc', 'Full access including Settings, Mind, Relationships') },
+                                        { value: 'manage', icon: <IconSettings size={14} stroke={1.8} />, label: t('wizard.step4.manageLevel', 'Manage'), desc: t('wizard.step4.manageDesc', 'Full access including Settings, Mind, and Directory') },
                                     ].map((lvl) => (
                                         <label key={lvl.value} style={{
                                             flex: 1, display: 'flex', alignItems: 'flex-start', gap: '10px', padding: '12px',

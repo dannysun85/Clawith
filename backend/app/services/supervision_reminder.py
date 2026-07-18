@@ -54,7 +54,7 @@ def _parse_schedule(remind_schedule: str) -> dict | None:
 
 def _is_reminder_due(remind_schedule: str, last_reminded_at: datetime | None, now_utc: datetime) -> bool:
     """Check if a reminder is due based on the schedule config.
-    
+
     All time calculations are anchored to now_utc (provided by tick loop).
     Default behavior is to use UTC for hour/minute checks unless a timezone is specified.
     """
@@ -159,7 +159,7 @@ async def _get_agent_reply(
         api_key=invocation.api_key,
         model=model.model,
         base_url=invocation.base_url,
-        timeout=float(getattr(model, 'request_timeout', None) or 60.0),
+        timeout=float(getattr(model, "request_timeout", None) or 60.0),
     )
     usage = None
     round_reservation_id = None
@@ -289,10 +289,7 @@ async def _send_supervision_reminder(task: Task, agent_name: str):
             return
 
         days_since = (datetime.now(timezone.utc) - task.created_at).days
-        reminder_msg = (
-            f"📋 督办提醒 — 来自 {agent_name}\n\n"
-            f"事项：{task.title}\n"
-        )
+        reminder_msg = f"📋 督办提醒 — 来自 {agent_name}\n\n事项：{task.title}\n"
         if task.description:
             reminder_msg += f"说明：{task.description}\n"
         reminder_msg += f"创建于：{days_since} 天前\n"
@@ -304,9 +301,7 @@ async def _send_supervision_reminder(task: Task, agent_name: str):
             sent = False
             send_method = ""
             owner_id = task.created_by
-            src_agent_r = await db.execute(
-                select(Agent).where(Agent.id == task.agent_id)
-            )
+            src_agent_r = await db.execute(select(Agent).where(Agent.id == task.agent_id))
             src_agent = src_agent_r.scalar_one_or_none()
             if src_agent is None or not await get_agent_access_level_for_user_id(
                 db,
@@ -343,22 +338,17 @@ async def _send_supervision_reminder(task: Task, agent_name: str):
                 )
                 return
             target_relation = agent_relations[0] if agent_relations else None
-            target_agent = (
-                target_relation.target_agent if target_relation else None
-            )
+            target_agent = target_relation.target_agent if target_relation else None
             if target_agent:
                 relationship_status = await evaluate_agent_relationship_status(
                     db,
                     target_relation,
                     current_user_id=owner_id,
                 )
-                if (
-                    relationship_status["access_status"] != "active"
-                    or not await get_agent_access_level_for_user_id(
-                        db,
-                        owner_id,
-                        target_agent,
-                    )
+                if relationship_status["access_status"] != "active" or not await get_agent_access_level_for_user_id(
+                    db,
+                    owner_id,
+                    target_agent,
                 ):
                     logger.warning(
                         "Supervision target access revoked task={} target={}",
@@ -370,8 +360,10 @@ async def _send_supervision_reminder(task: Task, agent_name: str):
             if target_agent:
                 # Send agent-to-agent message via ChatSession + ChatMessage
                 from app.models.audit import ChatMessage
-                from app.models.chat_session import ChatSession
                 from app.models.participant import Participant
+                from app.services.a2a_authorization import (
+                    ensure_private_a2a_session,
+                )
 
                 # Get participant for sender agent
                 src_part_r = await db.execute(
@@ -383,54 +375,28 @@ async def _send_supervision_reminder(task: Task, agent_name: str):
                 )
                 tgt_part = tgt_part_r.scalar_one_or_none()
 
-                # Find or create ChatSession
                 session_agent_id = min(task.agent_id, target_agent.id, key=str)
-                session_peer_id = max(task.agent_id, target_agent.id, key=str)
-                sess_r = await db.execute(
-                    select(ChatSession).where(
-                        ChatSession.agent_id == session_agent_id,
-                        ChatSession.peer_agent_id == session_peer_id,
-                        ChatSession.user_id == owner_id,
-                        ChatSession.source_channel == "agent",
-                    )
+                chat_session = await ensure_private_a2a_session(
+                    db,
+                    source_agent=src_agent,
+                    target_agent=target_agent,
+                    owner_user_id=owner_id,
+                    participant_id=src_part.id if src_part else None,
                 )
-                chat_session = sess_r.scalar_one_or_none()
-                if not chat_session:
-                    await db.execute(
-                        select(Agent.id)
-                        .where(Agent.id == session_agent_id)
-                        .with_for_update()
-                    )
-                    sess_r = await db.execute(
-                        select(ChatSession).where(
-                            ChatSession.agent_id == session_agent_id,
-                            ChatSession.peer_agent_id == session_peer_id,
-                            ChatSession.user_id == owner_id,
-                            ChatSession.source_channel == "agent",
-                        )
-                    )
-                    chat_session = sess_r.scalar_one_or_none()
-                if not chat_session:
-                    chat_session = ChatSession(
-                        agent_id=session_agent_id,
-                        user_id=owner_id,
-                        title=f"{agent_name} ↔ {target_agent.name}",
-                        source_channel="agent",
-                        participant_id=src_part.id if src_part else None,
-                        peer_agent_id=session_peer_id,
-                    )
-                    db.add(chat_session)
-                    await db.flush()
 
                 session_id = str(chat_session.id)
 
                 # Save reminder message
-                db.add(ChatMessage(
-                    agent_id=session_agent_id, user_id=owner_id,
-                    role="user", content=reminder_msg,
-                    conversation_id=session_id,
-                    participant_id=src_part.id if src_part else None,
-                ))
+                db.add(
+                    ChatMessage(
+                        agent_id=session_agent_id,
+                        user_id=owner_id,
+                        role="user",
+                        content=reminder_msg,
+                        conversation_id=session_id,
+                        participant_id=src_part.id if src_part else None,
+                    )
+                )
                 await db.flush()
                 chat_session.last_message_at = datetime.now(timezone.utc)
                 sent = True
@@ -445,12 +411,16 @@ async def _send_supervision_reminder(task: Task, agent_name: str):
                         owner_user_id=owner_id,
                     )
                     if reply:
-                        db.add(ChatMessage(
-                            agent_id=session_agent_id, user_id=owner_id,
-                            role="assistant", content=reply,
-                            conversation_id=session_id,
-                            participant_id=tgt_part.id if tgt_part else None,
-                        ))
+                        db.add(
+                            ChatMessage(
+                                agent_id=session_agent_id,
+                                user_id=owner_id,
+                                role="assistant",
+                                content=reply,
+                                conversation_id=session_id,
+                                participant_id=tgt_part.id if tgt_part else None,
+                            )
+                        )
                         send_method = "agent消息+回复"
                         logger.info(
                             "📋 Target agent replied agent={} reply_chars={}",
@@ -488,15 +458,20 @@ async def _send_supervision_reminder(task: Task, agent_name: str):
                     if config and (target_member.email or target_member.phone):
                         try:
                             resolved = await feishu_service.resolve_open_id(
-                                config.app_id, config.app_secret,
-                                email=target_member.email, mobile=target_member.phone,
+                                config.app_id,
+                                config.app_secret,
+                                email=target_member.email,
+                                mobile=target_member.phone,
                             )
                             if resolved:
                                 content = _json.dumps({"text": reminder_msg}, ensure_ascii=False)
                                 resp = await feishu_service.send_message(
-                                    config.app_id, config.app_secret,
-                                    receive_id=resolved, msg_type="text",
-                                    content=content, receive_id_type="open_id",
+                                    config.app_id,
+                                    config.app_secret,
+                                    receive_id=resolved,
+                                    msg_type="text",
+                                    content=content,
+                                    receive_id_type="open_id",
                                 )
                                 if resp.get("code") == 0:
                                     sent = True
@@ -548,7 +523,9 @@ async def _supervision_tick():
         async with async_session() as db:
             # Find active supervision tasks
             result = await db.execute(
-                select(Task, Agent.name).join(Agent, Agent.id == Task.agent_id).where(
+                select(Task, Agent.name)
+                .join(Agent, Agent.id == Task.agent_id)
+                .where(
                     Task.type == "supervision",
                     Task.status.in_(["pending", "doing"]),
                     Task.remind_schedule.isnot(None),
@@ -563,10 +540,7 @@ async def _supervision_tick():
                 try:
                     # Get last reminder log for this task
                     log_result = await db.execute(
-                        select(TaskLog)
-                        .where(TaskLog.task_id == task.id)
-                        .order_by(TaskLog.created_at.desc())
-                        .limit(1)
+                        select(TaskLog).where(TaskLog.task_id == task.id).order_by(TaskLog.created_at.desc()).limit(1)
                     )
                     last_log = log_result.scalar_one_or_none()
                     last_reminded = last_log.created_at if last_log else None

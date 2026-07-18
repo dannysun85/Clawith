@@ -57,6 +57,12 @@ backend:
     # Agent data directory
     agentDataDir: /data/agents
     agentTemplateDir: /app/agent_template
+    # v1.11 native Web Chat and Group collaboration use the durable Runtime.
+    # Set false only for an intentional allowlist/source-type staged rollout.
+    runtimeV2Enabled: true
+    runtimeV2AgentIds: ""
+    runtimeV2SourceTypes: task
+    runtimeCommandConcurrency: 10
     # Global kill switch for proactive Agent heartbeat. Explicit triggers are unaffected.
     heartbeatEnabled: false
     # Add custom environment variables here

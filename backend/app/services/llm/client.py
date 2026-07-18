@@ -39,6 +39,18 @@ _DETERMINISTIC_PROVIDER_ERROR_TYPES = frozenset({
 
 
 # ============================================================================
+# Errors and request-shape normalization
+# ============================================================================
+
+class LLMError(Exception):
+    """Base exception for LLM client errors."""
+
+
+class LLMRequestShapeError(LLMError):
+    """The final provider request violates a portable message-shape invariant."""
+
+
+# ============================================================================
 # Data Models
 # ============================================================================
 
@@ -179,6 +191,89 @@ class LLMMessage:
             content = content_blocks
 
         return {"role": role, "content": content}
+
+
+def _system_content_as_text(content: str | list | None) -> str:
+    """Convert a secondary system message into ordered text for the dynamic tail."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        raise LLMRequestShapeError(
+            f"system message content must be text or text blocks, got {type(content).__name__}"
+        )
+
+    text_parts: list[str] = []
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") != "text":
+            raise LLMRequestShapeError(
+                "secondary system messages may contain only text blocks"
+            )
+        text = part.get("text")
+        if text:
+            text_parts.append(str(text))
+    return "\n".join(text_parts)
+
+
+def normalize_provider_messages(messages: list[LLMMessage]) -> list[LLMMessage]:
+    """Return a provider-safe copy with at most one leading system message.
+
+    The first system message remains the cacheable/static prefix. Its dynamic
+    content and any later system records are folded, in encounter order, into
+    the uncached dynamic tail. Non-system history keeps its original order.
+    """
+    system_messages = [message for message in messages if message.role == "system"]
+    if not system_messages:
+        return list(messages)
+
+    for message in system_messages:
+        if message.tool_calls or message.tool_call_id or message.reasoning_content:
+            raise LLMRequestShapeError(
+                "system messages cannot contain tool calls, tool results, or reasoning content"
+            )
+
+    first = system_messages[0]
+    dynamic_parts: list[str] = []
+    if first.dynamic_content:
+        dynamic_parts.append(first.dynamic_content)
+
+    for message in system_messages[1:]:
+        content = _system_content_as_text(message.content)
+        if content:
+            dynamic_parts.append(content)
+        if message.dynamic_content:
+            dynamic_parts.append(message.dynamic_content)
+
+    normalized_system = LLMMessage(
+        role="system",
+        content=first.content if first.content is not None else "",
+        dynamic_content="\n\n".join(dynamic_parts) or None,
+    )
+    normalized = [normalized_system]
+    normalized.extend(message for message in messages if message.role != "system")
+    return normalized
+
+
+def validate_openai_message_shape(
+    messages: list[dict[str, Any]],
+    *,
+    provider_label: str,
+) -> None:
+    """Fail closed if a final OpenAI-style payload has an unsafe system shape."""
+    system_indexes = [
+        index
+        for index, message in enumerate(messages)
+        if isinstance(message, dict) and message.get("role") == "system"
+    ]
+    if len(system_indexes) > 1:
+        raise LLMRequestShapeError(
+            f"{provider_label} request contains multiple system messages; expected at most one"
+        )
+    if system_indexes and system_indexes[0] != 0:
+        raise LLMRequestShapeError(
+            f"{provider_label} request system message must be the first item"
+        )
 
 
 @dataclass
@@ -454,6 +549,7 @@ class OpenAICompatibleClient(LLMClient):
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Build request payload."""
+        messages = normalize_provider_messages(messages)
         messages_payload = self._messages_to_openai_payload(messages)
         logger.debug(
             "[LLM-Debug] OpenAICompatibleClient payload for model {} message_shape={}",
@@ -489,6 +585,20 @@ class OpenAICompatibleClient(LLMClient):
 
         # Add any additional kwargs (overrides extra_body)
         payload.update(kwargs)
+
+        final_messages = payload.get("messages")
+        if not isinstance(final_messages, list):
+            raise LLMRequestShapeError(
+                "OpenAI-compatible provider request messages must be a list"
+            )
+        validate_openai_message_shape(
+            final_messages,
+            provider_label="OpenAI-compatible provider",
+        )
+        logger.debug(
+            "[LLM-Debug] OpenAICompatibleClient payload messages for model "
+            f"{self.model}: {json.dumps(final_messages, indent=2, ensure_ascii=False)}"
+        )
 
         return payload
 
@@ -1134,9 +1244,11 @@ class OpenAIResponsesClient(LLMClient):
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Build request payload."""
+        normalized_messages = normalize_provider_messages(messages)
+        input_items = self._messages_to_input(normalized_messages)
         payload: dict[str, Any] = {
             "model": self.model,
-            "input": self._messages_to_input(messages),
+            "input": input_items,
             "temperature": temperature,
             "stream": stream,
         }
@@ -1151,6 +1263,15 @@ class OpenAIResponsesClient(LLMClient):
                 payload["tool_choice"] = "auto"
 
         payload.update(kwargs)
+        final_input = payload.get("input")
+        if not isinstance(final_input, list):
+            raise LLMRequestShapeError(
+                "OpenAI Responses provider request input must be a list"
+            )
+        validate_openai_message_shape(
+            final_input,
+            provider_label="OpenAI Responses provider",
+        )
         return payload
 
     def _parse_response_data(self, data: dict[str, Any]) -> LLMResponse:
@@ -1500,6 +1621,7 @@ class GeminiClient(LLMClient):
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Build Gemini request payload."""
+        messages = normalize_provider_messages(messages)
         system_blocks: list[str] = []
         contents: list[dict[str, Any]] = []
         tool_name_map = self._extract_tool_name_map(messages)
@@ -1508,6 +1630,8 @@ class GeminiClient(LLMClient):
             if msg.role == "system":
                 parts = self._content_to_gemini_parts(msg.content)
                 text_chunks = [p.get("text", "") for p in parts if p.get("text")]
+                if msg.dynamic_content:
+                    text_chunks.append(msg.dynamic_content)
                 if text_chunks:
                     system_blocks.append("\n".join(text_chunks))
                 continue
@@ -1924,6 +2048,7 @@ class AnthropicClient(LLMClient):
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Build Anthropic request payload."""
+        messages = normalize_provider_messages(messages)
         system_blocks = []
         anthropic_messages = []
 
@@ -2486,11 +2611,6 @@ MAX_TOKENS_BY_MODEL: dict[str, int] = {
     for spec in PROVIDER_REGISTRY.values()
     for prefix, limit in spec.model_max_tokens.items()
 }
-
-
-class LLMError(Exception):
-    """Base exception for LLM client errors."""
-    pass
 
 
 def get_provider_base_url(provider: str, custom_base_url: str | None = None) -> str | None:

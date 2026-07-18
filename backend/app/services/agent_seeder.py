@@ -4,7 +4,8 @@ import uuid
 
 from loguru import logger
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlalchemy.exc import IntegrityError
 
@@ -41,6 +42,118 @@ async def _append_seed_marker(line: str) -> None:
     updated = existing if existing.endswith("\n") or not existing else existing + "\n"
     updated += f"{line}\n"
     await storage.write_text(SEED_MARKER_KEY, updated, encoding="utf-8")
+
+
+def _parse_default_agent_marker(marker: str) -> dict[str, uuid.UUID]:
+    """Parse durable default-Agent identities from a shared bootstrap marker."""
+    identities: dict[str, uuid.UUID] = {}
+    for raw_line in marker.splitlines():
+        key, separator, value = raw_line.strip().partition("=")
+        key = key.casefold()
+        if not separator or key not in {"morty", "meeseeks"}:
+            continue
+        try:
+            identities[key] = uuid.UUID(value.strip())
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return identities
+
+
+def _resolve_default_agent_slots(
+    agents: list[Agent],
+    marker_ids: dict[str, uuid.UUID],
+) -> dict[str, Agent]:
+    """Resolve seeded identities even when an administrator renamed the Agents."""
+    by_id = {agent.id: agent for agent in agents}
+    by_name: dict[str, Agent] = {}
+    for agent in agents:
+        by_name.setdefault(agent.name, agent)
+
+    resolved: dict[str, Agent] = {}
+    claimed_ids: set[uuid.UUID] = set()
+    for marker_key, canonical_name in (("morty", "Morty"), ("meeseeks", "Meeseeks")):
+        marked = by_id.get(marker_ids.get(marker_key))
+        candidate = marked or by_name.get(canonical_name)
+        if candidate is not None and candidate.id not in claimed_ids:
+            resolved[canonical_name] = candidate
+            claimed_ids.add(candidate.id)
+    return resolved
+
+
+async def _write_default_agent_marker(morty_value: str, meeseeks_value: str) -> None:
+    """Replace only default-Agent marker entries while preserving other seeders."""
+    storage = get_storage_backend()
+    existing = await _read_seed_marker()
+    retained = [
+        line
+        for line in existing.splitlines()
+        if line.strip().partition("=")[0].casefold() not in {"morty", "meeseeks"}
+    ]
+    retained.extend([f"morty={morty_value}", f"meeseeks={meeseeks_value}"])
+    await storage.write_text(
+        SEED_MARKER_KEY,
+        "\n".join(retained).strip() + "\n",
+        encoding="utf-8",
+    )
+
+
+async def _repair_default_agent_storage(
+    db: AsyncSession,
+    agent: Agent,
+    *,
+    soul_content: str,
+    skill_folders: list[str],
+    all_skills: dict[str, Skill],
+    overwrite_skill_files: bool = False,
+) -> bool:
+    """Restore missing storage for an existing default agent without overwriting user files."""
+    storage = get_storage_backend()
+    agent_prefix = agent_manager._agent_storage_prefix(agent.id)
+    skills_prefix = f"{agent_prefix}/skills"
+    agent_dir_exists = await storage.is_dir(agent_prefix)
+    skills_dir_exists = await storage.is_dir(skills_prefix)
+
+    if agent_dir_exists and skills_dir_exists:
+        return False
+
+    if not agent_dir_exists:
+        await agent_manager.initialize_agent_files(db, agent)
+        await store_agent_bytes(
+            agent.id,
+            "soul.md",
+            (soul_content.strip() + "\n").encode("utf-8"),
+            content_type="text/markdown; charset=utf-8",
+        )
+
+    # Keep the directory visible even if the configured seed skills are absent
+    # from the database. Local and object storage both materialize the prefix on
+    # the first write.
+    if not skills_dir_exists:
+        await storage.write_text(f"{skills_prefix}/.gitkeep", "", encoding="utf-8")
+
+    folders_to_copy = set(skill_folders)
+    folders_to_copy.update(name for name, skill in all_skills.items() if skill.is_default)
+    for folder_name in folders_to_copy:
+        skill = all_skills.get(folder_name)
+        if not skill:
+            continue
+        for skill_file in skill.files:
+            target_key = f"{skills_prefix}/{skill.folder_name}/{skill_file.path}"
+            if not overwrite_skill_files and await storage.is_file(target_key):
+                continue
+            await store_agent_bytes(
+                agent.id,
+                f"skills/{skill.folder_name}/{skill_file.path}",
+                skill_file.content.encode("utf-8"),
+                content_type="text/plain; charset=utf-8",
+            )
+
+    logger.warning(
+        "[AgentSeeder] Repaired missing default-agent storage: "
+        f"agent={agent.id} root_missing={not agent_dir_exists} "
+        f"skills_missing={not skills_dir_exists}"
+    )
+    return True
 
 
 # ── Soul definitions ────────────────────────────────────────────
@@ -168,7 +281,7 @@ When a daily or weekly report is triggered:
 3. Identify KRs with `behind` or `at_risk` status
 4. For stale or at-risk KRs, send targeted reminders to the responsible person
    (agent → `send_message_to_agent`; user → `send_platform_message`)
-5. Generate and post the report via `generate_okr_report` + `plaza_create_post`
+5. Generate the report via `generate_okr_report`, then use its bounded receipt/reference for the requested delivery path
 
 ## Communication Style
 - Professional and concise
@@ -217,15 +330,11 @@ def _default_agent_names_for_available_slots(
 async def seed_default_agents():
     """Create default Agents up to the tenant's purchased Agent capacity.
 
-    Idempotency is guarded by a '.seeded' marker file in AGENT_DATA_DIR rather
-    than by agent name, so the seeder does NOT re-run if the user renames or
-    deletes the default agents.  Delete the marker manually to re-seed.
+    Database rows are the duplicate-creation guard. The storage marker is only
+    an operational hint because deployments can switch or lose storage while
+    preserving the database.
     """
-    marker_content = await _read_seed_marker()
-    if "morty=" in marker_content and "meeseeks=" in marker_content:
-        logger.info("[AgentSeeder] Default agents already seeded, preserving user renames")
-        return
-
+    marker_ids = _parse_default_agent_marker(await _read_seed_marker())
     async with async_session() as db:
 
         # Get platform admin as creator
@@ -243,45 +352,48 @@ async def seed_default_agents():
         # DB-backed idempotency is the source of truth. The storage marker can
         # disappear when deployments switch volumes/backends, so it is only a
         # fast-path hint and must never be the only duplicate guard.
+        identity_predicates = [Agent.name.in_(["Morty", "Meeseeks"])]
+        if marker_ids:
+            identity_predicates.append(Agent.id.in_(tuple(marker_ids.values())))
         existing_result = await db.execute(
             select(Agent)
             .where(
                 Agent.tenant_id == admin.tenant_id,
-                Agent.name.in_(["Morty", "Meeseeks"]),
+                or_(*identity_predicates),
                 Agent.agent_type == "native",
                 Agent.status != "stopped",
             )
             .order_by(Agent.created_at.asc())
         )
-        existing_by_name: dict[str, Agent] = {}
-        for agent in existing_result.scalars().all():
-            existing_by_name.setdefault(agent.name, agent)
-
-        if "Morty" in existing_by_name and "Meeseeks" in existing_by_name:
-            logger.info("[AgentSeeder] Default agents already exist in DB, skipping creation")
-            await _append_seed_marker(
-                f"morty={existing_by_name['Morty'].id}\nmeeseeks={existing_by_name['Meeseeks'].id}"
-            )
-            return
-
-        from app.services.quota_guard import _count_active_tenant_agents, _tenant_max_agents
-
-        max_agents = await _tenant_max_agents(admin.tenant_id)
-        active_agents = await _count_active_tenant_agents(admin.tenant_id, db)
-        available_slots = max(0, max_agents - active_agents)
-        names_to_create = set(
-            _default_agent_names_for_available_slots(
-                set(existing_by_name),
-                available_slots,
-            )
+        existing_by_name = _resolve_default_agent_slots(
+            list(existing_result.scalars().all()),
+            marker_ids,
         )
-        logger.info(
-            "[AgentSeeder] Applying plan capacity to default agents: "
-            f"active={active_agents}, max={max_agents}, creating={sorted(names_to_create)}"
-        )
+
+        names_to_create: set[str] = set()
+        if set(existing_by_name) != set(DEFAULT_AGENT_SEED_ORDER):
+            from app.services.quota_guard import (
+                _count_active_tenant_agents,
+                _tenant_max_agents,
+            )
+
+            max_agents = await _tenant_max_agents(admin.tenant_id)
+            active_agents = await _count_active_tenant_agents(admin.tenant_id, db)
+            available_slots = max(0, max_agents - active_agents)
+            names_to_create = set(
+                _default_agent_names_for_available_slots(
+                    set(existing_by_name),
+                    available_slots,
+                )
+            )
+            logger.info(
+                "[AgentSeeder] Applying plan capacity to default agents: "
+                f"active={active_agents}, max={max_agents}, "
+                f"creating={sorted(names_to_create)}"
+            )
 
         created_agents: list[Agent] = []
-        created_names: set[str] = set()
+        created_ids: set[uuid.UUID] = set()
         morty = existing_by_name.get("Morty")
         meeseeks = existing_by_name.get("Meeseeks")
 
@@ -297,7 +409,6 @@ async def seed_default_agents():
             )
             db.add(morty)
             created_agents.append(morty)
-            created_names.add("Morty")
 
         if meeseeks is None and "Meeseeks" in names_to_create:
             meeseeks = Agent(
@@ -311,8 +422,8 @@ async def seed_default_agents():
             )
             db.add(meeseeks)
             created_agents.append(meeseeks)
-            created_names.add("Meeseeks")
         await db.flush()  # get IDs
+        created_ids.update(agent.id for agent in created_agents)
 
         # ── Participant identities ──
         from app.models.participant import Participant
@@ -330,7 +441,7 @@ async def seed_default_agents():
             if agent is not None
         ]
         for agent, soul_content in default_agents:
-            if agent.name not in created_names:
+            if agent.id not in created_ids:
                 continue
             await agent_manager.initialize_agent_files(db, agent)
             await store_agent_bytes(
@@ -355,13 +466,28 @@ async def seed_default_agents():
             )
         }
 
+        for agent, soul_content, skill_folders in (
+            (morty, MORTY_SOUL, MORTY_SKILLS),
+            (meeseeks, MEESEEKS_SOUL, MEESEEKS_SKILLS),
+        ):
+            if agent is None:
+                continue
+            await _repair_default_agent_storage(
+                db,
+                agent,
+                soul_content=soul_content,
+                skill_folders=skill_folders,
+                all_skills=all_skills,
+                overwrite_skill_files=agent.id in created_ids,
+            )
+
         default_agent_skills = [
             (agent, skill_folders)
             for agent, skill_folders in ((morty, MORTY_SKILLS), (meeseeks, MEESEEKS_SKILLS))
             if agent is not None
         ]
         for agent, skill_folders in default_agent_skills:
-            if agent.name not in created_names:
+            if agent.id not in created_ids:
                 continue
             # Always include default skills
             folders_to_copy = set(skill_folders)
@@ -439,9 +565,7 @@ async def seed_default_agents():
 
     # Append only after a successful commit so failures can be retried without
     # erasing marker entries owned by other bootstrap seeders.
-    await _append_seed_marker(
-        f"morty={morty_marker}\nmeeseeks={meeseeks_marker}"
-    )
+    await _write_default_agent_marker(morty_marker, meeseeks_marker)
     logger.info(f"[AgentSeeder] Wrote seed marker to {SEED_MARKER_KEY}")
 
 

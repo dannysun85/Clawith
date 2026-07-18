@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.api import dingtalk
+from app.services.agent_runtime.channel_chat import ChannelChatRuntimeError
 
 
 class _Response:
@@ -224,25 +225,26 @@ async def test_failed_dingtalk_delivery_does_not_persist_false_assistant_history
         AsyncMock(return_value=(object(), object(), None, {})),
     )
     monkeypatch.setattr(
-        "app.api.feishu._call_llm_with_config",
-        AsyncMock(return_value="Generated but never delivered"),
-    )
-    monkeypatch.setattr(
         dingtalk,
-        "_deliver_dingtalk_session_reply",
-        AsyncMock(return_value=False),
+        "enqueue_channel_chat_runtime",
+        AsyncMock(
+            side_effect=ChannelChatRuntimeError(
+                "channel_runtime_disabled",
+                "Unified Agent Runtime is not enabled for this channel",
+            )
+        ),
     )
 
-    await dingtalk.process_dingtalk_message(
-        agent_id=agent_id,
-        sender_staff_id="staff-id",
-        user_text="hello",
-        conversation_id="conversation-id",
-        conversation_type="1",
-        session_webhook="https://oapi.example/robot/send?access_token=secret",
-    )
+    with pytest.raises(ChannelChatRuntimeError, match="not enabled"):
+        await dingtalk.process_dingtalk_message(
+            agent_id=agent_id,
+            sender_staff_id="staff-id",
+            user_text="hello",
+            conversation_id="conversation-id",
+            conversation_type="1",
+            session_webhook="https://oapi.example/robot/send?access_token=secret",
+        )
 
     assert session_factory_calls == 1
-    assert [message.role for message in db.added] == ["user"]
-    assert db.commits == 1
-    assert db.closed is True
+    assert db.added == []
+    assert db.commits == 0

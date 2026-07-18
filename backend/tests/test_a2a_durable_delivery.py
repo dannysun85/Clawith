@@ -7,6 +7,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.schema import CreateIndex
 
 from app.models.trigger import AgentTrigger
 from app.models.trigger_execution import TriggerExecution
@@ -111,6 +113,41 @@ def _context(*, source_message_id=None, message="Prepare the report") -> A2ACont
 
 
 @pytest.mark.asyncio
+async def test_private_a2a_session_persists_unified_tenant_scope():
+    from app.services.a2a_authorization import ensure_private_a2a_session
+
+    tenant_id = uuid.uuid4()
+    owner_id = uuid.uuid4()
+    participant_id = uuid.uuid4()
+    source = SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        name="Source",
+    )
+    target = SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        name="Target",
+    )
+    db = RecordingDB(responses=[DummyResult()])
+
+    session = await ensure_private_a2a_session(
+        db,
+        source_agent=source,
+        target_agent=target,
+        owner_user_id=owner_id,
+        participant_id=participant_id,
+    )
+
+    assert session.tenant_id == tenant_id
+    assert session.session_type == "a2a"
+    assert session.created_by_participant_id == participant_id
+    assert session.is_group is False
+    assert session.is_primary is False
+    assert session.deleted_at is None
+
+
+@pytest.mark.asyncio
 async def test_wake_agent_with_context_commits_durable_a2a_execution():
     from app.services.trigger_daemon import wake_agent_with_context
 
@@ -204,22 +241,12 @@ def test_a2a_invocation_batches_never_merge_durable_messages():
     from app.services.trigger_daemon import _build_invocation_batches
 
     agent_id = uuid.uuid4()
-    ordinary_one = AgentTrigger(
-        id=uuid.uuid4(), agent_id=agent_id, name="cron", type="cron", config={}, reason=""
-    )
-    a2a_one = AgentTrigger(
-        id=uuid.uuid4(), agent_id=agent_id, name="__a2a_wake__", type="a2a", config={}, reason=""
-    )
-    a2a_two = AgentTrigger(
-        id=uuid.uuid4(), agent_id=agent_id, name="__a2a_wake__", type="a2a", config={}, reason=""
-    )
-    ordinary_two = AgentTrigger(
-        id=uuid.uuid4(), agent_id=agent_id, name="poll", type="poll", config={}, reason=""
-    )
+    ordinary_one = AgentTrigger(id=uuid.uuid4(), agent_id=agent_id, name="cron", type="cron", config={}, reason="")
+    a2a_one = AgentTrigger(id=uuid.uuid4(), agent_id=agent_id, name="__a2a_wake__", type="a2a", config={}, reason="")
+    a2a_two = AgentTrigger(id=uuid.uuid4(), agent_id=agent_id, name="__a2a_wake__", type="a2a", config={}, reason="")
+    ordinary_two = AgentTrigger(id=uuid.uuid4(), agent_id=agent_id, name="poll", type="poll", config={}, reason="")
 
-    batches = _build_invocation_batches(
-        [ordinary_one, a2a_one, a2a_two, ordinary_two]
-    )
+    batches = _build_invocation_batches([ordinary_one, a2a_one, a2a_two, ordinary_two])
 
     assert [[trigger.type for trigger in batch] for batch in batches] == [
         ["cron"],
@@ -399,9 +426,7 @@ async def test_waiting_batch_renewal_failure_cancels_before_later_execution(
     )
     monkeypatch.setattr(trigger_daemon, "_invoke_agent_for_triggers", invoke)
 
-    task = asyncio.create_task(
-        trigger_daemon._invoke_agent_batches(agent_id, [[first], [second]])
-    )
+    task = asyncio.create_task(trigger_daemon._invoke_agent_batches(agent_id, [[first], [second]]))
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, timeout=1)
 
@@ -417,9 +442,11 @@ def test_a2a_claim_head_includes_live_processing_execution():
     assert 'status.in_(("pending", "processing"))' in source
     assert "earlier_is_unfinished" in source
     assert "earlier_execution.source" not in source
-    assert "uq_trigger_executions_processing_agent" in str(
-        TriggerExecution.__table__.indexes
+    processing_index = next(
+        index for index in TriggerExecution.__table__.indexes if index.name == "uq_trigger_executions_processing_agent"
     )
+    ddl = str(CreateIndex(processing_index).compile(dialect=postgresql.dialect()))
+    assert "status = 'processing' AND lease_owner IS NOT NULL" in ddl
 
 
 @pytest.mark.asyncio
@@ -427,18 +454,13 @@ async def test_default_execution_claim_sources_include_a2a():
     from app.services.trigger_runtime.executions import claim_pending_trigger_executions
 
     db = RecordingDB(responses=[DummyResult(), DummyResult(rows=[])])
-    with patch(
-        "app.services.trigger_runtime.executions.async_session"
-    ) as session_factory:
+    with patch("app.services.trigger_runtime.executions.async_session") as session_factory:
         session_factory.return_value.__aenter__ = AsyncMock(return_value=db)
         session_factory.return_value.__aexit__ = AsyncMock(return_value=False)
         assert await claim_pending_trigger_executions() == []
 
     compiled_params = db.statements[1].compile().params
-    assert any(
-        isinstance(value, list) and "a2a" in value
-        for value in compiled_params.values()
-    )
+    assert any(isinstance(value, list) and "a2a" in value for value in compiled_params.values())
 
 
 @pytest.mark.asyncio

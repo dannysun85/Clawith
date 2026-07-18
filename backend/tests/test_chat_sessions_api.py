@@ -1,12 +1,16 @@
-import uuid
-from contextlib import asynccontextmanager
+"""Focused tests for the tenant-scoped Direct Chat API lifecycle."""
+
+from collections import deque
 from datetime import UTC, datetime
+import json
 from types import SimpleNamespace
+import uuid
 
 import pytest
-from fastapi import HTTPException, Response
+from sqlalchemy.dialects import postgresql
 
 from app.api import chat_sessions as chat_sessions_api
+from app.services.chat_session_service import DirectSessionDeletion
 
 
 class DummyResult:
@@ -25,69 +29,140 @@ class DummyResult:
     def all(self):
         return list(self._values)
 
-    def scalar(self):
-        if self._scalar_value is not None:
-            return self._scalar_value
-        return self._values[0] if self._values else None
-
 
 class RecordingDB:
-    def __init__(self, responses=None):
-        self.responses = list(responses or [])
-        self.added = []
+    def __init__(self, *responses):
+        self.responses = deque(responses)
+        self.statements = []
         self.committed = False
         self.refreshed = []
-        self.deleted = []
 
-    async def execute(self, _statement, _params=None):
+    async def execute(self, statement, _params=None):
+        self.statements.append(statement)
         if not self.responses:
             raise AssertionError("unexpected execute() call")
-        return self.responses.pop(0)
-
-    def add(self, value):
-        self.added.append(value)
+        return self.responses.popleft()
 
     async def commit(self):
         self.committed = True
 
-    async def rollback(self):
-        return None
-
     async def refresh(self, value):
         self.refreshed.append(value)
 
-    async def delete(self, value):
-        self.deleted.append(value)
+
+def _sql(statement) -> str:
+    return str(
+        statement.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+
+
+def _actor(*, role="member"):
+    tenant_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    return SimpleNamespace(
+        id=user_id,
+        tenant_id=tenant_id,
+        role=role,
+        display_name="Current User",
+        avatar_url=None,
+    )
+
+
+def _agent(current_user, *, creator_id=None, agent_id=None):
+    return SimpleNamespace(
+        id=agent_id or uuid.uuid4(),
+        tenant_id=current_user.tenant_id,
+        creator_id=creator_id or current_user.id,
+    )
+
+
+def _session(
+    agent,
+    user_id,
+    *,
+    is_primary=False,
+    session_type="direct",
+    source_channel="web",
+    peer_agent_id=None,
+    is_group=False,
+    group_name=None,
+):
+    now = datetime(2026, 7, 13, 12, 0, tzinfo=UTC)
+    return SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=agent.tenant_id,
+        session_type=session_type,
+        agent_id=agent.id,
+        user_id=user_id,
+        source_channel=source_channel,
+        title="Customer follow-up",
+        created_at=now,
+        updated_at=now,
+        last_message_at=now,
+        last_read_at_by_user=None,
+        is_primary=is_primary,
+        peer_agent_id=peer_agent_id,
+        is_group=is_group,
+        group_name=group_name,
+    )
 
 
 @pytest.mark.asyncio
-async def test_org_admin_can_list_all_sessions(monkeypatch):
-    viewer_id = uuid.uuid4()
-    agent_id = uuid.uuid4()
+async def test_list_all_associated_sessions_is_tenant_scoped_and_direct_unread_only(
+    monkeypatch,
+):
+    current_user = _actor(role="org_admin")
+    agent = _agent(current_user, creator_id=uuid.uuid4())
     owner_id = uuid.uuid4()
-    now = datetime.now(UTC)
-
-    current_user = SimpleNamespace(id=viewer_id, role="org_admin")
-    agent = SimpleNamespace(id=agent_id, creator_id=uuid.uuid4())
-    session = SimpleNamespace(
-        id=uuid.uuid4(),
-        agent_id=agent_id,
-        user_id=owner_id,
-        source_channel="web",
-        title="Customer follow-up",
-        created_at=now,
-        last_message_at=now,
-        peer_agent_id=None,
-        is_group=False,
-        group_name=None,
-    )
+    session = _session(agent, owner_id)
     db = RecordingDB(
-        responses=[
-            DummyResult([agent]),
-            DummyResult([session]),
-            DummyResult([(str(session.id), 3)]),
-            DummyResult([(owner_id, "Alice")]),
-        ]
+        DummyResult([session]),
+        DummyResult([(str(session.id), 3)]),
+        DummyResult([]),
+        DummyResult([(owner_id, "Alice")]),
+    )
+
+    async def fake_check_agent_access(_db, _user, _agent_id):
+        return agent, "manage"
+
+    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
+
+    sessions = await chat_sessions_api.list_sessions(
+        agent_id=agent.id,
+        scope="all",
+        current_user=current_user,
+        db=db,
+    )
+
+    assert len(sessions) == 1
+    assert sessions[0].user_id == str(owner_id)
+    assert sessions[0].username == "Alice"
+    assert sessions[0].unread_count == 0
+    session_sql = _sql(db.statements[0])
+    assert f"chat_sessions.tenant_id = '{current_user.tenant_id}'" in session_sql
+    assert "chat_sessions.deleted_at IS NULL" in session_sql
+    assert "chat_sessions.peer_agent_id" in session_sql
+    assert "chat_sessions.session_type = 'a2a'" in session_sql
+    count_sql = _sql(db.statements[1])
+    assert f"chat_sessions.tenant_id = '{current_user.tenant_id}'" in count_sql
+    assert "chat_sessions.deleted_at IS NULL" in count_sql
+    unread_sql = _sql(db.statements[2])
+    assert "chat_sessions.session_type = 'direct'" in unread_sql
+    assert "chat_sessions.deleted_at IS NULL" in unread_sql
+
+
+@pytest.mark.asyncio
+async def test_list_mine_remains_active_direct_sessions_only(monkeypatch):
+    current_user = _actor()
+    agent = _agent(current_user)
+    session = _session(agent, current_user.id)
+    db = RecordingDB(
+        DummyResult([session]),
+        DummyResult([(str(session.id), 1)]),
+        DummyResult([]),
     )
 
     async def fake_check_agent_access(_db, _user, _agent_id):
@@ -96,84 +171,328 @@ async def test_org_admin_can_list_all_sessions(monkeypatch):
     monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
 
     sessions = await chat_sessions_api.list_sessions(
-        agent_id=agent_id,
-        scope="all",
+        agent_id=agent.id,
+        scope="mine",
         current_user=current_user,
         db=db,
     )
 
-    assert len(sessions) == 1
-    assert sessions[0].id == str(session.id)
-    assert sessions[0].user_id == str(owner_id)
-    assert sessions[0].username == "Alice"
+    assert [value.id for value in sessions] == [str(session.id)]
+    session_sql = _sql(db.statements[0])
+    assert f"chat_sessions.tenant_id = '{current_user.tenant_id}'" in session_sql
+    assert "chat_sessions.session_type = 'direct'" in session_sql
+    assert "chat_sessions.deleted_at IS NULL" in session_sql
+    assert f"chat_sessions.user_id = '{current_user.id}'" in session_sql
 
 
 @pytest.mark.asyncio
-async def test_creator_cannot_list_other_users_sessions(monkeypatch):
-    creator_id = uuid.uuid4()
-    agent_id = uuid.uuid4()
+async def test_cross_tenant_agent_is_rejected_before_session_query(monkeypatch):
+    current_user = _actor(role="org_admin")
+    cross_tenant_agent = SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        creator_id=current_user.id,
+    )
+    db = RecordingDB()
 
-    current_user = SimpleNamespace(id=creator_id, role="member")
-    agent = SimpleNamespace(id=agent_id, creator_id=creator_id)
-    db = RecordingDB(responses=[DummyResult([agent])])
+    async def fake_check_agent_access(_db, _user, _agent_id):
+        return cross_tenant_agent, "manage"
+
+    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
+
+    with pytest.raises(chat_sessions_api.HTTPException) as error:
+        await chat_sessions_api.list_sessions(
+            agent_id=cross_tenant_agent.id,
+            scope="all",
+            current_user=current_user,
+            db=db,
+        )
+
+    assert error.value.status_code == 403
+    assert db.statements == []
+
+
+@pytest.mark.asyncio
+async def test_list_all_preserves_trigger_session_shape(monkeypatch):
+    current_user = _actor(role="org_admin")
+    agent = _agent(current_user, creator_id=uuid.uuid4())
+    owner_id = uuid.uuid4()
+    session = _session(
+        agent,
+        owner_id,
+        session_type="trigger",
+        source_channel="trigger",
+    )
+    db = RecordingDB(
+        DummyResult([session]),
+        DummyResult([(str(session.id), 2)]),
+        DummyResult([]),
+        DummyResult([(owner_id, "Trigger Owner")]),
+    )
 
     async def fake_check_agent_access(_db, _user, _agent_id):
         return agent, "manage"
 
     monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
 
-    with pytest.raises(HTTPException) as exc_info:
-        await chat_sessions_api.list_sessions(
-            agent_id=agent_id,
-            scope="all",
-            current_user=current_user,
-            db=db,
-        )
+    sessions = await chat_sessions_api.list_sessions(
+        agent_id=agent.id,
+        scope="all",
+        current_user=current_user,
+        db=db,
+    )
 
-    assert exc_info.value.status_code == 403
+    assert len(sessions) == 1
+    assert sessions[0].source_channel == "trigger"
+    assert sessions[0].username == "Trigger Owner"
+    assert sessions[0].participant_type == "user"
+    assert sessions[0].is_group is False
+    assert sessions[0].unread_count == 0
 
 
 @pytest.mark.asyncio
-async def test_org_admin_can_view_other_users_session_messages(monkeypatch):
-    viewer_id = uuid.uuid4()
-    agent_id = uuid.uuid4()
-    owner_id = uuid.uuid4()
-    session_id = uuid.uuid4()
-    message_id = uuid.uuid4()
-    now = datetime.now(UTC)
-
-    current_user = SimpleNamespace(id=viewer_id, role="org_admin")
-    session = SimpleNamespace(
-        id=session_id,
-        agent_id=agent_id,
-        peer_agent_id=None,
-        user_id=owner_id,
-        source_channel="web",
+async def test_list_all_includes_a2a_session_from_peer_agent_side(monkeypatch):
+    current_user = _actor(role="org_admin")
+    requested_agent = _agent(current_user, creator_id=uuid.uuid4())
+    origin_agent_id = uuid.uuid4()
+    session = _session(
+        SimpleNamespace(id=origin_agent_id, tenant_id=current_user.tenant_id),
+        uuid.uuid4(),
+        session_type="a2a",
+        source_channel="agent",
+        peer_agent_id=requested_agent.id,
     )
+    db = RecordingDB(
+        DummyResult([session]),
+        DummyResult([(str(session.id), 4)]),
+        DummyResult([]),
+        DummyResult(
+            [
+                (origin_agent_id, "Researcher"),
+                (requested_agent.id, "Reviewer"),
+            ]
+        ),
+    )
+
+    async def fake_check_agent_access(_db, _user, _agent_id):
+        return requested_agent, "manage"
+
+    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
+
+    sessions = await chat_sessions_api.list_sessions(
+        agent_id=requested_agent.id,
+        scope="all",
+        current_user=current_user,
+        db=db,
+    )
+
+    assert len(sessions) == 1
+    assert sessions[0].participant_type == "agent"
+    assert sessions[0].peer_agent_id == str(origin_agent_id)
+    assert sessions[0].peer_agent_name == "Researcher"
+    assert sessions[0].username == "Agent Researcher - Reviewer"
+    session_sql = _sql(db.statements[0])
+    assert f"chat_sessions.peer_agent_id = '{requested_agent.id}'" in session_sql
+    agent_name_sql = _sql(db.statements[3])
+    assert f"agents.tenant_id = '{current_user.tenant_id}'" in agent_name_sql
+
+
+@pytest.mark.asyncio
+async def test_list_all_preserves_legacy_group_display_fields(monkeypatch):
+    current_user = _actor(role="org_admin")
+    agent = _agent(current_user, creator_id=uuid.uuid4())
+    session = _session(
+        agent,
+        uuid.uuid4(),
+        session_type="group",
+        source_channel="feishu",
+        is_group=True,
+        group_name="Clawith Developers",
+    )
+    db = RecordingDB(
+        DummyResult([session]),
+        DummyResult([(str(session.id), 5)]),
+        DummyResult([]),
+    )
+
+    async def fake_check_agent_access(_db, _user, _agent_id):
+        return agent, "manage"
+
+    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
+
+    sessions = await chat_sessions_api.list_sessions(
+        agent_id=agent.id,
+        scope="all",
+        current_user=current_user,
+        db=db,
+    )
+
+    assert len(sessions) == 1
+    assert sessions[0].username == "Clawith Developers"
+    assert sessions[0].participant_type == "group"
+    assert sessions[0].is_group is True
+    assert sessions[0].group_name == "Clawith Developers"
+
+
+@pytest.mark.asyncio
+async def test_create_resolves_same_tenant_user_and_participant(monkeypatch):
+    current_user = _actor()
+    agent = _agent(current_user)
+    participant = SimpleNamespace(id=uuid.uuid4())
+    created = _session(agent, current_user.id, is_primary=True)
+    db = RecordingDB(DummyResult([current_user]))
+    captured = {}
+
+    async def fake_check_agent_access(_db, _user, _agent_id):
+        return agent, "manage"
+
+    async def fake_get_or_create_participant(_db, user_id, display_name, avatar_url):
+        captured["participant"] = (user_id, display_name, avatar_url)
+        return participant
+
+    async def fake_create_direct_session(_db, **kwargs):
+        captured["create"] = kwargs
+        return created
+
+    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
+    monkeypatch.setattr(
+        chat_sessions_api,
+        "get_or_create_user_participant",
+        fake_get_or_create_participant,
+    )
+    monkeypatch.setattr(
+        chat_sessions_api,
+        "create_direct_session",
+        fake_create_direct_session,
+    )
+
+    result = await chat_sessions_api.create_session(
+        agent_id=agent.id,
+        body=chat_sessions_api.CreateSessionIn(title="Topic"),
+        current_user=current_user,
+        db=db,
+    )
+
+    assert result.agent_id == str(agent.id)
+    assert result.user_id == str(current_user.id)
+    assert result.is_primary is True
+    assert captured["participant"] == (
+        current_user.id,
+        current_user.display_name,
+        current_user.avatar_url,
+    )
+    assert captured["create"] == {
+        "tenant_id": current_user.tenant_id,
+        "agent_id": agent.id,
+        "user_id": current_user.id,
+        "created_by_participant_id": participant.id,
+        "title": "Topic",
+    }
+    user_sql = _sql(db.statements[0])
+    assert f"users.tenant_id = '{current_user.tenant_id}'" in user_sql
+    assert "users.is_active IS true" in user_sql
+    assert db.committed is True
+    assert db.refreshed == [created]
+
+
+@pytest.mark.asyncio
+async def test_rename_filters_tenant_direct_and_deleted(monkeypatch):
+    current_user = _actor()
+    agent = _agent(current_user)
+    session = _session(agent, current_user.id)
+    db = RecordingDB(DummyResult([session]))
+
+    async def fake_check_agent_access(_db, _user, _agent_id):
+        return agent, "manage"
+
+    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
+
+    result = await chat_sessions_api.rename_session(
+        agent_id=agent.id,
+        session_id=session.id,
+        body=chat_sessions_api.PatchSessionIn(title="Renamed"),
+        current_user=current_user,
+        db=db,
+    )
+
+    assert result == {"id": str(session.id), "title": "Renamed"}
+    sql = _sql(db.statements[0])
+    assert f"chat_sessions.tenant_id = '{current_user.tenant_id}'" in sql
+    assert "chat_sessions.session_type = 'direct'" in sql
+    assert "chat_sessions.deleted_at IS NULL" in sql
+
+
+@pytest.mark.asyncio
+async def test_delete_delegates_soft_delete_without_physical_message_delete(
+    monkeypatch,
+):
+    current_user = _actor()
+    agent = _agent(current_user)
+    session = _session(agent, current_user.id, is_primary=True)
+    db = RecordingDB(DummyResult([session]))
+    calls = []
+
+    async def fake_check_agent_access(_db, _user, _agent_id):
+        return agent, "manage"
+
+    async def fake_soft_delete(_db, **kwargs):
+        calls.append(kwargs)
+        return DirectSessionDeletion(session, None, ())
+
+    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
+    monkeypatch.setattr(chat_sessions_api, "soft_delete_direct_session", fake_soft_delete)
+
+    result = await chat_sessions_api.delete_session(
+        agent_id=agent.id,
+        session_id=session.id,
+        current_user=current_user,
+        db=db,
+    )
+
+    assert result is None
+    assert calls == [
+        {
+            "tenant_id": current_user.tenant_id,
+            "agent_id": agent.id,
+            "user_id": current_user.id,
+            "session_id": session.id,
+            "actor_user_id": current_user.id,
+        }
+    ]
+    assert db.committed is True
+    assert all(statement.__class__.__name__ != "Delete" for statement in db.statements)
+
+
+@pytest.mark.asyncio
+async def test_messages_use_created_at_id_cursor_and_plain_defaults(monkeypatch):
+    current_user = _actor(role="org_admin")
+    agent = _agent(current_user, creator_id=uuid.uuid4())
+    owner_id = uuid.uuid4()
+    session = _session(agent, owner_id)
+    message_id = uuid.uuid4()
+    created_at = datetime(2026, 7, 13, 11, 0, tzinfo=UTC)
     message = SimpleNamespace(
         id=message_id,
         role="user",
         content="hello",
-        created_at=now,
+        created_at=created_at,
         participant_id=None,
+        thinking=None,
     )
-    db = RecordingDB(
-        responses=[
-            DummyResult([session]),
-            DummyResult([message]),
-        ]
-    )
+    before_id = uuid.uuid4()
+    before_at = datetime(2026, 7, 13, 12, 0, tzinfo=UTC)
+    db = RecordingDB(DummyResult([session]), DummyResult([message]))
 
     async def fake_check_agent_access(_db, _user, _agent_id):
-        return SimpleNamespace(id=agent_id), "use"
+        return agent, "manage"
 
     monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
 
-    response = Response()
     messages = await chat_sessions_api.get_session_messages(
-        agent_id=agent_id,
-        session_id=session_id,
-        response=response,
+        agent_id=agent.id,
+        session_id=session.id,
+        limit=20,
+        before=f"{before_at.isoformat()}|{before_id}",
         current_user=current_user,
         db=db,
     )
@@ -183,538 +502,289 @@ async def test_org_admin_can_view_other_users_session_messages(monkeypatch):
             "id": str(message_id),
             "role": "user",
             "content": "hello",
-            "created_at": now.isoformat(),
-            "source_message_id": str(message_id),
-            "source_created_at": now.isoformat(),
+            "created_at": created_at.isoformat(),
+            "cursor": f"{created_at.isoformat()}|{message_id}",
         }
     ]
-    assert response.headers["X-History-Has-More"] == "false"
-    assert response.headers["X-History-Next-Before"] == now.isoformat()
-    assert response.headers["X-History-Next-Before-Id"] == str(message_id)
+    sql = _sql(db.statements[1])
+    assert f"chat_sessions.tenant_id = '{current_user.tenant_id}'" in sql
+    assert "chat_sessions.deleted_at IS NULL" in sql
+    assert "chat_sessions.session_type = 'a2a'" in sql
+    assert "chat_sessions.peer_agent_id" in sql
+    assert "(chat_messages.created_at, chat_messages.id) <" in sql
+    assert "ORDER BY chat_messages.created_at DESC, chat_messages.id DESC" in sql
+    assert chat_sessions_api.get_session_messages.__defaults__[0] == 20
+    assert chat_sessions_api.get_session_messages.__defaults__[1] is None
+    assert db.committed is False
 
 
 @pytest.mark.asyncio
-async def test_creator_cannot_view_other_users_session_messages(monkeypatch):
-    creator_id = uuid.uuid4()
-    agent_id = uuid.uuid4()
-    other_user_id = uuid.uuid4()
-    session_id = uuid.uuid4()
-
-    current_user = SimpleNamespace(id=creator_id, role="member")
-    agent = SimpleNamespace(id=agent_id, creator_id=creator_id)
-    session = SimpleNamespace(
-        id=session_id,
-        agent_id=agent_id,
-        peer_agent_id=None,
-        user_id=other_user_id,
-        source_channel="web",
+async def test_direct_owner_message_read_advances_unread_watermark(monkeypatch):
+    current_user = _actor()
+    agent = _agent(current_user)
+    session = _session(agent, current_user.id)
+    message_id = uuid.uuid4()
+    created_at = datetime(2026, 7, 13, 11, 0, tzinfo=UTC)
+    message = SimpleNamespace(
+        id=message_id,
+        role="assistant",
+        content="welcome back",
+        created_at=created_at,
+        participant_id=None,
+        thinking=None,
     )
-    db = RecordingDB(responses=[DummyResult([session])])
+    db = RecordingDB(DummyResult([session]), DummyResult([message]))
+
+    async def fake_check_agent_access(_db, _user, _agent_id):
+        return agent, "use"
+
+    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
+
+    await chat_sessions_api.get_session_messages(
+        agent_id=agent.id,
+        session_id=session.id,
+        current_user=current_user,
+        db=db,
+    )
+
+    assert db.committed is True
+    assert session.last_read_at_by_user is not None
+    assert session.updated_at == session.last_read_at_by_user
+
+
+@pytest.mark.asyncio
+async def test_non_object_tool_payload_remains_renderable(monkeypatch):
+    current_user = _actor(role="org_admin")
+    agent = _agent(current_user, creator_id=uuid.uuid4())
+    session = _session(agent, uuid.uuid4())
+    message_id = uuid.uuid4()
+    created_at = datetime(2026, 7, 13, 10, 30, tzinfo=UTC)
+    message = SimpleNamespace(
+        id=message_id,
+        role="tool_call",
+        content='["legacy"]',
+        created_at=created_at,
+        participant_id=None,
+        thinking=None,
+    )
+    db = RecordingDB(DummyResult([session]), DummyResult([message]))
 
     async def fake_check_agent_access(_db, _user, _agent_id):
         return agent, "manage"
 
     monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
 
-    with pytest.raises(HTTPException) as exc_info:
-        await chat_sessions_api.get_session_messages(
-            agent_id=agent_id,
-            session_id=session_id,
-            response=Response(),
-            current_user=current_user,
-            db=db,
-        )
-
-    assert exc_info.value.status_code == 403
-
-
-@pytest.mark.asyncio
-async def test_a2a_messages_include_stable_sender_identity(monkeypatch):
-    user_id = uuid.uuid4()
-    current_agent_id = uuid.uuid4()
-    peer_agent_id = uuid.uuid4()
-    session_id = uuid.uuid4()
-    current_participant_id = uuid.uuid4()
-    peer_participant_id = uuid.uuid4()
-    current_message_id = uuid.uuid4()
-    peer_message_id = uuid.uuid4()
-    now = datetime.now(UTC)
-    session = SimpleNamespace(
-        id=session_id,
-        agent_id=current_agent_id,
-        peer_agent_id=peer_agent_id,
-        user_id=user_id,
-        source_channel="agent",
-        is_group=False,
-    )
-    current_message = SimpleNamespace(
-        id=current_message_id,
-        role="user",
-        content="from current",
-        created_at=now,
-        participant_id=current_participant_id,
-    )
-    peer_message = SimpleNamespace(
-        id=peer_message_id,
-        role="user",
-        content="from peer",
-        created_at=now,
-        participant_id=peer_participant_id,
-    )
-    db = RecordingDB(responses=[
-        DummyResult([session]),
-        DummyResult([peer_message, current_message]),
-        DummyResult([
-            (current_participant_id, "Same Name", current_agent_id),
-            (peer_participant_id, "Same Name", peer_agent_id),
-        ]),
-    ])
-
-    async def fake_check_agent_access(_db, _user, _agent_id):
-        return SimpleNamespace(id=current_agent_id), "manage"
-
-    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
-
-    response = Response()
     messages = await chat_sessions_api.get_session_messages(
-        agent_id=current_agent_id,
-        session_id=session_id,
-        response=response,
-        current_user=SimpleNamespace(id=user_id, role="member"),
-        db=db,
-    )
-
-    assert messages[0]["sender_agent_id"] == str(current_agent_id)
-    assert messages[0]["id"] == str(current_message_id)
-    assert messages[0]["is_current_agent"] is True
-    assert messages[1]["sender_agent_id"] == str(peer_agent_id)
-    assert messages[1]["id"] == str(peer_message_id)
-    assert messages[1]["is_current_agent"] is False
-    assert response.headers["X-History-Has-More"] == "false"
-    assert response.headers["X-History-Next-Before-Id"] == str(current_message_id)
-
-
-@pytest.mark.asyncio
-async def test_create_session_returns_web_session_shape(monkeypatch):
-    user_id = uuid.uuid4()
-    agent_id = uuid.uuid4()
-
-    current_user = SimpleNamespace(id=user_id, role="member")
-    db = RecordingDB()
-
-    async def fake_check_agent_access(_db, _user, _agent_id):
-        return SimpleNamespace(id=agent_id), "use"
-
-    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
-
-    session = await chat_sessions_api.create_session(
-        agent_id=agent_id,
+        agent_id=agent.id,
+        session_id=session.id,
         current_user=current_user,
         db=db,
     )
 
-    assert session.agent_id == str(agent_id)
-    assert session.user_id == str(user_id)
-    assert session.source_channel == "web"
-    assert session.participant_type == "user"
-    assert session.is_group is False
-    assert session.model_tier is None
-    assert session.model_modality is None
-    assert db.committed is True
-    assert len(db.added) == 1
-
-
-@pytest.mark.asyncio
-async def test_create_session_snapshots_agent_model_default(monkeypatch):
-    user_id = uuid.uuid4()
-    agent_id = uuid.uuid4()
-    agent = SimpleNamespace(
-        id=agent_id,
-        tenant_id=None,
-        preferred_tier="ultra",
-        preferred_modality="image",
-    )
-    db = RecordingDB()
-
-    async def fake_check_agent_access(_db, _user, _agent_id):
-        return agent, "use"
-
-    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
-    current_user = SimpleNamespace(
-        id=user_id,
-        role="member",
-        preferred_chat_tier=None,
-    )
-
-    session = await chat_sessions_api.create_session(
-        agent_id=agent_id,
-        current_user=current_user,
-        db=db,
-    )
-
-    assert session.model_tier == "ultra"
-    assert session.model_modality == "image"
-    assert db.added[0].model_tier == "ultra"
-    assert db.added[0].model_modality == "image"
-    assert current_user.preferred_chat_tier is None
-
-
-@pytest.mark.asyncio
-async def test_create_session_prefers_users_cross_agent_chat_tier(monkeypatch):
-    user_id = uuid.uuid4()
-    agent_id = uuid.uuid4()
-    agent = SimpleNamespace(
-        id=agent_id,
-        tenant_id=None,
-        preferred_tier="lite",
-        preferred_modality="text",
-    )
-    current_user = SimpleNamespace(
-        id=user_id,
-        role="member",
-        preferred_chat_tier="ultra",
-    )
-    db = RecordingDB()
-
-    async def fake_check_agent_access(_db, _user, _agent_id):
-        return agent, "use"
-
-    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
-
-    session = await chat_sessions_api.create_session(
-        agent_id=agent_id,
-        current_user=current_user,
-        db=db,
-    )
-
-    assert session.model_tier == "ultra"
-    assert db.added[0].model_tier == "ultra"
-    assert current_user.preferred_chat_tier == "ultra"
-
-
-@pytest.mark.asyncio
-async def test_create_session_explicit_snapshot_does_not_change_user_preference(monkeypatch):
-    user_id = uuid.uuid4()
-    agent_id = uuid.uuid4()
-    agent = SimpleNamespace(
-        id=agent_id,
-        tenant_id=None,
-        preferred_tier="lite",
-        preferred_modality="text",
-    )
-    current_user = SimpleNamespace(
-        id=user_id,
-        role="member",
-        preferred_chat_tier="lite",
-        preferred_chat_tier_revision=3,
-    )
-    db = RecordingDB()
-
-    async def fake_check_agent_access(_db, _user, _agent_id):
-        return agent, "use"
-
-    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
-
-    session = await chat_sessions_api.create_session(
-        agent_id=agent_id,
-        body=chat_sessions_api.CreateSessionIn(model_tier="ultra"),
-        current_user=current_user,
-        db=db,
-    )
-
-    assert session.model_tier == "ultra"
-    assert current_user.preferred_chat_tier == "lite"
-    assert current_user.preferred_chat_tier_revision == 3
-
-
-@pytest.mark.asyncio
-async def test_session_owner_can_persist_model_selection(monkeypatch):
-    user_id = uuid.uuid4()
-    agent_id = uuid.uuid4()
-    session_id = uuid.uuid4()
-    agent = SimpleNamespace(
-        id=agent_id,
-        tenant_id=None,
-        preferred_tier="lite",
-        preferred_modality="text",
-    )
-    session = SimpleNamespace(
-        id=session_id,
-        agent_id=agent_id,
-        peer_agent_id=None,
-        user_id=user_id,
-        title="Current chat",
-        source_channel="web",
-        is_group=False,
-        model_tier="lite",
-        model_modality="text",
-    )
-    current_user = SimpleNamespace(
-        id=user_id,
-        role="member",
-        preferred_chat_tier="lite",
-        preferred_chat_tier_revision=4,
-    )
-    db = RecordingDB(responses=[DummyResult([session]), DummyResult([current_user])])
-
-    async def fake_check_agent_access(_db, _user, _agent_id):
-        return agent, "use"
-
-    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
-
-    result = await chat_sessions_api.rename_session(
-        agent_id=agent_id,
-        session_id=session_id,
-        body=chat_sessions_api.PatchSessionIn(
-            model_tier="ultra",
-            model_modality="image",
-            preference_revision=4,
-        ),
-        current_user=current_user,
-        db=db,
-    )
-
-    assert result == {
-        "id": str(session_id),
-        "title": "Current chat",
-        "model_tier": "ultra",
-        "model_modality": "image",
-        "preferred_chat_tier": "ultra",
-        "preferred_chat_tier_revision": 5,
-    }
-    assert session.model_tier == "ultra"
-    assert session.model_modality == "image"
-    assert current_user.preferred_chat_tier == "ultra"
-    assert current_user.preferred_chat_tier_revision == 5
-    assert db.committed is True
-
-
-@pytest.mark.asyncio
-async def test_stale_chat_tier_revision_cannot_overwrite_newer_preference(monkeypatch):
-    user_id = uuid.uuid4()
-    agent_id = uuid.uuid4()
-    session_id = uuid.uuid4()
-    agent = SimpleNamespace(
-        id=agent_id,
-        tenant_id=None,
-        preferred_tier="lite",
-        preferred_modality="text",
-    )
-    session = SimpleNamespace(
-        id=session_id,
-        agent_id=agent_id,
-        peer_agent_id=None,
-        user_id=user_id,
-        title="Current chat",
-        source_channel="web",
-        is_group=False,
-        model_tier="ultra",
-        model_modality="text",
-    )
-    current_user = SimpleNamespace(
-        id=user_id,
-        role="member",
-        preferred_chat_tier="ultra",
-        preferred_chat_tier_revision=7,
-    )
-    db = RecordingDB(responses=[DummyResult([session]), DummyResult([current_user])])
-
-    async def fake_check_agent_access(_db, _user, _agent_id):
-        return agent, "use"
-
-    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
-
-    with pytest.raises(HTTPException) as exc_info:
-        await chat_sessions_api.rename_session(
-            agent_id=agent_id,
-            session_id=session_id,
-            body=chat_sessions_api.PatchSessionIn(
-                model_tier="pro",
-                preference_revision=6,
-            ),
-            current_user=current_user,
-            db=db,
-        )
-
-    assert exc_info.value.status_code == 409
-    assert exc_info.value.detail["code"] == "chat_tier_preference_conflict"
-    assert session.model_tier == "ultra"
-    assert current_user.preferred_chat_tier == "ultra"
-    assert current_user.preferred_chat_tier_revision == 7
+    assert messages == [
+        {
+            "id": str(message_id),
+            "role": "tool_call",
+            "content": '["legacy"]',
+            "created_at": created_at.isoformat(),
+            "cursor": f"{created_at.isoformat()}|{message_id}",
+        }
+    ]
     assert db.committed is False
 
 
 @pytest.mark.asyncio
-async def test_admin_cannot_change_another_users_session_model_selection(monkeypatch):
-    admin_id = uuid.uuid4()
-    owner_id = uuid.uuid4()
-    agent_id = uuid.uuid4()
-    session_id = uuid.uuid4()
-    agent = SimpleNamespace(id=agent_id, tenant_id=None)
-    session = SimpleNamespace(
-        id=session_id,
-        agent_id=agent_id,
-        peer_agent_id=None,
-        user_id=owner_id,
-        title="Private chat",
-        source_channel="web",
-        is_group=False,
-        model_tier="lite",
-        model_modality="text",
+async def test_runtime_tool_history_returns_stable_call_identity(monkeypatch):
+    current_user = _actor(role="org_admin")
+    agent = _agent(current_user, creator_id=uuid.uuid4())
+    session = _session(agent, current_user.id)
+    message_id = uuid.uuid4()
+    created_at = datetime(2026, 7, 17, 10, 30, tzinfo=UTC)
+    message = SimpleNamespace(
+        id=message_id,
+        role="tool_call",
+        content=json.dumps(
+            {
+                "name": "read_file",
+                "args": {"path": "README.md"},
+                "status": "done",
+                "result": "contents",
+                "tool_call_id": "call-1",
+                "reasoning_content": "Inspect the file",
+            }
+        ),
+        created_at=created_at,
+        participant_id=None,
+        thinking=None,
     )
-    db = RecordingDB(responses=[DummyResult([session])])
+    db = RecordingDB(DummyResult([session]), DummyResult([message]))
+
+    async def fake_check_agent_access(_db, _user, _agent_id):
+        return agent, "use"
+
+    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
+
+    messages = await chat_sessions_api.get_session_messages(
+        agent_id=agent.id,
+        session_id=session.id,
+        current_user=current_user,
+        db=db,
+    )
+
+    assert messages[0]["toolName"] == "read_file"
+    assert messages[0]["toolCallId"] == "call-1"
+    assert messages[0]["toolStatus"] == "done"
+    assert messages[0]["toolResult"] == "contents"
+    assert messages[0]["toolThinking"] == "Inspect the file"
+
+
+@pytest.mark.asyncio
+async def test_trigger_messages_remain_available_without_updating_unread(monkeypatch):
+    current_user = _actor(role="org_admin")
+    agent = _agent(current_user, creator_id=uuid.uuid4())
+    session = _session(
+        agent,
+        current_user.id,
+        session_type="trigger",
+        source_channel="trigger",
+    )
+    message_id = uuid.uuid4()
+    created_at = datetime(2026, 7, 13, 10, 0, tzinfo=UTC)
+    message = SimpleNamespace(
+        id=message_id,
+        role="assistant",
+        content="scheduled result",
+        created_at=created_at,
+        participant_id=None,
+        thinking=None,
+    )
+    db = RecordingDB(DummyResult([session]), DummyResult([message]))
 
     async def fake_check_agent_access(_db, _user, _agent_id):
         return agent, "manage"
 
     monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
 
-    with pytest.raises(HTTPException) as exc_info:
-        await chat_sessions_api.rename_session(
-            agent_id=agent_id,
-            session_id=session_id,
-            body=chat_sessions_api.PatchSessionIn(model_tier="ultra"),
-            current_user=SimpleNamespace(id=admin_id, role="org_admin"),
-            db=db,
-        )
-
-    assert exc_info.value.status_code == 403
-    assert session.model_tier == "lite"
-    assert db.committed is False
-
-
-@pytest.mark.asyncio
-async def test_session_model_selection_rejects_tier_outside_plan(monkeypatch):
-    user_id = uuid.uuid4()
-    agent_id = uuid.uuid4()
-    session_id = uuid.uuid4()
-    agent = SimpleNamespace(
-        id=agent_id,
-        tenant_id=uuid.uuid4(),
-        preferred_tier="lite",
-        preferred_modality="text",
-    )
-    session = SimpleNamespace(
-        id=session_id,
-        agent_id=agent_id,
-        peer_agent_id=None,
-        user_id=user_id,
-        title="Plan protected chat",
-        source_channel="web",
-        is_group=False,
-        model_tier="lite",
-        model_modality="text",
-    )
-    db = RecordingDB(responses=[DummyResult([session])])
-
-    async def fake_check_agent_access(_db, _user, _agent_id):
-        return agent, "use"
-
-    async def fake_resolve(_agent, _tier, _modality, *, strict):
-        if strict:
-            raise chat_sessions_api.InvalidAgentPlanSelection(
-                "Tier 'ultra' is not included in your plan.",
-                quota_type="model_tier",
-            )
-        return "lite", "text"
-
-    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
-    monkeypatch.setattr(chat_sessions_api, "_resolve_session_model_selection", fake_resolve)
-
-    with pytest.raises(HTTPException) as exc_info:
-        await chat_sessions_api.rename_session(
-            agent_id=agent_id,
-            session_id=session_id,
-            body=chat_sessions_api.PatchSessionIn(model_tier="ultra"),
-            current_user=SimpleNamespace(id=user_id, role="member"),
-            db=db,
-        )
-
-    assert exc_info.value.status_code == 403
-    assert "not included" in exc_info.value.detail
-    assert session.model_tier == "lite"
-    assert db.committed is False
-
-
-@pytest.mark.asyncio
-async def test_peer_agent_can_rename_a2a_session(monkeypatch):
-    user_id = uuid.uuid4()
-    owner_agent_id = uuid.uuid4()
-    peer_agent_id = uuid.uuid4()
-    session_id = uuid.uuid4()
-    session = SimpleNamespace(
-        id=session_id,
-        agent_id=owner_agent_id,
-        peer_agent_id=peer_agent_id,
-        user_id=user_id,
-        title="Old title",
-        source_channel="agent",
-        is_group=False,
-    )
-    db = RecordingDB(responses=[DummyResult([session])])
-
-    async def fake_check_agent_access(_db, _user, _agent_id):
-        return SimpleNamespace(id=peer_agent_id, creator_id=user_id), "manage"
-
-    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
-
-    result = await chat_sessions_api.rename_session(
-        agent_id=peer_agent_id,
-        session_id=session_id,
-        body=chat_sessions_api.PatchSessionIn(title="New title"),
-        current_user=SimpleNamespace(id=user_id, role="member"),
+    messages = await chat_sessions_api.get_session_messages(
+        agent_id=agent.id,
+        session_id=session.id,
+        current_user=current_user,
         db=db,
     )
 
-    assert result == {"id": str(session_id), "title": "New title"}
-    assert session.title == "New title"
-    assert db.committed is True
+    assert messages == [
+        {
+            "id": str(message_id),
+            "role": "assistant",
+            "content": "scheduled result",
+            "created_at": created_at.isoformat(),
+            "cursor": f"{created_at.isoformat()}|{message_id}",
+        }
+    ]
+    assert db.committed is False
+    for statement in db.statements:
+        sql = _sql(statement)
+        assert f"chat_sessions.tenant_id = '{current_user.tenant_id}'" in sql
+        assert "chat_sessions.deleted_at IS NULL" in sql
 
 
 @pytest.mark.asyncio
-async def test_peer_agent_can_delete_a2a_session_and_messages(monkeypatch):
-    user_id = uuid.uuid4()
-    owner_agent_id = uuid.uuid4()
-    peer_agent_id = uuid.uuid4()
-    session_id = uuid.uuid4()
-    session = SimpleNamespace(
-        id=session_id,
-        agent_id=owner_agent_id,
-        peer_agent_id=peer_agent_id,
-        user_id=user_id,
+async def test_a2a_peer_side_messages_preserve_sender_and_inline_tools(monkeypatch):
+    current_user = _actor()
+    requested_agent = _agent(current_user)
+    origin_agent_id = uuid.uuid4()
+    participant_id = uuid.uuid4()
+    session = _session(
+        SimpleNamespace(id=origin_agent_id, tenant_id=current_user.tenant_id),
+        uuid.uuid4(),
+        session_type="a2a",
         source_channel="agent",
-        is_group=False,
+        peer_agent_id=requested_agent.id,
+    )
+    message_id = uuid.uuid4()
+    created_at = datetime(2026, 7, 13, 9, 0, tzinfo=UTC)
+    message = SimpleNamespace(
+        id=message_id,
+        role="assistant",
+        content=('I will check.\n```tool_code\nsearch_workspace\n```\n```json\n{"query": "runtime"}\n```\nDone.'),
+        created_at=created_at,
+        participant_id=participant_id,
+        thinking=None,
     )
     db = RecordingDB(
-        responses=[
-            DummyResult([session]),
-            DummyResult([session]),
-            DummyResult(),
-            DummyResult(),
-        ]
+        DummyResult([session]),
+        DummyResult([message]),
+        DummyResult([(participant_id, "Researcher")]),
     )
 
     async def fake_check_agent_access(_db, _user, _agent_id):
-        return SimpleNamespace(id=peer_agent_id, creator_id=user_id), "manage"
+        return requested_agent, "manage"
 
     monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
 
-    @asynccontextmanager
-    async def no_provider_sessions(**_kwargs):
-        yield
-
-    monkeypatch.setattr(
-        "app.services.agentbay_client.agentbay_chat_session_deletion_fence",
-        no_provider_sessions,
-    )
-
-    result = await chat_sessions_api.delete_session(
-        agent_id=peer_agent_id,
-        session_id=session_id,
-        current_user=SimpleNamespace(id=user_id, role="member"),
+    messages = await chat_sessions_api.get_session_messages(
+        agent_id=requested_agent.id,
+        session_id=session.id,
+        current_user=current_user,
         db=db,
     )
 
-    assert result is None
-    assert db.deleted == [session]
-    assert db.committed is True
+    assert [entry["role"] for entry in messages] == [
+        "assistant",
+        "tool_call",
+        "assistant",
+    ]
+    assert [entry["content"] for entry in messages] == ["I will check.", "", "Done."]
+    assert messages[1]["toolName"] == "search_workspace"
+    assert messages[1]["toolArgs"] == {"query": "runtime"}
+    for entry in messages:
+        assert entry["id"] == str(message_id)
+        assert entry["cursor"] == f"{created_at.isoformat()}|{message_id}"
+        assert entry["sender_name"] == "Researcher"
+        assert entry["participant_id"] == str(participant_id)
+    assert db.committed is False
+    session_sql = _sql(db.statements[0])
+    assert f"chat_sessions.peer_agent_id = '{requested_agent.id}'" in session_sql
+    assert f"chat_sessions.tenant_id = '{current_user.tenant_id}'" in session_sql
+    assert "chat_sessions.deleted_at IS NULL" in session_sql
+    participant_sql = _sql(db.statements[2])
+    assert "participants.type = 'agent'" in participant_sql
+    assert f"agents.tenant_id = '{current_user.tenant_id}'" in participant_sql
+
+
+@pytest.mark.asyncio
+async def test_messages_fail_closed_outside_active_tenant_scope(monkeypatch):
+    current_user = _actor(role="org_admin")
+    agent = _agent(current_user, creator_id=uuid.uuid4())
+    db = RecordingDB(DummyResult([]))
+
+    async def fake_check_agent_access(_db, _user, _agent_id):
+        return agent, "manage"
+
+    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
+
+    with pytest.raises(chat_sessions_api.HTTPException) as error:
+        await chat_sessions_api.get_session_messages(
+            agent_id=agent.id,
+            session_id=uuid.uuid4(),
+            current_user=current_user,
+            db=db,
+        )
+
+    assert error.value.status_code == 404
+    sql = _sql(db.statements[0])
+    assert f"chat_sessions.tenant_id = '{current_user.tenant_id}'" in sql
+    assert "chat_sessions.deleted_at IS NULL" in sql
+    assert "chat_sessions.session_type = 'a2a'" in sql
+    assert "chat_sessions.peer_agent_id" in sql
+
+
+def test_session_out_accepts_unified_nullable_agent_and_user_ids():
+    value = chat_sessions_api.SessionOut(
+        id=str(uuid.uuid4()),
+        title="System session",
+        created_at=datetime.now(UTC).isoformat(),
+    )
+
+    assert value.agent_id is None
+    assert value.user_id is None

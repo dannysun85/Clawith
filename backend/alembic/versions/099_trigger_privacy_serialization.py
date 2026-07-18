@@ -19,18 +19,11 @@ depends_on: str | Sequence[str] | None = None
 
 
 def _index_names(table_name: str) -> set[str]:
-    return {
-        str(index["name"])
-        for index in sa.inspect(op.get_bind()).get_indexes(table_name)
-        if index.get("name")
-    }
+    return {str(index["name"]) for index in sa.inspect(op.get_bind()).get_indexes(table_name) if index.get("name")}
 
 
 def _column_names(table_name: str) -> set[str]:
-    return {
-        str(column["name"])
-        for column in sa.inspect(op.get_bind()).get_columns(table_name)
-    }
+    return {str(column["name"]) for column in sa.inspect(op.get_bind()).get_columns(table_name)}
 
 
 def _foreign_key_name(
@@ -39,10 +32,7 @@ def _foreign_key_name(
     referred_table: str,
 ) -> str | None:
     for foreign_key in sa.inspect(op.get_bind()).get_foreign_keys(table_name):
-        if (
-            foreign_key.get("constrained_columns") == columns
-            and foreign_key.get("referred_table") == referred_table
-        ):
+        if foreign_key.get("constrained_columns") == columns and foreign_key.get("referred_table") == referred_table:
             name = foreign_key.get("name")
             return str(name) if name else None
     return None
@@ -63,21 +53,13 @@ def _ensure_agent_fk_set_null(
     """Preserve durable audit rows when an Agent is physically removed."""
 
     for foreign_key in sa.inspect(op.get_bind()).get_foreign_keys(table_name):
-        if (
-            foreign_key.get("constrained_columns") == [column_name]
-            and foreign_key.get("referred_table") == "agents"
-        ):
-            ondelete = str(
-                (foreign_key.get("options") or {}).get("ondelete") or ""
-            ).upper()
+        if foreign_key.get("constrained_columns") == [column_name] and foreign_key.get("referred_table") == "agents":
+            ondelete = str((foreign_key.get("options") or {}).get("ondelete") or "").upper()
             if ondelete == "SET NULL":
                 return
             existing_name = foreign_key.get("name")
             if not existing_name:
-                raise RuntimeError(
-                    f"Cannot safely replace unnamed foreign key "
-                    f"{table_name}.{column_name}"
-                )
+                raise RuntimeError(f"Cannot safely replace unnamed foreign key {table_name}.{column_name}")
             op.drop_constraint(
                 str(existing_name),
                 table_name,
@@ -220,10 +202,7 @@ def upgrade() -> None:
         WHERE trigger.id = pending.trigger_id
         """
     )
-    op.execute(
-        "UPDATE trigger_executions "
-        "SET fire_recorded_at = COALESCE(scheduled_at, created_at, now())"
-    )
+    op.execute("UPDATE trigger_executions SET fire_recorded_at = COALESCE(scheduled_at, created_at, now())")
     gateway_columns = _column_names("gateway_messages")
     if "delivery_lease_expires_at" not in gateway_columns:
         op.add_column(
@@ -253,9 +232,7 @@ def upgrade() -> None:
                 nullable=True,
             ),
         )
-    if "ix_gateway_messages_delivery_claim" not in _index_names(
-        "gateway_messages"
-    ):
+    if "ix_gateway_messages_delivery_claim" not in _index_names("gateway_messages"):
         op.create_index(
             "ix_gateway_messages_delivery_claim",
             "gateway_messages",
@@ -263,9 +240,7 @@ def upgrade() -> None:
             unique=False,
             postgresql_where=sa.text("status IN ('pending', 'delivered')"),
         )
-    if not _foreign_key_name(
-        "gateway_messages", ["authorization_source_agent_id"], "agents"
-    ):
+    if not _foreign_key_name("gateway_messages", ["authorization_source_agent_id"], "agents"):
         op.create_foreign_key(
             "fk_gateway_messages_authorization_source_agent",
             "gateway_messages",
@@ -283,9 +258,7 @@ def upgrade() -> None:
                 nullable=True,
             ),
         )
-    if not _foreign_key_name(
-        "agent_credentials", ["owner_user_id"], "users"
-    ):
+    if not _foreign_key_name("agent_credentials", ["owner_user_id"], "users"):
         op.create_foreign_key(
             "fk_agent_credentials_owner_user",
             "agent_credentials",
@@ -469,18 +442,14 @@ def upgrade() -> None:
           AND ranked.row_number > 1
         """
     )
-    if "uq_agent_relationship_agent_member" not in _index_names(
-        "agent_relationships"
-    ):
+    if "uq_agent_relationship_agent_member" not in _index_names("agent_relationships"):
         op.create_index(
             "uq_agent_relationship_agent_member",
             "agent_relationships",
             ["agent_id", "member_id"],
             unique=True,
         )
-    if "uq_agent_agent_relationship_pair" not in _index_names(
-        "agent_agent_relationships"
-    ):
+    if "uq_agent_agent_relationship_pair" not in _index_names("agent_agent_relationships"):
         op.create_index(
             "uq_agent_agent_relationship_pair",
             "agent_agent_relationships",
@@ -510,8 +479,18 @@ def upgrade() -> None:
           AND peer_agent_id IS NOT NULL
         """
     )
+    if "tenant_id" in _column_names("chat_sessions"):
+        unified_insert_columns = ", tenant_id, session_type, updated_at"
+        unified_insert_values = (
+            ", owner_agent.tenant_id, 'a2a', COALESCE(needed.last_message_at, needed.created_at, now())"
+        )
+        unified_insert_join = "JOIN agents AS owner_agent ON owner_agent.id = needed.agent_id"
+    else:
+        unified_insert_columns = ""
+        unified_insert_values = ""
+        unified_insert_join = ""
     op.execute(
-        """
+        f"""
         WITH durable_owners AS (
             SELECT
                 session.agent_id,
@@ -619,6 +598,7 @@ def upgrade() -> None:
         INSERT INTO chat_sessions (
             id, agent_id, peer_agent_id, user_id, title, source_channel,
             is_group, is_primary, created_at, last_message_at
+            {unified_insert_columns}
         )
         SELECT
             md5(
@@ -634,7 +614,9 @@ def upgrade() -> None:
             false,
             needed.created_at,
             needed.last_message_at
+            {unified_insert_values}
         FROM needed
+        {unified_insert_join}
         WHERE NOT EXISTS (
             SELECT 1
             FROM chat_sessions AS existing
@@ -1132,9 +1114,7 @@ def upgrade() -> None:
             "chat_sessions",
             ["agent_id", "peer_agent_id", "user_id"],
             unique=True,
-            postgresql_where=sa.text(
-                "source_channel = 'agent' AND peer_agent_id IS NOT NULL"
-            ),
+            postgresql_where=sa.text("source_channel = 'agent' AND peer_agent_id IS NOT NULL"),
         )
 
     # The ledger existed before it became a runtime source of truth, so legacy
@@ -1189,17 +1169,14 @@ def upgrade() -> None:
           AND ranked.row_number > 1
         """
     )
-    if "uq_agentbay_active_user_chat_image" not in _index_names(
-        "agentbay_session_ledger"
-    ):
+    if "uq_agentbay_active_user_chat_image" not in _index_names("agentbay_session_ledger"):
         op.create_index(
             "uq_agentbay_active_user_chat_image",
             "agentbay_session_ledger",
             ["agent_id", "user_id", "chat_session_id", "image_type"],
             unique=True,
             postgresql_where=sa.text(
-                "status = 'active' AND agent_id IS NOT NULL "
-                "AND user_id IS NOT NULL AND chat_session_id IS NOT NULL"
+                "status = 'active' AND agent_id IS NOT NULL AND user_id IS NOT NULL AND chat_session_id IS NOT NULL"
             ),
         )
 
@@ -1232,9 +1209,7 @@ def upgrade() -> None:
         """
     )
 
-    if "uq_trigger_executions_processing_agent" not in _index_names(
-        "trigger_executions"
-    ):
+    if "uq_trigger_executions_processing_agent" not in _index_names("trigger_executions"):
         op.create_index(
             "uq_trigger_executions_processing_agent",
             "trigger_executions",
@@ -1465,18 +1440,14 @@ def upgrade() -> None:
 def downgrade() -> None:
     # Data consolidation and untrusted-payload quarantine are intentionally
     # irreversible. Rolling back code must not restore unsafe routing values.
-    orphaned_media_tasks = op.get_bind().execute(
-        sa.text(
-            "SELECT count(*) FROM media_generation_tasks WHERE agent_id IS NULL"
-        )
-    ).scalar_one()
-    if orphaned_media_tasks:
-        raise RuntimeError(
-            "099 is forward-only after an Agent deletion preserved media audit rows"
-        )
-    media_agent_fk = _foreign_key_name(
-        "media_generation_tasks", ["agent_id"], "agents"
+    orphaned_media_tasks = (
+        op.get_bind()
+        .execute(sa.text("SELECT count(*) FROM media_generation_tasks WHERE agent_id IS NULL"))
+        .scalar_one()
     )
+    if orphaned_media_tasks:
+        raise RuntimeError("099 is forward-only after an Agent deletion preserved media audit rows")
+    media_agent_fk = _foreign_key_name("media_generation_tasks", ["agent_id"], "agents")
     if media_agent_fk:
         op.drop_constraint(
             media_agent_fk,
@@ -1508,9 +1479,7 @@ def downgrade() -> None:
         "ix_agent_credentials_owner_user_id",
         table_name="agent_credentials",
     )
-    credential_owner_fk = _foreign_key_name(
-        "agent_credentials", ["owner_user_id"], "users"
-    )
+    credential_owner_fk = _foreign_key_name("agent_credentials", ["owner_user_id"], "users")
     if credential_owner_fk:
         op.drop_constraint(
             credential_owner_fk,
@@ -1560,9 +1529,7 @@ def downgrade() -> None:
             table_name="agent_relationships",
         )
 
-    gateway_source_fk = _foreign_key_name(
-        "gateway_messages", ["authorization_source_agent_id"], "agents"
-    )
+    gateway_source_fk = _foreign_key_name("gateway_messages", ["authorization_source_agent_id"], "agents")
     if gateway_source_fk:
         op.drop_constraint(
             gateway_source_fk,

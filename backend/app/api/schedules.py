@@ -13,6 +13,7 @@ from app.core.security import get_current_user
 from app.database import get_db
 from app.models.schedule import AgentSchedule
 from app.models.user import User
+from app.services.heartbeat_runtime import enqueue_schedule_runtime
 from app.services.scheduler import compute_next_run
 
 router = APIRouter(prefix="/agents/{agent_id}/schedules", tags=["schedules"])
@@ -201,27 +202,28 @@ async def trigger_schedule(
     if not sched:
         raise HTTPException(status_code=404, detail="Schedule not found")
 
-    from app.services.scheduler import (
-        AUTOMATIC_SCHEDULE_EXECUTION_ENABLED,
-        _execute_schedule,
+    handle = await enqueue_schedule_runtime(
+        db,
+        agent=agent,
+        schedule_id=sched.id,
+        occurrence_id=uuid.uuid4(),
+        instruction=sched.instruction,
     )
-
-    if not AUTOMATIC_SCHEDULE_EXECUTION_ENABLED:
+    if handle is None:
         raise HTTPException(
-            status_code=409,
-            detail="Schedule execution is disabled by the operator",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Unified Agent Runtime is not enabled for schedules",
         )
 
-    # The worker reloads the durable schedule, requester, and Agent before it
-    # can spend Credits or invoke tools.
-    import asyncio
-
-    asyncio.create_task(_execute_schedule(sched.id, require_enabled=False))
     sched.last_run_at = datetime.now(timezone.utc)
     sched.run_count = (sched.run_count or 0) + 1
     await db.flush()
 
-    return {"status": "triggered", "schedule_id": str(schedule_id)}
+    return {
+        "status": "queued",
+        "schedule_id": str(schedule_id),
+        "run_id": str(handle.run_id),
+    }
 
 
 @router.get("/{schedule_id}/history")

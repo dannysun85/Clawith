@@ -1253,6 +1253,7 @@ select:focus {
 }
 
 .sidebar-item {
+  position: relative;
   display: flex;
   align-items: center;
   gap: var(--space-3);
@@ -1264,6 +1265,35 @@ select:focus {
   cursor: pointer;
   text-decoration: none;
   white-space: nowrap;
+}
+
+.sidebar-item-badge {
+  margin-left: auto;
+  flex: 0 0 auto;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--text-primary);
+  color: var(--bg-primary);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 18px;
+  text-align: center;
+}
+
+/* Collapsed sidebar hides the text and the number; keep just a dot so the signal survives. */
+.sidebar.collapsed .sidebar-item-badge {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  margin: 0;
+  min-width: 8px;
+  width: 8px;
+  height: 8px;
+  padding: 0;
+  font-size: 0;
+  line-height: 0;
 }
 
 .sidebar-item:hover {
@@ -5988,7 +6018,15 @@ select:focus {
 }
 
 .analysis-trace--running .analysis-trace-signal span:first-child {
+  background: var(--success);
   animation: analysis-tool-running-dot 1.25s ease-in-out infinite;
+}
+
+/* Stopped responding: a tool is still marked running but the chat is no longer streaming. */
+.analysis-trace--stopped .analysis-trace-signal span:first-child {
+  background: var(--error);
+  opacity: 1;
+  animation: none;
 }
 
 .analysis-trace-chevron {
@@ -7336,6 +7374,46 @@ select:focus {
 .chat-composer:focus-within {
   border-color: var(--border-strong);
   box-shadow: 0 0 0 3px rgba(58, 58, 66, 0.08);
+}
+
+.chat-tool-reconciliation {
+  margin: 8px;
+  padding: 10px;
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  border-radius: 8px;
+  background: rgba(245, 158, 11, 0.08);
+}
+
+.chat-tool-reconciliation__title,
+.chat-tool-reconciliation__detail,
+.chat-tool-reconciliation__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.chat-tool-reconciliation__title {
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.chat-tool-reconciliation__detail {
+  align-items: flex-start;
+  margin-top: 6px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.chat-tool-reconciliation__actions {
+  justify-content: flex-end;
+  margin-top: 10px;
+}
+
+.chat-tool-reconciliation__unsupported {
+  margin-top: 8px;
+  color: var(--text-tertiary);
+  font-size: 12px;
 }
 [data-theme="dark"] .chat-composer:focus-within {
   border-color: rgba(255, 255, 255, 0.18);

@@ -18,6 +18,10 @@ from app.database import get_db, transaction
 from app.models.channel_config import ChannelConfig
 from app.models.user import User
 from app.schemas.schemas import ChannelConfigOut
+from app.services.agent_runtime.channel_chat import (
+    channel_message_id,
+    enqueue_channel_chat_runtime,
+)
 from app.services.media_message_content import sanitize_inline_media_content
 from app.services.auth_provider import DingTalkAuthProvider
 from app.services.external_identity_policy import external_user_can_authenticate
@@ -281,256 +285,77 @@ async def process_dingtalk_message(
     sender_nick: str = "",
     message_id: str = "",
 ):
-    """Process an incoming DingTalk bot message and reply via session webhook.
-
-    Args:
-        image_base64_list: List of base64-encoded image data URIs for vision LLM.
-        saved_file_paths: List of local file paths where media files were saved.
-        sender_nick: Display name of the sender from DingTalk.
-        message_id: DingTalk message ID (used for reactions).
-    """
-    from datetime import datetime, timezone
+    """Persist one DingTalk input and enqueue exactly one durable Runtime command."""
     from sqlalchemy import select as _select
+
+    from app.api.feishu import _load_agent_and_model
     from app.database import async_session
     from app.models.agent import Agent as AgentModel
-    from app.models.audit import ChatMessage
     from app.services.channel_session import find_or_create_channel_session
     from app.services.channel_user_service import channel_user_service
 
-    async with async_session() as db:
-        sender_staff_id = (sender_staff_id or "").strip()
+    sender_staff_id = (sender_staff_id or "").strip()
+    if not sender_staff_id:
+        logger.warning("[DingTalk] Skip message attribution because sender_staff_id is empty")
+        return
 
-        # Load agent
+    async with async_session() as db:
         agent_r = await db.execute(_select(AgentModel).where(AgentModel.id == agent_id))
         agent_obj = agent_r.scalar_one_or_none()
-        if not agent_obj:
-            logger.warning(f"[DingTalk] Agent {agent_id} not found")
+        if agent_obj is None:
+            logger.warning("[DingTalk] Agent {} not found", agent_id)
             return
-        if not sender_staff_id:
-            logger.warning("[DingTalk] Skip message attribution because sender_staff_id is empty")
-            return
-        from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
-        ctx_size = (agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE) if agent_obj else DEFAULT_CONTEXT_WINDOW_SIZE
 
-        # Determine conv_id for session isolation
-        if conversation_type == "2":
-            # Group chat
-            conv_id = f"dingtalk_group_{conversation_id}"
-        else:
-            # P2P / single chat
-            conv_id = f"dingtalk_p2p_{sender_staff_id}"
-
-        # Resolve channel user via unified service (uses OrgMember + SSO patterns)
+        is_group = conversation_type == "2"
+        conv_id = (
+            f"dingtalk_group_{conversation_id}"
+            if is_group
+            else f"dingtalk_p2p_{sender_staff_id}"
+        )
         platform_user = await channel_user_service.resolve_channel_user(
             db=db,
             agent=agent_obj,
             channel_type="dingtalk",
             external_user_id=sender_staff_id,
-            extra_info={},
+            extra_info={"name": sender_nick or f"DingTalk User {sender_staff_id[:8]}"},
         )
-        platform_user_id = platform_user.id
-
-        # Find or create session
-        sess = await find_or_create_channel_session(
+        session = await find_or_create_channel_session(
             db=db,
             agent_id=agent_id,
-            user_id=platform_user_id,
+            user_id=agent_obj.creator_id if is_group else platform_user.id,
             external_conv_id=conv_id,
             source_channel="dingtalk",
             first_message_title=user_text,
+            is_group=is_group,
+            group_name=f"DingTalk Group {conversation_id[:8]}" if is_group else None,
+            created_by_user_id=platform_user.id,
         )
-        session_conv_id = str(sess.id)
 
-        # Load history
-        history_r = await db.execute(
-            _select(ChatMessage)
-            .where(ChatMessage.agent_id == agent_id, ChatMessage.conversation_id == session_conv_id)
-            .order_by(ChatMessage.created_at.desc())
-            .limit(ctx_size)
-        )
-        from app.services.llm.utils import convert_chat_messages_to_llm_format as _conv
-        history = _conv(reversed(history_r.scalars().all()))
-
-        # Persist only durable file references. Inline binary markers belong to
-        # the current provider call and must not enter conversation history.
-        saved_content = sanitize_inline_media_content(
+        display_content = sanitize_inline_media_content(
             user_text,
             file_names=saved_file_paths,
         )
-
-        # Save user message
-        db.add(ChatMessage(
-            agent_id=agent_id, user_id=platform_user_id,
-            role="user", content=saved_content,
-            conversation_id=session_conv_id,
-        ))
-        sess.last_message_at = datetime.now(timezone.utc)
-
-        # Also load DingTalk credentials and agent/model config in this transaction
-        _dt_cfg_r = await db.execute(
-            _select(ChannelConfig).where(
-                ChannelConfig.agent_id == agent_id,
-                ChannelConfig.channel_type == "dingtalk",
-            )
-        )
-        _dt_cfg = _dt_cfg_r.scalar_one_or_none()
-        _dt_app_key = _dt_cfg.app_id if _dt_cfg else None
-        _dt_app_secret = _dt_cfg.app_secret if _dt_cfg else None
-
-        # Pre-load agent/model for LLM call
-        from app.api.feishu import _load_agent_and_model
-        _agent_model, _llm_model, _fallback_model, _route_meta = await _load_agent_and_model(db, agent_id)
-
-        # Extract agent name before closing session
-        _agent_name = agent_obj.name
-
-        await db.commit()
-        # ── Phase 1 complete: release connection before slow LLM/HTTP work ──
-        await db.close()
-
-        # Build LLM input text: for images, inject base64 markers so vision models can see them
-        llm_user_text = _append_missing_image_markers(user_text, image_base64_list)
-
-        # Register current-conversation file delivery only when the DingTalk
-        # application credentials needed for a real media upload are present.
-        # A text-only filename fallback is not attachment delivery.
-        from app.services.agent_tools import channel_file_sender as _cfs
-        from app.services.dingtalk_stream import (
-            _send_dingtalk_media_message,
-            _upload_dingtalk_media,
-        )
-
-        _cfs_token = None
-        if _dt_app_key and _dt_app_secret:
-            _dt_target_id = conversation_id if conversation_type == "2" else sender_staff_id
-            _dt_conv_type = conversation_type
-
-            async def _dingtalk_file_sender(file_path: str, msg: str = "") -> bool:
-                """Return True only after DingTalk confirms the media message."""
-                from pathlib import Path as _P
-
-                file_name = _P(file_path).name
-                extension = _P(file_path).suffix.lower()
-                if extension in (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"):
-                    media_type = "image"
-                elif extension in (".mp4", ".mov", ".avi", ".mkv"):
-                    media_type = "video"
-                elif extension in (".mp3", ".wav", ".ogg", ".amr", ".m4a"):
-                    media_type = "voice"
-                else:
-                    media_type = "file"
-
-                media_id = await _upload_dingtalk_media(
-                    _dt_app_key,
-                    _dt_app_secret,
-                    file_path,
-                    media_type,
-                )
-                if not media_id:
-                    return False
-
-                delivered = await _send_dingtalk_media_message(
-                    _dt_app_key,
-                    _dt_app_secret,
-                    _dt_target_id,
-                    media_id,
-                    media_type,
-                    _dt_conv_type,
-                    filename=file_name,
-                )
-                if not delivered:
-                    return False
-
-                if msg:
-                    try:
-                        await _post_dingtalk_session_webhook(
-                            session_webhook,
-                            {"msgtype": "text", "text": {"content": msg}},
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "[DingTalk] Media caption delivery failed error_type={}",
-                            type(exc).__name__,
-                        )
-                return True
-
-            _cfs_token = _cfs.set(_dingtalk_file_sender)
-
-        # Call LLM (no DB session needed)
-        from app.api.feishu import _call_llm_with_config
-        try:
-            reply_text = await _call_llm_with_config(
-                _agent_model, _llm_model, _fallback_model, _route_meta,
-                agent_id, llm_user_text,
-                history=history, user_id=platform_user_id,
-                session_id=session_conv_id,
-            )
-        finally:
-            if _cfs_token is not None:
-                _cfs.reset(_cfs_token)
-            # Recall thinking reaction (before sending reply)
-            if message_id and _dt_app_key:
-                try:
-                    from app.services.dingtalk_reaction import recall_thinking_reaction
-                    await recall_thinking_reaction(
-                        _dt_app_key, _dt_app_secret,
-                        message_id, conversation_id,
-                    )
-                except Exception as _recall_err:
-                    logger.warning(
-                        "[DingTalk] Failed to recall thinking reaction error_type={}",
-                        type(_recall_err).__name__,
-                    )
-
-        has_media = bool(image_base64_list or saved_file_paths)
-        logger.info(
-            "[DingTalk] LLM reply generated input_type={} reply_chars={}",
-            "media" if has_media else "text",
-            len(reply_text),
-        )
-
-        delivered = await _deliver_dingtalk_session_reply(
-            session_webhook=session_webhook,
-            title=_agent_name or "AI Reply",
-            reply_text=reply_text,
-            agent_id=agent_id,
-            tenant_id=agent_obj.tenant_id,
-            user_id=platform_user_id,
-        )
-        if not delivered:
-            # The user never received this assistant turn. Do not persist a
-            # false delivery receipt into conversation history.
-            return
-
-        # Save assistant reply (new short transaction)
-        async with async_session() as _save_db:
-            _save_db.add(ChatMessage(
-                agent_id=agent_id, user_id=platform_user_id,
-                role="assistant", content=reply_text,
-                conversation_id=session_conv_id,
-            ))
-            # Reload session object to update last_message_at
-            from app.models.chat_session import ChatSession
-            _sess_r = await _save_db.execute(
-                _select(ChatSession).where(ChatSession.id == uuid.UUID(session_conv_id))
-            )
-            _sess_fresh = _sess_r.scalar_one_or_none()
-            if _sess_fresh:
-                _sess_fresh.last_message_at = datetime.now(timezone.utc)
-            await _save_db.commit()
-
-        # Log activity
-        from app.services.activity_logger import log_activity
-        await log_activity(
-            agent_id, "chat_reply",
-            "Replied to DingTalk message",
-            detail={
-                "channel": "dingtalk",
-                "request_chars": len(user_text),
-                "reply_chars": len(reply_text),
+        llm_content = _append_missing_image_markers(user_text, image_base64_list)
+        _, model, _, _ = await _load_agent_and_model(db, agent_id)
+        await enqueue_channel_chat_runtime(
+            db,
+            agent=agent_obj,
+            user=platform_user,
+            session=session,
+            model=model,
+            content=llm_content,
+            display_content=display_content,
+            source_channel="dingtalk",
+            channel_delivery_target={
+                "session_webhook": session_webhook,
+                "user_id": sender_staff_id,
+                "title": agent_obj.name or "AI Reply",
+                "source_message_id": message_id,
+                "conversation_id": conversation_id,
             },
+            message_id=channel_message_id(agent_id, "dingtalk", message_id),
         )
-
+        await db.commit()
 
 # ─── OAuth Callback (SSO) ──────────────────────────────
 

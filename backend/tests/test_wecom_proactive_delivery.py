@@ -166,8 +166,6 @@ async def test_wecom_standard_webhook_reply_rejects_legacy_invalid_agent_id_befo
     monkeypatch,
 ):
     config = SimpleNamespace(extra_config={"wecom_agent_id": "invalid"})
-    send = AsyncMock()
-    monkeypatch.setattr(wecom, "send_wecom_message", send)
     monkeypatch.setattr(
         wecom,
         "async_session",
@@ -180,8 +178,6 @@ async def test_wecom_standard_webhook_reply_rejects_legacy_invalid_agent_id_befo
         "wecom-user",
         "hello",
     )
-
-    send.assert_not_awaited()
 
 
 @pytest.mark.asyncio

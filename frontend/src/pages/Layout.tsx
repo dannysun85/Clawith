@@ -6,6 +6,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useAuthStore } from '../stores';
 import { canAccessSaasAdmin } from '../utils/saasAdmin';
 import { agentApi, tenantApi, authApi, onboardingApi } from '../services/api';
+import { useGroupUnread } from '../hooks/useGroupUnread';
 import { useToast } from '../components/Toast/ToastProvider';
 import {
     SUBSCRIPTION_UPGRADE_PATH,
@@ -26,6 +27,7 @@ import {
     IconChevronsRight,
     IconBell,
     IconBuildingMonument,
+    IconUsersGroup,
     IconSearch,
     IconX,
     IconPin,
@@ -312,7 +314,7 @@ function CompanyTourOverlay({ assistantId, isChinese, onDone }: { assistantId: s
         {
             selector: '[data-tour-target="main-nav"]',
             title: isChinese ? '三个主要功能' : 'Three main rooms',
-            body: isChinese ? 'Plaza 是公司广场，Dashboard 看公司概况，OKR 用来设定和追踪目标。' : 'Plaza is the company square, Dashboard shows company activity, and OKR tracks goals.',
+            body: isChinese ? '经验库沉淀团队私有经验供 AI 复用，Dashboard 看公司概况，OKR 用来设定和追踪目标。' : 'Experience is the team’s curated knowledge base for AI reuse, Dashboard shows company activity, and OKR tracks goals.',
             pad: 8,
             radius: 14,
         },
@@ -462,6 +464,8 @@ export default function Layout() {
     // Detect chat page: needs fixed-height main-content for inner scroll to work
     const isChatPage = !!useMatch('/agents/:id/chat');
     const isAgentSettingsPage = !!useMatch('/agents/:id/settings');
+    // Group chat scrolls inside its own panes, so it needs the same fixed-height shell.
+    const isGroupsPage = !!useMatch('/groups/*');
     const activeAgentNestedMatch = useMatch('/agents/:id/*');
     const activeAgentRootMatch = useMatch('/agents/:id');
     const activeAgentId = activeAgentNestedMatch?.params.id || activeAgentRootMatch?.params.id;
@@ -512,6 +516,8 @@ export default function Layout() {
         queryFn: () => fetchJson<any[]>(`/notifications?limit=50${notifCategory !== 'all' ? `&category=${notifCategory}` : ''}`),
         enabled: !!user && showNotifications,
     });
+    // Total unread across all group sessions, for the Groups nav badge.
+    const groupUnread = useGroupUnread();
     const markAllRead = async () => {
         const token = localStorage.getItem('token');
         await fetch('/api/notifications/read-all', { method: 'POST', headers: token ? { Authorization: `Bearer ${token}` } : {} });
@@ -1025,10 +1031,13 @@ export default function Layout() {
         <div className="sidebar-agent-search">
             <IconSearch size={14} stroke={2} className="sidebar-agent-search-icon" />
             <input
+                id="sidebar-agent-search"
+                name="sidebar_agent_search"
                 type="text"
                 value={sidebarSearch}
                 onChange={e => setSidebarSearch(e.target.value)}
                 placeholder={isChinese ? '搜索...' : 'Search...'}
+                aria-label={isChinese ? '搜索智能体' : 'Search agents'}
             />
             {sidebarSearch && (
                 <button onClick={() => setSidebarSearch('')} aria-label={isChinese ? '清空搜索' : 'Clear search'}>
@@ -1194,12 +1203,6 @@ export default function Layout() {
 
 
                     <div className="sidebar-section" data-tour-target="main-nav">
-                        <NavLink to="/plaza" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
-                            <span className="sidebar-item-icon" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
-                                <IconBuildingMonument size={14} stroke={1.5} />
-                            </span>
-                            <span className="sidebar-item-text">{t('nav.plaza', 'Plaza')}</span>
-                        </NavLink>
                         <NavLink to="/dashboard" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
                             <span className="sidebar-item-icon" style={{ display: 'flex' }}>{SidebarIcons.home}</span>
                             <span className="sidebar-item-text">{t('nav.dashboard')}</span>
@@ -1214,6 +1217,21 @@ export default function Layout() {
                                 </svg>
                             </span>
                             <span className="sidebar-item-text">{t('nav.okr', 'OKR')}</span>
+                        </NavLink>
+                        <NavLink to="/plaza" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
+                            <span className="sidebar-item-icon" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
+                                <IconBuildingMonument size={14} stroke={1.5} />
+                            </span>
+                            <span className="sidebar-item-text">{t('nav.plaza', 'Plaza')}</span>
+                        </NavLink>
+                        <NavLink to="/groups" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
+                            <span className="sidebar-item-icon" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
+                                <IconUsersGroup size={14} stroke={1.5} />
+                            </span>
+                            <span className="sidebar-item-text">{t('nav.groups', 'Groups')}</span>
+                            {groupUnread > 0 && (
+                                <span className="sidebar-item-badge">{groupUnread > 99 ? '99+' : groupUnread}</span>
+                            )}
                         </NavLink>
                     </div>
                 </div>

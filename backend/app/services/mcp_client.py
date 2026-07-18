@@ -4,7 +4,9 @@ Supports two transport modes:
 1. Streamable HTTP (modern) — single URL, POST JSON-RPC, response as JSON or SSE
 2. SSE Transport (legacy but widely used) — GET /sse for event stream, POST /messages for requests
 
-Transport is auto-detected: tries Streamable HTTP first, falls back to SSE.
+Transport is auto-detected with read-only MCP requests before a business
+``tools/call`` is dispatched.  A business request is never replayed merely
+because its response was lost on one transport.
 Reference: https://modelcontextprotocol.io/docs
 """
 
@@ -31,6 +33,10 @@ MAX_MCP_TOOL_SCHEMA_BYTES = 64 * 1024
 MAX_MCP_LIST_SECONDS = 45
 MAX_MCP_CALL_SECONDS = 90
 _MCP_GLOBAL_CONCURRENCY = asyncio.Semaphore(32)
+
+
+class MCPTransportDetectionError(RuntimeError):
+    """Neither transport accepted a read-only MCP probe."""
 
 
 class MCPClient:
@@ -222,7 +228,7 @@ class MCPClient:
                 headers=self._headers(),
             )
             if resp.status_code not in (200, 201):
-                raise Exception(f"HTTP {resp.status_code}")
+                resp.raise_for_status()
             return self._parse_response(resp)
 
     # ── SSE Transport ────────────────────────────────────────────
@@ -360,6 +366,9 @@ class MCPClient:
                     headers=headers_post,
                 )
 
+                if post_resp.status_code >= 400:
+                    post_resp.raise_for_status()
+
                 # Phase 3: Read the response — either from POST response or from SSE stream
                 if post_resp.status_code == 200:
                     ct = post_resp.headers.get("content-type", "")
@@ -402,6 +411,36 @@ class MCPClient:
         if self._transport == "streamable":
             return await self._streamable_request(method, params)
 
+        # ``tools/call`` is a business operation and may already have produced
+        # a side effect when its response is lost.  Detect the transport with a
+        # read-only catalog request first, then dispatch the business call once
+        # on the selected transport.  Never use a failed business response as a
+        # signal to replay it through the other transport.
+        if method == "tools/call":
+            streamable_error_type = "unknown"
+            try:
+                await self._streamable_request("tools/list")
+                self._transport = "streamable"
+            except Exception as streamable_err:
+                streamable_error_type = type(streamable_err).__name__
+                logger.info(
+                    "[MCPClient] Streamable HTTP probe failed error_type={}; trying SSE",
+                    streamable_error_type,
+                )
+                try:
+                    await self._sse_request("tools/list")
+                    self._transport = "sse"
+                except Exception as sse_err:
+                    raise MCPTransportDetectionError(
+                        "Both MCP transport probes failed "
+                        f"(streamable={streamable_error_type}, "
+                        f"sse={type(sse_err).__name__})"
+                    ) from sse_err
+
+            if self._transport == "streamable":
+                return await self._streamable_request(method, params)
+            return await self._sse_request(method, params)
+
         # Auto-detect: try Streamable HTTP first. Python clears exception
         # variables after an `except ... as name` block exits, so keep a stable
         # string copy for the later SSE fallback error.
@@ -417,7 +456,6 @@ class MCPClient:
                 streamable_error_type,
             )
 
-        # Fallback to SSE
         try:
             result = await self._sse_request(method, params)
             self._transport = "sse"
@@ -512,8 +550,19 @@ class MCPClient:
                 f"MCP connection failed ({type(exc).__name__})"
             ) from None
 
+    async def call_tool_result(self, tool_name: str, arguments: dict) -> dict:
+        """Execute once and preserve the complete JSON-RPC response."""
+        data = await self._bounded_request(
+            "tools/call",
+            {"name": tool_name, "arguments": arguments},
+            MAX_MCP_CALL_SECONDS,
+        )
+        if not isinstance(data, dict):
+            raise ValueError("MCP tools/call returned a non-object response")
+        return data
+
     async def call_tool(self, tool_name: str, arguments: dict) -> str:
-        """Execute a tool on the MCP server."""
+        """Legacy text adapter for callers outside Durable Runtime."""
         try:
             data = await self._bounded_request(
                 "tools/call",

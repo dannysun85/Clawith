@@ -4385,6 +4385,12 @@ updates = {
     "COMMIT": sys.argv[3],
     "ALLOW_MIGRATION_FAILURE": "false",
     "ALLOW_UNVERIFIED_LOCAL_SIGNUP": "false",
+    # v1.11 Web Chat and every native execution source share one durable
+    # Runtime. Code execution remains governed by its independent gates below.
+    "AGENT_RUNTIME_V2_ENABLED": "true",
+    "AGENT_RUNTIME_V2_AGENT_IDS": "",
+    "AGENT_RUNTIME_V2_SOURCE_TYPES": "task",
+    "AGENT_RUNTIME_COMMAND_CONCURRENCY": "10",
     "HEARTBEAT_ENABLED": "false",
     "TRIGGER_DAEMON_ENABLED": "true",
     "USER_AUTOMATION_EXECUTION_ENABLED": "true",
@@ -4833,6 +4839,10 @@ echo "[remote] applying migrations before candidate startup"
 write_cutover_state migration_started "$CANDIDATE_SLOT" "$RELEASE_ID"
 compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" \
     run --rm --no-deps -T --entrypoint alembic backend upgrade head < /dev/null
+echo "[remote] installing pinned LangGraph checkpoint schema"
+compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" \
+    run --rm --no-deps -T --entrypoint python backend \
+    -m app.scripts.setup_langgraph_checkpoints < /dev/null
 echo "[remote] verifying all media Credits bindings after migration"
 if ! compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" \
     run --rm --no-deps -T --entrypoint python backend \

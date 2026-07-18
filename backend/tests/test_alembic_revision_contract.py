@@ -23,7 +23,16 @@ def test_revision_ids_fit_the_default_alembic_version_column() -> None:
 
 
 def test_release_migration_graph_has_one_expected_head() -> None:
-    assert _script_directory().get_heads() == ["sso_password_login"]
+    assert _script_directory().get_heads() == ["merge_v111_astra_heads"]
+
+
+def test_release_head_preserves_both_upgrade_lineages() -> None:
+    release_head = _script_directory().get_revision("merge_v111_astra_heads")
+
+    assert set(release_head._normalized_down_revisions) == {
+        "sso_password_login",
+        "add_experience_revision_drafts",
+    }
 
 
 def test_sso_password_migration_is_fail_closed_and_non_destructive() -> None:

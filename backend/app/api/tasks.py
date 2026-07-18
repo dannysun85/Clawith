@@ -36,7 +36,7 @@ async def list_tasks(
     db: AsyncSession = Depends(get_db),
 ):
     """List tasks for an agent."""
-    await check_agent_access(db, current_user, agent_id)
+    agent, _access = await check_agent_access(db, current_user, agent_id)
     query = select(Task).where(Task.agent_id == agent_id)
     if status_filter:
         query = query.where(Task.status == status_filter)
@@ -67,7 +67,7 @@ async def create_task(
     db: AsyncSession = Depends(get_db),
 ):
     """Create a new task for an agent."""
-    await check_agent_access(db, current_user, agent_id)
+    agent, _access = await check_agent_access(db, current_user, agent_id)
     if data.type == "supervision":
         raise HTTPException(
             status_code=409,
@@ -91,22 +91,26 @@ async def create_task(
     db.add(task)
     await db.flush()
 
+    runtime_handle = None
+    if data.type == "todo":
+        from app.services.task_executor import enqueue_task_runtime
+
+        runtime_handle = await enqueue_task_runtime(
+            db,
+            task=task,
+            agent=agent,
+        )
+        if runtime_handle is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Unified Agent Runtime is not enabled for tasks",
+            )
+
     task_out = await _enrich_task_out(task, db)
 
     # Commit so the worker's independent session can see the durable task and
     # requester identity before any model/tool call.
     await db.commit()
-
-    if data.type == "todo":
-        from app.services.task_executor import (
-            AUTOMATIC_TASK_EXECUTION_ENABLED,
-            execute_task,
-        )
-
-        if AUTOMATIC_TASK_EXECUTION_ENABLED:
-            import asyncio
-
-            asyncio.create_task(execute_task(task.id, agent_id))
 
     return task_out
 
