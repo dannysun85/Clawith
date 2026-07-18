@@ -112,6 +112,8 @@ async def ensure_smoke_platform_admin(email: str, password: str) -> dict[str, st
 
         identity.username = username
         identity.password_hash = hash_password(password)
+        identity.password_login_enabled = True
+        identity.auth_version = int(identity.auth_version or 0) + 1
         identity.is_active = True
         identity.is_platform_admin = True
         identity.email_verified = True
