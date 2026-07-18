@@ -6,13 +6,17 @@
 - The WebSocket attachment contract now uses an authoritative `file_names: string[]` field while retaining the legacy comma-delimited `file_name` fallback. Filenames such as `report,final.png` are no longer split into multiple invalid history references.
 - Repeated customer-visible attachment names remain visible when they refer to distinct stored objects. Durable storage references continue to be normalized to safe basenames before they are written to chat history.
 - Intentionally delayed FastAPI router imports carry explicit Ruff annotations, closing the release diff gate without changing application startup order or runtime behavior.
+- Production subscription smoke now selects one explicitly approved internal tenant for multi-tenant accounts and proves the resulting API and browser sessions remain scoped to that tenant. The same identity may still exercise platform-administrator read-only reconciliation without falling through to a customer organization.
+- Failed release smokes retain only code-owned status metadata; login, subscription and CSV response bodies are no longer copied into deployment error evidence.
+- Formal release checks now install the locked Python `dev` extra and frontend lockfile explicitly, so a clean Git worktree cannot fall through to unrelated system `pytest`/`ruff` executables or depend on an untracked `node_modules` directory.
 
 ## Validation
 
-- The complete backend suite passes with 1,628 tests; the complete frontend suite passes with 113 tests; and the production frontend build completes with 7,003 transformed modules.
+- The complete backend suite passes with 1,632 tests; the complete frontend suite passes with 113 tests; and the production frontend build completes with 7,003 transformed modules.
 - The PostgreSQL fresh upgrade, downgrade and re-upgrade smoke passes with the single `sso_password_login` Alembic head. Ruff changed-file gating, Python compilation, deployment shell syntax and `git diff --check` pass.
 - Isolated browser acceptance covers registration, tenant onboarding, SaaS model-route administration, cross-Agent Lite/Pro/Ultra preference persistence, image/video upload and reload, Credits non-settlement on rejected provider work, automation default-off behavior, production-issue workflow and Code fail-closed controls.
-- Independent code and architecture reviews found no remaining release blocker in the attachment persistence change.
+- A read-only preflight against the currently deployed `1.10.12` confirms the `Default` internal tenant is unique and that the configured account can complete tenant-scoped subscription reads, platform reconciliation and both CSV exports without using a customer organization.
+- Independent code and architecture reviews found no remaining release blocker in the attachment persistence or release-gate changes.
 
 ## Upgrade Notes
 

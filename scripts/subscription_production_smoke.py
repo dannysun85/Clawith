@@ -14,7 +14,7 @@ The browser portion is intentionally implemented by the pinned, isolated
 credentials into JavaScript or process arguments.
 
 Environment variables:
-  SMOKE_TENANT_EMAIL / SMOKE_TENANT_PASSWORD
+  SMOKE_TENANT_EMAIL / SMOKE_TENANT_PASSWORD / SMOKE_TENANT_ID
   SMOKE_PLATFORM_ADMIN_EMAIL / SMOKE_PLATFORM_ADMIN_PASSWORD
   SMOKE_API_BASE (default: http://127.0.0.1:3008/api)
   SMOKE_FRONTEND_URL (default: http://127.0.0.1:3008)
@@ -28,6 +28,7 @@ import os
 import sys
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,7 @@ DEFAULT_FRONTEND_URL = "http://127.0.0.1:3008"
 REQUIRED_CREDENTIAL_KEYS = {
     "SMOKE_TENANT_EMAIL",
     "SMOKE_TENANT_PASSWORD",
+    "SMOKE_TENANT_ID",
     "SMOKE_PLATFORM_ADMIN_EMAIL",
     "SMOKE_PLATFORM_ADMIN_PASSWORD",
 }
@@ -130,17 +132,55 @@ def summarize_reconciliation(
     return {checked_field: checked, "issue_count": 0}
 
 
-def login(api_base: str, email: str, password: str, stage: str) -> dict[str, Any]:
+def login(
+    api_base: str,
+    email: str,
+    password: str,
+    stage: str,
+    *,
+    tenant_id: str | None = None,
+    tenant_fallback_id: str | None = None,
+) -> dict[str, Any]:
+    request_data = {"login_identifier": email, "password": password}
+    if tenant_id:
+        request_data["tenant_id"] = tenant_id
     status, payload = call_api(
         "POST",
         api_base,
         "/auth/login",
-        {"login_identifier": email, "password": password},
+        request_data,
     )
+    if (
+        status == 200
+        and tenant_fallback_id
+        and isinstance(payload, dict)
+        and payload.get("requires_tenant_selection") is True
+    ):
+        tenants = payload.get("tenants")
+        require(
+            isinstance(tenants, list)
+            and any(
+                isinstance(candidate, dict)
+                and str(candidate.get("tenant_id")) == tenant_fallback_id
+                for candidate in tenants
+            ),
+            stage,
+            {"code": "target_tenant_not_available"},
+        )
+        status, payload = call_api(
+            "POST",
+            api_base,
+            "/auth/login",
+            {
+                "login_identifier": email,
+                "password": password,
+                "tenant_id": tenant_fallback_id,
+            },
+        )
     require(
         status == 200 and isinstance(payload, dict) and payload.get("access_token"),
         stage,
-        {"status": status, "body": payload},
+        {"code": "unexpected_login_response", "status": status},
     )
     return payload
 
@@ -180,6 +220,7 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
     tenant_password = (
         args.tenant_password or credentials.get("SMOKE_TENANT_PASSWORD") or os.getenv("SMOKE_TENANT_PASSWORD")
     )
+    tenant_id_value = args.tenant_id or credentials.get("SMOKE_TENANT_ID") or os.getenv("SMOKE_TENANT_ID")
     admin_email = (
         args.platform_admin_email
         or credentials.get("SMOKE_PLATFORM_ADMIN_EMAIL")
@@ -198,6 +239,10 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
         "tenant_credentials_configured",
         "Set SMOKE_TENANT_EMAIL and SMOKE_TENANT_PASSWORD",
     )
+    try:
+        tenant_id = str(uuid.UUID(str(tenant_id_value)))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise SmokeFailure("tenant_id_configured", {"code": "valid_uuid_required"}) from exc
     require(
         bool(admin_email and admin_password),
         "platform_admin_credentials_configured",
@@ -246,7 +291,13 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
     summary["release_identity"] = release_identity
     summary["checks"].append("candidate_release_identity_ok")
 
-    tenant_login = login(api_base, tenant_email, tenant_password, "tenant_login")
+    tenant_login = login(
+        api_base,
+        tenant_email,
+        tenant_password,
+        "tenant_login",
+        tenant_id=tenant_id,
+    )
     tenant_token = tenant_login["access_token"]
     summary["checks"].append("tenant_login_ok")
 
@@ -259,10 +310,25 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
         ("/subscription/credit-packs", "client_credit_packs"),
     ]:
         status, body = call_api("GET", api_base, path, token=tenant_token)
-        require(status == 200, stage, {"status": status, "body": body})
+        require(
+            status == 200,
+            stage,
+            {"code": "unexpected_http_status", "status": status},
+        )
+        if stage == "tenant_me":
+            require(
+                isinstance(body, dict) and str(body.get("tenant_id")) == tenant_id,
+                "tenant_scope",
+                {"code": "unexpected_tenant_context"},
+            )
+            summary["checks"].append("tenant_scope_ok")
         summary["checks"].append(f"{stage}_ok")
         if stage == "client_subscription_summary":
-            require(isinstance(body, dict) and "balance" in body and "available_balance" in body, stage, body)
+            require(
+                isinstance(body, dict) and "balance" in body and "available_balance" in body,
+                stage,
+                {"code": "invalid_subscription_summary"},
+            )
             summary["subscription_summary"] = {
                 "plan_code": body.get("plan_code"),
                 "balance": body.get("balance"),
@@ -272,7 +338,13 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 "seats_total": body.get("seats_total"),
             }
 
-    admin_login = login(api_base, admin_email, admin_password, "platform_admin_login")
+    admin_login = login(
+        api_base,
+        admin_email,
+        admin_password,
+        "platform_admin_login",
+        tenant_fallback_id=tenant_id,
+    )
     admin_token = admin_login["access_token"]
     summary["checks"].append("platform_admin_login_ok")
 
@@ -309,7 +381,7 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
         require(
             status == 200 and isinstance(body, str) and "," in body,
             stage,
-            {"status": status, "body": body[:200] if isinstance(body, str) else body},
+            {"code": "unexpected_export_response", "status": status},
         )
         summary["checks"].append(f"{stage}_ok")
 
@@ -323,6 +395,7 @@ def main() -> int:
     parser.add_argument("--frontend-url", default=None)
     parser.add_argument("--tenant-email", default=None)
     parser.add_argument("--tenant-password", default=None)
+    parser.add_argument("--tenant-id", default=None)
     parser.add_argument("--platform-admin-email", default=None)
     parser.add_argument("--platform-admin-password", default=None)
     parser.add_argument("--credentials-file", default=None)

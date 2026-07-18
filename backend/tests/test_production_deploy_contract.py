@@ -197,7 +197,11 @@ def test_polluted_parent_environment_cannot_activate_code_in_effective_compose()
 def test_production_release_gate_covers_code_execution_security():
     script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
 
-    assert "(cd backend && uv run pytest -q)" in script
+    assert "(cd backend && uv run --frozen --extra dev pytest -q)" in script
+    assert "uv run --project backend --frozen --extra dev python scripts/ruff_diff_gate.py" in script
+    assert 'ALEMBIC_HEADS="$(cd backend && uv run --frozen alembic heads)"' in script
+    assert script.index("(cd frontend && npm ci)") < script.index("(cd frontend && npm test)")
+    assert script.index("(cd frontend && npm test)") < script.index("(cd frontend && npm run build)")
     assert "production releases cannot disable local release gates" in script
     assert "agentbay_unresolved_count" in script
     assert ("status IN ('active', 'cleanup_required', 'provider_identity_collision')") in script
@@ -527,6 +531,7 @@ def test_v2_candidate_evidence_binds_ui_release_runner_and_candidate_slot(tmp_pa
         "candidate_release_identity_ok",
         "tenant_login_ok",
         "tenant_me_ok",
+        "tenant_scope_ok",
         "client_plans_ok",
         "client_subscription_summary_ok",
         "client_credit_transactions_ok",
@@ -539,6 +544,7 @@ def test_v2_candidate_evidence_binds_ui_release_runner_and_candidate_slot(tmp_pa
         "credit_transactions_csv_export_ok",
         "ui_release_identity_ok",
         "ui_tenant_login_ok",
+        "ui_tenant_scope_ok",
         "ui_subscription_summary_api_ok",
         "ui_subscription_balance_rendered_ok",
         "ui_subscription_page_ok",
@@ -635,6 +641,7 @@ candidate_business_evidence_valid {release_id} 3009
 
 def test_browser_smoke_runner_is_isolated_pinned_and_pre_mutation():
     script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    api_runner = (ROOT / "scripts/subscription_production_smoke.py").read_text(encoding="utf-8")
     dockerfile = (ROOT / "deploy/browser-smoke/Dockerfile").read_text(encoding="utf-8")
     browser_runner = (ROOT / "deploy/browser-smoke/subscription_browser_smoke.mjs").read_text(encoding="utf-8")
 
@@ -657,12 +664,17 @@ def test_browser_smoke_runner_is_isolated_pinned_and_pre_mutation():
     assert "--network host" not in script
     assert "SMOKE_PLATFORM_ADMIN" not in browser_runner
     assert "credentials.SMOKE_TENANT_PASSWORD" in browser_runner
+    assert "credentials.SMOKE_TENANT_ID" in browser_runner
+    assert "requires_tenant_selection" in browser_runner
+    assert "target_tenant_not_available" in browser_runner
     assert "isolated_candidate_frontend_network" in browser_runner
     assert "subscription-credits-usage-value" in browser_runner
     assert "subscription-available-credits-value" in browser_runner
     assert "subscription-available-credits-reserved" in browser_runner
     assert "waitForExactText" in browser_runner
     assert "await Promise.all" in browser_runner
+    assert '"body": body' not in api_runner
+    assert "body[:200]" not in api_runner
     assert '(cd deploy/browser-smoke && npm test)' in script
     assert 'BROWSER_SMOKE_RUNTIME_ROOT="/dev/shm/astra-deploy-smoke"' in script
     assert 'mktemp -d "$BROWSER_SMOKE_RUNTIME_ROOT/.candidate-smoke.XXXXXX"' in script
@@ -790,14 +802,16 @@ def test_smoke_credentials_are_hidden_from_local_gate_children_and_emit_exact_js
     expected = {
         "SMOKE_TENANT_EMAIL": "tenant@example.com",
         "SMOKE_TENANT_PASSWORD": "tenant password with spaces",
+        "SMOKE_TENANT_ID": "11111111-1111-4111-8111-111111111111",
         "SMOKE_PLATFORM_ADMIN_EMAIL": "admin@example.com",
         "SMOKE_PLATFORM_ADMIN_PASSWORD": "管理员-password",
     }
     harness = f"""set -euo pipefail
-SMOKE_ENV_KEYS=(SMOKE_TENANT_EMAIL SMOKE_TENANT_PASSWORD SMOKE_PLATFORM_ADMIN_EMAIL SMOKE_PLATFORM_ADMIN_PASSWORD)
+SMOKE_ENV_KEYS=(SMOKE_TENANT_EMAIL SMOKE_TENANT_PASSWORD SMOKE_TENANT_ID SMOKE_PLATFORM_ADMIN_EMAIL SMOKE_PLATFORM_ADMIN_PASSWORD)
 SMOKE_ENV_VALUES=()
 export SMOKE_TENANT_EMAIL={shlex.quote(expected["SMOKE_TENANT_EMAIL"])}
 export SMOKE_TENANT_PASSWORD={shlex.quote(expected["SMOKE_TENANT_PASSWORD"])}
+export SMOKE_TENANT_ID={shlex.quote(expected["SMOKE_TENANT_ID"])}
 export SMOKE_PLATFORM_ADMIN_EMAIL={shlex.quote(expected["SMOKE_PLATFORM_ADMIN_EMAIL"])}
 export SMOKE_PLATFORM_ADMIN_PASSWORD={shlex.quote(expected["SMOKE_PLATFORM_ADMIN_PASSWORD"])}
 {capture}
@@ -825,6 +839,7 @@ def test_smoke_credentials_never_enter_bash_xtrace_output():
     expected = {
         "SMOKE_TENANT_EMAIL": "xtrace-tenant@example.test",
         "SMOKE_TENANT_PASSWORD": "xtrace-tenant-password-sentinel",
+        "SMOKE_TENANT_ID": "11111111-1111-4111-8111-111111111111",
         "SMOKE_PLATFORM_ADMIN_EMAIL": "xtrace-admin@example.test",
         "SMOKE_PLATFORM_ADMIN_PASSWORD": "xtrace-admin-password-sentinel",
     }
@@ -1278,7 +1293,7 @@ def test_production_deploy_health_checks_candidate_before_nginx_cutover():
     assert candidate_identity < nginx_reload
     assert "ACTIVE_SLOT_FILE" in script
     assert "DRAIN_TIMEOUT_SECONDS" in script
-    assert "(cd backend && uv run pytest -q)" in script
+    assert "(cd backend && uv run --frozen --extra dev pytest -q)" in script
     assert "JWT_ROTATION_MARKER" in script
     assert "SSO_PASSWORD_ROTATION_MARKER" in script
     assert 'write_atomic_line "$SSO_PASSWORD_ROTATION_MARKER" "$RELEASE_ID"' in script

@@ -26,6 +26,7 @@ def test_smoke_credentials_require_an_exact_regular_json_file(tmp_path):
     credentials = {
         "SMOKE_TENANT_EMAIL": "tenant@example.com",
         "SMOKE_TENANT_PASSWORD": "tenant-secret",
+        "SMOKE_TENANT_ID": "11111111-1111-4111-8111-111111111111",
         "SMOKE_PLATFORM_ADMIN_EMAIL": "admin@example.com",
         "SMOKE_PLATFORM_ADMIN_PASSWORD": "admin-secret",
     }
@@ -63,6 +64,7 @@ def _api_evidence(commit: str, release_id: str, nonce: str) -> dict:
             "candidate_release_identity_ok",
             "tenant_login_ok",
             "tenant_me_ok",
+            "tenant_scope_ok",
             "client_plans_ok",
             "client_subscription_summary_ok",
             "client_credit_transactions_ok",
@@ -108,6 +110,7 @@ def _ui_evidence(commit: str, release_id: str, nonce: str) -> dict:
         "checks": [
             "ui_release_identity_ok",
             "ui_tenant_login_ok",
+            "ui_tenant_scope_ok",
             "ui_subscription_summary_api_ok",
             "ui_subscription_balance_rendered_ok",
             "ui_subscription_page_ok",
@@ -182,6 +185,18 @@ def test_composite_smoke_evidence_requires_matching_api_and_browser_proof(tmp_pa
 
     missing_check = _merge(tmp_path, api, {**ui, "checks": ui["checks"][:-1]})
     assert missing_check.returncode != 0
+    missing_api_scope = _merge(
+        tmp_path,
+        {**api, "checks": [check for check in api["checks"] if check != "tenant_scope_ok"]},
+        ui,
+    )
+    assert missing_api_scope.returncode != 0
+    missing_ui_scope = _merge(
+        tmp_path,
+        api,
+        {**ui, "checks": [check for check in ui["checks"] if check != "ui_tenant_scope_ok"]},
+    )
+    assert missing_ui_scope.returncode != 0
     mismatched_summary = _merge(
         tmp_path,
         api,
@@ -234,3 +249,136 @@ def test_api_reconciliation_gate_fails_closed_without_leaking_issue_rows():
         checked_field="checked_orders",
         stage="saas_payment_reconciliation",
     ) == {"checked_orders": 0, "issue_count": 0}
+
+
+def test_login_sends_an_explicit_tenant_id(monkeypatch):
+    runner = _load_api_runner()
+    tenant_id = "11111111-1111-4111-8111-111111111111"
+    calls = []
+
+    def fake_call_api(method, api_base, path, data):
+        calls.append((method, api_base, path, data))
+        return 200, {"access_token": "tenant-token"}
+
+    monkeypatch.setattr(runner, "call_api", fake_call_api)
+
+    result = runner.login(
+        "https://candidate.example/api",
+        "tenant@example.com",
+        "secret",
+        "tenant_login",
+        tenant_id=tenant_id,
+    )
+
+    assert result == {"access_token": "tenant-token"}
+    assert calls == [
+        (
+            "POST",
+            "https://candidate.example/api",
+            "/auth/login",
+            {
+                "login_identifier": "tenant@example.com",
+                "password": "secret",
+                "tenant_id": tenant_id,
+            },
+        )
+    ]
+
+
+def test_platform_admin_login_retries_with_the_smoke_tenant(monkeypatch):
+    runner = _load_api_runner()
+    tenant_id = "11111111-1111-4111-8111-111111111111"
+    responses = iter(
+        [
+            (
+                200,
+                {
+                    "requires_tenant_selection": True,
+                    "tenants": [{"tenant_id": tenant_id, "tenant_name": "Default"}],
+                },
+            ),
+            (200, {"access_token": "admin-token"}),
+        ]
+    )
+    requests = []
+
+    def fake_call_api(method, api_base, path, data):
+        requests.append(data)
+        return next(responses)
+
+    monkeypatch.setattr(runner, "call_api", fake_call_api)
+
+    result = runner.login(
+        "https://candidate.example/api",
+        "admin@example.com",
+        "secret",
+        "platform_admin_login",
+        tenant_fallback_id=tenant_id,
+    )
+
+    assert result == {"access_token": "admin-token"}
+    assert requests == [
+        {"login_identifier": "admin@example.com", "password": "secret"},
+        {
+            "login_identifier": "admin@example.com",
+            "password": "secret",
+            "tenant_id": tenant_id,
+        },
+    ]
+
+
+def test_platform_admin_login_fails_closed_when_smoke_tenant_is_unavailable(monkeypatch):
+    runner = _load_api_runner()
+
+    monkeypatch.setattr(
+        runner,
+        "call_api",
+        lambda method, api_base, path, data: (
+            200,
+            {
+                "requires_tenant_selection": True,
+                "tenants": [
+                    {
+                        "tenant_id": "22222222-2222-4222-8222-222222222222",
+                        "tenant_name": "Another tenant",
+                    }
+                ],
+            },
+        ),
+    )
+
+    with pytest.raises(runner.SmokeFailure) as exc_info:
+        runner.login(
+            "https://candidate.example/api",
+            "admin@example.com",
+            "secret",
+            "platform_admin_login",
+            tenant_fallback_id="11111111-1111-4111-8111-111111111111",
+        )
+
+    assert exc_info.value.detail == {"code": "target_tenant_not_available"}
+
+
+def test_login_failure_does_not_copy_the_response_body(monkeypatch):
+    runner = _load_api_runner()
+    sensitive_body = {"detail": "private-provider-or-customer-response"}
+
+    monkeypatch.setattr(
+        runner,
+        "call_api",
+        lambda method, api_base, path, data: (401, sensitive_body),
+    )
+
+    with pytest.raises(runner.SmokeFailure) as exc_info:
+        runner.login(
+            "https://candidate.example/api",
+            "tenant@example.com",
+            "secret",
+            "tenant_login",
+        )
+
+    assert exc_info.value.detail == {
+        "code": "unexpected_login_response",
+        "status": 401,
+    }
+    assert sensitive_body["detail"] not in repr(exc_info.value.detail)

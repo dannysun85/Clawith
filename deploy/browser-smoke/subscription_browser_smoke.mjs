@@ -9,6 +9,7 @@ import { waitForExactText } from './browser_assertions.mjs';
 const REQUIRED_CREDENTIAL_KEYS = [
   'SMOKE_TENANT_EMAIL',
   'SMOKE_TENANT_PASSWORD',
+  'SMOKE_TENANT_ID',
 ];
 
 
@@ -109,6 +110,12 @@ async function requireExactCreditsText(locator, expected, field) {
 async function run() {
   const args = parseArgs(process.argv.slice(2));
   const credentials = readCredentials(args['credentials-file']);
+  requireCondition(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+      .test(credentials.SMOKE_TENANT_ID),
+    'credentials_file',
+    { invalid_key: 'SMOKE_TENANT_ID' },
+  );
   const frontendUrl = args['frontend-url'].replace(/\/+$/, '');
   const evidenceFrontendUrl = args['evidence-frontend-url'].replace(/\/+$/, '');
   const expectedCommit = args['expected-commit'];
@@ -192,6 +199,44 @@ async function run() {
     requireCondition(loginResponse.status() === 200, 'ui_tenant_login', {
       status: loginResponse.status(),
     });
+    const firstLoginPayload = await loginResponse.json();
+    if (firstLoginPayload?.requires_tenant_selection === true) {
+      const tenants = Array.isArray(firstLoginPayload.tenants) ? firstLoginPayload.tenants : [];
+      const targetTenant = tenants.find(
+        (tenant) => String(tenant?.tenant_id) === credentials.SMOKE_TENANT_ID,
+      );
+      requireCondition(Boolean(targetTenant), 'ui_tenant_selection', {
+        code: 'target_tenant_not_available',
+      });
+      const tenantButtonName = `${targetTenant.tenant_name}${
+        targetTenant.tenant_slug ? ` (${targetTenant.tenant_slug})` : ''
+      }`;
+      const scopedLoginResponsePromise = page.waitForResponse(
+        (response) => sameOriginPath(response.url(), frontendUrl, '/api/auth/login')
+          && response.request().method() === 'POST'
+          && response.request().postDataJSON()?.tenant_id === credentials.SMOKE_TENANT_ID,
+        { timeout: 30_000 },
+      );
+      const tenantButton = page.getByRole('button', { name: tenantButtonName, exact: true });
+      await tenantButton.waitFor({ state: 'visible', timeout: 30_000 });
+      await tenantButton.click();
+      const scopedLoginResponse = await scopedLoginResponsePromise;
+      requireCondition(scopedLoginResponse.status() === 200, 'ui_tenant_login', {
+        status: scopedLoginResponse.status(),
+      });
+      const scopedLoginPayload = await scopedLoginResponse.json();
+      requireCondition(
+        String(scopedLoginPayload?.user?.tenant_id) === credentials.SMOKE_TENANT_ID,
+        'ui_tenant_scope',
+        { code: 'unexpected_tenant_context' },
+      );
+    } else {
+      requireCondition(
+        String(firstLoginPayload?.user?.tenant_id) === credentials.SMOKE_TENANT_ID,
+        'ui_tenant_scope',
+        { code: 'unexpected_tenant_context' },
+      );
+    }
     await page.waitForURL(
       (url) => url.origin === new URL(frontendUrl).origin && url.pathname !== '/login',
       { timeout: 30_000 },
@@ -283,6 +328,7 @@ async function run() {
       checks: [
         'ui_release_identity_ok',
         'ui_tenant_login_ok',
+        'ui_tenant_scope_ok',
         'ui_subscription_summary_api_ok',
         'ui_subscription_balance_rendered_ok',
         'ui_subscription_page_ok',

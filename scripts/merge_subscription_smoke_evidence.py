@@ -15,6 +15,7 @@ API_CHECKS = {
     "candidate_release_identity_ok",
     "tenant_login_ok",
     "tenant_me_ok",
+    "tenant_scope_ok",
     "client_plans_ok",
     "client_subscription_summary_ok",
     "client_credit_transactions_ok",
@@ -29,6 +30,7 @@ API_CHECKS = {
 UI_CHECKS = {
     "ui_release_identity_ok",
     "ui_tenant_login_ok",
+    "ui_tenant_scope_ok",
     "ui_subscription_summary_api_ok",
     "ui_subscription_balance_rendered_ok",
     "ui_subscription_page_ok",

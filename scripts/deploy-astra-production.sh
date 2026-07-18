@@ -5,6 +5,7 @@ set -euo pipefail
 SMOKE_ENV_KEYS=(
     SMOKE_TENANT_EMAIL
     SMOKE_TENANT_PASSWORD
+    SMOKE_TENANT_ID
     SMOKE_PLATFORM_ADMIN_EMAIL
     SMOKE_PLATFORM_ADMIN_PASSWORD
 )
@@ -14,10 +15,11 @@ capture_smoke_credentials() {
     SMOKE_ENV_VALUES=(
         "${SMOKE_TENANT_EMAIL-}"
         "${SMOKE_TENANT_PASSWORD-}"
+        "${SMOKE_TENANT_ID-}"
         "${SMOKE_PLATFORM_ADMIN_EMAIL-}"
         "${SMOKE_PLATFORM_ADMIN_PASSWORD-}"
     )
-    unset SMOKE_TENANT_EMAIL SMOKE_TENANT_PASSWORD
+    unset SMOKE_TENANT_EMAIL SMOKE_TENANT_PASSWORD SMOKE_TENANT_ID
     unset SMOKE_PLATFORM_ADMIN_EMAIL SMOKE_PLATFORM_ADMIN_PASSWORD
     export -n SMOKE_ENV_VALUES 2>/dev/null || true
 }
@@ -259,7 +261,7 @@ if [ ! -f "$SSH_KEY" ]; then
 fi
 
 echo "[local] checking Alembic heads"
-ALEMBIC_HEADS="$(cd backend && uv run alembic heads)"
+ALEMBIC_HEADS="$(cd backend && uv run --frozen alembic heads)"
 ALEMBIC_HEAD_COUNT="$(printf '%s\n' "$ALEMBIC_HEADS" | grep -c '(head)')"
 if [ "$ALEMBIC_HEAD_COUNT" != "1" ]; then
     printf '%s\n' "$ALEMBIC_HEADS" >&2
@@ -268,14 +270,15 @@ if [ "$ALEMBIC_HEAD_COUNT" != "1" ]; then
 fi
 
 echo "[local] checking that the release adds no Ruff violations"
-uv run --project backend python scripts/ruff_diff_gate.py \
+uv run --project backend --frozen --extra dev python scripts/ruff_diff_gate.py \
     --base "$RELEASE_BASE_COMMIT" --target HEAD
 git diff --check
 
 echo "[local] running full backend suite"
-(cd backend && uv run pytest -q)
+(cd backend && uv run --frozen --extra dev pytest -q)
 
 echo "[local] running full frontend suite and production build"
+(cd frontend && npm ci)
 (cd frontend && npm test)
 (cd frontend && npm run build)
 
@@ -1336,10 +1339,11 @@ import sys
 source = Path(sys.argv[1])
 target = Path(sys.argv[2])
 payload = json.loads(source.read_text(encoding="utf-8"))
-keys = ("SMOKE_TENANT_EMAIL", "SMOKE_TENANT_PASSWORD")
+keys = ("SMOKE_TENANT_EMAIL", "SMOKE_TENANT_PASSWORD", "SMOKE_TENANT_ID")
 if set(payload) != {
     "SMOKE_TENANT_EMAIL",
     "SMOKE_TENANT_PASSWORD",
+    "SMOKE_TENANT_ID",
     "SMOKE_PLATFORM_ADMIN_EMAIL",
     "SMOKE_PLATFORM_ADMIN_PASSWORD",
 }:
@@ -1503,6 +1507,7 @@ if kind in {"smoke", "smoke-v2"}:
             "candidate_release_identity_ok",
             "tenant_login_ok",
             "tenant_me_ok",
+            "tenant_scope_ok",
             "client_plans_ok",
             "client_subscription_summary_ok",
             "client_credit_transactions_ok",
@@ -1515,6 +1520,7 @@ if kind in {"smoke", "smoke-v2"}:
             "credit_transactions_csv_export_ok",
             "ui_release_identity_ok",
             "ui_tenant_login_ok",
+            "ui_tenant_scope_ok",
             "ui_subscription_summary_api_ok",
             "ui_subscription_balance_rendered_ok",
             "ui_subscription_page_ok",

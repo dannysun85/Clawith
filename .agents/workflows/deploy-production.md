@@ -19,7 +19,8 @@
 
 1. 确认当前分支、完整 commit、`backend/VERSION` 和发布说明一致，工作区干净。
 2. Alembic 必须只有一个 head，并完成 PostgreSQL 升级、降级、再升级 smoke。
-3. 后端全量 pytest、前端测试与 `npm run build`、部署契约测试、Ruff Git
+3. 锁定 Python `dev` extra 后运行后端全量 pytest，前端先 `npm ci` 再运行测试与
+   `npm run build`；部署契约测试、Ruff Git
    基线差异检查（不得新增 violation）和 `git diff --check` 全部通过。历史存量
    Ruff 告警不作为本次伪失败，但新增文件或新增问题必须阻断发布。
 4. 至少完成一次独立 code review 和 architecture review；存在 `REQUEST CHANGES`
@@ -70,7 +71,9 @@ bash scripts/deploy-astra-production.sh
 身份校验、单 worker 交接和失败回滚。脏工作区会直接失败，不存在
 `ALLOW_DIRTY` 或 `RUN_LOCAL_CHECKS=0` 的正式发布旁路。
 
-真实账号 smoke 默认必跑（`RUN_REMOTE_SMOKE=1`），使用临时、最小权限的环境变量；
+真实账号 smoke 默认必跑（`RUN_REMOTE_SMOKE=1`），使用临时、最小权限的环境变量。
+`SMOKE_TENANT_ID` 必须指向明确批准的内部验证租户；API 与浏览器证据都必须证明
+最终 token 仍属于该租户，禁止依赖多租户账号的默认选择，也禁止误用客户租户；
 临时凭据文件必须由脚本清理，报告只记录通过/失败和 trace ID，不记录凭据。只有
 紧急恢复才允许 `RUN_REMOTE_SMOKE=0`，且必须同时提供带审批号、一次性随机
 `approval_nonce`、审批人、原因、目标版本、完整 commit、签发时间和未过期 UTC 时间的
