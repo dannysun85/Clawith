@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from functools import lru_cache
 import hashlib
 from io import BytesIO
@@ -72,6 +72,7 @@ class OverlayReceipt:
     font_family: str | None = None
     font_face_index: int | None = None
     line_count: int = 0
+    background_sanitized: bool = False
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -548,6 +549,11 @@ def _compose_overlay_canvas(
     return canvas, receipt
 
 
+def _brand_safe_background_blur(size: tuple[int, int]) -> float:
+    """Scale a text-suppressing blur without erasing the background motion."""
+    return round(max(8.0, min(24.0, min(size) * 0.02)), 2)
+
+
 def apply_image_brand_overlays(
     raw: bytes,
     text: str | None,
@@ -557,17 +563,22 @@ def apply_image_brand_overlays(
     brand_position: str = "center",
     brand_scale: float = 0.42,
     output_format: str | None = None,
+    sanitize_generated_background: bool = False,
 ) -> tuple[bytes, OverlayReceipt]:
     """Render exact copy and an immutable product/logo layer on one image."""
     normalized_text = normalize_overlay_text(text)
     if not normalized_text and not brand_asset and not output_format:
         return raw, OverlayReceipt()
 
-    from PIL import Image, ImageOps
+    from PIL import Image, ImageFilter, ImageOps
 
     validate_generated_image(raw)
     with Image.open(BytesIO(raw)) as source:
         image = ImageOps.exif_transpose(source).convert("RGBA")
+    if sanitize_generated_background:
+        image = image.filter(
+            ImageFilter.GaussianBlur(radius=_brand_safe_background_blur(image.size))
+        )
     overlay, receipt = _compose_overlay_canvas(
         image.size,
         normalized_text,
@@ -577,6 +588,8 @@ def apply_image_brand_overlays(
         brand_scale=brand_scale,
     )
     image.alpha_composite(overlay)
+    if sanitize_generated_background:
+        receipt = replace(receipt, background_sanitized=True)
 
     output = BytesIO()
     requested = str(output_format or "PNG").strip().upper().lstrip(".")
@@ -944,6 +957,7 @@ async def apply_video_brand_overlays(
     brand_asset: ImageAsset | None = None,
     brand_position: str = "center",
     brand_scale: float = 0.42,
+    sanitize_generated_background: bool = False,
 ) -> tuple[bytes, OverlayReceipt]:
     """Composite the same deterministic Pillow layer over every video frame."""
     info = await validate_generated_video(
@@ -978,6 +992,14 @@ async def apply_video_brand_overlays(
         output_path = root / "output.mp4"
         input_path.write_bytes(raw)
         overlay.save(overlay_path, format="PNG", optimize=True)
+        if sanitize_generated_background:
+            blur = _brand_safe_background_blur((info.width, info.height))
+            filter_complex = (
+                f"[0:v]gblur=sigma={blur}:steps=2[background];"
+                "[background][1:v]overlay=0:0:format=auto:shortest=1[v]"
+            )
+        else:
+            filter_complex = "[0:v][1:v]overlay=0:0:format=auto:shortest=1[v]"
         await _run_process(
             "ffmpeg",
             "-hide_banner",
@@ -993,7 +1015,7 @@ async def apply_video_brand_overlays(
             "-i",
             str(overlay_path),
             "-filter_complex",
-            "[0:v][1:v]overlay=0:0:format=auto:shortest=1[v]",
+            filter_complex,
             "-map",
             "[v]",
             "-map",
@@ -1021,6 +1043,8 @@ async def apply_video_brand_overlays(
             raise MediaContractError("Video brand-safe overlay did not create an output file")
         result = output_path.read_bytes()
     await validate_generated_video(result, label="Video overlay output")
+    if sanitize_generated_background:
+        receipt = replace(receipt, background_sanitized=True)
     return result, receipt
 
 

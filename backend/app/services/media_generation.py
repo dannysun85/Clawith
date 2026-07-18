@@ -2444,6 +2444,9 @@ async def reconcile_minimax_sync_media_task(
                 brand_position=str(metadata.get("brand_position") or "center"),
                 brand_scale=float(metadata.get("brand_scale") or 0.42),
                 output_format=str(metadata.get("output_extension") or ".png"),
+                sanitize_generated_background=bool(
+                    metadata.get("sanitize_generated_background")
+                ),
             )
             validate_generated_image(output_bytes)
             status_data["_astra_media_contract"] = receipt.as_dict()
@@ -2786,6 +2789,9 @@ async def reconcile_minimax_video_task(
                     brand_asset=brand_asset,
                     brand_position=str(request_metadata.get("brand_position") or "center"),
                     brand_scale=float(request_metadata.get("brand_scale") or 0.42),
+                    sanitize_generated_background=bool(
+                        request_metadata.get("sanitize_generated_background")
+                    ),
                 )
                 status_data = {
                     **(status_data or {}),

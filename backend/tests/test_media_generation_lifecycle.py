@@ -524,6 +524,7 @@ async def test_reconciliation_stores_valid_mp4_before_settlement_and_is_idempote
         brand_asset,
         brand_position,
         brand_scale,
+        sanitize_generated_background,
     ):
         events.append("overlay")
         assert text == "精确中文"
@@ -531,6 +532,7 @@ async def test_reconciliation_stores_valid_mp4_before_settlement_and_is_idempote
         assert brand_asset is None
         assert brand_position == "center"
         assert brand_scale == 0.42
+        assert sanitize_generated_background is False
         return data + b"overlay", OverlayReceipt(
             rendered_text_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
         )

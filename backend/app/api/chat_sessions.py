@@ -22,6 +22,7 @@ from app.services.agent_plan_selection import (
     InvalidAgentPlanSelection,
     resolve_agent_plan_selection,
 )
+from app.services.artifact_contract import sanitize_response_artifacts
 from app.services.entitlements import get_tenant_entitlements
 from app.services.chat_session_access import (
     can_audit_agent_chat_sessions,
@@ -664,6 +665,12 @@ async def get_session_messages(
 
     out = []
     for m in messages:
+        message_content = m.content
+        if m.role == "assistant":
+            message_content = await sanitize_response_artifacts(
+                agent_id,
+                message_content,
+            )
         sender_info = sender_cache.get(str(m.participant_id)) if m.participant_id else None
         sender_name = sender_info[0] if sender_info else None
         sender_agent_id = sender_info[1] if sender_info else None
@@ -682,7 +689,7 @@ async def get_session_messages(
             entry: dict = {
                 "id": str(m.id),
                 "role": m.role,
-                "content": m.content,
+                "content": message_content,
                 "created_at": m.created_at.isoformat() if m.created_at else None,
                 "source_message_id": str(m.id),
                 "source_created_at": (
@@ -704,8 +711,8 @@ async def get_session_messages(
             continue
 
         # For agent sessions, parse inline tool_code blocks from assistant messages
-        if session.source_channel == "agent" and m.role == "assistant" and "```tool_code" in (m.content or ""):
-            parts = _split_inline_tools(m.content)
+        if session.source_channel == "agent" and m.role == "assistant" and "```tool_code" in (message_content or ""):
+            parts = _split_inline_tools(message_content)
             for part_index, part in enumerate(parts):
                 part["id"] = f"{m.id}:part:{part_index}"
                 part["created_at"] = (
@@ -721,7 +728,7 @@ async def get_session_messages(
             entry = {
                 "id": str(m.id),
                 "role": m.role,
-                "content": m.content,
+                "content": message_content,
                 "created_at": m.created_at.isoformat() if m.created_at else None,
                 "source_message_id": str(m.id),
                 "source_created_at": (

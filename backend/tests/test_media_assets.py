@@ -6,7 +6,7 @@ import shutil
 import subprocess
 
 import pytest
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageStat
 
 from app.services.agent_tools import _read_file
 from app.services import media_assets
@@ -36,6 +36,16 @@ def _brand_asset_bytes(size=(160, 120)) -> bytes:
     image = Image.new("RGBA", size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
     draw.rounded_rectangle((8, 8, size[0] - 8, size[1] - 8), radius=18, fill=(238, 32, 48, 255))
+    image.save(output, format="PNG")
+    return output.getvalue()
+
+
+def _striped_image_bytes(size=(640, 360)) -> bytes:
+    output = BytesIO()
+    image = Image.new("RGB", size, "black")
+    draw = ImageDraw.Draw(image)
+    for x in range(0, size[0], 4):
+        draw.rectangle((x, 0, x + 1, size[1]), fill="white")
     image.save(output, format="PNG")
     return output.getvalue()
 
@@ -223,15 +233,46 @@ def test_product_asset_is_composited_unchanged_and_receipted():
         brand_asset=brand_asset,
         brand_position="center",
         brand_scale=0.25,
+        sanitize_generated_background=True,
     )
 
     assert receipt.brand_asset_sha256 == brand_asset.sha256
     assert receipt.rendered_text_sha256 is not None
     assert receipt.font_sha256 is not None
     assert receipt.line_count >= 1
+    assert receipt.background_sanitized is True
     with Image.open(BytesIO(result)) as image:
         red, green, blue = image.convert("RGB").getpixel((320, 180))
     assert red > 220 and green < 70 and blue < 80
+
+
+def test_brand_safe_image_suppresses_provider_background_pseudo_text():
+    brand_asset = image_asset_from_bytes(_brand_asset_bytes(), label="Product")
+
+    original, _ = apply_image_brand_overlays(
+        _striped_image_bytes(),
+        None,
+        brand_asset=brand_asset,
+        sanitize_generated_background=False,
+    )
+    sanitized, receipt = apply_image_brand_overlays(
+        _striped_image_bytes(),
+        None,
+        brand_asset=brand_asset,
+        sanitize_generated_background=True,
+    )
+
+    with Image.open(BytesIO(original)) as original_image:
+        original_variance = ImageStat.Stat(
+            original_image.convert("L").crop((0, 0, 160, 120))
+        ).var[0]
+    with Image.open(BytesIO(sanitized)) as sanitized_image:
+        sanitized_variance = ImageStat.Stat(
+            sanitized_image.convert("L").crop((0, 0, 160, 120))
+        ).var[0]
+
+    assert sanitized_variance < original_variance * 0.1
+    assert receipt.background_sanitized is True
 
 
 @pytest.mark.asyncio
@@ -246,6 +287,7 @@ async def test_real_video_decodes_and_contains_exact_copy_and_protected_product(
         brand_asset=brand_asset,
         brand_position="center",
         brand_scale=0.25,
+        sanitize_generated_background=True,
     )
     info = await validate_generated_video(result)
 
@@ -254,6 +296,7 @@ async def test_real_video_decodes_and_contains_exact_copy_and_protected_product(
     assert info.duration_seconds >= 1.0
     assert receipt.brand_asset_sha256 == brand_asset.sha256
     assert receipt.rendered_text_sha256 is not None
+    assert receipt.background_sanitized is True
 
     ffmpeg = shutil.which("ffmpeg")
     assert ffmpeg

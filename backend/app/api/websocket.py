@@ -7,6 +7,7 @@ import uuid
 from collections import deque
 from datetime import datetime, timezone as tz
 from time import perf_counter
+from types import SimpleNamespace
 
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
@@ -32,7 +33,11 @@ from app.models.task import Task
 from app.models.tenant import Tenant
 from app.models.user import User
 from app.services.activity_logger import log_activity
-from app.services.artifact_contract import append_authoritative_artifacts, verified_tool_artifacts
+from app.services.artifact_contract import (
+    MEDIA_GENERATION_TOOLS,
+    sanitize_response_artifacts,
+    verified_tool_artifacts,
+)
 from app.services.agentbay_live import detect_agentbay_env, get_browser_snapshot, get_desktop_screenshot
 from app.services.chat_session_service import ensure_primary_platform_session
 from app.services.chat_session_access import (
@@ -579,7 +584,23 @@ class WebSocketChatHandler:
                 .order_by(ChatMessage.created_at.desc())
                 .limit(self.ctx_size)
             )
-            self.history_messages = list(reversed(history_result.scalars().all()))
+            history_messages = list(reversed(history_result.scalars().all()))
+            self.history_messages = []
+            for message in history_messages:
+                content = message.content
+                if message.role == "assistant":
+                    content = await sanitize_response_artifacts(
+                        self.agent_id,
+                        content,
+                    )
+                self.history_messages.append(
+                    SimpleNamespace(
+                        id=message.id,
+                        role=message.role,
+                        content=content,
+                        thinking=message.thinking,
+                    )
+                )
             logger.info(f"[WS] Loaded {len(self.history_messages)} history messages for session {self.conv_id}")
         except Exception as e:
             logger.warning(f"[WS] History load failed (non-fatal): {e}")
@@ -1011,6 +1032,8 @@ class WebSocketChatHandler:
             # Track how many characters of finish-tool content have been streamed
             finish_content_sent_len = 0
             completed_artifact_paths: list[str] = []
+            completed_media_artifact_paths: list[str] = []
+            completed_tool_names: set[str] = set()
 
             # Set inside _call_with_failover when an onboarding prompt was injected
             needs_onboarding_mark = False
@@ -1050,11 +1073,13 @@ class WebSocketChatHandler:
                 if data.get("status") in {"running", "done"}:
                     await maybe_mark_onboarding_progress()
                 if data.get("status") == "done":
+                    completed_tool_name = str(data.get("name") or "")
+                    completed_tool_names.add(completed_tool_name)
                     # Inject Live Preview & Workspace Activities
                     await self._inject_live_preview_and_workspace_metadata(data)
                     verified = await verified_tool_artifacts(
                         self.agent_id,
-                        str(data.get("name") or ""),
+                        completed_tool_name,
                         data.get("args") if isinstance(data.get("args"), dict) else None,
                         str(data.get("result") or ""),
                     )
@@ -1066,6 +1091,12 @@ class WebSocketChatHandler:
                         completed_artifact_paths.extend(
                             path for path in verified if path not in completed_artifact_paths
                         )
+                        if completed_tool_name in MEDIA_GENERATION_TOOLS:
+                            completed_media_artifact_paths.extend(
+                                path
+                                for path in verified
+                                if path not in completed_media_artifact_paths
+                            )
 
                 # Persist before publishing the final frame so history hydration and
                 # realtime delivery share one stable database message ID.
@@ -1277,10 +1308,13 @@ class WebSocketChatHandler:
                 assistant_response = await llm_task
                 logger.info(f"[WS] LLM response complete chars={len(assistant_response)}")
 
-            assistant_response = append_authoritative_artifacts(
-                assistant_response,
+            assistant_response = await sanitize_response_artifacts(
                 self.agent_id,
+                assistant_response,
                 completed_artifact_paths,
+                allow_stored_response_artifacts=False,
+                completed_tool_names=completed_tool_names,
+                generated_media_artifact_paths=completed_media_artifact_paths,
             )
 
             # Raise error on prefix for failover matching

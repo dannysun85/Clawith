@@ -23,7 +23,10 @@ or brand asset to remain unchanged.
    intentionally preserved; never silently remove or redraw it.
 5. Use `brand_position` and `brand_scale` to reserve a stable product area. For video, the protected product layer is
    composited over every frame and remains static while the background moves.
-6. Only report success after the tool returns a real saved workspace path and a brand-safe receipt.
+6. Astra softens model-generated backgrounds in exact-copy and protected-product mode so provider-created pseudo-text
+   cannot remain legible. Creative reference-image/frame mode keeps scene detail and therefore cannot make this promise.
+7. Only report success after the tool returns a real saved workspace path and a brand-safe receipt. The receipt must
+   record `background_sanitized=true` whenever background sanitization was required.
 
 ### Creative delivery
 

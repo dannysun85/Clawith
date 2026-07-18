@@ -44,6 +44,7 @@ from app.services.agent_tools import (
 from app.api import tools as tools_api
 from app.services.quota_guard import QuotaExceeded
 from app.services.minimax_media_profiles import resolve_minimax_media_profile
+from app.services.mcp_security import MCPURLPolicyError
 
 
 def _valid_png_bytes() -> bytes:
@@ -59,6 +60,38 @@ def _media_config_schema() -> dict:
             {"key": "base_url", "type": "text"},
         ]
     }
+
+
+@pytest.mark.asyncio
+async def test_public_provider_client_marks_started_after_public_origin_preflight():
+    policy_error = MCPURLPolicyError(
+        "MCP endpoint must resolve only to public addresses"
+    )
+    policy_hook = AsyncMock(side_effect=policy_error)
+    guard = MagicMock()
+    guard.client_kwargs.return_value = {
+        "event_hooks": {"request": [policy_hook]},
+    }
+    started = MagicMock()
+
+    with (
+        patch("app.services.mcp_security.MCPHTTPGuard", return_value=guard),
+        patch("httpx.AsyncClient", return_value=MagicMock()) as client_class,
+    ):
+        agent_tools._public_only_async_client(
+            "https://api.minimax.test/v1/image_generation",
+            timeout=120,
+            on_request_started=started,
+        )
+
+    request_hooks = client_class.call_args.kwargs["event_hooks"]["request"]
+    assert request_hooks[0] is policy_hook
+    with pytest.raises(MCPURLPolicyError):
+        await request_hooks[0](MagicMock())
+    started.assert_not_called()
+
+    await request_hooks[1](MagicMock())
+    started.assert_called_once_with()
 
 
 def test_agent_owned_media_key_requires_a_frozen_agent_endpoint_bundle():
@@ -890,6 +923,7 @@ async def test_generate_image_accepted_provider_faults_never_refund_or_replay(
     generated = _valid_png_bytes()
 
     async def provider(**kwargs):
+        kwargs["on_provider_request_started"]()
         if failure_mode == "missing_image_url":
             raise ValueError("No image URL in MiniMax response")
         await kwargs["on_provider_accepted"]("https://asset.example/accepted.png")
@@ -995,6 +1029,77 @@ async def test_generate_image_accepted_provider_faults_never_refund_or_replay(
         ambiguous.assert_not_awaited()
         mark_credential.assert_not_awaited()
         assert "held by the durable recovery worker" in result
+
+
+@pytest.mark.asyncio
+async def test_generate_image_public_origin_preflight_failure_releases_hold(tmp_path):
+    agent_id = uuid.uuid4()
+    tenant_id = uuid.uuid4()
+    credential_id = uuid.uuid4()
+    error = MCPURLPolicyError(
+        "MCP endpoint must resolve only to public addresses"
+    )
+
+    with (
+        patch(
+            "app.services.agent_tools._generate_image_minimax",
+            AsyncMock(side_effect=error),
+        ),
+        patch(
+            "app.services.media_generation.create_minimax_sync_media_task_record",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    request_metadata={
+                        "recovery_asset_storage_key": "_internal/recovery/image.bin"
+                    }
+                )
+            ),
+        ) as create_task,
+        patch(
+            "app.services.media_generation.mark_media_generation_submission_failed",
+            AsyncMock(),
+        ) as failed,
+        patch(
+            "app.services.media_generation.mark_media_generation_submission_ambiguous",
+            AsyncMock(),
+        ) as ambiguous,
+        patch(
+            "app.services.agent_tools._record_minimax_tool_product_issue",
+            AsyncMock(),
+        ),
+        patch(
+            "app.services.agent_tools._mark_minimax_tool_credential_failure",
+            AsyncMock(),
+        ),
+    ):
+        result = await agent_tools._generate_image_minimax_durable(
+            agent_id=agent_id,
+            ws=tmp_path,
+            arguments={},
+            user_id=None,
+            session_id="",
+            tenant_id=tenant_id,
+            credential_id=credential_id,
+            api_key="sk-test",
+            base_url="https://api.minimax.test",
+            model="image-01",
+            tier="lite",
+            credit_cost=4,
+            provider_prompt="cat",
+            save_path="workspace/images/cat.png",
+            output_extension=".png",
+            overlay_text="",
+            overlay_position="bottom",
+            brand_asset=None,
+            brand_position="center",
+            brand_scale=0.42,
+        )
+
+    record_id = create_task.await_args.kwargs["record_id"]
+    failed.assert_awaited_once_with(record_id, error)
+    ambiguous.assert_not_awaited()
+    assert "remain held" not in result
+    assert "submission outcome is uncertain" not in result
 
 
 @pytest.mark.parametrize(
@@ -1361,6 +1466,7 @@ async def test_generate_music_minimax_records_success(tmp_path):
         "settlement_mark_failure",
         "ambiguous_timeout",
         "deterministic_rejection",
+        "pre_request_policy_failure",
     ],
 )
 @pytest.mark.asyncio
@@ -1391,7 +1497,12 @@ async def test_sync_minimax_audio_accounting_fault_matrix(
         credit_cost = 150
         model = "music-2.6"
 
-    async def provider(on_accepted):
+    async def provider(on_accepted, on_request_started):
+        if failure_mode == "pre_request_policy_failure":
+            raise MCPURLPolicyError(
+                "MCP endpoint must resolve only to public addresses"
+            )
+        on_request_started()
         if failure_mode == "ambiguous_timeout":
             raise httpx.ReadTimeout("provider outcome unknown")
         if failure_mode == "deterministic_rejection":
@@ -1497,7 +1608,7 @@ async def test_sync_minimax_audio_accounting_fault_matrix(
         failed.assert_not_awaited()
         mark_credential.assert_awaited_once()
         assert "submission outcome is uncertain" in result
-    else:
+    elif failure_mode == "deterministic_rejection":
         store_recovery.assert_not_awaited()
         mark_accepted.assert_not_awaited()
         recovery_retry.assert_not_awaited()
@@ -1505,6 +1616,15 @@ async def test_sync_minimax_audio_accounting_fault_matrix(
         failed.assert_awaited_once()
         mark_credential.assert_awaited_once()
         assert "Provider code: 2056" in result
+    else:
+        store_recovery.assert_not_awaited()
+        mark_accepted.assert_not_awaited()
+        recovery_retry.assert_not_awaited()
+        ambiguous.assert_not_awaited()
+        failed.assert_awaited_once()
+        mark_credential.assert_awaited_once()
+        assert "remain held" not in result
+        assert "submission outcome is uncertain" not in result
 
 
 @pytest.mark.asyncio
@@ -1524,6 +1644,7 @@ async def test_generate_video_minimax_creates_task_metadata(tmp_path):
         return SimpleNamespace(reservation_id=reservation_id)
 
     async def create_provider_task(**_kwargs):
+        _kwargs["on_provider_request_started"]()
         lifecycle_order.append("provider")
         return "task-123"
 
@@ -1597,6 +1718,88 @@ async def test_generate_video_minimax_creates_task_metadata(tmp_path):
         model="MiniMax-Hailuo-2.3",
     )
     check_credits.assert_awaited_once_with(tenant_id, 280)
+
+
+@pytest.mark.asyncio
+async def test_generate_video_public_origin_preflight_failure_releases_hold(tmp_path):
+    agent_id = uuid.uuid4()
+    tenant_id = uuid.uuid4()
+    credential_id = uuid.uuid4()
+    reservation_id = uuid.uuid4()
+    credential = SimpleNamespace(id=credential_id, base_url=None)
+    error = MCPURLPolicyError(
+        "MCP endpoint must resolve only to public addresses"
+    )
+
+    with (
+        patch("app.services.agent_tools._get_tool_config", AsyncMock(return_value={})),
+        patch(
+            "app.services.agent_tools._get_minimax_tenant_uuid",
+            AsyncMock(return_value=tenant_id),
+        ),
+        patch(
+            "app.services.agent_tools._resolve_minimax_tool_tier",
+            AsyncMock(return_value="lite"),
+        ),
+        patch(
+            "app.services.minimax_media_profiles.load_platform_minimax_media_profile",
+            AsyncMock(return_value=resolve_minimax_media_profile("video", "lite")),
+        ),
+        patch("app.services.agent_tools._check_minimax_credit_amount", AsyncMock()),
+        patch("app.services.agent_tools._check_minimax_tool_allowed", AsyncMock(return_value=None)),
+        patch(
+            "app.services.llm.load_balancer.pick_credential",
+            AsyncMock(return_value=credential),
+        ),
+        patch(
+            "app.services.llm.utils.get_credential_api_key",
+            MagicMock(return_value="sk-test"),
+        ),
+        patch(
+            "app.services.agent_tools._minimax_create_video_task",
+            AsyncMock(side_effect=error),
+        ),
+        patch(
+            "app.services.media_generation.create_minimax_video_task_record",
+            AsyncMock(return_value=SimpleNamespace(reservation_id=reservation_id)),
+        ) as create_task,
+        patch(
+            "app.services.media_generation.validate_media_origin_session",
+            AsyncMock(),
+        ),
+        patch(
+            "app.services.media_generation.mark_media_generation_submission_failed",
+            AsyncMock(return_value=True),
+        ) as failed,
+        patch(
+            "app.services.media_generation.mark_media_generation_submission_ambiguous",
+            AsyncMock(),
+        ) as ambiguous,
+        patch(
+            "app.services.agent_tools._release_minimax_tool_reservation",
+            AsyncMock(),
+        ) as release,
+        patch(
+            "app.services.agent_tools._mark_minimax_tool_credential_failure",
+            AsyncMock(),
+        ),
+        patch(
+            "app.services.agent_tools._record_minimax_tool_product_issue",
+            AsyncMock(),
+        ),
+    ):
+        result = await _generate_video_minimax(
+            agent_id,
+            tmp_path,
+            {"prompt": "safe preflight failure", "wait_for_completion": False},
+        )
+
+    record_id = create_task.await_args.kwargs["record_id"]
+    failed.assert_awaited_once_with(record_id, error)
+    ambiguous.assert_not_awaited()
+    release.assert_not_awaited()
+    assert "retained the Credits hold" not in result
+    assert "submission outcome is uncertain" not in result
 
 
 @pytest.mark.asyncio

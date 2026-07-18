@@ -11323,6 +11323,7 @@ async def _generate_image(
             brand_position=brand_position,
             brand_scale=brand_scale,
             output_format=full_save_path.suffix,
+            sanitize_generated_background=bool(overlay_text.strip() or brand_asset),
         )
         validate_generated_image(image_bytes)
 
@@ -11338,6 +11339,8 @@ async def _generate_image(
             contract_bits.append(f"copy={overlay_receipt.rendered_text_sha256[:12]}")
         if overlay_receipt.brand_asset_sha256:
             contract_bits.append(f"brand={overlay_receipt.brand_asset_sha256[:12]}")
+        if overlay_receipt.background_sanitized:
+            contract_bits.append("background=sanitized")
         contract_line = f"Brand-safe receipt: {', '.join(contract_bits)}\n" if contract_bits else ""
 
         return (
@@ -11421,6 +11424,9 @@ async def _generate_image_minimax_durable(
         arguments.get("reference_image"),
         label="Reference image",
     )
+    sanitize_generated_background = bool(
+        brand_asset or (overlay_text.strip() and not reference_image)
+    )
     output_content_type = (
         "image/jpeg" if output_extension in {".jpg", ".jpeg"} else "image/png"
     )
@@ -11473,6 +11479,7 @@ async def _generate_image_minimax_durable(
                 "overlay_position": overlay_position,
                 "brand_position": brand_position,
                 "brand_scale": brand_scale,
+                "sanitize_generated_background": sanitize_generated_background,
                 **brand_metadata,
             },
         )
@@ -11510,7 +11517,10 @@ async def _generate_image_minimax_durable(
             )
             provider_accepted = True
 
-        provider_request_started = True
+        def record_provider_request_started() -> None:
+            nonlocal provider_request_started
+            provider_request_started = True
+
         image_bytes = await _generate_image_minimax(
             api_key=api_key,
             base_url=base_url,
@@ -11518,6 +11528,7 @@ async def _generate_image_minimax_durable(
             prompt=provider_prompt,
             aspect_ratio=arguments.get("aspect_ratio", "1:1"),
             reference_image=reference_image,
+            on_provider_request_started=record_provider_request_started,
             on_provider_accepted=lambda image_url: _finish_durable_media_side_effect(
                 record_provider_acceptance(image_url)
             ),
@@ -11580,10 +11591,15 @@ async def _generate_image_minimax_durable(
         deterministic_rejection = _is_minimax_deterministic_rejection(exc)
         if task_created:
             try:
-                if deterministic_rejection or not provider_request_started:
-                    await mark_media_generation_submission_failed(record_id, exc)
-                elif provider_response_accepted and not provider_accepted:
+                # Provider acceptance evidence always outranks a missing local
+                # request-start marker. An adapter must never refund paid work
+                # merely because its telemetry callback was skipped.
+                if provider_response_accepted and not provider_accepted:
                     await record_minimax_sync_provider_response_retry(record_id, exc)
+                elif provider_accepted:
+                    pass
+                elif deterministic_rejection or not provider_request_started:
+                    await mark_media_generation_submission_failed(record_id, exc)
                 elif not provider_accepted:
                     await mark_media_generation_submission_ambiguous(record_id, exc)
             except Exception:
@@ -12316,7 +12332,12 @@ async def _bounded_http_download(
         )
 
 
-def _public_only_async_client(url: str, *, timeout: int):
+def _public_only_async_client(
+    url: str,
+    *,
+    timeout: int,
+    on_request_started: Callable[[], None] | None = None,
+):
     """Build a same-origin client for credentialed provider API requests."""
 
     import httpx
@@ -12324,7 +12345,21 @@ def _public_only_async_client(url: str, *, timeout: int):
     from app.services.mcp_security import MCPHTTPGuard
 
     guard = MCPHTTPGuard(url)
-    return httpx.AsyncClient(timeout=timeout, **guard.client_kwargs())
+    client_kwargs = guard.client_kwargs()
+    if on_request_started is not None:
+        event_hooks = dict(client_kwargs.get("event_hooks") or {})
+        request_hooks = list(event_hooks.get("request") or [])
+
+        async def mark_request_started(_request) -> None:
+            # This hook is appended after the public-origin validation hook.
+            # Rejections raised by the URL/DNS/peer preflight therefore remain
+            # safe to refund, while failures after this point stay ambiguous.
+            on_request_started()
+
+        request_hooks.append(mark_request_started)
+        event_hooks["request"] = request_hooks
+        client_kwargs["event_hooks"] = event_hooks
+    return httpx.AsyncClient(timeout=timeout, **client_kwargs)
 
 
 def _public_artifact_async_client(*, timeout: int):
@@ -12413,7 +12448,7 @@ async def _generate_minimax_audio_durable(
     content_type: str,
     sample_rate: int,
     provider_call: Callable[
-        [Callable[[bytes | None], Awaitable[None]]],
+        [Callable[[bytes | None], Awaitable[None]], Callable[[], None]],
         Awaitable[bytes],
     ],
 ) -> str:
@@ -12479,11 +12514,15 @@ async def _generate_minimax_audio_durable(
                 )
             provider_accepted = True
 
-        provider_request_started = True
+        def record_provider_request_started() -> None:
+            nonlocal provider_request_started
+            provider_request_started = True
+
         audio_bytes = await provider_call(
             lambda raw: _finish_durable_media_side_effect(
                 record_provider_acceptance(raw)
-            )
+            ),
+            record_provider_request_started,
         )
         if not provider_accepted:
             await _finish_durable_media_side_effect(
@@ -12533,10 +12572,12 @@ async def _generate_minimax_audio_durable(
         deterministic_rejection = _is_minimax_deterministic_rejection(exc)
         if task_created:
             try:
-                if deterministic_rejection or not provider_request_started:
-                    await mark_media_generation_submission_failed(record_id, exc)
-                elif provider_response_accepted and not provider_accepted:
+                if provider_response_accepted and not provider_accepted:
                     await record_minimax_sync_provider_response_retry(record_id, exc)
+                elif provider_accepted:
+                    pass
+                elif deterministic_rejection or not provider_request_started:
+                    await mark_media_generation_submission_failed(record_id, exc)
                 elif not provider_accepted:
                     await mark_media_generation_submission_ambiguous(record_id, exc)
             except Exception:
@@ -12656,7 +12697,7 @@ async def _generate_speech_minimax(
         audio_format=audio_format,
         content_type=content_type,
         sample_rate=sample_rate,
-        provider_call=lambda on_accepted: _minimax_tts_http(
+        provider_call=lambda on_accepted, on_request_started: _minimax_tts_http(
             api_key=credential.api_key,
             base_url=credential.base_url,
             model=model,
@@ -12673,6 +12714,7 @@ async def _generate_speech_minimax(
             sample_rate=sample_rate,
             bitrate=int(profile.bitrate or 128000),
             language_boost=config.get("language_boost") or "auto",
+            on_provider_request_started=on_request_started,
             on_provider_accepted=on_accepted,
         ),
     )
@@ -12752,7 +12794,7 @@ async def _generate_music_minimax(
         audio_format=audio_format,
         content_type=content_type,
         sample_rate=sample_rate,
-        provider_call=lambda on_accepted: _minimax_music_http(
+        provider_call=lambda on_accepted, on_request_started: _minimax_music_http(
             api_key=credential.api_key,
             base_url=credential.base_url,
             model=model,
@@ -12761,6 +12803,7 @@ async def _generate_music_minimax(
             audio_format=audio_format,
             sample_rate=sample_rate,
             bitrate=int(profile.bitrate or 256000),
+            on_provider_request_started=on_request_started,
             on_provider_accepted=on_accepted,
         ),
     )
@@ -12903,6 +12946,14 @@ async def _generate_video_minimax(
             "watermarks, product packaging, or product replicas. Leave clear negative space for Astra to add "
             "the exact copy and protected brand asset after generation."
         )
+    sanitize_generated_background = bool(
+        brand_asset
+        or (
+            overlay_text.strip()
+            and not first_frame_image
+            and not last_frame_image
+        )
+    )
 
     reservation_id: uuid.UUID | None = None
     record_id: uuid.UUID | None = None
@@ -12985,6 +13036,7 @@ async def _generate_video_minimax(
             "brand_asset_sha256": brand_asset.sha256 if brand_asset else None,
             "brand_position": brand_position,
             "brand_scale": brand_scale,
+            "sanitize_generated_background": sanitize_generated_background,
         }
         created_task = await create_minimax_video_task_record(
             record_id=record_id,
@@ -13010,7 +13062,10 @@ async def _generate_video_minimax(
                 )
             )
 
-        provider_request_started = True
+        def record_provider_request_started() -> None:
+            nonlocal provider_request_started
+            provider_request_started = True
+
         provider_task_id = await _minimax_create_video_task(
             api_key=credential.api_key,
             base_url=credential.base_url,
@@ -13021,6 +13076,7 @@ async def _generate_video_minimax(
             first_frame_image=first_frame_image,
             last_frame_image=last_frame_image,
             prompt_optimizer=bool(prompt_optimizer),
+            on_provider_request_started=record_provider_request_started,
         )
         try:
             await _finish_durable_media_side_effect(
@@ -13390,6 +13446,7 @@ async def _minimax_tts_http(
     sample_rate: int,
     bitrate: int,
     language_boost: str,
+    on_provider_request_started: Callable[[], None] | None = None,
     on_provider_accepted: Callable[[bytes | None], Awaitable[None]] | None = None,
 ) -> bytes:
     payload = {
@@ -13418,7 +13475,11 @@ async def _minimax_tts_http(
     # byte/string/object footprint within one worker process.
     async with _MINIMAX_AUDIO_RESPONSE_SEMAPHORE:
         url = f"{base_url.rstrip('/')}/v1/t2a_v2"
-        async with _public_only_async_client(url, timeout=120) as client:
+        async with _public_only_async_client(
+            url,
+            timeout=120,
+            on_request_started=on_provider_request_started,
+        ) as client:
             resp = await _bounded_json_request(
                 client,
                 "POST",
@@ -13452,6 +13513,7 @@ async def _minimax_music_http(
     audio_format: str,
     sample_rate: int,
     bitrate: int,
+    on_provider_request_started: Callable[[], None] | None = None,
     on_provider_accepted: Callable[[bytes | None], Awaitable[None]] | None = None,
 ) -> bytes:
     payload = {
@@ -13467,7 +13529,11 @@ async def _minimax_music_http(
 
     async with _MINIMAX_AUDIO_RESPONSE_SEMAPHORE:
         url = f"{base_url.rstrip('/')}/v1/music_generation"
-        async with _public_only_async_client(url, timeout=180) as client:
+        async with _public_only_async_client(
+            url,
+            timeout=180,
+            on_request_started=on_provider_request_started,
+        ) as client:
             resp = await _bounded_json_request(
                 client,
                 "POST",
@@ -13502,6 +13568,7 @@ async def _minimax_create_video_task(
     first_frame_image: str | None = None,
     last_frame_image: str | None = None,
     prompt_optimizer: bool = True,
+    on_provider_request_started: Callable[[], None] | None = None,
 ) -> str:
     payload = {
         "model": model,
@@ -13516,7 +13583,11 @@ async def _minimax_create_video_task(
         payload["last_frame_image"] = last_frame_image
 
     url = f"{base_url.rstrip('/')}/v1/video_generation"
-    async with _public_only_async_client(url, timeout=120) as client:
+    async with _public_only_async_client(
+        url,
+        timeout=120,
+        on_request_started=on_provider_request_started,
+    ) as client:
         resp = await _bounded_json_request(
             client,
             "POST",
@@ -14153,6 +14224,7 @@ async def _generate_image_minimax(
     prompt: str,
     aspect_ratio: str,
     reference_image: str | None = None,
+    on_provider_request_started: Callable[[], None] | None = None,
     on_provider_accepted: Callable[[str | None], Awaitable[None]] | None = None,
 ) -> bytes:
     """Generate image via MiniMax image-01 API.
@@ -14174,7 +14246,11 @@ async def _generate_image_minimax(
             {"type": "character", "image_file": reference_image}
         ]
 
-    async with _public_only_async_client(url, timeout=120) as client:
+    async with _public_only_async_client(
+        url,
+        timeout=120,
+        on_request_started=on_provider_request_started,
+    ) as client:
         resp = await _bounded_json_request(
             client,
             "POST",

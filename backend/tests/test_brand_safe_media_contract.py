@@ -78,6 +78,7 @@ def test_brand_safe_media_skill_is_a_default_runtime_skill():
     content = skill_path.read_text(encoding="utf-8")
     assert "Put the exact visible copy in `overlay_text`" in content
     assert "For video, the protected product layer is" in content
+    assert "background_sanitized=true" in content
     assert "Skills guide the workflow; the native media tools enforce" in content
 
 
