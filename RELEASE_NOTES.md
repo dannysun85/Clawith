@@ -1,3 +1,25 @@
+# v1.10.13 — Durable Chat Attachment History
+
+## Bug Fixes
+
+- Web chat now persists the collision-safe workspace basename returned by the upload API separately from the customer-visible original filename. Reloaded image and video messages therefore continue to preview and download the object that was actually stored instead of requesting a missing pre-rename path.
+- The WebSocket attachment contract now uses an authoritative `file_names: string[]` field while retaining the legacy comma-delimited `file_name` fallback. Filenames such as `report,final.png` are no longer split into multiple invalid history references.
+- Repeated customer-visible attachment names remain visible when they refer to distinct stored objects. Durable storage references continue to be normalized to safe basenames before they are written to chat history.
+- Intentionally delayed FastAPI router imports carry explicit Ruff annotations, closing the release diff gate without changing application startup order or runtime behavior.
+
+## Validation
+
+- The complete backend suite passes with 1,628 tests; the complete frontend suite passes with 113 tests; and the production frontend build completes with 7,003 transformed modules.
+- The PostgreSQL fresh upgrade, downgrade and re-upgrade smoke passes with the single `sso_password_login` Alembic head. Ruff changed-file gating, Python compilation, deployment shell syntax and `git diff --check` pass.
+- Isolated browser acceptance covers registration, tenant onboarding, SaaS model-route administration, cross-Agent Lite/Pro/Ultra preference persistence, image/video upload and reload, Credits non-settlement on rejected provider work, automation default-off behavior, production-issue workflow and Code fail-closed controls.
+- Independent code and architecture reviews found no remaining release blocker in the attachment persistence change.
+
+## Upgrade Notes
+
+- This patch has no database migration and does not change plan entitlements, shared model-pool ownership, Credits pricing, automation defaults or Code authorization policy.
+- Messages created by a previously deployed broken client may contain only an ambiguous original filename. The patch prevents new corruption but does not guess a historical storage object when multiple collision-safe candidates exist; production should be audited before claiming historical repair.
+- Local browser and test evidence does not replace production deployment, real MiniMax account-pool verification or post-cutover Credits reconciliation.
+
 # v1.10.12 — Safe MiniMax M3 Routing and Bounded Automation
 
 ## Model Routing and Multimodal Understanding

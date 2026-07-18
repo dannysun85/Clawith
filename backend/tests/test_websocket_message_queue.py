@@ -4,7 +4,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from app.api.websocket import WebSocketChatHandler, generic_llm_failure_user_message
+from app.api.websocket import (
+    WebSocketChatHandler,
+    _client_file_names,
+    generic_llm_failure_user_message,
+)
 from app.services.chat_session_access import ChatSessionAuthorizationError
 from app.services.llm import caller as llm_caller
 from app.services.llm.caller import RouteMeta
@@ -70,6 +74,20 @@ def test_generic_llm_failure_does_not_expose_internal_exception_details():
     assert message.startswith("[LLM call error]")
     assert "sqlalchemy" not in message.lower()
     assert "api_key" not in message.lower()
+
+
+def test_structured_file_names_are_authoritative_and_preserve_commas():
+    assert _client_file_names({
+        "file_names": ["report,final_4875d85abdb4.png"],
+        "file_name": "report,final_4875d85abdb4.png",
+    }) == ["report,final_4875d85abdb4.png"]
+    assert _client_file_names({"file_name": "legacy.png, demo.mp4"}) == (
+        "legacy.png, demo.mp4"
+    )
+    assert _client_file_names({
+        "file_names": ["valid.png", 7],
+        "file_name": "legacy.png",
+    }) == "legacy.png"
 
 
 @pytest.mark.asyncio

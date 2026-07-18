@@ -658,16 +658,16 @@ from app.api.notification import router as notification_router
 from app.api.gateway import router as gateway_router
 from app.api.admin import router as admin_router
 from app.api.pages import router as pages_router, public_router as pages_public_router
-from app.api.agent_credentials import router as agent_credentials_router
+from app.api.agent_credentials import router as agent_credentials_router  # noqa: E402
 from app.api.agentbay_control import router as agentbay_control_router
 from app.api.okr import router as okr_router
 from app.api.onboarding import router as onboarding_router
-from app.api.subscription import router as subscription_router
-from app.api.credentials import router as credential_pool_router
-from app.api.saas import router as saas_router
-from app.api.douyin import router as douyin_router
-from app.api.production_issues import admin_router as production_issue_admin_router
-from app.api.production_issues import client_router as production_issue_client_router
+from app.api.subscription import router as subscription_router  # noqa: E402
+from app.api.credentials import router as credential_pool_router  # noqa: E402
+from app.api.saas import router as saas_router  # noqa: E402
+from app.api.douyin import router as douyin_router  # noqa: E402
+from app.api.production_issues import admin_router as production_issue_admin_router  # noqa: E402
+from app.api.production_issues import client_router as production_issue_client_router  # noqa: E402
 
 app.include_router(auth_router, prefix=settings.API_PREFIX)
 app.include_router(agents_router, prefix=settings.API_PREFIX)

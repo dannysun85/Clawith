@@ -74,6 +74,16 @@ def generic_llm_failure_user_message() -> str:
     return "[LLM call error] 系统暂时无法完成模型调用，请稍后重试；若持续出现请联系管理员。"
 
 
+def _client_file_names(data: dict) -> str | list[str]:
+    """Prefer the unambiguous attachment array and retain legacy fallback."""
+
+    structured = data.get("file_names")
+    if isinstance(structured, list) and all(isinstance(name, str) for name in structured):
+        return structured
+    legacy = data.get("file_name", "")
+    return legacy if isinstance(legacy, str) else ""
+
+
 def extract_partial_content(args_str: str) -> str:
     """Extract the string value of the 'content' field from a partial JSON tool-arguments string.
 
@@ -628,7 +638,7 @@ class WebSocketChatHandler:
 
             content = data.get("content", "")
             display_content = data.get("display_content", "")
-            file_name = data.get("file_name", "")
+            file_names = _client_file_names(data)
             raw_client_message_id = data.get("client_message_id")
             client_message_id: uuid.UUID | None = None
             if isinstance(raw_client_message_id, str) and len(raw_client_message_id) <= 100:
@@ -647,7 +657,7 @@ class WebSocketChatHandler:
                 "[WS] Received message content_chars={} display_chars={} file_attached={} kind={}",
                 len(content),
                 len(display_content),
-                bool(file_name),
+                bool(file_names),
                 "onboarding_trigger" if is_onboarding_trigger else "chat",
             )
 
@@ -673,7 +683,7 @@ class WebSocketChatHandler:
             persisted_user_content = sanitize_inline_media_content(
                 content,
                 display_content=display_content,
-                file_names=file_name,
+                file_names=file_names,
             )
             self.current_user_text = persisted_user_content
 
@@ -715,7 +725,7 @@ class WebSocketChatHandler:
             await self._save_user_message(
                 content,
                 display_content,
-                file_name,
+                file_names,
                 is_onboarding_trigger,
                 message_id=client_message_id,
             )
@@ -932,7 +942,7 @@ class WebSocketChatHandler:
         self,
         content: str,
         display_content: str,
-        file_name: str,
+        file_names: str | list[str],
         is_onboarding_trigger: bool,
         *,
         message_id: uuid.UUID | None = None,
@@ -941,7 +951,7 @@ class WebSocketChatHandler:
         saved_content = sanitize_inline_media_content(
             content,
             display_content=display_content,
-            file_names=file_name,
+            file_names=file_names,
         )
         if is_onboarding_trigger:
             logger.info("[WS] Onboarding trigger — skipping user-message persistence")

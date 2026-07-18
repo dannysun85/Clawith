@@ -42,3 +42,12 @@ def test_filename_is_reduced_to_safe_basename_and_deduplicated():
     )
 
     assert saved == "[file:a.png]\n[file:bad)name.mp4]\nhello"
+
+
+def test_structured_filename_preserves_commas():
+    saved = sanitize_inline_media_content(
+        "hello",
+        file_names=["workspace/uploads/report,final_4875d85abdb4.png"],
+    )
+
+    assert saved == "[file:report,final_4875d85abdb4.png]\nhello"

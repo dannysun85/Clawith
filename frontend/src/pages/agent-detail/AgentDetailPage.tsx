@@ -26,6 +26,10 @@ import { useAppStore } from '../../stores';
 import { useAuthStore } from '../../stores';
 import { copyToClipboard } from '../../utils/clipboard';
 import { formatFileSize } from '../../utils/formatFileSize';
+import {
+    attachmentStorageBasename,
+    parsePersistedChatAttachments,
+} from '../../utils/chatAttachmentPersistence';
 import { canAccessSaasAdmin } from '../../utils/saasAdmin';
 import { displaySessionTitle } from '../../utils/sessionDisplay';
 import { appendUniqueById, safeMediaCompletionTool, safeWorkspaceMediaPath } from '../../utils/mediaCompletion';
@@ -2826,7 +2830,7 @@ export default function AgentDetailPage() {
         } catch (e: any) { toast.error(t('common.error.saveFailed', '保存失败'), { details: String(e?.message || e) }); }
         setExpirySaving(false);
     };
-    interface ChatMsg { id?: string; role: 'user' | 'assistant' | 'tool_call'; content: string; fileName?: string; toolName?: string; toolCallId?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; toolThinking?: string; thinking?: string; imageUrl?: string; timestamp?: string; quotaError?: { quota_type?: string; action?: string; details?: { upgrade_url?: string } }; }
+    interface ChatMsg { id?: string; role: 'user' | 'assistant' | 'tool_call'; content: string; fileName?: string; storageFileName?: string; toolName?: string; toolCallId?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; toolThinking?: string; thinking?: string; imageUrl?: string; timestamp?: string; quotaError?: { quota_type?: string; action?: string; details?: { upgrade_url?: string } }; }
     const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
     const getToolTargetKey = (args: any): string => {
         if (!args) return '';
@@ -2913,7 +2917,9 @@ export default function AgentDetailPage() {
         runtimeKey: SessionRuntimeKey;
         contentForLLM: string;
         userMsg: string;
-        fileName: string;
+        displayFileName: string;
+        storageFileNames: string[];
+        storageFileName?: string;
         imageUrl?: string;
         tier?: SaasTier | null;
         modality?: string;
@@ -3151,17 +3157,25 @@ export default function AgentDetailPage() {
     const parseChatMsg = (msg: ChatMsg): ChatMsg => {
         if (msg.role !== 'user') return msg;
         let parsed = { ...msg };
-        // Standard web chat format: [file:name.pdf]\ncontent
-        const newFmt = msg.content.match(/^\[file:([^\]]+)\]\n?/);
-        if (newFmt) { parsed = { ...msg, fileName: newFmt[1], content: msg.content.slice(newFmt[0].length).trim() }; }
+        // Standard web chat format: durable stored name(s), followed by the
+        // customer's display-only attachment name(s) and prompt.
+        const persistedAttachments = parsePersistedChatAttachments(msg.content);
+        if (persistedAttachments.storageFileNames.length > 0) {
+            parsed = {
+                ...msg,
+                fileName: persistedAttachments.displayFileNames.join(', '),
+                storageFileName: persistedAttachments.storageFileNames[0],
+                content: persistedAttachments.content,
+            };
+        }
         // Feishu/Slack channel format: [文件已上传: workspace/uploads/name]
-        const chanFmt = !newFmt && msg.content.match(/^\[\u6587\u4ef6\u5df2\u4e0a\u4f20: (?:workspace\/uploads\/)?([^\]\n]+)\]/);
+        const chanFmt = persistedAttachments.storageFileNames.length === 0 && msg.content.match(/^\[\u6587\u4ef6\u5df2\u4e0a\u4f20: (?:workspace\/uploads\/)?([^\]\n]+)\]/);
         if (chanFmt) {
             const raw = chanFmt[1]; const fileName = raw.split('/').pop() || raw;
             parsed = { ...msg, fileName, content: msg.content.slice(chanFmt[0].length).trim() };
         }
         // Old format: [File: name.pdf]\nFile location:...\nQuestion: user_msg
-        const oldFmt = !newFmt && !chanFmt && msg.content.match(/^\[File: ([^\]]+)\]/);
+        const oldFmt = persistedAttachments.storageFileNames.length === 0 && !chanFmt && msg.content.match(/^\[File: ([^\]]+)\]/);
         if (oldFmt) {
             const fileName = oldFmt[1];
             const qMatch = msg.content.match(/\nQuestion: ([\s\S]+)$/);
@@ -3169,9 +3183,10 @@ export default function AgentDetailPage() {
         }
         // If file is an image and no imageUrl yet, build download URL for preview
         if (parsed.fileName && !parsed.imageUrl && id) {
-            const ext = parsed.fileName.split('.').pop()?.toLowerCase() || '';
+            const durableFileName = parsed.storageFileName || parsed.fileName;
+            const ext = durableFileName.split('.').pop()?.toLowerCase() || '';
             if (IMAGE_EXTS.includes(ext)) {
-                parsed.imageUrl = fileApi.downloadUrl(id, `workspace/uploads/${parsed.fileName}`, { inline: true });
+                parsed.imageUrl = fileApi.downloadUrl(id, `workspace/uploads/${durableFileName}`, { inline: true });
             }
         }
         return parsed;
@@ -3734,14 +3749,18 @@ export default function AgentDetailPage() {
             id: clientMessageId,
             role: 'user',
             content: payload.userMsg,
-            fileName: payload.fileName,
+            fileName: payload.displayFileName,
+            storageFileName: payload.storageFileName,
             imageUrl: payload.imageUrl,
             timestamp: new Date().toISOString()
         })]);
         socket.send(JSON.stringify({
             content: payload.contentForLLM,
             display_content: payload.userMsg,
-            file_name: payload.fileName,
+            // Structured names are authoritative so commas inside a filename
+            // cannot be confused with the legacy comma-delimited protocol.
+            file_names: payload.storageFileNames,
+            file_name: payload.storageFileNames.join(', '),
             tier: payload.tier,
             modality: payload.modality,
             ephemeral_modality: payload.ephemeralModality === true,
@@ -4116,7 +4135,7 @@ export default function AgentDetailPage() {
         forceSenderLabel?: boolean;
         hideAvatar?: boolean;
     }) => {
-        const fe = msg.fileName?.split('.').pop()?.toLowerCase() ?? '';
+        const fe = (msg.storageFileName || msg.fileName)?.split('.').pop()?.toLowerCase() ?? '';
         const isImage = msg.imageUrl && ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'].includes(fe);
         const resolvedSenderLabel = msg.sender_name || senderLabel;
         const resolvedAvatarText = avatarText || (resolvedSenderLabel ? resolvedSenderLabel[0] : (isLeft ? 'A' : 'U'));
@@ -4430,7 +4449,13 @@ export default function AgentDetailPage() {
             runtimeKey: activeRuntimeKey,
             contentForLLM,
             userMsg,
-            fileName: attachedFiles.map(f => f.name).join(', '),
+            displayFileName: attachedFiles.map(f => f.name).join(', '),
+            storageFileNames: attachedFiles
+                .map(f => attachmentStorageBasename(f.path, f.name))
+                .filter(Boolean),
+            storageFileName: attachedFiles.length === 1
+                ? attachmentStorageBasename(attachedFiles[0].path, attachedFiles[0].name)
+                : undefined,
             imageUrl: attachedFiles.length === 1 ? attachedFiles[0].imageUrl : undefined,
             tier: effectiveChatTier,
             modality: outboundChatModality,
