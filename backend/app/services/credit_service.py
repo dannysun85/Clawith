@@ -26,6 +26,26 @@ from app.services.modalities import canonicalize_modality
 from app.services.quota_guard import QuotaExceeded, subscription_action_message
 
 IDEMPOTENT_GRANT_REASONS = {"subscribe", "topup", "refund", "refund_clawback"}
+SUBSCRIPTION_PLAN_CHANGE_REF_TYPE = "subscription_plan_change"
+
+
+def subscription_plan_change_grant_ref_id(
+    subscription_id: uuid.UUID,
+    previous_plan_id: uuid.UUID,
+    next_plan_id: uuid.UUID,
+    changed_at: datetime,
+) -> uuid.UUID:
+    """Build the idempotency key for one subscription plan-change grant.
+
+    The subscription row is retained across plan changes. Reusing only its ID
+    would collide with the initial grant and silently suppress every upgrade.
+    """
+
+    normalized_at = changed_at.astimezone(timezone.utc).isoformat(timespec="microseconds")
+    return uuid.uuid5(
+        subscription_id,
+        f"{previous_plan_id}->{next_plan_id}@{normalized_at}",
+    )
 
 
 async def get_credit_balance(tenant_id: uuid.UUID) -> CreditBalance:

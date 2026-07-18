@@ -57,7 +57,11 @@ from app.services.billing_reconciliation import (
     expire_stale_credit_reservations,
     reconcile_pending_payment_orders,
 )
-from app.services.credit_service import grant_credits_in_session
+from app.services.credit_service import (
+    SUBSCRIPTION_PLAN_CHANGE_REF_TYPE,
+    grant_credits_in_session,
+    subscription_plan_change_grant_ref_id,
+)
 from app.services.media_incident_remediation import (
     remediate_media_tasks,
     resolve_media_provider_debt,
@@ -921,14 +925,25 @@ async def assign_subscriptions(
             select(Subscription).where(
                 Subscription.tenant_id == tenant_id,
                 Subscription.status.in_(("active", "trialing")),
-            )
+            ).with_for_update()
         )
         existing_sub = existing.scalar_one_or_none()
         now = datetime.now(timezone.utc)
         period_end = now + timedelta(days=data.period_days) if data.period_days else None
+        grant_ref_type = "subscription"
+        grant_ref_id: uuid.UUID | None = None
 
         if existing_sub:
+            previous_plan_id = existing_sub.plan_id
             plan_changed = existing_sub.plan_id != data.plan_id
+            if plan_changed:
+                grant_ref_type = SUBSCRIPTION_PLAN_CHANGE_REF_TYPE
+                grant_ref_id = subscription_plan_change_grant_ref_id(
+                    existing_sub.id,
+                    previous_plan_id,
+                    data.plan_id,
+                    now,
+                )
             existing_sub.plan_id = data.plan_id
             existing_sub.status = "active"
             existing_sub.period_end = period_end
@@ -945,6 +960,7 @@ async def assign_subscriptions(
             )
             db.add(sub)
         await db.flush()
+        grant_ref_id = grant_ref_id or sub.id
         if plan_changed and plan.credits_per_period > 0:
             await grant_credits_in_session(
                 db,
@@ -952,8 +968,8 @@ async def assign_subscriptions(
                 amount=plan.credits_per_period,
                 reason="subscribe",
                 granted_by=current_user.id,
-                ref_type="subscription",
-                ref_id=sub.id,
+                ref_type=grant_ref_type,
+                ref_id=grant_ref_id,
             )
         updated += 1
 

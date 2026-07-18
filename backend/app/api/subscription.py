@@ -46,10 +46,12 @@ from app.schemas.subscription import (
 from app.services.billing_events import process_billing_webhook_event
 from app.services.billing_provider import get_billing_provider
 from app.services.credit_service import (
+    SUBSCRIPTION_PLAN_CHANGE_REF_TYPE,
     get_credit_balance,
     get_credit_packs,
     grant_credits_in_session,
     list_credit_transactions,
+    subscription_plan_change_grant_ref_id,
 )
 from app.services.entitlements import get_active_subscription, get_tenant_entitlements
 from app.services.agent_plan_selection import reconcile_tenant_agent_plan_selections
@@ -226,14 +228,33 @@ async def assign_subscription(
     if not plan or not plan.is_active:
         raise HTTPException(status_code=404, detail="Plan not found")
 
-    existing = await get_active_subscription(data.tenant_id)
+    existing_result = await db.execute(
+        select(Subscription)
+        .where(
+            Subscription.tenant_id == data.tenant_id,
+            Subscription.status.in_(("active", "trialing", "canceled", "past_due")),
+        )
+        .order_by(Subscription.created_at.desc())
+        .limit(1)
+        .with_for_update()
+    )
+    existing = existing_result.scalar_one_or_none()
     now = datetime.now(timezone.utc)
     period_end = now + timedelta(days=data.period_days) if data.period_days else None
+    grant_ref_type = "subscription"
+    grant_ref_id: uuid.UUID | None = None
 
     if existing:
-        if hasattr(db, "merge"):
-            existing = await db.merge(existing)
+        previous_plan_id = existing.plan_id
         plan_changed = existing.plan_id != data.plan_id
+        if plan_changed:
+            grant_ref_type = SUBSCRIPTION_PLAN_CHANGE_REF_TYPE
+            grant_ref_id = subscription_plan_change_grant_ref_id(
+                existing.id,
+                previous_plan_id,
+                data.plan_id,
+                now,
+            )
         # Upgrade/switch: immediate (3.6)
         existing.plan_id = data.plan_id
         existing.status = "active"
@@ -251,6 +272,7 @@ async def assign_subscription(
         )
         db.add(sub)
     await db.flush()
+    grant_ref_id = grant_ref_id or sub.id
     if plan_changed and plan.credits_per_period > 0:
         await grant_credits_in_session(
             db,
@@ -258,8 +280,8 @@ async def assign_subscription(
             amount=plan.credits_per_period,
             reason="subscribe",
             granted_by=current_user.id,
-            ref_type="subscription",
-            ref_id=sub.id,
+            ref_type=grant_ref_type,
+            ref_id=grant_ref_id,
         )
     await db.commit()
     await db.refresh(sub)

@@ -136,10 +136,9 @@ async def test_assign_subscription_plan_change_grants_period_credits():
         auto_renew=True,
         seats=1,
     )
-    db = MockDB(get_map={Plan: plan})
+    db = MockDB(get_map={Plan: plan}, execute_results=[DummyResult(sub)])
 
     with (
-        patch.object(subscription_api, "get_active_subscription", AsyncMock(return_value=sub)),
         patch.object(subscription_api, "grant_credits_in_session", AsyncMock()) as grant,
         patch.object(subscription_api, "reconcile_tenant_agent_plan_selections", AsyncMock()),
         patch("app.services.subscription_lifecycle.restore_stopped_agents", AsyncMock()),
@@ -157,7 +156,8 @@ async def test_assign_subscription_plan_change_grants_period_credits():
     assert grant.await_args.kwargs["tenant_id"] == tenant_id
     assert grant.await_args.kwargs["amount"] == 50_000
     assert grant.await_args.kwargs["reason"] == "subscribe"
-    assert grant.await_args.kwargs["ref_type"] == "subscription"
+    assert grant.await_args.kwargs["ref_type"] == "subscription_plan_change"
+    assert grant.await_args.kwargs["ref_id"] != sub.id
 
 
 @pytest.mark.asyncio
@@ -173,10 +173,9 @@ async def test_assign_subscription_same_plan_does_not_duplicate_grant():
         auto_renew=True,
         seats=1,
     )
-    db = MockDB(get_map={Plan: plan})
+    db = MockDB(get_map={Plan: plan}, execute_results=[DummyResult(sub)])
 
     with (
-        patch.object(subscription_api, "get_active_subscription", AsyncMock(return_value=sub)),
         patch.object(subscription_api, "grant_credits_in_session", AsyncMock()) as grant,
         patch.object(subscription_api, "reconcile_tenant_agent_plan_selections", AsyncMock()),
         patch("app.services.subscription_lifecycle.restore_stopped_agents", AsyncMock()),
@@ -225,6 +224,8 @@ async def test_saas_bulk_assign_existing_subscription_grants_plan_credits():
     assert grant.await_args.kwargs["tenant_id"] == tenant_id
     assert grant.await_args.kwargs["amount"] == 50_000
     assert grant.await_args.kwargs["reason"] == "subscribe"
+    assert grant.await_args.kwargs["ref_type"] == "subscription_plan_change"
+    assert grant.await_args.kwargs["ref_id"] != sub.id
 
 
 @pytest.mark.asyncio
