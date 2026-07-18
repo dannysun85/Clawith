@@ -11381,6 +11381,63 @@ async def _finish_durable_media_side_effect(awaitable: Awaitable[Any]) -> Any:
         raise
 
 
+async def _complete_media_cancellation_transition(
+    awaitable: Awaitable[Any],
+    *,
+    label: str,
+) -> None:
+    """Finish one cancellation-state write even if the caller is cancelled again."""
+
+    task = asyncio.create_task(awaitable)
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # A repeated abort/disconnect must not strand a paid reservation
+            # between provider/request states.  The original cancellation is
+            # re-raised by the caller after this durable transition finishes.
+            continue
+        except Exception:
+            break
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        logger.error("[MiniMaxMedia] cancelled durable transition label={}", label)
+    except Exception:
+        logger.exception(
+            "[MiniMaxMedia] durable cancellation transition failed label={}",
+            label,
+        )
+
+
+async def _record_cancelled_sync_media_submission(
+    record_id: uuid.UUID,
+    error: asyncio.CancelledError,
+    *,
+    provider_request_started: bool,
+    provider_response_accepted: bool,
+    provider_accepted: bool,
+) -> None:
+    """Persist the only safe settlement state for a cancelled sync request."""
+
+    from app.services.media_generation import (
+        mark_media_generation_submission_ambiguous,
+        mark_media_generation_submission_failed,
+        record_minimax_sync_provider_response_retry,
+    )
+
+    if provider_response_accepted and not provider_accepted:
+        await record_minimax_sync_provider_response_retry(record_id, error)
+    elif provider_accepted:
+        # Acceptance/recovery state was already durably stored.  The daemon owns
+        # the remaining delivery and Credits settlement.
+        return
+    elif provider_request_started:
+        await mark_media_generation_submission_ambiguous(record_id, error)
+    else:
+        await mark_media_generation_submission_failed(record_id, error)
+
+
 async def _generate_image_minimax_durable(
     *,
     agent_id: uuid.UUID,
@@ -11581,7 +11638,17 @@ async def _generate_image_minimax_durable(
             "⏳ MiniMax accepted the image request. The durable media worker is "
             f"finishing delivery (task {record_id}); please do not submit it again."
         )
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as exc:
+        await _complete_media_cancellation_transition(
+            _record_cancelled_sync_media_submission(
+                record_id,
+                exc,
+                provider_request_started=provider_request_started,
+                provider_response_accepted=provider_response_accepted,
+                provider_accepted=provider_accepted,
+            ),
+            label="image",
+        )
         raise
     except Exception as exc:
         from app.services.quota_guard import QuotaExceeded
@@ -12562,7 +12629,17 @@ async def _generate_minimax_audio_durable(
             f"⏳ MiniMax accepted the {label.lower()} request. The durable media "
             f"worker is finishing delivery (task {record_id}); do not submit it again."
         )
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as exc:
+        await _complete_media_cancellation_transition(
+            _record_cancelled_sync_media_submission(
+                record_id,
+                exc,
+                provider_request_started=provider_request_started,
+                provider_response_accepted=provider_response_accepted,
+                provider_accepted=provider_accepted,
+            ),
+            label=modality,
+        )
         raise
     except Exception as exc:
         from app.services.quota_guard import QuotaExceeded
@@ -12963,6 +13040,8 @@ async def _generate_video_minimax(
     meta_path = ""
     full_meta_path: Path | None = None
     metadata: dict[str, Any] = {}
+    request_metadata: dict[str, Any] = {}
+    output_path = ""
     metadata_persisted = False
     frozen_brand_key: str | None = None
     try:
@@ -13184,6 +13263,64 @@ async def _generate_video_minimax(
             full_meta_path,
             metadata,
         )
+    except asyncio.CancelledError as exc:
+        cancel_error = exc
+
+        async def persist_cancelled_video_state() -> None:
+            if record_id is None:
+                return
+            from app.services.media_generation import (
+                mark_media_generation_submission_ambiguous,
+                mark_media_generation_submission_failed,
+                mark_minimax_video_task_submitted,
+                store_minimax_video_provider_identity_evidence,
+            )
+
+            if provider_task_id:
+                try:
+                    await store_minimax_video_provider_identity_evidence(
+                        record_id=record_id,
+                        agent_id=agent_id,
+                        tenant_id=tenant_id,
+                        credential_id=credential.id,
+                        model=model,
+                        provider_task_id=provider_task_id,
+                    )
+                except Exception:
+                    logger.exception(
+                        "[MiniMaxVideo] cancellation identity evidence write failed"
+                    )
+                accepted_metadata = {
+                    "provider": "minimax",
+                    "task_record_id": str(record_id),
+                    "task_id": provider_task_id,
+                    "credential_id": str(credential.id),
+                    "reservation_id": str(reservation_id) if reservation_id else "",
+                    **request_metadata,
+                    "status": "submitted",
+                    "save_path": output_path,
+                }
+                await mark_minimax_video_task_submitted(
+                    record_id,
+                    provider_task_id=provider_task_id,
+                    metadata=accepted_metadata,
+                    poll_after_seconds=(
+                        poll_timeout_seconds + 10 if wait_for_completion else 0
+                    ),
+                )
+            elif provider_request_started:
+                await mark_media_generation_submission_ambiguous(
+                    record_id,
+                    cancel_error,
+                )
+            else:
+                await mark_media_generation_submission_failed(record_id, cancel_error)
+
+        await _complete_media_cancellation_transition(
+            persist_cancelled_video_state(),
+            label="video",
+        )
+        raise
     except ProviderTaskIdentityCollision:
         logger.error("[MiniMaxVideo] Provider task identity collision blocked for agent {}", agent_id)
         await _record_minimax_tool_product_issue(

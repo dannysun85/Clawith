@@ -1,3 +1,4 @@
+import asyncio
 import base64
 from functools import lru_cache
 from io import BytesIO
@@ -6,7 +7,7 @@ import shutil
 import subprocess
 import uuid
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 import httpx
@@ -903,6 +904,135 @@ async def test_generate_image_storage_failure_preserves_provider_debt_and_raw_re
     assert record_issue.await_args.kwargs["recovery_path"] == f"media-task:{record_id}"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_stage", ["pre_request", "request_started", "provider_accepted"])
+async def test_minimax_image_cancellation_persists_safe_credit_state(
+    tmp_path,
+    cancel_stage,
+):
+    agent_id = uuid.uuid4()
+    tenant_id = uuid.uuid4()
+    credential_id = uuid.uuid4()
+
+    async def provider(**kwargs):
+        if cancel_stage != "pre_request":
+            kwargs["on_provider_request_started"]()
+        if cancel_stage == "provider_accepted":
+            await kwargs["on_provider_accepted"](
+                "https://asset.example/accepted.png"
+            )
+        raise asyncio.CancelledError()
+
+    with (
+        patch(
+            "app.services.media_generation.create_minimax_sync_media_task_record",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    request_metadata={
+                        "recovery_asset_storage_key": "_internal/recovery/image.bin"
+                    }
+                )
+            ),
+        ) as create_task,
+        patch(
+            "app.services.agent_tools._generate_image_minimax",
+            AsyncMock(side_effect=provider),
+        ),
+        patch(
+            "app.services.agent_tools._store_minimax_image_acceptance_evidence",
+            AsyncMock(return_value=("_internal/provider-acceptance.json", "opaque")),
+        ),
+        patch(
+            "app.services.media_generation.mark_minimax_sync_provider_accepted",
+            AsyncMock(),
+        ) as accepted,
+        patch(
+            "app.services.media_generation.mark_media_generation_submission_failed",
+            AsyncMock(return_value=True),
+        ) as failed,
+        patch(
+            "app.services.media_generation.mark_media_generation_submission_ambiguous",
+            AsyncMock(),
+        ) as ambiguous,
+        patch(
+            "app.services.media_generation.record_minimax_sync_provider_response_retry",
+            AsyncMock(),
+        ) as response_retry,
+    ):
+        with pytest.raises(asyncio.CancelledError):
+            await agent_tools._generate_image_minimax_durable(
+                agent_id=agent_id,
+                ws=tmp_path,
+                arguments={},
+                user_id=None,
+                session_id="",
+                tenant_id=tenant_id,
+                credential_id=credential_id,
+                api_key="sk-test",
+                base_url="https://api.minimax.test",
+                model="image-01",
+                tier="pro",
+                credit_cost=4,
+                provider_prompt="cat",
+                save_path="workspace/images/cat.png",
+                output_extension=".png",
+                overlay_text="",
+                overlay_position="bottom",
+                brand_asset=None,
+                brand_position="center",
+                brand_scale=0.42,
+            )
+
+    record_id = create_task.await_args.kwargs["record_id"]
+    response_retry.assert_not_awaited()
+    if cancel_stage == "pre_request":
+        failed.assert_awaited_once_with(record_id, ANY)
+        ambiguous.assert_not_awaited()
+        accepted.assert_not_awaited()
+    elif cancel_stage == "request_started":
+        failed.assert_not_awaited()
+        ambiguous.assert_awaited_once_with(record_id, ANY)
+        accepted.assert_not_awaited()
+    else:
+        failed.assert_not_awaited()
+        ambiguous.assert_not_awaited()
+        accepted.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_media_cancellation_transition_survives_repeated_abort():
+    transition_started = asyncio.Event()
+    release_transition = asyncio.Event()
+    transition_completed = False
+
+    async def transition():
+        nonlocal transition_completed
+        transition_started.set()
+        await release_transition.wait()
+        transition_completed = True
+
+    async def operation():
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            await agent_tools._complete_media_cancellation_transition(
+                transition(),
+                label="test",
+            )
+            raise
+
+    task = asyncio.create_task(operation())
+    await asyncio.sleep(0)
+    task.cancel()
+    await transition_started.wait()
+    task.cancel()
+    release_transition.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert transition_completed is True
+
+
 @pytest.mark.parametrize(
     "failure_mode",
     [
@@ -1628,6 +1758,91 @@ async def test_sync_minimax_audio_accounting_fault_matrix(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("modality", ["audio", "music"])
+@pytest.mark.parametrize("cancel_stage", ["pre_request", "request_started", "provider_accepted"])
+async def test_minimax_audio_cancellation_persists_safe_credit_state(
+    modality,
+    cancel_stage,
+):
+    agent_id = uuid.uuid4()
+    tenant_id = uuid.uuid4()
+    credential = SimpleNamespace(
+        id=uuid.uuid4(),
+        api_key="sk-test",
+        base_url="https://api.minimax.test",
+    )
+    provider_bytes = _valid_mp3_bytes()
+
+    async def provider(on_accepted, on_request_started):
+        if cancel_stage != "pre_request":
+            on_request_started()
+        if cancel_stage == "provider_accepted":
+            await on_accepted(provider_bytes)
+        raise asyncio.CancelledError()
+
+    with (
+        patch(
+            "app.services.media_generation.create_minimax_sync_media_task_record",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    request_metadata={
+                        "recovery_asset_storage_key": "_internal/recovery/audio.mp3"
+                    }
+                )
+            ),
+        ) as create_task,
+        patch(
+            "app.services.media_generation.store_minimax_sync_recovery_asset",
+            AsyncMock(),
+        ) as store_recovery,
+        patch(
+            "app.services.media_generation.mark_media_generation_submission_failed",
+            AsyncMock(return_value=True),
+        ) as failed,
+        patch(
+            "app.services.media_generation.mark_media_generation_submission_ambiguous",
+            AsyncMock(),
+        ) as ambiguous,
+        patch(
+            "app.services.media_generation.record_minimax_sync_provider_response_retry",
+            AsyncMock(),
+        ) as response_retry,
+    ):
+        with pytest.raises(asyncio.CancelledError):
+            await agent_tools._generate_minimax_audio_durable(
+                agent_id=agent_id,
+                user_id=None,
+                session_id="",
+                tenant_id=tenant_id,
+                credential=credential,
+                modality=modality,
+                tier="pro",
+                model="speech-2.8-turbo" if modality == "audio" else "music-2.6",
+                credit_cost=1 if modality == "audio" else 150,
+                save_path=f"workspace/audio/{modality}.mp3",
+                audio_format="mp3",
+                content_type="audio/mpeg",
+                sample_rate=32000,
+                provider_call=provider,
+            )
+
+    record_id = create_task.await_args.kwargs["record_id"]
+    response_retry.assert_not_awaited()
+    if cancel_stage == "pre_request":
+        failed.assert_awaited_once_with(record_id, ANY)
+        ambiguous.assert_not_awaited()
+        store_recovery.assert_not_awaited()
+    elif cancel_stage == "request_started":
+        failed.assert_not_awaited()
+        ambiguous.assert_awaited_once_with(record_id, ANY)
+        store_recovery.assert_not_awaited()
+    else:
+        failed.assert_not_awaited()
+        ambiguous.assert_not_awaited()
+        store_recovery.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_generate_video_minimax_creates_task_metadata(tmp_path):
     agent_id = uuid.uuid4()
     tenant_id = uuid.uuid4()
@@ -1800,6 +2015,109 @@ async def test_generate_video_public_origin_preflight_failure_releases_hold(tmp_
     release.assert_not_awaited()
     assert "retained the Credits hold" not in result
     assert "submission outcome is uncertain" not in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_stage", ["pre_request", "request_started", "provider_accepted"])
+async def test_minimax_video_cancellation_persists_safe_credit_state(
+    tmp_path,
+    cancel_stage,
+):
+    agent_id = uuid.uuid4()
+    tenant_id = uuid.uuid4()
+    credential_id = uuid.uuid4()
+    reservation_id = uuid.uuid4()
+    credential = SimpleNamespace(id=credential_id, base_url=None)
+    bind_attempts = 0
+
+    async def provider(**kwargs):
+        if cancel_stage != "pre_request":
+            kwargs["on_provider_request_started"]()
+        if cancel_stage == "provider_accepted":
+            return "provider-task-cancelled"
+        raise asyncio.CancelledError()
+
+    async def mark_submitted(record_id, **_kwargs):
+        nonlocal bind_attempts
+        bind_attempts += 1
+        if bind_attempts == 1:
+            raise asyncio.CancelledError()
+        return record_id
+
+    with (
+        patch("app.services.agent_tools._get_tool_config", AsyncMock(return_value={})),
+        patch(
+            "app.services.agent_tools._get_minimax_tenant_uuid",
+            AsyncMock(return_value=tenant_id),
+        ),
+        patch(
+            "app.services.agent_tools._resolve_minimax_tool_tier",
+            AsyncMock(return_value="lite"),
+        ),
+        patch(
+            "app.services.minimax_media_profiles.load_platform_minimax_media_profile",
+            AsyncMock(return_value=resolve_minimax_media_profile("video", "lite")),
+        ),
+        patch("app.services.agent_tools._check_minimax_credit_amount", AsyncMock()),
+        patch("app.services.agent_tools._check_minimax_tool_allowed", AsyncMock(return_value=None)),
+        patch(
+            "app.services.llm.load_balancer.pick_credential",
+            AsyncMock(return_value=credential),
+        ),
+        patch(
+            "app.services.llm.utils.get_credential_api_key",
+            MagicMock(return_value="sk-test"),
+        ),
+        patch(
+            "app.services.agent_tools._minimax_create_video_task",
+            AsyncMock(side_effect=provider),
+        ),
+        patch(
+            "app.services.media_generation.validate_media_origin_session",
+            AsyncMock(),
+        ),
+        patch(
+            "app.services.media_generation.create_minimax_video_task_record",
+            AsyncMock(return_value=SimpleNamespace(reservation_id=reservation_id)),
+        ) as create_task,
+        patch(
+            "app.services.media_generation.store_minimax_video_provider_identity_evidence",
+            AsyncMock(return_value="_internal/provider-video.json"),
+        ) as store_identity,
+        patch(
+            "app.services.media_generation.mark_minimax_video_task_submitted",
+            AsyncMock(side_effect=mark_submitted),
+        ) as bind_provider,
+        patch(
+            "app.services.media_generation.mark_media_generation_submission_failed",
+            AsyncMock(return_value=True),
+        ) as failed,
+        patch(
+            "app.services.media_generation.mark_media_generation_submission_ambiguous",
+            AsyncMock(),
+        ) as ambiguous,
+    ):
+        with pytest.raises(asyncio.CancelledError):
+            await _generate_video_minimax(
+                agent_id,
+                tmp_path,
+                {"prompt": "cancelled video", "wait_for_completion": False},
+            )
+
+    record_id = create_task.await_args.kwargs["record_id"]
+    if cancel_stage == "pre_request":
+        failed.assert_awaited_once_with(record_id, ANY)
+        ambiguous.assert_not_awaited()
+        bind_provider.assert_not_awaited()
+    elif cancel_stage == "request_started":
+        failed.assert_not_awaited()
+        ambiguous.assert_awaited_once_with(record_id, ANY)
+        bind_provider.assert_not_awaited()
+    else:
+        failed.assert_not_awaited()
+        ambiguous.assert_not_awaited()
+        assert bind_provider.await_count == 2
+        assert store_identity.await_count == 2
 
 
 @pytest.mark.asyncio
