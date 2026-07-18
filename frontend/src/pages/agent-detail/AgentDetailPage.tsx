@@ -28,7 +28,7 @@ import { copyToClipboard } from '../../utils/clipboard';
 import { formatFileSize } from '../../utils/formatFileSize';
 import { canAccessSaasAdmin } from '../../utils/saasAdmin';
 import { displaySessionTitle } from '../../utils/sessionDisplay';
-import { appendUniqueById, safeWorkspaceMediaPath } from '../../utils/mediaCompletion';
+import { appendUniqueById, safeMediaCompletionTool, safeWorkspaceMediaPath } from '../../utils/mediaCompletion';
 import {
     activeSessionMatchesRequestedSession,
     awaitCurrentChatPagination,
@@ -3656,7 +3656,7 @@ export default function AgentDetailPage() {
                         const activity: WorkspaceActivity = {
                             action: 'write',
                             path: mediaPath,
-                            tool: 'generate_video_minimax',
+                            tool: safeMediaCompletionTool(d.modality, d.tool_name),
                             ok: true,
                         };
                         setWorkspaceActivePath(mediaPath);
@@ -4203,7 +4203,7 @@ export default function AgentDetailPage() {
                                         <div className="thinking-dots"><span /><span /><span /></div>
                                         <span style={{ color: 'var(--text-tertiary)', fontSize: '13px' }}>{t('agent.chat.thinking', 'Thinking...')}</span>
                                     </div>
-                                ) : <MarkdownRenderer content={displayContent} />
+                                ) : <MarkdownRenderer content={displayContent} streaming={!!(msg as any)._streaming} />
                             ) : <MarkdownRenderer content={displayContent} />}
                             {msg.role === 'assistant' && isSubscriptionQuotaError && (
                                 <button

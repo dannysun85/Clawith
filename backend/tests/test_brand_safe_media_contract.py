@@ -5,6 +5,7 @@ import pytest
 
 from app.services import agent_tools, media_generation, skill_seeder, tool_seeder
 from app.services.media_assets import MediaContractError
+from app.services.media_tool_registry import MEDIA_ARTIFACT_TOOL_NAMES
 
 
 IMAGE_TOOL_NAMES = {
@@ -47,6 +48,20 @@ def test_every_image_provider_exposes_the_same_brand_safe_contract():
         assert "public URL" not in reference_help
 
 
+def test_media_artifact_registry_covers_every_seeded_media_producer():
+    seeded_media_producers = {
+        item["name"]
+        for item in tool_seeder.BUILTIN_TOOLS
+        if item.get("category") == "media"
+        and (
+            str(item.get("name") or "").startswith("generate_")
+            or item.get("name") == "check_video_minimax"
+        )
+    }
+
+    assert MEDIA_ARTIFACT_TOOL_NAMES == seeded_media_producers
+
+
 def test_video_provider_exposes_exact_copy_and_protected_product_contract():
     required = BRAND_SAFE_IMAGE_FIELDS
     runtime_properties = _runtime_tool("generate_video_minimax")["function"]["parameters"]["properties"]
@@ -79,6 +94,7 @@ def test_brand_safe_media_skill_is_a_default_runtime_skill():
     assert "Put the exact visible copy in `overlay_text`" in content
     assert "For video, the protected product layer is" in content
     assert "background_sanitized=true" in content
+    assert "does not certify OCR unreadability" in content
     assert "Skills guide the workflow; the native media tools enforce" in content
 
 

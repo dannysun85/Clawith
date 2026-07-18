@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import uuid
 from pathlib import Path
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import parse_qs, unquote, urlencode, urlsplit
 
+from app.services.media_tool_registry import MEDIA_ARTIFACT_TOOL_NAMES
 from app.services.storage import agent_storage_key, get_storage_backend, normalize_storage_key
 
 
@@ -28,19 +30,25 @@ TARGET_PATH_TOOLS = {
     "convert_markdown_to_docx",
     "convert_markdown_to_pdf",
 }
-MEDIA_GENERATION_TOOLS = {
-    "generate_image_minimax",
-    "generate_music_minimax",
-    "generate_speech_minimax",
-    "generate_video_minimax",
-}
+# Backwards-compatible export for callers that still use the old name.  The
+# canonical registry covers every production media-artifact tool, not only one
+# provider.
+MEDIA_GENERATION_TOOLS = MEDIA_ARTIFACT_TOOL_NAMES
+
+MAX_RESPONSE_ARTIFACTS_PER_MESSAGE = 32
+MAX_RESPONSE_ARTIFACTS_PER_BATCH = 256
+ARTIFACT_VERIFICATION_CONCURRENCY = 8
 
 _WORKSPACE_ARTIFACT = re.compile(
     r"workspace/[^\n\r`<>]*?\.(?:aac|avi|bmp|csv|docx|flac|gif|jpe?g|m4a|m4v|mkv|mov|mp3|mp4|ogg|opus|pdf|png|pptx|svg|wav|webm|webp|xlsx)",
     re.IGNORECASE,
 )
-_MARKDOWN_DOWNLOAD = re.compile(
-    r"!?\[[^\]]*\]\((?P<url>/api/agents/(?P<agent>[0-9a-fA-F-]+)/files/download\?[^)]+)\)",
+_MARKDOWN_LINK = re.compile(
+    r"(?P<open>!?\[[^\]]*\]\()(?P<url><[^>\r\n]+>|[^)\s\r\n]+)(?P<close>\))",
+)
+_AGENT_DOWNLOAD_PATH = re.compile(
+    r"^/api/agents/(?P<agent>[0-9a-fA-F-]+)/files/download/?$",
+    re.IGNORECASE,
 )
 _MEDIA_TOOL_EXECUTION_CLAIM = re.compile(
     r"(?:调用次数\s*[:：]?\s*[1-9]|已(?:经)?调用|调用了|调用成功|仅调用|只调用|"
@@ -71,7 +79,7 @@ _NEGATED_MEDIA_SUCCESS = re.compile(
 )
 _UNVERIFIED_TASK_ID = re.compile(
     r"(?P<label>(?:task[_ ]?id|任务\s*ID|任务号)\s*[:：=]\s*)"
-    r"(?P<value>[0-9a-f]{12,}(?:_[^\s，。；;)]*)?)",
+    r"(?P<value>[A-Za-z0-9][A-Za-z0-9._:-]{7,})",
     re.IGNORECASE,
 )
 
@@ -116,13 +124,88 @@ async def verified_tool_artifacts(
     result: str | None,
 ) -> list[str]:
     """Return only artifact paths that exist as files in authoritative storage."""
+    return await _verify_artifact_paths(
+        agent_id,
+        artifact_candidates(tool_name, args, result),
+        max_candidates=MAX_RESPONSE_ARTIFACTS_PER_MESSAGE,
+    )
+
+
+def _same_agent(left: str, right: uuid.UUID | str) -> bool:
+    try:
+        return uuid.UUID(str(left)) == uuid.UUID(str(right))
+    except (TypeError, ValueError):
+        return False
+
+
+def _agent_download_claim(url: str) -> tuple[str, str | None] | None:
+    """Parse relative or absolute Agent download URLs without trusting the host."""
+    raw_url = str(url or "").strip().removeprefix("<").removesuffix(">")
+    try:
+        parsed = urlsplit(raw_url)
+        path = unquote(parsed.path)
+    except (TypeError, ValueError):
+        return None
+    match = _AGENT_DOWNLOAD_PATH.fullmatch(path)
+    if not match:
+        return None
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    linked_path = _normalize_artifact_path((query.get("path") or [""])[0])
+    return match.group("agent"), linked_path
+
+
+def response_artifact_candidates(
+    agent_id: uuid.UUID | str,
+    response: str | None,
+) -> list[str]:
+    """Extract bounded, same-Agent artifact claims from one model response."""
+    response_text = str(response or "")
+    candidates: list[str] = []
+
+    def add(path: str | None) -> None:
+        if path and path not in candidates:
+            candidates.append(path)
+
+    for match in _WORKSPACE_ARTIFACT.finditer(response_text):
+        add(_normalize_artifact_path(match.group(0)))
+        if len(candidates) >= MAX_RESPONSE_ARTIFACTS_PER_MESSAGE:
+            return candidates
+
+    for match in _MARKDOWN_LINK.finditer(response_text):
+        claim = _agent_download_claim(match.group("url"))
+        if claim and _same_agent(claim[0], agent_id):
+            add(claim[1])
+        if len(candidates) >= MAX_RESPONSE_ARTIFACTS_PER_MESSAGE:
+            break
+    return candidates
+
+
+async def _verify_artifact_paths(
+    agent_id: uuid.UUID | str,
+    paths: list[str],
+    *,
+    max_candidates: int,
+) -> list[str]:
+    """Verify unique paths with bounded concurrency and one file lookup each."""
+    candidates = list(dict.fromkeys(paths))[:max_candidates]
+    if not candidates:
+        return []
+
     storage = get_storage_backend()
-    verified: list[str] = []
-    for path in artifact_candidates(tool_name, args, result):
-        key = agent_storage_key(agent_id, path)
-        if await storage.exists(key) and await storage.is_file(key):
-            verified.append(path)
-    return verified
+    semaphore = asyncio.Semaphore(ARTIFACT_VERIFICATION_CONCURRENCY)
+
+    async def verify(path: str) -> str | None:
+        try:
+            async with semaphore:
+                key = agent_storage_key(agent_id, path)
+                return path if await storage.is_file(key) else None
+        except Exception:
+            # Model-authored links fail closed per path so one unavailable object
+            # cannot authorize itself or discard independently verified files.
+            return None
+
+    results = await asyncio.gather(*(verify(path) for path in candidates))
+    return [path for path in results if path]
 
 
 async def verified_response_artifacts(
@@ -135,25 +218,48 @@ async def verified_response_artifacts(
     those paths as presentation hints only; the storage backend remains the source
     of truth before a download or media link is allowed into the final response.
     """
-    response_text = str(response or "")
-    if not response_text:
-        return []
+    return await _verify_artifact_paths(
+        agent_id,
+        response_artifact_candidates(agent_id, response),
+        max_candidates=MAX_RESPONSE_ARTIFACTS_PER_MESSAGE,
+    )
 
-    candidates: list[str] = []
-    for match in _WORKSPACE_ARTIFACT.finditer(response_text):
-        normalized = _normalize_artifact_path(match.group(0))
-        if normalized and normalized not in candidates:
-            candidates.append(normalized)
-        if len(candidates) >= 32:
+
+async def sanitize_response_artifacts_batch(
+    agent_id: uuid.UUID | str,
+    responses: list[str | None],
+) -> list[str]:
+    """Sanitize persisted replies with one de-duplicated storage verification batch."""
+    response_texts = [str(response or "") for response in responses]
+    candidate_lists = [
+        response_artifact_candidates(agent_id, response)
+        for response in response_texts
+    ]
+    unique_candidates: list[str] = []
+    for candidates in candidate_lists:
+        for path in candidates:
+            if path not in unique_candidates:
+                unique_candidates.append(path)
+            if len(unique_candidates) >= MAX_RESPONSE_ARTIFACTS_PER_BATCH:
+                break
+        if len(unique_candidates) >= MAX_RESPONSE_ARTIFACTS_PER_BATCH:
             break
 
-    storage = get_storage_backend()
-    verified: list[str] = []
-    for path in candidates:
-        key = agent_storage_key(agent_id, path)
-        if await storage.exists(key) and await storage.is_file(key):
-            verified.append(path)
-    return verified
+    verified = set(
+        await _verify_artifact_paths(
+            agent_id,
+            unique_candidates,
+            max_candidates=MAX_RESPONSE_ARTIFACTS_PER_BATCH,
+        )
+    )
+    return [
+        append_authoritative_artifacts(
+            response_text,
+            agent_id,
+            [path for path in candidates if path in verified],
+        )
+        for response_text, candidates in zip(response_texts, candidate_lists, strict=True)
+    ]
 
 
 async def sanitize_response_artifacts(
@@ -279,18 +385,24 @@ def append_authoritative_artifacts(
     verified = list(dict.fromkeys(path for path in artifact_paths if _normalize_artifact_path(path)))
     verified_set = set(verified)
     unverified_paths: list[str] = []
+    removed_unverified_link = False
 
     def replace_unverified(match: re.Match) -> str:
-        query = parse_qs(urlsplit(match.group("url")).query)
-        linked_path = _normalize_artifact_path((query.get("path") or [""])[0])
-        if match.group("agent") == str(agent_id) and linked_path in verified_set:
+        nonlocal removed_unverified_link
+        claim = _agent_download_claim(match.group("url"))
+        if claim is None:
             return match.group(0)
+        linked_agent, linked_path = claim
+        if _same_agent(linked_agent, agent_id) and linked_path in verified_set:
+            canonical_url = artifact_download_url(agent_id, linked_path)
+            return f"{match.group('open')}{canonical_url}{match.group('close')}"
+        removed_unverified_link = True
         if linked_path and linked_path not in unverified_paths:
             unverified_paths.append(linked_path)
         return "（未验证的产物链接已移除）"
 
-    cleaned = _MARKDOWN_DOWNLOAD.sub(replace_unverified, response).rstrip()
-    if unverified_paths:
+    cleaned = _MARKDOWN_LINK.sub(replace_unverified, response).rstrip()
+    if removed_unverified_link:
         warning = "⚠️ 系统未验证到模型声明的产物，不能视为生成成功。"
         cleaned = f"{warning}\n\n{cleaned}"
 

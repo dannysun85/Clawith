@@ -36,6 +36,7 @@ from app.services.activity_logger import log_activity
 from app.services.artifact_contract import (
     MEDIA_GENERATION_TOOLS,
     sanitize_response_artifacts,
+    sanitize_response_artifacts_batch,
     verified_tool_artifacts,
 )
 from app.services.agentbay_live import detect_agentbay_env, get_browser_snapshot, get_desktop_screenshot
@@ -585,14 +586,16 @@ class WebSocketChatHandler:
                 .limit(self.ctx_size)
             )
             history_messages = list(reversed(history_result.scalars().all()))
+            assistant_contents = await sanitize_response_artifacts_batch(
+                self.agent_id,
+                [message.content for message in history_messages if message.role == "assistant"],
+            )
+            sanitized_assistant_contents = iter(assistant_contents)
             self.history_messages = []
             for message in history_messages:
                 content = message.content
                 if message.role == "assistant":
-                    content = await sanitize_response_artifacts(
-                        self.agent_id,
-                        content,
-                    )
+                    content = next(sanitized_assistant_contents)
                 self.history_messages.append(
                     SimpleNamespace(
                         id=message.id,

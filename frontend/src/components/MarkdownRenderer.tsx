@@ -26,7 +26,22 @@ function escapeAttribute(str: string): string {
     return escapeHtml(str).replace(/'/g, '&#39;');
 }
 
-function prepareUrl(url: string, kind: 'link' | 'image' = 'link'): string | null {
+function isAgentDownloadUrl(url: string): boolean {
+    const raw = url.trim().replace(/^<|>$/g, '');
+    try {
+        const parsed = new URL(raw, 'https://astra.invalid');
+        const path = decodeURIComponent(parsed.pathname);
+        return /^\/api\/agents\/[0-9a-f-]+\/files\/download\/?$/i.test(path);
+    } catch {
+        return false;
+    }
+}
+
+function prepareUrl(
+    url: string,
+    kind: 'link' | 'image' = 'link',
+    allowAgentArtifacts = true,
+): string | null {
     let finalUrl = url.trim().replace(/^<|>$/g, '');
     const lower = finalUrl.toLowerCase();
     const isAllowed =
@@ -36,13 +51,13 @@ function prepareUrl(url: string, kind: 'link' | 'image' = 'link'): string | null
         finalUrl.startsWith('/') ||
         (kind === 'image' && lower.startsWith('data:image/'));
 
-    if (!isAllowed) return null;
+    if (!isAllowed || (!allowAgentArtifacts && isAgentDownloadUrl(finalUrl))) return null;
 
     return finalUrl;
 }
 
-function renderLink(url: string, label: string): string {
-    const finalUrl = prepareUrl(url);
+function renderLink(url: string, label: string, allowAgentArtifacts = true): string {
+    const finalUrl = prepareUrl(url, 'link', allowAgentArtifacts);
     if (!finalUrl) return label;
     return `<a href="${escapeAttribute(finalUrl)}" target="_blank" rel="noopener noreferrer" style="color:var(--accent-primary);text-decoration:underline;text-underline-offset:2px;word-break:break-all">${label}</a>`;
 }
@@ -52,7 +67,8 @@ const AUDIO_EXTS = new Set(['mp3', 'wav', 'ogg', 'm4a', 'flac', 'aac', 'opus']);
 const VIDEO_EXTS = new Set(['mp4', 'webm', 'mov', 'avi', 'mkv', 'm4v']);
 
 /** Render a media element (image/audio/video) based on URL extension. */
-function renderMedia(alt: string, url: string): string | null {
+function renderMedia(alt: string, url: string, allowMedia = true): string | null {
+    if (!allowMedia) return null;
     const finalUrl = prepareUrl(url, 'image');
     if (!finalUrl) return null;
     const safeUrl = escapeAttribute(finalUrl);
@@ -86,13 +102,13 @@ function renderMedia(alt: string, url: string): string | null {
     );
 }
 
-function autolinkBareUrls(html: string): string {
+function autolinkBareUrls(html: string, allowAgentArtifacts = true): string {
     return html.replace(/https?:\/\/[^\s<>"']+/g, (rawUrl) => {
         const trailingMatch = rawUrl.match(/[),.;:!?，。！？；：、）】》]+$/);
         const trailing = trailingMatch?.[0] ?? '';
         const url = trailing ? rawUrl.slice(0, -trailing.length) : rawUrl;
         if (!url) return rawUrl;
-        return renderLink(url, url) + trailing;
+        return renderLink(url, url, allowAgentArtifacts) + trailing;
     });
 }
 
@@ -106,7 +122,7 @@ function triggerImageDownload(url: string, alt: string) {
     document.body.removeChild(link);
 }
 
-function renderInline(text: string): string {
+function renderInline(text: string, streaming = false): string {
     const tokens: string[] = [];
     const stash = (html: string) => {
         const key = `@@CLAWITHMDTOKEN${tokens.length}@@`;
@@ -119,12 +135,12 @@ function renderInline(text: string): string {
         .replace(/`([^`]+)`/g, (_match, code) => stash(`<code style="background:var(--bg-secondary);padding:1px 4px;border-radius:3px;font-family:monospace;font-size:0.9em">${escapeHtml(code)}</code>`))
         // Images / audio / video (extension-based branching)
         .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (match, alt, url) => {
-            const media = renderMedia(alt, url);
+            const media = renderMedia(alt, url, !streaming);
             if (!media) return escapeHtml(match);
             return stash(media);
         })
         // Links
-        .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_match, label, url) => stash(renderLink(url, escapeHtml(label))));
+        .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_match, label, url) => stash(renderLink(url, escapeHtml(label), !streaming)));
 
     working = escapeHtml(working)
         // Bold + italic
@@ -138,14 +154,14 @@ function renderInline(text: string): string {
         // Strikethrough
         .replace(/~~(.*?)~~/g, '<del>$1</del>');
 
-    working = autolinkBareUrls(working);
+    working = autolinkBareUrls(working, !streaming);
     tokens.forEach((html, i) => {
         working = working.replace(new RegExp(`@@CLAWITHMDTOKEN${i}@@`, 'g'), html);
     });
     return working;
 }
 
-function markdownToHtml(md: string): string {
+export function markdownToHtml(md: string, streaming = false): string {
     const lines = md.split('\n');
     let html = '';
     let inCodeBlock = false;
@@ -201,7 +217,7 @@ function markdownToHtml(md: string): string {
             const level = hMatch[1].length;
             const sizes = ['1.6em', '1.4em', '1.2em', '1.1em', '1em', '0.9em'];
             const margins = ['20px 0 8px', '16px 0 6px', '14px 0 5px', '12px 0 4px', '10px 0 4px', '8px 0 4px'];
-            html += `<h${level} style="margin:${margins[level - 1]};font-size:${sizes[level - 1]};font-weight:600;line-height:1.3">${renderInline(hMatch[2])}</h${level}>`;
+            html += `<h${level} style="margin:${margins[level - 1]};font-size:${sizes[level - 1]};font-weight:600;line-height:1.3">${renderInline(hMatch[2], streaming)}</h${level}>`;
             continue;
         }
 
@@ -219,7 +235,7 @@ function markdownToHtml(md: string): string {
                 html += '<blockquote style="border-left:3px solid var(--accent-primary);margin:8px 0;padding:4px 12px;color:var(--text-secondary);background:var(--bg-secondary);border-radius:0 4px 4px 0">';
                 inBlockquote = true;
             }
-            html += `<div>${renderInline(line.slice(2))}</div>`;
+            html += `<div>${renderInline(line.slice(2), streaming)}</div>`;
             continue;
         } else if (inBlockquote) {
             flushBlockquote();
@@ -239,10 +255,10 @@ function markdownToHtml(md: string): string {
                 inTable = true;
                 tableHeader = false;
                 // This is the header row
-                html += '<tr>' + cols.map(c => `<th style="border:1px solid rgba(128,128,128,0.4);padding:6px 10px;background:var(--bg-secondary);text-align:left;font-weight:600">${renderInline(c)}</th>`).join('') + '</tr>';
+                html += '<tr>' + cols.map(c => `<th style="border:1px solid rgba(128,128,128,0.4);padding:6px 10px;background:var(--bg-secondary);text-align:left;font-weight:600">${renderInline(c, streaming)}</th>`).join('') + '</tr>';
                 html += '</thead><tbody>';
             } else {
-                html += '<tr>' + cols.map(c => `<td style="border:1px solid rgba(128,128,128,0.4);padding:6px 10px">${renderInline(c)}</td>`).join('') + '</tr>';
+                html += '<tr>' + cols.map(c => `<td style="border:1px solid rgba(128,128,128,0.4);padding:6px 10px">${renderInline(c, streaming)}</td>`).join('') + '</tr>';
             }
             continue;
         } else if (inTable) {
@@ -254,7 +270,7 @@ function markdownToHtml(md: string): string {
         if (ulMatch) {
             flushBlockquote(); flushTable();
             if (inList !== 'ul') { if (inList) flushList(); html += '<ul style="margin:6px 0;padding-left:24px">'; inList = 'ul'; }
-            html += `<li style="margin:2px 0">${renderInline(ulMatch[2])}</li>`;
+            html += `<li style="margin:2px 0">${renderInline(ulMatch[2], streaming)}</li>`;
             continue;
         }
 
@@ -263,13 +279,13 @@ function markdownToHtml(md: string): string {
         if (olMatch) {
             flushBlockquote(); flushTable();
             if (inList !== 'ol') { if (inList) flushList(); html += '<ol style="margin:6px 0;padding-left:24px">'; inList = 'ol'; }
-            html += `<li style="margin:2px 0">${renderInline(olMatch[2])}</li>`;
+            html += `<li style="margin:2px 0">${renderInline(olMatch[2], streaming)}</li>`;
             continue;
         }
 
         // Regular paragraph
         flushList(); flushBlockquote(); flushTable();
-        html += `<p style="margin:4px 0;line-height:1.7">${renderInline(line)}</p>`;
+        html += `<p style="margin:4px 0;line-height:1.7">${renderInline(line, streaming)}</p>`;
     }
 
     // Close any open structures
@@ -285,10 +301,11 @@ interface MarkdownRendererProps {
     content: string;
     style?: React.CSSProperties;
     className?: string;
+    streaming?: boolean;
 }
 
-export const MarkdownRenderer = React.memo(function MarkdownRenderer({ content, style, className }: MarkdownRendererProps) {
-    const html = useMemo(() => markdownToHtml(content), [content]);
+export const MarkdownRenderer = React.memo(function MarkdownRenderer({ content, style, className, streaming = false }: MarkdownRendererProps) {
+    const html = useMemo(() => markdownToHtml(content, streaming), [content, streaming]);
     const [lightbox, setLightbox] = useState<{ src: string; alt: string; scale: number } | null>(null);
 
     const closeLightbox = useCallback(() => setLightbox(null), []);

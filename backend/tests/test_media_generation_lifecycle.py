@@ -1632,6 +1632,85 @@ async def test_completion_outbox_retries_when_exact_realtime_delivery_fails(monk
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("modality", "expected_tool"),
+    [
+        ("image", "generate_image_minimax"),
+        ("audio", "generate_speech_minimax"),
+        ("music", "generate_music_minimax"),
+        ("video", "generate_video_minimax"),
+    ],
+)
+async def test_completion_outbox_publishes_canonical_media_tool(
+    monkeypatch,
+    modality,
+    expected_tool,
+):
+    agent_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    session_id = uuid.uuid4()
+    message_id = uuid.uuid4()
+    task = SimpleNamespace(
+        id=uuid.uuid4(),
+        agent_id=agent_id,
+        user_id=user_id,
+        origin_session_id=session_id,
+        completion_message_id=message_id,
+        status="succeeded",
+        modality=modality,
+        output_path=f"workspace/{modality}/result.bin",
+        realtime_attempt_count=0,
+        realtime_next_attempt_at=None,
+        realtime_published_at=None,
+        realtime_last_error=None,
+    )
+    message = SimpleNamespace(
+        id=message_id,
+        agent_id=agent_id,
+        role="assistant",
+        content=f"{modality} ready",
+        conversation_id=str(session_id),
+        created_at=datetime.now(timezone.utc),
+    )
+    session = SimpleNamespace(
+        id=session_id,
+        agent_id=agent_id,
+        user_id=user_id,
+        source_channel="web",
+        is_group=False,
+    )
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, model, _record_id, **_kwargs):
+            if model is MediaGenerationTask:
+                return task
+            if model is ChatMessage:
+                return message
+            return session
+
+        async def commit(self):
+            return None
+
+    send = AsyncMock()
+    monkeypatch.setattr(media_generation, "async_session", lambda: Session())
+    monkeypatch.setattr("app.api.websocket.manager.send_to_session_user", send)
+
+    published = await media_generation.publish_media_completion_event(task.id)
+
+    assert published is True
+    payload = send.await_args.args[3]
+    assert payload["modality"] == modality
+    assert payload["tool_name"] == expected_tool
+    assert task.realtime_published_at is not None
+
+
+@pytest.mark.asyncio
 async def test_reconciliation_keeps_accepted_task_recoverable_on_quota_poll_error(monkeypatch):
     from app.services import agent_tools
 

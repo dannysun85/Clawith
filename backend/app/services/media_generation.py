@@ -3323,12 +3323,17 @@ async def publish_media_completion_event(record_id: uuid.UUID) -> bool:
         agent_id = str(task.agent_id)
         session_id = str(session.id)
         user_id = str(task.user_id)
+        from app.services.media_tool_registry import minimax_completion_tool
+
+        modality = str(getattr(task, "modality", "") or "").strip().lower()
         payload = {
             "type": "media_generation_result",
             "event_id": str(message.id),
             "session_id": session_id,
             "workspace_path": task.output_path,
             "media_generation_task_id": str(task.id),
+            "modality": modality,
+            "tool_name": minimax_completion_tool(modality),
             "message": {
                 "id": str(message.id),
                 "role": message.role,

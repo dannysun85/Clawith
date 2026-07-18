@@ -22,7 +22,7 @@ from app.services.agent_plan_selection import (
     InvalidAgentPlanSelection,
     resolve_agent_plan_selection,
 )
-from app.services.artifact_contract import sanitize_response_artifacts
+from app.services.artifact_contract import sanitize_response_artifacts_batch
 from app.services.entitlements import get_tenant_entitlements
 from app.services.chat_session_access import (
     can_audit_agent_chat_sessions,
@@ -663,14 +663,16 @@ async def get_session_messages(
             for row in p_result.all():
                 sender_cache[str(row[0])] = (row[1] or "Unknown", str(row[2]))
 
+    assistant_contents = await sanitize_response_artifacts_batch(
+        agent_id,
+        [m.content for m in messages if m.role == "assistant"],
+    )
+    sanitized_assistant_contents = iter(assistant_contents)
     out = []
     for m in messages:
         message_content = m.content
         if m.role == "assistant":
-            message_content = await sanitize_response_artifacts(
-                agent_id,
-                message_content,
-            )
+            message_content = next(sanitized_assistant_contents)
         sender_info = sender_cache.get(str(m.participant_id)) if m.participant_id else None
         sender_name = sender_info[0] if sender_info else None
         sender_agent_id = sender_info[1] if sender_info else None

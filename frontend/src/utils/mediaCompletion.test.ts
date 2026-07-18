@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { appendUniqueById, safeWorkspaceMediaPath } from './mediaCompletion';
+import { appendUniqueById, safeMediaCompletionTool, safeWorkspaceMediaPath } from './mediaCompletion';
 
 describe('media completion helpers', () => {
     it('accepts only workspace-scoped paths', () => {
@@ -16,5 +16,19 @@ describe('media completion helpers', () => {
         const existing = [{ id: 'message-1', content: 'ready' }];
         expect(appendUniqueById(existing, { id: 'message-1', content: 'ready' })).toBe(existing);
         expect(appendUniqueById(existing, { id: 'message-2', content: 'next' })).toHaveLength(2);
+    });
+
+    it.each([
+        ['image', 'generate_image_minimax'],
+        ['audio', 'generate_speech_minimax'],
+        ['music', 'generate_music_minimax'],
+        ['video', 'generate_video_minimax'],
+    ])('maps %s completion events to the canonical tool', (modality, expected) => {
+        expect(safeMediaCompletionTool(modality, expected)).toBe(expected);
+        expect(safeMediaCompletionTool(modality, 'generate_video_minimax')).toBe(expected);
+    });
+
+    it('uses a generic activity for an unknown completion modality', () => {
+        expect(safeMediaCompletionTool('document', 'generate_video_minimax')).toBe('media_generation');
     });
 });
