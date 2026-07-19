@@ -52,6 +52,34 @@ def test_primary_asyncpg_url_is_the_checkpoint_fallback() -> None:
     )
 
 
+def test_primary_asyncpg_ssl_parameter_is_normalized_for_psycopg() -> None:
+    settings = _settings(
+        DATABASE_URL=(
+            "postgresql+asyncpg://app:secret@db.example/clawith?ssl=disable"
+        )
+    )
+
+    normalized = checkpoint_database_url(settings)
+
+    assert normalized == (
+        "postgresql://app:secret@db.example/clawith?sslmode=disable&"
+        "options=-csearch_path%3Dlanggraph_checkpoint"
+    )
+    assert conninfo_to_dict(normalized)["sslmode"] == "disable"
+
+
+def test_checkpoint_url_rejects_conflicting_ssl_dialects() -> None:
+    settings = _settings(
+        DATABASE_URL=(
+            "postgresql+asyncpg://app:secret@db.example/clawith?"
+            "ssl=disable&sslmode=require"
+        )
+    )
+
+    with pytest.raises(CheckpointerConfigurationError, match="both ssl and sslmode"):
+        checkpoint_database_url(settings)
+
+
 def test_checkpoint_url_preserves_existing_options_and_forces_isolated_schema() -> None:
     settings = _settings(
         LANGGRAPH_CHECKPOINT_DATABASE_URL=(

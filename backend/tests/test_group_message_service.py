@@ -226,16 +226,19 @@ async def test_mention_resolution_only_exposes_active_group_members() -> None:
             _ScalarCollection(memberships),
             _ScalarCollection([user]),
             _ScalarCollection([mention.agent]),
-            _ScalarCollection([mention.model]),
         )
     )
 
-    resolved = await _resolve_mentions(
-        db,  # type: ignore[arg-type]
-        tenant_id=tenant_id,
-        group_id=scope.group.id,
-        participant_ids=(target.id, human_target.id, outsider.id),
-    )
+    with patch(
+        "app.services.group_message_service._resolve_agent_execution_model",
+        new=AsyncMock(return_value=mention.model),
+    ):
+        resolved = await _resolve_mentions(
+            db,  # type: ignore[arg-type]
+            tenant_id=tenant_id,
+            group_id=scope.group.id,
+            participant_ids=(target.id, human_target.id, outsider.id),
+        )
 
     assert resolved[0].valid is True and resolved[0].triggers_agent is True
     assert resolved[0].agent is mention.agent
@@ -244,6 +247,54 @@ async def test_mention_resolution_only_exposes_active_group_members() -> None:
     assert resolved[2].valid is False
     assert resolved[2].reason == "not_group_member"
     assert resolved[2].display_name is None
+
+
+@pytest.mark.asyncio
+async def test_mention_resolution_uses_saas_route_instead_of_legacy_primary_model() -> None:
+    tenant_id, _, scope, target, mention = _records()
+    legacy_model_id = mention.agent.primary_model_id
+    assert legacy_model_id is not None
+    routed_model = LLMModel(
+        id=uuid.uuid4(),
+        tenant_id=None,
+        provider="minimax",
+        model="MiniMax-M3",
+        api_key_encrypted=None,
+        label="MiniMax-M3 Lite Understanding (Platform)",
+        enabled=True,
+    )
+    membership = GroupMember(
+        id=uuid.uuid4(),
+        group_id=scope.group.id,
+        participant_id=target.id,
+        role="member",
+        joined_at=NOW,
+        session_read_state={},
+    )
+    db = _Session(
+        results=(
+            _ScalarCollection([target]),
+            _ScalarCollection([membership]),
+            _ScalarCollection([mention.agent]),
+        )
+    )
+
+    with patch(
+        "app.services.group_message_service._resolve_agent_execution_model",
+        new=AsyncMock(return_value=routed_model),
+    ) as resolve_model:
+        resolved = await _resolve_mentions(
+            db,  # type: ignore[arg-type]
+            tenant_id=tenant_id,
+            group_id=scope.group.id,
+            participant_ids=(target.id,),
+        )
+
+    assert legacy_model_id != routed_model.id
+    resolve_model.assert_awaited_once_with(mention.agent)
+    assert resolved[0].valid is True
+    assert resolved[0].triggers_agent is True
+    assert resolved[0].model is routed_model
 
 
 @pytest.mark.asyncio

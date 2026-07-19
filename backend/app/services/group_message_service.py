@@ -240,6 +240,31 @@ def _invalid_mention(
     )
 
 
+async def _resolve_agent_execution_model(agent: Agent) -> LLMModel | None:
+    """Resolve one Agent through the same SaaS route used by direct chat.
+
+    ``primary_model_id`` is a legacy concrete-model preference. It must not
+    bypass the tenant's current Lite/Pro/Ultra entitlements or make Group
+    Runtime unusable after a platform route migration.
+    """
+    from app.services.llm.caller import resolve_agent_model
+    from app.services.quota_guard import QuotaExceeded
+
+    try:
+        primary, fallback, _route_meta = await resolve_agent_model(agent)
+    except QuotaExceeded:
+        return None
+
+    for model in (primary, fallback):
+        if (
+            model is not None
+            and model.enabled
+            and model.tenant_id in {None, agent.tenant_id}
+        ):
+            return model
+    return None
+
+
 async def _resolve_mentions(
     db: AsyncSession,
     *,
@@ -277,7 +302,6 @@ async def _resolve_mentions(
     }
     users: dict[uuid.UUID, User] = {}
     agents: dict[uuid.UUID, Agent] = {}
-    models: dict[uuid.UUID, LLMModel] = {}
     if user_ref_ids:
         user_result = await db.execute(
             select(User).where(
@@ -298,19 +322,6 @@ async def _resolve_mentions(
             )
         )
         agents = {agent.id: agent for agent in agent_result.scalars().all()}
-        model_ids = {agent.primary_model_id for agent in agents.values() if agent.primary_model_id}
-        if model_ids:
-            model_result = await db.execute(
-                select(LLMModel).where(
-                    LLMModel.id.in_(model_ids),
-                    LLMModel.enabled.is_(True),
-                )
-            )
-            models = {
-                model.id: model
-                for model in model_result.scalars().all()
-                if model.tenant_id in {None, tenant_id}
-            }
 
     output: list[ResolvedGroupMention] = []
     for participant_id in participant_ids:
@@ -344,7 +355,7 @@ async def _resolve_mentions(
         if agent is None:
             output.append(_invalid_mention(participant_id, reason="agent_unavailable"))
             continue
-        model = models.get(agent.primary_model_id) if agent.primary_model_id is not None else None
+        model = await _resolve_agent_execution_model(agent)
         if model is None:
             output.append(_invalid_mention(participant_id, reason="agent_model_unavailable"))
             continue

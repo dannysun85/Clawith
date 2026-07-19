@@ -27,3 +27,23 @@ def test_compose_backends_do_not_insert_signal_intercepting_init_process():
         compose = (repository_root / relative_path).read_text(encoding="utf-8")
         assert "init: true" not in compose
         assert "stop_grace_period: 30s" in compose
+
+
+def test_source_restart_fails_closed_and_installs_checkpoint_schema_after_alembic():
+    repository_root = Path(__file__).parents[2]
+    restart = (repository_root / "restart.sh").read_text(encoding="utf-8")
+    alembic = ".venv/bin/alembic upgrade head"
+    checkpoint = ".venv/bin/python -m app.scripts.setup_langgraph_checkpoints"
+
+    assert f"{alembic} 2>/dev/null || true" not in restart
+    assert alembic in restart
+    assert checkpoint in restart
+    assert restart.index(alembic) < restart.index(checkpoint)
+
+
+def test_source_restart_defaults_public_url_to_the_frontend_origin():
+    repository_root = Path(__file__).parents[2]
+    restart = (repository_root / "restart.sh").read_text(encoding="utf-8")
+
+    assert ': "${PUBLIC_BASE_URL:=http://localhost:$FRONTEND_PORT}"' in restart
+    assert "export PUBLIC_BASE_URL" in restart

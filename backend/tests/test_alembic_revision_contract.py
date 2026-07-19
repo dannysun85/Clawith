@@ -23,16 +23,28 @@ def test_revision_ids_fit_the_default_alembic_version_column() -> None:
 
 
 def test_release_migration_graph_has_one_expected_head() -> None:
-    assert _script_directory().get_heads() == ["merge_v111_astra_heads"]
+    assert _script_directory().get_heads() == ["align_task_failed_status"]
 
 
 def test_release_head_preserves_both_upgrade_lineages() -> None:
-    release_head = _script_directory().get_revision("merge_v111_astra_heads")
+    script = _script_directory()
+    release_head = script.get_revision("align_task_failed_status")
+    merge_revision = script.get_revision("merge_v111_astra_heads")
 
-    assert set(release_head._normalized_down_revisions) == {
+    assert release_head._normalized_down_revisions == ("merge_v111_astra_heads",)
+
+    assert set(merge_revision._normalized_down_revisions) == {
         "sso_password_login",
         "add_experience_revision_drafts",
     }
+
+
+def test_postgres_migration_smoke_targets_the_release_head() -> None:
+    smoke = (BACKEND_ROOT.parent / "scripts/postgres-migration-smoke.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-align_task_failed_status' in smoke
 
 
 def test_sso_password_migration_is_fail_closed_and_non_destructive() -> None:

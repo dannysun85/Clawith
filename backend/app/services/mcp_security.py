@@ -380,3 +380,87 @@ class PublicArtifactHTTPGuard:
                 "response": [self.validate_response],
             },
         }
+
+
+class TrustedProviderProxyHTTPGuard:
+    """Constrain credentialed provider traffic sent through an explicit proxy.
+
+    Some operator networks use a TUN/fake-IP DNS range (for example
+    ``198.18.0.0/15``). A local DNS preflight correctly rejects those
+    synthetic addresses, even though the configured HTTP proxy resolves and
+    connects to the public provider. This narrow opt-in path only permits an
+    exact, reviewed HTTPS provider hostname. Normal MCP traffic never uses it.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        allowed_hostnames: Iterable[str],
+    ) -> None:
+        self._origin = _origin(base_url)
+        allowed = {str(value).strip().lower() for value in allowed_hostnames}
+        if self._origin[1] not in allowed:
+            raise MCPURLPolicyError(
+                "Provider proxy endpoint hostname is not allowlisted"
+            )
+
+    async def validate_request(self, request: httpx.Request) -> None:
+        if _origin(str(request.url)) != self._origin:
+            raise MCPURLPolicyError(
+                "Cross-origin provider proxy redirects are not allowed"
+            )
+
+    def client_kwargs(self, *, proxy_url: str) -> dict:
+        proxy = str(proxy_url or "").strip()
+        parsed = urlsplit(proxy)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise MCPURLPolicyError("Configured HTTP proxy URL is invalid")
+        return {
+            "follow_redirects": True,
+            "trust_env": False,
+            "proxy": proxy,
+            "event_hooks": {"request": [self.validate_request]},
+        }
+
+
+class PublicArtifactProxyHTTPGuard:
+    """Validate credential-free HTTPS artifact downloads through a proxy.
+
+    DNS and the connected peer are owned by the explicitly configured proxy,
+    so application-side public-IP pinning is unavailable. We retain the
+    boundaries enforceable locally: HTTPS/TLS, no URL credentials, no local or
+    intranet host syntax, no non-public IP literals, and bounded redirects.
+    """
+
+    async def validate_request(self, request: httpx.Request) -> None:
+        _, hostname, _, _ = _endpoint_parts(str(request.url))
+        normalized = hostname.rstrip(".").lower()
+        if (
+            normalized == "localhost"
+            or normalized.endswith(".localhost")
+            or normalized.endswith(".local")
+            or "." not in normalized
+        ):
+            raise MCPURLPolicyError(
+                "Artifact proxy endpoint must use a public DNS hostname"
+            )
+        try:
+            ipaddress.ip_address(normalized.split("%", 1)[0])
+        except ValueError:
+            pass
+        else:
+            _require_public_ip(normalized)
+
+    def client_kwargs(self, *, proxy_url: str) -> dict:
+        proxy = str(proxy_url or "").strip()
+        parsed = urlsplit(proxy)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise MCPURLPolicyError("Configured HTTP proxy URL is invalid")
+        return {
+            "follow_redirects": True,
+            "max_redirects": 5,
+            "trust_env": False,
+            "proxy": proxy,
+            "event_hooks": {"request": [self.validate_request]},
+        }

@@ -53,6 +53,13 @@ load_env() {
     : "${DATABASE_URL:=postgresql+asyncpg://clawith:clawith@localhost:5432/clawith?ssl=disable}"
     export DATABASE_URL
 
+    # Source-mode browser traffic is proxied through Vite, so the backend's
+    # request host is the API listener (8008). Without an explicit public URL,
+    # tenant switching would redirect the browser to the API port and land on
+    # a 404. Explicit deployment configuration remains authoritative.
+    : "${PUBLIC_BASE_URL:=http://localhost:$FRONTEND_PORT}"
+    export PUBLIC_BASE_URL
+
     # Parse host and port from DATABASE_URL regardless of hostname
     # Format: postgresql+asyncpg://user:pass@host:port/dbname?...
     _db_hostpart=$(echo "$DATABASE_URL" | sed 's|.*://[^@]*@||' | sed 's|/.*||' | sed 's|?.*||')
@@ -252,7 +259,13 @@ start_backend() {
 
     # Auto-run schema migrations via alembic
     echo -e "${YELLOW}🔄 Running schema migrations...${NC}"
-    .venv/bin/alembic upgrade head 2>/dev/null || true
+    .venv/bin/alembic upgrade head
+
+    # LangGraph owns its checkpoint tables through the pinned saver migration
+    # ledger. Install them only after the product Alembic graph is current and
+    # fail closed so the local Runtime cannot start against a partial schema.
+    echo -e "${YELLOW}🔄 Installing LangGraph checkpoint schema...${NC}"
+    .venv/bin/python -m app.scripts.setup_langgraph_checkpoints
 
     # Auto-run data migrations (idempotent)
     echo -e "${YELLOW}🔄 Running data migrations...${NC}"

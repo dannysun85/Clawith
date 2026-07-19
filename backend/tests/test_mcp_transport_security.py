@@ -131,3 +131,63 @@ async def test_public_artifact_guard_rejects_private_connected_peer():
 
     with pytest.raises(mcp_security.MCPURLPolicyError):
         await guard.validate_response(response)
+
+
+@pytest.mark.asyncio
+async def test_trusted_provider_proxy_guard_rejects_unreviewed_and_cross_origin_hosts():
+    with pytest.raises(
+        mcp_security.MCPURLPolicyError,
+        match="not allowlisted",
+    ):
+        mcp_security.TrustedProviderProxyHTTPGuard(
+            "https://tenant.invalid/v1/image_generation",
+            allowed_hostnames={"api.minimaxi.com"},
+        )
+
+    guard = mcp_security.TrustedProviderProxyHTTPGuard(
+        "https://api.minimaxi.com/v1/image_generation",
+        allowed_hostnames={"api.minimaxi.com"},
+    )
+    with pytest.raises(
+        mcp_security.MCPURLPolicyError,
+        match="Cross-origin",
+    ):
+        await guard.validate_request(
+            mcp_security.httpx.Request(
+                "GET",
+                "https://internal.invalid/object",
+            )
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://cdn.example/object",
+        "https://localhost/object",
+        "https://service.local/object",
+        "https://127.0.0.1/object",
+        "https://intranet/object",
+    ],
+)
+async def test_public_artifact_proxy_guard_rejects_unsafe_destinations(url):
+    guard = mcp_security.PublicArtifactProxyHTTPGuard()
+
+    with pytest.raises(mcp_security.MCPURLPolicyError):
+        await guard.validate_request(mcp_security.httpx.Request("GET", url))
+
+
+@pytest.mark.asyncio
+async def test_public_artifact_proxy_guard_allows_public_https_hostname():
+    guard = mcp_security.PublicArtifactProxyHTTPGuard()
+
+    await guard.validate_request(
+        mcp_security.httpx.Request(
+            "GET",
+            "https://cdn.example.com/signed-object",
+        )
+    )
+    kwargs = guard.client_kwargs(proxy_url="http://127.0.0.1:7890")
+    assert kwargs["proxy"] == "http://127.0.0.1:7890"
+    assert kwargs["follow_redirects"] is True

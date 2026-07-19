@@ -142,6 +142,12 @@ async def stream_web_chat_run(
                         "reasoning_content": str(payload.get("reasoning_content") or ""),
                         "execution_status": payload.get("execution_status"),
                         "error_code": payload.get("error_code"),
+                        "workspace_path": payload.get("workspace_path"),
+                        "artifact_refs": (
+                            payload.get("artifact_refs")
+                            if isinstance(payload.get("artifact_refs"), list)
+                            else []
+                        ),
                         **packet_position,
                     }
                 )

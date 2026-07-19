@@ -1,5 +1,6 @@
 from app.services.media_message_content import (
     contains_inline_media,
+    redact_inline_media_for_token_estimate,
     sanitize_inline_media_content,
 )
 
@@ -51,3 +52,18 @@ def test_structured_filename_preserves_commas():
     )
 
     assert saved == "[file:report,final_4875d85abdb4.png]\nhello"
+
+
+def test_token_estimate_redaction_keeps_text_but_omits_transport_bytes():
+    serialized = (
+        '{"content":"before [image_data:data:image/jpeg;base64,'
+        + "A" * 200_000
+        + '] after"}'
+    )
+
+    redacted = redact_inline_media_for_token_estimate(serialized)
+
+    assert redacted == (
+        '{"content":"before [image_data:data:media;base64,[omitted]] after"}'
+    )
+    assert len(redacted) < 100

@@ -16,6 +16,10 @@ _INLINE_MEDIA_MARKER_RE = re.compile(
     r"\[(?P<kind>image|video)_data:[^\]]*\]",
     flags=re.IGNORECASE,
 )
+_INLINE_MEDIA_DATA_URL_RE = re.compile(
+    r"data:(?:image|video)/[^;,\s\"']+;base64,[A-Za-z0-9+/=]+",
+    flags=re.IGNORECASE,
+)
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -23,6 +27,21 @@ def contains_inline_media(content: str | None) -> bool:
     """Return whether *content* contains an image/video transport marker."""
 
     return bool(_INLINE_MEDIA_MARKER_RE.search(content or ""))
+
+
+def redact_inline_media_for_token_estimate(serialized: str) -> str:
+    """Replace transport-only media bytes before estimating text tokens.
+
+    Vision providers account for an image or video as a media input rather
+    than one text token per few Base64 characters. Runtime context budgeting
+    therefore keeps a stable typed placeholder while preserving the original
+    payload for the actual provider request.
+    """
+
+    return _INLINE_MEDIA_DATA_URL_RE.sub(
+        "data:media;base64,[omitted]",
+        serialized,
+    )
 
 
 def _normalized_file_names(file_names: str | Iterable[str] | None) -> list[str]:

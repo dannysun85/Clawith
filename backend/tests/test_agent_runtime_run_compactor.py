@@ -10,6 +10,7 @@ import pytest
 from app.config import Settings
 from app.models.llm import LLMModel
 from app.services.agent_runtime.run_compactor import (
+    _estimate_tokens,
     RunCompactInputs,
     RunCompactorError,
     RuntimeRunCompactorService,
@@ -169,6 +170,23 @@ def _step(**overrides: str) -> LLMCompletionStep:
         retry_instruction=None,
         usage=TokenUsage(total_tokens=10),
     )
+
+
+def test_thread_compactor_budget_does_not_count_inline_media_bytes_as_text() -> None:
+    short = _estimate_tokens(
+        {"content": "[image_data:data:image/jpeg;base64,QUJD] make a poster"}
+    )
+    large = _estimate_tokens(
+        {
+            "content": (
+                "[image_data:data:image/jpeg;base64,"
+                + "A" * 600_000
+                + "] make a poster"
+            )
+        }
+    )
+
+    assert large == short
 
 
 def _service(

@@ -1825,8 +1825,17 @@ def _is_enterprise_info_path(path: str | None) -> bool:
     return normalized == "enterprise_info" or normalized.startswith("enterprise_info/")
 
 
-async def _get_agent_tenant_id(agent_id: uuid.UUID) -> str | None:
-    """Get the agent tenant ID for tenant-scoped shared paths."""
+async def _get_agent_tenant_id(
+    agent_id: uuid.UUID,
+    *,
+    strict: bool = False,
+) -> str | None:
+    """Get the Agent tenant ID for tenant-scoped operations.
+
+    Legacy workspace reads remain best-effort. Paid provider operations opt
+    into ``strict`` mode so a database failure cannot be mistaken for an
+    unscoped or free invocation.
+    """
     try:
         async with async_session() as db:
             r = await db.execute(select(AgentModel.tenant_id).where(AgentModel.id == agent_id))
@@ -1835,7 +1844,8 @@ async def _get_agent_tenant_id(agent_id: uuid.UUID) -> str | None:
             if tenant_id:
                 return str(tenant_id)
     except Exception:
-        pass
+        if strict:
+            raise
     return None
 
 
@@ -2185,6 +2195,7 @@ def _minimax_tool_result(
     model: str | None = None,
     tier: str | None = None,
     retryable: bool = False,
+    halt_run: bool = False,
 ) -> ToolExecutionOutcome | str:
     """Expose one explicit MiniMax lifecycle fact to legacy or Runtime callers.
 
@@ -2202,6 +2213,7 @@ def _minimax_tool_result(
         "saas_tier": tier,
         "task_record_id": str(record_id) if record_id else None,
         "workspace_path": output_path,
+        "runtime_halt_run": bool(halt_run),
     }
     if status == "succeeded":
         artifact_refs: tuple[str, ...] = ()
@@ -27477,17 +27489,32 @@ async def _generate_image_minimax_durable(
                 model=model,
                 tier=tier,
             )
-        summary = _safe_media_failure_message("Image generation", "minimax", exc)
+        from app.services.mcp_security import MCPURLPolicyError
+
+        network_policy_failure = isinstance(exc, MCPURLPolicyError)
+        summary = (
+            "❌ Image generation is blocked by the configured provider network "
+            "policy. An administrator must repair the provider egress route; "
+            "do not call this tool again in the current run. No provider request "
+            "was made and the media Credits hold was released."
+            if network_policy_failure
+            else _safe_media_failure_message("Image generation", "minimax", exc)
+        )
         return _minimax_tool_result(
             summary,
             typed=typed,
             status="failed",
-            error_code="minimax_image_provider_rejected",
+            error_code=(
+                "minimax_image_network_policy_blocked"
+                if network_policy_failure
+                else "minimax_image_provider_rejected"
+            ),
             agent_id=agent_id,
             modality="image",
             record_id=record_id if task_created else None,
             model=model,
             tier=tier,
+            halt_run=network_policy_failure,
         )
 
 
@@ -27585,7 +27612,10 @@ async def _get_minimax_tenant_uuid(agent_id: uuid.UUID) -> uuid.UUID:
             "Media billing is temporarily unavailable. No provider request was made."
         ) from exc
 
-    assert tenant_id is not None
+    if tenant_id is None:
+        raise MinimaxBillingContextError(
+            "Media billing context is unavailable. No provider request was made."
+        )
     try:
         return uuid.UUID(str(tenant_id))
     except (TypeError, ValueError) as exc:
@@ -28162,10 +28192,27 @@ def _public_only_async_client(
 
     import httpx
 
-    from app.services.mcp_security import MCPHTTPGuard
+    from app.services.mcp_security import (
+        MCPHTTPGuard,
+        TrustedProviderProxyHTTPGuard,
+    )
 
-    guard = MCPHTTPGuard(url)
-    client_kwargs = guard.client_kwargs()
+    explicit_proxy = str(get_settings().HTTP_PROXY or "").strip()
+    minimax_proxy_hosts = {
+        "api.minimaxi.com",
+        "api.minimax.io",
+        "api.minimax.chat",
+    }
+    request_hostname = str(urlsplit(url).hostname or "").lower()
+    if explicit_proxy and request_hostname in minimax_proxy_hosts:
+        guard = TrustedProviderProxyHTTPGuard(
+            url,
+            allowed_hostnames=minimax_proxy_hosts,
+        )
+        client_kwargs = guard.client_kwargs(proxy_url=explicit_proxy)
+    else:
+        guard = MCPHTTPGuard(url)
+        client_kwargs = guard.client_kwargs()
     if on_request_started is not None:
         event_hooks = dict(client_kwargs.get("event_hooks") or {})
         request_hooks = list(event_hooks.get("request") or [])
@@ -28187,10 +28234,19 @@ def _public_artifact_async_client(*, timeout: int):
 
     import httpx
 
-    from app.services.mcp_security import PublicArtifactHTTPGuard
+    from app.services.mcp_security import (
+        PublicArtifactHTTPGuard,
+        PublicArtifactProxyHTTPGuard,
+    )
 
-    guard = PublicArtifactHTTPGuard()
-    return httpx.AsyncClient(timeout=timeout, **guard.client_kwargs())
+    explicit_proxy = str(get_settings().HTTP_PROXY or "").strip()
+    if explicit_proxy:
+        guard = PublicArtifactProxyHTTPGuard()
+        client_kwargs = guard.client_kwargs(proxy_url=explicit_proxy)
+    else:
+        guard = PublicArtifactHTTPGuard()
+        client_kwargs = guard.client_kwargs()
+    return httpx.AsyncClient(timeout=timeout, **client_kwargs)
 
 
 async def _bounded_public_http_download(

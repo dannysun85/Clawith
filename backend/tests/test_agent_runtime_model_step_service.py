@@ -14,7 +14,10 @@ from app.services.agent_runtime.context_builder import RuntimeContextBuild
 from app.services.agent_runtime.group_handoff import GroupAgentHandoffIntent
 from app.services.agent_runtime.group_handoff import GroupAgentHandoffError
 from app.services.agent_runtime.model_step_service import RuntimeModelStepService
-from app.services.agent_runtime.model_step_service import _visible_mention_names
+from app.services.agent_runtime.model_step_service import (
+    _estimate_tokens,
+    _visible_mention_names,
+)
 from app.services.agent_runtime.state import (
     RunInputSnapshots,
     RunRegistrySnapshot,
@@ -245,6 +248,23 @@ def _context(state: RuntimeGraphState) -> RuntimeContext:
         parent_run_id=registry.parent_run_id,
         root_run_id=registry.root_run_id,
     )
+
+
+def test_runtime_budget_does_not_count_inline_image_bytes_as_text_tokens() -> None:
+    short = _estimate_tokens(
+        {"content": "[image_data:data:image/jpeg;base64,QUJD] inspect product"}
+    )
+    large = _estimate_tokens(
+        {
+            "content": (
+                "[image_data:data:image/jpeg;base64,"
+                + "A" * 600_000
+                + "] inspect product"
+            )
+        }
+    )
+
+    assert large == short
 
 
 def _service(

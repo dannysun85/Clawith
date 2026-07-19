@@ -14,6 +14,7 @@ import httpx
 from PIL import Image
 
 from app.services import agent_tools
+from app.services.agent_runtime.tool_execution import ToolExecutionOutcome
 from app.services.agent_tools import (
     _custom_image_reference_to_bytes,
     _bounded_base64_decode,
@@ -25,6 +26,7 @@ from app.services.agent_tools import (
     _generate_music_minimax,
     _generate_speech_minimax,
     _generate_video_minimax,
+    _get_agent_tenant_id,
     _get_minimax_tenant_uuid,
     _json_path_get,
     _is_minimax_deterministic_rejection,
@@ -93,6 +95,74 @@ async def test_public_provider_client_marks_started_after_public_origin_prefligh
 
     await request_hooks[1](MagicMock())
     started.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_public_provider_client_uses_allowlisted_explicit_proxy():
+    policy_hook = AsyncMock()
+    guard = MagicMock()
+    guard.client_kwargs.return_value = {
+        "proxy": "http://127.0.0.1:7890",
+        "event_hooks": {"request": [policy_hook]},
+    }
+    started = MagicMock()
+    settings = SimpleNamespace(HTTP_PROXY="http://127.0.0.1:7890")
+
+    with (
+        patch("app.services.agent_tools.get_settings", return_value=settings),
+        patch(
+            "app.services.mcp_security.TrustedProviderProxyHTTPGuard",
+            return_value=guard,
+        ) as guard_class,
+        patch("httpx.AsyncClient", return_value=MagicMock()) as client_class,
+    ):
+        agent_tools._public_only_async_client(
+            "https://api.minimaxi.com/v1/image_generation",
+            timeout=120,
+            on_request_started=started,
+        )
+
+    guard_class.assert_called_once_with(
+        "https://api.minimaxi.com/v1/image_generation",
+        allowed_hostnames={
+            "api.minimaxi.com",
+            "api.minimax.io",
+            "api.minimax.chat",
+        },
+    )
+    request_hooks = client_class.call_args.kwargs["event_hooks"]["request"]
+    assert request_hooks[0] is policy_hook
+    await request_hooks[0](MagicMock())
+    started.assert_not_called()
+    await request_hooks[1](MagicMock())
+    started.assert_called_once_with()
+
+
+def test_explicit_proxy_does_not_retarget_unreviewed_provider_origins():
+    public_guard = MagicMock()
+    public_guard.client_kwargs.return_value = {}
+    settings = SimpleNamespace(HTTP_PROXY="http://127.0.0.1:7890")
+
+    with (
+        patch("app.services.agent_tools.get_settings", return_value=settings),
+        patch(
+            "app.services.mcp_security.MCPHTTPGuard",
+            return_value=public_guard,
+        ) as guard_class,
+        patch(
+            "app.services.mcp_security.TrustedProviderProxyHTTPGuard"
+        ) as proxy_guard_class,
+        patch("httpx.AsyncClient", return_value=MagicMock()),
+    ):
+        agent_tools._public_only_async_client(
+            "https://custom.example/v1/images/generations",
+            timeout=120,
+        )
+
+    guard_class.assert_called_once_with(
+        "https://custom.example/v1/images/generations"
+    )
+    proxy_guard_class.assert_not_called()
 
 
 def test_agent_owned_media_key_requires_a_frozen_agent_endpoint_bundle():
@@ -335,6 +405,42 @@ async def test_minimax_billing_context_db_failure_is_not_treated_as_unbilled():
     with patch(
         "app.services.agent_tools._get_agent_tenant_id",
         AsyncMock(side_effect=RuntimeError("database unavailable")),
+    ):
+        with pytest.raises(MinimaxBillingContextError, match="No provider request was made"):
+            await _get_minimax_tenant_uuid(uuid.uuid4())
+
+
+@pytest.mark.asyncio
+async def test_agent_tenant_lookup_supports_strict_paid_media_mode():
+    tenant_id = uuid.uuid4()
+
+    class _Result:
+        def scalar_one_or_none(self):
+            return tenant_id
+
+    class _Session:
+        async def execute(self, statement):
+            del statement
+            return _Result()
+
+    class _SessionContext:
+        async def __aenter__(self):
+            return _Session()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            del exc_type, exc, tb
+
+    with patch("app.services.agent_tools.async_session", return_value=_SessionContext()):
+        result = await _get_agent_tenant_id(uuid.uuid4(), strict=True)
+
+    assert result == str(tenant_id)
+
+
+@pytest.mark.asyncio
+async def test_minimax_billing_context_rejects_missing_agent_tenant():
+    with patch(
+        "app.services.agent_tools._get_agent_tenant_id",
+        AsyncMock(return_value=None),
     ):
         with pytest.raises(MinimaxBillingContextError, match="No provider request was made"):
             await _get_minimax_tenant_uuid(uuid.uuid4())
@@ -1223,13 +1329,21 @@ async def test_generate_image_public_origin_preflight_failure_releases_hold(tmp_
             brand_asset=None,
             brand_position="center",
             brand_scale=0.42,
+            typed=True,
         )
 
     record_id = create_task.await_args.kwargs["record_id"]
     failed.assert_awaited_once_with(record_id, error)
     ambiguous.assert_not_awaited()
-    assert "remain held" not in result
-    assert "submission outcome is uncertain" not in result
+    assert isinstance(result, ToolExecutionOutcome)
+    assert result.status == "failed"
+    assert result.error_code == "minimax_image_network_policy_blocked"
+    assert result.metadata["runtime_halt_run"] is True
+    assert "do not call this tool again" in (result.result_summary or "")
+    assert "remain held" not in (result.result_summary or "")
+    assert "submission outcome is uncertain" not in (
+        result.result_summary or ""
+    )
 
 
 @pytest.mark.parametrize(

@@ -33,6 +33,9 @@ from app.services.llm.client import LLMMessage
 from app.services.llm.single_step import LLMCompletionStep, complete_llm_once
 from app.services.llm.failover import FailoverErrorType, classify_error
 from app.services.llm.utils import get_max_tokens
+from app.services.media_message_content import (
+    redact_inline_media_for_token_estimate,
+)
 
 
 _TOOL_NAME = "commit_thread_summary"
@@ -169,6 +172,7 @@ def _estimate_tokens(value: object) -> int:
         separators=(",", ":"),
         default=str,
     )
+    serialized = redact_inline_media_for_token_estimate(serialized)
     return max(1, math.ceil(len(serialized.encode("utf-8")) / 4))
 
 

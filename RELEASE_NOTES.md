@@ -23,19 +23,31 @@
 - Frontend merge conflicts in Direct Chat, model routing, runtime settings, MCP authorization, Markdown mentions, and the Experience Library were resolved without restoring deprecated object-level model selection.
 - Short Group sessions now skip model-budget resolution until an old message actually exists outside the recent raw-message window. An empty or provider-unconfigured local model pool can no longer create a repeating Session Compact error loop for ordinary new conversations.
 - The optional Agent `task_history.md` view now discovers the file before requesting its contents. A new Agent with no history renders the intended empty state without producing a browser 404 or polluting production issue monitoring.
+- The v1.11 upgrade now recognizes and normalizes the historical `gateway_messages` authorization foreign-key name emitted by migration 099, so real `trigger_privacy_serial` databases no longer fail the baseline-schema guard despite having the correct relationship.
+- Source-mode local deployment now fails closed on Alembic errors, installs the pinned LangGraph checkpoint schema before application startup, and translates the project's asyncpg `ssl=disable` DSN into psycopg's `sslmode=disable` form.
+- Source-mode tenant switching now defaults an unset `PUBLIC_BASE_URL` to the local frontend origin instead of redirecting browsers to the API port.
+- Historical tasks in the database with `status='failed'` are now part of the ORM and migration contract, preventing dashboard task-list reads from failing with SQLAlchemy `LookupError`.
+- Group Runtime mentions and Planning child Runs now use centralized SaaS tier routing, so a disabled legacy Agent model ID no longer blocks an otherwise entitled tenant.
+- Multimodal Runtime context budgeting now treats inline image and video Base64 as transport bytes instead of ordinary text tokens, preventing valid media requests from being rejected by Thread Compact before any provider or generation tool is called.
+- Paid MiniMax media tools now use the supported strict Agent-to-tenant lookup contract and report a missing tenant deterministically, fixing valid image and video requests that were blocked before provider submission by an unexpected keyword `TypeError`.
+- Proxied MiniMax media calls now use an explicit allowlisted provider path when `HTTP_PROXY` is configured. Production public-IP pinning remains fail-closed by default, while operator networks whose TUN DNS returns RFC 2544 fake-IP addresses can use the proxy without exposing provider credentials to tenant-configurable MCP endpoints; credential-free artifact downloads retain HTTPS, hostname, redirect, and size boundaries.
+- MiniMax provider-network policy failures now carry an explicit terminal Runtime outcome. The Agent stops after the first blocked media call instead of spending additional chat Credits on repeated calls that cannot succeed in the same Run.
+- Completed Runtime media events now carry the authoritative `workspace_path` and Agent-owned artifact references through durable activity and realtime delivery. Web Chat automatically opens only a verified artifact owned by the active Agent after synchronous or asynchronous completion, instead of leaving a successfully generated image or video hidden in the workspace.
 
 ## Validation
 
-- Complete backend suite: 3,453 tests passed. Production deployment/checkpoint contract suite: 189 tests passed.
-- Complete frontend suite: 65 Node contract tests and 112 Vitest tests passed; the production Vite build completed with 7,028 transformed modules.
-- PostgreSQL migration, A2A serialization, trigger-lane serialization, media Credits exactly-once settlement, production issue aggregation, approval CAS, and chat-tier preference smokes passed.
-- Isolated real-browser acceptance covered login, logout, local registration, account recovery screens, 12 core authenticated routes, all 12 Enterprise tabs, all 9 SaaS tabs, all 4 platform-admin tabs, all 8 Agent settings tabs, Group creation/session/member/message/mention/side-panel flows, Experience draft save-and-reopen, and Agent workspace/self-awareness empty states. The final post-fix window had no browser Console errors, HTTP 4xx/5xx responses, or backend ERROR events.
+- Complete backend suite: 3,478 tests passed. The changed Python files passed targeted Ruff validation; deployment shell syntax and `git diff --check` also passed.
+- Complete frontend suite: 65 Node contract tests and 113 Vitest tests passed; the production Vite build completed with 7,028 transformed modules.
+- PostgreSQL fresh upgrade, historical-schema upgrade, downgrade, and re-upgrade passed at the single `align_task_failed_status` head. A2A serialization, trigger-lane serialization, media Credits exactly-once settlement, production issue aggregation, approval CAS, and chat-tier preference smokes passed.
+- Isolated real-browser acceptance covered login, logout, local registration, account recovery screens, 12 core authenticated routes, all 12 Enterprise tabs, all 9 SaaS tabs, all 4 platform-admin tabs, all 8 Agent settings tabs, Group creation/session/member/message/mention/side-panel flows, Experience draft save-and-reopen/publish, and Agent workspace/self-awareness empty states. The final post-fix browser window had no Console errors or HTTP 4xx/5xx responses.
+- Local browser calls against the configured real MiniMax platform pool proved Lite `MiniMax-M3` image understanding, a brand-safe poster with the exact Chinese copy `天地一号 天下第一`, and an H.264 video that loaded, decoded, and played in Web Chat. The protected product SHA remained unchanged, successful media completion opened the exact workspace artifact, and each provider task finalized its Credits reservation exactly once.
 
 ## Upgrade Notes
 
 - Run both Alembic and the pinned checkpoint setup before starting any v1.11 worker. Supported container and production deployment paths now enforce this automatically.
 - Native Web Chat deliberately has no legacy fallback. A custom deployment that overrides `AGENT_RUNTIME_V2_ENABLED=false` must explicitly allow the required source types or Agent IDs; otherwise Chat and Group intake fail closed by design.
-- Existing local Astra capabilities remain code-owned and are not replaced by similarly named upstream implementations. Production deployment and provider-funded media/LLM verification remain separate approval-gated steps.
+- Existing local Astra capabilities remain code-owned and are not replaced by similarly named upstream implementations. Production deployment and production account-pool verification remain separate approval-gated steps.
+- Local acceptance proves integrity, routing, billing, delivery, and browser playback; it does not claim production deployment or creative-quality parity with dedicated Doubao/Qwen media products. The acceptance video deliberately favored immutable product pixels and exact copy over generative product motion, and the current output contains no audio track.
 
 # v1.10.13 — Durable Chat Attachment History
 

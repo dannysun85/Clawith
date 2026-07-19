@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
-import { appendUniqueById, safeMediaCompletionTool, safeWorkspaceMediaPath } from './mediaCompletion';
+import {
+    appendUniqueById,
+    safeMediaCompletionTool,
+    safeWorkspaceMediaPath,
+    workspaceMediaPathFromArtifactRefs,
+} from './mediaCompletion';
 
 describe('media completion helpers', () => {
     it('accepts only workspace-scoped paths', () => {
@@ -10,6 +15,21 @@ describe('media completion helpers', () => {
         expect(safeWorkspaceMediaPath('../secrets.mp4')).toBeNull();
         expect(safeWorkspaceMediaPath('workspace/../secrets.mp4')).toBeNull();
         expect(safeWorkspaceMediaPath('https://example.com/demo.mp4')).toBeNull();
+    });
+
+    it('accepts only workspace artifacts owned by the active agent', () => {
+        expect(workspaceMediaPathFromArtifactRefs(
+            ['workspace://agent-1/workspace/videos/demo.mp4'],
+            'agent-1',
+        )).toBe('workspace/videos/demo.mp4');
+        expect(workspaceMediaPathFromArtifactRefs(
+            ['workspace://agent-2/workspace/videos/demo.mp4'],
+            'agent-1',
+        )).toBeNull();
+        expect(workspaceMediaPathFromArtifactRefs(
+            ['workspace://agent-1/workspace/../secret.mp4'],
+            'agent-1',
+        )).toBeNull();
     });
 
     it('deduplicates realtime messages already loaded from history', () => {

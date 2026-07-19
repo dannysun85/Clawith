@@ -95,6 +95,7 @@ async def _insert_runtime_activity(
     key: str,
     summary: str,
     payload: dict,
+    artifact_refs: Sequence[str] = (),
 ) -> None:
     """Commit one idempotent observation beside the durable Tool Ledger fact."""
     await db.execute(
@@ -107,7 +108,7 @@ async def _insert_runtime_activity(
             event_type="status_changed",
             summary=summary,
             payload=payload,
-            artifact_refs=[],
+            artifact_refs=list(artifact_refs),
             idempotency_key=key,
             source_checkpoint_id=None,
             created_at=datetime.now(UTC),
@@ -278,6 +279,18 @@ def _result_message(
     if outcome.evidence_refs:
         message["evidence_refs"] = list(outcome.evidence_refs)
     return message
+
+
+def _runtime_halt_error(outcome: ToolExecutionOutcome) -> JsonObject | None:
+    """Translate an explicit tool control-plane stop into a terminal Run fact."""
+
+    if outcome.metadata.get("runtime_halt_run") is not True:
+        return None
+    return {
+        "code": outcome.error_code or "tool_run_halted",
+        "message": outcome.result_summary
+        or "Tool execution cannot safely continue in this run.",
+    }
 
 
 def _waiting_request(
@@ -900,7 +913,9 @@ class RuntimeToolStepService:
                         "result": execution.result_summary or "",
                         "execution_status": normalized.status,
                         "error_code": normalized.error_code,
+                        "workspace_path": normalized.metadata.get("workspace_path"),
                     },
+                    artifact_refs=normalized.artifact_refs,
                 )
         return replace(
             normalized,
@@ -1145,8 +1160,18 @@ class RuntimeToolStepService:
                                     "result": reused.result_summary or "",
                                     "execution_status": reused.status,
                                     "error_code": reused.error_code,
+                                    "workspace_path": reused.metadata.get("workspace_path"),
                                 },
+                                artifact_refs=reused.artifact_refs,
                             )
+                    halt_error = _runtime_halt_error(
+                        reservation.reusable_result
+                    )
+                    if halt_error is not None:
+                        return ToolStepResult(
+                            messages=tuple(messages),
+                            error=halt_error,
+                        )
                     if tool_name == "send_message_to_agent" and self._a2a_service:
                         waiting_request = a2a_waiting_request(
                             source_run_id=run_id,
@@ -1655,6 +1680,12 @@ class RuntimeToolStepService:
                         outcome=outcome,
                     )
                 )
+                halt_error = _runtime_halt_error(outcome)
+                if halt_error is not None:
+                    return ToolStepResult(
+                        messages=tuple(messages),
+                        error=halt_error,
+                    )
             return ToolStepResult(messages=tuple(messages))
         except (
             GroupWorkspaceReconciliationPending,

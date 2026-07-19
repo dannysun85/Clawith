@@ -386,9 +386,43 @@ _BASELINE_ORM_TABLE_OBJECTS = {
     for table_name in BASELINE_ORM_TABLES
 }
 
-_GATEWAY_MESSAGES_LEGACY_OBJECTS = _BASELINE_ORM_TABLE_OBJECTS["gateway_messages"] - {
-    "column:gateway_messages.conversation_id"
-}
+_GATEWAY_MESSAGES_CANONICAL_AUTHORIZATION_FK = (
+    "constraint:gateway_messages_authorization_source_agent_id_fkey"
+)
+_GATEWAY_MESSAGES_HISTORICAL_AUTHORIZATION_FK = (
+    "constraint:fk_gateway_messages_authorization_source_agent"
+)
+
+
+def _gateway_messages_with_historical_authorization_fk(
+    objects: set[str],
+) -> set[str]:
+    """Return the exact shape emitted by migration 099.
+
+    Migration 099 explicitly named this foreign key, while SQLAlchemy's
+    baseline table creation used PostgreSQL's generated name.  Both names bind
+    the same columns and target; the v1.11 migration normalizes the historical
+    name instead of rejecting a database produced by the supported release
+    line.
+    """
+    return (
+        objects - {_GATEWAY_MESSAGES_CANONICAL_AUTHORIZATION_FK}
+    ) | {_GATEWAY_MESSAGES_HISTORICAL_AUTHORIZATION_FK}
+
+
+_GATEWAY_MESSAGES_LEGACY_OBJECTS = _BASELINE_ORM_TABLE_OBJECTS[
+    "gateway_messages"
+] - {"column:gateway_messages.conversation_id"}
+_GATEWAY_MESSAGES_HISTORICAL_FK_OBJECTS = (
+    _gateway_messages_with_historical_authorization_fk(
+        _BASELINE_ORM_TABLE_OBJECTS["gateway_messages"]
+    )
+)
+_GATEWAY_MESSAGES_LEGACY_HISTORICAL_FK_OBJECTS = (
+    _gateway_messages_with_historical_authorization_fk(
+        _GATEWAY_MESSAGES_LEGACY_OBJECTS
+    )
+)
 _NOTIFICATION_EXTENSION_OBJECTS = {
     "column:notifications.agent_id",
     "column:notifications.sender_name",
@@ -597,10 +631,17 @@ def _baseline_orm_table_plan(
         return ("create", ())
 
     if table_name == "gateway_messages":
-        if present == expected:
+        gateway_present = (
+            expected | {_GATEWAY_MESSAGES_HISTORICAL_AUTHORIZATION_FK}
+        ).intersection(actual)
+        if gateway_present == expected:
             return ("keep", ())
-        if present == _GATEWAY_MESSAGES_LEGACY_OBJECTS:
+        if gateway_present == _GATEWAY_MESSAGES_LEGACY_OBJECTS:
             return ("upgrade_gateway_messages", ())
+        if gateway_present == _GATEWAY_MESSAGES_HISTORICAL_FK_OBJECTS:
+            return ("normalize_gateway_messages_fk", ())
+        if gateway_present == _GATEWAY_MESSAGES_LEGACY_HISTORICAL_FK_OBJECTS:
+            return ("upgrade_gateway_messages_historical_fk", ())
 
     elif table_name == "notifications":
         missing_indexes = tuple(name for name in BASELINE_ORM_INDEXES[table_name] if f"index:{name}" not in present)
@@ -922,6 +963,16 @@ def _upgrade_gateway_messages_legacy_shape() -> None:
     )
 
 
+def _normalize_gateway_messages_historical_authorization_fk() -> None:
+    op.execute(
+        sa.text(
+            "ALTER TABLE gateway_messages RENAME CONSTRAINT "
+            "fk_gateway_messages_authorization_source_agent TO "
+            "gateway_messages_authorization_source_agent_id_fkey"
+        )
+    )
+
+
 def _normalize_notifications_legacy_shape(*, add_extension: bool) -> None:
     if add_extension:
         op.add_column(
@@ -961,6 +1012,11 @@ def _upgrade_baseline_orm_tables() -> None:
             continue
         if action == "upgrade_gateway_messages":
             _upgrade_gateway_messages_legacy_shape()
+        elif action == "normalize_gateway_messages_fk":
+            _normalize_gateway_messages_historical_authorization_fk()
+        elif action == "upgrade_gateway_messages_historical_fk":
+            _upgrade_gateway_messages_legacy_shape()
+            _normalize_gateway_messages_historical_authorization_fk()
         elif action == "upgrade_legacy_notifications":
             _normalize_notifications_legacy_shape(add_extension=True)
         elif action == "normalize_notifications":

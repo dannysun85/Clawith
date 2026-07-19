@@ -120,6 +120,7 @@ _RESULT_METADATA_KEYS = frozenset(
         "runtime_attempt_count",
         "runtime_retry_pending",
         "runtime_retry_exhausted",
+        "runtime_halt_run",
         "last_error_code",
         "runtime_async_pending",
         "async_operation",

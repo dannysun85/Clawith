@@ -34,7 +34,12 @@ import {
 } from '../../utils/chatAttachmentPersistence';
 import { canAccessSaasAdmin } from '../../utils/saasAdmin';
 import { displaySessionTitle } from '../../utils/sessionDisplay';
-import { appendUniqueById, safeMediaCompletionTool, safeWorkspaceMediaPath } from '../../utils/mediaCompletion';
+import {
+    appendUniqueById,
+    safeMediaCompletionTool,
+    safeWorkspaceMediaPath,
+    workspaceMediaPathFromArtifactRefs,
+} from '../../utils/mediaCompletion';
 import {
     activeSessionMatchesRequestedSession,
     awaitCurrentChatPagination,
@@ -4036,6 +4041,26 @@ export default function AgentDetailPage() {
                     toolThinking: d.reasoning_content,
                 });
                 if (d.status === 'done') {
+                    const mediaPath = safeWorkspaceMediaPath(d.workspace_path)
+                        || workspaceMediaPathFromArtifactRefs(d.artifact_refs, agentId);
+                    if (mediaPath) {
+                        const activity: WorkspaceActivity = {
+                            action: 'write',
+                            path: mediaPath,
+                            tool: typeof d.name === 'string' && d.name.trim()
+                                ? d.name.trim()
+                                : 'media_generation',
+                            ok: true,
+                        };
+                        setWorkspaceActivePath(mediaPath);
+                        setWorkspaceActivities((prev) => [
+                            activity,
+                            ...prev.filter((item) => item.path !== mediaPath),
+                        ].slice(0, 20));
+                        setSidePanelTab('workspace');
+                        setLivePanelVisible(true);
+                        collapseSidebarsForLivePanel();
+                    }
                     const currentSessionId = activeSessionIdRef.current ? String(activeSessionIdRef.current) : '';
                     if (currentSessionId) clearUnreadForSession(currentSessionId);
                     queryClient.invalidateQueries({ queryKey: ['agents'] });

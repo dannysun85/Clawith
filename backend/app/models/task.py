@@ -3,8 +3,8 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Integer, String, Text, func
-from sqlalchemy.dialects.postgresql import JSON, UUID
+from sqlalchemy import DateTime, Enum, ForeignKey, String, Text, func
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -25,7 +25,7 @@ class Task(Base):
         nullable=False,
     )
     status: Mapped[str] = mapped_column(
-        Enum("pending", "doing", "done", name="task_status_enum"),
+        Enum("pending", "doing", "done", "failed", name="task_status_enum"),
         default="pending",
         nullable=False,
     )

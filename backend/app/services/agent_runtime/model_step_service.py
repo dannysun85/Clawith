@@ -55,6 +55,9 @@ from app.services.agent_runtime.thread_visibility import (
     model_visible_thread_messages,
 )
 from app.services.agent_tools import get_runtime_agent_tools_for_llm
+from app.services.media_message_content import (
+    redact_inline_media_for_token_estimate,
+)
 from app.services.vision_inject import compress_bytes_to_base64
 from app.services.llm.client import LLMMessage
 from app.services.llm.failover import FailoverErrorType, classify_error
@@ -267,6 +270,7 @@ def _estimate_tokens(value: object) -> int:
         sort_keys=True,
         default=str,
     )
+    serialized = redact_inline_media_for_token_estimate(serialized)
     return max((len(serialized) + 2) // 3, 1)
 
 

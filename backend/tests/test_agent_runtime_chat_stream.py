@@ -204,6 +204,10 @@ async def test_runtime_observation_events_restore_thinking_and_tool_packets() ->
                 "result": "contents",
                 "reasoning_content": "I should inspect the file.",
                 "execution_status": "succeeded",
+                "workspace_path": "workspace/images/poster.png",
+                "artifact_refs": [
+                    f"workspace://{agent_id}/workspace/images/poster.png"
+                ],
             },
         ),
         _event(handle, "run_completed", position=4, payload={"status": "completed"}),
@@ -244,6 +248,10 @@ async def test_runtime_observation_events_restore_thinking_and_tool_packets() ->
     assert packets[1]["status"] == "running"
     assert packets[2]["status"] == "done"
     assert packets[2]["result"] == "contents"
+    assert packets[2]["workspace_path"] == "workspace/images/poster.png"
+    assert packets[2]["artifact_refs"] == [
+        f"workspace://{agent_id}/workspace/images/poster.png"
+    ]
     assert packets[2]["event_cursor"].endswith(f"|{events[2].event_id}")
 
 

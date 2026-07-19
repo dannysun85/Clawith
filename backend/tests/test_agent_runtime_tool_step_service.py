@@ -1777,6 +1777,67 @@ async def test_group_preflight_confirmation_is_typed_failure_for_public_finish(
 
 
 @pytest.mark.asyncio
+async def test_explicit_control_plane_failure_halts_run_after_one_tool_call(
+    monkeypatch,
+) -> None:
+    tenant_id = uuid.uuid4()
+    agent = _agent(tenant_id)
+    call = _call("call-provider-policy", "write_file")
+    state = _state(tenant_id, agent, (call,))
+    execution = _execution(
+        tenant_id,
+        uuid.UUID(state["registry"].run_id),
+        "call-provider-policy",
+        "write_file",
+    )
+
+    async def reserve(db, **kwargs):
+        del db, kwargs
+        return _reservation(execution)
+
+    async def execute(*args, **kwargs):
+        del args, kwargs
+        return ToolExecutionOutcome(
+            status="failed",
+            result_summary=(
+                "Provider network policy blocked the request; do not retry."
+            ),
+            result_ref=None,
+            error_code="provider_network_policy_blocked",
+            retryable=False,
+            metadata={"runtime_halt_run": True},
+        )
+
+    async def mark_failed(db, **kwargs):
+        del db
+        execution.status = "failed"
+        execution.result_summary = kwargs["result_summary"]
+        execution.result_metadata = kwargs["metadata"]
+        return execution
+
+    monkeypatch.setattr(tool_step_service, "reserve_tool_execution", reserve)
+    monkeypatch.setattr(
+        tool_step_service,
+        "mark_tool_execution_failed",
+        mark_failed,
+    )
+
+    result = await _service(
+        agent,
+        _CancelSource(None),
+        execute,
+    ).execute_pending(state, _context(state), (call,))
+
+    assert result.waiting_request is None
+    assert result.pending_tool_calls == ()
+    assert result.messages[0]["execution_status"] == "failed"
+    assert result.error == {
+        "code": "provider_network_policy_blocked",
+        "message": "Provider network policy blocked the request; do not retry.",
+    }
+
+
+@pytest.mark.asyncio
 async def test_group_unknown_outcome_fails_run_without_user_interrupt(
     monkeypatch,
 ) -> None:

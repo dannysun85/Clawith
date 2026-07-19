@@ -769,6 +769,60 @@ def test_gateway_messages_known_legacy_shape_adds_conversation_id(
     assert str(added[0][1].type) == "VARCHAR(100)"
 
 
+@pytest.mark.parametrize(
+    ("actual_gateway_shape", "adds_conversation_id"),
+    (
+        ("_GATEWAY_MESSAGES_HISTORICAL_FK_OBJECTS", False),
+        ("_GATEWAY_MESSAGES_LEGACY_HISTORICAL_FK_OBJECTS", True),
+    ),
+)
+def test_gateway_messages_migration_099_fk_name_is_normalized(
+    monkeypatch,
+    actual_gateway_shape: str,
+    adds_conversation_id: bool,
+) -> None:
+    migration = _load_migration()
+    actual = set(getattr(migration, actual_gateway_shape))
+    for table_name in migration.BASELINE_ORM_TABLES:
+        if table_name != "gateway_messages":
+            actual.update(migration._BASELINE_ORM_TABLE_OBJECTS[table_name])
+    added: list[tuple[str, sa.Column]] = []
+    statements: list[str] = []
+
+    monkeypatch.setattr(migration.op, "get_bind", lambda: object())
+    monkeypatch.setattr(migration, "_schema_object_names", lambda _bind: actual)
+    monkeypatch.setattr(
+        migration.op,
+        "add_column",
+        lambda table_name, column: added.append((table_name, column)),
+    )
+    monkeypatch.setattr(migration.op, "alter_column", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        migration.op,
+        "execute",
+        lambda statement: statements.append(str(statement)),
+    )
+    monkeypatch.setattr(
+        migration,
+        "_BASELINE_ORM_CREATE",
+        {
+            table_name: lambda: pytest.fail("known tables must not be recreated")
+            for table_name in migration.BASELINE_ORM_TABLES
+        },
+    )
+
+    migration._upgrade_baseline_orm_tables()
+
+    assert [column.name for _table, column in added] == (
+        ["conversation_id"] if adds_conversation_id else []
+    )
+    assert statements == [
+        "ALTER TABLE gateway_messages RENAME CONSTRAINT "
+        "fk_gateway_messages_authorization_source_agent TO "
+        "gateway_messages_authorization_source_agent_id_fkey"
+    ]
+
+
 def test_notifications_original_shape_gets_lossless_016_repair(
     monkeypatch,
 ) -> None:

@@ -5,6 +5,20 @@ export function safeWorkspaceMediaPath(value: unknown): string | null {
     return path;
 }
 
+export function workspaceMediaPathFromArtifactRefs(
+    value: unknown,
+    agentId: string,
+): string | null {
+    if (!Array.isArray(value) || !agentId.trim()) return null;
+    const prefix = `workspace://${agentId}/`;
+    for (const ref of value) {
+        if (typeof ref !== 'string' || !ref.startsWith(prefix)) continue;
+        const path = safeWorkspaceMediaPath(ref.slice(prefix.length));
+        if (path) return path;
+    }
+    return null;
+}
+
 const COMPLETION_TOOLS: Record<string, string> = {
     image: 'generate_image_minimax',
     audio: 'generate_speech_minimax',

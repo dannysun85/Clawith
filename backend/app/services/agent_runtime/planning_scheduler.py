@@ -278,7 +278,6 @@ def _validate_entry_targets(
             or target.agent is None
             or target.agent.id != agent_id
             or target.model is None
-            or target.agent.primary_model_id != target.model.id
         ):
             raise PlanningSchedulingError(
                 "planning_entry_unavailable",

@@ -87,16 +87,47 @@ def _to_psycopg_url(database_url: str) -> str:
     parts = urlsplit(normalized)
     existing_options: list[str] = []
     other_query_parts: list[str] = []
+    asyncpg_sslmode: str | None = None
+    has_libpq_sslmode = False
     for query_part in parts.query.split("&"):
         if not query_part:
             continue
         encoded_key, separator, encoded_value = query_part.partition("=")
-        if unquote(encoded_key) == "options":
+        key = unquote(encoded_key)
+        if key == "options":
             existing_options.append(unquote(encoded_value) if separator else "")
+        elif key == "ssl":
+            if not separator:
+                raise CheckpointerConfigurationError(
+                    "Checkpoint database URL ssl parameter must have a value"
+                )
+            ssl_value = unquote(encoded_value).strip().lower()
+            ssl_aliases = {"true": "require", "false": "disable"}
+            asyncpg_sslmode = ssl_aliases.get(ssl_value, ssl_value)
+            if asyncpg_sslmode not in {
+                "disable",
+                "allow",
+                "prefer",
+                "require",
+                "verify-ca",
+                "verify-full",
+            }:
+                raise CheckpointerConfigurationError(
+                    "Checkpoint database URL contains an unsupported ssl value"
+                )
         else:
             # Preserve unrelated libpq parameters byte-for-byte. In PostgreSQL
             # connection URIs, unlike HTML form encoding, ``+`` is literal.
             other_query_parts.append(query_part)
+            if key == "sslmode":
+                has_libpq_sslmode = True
+
+    if asyncpg_sslmode is not None:
+        if has_libpq_sslmode:
+            raise CheckpointerConfigurationError(
+                "Checkpoint database URL cannot contain both ssl and sslmode"
+            )
+        other_query_parts.append(f"sslmode={quote(asyncpg_sslmode, safe='')}")
 
     search_path_option = f"-csearch_path={_CHECKPOINT_SCHEMA}"
     options = " ".join([option for option in existing_options if option] + [search_path_option])
