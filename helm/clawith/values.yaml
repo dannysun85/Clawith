@@ -61,7 +61,7 @@ backend:
     # Set false only for an intentional allowlist/source-type staged rollout.
     runtimeV2Enabled: true
     runtimeV2AgentIds: ""
-    runtimeV2SourceTypes: task
+    runtimeV2SourceTypes: ""
     runtimeCommandConcurrency: 10
     # Global kill switch for proactive Agent heartbeat. Explicit triggers are unaffected.
     heartbeatEnabled: false

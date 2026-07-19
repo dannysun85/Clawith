@@ -135,21 +135,28 @@ def test_runtime_rollout_policy_reaches_every_supported_deployment_path():
     )
     assert "runtimeV2Enabled: true" in values
     assert "runtimeV2AgentIds:" in values
-    assert "runtimeV2SourceTypes: task" in values
+    assert 'runtimeV2SourceTypes: ""' in values
     assert "runtimeCommandConcurrency: 10" in values
     for variable in variables:
         assert f"name: {variable}" in deployment
 
-    # Generic low-level defaults stay fail closed for staged rollout. The
-    # reviewed v1.11 production workflow opts the complete product path in.
-    root_compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
-    assert "AGENT_RUNTIME_V2_ENABLED: ${AGENT_RUNTIME_V2_ENABLED:-false}" in root_compose
+    # Supported v1.11.1 deployments pin the only remaining Runtime path and do
+    # not inherit stale rollout variables from an older release environment.
+    for relative_path in compose_contracts:
+        compose = (ROOT / relative_path).read_text(encoding="utf-8")
+        assert 'AGENT_RUNTIME_V2_ENABLED: "true"' in compose
+        assert 'AGENT_RUNTIME_V2_AGENT_IDS: ""' in compose
+        assert 'AGENT_RUNTIME_V2_SOURCE_TYPES: ""' in compose
+        assert "AGENT_RUNTIME_V2_ENABLED: ${" not in compose
+        assert "AGENT_RUNTIME_V2_AGENT_IDS: ${" not in compose
+        assert "AGENT_RUNTIME_V2_SOURCE_TYPES: ${" not in compose
+
     deploy_script = (ROOT / "scripts/deploy-astra-production.sh").read_text(
         encoding="utf-8"
     )
     assert '"AGENT_RUNTIME_V2_ENABLED": "true"' in deploy_script
     assert '"AGENT_RUNTIME_V2_AGENT_IDS": ""' in deploy_script
-    assert '"AGENT_RUNTIME_V2_SOURCE_TYPES": "task"' in deploy_script
+    assert '"AGENT_RUNTIME_V2_SOURCE_TYPES": ""' in deploy_script
 
 
 def test_production_code_execution_defaults_fail_closed():

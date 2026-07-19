@@ -52,32 +52,58 @@ def test_primary_asyncpg_url_is_the_checkpoint_fallback() -> None:
     )
 
 
-def test_primary_asyncpg_ssl_parameter_is_normalized_for_psycopg() -> None:
-    settings = _settings(
-        DATABASE_URL=(
-            "postgresql+asyncpg://app:secret@db.example/clawith?ssl=disable"
+@pytest.mark.parametrize(
+    ("asyncpg_value", "psycopg_value"),
+    [
+        ("disable", "disable"),
+        ("require", "require"),
+        ("false", "disable"),
+        ("true", "require"),
+        ("0", "disable"),
+        ("1", "require"),
+    ],
+)
+def test_primary_asyncpg_ssl_query_is_normalized_for_psycopg(
+    asyncpg_value: str,
+    psycopg_value: str,
+) -> None:
+    url = checkpoint_database_url(
+        _settings(
+            DATABASE_URL=(
+                "postgresql+asyncpg://app:secret@db.example/clawith"
+                f"?ssl={asyncpg_value}"
+            )
         )
     )
 
-    normalized = checkpoint_database_url(settings)
+    parsed = conninfo_to_dict(url)
 
-    assert normalized == (
-        "postgresql://app:secret@db.example/clawith?sslmode=disable&"
-        "options=-csearch_path%3Dlanggraph_checkpoint"
-    )
-    assert conninfo_to_dict(normalized)["sslmode"] == "disable"
+    assert parsed["sslmode"] == psycopg_value
+    assert parsed["options"] == "-csearch_path=langgraph_checkpoint"
 
 
-def test_checkpoint_url_rejects_conflicting_ssl_dialects() -> None:
-    settings = _settings(
-        DATABASE_URL=(
-            "postgresql+asyncpg://app:secret@db.example/clawith?"
-            "ssl=disable&sslmode=require"
+def test_conflicting_asyncpg_ssl_and_psycopg_sslmode_fails_closed() -> None:
+    with pytest.raises(CheckpointerConfigurationError, match="conflicting ssl"):
+        checkpoint_database_url(
+            _settings(
+                DATABASE_URL=(
+                    "postgresql+asyncpg://app:secret@db.example/clawith"
+                    "?ssl=disable&sslmode=require"
+                )
+            )
         )
-    )
 
-    with pytest.raises(CheckpointerConfigurationError, match="both ssl and sslmode"):
-        checkpoint_database_url(settings)
+
+@pytest.mark.parametrize("query", ["ssl=", "sslmode=", "ssl=maybe", "sslmode=maybe"])
+def test_invalid_checkpoint_ssl_query_fails_closed(query: str) -> None:
+    with pytest.raises(CheckpointerConfigurationError):
+        checkpoint_database_url(
+            _settings(
+                DATABASE_URL=(
+                    "postgresql+asyncpg://app:secret@db.example/clawith?" + query
+                )
+            )
+        )
 
 
 def test_checkpoint_url_preserves_existing_options_and_forces_isolated_schema() -> None:

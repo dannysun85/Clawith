@@ -1,3 +1,54 @@
+# v1.11.1 — Runtime Bootstrap and Deployment Stability
+
+## Stability Fixes
+
+- Integrated official Clawith `v1.11.1` while preserving Astra's tenant routing,
+  Credits, media, automation, Code authorization, CORS, deployment, and signal
+  handling safeguards.
+- Alembic now completes before the pinned LangGraph checkpoint migration, and
+  concurrent bootstrap processes serialize checkpoint DDL with a PostgreSQL
+  advisory lock. Supported startup paths fail closed before application startup
+  when the checkpoint schema cannot be prepared.
+- Supported Compose and Astra production deployments pin the durable Runtime on
+  with empty rollout filters, so stale `AGENT_RUNTIME_V2_*` values from an older
+  `.env` cannot silently switch Chat, Group, Trigger, Task, Heartbeat, or A2A back
+  to the retired execution path.
+- Checkpoint database URLs accept asyncpg and libpq SSL spellings, normalize
+  boolean/numeric aliases, preserve unrelated query options, and reject blank,
+  unsupported, or conflicting SSL policies.
+- Backend and frontend product versions are synchronized at `1.11.1`; the
+  imported upstream tag remains separately identifiable as
+  `upstream-v1.11.1`.
+
+## Validation
+
+- Complete backend suite: `3493 passed`; changed-file Ruff gate: no new
+  violations across eight changed Python files.
+- Complete frontend suite: `65` Node contract tests and `113` Vitest tests;
+  production build completed with `7028` transformed modules.
+- PostgreSQL fresh install, historical-schema upgrade, downgrade and re-upgrade
+  smoke passed at the single `align_task_failed_status` Alembic head, including
+  Credits, media, A2A, approval and production-issue checks.
+- Two simultaneous checkpoint bootstrap processes completed against the same
+  real PostgreSQL database; the saver migration ledger contained `10` rows and
+  all three core checkpoint tables were present. This also caught and fixed a
+  blocking advisory-lock/`CREATE INDEX CONCURRENTLY` deadlock not represented by
+  the upstream unit tests.
+- Root, CI, deploy, multi-process and Astra production Compose files parsed
+  successfully; backend/frontend lock consistency and deployment shell syntax
+  checks passed.
+
+## Upgrade Notes
+
+- Run Alembic and `python -m app.scripts.setup_langgraph_checkpoints` before any
+  Runtime worker starts. The supported entrypoint, source restart, CI, and Astra
+  production deployment paths enforce this ordering.
+- Runtime availability is no longer a tenant-facing or deployment-time feature
+  switch. Heartbeat/CEO automation, Code execution, provider credentials, and
+  paid media generation retain their independent fail-closed controls.
+- This patch changes Runtime startup and deployment behavior only. It does not
+  implement the planned PPT, poster, or video creative workbench.
+
 # v1.11.0 — Durable Runtime, Group Collaboration, and Experience Library
 
 ## What's New

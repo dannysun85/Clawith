@@ -4389,7 +4389,7 @@ updates = {
     # Runtime. Code execution remains governed by its independent gates below.
     "AGENT_RUNTIME_V2_ENABLED": "true",
     "AGENT_RUNTIME_V2_AGENT_IDS": "",
-    "AGENT_RUNTIME_V2_SOURCE_TYPES": "task",
+    "AGENT_RUNTIME_V2_SOURCE_TYPES": "",
     "AGENT_RUNTIME_COMMAND_CONCURRENCY": "10",
     "HEARTBEAT_ENABLED": "false",
     "TRIGGER_DAEMON_ENABLED": "true",

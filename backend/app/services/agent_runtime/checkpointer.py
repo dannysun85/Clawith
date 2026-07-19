@@ -87,8 +87,16 @@ def _to_psycopg_url(database_url: str) -> str:
     parts = urlsplit(normalized)
     existing_options: list[str] = []
     other_query_parts: list[str] = []
+    explicit_sslmode: str | None = None
     asyncpg_sslmode: str | None = None
-    has_libpq_sslmode = False
+    supported_sslmodes = {
+        "disable",
+        "allow",
+        "prefer",
+        "require",
+        "verify-ca",
+        "verify-full",
+    }
     for query_part in parts.query.split("&"):
         if not query_part:
             continue
@@ -97,37 +105,44 @@ def _to_psycopg_url(database_url: str) -> str:
         if key == "options":
             existing_options.append(unquote(encoded_value) if separator else "")
         elif key == "ssl":
-            if not separator:
+            if not separator or not encoded_value:
                 raise CheckpointerConfigurationError(
-                    "Checkpoint database URL ssl parameter must have a value"
+                    "Checkpoint database ssl query parameter must not be blank"
                 )
-            ssl_value = unquote(encoded_value).strip().lower()
-            ssl_aliases = {"true": "require", "false": "disable"}
-            asyncpg_sslmode = ssl_aliases.get(ssl_value, ssl_value)
-            if asyncpg_sslmode not in {
-                "disable",
-                "allow",
-                "prefer",
-                "require",
-                "verify-ca",
-                "verify-full",
-            }:
+            value = unquote(encoded_value).strip().lower()
+            asyncpg_sslmode = {
+                "true": "require",
+                "1": "require",
+                "false": "disable",
+                "0": "disable",
+            }.get(value, value)
+            if asyncpg_sslmode not in supported_sslmodes:
                 raise CheckpointerConfigurationError(
                     "Checkpoint database URL contains an unsupported ssl value"
                 )
+        elif key == "sslmode":
+            if not separator or not encoded_value:
+                raise CheckpointerConfigurationError(
+                    "Checkpoint database sslmode query parameter must not be blank"
+                )
+            explicit_sslmode = unquote(encoded_value).strip().lower()
+            if explicit_sslmode not in supported_sslmodes:
+                raise CheckpointerConfigurationError(
+                    "Checkpoint database URL contains an unsupported sslmode value"
+                )
+            other_query_parts.append(query_part)
         else:
             # Preserve unrelated libpq parameters byte-for-byte. In PostgreSQL
             # connection URIs, unlike HTML form encoding, ``+`` is literal.
             other_query_parts.append(query_part)
-            if key == "sslmode":
-                has_libpq_sslmode = True
 
     if asyncpg_sslmode is not None:
-        if has_libpq_sslmode:
+        if explicit_sslmode is not None and explicit_sslmode != asyncpg_sslmode:
             raise CheckpointerConfigurationError(
-                "Checkpoint database URL cannot contain both ssl and sslmode"
+                "Checkpoint database URL contains conflicting ssl and sslmode values"
             )
-        other_query_parts.append(f"sslmode={quote(asyncpg_sslmode, safe='')}")
+        if explicit_sslmode is None:
+            other_query_parts.append(f"sslmode={quote(asyncpg_sslmode, safe='')}")
 
     search_path_option = f"-csearch_path={_CHECKPOINT_SCHEMA}"
     options = " ".join([option for option in existing_options if option] + [search_path_option])

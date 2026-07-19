@@ -262,9 +262,9 @@ start_backend() {
     .venv/bin/alembic upgrade head
 
     # LangGraph owns its checkpoint tables through the pinned saver migration
-    # ledger. Install them only after the product Alembic graph is current and
-    # fail closed so the local Runtime cannot start against a partial schema.
-    echo -e "${YELLOW}🔄 Installing LangGraph checkpoint schema...${NC}"
+    # ledger. Run its idempotent, advisory-lock-serialized migration only after
+    # the product Alembic graph is current, and fail closed on any error.
+    echo -e "${YELLOW}🔄 Running LangGraph checkpoint migrations...${NC}"
     .venv/bin/python -m app.scripts.setup_langgraph_checkpoints
 
     # Auto-run data migrations (idempotent)
@@ -272,6 +272,9 @@ start_backend() {
     .venv/bin/python -m app.scripts.migrate_schedules_to_triggers || true
     start_detached "$BACKEND_DIR" "$BACKEND_LOG" "$BACKEND_PID" \
         env PYTHONUNBUFFERED=1 \
+            AGENT_RUNTIME_V2_ENABLED=true \
+            AGENT_RUNTIME_V2_AGENT_IDS= \
+            AGENT_RUNTIME_V2_SOURCE_TYPES= \
             PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-}" \
             DATABASE_URL="$DATABASE_URL" \
             .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port $BACKEND_PORT --ws-max-size 67108864

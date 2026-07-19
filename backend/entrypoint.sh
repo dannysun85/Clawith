@@ -63,14 +63,34 @@ if role_contains "bootstrap"; then
         echo "[entrypoint] Alembic migrations completed successfully."
     fi
 
-    echo "[entrypoint] Step 1b: Installing LangGraph checkpoint schema..."
-    python -m app.scripts.setup_langgraph_checkpoints
-    echo "[entrypoint] LangGraph checkpoint schema is ready."
+    echo "[entrypoint] Step 2: Installing LangGraph checkpoint tables..."
+    set +e
+    CHECKPOINT_OUTPUT=$(python -m app.scripts.setup_langgraph_checkpoints 2>&1)
+    CHECKPOINT_EXIT=$?
+    set -e
+
+    if [ $CHECKPOINT_EXIT -ne 0 ]; then
+        echo ""
+        echo "========================================================================"
+        echo "[entrypoint] ERROR: LangGraph checkpoint setup FAILED (exit code $CHECKPOINT_EXIT)"
+        echo "========================================================================"
+        echo ""
+        echo "$CHECKPOINT_OUTPUT"
+        echo ""
+        if [ "$ALLOW_MIGRATION_FAILURE" = "true" ]; then
+            echo "[entrypoint] Continuing because ALLOW_MIGRATION_FAILURE=true"
+        else
+            exit $CHECKPOINT_EXIT
+        fi
+    else
+        echo "[entrypoint] LangGraph checkpoint tables are ready."
+    fi
 else
     echo "[entrypoint] Step 1: Skipping alembic for PROCESS_ROLE=${PROCESS_ROLE}"
+    echo "[entrypoint] Step 2: Skipping LangGraph checkpoint setup for PROCESS_ROLE=${PROCESS_ROLE}"
 fi
 
-echo "[entrypoint] Step 2: Starting uvicorn..."
+echo "[entrypoint] Step 3: Starting uvicorn..."
 # The command itself must replace the shell so the application becomes PID 1.
 # Do not start a login shell here: bash would rebuild PATH and hide the locked
 # virtual environment installed at /app/.venv.

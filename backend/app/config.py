@@ -168,9 +168,10 @@ class Settings(BaseSettings):
     # Process role
     PROCESS_ROLE: str = "all"
 
-    # Durable Agent Runtime. The new runtime is opt-in until the integrated
-    # billing, routing, migration, and browser gates have passed.
-    AGENT_RUNTIME_V2_ENABLED: bool = False
+    # Durable Agent Runtime. This is the only supported execution path; the
+    # legacy rollout fields remain readable only for explicit test coverage and
+    # existing-Run compatibility.
+    AGENT_RUNTIME_V2_ENABLED: bool = True
     AGENT_RUNTIME_V2_AGENT_IDS: str = ""
     AGENT_RUNTIME_V2_SOURCE_TYPES: str = "task"
     AGENT_RUNTIME_GRAPH_NAME: str = "clawith_agent_runtime"
