@@ -5,6 +5,7 @@ import {
     deliverableLaunchMessage,
     deliverableRouteTier,
     latestPendingDeliverable,
+    latestTrackedDeliverable,
     requestCanLaunchFromComposer,
 } from './deliverables';
 
@@ -55,6 +56,15 @@ describe('deliverable composer selection', () => {
 
         expect(latestPendingDeliverable([running, dismissed, ready], new Set(['dismissed']))?.id).toBe('ready');
         expect(latestPendingDeliverable([running], new Set())).toBeNull();
+    });
+
+    it('shows only launched non-cancelled work in the delivery status card', () => {
+        const ready = request({ id: 'ready' });
+        const cancelled = request({ id: 'cancelled', status: 'cancelled', agent_run_id: 'run-cancelled' });
+        const completed = request({ id: 'completed', status: 'succeeded', agent_run_id: 'run-completed' });
+
+        expect(latestTrackedDeliverable([ready, cancelled, completed])?.id).toBe('completed');
+        expect(latestTrackedDeliverable([ready, cancelled])).toBeNull();
     });
 
     it('builds equivalent Chinese and English launch copy from the persisted goal', () => {

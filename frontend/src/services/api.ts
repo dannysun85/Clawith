@@ -643,6 +643,12 @@ export const deliverableApi = {
         return request<DeliverableRequest[]>(`/deliverables/requests?${query.toString()}`);
     },
     get: (requestId: string) => request<DeliverableRequest>(`/deliverables/requests/${requestId}`),
+    artifactDownloadUrl: (artifactId: string, options?: { inline?: boolean }) => {
+        const query = new URLSearchParams();
+        if (options?.inline) query.set('inline', 'true');
+        const suffix = query.toString();
+        return `/api/deliverables/artifacts/${encodeURIComponent(artifactId)}/download${suffix ? `?${suffix}` : ''}`;
+    },
     action: (requestId: string, action: 'submit' | 'approve' | 'request_changes' | 'cancel', expectedVersion: number) =>
         request<DeliverableRequest>(`/deliverables/requests/${requestId}/actions`, {
             method: 'POST',

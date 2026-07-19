@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.deliverable import DeliverableRequest
 from app.models.tool import AgentTool, Tool
+from app.services.deliverable_artifacts import reconcile_runtime_deliverable_artifacts
 from app.services.entitlements import get_tenant_entitlements
 from app.services.media_capabilities import get_agent_media_capabilities
 from app.services.minimax_media_profiles import resolve_minimax_media_profile
@@ -259,15 +260,22 @@ def build_deliverable_prompt(request: DeliverableRequest) -> str:
         "You are executing a persisted Astra Deliverable Request. Treat the following JSON as "
         "the authoritative product brief. Do not choose or reveal a provider/model. Use only enabled "
         "tools, keep every artifact under workspace/deliverables/"
-        f"{request.id}/, and never claim success until the requested files exist and validate.\n"
+        f"{request.id}/, and never claim success until every output_contract file exists and validates. "
+        "For presentation requests, create one structurally valid PPTX with convert_html_to_pptx and "
+        "one matching PDF with convert_html_to_pdf; report both exact workspace paths.\n"
         f"DELIVERABLE_REQUEST={json.dumps(contract, ensure_ascii=False, sort_keys=True)}"
     )
 
 
-async def _presentation_tool_available(db: AsyncSession, agent_id: uuid.UUID) -> bool:
+async def _agent_tool_available(
+    db: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+    tool_name: str,
+) -> bool:
     result = await db.execute(
         select(Tool).where(
-            Tool.name == "convert_html_to_pptx",
+            Tool.name == tool_name,
             Tool.enabled == True,  # noqa: E712
         )
     )
@@ -282,6 +290,23 @@ async def _presentation_tool_available(db: AsyncSession, agent_id: uuid.UUID) ->
     )
     assignment = assignment_result.scalar_one_or_none()
     return bool(assignment.enabled) if assignment is not None else bool(tool.is_default)
+
+
+async def _presentation_tool_available(db: AsyncSession, agent_id: uuid.UUID) -> bool:
+    return all(
+        [
+            await _agent_tool_available(
+                db,
+                agent_id=agent_id,
+                tool_name="convert_html_to_pptx",
+            ),
+            await _agent_tool_available(
+                db,
+                agent_id=agent_id,
+                tool_name="convert_html_to_pdf",
+            ),
+        ]
+    )
 
 
 def _credit_estimate(workflow: WorkflowManifest, tier: str, spec: dict[str, Any]) -> dict[str, Any]:
@@ -481,6 +506,53 @@ async def sync_deliverable_lifecycle(
     request = result.scalar_one_or_none()
     if not isinstance(request, DeliverableRequest):
         return None
+    if request.status in {"succeeded", "cancelled"}:
+        return request
+    if request.status == "failed" and request.current_stage == "changes_requested":
+        return request
+    normalized_lifecycle_status = str(lifecycle_status or "").strip().lower()
+    if normalized_lifecycle_status == "completed" and request.work_type == "presentation":
+        reconciliation = await reconcile_runtime_deliverable_artifacts(
+            db,
+            request=request,
+            run_id=run_id,
+        )
+        if reconciliation.complete:
+            next_status, next_stage, next_error_code = (
+                "waiting_approval",
+                "output_review",
+                None,
+            )
+        elif reconciliation.unavailable_types:
+            next_status, next_stage, next_error_code = (
+                "failed",
+                "artifact_verification_failed",
+                "deliverable_artifact_verification_unavailable",
+            )
+        elif reconciliation.invalid_types:
+            next_status, next_stage, next_error_code = (
+                "failed",
+                "artifact_verification_failed",
+                "deliverable_artifact_invalid",
+            )
+        else:
+            next_status, next_stage, next_error_code = (
+                "failed",
+                "artifact_verification_failed",
+                "deliverable_artifact_missing",
+            )
+        if (
+            request.status == next_status
+            and request.current_stage == next_stage
+            and request.last_error_code == next_error_code
+        ):
+            return request
+        request.status = next_status
+        request.current_stage = next_stage
+        request.completed_at = now or datetime.now(UTC) if next_status == "failed" else None
+        request.last_error_code = next_error_code
+        request.version += 1
+        return request
     terminal_mapping = {
         # A completed Runtime only proves that the agent stopped normally. The
         # deliverable still needs an artifact revision and evaluator evidence.
@@ -488,7 +560,7 @@ async def sync_deliverable_lifecycle(
         "failed": ("failed", "failed"),
         "cancelled": ("cancelled", "cancelled"),
     }
-    transition = terminal_mapping.get(str(lifecycle_status or "").strip().lower())
+    transition = terminal_mapping.get(normalized_lifecycle_status)
     if transition is None:
         return request
     next_status, next_stage = transition

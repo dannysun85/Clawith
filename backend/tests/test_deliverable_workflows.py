@@ -317,8 +317,21 @@ async def test_runtime_terminal_state_closes_the_linked_deliverable(
     lifecycle_status: str,
     expected_status: str,
     expected_error: str | None,
+    monkeypatch,
 ) -> None:
     request = _request(status="running", current_stage="running", agent_run_id=uuid.uuid4())
+    if lifecycle_status == "completed":
+        monkeypatch.setattr(
+            "app.services.deliverable_workflows.reconcile_runtime_deliverable_artifacts",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    complete=True,
+                    missing_types=(),
+                    invalid_types=(),
+                    unavailable_types=(),
+                )
+            ),
+        )
     result = await sync_deliverable_lifecycle(
         _Session(request),  # type: ignore[arg-type]
         tenant_id=request.tenant_id,
@@ -344,3 +357,60 @@ async def test_runtime_terminal_state_closes_the_linked_deliverable(
     )
     assert repeated is request
     assert request.version == 2
+
+
+@pytest.mark.asyncio
+async def test_completed_runtime_fails_deliverable_when_required_artifact_is_missing(monkeypatch) -> None:
+    request = _request(status="running", current_stage="running", agent_run_id=uuid.uuid4())
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.reconcile_runtime_deliverable_artifacts",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                complete=False,
+                missing_types=("pdf",),
+                invalid_types=(),
+                unavailable_types=(),
+            )
+        ),
+    )
+
+    result = await sync_deliverable_lifecycle(
+        _Session(request),  # type: ignore[arg-type]
+        tenant_id=request.tenant_id,
+        run_id=request.agent_run_id,
+        lifecycle_status="completed",
+    )
+
+    assert result is request
+    assert request.status == "failed"
+    assert request.current_stage == "artifact_verification_failed"
+    assert request.last_error_code == "deliverable_artifact_missing"
+    assert request.completed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_runtime_replay_never_regresses_an_approved_deliverable(monkeypatch) -> None:
+    request = _request(
+        status="succeeded",
+        current_stage="delivered",
+        agent_run_id=uuid.uuid4(),
+        version=3,
+    )
+    reconcile = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.reconcile_runtime_deliverable_artifacts",
+        reconcile,
+    )
+
+    result = await sync_deliverable_lifecycle(
+        _Session(request),  # type: ignore[arg-type]
+        tenant_id=request.tenant_id,
+        run_id=request.agent_run_id,
+        lifecycle_status="completed",
+    )
+
+    assert result is request
+    assert request.status == "succeeded"
+    assert request.current_stage == "delivered"
+    assert request.version == 3
+    reconcile.assert_not_awaited()

@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from pathlib import Path
+from urllib.parse import quote
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
+from fastapi.responses import Response
+from sqlalchemy import inspect as sa_inspect, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,6 +27,11 @@ from app.schemas.deliverable import (
     DeliverableRequestOut,
     DeliverableRequestUpdate,
 )
+from app.services.deliverable_artifacts import (
+    DeliverableArtifactError,
+    approve_deliverable_artifacts,
+    read_deliverable_artifact_snapshot,
+)
 from app.services.deliverable_workflows import (
     DeliverableWorkflowError,
     list_workflow_manifests,
@@ -31,6 +40,7 @@ from app.services.deliverable_workflows import (
     require_workflow,
     validate_workflow_spec,
 )
+from app.services.storage import get_storage_backend, guess_content_type
 
 
 router = APIRouter(prefix="/api/deliverables", tags=["deliverables"])
@@ -64,6 +74,12 @@ async def _require_direct_session(
 
 
 async def _request_out(db: AsyncSession, request: DeliverableRequest) -> DeliverableRequestOut:
+    # Server-side ``onupdate`` columns (notably ``updated_at``) are expired by
+    # SQLAlchemy after a flush.  Pydantic reads attributes synchronously, so an
+    # expired value would otherwise trigger async lazy IO and ``MissingGreenlet``
+    # while serializing a successful mutation response.
+    if sa_inspect(request).expired_attributes:
+        await db.refresh(request)
     result = await db.execute(
         select(DeliverableArtifactRevision)
         .where(
@@ -269,6 +285,41 @@ async def get_deliverable_request(
     return await _request_out(db, request)
 
 
+@router.get("/artifacts/{artifact_id}/download")
+async def download_deliverable_artifact(
+    artifact_id: uuid.UUID,
+    inline: bool = False,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(DeliverableArtifactRevision).where(
+            DeliverableArtifactRevision.id == artifact_id,
+            DeliverableArtifactRevision.tenant_id == current_user.tenant_id,
+        )
+    )
+    artifact = result.scalar_one_or_none()
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="Deliverable artifact not found")
+    await _owned_request(db, request_id=artifact.request_id, user=current_user)
+    storage = get_storage_backend()
+    try:
+        data = await read_deliverable_artifact_snapshot(storage, artifact=artifact)
+    except DeliverableArtifactError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+    filename = Path(artifact.workspace_path).name or f"deliverable.{artifact.artifact_type}"
+    disposition = "inline" if inline else "attachment"
+    encoded_filename = quote(filename, safe="")
+    return Response(
+        content=data,
+        media_type=artifact.mime_type or guess_content_type(filename),
+        headers={"Content-Disposition": f"{disposition}; filename*=UTF-8''{encoded_filename}"},
+    )
+
+
 @router.patch("/requests/{request_id}", response_model=DeliverableRequestOut)
 async def update_deliverable_request(
     request_id: uuid.UUID,
@@ -311,10 +362,46 @@ async def apply_deliverable_action(
     if request.version != data.expected_version:
         raise HTTPException(status_code=409, detail="Deliverable request changed; reload before acting")
     if request.current_stage == "output_review":
-        raise HTTPException(
-            status_code=409,
-            detail="Artifact verification is required before the completed run can be approved",
-        )
+        now = datetime.now(UTC)
+        if data.action == "approve":
+            try:
+                artifacts = await approve_deliverable_artifacts(db, request=request)
+            except DeliverableArtifactError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": exc.code, "message": str(exc)},
+                ) from exc
+            for artifact in artifacts:
+                artifact.status = "approved"
+                artifact.approved_by_user_id = current_user.id
+                artifact.approved_at = now
+            request.status = "succeeded"
+            request.current_stage = "delivered"
+            request.completed_at = now
+            request.last_error_code = None
+            request.version += 1
+            await db.flush()
+            return await _request_out(db, request)
+        if data.action == "request_changes":
+            artifact_result = await db.execute(
+                select(DeliverableArtifactRevision)
+                .where(
+                    DeliverableArtifactRevision.tenant_id == request.tenant_id,
+                    DeliverableArtifactRevision.request_id == request.id,
+                    DeliverableArtifactRevision.status == "candidate",
+                )
+                .with_for_update()
+            )
+            for artifact in artifact_result.scalars().all():
+                artifact.status = "rejected"
+            request.status = "failed"
+            request.current_stage = "changes_requested"
+            request.completed_at = now
+            request.last_error_code = "deliverable_changes_requested"
+            request.version += 1
+            await db.flush()
+            return await _request_out(db, request)
+        raise HTTPException(status_code=409, detail="Only approve or request_changes is valid during output review")
     transitions = {
         ("draft", "submit"): ("ready", "brief_confirmed"),
         ("waiting_approval", "approve"): ("ready", "approval_granted"),

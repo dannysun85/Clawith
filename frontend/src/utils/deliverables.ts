@@ -26,6 +26,16 @@ export function latestPendingDeliverable(
     )) || null;
 }
 
+
+export function latestTrackedDeliverable(
+    requests: DeliverableRequest[],
+): DeliverableRequest | null {
+    return requests.find((request) => (
+        request.agent_run_id !== null
+        && request.status !== 'cancelled'
+    )) || null;
+}
+
 export function deliverableLaunchMessage(request: DeliverableRequest, isChinese: boolean): string {
     return isChinese
         ? `请按照已确认的工作说明开始制作：${request.goal}`

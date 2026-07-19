@@ -4,7 +4,9 @@ import {
     IconAlertTriangle,
     IconCheck,
     IconChevronRight,
+    IconDownload,
     IconFileTypePpt,
+    IconLoader2,
     IconPhoto,
     IconSparkles,
     IconVideo,
@@ -42,6 +44,11 @@ interface DeliverableRequestCardProps {
     launchable: boolean;
     onRemove: () => void;
     onOpen: () => void;
+}
+
+interface DeliverableReviewCardProps {
+    request: DeliverableRequest;
+    onUpdated: (request: DeliverableRequest) => void;
 }
 
 const WORK_TYPE_ICONS: Record<string, React.ReactNode> = {
@@ -501,5 +508,107 @@ export function DeliverableRequestCard({ request, launchable, onRemove, onOpen }
                 <IconX size={16} stroke={1.75} />
             </button>
         </div>
+    );
+}
+
+
+function latestArtifacts(request: DeliverableRequest) {
+    const latest = new Map<string, DeliverableRequest['artifacts'][number]>();
+    for (const artifact of request.artifacts) {
+        const current = latest.get(artifact.artifact_key);
+        if (!current || artifact.revision_number > current.revision_number) {
+            latest.set(artifact.artifact_key, artifact);
+        }
+    }
+    return Array.from(latest.values()).sort((left, right) => left.artifact_key.localeCompare(right.artifact_key));
+}
+
+
+export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewCardProps) {
+    const { i18n } = useTranslation();
+    const isZh = i18n.language?.startsWith('zh');
+    const toast = useToast();
+    const [acting, setActing] = useState<'approve' | 'request_changes' | null>(null);
+    const artifacts = latestArtifacts(request);
+    const awaitingReview = request.status === 'waiting_approval' && request.current_stage === 'output_review';
+    const statusText = (() => {
+        if (request.status === 'running') return isZh ? '正在生成并校验交付文件' : 'Generating and validating deliverables';
+        if (awaitingReview) return isZh ? '文件已通过结构校验，请确认交付' : 'Files passed structural validation and await approval';
+        if (request.status === 'succeeded') return isZh ? '已批准并完成交付' : 'Approved and delivered';
+        if (request.status === 'failed') return isZh ? '交付失败，需要重新检查' : 'Delivery failed and needs review';
+        return isZh ? '正在处理交付请求' : 'Processing deliverable request';
+    })();
+
+    const applyAction = async (action: 'approve' | 'request_changes') => {
+        setActing(action);
+        try {
+            const updated = await deliverableApi.action(request.id, action, request.version);
+            onUpdated(updated);
+            toast.success(
+                action === 'approve'
+                    ? (isZh ? '交付文件已批准' : 'Deliverable files approved')
+                    : (isZh ? '已退回；请重新创建工作说明后再次生成' : 'Returned; create a new brief before regenerating'),
+            );
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            toast.error(isZh ? '交付操作失败' : 'Deliverable action failed', { details: message });
+        } finally {
+            setActing(null);
+        }
+    };
+
+    return (
+        <section className="deliverable-review-card" data-status={request.status} aria-live="polite">
+            <div className="deliverable-review-card__header">
+                <span className="deliverable-review-card__icon">
+                    {request.status === 'running' ? <IconLoader2 className="deliverable-spin" size={18} /> : <IconFileTypePpt size={18} />}
+                </span>
+                <div>
+                    <strong>{isZh ? 'PPT 交付任务' : 'Presentation delivery'}</strong>
+                    <small>{statusText}</small>
+                </div>
+                <em>{request.tier.toUpperCase()}</em>
+            </div>
+            {artifacts.length > 0 && (
+                <div className="deliverable-review-card__artifacts">
+                    {artifacts.map((artifact) => (
+                        <a
+                            key={artifact.id}
+                            href={deliverableApi.artifactDownloadUrl(artifact.id, { inline: artifact.artifact_type === 'pdf' })}
+                            target={artifact.artifact_type === 'pdf' ? '_blank' : undefined}
+                            rel={artifact.artifact_type === 'pdf' ? 'noreferrer' : undefined}
+                            download={artifact.artifact_type === 'pdf' ? undefined : true}
+                        >
+                            <IconDownload size={15} />
+                            <span>{artifact.artifact_type.toUpperCase()}</span>
+                            <small>v{artifact.revision_number} · {artifact.status}</small>
+                        </a>
+                    ))}
+                </div>
+            )}
+            {request.status === 'failed' && request.last_error_code && (
+                <div className="deliverable-review-card__error">{request.last_error_code}</div>
+            )}
+            {awaitingReview && (
+                <div className="deliverable-review-card__actions">
+                    <button
+                        type="button"
+                        className="btn btn-secondary"
+                        disabled={acting !== null}
+                        onClick={() => void applyAction('request_changes')}
+                    >
+                        {acting === 'request_changes' ? (isZh ? '正在退回…' : 'Returning…') : (isZh ? '退回重做' : 'Request changes')}
+                    </button>
+                    <button
+                        type="button"
+                        className="btn btn-primary"
+                        disabled={acting !== null}
+                        onClick={() => void applyAction('approve')}
+                    >
+                        {acting === 'approve' ? (isZh ? '正在批准…' : 'Approving…') : (isZh ? '批准交付' : 'Approve delivery')}
+                    </button>
+                </div>
+            )}
+        </section>
     );
 }

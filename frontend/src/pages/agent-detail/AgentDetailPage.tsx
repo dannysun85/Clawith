@@ -17,6 +17,7 @@ import AgentSidePanel, { SidePanelTab } from '../../components/AgentSidePanel';
 import {
     DeliverableLauncher,
     DeliverableRequestCard,
+    DeliverableReviewCard,
 } from '../../components/deliverables/DeliverableWorkbench';
 import type { WorkspaceActivity, WorkspaceLiveDraft } from '../../components/WorkspaceOperationPanel';
 import { activityApi, agentApi, channelApi, deliverableApi, experienceApi, fileApi, focusApi, scheduleApi, skillApi, taskApi, triggerApi, uploadFileWithProgress, type DeliverableRequest } from '../../services/api';
@@ -42,6 +43,7 @@ import {
     deliverableLaunchMessage,
     deliverableRouteTier,
     latestPendingDeliverable,
+    latestTrackedDeliverable,
     requestCanLaunchFromComposer,
 } from '../../utils/deliverables';
 import {
@@ -5446,7 +5448,11 @@ export default function AgentDetailPage() {
         queryKey: ['deliverable-requests', id, activeSession?.id],
         queryFn: () => deliverableApi.list(id!, String(activeSession!.id)),
         enabled: !!id && !!activeSession?.id && activeTab === 'chat' && (agent as any)?.agent_type !== 'openclaw',
+        refetchInterval: (query) => (
+            query.state.data?.some((request) => request.status === 'running') ? 3000 : false
+        ),
     });
+    const trackedDeliverable = latestTrackedDeliverable(sessionDeliverableRequests);
     useEffect(() => {
         if (!activeSession?.id) {
             setPendingDeliverable(null);
@@ -8058,6 +8064,19 @@ export default function AgentDetailPage() {
                                                             )}
                                                         </div>
                                                     ))}
+                                                    {trackedDeliverable && (
+                                                        <DeliverableReviewCard
+                                                            request={trackedDeliverable}
+                                                            onUpdated={(updated) => {
+                                                                queryClient.setQueryData<DeliverableRequest[]>(
+                                                                    ['deliverable-requests', id, activeSession?.id],
+                                                                    (current = []) => current.map((request) => (
+                                                                        request.id === updated.id ? updated : request
+                                                                    )),
+                                                                );
+                                                            }}
+                                                        />
+                                                    )}
                                                     {pendingDeliverable && (
                                                         <DeliverableRequestCard
                                                             request={pendingDeliverable.request}
