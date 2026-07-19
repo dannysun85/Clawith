@@ -1,3 +1,76 @@
+# v1.11.2 — Durable Deliverable Briefs and Tenant-Safe Sessions
+
+## Deliverable Workbench Foundation
+
+- Added a tenant-scoped deliverable workbench for structured presentation,
+  poster, and video briefs. Requests persist their workflow contract, tier,
+  approval policy, expected outputs, idempotency fingerprint, Runtime linkage,
+  status, and current stage instead of relying on an optimistic browser-only
+  timeline.
+- Added durable artifact-revision records with parent lineage, workspace path,
+  content hash, approval state, evaluation metadata, and tenant-bound foreign
+  keys. Refreshing or reconnecting therefore retains the request and artifact
+  audit trail.
+- Presentation briefs may launch through the durable Agent Runtime after
+  server-side preflight. Poster and video manifests remain deliberately
+  planning-only (`dry_run`): preflight does not call a paid provider or deduct
+  Credits, and this release does not describe them as completed generation
+  workflows.
+- The user-facing contract accepts business intent, inputs, tier, and output
+  requirements while provider/model routing remains controlled by the SaaS
+  platform. Existing direct media shortcuts, shared model-pool policy,
+  exactly-once Credits settlement, Workspace storage, and approval controls are
+  preserved.
+
+## Tenant and Session Stability
+
+- Platform administrators without an active tenant are kept out of tenant
+  workspace routes instead of reaching chat creation with a missing
+  `tenant_id`. Tenant navigation and Group unread queries are disabled until a
+  concrete company context exists.
+- React Query state is reset when the authenticated user or tenant scope
+  changes, preventing cached data from one company context from leaking into a
+  later workspace selection.
+- Local tenant-switch redirects treat `localhost`, `127.0.0.1`, and IPv6
+  loopback as the same browser host and preserve the active frontend origin.
+  Switching companies no longer lands on the backend API port and loses the
+  tenant-scoped session.
+- The backend continues to reject tenantless chat sessions. The fix preserves
+  the fail-closed multi-tenant boundary rather than weakening authorization to
+  hide the frontend context error.
+
+## Validation
+
+- Independent code review: `APPROVE`; independent architecture review:
+  `CLEAR`, with no local release-candidate blocker.
+- Complete backend suite: `3511 passed`; the Ruff release diff gate reported no
+  new violations relative to `v1.11.1` across 460 changed Python files.
+- Frontend locked install reported zero vulnerabilities; all 65 Node contract
+  tests and 123 Vitest tests passed, and the production build completed with
+  7031 transformed modules.
+- Alembic has the single `add_deliverable_workbench` head. PostgreSQL fresh
+  upgrade, historical upgrade, downgrade, and re-upgrade smoke passed together
+  with tenant, Credits, media, approval, A2A, monitoring, and channel-secret
+  checks.
+- Real Chrome acceptance covered platform-admin login, switching to the
+  approved Shenzhen tenant, opening the private assistant, and creating a new
+  chat session. The request returned `201`, the flow passed again in a fresh
+  tab, and the final browser console had no errors or warnings.
+
+## Upgrade Notes
+
+- Run Alembic before starting the candidate backend; this release creates
+  `deliverable_requests` and `deliverable_artifact_revisions` and supports a
+  tested downgrade to the prior v1.11.1 schema head.
+- This local candidate does not claim production deployment or production
+  provider verification. Production remains a separately authorized rollout
+  followed by real-account browser, model-route, media, Credits, and version
+  identity smoke.
+- A saved poster or video brief is not a generated asset. Those workflows stay
+  planning-only until their provider execution, product-preservation, exact-copy
+  validation, artifact delivery, and Credits settlement paths pass independent
+  acceptance.
+
 # v1.11.1 — Runtime Bootstrap and Deployment Stability
 
 ## Stability Fixes
