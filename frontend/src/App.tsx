@@ -4,7 +4,7 @@ import { Suspense, lazy, useEffect, useLayoutEffect, useState, useRef } from 're
 import { useTranslation } from 'react-i18next';
 import { authApi } from './services/api';
 import { canAccessSaasAdmin } from './utils/saasAdmin';
-import { consumeSessionTokenFromUrl } from './utils/authTransport';
+import { consumeSessionTokenFromUrl, resolveBootstrapToken } from './utils/authTransport';
 
 const Login = lazy(() => import('./pages/Login'));
 const ForgotPassword = lazy(() => import('./pages/ForgotPassword'));
@@ -225,7 +225,7 @@ function NotificationBar() {
 }
 
 export default function App() {
-    const { token, setAuth, user } = useAuthStore();
+    const { token, setAuth } = useAuthStore();
     const [loading, setLoading] = useState(true);
 
     useEffect(() => {
@@ -241,7 +241,11 @@ export default function App() {
             const pathsWithOwnToken = ['/reset-password', '/verify-email'];
             const currentUrl = new URL(window.location.href);
             const urlToken = consumeSessionTokenFromUrl(currentUrl, pathsWithOwnToken);
-            let effectiveToken = token;
+            const effectiveToken = resolveBootstrapToken(
+                urlToken,
+                localStorage.getItem('token'),
+                token,
+            );
 
             if (urlToken) {
                 // /auth/me reads its bearer credential from localStorage. The
@@ -249,19 +253,22 @@ export default function App() {
                 // also confirmed the HttpOnly browser session.
                 localStorage.setItem('token', urlToken);
                 useAuthStore.setState({ token: urlToken, user: null });
-                effectiveToken = urlToken;
 
                 // Remove the one-time transport fragment/query before auth calls.
                 const cleanUrl = currentUrl.pathname + currentUrl.search + currentUrl.hash;
                 window.history.replaceState({}, '', cleanUrl);
             }
 
-            if (effectiveToken && !user) {
+            if (effectiveToken && !useAuthStore.getState().user) {
                 try {
                     const authenticatedUser = await authApi.me();
-                    await setAuth(authenticatedUser, effectiveToken);
+                    if (!cancelled) {
+                        await setAuth(authenticatedUser, effectiveToken);
+                    }
                 } catch {
-                    useAuthStore.getState().logout();
+                    if (!cancelled) {
+                        useAuthStore.getState().logout();
+                    }
                 }
             }
             if (!cancelled) setLoading(false);

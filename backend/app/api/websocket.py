@@ -816,6 +816,10 @@ class WebSocketChatHandler:
                 data.get("run_id"),
                 field="run_id",
             )
+            work_request_id = self._optional_client_uuid(
+                data.get("work_request_id"),
+                field="work_request_id",
+            )
         except ChatRuntimeIntakeError as exc:
             await self.websocket.send_json({"type": "error", "content": str(exc), "code": exc.code})
             return None
@@ -865,6 +869,15 @@ class WebSocketChatHandler:
         if not await self._check_quotas(saas_tier=resolved_tier):
             return None
         if self.agent_type == "openclaw":
+            if work_request_id is not None:
+                await self.websocket.send_json(
+                    {
+                        "type": "error",
+                        "content": "Structured deliverable requests require a native Agent.",
+                        "code": "deliverable_runtime_unsupported",
+                    }
+                )
+                return None
             saved_content = sanitize_inline_media_content(
                 content,
                 display_content=display_content,
@@ -905,6 +918,7 @@ class WebSocketChatHandler:
                 message_id=message_id,
                 resume_run_id=resume_run_id,
                 resume_correlation_id=resume_correlation_id,
+                work_request_id=work_request_id,
                 is_onboarding_trigger=is_onboarding_trigger,
                 onboarding_source_execution_id=onboarding_source_execution,
             )
@@ -976,6 +990,7 @@ class WebSocketChatHandler:
         resume_run_id: uuid.UUID | None,
         resume_correlation_id: str | None,
         is_onboarding_trigger: bool,
+        work_request_id: uuid.UUID | None = None,
         onboarding_source_execution_id: str | None = None,
     ) -> WebChatRuntimeIntake | None:
         """Revalidate mutable ingress scope and commit one durable input."""
@@ -1061,6 +1076,7 @@ class WebSocketChatHandler:
                         message_id=message_id,
                         resume_run_id=resume_run_id,
                         resume_correlation_id=resume_correlation_id,
+                        work_request_id=work_request_id,
                         runtime_instruction=(onboarding.prompt if onboarding is not None else ""),
                         onboarding_target_phase=target_phase or "",
                         persist_user_message=not is_onboarding_trigger,

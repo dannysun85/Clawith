@@ -29,6 +29,7 @@ from app.services.agent_runtime.delivery import (
     DeliveryRequest,
     deliver_runtime_message,
 )
+from app.services.deliverable_workflows import sync_deliverable_lifecycle
 from app.services.agent_runtime.state import runtime_messages_as_json
 from app.services.agent_runtime.tool_execution import sanitize_tool_arguments
 from app.services.builtin_tool_definitions import builtin_sensitive_paths
@@ -531,6 +532,21 @@ async def _record_lifecycle_events(
             .on_conflict_do_nothing()
         )
         await db.execute(statement)
+
+    lifecycle_status = (
+        "cancelled"
+        if checkpoint is None
+        else str(checkpoint.state["lifecycle"]["status"])
+    )
+    if lifecycle_status in {"completed", "failed", "cancelled"}:
+        await sync_deliverable_lifecycle(
+            db,
+            tenant_id=run.tenant_id,
+            run_id=run.run_id,
+            lifecycle_status=lifecycle_status,
+            lifecycle=(checkpoint.state["lifecycle"] if checkpoint is not None else None),
+            now=now,
+        )
 
 
 class RuntimeCheckpointSideEffects:

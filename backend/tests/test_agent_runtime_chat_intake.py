@@ -215,6 +215,115 @@ async def test_chat_message_and_start_command_share_the_caller_session() -> None
 
 
 @pytest.mark.asyncio
+async def test_deliverable_request_is_server_augmented_and_linked_to_one_run() -> None:
+    agent, user, session, model = _records()
+    db = _Session()
+    message_id = uuid.uuid4()
+    request_id = uuid.uuid4()
+    participant = SimpleNamespace(id=uuid.uuid4())
+    handle = _handle(agent.tenant_id)
+    request = SimpleNamespace(
+        id=request_id,
+        goal="Create the approved presentation",
+        work_type="presentation",
+        workflow_version="1.0.0",
+        tier="pro",
+    )
+    prepared = SimpleNamespace(request=request, prompt="SERVER_OWNED_DELIVERABLE_CONTRACT")
+
+    with (
+        patch(
+            "app.services.agent_runtime.chat_intake.get_or_create_user_participant",
+            new=AsyncMock(return_value=participant),
+        ),
+        patch(
+            "app.services.agent_runtime.chat_intake.prepare_deliverable_launch",
+            new=AsyncMock(return_value=prepared),
+        ) as prepare,
+        patch(
+            "app.services.agent_runtime.chat_intake.attach_deliverable_run",
+        ) as attach,
+        patch(
+            "app.services.agent_runtime.chat_intake.RuntimeCommandIntake.start_run",
+            new=AsyncMock(return_value=handle),
+        ) as start_run,
+    ):
+        result = await enqueue_chat_runtime(
+            db,  # type: ignore[arg-type]
+            agent=agent,
+            user=user,
+            session=session,
+            model=model,
+            content="Please start from the saved brief",
+            display_content="开始制作这个 PPT",
+            message_id=message_id,
+            work_request_id=request_id,
+            saas_tier="pro",
+            settings_override=_settings(enabled=True),
+        )
+
+    assert result is not None
+    prepare.assert_awaited_once_with(
+        db,
+        request_id=request_id,
+        tenant_id=agent.tenant_id,
+        user_id=user.id,
+        agent_id=agent.id,
+        session_id=session.id,
+        message_id=message_id,
+    )
+    command = start_run.await_args.args[0]
+    assert command.goal == request.goal
+    assert command.payload["input_content"] == (
+        'SERVER_OWNED_DELIVERABLE_CONTRACT\n\nUSER_MESSAGE="Please start from the saved brief"'
+    )
+    assert command.payload["deliverable_request_id"] == str(request_id)
+    assert command.payload["work_type"] == "presentation"
+    assert command.payload["workflow_version"] == "1.0.0"
+    message = db.added[0]
+    assert isinstance(message, ChatMessage)
+    assert message.content == "开始制作这个 PPT"
+    attach.assert_called_once()
+    assert attach.call_args.kwargs["run_id"] == handle.run_id
+
+
+@pytest.mark.asyncio
+async def test_deliverable_request_rejects_route_tier_drift() -> None:
+    agent, user, session, model = _records()
+    request_id = uuid.uuid4()
+    prepared = SimpleNamespace(
+        request=SimpleNamespace(
+            id=request_id,
+            goal="Create the approved presentation",
+            work_type="presentation",
+            workflow_version="1.0.0",
+            tier="ultra",
+        ),
+        prompt="SERVER_OWNED_DELIVERABLE_CONTRACT",
+    )
+
+    with patch(
+        "app.services.agent_runtime.chat_intake.prepare_deliverable_launch",
+        new=AsyncMock(return_value=prepared),
+    ):
+        with pytest.raises(ChatRuntimeIntakeError) as error:
+            await enqueue_chat_runtime(
+                _Session(),  # type: ignore[arg-type]
+                agent=agent,
+                user=user,
+                session=session,
+                model=model,
+                content="Start the saved brief",
+                message_id=uuid.uuid4(),
+                work_request_id=request_id,
+                saas_tier="lite",
+                settings_override=_settings(enabled=True),
+            )
+
+    assert error.value.code == "deliverable_tier_mismatch"
+
+
+@pytest.mark.asyncio
 async def test_synthetic_onboarding_uses_pair_scoped_source_execution_identity() -> None:
     agent, user, session, model = _records()
     session.created_at = datetime(2026, 7, 16, 8, 0, tzinfo=UTC)

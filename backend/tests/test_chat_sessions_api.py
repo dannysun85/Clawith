@@ -186,6 +186,65 @@ async def test_list_mine_remains_active_direct_sessions_only(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_list_mine_keeps_zero_message_session_with_saved_deliverable(monkeypatch):
+    current_user = _actor()
+    agent = _agent(current_user)
+    session = _session(agent, current_user.id)
+    db = RecordingDB(
+        DummyResult([session]),
+        DummyResult([]),
+        DummyResult([session.id]),
+        DummyResult([]),
+    )
+
+    async def fake_check_agent_access(_db, _user, _agent_id):
+        return agent, "use"
+
+    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
+
+    sessions = await chat_sessions_api.list_sessions(
+        agent_id=agent.id,
+        scope="mine",
+        current_user=current_user,
+        db=db,
+    )
+
+    assert [value.id for value in sessions] == [str(session.id)]
+    assert sessions[0].message_count == 0
+    deliverable_sql = _sql(db.statements[2])
+    assert f"deliverable_requests.tenant_id = '{current_user.tenant_id}'" in deliverable_sql
+    assert f"deliverable_requests.agent_id = '{agent.id}'" in deliverable_sql
+    assert f"deliverable_requests.created_by_user_id = '{current_user.id}'" in deliverable_sql
+
+
+@pytest.mark.asyncio
+async def test_list_mine_still_hides_ordinary_zero_message_session(monkeypatch):
+    current_user = _actor()
+    agent = _agent(current_user)
+    session = _session(agent, current_user.id)
+    db = RecordingDB(
+        DummyResult([session]),
+        DummyResult([]),
+        DummyResult([]),
+        DummyResult([]),
+    )
+
+    async def fake_check_agent_access(_db, _user, _agent_id):
+        return agent, "use"
+
+    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
+
+    sessions = await chat_sessions_api.list_sessions(
+        agent_id=agent.id,
+        scope="mine",
+        current_user=current_user,
+        db=db,
+    )
+
+    assert sessions == []
+
+
+@pytest.mark.asyncio
 async def test_cross_tenant_agent_is_rejected_before_session_query(monkeypatch):
     current_user = _actor(role="org_admin")
     cross_tenant_agent = SimpleNamespace(

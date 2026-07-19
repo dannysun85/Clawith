@@ -4,6 +4,7 @@ import {
     consumeSessionTokenFromUrl,
     establishBrowserSession,
     normalizeTenantRedirectUrl,
+    resolveBootstrapToken,
     websocketAuthProtocols,
 } from './authTransport';
 
@@ -48,6 +49,14 @@ describe('credential-safe browser transports', () => {
         );
 
         expect(redirect).toBe('https://tenant.example/#session_token=target.jwt.token');
+    });
+
+    it('keeps the tenant-scoped token during a StrictMode auth bootstrap replay', () => {
+        const platformToken = 'platform-token';
+        const tenantToken = 'tenant-token';
+
+        expect(resolveBootstrapToken(tenantToken, platformToken, platformToken)).toBe(tenantToken);
+        expect(resolveBootstrapToken(null, tenantToken, platformToken)).toBe(tenantToken);
     });
 
     it('does not complete browser-session establishment before the cookie response', async () => {

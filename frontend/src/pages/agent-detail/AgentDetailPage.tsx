@@ -14,8 +14,12 @@ import { EntryDrawer } from '../../components/ExperienceDetailDrawer';
 import PromptModal from '../../components/PromptModal';
 import { appendLiveCodeOutput, type LivePreviewState } from '../../components/AgentBayLivePanel';
 import AgentSidePanel, { SidePanelTab } from '../../components/AgentSidePanel';
+import {
+    DeliverableLauncher,
+    DeliverableRequestCard,
+} from '../../components/deliverables/DeliverableWorkbench';
 import type { WorkspaceActivity, WorkspaceLiveDraft } from '../../components/WorkspaceOperationPanel';
-import { activityApi, agentApi, channelApi, experienceApi, fileApi, focusApi, scheduleApi, skillApi, taskApi, triggerApi, uploadFileWithProgress } from '../../services/api';
+import { activityApi, agentApi, channelApi, deliverableApi, experienceApi, fileApi, focusApi, scheduleApi, skillApi, taskApi, triggerApi, uploadFileWithProgress, type DeliverableRequest } from '../../services/api';
 import { websocketAuthProtocols } from '../../utils/authTransport';
 import { reportClientIssue, shouldReportWebSocketClose } from '../../services/productionIssueReporter';
 import type { FocusApiItem } from '../../services/api';
@@ -34,6 +38,12 @@ import {
 } from '../../utils/chatAttachmentPersistence';
 import { canAccessSaasAdmin } from '../../utils/saasAdmin';
 import { displaySessionTitle } from '../../utils/sessionDisplay';
+import {
+    deliverableLaunchMessage,
+    deliverableRouteTier,
+    latestPendingDeliverable,
+    requestCanLaunchFromComposer,
+} from '../../utils/deliverables';
 import {
     appendUniqueById,
     safeMediaCompletionTool,
@@ -3317,10 +3327,21 @@ export default function AgentDetailPage() {
         tier?: SaasTier | null;
         modality?: string;
         ephemeralModality?: boolean;
+        workRequestId?: string;
         resumeRunId?: string;
         resumeCorrelationId?: string;
     };
     const [attachedFiles, setAttachedFiles] = useState<AttachedFileRef[]>([]);
+    const [pendingDeliverable, setPendingDeliverable] = useState<{
+        request: DeliverableRequest;
+        launchable: boolean;
+    } | null>(null);
+    const inflightDeliverableRef = useRef<{
+        request: DeliverableRequest;
+        launchable: boolean;
+        runtimeKey: string;
+    } | null>(null);
+    const dismissedDeliverableRequestIdsRef = useRef<Set<string>>(new Set());
     const dismissedWorkspaceRefPath = useRef<string | null>(null);
     const pendingChatSendRef = useRef<PendingChatMessage | null>(null);
     const wsRef = useRef<WebSocket | null>(null);
@@ -3783,6 +3804,14 @@ export default function AgentDetailPage() {
                 setIsWaiting(false);
                 setIsStreaming(false);
             }
+            const unconfirmedDeliverable = inflightDeliverableRef.current;
+            if (unconfirmedDeliverable?.runtimeKey === key) {
+                inflightDeliverableRef.current = null;
+                dismissedDeliverableRequestIdsRef.current.delete(unconfirmedDeliverable.request.id);
+                void queryClient.invalidateQueries({
+                    queryKey: ['deliverable-requests', agentId, sessionId],
+                });
+            }
             if (shouldReportWebSocketClose(e.code, intentionalClose)) {
                 reportClientIssue({
                     category: 'websocket',
@@ -3823,6 +3852,23 @@ export default function AgentDetailPage() {
         };
         ws.onmessage = (e) => {
             const d = JSON.parse(e.data);
+            if (inflightDeliverableRef.current?.runtimeKey === key && d.run_id) {
+                inflightDeliverableRef.current = null;
+                void queryClient.invalidateQueries({
+                    queryKey: ['deliverable-requests', agentId, sessionId],
+                });
+            } else if (
+                inflightDeliverableRef.current?.runtimeKey === key
+                && (d.type === 'error' || d.type === 'quota_exceeded')
+            ) {
+                const rejectedDeliverable = inflightDeliverableRef.current;
+                inflightDeliverableRef.current = null;
+                dismissedDeliverableRequestIdsRef.current.delete(rejectedDeliverable.request.id);
+                setPendingDeliverable(rejectedDeliverable);
+                void queryClient.invalidateQueries({
+                    queryKey: ['deliverable-requests', agentId, sessionId],
+                });
+            }
             if (typeof d.event_cursor === 'string' && d.event_cursor && d.run_id) {
                 runtimeEventCursorRef.current[`${key}:${String(d.run_id)}`] = d.event_cursor;
             }
@@ -4244,6 +4290,7 @@ export default function AgentDetailPage() {
             tier: payload.tier,
             modality: payload.modality,
             ephemeral_modality: payload.ephemeralModality === true,
+            ...(payload.workRequestId ? { work_request_id: payload.workRequestId } : {}),
             client_message_id: clientMessageId,
             ...(payload.resumeRunId ? { run_id: payload.resumeRunId } : {}),
             ...(payload.resumeCorrelationId ? { correlation_id: payload.resumeCorrelationId } : {}),
@@ -5044,9 +5091,15 @@ export default function AgentDetailPage() {
                 ? attachmentStorageBasename(attachedFiles[0].path, attachedFiles[0].name)
                 : undefined,
             imageUrl: attachedFiles.length === 1 ? attachedFiles[0].imageUrl : undefined,
-            tier: effectiveChatTier,
+            tier: deliverableRouteTier(
+                pendingDeliverable?.launchable ? pendingDeliverable.request : null,
+                effectiveChatTier,
+            ),
             modality: outboundChatModality,
             ephemeralModality: outboundRoute.ephemeral,
+            workRequestId: pendingDeliverable?.launchable
+                ? pendingDeliverable.request.id
+                : undefined,
         };
 
         setChatInput('');
@@ -5058,6 +5111,15 @@ export default function AgentDetailPage() {
         }
         dismissedWorkspaceRefPath.current = null;
         setAttachedFiles((prev) => prev.filter((file) => file.source === 'workspace_auto'));
+        if (pendingDeliverable?.launchable) {
+            inflightDeliverableRef.current = {
+                ...pendingDeliverable,
+                runtimeKey: activeRuntimeKey,
+            };
+            dismissedDeliverableRequestIdsRef.current.add(pendingDeliverable.request.id);
+            setPendingDeliverable(null);
+            queryClient.invalidateQueries({ queryKey: ['deliverable-requests', id, activeSession.id] });
+        }
 
         if (!activeSocket || activeSocket.readyState !== WebSocket.OPEN) {
             pendingChatSendRef.current = payload;
@@ -5372,6 +5434,26 @@ export default function AgentDetailPage() {
         agent?.preferred_modality,
     );
     const effectiveTierReady = !!effectiveChatTier;
+    const { data: sessionDeliverableRequests = [] } = useQuery({
+        queryKey: ['deliverable-requests', id, activeSession?.id],
+        queryFn: () => deliverableApi.list(id!, String(activeSession!.id)),
+        enabled: !!id && !!activeSession?.id && activeTab === 'chat' && (agent as any)?.agent_type !== 'openclaw',
+    });
+    useEffect(() => {
+        if (!activeSession?.id) {
+            setPendingDeliverable(null);
+            return;
+        }
+        if (pendingDeliverable?.request.session_id === String(activeSession.id)) return;
+        const resumable = latestPendingDeliverable(
+            sessionDeliverableRequests,
+            dismissedDeliverableRequestIdsRef.current,
+        );
+        setPendingDeliverable(resumable ? {
+            request: resumable,
+            launchable: requestCanLaunchFromComposer(resumable),
+        } : null);
+    }, [activeSession?.id, pendingDeliverable?.request.session_id, sessionDeliverableRequests]);
     const { data: mediaCapabilitiesData, isLoading: mediaCapabilitiesLoading } = useQuery({
         queryKey: ['agent-media-capabilities', id, effectiveChatTier],
         queryFn: () => fetchAuth<MediaCapabilitiesResponse>(
@@ -7968,6 +8050,32 @@ export default function AgentDetailPage() {
                                                             )}
                                                         </div>
                                                     ))}
+                                                    {pendingDeliverable && (
+                                                        <DeliverableRequestCard
+                                                            request={pendingDeliverable.request}
+                                                            launchable={pendingDeliverable.launchable}
+                                                            onOpen={() => {
+                                                                if (!pendingDeliverable.launchable) {
+                                                                    toast.info(pendingDeliverable.request.goal);
+                                                                    return;
+                                                                }
+                                                                setChatInput(deliverableLaunchMessage(
+                                                                    pendingDeliverable.request,
+                                                                    i18n.language?.startsWith('zh'),
+                                                                ));
+                                                                window.setTimeout(() => {
+                                                                    if (chatInputRef.current) {
+                                                                        scheduleChatInputResize(chatInputRef.current);
+                                                                        chatInputRef.current.focus();
+                                                                    }
+                                                                }, 0);
+                                                            }}
+                                                            onRemove={() => {
+                                                                dismissedDeliverableRequestIdsRef.current.add(pendingDeliverable.request.id);
+                                                                setPendingDeliverable(null);
+                                                            }}
+                                                        />
+                                                    )}
                                                     {(chatUploadDrafts.length > 0 || attachedFiles.length > 0) && (
                                                         <div className="chat-composer-attachments">
                                                             {chatUploadDrafts.map((draft) => (
@@ -8083,6 +8191,31 @@ export default function AgentDetailPage() {
                                                         >
                                                             <IconPaperclip size={16} stroke={1.75} />
                                                         </button>
+                                                        <DeliverableLauncher
+                                                            agentId={id!}
+                                                            sessionId={activeSession?.id ? String(activeSession.id) : undefined}
+                                                            tier={effectiveChatTier || 'lite'}
+                                                            attachments={attachedFiles.map((file) => ({ name: file.name, path: file.path }))}
+                                                            disabled={chatInputDisabled || !wsConnected || !effectiveChatTier || isWaiting || isStreaming || (agent as any)?.agent_type === 'openclaw'}
+                                                            onCreated={(request, launchable) => {
+                                                                dismissedDeliverableRequestIdsRef.current.delete(request.id);
+                                                                setPendingDeliverable({ request, launchable });
+                                                                queryClient.invalidateQueries({ queryKey: ['deliverable-requests', id, activeSession?.id] });
+                                                                if (launchable) {
+                                                                    const launchText = deliverableLaunchMessage(
+                                                                        request,
+                                                                        i18n.language?.startsWith('zh'),
+                                                                    );
+                                                                    setChatInput((current) => current.trim() ? current : launchText);
+                                                                    window.setTimeout(() => {
+                                                                        if (chatInputRef.current) {
+                                                                            scheduleChatInputResize(chatInputRef.current);
+                                                                            chatInputRef.current.focus();
+                                                                        }
+                                                                    }, 0);
+                                                                }
+                                                            }}
+                                                        />
                                                         {(mediaCapabilitiesData?.capabilities || []).map((capability) => {
                                                             const language = i18n.language?.startsWith('zh') ? 'zh' : 'en';
                                                             const state = mediaCapabilityState(capability, language);

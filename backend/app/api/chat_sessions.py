@@ -22,6 +22,7 @@ from app.models.agent_run_command import AgentRunCommand
 from app.models.agent_tool_execution import AgentToolExecution
 from app.models.audit import AuditLog, ChatMessage
 from app.models.chat_session import ChatSession
+from app.models.deliverable import DeliverableRequest
 from app.models.participant import Participant
 from app.models.user import Identity, User
 from app.services.chat_session_service import (
@@ -316,6 +317,29 @@ async def list_sessions(
     )
     message_counts = {row[0]: int(row[1] or 0) for row in count_result.all()}
 
+    # A saved deliverable brief is durable work even before the user sends the
+    # first chat message. Keep only those zero-message sessions visible so a
+    # refresh can restore the pending work card without resurrecting ordinary
+    # abandoned empty sessions.
+    empty_session_ids = [
+        session.id
+        for session in sessions
+        if message_counts.get(str(session.id), 0) == 0
+    ]
+    deliverable_session_ids: set[uuid.UUID] = set()
+    if empty_session_ids:
+        deliverable_query = select(DeliverableRequest.session_id).where(
+            DeliverableRequest.tenant_id == tenant_id,
+            DeliverableRequest.agent_id == agent_id,
+            DeliverableRequest.session_id.in_(empty_session_ids),
+        )
+        if scope == "mine":
+            deliverable_query = deliverable_query.where(
+                DeliverableRequest.created_by_user_id == current_user.id,
+            )
+        deliverable_result = await db.execute(deliverable_query)
+        deliverable_session_ids = set(deliverable_result.scalars().all())
+
     unread_result = await db.execute(
         select(ChatSession.id, func.count(ChatMessage.id))
         .join(ChatMessage, ChatMessage.conversation_id == cast(ChatSession.id, String))
@@ -371,7 +395,7 @@ async def list_sessions(
     output = []
     for session in sessions:
         count = message_counts.get(str(session.id), 0)
-        if count == 0:
+        if count == 0 and session.id not in deliverable_session_ids:
             continue
         username = None
         peer_agent_id = None

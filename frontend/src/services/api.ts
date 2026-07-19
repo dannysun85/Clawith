@@ -510,6 +510,146 @@ export const activityApi = {
         request<any[]>(`/agents/${agentId}/activity?limit=${limit}`),
 };
 
+// ─── Deliverable Workbench ───────────────────────────
+export type DeliverableWorkType = 'presentation' | 'poster' | 'video' | 'report' | 'spreadsheet';
+
+export interface DeliverableWorkflowField {
+    key: string;
+    label_zh: string;
+    label_en: string;
+    kind: 'text' | 'textarea' | 'number' | 'select';
+    required: boolean;
+    default: string | number | null;
+    minimum: number | null;
+    maximum: number | null;
+    options: string[];
+    placeholder_zh: string;
+    placeholder_en: string;
+}
+
+export interface DeliverableWorkflow {
+    workflow_id: string;
+    workflow_version: string;
+    work_type: DeliverableWorkType;
+    label_zh: string;
+    label_en: string;
+    description_zh: string;
+    description_en: string;
+    fields: DeliverableWorkflowField[];
+    approval_policy: string[];
+    output_contract: string[];
+    required_capability: 'presentation' | 'image' | 'video' | 'document';
+    launch_policy: 'agent_runtime' | 'dry_run';
+}
+
+export interface DeliverableCreditEstimate {
+    mode: 'estimate' | 'usage_based';
+    minimum: number | null;
+    maximum: number | null;
+    billing_unit: string;
+}
+
+export interface DeliverablePreflight {
+    workflow_id: string;
+    workflow_version: string;
+    available: boolean;
+    launchable: boolean;
+    reasons: string[];
+    tier: 'lite' | 'pro' | 'ultra';
+    normalized_spec: Record<string, string | number>;
+    credit_estimate: DeliverableCreditEstimate;
+    creates_reservation: false;
+}
+
+export interface DeliverableArtifactRevision {
+    id: string;
+    request_id: string;
+    parent_revision_id: string | null;
+    artifact_key: string;
+    artifact_type: string;
+    workspace_path: string;
+    mime_type: string | null;
+    content_hash: string;
+    size_bytes: number | null;
+    revision_number: number;
+    status: string;
+    evaluation: Record<string, unknown>;
+    approved_by_user_id: string | null;
+    approved_at: string | null;
+    created_at: string;
+}
+
+export interface DeliverableRequest {
+    id: string;
+    tenant_id: string;
+    created_by_user_id: string;
+    agent_id: string;
+    session_id: string;
+    agent_run_id: string | null;
+    client_request_id: string;
+    work_type: DeliverableWorkType;
+    workflow_id: string;
+    workflow_version: string;
+    goal: string;
+    inputs: Array<{ type: 'workspace_file'; path: string; name?: string }>;
+    spec: Record<string, string | number>;
+    tier: 'lite' | 'pro' | 'ultra';
+    approval_policy: string[];
+    output_contract: string[];
+    status: 'draft' | 'ready' | 'running' | 'waiting_approval' | 'succeeded' | 'failed' | 'cancelled';
+    current_stage: string;
+    version: number;
+    last_error_code: string | null;
+    launched_at: string | null;
+    completed_at: string | null;
+    created_at: string;
+    updated_at: string;
+    artifacts: DeliverableArtifactRevision[];
+}
+
+export const deliverableApi = {
+    workflows: () => request<{ workflows: DeliverableWorkflow[] }>('/deliverables/workflows'),
+    preflight: (data: {
+        agent_id: string;
+        work_type: DeliverableWorkType;
+        workflow_id: string;
+        workflow_version: string;
+        spec: Record<string, string | number>;
+        tier: 'lite' | 'pro' | 'ultra';
+    }) => request<DeliverablePreflight>('/deliverables/preflight', {
+        method: 'POST',
+        body: JSON.stringify(data),
+    }),
+    create: (data: {
+        client_request_id: string;
+        agent_id: string;
+        session_id: string;
+        work_type: DeliverableWorkType;
+        workflow_id: string;
+        workflow_version: string;
+        goal: string;
+        inputs: Array<{ type: 'workspace_file'; path: string; name?: string }>;
+        spec: Record<string, string | number>;
+        tier: 'lite' | 'pro' | 'ultra';
+        approval_policy: string[];
+        output_contract: string[];
+    }) => request<DeliverableRequest>('/deliverables/requests', {
+        method: 'POST',
+        body: JSON.stringify(data),
+    }),
+    list: (agentId: string, sessionId?: string) => {
+        const query = new URLSearchParams({ agent_id: agentId });
+        if (sessionId) query.set('session_id', sessionId);
+        return request<DeliverableRequest[]>(`/deliverables/requests?${query.toString()}`);
+    },
+    get: (requestId: string) => request<DeliverableRequest>(`/deliverables/requests/${requestId}`),
+    action: (requestId: string, action: 'submit' | 'approve' | 'request_changes' | 'cancel', expectedVersion: number) =>
+        request<DeliverableRequest>(`/deliverables/requests/${requestId}/actions`, {
+            method: 'POST',
+            body: JSON.stringify({ action, expected_version: expectedVersion }),
+        }),
+};
+
 // ─── Messages ─────────────────────────────────────────
 export const messageApi = {
     inbox: (limit = 50) =>

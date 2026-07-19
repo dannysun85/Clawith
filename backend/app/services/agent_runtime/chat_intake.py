@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import json
 import uuid
 
 from sqlalchemy import select
@@ -33,6 +34,12 @@ from app.services.agent_runtime.run_state_reader import (
 )
 from app.services.media_message_content import sanitize_inline_media_content
 from app.services.participant_identity import get_or_create_user_participant
+from app.services.deliverable_workflows import (
+    DeliverableWorkflowError,
+    PreparedDeliverableLaunch,
+    attach_deliverable_run,
+    prepare_deliverable_launch,
+)
 
 
 _ACTIVE_AGENT_STATUSES = frozenset({"creating", "running", "idle"})
@@ -487,6 +494,7 @@ async def enqueue_chat_runtime(
     channel_delivery_target: dict | None = None,
     saas_tier: str | None = None,
     model_modality: str | None = None,
+    work_request_id: uuid.UUID | None = None,
     run_state_reader: RunStateReader | None = None,
     settings_override: Settings | None = None,
 ) -> ChatRuntimeIntake | None:
@@ -566,6 +574,36 @@ async def enqueue_chat_runtime(
         display_content=display_content,
         file_name=file_name,
     )
+    prepared_deliverable: PreparedDeliverableLaunch | None = None
+    runtime_content = content
+    if work_request_id is not None:
+        if resume_run_id is not None:
+            raise ChatRuntimeIntakeError(
+                "deliverable_resume_not_supported",
+                "A deliverable request can only start a new run",
+            )
+        try:
+            prepared_deliverable = await prepare_deliverable_launch(
+                db,
+                request_id=work_request_id,
+                tenant_id=tenant_id,
+                user_id=user.id,
+                agent_id=agent.id,
+                session_id=session.id,
+                message_id=resolved_message_id,
+            )
+        except DeliverableWorkflowError as exc:
+            raise ChatRuntimeIntakeError(exc.code, str(exc)) from exc
+        request_tier = str(prepared_deliverable.request.tier or "").strip().lower()
+        if normalized_saas_tier != request_tier:
+            raise ChatRuntimeIntakeError(
+                "deliverable_tier_mismatch",
+                "Deliverable requests must run with the tier saved in their work brief",
+            )
+        runtime_content = (
+            f"{prepared_deliverable.prompt}\n\n"
+            f"USER_MESSAGE={json.dumps(content, ensure_ascii=False)}"
+        )
     resumed_run: AgentRun | None = None
     if resume_run_id is not None:
         resumed_run = await _require_resume_run(
@@ -631,7 +669,7 @@ async def enqueue_chat_runtime(
                     "correlation_id": correlation_id,
                     "payload": {
                         "message_id": str(resolved_message_id),
-                        "content": content,
+                        "content": runtime_content,
                         **({"saas_tier": normalized_saas_tier} if normalized_saas_tier else {}),
                         **({"model_modality": normalized_model_modality} if normalized_model_modality else {}),
                     },
@@ -678,7 +716,11 @@ async def enqueue_chat_runtime(
             source_type="chat",
             source_id=str(resolved_message_id),
             source_execution_id=source_execution_id,
-            goal=_chat_goal(content, display_content, file_name),
+            goal=(
+                prepared_deliverable.request.goal
+                if prepared_deliverable is not None
+                else _chat_goal(content, display_content, file_name)
+            ),
             run_kind="foreground",
             model_id=model.id,
             runtime_thread_id=(str(session.id) if is_direct_thread else None),
@@ -690,7 +732,7 @@ async def enqueue_chat_runtime(
             idempotency_key=f"start:{source_execution_id}",
             payload={
                 "message_id": str(resolved_message_id),
-                "input_content": content,
+                "input_content": runtime_content,
                 "source_channel": normalized_channel,
                 "user_id": str(user.id),
                 "saas_tier": (normalized_saas_tier or session.model_tier or agent.preferred_tier or ""),
@@ -698,6 +740,15 @@ async def enqueue_chat_runtime(
                     normalized_model_modality or session.model_modality or agent.preferred_modality or "text"
                 ),
                 "application_tools_enabled": application_tools_enabled,
+                **(
+                    {
+                        "deliverable_request_id": str(prepared_deliverable.request.id),
+                        "work_type": prepared_deliverable.request.work_type,
+                        "workflow_version": prepared_deliverable.request.workflow_version,
+                    }
+                    if prepared_deliverable is not None
+                    else {}
+                ),
                 **({"runtime_instruction": normalized_runtime_instruction} if normalized_runtime_instruction else {}),
                 **(
                     {"onboarding_target_phase": normalized_onboarding_target_phase}
@@ -709,6 +760,12 @@ async def enqueue_chat_runtime(
             actor_user_id=user.id,
         )
     )
+    if prepared_deliverable is not None:
+        attach_deliverable_run(
+            prepared_deliverable,
+            run_id=handle.run_id,
+            launched_at=datetime.now(UTC),
+        )
     return ChatRuntimeIntake(
         handle=handle,
         message_id=resolved_message_id,

@@ -56,6 +56,17 @@ export function consumeSessionTokenFromUrl(url: URL, pathsWithOwnToken: string[]
     return token;
 }
 
+export function resolveBootstrapToken(
+    urlToken: string | null,
+    storedToken: string | null,
+    capturedToken: string | null,
+): string | null {
+    // React.StrictMode replays mount effects in development. A replay must read
+    // the token written by the first pass instead of restoring the render-time
+    // token captured before a tenant switch fragment was consumed.
+    return urlToken || storedToken || capturedToken;
+}
+
 export function normalizeTenantRedirectUrl(redirectUrl: string, currentHref: string): string {
     const currentUrl = new URL(currentHref);
     const targetUrl = new URL(redirectUrl, currentUrl.origin);

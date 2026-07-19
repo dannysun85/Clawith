@@ -685,6 +685,7 @@ from app.api.saas import router as saas_router  # noqa: E402
 from app.api.douyin import router as douyin_router  # noqa: E402
 from app.api.production_issues import admin_router as production_issue_admin_router  # noqa: E402
 from app.api.production_issues import client_router as production_issue_client_router  # noqa: E402
+from app.api.deliverables import router as deliverables_router  # noqa: E402
 
 app.include_router(auth_router, prefix=settings.API_PREFIX)
 app.include_router(agents_router, prefix=settings.API_PREFIX)
@@ -741,6 +742,7 @@ app.include_router(saas_router, prefix=settings.API_PREFIX)
 app.include_router(douyin_router, prefix=settings.API_PREFIX)
 app.include_router(production_issue_client_router, prefix=settings.API_PREFIX)
 app.include_router(production_issue_admin_router, prefix=settings.API_PREFIX)
+app.include_router(deliverables_router)
 
 
 @app.get("/api/health", response_model=HealthResponse, tags=["health"])
