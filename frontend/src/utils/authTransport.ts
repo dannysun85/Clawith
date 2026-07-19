@@ -70,7 +70,15 @@ export function resolveBootstrapToken(
 export function normalizeTenantRedirectUrl(redirectUrl: string, currentHref: string): string {
     const currentUrl = new URL(currentHref);
     const targetUrl = new URL(redirectUrl, currentUrl.origin);
-    if (targetUrl.hostname === currentUrl.hostname) {
+    const loopbackHosts = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
+    const isSameBrowserHost =
+        targetUrl.hostname === currentUrl.hostname ||
+        (loopbackHosts.has(targetUrl.hostname) && loopbackHosts.has(currentUrl.hostname));
+    if (isSameBrowserHost) {
+        // In local development the API may advertise localhost while the browser
+        // was opened through 127.0.0.1 (or vice versa). Keep the redirect on the
+        // active frontend origin so it cannot accidentally land on the API port.
+        targetUrl.hostname = currentUrl.hostname;
         targetUrl.protocol = currentUrl.protocol;
         targetUrl.port = currentUrl.port;
     }

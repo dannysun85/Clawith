@@ -5,6 +5,8 @@ import { useTranslation } from 'react-i18next';
 import { authApi } from './services/api';
 import { canAccessSaasAdmin } from './utils/saasAdmin';
 import { consumeSessionTokenFromUrl, resolveBootstrapToken } from './utils/authTransport';
+import { useQueryClient } from '@tanstack/react-query';
+import { authQueryScopeKey, tenantWorkspaceRedirect } from './utils/workspaceAccess';
 
 const Login = lazy(() => import('./pages/Login'));
 const ForgotPassword = lazy(() => import('./pages/ForgotPassword'));
@@ -44,6 +46,28 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
     if (user && !user.is_active) return <Navigate to="/verify-email" state={{ email: user.email }} replace />;
     
     return <>{children}</>;
+}
+
+function TenantWorkspaceRoute({ children }: { children: React.ReactNode }) {
+    const user = useAuthStore((s) => s.user);
+    const redirect = tenantWorkspaceRedirect(user);
+    if (redirect) return <Navigate to={redirect} replace />;
+    return <>{children}</>;
+}
+
+function AuthQueryScopeReset() {
+    const user = useAuthStore((s) => s.user);
+    const queryClient = useQueryClient();
+    const scopeKey = authQueryScopeKey(user);
+    const previousScopeRef = useRef(scopeKey);
+
+    useLayoutEffect(() => {
+        if (previousScopeRef.current === scopeKey) return;
+        queryClient.clear();
+        previousScopeRef.current = scopeKey;
+    }, [queryClient, scopeKey]);
+
+    return null;
 }
 
 function CompanyAdminRoute({ children }: { children: React.ReactNode }) {
@@ -291,6 +315,7 @@ export default function App() {
 
     return (
         <>
+            <AuthQueryScopeReset />
             <NotificationBar />
             <Suspense fallback={<div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', color: 'var(--text-tertiary)' }}>加载中...</div>}>
             <Routes>
@@ -302,27 +327,27 @@ export default function App() {
                 <Route path="/sso/entry" element={<SSOEntry />} />
                 <Route path="/setup-company" element={<CompanySetup />} />
                 <Route path="/admin/saas" element={<SaasAdminRoute><SaasAdmin /></SaasAdminRoute>} />
-                <Route path="/onboarding" element={<ProtectedRoute><Onboarding /></ProtectedRoute>} />
+                <Route path="/onboarding" element={<ProtectedRoute><TenantWorkspaceRoute><Onboarding /></TenantWorkspaceRoute></ProtectedRoute>} />
                 <Route path="/" element={<ProtectedRoute><Layout /></ProtectedRoute>}>
                     <Route index element={<Navigate to="/dashboard" replace />} />
-                    <Route path="dashboard" element={<Dashboard />} />
-                    <Route path="plaza" element={<Plaza />} />
-                    <Route path="agents/new" element={<AgentCreate />} />
-                    <Route path="agents/:id" element={<Navigate to="chat" replace />} />
-                    <Route path="agents/:id/chat" element={<AgentDetail />} />
-                    <Route path="agents/:id/directory" element={<AgentDetail />} />
-                    <Route path="agents/:id/settings" element={<AgentDetail />} />
-                    <Route path="groups" element={<GroupsPage />} />
-                    <Route path="groups/:groupId" element={<GroupsPage />} />
-                    <Route path="groups/:groupId/:sessionId" element={<GroupsPage />} />
-                    <Route path="messages" element={<Messages />} />
-                    <Route path="enterprise" element={<CompanyAdminRoute><EnterpriseSettings /></CompanyAdminRoute>} />
-                    <Route path="okr" element={<OKR />} />
-                    <Route path="invitations" element={<InvitationCodes />} />
+                    <Route path="dashboard" element={<TenantWorkspaceRoute><Dashboard /></TenantWorkspaceRoute>} />
+                    <Route path="plaza" element={<TenantWorkspaceRoute><Plaza /></TenantWorkspaceRoute>} />
+                    <Route path="agents/new" element={<TenantWorkspaceRoute><AgentCreate /></TenantWorkspaceRoute>} />
+                    <Route path="agents/:id" element={<TenantWorkspaceRoute><Navigate to="chat" replace /></TenantWorkspaceRoute>} />
+                    <Route path="agents/:id/chat" element={<TenantWorkspaceRoute><AgentDetail /></TenantWorkspaceRoute>} />
+                    <Route path="agents/:id/directory" element={<TenantWorkspaceRoute><AgentDetail /></TenantWorkspaceRoute>} />
+                    <Route path="agents/:id/settings" element={<TenantWorkspaceRoute><AgentDetail /></TenantWorkspaceRoute>} />
+                    <Route path="groups" element={<TenantWorkspaceRoute><GroupsPage /></TenantWorkspaceRoute>} />
+                    <Route path="groups/:groupId" element={<TenantWorkspaceRoute><GroupsPage /></TenantWorkspaceRoute>} />
+                    <Route path="groups/:groupId/:sessionId" element={<TenantWorkspaceRoute><GroupsPage /></TenantWorkspaceRoute>} />
+                    <Route path="messages" element={<TenantWorkspaceRoute><Messages /></TenantWorkspaceRoute>} />
+                    <Route path="enterprise" element={<TenantWorkspaceRoute><CompanyAdminRoute><EnterpriseSettings /></CompanyAdminRoute></TenantWorkspaceRoute>} />
+                    <Route path="okr" element={<TenantWorkspaceRoute><OKR /></TenantWorkspaceRoute>} />
+                    <Route path="invitations" element={<TenantWorkspaceRoute><InvitationCodes /></TenantWorkspaceRoute>} />
                     <Route path="admin/platform-settings" element={<AdminCompanies />} />
                     <Route path="account" element={<SaasAdminRoute><AccountManagement /></SaasAdminRoute>} />
-                    <Route path="account/subscription" element={<SubscriptionDetail />} />
-                    <Route path="billing/success" element={<BillingSuccess />} />
+                    <Route path="account/subscription" element={<TenantWorkspaceRoute><SubscriptionDetail /></TenantWorkspaceRoute>} />
+                    <Route path="billing/success" element={<TenantWorkspaceRoute><BillingSuccess /></TenantWorkspaceRoute>} />
                 </Route>
             </Routes>
             </Suspense>

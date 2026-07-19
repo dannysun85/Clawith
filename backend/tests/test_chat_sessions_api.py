@@ -455,6 +455,34 @@ async def test_create_resolves_same_tenant_user_and_participant(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_create_rejects_tenantless_platform_identity_before_agent_lookup(monkeypatch):
+    current_user = _actor(role="platform_admin")
+    current_user.tenant_id = None
+    db = RecordingDB()
+
+    async def unexpected_check_agent_access(*_args, **_kwargs):
+        raise AssertionError("tenantless identities must not enter agent access resolution")
+
+    monkeypatch.setattr(
+        chat_sessions_api,
+        "check_agent_access",
+        unexpected_check_agent_access,
+    )
+
+    with pytest.raises(chat_sessions_api.HTTPException) as error:
+        await chat_sessions_api.create_session(
+            agent_id=uuid.uuid4(),
+            body=chat_sessions_api.CreateSessionIn(),
+            current_user=current_user,
+            db=db,
+        )
+
+    assert error.value.status_code == 403
+    assert error.value.detail == "A tenant is required for chat sessions"
+    assert db.statements == []
+
+
+@pytest.mark.asyncio
 async def test_rename_filters_tenant_direct_and_deleted(monkeypatch):
     current_user = _actor()
     agent = _agent(current_user)

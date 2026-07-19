@@ -3119,6 +3119,14 @@ export default function AgentDetailPage() {
 
     const createNewSession = async () => {
         if (!id) return;
+        if (!currentUser?.tenant_id) {
+            toast.error(
+                t('common.error.sessionCreateFailed', '创建会话失败'),
+                { details: t('common.error.switchCompanyFirst', '请先切换到公司，再开始新会话。') },
+            );
+            navigate('/admin/platform-settings', { replace: true });
+            return;
+        }
         try {
             const tkn = localStorage.getItem('token');
             const res = await fetch(`/api/agents/${id}/sessions`, {

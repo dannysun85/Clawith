@@ -8,9 +8,9 @@ import { groupApi } from '../services/groupApi';
  * same cache. On other pages the sidebar drives these queries with a slow poll (the real-time push
  * that would make polling unnecessary is not on the backend yet).
  */
-export function useGroupUnread(): number {
+export function useGroupUnread(enabled = true): number {
     const {
-        data: groups = [],
+        data: queriedGroups = [],
         isFetchedAfterMount,
         isRefetchError,
     } = useQuery({
@@ -18,7 +18,9 @@ export function useGroupUnread(): number {
         queryFn: () => groupApi.list(),
         staleTime: 15_000,
         refetchOnMount: 'always',
+        enabled,
     });
+    const groups = enabled ? queriedGroups : [];
     const groupsReady = isFetchedAfterMount && !isRefetchError;
 
     const sessionQueries = useQueries({

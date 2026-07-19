@@ -51,6 +51,15 @@ describe('credential-safe browser transports', () => {
         expect(redirect).toBe('https://tenant.example/#session_token=target.jwt.token');
     });
 
+    it('keeps loopback tenant switching on the active frontend origin', () => {
+        const redirect = normalizeTenantRedirectUrl(
+            'http://localhost:8008/#session_token=target.jwt.token',
+            'http://127.0.0.1:3008/admin/platform-settings',
+        );
+
+        expect(redirect).toBe('http://127.0.0.1:3008/#session_token=target.jwt.token');
+    });
+
     it('keeps the tenant-scoped token during a StrictMode auth bootstrap replay', () => {
         const platformToken = 'platform-token';
         const tenantToken = 'tenant-token';

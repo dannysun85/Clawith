@@ -517,7 +517,8 @@ export default function Layout() {
         enabled: !!user && showNotifications,
     });
     // Total unread across all group sessions, for the Groups nav badge.
-    const groupUnread = useGroupUnread();
+    const hasTenantContext = !!user?.tenant_id;
+    const groupUnread = useGroupUnread(hasTenantContext);
     const markAllRead = async () => {
         const token = localStorage.getItem('token');
         await fetch('/api/notifications/read-all', { method: 'POST', headers: token ? { Authorization: `Bearer ${token}` } : {} });
@@ -741,6 +742,7 @@ export default function Layout() {
     // Use user's own tenant_id directly (no switching)
     const currentTenant = user?.tenant_id || '';
     const currentTenantName = useMemo(() => {
+        if (!currentTenant) return isChinese ? '平台管理' : 'Platform Console';
         const tenant = (myTenants as any[]).find((item: any) => item.tenant_id === currentTenant);
         return tenant?.tenant_name || (isChinese ? '当前公司' : 'Current Company');
     }, [currentTenant, isChinese, myTenants]);
@@ -767,6 +769,7 @@ export default function Layout() {
         queryKey: ['agents', currentTenant],
         queryFn: () => agentApi.list(currentTenant || undefined),
         refetchInterval: 30000,
+        enabled: hasTenantContext,
     });
     const agentCreationLimit = useAgentCreationLimit(agents as any[]);
 
@@ -1202,7 +1205,7 @@ export default function Layout() {
 
 
 
-                    <div className="sidebar-section" data-tour-target="main-nav">
+                    {hasTenantContext && <div className="sidebar-section" data-tour-target="main-nav">
                         <NavLink to="/dashboard" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
                             <span className="sidebar-item-icon" style={{ display: 'flex' }}>{SidebarIcons.home}</span>
                             <span className="sidebar-item-text">{t('nav.dashboard')}</span>
@@ -1233,11 +1236,10 @@ export default function Layout() {
                                 <span className="sidebar-item-badge">{groupUnread > 99 ? '99+' : groupUnread}</span>
                             )}
                         </NavLink>
-                    </div>
+                    </div>}
                 </div>
-                
+                {hasTenantContext && <>
                 <div className="sidebar-divider" />
-
                 <div
                     className="sidebar-scrollable"
                     data-tour-target="agent-list"
@@ -1262,6 +1264,7 @@ export default function Layout() {
                     {!isSidebarCollapsed && agentSearchBox()}
                     {agentListContent()}
                 </div>
+                </>}
 
                 <div className="sidebar-bottom">
                     <div className="sidebar-footer">
