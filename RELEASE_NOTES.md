@@ -1,6 +1,6 @@
-# v1.11.2 — Durable Deliverable Briefs and Tenant-Safe Sessions
+# v1.11.2 — Verified Presentation Delivery and Tenant-Safe Sessions
 
-## Deliverable Workbench Foundation
+## Deliverable Workbench and Verified Presentation Delivery
 
 - Added a tenant-scoped deliverable workbench for structured presentation,
   poster, and video briefs. Requests persist their workflow contract, tier,
@@ -8,14 +8,23 @@
   status, and current stage instead of relying on an optimistic browser-only
   timeline.
 - Added durable artifact-revision records with parent lineage, workspace path,
-  content hash, approval state, evaluation metadata, and tenant-bound foreign
-  keys. Refreshing or reconnecting therefore retains the request and artifact
-  audit trail.
-- Presentation briefs may launch through the durable Agent Runtime after
-  server-side preflight. Poster and video manifests remain deliberately
-  planning-only (`dry_run`): preflight does not call a paid provider or deduct
-  Credits, and this release does not describe them as completed generation
-  workflows.
+  content hash, approval state, evaluation metadata, tenant-bound foreign keys,
+  and private content-addressed snapshots. Refreshing or reconnecting retains
+  the request and artifact audit trail without serving mutable Agent workspace
+  files as approved customer deliverables.
+- Presentation preflight now requires both `convert_html_to_pptx` and
+  `convert_html_to_pdf`. A completed Runtime run is reconciled only from its
+  successful tool-execution ledger and exact request-scoped workspace paths;
+  PPTX ZIP structure, PDF signatures, size limits, tenant/run/request identity,
+  hashes, and immutable snapshots must all validate before review is allowed.
+- Added a persisted review card with live running-state polling, authenticated
+  PDF preview and PPTX download, explicit approval, and request-changes actions.
+  Approval revalidates both the mutable source and private snapshot; missing,
+  changed, invalid, or unavailable output fails closed instead of being marked
+  delivered.
+- Poster and video manifests remain deliberately planning-only (`dry_run`):
+  preflight does not call a paid provider or deduct Credits, and this release
+  does not describe them as completed generation workflows.
 - The user-facing contract accepts business intent, inputs, tier, and output
   requirements while provider/model routing remains controlled by the SaaS
   platform. Existing direct media shortcuts, shared model-pool policy,
@@ -38,24 +47,29 @@
 - The backend continues to reject tenantless chat sessions. The fix preserves
   the fail-closed multi-tenant boundary rather than weakening authorization to
   hide the frontend context error.
+- Deliverable mutations refresh server-managed `updated_at` values before
+  Pydantic response serialization, preventing successful approvals from being
+  rolled back by SQLAlchemy async `MissingGreenlet` lazy-load errors.
 
 ## Validation
 
-- Independent code review: `APPROVE`; independent architecture review:
-  `CLEAR`, with no local release-candidate blocker.
-- Complete backend suite: `3511 passed`; the Ruff release diff gate reported no
-  new violations relative to `v1.11.1` across 460 changed Python files.
+- Complete backend suite: `3520 passed`; the Ruff release diff gate reported no
+  new violations relative to `v1.11.1` across 463 changed Python files.
 - Frontend locked install reported zero vulnerabilities; all 65 Node contract
-  tests and 123 Vitest tests passed, and the production build completed with
+  tests and 124 Vitest tests passed, and the production build completed with
   7031 transformed modules.
 - Alembic has the single `add_deliverable_workbench` head. PostgreSQL fresh
   upgrade, historical upgrade, downgrade, and re-upgrade smoke passed together
   with tenant, Credits, media, approval, A2A, monitoring, and channel-secret
-  checks.
+  checks. Effective production Compose rendering and both packaged browser
+  assertions also passed.
 - Real Chrome acceptance covered platform-admin login, switching to the
   approved Shenzhen tenant, opening the private assistant, and creating a new
   chat session. The request returned `201`, the flow passed again in a fresh
-  tab, and the final browser console had no errors or warnings.
+  tab, and the final browser console had no errors or warnings. Presentation
+  review, authenticated preview/download, and approval were exercised with a
+  local deterministic Runtime fixture; that proves the product workflow but is
+  not a paid-provider or production acceptance result.
 
 ## Upgrade Notes
 
