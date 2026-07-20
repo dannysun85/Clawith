@@ -1,5 +1,14 @@
 # v1.11.2 — Verified Presentation Delivery and Tenant-Safe Sessions
 
+## Production Egress Guard Binding Hardening
+
+- Host egress guard installation now requires an explicit Docker network and
+  refuses an empty network, preventing a valid contract from being attached to
+  an unused Compose network.
+- The production workflow reads `DOCKER_NETWORK` from the active release and
+  verifies the same network after installation; deployment now fails closed
+  when the active release does not declare that value.
+
 ## Media Generation Reliability Hotfix
 
 - Chat uploads now use the canonical `workspace/uploads/<filename>` contract

@@ -89,15 +89,24 @@ commit 的 root-owned 证据完成 fsync 并原子发布后才算消费；发布
 授权并在生产主机执行：
 
 ```bash
+DOCKER_NETWORK_NAME="$(
+  grep -E '^DOCKER_NETWORK=' /opt/astra-poc/current/.env | tail -1 | \
+    cut -d= -f2- | sed -E 's/^"//; s/"$//'
+)"
+test -n "$DOCKER_NETWORK_NAME"
 sudo bash scripts/manage-production-mcp-egress-guard.sh install \
-  astra_network deploy/security-contracts/mcp-egress-v1
+  "$DOCKER_NETWORK_NAME" deploy/security-contracts/mcp-egress-v1
+sudo bash scripts/manage-production-mcp-egress-guard.sh verify \
+  "$DOCKER_NETWORK_NAME" deploy/security-contracts/mcp-egress-v1
 ```
 
 该操作安装 root-owned `DOCKER-USER` 出网规则和 systemd watchdog：应用网络保留
 内部 PostgreSQL/Redis/服务通信以及现有产品所需的公网端口，私网、loopback、
 link-local、metadata、benchmark 和保留地址全部拒绝。MCP 的 HTTPS、DNS 解析和
 connected-peer 校验仍由应用层独立执行；主机层不把整个共享应用网络误收窄为
-53/443。规则修复先插入临时 REJECT 栅栏，完整链和唯一首条 jump 校验成功后才
+53/443。安装时必须从当前生产 `.env` 读取显式 `DOCKER_NETWORK`，且目标网络必须
+已有应用容器；禁止使用脚本默认值或对空网络安装。规则修复先插入临时 REJECT
+栅栏，完整链和唯一首条 jump 校验成功后才
 移除，禁止瞬时 fail-open。普通部署在备份、维护窗口和迁移之前核对合同 SHA-256、
 network subnet、规则顺序和 watchdog marker；缺失或漂移时停止发布。安装或修改
 该规则属于独立的生产主机安全变更，必须先验证现有公网集成与内部服务均正常。

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ACTION="${1:-verify}"
-NETWORK="${2:-astra_network}"
+NETWORK="${2:-}"
 SOURCE_CONTRACT="${3:-}"
 CHAIN="ASTRA_MCP_EGRESS_V1"
 JUMP_COMMENT="astra-mcp-egress-v1"
@@ -26,13 +26,6 @@ require_cmd() {
     command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
 }
 
-require_cmd docker
-require_cmd iptables
-require_cmd sha256sum
-require_cmd python3
-require_cmd diff
-require_cmd flock
-
 acquire_process_lock() {
     exec 9>/run/lock/astra-mcp-egress-guard.lock
     flock -w 30 9 || die "another MCP egress guard operation is running"
@@ -50,6 +43,13 @@ fi
 case "$NETWORK" in
     ''|*[!A-Za-z0-9_.-]*) die "invalid Docker network name" ;;
 esac
+
+require_cmd docker
+require_cmd iptables
+require_cmd sha256sum
+require_cmd python3
+require_cmd diff
+require_cmd flock
 
 network_contract() {
     docker network inspect "$NETWORK" | python3 -c '
@@ -73,6 +73,18 @@ for item in (network.get("IPAM") or {}).get("Config") or []:
 if len(subnets) != 1:
     raise SystemExit("Docker application network must have exactly one IPv4 subnet")
 print(subnets[0])
+'
+}
+
+network_attached_container_count() {
+    docker network inspect "$NETWORK" | python3 -c '
+import json
+import sys
+
+payload = json.load(sys.stdin)
+if len(payload) != 1:
+    raise SystemExit("Docker network lookup must return exactly one network")
+print(len(payload[0].get("Containers") or {}))
 '
 }
 
@@ -268,6 +280,10 @@ install_watchdog() {
     require_root
     require_cmd install
     require_cmd systemctl
+    local attached_container_count
+    attached_container_count="$(network_attached_container_count)"
+    [ "$attached_container_count" -gt 0 ] || \
+        die "refusing MCP egress guard installation on a Docker network with no attached containers"
     install -d -m 0700 "$INSTALL_DIR"
     install -m 0755 "${BASH_SOURCE[0]}" "$INSTALL_SCRIPT"
     install -m 0600 "$SOURCE_CONTRACT" "$INSTALL_CONTRACT"
@@ -320,6 +336,6 @@ case "$ACTION" in
         verify_rules
         ;;
     *)
-        die "usage: $0 {install|ensure|apply|verify} [docker-network] [contract-file]"
+        die "usage: $0 {install|ensure|apply|verify} <docker-network> [contract-file]"
         ;;
 esac

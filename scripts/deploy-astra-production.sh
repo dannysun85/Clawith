@@ -4181,7 +4181,8 @@ DOCKER_NETWORK_NAME="$(
         cut -d= -f2- | sed -E 's/^"//; s/"$//'
 )"
 if [ -z "$DOCKER_NETWORK_NAME" ]; then
-    DOCKER_NETWORK_NAME="astra_network"
+    echo "current release environment must define DOCKER_NETWORK before host egress verification" >&2
+    exit 1
 fi
 echo "[remote] verifying host-level MCP egress contract"
 sudo bash "$RELEASE/scripts/manage-production-mcp-egress-guard.sh" verify \

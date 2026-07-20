@@ -1152,6 +1152,14 @@ def test_mcp_host_egress_guard_is_a_pre_mutation_release_gate():
     assert "MCP egress chain must have exactly one DOCKER-USER jump" in guard
     assert "repair can interrupt" in guard
     assert "flock -w 30" in guard
+    assert 'NETWORK="${2:-}"' in guard
+    assert 'NETWORK="${2:-astra_network}"' not in guard
+    assert "network_attached_container_count" in guard
+    assert "Docker network with no attached containers" in guard
+    install_watchdog = guard[guard.index("install_watchdog()") : guard.index('case "$ACTION"')]
+    assert install_watchdog.index('attached_container_count="$(network_attached_container_count)"') < (
+        install_watchdog.index('install -d -m 0700 "$INSTALL_DIR"')
+    )
     # POSIX awk implementations reserve `index` as a built-in function name.
     # Using it as a loop variable passed source inspection but failed on the
     # Ubuntu production host before the guard could be installed.
@@ -1172,6 +1180,27 @@ def test_mcp_host_egress_guard_is_a_pre_mutation_release_gate():
     migration = deploy_script.index("backend upgrade head", maintenance)
     assert gate < recovery < backup < maintenance < migration
     assert 'manage-production-mcp-egress-guard.sh" verify' in deploy_script
+    assert 'DOCKER_NETWORK_NAME="astra_network"' not in deploy_script
+    assert "current release environment must define DOCKER_NETWORK" in deploy_script
+
+    missing_network = subprocess.run(
+        ["bash", str(guard_path), "verify"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert missing_network.returncode != 0
+    assert "invalid Docker network name" in missing_network.stderr
+
+
+def test_mcp_host_egress_guard_installation_uses_the_live_network():
+    workflow = (ROOT / ".agents/workflows/deploy-production.md").read_text(encoding="utf-8")
+
+    assert "/opt/astra-poc/current/.env" in workflow
+    assert '"$DOCKER_NETWORK_NAME" deploy/security-contracts/mcp-egress-v1' in workflow
+    assert "目标网络必须\n已有应用容器" in workflow
+    assert "禁止使用脚本默认值或对空网络安装" in workflow
 
 
 def test_normal_production_deploy_force_disables_code_activation():
