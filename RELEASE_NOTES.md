@@ -22,6 +22,13 @@
   Approval revalidates both the mutable source and private snapshot; missing,
   changed, invalid, or unavailable output fails closed instead of being marked
   delivered.
+- Native preview and download links now accept the same-origin HttpOnly browser
+  session as well as an explicit Bearer token. Artifact lookup remains bound to
+  the active tenant, requesting user, and authorized Agent, so opening a PDF in
+  a new tab no longer loses authentication or weakens ownership checks.
+- The deliverable drawer now stays above the complete mobile application shell,
+  while remaining below the onboarding tour. Pointer close controls and Escape
+  dismissal are covered by a shared interaction contract.
 - Poster and video manifests remain deliberately planning-only (`dry_run`):
   preflight does not call a paid provider or deduct Credits, and this release
   does not describe them as completed generation workflows.
@@ -53,9 +60,9 @@
 
 ## Validation
 
-- Complete backend suite: `3520 passed`; the Ruff release diff gate reported no
+- Complete backend suite: `3522 passed`; the Ruff release diff gate reported no
   new violations relative to `v1.11.1` across 463 changed Python files.
-- Frontend locked install reported zero vulnerabilities; all 65 Node contract
+- Frontend locked install reported zero vulnerabilities; all 67 Node contract
   tests and 124 Vitest tests passed, and the production build completed with
   7031 transformed modules.
 - Alembic has the single `add_deliverable_workbench` head. PostgreSQL fresh
@@ -68,8 +75,10 @@
   chat session. The request returned `201`, the flow passed again in a fresh
   tab, and the final browser console had no errors or warnings. Presentation
   review, authenticated preview/download, and approval were exercised with a
-  local deterministic Runtime fixture; that proves the product workflow but is
-  not a paid-provider or production acceptance result.
+  local deterministic Runtime fixture. Native same-origin navigation also
+  returned a browser-recognized `application/pdf` resource, after which its
+  temporary database and storage fixture was removed. These checks prove the
+  local product workflow but are not paid-provider or production acceptance.
 
 ## Upgrade Notes
 

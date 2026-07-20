@@ -14,7 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import check_agent_access
-from app.core.security import get_current_user
+from app.core.security import get_current_user, get_current_user_from_bearer_or_browser_session
 from app.database import get_db
 from app.models.chat_session import ChatSession
 from app.models.deliverable import DeliverableArtifactRevision, DeliverableRequest
@@ -289,7 +289,7 @@ async def get_deliverable_request(
 async def download_deliverable_artifact(
     artifact_id: uuid.UUID,
     inline: bool = False,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user_from_bearer_or_browser_session),
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(

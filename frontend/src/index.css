@@ -7683,7 +7683,9 @@ select:focus {
 .deliverable-drawer-layer {
   position: fixed;
   inset: 0;
-  z-index: 9000;
+  /* Stay above the mobile app shell (10000-10040) so pointer users can close
+     the drawer; keep the onboarding tour (20000+) authoritative. */
+  z-index: 10050;
   display: flex;
   justify-content: flex-end;
 }

@@ -671,7 +671,7 @@ async def report_result(
         # Look up OpenClaw agent's participant_id
         part_r = await db.execute(select(Participant).where(Participant.type == "agent", Participant.ref_id == agent.id))
         participant = part_r.scalar_one_or_none()
-        
+
         assistant_msg = ChatMessage(
             id=uuid.uuid5(msg.id, "gateway-report-result"),
             agent_id=session.agent_id,

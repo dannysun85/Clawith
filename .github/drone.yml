@@ -164,12 +164,12 @@ steps:
       - echo "启动全部服务 (postgres/redis/backend/frontend)..."
       - IMAGE_TAG=new docker compose -f docker-compose.ci.yml up -d --no-build
       - sleep 5
-      
+
       # 等待基础设施就绪
       - echo "等待 postgres 和 redis 健康检查通过..."
       - timeout 30s bash -c 'until [ "$(docker inspect --format="{{.State.Health.Status}}" $(docker compose -f docker-compose.ci.yml ps -q postgres) 2>/dev/null)" = "healthy" ]; do sleep 2; done' || (echo "postgres 启动超时" && docker compose -f docker-compose.ci.yml logs postgres && exit 1)
       - timeout 30s bash -c 'until [ "$(docker inspect --format="{{.State.Health.Status}}" $(docker compose -f docker-compose.ci.yml ps -q redis) 2>/dev/null)" = "healthy" ]; do sleep 2; done' || (echo "redis 启动超时" && docker compose -f docker-compose.ci.yml logs redis && exit 1)
-      
+
       # 核心验证: backend 启动
       - echo "等待 backend 启动 (最多 90 秒)..."
       - timeout 90s bash -c 'until docker compose -f docker-compose.ci.yml logs --tail=200 backend 2>&1 | grep -q "Application startup complete"; do sleep 3; done'
@@ -180,7 +180,7 @@ steps:
           docker compose -f docker-compose.ci.yml logs --tail=100 backend
           exit 1
         fi
-        
+
       # 检查迁移是否失败
       - echo "检查数据库迁移状态..."
       - |
@@ -190,7 +190,7 @@ steps:
           echo "$MIGRATION_LOG" | grep -Ei "migration|alembic|error|FAIL"
           exit 1
         fi
-        
+
       # 验证 health endpoint (通过 docker compose exec 直接在容器内 curl)
       - echo "验证 health endpoint..."
       - timeout 10s bash -c 'until docker compose -f docker-compose.ci.yml exec -T backend curl -sf http://localhost:8000/api/health > /dev/null 2>&1; do sleep 2; done' || (echo "❌ health endpoint 不可达" && exit 1)
@@ -198,7 +198,7 @@ steps:
       # 健康检查不能证明 execute_code 可用；实际运行 bubblewrap 沙箱。
       - echo "验证本地 execute_code 沙箱..."
       - docker compose -f docker-compose.ci.yml exec -T -u clawith backend python -m app.scripts.sandbox_smoke
-      
+
       # 清理环境
       - echo "清理测试环境..."
       - docker compose -f docker-compose.ci.yml down -v --remove-orphans

@@ -28,6 +28,7 @@ WEBSOCKET_TOKEN_PROTOCOL_PREFIX = "astra-token."
 
 # Bearer token scheme
 security = HTTPBearer()
+optional_security = HTTPBearer(auto_error=False)
 
 # Thread pool for CPU-intensive bcrypt operations (avoids blocking the event loop)
 _bcrypt_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="bcrypt")
@@ -252,15 +253,15 @@ def websocket_response_subprotocol(websocket: WebSocket) -> str | None:
     return WEBSOCKET_APP_PROTOCOL if WEBSOCKET_APP_PROTOCOL in protocols else None
 
 
-async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-    db: AsyncSession = Depends(get_db),
+async def get_current_user_for_access_token(
+    token: str,
+    db: AsyncSession,
 ):
-    """Require an active account in an active tenant for business APIs."""
+    """Resolve one access token to an active account and active tenant."""
     from app.models.tenant import Tenant
     from app.models.user import User
 
-    payload = decode_access_token(credentials.credentials)
+    payload = decode_access_token(token)
     user_id = payload.get("sub")
     if not user_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
@@ -295,6 +296,26 @@ async def get_current_user(
     # before the endpoint performs CPU work or external network I/O.
     await db.commit()
     return user
+
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: AsyncSession = Depends(get_db),
+):
+    """Require an active account in an active tenant for business APIs."""
+    return await get_current_user_for_access_token(credentials.credentials, db)
+
+
+async def get_current_user_from_bearer_or_browser_session(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(optional_security),
+    db: AsyncSession = Depends(get_db),
+):
+    """Authenticate browser-native same-origin resources without URL secrets."""
+    token = credentials.credentials if credentials is not None else request.cookies.get(BROWSER_SESSION_COOKIE)
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
+    return await get_current_user_for_access_token(token, db)
 
 
 async def get_authenticated_user(

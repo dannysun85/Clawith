@@ -3305,7 +3305,7 @@ AGENTBAY_TOOLS = [
 
 BUILTIN_TOOLS = [
     *BUILTIN_TOOLS,
-    # ── AgentBay Tools ──  
+    # ── AgentBay Tools ──
     *AGENTBAY_TOOLS,
 ]
 

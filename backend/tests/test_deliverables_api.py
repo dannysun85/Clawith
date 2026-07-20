@@ -7,10 +7,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 import uuid
 
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 import pytest
 
 from app.api import deliverables
+from app.core.security import BROWSER_SESSION_COOKIE, create_access_token
+from app.database import get_db
 from app.models.deliverable import DeliverableArtifactRevision, DeliverableRequest
 from app.schemas.deliverable import DeliverableActionIn
 from app.services.deliverable_artifacts import DeliverableArtifactError
@@ -67,6 +70,21 @@ class _Storage:
 
     async def read_bytes(self, _key: str) -> bytes:
         return self.data
+
+
+class _HttpSession:
+    def __init__(self, *execute_values: object | None) -> None:
+        self.execute_values = list(execute_values)
+        self.tenant = SimpleNamespace(is_active=True)
+
+    async def execute(self, _statement):
+        return _Result(self.execute_values.pop(0))
+
+    async def get(self, _model, _key):
+        return self.tenant
+
+    async def commit(self) -> None:
+        return None
 
 
 def _request() -> DeliverableRequest:
@@ -217,3 +235,71 @@ async def test_artifact_download_serves_private_snapshot_after_owned_request_che
         user=user,
     )
     snapshot.assert_awaited_once_with(storage, artifact=artifact)
+
+
+def test_artifact_download_accepts_same_origin_browser_session_cookie(monkeypatch) -> None:
+    request = _request()
+    artifact = _artifact(request, "pdf")
+    artifact.mime_type = "application/pdf"
+    identity = SimpleNamespace(is_active=True, auth_version=0)
+    user = SimpleNamespace(
+        id=request.created_by_user_id,
+        tenant_id=request.tenant_id,
+        is_active=True,
+        identity=identity,
+    )
+    db = _HttpSession(user, artifact)
+    storage = _Storage(b"unused")
+    owned_request = AsyncMock(return_value=request)
+    snapshot = AsyncMock(return_value=b"%PDF-1.7\n%%EOF")
+    monkeypatch.setattr(deliverables, "_owned_request", owned_request)
+    monkeypatch.setattr(deliverables, "read_deliverable_artifact_snapshot", snapshot)
+    monkeypatch.setattr(deliverables, "get_storage_backend", lambda: storage)
+
+    app = FastAPI()
+    app.include_router(deliverables.router)
+    app.dependency_overrides[get_db] = lambda: db
+    token = create_access_token(str(user.id), "member", auth_version=0)
+
+    with TestClient(app) as client:
+        client.cookies.set(BROWSER_SESSION_COOKIE, token)
+        response = client.get(f"/api/deliverables/artifacts/{artifact.id}/download?inline=true")
+
+    assert response.status_code == 200
+    assert response.content == b"%PDF-1.7\n%%EOF"
+    assert response.headers["content-type"] == "application/pdf"
+    assert response.headers["content-disposition"].startswith("inline;")
+    owned_request.assert_awaited_once_with(db, request_id=request.id, user=user)
+    snapshot.assert_awaited_once_with(storage, artifact=artifact)
+
+
+def test_artifact_download_rejects_missing_or_cross_tenant_browser_session(monkeypatch) -> None:
+    request = _request()
+    identity = SimpleNamespace(is_active=True, auth_version=0)
+    user = SimpleNamespace(
+        id=request.created_by_user_id,
+        tenant_id=request.tenant_id,
+        is_active=True,
+        identity=identity,
+    )
+    token = create_access_token(str(user.id), "member", auth_version=0)
+    owned_request = AsyncMock(return_value=request)
+    monkeypatch.setattr(deliverables, "_owned_request", owned_request)
+
+    unauthenticated_app = FastAPI()
+    unauthenticated_app.include_router(deliverables.router)
+    unauthenticated_app.dependency_overrides[get_db] = lambda: _HttpSession()
+    with TestClient(unauthenticated_app) as client:
+        missing = client.get(f"/api/deliverables/artifacts/{uuid.uuid4()}/download")
+    assert missing.status_code == 401
+
+    cross_tenant_db = _HttpSession(user, None)
+    cross_tenant_app = FastAPI()
+    cross_tenant_app.include_router(deliverables.router)
+    cross_tenant_app.dependency_overrides[get_db] = lambda: cross_tenant_db
+    with TestClient(cross_tenant_app) as client:
+        client.cookies.set(BROWSER_SESSION_COOKIE, token)
+        hidden = client.get(f"/api/deliverables/artifacts/{uuid.uuid4()}/download")
+
+    assert hidden.status_code == 404
+    owned_request.assert_not_awaited()
