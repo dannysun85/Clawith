@@ -935,6 +935,45 @@ async def test_generate_image_minimax_records_success(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_generate_image_minimax_missing_reference_is_typed_failure_before_task(tmp_path):
+    create_task = AsyncMock()
+
+    with patch(
+        "app.services.media_generation.create_minimax_sync_media_task_record",
+        create_task,
+    ):
+        result = await agent_tools._generate_image_minimax_durable(
+            agent_id=uuid.uuid4(),
+            ws=tmp_path,
+            arguments={"reference_image": "uploads/missing.png"},
+            user_id=None,
+            session_id="",
+            tenant_id=uuid.uuid4(),
+            credential_id=uuid.uuid4(),
+            api_key="sk-test",
+            base_url="https://api.minimax.test",
+            model="image-01",
+            tier="lite",
+            credit_cost=4,
+            provider_prompt="poster",
+            save_path="workspace/images/poster.png",
+            output_extension=".png",
+            overlay_text="",
+            overlay_position="bottom",
+            brand_asset=None,
+            brand_position="center",
+            brand_scale=0.42,
+            typed=True,
+        )
+
+    assert isinstance(result, ToolExecutionOutcome)
+    assert result.status == "failed"
+    assert result.error_code == "brand_safe_media_contract_invalid"
+    assert "was not found in the workspace" in result.result_summary
+    create_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_generate_image_storage_failure_preserves_provider_debt_and_raw_recovery(tmp_path):
     agent_id = uuid.uuid4()
     tenant_id = uuid.uuid4()

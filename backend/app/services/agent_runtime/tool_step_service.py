@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
+import re
 from typing import Protocol, cast
 import uuid
 
@@ -77,6 +78,9 @@ from app.services.builtin_tool_definitions import (
     builtin_policy,
     builtin_sensitive_paths,
 )
+from app.services.media_tool_registry import MEDIA_ARTIFACT_TOOL_MODALITIES
+
+
 _CONTROL_TOOL_NAMES = frozenset({"finish", "wait"})
 _HEARTBEAT_PRIVATE_PLAZA_TOOLS = frozenset(
     {"plaza_get_new_posts", "plaza_create_post", "plaza_add_comment"}
@@ -85,6 +89,195 @@ _HEARTBEAT_PLAZA_LIMITS = {
     "plaza_create_post": 1,
     "plaza_add_comment": 2,
 }
+
+_MEDIA_GENERATION_TOOL_MODALITIES = {
+    name: modality
+    for name, modality in MEDIA_ARTIFACT_TOOL_MODALITIES.items()
+    if name != "check_video_minimax"
+}
+_CHINESE_OUTPUT_NUMBERS = {
+    "一": 1,
+    "壹": 1,
+    "二": 2,
+    "两": 2,
+    "贰": 2,
+    "三": 3,
+    "叁": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+    "十": 10,
+}
+_EXACT_COPY_PATTERNS = (
+    re.compile(
+        r"(?:主标题|副标题|标题|文案|字幕|文字|一句话)"
+        r"[^。！？\n]{0,96}?[“\"「『]([^”\"」』\n]{1,200})[”\"」』]",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:headline|title|caption|copy|visible text)"
+        r"[^.!?\n]{0,96}?(?:read|say|show|display|be)\s*[:：]?\s*"
+        r"[“\"]([^”\"\n]{1,200})[”\"]",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _required_exact_overlay_text(goal: str) -> str | None:
+    """Return user-specified visible copy only when the request is explicit."""
+
+    candidates: list[tuple[int, str]] = []
+    for pattern in _EXACT_COPY_PATTERNS:
+        for match in pattern.finditer(goal):
+            value = match.group(1).strip()
+            if value:
+                candidates.append((match.start(1), value))
+    if not candidates:
+        return None
+    ordered: list[str] = []
+    for _offset, value in sorted(candidates):
+        if value not in ordered:
+            ordered.append(value)
+    return "\n".join(ordered)
+
+
+def _media_reference_requirement(goal: str, modality: str) -> str | None:
+    """Identify when an attached asset must participate in one media call."""
+
+    normalized = goal.casefold()
+    has_attachment = any(
+        marker in normalized
+        for marker in ("[attachment:", "attached file:", "[image_data:", "[video_data:")
+    )
+    if not has_attachment:
+        return None
+    references_attachment = any(
+        cue in normalized
+        for cue in (
+            "参考",
+            "原型",
+            "基于",
+            "保持",
+            "保留",
+            "reference",
+            "prototype",
+            "based on",
+            "preserve",
+            "keep the",
+        )
+    )
+    if not references_attachment:
+        return None
+    if modality == "image" and any(
+        cue in normalized
+        for cue in (
+            "保持",
+            "保留",
+            "品牌辨识",
+            "产品原型",
+            "产品为",
+            "unchanged",
+            "preserve",
+            "same product",
+        )
+    ):
+        return "brand_asset"
+    return "reference"
+
+
+def _parse_output_number(value: str) -> int | None:
+    if value.isdecimal():
+        parsed = int(value)
+        return parsed if 1 <= parsed <= 99 else None
+    return _CHINESE_OUTPUT_NUMBERS.get(value)
+
+
+def _explicit_media_output_limit(goal: str, modality: str) -> int | None:
+    """Read a bounded, explicit output count without guessing workflow intent."""
+
+    if modality == "image":
+        patterns = (
+            r"([1-9]\d?|[一二两三四五六七八九十壹贰叁])\s*(?:张|幅)\s*(?:图片|图像|海报|宣传图)?",
+            r"(?:生成|制作|创建|输出|做)\s*([1-9]\d?|[一二两三四五六七八九十壹贰叁])\s*(?:个)?\s*(?:图片|图像|海报|宣传图)",
+            r"\b(?:generate|create|make|produce)\s+(?:exactly\s+)?(one|two|three|[1-9]\d?)\s+(?:image|poster)s?\b",
+        )
+    elif modality == "video":
+        patterns = (
+            r"([1-9]\d?|[一二两三四五六七八九十壹贰叁])\s*(?:个|支|段|条|部)\s*(?:视频|短片|广告片)",
+            r"(?:生成|制作|创建|输出|做)\s*([1-9]\d?|[一二两三四五六七八九十壹贰叁])\s*(?:个|支|段|条|部)?\s*(?:视频|短片|广告片)",
+            r"\b(?:generate|create|make|produce)\s+(?:exactly\s+)?(one|two|three|[1-9]\d?)\s+(?:video|clip)s?\b",
+        )
+    else:
+        return None
+    english_numbers = {"one": 1, "two": 2, "three": 3}
+    for pattern in patterns:
+        match = re.search(pattern, goal, re.IGNORECASE)
+        if match is None:
+            continue
+        raw = match.group(1).casefold()
+        return english_numbers.get(raw) or _parse_output_number(raw)
+    return None
+
+
+def _media_contract_block(
+    goal: str,
+    tool_name: str,
+    arguments: Mapping[str, object],
+) -> tuple[str, str] | None:
+    modality = _MEDIA_GENERATION_TOOL_MODALITIES.get(tool_name)
+    if modality not in {"image", "video"}:
+        return None
+
+    exact_copy = _required_exact_overlay_text(goal)
+    overlay_text = str(arguments.get("overlay_text") or "").strip()
+    if exact_copy is not None and overlay_text != exact_copy:
+        return (
+            "media_generation_contract_blocked",
+            (
+                "[BLOCKED] This request requires exact visible copy. Retry one "
+                f"{modality} generation call with overlay_text set exactly to "
+                f"{json.dumps(exact_copy, ensure_ascii=False)}, together with every "
+                "required reference asset. No media provider request was made."
+            ),
+        )
+
+    reference_requirement = _media_reference_requirement(goal, modality)
+    if reference_requirement is None:
+        return None
+    non_empty = {
+        key
+        for key in (
+            "brand_asset",
+            "reference_image",
+            "first_frame_image",
+            "last_frame_image",
+        )
+        if isinstance(arguments.get(key), str) and str(arguments[key]).strip()
+    }
+    if reference_requirement == "brand_asset":
+        satisfied = "brand_asset" in non_empty
+        required_fields = "brand_asset"
+    else:
+        satisfied = bool(non_empty)
+        required_fields = (
+            "brand_asset or reference_image"
+            if modality == "image"
+            else "brand_asset, first_frame_image, or last_frame_image"
+        )
+    if satisfied:
+        return None
+    return (
+        "media_generation_contract_blocked",
+        (
+            "[BLOCKED] This request requires the uploaded/reference asset in the "
+            f"same {modality} generation call. Retry with {required_fields}, "
+            "together with overlay_text when exact copy was requested. No media "
+            "provider request was made."
+        ),
+    )
 
 
 async def _insert_runtime_activity(
@@ -1035,6 +1228,31 @@ class RuntimeToolStepService:
             )
             return int(result.scalar_one())
 
+    async def _successful_media_count(
+        self,
+        *,
+        tenant_id: uuid.UUID,
+        run_id: uuid.UUID,
+        modality: str,
+    ) -> int:
+        tool_names = tuple(
+            name
+            for name, candidate_modality in _MEDIA_GENERATION_TOOL_MODALITIES.items()
+            if candidate_modality == modality
+        )
+        if not tool_names:
+            return 0
+        async with self._session_factory() as db:
+            result = await db.execute(
+                select(func.count(AgentToolExecution.id)).where(
+                    AgentToolExecution.tenant_id == tenant_id,
+                    AgentToolExecution.run_id == run_id,
+                    AgentToolExecution.tool_name.in_(tool_names),
+                    AgentToolExecution.status == "succeeded",
+                )
+            )
+            return int(result.scalar_one())
+
     async def _mark_policy_blocked(
         self,
         *,
@@ -1043,6 +1261,7 @@ class RuntimeToolStepService:
         lease_owner: str,
         policy: ToolPolicy,
         result_summary: str,
+        error_code: str = "tool_policy_blocked",
     ) -> ToolExecutionOutcome:
         return await self._settle_outcome(
             tenant_id=tenant_id,
@@ -1053,7 +1272,7 @@ class RuntimeToolStepService:
                 status="failed",
                 result_summary=result_summary,
                 result_ref=None,
-                error_code="tool_policy_blocked",
+                error_code=error_code,
             ),
         )
 
@@ -1483,6 +1702,69 @@ class RuntimeToolStepService:
                                     pending_tool_calls=tool_calls[index + 1 :],
                                 )
                             continue
+
+                media_modality = _MEDIA_GENERATION_TOOL_MODALITIES.get(tool_name)
+                if media_modality in {"image", "video"}:
+                    output_limit = _explicit_media_output_limit(
+                        context.goal,
+                        media_modality,
+                    )
+                    if output_limit is not None:
+                        successful_count = await self._successful_media_count(
+                            tenant_id=tenant_id,
+                            run_id=run_id,
+                            modality=media_modality,
+                        )
+                        if successful_count >= output_limit:
+                            outcome = await self._mark_policy_blocked(
+                                tenant_id=tenant_id,
+                                reservation=reservation,
+                                lease_owner=lease_owner,
+                                policy=policy,
+                                result_summary=(
+                                    "[BLOCKED] The explicitly requested "
+                                    f"{media_modality} output limit has already "
+                                    f"been reached (maximum {output_limit}). Reuse "
+                                    "the existing artifact; do not call another "
+                                    f"{media_modality} generation tool. No media "
+                                    "provider request was made."
+                                ),
+                                error_code="media_generation_limit_reached",
+                            )
+                            messages.append(
+                                _result_message(
+                                    run_id=run_id,
+                                    call_id=call_id,
+                                    tool_name=tool_name,
+                                    outcome=outcome,
+                                )
+                            )
+                            continue
+
+                    media_block = _media_contract_block(
+                        context.goal,
+                        tool_name,
+                        arguments,
+                    )
+                    if media_block is not None:
+                        error_code, result_summary = media_block
+                        outcome = await self._mark_policy_blocked(
+                            tenant_id=tenant_id,
+                            reservation=reservation,
+                            lease_owner=lease_owner,
+                            policy=policy,
+                            result_summary=result_summary,
+                            error_code=error_code,
+                        )
+                        messages.append(
+                            _result_message(
+                                run_id=run_id,
+                                call_id=call_id,
+                                tool_name=tool_name,
+                                outcome=outcome,
+                            )
+                        )
+                        continue
 
                 heartbeat_limit = _heartbeat_tool_limit(context, agent, tool_name)
                 if heartbeat_limit is not None:

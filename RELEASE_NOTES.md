@@ -1,5 +1,24 @@
 # v1.11.2 — Verified Presentation Delivery and Tenant-Safe Sessions
 
+## Media Generation Reliability Hotfix
+
+- Chat uploads now use the canonical `workspace/uploads/<filename>` contract
+  end to end. The media resolver accepts only the bounded historical
+  `uploads/<filename>` alias, ignores remote/data URLs during local workspace
+  materialization, and returns a typed terminal contract failure when a required
+  local asset is missing. A malformed path can no longer escape before durable
+  task creation and leave the Runtime outcome `unknown`.
+- Image and video generation now enforce explicit user contracts before a paid
+  provider call. Exact visible copy and a required uploaded/reference asset must
+  be supplied in the same tool invocation, and an explicit one-image/one-video
+  request cannot produce another successful provider task in the same Run.
+  Contract retries remain possible before any provider work, while duplicated
+  successful media calls fail closed without a second Credits charge.
+- Local operator networks whose TUN DNS returns RFC 2544 fake-IP addresses use
+  the existing explicit `HTTP_PROXY` provider path. Production keeps direct
+  public-IP pinning; environment-specific proxy settings are not copied between
+  local and production deployments.
+
 ## Deliverable Workbench and Verified Presentation Delivery
 
 - Added a tenant-scoped deliverable workbench for structured presentation,
@@ -60,7 +79,8 @@
 
 ## Validation
 
-- Complete backend suite: `3522 passed`; the Ruff release diff gate reported no
+- Complete backend suite: `3529 passed`; the changed Python files passed Ruff
+  and the release diff gate reported no
   new violations relative to `v1.11.1` across 463 changed Python files.
 - Frontend locked install reported zero vulnerabilities; all 67 Node contract
   tests and 124 Vitest tests passed, and the production build completed with
@@ -79,6 +99,14 @@
   returned a browser-recognized `application/pdf` resource, after which its
   temporary database and storage fixture was removed. These checks prove the
   local product workflow but are not paid-provider or production acceptance.
+- A separate isolated `Release Gate QA` browser flow uploaded the real product
+  photo and generated one 864x1152 poster with the exact copy
+  `天地一号 天下第一`. The durable ledger recorded exactly one successful
+  `generate_image_minimax` execution, one media task, one 4-Credits image
+  settlement, two 5-Credits LLM settlements, and zero remaining reservations.
+  The resulting image retained the uploaded product pixels and exact overlay in
+  the same artifact. This verifies functional integrity and billing, not visual
+  quality parity with dedicated Doubao/Qwen creative products.
 
 ## Upgrade Notes
 

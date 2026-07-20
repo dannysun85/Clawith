@@ -2,6 +2,7 @@
 
 from contextlib import asynccontextmanager
 from collections import deque
+import json
 import uuid
 
 import pytest
@@ -108,11 +109,14 @@ def _agent(tenant_id: uuid.UUID, *, access_mode: str = "company") -> Agent:
     )
 
 
-def _call(call_id: str, name: str) -> dict:
+def _call(call_id: str, name: str, arguments: dict | None = None) -> dict:
     return {
         "id": call_id,
         "type": "function",
-        "function": {"name": name, "arguments": "{}"},
+        "function": {
+            "name": name,
+            "arguments": json.dumps(arguments or {}, ensure_ascii=False),
+        },
     }
 
 
@@ -136,13 +140,14 @@ def _state(
     calls: tuple[dict, ...],
     *,
     source_type: str = "chat",
+    goal: str = "Use tools",
 ) -> RuntimeGraphState:
     run_id = uuid.uuid4()
     return {
         "registry": RunRegistrySnapshot(
             tenant_id=str(tenant_id),
             run_id=str(run_id),
-            goal="Use tools",
+            goal=goal,
             run_kind="foreground",
             source_type=source_type,
             model_id=str(uuid.uuid4()),
@@ -280,11 +285,12 @@ def _service(
     *,
     a2a_service=None,
     tool_result_reconciler=None,
+    tool_provider=_tools,
 ) -> tool_step_service.RuntimeToolStepService:
     return tool_step_service.RuntimeToolStepService(
         session_factory=_session_factory(agent),
         cancel_source=cancel_source,
-        tool_provider=_tools,
+        tool_provider=tool_provider,
         tool_executor=executor,
         a2a_service=a2a_service,
         tool_result_reconciler=tool_result_reconciler,
@@ -3106,3 +3112,259 @@ async def test_group_cross_space_policy_does_not_change_other_tool_paths(
     assert result.error is None
     assert dispatched == [tool_name]
     assert result.messages[0]["execution_status"] == "succeeded"
+
+
+_BRAND_SAFE_IMAGE_GOAL = (
+    "[Attachment: product.jpg]\n"
+    "请生成一张图片：以本消息已上传的产品照片为参考原型，保持绿色罐体作为"
+    "中心主体和品牌辨识度，主标题必须清晰、准确写成“天地一号 天下第一”。\n"
+    "Attached file: workspace/uploads/product.jpg"
+)
+
+
+async def _media_tools(agent_id: uuid.UUID) -> list[dict]:
+    del agent_id
+    return [
+        {"type": "function", "function": {"name": "generate_image_minimax"}}
+    ]
+
+
+def test_media_contract_extracts_only_explicit_requirements() -> None:
+    assert (
+        tool_step_service._required_exact_overlay_text(_BRAND_SAFE_IMAGE_GOAL)
+        == "天地一号 天下第一"
+    )
+    assert (
+        tool_step_service._media_reference_requirement(
+            _BRAND_SAFE_IMAGE_GOAL,
+            "image",
+        )
+        == "brand_asset"
+    )
+    assert (
+        tool_step_service._explicit_media_output_limit(
+            _BRAND_SAFE_IMAGE_GOAL,
+            "image",
+        )
+        == 1
+    )
+    assert (
+        tool_step_service._explicit_media_output_limit(
+            "请制作一套 10 页 PPT，每页按内容需要配图。",
+            "image",
+        )
+        is None
+    )
+    assert (
+        tool_step_service._explicit_media_output_limit(
+            "请生成三张图片，分别展示不同场景。",
+            "image",
+        )
+        == 3
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("arguments", "expected_fragment"),
+    (
+        (
+            {"prompt": "poster", "brand_asset": "workspace/uploads/product.jpg"},
+            "requires exact visible copy",
+        ),
+        (
+            {"prompt": "poster", "overlay_text": "天地一号 天下第一"},
+            "requires the uploaded/reference asset",
+        ),
+    ),
+)
+async def test_media_contract_blocks_split_generation_before_provider(
+    monkeypatch,
+    arguments: dict,
+    expected_fragment: str,
+) -> None:
+    tenant_id = uuid.uuid4()
+    agent = _agent(tenant_id)
+    call = _call("media-contract", "generate_image_minimax", arguments)
+    state = _state(
+        tenant_id,
+        agent,
+        (call,),
+        goal=_BRAND_SAFE_IMAGE_GOAL,
+    )
+    execution = _execution(
+        tenant_id,
+        uuid.UUID(state["registry"].run_id),
+        "media-contract",
+        "generate_image_minimax",
+    )
+
+    async def reserve(db, **kwargs):
+        del db, kwargs
+        return _reservation(execution)
+
+    async def mark_failed(db, **kwargs):
+        del db
+        execution.status = "failed"
+        execution.result_summary = kwargs["result_summary"]
+        execution.error_code = kwargs["error_code"]
+        return execution
+
+    async def no_successes(**kwargs):
+        assert kwargs["modality"] == "image"
+        return 0
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError(f"media provider was called: {args}, {kwargs}")
+
+    monkeypatch.setattr(tool_step_service, "reserve_tool_execution", reserve)
+    monkeypatch.setattr(tool_step_service, "mark_tool_execution_failed", mark_failed)
+    service = _service(
+        agent,
+        _CancelSource(None),
+        forbidden,
+        tool_provider=_media_tools,
+    )
+    monkeypatch.setattr(service, "_successful_media_count", no_successes)
+
+    result = await service.execute_pending(state, _context(state), (call,))
+
+    assert result.messages[0]["execution_status"] == "failed"
+    assert result.messages[0]["error_code"] == "media_generation_contract_blocked"
+    assert expected_fragment in result.messages[0]["content"]
+    assert "No media provider request was made" in result.messages[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_media_contract_combines_brand_asset_and_exact_copy_in_one_call(
+    monkeypatch,
+) -> None:
+    tenant_id = uuid.uuid4()
+    agent = _agent(tenant_id)
+    arguments = {
+        "prompt": "Japanese commercial poster",
+        "overlay_text": "天地一号 天下第一",
+        "brand_asset": "workspace/uploads/product.jpg",
+    }
+    call = _call("media-combined", "generate_image_minimax", arguments)
+    state = _state(
+        tenant_id,
+        agent,
+        (call,),
+        goal=_BRAND_SAFE_IMAGE_GOAL,
+    )
+    execution = _execution(
+        tenant_id,
+        uuid.UUID(state["registry"].run_id),
+        "media-combined",
+        "generate_image_minimax",
+    )
+    dispatched: list[dict] = []
+
+    async def reserve(db, **kwargs):
+        del db, kwargs
+        return _reservation(execution)
+
+    async def no_successes(**kwargs):
+        del kwargs
+        return 0
+
+    async def execute(name, actual, *args, **kwargs):
+        del args, kwargs
+        dispatched.append({"name": name, "arguments": actual})
+        return ToolExecutionOutcome(
+            status="succeeded",
+            result_summary="workspace/poster.jpg",
+            result_ref=None,
+        )
+
+    async def mark_succeeded(db, **kwargs):
+        del db
+        execution.status = "succeeded"
+        execution.result_summary = kwargs["result_summary"]
+        return execution
+
+    monkeypatch.setattr(tool_step_service, "reserve_tool_execution", reserve)
+    monkeypatch.setattr(
+        tool_step_service,
+        "mark_tool_execution_succeeded",
+        mark_succeeded,
+    )
+    service = _service(
+        agent,
+        _CancelSource(None),
+        execute,
+        tool_provider=_media_tools,
+    )
+    monkeypatch.setattr(service, "_successful_media_count", no_successes)
+
+    result = await service.execute_pending(state, _context(state), (call,))
+
+    assert result.messages[0]["execution_status"] == "succeeded"
+    assert dispatched == [
+        {"name": "generate_image_minimax", "arguments": arguments}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_explicit_single_image_limit_blocks_second_provider_call(
+    monkeypatch,
+) -> None:
+    tenant_id = uuid.uuid4()
+    agent = _agent(tenant_id)
+    call = _call(
+        "media-duplicate",
+        "generate_image_minimax",
+        {
+            "prompt": "poster",
+            "overlay_text": "天地一号 天下第一",
+            "brand_asset": "workspace/uploads/product.jpg",
+        },
+    )
+    state = _state(
+        tenant_id,
+        agent,
+        (call,),
+        goal=_BRAND_SAFE_IMAGE_GOAL,
+    )
+    execution = _execution(
+        tenant_id,
+        uuid.UUID(state["registry"].run_id),
+        "media-duplicate",
+        "generate_image_minimax",
+    )
+
+    async def reserve(db, **kwargs):
+        del db, kwargs
+        return _reservation(execution)
+
+    async def one_success(**kwargs):
+        assert kwargs["modality"] == "image"
+        return 1
+
+    async def mark_failed(db, **kwargs):
+        del db
+        execution.status = "failed"
+        execution.result_summary = kwargs["result_summary"]
+        execution.error_code = kwargs["error_code"]
+        return execution
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError(f"duplicate media provider call: {args}, {kwargs}")
+
+    monkeypatch.setattr(tool_step_service, "reserve_tool_execution", reserve)
+    monkeypatch.setattr(tool_step_service, "mark_tool_execution_failed", mark_failed)
+    service = _service(
+        agent,
+        _CancelSource(None),
+        forbidden,
+        tool_provider=_media_tools,
+    )
+    monkeypatch.setattr(service, "_successful_media_count", one_success)
+
+    result = await service.execute_pending(state, _context(state), (call,))
+
+    assert result.messages[0]["execution_status"] == "failed"
+    assert result.messages[0]["error_code"] == "media_generation_limit_reached"
+    assert "maximum 1" in result.messages[0]["content"]
+    assert "Reuse the existing artifact" in result.messages[0]["content"]

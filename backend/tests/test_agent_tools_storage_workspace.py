@@ -186,6 +186,13 @@ def test_explicit_media_paths_ignore_data_urls_and_never_fall_back_to_workspace(
         None,
     ) == ["workspace/images/product.png"]
     assert agent_tools._explicit_media_workspace_paths(None, "", "data:video/mp4;base64,AAAA") == []
+    assert agent_tools._media_workspace_input_paths("uploads/product.png") == [
+        "workspace/uploads/product.png"
+    ]
+    assert agent_tools._explicit_media_workspace_paths(
+        "uploads/product.png",
+        "https://example.invalid/product.png",
+    ) == ["workspace/uploads/product.png"]
 
 
 @pytest.mark.asyncio

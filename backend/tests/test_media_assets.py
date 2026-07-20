@@ -116,6 +116,21 @@ def test_workspace_reference_is_validated_and_transported_as_data_url(tmp_path):
     assert base64.b64decode(data_url.split(",", 1)[1]) == source.read_bytes()
 
 
+def test_workspace_reference_accepts_chat_upload_shorthand(tmp_path):
+    source = tmp_path / "workspace" / "uploads" / "product.png"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(_image_bytes((720, 480)))
+
+    data_url = image_reference_for_provider(
+        tmp_path,
+        "uploads/product.png",
+        label="Reference image",
+    )
+
+    assert data_url.startswith("data:image/png;base64,")
+    assert base64.b64decode(data_url.split(",", 1)[1]) == source.read_bytes()
+
+
 def test_video_reference_rejects_too_small_image(tmp_path):
     source = tmp_path / "small.png"
     source.write_bytes(_image_bytes((300, 600)))

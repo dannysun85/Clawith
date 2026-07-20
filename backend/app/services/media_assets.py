@@ -211,11 +211,19 @@ def _workspace_image_asset(
     require_video_dimensions: bool = False,
 ) -> ImageAsset:
     root = workspace.resolve()
-    path = (root / value.lstrip("/")).resolve()
-    try:
-        relative_path = path.relative_to(root).as_posix()
-    except ValueError as exc:
-        raise MediaContractError(f"{label} is outside the workspace") from exc
+    reference = value.strip().replace("\\", "/").lstrip("/")
+
+    def resolve_inside_workspace(candidate: str) -> tuple[Path, str]:
+        path = (root / candidate).resolve()
+        try:
+            relative_path = path.relative_to(root).as_posix()
+        except ValueError as exc:
+            raise MediaContractError(f"{label} is outside the workspace") from exc
+        return path, relative_path
+
+    path, relative_path = resolve_inside_workspace(reference)
+    if not path.is_file() and reference.startswith("uploads/"):
+        path, relative_path = resolve_inside_workspace(f"workspace/{reference}")
     if not path.is_file():
         raise MediaContractError(f"{label} was not found in the workspace: {value}")
     try:

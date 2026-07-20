@@ -1859,10 +1859,27 @@ def _non_empty_paths(*paths: str | None) -> list[str] | None:
     return selected or None
 
 
+def _canonical_media_workspace_path(value: str) -> str:
+    """Map the legacy upload shorthand to the canonical workspace path.
+
+    Chat uploads are stored below ``workspace/uploads``. Models occasionally
+    preserve the filename while shortening that path to ``uploads/...`` when
+    they call a media tool. Accept only that exact, bounded shorthand; do not
+    rewrite arbitrary relative paths or traversal-shaped input.
+    """
+
+    candidate = value.strip().replace("\\", "/")
+    while candidate.startswith("./"):
+        candidate = candidate[2:]
+    if candidate.startswith("uploads/"):
+        return f"workspace/{candidate}"
+    return candidate
+
+
 def _media_workspace_input_paths(*values: object) -> list[str] | None:
     """Select only workspace-backed inputs for temporary materialization."""
     selected = [
-        value.strip()
+        _canonical_media_workspace_path(value)
         for value in values
         if isinstance(value, str)
         and value.strip()
@@ -25333,9 +25350,9 @@ def _explicit_media_workspace_paths(*values: object) -> list[str]:
         if not isinstance(value, str):
             continue
         candidate = value.strip()
-        if not candidate or candidate.lower().startswith("data:"):
+        if not candidate or candidate.lower().startswith(("data:", "http://", "https://")):
             continue
-        selected.append(candidate.replace("\\", "/"))
+        selected.append(_canonical_media_workspace_path(candidate))
     return selected
 
 
@@ -27182,7 +27199,7 @@ async def _generate_image_minimax_durable(
 ) -> ToolExecutionOutcome | str:
     """Run MiniMax image generation through the durable media state machine."""
 
-    from app.services.media_assets import image_reference_for_provider
+    from app.services.media_assets import MediaContractError, image_reference_for_provider
     from app.services.media_generation import (
         create_minimax_sync_media_task_record,
         mark_media_generation_submission_ambiguous,
@@ -27195,11 +27212,23 @@ async def _generate_image_minimax_durable(
         store_minimax_sync_recovery_asset,
     )
 
-    reference_image = image_reference_for_provider(
-        ws,
-        arguments.get("reference_image"),
-        label="Reference image",
-    )
+    try:
+        reference_image = image_reference_for_provider(
+            ws,
+            arguments.get("reference_image"),
+            label="Reference image",
+        )
+    except MediaContractError as exc:
+        return _minimax_tool_result(
+            f"❌ Reference image contract is invalid: {exc}",
+            typed=typed,
+            status="failed",
+            error_code="brand_safe_media_contract_invalid",
+            agent_id=agent_id,
+            modality="image",
+            model=model,
+            tier=tier,
+        )
     sanitize_generated_background = bool(brand_asset or (overlay_text.strip() and not reference_image))
     output_content_type = "image/jpeg" if output_extension in {".jpg", ".jpeg"} else "image/png"
     record_id = uuid.uuid4()

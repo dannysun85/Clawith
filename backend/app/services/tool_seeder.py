@@ -1355,7 +1355,7 @@ BUILTIN_TOOLS = [
     {
         "name": "generate_image_minimax",
         "display_name": "Generate Image (MiniMax)",
-        "description": "Generate an image via the MiniMax credential pool. Model quality is selected from the active Lite, Pro, or Ultra product tier.",
+        "description": "Generate an image via the MiniMax credential pool. Model quality is selected from the active Lite, Pro, or Ultra product tier. Generate exactly the number of outputs requested. When one request requires both an uploaded product/reference and exact visible copy, pass brand_asset or reference_image together with overlay_text in the same single call; never split them into separate variants unless the user explicitly asks for multiple outputs.",
         "category": "media",
         "icon": "🎨",
         "is_default": True,
@@ -1369,18 +1369,18 @@ BUILTIN_TOOLS = [
                 },
                 "reference_image": {
                     "type": "string",
-                    "description": "Optional workspace image path or image data URL for creative subject guidance. The model may redraw text, logos, packaging, and geometry; use brand_asset for an unchanged product/logo layer.",
+                    "description": "Optional canonical workspace image path (for chat uploads, use workspace/uploads/<filename>) or image data URL for creative subject guidance. The model may redraw text, logos, packaging, and geometry; use brand_asset for an unchanged product/logo layer.",
                 },
                 "overlay_text": {
                     "type": "string",
-                    "description": "Optional exact Chinese/English copy rendered after generation with a real font.",
+                    "description": "Optional exact Chinese/English copy rendered after generation with a real font. If the user specifies exact copy, pass it here in the same call as the required brand/reference asset.",
                 },
                 "overlay_position": {
                     "type": "string",
                     "enum": ["top", "center", "bottom"],
                     "description": "Position for overlay_text. Default: bottom.",
                 },
-                "brand_asset": {"type": "string", "description": "Workspace image path or data URL composited unchanged as a product/logo layer. Do not combine with reference_image."},
+                "brand_asset": {"type": "string", "description": "Canonical workspace image path or data URL composited unchanged as a product/logo layer. For a chat upload use workspace/uploads/<filename>. When exact copy is also requested, include overlay_text in this same call. Do not combine with reference_image."},
                 "brand_position": {"type": "string", "enum": ["top_left", "top_right", "center", "bottom_left", "bottom_right"]},
                 "brand_scale": {"type": "number", "description": "Canvas width fraction from 0.1 to 0.8. Default: 0.42."},
                 "save_path": {"type": "string", "description": "Save path in workspace. Default: auto."},
