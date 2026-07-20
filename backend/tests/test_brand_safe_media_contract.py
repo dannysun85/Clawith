@@ -2,6 +2,7 @@ import uuid
 from pathlib import Path
 
 import pytest
+import yaml
 
 from app.services import agent_tools, media_generation, skill_seeder, tool_seeder
 from app.services.media_assets import MediaContractError
@@ -78,7 +79,7 @@ def test_video_provider_exposes_exact_copy_and_protected_product_contract():
             assert "public URL" not in frame_help
 
 
-def test_brand_safe_media_skill_is_a_default_runtime_skill():
+def test_brand_safe_media_skill_is_role_scoped_with_explicit_media_grants():
     skill = next(item for item in skill_seeder.BUILTIN_SKILLS if item["folder_name"] == "brand-safe-media")
     skill_path = (
         Path(__file__).parents[1]
@@ -88,14 +89,28 @@ def test_brand_safe_media_skill_is_a_default_runtime_skill():
         / "SKILL.md"
     )
 
-    assert skill["is_default"] is True
+    assert skill["is_default"] is False
     assert skill_path.is_file()
     content = skill_path.read_text(encoding="utf-8")
+    assert "Do not make the user complete a production form" in content
     assert "Put the exact visible copy in `overlay_text`" in content
-    assert "For video, the protected product layer is" in content
+    assert "Never use the static product-layer workaround for outcome 2" in content
+    assert "Do not blur or soften the scene by default" in content
+    assert "If the selected provider cannot accept the reference frame, stop" in content
     assert "background_sanitized=true" in content
-    assert "does not certify OCR unreadability" in content
     assert "Skills guide the workflow; the native media tools enforce" in content
+
+    templates_root = Path(__file__).parents[1] / "agent_templates"
+    for folder in (
+        "content-creator",
+        "douyin-operator",
+        "tiktok-strategist",
+        "linkedin-content-creator",
+        "growth-hacker",
+    ):
+        metadata = yaml.safe_load((templates_root / folder / "meta.yaml").read_text())
+        assert "brand-safe-media" in metadata["default_skills"]
+        assert metadata["default_tools"]
 
 
 def test_video_brand_asset_is_frozen_outside_agent_workspace():

@@ -23,6 +23,11 @@ def _isolate_storage_semantics_from_distributed_locking(monkeypatch):
     """These in-memory storage tests do not exercise the Redis lock backend."""
     monkeypatch.setattr(agent_tools, "workspace_locks", _noop_workspace_locks)
     monkeypatch.setattr(
+        agent_tools,
+        "_enforce_tool_autonomy",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
         workspace_collaboration,
         "workspace_locks",
         _noop_workspace_locks,

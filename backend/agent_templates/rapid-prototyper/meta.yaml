@@ -8,6 +8,11 @@ capability_bullets:
   - "User-testable demos — click-throughable builds, not mockups"
 default_skills:
   - "mcp-installer"
+  - "vercel-full-stack-deploy"
+default_tools:
+  - "execute_code"
+  - "import_mcp_server"
+  - "publish_page"
 default_autonomy_policy:
   read_files: "L1"
   write_workspace_files: "L1"

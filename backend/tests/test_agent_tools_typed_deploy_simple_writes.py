@@ -35,6 +35,16 @@ VERCEL_TOKEN = "vercel-token"
 NEON_API_KEY = "neon-api-key"
 
 
+@pytest.fixture(autouse=True)
+def _allow_autonomy_for_provider_contract_tests(monkeypatch):
+    """Exercise provider settlement after the separate autonomy gate is cleared."""
+
+    async def allow(**_kwargs):
+        return {"allowed": True, "level": "L1"}
+
+    monkeypatch.setattr(agent_tools, "_enforce_tool_autonomy", allow)
+
+
 class FakeResponse:
     def __init__(
         self,

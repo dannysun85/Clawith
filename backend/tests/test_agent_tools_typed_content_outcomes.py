@@ -322,6 +322,11 @@ async def test_upload_image_uses_provider_response_and_timeout_is_unknown(
 
     monkeypatch.setattr(agent_tools, "_get_tool_config", configured)
 
+    async def public_url(url):
+        return url, None
+
+    monkeypatch.setattr(agent_tools, "_validate_public_http_url", public_url)
+
     class Response:
         status_code = 201
         text = ""

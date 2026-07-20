@@ -69,6 +69,7 @@ from app.services.agent_runtime.tool_result_store import (
 )
 from app.services.agent_tools import (
     agentbay_run_scope_id,
+    enforce_builtin_tool_autonomy_outcome,
     execute_builtin_tool_outcome,
     get_runtime_agent_tools_for_llm,
     minimax_saas_tier,
@@ -320,6 +321,18 @@ class ToolExecutor(Protocol):
         session_id: str = "",
         on_output: object | None = None,
     ) -> ToolExecutionOutcome | str: ...
+
+
+class ToolAutonomyEnforcer(Protocol):
+    async def __call__(
+        self,
+        *,
+        tool_name: str,
+        arguments: Mapping[str, object],
+        agent_id: uuid.UUID,
+        user_id: uuid.UUID,
+        session_id: str = "",
+    ) -> ToolExecutionOutcome | None: ...
 
 
 ToolProvider = Callable[[uuid.UUID], Awaitable[list[dict]]]
@@ -679,6 +692,7 @@ class RuntimeToolStepService:
         cancel_source: RuntimeCancelSource,
         tool_provider: ToolProvider = get_runtime_agent_tools_for_llm,
         tool_executor: ToolExecutor = execute_builtin_tool_outcome,
+        autonomy_enforcer: ToolAutonomyEnforcer = enforce_builtin_tool_autonomy_outcome,
         group_tool_service: GroupRuntimeToolService | None = None,
         a2a_service: RuntimeA2AService | None = None,
         tool_result_store: ToolResultStore | None = None,
@@ -691,6 +705,7 @@ class RuntimeToolStepService:
         self._cancel_source = cancel_source
         self._tool_provider = tool_provider
         self._tool_executor = tool_executor
+        self._autonomy_enforcer = autonomy_enforcer
         self._group_tool_service = group_tool_service or GroupRuntimeToolService(
             session_factory=session_factory
         )
@@ -1631,8 +1646,58 @@ class RuntimeToolStepService:
                         actor_user_id = (
                             uuid.UUID(context.actor_user_id)
                             if context.actor_user_id
-                            else None
+                            else agent.creator_id
                         )
+                    except (TypeError, ValueError, AttributeError):
+                        outcome = await self._settle_outcome(
+                            tenant_id=tenant_id,
+                            reservation=reservation,
+                            lease_owner=lease_owner,
+                            policy=policy,
+                            outcome=ToolExecutionOutcome(
+                                status="failed",
+                                result_summary=(
+                                    "The Runtime requester identity is invalid; "
+                                    "the Agent message was not sent."
+                                ),
+                                result_ref=None,
+                                error_code="runtime_actor_invalid",
+                            ),
+                        )
+                        messages.append(
+                            _result_message(
+                                run_id=run_id,
+                                call_id=call_id,
+                                tool_name=tool_name,
+                                outcome=outcome,
+                            )
+                        )
+                        continue
+                    autonomy_outcome = await self._autonomy_enforcer(
+                        tool_name=tool_name,
+                        arguments=arguments,
+                        agent_id=agent.id,
+                        user_id=actor_user_id,
+                        session_id=context.session_id or "",
+                    )
+                    if autonomy_outcome is not None:
+                        outcome = await self._settle_outcome(
+                            tenant_id=tenant_id,
+                            reservation=reservation,
+                            lease_owner=lease_owner,
+                            policy=policy,
+                            outcome=autonomy_outcome,
+                        )
+                        messages.append(
+                            _result_message(
+                                run_id=run_id,
+                                call_id=call_id,
+                                tool_name=tool_name,
+                                outcome=outcome,
+                            )
+                        )
+                        continue
+                    try:
                         a2a_result = await self._a2a_service.execute(
                             tenant_id=tenant_id,
                             source_run_id=run_id,

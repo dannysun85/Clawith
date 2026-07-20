@@ -106,8 +106,9 @@ class TemplateCreate(BaseModel):
     icon: str = "🤖"
     category: str = "general"
     soul_template: str = ""
-    default_skills: list[str] = []
-    default_autonomy_policy: dict = {}
+    default_skills: list[str] = Field(default_factory=list)
+    default_tools: list[str] = Field(default_factory=list)
+    default_autonomy_policy: dict = Field(default_factory=dict)
 
 
 class TemplateOut(BaseModel):
@@ -118,6 +119,7 @@ class TemplateOut(BaseModel):
     category: str
     soul_template: str
     default_skills: list
+    default_tools: list
     default_autonomy_policy: dict
     is_builtin: bool
     created_at: str | None = None
@@ -155,6 +157,15 @@ async def create_template(
     db: AsyncSession = Depends(get_db),
 ):
     """Create a new agent template (share to template market)."""
+    if data.default_tools or data.default_autonomy_policy:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Executable default Tools and autonomy policies are reserved for "
+                "reviewed builtin templates. Users can configure them explicitly "
+                "after creating an Agent."
+            ),
+        )
     template = AgentTemplate(
         name=data.name,
         description=data.description,
@@ -162,7 +173,8 @@ async def create_template(
         category=data.category,
         soul_template=data.soul_template,
         default_skills=data.default_skills,
-        default_autonomy_policy=data.default_autonomy_policy,
+        default_tools=[],
+        default_autonomy_policy={},
         created_by=current_user.id,
     )
     db.add(template)

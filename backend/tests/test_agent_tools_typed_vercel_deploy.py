@@ -33,6 +33,16 @@ DEPLOYMENT_HOST = "app-abc.vercel.app"
 DEPLOYMENT_URL = f"https://{DEPLOYMENT_HOST}"
 
 
+@pytest.fixture(autouse=True)
+def _allow_autonomy_for_provider_contract_tests(monkeypatch):
+    """Exercise Vercel settlement after the separate autonomy gate is cleared."""
+
+    async def allow(**_kwargs):
+        return {"allowed": True, "level": "L1"}
+
+    monkeypatch.setattr(agent_tools, "_enforce_tool_autonomy", allow)
+
+
 class FakeResponse:
     def __init__(
         self,

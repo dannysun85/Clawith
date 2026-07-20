@@ -25,6 +25,7 @@ from app.services.builtin_tool_definitions import (
     builtin_model_definition,
     builtin_readiness,
 )
+from app.services.code_execution_policy import CODE_EXECUTION_TOOL_NAMES
 
 
 AGENTBAY_TOOL_NAMES = frozenset(
@@ -180,7 +181,10 @@ async def test_agentbay_readiness_uses_only_local_key_and_os_configuration(
 
     resolved = await agent_tools.get_runtime_agent_tools_for_llm(agent_id)
 
-    assert _runtime_names(resolved) == AGENTBAY_TOOL_NAMES
+    # AgentBay provider readiness alone must not grant its code/command
+    # capabilities. Those tools additionally require the platform, tenant,
+    # and exact-Agent code authorization gates.
+    assert _runtime_names(resolved) == AGENTBAY_TOOL_NAMES - CODE_EXECUTION_TOOL_NAMES
     assert config_calls
     assert {tool_name for _, tool_name in config_calls} == {
         "agentbay_browser_navigate"

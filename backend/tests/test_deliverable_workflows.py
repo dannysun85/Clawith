@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock
 import uuid
 
 import pytest
@@ -16,6 +16,7 @@ from app.services.deliverable_workflows import (
     DeliverableWorkflowError,
     attach_deliverable_run,
     build_deliverable_prompt,
+    list_agent_launchable_workflows,
     list_workflow_manifests,
     prepare_deliverable_launch,
     preflight_workflow,
@@ -92,6 +93,51 @@ def test_builtin_workflow_manifests_are_versioned_and_unique() -> None:
     assert all(workflow.workflow_version == "1.0.0" for workflow in workflows)
     assert require_workflow("presentation").launch_policy == "agent_runtime"
     assert require_workflow("poster").launch_policy == "dry_run"
+
+
+@pytest.mark.asyncio
+async def test_launcher_lists_only_workflows_executable_by_this_agent(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.resolve_route",
+        AsyncMock(return_value=SimpleNamespace()),
+    )
+    available = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows._presentation_tool_available",
+        available,
+    )
+    agent_id = uuid.uuid4()
+
+    workflows = await list_agent_launchable_workflows(
+        SimpleNamespace(),  # type: ignore[arg-type]
+        tenant_id=uuid.uuid4(),
+        agent_id=agent_id,
+        tier="pro",
+    )
+
+    assert [workflow.work_type for workflow in workflows] == ["presentation"]
+    available.assert_awaited_once_with(ANY, agent_id)
+
+
+@pytest.mark.asyncio
+async def test_launcher_hides_workflow_when_agent_lacks_its_tool(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.resolve_route",
+        AsyncMock(return_value=SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows._presentation_tool_available",
+        AsyncMock(return_value=False),
+    )
+
+    workflows = await list_agent_launchable_workflows(
+        SimpleNamespace(),  # type: ignore[arg-type]
+        tenant_id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        tier="ultra",
+    )
+
+    assert workflows == []
 
 
 def test_presentation_spec_defaults_and_bounds_are_server_validated() -> None:

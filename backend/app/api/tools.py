@@ -5,8 +5,6 @@ import json
 import uuid
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from loguru import logger
-
 from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
 from sqlalchemy import String, cast, select, delete, or_
@@ -18,14 +16,19 @@ from app.database import get_db
 from app.models.tool import Tool, AgentTool
 from app.models.user import User
 from app.services.tool_config import (
+    contains_sensitive_material,
     decrypt_sensitive_fields,
     encrypt_sensitive_fields,
     get_sensitive_keys,
     get_tool_company_config,
     mask_sensitive_fields,
     merge_config_preserving_sensitive,
+    sanitize_tool_config_credential_ownership,
     set_tenant_tool_config,
     tenant_scoped_tool_name,
+)
+from app.services.tool_capability_policy import (
+    CENTRAL_CREDENTIAL_POOL_TOOL_NAMES,
 )
 from app.services.mcp_security import (
     MCPURLPolicyError,
@@ -38,6 +41,11 @@ from app.services.mcp_security import (
 from app.services.agent_tool_assignments import (
     lock_agent_tool_owner,
     upsert_agent_tool,
+)
+from app.services.tool_visibility import (
+    agent_visible_tool_clause,
+    tool_enabled_for_agent,
+    tool_record_visible_to_agent,
 )
 from app.services.resource_discovery import (
     _get_smithery_api_key,
@@ -430,21 +438,7 @@ def _agent_visible_tool_clause(agent_tenant_id: uuid.UUID | None, assignments: d
     - agent-installed tools require both an explicit assignment and exact
       company ownership
     """
-    clauses = [Tool.source == "builtin"]
-    admin_cond = Tool.tenant_id.is_(None)
-    if agent_tenant_id:
-        admin_cond = admin_cond | (Tool.tenant_id == agent_tenant_id)
-    clauses.append((Tool.source == "admin") & admin_cond)
-
-    assigned_tool_ids = [uuid.UUID(tool_id) for tool_id in assignments]
-    if assigned_tool_ids and agent_tenant_id is not None:
-        clauses.append(
-            (Tool.source == "agent")
-            & (Tool.tenant_id == agent_tenant_id)
-            & Tool.id.in_(assigned_tool_ids)
-        )
-
-    return or_(*clauses)
+    return agent_visible_tool_clause(agent_tenant_id, assignments)
 
 
 def _tool_record_visible_to_agent(
@@ -453,18 +447,7 @@ def _tool_record_visible_to_agent(
     assignments: dict[str, AgentTool],
 ) -> bool:
     """Pure visibility check mirroring _agent_visible_tool_clause."""
-    if tool.source == "builtin":
-        return True
-    if tool.source == "admin":
-        return tool.tenant_id is None or (agent_tenant_id is not None and tool.tenant_id == agent_tenant_id)
-    if tool.source == "agent":
-        return (
-            agent_tenant_id is not None
-            and tool.tenant_id is not None
-            and tool.tenant_id == agent_tenant_id
-            and str(tool.id) in assignments
-        )
-    return False
+    return tool_record_visible_to_agent(tool, agent_tenant_id, assignments)
 
 
 def _smithery_authorization_provider(
@@ -567,6 +550,22 @@ def _enforce_code_control_permission(
         )
 
 
+def _reject_platform_pool_tool_credentials(tool: Tool, incoming_config: dict) -> None:
+    """Keep centrally funded Provider authentication out of Tool overrides."""
+
+    if (
+        tool.name in CENTRAL_CREDENTIAL_POOL_TOOL_NAMES
+        and contains_sensitive_material(incoming_config, tool.config_schema)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "MiniMax authentication is managed by the shared platform "
+                "credential pool and cannot be configured on a Tool or Agent"
+            ),
+        )
+
+
 async def _code_tool_availability(
     db: AsyncSession,
     tool: Tool,
@@ -592,6 +591,23 @@ async def _code_tool_availability(
         api_url=effective_config.get("api_url"),
     )
     return denial is None, denial
+
+
+async def _agent_tool_availability(
+    db: AsyncSession,
+    tool: Tool,
+    tenant_id: uuid.UUID | None,
+    *,
+    has_any_channel: bool,
+) -> tuple[bool, str | None]:
+    """Mirror deterministic Runtime prerequisites in the Agent Tools UI."""
+
+    available, reason = await _code_tool_availability(db, tool, tenant_id)
+    if not available:
+        return available, reason
+    if tool.name == "send_channel_message" and not has_any_channel:
+        return False, "Configure an external Agent channel before enabling this tool"
+    return True, None
 
 
 def _get_sensitive_keys(config_schema: dict | None = None) -> set[str]:
@@ -848,6 +864,7 @@ async def update_tool(
                 ),
             )
         _enforce_code_control_permission(current_user, tool, incoming_config)
+        _reject_platform_pool_tool_credentials(tool, incoming_config)
         existing_config = mcp_config_from_url
         if existing_config is None:
             existing_config = await get_tool_company_config(db, tool, target_tenant_id)
@@ -942,8 +959,9 @@ async def get_agent_tools(
 ):
     """Get tools for a specific agent with their enabled status."""
     agent_obj = await _require_agent_tool_access(db, current_user, agent_id)
-    from app.services.agent_tools import _agent_has_feishu
+    from app.services.agent_tools import _agent_has_any_channel, _agent_has_feishu
     has_feishu = await _agent_has_feishu(agent_id)
+    has_any_channel = await _agent_has_any_channel(agent_id)
 
     # Determine if this is a system agent (e.g. OKR Agent).
     # System agents can see all tools; regular agents cannot see okr_agent_only tools.
@@ -960,38 +978,6 @@ async def get_agent_tools(
     )
     all_tools = all_tools_r.scalars().all()
 
-    # ── Backfill: create missing AgentTool records ──────────────────────
-    # For agents that already have at least one AgentTool assignment (i.e.
-    # the tool panel has been configured), create AgentTool records for any
-    # visible tool that doesn't have one yet.  The initial `enabled` value
-    # is taken from `is_default`.
-    #
-    # This keeps the UI state and `get_agent_tools_for_llm` in sync: both
-    # now rely on explicit AgentTool records instead of the implicit
-    # `is_default` fallback.
-    if assignments:
-        await lock_agent_tool_owner(db, agent_id)
-        assignments = await _load_agent_tool_assignments(db, agent_id)
-        backfilled = 0
-        for t in all_tools:
-            tid = str(t.id)
-            if tid not in assignments:
-                await upsert_agent_tool(
-                    db,
-                    agent_id=agent_id,
-                    tool_id=t.id,
-                    enabled=t.is_default,
-                    on_conflict="preserve",
-                )
-                backfilled += 1
-        if backfilled:
-            await db.commit()
-            assignments = await _load_agent_tool_assignments(db, agent_id)
-            logger.info(
-                f"[Tools] Backfilled {backfilled} AgentTool records for "
-                f"agent={agent_id}"
-            )
-
     result = []
     for t in all_tools:
         # Hide feishu tools for agents without Feishu channel
@@ -1006,13 +992,13 @@ async def get_agent_tools(
         at = assignments.get(tid)
         if not _tool_record_visible_to_agent(t, agent_obj.tenant_id, assignments):
             continue
-        # If no explicit assignment, use is_default
-        available, availability_reason = await _code_tool_availability(
+        available, availability_reason = await _agent_tool_availability(
             db,
             t,
             agent_obj.tenant_id,
+            has_any_channel=has_any_channel,
         )
-        enabled = (at.enabled if at else t.is_default) and available
+        enabled = tool_enabled_for_agent(t, at) and available
         result.append({
             "id": tid,
             "name": t.name,
@@ -1048,6 +1034,9 @@ async def update_agent_tools(
     )
     await lock_agent_tool_owner(db, agent_id)
     assignments = await _load_agent_tool_assignments(db, agent_id)
+    from app.services.agent_tools import _agent_has_any_channel
+
+    has_any_channel = await _agent_has_any_channel(agent_id)
     for u in updates:
         tool_id = uuid.UUID(u.tool_id)
         tool_r = await db.execute(
@@ -1059,10 +1048,11 @@ async def update_agent_tools(
         tool_obj = tool_r.scalar_one_or_none()
         if not tool_obj:
             raise HTTPException(status_code=404, detail="Tool not found")
-        available, availability_reason = await _code_tool_availability(
+        available, availability_reason = await _agent_tool_availability(
             db,
             tool_obj,
             agent_obj.tenant_id,
+            has_any_channel=has_any_channel,
         )
         if u.enabled and not available:
             raise HTTPException(
@@ -1080,7 +1070,8 @@ async def update_agent_tools(
             agent_id=agent_id,
             tool_id=tool_id,
             enabled=u.enabled,
-            on_conflict="enabled",
+            source="user_selected",
+            on_conflict="selection",
         )
     await db.commit()
     return {"ok": True}
@@ -1480,7 +1471,11 @@ async def get_agent_tool_config(
     # Decrypt both configs using the tool's config_schema for field type awareness
     schema = tool.config_schema
     raw_global = await get_tool_company_config(db, tool, agent.tenant_id)
-    raw_agent = _decrypt_sensitive_fields(at.config if at else {}, schema)
+    raw_agent = sanitize_tool_config_credential_ownership(
+        tool.name,
+        _decrypt_sensitive_fields(at.config if at else {}, schema),
+        schema,
+    )
 
     # Mask sensitive fields in global config for display
     masked_global = mask_sensitive_fields(raw_global, schema)
@@ -1542,13 +1537,18 @@ async def update_agent_tool_config(
         tool_for_schema,
         data.config,
     )
+    _reject_platform_pool_tool_credentials(tool_for_schema, data.config)
 
     at_r = await db.execute(
         select(AgentTool).where(AgentTool.agent_id == agent_id, AgentTool.tool_id == tool_id)
     )
     at = at_r.scalar_one_or_none()
-    existing_plain = _decrypt_sensitive_fields(
-        (at.config if at else {}) or {},
+    existing_plain = sanitize_tool_config_credential_ownership(
+        tool_for_schema.name,
+        _decrypt_sensitive_fields(
+            (at.config if at else {}) or {},
+            tool_for_schema.config_schema,
+        ),
         tool_for_schema.config_schema,
     )
     company_plain = await get_tool_company_config(
@@ -1569,7 +1569,11 @@ async def update_agent_tool_config(
         tool_for_schema.config_schema,
     )
     encrypted_config = _encrypt_sensitive_fields(
-        merged_config,
+        sanitize_tool_config_credential_ownership(
+            tool_for_schema.name,
+            merged_config,
+            tool_for_schema.config_schema,
+        ),
         tool_for_schema.config_schema,
     )
     # Saving configuration is not an authorization action. On a concurrent
@@ -1607,8 +1611,9 @@ async def get_agent_tools_with_config(
         agent_id,
         manage=True,
     )
-    from app.services.agent_tools import _agent_has_feishu
+    from app.services.agent_tools import _agent_has_any_channel, _agent_has_feishu
     has_feishu = await _agent_has_feishu(agent_id)
+    has_any_channel = await _agent_has_any_channel(agent_id)
 
     # Determine if this is a system agent (e.g. OKR Agent).
     is_system_agent2 = bool(agent_obj2 and agent_obj2.is_system)
@@ -1642,12 +1647,13 @@ async def get_agent_tools_with_config(
         at = assignments.get(tid)
         if not _tool_record_visible_to_agent(t, agent_obj2.tenant_id, assignments):
             continue
-        available, availability_reason = await _code_tool_availability(
+        available, availability_reason = await _agent_tool_availability(
             db,
             t,
             agent_obj2.tenant_id,
+            has_any_channel=has_any_channel,
         )
-        enabled = (at.enabled if at else t.is_default) and available
+        enabled = tool_enabled_for_agent(t, at) and available
 
         # Decrypt tenant/company config for the frontend. Builtin tool configs
         # are tenant-scoped via tenant_settings, not shared Tool.config.
@@ -1664,15 +1670,28 @@ async def get_agent_tools_with_config(
                         select(SystemSetting).where(SystemSetting.key == ss_key)
                     )
                     ss = ss_r.scalar_one_or_none()
-                    system_keys_cache[ss_key] = (
-                        ss.value.get(ss_field, "") if ss and ss.value else ""
-                    )
+                    if ss and ss.value:
+                        from app.services.system_setting_security import (
+                            decrypt_system_setting_value,
+                        )
+
+                        value = decrypt_system_setting_value(ss_key, ss.value)
+                        system_keys_cache[ss_key] = value.get(ss_field, "")
+                    else:
+                        system_keys_cache[ss_key] = ""
                 except Exception:
                     system_keys_cache[ss_key] = ""
             if system_keys_cache[ss_key]:
                 raw_global["api_key"] = system_keys_cache[ss_key]
 
-        raw_agent = _decrypt_sensitive_fields((at.config if at else {}) or {}, t.config_schema)
+        raw_agent = sanitize_tool_config_credential_ownership(
+            t.name,
+            _decrypt_sensitive_fields(
+                (at.config if at else {}) or {},
+                t.config_schema,
+            ),
+            t.config_schema,
+        )
 
         # Mask sensitive fields in global_config so users can see that a key
         # is configured at the company level without exposing the full value.

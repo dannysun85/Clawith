@@ -126,10 +126,10 @@ def test_video_tools_do_not_sync_temp_workspace_over_durable_storage():
     assert "sync_back=False" in check_branch
 
 
-def test_manual_video_check_is_available_to_every_agent_by_default():
+def test_manual_video_check_requires_an_explicit_role_or_user_grant():
     definition = next(tool for tool in tool_seeder.BUILTIN_TOOLS if tool["name"] == "check_video_minimax")
 
-    assert definition["is_default"] is True
+    assert definition["is_default"] is False
     assert "check_video_minimax" in tool_seeder.SYNC_IS_DEFAULT_TOOL_NAMES
 
 

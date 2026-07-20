@@ -259,6 +259,7 @@ def _load_folder_templates() -> list[dict]:
             "capability_bullets": meta.get("capability_bullets", []),
             "soul_template": soul_template,
             "default_skills": meta.get("default_skills", []),
+            "default_tools": meta.get("default_tools", []),
             "default_mcp_servers": meta.get("default_mcp_servers", []),
             "default_autonomy_policy": meta.get("default_autonomy_policy", {}),
         })
@@ -320,6 +321,7 @@ async def seed_agent_templates():
                     existing.category = tmpl["category"]
                     existing.soul_template = tmpl["soul_template"]
                     existing.default_skills = tmpl["default_skills"]
+                    existing.default_tools = tmpl.get("default_tools", [])
                     existing.default_mcp_servers = tmpl.get("default_mcp_servers", [])
                     existing.default_autonomy_policy = tmpl["default_autonomy_policy"]
                     existing.capability_bullets = tmpl["capability_bullets"]
@@ -332,6 +334,7 @@ async def seed_agent_templates():
                         is_builtin=True,
                         soul_template=tmpl["soul_template"],
                         default_skills=tmpl["default_skills"],
+                        default_tools=tmpl.get("default_tools", []),
                         default_mcp_servers=tmpl.get("default_mcp_servers", []),
                         default_autonomy_policy=tmpl["default_autonomy_policy"],
                         capability_bullets=tmpl["capability_bullets"],
@@ -341,3 +344,18 @@ async def seed_agent_templates():
             logger.info(f"[TemplateSeeder] Seeded {len(templates)} templates "
                         f"({len(DEFAULT_TEMPLATES)} legacy + "
                         f"{len(templates) - len(DEFAULT_TEMPLATES)} folder)")
+
+    # Tools are executable grants, separate from copied Skill instructions.
+    # Reconciliation owns only source=template rows, so a removed role grant is
+    # revoked without disabling or rewriting an explicit user choice.
+    from app.services.template_capabilities import reconcile_template_tool_grants
+
+    async with async_session() as db:
+        granted, removed = await reconcile_template_tool_grants(db)
+        await db.commit()
+    if granted or removed:
+        logger.info(
+            "[TemplateSeeder] Reconciled template tool grants processed={} removed={}",
+            granted,
+            removed,
+        )

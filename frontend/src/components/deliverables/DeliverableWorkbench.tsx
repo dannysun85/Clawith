@@ -1,8 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
-    IconAlertTriangle,
-    IconCheck,
     IconChevronRight,
     IconDownload,
     IconFileTypePpt,
@@ -57,18 +55,6 @@ const WORK_TYPE_ICONS: Record<string, React.ReactNode> = {
     video: <IconVideo size={20} stroke={1.75} />,
 };
 
-const REASON_LABELS: Record<string, { zh: string; en: string }> = {
-    no_route: { zh: '当前档位缺少可用的理解模型', en: 'No understanding route is available for this tier' },
-    model_tier: { zh: '当前套餐不包含此档位', en: 'This tier is not included in the current plan' },
-    model_modality: { zh: '当前套餐不包含所需能力', en: 'The required capability is not included in the current plan' },
-    presentation_tool_unavailable: { zh: '该数字员工尚未启用 PPT 转换能力', en: 'This Agent does not have presentation conversion enabled' },
-    plan_denied: { zh: '当前套餐尚未开放此生成能力', en: 'The current plan does not include this generation capability' },
-    agent_tool_disabled: { zh: '该数字员工尚未启用所需工具', en: 'The required Agent tool is disabled' },
-    pool_unavailable: { zh: '平台生成能力暂时不可用', en: 'The platform generation capability is temporarily unavailable' },
-    media_capability_unavailable: { zh: '媒体生成能力暂时不可用', en: 'Media generation is temporarily unavailable' },
-    workflow_execution_not_enabled: { zh: '当前阶段只保存工作说明，不会启动生成', en: 'This phase saves the brief without starting generation' },
-};
-
 function workflowLabel(workflow: DeliverableWorkflow, isZh: boolean) {
     return isZh ? workflow.label_zh : workflow.label_en;
 }
@@ -80,19 +66,6 @@ function initialSpec(workflow?: DeliverableWorkflow): Record<string, string | nu
             .filter((field) => field.default !== null && field.default !== undefined)
             .map((field) => [field.key, field.default as string | number]),
     );
-}
-
-function creditText(preflight: DeliverablePreflight, isZh: boolean) {
-    const estimate = preflight.credit_estimate;
-    if (estimate.mode === 'usage_based' || estimate.minimum === null) {
-        return isZh ? '按实际用量结算' : 'Settled from actual usage';
-    }
-    if (estimate.maximum === estimate.minimum) {
-        return isZh ? `预计 ${estimate.minimum} Credits` : `Estimated ${estimate.minimum} Credits`;
-    }
-    return isZh
-        ? `预计 ${estimate.minimum}–${estimate.maximum} Credits`
-        : `Estimated ${estimate.minimum}–${estimate.maximum} Credits`;
 }
 
 export function DeliverableLauncher({
@@ -111,13 +84,14 @@ export function DeliverableLauncher({
     const [open, setOpen] = useState(false);
     const [workflows, setWorkflows] = useState<DeliverableWorkflow[]>([]);
     const [loadingWorkflows, setLoadingWorkflows] = useState(false);
+    const [workflowsLoaded, setWorkflowsLoaded] = useState(false);
     const [selectedType, setSelectedType] = useState<DeliverableWorkType>('presentation');
     const [goal, setGoal] = useState('');
     const [spec, setSpec] = useState<Record<string, string | number>>({});
-    const [preflight, setPreflight] = useState<DeliverablePreflight | null>(null);
     const [checking, setChecking] = useState(false);
     const [saving, setSaving] = useState(false);
     const [error, setError] = useState('');
+    const [showAdvanced, setShowAdvanced] = useState(false);
     const [clientRequestId, setClientRequestId] = useState(() => crypto.randomUUID());
 
     const selectedWorkflow = useMemo(
@@ -126,26 +100,33 @@ export function DeliverableLauncher({
     );
 
     useEffect(() => {
-        if (!open || workflows.length > 0) return;
         let active = true;
         setLoadingWorkflows(true);
-        deliverableApi.workflows()
+        setWorkflowsLoaded(false);
+        setWorkflows([]);
+        deliverableApi.workflows(agentId, tier)
             .then((response) => {
                 if (!active) return;
                 setLoadingWorkflows(false);
+                setWorkflowsLoaded(true);
                 setWorkflows(response.workflows);
                 const presentation = response.workflows.find((item) => item.work_type === 'presentation');
-                setSpec(initialSpec(presentation || response.workflows[0]));
+                const initial = presentation || response.workflows[0];
+                if (initial) {
+                    setSelectedType(initial.work_type);
+                    setSpec(initialSpec(initial));
+                }
             })
             .catch((nextError) => {
                 if (!active) return;
                 setLoadingWorkflows(false);
+                setWorkflowsLoaded(true);
                 const message = nextError instanceof Error ? nextError.message : String(nextError);
                 setError(message);
                 toast.error(isZh ? '无法加载交付物工作流' : 'Could not load deliverable workflows', { details: message });
             });
         return () => { active = false; };
-    }, [isZh, open, toast, workflows.length]);
+    }, [agentId, isZh, tier, toast]);
 
     const closeDrawer = useCallback(() => {
         if (saving) return;
@@ -199,14 +180,12 @@ export function DeliverableLauncher({
     const selectWorkflow = (workflow: DeliverableWorkflow) => {
         setSelectedType(workflow.work_type);
         setSpec(initialSpec(workflow));
-        setPreflight(null);
         setError('');
         setClientRequestId(crypto.randomUUID());
     };
 
     const updateField = (key: string, value: string | number) => {
         setSpec((current) => ({ ...current, [key]: value }));
-        setPreflight(null);
         setError('');
     };
 
@@ -224,7 +203,6 @@ export function DeliverableLauncher({
                 tier,
             });
             setSpec(result.normalized_spec);
-            setPreflight(result);
             return result;
         } catch (nextError) {
             const message = nextError instanceof Error ? nextError.message : String(nextError);
@@ -307,8 +285,8 @@ export function DeliverableLauncher({
                 <header className="deliverable-drawer__header">
                     <div>
                         <span className="deliverable-drawer__eyebrow">{isZh ? '交付物工作台' : 'Deliverable workbench'}</span>
-                        <h2 id="deliverable-drawer-title">{isZh ? '确认工作说明' : 'Confirm the work brief'}</h2>
-                        <p>{isZh ? '先保存结构化需求，再由后端检查能力、路由和费用。' : 'Save a structured request before capability, routing, and cost checks.'}</p>
+                        <h2 id="deliverable-drawer-title">{isZh ? '制作 PPT' : 'Create a presentation'}</h2>
+                        <p>{isZh ? '直接描述你想要的内容；页数、受众和风格可以由数字员工推断。' : 'Describe the result directly; the Agent can infer audience, length, and style.'}</p>
                     </div>
                     <button
                         type="button"
@@ -321,7 +299,7 @@ export function DeliverableLauncher({
                 </header>
 
                 <div className="deliverable-drawer__body">
-                    <section className="deliverable-section" aria-labelledby="deliverable-type-heading">
+                    {workflows.length > 1 && <section className="deliverable-section" aria-labelledby="deliverable-type-heading">
                         <div className="deliverable-section__heading">
                             <span className="deliverable-step">1</span>
                             <div>
@@ -350,15 +328,15 @@ export function DeliverableLauncher({
                             })}
                             {loadingWorkflows && <div className="deliverable-loading">{isZh ? '正在加载…' : 'Loading…'}</div>}
                         </div>
-                    </section>
+                    </section>}
 
                     {selectedWorkflow && (
                         <section className="deliverable-section" aria-labelledby="deliverable-brief-heading">
                             <div className="deliverable-section__heading">
-                                <span className="deliverable-step">2</span>
+                                <span className="deliverable-step">1</span>
                                 <div>
-                                    <h3 id="deliverable-brief-heading">{isZh ? '填写工作说明' : 'Complete the brief'}</h3>
-                                    <p>{isZh ? `当前档位：${tier.toUpperCase()}` : `Current tier: ${tier.toUpperCase()}`}</p>
+                                    <h3 id="deliverable-brief-heading">{isZh ? '你想做什么？' : 'What should it communicate?'}</h3>
+                                    <p>{isZh ? `使用当前 ${tier.toUpperCase()} 档位` : `Using the current ${tier.toUpperCase()} tier`}</p>
                                 </div>
                             </div>
                             <div className="deliverable-form">
@@ -367,11 +345,21 @@ export function DeliverableLauncher({
                                     <textarea
                                         value={goal}
                                         onChange={(event) => { setGoal(event.target.value); setError(''); }}
-                                        placeholder={isZh ? '例如：为潜在投资人制作一份 8 页融资汇报' : 'e.g. Create an 8-slide fundraising deck for prospective investors'}
+                                        placeholder={isZh ? '例如：用上传的产品资料制作一份面向经销商的招商演示，突出卖点、渠道政策和合作方式' : 'e.g. Create a partner pitch from the attached product material, focusing on benefits, channel terms, and next steps'}
                                         rows={3}
                                     />
                                 </label>
-                                {selectedWorkflow.fields.map((field) => {
+                                <button
+                                    type="button"
+                                    className="btn btn-secondary deliverable-preflight-button"
+                                    onClick={() => setShowAdvanced((current) => !current)}
+                                    aria-expanded={showAdvanced}
+                                >
+                                    {showAdvanced
+                                        ? (isZh ? '收起可选设置' : 'Hide optional settings')
+                                        : (isZh ? '页数、受众与风格（可选）' : 'Slides, audience, and style (optional)')}
+                                </button>
+                                {showAdvanced && selectedWorkflow.fields.map((field) => {
                                     const label = isZh ? field.label_zh : field.label_en;
                                     const placeholder = isZh ? field.placeholder_zh : field.placeholder_en;
                                     const value = spec[field.key] ?? '';
@@ -410,6 +398,7 @@ export function DeliverableLauncher({
                                         </label>
                                     );
                                 })}
+                                {error && <div className="deliverable-error" role="alert">{error}</div>}
                             </div>
                             <div className="deliverable-input-summary">
                                 <span>{isZh ? '已附加资料' : 'Attached references'}</span>
@@ -419,40 +408,12 @@ export function DeliverableLauncher({
                         </section>
                     )}
 
-                    <section className="deliverable-section" aria-labelledby="deliverable-preflight-heading">
-                        <div className="deliverable-section__heading">
-                            <span className="deliverable-step">3</span>
-                            <div>
-                                <h3 id="deliverable-preflight-heading">{isZh ? '能力与费用预检' : 'Capability and cost preflight'}</h3>
-                                <p>{isZh ? '预检和保存不会预留或扣除 Credits。' : 'Preflight and saving do not reserve or spend Credits.'}</p>
-                            </div>
-                        </div>
-                        {preflight ? (
-                            <div className={`deliverable-preflight ${preflight.available ? 'is-ready' : 'is-blocked'}`} aria-live="polite">
-                                <span className="deliverable-preflight__icon">
-                                    {preflight.available ? <IconCheck size={18} /> : <IconAlertTriangle size={18} />}
-                                </span>
-                                <div>
-                                    <strong>{preflight.available ? (isZh ? '基础能力可用' : 'Base capability available') : (isZh ? '暂时无法使用' : 'Currently unavailable')}</strong>
-                                    <p>{creditText(preflight, isZh)}</p>
-                                    {preflight.reasons.map((reason) => (
-                                        <small key={reason}>{(REASON_LABELS[reason]?.[isZh ? 'zh' : 'en']) || reason}</small>
-                                    ))}
-                                </div>
-                            </div>
-                        ) : (
-                            <button type="button" className="btn btn-secondary deliverable-preflight-button" disabled={checking || !selectedWorkflow} onClick={() => void checkCapability()}>
-                                {checking ? (isZh ? '正在检查…' : 'Checking…') : (isZh ? '检查当前配置' : 'Check current setup')}
-                            </button>
-                        )}
-                        {error && <div className="deliverable-error" role="alert">{error}</div>}
-                    </section>
                 </div>
 
                 <footer className="deliverable-drawer__footer">
                     <div>
-                        <strong>{isZh ? '不会直接调用具体模型' : 'No direct model invocation'}</strong>
-                        <small>{isZh ? '请求由平台统一路由，并在真实执行时按实际用量结算。' : 'The platform routes execution and settles actual usage.'}</small>
+                        <strong>{isZh ? '发送前不会扣除 Credits' : 'No Credits are spent before you send'}</strong>
+                        <small>{isZh ? '系统会先检查当前数字员工是否具备 PPT 能力。' : 'The system validates this Agent\'s presentation capability first.'}</small>
                     </div>
                     <button type="button" className="btn btn-primary" disabled={saving || checking || !selectedWorkflow || !sessionId} onClick={() => void saveBrief()}>
                         {saving ? (isZh ? '正在保存…' : 'Saving…') : (isZh ? '确认并保存' : 'Confirm and save')}
@@ -464,6 +425,10 @@ export function DeliverableLauncher({
         document.body,
     ) : null;
 
+    if (!workflowsLoaded || loadingWorkflows || workflows.length === 0) {
+        return null;
+    }
+
     return (
         <>
             <button
@@ -472,11 +437,11 @@ export function DeliverableLauncher({
                 className="chat-composer-btn deliverable-launcher"
                 onClick={() => setOpen(true)}
                 disabled={disabled || !sessionId}
-                aria-label={isZh ? '打开交付物工作台' : 'Open deliverable workbench'}
-                title={isZh ? 'PPT、海报和短视频工作说明' : 'Presentation, poster, and video briefs'}
+                aria-label={isZh ? '制作 PPT' : 'Create a presentation'}
+                title={isZh ? '制作 PPT' : 'Create a presentation'}
             >
                 <IconSparkles size={16} stroke={1.75} />
-                <span>{isZh ? '交付物' : 'Create'}</span>
+                <span>{isZh ? 'PPT' : 'PPT'}</span>
             </button>
             {drawer}
         </>

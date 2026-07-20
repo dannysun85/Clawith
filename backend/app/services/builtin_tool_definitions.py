@@ -14,6 +14,9 @@ from copy import deepcopy
 from typing import Any, Mapping
 
 from app.services.llm.finish import FINISH_TOOL_SEED
+from app.services.tool_capability_policy import (
+    PERSISTED_NON_DEFAULT_TOOL_NAMES,
+)
 
 
 # Builtin tool definitions — these map to the hardcoded AGENT_TOOLS
@@ -3961,13 +3964,8 @@ for _seed in _BUILTIN_TOOL_SOURCE:
 # v1.11 replaced the AI-posting Plaza with a human-curated experience library.
 # Keep the legacy names registered so historical assignments remain readable,
 # but never grant them to new/default Agents.
-_DISABLED_LEGACY_PLAZA_TOOL_NAMES = {
-    "plaza_get_new_posts",
-    "plaza_create_post",
-    "plaza_add_comment",
-}
 for _seed in _BUILTIN_TOOL_SOURCE:
-    if str(_seed["name"]) in _DISABLED_LEGACY_PLAZA_TOOL_NAMES:
+    if str(_seed["name"]) in PERSISTED_NON_DEFAULT_TOOL_NAMES:
         _seed["is_default"] = False
 
 

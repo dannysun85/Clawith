@@ -287,6 +287,49 @@ async def test_import_skill_returns_not_found_outside_agent_tenant():
     assert exc.value.status_code == 404
 
 
+@pytest.mark.asyncio
+async def test_import_skill_returns_conflict_when_workspace_has_user_changes():
+    agent = SimpleNamespace(tenant_id=uuid.uuid4())
+    skill = SimpleNamespace(
+        id=uuid.uuid4(),
+        name="Protected Skill",
+        folder_name="protected-skill",
+        files=[SimpleNamespace(path="SKILL.md", content="# Protected")],
+    )
+    db = FakeSession([skill])
+    user = SimpleNamespace(id=uuid.uuid4(), tenant_id=agent.tenant_id)
+
+    with (
+        patch.object(
+            files_api,
+            "check_agent_access",
+            AsyncMock(return_value=(agent, "manage")),
+        ),
+        patch(
+            "app.services.skill_workspace.deploy_skills_to_agent_workspace",
+            AsyncMock(
+                return_value={
+                    "files": 0,
+                    "created": 0,
+                    "updated": 0,
+                    "adopted": 0,
+                    "unchanged": 0,
+                    "conflicts": 1,
+                }
+            ),
+        ),
+        pytest.raises(HTTPException) as exc,
+    ):
+        await files_api.import_skill_to_agent(
+            agent_id=uuid.uuid4(),
+            body=files_api.ImportSkillBody(skill_id=skill.id),
+            current_user=user,
+            db=db,
+        )
+
+    assert exc.value.status_code == 409
+
+
 @pytest.mark.parametrize(
     "path",
     ["../secret", "scripts/../../secret", "/absolute", "scripts\\evil.py"],

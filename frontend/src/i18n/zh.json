@@ -378,7 +378,8 @@
         },
         "skills": {
             "title": "技能定义",
-            "description": "技能定义了数字员工在特定场景下的行为方式。每个.md文件是一个技能。建议使用YAML frontmatter（name + description）来定义技能元数据。",
+            "description": "技能是可复用的工作方法和说明，不是可执行权限。请求与技能明确匹配时，数字员工会先读取对应 SKILL.md；实际执行仍取决于已启用的工具、凭据、套餐和审批策略。",
+            "capabilityBoundary": "技能告诉数字员工“应该怎样做”，不会自动授予工具、API 密钥或外部系统权限。",
             "skillFiles": "技能文件",
             "noSkills": "暂未定义技能",
             "newSkill": "新建技能",
@@ -650,7 +651,8 @@
                 "reloadPage": "重新加载页面",
                 "selectAgent": "— 选择数字员工 —",
                 "failedToCreateSession": "创建会话失败",
-                "failed": "失败"
+                "failed": "失败",
+                "capabilityBoundary": "工具是可执行能力。启用后会进入当前数字员工的模型工具列表，模型可按请求自动选择调用，但仍必须通过配置、租户隔离、可用性和审批检查。"
             },
             "toolCategories": {
                 "file": "文件操作",
@@ -793,7 +795,7 @@
             "complex-task-executor": "用于分解、规划和执行复杂多步骤任务的结构化方法，支持进度跟踪",
             "skill-creator": "创建新技能、修改和改进现有技能，并衡量技能表现",
             "content-research-writer": "通过进行研究、添加引用、改进开头、迭代大纲和提供实时章节反馈来协助撰写高质量内容",
-            "mcp-installer": "引导用户在聊天中直接发现、配置和安装 MCP 工具——无需设置页面"
+            "mcp-installer": "引导有权限的用户发现并导入 MCP 工具；第三方授权需在该 Agent 的工具页面完成"
         },
         "credentials": {
             "title": "凭据",
@@ -921,7 +923,7 @@
         },
         "step3": {
             "title": "技能配置",
-            "description": "选择数字员工的技能，创建后可在详情页继续编辑。",
+            "description": "选择可复用的工作方法。技能本身不授予工具、API 密钥或外部系统权限；创建后可在详情页继续编辑。",
             "infoSearch": "信息搜索",
             "infoSearchDesc": "联网搜索和信息检索",
             "dataAnalysis": "数据分析",
@@ -971,7 +973,7 @@
                 },
                 "MCP Tool Installer": {
                     "name": "MCP 工具安装器",
-                    "description": "引导用户在聊天中直接发现、配置和安装 MCP 工具——无需访问设置页面"
+                    "description": "引导有权限的用户发现并导入 MCP 工具；第三方授权需在该 Agent 的工具页面完成"
                 }
             }
         },

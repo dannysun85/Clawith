@@ -21,6 +21,9 @@ from app.core.security import decrypt_data, encrypt_data
 from app.models.tenant_setting import TenantSetting
 from app.models.tool import Tool
 from app.services.mcp_security import is_sensitive_mcp_query_key
+from app.services.tool_capability_policy import (
+    CENTRAL_CREDENTIAL_POOL_TOOL_NAMES,
+)
 
 
 SENSITIVE_FIELD_KEYS = {
@@ -164,6 +167,87 @@ def decrypt_sensitive_fields(config: dict, config_schema: dict | None = None) ->
     return decrypt_value(dict(config))
 
 
+def remove_sensitive_fields(config: dict, config_schema: dict | None = None) -> dict:
+    """Return config without any credential-bearing entries.
+
+    Encryption protects a value at rest but does not establish which tenant
+    owns it.  This helper is used when a legacy global builtin credential has
+    no unambiguous tenant owner and therefore must not remain on the runtime
+    fallback row at all.
+    """
+
+    if not config:
+        return {}
+
+    sensitive_keys = get_sensitive_keys(config_schema)
+
+    def scrub(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: scrub(nested)
+                for key, nested in value.items()
+                if str(key) not in sensitive_keys
+                and not is_sensitive_mcp_query_key(str(key))
+            }
+        if isinstance(value, list):
+            return [scrub(item) for item in value]
+        return value
+
+    return scrub(dict(config))
+
+
+def contains_sensitive_material(
+    config: dict | None,
+    config_schema: dict | None = None,
+) -> bool:
+    """Return whether config carries a non-empty credential value."""
+
+    if not config:
+        return False
+    sensitive_keys = get_sensitive_keys(config_schema)
+
+    def contains(value: Any, *, sensitive: bool = False) -> bool:
+        if isinstance(value, dict):
+            return any(
+                contains(
+                    nested,
+                    sensitive=(
+                        sensitive
+                        or str(key) in sensitive_keys
+                        or is_sensitive_mcp_query_key(str(key))
+                    ),
+                )
+                for key, nested in value.items()
+            )
+        if isinstance(value, list):
+            return any(contains(item, sensitive=sensitive) for item in value)
+        if not sensitive or value is None:
+            return False
+        if isinstance(value, str):
+            return bool(value.strip())
+        return True
+
+    return contains(config)
+
+
+def sanitize_tool_config_credential_ownership(
+    tool_name: str,
+    config: dict | None,
+    config_schema: dict | None = None,
+) -> dict:
+    """Remove credentials owned by a separate platform Provider pool.
+
+    MiniMax Tool configuration may retain non-secret generation preferences.
+    Authentication is selected only through ``LLMCredential``; stale
+    Tool/AgentTool keys are never an alternate routing authority.
+    """
+
+    value = dict(config or {})
+    if tool_name in CENTRAL_CREDENTIAL_POOL_TOOL_NAMES:
+        return remove_sensitive_fields(value, config_schema)
+    return value
+
+
 def meaningful_config(config: dict | None) -> dict:
     """Drop empty form values while preserving booleans/numbers."""
     if not config:
@@ -194,7 +278,12 @@ async def get_tenant_tool_config(
     )
     setting = result.scalar_one_or_none()
     raw = (setting.value or {}).get("config", {}) if setting else {}
-    return decrypt_sensitive_fields(raw, config_schema)
+    decrypted = decrypt_sensitive_fields(raw, config_schema)
+    return sanitize_tool_config_credential_ownership(
+        tool_name,
+        decrypted,
+        config_schema,
+    )
 
 
 async def set_tenant_tool_config(
@@ -204,7 +293,12 @@ async def set_tenant_tool_config(
     config: dict,
     config_schema: dict | None = None,
 ) -> None:
-    encrypted = encrypt_sensitive_fields(meaningful_config(config), config_schema)
+    owned_config = sanitize_tool_config_credential_ownership(
+        tool_name,
+        meaningful_config(config),
+        config_schema,
+    )
+    encrypted = encrypt_sensitive_fields(owned_config, config_schema)
     key = tenant_tool_config_key(tool_name)
     result = await db.execute(
         select(TenantSetting).where(

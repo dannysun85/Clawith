@@ -8098,6 +8098,15 @@ export default function AgentDetailPage() {
                                                                 }, 0);
                                                             }}
                                                             onRemove={() => {
+                                                                const generatedLaunchText = deliverableLaunchMessage(
+                                                                    pendingDeliverable.request,
+                                                                    i18n.language?.startsWith('zh'),
+                                                                );
+                                                                setChatInput((current) => (
+                                                                    current.trim() === generatedLaunchText.trim()
+                                                                        ? ''
+                                                                        : current
+                                                                ));
                                                                 dismissedDeliverableRequestIdsRef.current.add(pendingDeliverable.request.id);
                                                                 setPendingDeliverable(null);
                                                             }}
@@ -8243,7 +8252,9 @@ export default function AgentDetailPage() {
                                                                 }
                                                             }}
                                                         />
-                                                        {(mediaCapabilitiesData?.capabilities || []).map((capability) => {
+                                                        {(mediaCapabilitiesData?.capabilities || [])
+                                                            .filter((capability) => capability.available)
+                                                            .map((capability) => {
                                                             const language = i18n.language?.startsWith('zh') ? 'zh' : 'en';
                                                             const state = mediaCapabilityState(capability, language);
                                                             const mediaIcons: Record<MediaModality, React.ReactNode> = {

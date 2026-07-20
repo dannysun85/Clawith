@@ -1219,15 +1219,29 @@ async def get_notification_bar_public(
 @router.get("/system-settings/{key}")
 async def get_system_setting(
     key: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
     """Get a system setting by key."""
+    from app.services.system_setting_security import (
+        is_sensitive_system_setting,
+        mask_system_setting_value,
+    )
+
+    if is_sensitive_system_setting(key) and not _is_platform_admin_user(current_user):
+        raise HTTPException(
+            status_code=403,
+            detail="Only platform admin can read platform credential settings",
+        )
     result = await db.execute(select(SystemSetting).where(SystemSetting.key == key))
     setting = result.scalar_one_or_none()
     if not setting:
         return {"key": key, "value": {}}
-    return {"key": setting.key, "value": setting.value, "updated_at": setting.updated_at.isoformat() if setting.updated_at else None}
+    return {
+        "key": setting.key,
+        "value": mask_system_setting_value(setting.key, setting.value),
+        "updated_at": setting.updated_at.isoformat() if setting.updated_at else None,
+    }
 
 
 @router.put("/system-settings/{key}")
@@ -1238,8 +1252,16 @@ async def update_system_setting(
     db: AsyncSession = Depends(get_db),
 ):
     """Create or update a system setting."""
+    from app.services.system_setting_security import (
+        encrypt_system_setting_value,
+        is_sensitive_system_setting,
+        mask_system_setting_value,
+    )
+
     # Platform-level settings (e.g. PUBLIC_BASE_URL) require platform_admin
-    if key == "platform" and not _is_platform_admin_user(current_user):
+    if (
+        key == "platform" or is_sensitive_system_setting(key)
+    ) and not _is_platform_admin_user(current_user):
         raise HTTPException(status_code=403, detail="Only platform admin can modify platform settings")
     if key == "platform" and data.value.get("public_base_url"):
         try:
@@ -1251,21 +1273,26 @@ async def update_system_setting(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     result = await db.execute(select(SystemSetting).where(SystemSetting.key == key))
     setting = result.scalar_one_or_none()
+    secured_value = encrypt_system_setting_value(
+        key,
+        data.value,
+        existing_value=dict(setting.value or {}) if setting else None,
+    )
     if setting:
-        setting.value = data.value
+        setting.value = secured_value
     else:
-        setting = SystemSetting(key=key, value=data.value)
+        setting = SystemSetting(key=key, value=secured_value)
         db.add(setting)
     await db.commit()
 
     # When public_base_url changes, regenerate sso_domain for all SSO-enabled tenants
-    if key == "platform" and data.value.get("public_base_url"):
+    if key == "platform" and secured_value.get("public_base_url"):
         await _regenerate_all_sso_domains(db)
 
     await db.refresh(setting)
     return {
         "key": setting.key,
-        "value": setting.value,
+        "value": mask_system_setting_value(setting.key, setting.value),
         "updated_at": setting.updated_at.isoformat() if setting.updated_at else None,
     }
 

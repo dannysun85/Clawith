@@ -526,6 +526,15 @@ async def test_runtime_rechecks_explicit_agent_code_assignment(monkeypatch):
 
     monkeypatch.setattr(agent_tools, "_get_agent_tenant_id", get_tenant)
 
+    async def get_config(_agent_id, _tool_name):
+        return {
+            "sandbox_type": "e2b",
+            "api_key": "secret",
+            "allow_network": True,
+        }
+
+    monkeypatch.setattr(agent_tools, "_get_tool_config", get_config)
+
     class Result:
         def __init__(self, value):
             self.value = value
@@ -556,7 +565,7 @@ async def test_runtime_rechecks_explicit_agent_code_assignment(monkeypatch):
         lambda: SessionContext(None),
     )
     assert "not authorized for this Agent" in await agent_tools._code_tool_denial_reason(
-        "execute_code",
+        "execute_code_e2b",
         agent_id,
     )
 
@@ -567,11 +576,37 @@ async def test_runtime_rechecks_explicit_agent_code_assignment(monkeypatch):
     )
     assert (
         await agent_tools._code_tool_denial_reason(
-            "execute_code",
+            "execute_code_e2b",
             agent_id,
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_typed_code_execution_blocks_before_autonomy_and_dispatch(monkeypatch):
+    async def deny(_tool_name, _agent_id):
+        return "Code execution is not authorized for this Agent"
+
+    async def forbidden_autonomy(**_kwargs):
+        raise AssertionError("autonomy must not run for an unauthorized Code tool")
+
+    monkeypatch.setattr(agent_tools, "_code_tool_denial_reason", deny)
+    monkeypatch.setattr(
+        agent_tools,
+        "enforce_builtin_tool_autonomy_outcome",
+        forbidden_autonomy,
+    )
+
+    outcome = await agent_tools.execute_builtin_tool_outcome(
+        "execute_code",
+        {"language": "python", "code": "print('blocked')"},
+        agent_id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+    )
+
+    assert outcome.status == "failed"
+    assert outcome.error_code == "code_execution_not_authorized"
 
 
 @pytest.mark.asyncio
@@ -584,6 +619,7 @@ async def test_agent_tool_config_response_masks_agent_and_company_secrets(
     schema = {"fields": [{"key": "api_key", "type": "password"}]}
     tool = SimpleNamespace(
         id=tool_id,
+        name="some_tool",
         source="builtin",
         tenant_id=None,
         config_schema=schema,

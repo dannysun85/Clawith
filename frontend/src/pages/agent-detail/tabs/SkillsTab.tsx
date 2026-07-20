@@ -121,6 +121,9 @@ export default function SkillsTab(props: Props) {
                     </div>}
                 </div>
                 <div style={{ marginTop: '8px', padding: '10px 14px', background: 'var(--bg-secondary)', borderRadius: '8px', fontSize: '12px', color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+                    <div style={{ marginBottom: '8px' }}>
+                        {t('agent.skills.capabilityBoundary')}
+                    </div>
                     <strong>Skill Format:</strong><br />
                     • <code>skills/my-skill/SKILL.md</code> — {t('agent.skills.folderFormat', 'Each skill is a folder with a SKILL.md file and optional auxiliary files (scripts/, examples/)')}
                 </div>

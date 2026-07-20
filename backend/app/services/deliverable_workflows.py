@@ -22,6 +22,7 @@ from app.services.minimax_media_profiles import resolve_minimax_media_profile
 from app.services.model_router import resolve_route
 from app.services.provider_pricing import minimax_image_credits, minimax_video_credits
 from app.services.quota_guard import QuotaExceeded
+from app.services.tool_visibility import tool_enabled_for_agent
 
 
 SAAS_TIERS = ("lite", "pro", "ultra")
@@ -80,7 +81,7 @@ _WORKFLOWS = (
         description_en="Confirm the goal, audience, and structure before generating a previewable file.",
         fields=[
             WorkflowField(
-                key="audience", label_zh="目标受众", label_en="Audience", kind="text", required=True,
+                key="audience", label_zh="目标受众", label_en="Audience", kind="text",
                 placeholder_zh="例如：潜在投资人", placeholder_en="e.g. prospective investors",
             ),
             WorkflowField(
@@ -181,6 +182,35 @@ class DeliverableWorkflowError(ValueError):
 
 def list_workflow_manifests() -> list[WorkflowManifest]:
     return list(_WORKFLOWS)
+
+
+async def list_agent_launchable_workflows(
+    db: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    agent_id: uuid.UUID,
+    tier: str,
+) -> list[WorkflowManifest]:
+    """Return only real executable workflows for the exact Agent context."""
+    normalized_tier = str(tier or "").strip().lower()
+    if normalized_tier not in SAAS_TIERS:
+        return []
+    try:
+        await resolve_route(tenant_id, normalized_tier, "text")
+    except QuotaExceeded:
+        return []
+
+    available: list[WorkflowManifest] = []
+    for workflow in _WORKFLOWS:
+        if workflow.launch_policy != "agent_runtime":
+            continue
+        if (
+            workflow.required_capability == "presentation"
+            and not await _presentation_tool_available(db, agent_id)
+        ):
+            continue
+        available.append(workflow)
+    return available
 
 
 def require_workflow(
@@ -289,7 +319,7 @@ async def _agent_tool_available(
         )
     )
     assignment = assignment_result.scalar_one_or_none()
-    return bool(assignment.enabled) if assignment is not None else bool(tool.is_default)
+    return tool_enabled_for_agent(tool, assignment)
 
 
 async def _presentation_tool_available(db: AsyncSession, agent_id: uuid.UUID) -> bool:

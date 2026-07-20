@@ -225,6 +225,10 @@ async def _tools(agent_id: uuid.UUID) -> list[dict]:
     ]
 
 
+async def _allow_autonomy(**_kwargs) -> None:
+    return None
+
+
 def _execution(
     tenant_id: uuid.UUID,
     run_id: uuid.UUID,
@@ -284,6 +288,7 @@ def _service(
     executor,
     *,
     a2a_service=None,
+    autonomy_enforcer=_allow_autonomy,
     tool_result_reconciler=None,
     tool_provider=_tools,
 ) -> tool_step_service.RuntimeToolStepService:
@@ -292,6 +297,7 @@ def _service(
         cancel_source=cancel_source,
         tool_provider=tool_provider,
         tool_executor=executor,
+        autonomy_enforcer=autonomy_enforcer,
         a2a_service=a2a_service,
         tool_result_reconciler=tool_result_reconciler,
     )
@@ -2966,6 +2972,139 @@ async def test_runtime_a2a_notify_continues_without_waiting(monkeypatch) -> None
     assert result.waiting_request is None
     assert result.pending_tool_calls == ()
     assert result.messages[0]["content"] == "notification accepted"
+
+
+@pytest.mark.asyncio
+async def test_runtime_a2a_autonomy_blocks_before_target_dispatch(monkeypatch) -> None:
+    tenant_id = uuid.uuid4()
+    agent = _agent(tenant_id)
+    call = _a2a_call("blocked-a2a", mode="notify")
+    state = _state(tenant_id, agent, (call,))
+    execution = _execution(
+        tenant_id,
+        uuid.UUID(state["registry"].run_id),
+        "blocked-a2a",
+        "send_message_to_agent",
+    )
+    a2a_service = _A2AService(
+        A2ARuntimeToolResult(
+            outcome=ToolExecutionOutcome(
+                status="succeeded",
+                result_summary="must not dispatch",
+                result_ref=None,
+            ),
+            target_run_id=uuid.uuid4(),
+        )
+    )
+
+    async def reserve(db, **kwargs):
+        del db, kwargs
+        return _reservation(execution)
+
+    async def block_autonomy(**kwargs):
+        assert kwargs["tool_name"] == "send_message_to_agent"
+        assert kwargs["agent_id"] == agent.id
+        return ToolExecutionOutcome(
+            status="failed",
+            result_summary="human approval required",
+            result_ref=None,
+            error_code="autonomy_approval_required",
+        )
+
+    async def mark_failed(db, **kwargs):
+        del db
+        execution.status = "failed"
+        execution.result_summary = kwargs["result_summary"]
+        execution.error_code = kwargs["error_code"]
+        return execution
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError(f"legacy A2A executor called: {args}, {kwargs}")
+
+    monkeypatch.setattr(tool_step_service, "reserve_tool_execution", reserve)
+    monkeypatch.setattr(tool_step_service, "mark_tool_execution_failed", mark_failed)
+    result = await _service(
+        agent,
+        _CancelSource(None),
+        forbidden,
+        a2a_service=a2a_service,
+        autonomy_enforcer=block_autonomy,
+    ).execute_pending(state, _context(state), (call,))
+
+    assert a2a_service.calls == []
+    assert result.messages[0]["execution_status"] == "failed"
+    assert result.messages[0]["error_code"] == "autonomy_approval_required"
+
+
+@pytest.mark.asyncio
+async def test_runtime_a2a_invalid_actor_fails_closed_before_dispatch(monkeypatch) -> None:
+    tenant_id = uuid.uuid4()
+    agent = _agent(tenant_id)
+    call = _a2a_call("invalid-actor-a2a", mode="notify")
+    state = _state(tenant_id, agent, (call,))
+    context = _context(state)
+    context = RuntimeContext(
+        tenant_id=context.tenant_id,
+        run_id=context.run_id,
+        command_id=context.command_id,
+        executor=context.executor,
+        goal=context.goal,
+        run_kind=context.run_kind,
+        source_type=context.source_type,
+        model_id=context.model_id,
+        graph_name=context.graph_name,
+        graph_version=context.graph_version,
+        agent_id=context.agent_id,
+        session_id=context.session_id,
+        system_role=context.system_role,
+        parent_run_id=context.parent_run_id,
+        root_run_id=context.root_run_id,
+        actor_user_id="not-a-uuid",
+    )
+    execution = _execution(
+        tenant_id,
+        uuid.UUID(state["registry"].run_id),
+        "invalid-actor-a2a",
+        "send_message_to_agent",
+    )
+    a2a_service = _A2AService(
+        A2ARuntimeToolResult(
+            outcome=ToolExecutionOutcome(
+                status="succeeded",
+                result_summary="must not dispatch",
+                result_ref=None,
+            ),
+            target_run_id=uuid.uuid4(),
+        )
+    )
+
+    async def reserve(db, **kwargs):
+        del db, kwargs
+        return _reservation(execution)
+
+    async def mark_failed(db, **kwargs):
+        del db
+        execution.status = "failed"
+        execution.result_summary = kwargs["result_summary"]
+        execution.error_code = kwargs["error_code"]
+        return execution
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError(f"invalid actor reached execution: {args}, {kwargs}")
+
+    monkeypatch.setattr(tool_step_service, "reserve_tool_execution", reserve)
+    monkeypatch.setattr(tool_step_service, "mark_tool_execution_failed", mark_failed)
+    result = await _service(
+        agent,
+        _CancelSource(None),
+        forbidden,
+        a2a_service=a2a_service,
+        autonomy_enforcer=forbidden,
+    ).execute_pending(state, context, (call,))
+
+    assert a2a_service.calls == []
+    assert result.messages[0]["execution_status"] == "failed"
+    assert result.messages[0]["error_code"] == "runtime_actor_invalid"
 
 
 @pytest.mark.asyncio

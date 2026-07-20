@@ -126,6 +126,11 @@ async def test_publish_page_returns_absolute_public_url(monkeypatch, tmp_path):
         AsyncMock(return_value="https://astra.example/"),
     )
 
+    async def public_url(url):
+        return url, None
+
+    monkeypatch.setattr(agent_tools, "_validate_public_http_url", public_url)
+
     result = await agent_tools._publish_page(
         agent_id,
         uuid.uuid4(),

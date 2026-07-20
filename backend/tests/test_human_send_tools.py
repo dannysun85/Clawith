@@ -84,6 +84,14 @@ class DummyResult:
     def scalars(self):
         return self
 
+    def first(self):
+        return self._values[0] if self._values else None
+
+
+class StrictMultiResult(DummyResult):
+    def scalar_one_or_none(self):
+        raise AssertionError("multiple configured channels are a valid result set")
+
 
 class RecordingDB:
     def __init__(self, responses):
@@ -179,6 +187,52 @@ async def test_runtime_channel_message_dispatches_typed_provider_outcome(
 
     assert outcome is expected
     mock_send.assert_awaited_once_with(agent_id, member.name, "hi", member)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_type", "legacy_helper"),
+    [
+        ("slack", "_send_slack_message"),
+        ("teams", "_send_teams_channel_message"),
+        ("wechat", "_send_wechat_channel_message"),
+    ],
+)
+async def test_runtime_channel_message_blocks_untyped_provider_before_dispatch(
+    provider_type,
+    legacy_helper,
+):
+    agent_id = uuid.uuid4()
+    member = _make_member(external_id="provider-user")
+    target = SimpleNamespace(
+        member=member,
+        provider_type=provider_type,
+        platform_user=None,
+    )
+
+    with (
+        patch(
+            "app.services.agent_tools._resolve_roster_human_target",
+            new_callable=AsyncMock,
+            return_value=(target, None),
+        ),
+        patch(
+            f"app.services.agent_tools.{legacy_helper}",
+            new_callable=AsyncMock,
+        ) as mock_send,
+    ):
+        outcome = await agent_tools._send_channel_message_outcome(
+            agent_id,
+            {
+                "target_member_id": str(member.id),
+                "channel": provider_type,
+                "message": "hi",
+            },
+        )
+
+    assert outcome.status == "failed"
+    assert outcome.error_code == "channel_provider_not_durable"
+    mock_send.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -530,6 +584,19 @@ async def test_get_agent_tools_for_llm_hides_channel_message_without_configured_
     tool_names = {tool["function"]["name"] for tool in tools}
     assert "send_platform_message" in tool_names
     assert "send_channel_message" not in tool_names
+
+
+@pytest.mark.asyncio
+async def test_multiple_durable_channels_still_count_as_ready():
+    db = RecordingDB([
+        StrictMultiResult(values=[SimpleNamespace(), SimpleNamespace()]),
+    ])
+
+    with patch("app.services.agent_tools.async_session") as mock_session_ctx:
+        mock_session_ctx.return_value.__aenter__ = AsyncMock(return_value=db)
+        mock_session_ctx.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        assert await agent_tools._agent_has_any_channel(uuid.uuid4()) is True
 
 
 @pytest.mark.asyncio

@@ -341,6 +341,15 @@ async def test_external_provider_typed_outcome_is_preserved_without_string_guess
         fake_channel_outcome,
     )
 
+    async def allow_autonomy(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(
+        agent_tools,
+        "enforce_builtin_tool_autonomy_outcome",
+        allow_autonomy,
+    )
+
     outcome = await agent_tools.execute_builtin_tool_outcome(
         "send_channel_message",
         {"target_member_id": "member-id", "message": "hello"},

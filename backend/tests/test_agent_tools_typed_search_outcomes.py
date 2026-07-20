@@ -27,6 +27,20 @@ TYPED_SEARCH_TOOLS = {
 }
 
 
+@pytest.fixture(autouse=True)
+def allow_test_tool_autonomy(monkeypatch):
+    """Search outcome tests exercise provider contracts, not policy storage."""
+
+    async def allow(**_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        agent_tools,
+        "enforce_builtin_tool_autonomy_outcome",
+        allow,
+    )
+
+
 class FakeResponse:
     def __init__(
         self,

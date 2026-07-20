@@ -27,7 +27,11 @@ class SystemSettingDAO(BaseDAO[SystemSetting]):
         setting = await self.get_by_key(key)
         if setting is None:
             return default
-        return setting.value
+        from app.services.system_setting_security import (
+            decrypt_system_setting_value,
+        )
+
+        return decrypt_system_setting_value(key, setting.value)
 
     async def is_invitation_code_enabled(self) -> bool:
         """Return whether invitation-code enforcement is active."""

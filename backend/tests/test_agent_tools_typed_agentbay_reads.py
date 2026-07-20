@@ -344,6 +344,22 @@ def install_provider(
         del args, kwargs
 
     monkeypatch.setattr(activity_logger, "log_activity", no_activity)
+
+    async def allow_code_capability(*_args, **_kwargs):
+        return None
+
+    # Provider outcome tests deliberately isolate the AgentBay adapter from
+    # the independent platform/tenant/Agent grant and autonomy gates.
+    monkeypatch.setattr(
+        agent_tools,
+        "_code_tool_denial_reason",
+        allow_code_capability,
+    )
+    monkeypatch.setattr(
+        agent_tools,
+        "enforce_builtin_tool_autonomy_outcome",
+        allow_code_capability,
+    )
     if case.tool_name in SCREENSHOT_TOOL_NAMES:
         monkeypatch.setattr(
             vision_inject,

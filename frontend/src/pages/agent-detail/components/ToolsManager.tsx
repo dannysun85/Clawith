@@ -685,6 +685,9 @@ export default function ToolsManager({ agentId, canManage = false }: { agentId: 
     return (
         <>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                <div style={{ padding: '10px 14px', borderRadius: '8px', background: 'var(--bg-secondary)', color: 'var(--text-secondary)', fontSize: '12px', lineHeight: 1.6 }}>
+                    {t('agent.tools.capabilityBoundary')}
+                </div>
                 <div className="tool-source-tabs" role="tablist" aria-label={t('agent.tools.sourceTabs', 'Tool sources')}>
                     <button
                         type="button"

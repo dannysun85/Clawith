@@ -35,6 +35,11 @@ HIGH_RISK_DEFAULT_L3_ACTIONS = {
     "douyin_reply_comment",
     "douyin_external_write",
     "execute_code",
+    "manage_agent_capabilities",
+    "manage_automation",
+    "manage_external_deployment",
+    "publish_external_content",
+    "send_external_message",
 }
 
 APPROVAL_EXECUTION_STALE_AFTER = timedelta(minutes=20)
@@ -468,6 +473,18 @@ def _approval_action_matches_tool(action_type: str, tool_name: str) -> bool:
         "write_workspace_files": {"write_file", "move_file", "edit_file"},
         "delete_files": {"delete_file"},
         "send_feishu_message": {"send_feishu_message"},
+        "send_external_message": {
+            "send_channel_message",
+            "send_platform_message",
+            "send_channel_file",
+            "send_email",
+            "reply_email",
+        },
+        "manage_automation": {
+            "set_trigger",
+            "update_trigger",
+            "cancel_trigger",
+        },
         "send_message_to_agent": {"send_message_to_agent"},
         "send_file_to_agent": {"send_file_to_agent"},
         "web_search": {"web_search"},
@@ -480,6 +497,17 @@ def _approval_action_matches_tool(action_type: str, tool_name: str) -> bool:
             "agentbay_code_edit_file",
             "agentbay_command_exec",
         },
+        "manage_agent_capabilities": {
+            "import_mcp_server",
+            "install_skill",
+        },
+        "manage_external_deployment": {
+            "vercel_deploy",
+            "vercel_set_env",
+            "vercel_manage_domain",
+            "neon_create_database",
+        },
+        "publish_external_content": {"publish_page"},
         "douyin_publish_job": {"douyin_run_publish_job"},
         "douyin_reply_comment": {"douyin_reply_comment"},
     }
@@ -894,6 +922,7 @@ class AutonomyService:
         from app.core.permissions import is_agent_expired
         from app.models.tool import AgentTool, Tool
         from app.services.agent_tools import _code_tool_denial_reason
+        from app.services.tool_visibility import tool_enabled_for_agent
 
         async with async_session() as permission_db:
             agent_result = await permission_db.execute(
@@ -923,11 +952,7 @@ class AutonomyService:
             if row is None:
                 raise ValueError("Approved Tool is no longer available")
             tool, assignment = row
-            currently_enabled = (
-                bool(assignment.enabled)
-                if assignment is not None
-                else bool(tool.is_default)
-            )
+            currently_enabled = tool_enabled_for_agent(tool, assignment)
             if not currently_enabled:
                 raise ValueError("Approved Tool permission has been revoked")
             if tool.tenant_id is not None and tool.tenant_id != agent.tenant_id:

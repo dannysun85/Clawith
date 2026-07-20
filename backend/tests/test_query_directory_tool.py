@@ -87,9 +87,11 @@ class RecordingDB:
 
 def test_query_directory_tool_is_available_to_agents():
     tool_names = {tool["function"]["name"] for tool in agent_tools.AGENT_TOOLS}
+    persisted = next(tool for tool in tool_seeder.BUILTIN_TOOLS if tool["name"] == "query_directory")
 
     assert "query_directory" in tool_names
-    assert "query_directory" in agent_tools._ALWAYS_INCLUDE_CORE
+    assert persisted["is_default"] is True
+    assert "query_directory" not in agent_tools._ALWAYS_INCLUDE_CORE
     assert "query_directory" not in agent_tools._HIDDEN_FROM_LLM_TOOL_NAMES
     assert "query_roster" not in tool_names
     assert "query_roster" not in agent_tools._ALWAYS_INCLUDE_CORE

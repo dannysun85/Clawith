@@ -137,6 +137,12 @@ class AgentManager:
                 rel = src.relative_to(template_dir).as_posix()
                 if rel == "tasks.json" or rel == "todo.json" or rel.startswith("enterprise_info/"):
                     continue
+                # Product Skills are resolved from the registry for this exact
+                # tenant/template/selection after base workspace creation. The
+                # repository template may contain source packages, but copying
+                # them here would silently grant every Agent every Skill.
+                if rel.startswith("skills/") and rel != "skills/.gitkeep":
+                    continue
                 target_key = f"{agent_prefix}/{rel}"
                 if not await storage.exists(target_key):
                     tasks.append(storage.write_bytes(target_key, src.read_bytes()))

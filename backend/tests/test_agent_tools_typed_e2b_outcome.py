@@ -82,10 +82,14 @@ async def test_e2b_resolver_hides_without_config_and_never_health_pings(
     async def assigned(_agent_id):
         return [tool]
 
+    async def authorized(_tool_name, _agent_id):
+        return None
+
     async def missing(_agent_id, _name):
         return {}
 
     monkeypatch.setattr(agent_tools, "get_agent_tools_for_llm", assigned)
+    monkeypatch.setattr(agent_tools, "_code_tool_denial_reason", authorized)
     monkeypatch.setattr(agent_tools, "_get_tool_config", missing)
 
     assert await agent_tools.get_runtime_agent_tools_for_llm(uuid.uuid4()) == []
@@ -122,8 +126,20 @@ async def test_e2b_dispatcher_reuses_typed_temp_workspace_path(
         assert kwargs["sync_back_on_non_success"] is True
         return await operation(tmp_path)
 
+    async def authorized(_tool_name, _agent_id):
+        return None
+
+    async def allow_autonomy(**_kwargs):
+        return None
+
     monkeypatch.setattr(agent_tools, "_get_tool_config", configured)
     monkeypatch.setattr(agent_tools, "_get_agent_tenant_id", tenant)
+    monkeypatch.setattr(agent_tools, "_code_tool_denial_reason", authorized)
+    monkeypatch.setattr(
+        agent_tools,
+        "enforce_builtin_tool_autonomy_outcome",
+        allow_autonomy,
+    )
     monkeypatch.setattr(
         agent_tools,
         "_run_with_temp_workspace_outcome",

@@ -34,7 +34,7 @@ from app.services.deliverable_artifacts import (
 )
 from app.services.deliverable_workflows import (
     DeliverableWorkflowError,
-    list_workflow_manifests,
+    list_agent_launchable_workflows,
     preflight_workflow,
     request_fingerprint,
     require_workflow,
@@ -122,10 +122,21 @@ async def _owned_request(
 
 @router.get("/workflows")
 async def list_deliverable_workflows(
+    agent_id: uuid.UUID = Query(...),
+    tier: str = Query("lite", pattern="^(lite|pro|ultra)$"),
     current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
-    del current_user
-    return {"workflows": [workflow.model_dump() for workflow in list_workflow_manifests()]}
+    agent, _ = await check_agent_access(db, current_user, agent_id)
+    if agent.tenant_id is None or agent.tenant_id != current_user.tenant_id:
+        raise HTTPException(status_code=403, detail="No access to this agent")
+    workflows = await list_agent_launchable_workflows(
+        db,
+        tenant_id=agent.tenant_id,
+        agent_id=agent.id,
+        tier=tier,
+    )
+    return {"workflows": [workflow.model_dump() for workflow in workflows]}
 
 
 @router.post("/preflight")

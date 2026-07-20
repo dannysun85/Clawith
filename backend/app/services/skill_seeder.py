@@ -1,10 +1,49 @@
 """Seed builtin skills into the global skill registry."""
 
+from __future__ import annotations
+
+import hashlib
+import json
+
 from loguru import logger
 from sqlalchemy import select
+
 from app.database import async_session
 from app.models.skill import Skill, SkillFile
 from app.services.skill_scope import resolve_agent_skills
+from app.services.skill_workspace import (
+    _remove_stale_automatic_skill,
+    _skill_content_hash,
+    _skill_file_map,
+    _sync_managed_skill,
+)
+
+
+# These folders were incorrectly pushed to every Agent before role-specific
+# capability governance was introduced. The hashes are the reviewed historical
+# package contents. They allow a one-time, byte-exact cleanup for old workspaces
+# that predate the managed provisioning marker; user edits fail closed.
+LEGACY_AMBIENT_SKILL_HASHES: dict[str, frozenset[str]] = {
+    "skill-creator": frozenset(
+        {"26065555e54aa8e32ed903c4a2d73ddc41be0eafceee04cca095bfb074e77502"}
+    ),
+    "mcp-installer": frozenset(
+        {"170e1c4e6e0ec89e5ab4b449293b9e4ed9e46c6dce3f7e817122f1a81b91e1f3"}
+    ),
+    "brand-safe-media": frozenset(
+        {
+            "63468e3dac198a61b292e5bcae657302efa6fe9ac7f29d8b69779087a74f6b0f",
+            "33544bfb7bd148b0744b209a09789a6148bd7196b6f07d10678e45814c696f16",
+        }
+    ),
+    "vercel-full-stack-deploy": frozenset(
+        {
+            "b3e900e1c293566e9301a1b66c433dce680ab14af6807700674e55014bac473b",
+            "dd3955e421d281dbab240a9f01a16e77d0a4c99ca296902c4a7604ead12dc455",
+        }
+    ),
+}
+_SKILL_SYNC_POLICY_REVISION = "role-scoped-skills-v2"
 
 
 BUILTIN_SKILLS = [
@@ -531,14 +570,14 @@ Plan would be:
             },
         ],
     },
-    # ─── Skill Creator (mandatory default) ─────────
+    # ─── Skill Creator (developer-role Skill) ──────
     {
         "name": "Skill Creator",
         "description": "Create new skills, modify and improve existing skills, and measure skill performance",
         "category": "development",
         "icon": "🛠️",
         "folder_name": "skill-creator",
-        "is_default": True,
+        "is_default": False,
         "files": [],  # populated at runtime from skill_creator_content
     },
     # ─── Content Research Writer ──────────────────
@@ -550,24 +589,24 @@ Plan would be:
         "folder_name": "content-research-writer",
         "files": [],  # populated at runtime
     },
-    # ─── MCP Tool Installer (mandatory default) ──────────────
+    # ─── MCP Tool Installer (integration-role Skill) ─────────
     {
         "name": "MCP Tool Installer",
-        "description": "Guide users through discovering, configuring, and installing MCP tools directly in chat — no Settings page required",
+        "description": "Guide authorized users through discovering and importing MCP tools; provider authorization is completed on the Agent Tools page",
         "category": "development",
         "icon": "🔌",
         "folder_name": "mcp-installer",
-        "is_default": True,
+        "is_default": False,
         "files": [],  # populated at runtime from agent_template/skills/mcp-installer/SKILL.md
     },
-    # ─── Brand-safe media (mandatory default) ──────
+    # ─── Brand-safe media (media/content-role Skill) ──────────
     {
         "name": "Brand-safe Media",
         "description": "Required workflow for customer-facing images or videos containing exact copy, logos, packaging, or reference products",
         "category": "creation",
         "icon": "🎬",
         "folder_name": "brand-safe-media",
-        "is_default": True,
+        "is_default": False,
         "files": [],  # populated from agent_template/skills/brand-safe-media/SKILL.md
     },
     # ─── Market Data (trading agents) ──────────────
@@ -605,9 +644,16 @@ Use when a trading agent needs:
 
 Look at your tool list. If you have `unlock_financial_analysis` and `stock_data_query` tools, skip to Step 3.
 
-### Step 2 — Install via MCP_INSTALLER
+### Step 2 — Stop or request an explicit capability grant
 
-Use the `mcp-installer` skill to install Shibui Finance (free, no API key, no per-call cost):
+The presence of this Skill does not grant installation Tools. If
+`import_mcp_server` is not visible in the current tool list, explain that live
+market data is not configured for this Agent and ask an authorized manager to
+enable/import it from the Agent's Tools page. Fall back to `web-research` only
+when the user accepts the lower freshness and structure guarantees.
+
+If `import_mcp_server` is visible and the user explicitly asked to install the
+data integration, import Shibui Finance:
 
 ```
 import_mcp_server(
@@ -616,7 +662,9 @@ import_mcp_server(
 )
 ```
 
-If the user has not yet provided a Smithery API key, the `mcp-installer` skill explains how to register and obtain one.
+If the tool reports that no Smithery API key is configured, direct the user to
+the Agent's Tools page. Never ask for or echo a credential in chat, and never
+claim market data is live before the imported tools pass their readiness check.
 
 ### Step 3 — Activate the data session
 
@@ -864,7 +912,7 @@ Until then, structured web search is the contract.
         "category": "deploy",
         "icon": "🚀",
         "folder_name": "vercel-full-stack-deploy",
-        "is_default": True,
+        "is_default": False,
         "files": [
             {
                 "path": "SKILL.md",
@@ -877,11 +925,17 @@ description: Guides the agent through the planning, development, and deployment 
 
 ## When to Use
 Use this skill when the user requests a "website", "web app", or "online system" (product) that requires a database.
-If the user only requests static frontend pages without a database or backend APIs, use the existing `publish_page` tool directly.
+If the user only requests static frontend pages without a database or backend
+APIs, use `publish_page` only when it is visible and enabled for this Agent.
+Otherwise explain the missing capability; a Skill never grants a Tool.
 
 > [!IMPORTANT]
-> **Code Development and Editing Priority:**
-> Code development and editing MUST be prioritized inside the local workspace (`workspace`). First develop and edit your changes in the workspace. If the `execute_code` tool is enabled, you can run `npm run build` inside the workspace using bash to verify compilation locally. Otherwise, directly call the `vercel_deploy` tool to deploy the workspace to Vercel (using the default Direct Upload method); if the build fails, use the `vercel_get_deploy_logs` tool to retrieve build logs and fix any errors. Do not write code in remote environments or rely on external triggers.
+> **Capability and verification boundary:**
+> Develop inside `workspace`. Use `execute_code` for builds only when it is
+> visible and authorized. If build execution or the required deployment Tools
+> are absent, stop and report the exact missing capability. Never compensate
+> for a missing Tool by claiming a deployment, and never use production as the
+> first build test.
 
 ---
 
@@ -936,22 +990,32 @@ To avoid unnecessary deployments, save Vercel build limits, and prevent serving 
    - Key: `DATABASE_URL`
    - Value: `<The connection string obtained>`
 3. **Deploy the application**: Once the environment variables are successfully configured in Vercel, call the `vercel_deploy` tool to deploy.
-   - **Note on Deployment Security**: The deploy tool automatically sends a request to disable Vercel's Deployment Protection (SSO/password protection) on project creation and deployment. This is done to enable full-auto debugging, screenshot verification, and crawling of preview URLs by the AI Agent.
+   - Keep Vercel Deployment Protection and any existing access controls in
+     their current state. Changing authentication, domains, or protection is a
+     separate security-sensitive action and requires explicit user approval.
 
 ### 2.3 Development, Testing, and Debugging
-- **Local Verification (Optional)**: If the `execute_code` tool is enabled, run `npm run build` inside the workspace using the `execute_code` tool (with `bash` language) to ensure there are no compilation or TypeScript errors before deploying. Otherwise, skip local verification and deploy directly.
+- **Local Verification**: If `execute_code` is enabled, run the repository's
+  declared build/test command inside the workspace. If it is unavailable, state
+  that local execution is unverified and ask before incurring a provider
+  deployment merely to test a build.
 - **Preview Deployment**: Call `vercel_deploy` (specifying `production=False`) to get a unique Preview URL.
-- **Automated Verification**: Use the Browser tool to navigate to the Preview URL, take screenshots, and verify the UI rendering and API operations.
+- **Automated Verification**: Use a Browser tool only if one is actually visible;
+  otherwise provide the Preview URL and a concrete manual verification list.
 - **Build and Log Debugging**: If the build fails, call `vercel_get_deploy_logs` to view compilation or runtime logs to diagnose and fix errors.
-- **Production Deployment**: Once testing is successful, call `vercel_deploy` (specifying `production=True`) to publish to production.
+- **Production Deployment**: A successful Preview is not permission to publish.
+  Call `vercel_deploy(production=True)` only after the user explicitly approves
+  production deployment in the current task.
 
 ---
 
 ## Debugging and Limit Status Monitoring
 - **Build Failures** → Use `vercel_get_deploy_logs` to check build logs.
 - **Runtime Errors** → Use `vercel_get_deploy_logs` to check runtime logs.
-- **Limit Monitoring** → Whenever a deployment completes, check the build logs/Vercel status, and proactively display the Vercel bandwidth/build usage percentage and Neon project limit status (e.g. 1/1 projects). If usage exceeds 80%, highlight it in bold to warn the user.
-- **Visual Checks** → Use the Browser tool to screenshot and verify layouts.
+- **Limit Monitoring** → Report usage only when an enabled provider Tool returns
+  that data. Do not invent bandwidth, build, or Neon quota percentages.
+- **Visual Checks** → Use a Browser tool only when available; do not claim a
+  page-level check from build output alone.
 """
             }
         ]
@@ -1043,18 +1107,19 @@ async def seed_skills():
 
 
 async def push_default_skills_to_existing_agents():
-    """Deploy all is_default skills into the workspace of every existing agent that is missing them.
-    
-    Called at startup after seed_skills() so existing agents automatically receive new default skills
-    like mcp-installer without requiring manual re-creation.
+    """Sync effective global and role Skills into every existing Agent.
+
+    The historical function name is retained for startup compatibility. The
+    effective set is tenant-scoped and includes global defaults plus the
+    AgentTemplate's declared Skill folders; registry-managed files are updated
+    only while the Agent copy remains unmodified.
     """
-    from app.models.agent import Agent
+    from app.models.agent import Agent, AgentTemplate
     from app.models.skill import Skill
     from app.models.system_settings import SystemSetting
     from sqlalchemy.orm import selectinload
     from app.services.agent_manager import agent_manager
     from app.services.storage import get_storage_backend
-    import hashlib
 
     async with async_session() as db:
         # Load the registry once. Resolution below applies each agent's tenant
@@ -1063,6 +1128,18 @@ async def push_default_skills_to_existing_agents():
             select(Skill).options(selectinload(Skill.files))
         )
         all_skills = skills_r.scalars().all()
+        templates_r = await db.execute(select(AgentTemplate))
+        templates = templates_r.scalars().all()
+        template_folders_by_id = {
+            template.id: tuple(template.default_skills or [])
+            for template in templates
+        }
+        template_skill_folders = {
+            folder
+            for folders in template_folders_by_id.values()
+            for folder in folders
+            if isinstance(folder, str) and folder
+        }
         global_default_folders = {
             skill.folder_name
             for skill in all_skills
@@ -1071,14 +1148,28 @@ async def push_default_skills_to_existing_agents():
         relevant_skills = [
             skill
             for skill in all_skills
-            if skill.is_default or skill.folder_name in global_default_folders
+            if (
+                skill.is_default
+                or skill.folder_name in global_default_folders
+                or skill.folder_name in template_skill_folders
+            )
         ]
-        if not relevant_skills:
-            return
+        cleanup_candidate_folders = {
+            skill.folder_name for skill in all_skills if skill.folder_name
+        } | set(LEGACY_AMBIENT_SKILL_HASHES)
+
+        # Agent/template identity is part of the desired state. Without this,
+        # assigning an existing agent to a different role could be hidden by a
+        # previously matching registry-only hash.
+        agents_r = await db.execute(select(Agent))
+        agents = agents_r.scalars().all()
 
         # Include owner and identity so a new tenant override triggers a safe
         # scoped rescan without ever copying it into another tenant.
         hasher = hashlib.sha256()
+        hasher.update(_SKILL_SYNC_POLICY_REVISION.encode())
+        for folder in sorted(cleanup_candidate_folders):
+            hasher.update(folder.encode())
         for skill in sorted(
             relevant_skills,
             key=lambda item: (
@@ -1090,6 +1181,18 @@ async def push_default_skills_to_existing_agents():
             hasher.update(
                 f"{skill.tenant_id}:{skill.id}:{skill.folder_name}:{skill.is_default}".encode()
             )
+            hasher.update(_skill_content_hash(_skill_file_map(skill)).encode())
+        for template in sorted(templates, key=lambda item: str(item.id)):
+            hasher.update(str(template.id).encode())
+            hasher.update(
+                json.dumps(
+                    list(template.default_skills or []),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ).encode()
+            )
+        for agent in sorted(agents, key=lambda item: str(item.id)):
+            hasher.update(f"{agent.id}:{agent.template_id}".encode())
         current_hash = hasher.hexdigest()
 
         # Check if we already synced this version of default skills
@@ -1097,60 +1200,98 @@ async def push_default_skills_to_existing_agents():
             select(SystemSetting).where(SystemSetting.key == "default_skills_sync_hash")
         )
         setting = setting_r.scalar_one_or_none()
-        if setting and setting.value.get("hash") == current_hash:
+        if (
+            setting
+            and setting.value.get("hash") == current_hash
+            and not setting.value.get("conflicts")
+        ):
             logger.info(f"[SkillSeeder] Default skills sync hash '{current_hash}' matches, skipping sync for existing agents")
             return
 
-        # Load all agents
-        agents_r = await db.execute(select(Agent))
-        agents = agents_r.scalars().all()
-
         pushed = 0
-        removed_legacy = 0
+        adopted = 0
+        updated = 0
+        removed = 0
+        preserved = 0
+        conflicts = 0
         storage = get_storage_backend()
         for agent in agents:
             default_skills = resolve_agent_skills(
                 relevant_skills,
                 agent.tenant_id,
+                template_folders=template_folders_by_id.get(agent.template_id, ()),
             )
             agent_prefix = agent_manager._agent_storage_prefix(agent.id)
-            legacy_key = f"{agent_prefix}/skills/MCP_INSTALLER.md"
-            if await storage.is_file(legacy_key):
-                try:
-                    await storage.delete(legacy_key)
-                    removed_legacy += 1
-                except Exception as exc:
+            desired_folders = {skill.folder_name for skill in default_skills}
+            for folder_name in sorted(cleanup_candidate_folders - desired_folders):
+                cleanup_status = await _remove_stale_automatic_skill(
+                    storage,
+                    f"{agent_prefix}/skills/{folder_name}",
+                    accepted_legacy_hashes=LEGACY_AMBIENT_SKILL_HASHES.get(
+                        folder_name,
+                        frozenset(),
+                    ),
+                )
+                if cleanup_status == "removed":
+                    removed += 1
+                elif cleanup_status == "preserved":
+                    preserved += 1
+                elif cleanup_status == "conflict":
+                    conflicts += 1
                     logger.warning(
-                        "[SkillSeeder] Failed to remove legacy MCP installer "
-                        "error_type={}",
-                        type(exc).__name__,
+                        "[SkillSeeder] Preserved ambiguous or user-edited stale Skill "
+                        "folder agent_id={} skill_folder={}",
+                        agent.id,
+                        folder_name,
                     )
             for skill in default_skills:
                 if not skill.files:
                     continue
 
-                # Determine if the agent already has this skill by checking if its first file exists in storage
-                first_file_key = f"{agent_prefix}/skills/{skill.folder_name}/{skill.files[0].path}"
-                if await storage.is_file(first_file_key):
-                    continue  # Skill already exists, do not update
-
-                for sf in skill.files:
-                    key = f"{agent_prefix}/skills/{skill.folder_name}/{sf.path}"
-                    await storage.write_text(key, sf.content, encoding="utf-8")
-                    pushed += 1
-                logger.info("[SkillSeeder] Pushed new default skill to existing agent")
+                skill_prefix = f"{agent_prefix}/skills/{skill.folder_name}"
+                status, changed_files = await _sync_managed_skill(
+                    storage,
+                    skill_prefix,
+                    skill,
+                )
+                if status == "conflict":
+                    conflicts += 1
+                    logger.warning(
+                        "[SkillSeeder] Preserved user-edited Skill folder "
+                        "agent_id={} skill_folder={}",
+                        agent.id,
+                        skill.folder_name,
+                    )
+                    continue
+                if status == "adopted":
+                    adopted += 1
+                elif status == "updated":
+                    updated += 1
+                pushed += changed_files
 
         # Save/update the sync hash in settings
+        sync_state = {
+            "hash": current_hash,
+            "conflicts": conflicts,
+            "removed": removed,
+            "preserved": preserved,
+        }
         if setting:
-            setting.value = {"hash": current_hash}
+            setting.value = sync_state
         else:
-            db.add(SystemSetting(key="default_skills_sync_hash", value={"hash": current_hash}))
+            db.add(SystemSetting(key="default_skills_sync_hash", value=sync_state))
         await db.commit()
 
-        if pushed or removed_legacy:
+        if pushed or adopted or updated or removed or preserved or conflicts:
             logger.info(
-                f"[SkillSeeder] Pushed {pushed} new skill files "
-                f"to existing agents; removed {removed_legacy} legacy MCP installer files"
+                "[SkillSeeder] Default Skill sync files={} adopted={} updated={} "
+                "removed={} preserved={} conflicts={}",
+                pushed,
+                adopted,
+                updated,
+                removed,
+                preserved,
+                conflicts,
             )
         else:
             logger.info("[SkillSeeder] All existing agents already have all default skills")

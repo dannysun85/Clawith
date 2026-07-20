@@ -608,7 +608,9 @@ export interface DeliverableRequest {
 }
 
 export const deliverableApi = {
-    workflows: () => request<{ workflows: DeliverableWorkflow[] }>('/deliverables/workflows'),
+    workflows: (agentId: string, tier: 'lite' | 'pro' | 'ultra') => request<{ workflows: DeliverableWorkflow[] }>(
+        `/deliverables/workflows?agent_id=${encodeURIComponent(agentId)}&tier=${encodeURIComponent(tier)}`,
+    ),
     preflight: (data: {
         agent_id: string;
         work_type: DeliverableWorkType;

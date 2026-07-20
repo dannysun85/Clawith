@@ -586,45 +586,6 @@ export default function EnterpriseSettings() {
     };
     useEffect(() => { if (activeTab === 'tools') { loadAllTools(); loadAgentInstalledTools(); } }, [activeTab, selectedTenantId]);
 
-    // ─── Jina API Key
-    const [jinaKey, setJinaKey] = useState('');
-    const [jinaKeySaved, setJinaKeySaved] = useState(false);
-    const [jinaKeySaving, setJinaKeySaving] = useState(false);
-    const [jinaKeyMasked, setJinaKeyMasked] = useState('');  // stored key from DB
-    useEffect(() => {
-        if (activeTab !== 'tools') return;
-        const token = localStorage.getItem('token');
-        fetch('/api/enterprise/system-settings/jina_api_key', { headers: { Authorization: `Bearer ${token}` } })
-            .then(r => r.json())
-            .then(d => { if (d.value?.api_key) setJinaKeyMasked(d.value.api_key.slice(0, 8) + '••••••••'); })
-            .catch(() => { });
-    }, [activeTab]);
-    const saveJinaKey = async () => {
-        setJinaKeySaving(true);
-        const token = localStorage.getItem('token');
-        await fetch('/api/enterprise/system-settings/jina_api_key', {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-            body: JSON.stringify({ value: { api_key: jinaKey } }),
-        });
-        setJinaKeyMasked(jinaKey.slice(0, 8) + '••••••••');
-        setJinaKey('');
-        setJinaKeySaving(false);
-        setJinaKeySaved(true);
-        setTimeout(() => setJinaKeySaved(false), 2000);
-    };
-    const clearJinaKey = async () => {
-        const token = localStorage.getItem('token');
-        await fetch('/api/enterprise/system-settings/jina_api_key', {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-            body: JSON.stringify({ value: {} }),
-        });
-        setJinaKeyMasked('');
-        setJinaKey('');
-    };
-
-
     const { data: currentTenant } = useQuery({
         queryKey: ['tenant', selectedTenantId],
         queryFn: () => fetchJson<any>(`/tenants/${selectedTenantId}`),
@@ -1453,15 +1414,7 @@ export default function EnterpriseSettings() {
                                                         onClick={async () => {
                                                             setEditingToolId(tool.id);
                                                             setShowAdvancedToolConfig(false);
-                                                            let cfg = applyConfigDefaults(tool.config_schema?.fields || [], tool.config || {});
-                                                            if (tool.name === 'jina_search' || tool.name === 'jina_read') {
-                                                                try {
-                                                                    const token = localStorage.getItem('token');
-                                                                    const res = await fetch('/api/enterprise/system-settings/jina_api_key', { headers: { Authorization: `Bearer ${token}` } });
-                                                                    const d = await res.json();
-                                                                    if (d.value?.api_key) cfg.api_key = d.value.api_key;
-                                                                } catch { }
-                                                            }
+                                                            const cfg = applyConfigDefaults(tool.config_schema?.fields || [], tool.config || {});
                                                             setEditingConfig(cfg);
                                                         }}
                                                     >
@@ -1779,18 +1732,7 @@ export default function EnterpriseSettings() {
                                                 <div style={{ display: 'flex', gap: '8px', marginTop: '12px', justifyContent: 'flex-end', borderTop: '1px solid var(--border-subtle)', paddingTop: '16px' }}>
                                                     <button className="btn btn-secondary" onClick={() => setEditingToolId(null)}>{t('common.cancel')}</button>
                                                     <button className="btn btn-primary" onClick={async () => {
-                                                        if (tool.name === 'jina_search' || tool.name === 'jina_read') {
-                                                            if (editingConfig.api_key) {
-                                                                const token = localStorage.getItem('token');
-                                                                await fetch('/api/enterprise/system-settings/jina_api_key', {
-                                                                    method: 'PUT',
-                                                                    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-                                                                    body: JSON.stringify({ value: { api_key: editingConfig.api_key } }),
-                                                                });
-                                                            }
-                                                        } else {
-                                                            await fetchJson(`/tools/${tool.id}`, { method: 'PUT', body: JSON.stringify({ config: editingConfig, tenant_id: selectedTenantId || undefined }) });
-                                                        }
+                                                        await fetchJson(`/tools/${tool.id}`, { method: 'PUT', body: JSON.stringify({ config: editingConfig, tenant_id: selectedTenantId || undefined }) });
                                                         setEditingToolId(null);
                                                         loadAllTools();
                                                     }}>{t('enterprise.tools.saveConfig')}</button>

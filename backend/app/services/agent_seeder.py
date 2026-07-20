@@ -20,6 +20,7 @@ from app.models.okr import OKRSettings
 from app.config import get_settings
 from app.services.agent_manager import agent_manager
 from app.services.skill_scope import prefer_tenant_skill_overrides, scope_skill_query
+from app.services.skill_workspace import _sync_managed_skill
 from app.services.storage import get_storage_backend, store_agent_bytes
 from app.services.agent_tool_assignments import upsert_agent_tool
 
@@ -106,15 +107,19 @@ async def _repair_default_agent_storage(
     all_skills: dict[str, Skill],
     overwrite_skill_files: bool = False,
 ) -> bool:
-    """Restore missing storage for an existing default agent without overwriting user files."""
+    """Restore storage and reconcile seeded Skills without overwriting users.
+
+    ``overwrite_skill_files`` is retained for call compatibility only. Skill
+    writes now always use the same managed-copy contract as template Agents.
+    """
+    del overwrite_skill_files
     storage = get_storage_backend()
     agent_prefix = agent_manager._agent_storage_prefix(agent.id)
     skills_prefix = f"{agent_prefix}/skills"
     agent_dir_exists = await storage.is_dir(agent_prefix)
     skills_dir_exists = await storage.is_dir(skills_prefix)
 
-    if agent_dir_exists and skills_dir_exists:
-        return False
+    changed = False
 
     if not agent_dir_exists:
         await agent_manager.initialize_agent_files(db, agent)
@@ -124,36 +129,44 @@ async def _repair_default_agent_storage(
             (soul_content.strip() + "\n").encode("utf-8"),
             content_type="text/markdown; charset=utf-8",
         )
+        changed = True
 
     # Keep the directory visible even if the configured seed skills are absent
     # from the database. Local and object storage both materialize the prefix on
     # the first write.
     if not skills_dir_exists:
         await storage.write_text(f"{skills_prefix}/.gitkeep", "", encoding="utf-8")
+        changed = True
 
     folders_to_copy = set(skill_folders)
     folders_to_copy.update(name for name, skill in all_skills.items() if skill.is_default)
     for folder_name in folders_to_copy:
         skill = all_skills.get(folder_name)
-        if not skill:
+        if not skill or not skill.files:
             continue
-        for skill_file in skill.files:
-            target_key = f"{skills_prefix}/{skill.folder_name}/{skill_file.path}"
-            if not overwrite_skill_files and await storage.is_file(target_key):
-                continue
-            await store_agent_bytes(
+        status, _changed_files = await _sync_managed_skill(
+            storage,
+            f"{skills_prefix}/{skill.folder_name}",
+            skill,
+        )
+        if status == "conflict":
+            logger.warning(
+                "[AgentSeeder] Preserved user-edited seeded Skill "
+                "agent_id={} skill_folder={}",
                 agent.id,
-                f"skills/{skill.folder_name}/{skill_file.path}",
-                skill_file.content.encode("utf-8"),
-                content_type="text/plain; charset=utf-8",
+                skill.folder_name,
             )
+            continue
+        if status in {"created", "updated", "adopted"}:
+            changed = True
 
-    logger.warning(
-        "[AgentSeeder] Repaired missing default-agent storage: "
-        f"agent={agent.id} root_missing={not agent_dir_exists} "
-        f"skills_missing={not skills_dir_exists}"
-    )
-    return True
+    if changed:
+        logger.warning(
+            "[AgentSeeder] Reconciled default-agent storage: "
+            f"agent={agent.id} root_missing={not agent_dir_exists} "
+            f"skills_missing={not skills_dir_exists}"
+        )
+    return changed
 
 
 # ── Soul definitions ────────────────────────────────────────────
@@ -480,32 +493,6 @@ async def seed_default_agents():
                 all_skills=all_skills,
                 overwrite_skill_files=agent.id in created_ids,
             )
-
-        default_agent_skills = [
-            (agent, skill_folders)
-            for agent, skill_folders in ((morty, MORTY_SKILLS), (meeseeks, MEESEEKS_SKILLS))
-            if agent is not None
-        ]
-        for agent, skill_folders in default_agent_skills:
-            if agent.id not in created_ids:
-                continue
-            # Always include default skills
-            folders_to_copy = set(skill_folders)
-            for fname, skill in all_skills.items():
-                if skill.is_default:
-                    folders_to_copy.add(fname)
-
-            for fname in folders_to_copy:
-                skill = all_skills.get(fname)
-                if not skill:
-                    continue
-                for sf in skill.files:
-                    await store_agent_bytes(
-                        agent.id,
-                        f"skills/{skill.folder_name}/{sf.path}",
-                        sf.content.encode("utf-8"),
-                        content_type="text/plain; charset=utf-8",
-                    )
 
         # ── Assign all default tools ──
         default_tools_result = await db.execute(

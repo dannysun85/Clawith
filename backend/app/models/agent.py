@@ -192,16 +192,19 @@ class AgentTemplate(Base):
     icon: Mapped[str] = mapped_column(String(50), default="🤖")
     category: Mapped[str] = mapped_column(String(50), default="general")
     soul_template: Mapped[str] = mapped_column(Text, default="")
-    default_skills: Mapped[list] = mapped_column(JSON, default=[])
+    default_skills: Mapped[list] = mapped_column(JSON, default=list)
+    # Explicit executable capabilities granted to agents created from this
+    # role. Skills remain instructions; they never imply tool permission.
+    default_tools: Mapped[list] = mapped_column(JSON, default=list)
     # Smithery server IDs (e.g. "shibui/finance") to auto-import + bind when
     # an agent is created from this template. The new-agent handler in
     # api.agents.create_agent calls import_mcp_from_smithery for each, using
     # the system-level Smithery key, then assigns the resulting Tool(s) via
     # AgentTool. Idempotent: existing Tool with same mcp_server_url is reused.
-    default_mcp_servers: Mapped[list] = mapped_column(JSON, default=[])
-    default_autonomy_policy: Mapped[dict] = mapped_column(JSON, default={})
+    default_mcp_servers: Mapped[list] = mapped_column(JSON, default=list)
+    default_autonomy_policy: Mapped[dict] = mapped_column(JSON, default=dict)
     # Talent Market card: 2-4 short capability bullets shown under the role
-    capability_bullets: Mapped[list] = mapped_column(JSON, default=[])
+    capability_bullets: Mapped[list] = mapped_column(JSON, default=list)
     is_builtin: Mapped[bool] = mapped_column(default=False)
     created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

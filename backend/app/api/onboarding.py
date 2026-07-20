@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.security import get_current_user
 from app.database import get_db
@@ -15,6 +16,7 @@ from app.models.agent import Agent, AgentPermission, AgentTemplate
 from app.models.llm import LLMModel
 from app.models.onboarding import UserTenantOnboarding
 from app.models.participant import Participant
+from app.models.skill import Skill
 from app.models.tenant import Tenant
 from app.models.user import User
 from app.services.access_relationships import ensure_access_granted_platform_relationships
@@ -24,6 +26,7 @@ from app.services.agent_plan_selection import (
 )
 from app.services.entitlements import get_tenant_entitlements
 from app.services.quota_guard import QuotaExceeded, check_agent_creation_quota
+from app.services.skill_scope import resolve_agent_skills, scope_skill_query
 
 router = APIRouter(prefix="/onboarding", tags=["onboarding"])
 
@@ -130,7 +133,10 @@ async def _create_personal_assistant(
         raise HTTPException(status_code=400, detail="Company is required before creating a personal assistant")
 
     template_result = await db.execute(
-        select(AgentTemplate).where(AgentTemplate.name == "Private Assistant")
+        select(AgentTemplate).where(
+            AgentTemplate.name == "Private Assistant",
+            AgentTemplate.is_builtin.is_(True),
+        )
     )
     template = template_result.scalar_one_or_none()
     primary_model_id = await _tenant_default_model_id(db, user.tenant_id)
@@ -176,6 +182,32 @@ async def _create_personal_assistant(
         personality=personality_note,
         boundaries=boundaries,
     )
+
+    skills_result = await db.execute(
+        scope_skill_query(
+            select(Skill).options(selectinload(Skill.files)),
+            user.tenant_id,
+        )
+    )
+    resolved_skills = resolve_agent_skills(
+        skills_result.scalars().all(),
+        user.tenant_id,
+        template_folders=list(template.default_skills or []) if template else [],
+    )
+    if resolved_skills:
+        from app.services.skill_workspace import deploy_skills_to_agent_workspace
+
+        await deploy_skills_to_agent_workspace(agent.id, resolved_skills)
+
+    if template and template.default_tools:
+        from app.services.template_capabilities import grant_template_tools
+
+        await grant_template_tools(
+            db,
+            agent_id=agent.id,
+            tool_names=list(template.default_tools),
+        )
+
     from app.api.relationships import _regenerate_relationships_file
     await _regenerate_relationships_file(db, agent.id)
 

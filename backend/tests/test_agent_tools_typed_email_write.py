@@ -29,6 +29,16 @@ OUTBOUND_MESSAGE_ID = "<outbound-1@example.test>"
 AUTH_SECRET = "smtp-super-secret-do-not-leak"
 LARGE_BODY_TAIL = "BODY-TAIL-MUST-NOT-BE-ECHOED"
 
+
+@pytest.fixture(autouse=True)
+def _allow_autonomy_for_provider_contract_tests(monkeypatch):
+    """Exercise SMTP settlement after the separate autonomy gate is cleared."""
+
+    async def allow(**_kwargs):
+        return {"allowed": True, "level": "L1"}
+
+    monkeypatch.setattr(agent_tools, "_enforce_tool_autonomy", allow)
+
 ORIGINAL_EMAIL = (
     b"From: Alice Example <alice@example.test>\r\n"
     b"Subject: Quarterly plan\r\n"

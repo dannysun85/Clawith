@@ -60,6 +60,9 @@ class AgentTool(Base):
     tool_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tools.id", ondelete="CASCADE"))
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     config: Mapped[dict] = mapped_column(JSON, default=dict)  # per-agent tool config overrides
-    source: Mapped[str] = mapped_column(String(20), default="system")  # "system" | "user_installed"
+    # Grant provenance: system bootstrap, reviewed template, explicit user
+    # selection, an Agent-installed MCP capability, or a preserved
+    # ``legacy_ambiguous`` row whose old release did not record intent.
+    source: Mapped[str] = mapped_column(String(20), default="system")
     installed_by_agent_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)  # agent that installed this tool
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

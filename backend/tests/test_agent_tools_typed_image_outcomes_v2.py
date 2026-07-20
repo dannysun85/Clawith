@@ -322,6 +322,11 @@ async def test_upload_image_classifies_provider_receipts(
             return FakeResponse(status_code, payload, text="provider response")
 
     monkeypatch.setattr(agent_tools, "_get_tool_config", configured)
+
+    async def public_url(url):
+        return url, None
+
+    monkeypatch.setattr(agent_tools, "_validate_public_http_url", public_url)
     monkeypatch.setattr(httpx, "AsyncClient", Client)
 
     outcome = await agent_tools._upload_image_outcome(

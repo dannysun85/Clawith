@@ -399,7 +399,8 @@
     },
     "skills": {
       "title": "Skill Definitions",
-      "description": "Skills define how the agent behaves in specific scenarios. Each .md file is a skill. Use YAML frontmatter (name + description) for best results.",
+      "description": "Skills are reusable methods and instructions, not executable permissions. When a request clearly matches a Skill, the agent reads its SKILL.md first; execution still depends on enabled Tools, credentials, plan entitlements, and approval policy.",
+      "capabilityBoundary": "A Skill explains how work should be done. It never grants a Tool, API key, or external-system permission.",
       "skillFiles": "Skill Files",
       "noSkills": "No skills defined yet",
       "newSkill": "New Skill",
@@ -696,7 +697,8 @@
       "reloadPage": "Reload Page",
       "selectAgent": "— Select Agent —",
       "failedToCreateSession": "Failed to create session",
-      "failed": "Failed"
+      "failed": "Failed",
+      "capabilityBoundary": "Tools are executable capabilities. Once enabled they enter this agent's model tool list, where the model may select them automatically, but configuration, tenant isolation, readiness, and approval checks still apply."
     },
     "toolCategories": {
       "file": "File Operations",
@@ -740,7 +742,7 @@
       "complex-task-executor": "Structured methodology for decomposing, planning, and executing complex multi-step tasks with progress tracking",
       "skill-creator": "Create new skills, modify and improve existing skills, and measure skill performance",
       "content-research-writer": "Assists in writing high-quality content by conducting research, adding citations, improving hooks, iterating on outlines, and providing real-time section feedback",
-      "mcp-installer": "Guide users through discovering, configuring, and installing MCP tools directly in chat — no Settings page required"
+      "mcp-installer": "Guide authorized users through discovering and importing MCP tools; provider authorization is completed on the Agent Tools page"
     },
     "credentials": {
       "title": "Credentials",
@@ -840,7 +842,7 @@
     },
     "step3": {
       "title": "Skills Configuration",
-      "description": "Select skills for the digital employee. You can edit them later on the detail page.",
+      "description": "Select reusable work methods. Skills do not grant Tools, API keys, or external-system permissions; you can edit them later on the detail page.",
       "infoSearch": "Info Search",
       "infoSearchDesc": "Web search and information retrieval",
       "dataAnalysis": "Data Analysis",
@@ -890,7 +892,7 @@
         },
         "MCP Tool Installer": {
           "name": "MCP Tool Installer",
-          "description": "Guide users through discovering, configuring, and installing MCP tools directly in chat — no Settings page required"
+          "description": "Guide authorized users through discovering and importing MCP tools; provider authorization is completed on the Agent Tools page"
         }
       }
     },

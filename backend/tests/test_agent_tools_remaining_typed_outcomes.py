@@ -18,7 +18,7 @@ from app.services.builtin_tool_definitions import (
 )
 
 
-REMAINING_DEFAULT_TYPED_TOOLS = {
+MIGRATED_TYPED_TOOLS = {
     "set_trigger",
     "send_channel_file",
     "send_file_to_agent",
@@ -39,8 +39,8 @@ REMAINING_DEFAULT_TYPED_TOOLS = {
 }
 
 
-def test_remaining_default_tools_are_runtime_visible_only_after_typed_migration() -> None:
-    assert REMAINING_DEFAULT_TYPED_TOOLS <= (
+def test_migrated_tools_are_runtime_visible_only_after_typed_migration() -> None:
+    assert MIGRATED_TYPED_TOOLS <= (
         agent_tools.RUNTIME_TYPED_APPLICATION_TOOL_NAMES
     )
     assert "send_channel_message" in agent_tools.RUNTIME_TYPED_APPLICATION_TOOL_NAMES
@@ -107,8 +107,8 @@ async def test_runtime_resolver_applies_channel_and_registry_readiness(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tool_name", sorted(REMAINING_DEFAULT_TYPED_TOOLS))
-async def test_remaining_default_tools_have_native_typed_validation_failures(
+@pytest.mark.parametrize("tool_name", sorted(MIGRATED_TYPED_TOOLS))
+async def test_migrated_tools_have_native_typed_validation_failures(
     tool_name: str,
 ) -> None:
     outcome = await agent_tools.execute_builtin_tool_outcome(
@@ -493,3 +493,64 @@ async def test_clawhub_search_and_skill_install_use_decoded_payloads(
         f"workspace://{agent_id}/skills/research/SKILL.md",
         f"workspace://{agent_id}/skills/research/references/checklist.md",
     )
+
+    # Re-importing the same source must not merge into or overwrite the
+    # existing Agent-owned folder.
+    (tmp_path / "skills/research/SKILL.md").write_text(
+        "# User customized research",
+        encoding="utf-8",
+    )
+    conflict_outcome = await agent_tools._install_skill_outcome(
+        agent_id,
+        tmp_path,
+        {"source": "research"},
+    )
+    assert conflict_outcome.status == "failed"
+    assert conflict_outcome.error_code == "skill_folder_conflict"
+    assert (tmp_path / "skills/research/SKILL.md").read_text(
+        encoding="utf-8"
+    ) == "# User customized research"
+
+
+@pytest.mark.asyncio
+async def test_clawhub_suspicious_skill_is_blocked_before_archive_download(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from app.api import skills as skills_api
+
+    async def tenant(_agent_id):
+        return "tenant"
+
+    async def no_key(_tenant_id):
+        return ""
+
+    async def suspicious_meta(*_args, **_kwargs):
+        return {
+            "moderation": {
+                "isSuspicious": True,
+                "summary": "unsafe package",
+            }
+        }, "https://clawhub.test/api"
+
+    async def archive_must_not_run(*_args, **_kwargs):
+        pytest.fail("flagged package archive must not be downloaded")
+
+    monkeypatch.setattr(agent_tools, "_get_agent_tenant_id", tenant)
+    monkeypatch.setattr(skills_api, "_get_clawhub_key", no_key)
+    monkeypatch.setattr(skills_api, "_fetch_clawhub_skill_meta", suspicious_meta)
+    monkeypatch.setattr(
+        skills_api,
+        "_fetch_clawhub_skill_archive",
+        archive_must_not_run,
+    )
+
+    outcome = await agent_tools._install_skill_outcome(
+        uuid.uuid4(),
+        tmp_path,
+        {"source": "unsafe"},
+    )
+
+    assert outcome.status == "failed"
+    assert outcome.error_code == "skill_source_flagged_suspicious"
+    assert not (tmp_path / "skills/unsafe").exists()

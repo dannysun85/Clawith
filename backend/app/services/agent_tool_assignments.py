@@ -16,6 +16,8 @@ from app.models.tool import AgentTool
 AgentToolConflictMode = Literal[
     "preserve",
     "enabled",
+    "selection",
+    "template",
     "config",
     "reauthorize",
 ]
@@ -67,6 +69,16 @@ async def upsert_agent_tool(
         update_fields: dict[str, Any]
         if on_conflict == "enabled":
             update_fields = {"enabled": statement.excluded.enabled}
+        elif on_conflict == "selection":
+            update_fields = {
+                "enabled": statement.excluded.enabled,
+                "source": statement.excluded.source,
+            }
+        elif on_conflict == "template":
+            update_fields = {
+                "enabled": statement.excluded.enabled,
+                "source": statement.excluded.source,
+            }
         elif on_conflict == "config":
             update_fields = {"config": statement.excluded.config}
         elif on_conflict == "reauthorize":
@@ -81,5 +93,10 @@ async def upsert_agent_tool(
         statement = statement.on_conflict_do_update(
             index_elements=[AgentTool.agent_id, AgentTool.tool_id],
             set_=update_fields,
+            where=(
+                AgentTool.source == "template"
+                if on_conflict == "template"
+                else None
+            ),
         )
     await db.execute(statement)

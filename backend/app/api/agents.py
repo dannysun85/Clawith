@@ -27,7 +27,6 @@ from app.models.media_generation import MediaGenerationTask
 from app.models.subscription import CreditReservation
 from app.models.user import User
 from app.schemas.schemas import AgentCreate, AgentOut, AgentUpdate, ApprovalAction, ApprovalRequestOut
-from app.services.storage import get_storage_backend
 from app.services.media_generation import UNRESOLVED_MEDIA_STATUSES
 from app.services.access_relationships import ensure_access_granted_platform_relationships
 from app.services.quota_guard import check_agent_creation_quota, QuotaExceeded, quota_error_payload
@@ -322,6 +321,7 @@ async def list_templates(
             "is_builtin": t.is_builtin,
             "soul_template": t.soul_template,
             "default_skills": t.default_skills,
+            "default_tools": t.default_tools,
             "default_autonomy_policy": t.default_autonomy_policy,
             "capability_bullets": t.capability_bullets or [],
         }
@@ -478,6 +478,7 @@ async def _background_agent_setup(
     boundaries: str,
     skill_ids: list[uuid.UUID],
     template_skill_folder_names: list[str],
+    template_tool_names: list[str],
     template_mcp_servers: list[str],
 ) -> None:
     """Run all creation tasks asynchronously with small, short-lived transactions."""
@@ -504,7 +505,8 @@ async def _background_agent_setup(
         return
 
     # 2. Skill resolution (reads from DB)
-    skill_files_to_write = []
+    automatic_skills = []
+    user_selected_skills = []
     try:
         async with async_session() as db:
             skills_result = await db.execute(
@@ -520,34 +522,80 @@ async def _background_agent_setup(
                 selected_ids=skill_ids,
                 template_folders=template_skill_folder_names,
             )
-            if skills:
-                agent_prefix = agent_manager._agent_storage_prefix(agent_id)
-                for skill in skills:
-                    for sf in skill.files:
-                        skill_files_to_write.append(
-                            (f"{agent_prefix}/skills/{skill.folder_name}/{sf.path}", sf.content)
-                        )
+            automatic_folders = set(template_skill_folder_names)
+            automatic_folders.update(
+                skill.folder_name for skill in visible_skills if skill.is_default
+            )
+            automatic_skills = [
+                skill for skill in skills if skill.folder_name in automatic_folders
+            ]
+            user_selected_skills = [
+                skill for skill in skills if skill.folder_name not in automatic_folders
+            ]
     except Exception as e:
         logger.exception(f"Error resolving skills for agent {agent_id}: {e}")
         await _record_agent_setup_error(agent_id, "skill_resolution", e)
         return
 
     # 3. Skills Copying (I/O only, NO db connection held!)
-    if skill_files_to_write:
+    if automatic_skills or user_selected_skills:
         try:
-            import asyncio
+            from app.services.skill_workspace import deploy_skills_to_agent_workspace
 
-            storage = get_storage_backend()
-            await asyncio.gather(
-                *[storage.write_text(key, content, encoding="utf-8") for key, content in skill_files_to_write]
+            stats = {"files": 0, "conflicts": 0}
+            for skills, provisioning in (
+                (automatic_skills, "automatic"),
+                (user_selected_skills, "user_selected"),
+            ):
+                if not skills:
+                    continue
+                batch_stats = await deploy_skills_to_agent_workspace(
+                    agent_id,
+                    skills,
+                    provisioning=provisioning,
+                )
+                stats["files"] += batch_stats["files"]
+                stats["conflicts"] += batch_stats["conflicts"]
+            logger.info(
+                "[_skills_copy] background agent={} files={} conflicts={}",
+                agent_id,
+                stats["files"],
+                stats["conflicts"],
             )
-            logger.info(f"[_skills_copy] background agent={agent_id} files={len(skill_files_to_write)} completed")
         except Exception as e:
             logger.exception(f"Error copying skills files for agent {agent_id}: {e}")
             await _record_agent_setup_error(agent_id, "skill_copy", e)
             return
 
-    # 4. Install template MCP servers
+    # 4. Grant executable role capabilities. Skill copying above only adds
+    # instructions and must never be treated as execution permission.
+    if template_tool_names:
+        try:
+            from app.services.template_capabilities import grant_template_tools
+
+            async with async_session() as db:
+                _, unresolved = await grant_template_tools(
+                    db,
+                    agent_id=agent_id,
+                    tool_names=template_tool_names,
+                )
+                await db.commit()
+            if unresolved:
+                logger.warning(
+                    "[create_agent] Unknown template tools agent={} names={}",
+                    agent_id,
+                    list(unresolved),
+                )
+        except Exception as e:
+            logger.exception(
+                "Error granting template tools agent={} error_type={}",
+                agent_id,
+                type(e).__name__,
+            )
+            await _record_agent_setup_error(agent_id, "template_tools", e)
+            return
+
+    # 5. Install template MCP servers
     if template_mcp_servers:
         for server_id in template_mcp_servers:
             try:
@@ -577,7 +625,7 @@ async def _background_agent_setup(
                     type(e).__name__,
                 )
 
-    # 5. Start container and Hook OKR Agent
+    # 6. Start container and Hook OKR Agent
     try:
         async with async_session() as db:
             agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
@@ -632,6 +680,18 @@ async def create_agent(
         list(data.skill_ids or []),
         target_tenant_id,
     )
+
+    selected_template = None
+    if data.template_id:
+        template_result = await db.execute(
+            select(AgentTemplate).where(AgentTemplate.id == data.template_id)
+        )
+        selected_template = template_result.scalar_one_or_none()
+        if selected_template is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Agent template not found",
+            )
 
     # Plan max_agents is a tenant-level commercial limit. Enforce it after the
     # final target tenant is known so org/platform admins cannot bypass it.
@@ -714,6 +774,12 @@ async def create_agent(
     )
     if data.autonomy_policy:
         agent.autonomy_policy = data.autonomy_policy
+    elif (
+        selected_template
+        and selected_template.is_builtin
+        and selected_template.default_autonomy_policy
+    ):
+        agent.autonomy_policy = dict(selected_template.default_autonomy_policy)
 
     db.add(agent)
     await db.flush()
@@ -776,13 +842,13 @@ async def create_agent(
 
     # Resolve template settings
     folder_names = []
+    template_tool_names = []
     template_mcp_servers = []
-    if data.template_id:
-        tpl_r = await db.execute(select(AgentTemplate).where(AgentTemplate.id == data.template_id))
-        tpl = tpl_r.scalar_one_or_none()
-        if tpl:
-            folder_names = list(tpl.default_skills or [])
-            template_mcp_servers = list(tpl.default_mcp_servers or [])
+    if selected_template:
+        folder_names = list(selected_template.default_skills or [])
+        if selected_template.is_builtin:
+            template_tool_names = list(selected_template.default_tools or [])
+            template_mcp_servers = list(selected_template.default_mcp_servers or [])
 
     # Prepare return response before transaction is committed
     out = await _agent_to_out(db, agent, current_user.id)
@@ -798,6 +864,7 @@ async def create_agent(
         boundaries=data.boundaries or "",
         skill_ids=list(data.skill_ids or []),
         template_skill_folder_names=folder_names,
+        template_tool_names=template_tool_names,
         template_mcp_servers=template_mcp_servers,
     )
 

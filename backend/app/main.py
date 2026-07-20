@@ -387,6 +387,23 @@ async def lifespan(app: FastAPI):
             logger.warning(f"[startup] ⚠️ enterprise_info migration failed: {e}")
 
         try:
+            from app.services.system_setting_security import (
+                migrate_sensitive_system_settings,
+            )
+
+            migrated_settings = await migrate_sensitive_system_settings()
+            if migrated_settings:
+                logger.info(
+                    "[startup] Encrypted legacy sensitive system settings count={}",
+                    migrated_settings,
+                )
+        except Exception as e:
+            logger.warning(
+                "[startup] Sensitive system setting migration failed: {}",
+                type(e).__name__,
+            )
+
+        try:
             from app.services.tool_seeder import seed_builtin_tools, clean_orphaned_mcp_tools
             await seed_builtin_tools()
             await clean_orphaned_mcp_tools()
@@ -409,9 +426,8 @@ async def lifespan(app: FastAPI):
             logger.warning(f"[startup] Agent templates seed failed: {e}")
 
         try:
-            from app.services.skill_seeder import seed_skills, push_default_skills_to_existing_agents
+            from app.services.skill_seeder import seed_skills
             await seed_skills()
-            await push_default_skills_to_existing_agents()
         except Exception as e:
             logger.warning(f"[startup] Skills seed failed: {e}")
 
@@ -432,6 +448,16 @@ async def lifespan(app: FastAPI):
             await patch_existing_okr_agent()
         except Exception as e:
             logger.warning(f"[startup] OKR Agent patch failed: {e}")
+
+        # Run effective Skill deployment only after every built-in Agent has
+        # been created or repaired. Base workspace initialization deliberately
+        # skips repository Skill source packages.
+        try:
+            from app.services.skill_seeder import push_default_skills_to_existing_agents
+
+            await push_default_skills_to_existing_agents()
+        except Exception as e:
+            logger.warning(f"[startup] Effective Agent Skill sync failed: {e}")
     else:
         logger.info(f"[startup] bootstrap skipped for PROCESS_ROLE={settings.PROCESS_ROLE}")
 

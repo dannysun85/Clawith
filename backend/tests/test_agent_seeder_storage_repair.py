@@ -54,9 +54,11 @@ async def test_repair_default_agent_storage_restores_missing_root_and_skills(mon
     )
     initialize = AsyncMock()
     store_bytes = AsyncMock()
+    sync_skill = AsyncMock(return_value=("created", 1))
     monkeypatch.setattr(agent_seeder, "get_storage_backend", lambda: storage)
     monkeypatch.setattr(agent_seeder.agent_manager, "initialize_agent_files", initialize)
     monkeypatch.setattr(agent_seeder, "store_agent_bytes", store_bytes)
+    monkeypatch.setattr(agent_seeder, "_sync_managed_skill", sync_skill)
 
     repaired = await agent_seeder._repair_default_agent_storage(
         db=SimpleNamespace(),
@@ -70,7 +72,8 @@ async def test_repair_default_agent_storage_restores_missing_root_and_skills(mon
     initialize.assert_awaited_once()
     storage.write_text.assert_awaited_once_with(f"{prefix}/skills/.gitkeep", "", encoding="utf-8")
     written_paths = [call.args[1] for call in store_bytes.await_args_list]
-    assert written_paths == ["soul.md", "skills/skill-creator/SKILL.md"]
+    assert written_paths == ["soul.md"]
+    sync_skill.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -89,9 +92,11 @@ async def test_repair_default_agent_storage_only_restores_missing_skills(monkeyp
     )
     initialize = AsyncMock()
     store_bytes = AsyncMock()
+    sync_skill = AsyncMock(return_value=("created", 1))
     monkeypatch.setattr(agent_seeder, "get_storage_backend", lambda: storage)
     monkeypatch.setattr(agent_seeder.agent_manager, "initialize_agent_files", initialize)
     monkeypatch.setattr(agent_seeder, "store_agent_bytes", store_bytes)
+    monkeypatch.setattr(agent_seeder, "_sync_managed_skill", sync_skill)
 
     repaired = await agent_seeder._repair_default_agent_storage(
         db=SimpleNamespace(),
@@ -104,7 +109,8 @@ async def test_repair_default_agent_storage_only_restores_missing_skills(monkeyp
     assert repaired is True
     initialize.assert_not_awaited()
     storage.write_text.assert_awaited_once_with(f"{prefix}/skills/.gitkeep", "", encoding="utf-8")
-    assert [call.args[1] for call in store_bytes.await_args_list] == ["skills/skill-creator/SKILL.md"]
+    store_bytes.assert_not_awaited()
+    sync_skill.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -118,9 +124,11 @@ async def test_repair_default_agent_storage_leaves_healthy_storage_untouched(mon
     )
     initialize = AsyncMock()
     store_bytes = AsyncMock()
+    sync_skill = AsyncMock(return_value=("unchanged", 0))
     monkeypatch.setattr(agent_seeder, "get_storage_backend", lambda: storage)
     monkeypatch.setattr(agent_seeder.agent_manager, "initialize_agent_files", initialize)
     monkeypatch.setattr(agent_seeder, "store_agent_bytes", store_bytes)
+    monkeypatch.setattr(agent_seeder, "_sync_managed_skill", sync_skill)
 
     repaired = await agent_seeder._repair_default_agent_storage(
         db=SimpleNamespace(),
@@ -134,6 +142,7 @@ async def test_repair_default_agent_storage_leaves_healthy_storage_untouched(mon
     initialize.assert_not_awaited()
     storage.write_text.assert_not_awaited()
     store_bytes.assert_not_awaited()
+    sync_skill.assert_awaited_once()
 
 
 @pytest.mark.asyncio

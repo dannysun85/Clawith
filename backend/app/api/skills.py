@@ -7,7 +7,8 @@ import os
 import re
 import uuid
 import zipfile
-from pathlib import Path, PurePosixPath
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
@@ -306,19 +307,44 @@ def _parse_skill_md_frontmatter(content: str) -> dict:
 
 
 def _parse_github_url(url: str) -> dict | None:
-    """Parse a GitHub URL into owner/repo/branch/path components."""
-    # https://github.com/{owner}/{repo}/tree/{branch}/{path}
-    m = re.match(
-        r"https?://github\.com/([^/]+)/([^/]+)/tree/([^/]+)/(.*?)/?$", url
-    )
-    if m:
-        return {"owner": m.group(1), "repo": m.group(2), "branch": m.group(3), "path": m.group(4)}
-    # https://github.com/{owner}/{repo}/{path} (assume main branch)
-    m = re.match(
-        r"https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$", url
-    )
-    if m:
-        return {"owner": m.group(1), "repo": m.group(2), "branch": "main", "path": ""}
+    """Parse a credential-free canonical GitHub repository/directory URL."""
+    try:
+        parsed = urlsplit(str(url or "").strip())
+        hostname = (parsed.hostname or "").casefold()
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or hostname != "github.com"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+
+    raw_segments = [segment for segment in parsed.path.strip("/").split("/") if segment]
+    segments = [unquote(segment) for segment in raw_segments]
+    if len(segments) < 2 or any("/" in segment or "\\" in segment for segment in segments):
+        return None
+    owner, repo = segments[0], segments[1]
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+    repository_segment = re.compile(r"^[A-Za-z0-9_.-]+$")
+    if not repository_segment.fullmatch(owner) or not repository_segment.fullmatch(repo):
+        return None
+
+    remainder = segments[2:]
+    if not remainder:
+        return {"owner": owner, "repo": repo, "branch": "main", "path": ""}
+    if len(remainder) >= 2 and remainder[0] == "tree":
+        branch = remainder[1]
+        path = "/".join(remainder[2:])
+        if not branch or branch in {".", ".."}:
+            return None
+        return {"owner": owner, "repo": repo, "branch": branch, "path": path}
     return None
 
 
@@ -347,32 +373,27 @@ def _ensure_skill_write_access(skill: Skill, current_user: User):
 
 
 def _validate_skill_folder(folder_name: str) -> str:
-    folder = folder_name.strip()
-    if (
-        not folder
-        or len(folder) > 100
-        or folder in {".", ".."}
-        or "/" in folder
-        or "\\" in folder
-        or "\x00" in folder
-    ):
-        raise HTTPException(400, "Invalid skill folder name")
-    return folder
+    from app.services.skill_workspace import (
+        SkillWorkspaceError,
+        validate_skill_folder_name,
+    )
+
+    try:
+        return validate_skill_folder_name(folder_name)
+    except SkillWorkspaceError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 def _validate_skill_file_path(file_path: str) -> str:
-    path = file_path.strip()
-    parsed = PurePosixPath(path)
-    if (
-        not path
-        or len(path) > 500
-        or parsed.is_absolute()
-        or any(part in {"", ".", ".."} for part in parsed.parts)
-        or "\\" in path
-        or "\x00" in path
-    ):
-        raise HTTPException(400, "Invalid skill file path")
-    return path
+    from app.services.skill_workspace import (
+        SkillWorkspaceError,
+        validate_skill_file_path,
+    )
+
+    try:
+        return validate_skill_file_path(file_path)
+    except SkillWorkspaceError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 def _exact_owner_clause(tenant_id: uuid.UUID | None):
@@ -540,10 +561,16 @@ async def _save_skill_to_db(
     if not normalized_name:
         raise HTTPException(400, "Skill name is required")
     owner_id = uuid.UUID(tenant_id) if tenant_id else None
-    normalized_files = [
-        {"path": _validate_skill_file_path(file["path"]), "content": file.get("content", "")}
-        for file in files
-    ]
+    normalized_files = []
+    normalized_paths: set[str] = set()
+    for file in files:
+        path = _validate_skill_file_path(file["path"])
+        if path in normalized_paths:
+            raise HTTPException(400, f"Duplicate skill file path: {path}")
+        normalized_paths.add(path)
+        normalized_files.append({"path": path, "content": file.get("content", "")})
+    if "SKILL.md" not in normalized_paths:
+        raise HTTPException(400, "Skill package must contain a root SKILL.md")
 
     async with async_session() as db:
         existing = await _find_skill_conflict(
@@ -660,6 +687,12 @@ async def install_from_clawhub(body: ClawhubInstallIn, current_user: User = Depe
     # 2. Build result with moderation warning
     is_suspicious = moderation.get("isSuspicious", False)
     moderation_summary = moderation.get("summary", "")
+    if is_suspicious:
+        summary = str(moderation_summary or "ClawHub moderation flagged this package")[:300]
+        raise HTTPException(
+            422,
+            f"Skill installation blocked by ClawHub moderation: {summary}",
+        )
 
     # 3. Fetch files from the ClawHub archive
     files, archive_base = await _fetch_clawhub_skill_archive(slug, api_key=api_key, preferred_base=meta_base)

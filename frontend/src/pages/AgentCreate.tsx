@@ -630,7 +630,7 @@ For humans, the message is delivered via their available channel (e.g. Feishu).`
                                         <div style={{ flex: 1 }}>
                                             <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                                                 <span style={{ fontWeight: 500, fontSize: '13px' }}>{skill.name}</span>
-                                                {isDefault && <span style={{ fontSize: '10px', padding: '1px 6px', borderRadius: '4px', background: 'var(--accent-primary)', color: '#fff', fontWeight: 500 }}>Required</span>}
+                                                {isDefault && <span style={{ fontSize: '10px', padding: '1px 6px', borderRadius: '4px', background: 'var(--accent-primary)', color: '#fff', fontWeight: 500 }}>{t('wizard.step3.required')}</span>}
                                             </div>
                                             <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>{skill.description}</div>
                                         </div>
@@ -638,7 +638,7 @@ For humans, the message is delivered via their available channel (e.g. Feishu).`
                             })}
                             {globalSkills.length === 0 && (
                                 <div style={{ padding: '16px', background: 'var(--bg-elevated)', borderRadius: '8px', fontSize: '13px', color: 'var(--text-tertiary)', textAlign: 'center' }}>
-                                    No skills available. Add skills in Company Settings.
+                                    {t('wizard.step3.noSkills')}
                                 </div>
                             )}
                         </div>

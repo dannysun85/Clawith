@@ -1,20 +1,29 @@
 """Seed builtin tools into the database on startup."""
 
+import hashlib
+
 from loguru import logger
 from sqlalchemy import or_, select
 from app.database import async_session
 from app.models.tenant import Tenant
 from app.models.tenant_setting import TenantSetting
+from app.models.system_settings import SystemSetting
 from app.models.tool import Tool
 from app.services.llm.finish import FINISH_TOOL_SEED
 from app.services.tool_config import (
     encrypt_sensitive_fields,
     meaningful_config,
+    remove_sensitive_fields,
+    set_tenant_tool_config,
     tenant_tool_config_key,
 )
 from app.services.code_execution_policy import CODE_EXECUTION_TOOL_NAMES
 from app.services.agent_tool_assignments import upsert_agent_tool
 from app.services.tool_release_policy import RELEASE_DISABLED_TOOL_NAMES
+from app.services.tool_capability_policy import (
+    CENTRAL_CREDENTIAL_POOL_TOOL_NAMES,
+    PERSISTED_NON_DEFAULT_TOOL_NAMES,
+)
 
 SYNC_IS_DEFAULT_TOOL_NAMES = {
     "finish",
@@ -67,7 +76,7 @@ SYNC_IS_DEFAULT_TOOL_NAMES = {
     "agentbay_computer_close_window",
     "agentbay_computer_dismiss_dialog",
     "agentbay_file_transfer",
-}
+} | PERSISTED_NON_DEFAULT_TOOL_NAMES
 
 LEGACY_IMAGE_TOOL_MODEL_DEFAULTS = {
     "generate_image_siliconflow": "black-forest-labs/FLUX.1-schnell",
@@ -3580,17 +3589,120 @@ BUILTIN_TOOLS = [
     *OKR_BUILTIN_TOOLS,
     *DEPLOY_BUILTIN_TOOLS,
 ]
+
+# Specialized, provider-paid, code-execution, install, publishing, and
+# role-specific tools must be granted explicitly by a reviewed role template
+# or an Agent manager. A Skill is an instruction set, not an execution grant.
+# General workspace, reminder, and communication capabilities remain available
+# by product policy; their individual side effects are controlled separately by
+# the Agent autonomy/approval boundary.
+for _tool_definition in BUILTIN_TOOLS:
+    if _tool_definition["name"] in PERSISTED_NON_DEFAULT_TOOL_NAMES:
+        _tool_definition["is_default"] = False
+SYNC_IS_DEFAULT_TOOL_NAMES.update(PERSISTED_NON_DEFAULT_TOOL_NAMES)
+
 BUILTIN_TOOL_NAMES = frozenset(tool["name"] for tool in BUILTIN_TOOLS)
 
 
 def is_registered_builtin_tool_name(name: str) -> bool:
-    return str(name or "") in BUILTIN_TOOL_NAMES
+    # Import lazily to avoid the compatibility bridge's import cycle while
+    # guaranteeing the complete canonical v1.11 catalog even when this module
+    # was imported first.
+    from app.services.builtin_tool_definitions import BUILTIN_TOOL_NAMES as canonical_names
+
+    return str(name or "") in canonical_names
+
+
+async def _quarantine_legacy_builtin_config(db, tool: Tool, config: dict) -> None:
+    """Preserve an encrypted, non-runtime recovery copy of ownerless config."""
+
+    digest = hashlib.sha256(str(tool.name).encode("utf-8")).hexdigest()[:20]
+    key = f"legacy_tool_config_quarantine:{digest}"
+    existing_r = await db.execute(
+        select(SystemSetting).where(SystemSetting.key == key)
+    )
+    if existing_r.scalar_one_or_none() is not None:
+        return
+    db.add(
+        SystemSetting(
+            key=key,
+            value={
+                "tool_name": tool.name,
+                "config": encrypt_sensitive_fields(config, tool.config_schema),
+                "runtime_enabled": False,
+                "reason": "tenant_owner_ambiguous",
+            },
+        )
+    )
+
+
+async def _migrate_legacy_builtin_credentials(
+    db,
+    *,
+    tool: Tool,
+    sole_tenant: Tenant | None,
+) -> str:
+    """Remove a legacy global credential without overwriting tenant state.
+
+    Returns one of ``ignored``, ``migrated``, ``preserved``, ``quarantined``,
+    or ``platform_pool_removed``. Non-secret platform defaults remain on the
+    builtin Tool row. Ownerless secrets are kept encrypted outside the runtime
+    lookup path so the repair is reversible without leaking across tenants.
+    """
+
+    if tool.name in CODE_EXECUTION_TOOL_NAMES:
+        return "ignored"
+    legacy_config = meaningful_config(tool.config or {})
+    if not legacy_config:
+        return "ignored"
+    if remove_sensitive_fields(legacy_config, tool.config_schema) == legacy_config:
+        return "ignored"
+
+    # MiniMax credentials belong exclusively to the centrally funded
+    # LLMCredential pool.  Moving an obsolete per-Tool key into the sole
+    # tenant would recreate the object/tenant credential model that the SaaS
+    # routing architecture deliberately removed.
+    if tool.name in CENTRAL_CREDENTIAL_POOL_TOOL_NAMES:
+        tool.config = remove_sensitive_fields(tool.config or {}, tool.config_schema)
+        return "platform_pool_removed"
+
+    migration_status = "quarantined"
+    if sole_tenant is not None:
+        setting_r = await db.execute(
+            select(TenantSetting).where(
+                TenantSetting.tenant_id == sole_tenant.id,
+                TenantSetting.key == tenant_tool_config_key(tool.name),
+            )
+        )
+        if setting_r.scalar_one_or_none() is None:
+            await set_tenant_tool_config(
+                db,
+                sole_tenant.id,
+                tool.name,
+                legacy_config,
+                tool.config_schema,
+            )
+            migration_status = "migrated"
+        else:
+            # A tenant-owned value is authoritative. Startup repair must never
+            # replace it with a stale global snapshot.
+            migration_status = "preserved"
+
+    if migration_status in {"quarantined", "preserved"}:
+        await _quarantine_legacy_builtin_config(db, tool, legacy_config)
+
+    tool.config = remove_sensitive_fields(tool.config or {}, tool.config_schema)
+    return migration_status
 
 
 async def seed_builtin_tools():
     """Insert or update builtin tools in the database."""
     from app.models.tool import AgentTool
     from app.models.agent import Agent
+    from app.services.builtin_tool_definitions import (
+        BUILTIN_TOOL_NAMES as canonical_tool_names,
+        BUILTIN_TOOL_SEEDS,
+    )
 
 
     async with async_session() as db:
@@ -3622,7 +3734,9 @@ async def seed_builtin_tools():
 
         new_tool_ids = []
         release_disabled_tool_ids = []
-        for t in BUILTIN_TOOLS:
+        # Always seed from the canonical catalog.  Import order must not make
+        # startup fall back to the older duplicated list in this module.
+        for t in BUILTIN_TOOL_SEEDS:
             seed_config = _global_builtin_config(t)
             result = await db.execute(select(Tool).where(Tool.name == t["name"]))
             existing = result.scalar_one_or_none()
@@ -3859,7 +3973,7 @@ async def seed_builtin_tools():
         stale_builtin_r = await db.execute(
             select(Tool).where(
                 or_(Tool.source == "builtin", Tool.type == "builtin"),
-                Tool.name.not_in(BUILTIN_TOOL_NAMES),
+                Tool.name.not_in(canonical_tool_names),
             )
         )
         stale_builtins = list(stale_builtin_r.scalars().all())
@@ -3879,52 +3993,126 @@ async def seed_builtin_tools():
             )
 
         # Legacy deployments stored company credentials for builtin tools in
-        # the global tools.config row. Move those values into the first tenant's
-        # tenant_settings once, then clear the global row so new companies do
-        # not inherit another company's keys.
-        first_tenant_r = await db.execute(select(Tenant).order_by(Tenant.created_at).limit(1))
-        first_tenant = first_tenant_r.scalar_one_or_none()
-        if first_tenant:
-            builtin_config_tools_r = await db.execute(select(Tool).where(Tool.source == "builtin"))
-            migrated = 0
-            for tool in builtin_config_tools_r.scalars().all():
-                # Code isolation/provider values are platform controls. Never
-                # reinterpret a legacy global value as one company's override.
-                if tool.name in CODE_EXECUTION_TOOL_NAMES:
-                    continue
-                if not (tool.config_schema or {}).get("fields"):
-                    continue
-                legacy_config = meaningful_config(tool.config or {})
-                if not legacy_config:
-                    continue
-                setting_key = tenant_tool_config_key(tool.name)
-                existing_setting_r = await db.execute(
-                    select(TenantSetting).where(
-                        TenantSetting.tenant_id == first_tenant.id,
-                        TenantSetting.key == setting_key,
-                    )
+        # the global tools.config row. Ownership cannot be inferred once more
+        # than one company exists: assigning the value to the oldest tenant
+        # would silently transfer another company's secret. Migrate only when
+        # there is exactly one possible owner. Otherwise quarantine an
+        # encrypted recovery copy outside the runtime lookup path, remove it
+        # from the global fallback, and require an administrator to configure
+        # each tenant explicitly. Encryption alone is insufficient because
+        # runtime config resolution intentionally decrypts Tool.config.
+        tenants_r = await db.execute(select(Tenant).order_by(Tenant.created_at).limit(2))
+        legacy_tenants = list(tenants_r.scalars().all())
+        sole_tenant = legacy_tenants[0] if len(legacy_tenants) == 1 else None
+        builtin_config_tools_r = await db.execute(select(Tool).where(Tool.source == "builtin"))
+        migrated = 0
+        existing_tenant_configs_preserved = 0
+        ambiguous_credentials_quarantined = 0
+        platform_pool_credentials_removed = 0
+        for tool in builtin_config_tools_r.scalars().all():
+            migration_status = await _migrate_legacy_builtin_credentials(
+                db,
+                tool=tool,
+                sole_tenant=sole_tenant,
+            )
+            if migration_status == "migrated":
+                migrated += 1
+            elif migration_status == "preserved":
+                existing_tenant_configs_preserved += 1
+            elif migration_status == "quarantined":
+                ambiguous_credentials_quarantined += 1
+            elif migration_status == "platform_pool_removed":
+                platform_pool_credentials_removed += 1
+
+        if migrated:
+            logger.info(
+                "[ToolSeeder] Migrated {} legacy builtin tool config(s) "
+                "to encrypted tenant settings tenant_id={}",
+                migrated,
+                sole_tenant.id,
+            )
+        if existing_tenant_configs_preserved:
+            logger.info(
+                "[ToolSeeder] Preserved {} existing tenant tool config(s) "
+                "while removing stale global credential fallbacks",
+                existing_tenant_configs_preserved,
+            )
+        if ambiguous_credentials_quarantined:
+            logger.warning(
+                "[ToolSeeder] Quarantined ambiguous legacy credentials from {} "
+                "builtin tool config(s) outside runtime; tenant ownership is "
+                "unknown tenant_count_class={}; configure each tenant explicitly",
+                ambiguous_credentials_quarantined,
+                "none" if not legacy_tenants else "multiple",
+            )
+        if platform_pool_credentials_removed:
+            logger.warning(
+                "[ToolSeeder] Removed obsolete per-Tool credentials from {} "
+                "platform-pool tool config(s); MiniMax credentials remain "
+                "owned by the shared LLMCredential pool",
+                platform_pool_credentials_removed,
+            )
+
+        # Remove the same obsolete MiniMax credential shape from older
+        # tenant/Agent overrides.  Non-secret media preferences remain intact;
+        # the actual shared account pool is a separate table and is untouched.
+        central_tools_r = await db.execute(
+            select(Tool).where(
+                Tool.source == "builtin",
+                Tool.name.in_(CENTRAL_CREDENTIAL_POOL_TOOL_NAMES),
+            )
+        )
+        central_tools = list(central_tools_r.scalars().all())
+        central_by_name = {tool.name: tool for tool in central_tools}
+        scrubbed_tenant_configs = 0
+        if central_by_name:
+            central_setting_keys = {
+                tenant_tool_config_key(name) for name in central_by_name
+            }
+            settings_r = await db.execute(
+                select(TenantSetting).where(
+                    TenantSetting.key.in_(central_setting_keys)
                 )
-                if not existing_setting_r.scalar_one_or_none():
-                    db.add(TenantSetting(
-                        tenant_id=first_tenant.id,
-                        key=setting_key,
-                        value={"config": legacy_config},
-                    ))
-                    migrated += 1
-                
-                # Remove sensitive fields from global config instead of wiping it
-                clean_config = {}
-                schema_fields = (tool.config_schema or {}).get("fields", [])
-                sensitive_keys = {f["key"] for f in schema_fields if f.get("type") == "password"}
-                for k, v in (tool.config or {}).items():
-                    if k not in sensitive_keys:
-                        clean_config[k] = v
-                tool.config = clean_config
-            if migrated:
-                logger.info(
-                    f"[ToolSeeder] Migrated {migrated} legacy builtin tool config(s) "
-                    f"to tenant_settings for tenant {first_tenant.id}"
+            )
+            for setting in settings_r.scalars().all():
+                tool_name = str(setting.key)[len("tool_config:") :]
+                tool = central_by_name.get(tool_name)
+                if tool is None:
+                    continue
+                value = dict(setting.value or {})
+                raw_config = dict(value.get("config") or {})
+                cleaned = remove_sensitive_fields(
+                    raw_config,
+                    tool.config_schema,
                 )
+                if cleaned != raw_config:
+                    value["config"] = cleaned
+                    setting.value = value
+                    scrubbed_tenant_configs += 1
+
+        scrubbed_agent_configs = 0
+        if central_tools:
+            assignments_r = await db.execute(
+                select(AgentTool, Tool)
+                .join(Tool, Tool.id == AgentTool.tool_id)
+                .where(Tool.name.in_(CENTRAL_CREDENTIAL_POOL_TOOL_NAMES))
+            )
+            for assignment, tool in assignments_r.all():
+                raw_config = dict(assignment.config or {})
+                cleaned = remove_sensitive_fields(
+                    raw_config,
+                    tool.config_schema,
+                )
+                if cleaned != raw_config:
+                    assignment.config = cleaned
+                    scrubbed_agent_configs += 1
+        if scrubbed_tenant_configs or scrubbed_agent_configs:
+            logger.warning(
+                "[ToolSeeder] Removed obsolete MiniMax Tool credentials "
+                "tenant_config_count={} agent_config_count={}",
+                scrubbed_tenant_configs,
+                scrubbed_agent_configs,
+            )
 
         # Encrypt legacy MCP config secrets in place. Older application
         # versions already decrypt these canonical fields, so this hardening is

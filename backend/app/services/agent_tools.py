@@ -59,6 +59,7 @@ from app.models.task import Task
 from app.models.user import User as UserModel
 from app.services.channel_session import find_or_create_channel_session
 from app.services.channel_user_service import get_platform_user_by_org_member
+from app.services.code_execution_policy import is_code_execution_tool
 from app.services.document_conversion import (
     convert_html_to_pdf as convert_html_file_to_pdf,
     convert_html_to_pptx as convert_html_file_to_pptx,
@@ -475,45 +476,12 @@ def _observability_text(value: object) -> str:
 _tool_config_cache: dict[tuple, tuple[dict, datetime]] = {}
 _TOOL_CONFIG_CACHE_TTL_SECONDS = 60
 
-# Sensitive field keys that should be encrypted/decrypted
-SENSITIVE_FIELD_KEYS = {"api_key", "private_key", "auth_code", "password", "secret", "atlassian_api_key"}
-
-
 def _decrypt_sensitive_fields(config: dict, config_schema: dict | None = None) -> dict:
-    """Decrypt sensitive fields in config dict.
+    """Compatibility wrapper around the canonical recursive decryptor."""
 
-    When config_schema is provided, also decrypts fields with type='password'
-    (e.g. smithery_api_key) that are not in the hardcoded SENSITIVE_FIELD_KEYS.
-    """
-    if not config:
-        return config
+    from app.services.tool_config import decrypt_sensitive_fields
 
-    from app.core.security import decrypt_data
-    from app.config import get_settings
-
-    settings = get_settings()
-    result = dict(config)
-
-    # Build the set of sensitive keys: hardcoded + schema-derived
-    sensitive_keys = set(SENSITIVE_FIELD_KEYS)
-    if config_schema:
-        for field in config_schema.get("fields", []):
-            if field.get("type") == "password":
-                key = field.get("key", "")
-                if key:
-                    sensitive_keys.add(key)
-
-    for key in sensitive_keys:
-        if key in result and result[key]:
-            value = result[key]
-            if isinstance(value, str) and value:
-                try:
-                    result[key] = decrypt_data(value, settings.SECRET_KEY)
-                except Exception:
-                    # If decryption fails, assume it's plaintext
-                    pass
-
-    return result
+    return decrypt_sensitive_fields(config, config_schema)
 
 
 def _get_cached_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Optional[dict]:
@@ -554,7 +522,10 @@ async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Opt
 
     from app.models.tool import Tool, AgentTool
     from app.models.agent import Agent as AgentModel
-    from app.services.tool_config import get_tenant_tool_config
+    from app.services.tool_config import (
+        get_tenant_tool_config,
+        sanitize_tool_config_credential_ownership,
+    )
 
     async with async_session() as db:
         agent_tenant_id = None
@@ -577,7 +548,11 @@ async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Opt
                 if tool_source == "builtin":
                     tenant_config = await get_tenant_tool_config(db, agent_tenant_id, db_tool_name, config_schema)
                 # Merge: agent overrides global
-                merged = {**base_config, **tenant_config, **(agent_config or {})}
+                merged = sanitize_tool_config_credential_ownership(
+                    db_tool_name,
+                    {**base_config, **tenant_config, **(agent_config or {})},
+                    config_schema,
+                )
                 if merged:
                     # Decrypt with schema awareness
                     merged = _decrypt_sensitive_fields(merged, config_schema)
@@ -593,7 +568,11 @@ async def _get_tool_config(agent_id: Optional[uuid.UUID], tool_name: str) -> Opt
             if tool.source == "builtin":
                 tenant_config = await get_tenant_tool_config(db, agent_tenant_id, tool.name, tool.config_schema)
             base_config = tool.config or {}
-            merged = {**base_config, **tenant_config}
+            merged = sanitize_tool_config_credential_ownership(
+                tool.name,
+                {**base_config, **tenant_config},
+                tool.config_schema,
+            )
         else:
             merged = {}
         if tool and merged:
@@ -875,27 +854,18 @@ RUNTIME_TYPED_APPLICATION_TOOL_NAMES = frozenset(
 )
 
 
-# Core tools that should always be available to agents regardless of
-# DB configuration.
-# Note: send_channel_message is intentionally NOT here — it lives in
-# _CHANNEL_MESSAGE_TOOL_NAMES and is only added when a channel is configured,
-# to avoid sending duplicate tool definitions to the LLM.
+# Runtime protocol controls are the only tools allowed to bypass persisted
+# capability grants. Workspace writes, Focus mutations, A2A delivery, and
+# channel delivery all follow the same AgentTool/is_default resolution as every
+# other executable capability.
 _ALWAYS_INCLUDE_CORE = {
-    "complete_focus_item",
     FINISH_TOOL_NAME,
-    "list_focus_items",
-    "query_directory",
-    "send_channel_file",
-    "send_file_to_agent",
-    "upsert_focus_item",
-    "write_file",
 }
 # Channel message tool - available when any channel (Feishu/DingTalk/WeCom) is configured
 _CHANNEL_MESSAGE_TOOL_NAMES = {
     "send_channel_message",
 }
 _always_core_tools = [t for t in AGENT_TOOLS if t["function"]["name"] in _ALWAYS_INCLUDE_CORE]
-_channel_tools = [t for t in AGENT_TOOLS if t["function"]["name"] in _CHANNEL_MESSAGE_TOOL_NAMES]
 
 
 async def _get_computer_os_type(agent_id: uuid.UUID) -> str:
@@ -1034,7 +1004,13 @@ async def _agent_has_feishu(agent_id: uuid.UUID) -> bool:
 
 
 async def _agent_has_any_channel(agent_id: uuid.UUID) -> bool:
-    """Check if agent has any configured channel (Feishu/DingTalk/WeCom)."""
+    """Check for a configured channel with a durable proactive-send fact.
+
+    Slack, Teams, and WeChat currently have inbound/reply integrations, but
+    their proactive helpers do not yet expose a typed provider acknowledgement.
+    Advertising ``send_channel_message`` for those channels would let the UI
+    and model promise a capability the durable Runtime intentionally blocks.
+    """
     try:
         from app.models.channel_config import ChannelConfig
 
@@ -1042,10 +1018,15 @@ async def _agent_has_any_channel(agent_id: uuid.UUID) -> bool:
             r = await db.execute(
                 select(ChannelConfig).where(
                     ChannelConfig.agent_id == agent_id,
+                    ChannelConfig.channel_type.in_(("feishu", "dingtalk", "wecom")),
                     ChannelConfig.is_configured.is_(True),
                 )
             )
-            return r.scalar_one_or_none() is not None
+            # More than one configured provider is a normal Agent state.  A
+            # scalar_one_or_none() check raises MultipleResultsFound here and
+            # the broad fail-closed handler below would incorrectly report no
+            # channel at all.
+            return r.scalars().first() is not None
     except Exception:
         return False
 
@@ -1064,9 +1045,7 @@ def _canonicalize_llm_tool(tool_def: dict, *, source: str = "builtin") -> dict:
 async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
     """Load enabled tools for an agent from DB (OpenAI function-calling format).
 
-    Falls back to hardcoded AGENT_TOOLS if DB not ready.
-    Includes core system tools (send_channel_file, write_file) unless the user
-    has explicitly disabled them via the Agent tool panel.
+    Falls back only to protocol controls if DB capability state is unavailable.
     Feishu tools are only included when the agent has a configured Feishu channel.
     send_channel_message is included when any channel (Feishu/DingTalk/WeCom) is configured.
 
@@ -1081,9 +1060,10 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
     # A configured channel satisfies a prerequisite; it does not assign every
     # tool in that provider family. Feishu application tools still require an
     # enabled AgentTool assignment or their explicit canonical default.
-    _always_tools = _always_core_tools + (_channel_tools if has_any_channel else [])
+    _always_tools = _always_core_tools
 
     is_system_agent = False
+    agent_found = False
     agent_tenant_id = None
     try:
         from app.models.agent import Agent as AgentModel
@@ -1091,11 +1071,16 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
         async with async_session() as _flag_db:
             _ag_r = await _flag_db.execute(select(AgentModel).where(AgentModel.id == agent_id))
             _agent = _ag_r.scalar_one_or_none()
+            agent_found = _agent is not None
             _tid = _agent.tenant_id if _agent else None
             agent_tenant_id = _tid
             is_system_agent = bool(_agent and _agent.is_system)
     except Exception:
         pass
+
+    if not agent_found:
+        logger.warning("[Tools] Agent lookup failed; exposing only protocol-safe fallback tools")
+        return _patch_computer_tool_descriptions(_always_tools, None)
 
     # Read os_type once; used to patch agentbay_file_transfer paths below
     computer_os_type = await _get_computer_os_type(agent_id)
@@ -1107,20 +1092,19 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
             # Get agent-specific assignments
             agent_tools_r = await db.execute(select(AgentTool).where(AgentTool.agent_id == agent_id))
             assignments = {str(at.tool_id): at for at in agent_tools_r.scalars().all()}
-            assigned_tool_ids = [uuid.UUID(tool_id) for tool_id in assignments]
-
-            visible_clauses = [Tool.source == "builtin"]
-            # Admin tools: visible if they are global (tenant_id is NULL) or belong to the agent's tenant
-            admin_cond = Tool.tenant_id.is_(None)
-            if agent_tenant_id:
-                admin_cond = admin_cond | (Tool.tenant_id == agent_tenant_id)
-            visible_clauses.append((Tool.source == "admin") & admin_cond)
-            # Explicitly assigned tools: always visible regardless of source (builtin, admin, agent)
-            if assigned_tool_ids:
-                visible_clauses.append(Tool.id.in_(assigned_tool_ids))
+            from app.services.tool_visibility import (
+                agent_visible_tool_clause,
+                tool_enabled_for_agent,
+                tool_record_visible_to_agent,
+            )
 
             # Get all tools visible within this agent's tenant boundary.
-            all_tools_r = await db.execute(select(Tool).where(Tool.enabled.is_(True), or_(*visible_clauses)))
+            all_tools_r = await db.execute(
+                select(Tool).where(
+                    Tool.enabled.is_(True),
+                    agent_visible_tool_clause(agent_tenant_id, assignments),
+                )
+            )
             all_tools = all_tools_r.scalars().all()
 
             result = []
@@ -1133,6 +1117,15 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
             default_included_names = []
 
             for t in all_tools:
+                # Defense in depth for stale rows and lightweight fixtures:
+                # an assignment never overrides the owning tenant boundary.
+                if not tool_record_visible_to_agent(t, agent_tenant_id, assignments):
+                    logger.warning(
+                        "[Tools] Ignoring tool outside Agent tenant boundary id={} source={}",
+                        t.id,
+                        getattr(t, "source", "unknown"),
+                    )
+                    continue
                 # ORM rows always carry `source`; lightweight compatibility
                 # fixtures and pre-source legacy rows are builtin by default.
                 source = getattr(t, "source", "builtin")
@@ -1154,10 +1147,9 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                 tid = str(t.id)
                 at = assignments.get(tid)
 
-                # If no explicit assignment, fallback to t.is_default
-                enabled = at.enabled if at is not None else t.is_default
+                enabled = tool_enabled_for_agent(t, at)
 
-                if at is None and t.is_default:
+                if at is None and enabled:
                     default_included_names.append(t.name)
 
                 if not enabled:
@@ -1206,40 +1198,32 @@ async def get_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
                     f"{sorted(default_included_names)}"
                 )
 
-            if result:
-                # Append always-available system tools that aren't already in
-                # the DB list — but respect explicit user disabling.
-                always_added = []
-                for t in _always_tools:
-                    fn_name = t["function"]["name"]
-                    if fn_name not in db_tool_names and fn_name not in explicitly_disabled_names:
-                        result.append(t)
-                        always_added.append(fn_name)
-                if always_added:
-                    logger.debug(f"[Tools] agent={agent_id} added from _always_tools: {always_added}")
-                # Inject OS-aware paths into computer-related tool descriptions
-                result = _patch_computer_tool_descriptions(result, computer_os_type)
-                # Final diagnostic: log the complete tool list and assignment stats
-                logger.info(
-                    "[Tools] agent={} final_tools={} assignments={} disabled={} default_fallback={}",
-                    agent_id,
-                    len(result),
-                    len(assignments),
-                    len(explicitly_disabled_names),
-                    len(default_included_names),
-                )
-                return result
-            # If DB loading fails, do not expose the full hardcoded tool catalog: that
-            # can leak disabled tools (for example search tools) into the LLM. Keep only
-            # the minimal always-available core/channel tools.
-            # (Note: we fall through to the except-clause fallback below if result is empty or exception is raised)
-            raise ValueError("No tools found for agent in DB")
+            # Append protocol controls only. An intentionally empty capability
+            # selection is valid and must not be mistaken for a DB failure.
+            always_added = []
+            for t in _always_tools:
+                fn_name = t["function"]["name"]
+                if fn_name not in db_tool_names:
+                    result.append(t)
+                    always_added.append(fn_name)
+            if always_added:
+                logger.debug(f"[Tools] agent={agent_id} added protocol tools: {always_added}")
+            result = _patch_computer_tool_descriptions(result, computer_os_type)
+            logger.info(
+                "[Tools] agent={} final_tools={} assignments={} disabled={} default_fallback={}",
+                agent_id,
+                len(result),
+                len(assignments),
+                len(explicitly_disabled_names),
+                len(default_included_names),
+            )
+            return result
     except Exception as e:
         logger.error(f"[Tools] DB load failed, using fallback: {e}")
 
     # If DB loading fails, do not expose the full hardcoded tool catalog: that
     # can leak disabled tools (for example search tools) into the LLM. Keep only
-    # the minimal always-available core/channel tools.
+    # the minimal protocol control tools.
     fallback = _patch_computer_tool_descriptions(_always_tools, computer_os_type)
     return fallback
 
@@ -1343,6 +1327,22 @@ async def get_runtime_agent_tools_for_llm(agent_id: uuid.UUID) -> list[dict]:
     is_designated_okr_agent: bool | None = None
     for tool in resolved:
         name = str(tool.get("function", {}).get("name") or "")
+        if is_code_execution_tool(name):
+            try:
+                code_denial = await _code_tool_denial_reason(name, agent_id)
+            except Exception as exc:
+                logger.warning(
+                    "[Tools] Code readiness lookup failed for {}: {}",
+                    name,
+                    type(exc).__name__,
+                )
+                continue
+            if code_denial:
+                logger.info(
+                    "[Tools] Durable Runtime hid {} because local authorization/readiness is incomplete",
+                    name,
+                )
+                continue
         if name in _OKR_AGENT_ONLY_TOOL_NAMES:
             if is_designated_okr_agent is None:
                 is_designated_okr_agent = await _agent_is_designated_okr_agent(agent_id)
@@ -1807,8 +1807,16 @@ _TOOL_AUTONOMY_MAP = {
     "edit_file": "write_workspace_files",
     "delete_file": "delete_files",
     "send_feishu_message": "send_feishu_message",
+    "send_channel_message": "send_external_message",
+    "send_platform_message": "send_external_message",
+    "send_channel_file": "send_external_message",
+    "send_email": "send_external_message",
+    "reply_email": "send_external_message",
     "send_message_to_agent": "send_message_to_agent",  # A2A messaging — distinct from feishu
     "send_file_to_agent": "send_file_to_agent",  # A2A file transfer
+    "set_trigger": "manage_automation",
+    "update_trigger": "manage_automation",
+    "cancel_trigger": "manage_automation",
     "web_search": "web_search",
     "execute_code": "execute_code",
     "execute_code_e2b": "execute_code",
@@ -1817,7 +1825,99 @@ _TOOL_AUTONOMY_MAP = {
     "agentbay_code_read_file": "execute_code",
     "agentbay_code_edit_file": "execute_code",
     "agentbay_command_exec": "execute_code",
+    "import_mcp_server": "manage_agent_capabilities",
+    "install_skill": "manage_agent_capabilities",
+    "vercel_deploy": "manage_external_deployment",
+    "vercel_set_env": "manage_external_deployment",
+    "vercel_manage_domain": "manage_external_deployment",
+    "neon_create_database": "manage_external_deployment",
+    "publish_page": "publish_external_content",
 }
+
+
+async def _enforce_tool_autonomy(
+    *,
+    tool_name: str,
+    arguments: dict,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    session_id: str = "",
+) -> dict | None:
+    """Apply the signed autonomy contract to every executor path."""
+    action_type = _TOOL_AUTONOMY_MAP.get(tool_name)
+    if action_type is None:
+        return None
+
+    from app.models.agent import Agent as AgentModel
+    from app.services.autonomy_service import (
+        autonomy_service,
+        build_tool_approval_details,
+    )
+
+    async with async_session() as db:
+        result = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
+        agent = result.scalar_one_or_none()
+        if agent is None:
+            raise ValueError("Agent not found while enforcing autonomy")
+        details = build_tool_approval_details(
+            agent.id,
+            action_type,
+            tool_name,
+            arguments,
+            uuid.UUID(str(user_id)),
+            origin_session_id=session_id or None,
+        )
+        enforcement = await autonomy_service.check_and_enforce(
+            db,
+            agent,
+            action_type,
+            details,
+        )
+        await db.commit()
+        return enforcement
+
+
+async def enforce_builtin_tool_autonomy_outcome(
+    *,
+    tool_name: str,
+    arguments: dict,
+    agent_id: uuid.UUID,
+    user_id: uuid.UUID,
+    session_id: str = "",
+) -> ToolExecutionOutcome | None:
+    """Return a typed blocking fact, or ``None`` when execution may proceed."""
+    try:
+        enforcement = await _enforce_tool_autonomy(
+            tool_name=tool_name,
+            arguments=arguments,
+            agent_id=agent_id,
+            user_id=user_id,
+            session_id=session_id,
+        )
+    except Exception as exc:
+        logger.exception(
+            "[Autonomy] Typed tool check failed tool={} error_type={}",
+            tool_name,
+            type(exc).__name__,
+        )
+        return _typed_failure(
+            "Autonomy policy could not be verified. The operation was blocked for safety.",
+            "autonomy_check_failed",
+            retryable=True,
+        )
+    if enforcement is None or enforcement.get("allowed"):
+        return None
+    if enforcement.get("level") == "L3":
+        approval_id = enforcement.get("approval_id")
+        return _typed_failure(
+            _queued_approval_message(approval_id),
+            "tool_approval_required",
+            metadata={"approval_id": str(approval_id) if approval_id else None},
+        )
+    return _typed_failure(
+        str(enforcement.get("message") or "Action denied by autonomy policy"),
+        "autonomy_policy_denied",
+    )
 
 
 def _is_enterprise_info_path(path: str | None) -> bool:
@@ -2860,6 +2960,42 @@ async def execute_builtin_tool_outcome(
             "invalid_tool_arguments",
         )
 
+    # Reject structurally incomplete calls before loading autonomy state. This
+    # is validation only; no business handler or external side effect runs.
+    if tool_name in BUILTIN_TOOL_NAMES:
+        required = builtin_model_definition(tool_name)["function"]["parameters"].get(
+            "required", []
+        )
+        missing_required = tuple(
+            name
+            for name in required
+            if name not in arguments
+            or arguments[name] is None
+            or (isinstance(arguments[name], str) and not arguments[name].strip())
+        )
+        if missing_required:
+            return _typed_failure(
+                f"{tool_name} requires: {', '.join(missing_required)}.",
+                "invalid_tool_arguments",
+            )
+
+    code_denial = await _code_tool_denial_reason(tool_name, agent_id)
+    if code_denial:
+        return _typed_failure(
+            code_denial,
+            "code_execution_not_authorized",
+        )
+
+    autonomy_outcome = await enforce_builtin_tool_autonomy_outcome(
+        tool_name=tool_name,
+        arguments=arguments,
+        agent_id=agent_id,
+        user_id=user_id,
+        session_id=session_id,
+    )
+    if autonomy_outcome is not None:
+        return autonomy_outcome
+
     tenant_id: str | None = None
     if tool_name in {
         "list_files",
@@ -3542,36 +3678,23 @@ async def _execute_tool_impl(
     ws = _agent_workspace_root(agent_id)
 
     # ── Autonomy boundary check ──
-    action_type = _TOOL_AUTONOMY_MAP.get(tool_name)
-    if action_type:
-        try:
-            from app.services.autonomy_service import autonomy_service
-            from app.models.agent import Agent as AgentModel
-
-            async with async_session() as _adb:
-                _ar = await _adb.execute(select(AgentModel).where(AgentModel.id == agent_id))
-                _agent = _ar.scalar_one_or_none()
-                if _agent:
-                    result_check = await autonomy_service.check_and_enforce(
-                        _adb,
-                        _agent,
-                        action_type,
-                        {
-                            "tool": tool_name,
-                            "args": str(_observability_arguments(tool_name, arguments))[:200],
-                            "requested_by": str(user_id),
-                        },
-                    )
-                    await _adb.commit()
-                    if not result_check.get("allowed"):
-                        level = result_check.get("level", "L3")
-                        logger.info(f"[Autonomy] Tool {tool_name} denied, level: {level}")
-                        if level == "L3":
-                            return f"⏳ This action requires approval. An approval request has been sent. Please wait for approval before retrying. (Approval ID: {result_check.get('approval_id', 'N/A')})"
-                        return f"❌ Action denied: {result_check.get('message', 'unknown reason')}"
-        except Exception as e:
-            logger.exception(f"[Autonomy] Check failed: {e}")
-            return f"⚠️ Autonomy check failed ({e}). Operation blocked for safety. Please retry or contact admin."
+    try:
+        result_check = await _enforce_tool_autonomy(
+            tool_name=tool_name,
+            arguments=arguments,
+            agent_id=agent_id,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        if result_check is not None and not result_check.get("allowed"):
+            level = result_check.get("level", "L3")
+            logger.info(f"[Autonomy] Tool {tool_name} denied, level: {level}")
+            if level == "L3":
+                return _queued_approval_message(result_check.get("approval_id"))
+            return f"❌ Action denied: {result_check.get('message', 'unknown reason')}"
+    except Exception as e:
+        logger.exception(f"[Autonomy] Check failed: {e}")
+        return "⚠️ Autonomy check failed. Operation blocked for safety. Please retry or contact admin."
 
     agentbay_scope_token = None
     if tool_name.startswith("agentbay_"):
@@ -4248,7 +4371,12 @@ async def _get_jina_api_key() -> str:
             result = await db.execute(select(SystemSetting).where(SystemSetting.key == "jina_api_key"))
             setting = result.scalar_one_or_none()
             if setting and setting.value.get("api_key"):
-                return setting.value["api_key"]
+                from app.services.system_setting_security import (
+                    decrypt_system_setting_value,
+                )
+
+                value = decrypt_system_setting_value("jina_api_key", setting.value)
+                return value.get("api_key", "")
     except Exception:
         pass
     from app.config import get_settings
@@ -9234,11 +9362,20 @@ async def _send_channel_message_outcome(
     if provider_type == "wecom":
         return await _send_wecom_message_outcome(agent_id, display_name, message_text, target_member)
     if provider_type == "slack":
-        return await _send_slack_message(agent_id, display_name, message_text, target_member)
+        return _typed_failure(
+            "Proactive Slack dispatch is not yet available through the durable tool runtime.",
+            "channel_provider_not_durable",
+        )
     if provider_type == "teams":
-        return await _send_teams_channel_message(agent_id, display_name, message_text, target_member)
+        return _typed_failure(
+            "Proactive Teams dispatch is not yet available through the durable tool runtime.",
+            "channel_provider_not_durable",
+        )
     if provider_type == "wechat":
-        return await _send_wechat_channel_message(agent_id, display_name, message_text, target_member)
+        return _typed_failure(
+            "Proactive WeChat dispatch is not yet available through the durable tool runtime.",
+            "channel_provider_not_durable",
+        )
     return _typed_failure(
         f"Unsupported channel type: {provider_type}",
         "channel_provider_unsupported",
@@ -19363,6 +19500,12 @@ async def _install_skill_outcome(
                     f"ClawHub Skill lookup failed: {type(e).__name__}.",
                     "skill_source_lookup_failed",
                 )
+            moderation = _meta.get("moderation") if isinstance(_meta, Mapping) else None
+            if isinstance(moderation, Mapping) and moderation.get("isSuspicious"):
+                return _typed_failure(
+                    "Skill installation blocked because ClawHub moderation flagged the package.",
+                    "skill_source_flagged_suspicious",
+                )
 
             # 2. Fetch files from the ClawHub archive
             files, _ = await _fetch_clawhub_skill_archive(slug, api_key=api_key, preferred_base=meta_base)
@@ -19374,42 +19517,42 @@ async def _install_skill_outcome(
 
             folder_name = slug
 
-        if (
-            not isinstance(folder_name, str)
-            or not folder_name.strip()
-            or Path(folder_name).name != folder_name
-            or folder_name in {".", ".."}
-        ):
+        from app.services.skill_workspace import (
+            SkillWorkspaceError,
+            normalize_skill_snapshot_files,
+            validate_skill_folder_name,
+        )
+
+        try:
+            folder_name = validate_skill_folder_name(folder_name)
+            normalized_files = normalize_skill_snapshot_files(files)
+        except SkillWorkspaceError as exc:
             return _typed_failure(
-                "Skill source resolved to an invalid folder name.",
+                str(exc),
                 "skill_package_invalid",
             )
-        if not any(isinstance(file, Mapping) and str(file.get("path") or "").upper() == "SKILL.MD" for file in files):
+
+        # The temporary workspace contains the current durable ``skills/``
+        # tree. Refuse to merge into an existing folder: otherwise an Agent
+        # could silently replace user-authored instructions or registry-managed
+        # files before the wrapper syncs the directory back to storage.
+        skill_dir = base / "skills" / folder_name
+        if skill_dir.exists():
             return _typed_failure(
-                "Skill package does not contain a root SKILL.md.",
-                "skill_package_invalid",
+                (
+                    f"Skill folder '{folder_name}' already exists. Rename or "
+                    "delete it explicitly before importing another package."
+                ),
+                "skill_folder_conflict",
             )
 
         # 3. Write files to the temporary Agent workspace. Durable sync is
         # performed only after this function returns a typed success.
-        skill_dir = base / "skills" / folder_name
         skill_dir.mkdir(parents=True, exist_ok=True)
         skill_root = skill_dir.resolve()
 
         written = []
-        for file in files:
-            if not isinstance(file, Mapping):
-                return _typed_failure(
-                    "Skill package contains an invalid file entry.",
-                    "skill_package_invalid",
-                )
-            rel_path = file.get("path")
-            content = file.get("content")
-            if not isinstance(rel_path, str) or not isinstance(content, str):
-                return _typed_failure(
-                    "Skill package contains an invalid file entry.",
-                    "skill_package_invalid",
-                )
+        for rel_path, content in normalized_files.items():
             file_path = (skill_root / rel_path).resolve()
             if not file_path.is_relative_to(skill_root):
                 return _typed_failure(
@@ -25294,26 +25437,14 @@ async def _code_tool_denial_reason(
     if not is_code_execution_tool(tool_name):
         return None
     tenant_id = await _get_agent_tenant_id(agent_id) if agent_id else None
+    settings = get_settings()
     denial = code_execution_denial_reason(
-        get_settings(),
+        settings,
         tenant_id,
         tool_name=tool_name,
     )
     if denial:
         return denial
-    if tool_name.startswith("agentbay_"):
-        # AgentBay does not currently expose a proven per-session egress-off
-        # control, so it remains unavailable in production even if somebody
-        # accidentally adds it to a tool allowlist.
-        denial = code_execution_denial_reason(
-            get_settings(),
-            tenant_id,
-            tool_name=tool_name,
-            sandbox_type="agentbay",
-            allow_network=False,
-        )
-        if denial:
-            return denial
     if agent_id is None:
         return "Code execution requires an Agent authorization"
 
@@ -25335,7 +25466,29 @@ async def _code_tool_denial_reason(
         )
         if assignment.scalar_one_or_none() is None:
             return "Code execution is not authorized for this Agent"
-    return None
+
+    environment = str(getattr(settings, "ENVIRONMENT", "development")).strip().lower()
+    if environment not in {"production", "prod"}:
+        return None
+
+    tool_config = await _get_tool_config(agent_id, tool_name) or {}
+    sandbox_type = tool_config.get("sandbox_type")
+    if tool_name.startswith("agentbay_"):
+        # AgentBay does not currently expose a proven per-session egress-off
+        # control, so it remains unavailable in production even if somebody
+        # accidentally adds it to a tool allowlist.
+        sandbox_type = "agentbay"
+        allow_network = False
+    else:
+        allow_network = tool_config.get("allow_network")
+    return code_execution_denial_reason(
+        settings,
+        tenant_id,
+        tool_name=tool_name,
+        sandbox_type=str(sandbox_type) if sandbox_type else None,
+        allow_network=allow_network,
+        api_url=tool_config.get("api_url"),
+    )
 
 
 def _explicit_media_workspace_paths(*values: object) -> list[str]:
@@ -25364,6 +25517,32 @@ class ApprovedToolExecutionOutcome:
     result: object | None = None
     error_code: str | None = None
     outcome_code: str | None = None
+
+
+def _approved_outcome_from_tool_outcome(
+    outcome: ToolExecutionOutcome,
+) -> ApprovedToolExecutionOutcome:
+    """Project a typed runtime fact into the approval worker contract."""
+
+    result = {
+        "summary": outcome.result_summary,
+        "result_ref": outcome.result_ref,
+        "artifact_refs": list(outcome.artifact_refs),
+        "evidence_refs": list(outcome.evidence_refs),
+    }
+    if outcome.status == "succeeded":
+        return ApprovedToolExecutionOutcome(status="succeeded", result=result)
+    if outcome.status == "unknown":
+        return ApprovedToolExecutionOutcome(
+            status="ambiguous",
+            result=result,
+            error_code=outcome.error_code or "ToolOutcomeUnknown",
+        )
+    return ApprovedToolExecutionOutcome(
+        status="failed",
+        result=result,
+        error_code=outcome.error_code or "ToolExecutionRejected",
+    )
 
 
 def _delivery_execution_result(
@@ -25460,6 +25639,93 @@ async def _execute_approved_tool(
         if not isinstance(outcome, ApprovedToolExecutionOutcome):
             raise RuntimeError("Agent file approval executor returned an invalid outcome")
         return outcome
+
+    if tool_name == "send_platform_message":
+        return _approved_outcome_from_tool_outcome(
+            await _send_platform_message_outcome(agent_id, arguments)
+        )
+    if tool_name == "send_channel_message":
+        outcome = await _send_channel_message_outcome(agent_id, arguments)
+        if not isinstance(outcome, ToolExecutionOutcome):
+            return ApprovedToolExecutionOutcome(
+                status="failed",
+                error_code="ChannelProviderNotDurable",
+            )
+        return _approved_outcome_from_tool_outcome(outcome)
+    if tool_name == "send_channel_file":
+        return _approved_outcome_from_tool_outcome(
+            await _send_channel_file_outcome(
+                agent_id,
+                _agent_workspace_root(agent_id),
+                arguments,
+            )
+        )
+    if tool_name in {"send_email", "reply_email"}:
+        return _approved_outcome_from_tool_outcome(
+            await _email_write_outcome(tool_name, agent_id, arguments)
+        )
+    if tool_name == "publish_page":
+        if user_id is None:
+            return ApprovedToolExecutionOutcome(
+                status="failed",
+                error_code="ApprovalUserMissing",
+            )
+        return _approved_outcome_from_tool_outcome(
+            await _publish_page_outcome(
+                agent_id,
+                user_id,
+                _agent_workspace_root(agent_id),
+                arguments,
+            )
+        )
+    if tool_name == "import_mcp_server":
+        return _approved_outcome_from_tool_outcome(
+            await _import_mcp_server_outcome(agent_id, arguments)
+        )
+    if tool_name == "install_skill":
+        tenant_id = await _get_agent_tenant_id(agent_id)
+        return _approved_outcome_from_tool_outcome(
+            await _run_with_temp_workspace_outcome(
+                agent_id,
+                tenant_id,
+                lambda temp_ws: _install_skill_outcome(
+                    agent_id,
+                    temp_ws,
+                    arguments,
+                ),
+                paths=["skills"],
+                sync_back=True,
+            )
+        )
+    if tool_name == "vercel_deploy":
+        return _approved_outcome_from_tool_outcome(
+            await _vercel_deploy_outcome(
+                agent_id,
+                _agent_workspace_root(agent_id),
+                arguments,
+            )
+        )
+    if tool_name in _DEPLOY_SIMPLE_WRITE_TOOL_NAMES:
+        return _approved_outcome_from_tool_outcome(
+            await _deploy_simple_write_outcome(tool_name, agent_id, arguments)
+        )
+    if tool_name == "set_trigger":
+        return _approved_outcome_from_tool_outcome(
+            await _handle_set_trigger_outcome(
+                agent_id,
+                arguments,
+                session_id=origin_session_id or "",
+                user_id=user_id,
+            )
+        )
+    if tool_name == "update_trigger":
+        return _approved_outcome_from_tool_outcome(
+            await _handle_update_trigger_outcome(agent_id, arguments)
+        )
+    if tool_name == "cancel_trigger":
+        return _approved_outcome_from_tool_outcome(
+            await _handle_cancel_trigger_outcome(agent_id, arguments)
+        )
 
     result = await _execute_tool_direct(
         tool_name,

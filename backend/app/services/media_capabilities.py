@@ -14,6 +14,7 @@ from app.services.entitlements import Entitlements
 from app.services.minimax_media_profiles import resolve_minimax_media_profile
 from app.services.llm.load_balancer import credential_modality_is_blocked
 from app.services.modalities import canonicalize_modalities
+from app.services.tool_visibility import tool_enabled_for_agent
 
 
 MEDIA_TOOL_NAMES: dict[str, str] = {
@@ -116,7 +117,7 @@ async def get_agent_media_capabilities(
     enabled_tools: set[str] = set()
     for tool in tools:
         assignment = assignments.get(tool.id)
-        enabled = bool(assignment.enabled) if assignment is not None else bool(tool.is_default)
+        enabled = tool_enabled_for_agent(tool, assignment)
         modality = next(
             (key for key, name in MEDIA_TOOL_NAMES.items() if name == tool.name),
             None,

@@ -5,8 +5,42 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.api import files
+from app.api import skills as skills_api
 from app.services.agent_manager import AgentManager
 from app.services.storage_runtime.base import StorageBackend, StorageEntry, StorageVersion
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    (
+        (
+            "https://github.com/acme/media-skills",
+            {"owner": "acme", "repo": "media-skills", "branch": "main", "path": ""},
+        ),
+        (
+            "https://github.com/acme/media-skills/tree/release/poster",
+            {"owner": "acme", "repo": "media-skills", "branch": "release", "path": "poster"},
+        ),
+    ),
+)
+def test_github_skill_url_parser_returns_canonical_identity(url, expected):
+    assert skills_api._parse_github_url(url) == expected
+
+
+@pytest.mark.parametrize(
+    "url",
+    (
+        "https://token@github.com/acme/media-skills",
+        "https://github.com/acme/media-skills?token=secret",
+        "https://github.com/acme/media-skills#private",
+        "https://github.com.evil.example/acme/media-skills",
+        "https://github.com:invalid/acme/media-skills",
+        "https://github.com/acme/media-skills/blob/main/SKILL.md",
+        "https://github.com/acme%2Fother/media-skills",
+    ),
+)
+def test_github_skill_url_parser_rejects_noncanonical_or_secret_bearing_urls(url):
+    assert skills_api._parse_github_url(url) is None
 
 
 class PrefixOnlyStorage(StorageBackend):
@@ -72,6 +106,96 @@ class PrefixOnlyStorage(StorageBackend):
             etag=token,
             content_hash=token,
         )
+
+
+@pytest.mark.asyncio
+async def test_external_skill_snapshot_uses_storage_and_never_overwrites(monkeypatch):
+    agent_id = uuid.uuid4()
+    storage = PrefixOnlyStorage()
+    monkeypatch.setattr(files, "get_storage_backend", lambda: storage)
+
+    result = await files._write_external_skill_snapshot(
+        agent_id=agent_id,
+        folder_name="campaign-copy",
+        files=[
+            {"path": "skill.md", "content": "# Campaign Copy\n"},
+            {"path": "references/guide.md", "content": "guide"},
+        ],
+        source="https://github.com/example/skills",
+    )
+
+    assert result["files"] == ["SKILL.md", "references/guide.md"]
+    assert storage.objects[f"{agent_id}/skills/campaign-copy/SKILL.md"] == b"# Campaign Copy\n"
+    assert f"{agent_id}/skills/campaign-copy/.astra-import.json" in storage.objects
+
+    with pytest.raises(files.HTTPException) as exc:
+        await files._write_external_skill_snapshot(
+            agent_id=agent_id,
+            folder_name="campaign-copy",
+            files=[{"path": "SKILL.md", "content": "replacement"}],
+            source="https://github.com/example/replacement",
+        )
+
+    assert exc.value.status_code == 409
+    assert storage.objects[f"{agent_id}/skills/campaign-copy/SKILL.md"] == b"# Campaign Copy\n"
+
+
+@pytest.mark.asyncio
+async def test_external_skill_snapshot_rejects_invalid_package(monkeypatch):
+    monkeypatch.setattr(files, "get_storage_backend", lambda: PrefixOnlyStorage())
+
+    with pytest.raises(files.HTTPException) as exc:
+        await files._write_external_skill_snapshot(
+            agent_id=uuid.uuid4(),
+            folder_name="unsafe",
+            files=[{"path": "../SKILL.md", "content": "bad"}],
+            source="test",
+        )
+
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_agent_clawhub_import_blocks_moderated_package_before_archive(
+    monkeypatch,
+):
+    agent_id = uuid.uuid4()
+    user = SimpleNamespace(tenant_id=uuid.uuid4())
+    archive = AsyncMock()
+
+    async def allow_access(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(files, "check_agent_access", allow_access)
+    monkeypatch.setattr(skills_api, "_get_clawhub_key", AsyncMock(return_value=""))
+    monkeypatch.setattr(
+        skills_api,
+        "_fetch_clawhub_skill_meta",
+        AsyncMock(
+            return_value=(
+                {
+                    "skill": {"displayName": "Unsafe"},
+                    "moderation": {
+                        "isSuspicious": True,
+                        "summary": "unsafe package",
+                    },
+                },
+                "https://clawhub.ai/api",
+            )
+        ),
+    )
+    monkeypatch.setattr(skills_api, "_fetch_clawhub_skill_archive", archive)
+
+    with pytest.raises(files.HTTPException) as exc:
+        await files.agent_import_from_clawhub(
+            agent_id=agent_id,
+            body=files.ClawhubImportBody(slug="unsafe"),
+            current_user=user,
+            db=object(),
+        )
+
+    assert exc.value.status_code == 422
+    archive.assert_not_awaited()
 
 
 def test_file_kind_recognizes_browser_playable_media():
@@ -176,6 +300,50 @@ async def test_list_files_reports_recursive_directory_total_size(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_skill_management_metadata_is_hidden_and_not_user_editable(monkeypatch):
+    agent_id = uuid.uuid4()
+    storage = PrefixOnlyStorage({
+        f"{agent_id}/skills/web-research/SKILL.md": b"skill-body",
+        f"{agent_id}/skills/web-research/.astra-managed.json": b"{}",
+        f"{agent_id}/skills/web-research/.astra-import.json": b"{}",
+    })
+    monkeypatch.setattr(files, "get_storage_backend", lambda: storage)
+
+    async def allow_access(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(files, "check_agent_access", allow_access)
+    user = SimpleNamespace(tenant_id=None)
+
+    listed = await files.list_files(
+        agent_id,
+        path="skills/web-research",
+        current_user=user,
+        db=None,
+    )
+
+    assert [entry.name for entry in listed] == ["SKILL.md"]
+    with pytest.raises(files.HTTPException) as read_exc:
+        await files.read_file(
+            agent_id,
+            path="skills/web-research/.astra-managed.json",
+            current_user=user,
+            db=None,
+        )
+    assert read_exc.value.status_code == 404
+
+    with pytest.raises(files.HTTPException) as write_exc:
+        await files.write_file(
+            agent_id,
+            path="skills/web-research/.astra-managed.json",
+            data=files.FileWrite(content="tampered"),
+            current_user=user,
+            db=None,
+        )
+    assert write_exc.value.status_code == 403
+
+
+@pytest.mark.asyncio
 async def test_read_file_returns_version_token(monkeypatch):
     agent_id = uuid.uuid4()
     storage = PrefixOnlyStorage({f"{agent_id}/workspace/note.md": b"# Note\n"})
@@ -271,6 +439,42 @@ async def test_agent_manager_repairs_partial_s3_prefix_without_overwriting(monke
 
     assert storage.objects[f"{agent_id}/soul.md"] == b"existing"
     assert storage.objects[f"{agent_id}/instructions.md"] == b"# Instructions\n"
+
+
+@pytest.mark.asyncio
+async def test_agent_manager_does_not_copy_registry_skill_sources_to_every_agent(
+    monkeypatch,
+    tmp_path,
+):
+    agent_id = uuid.uuid4()
+    storage = PrefixOnlyStorage()
+    template_dir = tmp_path / "templates"
+    (template_dir / "skills/brand-safe-media").mkdir(parents=True)
+    (template_dir / "skills/.gitkeep").write_text("", encoding="utf-8")
+    (template_dir / "skills/brand-safe-media/SKILL.md").write_text(
+        "role-scoped",
+        encoding="utf-8",
+    )
+    (template_dir / "soul.md").write_text("# Soul", encoding="utf-8")
+    monkeypatch.setattr("app.services.agent_manager.get_storage_backend", lambda: storage)
+    monkeypatch.setattr("app.services.agent_manager.settings.STORAGE_LOCAL_ROOT", str(tmp_path))
+    monkeypatch.setattr("app.services.agent_manager.settings.AGENT_TEMPLATE_DIR", str(template_dir))
+
+    agent = SimpleNamespace(
+        id=agent_id,
+        creator_id=uuid.uuid4(),
+        name="General Agent",
+        role_description="",
+        template_id=None,
+    )
+    db = SimpleNamespace(
+        execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: None)),
+    )
+
+    await AgentManager().initialize_agent_files(db, agent)
+
+    assert f"{agent_id}/skills/.gitkeep" in storage.objects
+    assert f"{agent_id}/skills/brand-safe-media/SKILL.md" not in storage.objects
 
 
 @pytest.mark.asyncio
