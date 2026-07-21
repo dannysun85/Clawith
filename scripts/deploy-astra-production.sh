@@ -104,6 +104,7 @@ require_cmd docker
 require_cmd createdb
 require_cmd dropdb
 require_cmd psql
+require_cmd curl
 assert_smoke_credentials_not_exported
 
 if [ "$RUN_LOCAL_CHECKS" != "1" ]; then
@@ -437,7 +438,13 @@ ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
     "$SMOKE_ENV_REMOTE" "$DRAIN_TIMEOUT_SECONDS" \
     "$REMOTE_SMOKE_BREAK_GLASS_DIGEST" "$BREAK_GLASS_FILE_REMOTE" \
     "$RELEASE_BASE_COMMIT" "$REMOTE_SMOKE_BREAK_GLASS_NONCE_HASH" \
-    "$PACKAGE_SHA256" "$REMOTE_SMOKE_CREDENTIAL_DIGEST" <<'REMOTE_SCRIPT'
+    "$PACKAGE_SHA256" "$REMOTE_SMOKE_CREDENTIAL_DIGEST" <<'REMOTE_LOADER'
+{ set +x; } 2>/dev/null
+set -euo pipefail
+umask 077
+REMOTE_SCRIPT_FILE="$(mktemp /tmp/.astra-production-deploy.XXXXXX)"
+trap 'rm -f "$REMOTE_SCRIPT_FILE"' EXIT
+cat > "$REMOTE_SCRIPT_FILE" <<'REMOTE_SCRIPT'
 { set +x; } 2>/dev/null
 set -euo pipefail
 
@@ -802,7 +809,7 @@ ensure_browser_smoke_image() {
         --network "$BROWSER_SMOKE_NETWORK" \
         --entrypoint node \
         "$image" \
-        /opt/astra-browser-smoke/browser_launch_selftest.mjs; then
+        /opt/astra-browser-smoke/browser_launch_selftest.mjs < /dev/null; then
         cleanup_browser_smoke_runtime 0
         trap - HUP INT TERM
         return 1
@@ -843,7 +850,8 @@ run_alert_canary_preflight() {
         "$target_project" "$target_release/.env" "$target_release/$COMPOSE_FILE" \
         run --rm --no-deps -T --entrypoint python backend \
         -m app.scripts.verify_production_issue_alerts \
-        --release-id "$target_release_id" --preflight-only > "$output"; then
+        --release-id "$target_release_id" --preflight-only \
+        > "$output" < /dev/null; then
         rm -f "$output"
         return 1
     fi
@@ -993,7 +1001,7 @@ run_candidate_alert_canary() {
         run --rm --no-deps -T --entrypoint python backend \
         -m app.scripts.verify_production_issue_alerts \
         --release-id "$target_release_id" --timeout-seconds 180 \
-        > "$raw_output"; then
+        > "$raw_output" < /dev/null; then
         rm -f "$raw_output" "$output"
         return 1
     fi
@@ -1367,7 +1375,7 @@ PY_BROWSER_CREDENTIALS
         --expected-commit "$target_commit" \
         --expected-release-id "$target_release_id" \
         --evidence-nonce "$evidence_nonce" \
-        > "$api_evidence"; then
+        > "$api_evidence" < /dev/null; then
         cleanup_browser_smoke_runtime
         return 1
     fi
@@ -1417,7 +1425,7 @@ PY_BROWSER_CREDENTIALS
         --expected-commit "$target_commit" \
         --expected-release-id "$target_release_id" \
         --evidence-nonce "$evidence_nonce" \
-        > "$ui_evidence"; then
+        > "$ui_evidence" < /dev/null; then
         cleanup_browser_smoke_runtime
         return 1
     fi
@@ -1910,7 +1918,8 @@ approval_schema_forward_state() {
             "$COMPOSE_PROJECT" "$release/.env" "$release/$COMPOSE_FILE" \
             exec -T postgres psql -qAt -v ON_ERROR_STOP=1 \
             -U "$postgres_user" -d "$postgres_db" \
-            -c "SELECT count(*) FROM pg_constraint WHERE conname = 'ck_approval_execution_state_consistency' AND conrelid = 'approval_requests'::regclass;"
+            -c "SELECT count(*) FROM pg_constraint WHERE conname = 'ck_approval_execution_state_consistency' AND conrelid = 'approval_requests'::regclass;" \
+            < /dev/null
     )" || return 1
     case "$result" in
         0|1) printf '%s' "$result" ;;
@@ -1931,7 +1940,8 @@ agentbay_cleanup_required_count() {
             "$COMPOSE_PROJECT" "$release/.env" "$release/$COMPOSE_FILE" \
             exec -T postgres psql -qAt -v ON_ERROR_STOP=1 \
             -U "$postgres_user" -d "$postgres_db" \
-            -c "SELECT count(*) FROM agentbay_session_ledger WHERE status = 'cleanup_required';"
+            -c "SELECT count(*) FROM agentbay_session_ledger WHERE status = 'cleanup_required';" \
+            < /dev/null
     )" || return 1
     case "$result" in
         ''|*[!0-9]*) return 1 ;;
@@ -1952,7 +1962,8 @@ agentbay_unresolved_count() {
             "$COMPOSE_PROJECT" "$release/.env" "$release/$COMPOSE_FILE" \
             exec -T postgres psql -qAt -v ON_ERROR_STOP=1 \
             -U "$postgres_user" -d "$postgres_db" \
-            -c "SELECT count(*) FROM agentbay_session_ledger WHERE status IN ('active', 'cleanup_required', 'provider_identity_collision');"
+            -c "SELECT count(*) FROM agentbay_session_ledger WHERE status IN ('active', 'cleanup_required', 'provider_identity_collision');" \
+            < /dev/null
     )" || return 1
     case "$result" in
         ''|*[!0-9]*) return 1 ;;
@@ -1985,7 +1996,8 @@ identity_provider_config_storage_type() {
                 FROM information_schema.columns
                 WHERE table_schema = 'public'
                   AND table_name = 'identity_providers'
-                  AND column_name = 'config';"
+                  AND column_name = 'config';" \
+            < /dev/null
     )" || return 1
     case "$result" in
         json|jsonb|text|'character varying') printf '%s' "$result" ;;
@@ -2225,7 +2237,7 @@ SELECT json_build_object(
         SELECT count(*) FROM identities WHERE password_hash IS NOT NULL
     ) - (SELECT value FROM password_candidates)
 )::text;
-" > "$raw_path"; then
+" > "$raw_path" < /dev/null; then
         rm -f "$raw_path"
         return 1
     fi
@@ -4821,7 +4833,7 @@ if ! compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FIL
     run --rm --no-deps -T --entrypoint python backend \
     -m app.scripts.inventory_legacy_media_reservations \
     --fail-on-blocking \
-    > "$BACKUP/media-credit-inventory.pre-migration.json"; then
+    > "$BACKUP/media-credit-inventory.pre-migration.json" < /dev/null; then
     chmod 0600 "$BACKUP/media-credit-inventory.pre-migration.json" || true
     abort_release "media Credits inventory found a blocking pre-migration inconsistency"
 fi
@@ -4849,7 +4861,7 @@ if ! compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FIL
     run --rm --no-deps -T --entrypoint python backend \
     -m app.scripts.inventory_legacy_media_reservations \
     --fail-on-blocking --require-no-legacy \
-    > "$BACKUP/media-credit-inventory.post-migration.json"; then
+    > "$BACKUP/media-credit-inventory.post-migration.json" < /dev/null; then
     chmod 0600 "$BACKUP/media-credit-inventory.post-migration.json" || true
     abort_release "media Credits inventory is not canonical after migration"
 fi
@@ -5040,5 +5052,46 @@ sudo find /var/log/nginx -maxdepth 1 -type f -name 'access.log.*' -exec chmod 60
 rm -f "$PACKAGE" "$SMOKE_ENV_FILE"
 echo "[remote] release $RELEASE_ID deployed on slot $CANDIDATE_SLOT"
 REMOTE_SCRIPT
+
+env -u BASH_ENV -u BASHOPTS -u SHELLOPTS \
+    bash "$REMOTE_SCRIPT_FILE" "$@" < /dev/null
+REMOTE_LOADER
+
+echo "[verify] independently checking public release identity"
+PUBLIC_RELEASE_VERIFIED=0
+for _ in $(seq 1 30); do
+    PUBLIC_HEALTH_PAYLOAD="$(
+        curl -fsS -H 'Cache-Control: no-cache' \
+            "$PUBLIC_URL/api/health?release=$RELEASE_ID" || true
+    )"
+    PUBLIC_VERSION_PAYLOAD="$(
+        curl -fsS -H 'Cache-Control: no-cache' \
+            "$PUBLIC_URL/api/version?release=$RELEASE_ID" || true
+    )"
+    if python3 - \
+        "$PUBLIC_HEALTH_PAYLOAD" "$PUBLIC_VERSION_PAYLOAD" \
+        "$VERSION" "$COMMIT" 2>/dev/null <<'PY_PUBLIC_RELEASE_VERIFY'
+import json
+import sys
+
+health = json.loads(sys.argv[1])
+version = json.loads(sys.argv[2])
+expected_version = sys.argv[3]
+expected_commit = sys.argv[4]
+if health.get("status") != "ok" or health.get("version") != expected_version:
+    raise SystemExit(1)
+if version.get("version") != expected_version or version.get("commit") != expected_commit:
+    raise SystemExit(1)
+PY_PUBLIC_RELEASE_VERIFY
+    then
+        PUBLIC_RELEASE_VERIFIED=1
+        break
+    fi
+    sleep 1
+done
+if [ "$PUBLIC_RELEASE_VERIFIED" != "1" ]; then
+    echo "public release identity does not match the sealed artifact" >&2
+    exit 1
+fi
 
 echo "[done] deployed $RELEASE_ID to $PUBLIC_URL"

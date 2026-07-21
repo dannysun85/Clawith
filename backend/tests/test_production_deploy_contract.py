@@ -352,7 +352,10 @@ def test_production_identity_preflight_runs_before_maintenance_and_redacts_value
     assert 'git archive --format=tar --output="$PACKAGE_TAR" "$COMMIT"' in script
     assert 'git get-tar-commit-id < "$PACKAGE_TAR"' in script
     assert 'gzip -n -c "$PACKAGE_TAR" > "$PACKAGE"' in script
-    assert ('"$PACKAGE_SHA256" "$REMOTE_SMOKE_CREDENTIAL_DIGEST" <<\'REMOTE_SCRIPT\'') in script
+    assert ('"$PACKAGE_SHA256" "$REMOTE_SMOKE_CREDENTIAL_DIGEST" <<\'REMOTE_LOADER\'') in script
+    assert 'cat > "$REMOTE_SCRIPT_FILE" <<\'REMOTE_SCRIPT\'' in script
+    assert 'bash "$REMOTE_SCRIPT_FILE" "$@" < /dev/null' in script
+    assert '" > "$raw_path" < /dev/null; then' in function
     assert "release package digest mismatch" in script
     assert 'write_atomic_line "$RELEASE/PACKAGE_SHA256" "$PACKAGE_SHA256"' in script
     assert (
@@ -1015,6 +1018,37 @@ def test_remote_worker_identity_is_allowlisted_and_xtrace_safe(tmp_path):
         timeout=10,
     )
     assert duplicated.returncode != 0
+
+
+def test_remote_deploy_buffers_script_and_rechecks_public_release_identity():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+
+    loader_start = script.index("<<'REMOTE_LOADER'\n")
+    buffered_script_start = script.index(
+        'cat > "$REMOTE_SCRIPT_FILE" <<\'REMOTE_SCRIPT\'\n',
+        loader_start,
+    )
+    buffered_script_end = script.index("\nREMOTE_SCRIPT\n", buffered_script_start)
+    loader_end = script.index("\nREMOTE_LOADER\n", buffered_script_end)
+    public_verify = script.index(
+        'echo "[verify] independently checking public release identity"',
+        loader_end,
+    )
+    done = script.index('echo "[done] deployed $RELEASE_ID to $PUBLIC_URL"')
+
+    loader = script[loader_start:loader_end]
+    assert "set -euo pipefail" in loader
+    assert "umask 077" in loader
+    assert 'mktemp /tmp/.astra-production-deploy.XXXXXX' in loader
+    assert 'trap \'rm -f "$REMOTE_SCRIPT_FILE"\' EXIT' in loader
+    assert 'bash "$REMOTE_SCRIPT_FILE" "$@" < /dev/null' in loader
+    assert loader_start < buffered_script_start < buffered_script_end < loader_end
+    assert loader_end < public_verify < done
+    assert "require_cmd curl" in script
+    assert '"$PUBLIC_URL/api/health?release=$RELEASE_ID"' in script
+    assert '"$PUBLIC_URL/api/version?release=$RELEASE_ID"' in script
+    assert 'version.get("commit") != expected_commit' in script
+    assert 'public release identity does not match the sealed artifact' in script
 
 
 def test_remote_smoke_credential_writer_is_exclusive_and_symlink_safe(tmp_path):
