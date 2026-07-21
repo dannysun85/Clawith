@@ -2748,6 +2748,11 @@ WITH expected(tier, modality, route_id, model_id) AS (
        OR model.enabled IS NOT TRUE
        OR model.tenant_id IS NOT NULL
        OR model.supports_vision IS NOT TRUE
+       OR model.supports_tool_calling IS NOT TRUE
+       OR model.tool_calling_capability_source IS NULL
+       OR model.tool_calling_capability_source NOT IN ('probe', 'builtin_registry')
+       OR model.tool_calling_checked_at IS NULL
+       OR model.tool_calling_error IS NOT NULL
        OR NOT (model.modalities::jsonb @> '["text","image","video"]'::jsonb)
 )
 SELECT COUNT(*) FROM invalid;

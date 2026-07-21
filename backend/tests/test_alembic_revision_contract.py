@@ -23,17 +23,19 @@ def test_revision_ids_fit_the_default_alembic_version_column() -> None:
 
 
 def test_release_migration_graph_has_one_expected_head() -> None:
-    assert _script_directory().get_heads() == ["agent_template_default_tools"]
+    assert _script_directory().get_heads() == ["reconcile_m3_runtime_caps"]
 
 
 def test_release_head_preserves_both_upgrade_lineages() -> None:
     script = _script_directory()
-    release_head = script.get_revision("agent_template_default_tools")
+    release_head = script.get_revision("reconcile_m3_runtime_caps")
+    template_tools_revision = script.get_revision("agent_template_default_tools")
     deliverable_revision = script.get_revision("add_deliverable_workbench")
     task_status_revision = script.get_revision("align_task_failed_status")
     merge_revision = script.get_revision("merge_v111_astra_heads")
 
-    assert release_head._normalized_down_revisions == ("add_deliverable_workbench",)
+    assert release_head._normalized_down_revisions == ("agent_template_default_tools",)
+    assert template_tools_revision._normalized_down_revisions == ("add_deliverable_workbench",)
     assert deliverable_revision._normalized_down_revisions == ("align_task_failed_status",)
     assert task_status_revision._normalized_down_revisions == ("merge_v111_astra_heads",)
 
@@ -48,7 +50,7 @@ def test_postgres_migration_smoke_targets_the_release_head() -> None:
         encoding="utf-8"
     )
 
-    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-agent_template_default_tools' in smoke
+    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-reconcile_m3_runtime_caps' in smoke
 
 
 def test_sso_password_migration_is_fail_closed_and_non_destructive() -> None:

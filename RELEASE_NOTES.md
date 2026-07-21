@@ -1,3 +1,20 @@
+# v1.11.3 — MiniMax-M3 Durable Runtime Intake Hotfix
+
+## Durable Runtime Model Capability Repair
+
+- Reconciled the three revision-owned MiniMax-M3 Lite, Pro, and Ultra catalog
+  rows with verified tool-calling metadata. Production databases whose M3 seed
+  migration ran after the legacy capability backfill no longer leave those
+  rows as `supports_tool_calling = NULL`, so Durable Runtime can accept video,
+  image, and text chat messages instead of returning
+  `Warning: Message could not be accepted by the durable Runtime.`
+- The repair is fail-closed and ownership-bounded: it targets only the three
+  deterministic seed IDs, accepts only untouched or already-verified metadata,
+  and refuses contradictory probe or administrator state.
+- Production deployment now rejects an M3 route unless its tool-calling result,
+  evidence source, check timestamp, and error state are coherent. PostgreSQL
+  migration smoke coverage enforces the same Runtime readiness contract.
+
 # v1.11.2 — Verified Presentation Delivery and Tenant-Safe Sessions
 
 ## Production Egress Guard Binding Hardening

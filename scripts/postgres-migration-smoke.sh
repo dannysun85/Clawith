@@ -7,7 +7,7 @@ fresh_db_name="${db_name}_fresh"
 db_user="${PGUSER:-$USER}"
 db_host="${PGHOST:-127.0.0.1}"
 db_port="${PGPORT:-5432}"
-release_head="${MIGRATION_SMOKE_EXPECTED_HEAD:-agent_template_default_tools}"
+release_head="${MIGRATION_SMOKE_EXPECTED_HEAD:-reconcile_m3_runtime_caps}"
 
 assert_at_release_head() {
   .venv/bin/alembic current | grep -F "${release_head} (head)"
@@ -1087,6 +1087,139 @@ SQL
 assert_at_release_head
 assert_sso_password_security
 
+# The M3 Runtime repair must own only the exact NULL metadata it writes. A
+# newer probe must survive a one-step downgrade, while contradictory evidence
+# must block a later upgrade instead of being overwritten. First reproduce the
+# production branch order: the legacy capability backfill has already run, then
+# M3 rows arrive with all four Runtime capability fields still NULL.
+.venv/bin/alembic downgrade agent_template_default_tools
+psql --host "$db_host" --port "$db_port" --username "$db_user" \
+  --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+UPDATE llm_models
+SET supports_tool_calling = NULL,
+    tool_calling_capability_source = NULL,
+    tool_calling_checked_at = NULL,
+    tool_calling_error = NULL
+WHERE id IN (
+  '09300000-0000-4000-8000-000000000001',
+  '09300000-0000-4000-8000-000000000002',
+  '09300000-0000-4000-8000-000000000003'
+);
+SQL
+.venv/bin/alembic upgrade head
+assert_at_release_head
+psql --host "$db_host" --port "$db_port" --username "$db_user" \
+  --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+DO $$
+BEGIN
+  IF (
+    SELECT count(*)
+    FROM llm_models
+    WHERE id IN (
+      '09300000-0000-4000-8000-000000000001',
+      '09300000-0000-4000-8000-000000000002',
+      '09300000-0000-4000-8000-000000000003'
+    )
+      AND supports_tool_calling = true
+      AND tool_calling_capability_source = 'builtin_registry'
+      AND tool_calling_checked_at IS NOT NULL
+      AND tool_calling_error IS NULL
+      AND capabilities::jsonb ? '__reconcile_m3_runtime_caps_applied_at'
+  ) <> 3 THEN
+    RAISE EXCEPTION 'M3 Runtime repair did not mark exactly three owned rows';
+  END IF;
+END $$;
+
+UPDATE llm_models
+SET tool_calling_capability_source = 'probe',
+    tool_calling_checked_at = clock_timestamp()
+WHERE id = '09300000-0000-4000-8000-000000000001';
+SQL
+.venv/bin/alembic downgrade agent_template_default_tools
+.venv/bin/alembic current | grep -F "agent_template_default_tools"
+psql --host "$db_host" --port "$db_port" --username "$db_user" \
+  --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM llm_models
+    WHERE id = '09300000-0000-4000-8000-000000000001'
+      AND supports_tool_calling = true
+      AND tool_calling_capability_source = 'probe'
+      AND tool_calling_checked_at IS NOT NULL
+      AND tool_calling_error IS NULL
+      AND NOT (capabilities::jsonb ? '__reconcile_m3_runtime_caps_applied_at')
+  ) OR (
+    SELECT count(*)
+    FROM llm_models
+    WHERE id IN (
+      '09300000-0000-4000-8000-000000000002',
+      '09300000-0000-4000-8000-000000000003'
+    )
+      AND supports_tool_calling IS NULL
+      AND tool_calling_capability_source IS NULL
+      AND tool_calling_checked_at IS NULL
+      AND tool_calling_error IS NULL
+      AND NOT (capabilities::jsonb ? '__reconcile_m3_runtime_caps_applied_at')
+  ) <> 2 THEN
+    RAISE EXCEPTION 'M3 Runtime repair downgrade overwrote newer probe evidence';
+  END IF;
+END $$;
+
+UPDATE llm_models
+SET supports_tool_calling = NULL,
+    tool_calling_capability_source = NULL,
+    tool_calling_checked_at = NULL,
+    tool_calling_error = NULL
+WHERE id IN (
+  '09300000-0000-4000-8000-000000000001',
+  '09300000-0000-4000-8000-000000000002',
+  '09300000-0000-4000-8000-000000000003'
+);
+SQL
+.venv/bin/alembic upgrade head
+assert_at_release_head
+.venv/bin/alembic downgrade agent_template_default_tools
+psql --host "$db_host" --port "$db_port" --username "$db_user" \
+  --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+UPDATE llm_models
+SET supports_tool_calling = false,
+    tool_calling_capability_source = 'probe',
+    tool_calling_checked_at = clock_timestamp(),
+    tool_calling_error = NULL
+WHERE id = '09300000-0000-4000-8000-000000000001';
+SQL
+set +e
+contradictory_m3_upgrade_output="$(.venv/bin/alembic upgrade head 2>&1)"
+contradictory_m3_upgrade_status=$?
+set -e
+if [ "$contradictory_m3_upgrade_status" -eq 0 ]; then
+  echo "M3 Runtime repair accepted contradictory probe evidence" >&2
+  exit 1
+fi
+case "$contradictory_m3_upgrade_output" in
+  *'Refusing MiniMax-M3 Runtime capability repair:'*) ;;
+  *)
+    echo "M3 Runtime repair did not report its sanitized ownership blocker" >&2
+    printf '%s\n' "$contradictory_m3_upgrade_output" >&2
+    exit 1
+    ;;
+esac
+unset contradictory_m3_upgrade_output contradictory_m3_upgrade_status
+.venv/bin/alembic current | grep -F "agent_template_default_tools"
+psql --host "$db_host" --port "$db_port" --username "$db_user" \
+  --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+UPDATE llm_models
+SET supports_tool_calling = NULL,
+    tool_calling_capability_source = NULL,
+    tool_calling_checked_at = NULL,
+    tool_calling_error = NULL
+WHERE id = '09300000-0000-4000-8000-000000000001';
+SQL
+.venv/bin/alembic upgrade head
+assert_at_release_head
+
 # Historical rows can contain a username that shadows another Identity's
 # email. The runtime must resolve the ownership-bearing email deterministically
 # instead of raising MultipleResultsFound or authenticating the alias owner.
@@ -1867,8 +2000,12 @@ BEGIN
       AND lm.model = 'MiniMax-M3'
       AND lm.supports_vision = true
       AND lm.modalities::jsonb @> '["text","image","video"]'::jsonb
+      AND lm.supports_tool_calling = true
+      AND lm.tool_calling_capability_source IN ('probe', 'builtin_registry')
+      AND lm.tool_calling_checked_at IS NOT NULL
+      AND lm.tool_calling_error IS NULL
   ) <> 9 THEN
-    RAISE EXCEPTION 'MiniMax-M3 text/image/video understanding routes were not seeded';
+    RAISE EXCEPTION 'MiniMax-M3 understanding routes lack verified Runtime tool-calling capability';
   END IF;
   IF (
     SELECT count(*) FROM pg_indexes

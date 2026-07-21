@@ -405,6 +405,21 @@ def test_production_model_route_gate_rejects_invalid_platform_models():
     assert "'[\"vision\"]'::jsonb" in preflight
 
 
+def test_m3_post_migration_gate_requires_verified_runtime_tool_calling():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    postflight = _shell_function_source(
+        script,
+        "m3_route_post_migration_preflight",
+        "quarantine_mcp_for_unsafe_release",
+    )
+
+    assert "model.supports_tool_calling IS NOT TRUE" in postflight
+    assert "model.tool_calling_capability_source IS NULL" in postflight
+    assert "model.tool_calling_capability_source NOT IN ('probe', 'builtin_registry')" in postflight
+    assert "model.tool_calling_checked_at IS NULL" in postflight
+    assert "model.tool_calling_error IS NOT NULL" in postflight
+
+
 def test_remote_product_smoke_is_required_unless_break_glass_is_audited():
     script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
     consumer_path = ROOT / "scripts/consume_break_glass_approval.py"
