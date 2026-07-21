@@ -579,10 +579,21 @@ def upgrade() -> None:
                    session.last_message_at
             FROM trigger_executions AS execution
             JOIN chat_messages AS source_message
-              ON source_message.id::text =
-                    execution.payload ->> '_source_message_id'
+              ON source_message.id = CASE
+                  WHEN COALESCE(
+                      execution.payload ->> '_source_message_id', ''
+                  ) ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                  THEN (execution.payload ->> '_source_message_id')::uuid
+                  ELSE NULL
+              END
             JOIN chat_sessions AS session
-              ON session.id::text = execution.payload ->> '_a2a_session_id'
+              ON session.id = CASE
+                  WHEN COALESCE(
+                      execution.payload ->> '_a2a_session_id', ''
+                  ) ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                  THEN (execution.payload ->> '_a2a_session_id')::uuid
+                  ELSE NULL
+              END
              AND source_message.conversation_id = session.id::text
             WHERE execution.source = 'a2a'
               AND source_message.user_id IS NOT NULL
@@ -630,16 +641,33 @@ def upgrade() -> None:
     )
 
     # Route every durable object with an explicit user to that user's lane
-    # before the remaining duplicate sessions are consolidated.
+    # before the remaining duplicate sessions are consolidated. Materialize
+    # this lookup once: production can contain tens of thousands of sessions,
+    # and rebuilding the DISTINCT ON relation for every UPDATE makes the
+    # migration runtime scale with the number of reference types.
+    op.execute(
+        """
+        CREATE TEMP TABLE _a2a_owner_sessions ON COMMIT DROP AS
+        SELECT DISTINCT ON (agent_id, peer_agent_id, user_id)
+            id, agent_id, peer_agent_id, user_id
+        FROM chat_sessions
+        WHERE source_channel = 'agent'
+          AND peer_agent_id IS NOT NULL
+        ORDER BY agent_id, peer_agent_id, user_id,
+                 created_at NULLS LAST, id
+        """
+    )
+    op.execute(
+        """
+        CREATE UNIQUE INDEX _a2a_owner_sessions_lookup_idx
+        ON _a2a_owner_sessions (agent_id, peer_agent_id, user_id)
+        """
+    )
+    op.execute("ANALYZE _a2a_owner_sessions")
     owner_session_cte = """
         WITH owner_sessions AS (
-            SELECT DISTINCT ON (agent_id, peer_agent_id, user_id)
-                id, agent_id, peer_agent_id, user_id
-            FROM chat_sessions
-            WHERE source_channel = 'agent'
-              AND peer_agent_id IS NOT NULL
-            ORDER BY agent_id, peer_agent_id, user_id,
-                     created_at NULLS LAST, id
+            SELECT id, agent_id, peer_agent_id, user_id
+            FROM _a2a_owner_sessions
         )
     """
     op.execute(
@@ -761,35 +789,71 @@ def upgrade() -> None:
               AND owner.peer_agent_id = source.peer_agent_id
             """
         )
-    for key in (
-        "_a2a_session_id",
-        "_origin_session_id",
-        "_matched_conversation_id",
-    ):
-        op.execute(
-            owner_session_cte
-            + f"""
-            UPDATE trigger_executions AS execution
-            SET payload = jsonb_set(
-                execution.payload,
-                '{{{key}}}',
-                to_jsonb(owner.id::text),
-                false
-            )
-            FROM chat_messages AS source_message,
-                 chat_sessions AS source,
-                 owner_sessions AS owner
-            WHERE execution.source = 'a2a'
-              AND execution.payload ->> '_source_message_id' =
-                    source_message.id::text
-              AND execution.payload ->> '{key}' = source.id::text
-              AND source.source_channel = 'agent'
-              AND source.peer_agent_id IS NOT NULL
-              AND owner.agent_id = source.agent_id
-              AND owner.peer_agent_id = source.peer_agent_id
-              AND owner.user_id = source_message.user_id
-            """
-        )
+    # Some historical A2A executions predate _origin_user_id. Recover their
+    # owner from the source message, but keep both joins indexable by casting
+    # validated payload UUIDs to the primary-key type. Comparing UUID columns
+    # as text forced full scans on production's chat_messages table. Build all
+    # three payload-key changes in one pass so each execution is updated once.
+    op.execute(
+        """
+        CREATE TEMP TABLE _a2a_source_message_payload_patches
+        ON COMMIT DROP AS
+        SELECT execution.id AS execution_id,
+               jsonb_object_agg(
+                   candidate.payload_key,
+                   to_jsonb(owner.id::text)
+               ) AS payload_patch
+        FROM trigger_executions AS execution
+        JOIN chat_messages AS source_message
+          ON source_message.id = CASE
+              WHEN COALESCE(
+                  execution.payload ->> '_source_message_id', ''
+              ) ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+              THEN (execution.payload ->> '_source_message_id')::uuid
+              ELSE NULL
+          END
+        CROSS JOIN LATERAL (
+            VALUES
+                ('_a2a_session_id', execution.payload ->> '_a2a_session_id'),
+                ('_origin_session_id', execution.payload ->> '_origin_session_id'),
+                (
+                    '_matched_conversation_id',
+                    execution.payload ->> '_matched_conversation_id'
+                )
+        ) AS candidate(payload_key, raw_session_id)
+        JOIN chat_sessions AS source
+          ON source.id = CASE
+              WHEN COALESCE(candidate.raw_session_id, '')
+                   ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+              THEN candidate.raw_session_id::uuid
+              ELSE NULL
+          END
+        JOIN _a2a_owner_sessions AS owner
+          ON owner.agent_id = source.agent_id
+         AND owner.peer_agent_id = source.peer_agent_id
+         AND owner.user_id = source_message.user_id
+        WHERE execution.source = 'a2a'
+          AND source.source_channel = 'agent'
+          AND source.peer_agent_id IS NOT NULL
+        GROUP BY execution.id
+        """
+    )
+    op.execute(
+        """
+        CREATE UNIQUE INDEX _a2a_source_message_payload_patches_idx
+        ON _a2a_source_message_payload_patches (execution_id)
+        """
+    )
+    op.execute(
+        """
+        UPDATE trigger_executions AS execution
+        SET payload = execution.payload || patch.payload_patch
+        FROM _a2a_source_message_payload_patches AS patch
+        WHERE execution.id = patch.execution_id
+          AND execution.payload IS DISTINCT FROM
+              execution.payload || patch.payload_patch
+        """
+    )
 
     # Materialize the final old->keeper map once so every remaining reference
     # moves atomically before any duplicate row is deleted.
@@ -1060,10 +1124,21 @@ def upgrade() -> None:
             SELECT 1
             FROM trigger_executions AS execution
             JOIN chat_messages AS source_message
-              ON source_message.id::text =
-                    execution.payload ->> '_source_message_id'
+              ON source_message.id = CASE
+                  WHEN COALESCE(
+                      execution.payload ->> '_source_message_id', ''
+                  ) ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                  THEN (execution.payload ->> '_source_message_id')::uuid
+                  ELSE NULL
+              END
             JOIN chat_sessions AS session
-              ON session.id::text = execution.payload ->> '_a2a_session_id'
+              ON session.id = CASE
+                  WHEN COALESCE(
+                      execution.payload ->> '_a2a_session_id', ''
+                  ) ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                  THEN (execution.payload ->> '_a2a_session_id')::uuid
+                  ELSE NULL
+              END
             WHERE execution.source = 'a2a'
               AND source_message.user_id IS DISTINCT FROM session.user_id
           ) THEN
@@ -1425,9 +1500,20 @@ def upgrade() -> None:
               SELECT 1
               FROM chat_messages AS source_message
               JOIN chat_sessions AS session
-                ON session.id::text = execution.payload ->> '_a2a_session_id'
-              WHERE source_message.id::text =
-                        execution.payload ->> '_source_message_id'
+                ON session.id = CASE
+                    WHEN COALESCE(
+                        execution.payload ->> '_a2a_session_id', ''
+                    ) ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                    THEN (execution.payload ->> '_a2a_session_id')::uuid
+                    ELSE NULL
+                END
+              WHERE source_message.id = CASE
+                        WHEN COALESCE(
+                            execution.payload ->> '_source_message_id', ''
+                        ) ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                        THEN (execution.payload ->> '_source_message_id')::uuid
+                        ELSE NULL
+                    END
                 AND source_message.conversation_id = session.id::text
                 AND source_message.user_id = session.user_id
                 AND session.source_channel = 'agent'

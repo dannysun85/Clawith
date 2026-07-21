@@ -317,6 +317,23 @@ def test_okr_shutdown_migration_preserves_tenant_settings_and_never_auto_restart
     assert "Never restart token-consuming automation" in migration
 
 
+def test_trigger_privacy_migration_uses_indexable_bounded_a2a_remapping():
+    from pathlib import Path
+
+    migration = (
+        Path(__file__).parents[1]
+        / "alembic/versions/099_trigger_privacy_serialization.py"
+    ).read_text(encoding="utf-8")
+
+    assert "CREATE TEMP TABLE _a2a_owner_sessions" in migration
+    assert "CREATE UNIQUE INDEX _a2a_owner_sessions_lookup_idx" in migration
+    assert "CREATE TEMP TABLE _a2a_source_message_payload_patches" in migration
+    assert "jsonb_object_agg(" in migration
+    assert "THEN (execution.payload ->> '_source_message_id')::uuid" in migration
+    assert "THEN candidate.raw_session_id::uuid" in migration
+    assert "source_message.id::text" not in migration
+
+
 def test_execution_completion_cannot_overwrite_migration_or_operator_terminal_state():
     from inspect import getsource
 
