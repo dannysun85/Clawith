@@ -941,6 +941,48 @@ sys.stdout.write(f"{release_id}\n{release_commit}\n{actor_id.lower()}\n{process_
 '
 }
 
+inspect_rollback_worker_runtime_identity() {
+    local worker_id="$1"
+
+    # Releases created before worker-attributed alert canaries do not contain
+    # ASTRA_ALERT_WORKER_ACTOR_ID and may carry an abbreviated Git commit.  A
+    # pre-migration rollback still verifies every identity field that the old
+    # release declared, without ever dumping the rest of Config.Env.
+    docker inspect -f \
+        '{{range .Config.Env}}{{if eq (index (split . "=") 0) "ASTRA_RELEASE_ID"}}{{println .}}{{end}}{{if eq (index (split . "=") 0) "ASTRA_RELEASE_COMMIT"}}{{println .}}{{end}}{{if eq (index (split . "=") 0) "PROCESS_ROLE"}}{{println .}}{{end}}{{end}}' \
+        "$worker_id" | python3 -c '
+import re
+import sys
+
+raw = sys.stdin.read(8_193)
+if len(raw) > 8_192:
+    raise SystemExit("rollback worker identity output is too large")
+values = {
+    "ASTRA_RELEASE_ID": [],
+    "ASTRA_RELEASE_COMMIT": [],
+    "PROCESS_ROLE": [],
+}
+for line in raw.splitlines():
+    key, separator, value = line.partition("=")
+    if separator and key in values:
+        values[key].append(value)
+if any(len(items) != 1 for items in values.values()):
+    raise SystemExit("rollback worker identity is missing or duplicated")
+release_id = values["ASTRA_RELEASE_ID"][0]
+release_commit = values["ASTRA_RELEASE_COMMIT"][0]
+process_role = values["PROCESS_ROLE"][0]
+if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}", release_id) is None:
+    raise SystemExit("rollback worker release identity has an invalid format")
+if re.fullmatch(r"[0-9a-f]{7,40}", release_commit) is None:
+    raise SystemExit("rollback worker release commit has an invalid format")
+if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*(?:,[A-Za-z][A-Za-z0-9_-]*)*", process_role) is None:
+    raise SystemExit("rollback worker process role has an invalid format")
+if len(process_role) > 128:
+    raise SystemExit("rollback worker process role is too long")
+sys.stdout.write(f"{release_id}\n{release_commit}\n{process_role}\n")
+'
+}
+
 run_candidate_alert_canary() {
     local target_release="$1"
     local target_project="$2"
@@ -3369,6 +3411,94 @@ wait_for_worker_release() {
     return 1
 }
 
+wait_for_rollback_worker_release() {
+    local project="$1"
+    local env_file="$2"
+    local compose_file="$3"
+    local expected_release_id="$4"
+    local expected_commit="$5"
+    local attempts="$6"
+    local backend_id
+    local backend_health
+    local backend_image_id
+    local worker_id
+    local worker_health
+    local worker_image_id
+    local worker_image_name
+    local worker_identity
+    local -a worker_identity_fields=()
+    local worker_identity_field
+    local worker_release_id
+    local worker_release_commit
+    local worker_role
+
+    for _ in $(seq 1 "$attempts"); do
+        backend_id="$(
+            compose_project "$project" "$env_file" "$compose_file" ps -q backend \
+                2>/dev/null || true
+        )"
+        worker_id="$(
+            compose_project "$project" "$env_file" "$compose_file" ps -q worker \
+                2>/dev/null || true
+        )"
+        if [ -n "$backend_id" ] && [[ "$backend_id" != *$'\n'* ]] && \
+            [ -n "$worker_id" ] && [[ "$worker_id" != *$'\n'* ]]; then
+            backend_health="$(
+                docker inspect \
+                    -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
+                    "$backend_id" 2>/dev/null || true
+            )"
+            worker_health="$(
+                docker inspect \
+                    -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
+                    "$worker_id" 2>/dev/null || true
+            )"
+            backend_image_id="$(
+                docker inspect -f '{{.Image}}' "$backend_id" 2>/dev/null || true
+            )"
+            worker_image_id="$(
+                docker inspect -f '{{.Image}}' "$worker_id" 2>/dev/null || true
+            )"
+            worker_image_name="$(
+                docker inspect -f '{{.Config.Image}}' "$worker_id" 2>/dev/null || true
+            )"
+            worker_identity="$(
+                inspect_rollback_worker_runtime_identity "$worker_id" \
+                    2>/dev/null || true
+            )"
+            worker_identity_fields=()
+            while IFS= read -r worker_identity_field; do
+                worker_identity_fields+=("$worker_identity_field")
+            done <<< "$worker_identity"
+            if [ "${#worker_identity_fields[@]}" = "3" ]; then
+                worker_release_id="${worker_identity_fields[0]}"
+                worker_release_commit="${worker_identity_fields[1]}"
+                worker_role="${worker_identity_fields[2]}"
+            else
+                worker_release_id=""
+                worker_release_commit=""
+                worker_role=""
+            fi
+            case "$worker_image_name" in
+                *":$expected_release_id")
+                    if [ "$backend_health" = "healthy" ] && \
+                        [ "$worker_health" = "healthy" ] && \
+                        [ -n "$backend_image_id" ] && \
+                        [ "$backend_image_id" = "$worker_image_id" ] && \
+                        [ "$worker_release_id" = "$expected_release_id" ] && \
+                        [ "$worker_release_commit" = "$expected_commit" ]; then
+                        case ",$worker_role," in
+                            *,worker,*) return 0 ;;
+                        esac
+                    fi
+                    ;;
+            esac
+        fi
+        sleep 2
+    done
+    return 1
+}
+
 managed_worker_ids() {
     local project="$1"
     # `docker compose ps -q` returns a full container ID. Keep the same form so
@@ -3398,11 +3528,10 @@ stop_managed_workers_except() {
     done
 }
 
-assert_single_active_worker() {
+assert_single_managed_worker() {
     local target_project="$1"
     local env_file="$2"
     local compose_file="$3"
-    local expected_release_id="$4"
     local target_worker_id
     local project
     local worker_ids
@@ -3443,6 +3572,16 @@ assert_single_active_worker() {
         echo "active worker Compose project does not match target" >&2
         return 1
     fi
+}
+
+assert_single_active_worker() {
+    local target_project="$1"
+    local env_file="$2"
+    local compose_file="$3"
+    local expected_release_id="$4"
+
+    assert_single_managed_worker \
+        "$target_project" "$env_file" "$compose_file" || return 1
     wait_for_worker_release \
         "$target_project" "$env_file" "$compose_file" \
         "$expected_release_id" 1
@@ -3454,19 +3593,46 @@ activate_worker_release() {
     local compose_file="$3"
     local expected_release_id="$4"
     local attempts="$5"
+    local validation_mode="${6:-strict}"
+    local expected_commit="${7:-}"
 
     stop_managed_workers_except "$project" || return 1
     if ! compose_project \
         "$project" "$env_file" "$compose_file" up -d --no-deps worker; then
         return 1
     fi
-    if ! wait_for_worker_release \
-        "$project" "$env_file" "$compose_file" "$expected_release_id" "$attempts" || \
-        ! assert_single_active_worker \
-            "$project" "$env_file" "$compose_file" "$expected_release_id"; then
-        compose_project "$project" "$env_file" "$compose_file" stop worker || true
-        return 1
-    fi
+    case "$validation_mode" in
+        strict)
+            if ! wait_for_worker_release \
+                "$project" "$env_file" "$compose_file" \
+                "$expected_release_id" "$attempts" || \
+                ! assert_single_active_worker \
+                    "$project" "$env_file" "$compose_file" \
+                    "$expected_release_id"; then
+                compose_project \
+                    "$project" "$env_file" "$compose_file" stop worker || true
+                return 1
+            fi
+            ;;
+        rollback_legacy)
+            if [ -z "$expected_commit" ] || \
+                ! wait_for_rollback_worker_release \
+                    "$project" "$env_file" "$compose_file" \
+                    "$expected_release_id" "$expected_commit" "$attempts" || \
+                ! assert_single_managed_worker \
+                    "$project" "$env_file" "$compose_file"; then
+                # The old worker was the sole known writer before maintenance.
+                # Do not turn an inconclusive rollback identity check into a
+                # second background-processing outage by stopping it again.
+                echo "rollback worker verification did not converge; leaving the sole previous worker running" >&2
+                return 1
+            fi
+            ;;
+        *)
+            echo "unknown worker validation mode: $validation_mode" >&2
+            return 1
+            ;;
+    esac
 }
 
 remaining_old_nginx_workers() {
@@ -4693,7 +4859,7 @@ rollback() {
     rollback_status=0
     if ! activate_worker_release \
         "$OLD_PROJECT" "$PREVIOUS/.env" "$PREVIOUS/$COMPOSE_FILE" \
-        "$PREVIOUS_RELEASE_ID" 90; then
+        "$PREVIOUS_RELEASE_ID" 90 rollback_legacy "$PREVIOUS_COMMIT"; then
         if [ "$NGINX_CONFIG_TOUCHED" = "1" ]; then
             recover_candidate_traffic || true
         else

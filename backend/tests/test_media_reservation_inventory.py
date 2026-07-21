@@ -1,7 +1,10 @@
 from types import SimpleNamespace
 import uuid
 
+from sqlalchemy.dialects import postgresql
+
 from app.scripts.inventory_legacy_media_reservations import (
+    _task_binding_inventory_query,
     classify_binding,
     classify_reserved_balances,
 )
@@ -25,6 +28,28 @@ def _pair(**reservation_overrides):
     }
     values.update(reservation_overrides)
     return task, SimpleNamespace(**values)
+
+
+def test_inventory_query_is_compatible_with_the_pre_098_media_schema():
+    sql = str(
+        _task_binding_inventory_query().compile(
+            dialect=postgresql.dialect(),
+        )
+    )
+
+    assert "media_generation_tasks.reservation_id" in sql
+    assert "media_generation_tasks.request_metadata" in sql
+    for post_098_column in (
+        "origin_session_id",
+        "completion_message_id",
+        "output_size",
+        "completion_delivery_status",
+        "realtime_attempt_count",
+        "realtime_next_attempt_at",
+        "realtime_published_at",
+        "realtime_last_error",
+    ):
+        assert post_098_column not in sql
 
 
 def test_inventory_accepts_only_exact_canonical_or_relinkable_bindings():

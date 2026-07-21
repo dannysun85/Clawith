@@ -1020,6 +1020,96 @@ def test_remote_worker_identity_is_allowlisted_and_xtrace_safe(tmp_path):
     assert duplicated.returncode != 0
 
 
+def test_rollback_worker_identity_accepts_the_legacy_release_contract(tmp_path):
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    helper = _shell_function_source(
+        script,
+        "inspect_rollback_worker_runtime_identity",
+        "run_candidate_alert_canary",
+    )
+    sentinel = "legacy-worker-secret-must-not-be-traced"
+    docker_stub = tmp_path / "docker"
+    docker_stub.write_text(
+        "#!/usr/bin/env python3\n"
+        "print('ASTRA_RELEASE_ID=release-legacy')\n"
+        "print('ASTRA_RELEASE_COMMIT=53b7cbd')\n"
+        "print('PROCESS_ROLE=worker,connector')\n"
+        f"print('DATABASE_URL={sentinel}')\n",
+        encoding="utf-8",
+    )
+    docker_stub.chmod(0o700)
+    env = {
+        "PATH": (
+            f"{tmp_path}{os.pathsep}{Path(sys.executable).parent}"
+            f"{os.pathsep}{os.environ.get('PATH', '')}"
+        )
+    }
+
+    traced = subprocess.run(
+        [
+            "bash",
+            "-x",
+            "-c",
+            (
+                f"set -euo pipefail\n{helper}\n"
+                "inspect_rollback_worker_runtime_identity worker-id"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert traced.returncode == 0, traced.stderr.decode()
+    assert traced.stdout.decode().splitlines() == [
+        "release-legacy",
+        "53b7cbd",
+        "worker,connector",
+    ]
+    assert sentinel.encode() not in traced.stdout + traced.stderr
+
+
+def test_failed_legacy_rollback_check_never_stops_the_previous_worker():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    activate = _shell_function_source(
+        script,
+        "activate_worker_release",
+        "remaining_old_nginx_workers",
+    )
+    harness = f"""set +e
+stop_managed_workers_except() {{ :; }}
+compose_project() {{
+    case " $* " in
+        *" stop worker "*) echo unexpected_worker_stop ;;
+        *) echo compose_ok ;;
+    esac
+}}
+wait_for_worker_release() {{ echo unexpected_strict_wait; return 1; }}
+assert_single_active_worker() {{ echo unexpected_strict_assert; return 1; }}
+wait_for_rollback_worker_release() {{ return 1; }}
+assert_single_managed_worker() {{ echo unexpected_single_assert; return 1; }}
+{activate}
+activate_worker_release project env compose release-old 1 rollback_legacy 53b7cbd
+status=$?
+echo status=$status
+exit 0
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", harness],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "status=1" in result.stdout
+    assert "compose_ok" in result.stdout
+    assert "unexpected_" not in result.stdout
+
+
 def test_remote_deploy_buffers_script_and_rechecks_public_release_identity():
     script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
 
@@ -1368,6 +1458,7 @@ rollback
     assert result.returncode == 0, result.stderr
     assert "unexpected_mcp_quarantine" not in result.stdout
     assert "unexpected_forward_only" not in result.stdout
+    assert 'rollback_legacy "$PREVIOUS_COMMIT"' in rollback
 
 
 def test_forward_only_rollback_preserves_maintenance_and_never_starts_old_code(tmp_path):

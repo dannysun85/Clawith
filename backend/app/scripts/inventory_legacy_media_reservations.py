@@ -49,6 +49,96 @@ class ReservedBalanceFinding:
     actual_reserved: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class MediaTaskSnapshot:
+    """Schema-stable subset used by the pre-migration release inventory."""
+
+    id: uuid.UUID
+    tenant_id: uuid.UUID | None
+    agent_id: uuid.UUID | None
+    user_id: uuid.UUID | None
+    reservation_id: uuid.UUID | None
+    status: str
+    request_metadata: dict | None
+
+
+@dataclass(frozen=True, slots=True)
+class ReservationSnapshot:
+    """Credits reservation fields required by binding classification."""
+
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    agent_id: uuid.UUID | None
+    user_id: uuid.UUID | None
+    status: str
+    ref_type: str | None
+    ref_id: uuid.UUID | None
+
+
+@dataclass(frozen=True, slots=True)
+class CreditBalanceSnapshot:
+    """Materialized tenant hold counter required by the inventory."""
+
+    tenant_id: uuid.UUID
+    reserved: int
+
+
+def _task_binding_inventory_query():
+    """Select only columns that exist before and after migration 098.
+
+    Selecting the mapped ``MediaGenerationTask`` entity would also select
+    every column known to the candidate code.  That cannot run against the
+    production schema before Alembic adds the durable completion columns.
+    """
+
+    return (
+        select(
+            MediaGenerationTask.id.label("task_id"),
+            MediaGenerationTask.tenant_id.label("task_tenant_id"),
+            MediaGenerationTask.agent_id.label("task_agent_id"),
+            MediaGenerationTask.user_id.label("task_user_id"),
+            MediaGenerationTask.reservation_id.label("task_reservation_id"),
+            MediaGenerationTask.status.label("task_status"),
+            MediaGenerationTask.request_metadata.label("task_request_metadata"),
+            CreditReservation.id.label("linked_reservation_id"),
+            CreditReservation.tenant_id.label("reservation_tenant_id"),
+            CreditReservation.agent_id.label("reservation_agent_id"),
+            CreditReservation.user_id.label("reservation_user_id"),
+            CreditReservation.status.label("reservation_status"),
+            CreditReservation.ref_type.label("reservation_ref_type"),
+            CreditReservation.ref_id.label("reservation_ref_id"),
+        )
+        .outerjoin(
+            CreditReservation,
+            CreditReservation.id == MediaGenerationTask.reservation_id,
+        )
+        .order_by(MediaGenerationTask.created_at, MediaGenerationTask.id)
+    )
+
+
+def _task_binding_snapshots(row) -> tuple[MediaTaskSnapshot, ReservationSnapshot | None]:
+    task = MediaTaskSnapshot(
+        id=row["task_id"],
+        tenant_id=row["task_tenant_id"],
+        agent_id=row["task_agent_id"],
+        user_id=row["task_user_id"],
+        reservation_id=row["task_reservation_id"],
+        status=row["task_status"],
+        request_metadata=row["task_request_metadata"],
+    )
+    if row["linked_reservation_id"] is None:
+        return task, None
+    return task, ReservationSnapshot(
+        id=row["linked_reservation_id"],
+        tenant_id=row["reservation_tenant_id"],
+        agent_id=row["reservation_agent_id"],
+        user_id=row["reservation_user_id"],
+        status=row["reservation_status"],
+        ref_type=row["reservation_ref_type"],
+        ref_id=row["reservation_ref_id"],
+    )
+
+
 def _same_uuid(left, right) -> bool:
     if left is None or right is None:
         return left is None and right is None
@@ -183,39 +273,53 @@ async def inventory(*, detail_limit: int = 100) -> dict:
     """Return a bounded, privacy-safe report from a read-only transaction."""
 
     async with async_session() as db:
-        task_rows = (
-            await db.execute(
-                select(MediaGenerationTask, CreditReservation)
-                .outerjoin(
-                    CreditReservation,
-                    CreditReservation.id == MediaGenerationTask.reservation_id,
-                )
-                .order_by(MediaGenerationTask.created_at, MediaGenerationTask.id)
-            )
-        ).all()
+        task_rows = [
+            _task_binding_snapshots(row)
+            for row in (
+                await db.execute(_task_binding_inventory_query())
+            ).mappings()
+        ]
 
         referenced = (
             select(MediaGenerationTask.id)
             .where(MediaGenerationTask.reservation_id == CreditReservation.id)
             .exists()
         )
-        unlinked = list(
-            (
-                await db.execute(
-                    select(CreditReservation)
-                    .where(
-                        CreditReservation.provider == "minimax",
-                        CreditReservation.action.in_(LEGACY_MEDIA_ACTIONS),
-                        CreditReservation.status.in_(OPEN_RESERVATION_STATUSES),
-                        ~referenced,
-                    )
-                    .order_by(
-                        CreditReservation.created_at,
-                        CreditReservation.id,
-                    )
+        unlinked_rows = (
+            await db.execute(
+                select(
+                    CreditReservation.id,
+                    CreditReservation.tenant_id,
+                    CreditReservation.agent_id,
+                    CreditReservation.user_id,
+                    CreditReservation.status,
+                    CreditReservation.ref_type,
+                    CreditReservation.ref_id,
                 )
-            ).scalars().all()
-        )
+                .where(
+                    CreditReservation.provider == "minimax",
+                    CreditReservation.action.in_(LEGACY_MEDIA_ACTIONS),
+                    CreditReservation.status.in_(OPEN_RESERVATION_STATUSES),
+                    ~referenced,
+                )
+                .order_by(
+                    CreditReservation.created_at,
+                    CreditReservation.id,
+                )
+            )
+        ).mappings()
+        unlinked = [
+            ReservationSnapshot(
+                id=row["id"],
+                tenant_id=row["tenant_id"],
+                agent_id=row["agent_id"],
+                user_id=row["user_id"],
+                status=row["status"],
+                ref_type=row["ref_type"],
+                ref_id=row["ref_id"],
+            )
+            for row in unlinked_rows
+        ]
         finalized_unlinked_count = int(
             (
                 await db.execute(
@@ -231,9 +335,18 @@ async def inventory(*, detail_limit: int = 100) -> dict:
             ).scalar_one()
             or 0
         )
-        balances = list(
-            (await db.execute(select(CreditBalance))).scalars().all()
-        )
+        balance_rows = (
+            await db.execute(
+                select(CreditBalance.tenant_id, CreditBalance.reserved)
+            )
+        ).mappings()
+        balances = [
+            CreditBalanceSnapshot(
+                tenant_id=row["tenant_id"],
+                reserved=row["reserved"],
+            )
+            for row in balance_rows
+        ]
         reserved_rows = (
             await db.execute(
                 select(
