@@ -3,6 +3,8 @@
 from datetime import datetime, timezone
 import inspect
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 import uuid
@@ -252,6 +254,28 @@ def test_canary_returns_scalar_id_after_transaction_expiration_boundaries():
     assert "return issue.id" not in source
     assert source.count("return issue_id") == 2
     assert source.index("issue_id = issue.id") < source.index("await db.commit()")
+
+
+def test_canary_standalone_process_loads_event_foreign_key_metadata():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from app.scripts import verify_production_issue_alerts; "
+                "from app.models.production_issue import ProductionIssueEvent; "
+                "assert [table.name for table in "
+                "ProductionIssueEvent.__mapper__._sorted_tables] == "
+                "['production_issue_events']"
+            ),
+        ],
+        cwd=ROOT / "backend",
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_canary_epoch_is_immutable_after_first_creation():

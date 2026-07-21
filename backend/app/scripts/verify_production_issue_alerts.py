@@ -25,6 +25,10 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.config import get_settings
 from app.database import async_session, engine
+# This command runs outside the FastAPI bootstrap that normally registers all
+# ORM tables. ProductionIssueEvent has a tenant FK, so load that target before
+# SQLAlchemy sorts mapper tables during the canary flush.
+import app.models.tenant  # noqa: F401
 from app.models.production_issue import (
     ProductionIssue,
     ProductionIssueAlertDelivery,
