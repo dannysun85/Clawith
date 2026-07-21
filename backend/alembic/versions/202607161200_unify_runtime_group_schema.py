@@ -451,6 +451,10 @@ _NOTIFICATION_LEGACY_CORE_OBJECTS = _NOTIFICATION_CORE_OBJECTS - _NOTIFICATION_E
 _TRIGGER_EXECUTION_CORE_OBJECTS = _BASELINE_ORM_TABLE_OBJECTS["trigger_executions"] - {
     f"index:{name}" for name in BASELINE_ORM_INDEXES["trigger_executions"]
 }
+_TRIGGER_EXECUTION_PRE_TRIGGER_PRIVACY_CORE_OBJECTS = (
+    _TRIGGER_EXECUTION_CORE_OBJECTS
+    - {"column:trigger_executions.fire_recorded_at"}
+)
 
 _PRECREATED_PHASE_OBJECTS = {
     "experience_library": {
@@ -679,6 +683,12 @@ def _baseline_orm_table_plan(
         if _TRIGGER_EXECUTION_CORE_OBJECTS.issubset(present):
             missing_indexes = tuple(name for name in BASELINE_ORM_INDEXES[table_name] if f"index:{name}" not in present)
             return ("keep", missing_indexes)
+        if (
+            _TRIGGER_EXECUTION_PRE_TRIGGER_PRIVACY_CORE_OBJECTS.issubset(present)
+            and "column:trigger_executions.fire_recorded_at" not in present
+        ):
+            missing_indexes = tuple(name for name in BASELINE_ORM_INDEXES[table_name] if f"index:{name}" not in present)
+            return ("upgrade_trigger_executions_pre_privacy", missing_indexes)
 
     missing = sorted(expected - present)
     raise RuntimeError(f"Refusing unknown partial baseline ORM table {table_name}; missing: {', '.join(missing)}")
@@ -1025,6 +1035,76 @@ def _upgrade_gateway_messages_trigger_privacy_shape() -> None:
     )
 
 
+def _upgrade_trigger_executions_pre_privacy_shape() -> None:
+    """Repair the exact trigger queue shape shipped before migration 099."""
+    op.add_column(
+        "trigger_executions",
+        sa.Column(
+            "fire_recorded_at",
+            sa.DateTime(timezone=True),
+            nullable=True,
+        ),
+    )
+    # Migration 099 owns these accounting and serialization semantics. Apply
+    # them here as well because some supported installations were stamped past
+    # that revision without receiving its DDL. The later 099 run remains
+    # idempotent because every historical row is marked before it executes.
+    op.execute(
+        sa.text(
+            """
+            WITH pending_counts AS (
+                SELECT trigger_id,
+                       count(*)::integer AS pending_count,
+                       max(COALESCE(scheduled_at, created_at, now())) AS last_at
+                FROM trigger_executions
+                WHERE status = 'pending'
+                  AND fire_recorded_at IS NULL
+                GROUP BY trigger_id
+            )
+            UPDATE agent_triggers AS trigger
+            SET fire_count = COALESCE(trigger.fire_count, 0) + pending.pending_count,
+                last_fired_at = GREATEST(trigger.last_fired_at, pending.last_at)
+            FROM pending_counts AS pending
+            WHERE trigger.id = pending.trigger_id
+            """
+        )
+    )
+    op.execute(
+        sa.text(
+            "UPDATE trigger_executions "
+            "SET fire_recorded_at = COALESCE(scheduled_at, created_at, now())"
+        )
+    )
+    op.execute(
+        sa.text(
+            """
+            WITH ranked AS (
+                SELECT
+                    id,
+                    status,
+                    row_number() OVER (
+                        PARTITION BY agent_id
+                        ORDER BY scheduled_at, id
+                    ) AS row_number
+                FROM trigger_executions
+                WHERE status IN ('pending', 'processing')
+            )
+            UPDATE trigger_executions AS execution
+            SET status = 'pending',
+                started_at = NULL,
+                finished_at = NULL,
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                last_error = 'Requeued by per-Agent serialization migration'
+            FROM ranked
+            WHERE execution.id = ranked.id
+              AND execution.status = 'processing'
+              AND ranked.row_number > 1
+            """
+        )
+    )
+
+
 def _normalize_gateway_messages_historical_authorization_fk() -> None:
     op.execute(
         sa.text(
@@ -1084,6 +1164,8 @@ def _upgrade_baseline_orm_tables() -> None:
         elif action == "upgrade_gateway_messages_legacy_trigger_privacy":
             _upgrade_gateway_messages_legacy_shape()
             _upgrade_gateway_messages_trigger_privacy_shape()
+        elif action == "upgrade_trigger_executions_pre_privacy":
+            _upgrade_trigger_executions_pre_privacy_shape()
         elif action == "upgrade_legacy_notifications":
             _normalize_notifications_legacy_shape(add_extension=True)
         elif action == "normalize_notifications":

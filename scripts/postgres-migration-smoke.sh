@@ -222,6 +222,12 @@ ALTER TABLE gateway_messages
 ALTER TABLE gateway_messages
   DROP COLUMN IF EXISTS delivery_attempts;
 
+-- Reproduce the corresponding pre-099 trigger queue shape. The repair must
+-- preserve existing executions while adding accounting and serialization.
+DROP INDEX IF EXISTS uq_trigger_executions_processing_agent;
+ALTER TABLE trigger_executions
+  DROP COLUMN IF EXISTS fire_recorded_at;
+
 ALTER TABLE llm_models DROP COLUMN IF EXISTS verification_status;
 ALTER TABLE llm_models DROP COLUMN IF EXISTS last_verified_at;
 ALTER TABLE llm_models DROP COLUMN IF EXISTS last_error_code;

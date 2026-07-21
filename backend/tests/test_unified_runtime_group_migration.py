@@ -1020,6 +1020,71 @@ def test_trigger_executions_missing_safe_index_is_repaired(monkeypatch) -> None:
     ]
 
 
+def test_trigger_executions_pre_099_shape_gets_lossless_queue_repair(
+    monkeypatch,
+) -> None:
+    migration = _load_migration()
+    actual: set[str] = set()
+    for table_name in migration.BASELINE_ORM_TABLES:
+        actual.update(migration._BASELINE_ORM_TABLE_OBJECTS[table_name])
+    actual.remove("column:trigger_executions.fire_recorded_at")
+    actual.remove("index:uq_trigger_executions_processing_agent")
+    added: list[tuple[str, sa.Column]] = []
+    statements: list[str] = []
+    indexes: list[tuple[str, str, tuple[str, ...], bool, str | None]] = []
+
+    monkeypatch.setattr(migration.op, "get_bind", lambda: object())
+    monkeypatch.setattr(migration, "_schema_object_names", lambda _bind: actual)
+    monkeypatch.setattr(
+        migration.op,
+        "add_column",
+        lambda table_name, column: added.append((table_name, column)),
+    )
+    monkeypatch.setattr(migration.op, "alter_column", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        migration.op,
+        "execute",
+        lambda statement: statements.append(str(statement)),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "create_index",
+        lambda name, table_name, columns, unique=False, **kwargs: indexes.append(
+            (
+                name,
+                table_name,
+                tuple(columns),
+                bool(unique),
+                str(kwargs.get("postgresql_where"))
+                if kwargs.get("postgresql_where") is not None
+                else None,
+            )
+        ),
+    )
+
+    migration._upgrade_baseline_orm_tables()
+
+    assert [(table_name, column.name) for table_name, column in added] == [
+        ("trigger_executions", "fire_recorded_at")
+    ]
+    assert added[0][1].nullable is True
+    assert len(statements) == 3
+    assert "WITH pending_counts AS" in statements[0]
+    assert "fire_count = COALESCE(trigger.fire_count, 0)" in statements[0]
+    assert "SET fire_recorded_at = COALESCE" in statements[1]
+    assert "WITH ranked AS" in statements[2]
+    assert "Requeued by per-Agent serialization migration" in statements[2]
+    assert indexes == [
+        (
+            "uq_trigger_executions_processing_agent",
+            "trigger_executions",
+            ("agent_id",),
+            True,
+            "status = 'processing' AND lease_owner IS NOT NULL",
+        )
+    ]
+
+
 def test_baseline_orm_partial_table_fails_before_any_ddl(monkeypatch) -> None:
     migration = _load_migration()
     # Put the invalid table last so the assertion proves the first three
