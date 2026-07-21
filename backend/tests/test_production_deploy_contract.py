@@ -1383,6 +1383,8 @@ def test_mcp_deployment_contract_is_fail_closed_and_matches_runtime_classifier()
     assert quarantine.index("CREATE TRIGGER astra_deploy_mcp_quarantine_tools_guard") < (
         quarantine.index("UPDATE tools")
     )
+    assert "SELECT pg_advisory_xact_lock" not in quarantine
+    assert "PERFORM pg_advisory_xact_lock" in quarantine
     assert restore.index("SET LOCAL astra.mcp_quarantine_restore") < restore.index("UPDATE tools AS tool")
     assert restore.index("UPDATE agent_tools AS assignment") < restore.index(
         "DELETE FROM astra_deploy_mcp_quarantine_state"
@@ -1397,11 +1399,11 @@ def test_mcp_deployment_contract_is_fail_closed_and_matches_runtime_classifier()
     )
     migration_gate = script.index(
         "ROLLBACK_REQUIRES_MCP_QUARANTINE=1",
-        migration_quarantine,
+        build,
     )
-    migration = script.index("backend upgrade head", migration_gate)
+    migration = script.index("backend upgrade head", migration_quarantine)
     assert "ROLLBACK_REQUIRES_MCP_QUARANTINE=0" in script[:trap]
-    assert trap < build < migration_quarantine < migration_gate < migration
+    assert trap < build < migration_gate < migration_quarantine < migration
 
     rollback_start = script.index("rollback() {")
     rollback_end = script.index("abort_release() {", rollback_start)

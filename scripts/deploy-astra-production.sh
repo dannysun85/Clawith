@@ -2790,7 +2790,11 @@ quarantine_mcp_for_unsafe_release() {
         -v snapshot_id="$snapshot_id" -U "$postgres_user" -d "$postgres_db" \
         <<'SQL_MCP_QUARANTINE'
 BEGIN;
-SELECT pg_advisory_xact_lock(hashtext('astra-deploy-mcp-quarantine-v1'));
+DO $$
+BEGIN
+    PERFORM pg_advisory_xact_lock(hashtext('astra-deploy-mcp-quarantine-v1'));
+END
+$$;
 LOCK TABLE tools IN SHARE ROW EXCLUSIVE MODE;
 LOCK TABLE agent_tools IN SHARE ROW EXCLUSIVE MODE;
 CREATE TABLE IF NOT EXISTS astra_deploy_mcp_quarantine_state (
@@ -5008,11 +5012,14 @@ fi
 chmod 0600 "$BACKUP/media-credit-inventory.pre-migration.json"
 test -s "$BACKUP/media-credit-inventory.pre-migration.json"
 
+# The quarantine transaction can commit before a later shell-side identity
+# validation fails. Arm rollback first so every exit path preserves or resumes
+# the already-created snapshot instead of forgetting durable isolation state.
+ROLLBACK_REQUIRES_MCP_QUARANTINE=1
 if ! quarantine_mcp_for_unsafe_release \
     "$PREVIOUS" "migration-${RELEASE_ID}"; then
     abort_release "cannot install the MCP rollback guard before migrations"
 fi
-ROLLBACK_REQUIRES_MCP_QUARANTINE=1
 if ! secure_mcp_quarantine_snapshot "$RELEASE" "$CANDIDATE_PROJECT"; then
     abort_release "cannot encrypt and sanitize the MCP rollback snapshot"
 fi
