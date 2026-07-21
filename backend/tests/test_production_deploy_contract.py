@@ -4544,6 +4544,18 @@ def test_remote_preflight_requires_timeout_before_deploy_lock_mutation():
     assert timeout_check < deploy_lock < first_timed_call
 
 
+def test_model_route_preflight_declares_recursive_fallback_walk():
+    script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    preflight = _shell_function_source(
+        script,
+        "model_route_credential_preflight",
+        "m3_route_post_migration_preflight",
+    )
+
+    assert "WITH RECURSIVE expected_minimax_capability" in preflight
+    assert "fallback_walk(start_id, id, fallback_route_id, path, cycle) AS" in preflight
+
+
 def test_recovery_persists_existing_proof_requirements_across_interruptions():
     script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
     recovery_start = script.index("recover_indeterminate_cutover() {")

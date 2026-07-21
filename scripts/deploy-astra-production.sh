@@ -2447,7 +2447,7 @@ model_route_credential_preflight() {
             "$COMPOSE_PROJECT" "$release/.env" "$release/$COMPOSE_FILE" \
             exec -T postgres psql -v ON_ERROR_STOP=1 -At \
             -U "$postgres_user" -d "$postgres_db" <<'SQL_MODEL_ROUTE_PREFLIGHT'
-WITH expected_minimax_capability(modality) AS (
+WITH RECURSIVE expected_minimax_capability(modality) AS (
     VALUES ('text'), ('image'), ('video')
 ), route_duplicates AS (
     SELECT 1
