@@ -772,6 +772,103 @@ def test_gateway_messages_known_legacy_shape_adds_conversation_id(
 @pytest.mark.parametrize(
     ("actual_gateway_shape", "adds_conversation_id"),
     (
+        ("_GATEWAY_MESSAGES_PRE_TRIGGER_PRIVACY_OBJECTS", False),
+        ("_GATEWAY_MESSAGES_LEGACY_PRE_TRIGGER_PRIVACY_OBJECTS", True),
+    ),
+)
+def test_gateway_messages_pre_099_shape_gets_lossless_queue_repair(
+    monkeypatch,
+    actual_gateway_shape: str,
+    adds_conversation_id: bool,
+) -> None:
+    migration = _load_migration()
+    actual = set(getattr(migration, actual_gateway_shape))
+    for table_name in migration.BASELINE_ORM_TABLES:
+        if table_name != "gateway_messages":
+            actual.update(migration._BASELINE_ORM_TABLE_OBJECTS[table_name])
+    added: list[tuple[str, sa.Column]] = []
+    foreign_keys: list[tuple[str, str, str, tuple[str, ...], tuple[str, ...]]] = []
+    indexes: list[tuple[str, str, tuple[str, ...], dict[str, object]]] = []
+
+    monkeypatch.setattr(migration.op, "get_bind", lambda: object())
+    monkeypatch.setattr(migration, "_schema_object_names", lambda _bind: actual)
+    monkeypatch.setattr(
+        migration.op,
+        "add_column",
+        lambda table_name, column: added.append((table_name, column)),
+    )
+    monkeypatch.setattr(migration.op, "alter_column", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        migration.op,
+        "create_foreign_key",
+        lambda name, source, target, local, remote, **_kwargs: foreign_keys.append(
+            (name, source, target, tuple(local), tuple(remote))
+        ),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "create_index",
+        lambda name, table_name, columns, **kwargs: indexes.append(
+            (name, table_name, tuple(columns), kwargs)
+        ),
+    )
+    monkeypatch.setattr(
+        migration,
+        "_BASELINE_ORM_CREATE",
+        {
+            table_name: lambda: pytest.fail("known tables must not be recreated")
+            for table_name in migration.BASELINE_ORM_TABLES
+        },
+    )
+
+    migration._upgrade_baseline_orm_tables()
+
+    expected_columns = [
+        "authorization_source_agent_id",
+        "delivery_lease_expires_at",
+        "delivery_attempts",
+    ]
+    if adds_conversation_id:
+        expected_columns.insert(0, "conversation_id")
+    assert [column.name for _table, column in added] == expected_columns
+    delivery_attempts = next(
+        column for _table, column in added if column.name == "delivery_attempts"
+    )
+    assert delivery_attempts.nullable is False
+    assert str(delivery_attempts.server_default.arg) == "0"
+    assert foreign_keys == [
+        (
+            "gateway_messages_authorization_source_agent_id_fkey",
+            "gateway_messages",
+            "agents",
+            ("authorization_source_agent_id",),
+            ("id",),
+        )
+    ]
+    assert indexes == [
+        (
+            "ix_gateway_messages_delivery_claim",
+            "gateway_messages",
+            (
+                "agent_id",
+                "status",
+                "delivery_lease_expires_at",
+                "created_at",
+            ),
+            {
+                "unique": False,
+                "postgresql_where": indexes[0][3]["postgresql_where"],
+            },
+        )
+    ]
+    assert str(indexes[0][3]["postgresql_where"]) == (
+        "status IN ('pending', 'delivered')"
+    )
+
+
+@pytest.mark.parametrize(
+    ("actual_gateway_shape", "adds_conversation_id"),
+    (
         ("_GATEWAY_MESSAGES_HISTORICAL_FK_OBJECTS", False),
         ("_GATEWAY_MESSAGES_LEGACY_HISTORICAL_FK_OBJECTS", True),
     ),

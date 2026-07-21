@@ -945,7 +945,7 @@ def test_remote_worker_identity_is_allowlisted_and_xtrace_safe(tmp_path):
         1,
     )[0]
 
-    assert remote_body.startswith("{ set +x; } 2>/dev/null\nset -euo pipefail\n")
+    assert remote_body.startswith("{ set +x; } 2>/dev/null\nset -Eeuo pipefail\n")
     assert runtime_root_body.startswith("{ set +x; } 2>/dev/null\nset -euo pipefail\n")
     assert script.count("env -u BASH_ENV -u BASHOPTS -u SHELLOPTS bash -s --") == 2
     assert "worker_environment" not in script
@@ -2173,16 +2173,22 @@ def test_production_deploy_rollback_keeps_privacy_safe_nginx_format():
     assert "reload_nginx_with_worker_snapshot" in maintenance_helper
 
 
-def test_production_deploy_error_trap_is_terminal():
+def test_production_deploy_error_trap_is_terminal_inside_helpers():
     script = (ROOT / "scripts/deploy-astra-production.sh").read_text(encoding="utf-8")
+    remote_script = script.split("<<'REMOTE_SCRIPT'\n", 1)[1]
+    assert remote_script.startswith("{ set +x; } 2>/dev/null\nset -Eeuo pipefail\n")
     handler_start = script.index("on_error() {")
     trap_line = "trap 'on_error $?' ERR"
     handler_end = script.index(trap_line, handler_start) + len(trap_line)
     handler = script[handler_start:handler_end]
-    harness = f"""set -e
+    harness = f"""set -Eeuo pipefail
 rollback() {{ echo rollback_called; return 0; }}
 {handler}
-false
+compose_helper() {{
+    false
+    echo continued_inside_helper
+}}
+compose_helper
 echo continued_after_failure
 """
 
@@ -2195,6 +2201,7 @@ echo continued_after_failure
 
     assert result.returncode == 1
     assert "rollback_called" in result.stdout
+    assert "continued_inside_helper" not in result.stdout
     assert "continued_after_failure" not in result.stdout
 
 

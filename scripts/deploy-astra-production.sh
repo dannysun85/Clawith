@@ -448,7 +448,7 @@ umask "$ORIGINAL_UMASK"
 trap 'rm -f "$REMOTE_SCRIPT_FILE"' EXIT
 cat > "$REMOTE_SCRIPT_FILE" <<'REMOTE_SCRIPT'
 { set +x; } 2>/dev/null
-set -euo pipefail
+set -Eeuo pipefail
 
 APP_ROOT="$1"
 RELEASE_ID="$2"

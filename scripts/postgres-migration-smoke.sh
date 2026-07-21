@@ -208,6 +208,20 @@ DATABASE_URL="postgresql+asyncpg://${db_user}@${db_host}:${db_port}/${fresh_db_n
 # Simulate a deployment already stamped beyond revisions that were later
 # inserted into historical migration order.
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+-- Reproduce the exact gateway queue shape observed on the supported
+-- production line before migration 099 added its privacy/lease columns.
+DROP INDEX IF EXISTS ix_gateway_messages_delivery_claim;
+ALTER TABLE gateway_messages
+  DROP CONSTRAINT IF EXISTS gateway_messages_authorization_source_agent_id_fkey;
+ALTER TABLE gateway_messages
+  DROP CONSTRAINT IF EXISTS fk_gateway_messages_authorization_source_agent;
+ALTER TABLE gateway_messages
+  DROP COLUMN IF EXISTS authorization_source_agent_id;
+ALTER TABLE gateway_messages
+  DROP COLUMN IF EXISTS delivery_lease_expires_at;
+ALTER TABLE gateway_messages
+  DROP COLUMN IF EXISTS delivery_attempts;
+
 ALTER TABLE llm_models DROP COLUMN IF EXISTS verification_status;
 ALTER TABLE llm_models DROP COLUMN IF EXISTS last_verified_at;
 ALTER TABLE llm_models DROP COLUMN IF EXISTS last_error_code;

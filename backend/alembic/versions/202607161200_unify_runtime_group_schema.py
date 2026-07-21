@@ -423,6 +423,21 @@ _GATEWAY_MESSAGES_LEGACY_HISTORICAL_FK_OBJECTS = (
         _GATEWAY_MESSAGES_LEGACY_OBJECTS
     )
 )
+_GATEWAY_MESSAGES_TRIGGER_PRIVACY_OBJECTS = {
+    "column:gateway_messages.authorization_source_agent_id",
+    "column:gateway_messages.delivery_lease_expires_at",
+    "column:gateway_messages.delivery_attempts",
+    "index:ix_gateway_messages_delivery_claim",
+    _GATEWAY_MESSAGES_CANONICAL_AUTHORIZATION_FK,
+}
+_GATEWAY_MESSAGES_PRE_TRIGGER_PRIVACY_OBJECTS = (
+    _BASELINE_ORM_TABLE_OBJECTS["gateway_messages"]
+    - _GATEWAY_MESSAGES_TRIGGER_PRIVACY_OBJECTS
+)
+_GATEWAY_MESSAGES_LEGACY_PRE_TRIGGER_PRIVACY_OBJECTS = (
+    _GATEWAY_MESSAGES_PRE_TRIGGER_PRIVACY_OBJECTS
+    - {"column:gateway_messages.conversation_id"}
+)
 _NOTIFICATION_EXTENSION_OBJECTS = {
     "column:notifications.agent_id",
     "column:notifications.sender_name",
@@ -642,6 +657,10 @@ def _baseline_orm_table_plan(
             return ("normalize_gateway_messages_fk", ())
         if gateway_present == _GATEWAY_MESSAGES_LEGACY_HISTORICAL_FK_OBJECTS:
             return ("upgrade_gateway_messages_historical_fk", ())
+        if gateway_present == _GATEWAY_MESSAGES_PRE_TRIGGER_PRIVACY_OBJECTS:
+            return ("upgrade_gateway_messages_trigger_privacy", ())
+        if gateway_present == _GATEWAY_MESSAGES_LEGACY_PRE_TRIGGER_PRIVACY_OBJECTS:
+            return ("upgrade_gateway_messages_legacy_trigger_privacy", ())
 
     elif table_name == "notifications":
         missing_indexes = tuple(name for name in BASELINE_ORM_INDEXES[table_name] if f"index:{name}" not in present)
@@ -963,6 +982,49 @@ def _upgrade_gateway_messages_legacy_shape() -> None:
     )
 
 
+def _upgrade_gateway_messages_trigger_privacy_shape() -> None:
+    """Repair the exact pre-099 queue shape shipped by older deployments."""
+    op.add_column(
+        "gateway_messages",
+        sa.Column(
+            "authorization_source_agent_id",
+            postgresql.UUID(as_uuid=True),
+            nullable=True,
+        ),
+    )
+    op.add_column(
+        "gateway_messages",
+        sa.Column(
+            "delivery_lease_expires_at",
+            sa.DateTime(timezone=True),
+            nullable=True,
+        ),
+    )
+    op.add_column(
+        "gateway_messages",
+        sa.Column(
+            "delivery_attempts",
+            sa.Integer(),
+            server_default="0",
+            nullable=False,
+        ),
+    )
+    op.create_foreign_key(
+        "gateway_messages_authorization_source_agent_id_fkey",
+        "gateway_messages",
+        "agents",
+        ["authorization_source_agent_id"],
+        ["id"],
+    )
+    op.create_index(
+        "ix_gateway_messages_delivery_claim",
+        "gateway_messages",
+        ["agent_id", "status", "delivery_lease_expires_at", "created_at"],
+        unique=False,
+        postgresql_where=sa.text("status IN ('pending', 'delivered')"),
+    )
+
+
 def _normalize_gateway_messages_historical_authorization_fk() -> None:
     op.execute(
         sa.text(
@@ -1017,6 +1079,11 @@ def _upgrade_baseline_orm_tables() -> None:
         elif action == "upgrade_gateway_messages_historical_fk":
             _upgrade_gateway_messages_legacy_shape()
             _normalize_gateway_messages_historical_authorization_fk()
+        elif action == "upgrade_gateway_messages_trigger_privacy":
+            _upgrade_gateway_messages_trigger_privacy_shape()
+        elif action == "upgrade_gateway_messages_legacy_trigger_privacy":
+            _upgrade_gateway_messages_legacy_shape()
+            _upgrade_gateway_messages_trigger_privacy_shape()
         elif action == "upgrade_legacy_notifications":
             _normalize_notifications_legacy_shape(add_extension=True)
         elif action == "normalize_notifications":
