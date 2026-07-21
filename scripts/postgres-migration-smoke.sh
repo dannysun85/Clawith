@@ -1997,6 +1997,15 @@ SQL
 assert_legacy_channel_config_downgraded
 assert_sso_password_security_downgraded
 PYTHONPATH=. .venv/bin/python ../scripts/code-execution-migration-postgres-smoke.py assert-secured
+# Exact v1.10.12 production shape: uniqueness was already enforced by a
+# standalone index with the name later used by revision 096's constraint.
+# The in-place upgrade must accept it, and a later downgrade must retain this
+# pre-existing invariant rather than claiming ownership of it.
+psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+DROP INDEX IF EXISTS uq_agent_tools_agent_tool;
+CREATE UNIQUE INDEX uq_agent_tools_agent_tool
+ON agent_tools (agent_id, tool_id);
+SQL
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
 DO $$
 BEGIN
@@ -2089,6 +2098,26 @@ SQL
 .venv/bin/alembic upgrade head
 assert_at_release_head
 assert_sso_password_security
+psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_indexes
+    WHERE schemaname = 'public'
+      AND tablename = 'agent_tools'
+      AND indexname = 'uq_agent_tools_agent_tool'
+      AND indexdef = 'CREATE UNIQUE INDEX uq_agent_tools_agent_tool ON public.agent_tools USING btree (agent_id, tool_id)'
+  ) OR EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'uq_agent_tools_agent_tool'
+      AND conrelid = 'agent_tools'::regclass
+  ) THEN
+    RAISE EXCEPTION '096 did not preserve the production-era standalone unique index';
+  END IF;
+END $$;
+SQL
 PYTHONPATH=. .venv/bin/python ../scripts/code-execution-migration-postgres-smoke.py assert-secured
 PYTHONPATH=. .venv/bin/python ../scripts/channel-config-encryption-postgres-smoke.py \
   --require-legacy-fixture --legacy-only

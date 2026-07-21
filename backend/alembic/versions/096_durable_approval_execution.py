@@ -50,10 +50,25 @@ def _check_constraint_names(table_name: str) -> set[str]:
     }
 
 
-def _has_unique_constraint(table_name: str, columns: list[str]) -> bool:
-    return any(
+def _has_unique_enforcement(table_name: str, columns: list[str]) -> bool:
+    inspector = sa.inspect(op.get_bind())
+    if any(
         constraint.get("column_names") == columns
-        for constraint in sa.inspect(op.get_bind()).get_unique_constraints(table_name)
+        for constraint in inspector.get_unique_constraints(table_name)
+    ):
+        return True
+
+    # Historical production bootstraps created this invariant as a standalone
+    # UNIQUE INDEX rather than a table constraint.  PostgreSQL stores both in
+    # the same relation namespace, so trying to create the constraint with the
+    # existing index name fails even though the required uniqueness is already
+    # enforced.  A partial unique index is not equivalent and must not satisfy
+    # this check.
+    return any(
+        index.get("unique") is True
+        and index.get("column_names") == columns
+        and not (index.get("dialect_options") or {}).get("postgresql_where")
+        for index in inspector.get_indexes(table_name)
     )
 
 
@@ -303,7 +318,7 @@ def upgrade() -> None:
         """
     )
     op.get_bind().exec_driver_sql("SET LOCAL astra.mcp_quarantine_restore = 'off'")
-    if not _has_unique_constraint(AGENT_TOOL_TABLE, ["agent_id", "tool_id"]):
+    if not _has_unique_enforcement(AGENT_TOOL_TABLE, ["agent_id", "tool_id"]):
         op.create_unique_constraint(
             "uq_agent_tools_agent_tool",
             AGENT_TOOL_TABLE,
@@ -312,11 +327,22 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_constraint(
-        "uq_agent_tools_agent_tool",
-        "agent_tools",
-        type_="unique",
-    )
+    # Only remove the constraint created by this revision.  A same-named
+    # standalone UNIQUE INDEX can predate the revision in production and must
+    # survive a rollback to that historical release.
+    unique_constraint_names = {
+        str(constraint["name"])
+        for constraint in sa.inspect(op.get_bind()).get_unique_constraints(
+            AGENT_TOOL_TABLE
+        )
+        if constraint.get("name")
+    }
+    if "uq_agent_tools_agent_tool" in unique_constraint_names:
+        op.drop_constraint(
+            "uq_agent_tools_agent_tool",
+            AGENT_TOOL_TABLE,
+            type_="unique",
+        )
     op.drop_index(
         "ix_approval_execution_claimable",
         table_name="approval_requests",
