@@ -1038,10 +1038,18 @@ def test_remote_deploy_buffers_script_and_rechecks_public_release_identity():
 
     loader = script[loader_start:loader_end]
     assert "set -euo pipefail" in loader
+    assert 'ORIGINAL_UMASK="$(umask)"' in loader
     assert "umask 077" in loader
     assert 'mktemp /tmp/.astra-production-deploy.XXXXXX' in loader
+    assert 'umask "$ORIGINAL_UMASK"' in loader
     assert 'trap \'rm -f "$REMOTE_SCRIPT_FILE"\' EXIT' in loader
     assert 'bash "$REMOTE_SCRIPT_FILE" "$@" < /dev/null' in loader
+    assert (
+        loader.index("umask 077")
+        < loader.index('mktemp /tmp/.astra-production-deploy.XXXXXX')
+        < loader.index('umask "$ORIGINAL_UMASK"')
+        < loader.index('cat > "$REMOTE_SCRIPT_FILE"')
+    )
     assert loader_start < buffered_script_start < buffered_script_end < loader_end
     assert loader_end < public_verify < done
     assert "require_cmd curl" in script

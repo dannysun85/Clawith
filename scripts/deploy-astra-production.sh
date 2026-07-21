@@ -441,8 +441,10 @@ ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
     "$PACKAGE_SHA256" "$REMOTE_SMOKE_CREDENTIAL_DIGEST" <<'REMOTE_LOADER'
 { set +x; } 2>/dev/null
 set -euo pipefail
+ORIGINAL_UMASK="$(umask)"
 umask 077
 REMOTE_SCRIPT_FILE="$(mktemp /tmp/.astra-production-deploy.XXXXXX)"
+umask "$ORIGINAL_UMASK"
 trap 'rm -f "$REMOTE_SCRIPT_FILE"' EXIT
 cat > "$REMOTE_SCRIPT_FILE" <<'REMOTE_SCRIPT'
 { set +x; } 2>/dev/null
