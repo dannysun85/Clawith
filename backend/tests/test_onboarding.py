@@ -5,6 +5,7 @@ import pytest
 
 from app.services.onboarding import (
     PHASE_CUSTOM_STYLE,
+    PHASE_COMPLETED,
     PHASE_GREETED,
     PHASE_TEMPLATE_FOCUS,
     _CUSTOM_CONFIG_PROMPT,
@@ -96,6 +97,30 @@ async def test_first_contact_is_the_only_tool_free_greeting_turn():
 
     assert injection is not None
     assert injection.is_greeting_turn is True
+
+
+@pytest.mark.asyncio
+async def test_first_real_task_bypasses_greeting_and_keeps_runtime_tools():
+    db = RecordingDB(
+        [
+            DummyResult(scalar_value=None),  # onboarding row
+        ]
+    )
+
+    injection = await resolve_onboarding_prompt(
+        db,
+        _make_agent(),
+        uuid.uuid4(),
+        user_name="Ray",
+        user_locale="zh",
+        allow_greeting_turn=False,
+    )
+
+    assert injection is not None
+    assert injection.target_phase == PHASE_COMPLETED
+    assert injection.is_greeting_turn is False
+    assert "normal work turn" in injection.prompt
+    assert "Do not ask onboarding" in injection.prompt
 
 
 @pytest.mark.asyncio

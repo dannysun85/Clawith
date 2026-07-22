@@ -17,25 +17,36 @@ export interface MediaCapabilitiesResponse {
 
 const PROMPTS: Record<MediaModality, { zh: string; en: string }> = {
     image: {
-        zh: '请生成一张图片：',
-        en: 'Create an image: ',
+        zh: '请生成一张图片，并返回可直接预览的图片文件：',
+        en: 'Create an image and return a directly previewable image file: ',
     },
     audio: {
-        zh: '请将下面的内容生成语音：',
-        en: 'Create speech audio from: ',
+        zh: '请将下面的内容生成语音，并返回可直接播放的音频文件：',
+        en: 'Create speech audio and return a directly playable audio file from: ',
     },
     music: {
         zh: '请生成一首音乐，风格与歌词如下：',
         en: 'Create a song with this style and lyrics: ',
     },
     video: {
-        zh: '请生成一个视频：',
-        en: 'Create a video: ',
+        zh: '请生成一个视频，持续查询直到生成完成，并返回可直接播放或下载的视频文件：',
+        en: 'Create a video, keep checking until generation completes, and return a directly playable or downloadable video file: ',
     },
+};
+
+const ACTION_LABELS: Record<MediaModality, { zh: string; en: string }> = {
+    image: { zh: '图片', en: 'Image' },
+    audio: { zh: '语音', en: 'Speech' },
+    music: { zh: '音乐', en: 'Music' },
+    video: { zh: '视频', en: 'Video' },
 };
 
 export function buildMediaPrompt(modality: MediaModality, language: 'zh' | 'en'): string {
     return PROMPTS[modality][language];
+}
+
+export function mediaCapabilityShortLabel(modality: MediaModality, language: 'zh' | 'en'): string {
+    return ACTION_LABELS[modality][language];
 }
 
 export function mediaCapabilityState(
@@ -43,9 +54,12 @@ export function mediaCapabilityState(
     language: 'zh' | 'en',
 ): { disabled: boolean; label: string; action: 'upgrade' | 'open_tools' | 'contact_admin' | null } {
     if (capability.available) {
+        const actionLabel = mediaCapabilityShortLabel(capability.modality, language);
         return {
             disabled: false,
-            label: language === 'zh' ? '插入生成需求（不会自动发送）' : 'Insert a generation request (not sent automatically)',
+            label: language === 'zh'
+                ? `生成${actionLabel}（点击后填写需求，不会自动发送）`
+                : `Generate ${actionLabel.toLowerCase()} (insert a request; not sent automatically)`,
             action: null,
         };
     }

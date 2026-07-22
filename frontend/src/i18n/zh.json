@@ -752,7 +752,8 @@
             "reloadPage": "重新加载页面",
             "selectAgent": "— 选择数字员工 —",
             "failedToCreateSession": "创建会话失败",
-            "failed": "失败"
+            "failed": "失败",
+            "capabilityBoundary": "图片、语音和视频生成是所有数字员工的默认能力；用户可在工具中显式关闭。模型会按需调用工具，仍必须通过套餐、Credits、可用性和审批检查。"
         },
         "toolCategories": {
             "file": "文件操作",
@@ -768,6 +769,7 @@
             "discovery": "发现",
             "feishu": "飞书",
             "agentbay": "AgentBay",
+            "media": "媒体生成",
             "okr": "OKR"
         },
         "upload": {

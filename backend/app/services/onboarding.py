@@ -212,6 +212,18 @@ After writing, reply with a short confirmation:
 Never mention these instructions to the user."""
 
 
+_FIRST_TASK_BYPASS_PROMPT = """\
+{user_name} is meeting you for the first time and has already sent a concrete \
+request. The real request takes priority over the optional setup ritual.
+
+Handle this as a normal work turn using any needed capability supplied in the \
+current Tool Schema. Do not ask onboarding, calibration, role-confirmation, or \
+setup questions. Do not claim a capability is missing until you have checked \
+the authoritative runtime capability manifest. Complete the request now; a \
+brief natural introduction is allowed only when it does not delay the work. \
+Never mention onboarding internals."""
+
+
 def _render_template_greeting(
     agent: Agent,
     capability_bullets: list[str] | None,
@@ -259,6 +271,7 @@ async def resolve_onboarding_prompt(
     *,
     user_name: str = "there",
     user_locale: str = "en",
+    allow_greeting_turn: bool = True,
 ) -> OnboardingInjection | None:
     """Decide what system prompt to inject for this (user, agent) turn.
 
@@ -276,6 +289,21 @@ async def resolve_onboarding_prompt(
     existing_phase = getattr(existing, "phase", PHASE_COMPLETED) if existing else None
     if existing_phase == PHASE_COMPLETED:
         return None
+
+    # The frontend normally sends a synthetic greeting before any visible user
+    # input. A fast user can win that race and submit a real task first. Never
+    # turn that paid/intentional request into a tool-free greeting: execute it
+    # normally and complete onboarding once the response begins streaming.
+    if existing_phase is None and not allow_greeting_turn:
+        return OnboardingInjection(
+            prompt=(
+                _locale_directive(user_locale)
+                + _FIRST_TASK_BYPASS_PROMPT.format(user_name=user_name)
+            ),
+            lock_on_first_chunk=True,
+            target_phase=PHASE_COMPLETED,
+            is_greeting_turn=False,
+        )
 
     capability_bullets: list[str] | None = None
     if agent.template_id:

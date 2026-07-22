@@ -73,6 +73,7 @@ import {
 } from '../../utils/chatSessionModelSelection';
 import {
     buildMediaPrompt,
+    mediaCapabilityShortLabel,
     mediaCapabilityState,
     type MediaCapabilitiesResponse,
     type MediaCapability,
@@ -8278,7 +8279,7 @@ export default function AgentDetailPage() {
                                                                 <button
                                                                     key={capability.modality}
                                                                     type="button"
-                                                                    className="chat-composer-btn"
+                                                                    className="chat-composer-btn media-capability-launcher"
                                                                     onClick={() => handleMediaCapabilityClick(capability)}
                                                                     disabled={chatInputDisabled || !wsConnected || mediaCapabilitiesLoading}
                                                                     aria-label={state.label}
@@ -8287,6 +8288,9 @@ export default function AgentDetailPage() {
                                                                     style={state.disabled ? { opacity: 0.48 } : undefined}
                                                                 >
                                                                     {mediaIcons[capability.modality]}
+                                                                    <span className="media-capability-label">
+                                                                        {mediaCapabilityShortLabel(capability.modality, language)}
+                                                                    </span>
                                                                 </button>
                                                             );
                                                         })}

@@ -22,6 +22,7 @@ from app.services.builtin_tool_definitions import BUILTIN_TOOL_DEFINITIONS
 from app.services.tool_capability_policy import (
     CENTRAL_CREDENTIAL_POOL_TOOL_NAMES,
     EXPLICIT_GRANT_TOOL_NAMES,
+    GLOBAL_DEFAULT_MEDIA_TOOL_NAMES,
 )
 from app.services.tool_config import (
     remove_sensitive_fields,
@@ -60,17 +61,37 @@ def test_only_finish_bypasses_persisted_capability_resolution() -> None:
 
 
 def test_explicit_grant_tools_never_use_stale_default_fallback() -> None:
-    stale_media_tool = SimpleNamespace(
-        name="generate_image_minimax",
+    stale_role_tool = SimpleNamespace(
+        name="generate_music_minimax",
         source="builtin",
         is_default=True,
     )
     explicit_grant = SimpleNamespace(enabled=True)
     explicit_revoke = SimpleNamespace(enabled=False)
 
-    assert tool_enabled_for_agent(stale_media_tool, None) is False
-    assert tool_enabled_for_agent(stale_media_tool, explicit_grant) is True
-    assert tool_enabled_for_agent(stale_media_tool, explicit_revoke) is False
+    assert tool_enabled_for_agent(stale_role_tool, None) is False
+    assert tool_enabled_for_agent(stale_role_tool, explicit_grant) is True
+    assert tool_enabled_for_agent(stale_role_tool, explicit_revoke) is False
+
+
+def test_image_speech_and_video_are_global_defaults_with_agent_opt_out() -> None:
+    canonical = {item["name"]: item for item in BUILTIN_TOOL_DEFINITIONS}
+    persisted = {item["name"]: item for item in tool_seeder.BUILTIN_TOOLS}
+
+    assert GLOBAL_DEFAULT_MEDIA_TOOL_NAMES == {
+        "generate_image_minimax",
+        "generate_speech_minimax",
+        "generate_video_minimax",
+        "check_video_minimax",
+    }
+    assert GLOBAL_DEFAULT_MEDIA_TOOL_NAMES.isdisjoint(EXPLICIT_GRANT_TOOL_NAMES)
+    for name in GLOBAL_DEFAULT_MEDIA_TOOL_NAMES:
+        assert canonical[name]["is_default"] is True
+        assert persisted[name]["is_default"] is True
+        assert name in tool_seeder.SYNC_IS_DEFAULT_TOOL_NAMES
+        tool = SimpleNamespace(name=name, source="builtin", is_default=True)
+        assert tool_enabled_for_agent(tool, None) is True
+        assert tool_enabled_for_agent(tool, SimpleNamespace(enabled=False)) is False
 
 
 def test_core_default_tools_keep_product_policy_fallback() -> None:

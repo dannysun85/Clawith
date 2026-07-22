@@ -33,6 +33,7 @@ import {
     IconFileText,
     IconLink,
     IconMessageCircle,
+    IconPhoto,
     IconSearch,
     IconSettings,
     IconShieldCheck,
@@ -480,6 +481,7 @@ export default function EnterpriseSettings() {
         custom: t('agent.toolCategories.custom'),
         general: t('agent.toolCategories.general'),
         agentbay: t('agent.toolCategories.agentbay', 'AgentBay'),
+        media: t('agent.toolCategories.media', 'Media Generation'),
     };
     const categoryDescriptions: Record<string, string> = {
         agentbay: 'Browser and cloud computer automation',
@@ -495,6 +497,7 @@ export default function EnterpriseSettings() {
         discovery: 'Tool and capability discovery',
         custom: 'Company-added or MCP tools',
         general: 'General purpose tools',
+        media: 'Image, speech, music, and video generation tools',
     };
     const renderCategoryIcon = (category: string, size = 15) => {
         const style = { color: 'var(--text-tertiary)' };
@@ -511,6 +514,7 @@ export default function EnterpriseSettings() {
                 return <IconSearch size={size} stroke={1.8} style={style} />;
             case 'code': return <IconTerminal2 size={size} stroke={1.8} style={style} />;
             case 'aware': return <IconClock size={size} stroke={1.8} style={style} />;
+            case 'media': return <IconPhoto size={size} stroke={1.8} style={style} />;
             case 'custom': return <IconSettings size={size} stroke={1.8} style={style} />;
             default: return <IconTools size={size} stroke={1.8} style={style} />;
         }

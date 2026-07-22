@@ -5,8 +5,22 @@ from __future__ import annotations
 from app.services.code_execution_policy import CODE_EXECUTION_TOOL_NAMES
 
 
-# These capabilities are role-specific, provider-paid, or install/publish new
-# executable reach. They may be assigned by a reviewed AgentTemplate or an
+# Image, speech, and video creation are product-wide Agent capabilities.  The
+# provider credential remains centralized and every call still passes through
+# tenant entitlements, tier selection, Credits reservation, and media contract
+# validation.  An explicit disabled AgentTool row remains a user opt-out.
+GLOBAL_DEFAULT_MEDIA_TOOL_NAMES = frozenset(
+    {
+        "generate_image_minimax",
+        "generate_speech_minimax",
+        "generate_video_minimax",
+        "check_video_minimax",
+    }
+)
+
+
+# These capabilities remain role-specific, provider-paid, or install/publish
+# new executable reach. They may be assigned by a reviewed AgentTemplate or an
 # Agent manager, but an absent AgentTool row never grants them implicitly.
 #
 # Ordinary workspace, reminder, directory, and communication tools are not in
@@ -17,11 +31,7 @@ from app.services.code_execution_policy import CODE_EXECUTION_TOOL_NAMES
 EXPLICIT_GRANT_TOOL_NAMES = frozenset(
     {
         "upload_image",
-        "generate_image_minimax",
-        "generate_speech_minimax",
         "generate_music_minimax",
-        "generate_video_minimax",
-        "check_video_minimax",
         "import_mcp_server",
         "install_skill",
         "publish_page",
@@ -32,18 +42,12 @@ EXPLICIT_GRANT_TOOL_NAMES = frozenset(
 
 
 # These media tools are funded and authenticated by the platform-level
-# ``LLMCredential`` pool.  A Tool/AgentTool assignment grants the ability to
-# request the capability; it must never become an object-level or tenant BYOK
-# credential binding for MiniMax.
-CENTRAL_CREDENTIAL_POOL_TOOL_NAMES = frozenset(
-    {
-        "generate_image_minimax",
-        "generate_speech_minimax",
-        "generate_music_minimax",
-        "generate_video_minimax",
-        "check_video_minimax",
-    }
-)
+# ``LLMCredential`` pool. Tool visibility may come from the global product
+# default or an explicit Agent assignment; neither path may become an
+# object-level or tenant BYOK credential binding for MiniMax.
+CENTRAL_CREDENTIAL_POOL_TOOL_NAMES = GLOBAL_DEFAULT_MEDIA_TOOL_NAMES | {
+    "generate_music_minimax",
+}
 
 
 # v1.11 replaced the AI-posting Plaza.  Keep the names registered for old
@@ -67,6 +71,7 @@ PERSISTED_NON_DEFAULT_TOOL_NAMES = (
 __all__ = [
     "CENTRAL_CREDENTIAL_POOL_TOOL_NAMES",
     "EXPLICIT_GRANT_TOOL_NAMES",
+    "GLOBAL_DEFAULT_MEDIA_TOOL_NAMES",
     "LEGACY_NON_DEFAULT_TOOL_NAMES",
     "PERSISTED_NON_DEFAULT_TOOL_NAMES",
 ]

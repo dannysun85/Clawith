@@ -698,7 +698,7 @@
       "selectAgent": "— Select Agent —",
       "failedToCreateSession": "Failed to create session",
       "failed": "Failed",
-      "capabilityBoundary": "Tools are executable capabilities. Once enabled they enter this agent's model tool list, where the model may select them automatically, but configuration, tenant isolation, readiness, and approval checks still apply."
+      "capabilityBoundary": "Image, speech, and video generation are default capabilities for every agent and may be explicitly disabled in Tools. The model invokes tools as needed, subject to plan, Credits, readiness, and approval checks."
     },
     "toolCategories": {
       "file": "File Operations",
@@ -714,6 +714,7 @@
       "discovery": "Discovery",
       "feishu": "Feishu / Lark",
       "agentbay": "AgentBay",
+      "media": "Media Generation",
       "okr": "OKR"
     },
     "upload": {

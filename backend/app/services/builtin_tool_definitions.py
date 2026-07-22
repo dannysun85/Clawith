@@ -15,6 +15,7 @@ from typing import Any, Mapping
 
 from app.services.llm.finish import FINISH_TOOL_SEED
 from app.services.tool_capability_policy import (
+    GLOBAL_DEFAULT_MEDIA_TOOL_NAMES,
     PERSISTED_NON_DEFAULT_TOOL_NAMES,
 )
 
@@ -3961,11 +3962,13 @@ for _seed in _BUILTIN_TOOL_SOURCE:
         if _field in _legacy_properties:
             _properties[_field] = deepcopy(_legacy_properties[_field])
 
-# v1.11 replaced the AI-posting Plaza with a human-curated experience library.
-# Keep the legacy names registered so historical assignments remain readable,
-# but never grant them to new/default Agents.
+# Keep product-wide image, speech, and video capabilities ambient even when an
+# upstream seed changes its default. Legacy Plaza and the remaining reviewed
+# capabilities stay non-default.
 for _seed in _BUILTIN_TOOL_SOURCE:
-    if str(_seed["name"]) in PERSISTED_NON_DEFAULT_TOOL_NAMES:
+    if str(_seed["name"]) in GLOBAL_DEFAULT_MEDIA_TOOL_NAMES:
+        _seed["is_default"] = True
+    elif str(_seed["name"]) in PERSISTED_NON_DEFAULT_TOOL_NAMES:
         _seed["is_default"] = False
 
 

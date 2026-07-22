@@ -628,6 +628,63 @@ async def test_web_intake_pins_onboarding_metadata_without_a_visible_user_messag
 
 
 @pytest.mark.asyncio
+async def test_first_real_user_task_keeps_tools_when_it_wins_onboarding_race() -> None:
+    handler = _handler(_WebSocket())
+    model = SimpleNamespace(id=uuid.uuid4())
+    session = SimpleNamespace(title="Session 1")
+    agent = SimpleNamespace(id=handler.agent_id)
+    intake = ChatRuntimeIntake(
+        handle=_handle(handler.user.tenant_id),
+        message_id=uuid.uuid4(),
+        resumed=False,
+    )
+    db = _Session({User: handler.user, ChatSession: session, LLMModel: model})
+    onboarding = SimpleNamespace(
+        prompt="Execute the first real task now",
+        target_phase="completed",
+        lock_on_first_chunk=True,
+        is_greeting_turn=False,
+    )
+    run_state_reader = SimpleNamespace()
+
+    with (
+        patch("app.api.websocket.async_session", return_value=db),
+        patch(
+            "app.api.websocket.open_run_state_reader",
+            return_value=_AsyncContext(run_state_reader),
+        ),
+        patch("app.api.websocket.check_agent_access", new=AsyncMock(return_value=(agent, None))),
+        patch(
+            "app.api.websocket.resolve_onboarding_prompt",
+            new=AsyncMock(return_value=onboarding),
+        ) as resolve,
+        patch(
+            "app.api.websocket.enqueue_chat_runtime",
+            new=AsyncMock(return_value=intake),
+        ) as enqueue,
+    ):
+        result = await handler._enqueue_runtime_chat(
+            content="Create a poster from this image",
+            display_content="Create a poster from this image",
+            file_name="reference.jpg",
+            model_id=model.id,
+            message_id=None,
+            resume_run_id=None,
+            resume_correlation_id=None,
+            is_onboarding_trigger=False,
+        )
+
+    assert result == WebChatRuntimeIntake(
+        run=intake,
+        onboarding_target_phase="completed",
+    )
+    assert resolve.await_args.kwargs["allow_greeting_turn"] is False
+    assert enqueue.await_args.kwargs["application_tools_enabled"] is True
+    assert enqueue.await_args.kwargs["persist_user_message"] is True
+    assert enqueue.await_args.kwargs["source_execution_id_override"] is None
+
+
+@pytest.mark.asyncio
 async def test_abort_enqueues_a_durable_cancel_command() -> None:
     handler = _handler(_WebSocket())
     handle = _handle(handler.user.tenant_id)

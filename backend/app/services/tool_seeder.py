@@ -22,6 +22,7 @@ from app.services.agent_tool_assignments import upsert_agent_tool
 from app.services.tool_release_policy import RELEASE_DISABLED_TOOL_NAMES
 from app.services.tool_capability_policy import (
     CENTRAL_CREDENTIAL_POOL_TOOL_NAMES,
+    GLOBAL_DEFAULT_MEDIA_TOOL_NAMES,
     PERSISTED_NON_DEFAULT_TOOL_NAMES,
 )
 
@@ -3594,15 +3595,17 @@ BUILTIN_TOOLS = [
     *DEPLOY_BUILTIN_TOOLS,
 ]
 
-# Specialized, provider-paid, code-execution, install, publishing, and
+# Specialized provider-paid, code-execution, install, publishing, and
 # role-specific tools must be granted explicitly by a reviewed role template
-# or an Agent manager. A Skill is an instruction set, not an execution grant.
-# General workspace, reminder, and communication capabilities remain available
-# by product policy; their individual side effects are controlled separately by
-# the Agent autonomy/approval boundary.
+# or an Agent manager. Image, speech, and video generation are the deliberate
+# product-wide exception: plans, tiers, Credits, and provider readiness still
+# gate each call, while an explicit AgentTool row can opt an Agent out.
 for _tool_definition in BUILTIN_TOOLS:
-    if _tool_definition["name"] in PERSISTED_NON_DEFAULT_TOOL_NAMES:
+    if _tool_definition["name"] in GLOBAL_DEFAULT_MEDIA_TOOL_NAMES:
+        _tool_definition["is_default"] = True
+    elif _tool_definition["name"] in PERSISTED_NON_DEFAULT_TOOL_NAMES:
         _tool_definition["is_default"] = False
+SYNC_IS_DEFAULT_TOOL_NAMES.update(GLOBAL_DEFAULT_MEDIA_TOOL_NAMES)
 SYNC_IS_DEFAULT_TOOL_NAMES.update(PERSISTED_NON_DEFAULT_TOOL_NAMES)
 
 BUILTIN_TOOL_NAMES = frozenset(tool["name"] for tool in BUILTIN_TOOLS)

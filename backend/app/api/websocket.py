@@ -1062,6 +1062,7 @@ class WebSocketChatHandler:
                         user.id,
                         user_name=(user.display_name or "").strip() or "there",
                         user_locale=self.lang,
+                        allow_greeting_turn=is_onboarding_trigger,
                     )
                 )
                 target_phase = (
@@ -1090,7 +1091,11 @@ class WebSocketChatHandler:
                         source_execution_id_override=(
                             onboarding_source_execution_id if is_onboarding_trigger else None
                         ),
-                        application_tools_enabled=not (onboarding is not None and onboarding.is_greeting_turn),
+                        application_tools_enabled=not (
+                            is_onboarding_trigger
+                            and onboarding is not None
+                            and onboarding.is_greeting_turn
+                        ),
                         run_state_reader=run_state_reader,
                     )
                 if intake is None:

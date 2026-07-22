@@ -77,10 +77,11 @@ def tool_enabled_for_agent(
     """Resolve an Agent grant without reviving explicit-grant capabilities.
 
     ``Tool.is_default`` remains the product-policy grant for ordinary core
-    capabilities. Specialized, provider-paid, code, install, and publishing
-    tools always require an ``AgentTool`` row, even if a stale database row
-    still carries ``is_default=True`` before the canonical seeder repairs it.
-    Agent-owned tools likewise require their exact assignment.
+    capabilities, including the reviewed global image, speech, and video
+    tools. Capabilities retained in ``EXPLICIT_GRANT_TOOL_NAMES`` always
+    require an ``AgentTool`` row, even if a stale database row still carries
+    ``is_default=True`` before the canonical seeder repairs it. Agent-owned
+    tools likewise require their exact assignment.
     """
 
     if assignment is not None:
