@@ -1565,6 +1565,26 @@ async def test_success_completion_persists_one_message_and_exact_session_deep_li
     publish_completion.assert_awaited_once_with(task.id)
 
 
+def test_completion_notification_link_falls_back_for_long_unicode_path():
+    agent_id = uuid.uuid4()
+    session_id = uuid.uuid4()
+    message_id = uuid.uuid4()
+    output_path = f"workspace/videos/{'天地壹号国风产品广告' * 35}.mp4"
+
+    link = media_generation._media_completion_notification_link(
+        agent_id=agent_id,
+        output_path=output_path,
+        session_id=session_id,
+        message_id=message_id,
+    )
+
+    assert len(link) <= 500
+    assert f"/agents/{agent_id}/chat?" in link
+    assert f"session_id={session_id}" in link
+    assert f"message_id={message_id}" in link
+    assert "workspace_path=" not in link
+
+
 @pytest.mark.asyncio
 async def test_completion_outbox_retries_when_exact_realtime_delivery_fails(monkeypatch):
     agent_id = uuid.uuid4()

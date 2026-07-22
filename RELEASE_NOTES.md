@@ -1,3 +1,27 @@
+# v1.11.5 — Durable Media Completion Settlement Hotfix
+
+## Media Completion and Credits Settlement
+
+- Successful image, video, audio, and music tasks now keep completion
+  notification links within the database's 500-character contract. Long
+  Unicode workspace filenames no longer expand during URL encoding until the
+  notification insert fails after the provider has already completed.
+- When a workspace path would exceed that contract, the notification retains
+  the stable Agent, chat session, and completion-message target while the
+  durable completion message continues to carry the exact artifact path. This
+  preserves delivery without weakening tenant or Agent authorization.
+- Provider success, artifact persistence, completion messaging, notification,
+  and Credits finalization remain one retriable settlement boundary. Existing
+  `settlement_ready` tasks can therefore finish safely after this hotfix
+  without a second provider request or duplicate charge.
+
+## Validation
+
+- Media lifecycle tests: `43 passed`; expanded media, Credits, notification,
+  MiniMax quota, and failover regression set: `199 passed`.
+- Complete backend suite: `3625 passed`; changed Python files passed Ruff.
+  Production browser results are recorded by the deployment verification.
+
 # v1.11.4 — Durable Model Routing and Provider Diagnostics Hotfix
 
 ## MiniMax-M3 Runtime Request Alignment

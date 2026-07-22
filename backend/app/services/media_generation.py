@@ -101,6 +101,7 @@ _SYNC_MEDIA_EXTENSIONS = {
 }
 _MAX_SYNC_IMAGE_BYTES = 20 * 1024 * 1024
 _MAX_SYNC_AUDIO_BYTES = 16 * 1024 * 1024
+_NOTIFICATION_LINK_MAX_LENGTH = 500
 _PUBLIC_MEDIA_METADATA_KEYS = frozenset(
     {
         "provider",
@@ -129,6 +130,42 @@ _PUBLIC_MEDIA_METADATA_KEYS = frozenset(
         "error",
     }
 )
+
+
+def _media_completion_notification_link(
+    *,
+    agent_id: uuid.UUID,
+    output_path: str,
+    session_id: uuid.UUID | None,
+    message_id: uuid.UUID | None,
+) -> str:
+    """Build a useful notification link within the database column limit.
+
+    Unicode workspace filenames expand substantially when URL encoded.  The
+    completion message already contains the durable artifact link, so a long
+    workspace path may be omitted while retaining the exact session/message
+    target instead of aborting settlement after the provider succeeded.
+    """
+
+    base = f"/agents/{agent_id}/chat"
+    query = {"workspace_path": output_path}
+    if session_id:
+        query["session_id"] = str(session_id)
+    if message_id:
+        query["message_id"] = str(message_id)
+    candidate = f"{base}?{urlencode(query)}"
+    if len(candidate) <= _NOTIFICATION_LINK_MAX_LENGTH:
+        return candidate
+
+    stable_query = {}
+    if session_id:
+        stable_query["session_id"] = str(session_id)
+    if message_id:
+        stable_query["message_id"] = str(message_id)
+    if not stable_query:
+        return base
+    fallback = f"{base}?{urlencode(stable_query)}"
+    return fallback if len(fallback) <= _NOTIFICATION_LINK_MAX_LENGTH else base
 
 
 def minimax_video_brand_asset_key(
@@ -3242,20 +3279,18 @@ async def _finalize_success(
                 ))
             if task.user_id and not was_already_completed:
                 chinese_label, _english_label, _action_label = _media_labels(task)
-                query = {
-                    "workspace_path": task.output_path,
-                }
-                if valid_session:
-                    query["session_id"] = str(valid_session.id)
-                if task.completion_message_id:
-                    query["message_id"] = str(task.completion_message_id)
                 db.add(Notification(
                     user_id=task.user_id,
                     agent_id=task.agent_id,
                     type="system",
                     title=f"{chinese_label}生成完成",
                     body=f"{chinese_label}已保存到 {task.output_path}",
-                    link=f"/agents/{task.agent_id}/chat?{urlencode(query)}",
+                    link=_media_completion_notification_link(
+                        agent_id=task.agent_id,
+                        output_path=task.output_path,
+                        session_id=valid_session.id if valid_session else None,
+                        message_id=task.completion_message_id,
+                    ),
                     ref_id=task.id,
                     sender_name="Astra",
                 ))
