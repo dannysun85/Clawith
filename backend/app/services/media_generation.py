@@ -44,7 +44,6 @@ from app.services.llm.failover import (
 )
 from app.services.media_assets import (
     MediaContractError,
-    OverlayReceipt,
     apply_image_brand_overlays,
     apply_video_brand_overlays,
     image_asset_from_bytes,
@@ -2837,24 +2836,29 @@ async def reconcile_minimax_video_task(
                 ):
                     raise MediaContractError("Frozen video brand asset hash does not match the submitted asset")
 
+            # Provider output is not guaranteed to be directly playable in a
+            # browser.  The overlay helper is also the single compatibility
+            # normalizer: when no copy or brand asset is requested it keeps an
+            # already-safe MP4 unchanged, otherwise it transcodes to
+            # H.264/yuv420p, optional AAC audio, and faststart.  Skipping the
+            # helper for an unbranded video left successful provider tasks in
+            # the durable ``downloading`` retry state.
+            video_bytes, overlay_receipt = await apply_video_brand_overlays(
+                video_bytes,
+                overlay_text,
+                text_position=str(request_metadata.get("overlay_position") or "bottom"),
+                brand_asset=brand_asset,
+                brand_position=str(request_metadata.get("brand_position") or "center"),
+                brand_scale=float(request_metadata.get("brand_scale") or 0.42),
+                sanitize_generated_background=bool(
+                    request_metadata.get("sanitize_generated_background")
+                ),
+            )
             if overlay_text.strip() or brand_asset:
-                video_bytes, overlay_receipt = await apply_video_brand_overlays(
-                    video_bytes,
-                    overlay_text,
-                    text_position=str(request_metadata.get("overlay_position") or "bottom"),
-                    brand_asset=brand_asset,
-                    brand_position=str(request_metadata.get("brand_position") or "center"),
-                    brand_scale=float(request_metadata.get("brand_scale") or 0.42),
-                    sanitize_generated_background=bool(
-                        request_metadata.get("sanitize_generated_background")
-                    ),
-                )
                 status_data = {
                     **(status_data or {}),
                     "_astra_media_contract": overlay_receipt.as_dict(),
                 }
-            else:
-                overlay_receipt = OverlayReceipt()
             await validate_generated_video(video_bytes, label="Final brand-safe video")
             status_data = {
                 **(status_data or {}),

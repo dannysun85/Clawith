@@ -12,6 +12,7 @@ from app.services.agent_tools import _read_file
 from app.services import media_assets
 from app.services.media_assets import (
     MediaContractError,
+    OverlayReceipt,
     apply_image_brand_overlays,
     apply_image_text_overlay,
     apply_video_brand_overlays,
@@ -288,6 +289,25 @@ def test_brand_safe_image_suppresses_provider_background_pseudo_text():
 
     assert sanitized_variance < original_variance * 0.1
     assert receipt.background_sanitized is True
+
+
+@pytest.mark.asyncio
+async def test_unbranded_video_is_normalized_to_browser_safe_mp4(tmp_path):
+    source = _real_mp4(tmp_path)
+    source_info = await validate_generated_video(
+        source,
+        require_browser_safe=False,
+    )
+
+    result, receipt = await apply_video_brand_overlays(source, None)
+    result_info = await validate_generated_video(result)
+
+    assert source_info.fast_start is False
+    assert result_info.codec_name == "h264"
+    assert result_info.pixel_format == "yuv420p"
+    assert result_info.audio_codec_name in {None, "aac"}
+    assert result_info.fast_start is True
+    assert receipt == OverlayReceipt()
 
 
 @pytest.mark.asyncio

@@ -1,3 +1,23 @@
+# v1.11.8 — Browser-safe Provider Video Delivery Hotfix
+
+## Provider Output Normalization
+
+- Successful MiniMax videos are now passed through the existing browser
+  compatibility normalizer even when the request has no text or brand overlay.
+  Already-compatible MP4 files remain byte-for-byte unchanged; HEVC, 10-bit,
+  non-faststart, or otherwise incompatible provider outputs are normalized to
+  H.264/yuv420p, optional AAC audio, and faststart before durable storage.
+- Provider acceptance, durable Runtime polling, Credits settlement, and
+  completion delivery remain exactly-once. The fix resumes existing provider-
+  successful tasks from their durable `downloading` state without submitting a
+  second generation request or charging again.
+
+## Validation
+
+- Added a regression for an unbranded provider video that is valid media but
+  not browser-compatible; the task must normalize the bytes and settle
+  successfully before the Runtime emits its single completion result.
+
 # v1.11.7 — Durable Media Runtime Completion Hotfix
 
 ## Video Run Completion and Session Recovery
