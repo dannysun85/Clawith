@@ -1742,6 +1742,25 @@ async def find_media_generation_task(
         return result.scalar_one_or_none()
 
 
+async def find_media_generation_task_by_id(
+    *,
+    agent_id: uuid.UUID,
+    record_id: uuid.UUID,
+) -> MediaGenerationTask | None:
+    """Load one durable media task without trusting editable workspace metadata."""
+
+    async with async_session() as db:
+        result = await db.execute(
+            select(MediaGenerationTask).where(
+                MediaGenerationTask.id == record_id,
+                MediaGenerationTask.agent_id == agent_id,
+                MediaGenerationTask.provider == "minimax",
+                MediaGenerationTask.modality == "video",
+            )
+        )
+        return result.scalar_one_or_none()
+
+
 async def _begin_missing_asset_repair(record_id: uuid.UUID) -> MediaGenerationTask:
     """Move a completed row back into download recovery when its object vanished."""
     async with async_session() as db:
@@ -3891,7 +3910,18 @@ async def reconcile_pending_media_generation_tasks() -> int:
                 if not task:
                     return
                 if task.modality == "video":
-                    await reconcile_minimax_video_task(task_id)
+                    runtime_managed = bool(
+                        (getattr(task, "request_metadata", None) or {}).get(
+                            "runtime_managed_completion"
+                        )
+                    )
+                    if runtime_managed:
+                        await reconcile_minimax_video_task(
+                            task_id,
+                            deliver_completion=False,
+                        )
+                    else:
+                        await reconcile_minimax_video_task(task_id)
                 elif task.modality in _SYNC_MEDIA_MODALITIES:
                     await reconcile_minimax_sync_media_task(task_id)
                 else:

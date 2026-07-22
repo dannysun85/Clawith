@@ -1996,7 +1996,8 @@ async def test_minimax_audio_cancellation_persists_safe_credit_state(
 
 
 @pytest.mark.asyncio
-async def test_generate_video_minimax_creates_task_metadata(tmp_path):
+@pytest.mark.parametrize("typed", [False, True])
+async def test_generate_video_minimax_creates_task_metadata(tmp_path, typed):
     agent_id = uuid.uuid4()
     tenant_id = uuid.uuid4()
     cred_id = uuid.uuid4()
@@ -2057,9 +2058,15 @@ async def test_generate_video_minimax_creates_task_metadata(tmp_path):
                 "first_frame_image": "workspace/images/product.png",
                 "wait_for_completion": False,
             },
+            typed=typed,
         )
 
-    assert "task_id=task-123" in result
+    result_text = (
+        result.result_summary
+        if isinstance(result, ToolExecutionOutcome)
+        else result
+    )
+    assert "task_id=task-123" in result_text
     metadata_files = list((tmp_path / "workspace/videos").glob("*.json"))
     assert len(metadata_files) == 1
     metadata = json.loads(metadata_files[0].read_text(encoding="utf-8"))
@@ -2077,7 +2084,19 @@ async def test_generate_video_minimax_creates_task_metadata(tmp_path):
     assert register.await_args.kwargs["tier"] == "pro"
     assert register.await_args.kwargs["credit_cost"] == 280
     assert create_task.await_args.kwargs["first_frame_image"].startswith("data:image/png;base64,")
-    assert "automatic" in result.lower()
+    assert "automatic" in result_text.lower()
+    assert register.await_args.kwargs["request_metadata"][
+        "runtime_managed_completion"
+    ] is typed
+    if typed:
+        assert isinstance(result, ToolExecutionOutcome)
+        assert result.status == "pending"
+        assert result.metadata["runtime_async_pending"] is True
+        poll = result.metadata["async_operation"]["poll"]
+        assert poll["tool"] == "check_video_minimax"
+        assert poll["arguments"]["task_record_id"] == str(
+            register.await_args.kwargs["record_id"]
+        )
     record_success.assert_awaited_once_with(
         agent_id,
         cred_id,

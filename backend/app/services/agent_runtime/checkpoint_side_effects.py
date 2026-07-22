@@ -229,6 +229,23 @@ def delivery_from_checkpoint(
     )
 
 
+def _cancel_delivery_checkpoint_id(
+    command: RuntimeCommandRecord,
+) -> str:
+    """Name the control boundary that projects a cancel delivery.
+
+    A cancel command intentionally reuses the last committed LangGraph
+    checkpoint.  A waiting prompt may already have emitted a successful
+    delivery event from that checkpoint, while ``agent_run_events`` permits
+    only one event of a given type per checkpoint.  The command is the new
+    authoritative control boundary, so use its durable identity for the
+    cancel delivery receipt instead of pretending that the old waiting
+    checkpoint produced the terminal message.
+    """
+
+    return f"cancel:{command.id}"
+
+
 def _event_payload(checkpoint: CheckpointObservation) -> dict:
     lifecycle = checkpoint.state["lifecycle"]
     status = lifecycle["status"]
@@ -635,6 +652,11 @@ class RuntimeCheckpointSideEffects:
 
         errors: list[Exception] = []
         delivery = delivery_from_checkpoint(run, product_checkpoint)
+        if delivery is not None and command.command_type == "cancel":
+            delivery = replace(
+                delivery,
+                checkpoint_id=_cancel_delivery_checkpoint_id(command),
+            )
         receipt: DeliveryReceipt | None = None
         try:
             async with self._session_factory() as db:

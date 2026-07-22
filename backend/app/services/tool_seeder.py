@@ -1509,9 +1509,13 @@ BUILTIN_TOOLS = [
             "type": "object",
             "properties": {
                 "task_meta_path": {"type": "string", "description": "Workspace path returned by generate_video_minimax."},
+                "task_record_id": {"type": "string", "description": "Durable task UUID returned internally by Runtime polling."},
                 "save_path": {"type": "string", "description": "Save path for the completed video. Default: auto."},
             },
-            "required": ["task_meta_path"],
+            "anyOf": [
+                {"required": ["task_meta_path"]},
+                {"required": ["task_record_id"]},
+            ],
         },
         "config": {},
         "config_schema": {},

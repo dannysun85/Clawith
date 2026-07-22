@@ -407,15 +407,22 @@ async def test_cancel_uses_control_disposition_without_mutating_preserved_checkp
     )
     terminal = _Handler()
     handler = RuntimeCheckpointSideEffects(
-        session_factory=_SessionFactory("not_required"),  # type: ignore[arg-type]
+        session_factory=_SessionFactory("pending"),  # type: ignore[arg-type]
         terminal_handlers=(terminal,),
     )
 
-    await handler.handle(run=run, command=command, checkpoint=checkpoint)
+    with patch(
+        "app.services.agent_runtime.checkpoint_side_effects.deliver_runtime_message",
+        new=AsyncMock(),
+    ) as deliver:
+        await handler.handle(run=run, command=command, checkpoint=checkpoint)
 
     assert checkpoint.state["lifecycle"]["status"] == "waiting_user"
     assert checkpoint.next_nodes == ("wait",)
     assert terminal.statuses == ["cancelled"]
+    request = deliver.await_args.args[1]
+    assert request.lifecycle_status == "cancelled"
+    assert request.checkpoint_id == f"cancel:{command.id}"
 
 
 @pytest.mark.asyncio

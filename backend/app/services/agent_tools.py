@@ -2313,6 +2313,7 @@ def _minimax_tool_result(
     tier: str | None = None,
     retryable: bool = False,
     halt_run: bool = False,
+    runtime_metadata: Mapping[str, object] | None = None,
 ) -> ToolExecutionOutcome | str:
     """Expose one explicit MiniMax lifecycle fact to legacy or Runtime callers.
 
@@ -2331,7 +2332,10 @@ def _minimax_tool_result(
         "task_record_id": str(record_id) if record_id else None,
         "workspace_path": output_path,
         "runtime_halt_run": bool(halt_run),
+        **dict(runtime_metadata or {}),
     }
+    if status == "pending":
+        return _typed_pending(summary, metadata=metadata)
     if status == "succeeded":
         artifact_refs: tuple[str, ...] = ()
         result_ref = None
@@ -2356,6 +2360,53 @@ def _minimax_tool_result(
         error_code or "minimax_media_outcome_unknown",
         metadata=metadata,
     )
+
+
+def _minimax_video_async_metadata(
+    *,
+    record_id: uuid.UUID,
+    task_meta_path: str | None,
+    state: str,
+    pending: bool,
+) -> dict[str, object]:
+    """Describe one durable MiniMax video operation to Runtime polling.
+
+    The media daemon owns provider reconciliation while Runtime owns the Agent
+    turn.  Both converge on the same durable task ID; Runtime polls by that ID
+    (with the editable metadata path only as a compatibility hint) so a local
+    metadata write failure cannot strand the Run.
+    """
+
+    operation_id = str(record_id)
+    operation_key = hashlib.sha256(
+        json.dumps(
+            {"provider": "minimax", "modality": "video", "task_id": operation_id},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    poll_arguments: dict[str, object] = {"task_record_id": operation_id}
+    normalized_meta_path = str(task_meta_path or "").strip()
+    if normalized_meta_path:
+        poll_arguments["task_meta_path"] = normalized_meta_path
+    interval_ms = min(
+        max(int(_settings.MEDIA_GENERATION_POLL_INTERVAL_SECONDS), 5) * 1000,
+        600_000,
+    )
+    return {
+        "runtime_async_pending": pending,
+        "async_operation": {
+            "version": 1,
+            "operation_key": operation_key,
+            "operation_id": operation_id,
+            "state": state,
+            "poll": {
+                "tool": "check_video_minimax",
+                "arguments": poll_arguments,
+                "interval_ms": interval_ms,
+            },
+        },
+    }
 
 
 def _propose_experience_draft_outcome(
@@ -2947,7 +2998,6 @@ async def execute_builtin_tool_outcome(
         "generate_speech_minimax": ("text",),
         "generate_music_minimax": ("prompt", "lyrics"),
         "generate_video_minimax": ("prompt",),
-        "check_video_minimax": ("task_meta_path",),
     }
     missing_minimax_arguments = tuple(
         name
@@ -2957,6 +3007,15 @@ async def execute_builtin_tool_outcome(
     if missing_minimax_arguments:
         return _typed_failure(
             f"{tool_name} requires: {', '.join(missing_minimax_arguments)}.",
+            "invalid_tool_arguments",
+        )
+    if tool_name == "check_video_minimax" and not any(
+        isinstance(arguments.get(name), str)
+        and bool(str(arguments.get(name)).strip())
+        for name in ("task_meta_path", "task_record_id")
+    ):
+        return _typed_failure(
+            "check_video_minimax requires task_meta_path or task_record_id.",
             "invalid_tool_arguments",
         )
 
@@ -29496,6 +29555,7 @@ async def _generate_video_minimax(
         request_metadata = {
             "credit_cost": credit_cost,
             "model": model,
+            "tier": tier,
             "prompt": prompt,
             "duration": duration,
             "resolution": resolution,
@@ -29516,6 +29576,10 @@ async def _generate_video_minimax(
             "brand_position": brand_position,
             "brand_scale": brand_scale,
             "sanitize_generated_background": sanitize_generated_background,
+            # Runtime waits on the durable async operation and emits the one
+            # terminal Agent message. Legacy callers keep the media daemon's
+            # existing completion delivery behavior.
+            "runtime_managed_completion": bool(typed),
         }
         created_task = await create_minimax_video_task_record(
             record_id=record_id,
@@ -29804,13 +29868,23 @@ async def _generate_video_minimax(
             return _minimax_tool_result(
                 f"⏳ MiniMax video task was submitted and automatic recovery is continuing. {metadata_notice}",
                 typed=typed,
-                status="unknown",
+                status="pending" if typed else "unknown",
                 error_code="minimax_video_recovery_pending",
                 agent_id=agent_id,
                 modality="video",
                 record_id=record_id,
                 model=model,
                 tier=tier,
+                runtime_metadata=(
+                    _minimax_video_async_metadata(
+                        record_id=record_id,
+                        task_meta_path=meta_path,
+                        state="retrying",
+                        pending=True,
+                    )
+                    if typed
+                    else None
+                ),
             )
 
         incident_recorded = False
@@ -29943,24 +30017,44 @@ async def _generate_video_minimax(
             f"⏳ MiniMax video task is still {status}. {metadata_notice}\n"
             "The system will keep checking automatically and save the video when it is ready.",
             typed=typed,
-            status="succeeded",
+            status="pending" if typed and record_id else "succeeded",
             agent_id=agent_id,
             modality="video",
             record_id=record_id,
             model=model,
             tier=tier,
+            runtime_metadata=(
+                _minimax_video_async_metadata(
+                    record_id=record_id,
+                    task_meta_path=meta_path,
+                    state=str(status or "processing"),
+                    pending=True,
+                )
+                if typed and record_id
+                else None
+            ),
         )
     return _minimax_tool_result(
         f"✅ MiniMax video task submitted. task_id={provider_task_id}\n"
         f"{metadata_notice}\n"
         "The system will keep checking automatically and save the video when it is ready.",
         typed=typed,
-        status="succeeded",
+        status="pending" if typed and record_id else "succeeded",
         agent_id=agent_id,
         modality="video",
         record_id=record_id,
         model=model,
         tier=tier,
+        runtime_metadata=(
+            _minimax_video_async_metadata(
+                record_id=record_id,
+                task_meta_path=meta_path,
+                state="submitted",
+                pending=True,
+            )
+            if typed and record_id
+            else None
+        ),
     )
 
 
@@ -29971,10 +30065,11 @@ async def _check_video_minimax(
     *,
     typed: bool = False,
 ) -> ToolExecutionOutcome | str:
-    task_meta_path = (arguments.get("task_meta_path") or "").strip()
-    if not task_meta_path:
+    task_meta_path = str(arguments.get("task_meta_path") or "").strip()
+    task_record_id = str(arguments.get("task_record_id") or "").strip()
+    if not task_meta_path and not task_record_id:
         return _minimax_tool_result(
-            "❌ Missing required argument 'task_meta_path' for check_video_minimax",
+            "❌ check_video_minimax requires task_meta_path or task_record_id",
             typed=typed,
             status="failed",
             error_code="invalid_tool_arguments",
@@ -29983,10 +30078,69 @@ async def _check_video_minimax(
         )
 
     try:
-        full_meta_path = _resolve_workspace_read_path(ws, task_meta_path)
-        metadata = json.loads(full_meta_path.read_text(encoding="utf-8"))
+        from app.services.media_generation import (
+            find_media_generation_task,
+            find_media_generation_task_by_id,
+            reconcile_minimax_video_task,
+        )
+
+        durable_task = None
+        if task_record_id:
+            try:
+                record_uuid = uuid.UUID(task_record_id)
+            except ValueError:
+                return _minimax_tool_result(
+                    "❌ Invalid MiniMax video task_record_id",
+                    typed=typed,
+                    status="failed",
+                    error_code="invalid_tool_arguments",
+                    agent_id=agent_id,
+                    modality="video_check",
+                )
+            durable_task = await find_media_generation_task_by_id(
+                agent_id=agent_id,
+                record_id=record_uuid,
+            )
+            if durable_task is None:
+                return _minimax_tool_result(
+                    "❌ MiniMax video task is unavailable in this Agent workspace.",
+                    typed=typed,
+                    status="failed",
+                    error_code="minimax_video_task_unavailable",
+                    agent_id=agent_id,
+                    modality="video_check",
+                )
+
+        metadata: dict[str, Any] = {}
+        full_meta_path: Path | None = None
+        if task_meta_path:
+            try:
+                full_meta_path = _resolve_workspace_read_path(ws, task_meta_path)
+                loaded = json.loads(full_meta_path.read_text(encoding="utf-8"))
+                if not isinstance(loaded, dict):
+                    raise ValueError("MiniMax video metadata must be an object")
+                metadata = loaded
+            except Exception:
+                if durable_task is None:
+                    raise
+                # Runtime polling is anchored to the durable task. The
+                # workspace JSON remains an editable compatibility artifact.
+                full_meta_path = None
+
+        if durable_task is not None:
+            durable_metadata = dict(durable_task.request_metadata or {})
+            metadata = {
+                **durable_metadata,
+                **metadata,
+                "task_record_id": str(durable_task.id),
+                "task_id": durable_task.provider_task_id or metadata.get("task_id"),
+                "model": durable_task.model or metadata.get("model"),
+                "tier": durable_metadata.get("tier") or metadata.get("tier"),
+                "save_path": durable_task.output_path,
+            }
+
         task_id = str(metadata.get("task_id") or "").strip()
-        if not task_id:
+        if durable_task is None and not task_id:
             return _minimax_tool_result(
                 "❌ Invalid MiniMax video metadata: missing task_id",
                 typed=typed,
@@ -29998,12 +30152,27 @@ async def _check_video_minimax(
                 tier=str(metadata.get("tier") or "") or None,
             )
 
-        from app.services.media_generation import find_media_generation_task, reconcile_minimax_video_task
-
-        durable_task = await find_media_generation_task(
-            agent_id=agent_id,
-            provider_task_id=task_id,
-        )
+        if durable_task is None:
+            durable_task = await find_media_generation_task(
+                agent_id=agent_id,
+                provider_task_id=task_id,
+            )
+        elif (
+            task_id
+            and durable_task.provider_task_id
+            and task_id != durable_task.provider_task_id
+        ):
+            return _minimax_tool_result(
+                "❌ MiniMax video metadata does not match the durable task.",
+                typed=typed,
+                status="failed",
+                error_code="minimax_video_metadata_mismatch",
+                agent_id=agent_id,
+                modality="video_check",
+                record_id=durable_task.id,
+                model=str(metadata.get("model") or "") or None,
+                tier=str(metadata.get("tier") or "") or None,
+            )
         if not durable_task:
             await _record_minimax_tool_product_issue(
                 agent_id,
@@ -30030,6 +30199,7 @@ async def _check_video_minimax(
             durable_task.id,
             deliver_completion=False,
         )
+        async_task_meta_path = task_meta_path or str(durable_task.metadata_path or "")
         metadata["last_checked_at"] = datetime.now(timezone.utc).isoformat()
         if outcome.status == "succeeded":
             output_path = outcome.output_path or durable_task.output_path
@@ -30037,10 +30207,11 @@ async def _check_video_minimax(
             metadata["reservation_status"] = "finalized" if durable_task.reservation_id else "not_required"
             metadata["downloaded_path"] = output_path
             metadata["completed_at"] = datetime.now(timezone.utc).isoformat()
-            full_meta_path.write_text(
-                json.dumps(metadata, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            if full_meta_path is not None:
+                full_meta_path.write_text(
+                    json.dumps(metadata, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
             return _minimax_tool_result(
                 f"✅ MiniMax video is ready and saved to: {output_path}\n\n"
                 f"▶️ Play the video:\n![]({_agent_file_download_url(agent_id, output_path)})",
@@ -30052,14 +30223,25 @@ async def _check_video_minimax(
                 output_path=output_path,
                 model=str(metadata.get("model") or "") or None,
                 tier=str(metadata.get("tier") or "") or None,
+                runtime_metadata=(
+                    _minimax_video_async_metadata(
+                        record_id=durable_task.id,
+                        task_meta_path=async_task_meta_path,
+                        state="Success",
+                        pending=False,
+                    )
+                    if typed
+                    else None
+                ),
             )
         if outcome.status == "failed":
             metadata["status"] = "Fail"
             metadata["error"] = "Video generation failed; see production issue log"
-            full_meta_path.write_text(
-                json.dumps(metadata, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            if full_meta_path is not None:
+                full_meta_path.write_text(
+                    json.dumps(metadata, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
             return _minimax_tool_result(
                 _safe_media_failure_message("Video task", "minimax", outcome.error),
                 typed=typed,
@@ -30070,22 +30252,43 @@ async def _check_video_minimax(
                 record_id=durable_task.id,
                 model=str(metadata.get("model") or "") or None,
                 tier=str(metadata.get("tier") or "") or None,
+                runtime_metadata=(
+                    _minimax_video_async_metadata(
+                        record_id=durable_task.id,
+                        task_meta_path=async_task_meta_path,
+                        state="Fail",
+                        pending=False,
+                    )
+                    if typed
+                    else None
+                ),
             )
 
         metadata["status"] = outcome.status
-        full_meta_path.write_text(
-            json.dumps(metadata, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        if full_meta_path is not None:
+            full_meta_path.write_text(
+                json.dumps(metadata, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
         return _minimax_tool_result(
             "⏳ MiniMax video task is still processing. The system will continue checking automatically.",
             typed=typed,
-            status="succeeded",
+            status="pending" if typed else "succeeded",
             agent_id=agent_id,
             modality="video_check",
             record_id=durable_task.id,
             model=str(metadata.get("model") or "") or None,
             tier=str(metadata.get("tier") or "") or None,
+            runtime_metadata=(
+                _minimax_video_async_metadata(
+                    record_id=durable_task.id,
+                    task_meta_path=async_task_meta_path,
+                    state=str(outcome.status or "processing"),
+                    pending=True,
+                )
+                if typed
+                else None
+            ),
         )
     except Exception as exc:
         await _record_minimax_tool_product_issue(
@@ -30103,9 +30306,22 @@ async def _check_video_minimax(
             error_code="minimax_video_check_failed",
             agent_id=agent_id,
             modality="video_check",
+            record_id=(durable_task.id if "durable_task" in locals() and durable_task else None),
             model=(str(metadata.get("model") or "") or None) if "metadata" in locals() else None,
             tier=(str(metadata.get("tier") or "") or None) if "metadata" in locals() else None,
             retryable=True,
+            runtime_metadata=(
+                _minimax_video_async_metadata(
+                    record_id=durable_task.id,
+                    task_meta_path=(
+                        task_meta_path or str(durable_task.metadata_path or "")
+                    ),
+                    state="check_error",
+                    pending=False,
+                )
+                if typed and "durable_task" in locals() and durable_task
+                else None
+            ),
         )
 
 

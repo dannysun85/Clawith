@@ -1,3 +1,45 @@
+# v1.11.7 — Durable Media Runtime Completion Hotfix
+
+## Video Run Completion and Session Recovery
+
+- MiniMax video generation now enters the Runtime's existing durable
+  asynchronous Tool protocol instead of reporting a submitted provider task as
+  a completed Tool call. The Run waits externally, polls by the immutable media
+  task UUID, resumes from its checkpoint, and releases the Agent session lane
+  only after the provider result has reached a terminal state.
+- Runtime polling no longer depends on an editable Workspace JSON file. The
+  metadata path remains a backwards-compatible hint, while tenant-scoped Agent
+  ownership and the durable media task record remain authoritative.
+- The background media reconciler and Runtime now share one completion owner.
+  New Runtime-managed tasks suppress the legacy daemon completion message,
+  preventing duplicate terminal messages while preserving legacy Agent and
+  non-Runtime behavior.
+- Credits reservation, provider acceptance, output validation, storage, and
+  finalization keep the existing exactly-once media settlement boundary; this
+  release changes orchestration ownership, not pricing or model authorization.
+
+## Cancelled Run Reconciliation
+
+- A cancel command now records terminal delivery against its own durable
+  control boundary instead of reusing the preceding waiting checkpoint. This
+  removes the `uq_agent_run_events_checkpoint_type` collision that caused the
+  production reconciler to retry a completed cancellation continuously.
+- The preserved LangGraph checkpoint remains unchanged, so resume, audit, and
+  cancellation semantics retain their existing compatibility contract.
+
+## Validation
+
+- Expanded media, Runtime async polling, cancellation, delivery, Tool outcome,
+  Credits lifecycle, and capability-governance regression set: `376 passed`;
+  complete backend suite: `3635 passed`.
+- Frontend Node contracts: `67 passed`; Vitest: `127 passed`; TypeScript/Vite
+  production build completed with `7031` transformed modules.
+- Changed Python files pass Ruff and byte-code compilation. PostgreSQL fresh
+  upgrade, historical upgrade, downgrade, re-upgrade, Credits/media
+  exactly-once, production-monitoring, and deployment smokes passed together
+  with the single Alembic head and `git diff --check`. Production-browser
+  evidence is recorded by the deployment verification.
+
 # v1.11.6 — Generated Workspace Image Preview Hotfix
 
 ## Historical and Live Image Preview Recovery
