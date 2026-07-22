@@ -39,6 +39,10 @@
   Agent manager, AgentBay execution lease, and ephemeral PDF preview port.
   These changes remove machine-dependent Redis/socket failures without
   weakening their production assertions.
+- Production SSH sessions keep their 15-second liveness probe while allowing a
+  bounded ten-minute recovery window for remote Docker builds. A temporary
+  sshd scheduling delay no longer terminates the cutover state machine after
+  only 90 seconds and leaves an otherwise recoverable candidate incomplete.
 
 ## Validation
 

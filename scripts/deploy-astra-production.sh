@@ -89,7 +89,10 @@ SSH_OPTS=(
     -o BatchMode=yes
     -o ConnectTimeout=15
     -o ServerAliveInterval=15
-    -o ServerAliveCountMax=6
+    # Remote Docker builds can temporarily delay sshd long enough to exceed
+    # the old 90-second window. Keep probing every 15 seconds, but allow the
+    # production recovery state machine to survive a bounded ten-minute stall.
+    -o ServerAliveCountMax=40
 )
 
 require_cmd git
