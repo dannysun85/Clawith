@@ -376,13 +376,15 @@ async def slack_event_webhook(
     if _file_user_messages and user_text:
         user_text += "\n" + " ".join(f"[file:{p.split('/')[-1]}]" for p in _file_user_messages)
 
-    _, model, _, _ = await _load_agent_and_model(db, agent_id)
+    _, model, fallback_model, route_meta = await _load_agent_and_model(db, agent_id)
     await enqueue_channel_chat_runtime(
         db,
         agent=agent_obj,
         user=platform_user,
         session=sess,
         model=model,
+        fallback_model=fallback_model,
+        route_meta=route_meta,
         content=user_text,
         source_channel="slack",
         channel_delivery_target={"channel_id": channel_id},

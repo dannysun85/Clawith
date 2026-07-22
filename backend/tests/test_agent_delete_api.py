@@ -188,7 +188,7 @@ async def test_delete_agent_cleans_remaining_foreign_key_rows(monkeypatch):
 
     monkeypatch.setattr(agents_api, "check_agent_access", fake_check_agent_access)
     monkeypatch.setattr(agents_api, "is_agent_creator", lambda _user, _agent: True)
-    monkeypatch.setattr("app.services.agent_manager.agent_manager", FakeAgentManager())
+    monkeypatch.setattr(agents_api, "agent_manager", FakeAgentManager())
 
     @asynccontextmanager
     async def no_provider_sessions(**_kwargs):

@@ -14,6 +14,8 @@ from .caller import (
     _get_model_timeout,
     _sanitize_tool_calls_for_context,
     _usage_from_response_or_estimate,
+    get_llm_request_options,
+    record_agent_llm_invocation_failure,
     release_llm_round_credits,
     reserve_llm_round_credits,
     settle_agent_llm_invocation,
@@ -84,8 +86,9 @@ async def complete_llm_once(
             tools=tools or None,
             temperature=effective_model.temperature,
             max_tokens=max_tokens,
+            **get_llm_request_options(effective_model),
         )
-    except BaseException:
+    except BaseException as exc:
         if invocation is not None:
             await release_llm_round_credits(
                 reservation_id,
@@ -96,6 +99,13 @@ async def complete_llm_once(
                 tenant_id=invocation.tenant_id,
                 provider_failed=not llm_provider_may_have_accepted(client),
             )
+            if isinstance(exc, Exception):
+                await record_agent_llm_invocation_failure(
+                    invocation,
+                    exc,
+                    agent_id=agent_id,
+                    user_id=user_id,
+                )
         raise
     finally:
         await client.close()

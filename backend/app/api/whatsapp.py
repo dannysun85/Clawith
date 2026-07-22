@@ -270,13 +270,18 @@ async def whatsapp_event_webhook(
                     first_message_title=user_text,
                     created_by_user_id=platform_user_id,
                 )
-                _, model, _, _ = await _load_agent_and_model(db, agent_id)
+                _, model, fallback_model, route_meta = await _load_agent_and_model(
+                    db,
+                    agent_id,
+                )
                 await enqueue_channel_chat_runtime(
                     db,
                     agent=agent_obj,
                     user=platform_user,
                     session=sess,
                     model=model,
+                    fallback_model=fallback_model,
+                    route_meta=route_meta,
                     content=user_text,
                     source_channel="whatsapp",
                     channel_delivery_target={"phone": sender_phone},

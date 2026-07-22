@@ -18,6 +18,10 @@ from app.models.trigger_execution import TriggerExecution
 from app.services.agent_runtime.adapter import RuntimeCommandIntake
 from app.services.agent_runtime.config import decide_runtime_v2
 from app.services.agent_runtime.contracts import RunHandle, StartRunCommand
+from app.services.agent_runtime.model_route import (
+    RuntimeModelRouteError,
+    resolve_runtime_model_route,
+)
 from app.services.chat_session_service import ensure_primary_platform_session
 from app.services.participant_identity import get_or_create_agent_participant
 from app.services.trigger_runtime.executions import build_execution_runtime_trigger
@@ -247,11 +251,13 @@ async def enqueue_trigger_runtime(
             "agent_tenant_missing",
             "Runtime Trigger Agent has no tenant",
         )
-    if agent.primary_model_id is None:
+    try:
+        route = await resolve_runtime_model_route(agent)
+    except RuntimeModelRouteError as exc:
         raise TriggerRuntimeIntakeError(
             "agent_model_missing",
-            "Runtime Trigger Agent has no primary model",
-        )
+            "Runtime Trigger Agent has no available model route",
+        ) from exc
     if agent.is_expired or agent.status not in {"creating", "running", "idle"}:
         raise TriggerRuntimeIntakeError(
             "agent_unavailable",
@@ -290,7 +296,7 @@ async def enqueue_trigger_runtime(
             source_execution_id=execution_id,
             goal=f"处理触发器 {trigger.name}：{trigger.reason}".strip(),
             run_kind="background",
-            model_id=agent.primary_model_id,
+            model_id=route.model_id,
             scheduling_lane_key=f"trigger:{agent.tenant_id}:{agent.id}",
             scheduling_position_created_at=scheduling_position,
             scheduling_position_id=execution.id,
@@ -304,6 +310,13 @@ async def enqueue_trigger_runtime(
                 "trigger_type": trigger.type,
                 "message_id": str(message_id),
                 "input_content": context,
+                "saas_tier": route.saas_tier,
+                "model_modality": route.modality,
+                "fallback_model_id": (
+                    str(route.fallback_model_id)
+                    if route.fallback_model_id is not None
+                    else None
+                ),
                 **({"trigger_event_data": event_data} if event_data else {}),
             },
             origin_user_id=origin_user_id,

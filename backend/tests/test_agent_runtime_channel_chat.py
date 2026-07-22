@@ -112,12 +112,15 @@ async def test_channel_intake_resumes_the_latest_waiting_run(monkeypatch) -> Non
     monkeypatch.setattr(channel_chat, "enqueue_chat_runtime", fake_enqueue)
     monkeypatch.setattr(channel_chat, "open_run_state_reader", fake_open_reader)
 
+    fallback_model_id = uuid.uuid4()
     result = await enqueue_channel_chat_runtime(
         object(),  # type: ignore[arg-type]
         agent=SimpleNamespace(id=agent_id, tenant_id=tenant_id),  # type: ignore[arg-type]
         user=SimpleNamespace(id=user_id),  # type: ignore[arg-type]
         session=SimpleNamespace(id=session_id),  # type: ignore[arg-type]
         model=SimpleNamespace(id=uuid.uuid4()),  # type: ignore[arg-type]
+        fallback_model=SimpleNamespace(id=fallback_model_id),  # type: ignore[arg-type]
+        route_meta=SimpleNamespace(saas_tier="pro", modality="text"),
         content="approve",
         source_channel="wechat",
         channel_delivery_target={"user_id": "wechat-user-1"},
@@ -137,5 +140,8 @@ async def test_channel_intake_resumes_the_latest_waiting_run(monkeypatch) -> Non
     assert enqueue["resume_run_id"] == waiting_run_id
     assert enqueue["resume_correlation_id"] == "approval-7"
     assert enqueue["source_channel"] == "wechat"
+    assert enqueue["fallback_model_id"] == fallback_model_id
+    assert enqueue["saas_tier"] == "pro"
+    assert enqueue["model_modality"] == "text"
     assert enqueue["channel_delivery_target"] == {"user_id": "wechat-user-1"}
     assert enqueue["run_state_reader"] is reader

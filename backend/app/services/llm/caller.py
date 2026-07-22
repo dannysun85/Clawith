@@ -149,6 +149,7 @@ async def _record_llm_product_issue(
     severity: str = "error",
     reservation_id: uuid.UUID | None = None,
     settlement_credits: int | None = None,
+    error: Exception | None = None,
 ) -> None:
     from app.services.production_issue_monitor import record_production_issue
 
@@ -179,6 +180,9 @@ async def _record_llm_product_issue(
             "reason_code": error_code if category == "credential" else None,
             "reservation_id": str(reservation_id) if reservation_id else None,
             "settlement_credits": settlement_credits,
+            "provider_http_status": getattr(error, "http_status", None),
+            "provider_error_code": getattr(error, "provider_code", None),
+            "provider_trace_id": getattr(error, "provider_trace_id", None),
         },
     )
 
@@ -261,6 +265,68 @@ async def _apply_credential_failure_policy(
             # credential stays healthy because a rate rejection is not an
             # authentication or provider-quota failure.
             await asyncio.sleep(1.0)
+
+
+async def record_agent_llm_invocation_failure(
+    invocation: "AgentLLMInvocation",
+    error: Exception,
+    *,
+    agent_id: uuid.UUID | None,
+    user_id: uuid.UUID | None,
+) -> None:
+    """Persist one Runtime provider failure without masking the provider error."""
+
+    provider_code = (
+        getattr(error, "provider_code", None)
+        or extract_minimax_code(str(error))
+        or type(error).__name__
+    )
+    logger.error(
+        "[RuntimeLLM] provider operation failed provider={} model={} "
+        "error_type={} http_status={} provider_code={} provider_trace_id={}",
+        getattr(invocation.model, "provider", "?"),
+        getattr(invocation.model, "model", "?"),
+        type(error).__name__,
+        getattr(error, "http_status", None),
+        provider_code,
+        getattr(error, "provider_trace_id", None),
+    )
+    try:
+        await _record_llm_product_issue(
+            category="llm_provider",
+            error_code=str(provider_code)[:100],
+            model=invocation.model,
+            agent_id=agent_id,
+            user_id=user_id,
+            tenant_id=invocation.tenant_id,
+            route_meta=invocation.route_meta,
+            error=error,
+        )
+    except Exception as monitor_error:
+        logger.error(
+            "[RuntimeLLM] provider failure monitoring failed error_type={}",
+            type(monitor_error).__name__,
+        )
+    if invocation.credential_id is None:
+        return
+    try:
+        await _apply_credential_failure_policy(
+            invocation.credential_id,
+            error,
+            log_context="RuntimeLLM",
+            modality=_llm_quota_modality(
+                invocation.model,
+                _llm_capability_modality(
+                    invocation.model,
+                    invocation.route_meta,
+                ),
+            ),
+        )
+    except Exception as policy_error:
+        logger.error(
+            "[RuntimeLLM] credential failure policy failed error_type={}",
+            type(policy_error).__name__,
+        )
 
 # NOTE: agent_tools imports are deferred to function bodies to avoid circular
 # import: agent_tools → llm.finish → llm/__init__ → caller → agent_tools
@@ -2152,10 +2218,28 @@ async def prepare_pinned_agent_llm_invocation(
         route_meta = replace(route_meta, action=action)
 
     tenant_id = await _prepare_llm_billing_context(agent.id, model, route_meta)
-    api_key, base_url, credential_id = await resolve_model_key(
-        model,
-        capability_modality=_llm_capability_modality(model, route_meta),
-    )
+    try:
+        api_key, base_url, credential_id = await resolve_model_key(
+            model,
+            capability_modality=_llm_capability_modality(model, route_meta),
+        )
+    except NoCredentialAvailable as exc:
+        await _record_llm_product_issue(
+            category="credential",
+            error_code=exc.reason_code.value,
+            model=model,
+            agent_id=agent.id,
+            user_id=None,
+            tenant_id=tenant_id,
+            route_meta=route_meta,
+            severity=(
+                "critical"
+                if exc.reason_code.value == "all_unhealthy"
+                else "error"
+            ),
+            error=exc,
+        )
+        raise
     return AgentLLMInvocation(
         model=model,
         fallback_model=None,

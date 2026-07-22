@@ -467,7 +467,10 @@ async def _accept_feishu_runtime_message(
             group_name=f"Feishu Group {chat_id[:8]}" if is_group else None,
             created_by_user_id=user.id,
         )
-        _, model, _, _ = await _load_agent_and_model(db, agent_id)
+        _, model, fallback_model, route_meta = await _load_agent_and_model(
+            db,
+            agent_id,
+        )
         sender_name = (user.display_name or "").strip()
         executable_content = (
             f"[发送者: {sender_name}] {content}" if sender_name else content
@@ -478,6 +481,8 @@ async def _accept_feishu_runtime_message(
             user=user,
             session=session,
             model=model,
+            fallback_model=fallback_model,
+            route_meta=route_meta,
             content=executable_content,
             display_content=display_content,
             source_channel="feishu",

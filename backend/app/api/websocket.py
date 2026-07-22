@@ -913,6 +913,11 @@ class WebSocketChatHandler:
                 display_content=display_content,
                 file_name=file_names,
                 model_id=effective_llm_model.id,
+                fallback_model_id=(
+                    self.fallback_llm_model.id
+                    if self.fallback_llm_model is not None
+                    else None
+                ),
                 saas_tier=resolved_tier,
                 model_modality=resolved_modality,
                 message_id=message_id,
@@ -984,12 +989,13 @@ class WebSocketChatHandler:
         display_content: str,
         file_name: str | list[str],
         model_id: uuid.UUID,
-        saas_tier: str | None = None,
-        model_modality: str | None = None,
         message_id: uuid.UUID | None,
         resume_run_id: uuid.UUID | None,
         resume_correlation_id: str | None,
         is_onboarding_trigger: bool,
+        fallback_model_id: uuid.UUID | None = None,
+        saas_tier: str | None = None,
+        model_modality: str | None = None,
         work_request_id: uuid.UUID | None = None,
         onboarding_source_execution_id: str | None = None,
     ) -> WebChatRuntimeIntake | None:
@@ -1068,6 +1074,7 @@ class WebSocketChatHandler:
                         user=user,
                         session=session,
                         model=model,
+                        fallback_model_id=fallback_model_id,
                         content=content,
                         display_content=display_content,
                         file_name=file_name,

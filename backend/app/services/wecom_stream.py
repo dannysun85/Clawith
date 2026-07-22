@@ -521,13 +521,18 @@ async def _process_wecom_stream_message(
             group_name=f"WeCom Group {chat_id[:8]}" if _is_group else None,
             created_by_user_id=platform_user_id,
         )
-        _, model, _, _ = await _load_agent_and_model(db, agent_id)
+        _, model, fallback_model, route_meta = await _load_agent_and_model(
+            db,
+            agent_id,
+        )
         await enqueue_channel_chat_runtime(
             db,
             agent=agent_obj,
             user=platform_user,
             session=sess,
             model=model,
+            fallback_model=fallback_model,
+            route_meta=route_meta,
             content=user_text,
             source_channel="wecom",
             channel_delivery_target={

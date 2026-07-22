@@ -494,6 +494,7 @@ async def enqueue_chat_runtime(
     channel_delivery_target: dict | None = None,
     saas_tier: str | None = None,
     model_modality: str | None = None,
+    fallback_model_id: uuid.UUID | None = None,
     work_request_id: uuid.UUID | None = None,
     run_state_reader: RunStateReader | None = None,
     settings_override: Settings | None = None,
@@ -738,6 +739,11 @@ async def enqueue_chat_runtime(
                 "saas_tier": (normalized_saas_tier or session.model_tier or agent.preferred_tier or ""),
                 "model_modality": (
                     normalized_model_modality or session.model_modality or agent.preferred_modality or "text"
+                ),
+                "fallback_model_id": (
+                    str(fallback_model_id)
+                    if fallback_model_id is not None and fallback_model_id != model.id
+                    else None
                 ),
                 "application_tools_enabled": application_tools_enabled,
                 **(

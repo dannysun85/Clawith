@@ -158,6 +158,35 @@ async def test_http_failures_release_only_deterministic_rejections(
 
 
 @pytest.mark.asyncio
+async def test_http_failure_preserves_privacy_safe_provider_evidence():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            json={"error": {"code": "rate_limit", "message": "busy"}},
+            headers={"x-request-id": "provider-request-7", "retry-after": "3"},
+            request=request,
+        )
+
+    client = OpenAICompatibleClient(
+        api_key="test-key",
+        base_url="https://provider.test/v1",
+        model="test-model",
+    )
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    try:
+        with pytest.raises(LLMError) as raised:
+            await client.complete(messages=[LLMMessage(role="user", content="hello")])
+    finally:
+        await client.close()
+
+    assert raised.value.http_status == 429
+    assert raised.value.provider_code == "rate_limit"
+    assert raised.value.provider_trace_id == "provider-request-7"
+    assert raised.value.retry_after_seconds == 3.0
+
+
+@pytest.mark.asyncio
 async def test_minimax_business_error_in_http_200_releases_provider_hold():
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

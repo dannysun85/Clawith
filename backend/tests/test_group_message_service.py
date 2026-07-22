@@ -231,7 +231,7 @@ async def test_mention_resolution_only_exposes_active_group_members() -> None:
 
     with patch(
         "app.services.group_message_service._resolve_agent_execution_model",
-        new=AsyncMock(return_value=mention.model),
+        new=AsyncMock(return_value=(mention.model, None, None)),
     ):
         resolved = await _resolve_mentions(
             db,  # type: ignore[arg-type]
@@ -281,7 +281,7 @@ async def test_mention_resolution_uses_saas_route_instead_of_legacy_primary_mode
 
     with patch(
         "app.services.group_message_service._resolve_agent_execution_model",
-        new=AsyncMock(return_value=routed_model),
+        new=AsyncMock(return_value=(routed_model, None, None)),
     ) as resolve_model:
         resolved = await _resolve_mentions(
             db,  # type: ignore[arg-type]

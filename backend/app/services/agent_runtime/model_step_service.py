@@ -156,8 +156,26 @@ async def _missing_visible_group_mentions(
 
 
 def _retry_http_status(error: Exception) -> str:
+    structured = getattr(error, "http_status", None)
+    if structured is not None:
+        return str(structured)
     match = re.search(r"(?<!\d)(408|429|500|502|503|504)(?!\d)", str(error))
     return match.group(1) if match else "unknown"
+
+
+def _provider_error_facts(error: Exception) -> dict[str, JsonValue]:
+    facts: dict[str, JsonValue] = {
+        "error_type": type(error).__name__,
+    }
+    for source, target in (
+        ("http_status", "http_status"),
+        ("provider_code", "provider_code"),
+        ("provider_trace_id", "provider_trace_id"),
+    ):
+        value = getattr(error, source, None)
+        if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+            facts[target] = value
+    return facts
 _RUNTIME_WAIT_TOOL_DEFINITION: dict = {
     "type": "function",
     "function": {
@@ -1031,8 +1049,24 @@ class RuntimeModelStepService:
         tenant_id: uuid.UUID,
         agent: Agent,
         primary_model: LLMModel,
+        state: RuntimeGraphState,
     ) -> LLMModel | None:
-        fallback_id = agent.fallback_model_id
+        initial_input = state["snapshots"].initial_input
+        if "fallback_model_id" in initial_input:
+            raw_fallback_id = initial_input.get("fallback_model_id")
+            if raw_fallback_id in (None, ""):
+                return None
+            try:
+                fallback_id = uuid.UUID(str(raw_fallback_id))
+            except (TypeError, ValueError, AttributeError) as exc:
+                raise ContextBuildError(
+                    "invalid_fallback_model_id",
+                    "Runtime fallback model snapshot contains an invalid UUID",
+                ) from exc
+        else:
+            # Backward compatibility for checkpoints created before the route
+            # fallback became an explicit immutable Run input.
+            fallback_id = agent.fallback_model_id
         if fallback_id is None or fallback_id == primary_model.id:
             return None
         async with self._session_factory() as db:
@@ -1404,6 +1438,15 @@ class RuntimeModelStepService:
                     1.0 + self._model_retry_jitter_ratio,
                 )
                 delay = base_delay * jitter
+                retry_after = getattr(exc, "retry_after_seconds", None)
+                if isinstance(retry_after, (int, float)) and not isinstance(
+                    retry_after,
+                    bool,
+                ):
+                    delay = max(
+                        delay,
+                        min(float(retry_after), self._model_retry_max_delay_seconds),
+                    )
                 logger.warning(
                     "[RuntimeModelRetry] provider={} model={} attempt={}/{} "
                     "error_type={} http_status={} classification={} backoff_seconds={:.3f}",
@@ -1425,6 +1468,7 @@ class RuntimeModelStepService:
         *,
         context: RuntimeContext,
         model: LLMModel,
+        error: Exception,
     ) -> ModelStepResult:
         attempts = self._model_retry_attempts + 1
         return ModelStepResult(
@@ -1432,10 +1476,12 @@ class RuntimeModelStepService:
             waiting_request={
                 "waiting_type": "user",
                 "reason": (
-                    f"Model provider remained unavailable after {attempts} attempts. "
-                    "The Run checkpoint is preserved; resume to retry the model call."
+                    f"模型服务暂时不可用，系统已重试 {attempts} 次。"
+                    "任务进度已安全保存，请稍后继续本次任务。"
                 ),
                 "correlation_id": f"model-provider-retry:{context.run_id}:{model.id}",
+                "error_code": "model_provider_unavailable",
+                "provider_error": _provider_error_facts(error),
             },
         )
 
@@ -1529,11 +1575,13 @@ class RuntimeModelStepService:
                     tenant_id=tenant_id,
                     agent=agent,
                     primary_model=model,
+                    state=state,
                 )
                 if fallback is None:
                     return self._provider_retry_wait(
                         context=context,
                         model=model,
+                        error=primary_error,
                     )
                 fallback_application_tools = _application_tools_for_model(
                     available_application_tools,
@@ -1591,6 +1639,7 @@ class RuntimeModelStepService:
                         return self._provider_retry_wait(
                             context=context,
                             model=fallback,
+                            error=fallback_error,
                         )
                     logger.error(
                         "[RuntimeModelFailure] run_id={} agent_id={} stage=fallback "

@@ -13,6 +13,10 @@ from app.models.task import Task, TaskLog
 from app.services.agent_runtime.adapter import RuntimeCommandIntake
 from app.services.agent_runtime.config import decide_runtime_v2
 from app.services.agent_runtime.contracts import RunHandle, StartRunCommand
+from app.services.agent_runtime.model_route import (
+    RuntimeModelRouteError,
+    resolve_runtime_model_route,
+)
 
 settings = get_settings()
 AUTOMATIC_TASK_EXECUTION_ENABLED = settings.USER_TASK_EXECUTION_ENABLED
@@ -72,12 +76,13 @@ async def enqueue_task_runtime(
             "agent_tenant_missing",
             "Runtime Task Agent has no tenant",
         )
-    model_id = agent.primary_model_id
-    if model_id is None:
+    try:
+        route = await resolve_runtime_model_route(agent)
+    except RuntimeModelRouteError as exc:
         raise TaskRuntimeIntakeError(
             "agent_model_missing",
-            "Runtime Task Agent has no configured primary model",
-        )
+            "Runtime Task Agent has no available model route",
+        ) from exc
 
     if task.type == "supervision":
         occurrence_id = execution_id or uuid.uuid4()
@@ -97,7 +102,7 @@ async def enqueue_task_runtime(
             source_execution_id=source_execution_id,
             goal=_task_goal(task),
             run_kind="background",
-            model_id=model_id,
+            model_id=route.model_id,
             delivery_status="not_required",
             idempotency_key=f"start:{source_execution_id}",
             payload={
@@ -105,6 +110,13 @@ async def enqueue_task_runtime(
                 "task_type": task.type,
                 "title": task.title,
                 "description": task.description,
+                "saas_tier": route.saas_tier,
+                "model_modality": route.modality,
+                "fallback_model_id": (
+                    str(route.fallback_model_id)
+                    if route.fallback_model_id is not None
+                    else None
+                ),
             },
             origin_user_id=task.created_by,
             actor_user_id=task.created_by,

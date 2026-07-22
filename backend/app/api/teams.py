@@ -499,13 +499,18 @@ async def teams_event_webhook(
             group_name=activity.get("conversation", {}).get("name") or (f"Teams Group {conversation_id[:8]}" if _is_group_teams else None),
             created_by_user_id=platform_user_id,
         )
-        _, model, _, _ = await _load_agent_and_model(db, agent_id)
+        _, model, fallback_model, route_meta = await _load_agent_and_model(
+            db,
+            agent_id,
+        )
         await enqueue_channel_chat_runtime(
             db,
             agent=agent_obj,
             user=platform_user,
             session=sess,
             model=model,
+            fallback_model=fallback_model,
+            route_meta=route_meta,
             content=user_text,
             source_channel="microsoft_teams",
             channel_delivery_target={

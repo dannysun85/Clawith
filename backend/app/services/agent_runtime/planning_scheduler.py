@@ -343,6 +343,13 @@ def _entry_command(
             "mode": mode,
             "plan_prompt": plan_prompt,
             "current_responsibility": instruction,
+            "fallback_model_id": (
+                str(target.fallback_model_id)
+                if target.fallback_model_id is not None
+                else None
+            ),
+            "saas_tier": target.saas_tier,
+            "model_modality": target.model_modality,
             "context_cutoff": {
                 "message_id": str(message.id),
                 "created_at": message.created_at.isoformat(),

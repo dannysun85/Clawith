@@ -123,6 +123,8 @@ async def test_runtime_trigger_pins_execution_identity_and_caller_transaction() 
     assert command.source_execution_id == str(execution.id)
     assert command.idempotency_key == f"start:trigger:{execution.id}"
     assert command.model_id == agent.primary_model_id
+    assert command.payload["fallback_model_id"] is None
+    assert command.payload["model_modality"] == "text"
     assert command.scheduling_lane_key == (f"trigger:{agent.tenant_id}:{agent.id}")
     assert command.scheduling_position_id == execution.id
     assert command.scheduling_position_created_at is not None

@@ -56,6 +56,9 @@ class ResolvedGroupMention:
     reason: str | None = None
     agent: Agent | None = None
     model: LLMModel | None = None
+    fallback_model_id: uuid.UUID | None = None
+    saas_tier: str = ""
+    model_modality: str = "text"
 
     def payload(self) -> dict[str, object]:
         return {
@@ -240,7 +243,9 @@ def _invalid_mention(
     )
 
 
-async def _resolve_agent_execution_model(agent: Agent) -> LLMModel | None:
+async def _resolve_agent_execution_model(
+    agent: Agent,
+) -> tuple[LLMModel | None, uuid.UUID | None, object | None]:
     """Resolve one Agent through the same SaaS route used by direct chat.
 
     ``primary_model_id`` is a legacy concrete-model preference. It must not
@@ -251,18 +256,33 @@ async def _resolve_agent_execution_model(agent: Agent) -> LLMModel | None:
     from app.services.quota_guard import QuotaExceeded
 
     try:
-        primary, fallback, _route_meta = await resolve_agent_model(agent)
+        primary, fallback, route_meta = await resolve_agent_model(agent)
     except QuotaExceeded:
-        return None
+        return None, None, None
 
-    for model in (primary, fallback):
-        if (
-            model is not None
-            and model.enabled
-            and model.tenant_id in {None, agent.tenant_id}
-        ):
-            return model
-    return None
+    valid_primary = (
+        primary
+        if primary is not None
+        and primary.enabled
+        and primary.tenant_id in {None, agent.tenant_id}
+        else None
+    )
+    valid_fallback = (
+        fallback
+        if fallback is not None
+        and fallback.enabled
+        and fallback.tenant_id in {None, agent.tenant_id}
+        else None
+    )
+    if valid_primary is not None:
+        return (
+            valid_primary,
+            valid_fallback.id if valid_fallback is not None else None,
+            route_meta,
+        )
+    if valid_fallback is not None:
+        return valid_fallback, None, route_meta
+    return None, None, route_meta
 
 
 async def _resolve_mentions(
@@ -355,7 +375,9 @@ async def _resolve_mentions(
         if agent is None:
             output.append(_invalid_mention(participant_id, reason="agent_unavailable"))
             continue
-        model = await _resolve_agent_execution_model(agent)
+        model, fallback_model_id, route_meta = await _resolve_agent_execution_model(
+            agent
+        )
         if model is None:
             output.append(_invalid_mention(participant_id, reason="agent_model_unavailable"))
             continue
@@ -369,6 +391,13 @@ async def _resolve_mentions(
                 triggers_agent=True,
                 agent=agent,
                 model=model,
+                fallback_model_id=fallback_model_id,
+                saas_tier=getattr(route_meta, "saas_tier", ""),
+                model_modality=getattr(
+                    route_meta,
+                    "modality",
+                    agent.preferred_modality or "text",
+                ),
             )
         )
     return tuple(output)
@@ -477,6 +506,13 @@ def _single_mention_command(
                 "created_at": message.created_at.isoformat(),
             },
             "source_channel": scope.session.source_channel,
+            "fallback_model_id": (
+                str(target.fallback_model_id)
+                if target.fallback_model_id is not None
+                else None
+            ),
+            "saas_tier": target.saas_tier,
+            "model_modality": target.model_modality,
         },
         origin_user_id=origin_user_id,
         origin_agent_id=origin_agent_id,

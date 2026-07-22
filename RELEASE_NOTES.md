@@ -1,3 +1,56 @@
+# v1.11.4 — Durable Model Routing and Provider Diagnostics Hotfix
+
+## MiniMax-M3 Runtime Request Alignment
+
+- Durable Runtime one-step calls now apply the same verified MiniMax-M3
+  `thinking`, `service_tier`, and `reasoning_split` request options as the
+  established direct chat path. Lite, Pro, and Ultra therefore no longer lose
+  their provider request policy after a message is accepted into Runtime.
+- Every accepted web, channel, Group, A2A, trigger, task, schedule, one-shot,
+  and heartbeat Run now persists an immutable primary/fallback model route
+  together with its SaaS tier and input modality. Later administrator or Agent
+  edits cannot silently switch an in-flight Run to another tier or reintroduce
+  a fallback that was not available when the Run started.
+- The route snapshot is an execution decision, not object-level model
+  authorization. Existing shared SaaS routing, tenant boundaries, Agent skill
+  grants, and explicit tool grants remain unchanged.
+
+## Provider Failure Recovery and Monitoring
+
+- OpenAI-compatible provider errors now retain bounded, privacy-safe
+  `http_status`, provider error code, trace ID, and `Retry-After` facts without
+  requiring Runtime or monitoring code to parse a response string.
+- Runtime retries honor a bounded provider `Retry-After`, classify structured
+  MiniMax and HTTP failures consistently, and use only the fallback captured in
+  the original Run. Retry exhaustion preserves the checkpoint and returns an
+  actionable Chinese recovery message with a stable error code.
+- Failed Runtime invocations now reach the existing production issue monitor
+  and shared credential circuit-breaker. Authentication, Token Plan quota,
+  modality allowance, rate saturation, and transient provider failures remain
+  distinct; request-scoped transient errors do not poison the global
+  credential pool.
+- Credits holds are released only when the provider is known not to have
+  accepted the request. Ambiguous post-send failures remain reconciliation
+  work instead of being automatically refunded and risking double settlement.
+
+## Regression Reliability
+
+- Corrected three isolated tests whose mocks had drifted behind the imported
+  Agent manager, AgentBay execution lease, and ephemeral PDF preview port.
+  These changes remove machine-dependent Redis/socket failures without
+  weakening their production assertions.
+
+## Validation
+
+- Complete backend suite: `3624 passed`; all changed Python files passed Ruff.
+- Frontend: all 67 Node contract tests and 124 Vitest tests passed; the
+  production build completed with 7031 transformed modules.
+- PostgreSQL fresh upgrade, historical upgrade, downgrade, and re-upgrade smoke
+  passed together with Credits, media exactly-once, A2A, monitoring, channel
+  secret, and cross-Agent concurrency checks.
+- Alembic has the single `reconcile_m3_runtime_caps` head, and the packaged
+  browser assertion tests passed.
+
 # v1.11.3 — MiniMax-M3 Durable Runtime Intake Hotfix
 
 ## Durable Runtime Model Capability Repair

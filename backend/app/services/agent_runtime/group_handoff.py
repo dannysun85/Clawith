@@ -728,6 +728,13 @@ def _handoff_child_command(
         "source_channel": scope.session.source_channel,
         "source_run_id": str(source_run.id),
         "current_responsibility": current_responsibility,
+        "fallback_model_id": (
+            str(target.fallback_model_id)
+            if target.fallback_model_id is not None
+            else None
+        ),
+        "saas_tier": target.saas_tier,
+        "model_modality": target.model_modality,
         "context_cutoff": {
             "message_id": str(intent.trigger_message_id),
             "created_at": intent.cutoff_created_at.isoformat(),

@@ -1,4 +1,3 @@
-import sys
 import pytest
 from unittest.mock import MagicMock, patch
 from pathlib import Path
@@ -24,7 +23,9 @@ async def test_convert_html_to_pdf_linux(mock_weasy_html, mock_time, mock_popen,
     src = Path("/tmp/src.html")
     tgt = Path("/tmp/tgt.pdf")
     
-    with patch("sys.platform", "linux"):
+    mock_socket = MagicMock()
+    mock_socket.__enter__.return_value.getsockname.return_value = ("127.0.0.1", 9222)
+    with patch("sys.platform", "linux"), patch("socket.socket", return_value=mock_socket):
         res = await convert_html_to_pdf(src, tgt, "tgt.pdf", {})
         
     assert mock_popen.called
@@ -54,7 +55,9 @@ async def test_convert_html_to_pdf_darwin(mock_weasy_html, mock_time, mock_popen
     src = Path("/tmp/src.html")
     tgt = Path("/tmp/tgt.pdf")
     
-    with patch("sys.platform", "darwin"):
+    mock_socket = MagicMock()
+    mock_socket.__enter__.return_value.getsockname.return_value = ("127.0.0.1", 9222)
+    with patch("sys.platform", "darwin"), patch("socket.socket", return_value=mock_socket):
         res = await convert_html_to_pdf(src, tgt, "tgt.pdf", {})
         
     assert mock_popen.called

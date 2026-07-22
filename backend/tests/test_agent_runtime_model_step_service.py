@@ -2331,5 +2331,42 @@ async def test_retryable_primary_error_without_fallback_pauses_for_resume() -> N
     assert result.waiting_request is not None
     assert result.waiting_request["waiting_type"] == "user"
     assert str(result.waiting_request["correlation_id"]).startswith("model-provider-retry:")
-    assert "4 attempts" in str(result.waiting_request["reason"])
+    assert "重试 4 次" in str(result.waiting_request["reason"])
+    assert result.waiting_request["error_code"] == "model_provider_unavailable"
+    assert result.waiting_request["provider_error"] == {
+        "error_type": "RuntimeError"
+    }
+    assert calls == 4
+
+
+@pytest.mark.asyncio
+async def test_explicit_run_snapshot_without_fallback_ignores_later_agent_change() -> None:
+    tenant_id = uuid.uuid4()
+    model = _model(tenant_id)
+    agent = _agent(tenant_id)
+    agent.fallback_model_id = uuid.uuid4()
+    state = _state(tenant_id, model, agent)
+    state["snapshots"] = replace(
+        state["snapshots"],
+        initial_input={
+            **state["snapshots"].initial_input,
+            "fallback_model_id": None,
+        },
+    )
+    calls = 0
+
+    async def complete(*args, **kwargs):
+        nonlocal calls
+        del args, kwargs
+        calls += 1
+        raise RuntimeError("HTTP 502 Bad Gateway")
+
+    result = await _service(
+        model,
+        agent,
+        _ContextBuilder(_build()),
+        complete,
+    ).complete_once(state, _context(state))
+
+    assert result.intent == "wait"
     assert calls == 4

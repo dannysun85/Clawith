@@ -108,6 +108,8 @@ async def enqueue_channel_chat_runtime(
     user: User,
     session: ChatSession,
     model: LLMModel | None,
+    fallback_model: LLMModel | None = None,
+    route_meta: object | None = None,
     content: str,
     source_channel: str,
     message_id: uuid.UUID,
@@ -136,6 +138,11 @@ async def enqueue_channel_chat_runtime(
             user=user,
             session=session,
             model=model,
+            fallback_model_id=(
+                fallback_model.id if fallback_model is not None else None
+            ),
+            saas_tier=getattr(route_meta, "saas_tier", None),
+            model_modality=getattr(route_meta, "modality", None),
             content=content,
             display_content=display_content,
             file_name=file_name,

@@ -13,6 +13,11 @@ from app.models.agent import Agent
 from app.services.agent_runtime.adapter import RuntimeCommandIntake
 from app.services.agent_runtime.config import decide_runtime_v2
 from app.services.agent_runtime.contracts import RunHandle, StartRunCommand
+from app.services.agent_runtime.model_route import (
+    RuntimeModelRoute,
+    RuntimeModelRouteError,
+    resolve_runtime_model_route,
+)
 
 
 class HeartbeatRuntimeIntakeError(RuntimeError):
@@ -77,41 +82,20 @@ async def _resolve_background_runtime_route(
     agent: Agent,
     *,
     mode: str,
-) -> tuple[uuid.UUID, str, str]:
+) -> RuntimeModelRoute:
     """Resolve the SaaS route once, then pin its concrete model on the Run.
 
     ``model_id`` is an immutable execution snapshot, not model-object
     authorization.  Legacy agents without a SaaS tier retain their concrete
     primary model until they are migrated to the unified route catalog.
     """
-    if agent.preferred_tier:
-        from app.services.llm.caller import resolve_agent_model
-
-        primary, fallback, route_meta = await resolve_agent_model(agent)
-        model = primary or fallback
-        if model is None or getattr(model, "id", None) is None:
-            raise HeartbeatRuntimeIntakeError(
-                "agent_model_missing",
-                f"Runtime {mode} Agent has no available SaaS model route",
-            )
-        return (
-            model.id,
-            route_meta.saas_tier if route_meta is not None else agent.preferred_tier,
-            route_meta.modality
-            if route_meta is not None
-            else (agent.preferred_modality or "text"),
-        )
-
-    if agent.primary_model_id is None:
+    try:
+        return await resolve_runtime_model_route(agent)
+    except RuntimeModelRouteError as exc:
         raise HeartbeatRuntimeIntakeError(
             "agent_model_missing",
-            f"Runtime {mode} Agent has no model route or legacy primary model",
-        )
-    return (
-        agent.primary_model_id,
-        "",
-        agent.preferred_modality or "text",
-    )
+            f"Runtime {mode} Agent has no available model route",
+        ) from exc
 
 
 async def enqueue_heartbeat_runtime(
@@ -133,7 +117,7 @@ async def enqueue_heartbeat_runtime(
     if not decision.use_v2:
         return None
     tenant_id = _require_background_agent(agent, mode="Heartbeat")
-    model_id, saas_tier, model_modality = await _resolve_background_runtime_route(
+    route = await _resolve_background_runtime_route(
         agent,
         mode="Heartbeat",
     )
@@ -157,13 +141,18 @@ async def enqueue_heartbeat_runtime(
             source_execution_id=source_execution_id,
             goal=normalized_instruction,
             run_kind="background",
-            model_id=model_id,
+            model_id=route.model_id,
             delivery_status="not_required",
             idempotency_key=f"start:{source_execution_id}",
             payload={
                 "background_mode": "heartbeat",
-                "saas_tier": saas_tier,
-                "model_modality": model_modality,
+                "saas_tier": route.saas_tier,
+                "model_modality": route.modality,
+                "fallback_model_id": (
+                    str(route.fallback_model_id)
+                    if route.fallback_model_id is not None
+                    else None
+                ),
                 "heartbeat_occurrence_at": occurrence_at.astimezone(UTC).isoformat(),
                 "heartbeat_context": dict(context or {}),
             },
@@ -192,7 +181,7 @@ async def enqueue_oneshot_runtime(
     if not decision.use_v2:
         return None
     tenant_id = _require_background_agent(agent, mode="oneshot")
-    model_id, saas_tier, model_modality = await _resolve_background_runtime_route(
+    route = await _resolve_background_runtime_route(
         agent,
         mode="oneshot",
     )
@@ -224,14 +213,19 @@ async def enqueue_oneshot_runtime(
             source_execution_id=source_execution_id,
             goal=normalized_prompt,
             run_kind="background",
-            model_id=model_id,
+            model_id=route.model_id,
             requested_model_turn_limit=requested_model_turn_limit,
             delivery_status="not_required",
             idempotency_key=f"start:{source_execution_id}",
             payload={
                 "background_mode": "oneshot",
-                "saas_tier": saas_tier,
-                "model_modality": model_modality,
+                "saas_tier": route.saas_tier,
+                "model_modality": route.modality,
+                "fallback_model_id": (
+                    str(route.fallback_model_id)
+                    if route.fallback_model_id is not None
+                    else None
+                ),
                 "oneshot_occurrence_id": str(occurrence_id),
                 "oneshot_prompt": normalized_prompt,
                 "triggered_by_user_id": (
@@ -266,7 +260,7 @@ async def enqueue_schedule_runtime(
     if not decision.use_v2:
         return None
     tenant_id = _require_background_agent(agent, mode="schedule")
-    model_id, saas_tier, model_modality = await _resolve_background_runtime_route(
+    route = await _resolve_background_runtime_route(
         agent,
         mode="schedule",
     )
@@ -289,13 +283,18 @@ async def enqueue_schedule_runtime(
             source_execution_id=source_execution_id,
             goal=f"[自动调度任务] {normalized_instruction}",
             run_kind="background",
-            model_id=model_id,
+            model_id=route.model_id,
             delivery_status="not_required",
             idempotency_key=f"start:{source_execution_id}",
             payload={
                 "background_mode": "schedule",
-                "saas_tier": saas_tier,
-                "model_modality": model_modality,
+                "saas_tier": route.saas_tier,
+                "model_modality": route.modality,
+                "fallback_model_id": (
+                    str(route.fallback_model_id)
+                    if route.fallback_model_id is not None
+                    else None
+                ),
                 "schedule_id": str(schedule_id),
                 "schedule_occurrence_id": str(occurrence_id),
                 "schedule_instruction": normalized_instruction,

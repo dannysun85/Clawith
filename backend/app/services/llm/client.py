@@ -43,7 +43,87 @@ _DETERMINISTIC_PROVIDER_ERROR_TYPES = frozenset({
 # ============================================================================
 
 class LLMError(Exception):
-    """Base exception for LLM client errors."""
+    """Base exception for LLM client errors with privacy-safe provider facts.
+
+    Provider response bodies may contain user content, so operational callers
+    must not depend on parsing the rendered exception string.  The structured
+    fields retain only routing evidence that is safe to log and aggregate.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        http_status: int | None = None,
+        provider_code: str | int | None = None,
+        provider_trace_id: str | None = None,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+        self.provider_code = (
+            str(provider_code).strip()[:100] if provider_code is not None else None
+        ) or None
+        self.provider_trace_id = (
+            str(provider_trace_id).strip()[:200]
+            if provider_trace_id is not None
+            else None
+        ) or None
+        self.retry_after_seconds = retry_after_seconds
+
+
+def _provider_trace_id(
+    payload: Any,
+    headers: Any = None,
+) -> str | None:
+    """Extract a bounded provider correlation identifier without response text."""
+
+    if headers is not None:
+        for name in ("trace-id", "x-trace-id", "x-request-id", "request-id"):
+            value = headers.get(name)
+            if value:
+                return str(value).strip()[:200] or None
+    if isinstance(payload, dict):
+        for name in ("trace_id", "request_id"):
+            value = payload.get(name)
+            if value:
+                return str(value).strip()[:200] or None
+        base_resp = payload.get("base_resp")
+        if isinstance(base_resp, dict):
+            for name in ("trace_id", "request_id"):
+                value = base_resp.get(name)
+                if value:
+                    return str(value).strip()[:200] or None
+    return None
+
+
+def _provider_error_code(payload: Any) -> str | int | None:
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    if isinstance(error, dict):
+        code = error.get("code") or error.get("status_code") or error.get("type")
+        if code is not None:
+            return code
+    base_resp = payload.get("base_resp")
+    if isinstance(base_resp, dict):
+        code = base_resp.get("status_code")
+        if code not in (None, 0, "0"):
+            return code
+    return None
+
+
+def _retry_after_seconds(headers: Any) -> float | None:
+    if headers is None:
+        return None
+    value = headers.get("retry-after")
+    if value is None:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    return seconds if 0.0 <= seconds <= 300.0 else None
 
 
 class LLMRequestShapeError(LLMError):
@@ -727,7 +807,11 @@ class OpenAICompatibleClient(LLMClient):
 
         if "error" in data:
             self._mark_explicit_provider_failure(data["error"])
-            raise LLMError(f"Stream error: {data['error']}")
+            raise LLMError(
+                f"Stream error: {data['error']}",
+                provider_code=_provider_error_code(data),
+                provider_trace_id=_provider_trace_id(data),
+            )
 
         # Check for provider-specific business errors (e.g. MiniMax base_resp.status_code in SSE frames)
         base_resp = data.get("base_resp")
@@ -735,7 +819,11 @@ class OpenAICompatibleClient(LLMClient):
             code = base_resp.get("status_code")
             self._mark_explicit_provider_failure(provider_code=code)
             msg = base_resp.get("status_msg", "")
-            raise LLMError(f"Stream error (code={code}): {msg}")
+            raise LLMError(
+                f"Stream error (code={code}): {msg}",
+                provider_code=code,
+                provider_trace_id=_provider_trace_id(data),
+            )
 
         # Parse usage from stream (returned in the final chunk with include_usage)
         if data.get("usage"):
@@ -847,7 +935,20 @@ class OpenAICompatibleClient(LLMClient):
         if response.status_code >= 400:
             self._mark_provider_http_error(response.status_code)
             error_text = response.text[:500]
-            raise LLMError(f"HTTP {response.status_code}: {error_text}")
+            try:
+                error_payload = response.json()
+            except ValueError:
+                error_payload = {}
+            raise LLMError(
+                f"HTTP {response.status_code}: {error_text}",
+                http_status=response.status_code,
+                provider_code=_provider_error_code(error_payload),
+                provider_trace_id=_provider_trace_id(
+                    error_payload,
+                    response.headers,
+                ),
+                retry_after_seconds=_retry_after_seconds(response.headers),
+            )
 
         self._mark_provider_response_started()
         data = response.json()
@@ -856,7 +957,11 @@ class OpenAICompatibleClient(LLMClient):
             if data.get("choices") or self._has_billable_usage(data.get("usage")):
                 self._mark_provider_output_started()
             self._mark_explicit_provider_failure(data["error"])
-            raise LLMError(f"API error: {data['error']}")
+            raise LLMError(
+                f"API error: {data['error']}",
+                provider_code=_provider_error_code(data),
+                provider_trace_id=_provider_trace_id(data, response.headers),
+            )
 
         # Check for provider-specific business errors (e.g. MiniMax base_resp.status_code)
         base_resp = data.get("base_resp")
@@ -866,7 +971,11 @@ class OpenAICompatibleClient(LLMClient):
             code = base_resp.get("status_code")
             self._mark_explicit_provider_failure(provider_code=code)
             msg = base_resp.get("status_msg", "")
-            raise LLMError(f"API error (code={code}): {msg}")
+            raise LLMError(
+                f"API error (code={code}): {msg}",
+                provider_code=code,
+                provider_trace_id=_provider_trace_id(data, response.headers),
+            )
 
         choice = data.get("choices", [{}])[0]
         msg = choice.get("message", {})
@@ -932,7 +1041,20 @@ class OpenAICompatibleClient(LLMClient):
                         error_body = ""
                         async for chunk in resp.aiter_bytes():
                             error_body += chunk.decode(errors="replace")
-                        raise LLMError(f"HTTP {resp.status_code}: {error_body[:500]}")
+                        try:
+                            error_payload = json.loads(error_body)
+                        except (TypeError, ValueError):
+                            error_payload = {}
+                        raise LLMError(
+                            f"HTTP {resp.status_code}: {error_body[:500]}",
+                            http_status=resp.status_code,
+                            provider_code=_provider_error_code(error_payload),
+                            provider_trace_id=_provider_trace_id(
+                                error_payload,
+                                resp.headers,
+                            ),
+                            retry_after_seconds=_retry_after_seconds(resp.headers),
+                        )
 
                     self._mark_provider_response_started()
                     async for line in resp.aiter_lines():

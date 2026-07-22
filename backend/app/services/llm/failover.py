@@ -64,6 +64,19 @@ def extract_minimax_code(error_msg: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _structured_provider_code(error: Exception) -> str | None:
+    value = getattr(error, "provider_code", None)
+    return str(value).strip() if value is not None and str(value).strip() else None
+
+
+def _structured_http_status(error: Exception) -> int | None:
+    value = getattr(error, "http_status", None)
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _match_any(text: str, keywords: tuple[str, ...]) -> bool:
     return any(kw in text for kw in keywords)
 
@@ -87,7 +100,7 @@ def classify_error(error: Exception) -> FailoverErrorType:
     error_msg = str(error).lower()
 
     # Extract MiniMax-specific code if present (checked first — higher signal than keywords)
-    mm_code = extract_minimax_code(error_msg)
+    mm_code = _structured_provider_code(error) or extract_minimax_code(error_msg)
     if mm_code:
         if mm_code in MINIMAX_AUTH_CODES | MINIMAX_BILLING_CODES | MINIMAX_QUOTA_CODES | MINIMAX_VALIDATION_CODES | MINIMAX_POLICY_CODES:
             return FailoverErrorType.NON_RETRYABLE
@@ -113,6 +126,12 @@ def classify_error(error: Exception) -> FailoverErrorType:
 
     # Non-retryable: content policy
     if _match_any(error_msg, ("content policy", "content_filter", "safety", "moderation", "sensitive")):
+        return FailoverErrorType.NON_RETRYABLE
+
+    http_status = _structured_http_status(error)
+    if http_status in {408, 429, 500, 502, 503, 504}:
+        return FailoverErrorType.RETRYABLE
+    if http_status in {400, 401, 403, 404, 409, 413, 422}:
         return FailoverErrorType.NON_RETRYABLE
 
     # Retryable: rate limiting
@@ -155,7 +174,7 @@ def classify_error(error: Exception) -> FailoverErrorType:
 def is_auth_error(error: Exception) -> bool:
     """Return True if the error indicates an invalid/expired/rejected API key."""
     msg = str(error).lower()
-    code = extract_minimax_code(msg)
+    code = _structured_provider_code(error) or extract_minimax_code(msg)
     if code in MINIMAX_AUTH_CODES:
         return True
     return _match_any(msg, (
@@ -174,7 +193,7 @@ def is_auth_error(error: Exception) -> bool:
 def is_billing_or_quota_error(error: Exception) -> bool:
     """Return True if the error indicates insufficient balance or exhausted plan quota."""
     msg = str(error).lower()
-    code = extract_minimax_code(msg)
+    code = _structured_provider_code(error) or extract_minimax_code(msg)
     if code in MINIMAX_BILLING_CODES | MINIMAX_QUOTA_CODES:
         return True
     return _match_any(msg, (
@@ -195,8 +214,10 @@ def is_rate_limit_error(error: Exception) -> bool:
     """Return True if the error is a transient rate-limit (429 / MiniMax 1002/2045/2062)
     that may succeed on another credential or after a brief backoff."""
     msg = str(error).lower()
-    code = extract_minimax_code(msg)
+    code = _structured_provider_code(error) or extract_minimax_code(msg)
     if code in MINIMAX_RATELIMIT_CODES:
+        return True
+    if _structured_http_status(error) == 429:
         return True
     if _match_any(msg, ("rate limit", "429", "too many requests", "request frequency exceeded")):
         return True
@@ -223,7 +244,10 @@ def credential_failure_action(
     # allowance resource they actually consumed (normally the shared ``plan``
     # resource). Exact media-model circuits are opened only from the remains
     # endpoint, which names the affected model explicitly.
-    if extract_minimax_code(str(error).lower()) in MINIMAX_QUOTA_CODES and modality:
+    if (
+        _structured_provider_code(error)
+        or extract_minimax_code(str(error).lower())
+    ) in MINIMAX_QUOTA_CODES and modality:
         return CredentialFailureAction.MODALITY_QUOTA_EXCEEDED
     if is_billing_or_quota_error(error):
         return CredentialFailureAction.QUOTA_EXCEEDED

@@ -79,6 +79,22 @@ class TestClassifyMinimaxErrors:
         err = LLMError("API error (1013): internal error")
         assert classify_error(err) == FailoverErrorType.RETRYABLE
 
+    def test_structured_http_status_is_classified_without_message_parsing(self):
+        assert (
+            classify_error(LLMError("provider rejected", http_status=503))
+            == FailoverErrorType.RETRYABLE
+        )
+
+    def test_structured_provider_code_is_classified_without_message_parsing(self):
+        error = LLMError("provider rejected", provider_code=2056)
+        assert classify_error(error) == FailoverErrorType.NON_RETRYABLE
+        assert is_billing_or_quota_error(error)
+
+    def test_structured_429_is_rate_limited_without_message_parsing(self):
+        assert is_rate_limit_error(
+            LLMError("provider rejected", http_status=429)
+        )
+
     def test_param_error_2013_is_non_retryable(self):
         err = LLMError("API error (2013): param error")
         assert classify_error(err) == FailoverErrorType.NON_RETRYABLE

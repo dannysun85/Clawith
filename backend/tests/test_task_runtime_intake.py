@@ -93,6 +93,8 @@ async def test_todo_registration_updates_task_in_same_caller_session() -> None:
     assert command.source_id == str(task.id)
     assert command.source_execution_id == f"task:{task.id}"
     assert command.model_id == agent.primary_model_id
+    assert command.payload["fallback_model_id"] is None
+    assert command.payload["model_modality"] == "text"
     assert command.delivery_status == "not_required"
     assert command.payload["task_id"] == str(task.id)
 

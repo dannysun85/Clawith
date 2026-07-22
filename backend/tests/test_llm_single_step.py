@@ -1,6 +1,7 @@
 """One-call LLM provider boundary tests for the durable Runtime."""
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 import uuid
 
 import pytest
@@ -13,6 +14,7 @@ from app.services.llm.client import (
     OpenAICompatibleClient,
     OpenAIResponsesClient,
 )
+from app.services.llm.caller import AgentLLMInvocation, RouteMeta
 from app.services.llm import single_step
 
 
@@ -222,3 +224,68 @@ async def test_complete_once_closes_the_provider_client_when_the_request_fails(
 
     assert client.closed is True
     assert len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_complete_once_sends_minimax_m3_route_request_policy(monkeypatch) -> None:
+    client = _Client(LLMResponse(content="ok"))
+    _patch_client(monkeypatch, client)
+    model = SimpleNamespace(
+        provider="minimax",
+        model="MiniMax-M3",
+        base_url="https://api.minimaxi.com/v1",
+        request_timeout=30,
+        temperature=1,
+        max_output_tokens=2048,
+        capabilities={"thinking": "adaptive", "service_tier": "priority"},
+    )
+
+    await single_step.complete_llm_once(
+        model,
+        [LLMMessage(role="user", content="Hello")],
+    )
+
+    assert client.calls[0]["thinking"] == {"type": "adaptive"}
+    assert client.calls[0]["service_tier"] == "priority"
+    assert client.calls[0]["reasoning_split"] is True
+
+
+@pytest.mark.asyncio
+async def test_complete_once_reports_pinned_invocation_provider_failure(
+    monkeypatch,
+) -> None:
+    error = RuntimeError("provider unavailable")
+    client = _Client(error)
+    _patch_client(monkeypatch, client)
+    model = _model()
+    invocation = AgentLLMInvocation(
+        model=model,
+        fallback_model=None,
+        route_meta=RouteMeta(saas_tier="ultra", modality="video"),
+        tenant_id=uuid.uuid4(),
+        api_key="secret",
+        base_url=model.base_url,
+        credential_id=uuid.uuid4(),
+    )
+    reservation_id = uuid.uuid4()
+    reserve = AsyncMock(return_value=reservation_id)
+    release = AsyncMock()
+    report = AsyncMock()
+    monkeypatch.setattr(single_step, "reserve_llm_round_credits", reserve)
+    monkeypatch.setattr(single_step, "release_llm_round_credits", release)
+    monkeypatch.setattr(single_step, "record_agent_llm_invocation_failure", report)
+
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        await single_step.complete_llm_once(
+            model,
+            [LLMMessage(role="user", content="Hello")],
+            invocation=invocation,
+        )
+
+    release.assert_awaited_once()
+    report.assert_awaited_once_with(
+        invocation,
+        error,
+        agent_id=None,
+        user_id=None,
+    )

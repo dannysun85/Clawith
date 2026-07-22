@@ -1,5 +1,6 @@
 import shlex
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -451,10 +452,18 @@ async def test_direct_approval_dispatch_supports_agentbay_file_helpers(
     async def write_file(agent_id, workspace, arguments):
         return f"wrote:{agent_id}:{workspace}:{arguments['path']}"
 
+    @asynccontextmanager
+    async def no_control_lock(*_args, **_kwargs):
+        yield
+
     monkeypatch.setattr(agent_tools, "_code_tool_denial_reason", no_denial)
     monkeypatch.setattr(agent_tools, "_get_agent_tenant_id", tenant_id)
     monkeypatch.setattr(agent_tools, "_agent_workspace_root", lambda _agent_id: tmp_path)
     monkeypatch.setattr(agent_tools, "_agentbay_code_write_file", write_file)
+    monkeypatch.setattr(
+        "app.services.agentbay_control_lock.agentbay_tool_execution_lease",
+        no_control_lock,
+    )
 
     result = await agent_tools._execute_tool_direct(
         "agentbay_code_write_file",

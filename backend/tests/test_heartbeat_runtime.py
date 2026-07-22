@@ -97,6 +97,7 @@ async def test_runtime_heartbeat_pins_claimed_occurrence_and_caller_transaction(
     assert command.model_id == agent.primary_model_id
     assert command.payload["saas_tier"] == ""
     assert command.payload["model_modality"] == "text"
+    assert command.payload["fallback_model_id"] is None
     assert command.delivery_status == "not_required"
     assert command.idempotency_key == f"start:{command.source_execution_id}"
     assert "heartbeat_instruction" not in command.payload
@@ -219,6 +220,7 @@ async def test_oneshot_registration_uses_a_unique_background_occurrence() -> Non
     assert command.requested_model_turn_limit == 40
     assert command.payload["saas_tier"] == ""
     assert command.payload["model_modality"] == "text"
+    assert command.payload["fallback_model_id"] is None
     assert "requested_max_steps" not in command.payload
 
 

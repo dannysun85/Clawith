@@ -336,13 +336,18 @@ async def process_dingtalk_message(
             file_names=saved_file_paths,
         )
         llm_content = _append_missing_image_markers(user_text, image_base64_list)
-        _, model, _, _ = await _load_agent_and_model(db, agent_id)
+        _, model, fallback_model, route_meta = await _load_agent_and_model(
+            db,
+            agent_id,
+        )
         await enqueue_channel_chat_runtime(
             db,
             agent=agent_obj,
             user=platform_user,
             session=session,
             model=model,
+            fallback_model=fallback_model,
+            route_meta=route_meta,
             content=llm_content,
             display_content=display_content,
             source_channel="dingtalk",

@@ -30,6 +30,11 @@ from app.services.agent_runtime.cycle_guard import (
     AgentCycleGuard,
     AgentCycleGuardError,
 )
+from app.services.agent_runtime.model_route import (
+    RuntimeModelRoute,
+    RuntimeModelRouteError,
+    resolve_runtime_model_route,
+)
 from app.services.agent_runtime.tool_execution import (
     ToolExecutionOutcome,
     ToolExecutionReservation,
@@ -567,11 +572,13 @@ async def enqueue_gateway_a2a_runtime(
             "a2a_target_unavailable",
             f"Agent {target_agent.name} is unavailable",
         )
-    if target_agent.primary_model_id is None:
+    try:
+        target_route = await resolve_runtime_model_route(target_agent)
+    except RuntimeModelRouteError as exc:
         raise A2ARuntimeError(
             "a2a_target_model_missing",
-            f"Agent {target_agent.name} has no primary model",
-        )
+            f"Agent {target_agent.name} has no available model route",
+        ) from exc
     decision = decide_runtime_v2(
         agent_id=target_agent.id,
         source_type="a2a",
@@ -659,7 +666,7 @@ async def enqueue_gateway_a2a_runtime(
                 f"through the gateway. Source Agent: {source_agent.name}. Request: {message}"
             ),
             run_kind="delegated",
-            model_id=target_agent.primary_model_id,
+            model_id=target_route.model_id,
             origin_user_id=owner_user_id,
             origin_agent_id=source_agent.id,
             delivery_status="not_required",
@@ -667,6 +674,13 @@ async def enqueue_gateway_a2a_runtime(
             payload={
                 "message_id": str(chat_message_id),
                 "input_content": message,
+                "saas_tier": target_route.saas_tier,
+                "model_modality": target_route.modality,
+                "fallback_model_id": (
+                    str(target_route.fallback_model_id)
+                    if target_route.fallback_model_id is not None
+                    else None
+                ),
                 "runtime_instruction": (
                     "This Run was initiated by another digital employee through the "
                     "OpenClaw gateway. Reply naturally; the verified final answer is "
@@ -825,11 +839,15 @@ class RuntimeA2AService:
                                 "runtime_disabled",
                                 "Durable Runtime is required for native A2A execution",
                             )
-                    if not is_openclaw and target.primary_model_id is None:
-                        raise A2ARuntimeError(
-                            "a2a_target_model_missing",
-                            f"Agent {target.name} has no primary model",
-                        )
+                    target_route: RuntimeModelRoute | None = None
+                    if not is_openclaw:
+                        try:
+                            target_route = await resolve_runtime_model_route(target)
+                        except RuntimeModelRouteError as exc:
+                            raise A2ARuntimeError(
+                                "a2a_target_model_missing",
+                                f"Agent {target.name} has no available model route",
+                            ) from exc
 
                     await self._cycle_guard.ensure_delegation_allowed(
                         db,
@@ -927,7 +945,7 @@ class RuntimeA2AService:
                                 correlation_id=correlation_id,
                                 goal=_target_goal(source_agent, request),
                                 run_kind="delegated",
-                                model_id=target.primary_model_id,
+                                model_id=target_route.model_id,
                                 origin_user_id=owner_user_id,
                                 origin_agent_id=source_agent.id,
                                 parent_run_id=source_run.id,
@@ -937,6 +955,13 @@ class RuntimeA2AService:
                                 payload={
                                     "message_id": str(message_id),
                                     "input_content": request.message,
+                                    "saas_tier": target_route.saas_tier,
+                                    "model_modality": target_route.modality,
+                                    "fallback_model_id": (
+                                        str(target_route.fallback_model_id)
+                                        if target_route.fallback_model_id is not None
+                                        else None
+                                    ),
                                     "a2a_mode": request.mode,
                                     "runtime_instruction": _target_runtime_instruction(
                                         request.mode

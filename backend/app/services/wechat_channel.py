@@ -251,6 +251,8 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
             user=platform_user,
             session=sess,
             model=runtime_model,
+            fallback_model=_fallback_model,
+            route_meta=_route_meta,
             content=user_text,
             source_channel="wechat",
             channel_delivery_target={"user_id": from_user_id},
