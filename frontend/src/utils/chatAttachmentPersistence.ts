@@ -10,6 +10,49 @@ export type PersistedChatAttachments = {
     content: string;
     displayFileNames: string[];
     storageFileNames: string[];
+    storageFilePaths: string[];
+};
+
+const safeWorkspaceAttachmentPath = (
+    storageFileName: string,
+    displayFileName: string,
+): string | null => {
+    const storageName = safeBasename(storageFileName);
+    if (!storageName) return null;
+
+    const normalizedDisplay = displayFileName.replace(/\\/g, '/').trim();
+    const relativePath = normalizedDisplay.replace(/^workspace\//, '');
+    const segments = relativePath.split('/');
+    if (
+        segments.length < 2
+        || segments.some((segment) => (
+            !segment
+            || segment === '.'
+            || segment === '..'
+            || /[\x00-\x1f\x7f:\[\]]/.test(segment)
+        ))
+        || safeBasename(relativePath) !== storageName
+    ) {
+        return null;
+    }
+    return `workspace/${segments.join('/')}`;
+};
+
+/**
+ * Resolve the server path used to preview a persisted attachment.
+ *
+ * Browser uploads keep their collision-safe basename under
+ * `workspace/uploads/`. Workspace-generated files retain their relative path
+ * in the display marker (for example `posters/example.jpg`); accept that path
+ * only when every segment is safe and its basename matches the durable marker.
+ */
+export const attachmentStoragePath = (
+    storageFileName: string,
+    displayFileName: string,
+): string => {
+    const storageName = safeBasename(storageFileName);
+    return safeWorkspaceAttachmentPath(storageName, displayFileName)
+        || `workspace/uploads/${storageName}`;
 };
 
 /**
@@ -48,10 +91,17 @@ export const parsePersistedChatAttachments = (content: string): PersistedChatAtt
         }
     }
 
+    const resolvedDisplayFileNames = displayFileNames.length > 0
+        ? displayFileNames
+        : storageFileNames;
+
     return {
         content: remainder.trim(),
-        displayFileNames: displayFileNames.length > 0 ? displayFileNames : storageFileNames,
+        displayFileNames: resolvedDisplayFileNames,
         storageFileNames,
+        storageFilePaths: storageFileNames.map((storageName, index) => (
+            attachmentStoragePath(storageName, resolvedDisplayFileNames[index] || storageName)
+        )),
     };
 };
 

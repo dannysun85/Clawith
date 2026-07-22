@@ -3214,7 +3214,7 @@ export default function AgentDetailPage() {
         } catch (e: any) { toast.error(t('common.error.saveFailed', '保存失败'), { details: String(e?.message || e) }); }
         setExpirySaving(false);
     };
-    interface ChatMsg { id?: string; role: 'user' | 'assistant' | 'tool_call'; content: string; fileName?: string; storageFileName?: string; toolName?: string; toolCallId?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; toolThinking?: string; thinking?: string; imageUrl?: string; timestamp?: string; quotaError?: { quota_type?: string; action?: string; details?: { upgrade_url?: string } }; }
+    interface ChatMsg { id?: string; role: 'user' | 'assistant' | 'tool_call'; content: string; fileName?: string; storageFileName?: string; storageFilePath?: string; toolName?: string; toolCallId?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; toolThinking?: string; thinking?: string; imageUrl?: string; timestamp?: string; quotaError?: { quota_type?: string; action?: string; details?: { upgrade_url?: string } }; }
     const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
     const getToolTargetKey = (args: any): string => {
         if (!args) return '';
@@ -3333,6 +3333,7 @@ export default function AgentDetailPage() {
         displayFileName: string;
         storageFileNames: string[];
         storageFileName?: string;
+        storageFilePath?: string;
         imageUrl?: string;
         tier?: SaasTier | null;
         modality?: string;
@@ -3591,6 +3592,7 @@ export default function AgentDetailPage() {
                 ...msg,
                 fileName: persistedAttachments.displayFileNames.join(', '),
                 storageFileName: persistedAttachments.storageFileNames[0],
+                storageFilePath: persistedAttachments.storageFilePaths[0],
                 content: persistedAttachments.content,
             };
         }
@@ -3612,7 +3614,8 @@ export default function AgentDetailPage() {
             const durableFileName = parsed.storageFileName || parsed.fileName;
             const ext = durableFileName.split('.').pop()?.toLowerCase() || '';
             if (IMAGE_EXTS.includes(ext)) {
-                parsed.imageUrl = fileApi.downloadUrl(id, `workspace/uploads/${durableFileName}`, { inline: true });
+                const durableFilePath = parsed.storageFilePath || `workspace/uploads/${durableFileName}`;
+                parsed.imageUrl = fileApi.downloadUrl(id, durableFilePath, { inline: true });
             }
         }
         return parsed;
@@ -4287,6 +4290,7 @@ export default function AgentDetailPage() {
             content: payload.userMsg,
             fileName: payload.displayFileName,
             storageFileName: payload.storageFileName,
+            storageFilePath: payload.storageFilePath,
             imageUrl: payload.imageUrl,
             timestamp: new Date().toISOString()
         })]);
@@ -5099,6 +5103,13 @@ export default function AgentDetailPage() {
                 .filter(Boolean),
             storageFileName: attachedFiles.length === 1
                 ? attachmentStorageBasename(attachedFiles[0].path, attachedFiles[0].name)
+                : undefined,
+            storageFilePath: attachedFiles.length === 1
+                ? (
+                    attachedFiles[0].source === 'workspace_auto' && attachedFiles[0].path
+                        ? attachedFiles[0].path
+                        : `workspace/uploads/${attachmentStorageBasename(attachedFiles[0].path, attachedFiles[0].name)}`
+                )
                 : undefined,
             imageUrl: attachedFiles.length === 1 ? attachedFiles[0].imageUrl : undefined,
             tier: deliverableRouteTier(

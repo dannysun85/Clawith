@@ -1,3 +1,28 @@
+# v1.11.6 — Generated Workspace Image Preview Hotfix
+
+## Historical and Live Image Preview Recovery
+
+- Chat history now restores Agent-generated image paths from their persisted
+  Workspace directory instead of rewriting every attachment to
+  `workspace/uploads/`. Generated posters and images under directories such as
+  `workspace/posters/` therefore load through the same tenant-authorized file
+  endpoint that already serves the stored artifact.
+- Ordinary browser uploads remain bound to their collision-safe
+  `workspace/uploads/<filename>` path. Workspace-relative paths are accepted
+  only when every segment is safe and the final basename matches the durable
+  `[file:...]` marker, preventing traversal, URL injection, and attachment
+  substitution.
+- The same path contract is applied to optimistic messages and restored chat
+  history, so a generated image no longer appears initially and then breaks
+  after refresh or reconnect.
+
+## Validation
+
+- Frontend attachment persistence tests: `8 passed`; complete frontend tests:
+  `67` Node contract tests plus `127` Vitest tests passed.
+- TypeScript production build completed with `7031` transformed modules, and
+  the focused diff passed independent code and architecture review.
+
 # v1.11.5 — Durable Media Completion Settlement Hotfix
 
 ## Media Completion and Credits Settlement
