@@ -31,7 +31,7 @@
 
 - Expanded media, Runtime async polling, cancellation, delivery, Tool outcome,
   Credits lifecycle, and capability-governance regression set: `376 passed`;
-  complete backend suite: `3635 passed`.
+  clean-candidate complete backend suite: `3632 passed`.
 - Frontend Node contracts: `67 passed`; Vitest: `127 passed`; TypeScript/Vite
   production build completed with `7031` transformed modules.
 - Changed Python files pass Ruff and byte-code compilation. PostgreSQL fresh
