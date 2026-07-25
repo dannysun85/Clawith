@@ -194,17 +194,21 @@ Clawith/
 ## 7. 专题文件索引
 
 随项目演进，在 `.agents/` 下按主题拆分细化文件。新建后在此登记，避免散落漂移。
+开始任务前必须读取并遵守所有与任务范围相关的已登记专题文件；它们是本文件的强制扩展，不是可选背景资料。
 
 **规则（`.agents/rules/`）——行为指令"必须/禁止"**
 
-- （暂无，按需新增：设计与开发、部署、GitHub 流程、发布流程等）
+- `.agents/rules/capability-and-agent-governance.md` — 新能力、Skill、Tool、Provider 与 Agent 员工的强制边界和上线门禁
 
 **工作流（`.agents/workflows/`）——步骤化操作指南**
 
 - `.agents/workflows/deploy-production.md` — 生产部署固定流程（`opc.reeftotem.ai` / `/opt/astra-poc`）
+- `.agents/workflows/add-product-capability.md` — 新增或升级产品能力、Skill、Tool、Provider 与 Agent 员工的统一流程
+- `.agents/workflows/creative-deliverables-implementation-rollout.md` — 图片、视频、PPT 的完整落地、兼容迁移、灰度、验收和回滚方案
 
 **参考（`.agents/reference/`）——纯事实性知识，按需拆分自本文件**
 
-- （暂无；当本文件某一节超过 ~80 行时拆出）
+- `.agents/reference/creative-deliverables-capability.md` — 当前图片、视频、PPT 实现基线、质量方案、调用链与降级矩阵
+- `.agents/reference/agency-agents-zh-provenance.md` — 首批外部 Agent 角色的固定版本、筛选映射、MIT 来源和 Astra 重写边界
 
 > 规则：本文件总长度控制在 250 行以内。超过时优先把最详细的部分拆到 `.agents/reference/`，并在上面登记链接。

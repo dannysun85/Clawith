@@ -37,6 +37,22 @@ ss-nodes.json
 _agent/
 _agents/
 
+# Canonical Agent rules registered by SKILL.md must remain versioned.
+!.agents/
+.agents/*
+!.agents/rules/
+.agents/rules/*
+!.agents/rules/capability-and-agent-governance.md
+!.agents/workflows/
+.agents/workflows/*
+!.agents/workflows/deploy-production.md
+!.agents/workflows/add-product-capability.md
+!.agents/workflows/creative-deliverables-implementation-rollout.md
+!.agents/reference/
+.agents/reference/*
+!.agents/reference/creative-deliverables-capability.md
+!.agents/reference/agency-agents-zh-provenance.md
+
 # Internal docs
 docs/
 .agents/rules/deploy.md
