@@ -202,11 +202,15 @@ async def _create_personal_assistant(
     if template and template.default_tools:
         from app.services.template_capabilities import grant_template_tools
 
-        await grant_template_tools(
+        _, unresolved = await grant_template_tools(
             db,
             agent_id=agent.id,
             tool_names=list(template.default_tools),
         )
+        if unresolved:
+            raise RuntimeError(
+                "Template Tool registry is incomplete: " + ", ".join(unresolved)
+            )
 
     from app.api.relationships import _regenerate_relationships_file
     await _regenerate_relationships_file(db, agent.id)

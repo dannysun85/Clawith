@@ -581,10 +581,9 @@ async def _background_agent_setup(
                 )
                 await db.commit()
             if unresolved:
-                logger.warning(
-                    "[create_agent] Unknown template tools agent={} names={}",
-                    agent_id,
-                    list(unresolved),
+                raise RuntimeError(
+                    "Template Tool registry is incomplete: "
+                    + ", ".join(unresolved)
                 )
         except Exception as e:
             logger.exception(

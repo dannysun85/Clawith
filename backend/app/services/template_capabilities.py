@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from dataclasses import asdict, dataclass
 
 from loguru import logger
 from sqlalchemy import select
@@ -12,6 +13,36 @@ from app.models.agent import Agent, AgentTemplate
 from app.models.tool import AgentTool, Tool
 from app.services.agent_tool_assignments import upsert_agent_tool
 from app.services.tool_capability_policy import EXPLICIT_GRANT_TOOL_NAMES
+
+
+@dataclass(frozen=True)
+class TemplateToolReconcileReport:
+    """Auditable result of synchronizing role-owned Tool assignments."""
+
+    agents_reviewed: int
+    granted: int
+    removed: int
+    missing_tool_names: tuple[str, ...]
+    migrated_to_template: int
+    disabled_ambient: int
+    preserved_opt_out: int
+    preserved_ambiguous: int
+
+    @property
+    def changed(self) -> bool:
+        return any(
+            (
+                self.granted,
+                self.removed,
+                self.migrated_to_template,
+                self.disabled_ambient,
+                self.preserved_opt_out,
+                self.preserved_ambiguous,
+            )
+        )
+
+    def as_log_dict(self) -> dict[str, object]:
+        return asdict(self)
 
 
 async def grant_template_tools(
@@ -35,7 +66,6 @@ async def grant_template_tools(
         select(Tool).where(
             Tool.name.in_(requested),
             Tool.source == "builtin",
-            Tool.enabled.is_(True),
         )
     )
     tools = list(result.scalars().all())
@@ -52,7 +82,9 @@ async def grant_template_tools(
     return len(tools), tuple(sorted(requested - found))
 
 
-async def reconcile_template_tool_grants(db: AsyncSession) -> tuple[int, int]:
+async def reconcile_template_tool_grants(
+    db: AsyncSession,
+) -> TemplateToolReconcileReport:
     """Reconcile reviewed role grants without touching user-owned choices.
 
     ``source=template`` is the only provenance this synchronizer owns.  When a
@@ -137,10 +169,11 @@ async def reconcile_template_tool_grants(db: AsyncSession) -> tuple[int, int]:
             continue
         await db.delete(assignment)
         removed += 1
-    if missing:
+    missing_tool_names = tuple(sorted(missing))
+    if missing_tool_names:
         logger.warning(
             "[TemplateCapabilities] Ignored unknown builtin tools names={}",
-            sorted(missing),
+            missing_tool_names,
         )
     if (
         migrated_to_template
@@ -157,4 +190,13 @@ async def reconcile_template_tool_grants(db: AsyncSession) -> tuple[int, int]:
             preserved_opt_out,
             preserved_ambiguous,
         )
-    return granted, removed
+    return TemplateToolReconcileReport(
+        agents_reviewed=len(desired_by_agent),
+        granted=granted,
+        removed=removed,
+        missing_tool_names=missing_tool_names,
+        migrated_to_template=migrated_to_template,
+        disabled_ambient=disabled_ambient,
+        preserved_opt_out=preserved_opt_out,
+        preserved_ambiguous=preserved_ambiguous,
+    )

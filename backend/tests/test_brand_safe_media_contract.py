@@ -107,6 +107,7 @@ def test_brand_safe_media_skill_is_role_scoped_with_explicit_media_grants():
         "tiktok-strategist",
         "linkedin-content-creator",
         "growth-hacker",
+        "xiaohongshu-operator",
     ):
         metadata = yaml.safe_load((templates_root / folder / "meta.yaml").read_text())
         assert "brand-safe-media" in metadata["default_skills"]

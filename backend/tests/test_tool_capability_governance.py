@@ -580,6 +580,37 @@ async def test_template_grant_can_replace_only_template_provenance() -> None:
 
 
 @pytest.mark.asyncio
+async def test_globally_disabled_tool_keeps_role_assignment(monkeypatch) -> None:
+    agent_id = uuid.uuid4()
+    tool = SimpleNamespace(
+        id=uuid.uuid4(),
+        name="execute_code",
+        source="builtin",
+        enabled=False,
+    )
+    db = _Db([_Result(rows=[tool])])
+    upsert = AsyncMock()
+    monkeypatch.setattr(template_capabilities, "upsert_agent_tool", upsert)
+
+    granted, unresolved = await template_capabilities.grant_template_tools(
+        db,
+        agent_id=agent_id,
+        tool_names=["execute_code"],
+    )
+
+    assert granted == 1
+    assert unresolved == ()
+    upsert.assert_awaited_once_with(
+        db,
+        agent_id=agent_id,
+        tool_id=tool.id,
+        enabled=True,
+        source="template",
+        on_conflict="template",
+    )
+
+
+@pytest.mark.asyncio
 async def test_template_reconciliation_removes_only_stale_template_grants(
     monkeypatch,
 ) -> None:
@@ -619,10 +650,19 @@ async def test_template_reconciliation_removes_only_stale_template_grants(
     grant = AsyncMock(return_value=(1, ()))
     monkeypatch.setattr(template_capabilities, "grant_template_tools", grant)
 
-    processed, removed = await template_capabilities.reconcile_template_tool_grants(db)
+    report = await template_capabilities.reconcile_template_tool_grants(db)
 
-    assert processed == 1
-    assert removed == 2
+    assert report == template_capabilities.TemplateToolReconcileReport(
+        agents_reviewed=1,
+        granted=1,
+        removed=2,
+        missing_tool_names=(),
+        migrated_to_template=1,
+        disabled_ambient=0,
+        preserved_opt_out=1,
+        preserved_ambiguous=1,
+    )
+    assert report.changed is True
     assert db.deleted == [stale, detached]
     assert legacy_role.source == "template"
     assert legacy_role.enabled is True

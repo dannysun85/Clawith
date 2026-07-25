@@ -13,11 +13,18 @@ surface we'll shrink as old templates are ported.
 
 from pathlib import Path
 
-import yaml
 from loguru import logger
 from sqlalchemy import select
 from app.database import async_session
 from app.models.agent import AgentTemplate
+from app.services.agent_template_contract import (
+    TemplateContractError,
+    load_agent_template_manifest,
+    validate_template_capability_references,
+)
+from app.services.agent_tools import RUNTIME_TYPED_APPLICATION_TOOL_NAMES
+from app.services.builtin_tool_definitions import BUILTIN_TOOL_DEFINITIONS
+from app.services.skill_seeder import BUILTIN_SKILLS
 
 
 # ─── Legacy Python templates ────────────────────────────────────────
@@ -212,57 +219,31 @@ DEFAULT_TEMPLATES = [
 # backend/app/services/template_seeder.py → parents[2] is backend/
 _TEMPLATE_ROOT = Path(__file__).resolve().parents[2] / "agent_templates"
 
-_REQUIRED_META_FIELDS = {"name", "description", "icon", "category"}
-
-
 def _load_folder_templates() -> list[dict]:
     """Return a list of template dicts matching DEFAULT_TEMPLATES shape."""
     if not _TEMPLATE_ROOT.exists():
         return []
 
+    known_skill_folders = {skill["folder_name"] for skill in BUILTIN_SKILLS}
+    known_tool_names = {tool["name"] for tool in BUILTIN_TOOL_DEFINITIONS}
     out: list[dict] = []
     for slug_dir in sorted(p for p in _TEMPLATE_ROOT.iterdir() if p.is_dir()):
-        meta_path = slug_dir / "meta.yaml"
-        soul_path = slug_dir / "soul.md"
-
-        if not meta_path.exists():
-            logger.warning("[TemplateSeeder] Folder template has no meta.yaml; skipping")
-            continue
-        if not soul_path.exists():
-            logger.warning("[TemplateSeeder] Folder template has no soul.md; skipping")
-            continue
-
         try:
-            meta = yaml.safe_load(meta_path.read_text(encoding="utf-8")) or {}
-        except yaml.YAMLError as exc:
-            logger.error(
-                "[TemplateSeeder] meta.yaml parse failed error_type={}",
+            manifest = load_agent_template_manifest(slug_dir)
+            validate_template_capability_references(
+                manifest,
+                known_skill_folders=known_skill_folders,
+                known_tool_names=known_tool_names,
+                runtime_typed_tool_names=RUNTIME_TYPED_APPLICATION_TOOL_NAMES,
+            )
+        except TemplateContractError as exc:
+            logger.exception(
+                "[TemplateSeeder] Invalid folder template error_type={}",
                 type(exc).__name__,
             )
-            continue
-
-        missing = _REQUIRED_META_FIELDS - meta.keys()
-        if missing:
-            logger.error(
-                "[TemplateSeeder] meta.yaml missing required fields missing_count={}; skipping",
-                len(missing),
-            )
-            continue
-
-        soul_template = soul_path.read_text(encoding="utf-8")
-        out.append({
-            "name": meta["name"],
-            "description": meta["description"],
-            "icon": meta["icon"],
-            "category": meta["category"],
-            "is_builtin": True,
-            "capability_bullets": meta.get("capability_bullets", []),
-            "soul_template": soul_template,
-            "default_skills": meta.get("default_skills", []),
-            "default_tools": meta.get("default_tools", []),
-            "default_mcp_servers": meta.get("default_mcp_servers", []),
-            "default_autonomy_policy": meta.get("default_autonomy_policy", {}),
-        })
+            raise
+        soul_template = (slug_dir / "soul.md").read_text(encoding="utf-8")
+        out.append(manifest.to_seed_dict(soul_template=soul_template))
         logger.debug("[TemplateSeeder] Loaded folder template")
 
     return out
@@ -351,11 +332,10 @@ async def seed_agent_templates():
     from app.services.template_capabilities import reconcile_template_tool_grants
 
     async with async_session() as db:
-        granted, removed = await reconcile_template_tool_grants(db)
+        report = await reconcile_template_tool_grants(db)
         await db.commit()
-    if granted or removed:
+    if report.changed:
         logger.info(
-            "[TemplateSeeder] Reconciled template tool grants processed={} removed={}",
-            granted,
-            removed,
+            "[TemplateSeeder] Reconciled template tool grants report={}",
+            report.as_log_dict(),
         )

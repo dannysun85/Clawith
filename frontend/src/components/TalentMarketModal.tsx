@@ -34,7 +34,10 @@ const FEATURED_TEMPLATE_NAMES = new Set<string>([
     'Private Assistant',
     'Chief of Staff',
     'Project Manager',
+    'Product Manager',
+    'Customer Success Manager',
     'Douyin Operations Manager',
+    'Xiaohongshu Operations Manager',
     'Growth Hacker',
     'Content Creator',
     'Frontend Developer',
@@ -46,7 +49,15 @@ const FEATURED_TEMPLATE_NAMES = new Set<string>([
     'Market Intel Aggregator',
 ]);
 
-type TabId = 'popular' | 'software-development' | 'marketing' | 'office' | 'trading';
+type TabId =
+    | 'popular'
+    | 'product-project'
+    | 'software-development'
+    | 'marketing'
+    | 'data-research'
+    | 'customer-success'
+    | 'office'
+    | 'trading';
 
 export default function TalentMarketModal({
     open,
@@ -79,8 +90,11 @@ export default function TalentMarketModal({
 
     const tabs: Array<{ id: TabId; label: string }> = [
         { id: 'popular', label: t('talentMarket.tabPopular', isChinese ? '热门推荐' : 'Popular') },
+        { id: 'product-project', label: t('talentMarket.tabProduct', isChinese ? '产品项目' : 'Product & Project') },
         { id: 'software-development', label: t('talentMarket.tabSWE', isChinese ? '软件开发' : 'Software Development') },
         { id: 'marketing', label: t('talentMarket.tabMarketing', isChinese ? '营销' : 'Marketing') },
+        { id: 'data-research', label: t('talentMarket.tabData', isChinese ? '数据研究' : 'Data & Research') },
+        { id: 'customer-success', label: t('talentMarket.tabCustomer', isChinese ? '客户成功' : 'Customer Success') },
         { id: 'office', label: t('talentMarket.tabOffice', isChinese ? '办公通用' : 'Office') },
         { id: 'trading', label: t('talentMarket.tabTrading', isChinese ? '交易投资' : 'Trading') },
     ];
