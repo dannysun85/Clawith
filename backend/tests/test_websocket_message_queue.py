@@ -134,13 +134,12 @@ async def test_runtime_intake_uses_validated_client_message_id():
     assert handler._enqueue_runtime_chat.await_args.kwargs["message_id"] == client_message_id
     handler._save_user_message.assert_not_awaited()
     handler._save_assistant_reply.assert_not_awaited()
-    assert websocket.sent == [
-        {
-            "type": "error",
-            "content": "Durable Runtime is not enabled for native Web Chat.",
-            "code": "runtime_disabled",
-        },
-    ]
+    packet = websocket.sent[-1]
+    assert packet["type"] == "error"
+    assert packet["content"] == "Durable Runtime is not enabled for native Web Chat."
+    assert packet["code"] == "runtime_disabled"
+    assert packet["stage"] == "intake"
+    assert packet["error"]["trace_id"] == packet["trace_id"]
 
 
 @pytest.mark.asyncio
@@ -317,13 +316,12 @@ async def test_websocket_rejects_non_private_web_session(
     resolved = await handler._resolve_chat_session(RecordingDB([session]), requested_user_id)
 
     assert resolved is None
-    assert websocket.sent == [
-        {
-            "type": "error",
-            "content": "Not authorized for this session",
-            "code": "chat_session_scope_mismatch",
-        }
-    ]
+    packet = websocket.sent[-1]
+    assert packet["type"] == "error"
+    assert packet["content"] == "Not authorized for this session"
+    assert packet["code"] == "chat_session_scope_mismatch"
+    assert packet["stage"] == "request"
+    assert packet["error"]["trace_id"] == packet["trace_id"]
     assert websocket.close_code == 4002
 
 

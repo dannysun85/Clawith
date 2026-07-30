@@ -10,6 +10,22 @@ const enterpriseSettingsSource = readFileSync(
   new URL('../src/pages/EnterpriseSettings.tsx', import.meta.url),
   'utf8',
 );
+const modelSwitcher = readFileSync(
+  new URL('../src/components/ModelSwitcher.tsx', import.meta.url),
+  'utf8',
+);
+const modelCacheEvents = readFileSync(
+  new URL('../src/services/modelCacheEvents.ts', import.meta.url),
+  'utf8',
+);
+const agentDetail = readFileSync(
+  new URL('../src/pages/agent-detail/AgentDetailPage.tsx', import.meta.url),
+  'utf8',
+);
+const source = readFileSync(
+  new URL('../src/pages/enterprise-settings/tabs/LlmTab.tsx', import.meta.url),
+  'utf8',
+);
 
 test('the centralized SaaS owner can select planning and group context models per tenant', () => {
   assert.match(saasAdminSource, /\/enterprise\/runtime-model-settings\?tenant_id=/);
@@ -26,4 +42,30 @@ test('runtime model choices use tenant-safe backend candidates without restoring
   assert.match(saasAdminSource, /候选模型必须已启用并通过原生工具调用测试/);
   assert.match(saasAdminSource, /运行时模型配置已更新并立即生效/);
   assert.match(enterpriseSettingsSource, /navigate\(`\/admin\/saas\?tab=\$\{activeTab === 'llm' \? 'model-routes' : 'plans'\}`/);
+});
+
+test('stale runtime model ids stay unselected instead of selecting the first option', () => {
+  assert.match(source, /planning_source: 'database' \| 'environment' \| 'unavailable'/);
+  assert.match(source, /planning_model_id: runtimeModelSettings\.planning_model_id \|\| ''/);
+  assert.match(source, /compact_model_id: runtimeModelSettings\.compact_model_id \|\| ''/);
+  assert.match(source, /<option value="" disabled>/);
+});
+
+test('chat model choices allow every enabled model and refresh across tabs', () => {
+  assert.match(
+    modelSwitcher,
+    /filter\(m => m\.enabled !== false\)/,
+  );
+  assert.match(modelSwitcher, /subscribeModelCacheInvalidation/);
+  assert.match(modelSwitcher, /void refetchModels\(\)/);
+  assert.match(source, /notifyModelCacheInvalidated\(\)/);
+  assert.match(modelCacheEvents, /window\.addEventListener\('storage'/);
+  assert.match(modelCacheEvents, /window\.dispatchEvent\(new Event\(MODEL_CACHE_EVENT\)\)/);
+});
+
+test('chat routes through enabled SaaS tiers instead of stale direct model ids', () => {
+  assert.match(agentDetail, /const effectiveChatTier = resolveChatSessionTier\(/);
+  assert.match(agentDetail, /const effectiveTierReady = !!effectiveChatTier/);
+  assert.match(agentDetail, /queryKey: \['agent-media-capabilities', id, effectiveChatTier\]/);
+  assert.doesNotMatch(agentDetail, /const effectiveChatModelId = overrideModelId/);
 });

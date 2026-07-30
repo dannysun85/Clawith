@@ -124,10 +124,10 @@ import AgentDirectory from './AgentDirectory';
 import { useAgentDetailRoute } from './hooks/useAgentDetailRoute';
 import {
     failClosedSessionActiveRun,
+    mergeTerminalAssistantMessage,
     runtimeCompletionNeedsMessageRefresh,
     sessionActiveRunFromResponse,
     sessionRuntimeStateResponseIsValid,
-    terminalAssistantMessageAlreadyPresent,
     type SessionActiveRun,
     type ToolReconciliation,
     waitingSessionActiveRunHint,
@@ -135,6 +135,13 @@ import {
 } from './sessionRuntimeState';
 import { onboardingKickoffKey, shouldKickoffOnboarding } from './onboardingKickoff';
 import { fetchAuth } from './utils/fetchAuth';
+import {
+    formatRuntimeErrorDiagnostics,
+    normalizeRuntimeError,
+    runtimeErrorDisablesReconnect,
+    runtimeErrorMarksAgentExpired,
+    type RuntimeErrorContext,
+} from '../../services/runtimeError';
 
 const closeWebSocketIntentionally = (ws: WebSocket) => {
     if (ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED) return;
@@ -2534,10 +2541,16 @@ export default function AgentDetailPage() {
                 ...(message.thinking && { thinking: message.thinking }),
                 ...(message.created_at && { timestamp: message.created_at }),
                 ...(message.id && { id: message.id }),
+                ...(message.runtime_error && {
+                    runtimeError: normalizeRuntimeError({ error: message.runtime_error }),
+                }),
             }));
             setChatMessages(parsed);
+            // Round-trip the backend's compound `<created_at>|<id>` cursor. A bare
+            // created_at cannot page past a batch of messages that share one timestamp
+            // (e.g. a burst of tool_call rows), so older messages would never load.
             setChatOldestTimestamp(
-                messages.length > 0 ? messages[0].created_at : null,
+                messages.length > 0 ? (messages[0].cursor ?? messages[0].created_at) : null,
             );
             setChatHistoryHasMore(messages.length >= HISTORY_PAGE_SIZE);
             setMessagesLoadedRuntimeKey(buildSessionRuntimeKey(agentId, sessionId));
@@ -3091,6 +3104,9 @@ export default function AgentDetailPage() {
                 ...(m.thinking && { thinking: m.thinking }),
                 ...(m.created_at && { timestamp: m.created_at }),
                 ...(m.id && { id: m.id }),
+                ...(m.runtime_error && {
+                    runtimeError: normalizeRuntimeError({ error: m.runtime_error }),
+                }),
             }));
 
             const historyCursor = resolveChatHistoryCursor(
@@ -3216,7 +3232,7 @@ export default function AgentDetailPage() {
         } catch (e: any) { toast.error(t('common.error.saveFailed', '保存失败'), { details: String(e?.message || e) }); }
         setExpirySaving(false);
     };
-    interface ChatMsg { id?: string; role: 'user' | 'assistant' | 'tool_call'; content: string; fileName?: string; storageFileName?: string; storageFilePath?: string; toolName?: string; toolCallId?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; toolThinking?: string; thinking?: string; imageUrl?: string; timestamp?: string; quotaError?: { quota_type?: string; action?: string; details?: { upgrade_url?: string } }; }
+    interface ChatMsg { id?: string; role: 'user' | 'assistant' | 'tool_call'; content: string; fileName?: string; storageFileName?: string; storageFilePath?: string; toolName?: string; toolCallId?: string; toolArgs?: any; toolStatus?: 'running' | 'done'; toolResult?: string; toolThinking?: string; thinking?: string; imageUrl?: string; timestamp?: string; runtimeError?: RuntimeErrorContext; quotaError?: { quota_type?: string; action?: string; details?: { upgrade_url?: string } }; }
     const [chatMessages, setChatMessages] = useState<ChatMsg[]>([]);
     const getToolTargetKey = (args: any): string => {
         if (!args) return '';
@@ -3611,8 +3627,15 @@ export default function AgentDetailPage() {
             const qMatch = msg.content.match(/\nQuestion: ([\s\S]+)$/);
             parsed = { ...msg, fileName, content: qMatch ? qMatch[1].trim() : '' };
         }
-        // If file is an image and no imageUrl yet, build download URL for preview
-        if (parsed.fileName && !parsed.imageUrl && id) {
+        // A multi-image message has one durable attachment label but multiple
+        // inline markers. Rendering that label as one file URL would hide all
+        // but one image, so ChatMessageItem owns the per-marker preview.
+        const inlineImageMarkerCount = (
+            parsed.content.match(/\[image_data:data:image\//g) || []
+        ).length;
+        // If this is a single image and no imageUrl exists yet, build its
+        // authenticated inline download URL.
+        if (parsed.fileName && !parsed.imageUrl && inlineImageMarkerCount <= 1 && id) {
             const durableFileName = parsed.storageFileName || parsed.fileName;
             const ext = durableFileName.split('.').pop()?.toLowerCase() || '';
             if (IMAGE_EXTS.includes(ext)) {
@@ -4176,22 +4199,22 @@ export default function AgentDetailPage() {
                 }
                 queryClient.invalidateQueries({ queryKey: ['agents'] });
             } else if (d.type === 'error' || d.type === 'quota_exceeded') {
-                const msg = d.content || d.detail || d.message || 'Request denied';
-                const isNoModelError = msg.includes('no LLM model') || msg.includes('No model');
-                if (isNoModelError) {
+                const runtimeError = normalizeRuntimeError(d);
+                if (runtimeErrorDisablesReconnect(runtimeError)) {
                     reconnectDisabledRef.current[key] = true;
-                    return;
                 }
                 setChatMessages(prev => {
                     const last = prev[prev.length - 1];
-                    const warningText = `Warning: ${msg}`;
+                    const warningText = `Warning: ${runtimeError.message}`;
                     if (last && last.role === 'assistant' && last.content === warningText) return prev;
-                    return [...prev, parseChatMsg({ role: 'assistant', content: warningText, quotaError: d.quota_error })];
+                    return [...prev, parseChatMsg({
+                        role: 'assistant',
+                        content: warningText,
+                        runtimeError,
+                        quotaError: d.quota_error,
+                    })];
                 });
-                if (msg.includes('expired') || msg.includes('Setup failed')) {
-                    reconnectDisabledRef.current[key] = true;
-                    if (msg.includes('expired')) setAgentExpired(true);
-                }
+                if (runtimeErrorMarksAgentExpired(runtimeError)) setAgentExpired(true);
             } else if (d.type === 'media_generation_result') {
                 const targetSessionId = d.session_id ? String(d.session_id) : '';
                 const currentSessionId = activeSessionIdRef.current ? String(activeSessionIdRef.current) : '';
@@ -4611,6 +4634,9 @@ export default function AgentDetailPage() {
                 ...(m.thinking && { thinking: m.thinking }),
                 ...(m.created_at && { timestamp: m.created_at }),
                 ...(m.id && { id: m.id }),
+                ...(m.runtime_error && {
+                    runtimeError: normalizeRuntimeError({ error: m.runtime_error }),
+                }),
             }));
             // Save current scroll position
             const el = historyContainerRef.current;
@@ -4698,6 +4724,9 @@ export default function AgentDetailPage() {
                 ...(m.thinking && { thinking: m.thinking }),
                 ...(m.created_at && { timestamp: m.created_at }),
                 ...(m.id && { id: m.id }),
+                ...(m.runtime_error && {
+                    runtimeError: normalizeRuntimeError({ error: m.runtime_error }),
+                }),
             }));
             // Save current scroll position
             const el = chatContainerRef.current;
@@ -4785,6 +4814,9 @@ export default function AgentDetailPage() {
         const resolvedSenderLabel = msg.sender_name || senderLabel;
         const resolvedAvatarText = avatarText || (resolvedSenderLabel ? resolvedSenderLabel[0] : (isLeft ? 'A' : 'U'));
         const showSenderLabel = !!resolvedSenderLabel && (forceSenderLabel || !!msg.sender_name);
+        const runtimeDiagnostics = msg.runtimeError
+            ? formatRuntimeErrorDiagnostics(msg.runtimeError)
+            : '';
 
         // Parse [image_data:data:image/...;base64,...] markers from user message content.
         // The backend persists these markers in the DB to preserve multimodal context
@@ -7375,7 +7407,7 @@ export default function AgentDetailPage() {
                             write: (p, c) => fileApi.write(id!, p, c),
                             delete: (p) => fileApi.delete(id!, p),
                             upload: (file, path, onProgress) => fileApi.upload(id!, file, path + '/', onProgress),
-                            downloadUrl: (p) => fileApi.downloadUrl(id!, p),
+                            downloadUrl: (p, options) => fileApi.downloadUrl(id!, p, options),
                         };
                         return <FileBrowser api={adapter} rootPath="workspace" features={{ upload: canManage, newFile: canManage, newFolder: canManage, edit: canManage, delete: canManage, directoryNavigation: true }} />;
                     })()

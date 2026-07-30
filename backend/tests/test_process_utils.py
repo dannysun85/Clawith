@@ -258,7 +258,10 @@ async def test_subprocess_backend_cancellation_reaps_process(monkeypatch, tmp_pa
     backend = SubprocessBackend(
         SandboxConfig(allow_unsafe_fallback_when_bwrap_missing=True)
     )
-    monkeypatch.setattr(backend, "_ensure_workspace_venv", lambda _path: None)
+    async def ensure_workspace_venv(_path):
+        return None
+
+    monkeypatch.setattr(backend, "_ensure_workspace_venv", ensure_workspace_venv)
     monkeypatch.setattr(backend, "_build_bwrap_command", lambda *_args: None)
     monkeypatch.setattr(backend, "_build_host_command", lambda *_args: ["fake"])
     monkeypatch.setattr(

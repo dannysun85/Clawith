@@ -7,7 +7,7 @@ fresh_db_name="${db_name}_fresh"
 db_user="${PGUSER:-$USER}"
 db_host="${PGHOST:-127.0.0.1}"
 db_port="${PGPORT:-5432}"
-release_head="${MIGRATION_SMOKE_EXPECTED_HEAD:-add_deliverable_quality_reviews}"
+release_head="${MIGRATION_SMOKE_EXPECTED_HEAD:-merge_v1113_astra_heads}"
 
 assert_at_release_head() {
   .venv/bin/alembic current | grep -F "${release_head} (head)"

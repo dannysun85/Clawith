@@ -137,7 +137,7 @@ def test_dedicated_worker_registers_user_schedule_as_critical_daemon():
     source = (Path(__file__).parents[1] / "app/main.py").read_text(encoding="utf-8")
 
     assert 'from app.services.scheduler import start_scheduler' in source
-    assert '("user_schedule", start_scheduler())' in source
+    assert '("agent_schedule_scheduler", start_scheduler())' in source
 
 
 def test_schedule_lock_uses_a_dedicated_postgresql_session():

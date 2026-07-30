@@ -210,5 +210,6 @@ Clawith/
 
 - `.agents/reference/creative-deliverables-capability.md` — 当前图片、视频、PPT 实现基线、质量方案、调用链与降级矩阵
 - `.agents/reference/agency-agents-zh-provenance.md` — 首批外部 Agent 角色的固定版本、筛选映射、MIT 来源和 Astra 重写边界
+- `.agents/reference/clawith-v1.11.3-upgrade.md` — 上游 v1.11.3 语义升级范围、Astra 保留项、拒绝项和验证门禁
 
 > 规则：本文件总长度控制在 250 行以内。超过时优先把最详细的部分拆到 `.agents/reference/`，并在上面登记链接。

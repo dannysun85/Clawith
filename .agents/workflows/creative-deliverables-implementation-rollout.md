@@ -22,7 +22,9 @@
   - `tool_ready`：Seedance 1.5 Pro 的 Medium 路由、官方版本化 ID、4–12 秒/分辨率/比例/联网/
     draft/flex 能力校验、首尾帧和显式音频意图已在本地 adapter 与测试中落地；
   - `production_verified`：否，生产配置与发布未获授权。
-- 底座边界：继续基于当前 v1.11.0 衍生定制线演进，本阶段不合并新的上游 Clawith。
+- 底座边界：当前 Astra v1.11.9 已吸收上游 Clawith v1.11.3；后续上游升级仍必须按
+  `.agents/reference/clawith-v1.11.3-upgrade.md` 的语义合并方式执行，禁止覆盖自有 Deliverable、
+  Credits、Approval、Provider 路由和质量门禁。
 - 本文是图片、视频、PPT 实施阶段的强制工作流；同时遵守：
   - `.agents/rules/capability-and-agent-governance.md`
   - `.agents/workflows/add-product-capability.md`

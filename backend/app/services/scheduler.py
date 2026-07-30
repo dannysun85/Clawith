@@ -212,8 +212,14 @@ async def _tick():
     if not AUTOMATIC_SCHEDULE_EXECUTION_ENABLED:
         return
     from app.database import async_session
+    from app.core.permissions import is_agent_expired
+    from app.models.agent import Agent
     from app.models.schedule import AgentSchedule
     from app.services.audit_logger import write_audit_log
+    from app.services.heartbeat_runtime import (
+        enqueue_schedule_runtime,
+        schedule_occurrence_id,
+    )
 
     now = datetime.now(timezone.utc)
 
@@ -231,32 +237,73 @@ async def _tick():
             )
             due_schedules = result.scalars().all()
 
-            claimed_schedules: list[tuple[uuid.UUID, uuid.UUID]] = []
+            if due_schedules:
+                await write_audit_log(
+                    "schedule_tick", {"due_count": len(due_schedules)}
+                )
+
             for sched in due_schedules:
+                occurrence_at = sched.next_run_at
+                if occurrence_at is None:
+                    continue
+                agent_result = await db.execute(
+                    select(Agent).where(
+                        Agent.id == sched.agent_id,
+                        Agent.deleted_at.is_(None),
+                    )
+                )
+                agent = agent_result.scalar_one_or_none()
+                if (
+                    agent is None
+                    or agent.status not in {"creating", "running", "idle"}
+                    or is_agent_expired(agent)
+                ):
+                    logger.info(
+                        "Schedule {} owner Agent is unavailable; advancing occurrence",
+                        sched.id,
+                    )
+                    sched.last_run_at = now
+                    sched.next_run_at = compute_next_run(sched.cron_expr, now)
+                    sched.run_count = (sched.run_count or 0) + 1
+                    await db.commit()
+                    continue
+
+                handle = await enqueue_schedule_runtime(
+                    db,
+                    agent=agent,
+                    schedule_id=sched.id,
+                    occurrence_id=schedule_occurrence_id(sched.id, occurrence_at),
+                    instruction=sched.instruction,
+                )
+                if handle is None:
+                    logger.error(
+                        "Schedule {} Runtime is disabled; occurrence remains due",
+                        sched.id,
+                    )
+                    await db.rollback()
+                    return
+
                 next_run = compute_next_run(sched.cron_expr, now)
                 sched.last_run_at = now
                 sched.next_run_at = next_run
                 sched.run_count = (sched.run_count or 0) + 1
-                claimed_schedules.append((sched.id, sched.agent_id))
-
-            # One transaction is the cross-process claim: the next due time is
-            # advanced before any other scheduler can acquire these rows.
-            await db.commit()
-
-            if claimed_schedules:
-                await write_audit_log(
-                    "schedule_tick", {"due_count": len(claimed_schedules)}
-                )
-            for schedule_id, agent_id in claimed_schedules:
+                await db.commit()
                 await write_audit_log(
                     "schedule_fire",
-                    {"schedule_id": str(schedule_id)},
-                    agent_id=agent_id,
+                    {
+                        "schedule_id": str(sched.id),
+                        "name": sched.name,
+                        "instruction_chars": len(sched.instruction),
+                        "next_run": str(next_run),
+                        "run_id": str(handle.run_id),
+                    },
+                    agent_id=sched.agent_id,
                 )
-
-                # Fire execution in background (don't block ticker)
-                asyncio.create_task(_execute_schedule(schedule_id))
-                logger.info("Triggered schedule {}", schedule_id)
+                logger.info(
+                    "Queued schedule {} as Runtime Run {}",
+                    sched.id,
+                    handle.run_id,
+                )
 
     except Exception as exc:
         logger.error("Scheduler tick failed error_type={}", type(exc).__name__)

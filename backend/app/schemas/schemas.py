@@ -349,6 +349,7 @@ class AgentOut(BaseModel):
     execution_capabilities: dict[str, bool] = Field(default_factory=dict)
     created_at: datetime
     last_active_at: datetime | None = None
+    deleted_at: datetime | None = None
 
     model_config = {"from_attributes": True}
 
@@ -501,6 +502,7 @@ class LLMModelOut(BaseModel):
     modality: str = "text"
     tier: str = "standard"
     created_at: datetime
+    deleted_at: datetime | None = None
 
     model_config = {"from_attributes": True}
 

@@ -1060,7 +1060,7 @@ async def update_agent_tools(
                 detail=availability_reason or "Code execution is not authorized",
             )
 
-        # System-category tools (e.g. finish) are protocol-level and
+        # System-category tools are protocol-level and
         # must always remain enabled — reject any attempt to disable them.
         if tool_obj.category == "system" and not u.enabled:
             continue

@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
 from app.config import get_settings
+from app.core.error_contract import register_error_handlers
 from app.core.events import close_redis
 from app.core.logging_config import configure_logging, intercept_standard_logging
 from app.core.middleware import TraceIdMiddleware
@@ -276,6 +277,7 @@ async def lifespan(app: FastAPI):
     import asyncio
     import os
     from contextlib import AsyncExitStack
+    from app.services.scheduler import start_scheduler
     from app.services.trigger_daemon import start_trigger_daemon
     from app.services.subscription_lifecycle import start_subscription_lifecycle_daemon
     from app.services.llm.minimax_quota import start_minimax_quota_monitor_daemon
@@ -283,7 +285,6 @@ async def lifespan(app: FastAPI):
     from app.services.media_generation import start_media_generation_daemon
     from app.services.agentbay_client import start_agentbay_session_cache_daemon
     from app.services.autonomy_service import start_approval_execution_daemon
-    from app.services.scheduler import start_scheduler
     from app.services.production_issue_monitor import (
         record_production_issue,
         start_production_issue_monitor_daemon,
@@ -537,7 +538,7 @@ async def lifespan(app: FastAPI):
         if _role_enabled("all", "worker"):
             worker_task_specs = [
                 ("trigger_daemon", start_trigger_daemon()),
-                ("user_schedule", start_scheduler()),
+                ("agent_schedule_scheduler", start_scheduler()),
                 ("subscription_lifecycle", start_subscription_lifecycle_daemon()),
                 ("minimax_quota_monitor", start_minimax_quota_monitor_daemon()),
                 ("media_generation", start_media_generation_daemon()),
@@ -642,6 +643,7 @@ app = FastAPI(
     version=settings.APP_VERSION,
     lifespan=lifespan,
 )
+register_error_handlers(app)
 
 # Add TraceIdMiddleware first so it's executed for all requests
 app.add_middleware(TraceIdMiddleware)

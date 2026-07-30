@@ -96,6 +96,7 @@ from app.services.llm.finish import (
 from app.services.builtin_tool_definitions import (
     BUILTIN_TOOL_DEFINITIONS,
     BUILTIN_TOOL_NAMES,
+    WRITE_FILE_MAX_CONTENT_CHARS,
     builtin_model_definition,
     builtin_model_definitions,
     builtin_readiness,
@@ -436,6 +437,19 @@ _READ_FILE_BINARY_EXTENSIONS = frozenset(
         ".xlsm",
         ".xlsx",
         ".zip",
+    }
+)
+_WORKSPACE_SCOPED_FILE_TOOL_NAMES = frozenset(
+    {
+        "list_files",
+        "read_file",
+        "read_document",
+        "search_files",
+        "find_files",
+        "write_file",
+        "edit_file",
+        "move_file",
+        "delete_file",
     }
 )
 
@@ -2245,10 +2259,20 @@ async def _execute_workspace_mutation(
     if tool_name == "write_file":
         path = arguments.get("path")
         content = arguments.get("content")
+        mode = arguments.get("mode", "overwrite")
         if not path:
             return "❌ Missing required argument 'path' for write_file. Please provide a file path like 'skills/my-skill/SKILL.md'"
         if content is None:
             return "❌ Missing required argument 'content' for write_file"
+        if not isinstance(content, str):
+            return "❌ write_file content must be a string"
+        if mode not in {"overwrite", "append"}:
+            return "❌ write_file mode must be overwrite or append"
+        if len(content) > WRITE_FILE_MAX_CONTENT_CHARS:
+            return (
+                "❌ write_file content exceeds 6000 characters. Write the first "
+                "chunk with mode=overwrite, then append one smaller chunk per later turn."
+            )
         if is_focus_file_path(path):
             return "❌ Focus is no longer stored in focus.md. Use upsert_focus_item or complete_focus_item."
         if _is_enterprise_info_path(path):
@@ -2267,13 +2291,10 @@ async def _execute_workspace_mutation(
                 operation="write",
                 session_id=session_id,
                 enforce_human_lock=True,
+                append=mode == "append",
             )
             await _wdb.commit()
-        return (
-            f"✅ Written to {write_result.path} ({len(content)} chars)"
-            if write_result.ok
-            else f"❌ {write_result.message}"
-        )
+        return f"✅ {write_result.message}" if write_result.ok else f"❌ {write_result.message}"
 
     if tool_name == "move_file":
         source_path = arguments.get("source_path")
@@ -2764,6 +2785,7 @@ async def _write_file_outcome(
     """Write one workspace file using the structured collaboration result."""
     path = arguments.get("path")
     content = arguments.get("content")
+    mode = arguments.get("mode", "overwrite")
     if not isinstance(path, str) or not path.strip() or content is None:
         return _typed_failure(
             "write_file requires non-empty path and content.",
@@ -2773,6 +2795,17 @@ async def _write_file_outcome(
         return _typed_failure(
             "write_file content must be a string.",
             "invalid_tool_arguments",
+        )
+    if mode not in {"overwrite", "append"}:
+        return _typed_failure(
+            "write_file mode must be overwrite or append.",
+            "invalid_tool_arguments",
+        )
+    if len(content) > WRITE_FILE_MAX_CONTENT_CHARS:
+        return _typed_failure(
+            "write_file content exceeds 6000 characters. Write the first chunk "
+            "with mode=overwrite, then append one smaller chunk per later turn.",
+            "write_file_content_too_large",
         )
     if is_focus_file_path(path):
         return _typed_failure(
@@ -2799,6 +2832,7 @@ async def _write_file_outcome(
                 operation="write",
                 session_id=session_id,
                 enforce_human_lock=True,
+                append=mode == "append",
             )
             if not write_result.ok:
                 return _typed_failure(
@@ -3159,6 +3193,15 @@ async def execute_builtin_tool_outcome(
     Durable Runtime rejects those as ``untyped_tool_outcome``; this function
     never infers success from display text or from a non-raising handler.
     """
+    if (
+        tool_name in _WORKSPACE_SCOPED_FILE_TOOL_NAMES
+        and arguments.get("workspace_scope", "agent") != "agent"
+    ):
+        return _typed_failure(
+            "workspace_scope=group is only available in a validated Group Run.",
+            "workspace_scope_unavailable",
+        )
+
     minimax_required_arguments = {
         "generate_image_minimax": ("prompt",),
         "generate_speech_minimax": ("text",),
@@ -3202,6 +3245,25 @@ async def execute_builtin_tool_outcome(
             return _typed_failure(
                 f"{tool_name} requires: {', '.join(missing_required)}.",
                 "invalid_tool_arguments",
+            )
+    if tool_name == "write_file":
+        content = arguments.get("content")
+        mode = arguments.get("mode", "overwrite")
+        if not isinstance(content, str):
+            return _typed_failure(
+                "write_file content must be a string.",
+                "invalid_tool_arguments",
+            )
+        if mode not in {"overwrite", "append"}:
+            return _typed_failure(
+                "write_file mode must be overwrite or append.",
+                "invalid_tool_arguments",
+            )
+        if len(content) > WRITE_FILE_MAX_CONTENT_CHARS:
+            return _typed_failure(
+                "write_file content exceeds 6000 characters. Write the first chunk "
+                "with mode=overwrite, then append one smaller chunk per later turn.",
+                "write_file_content_too_large",
             )
 
     code_denial = await _code_tool_denial_reason(tool_name, agent_id)
@@ -7834,8 +7896,9 @@ def _read_document_sync(
             prs = Presentation(str(file_path))
             slides = []
             start_index = max(page_start - 1, 0)
-            selected_slides = prs.slides[start_index : start_index + max_pages]
-            for i, slide in enumerate(selected_slides, start=start_index):
+            end_index = min(len(prs.slides), start_index + max_pages)
+            for i in range(start_index, end_index):
+                slide = prs.slides[i]
                 texts = []
                 for shape in slide.shapes:
                     if hasattr(shape, "text") and shape.text.strip():
@@ -8136,6 +8199,31 @@ async def _read_document_result(
         page_start,
         max_pages,
     )
+
+
+async def read_document_bytes(
+    file_bytes: bytes,
+    filename: str,
+    *,
+    max_chars: int = 8000,
+) -> DocumentReadResult:
+    """Run the shared document extractor for bytes from any authorized workspace."""
+    safe_name = Path(filename).name
+    if not safe_name:
+        return DocumentReadResult(
+            False,
+            "Document filename is required.",
+            "invalid_tool_arguments",
+        )
+    with tempfile.TemporaryDirectory(prefix="clawith-document-") as temp_dir:
+        root = Path(temp_dir)
+        (root / safe_name).write_bytes(file_bytes)
+        return await _read_document_result(
+            root,
+            safe_name,
+            max_chars=max_chars,
+            tenant_id=None,
+        )
 
 
 async def _read_document(
@@ -21284,7 +21372,12 @@ async def _get_agent_owner_info(agent_id: uuid.UUID) -> tuple[str, str]:
     from sqlalchemy import select as _select
 
     async with async_session() as db:
-        result = await db.execute(_select(Agent).where(Agent.id == agent_id))
+        result = await db.execute(
+            _select(Agent).where(
+                Agent.id == agent_id,
+                Agent.deleted_at.is_(None),
+            )
+        )
         agent = result.scalar_one_or_none()
     if not agent:
         return "agent", str(agent_id)
@@ -21653,7 +21746,12 @@ async def _get_okr(agent_id: uuid.UUID | None, arguments: dict) -> str:
 
         async with async_session() as db:
             # Look up the agent's tenant
-            agent_result = await db.execute(_select(Agent).where(Agent.id == agent_id))
+            agent_result = await db.execute(
+                _select(Agent).where(
+                    Agent.id == agent_id,
+                    Agent.deleted_at.is_(None),
+                )
+            )
             agent = agent_result.scalar_one_or_none()
             if not agent:
                 return "Agent not found."
@@ -21798,7 +21896,12 @@ async def _get_my_okr(agent_id: uuid.UUID | None, arguments: dict) -> str:
         from sqlalchemy import select as _select
 
         async with async_session() as db:
-            agent_result = await db.execute(_select(Agent).where(Agent.id == agent_id))
+            agent_result = await db.execute(
+                _select(Agent).where(
+                    Agent.id == agent_id,
+                    Agent.deleted_at.is_(None),
+                )
+            )
             agent = agent_result.scalar_one_or_none()
             if not agent:
                 return "Agent not found."

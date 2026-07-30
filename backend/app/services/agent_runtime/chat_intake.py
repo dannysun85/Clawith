@@ -33,6 +33,10 @@ from app.services.agent_runtime.run_state_reader import (
     RunStateReader,
 )
 from app.services.media_message_content import sanitize_inline_media_content
+from app.services.llm.multimodal_content import (
+    MultimodalContentError,
+    parse_multimodal_content,
+)
 from app.services.participant_identity import get_or_create_user_participant
 from app.services.deliverable_workflows import (
     DeliverableWorkflowError,
@@ -541,6 +545,10 @@ async def enqueue_chat_runtime(
         model=model,
         source_channel=normalized_channel,
     )
+    try:
+        runtime_content = parse_multimodal_content(content)
+    except MultimodalContentError as exc:
+        raise ChatRuntimeIntakeError(exc.code, str(exc)) from exc
     if (resume_run_id is None) != (resume_correlation_id is None):
         raise ChatRuntimeIntakeError(
             "incomplete_chat_resume",

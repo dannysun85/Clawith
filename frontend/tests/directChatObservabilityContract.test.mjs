@@ -1,9 +1,18 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
+import {
+  formatRuntimeErrorDiagnostics,
+  normalizeRuntimeError,
+  runtimeErrorDisablesReconnect,
+} from '../src/services/runtimeError.ts';
 
 const source = readFileSync(
   new URL('../src/pages/agent-detail/AgentDetailPage.tsx', import.meta.url),
+  'utf8',
+);
+const runtimeErrorSource = readFileSync(
+  new URL('../src/services/runtimeError.ts', import.meta.url),
   'utf8',
 );
 

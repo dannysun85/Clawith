@@ -6,11 +6,10 @@ import re
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response, status
 from loguru import logger
-from sqlalchemy import String, cast, func, select, text
+from sqlalchemy import String, cast, delete, exists, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -19,8 +18,10 @@ from app.core.permissions import build_visible_agents_query, check_agent_access,
 from app.core.security import get_current_user
 from app.database import async_session, get_db
 from app.models.agent import Agent, AgentPermission, AgentTemplate
+from app.models.agent_run import AgentRun
+from app.models.agent_run_event import AgentRunEvent
 from app.models.org import OrgMember
-from app.models.audit import ApprovalRequest, ChatMessage
+from app.models.audit import ApprovalRequest, AuditLog, ChatMessage
 from app.models.chat_session import ChatSession
 from app.models.douyin import DouyinOperation, DouyinPublishJob
 from app.models.media_generation import MediaGenerationTask
@@ -37,11 +38,14 @@ from app.services.agent_plan_selection import (
 )
 from app.models.tenant import Tenant
 from app.models.participant import Participant
+from app.models.workspace import WorkspaceEditLock
 from app.services.okr_agent_hook import hook_new_agent
 from app.services.agent_manager import agent_manager
 from app.models.skill import Skill
 from app.services.resource_discovery import import_mcp_from_smithery
 from app.services.skill_scope import resolve_agent_skills, scope_skill_query
+from app.services.agent_runtime.persistence import enqueue_cancel
+from app.services.llm.model_resolution import load_active_model
 
 router = APIRouter(prefix="/agents", tags=["agents"])
 settings = get_settings()
@@ -100,66 +104,20 @@ async def _get_active_admin_users(db: AsyncSession, tenant_id: uuid.UUID | None)
     return result.scalars().all()
 
 
-def _serialize_dt(value: datetime | None) -> str | None:
-    return value.isoformat() if value else None
-
-
-async def _archive_agent_task_history(db: AsyncSession, agent_id: uuid.UUID, archive_dir: Path) -> Path | None:
-    """Persist task and task-log history into the agent archive directory before DB cleanup."""
-    from app.models.task import Task, TaskLog
-
-    task_result = await db.execute(select(Task).where(Task.agent_id == agent_id).order_by(Task.created_at.asc()))
-    tasks = task_result.scalars().all()
-    if not tasks:
-        return None
-
-    archive_dir.mkdir(parents=True, exist_ok=True)
-
-    payload = {
-        "agent_id": str(agent_id),
-        "archived_at": datetime.now(timezone.utc).isoformat(),
-        "tasks": [],
-    }
-
-    for task in tasks:
-        log_result = await db.execute(
-            select(TaskLog).where(TaskLog.task_id == task.id).order_by(TaskLog.created_at.asc())
+async def _validate_active_agent_model(
+    db: AsyncSession,
+    *,
+    model_id: uuid.UUID | None,
+    tenant_id: uuid.UUID | None,
+    field_name: str,
+) -> None:
+    if model_id is None:
+        return
+    if await load_active_model(db, model_id=model_id, tenant_id=tenant_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{field_name} must reference an active model in the Agent tenant",
         )
-        logs = log_result.scalars().all()
-        payload["tasks"].append(
-            {
-                "id": str(task.id),
-                "title": task.title,
-                "description": task.description,
-                "type": task.type,
-                "status": task.status,
-                "priority": task.priority,
-                "assignee": task.assignee,
-                "created_by": str(task.created_by),
-                "due_date": _serialize_dt(task.due_date),
-                "supervision_target_user_id": (
-                    str(task.supervision_target_user_id) if task.supervision_target_user_id else None
-                ),
-                "supervision_target_name": task.supervision_target_name,
-                "supervision_channel": task.supervision_channel,
-                "remind_schedule": task.remind_schedule,
-                "created_at": _serialize_dt(task.created_at),
-                "updated_at": _serialize_dt(task.updated_at),
-                "completed_at": _serialize_dt(task.completed_at),
-                "logs": [
-                    {
-                        "id": str(log.id),
-                        "content": log.content,
-                        "created_at": _serialize_dt(log.created_at),
-                    }
-                    for log in logs
-                ],
-            }
-        )
-
-    archive_path = archive_dir / "task_history.json"
-    archive_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return archive_path
 
 
 async def _agent_deletion_blockers(
@@ -486,7 +444,12 @@ async def _background_agent_setup(
     # 1. Initialize agent file system from template
     try:
         async with async_session() as db:
-            agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
+            agent_result = await db.execute(
+                select(Agent).where(
+                    Agent.id == agent_id,
+                    Agent.deleted_at.is_(None),
+                )
+            )
             agent = agent_result.scalar_one_or_none()
             if not agent:
                 logger.error(f"[background_agent_setup] Agent {agent_id} not found")
@@ -627,7 +590,12 @@ async def _background_agent_setup(
     # 6. Start container and Hook OKR Agent
     try:
         async with async_session() as db:
-            agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
+            agent_result = await db.execute(
+                select(Agent).where(
+                    Agent.id == agent_id,
+                    Agent.deleted_at.is_(None),
+                )
+            )
             agent = agent_result.scalar_one_or_none()
             if not agent:
                 logger.error(f"[background_agent_setup] Agent {agent_id} not found before starting container")
@@ -1372,364 +1340,107 @@ async def delete_agent(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Delete an Agent only after runtime and provider cleanup is proven."""
-
-    # Phase 1 is the global execution fence. Acquire Agent first (the same
-    # order used by Gateway/chat/trigger authority paths), then persist a
-    # stopped + deletion-requested state before any slow external cleanup.
-    await check_agent_access(db, current_user, agent_id)
-    agent = (
-        await db.execute(
-            select(Agent)
-            .where(Agent.id == agent_id)
-            .execution_options(populate_existing=True)
-            .with_for_update()
-        )
-    ).scalar_one_or_none()
-    fresh_user = (
-        await db.execute(
-            select(User)
-            .where(User.id == current_user.id)
-            .execution_options(populate_existing=True)
-            .with_for_update(read=True)
-        )
-    ).scalar_one_or_none()
-    if agent is None:
-        raise HTTPException(status_code=404, detail="Agent not found")
-    if fresh_user is None or not fresh_user.is_active:
-        raise HTTPException(status_code=403, detail="User account is inactive")
-    if not is_agent_creator(fresh_user, agent) and fresh_user.role not in (
+    """Logically delete an Agent after commercial side effects are reconciled."""
+    agent, _access = await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        include_deleted=True,
+    )
+    if not is_agent_creator(current_user, agent) and current_user.role not in (
         "super_admin",
         "org_admin",
         "platform_admin",
     ):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only creator or admin can delete agent")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only creator or admin can delete agent",
+        )
 
-    # System agents (OKR Agent, etc.) cannot be deleted — they are seeded by the
-    # platform and required for core features. Disable them via settings instead.
     if agent.is_system:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="System agents cannot be deleted. Disable the related feature (e.g. OKR) in Company Settings instead.",
-        )
-
-    blockers = await _agent_deletion_blockers(db, agent.id)
-    if blockers:
-        raise HTTPException(
-            status_code=409,
             detail=(
-                "Agent has in-flight work that must be reconciled before "
-                f"deletion: {', '.join(blockers)}"
+                "System agents cannot be deleted. Disable the related feature "
+                "(e.g. OKR) in Company Settings instead."
             ),
         )
 
-    agent.status = "stopped"
-    agent.heartbeat_enabled = False
-    agent.deletion_requested_at = (
-        agent.deletion_requested_at or datetime.now(timezone.utc)
+    if agent.deleted_at is None:
+        blockers = await _agent_deletion_blockers(db, agent.id)
+        if blockers:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Agent has in-flight work that must be reconciled before "
+                    f"deletion: {', '.join(blockers)}"
+                ),
+            )
+
+        now = datetime.now(timezone.utc)
+        agent.deleted_at = now
+        agent.deletion_requested_at = agent.deletion_requested_at or now
+        agent.status = "stopped"
+        agent.heartbeat_enabled = False
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                agent_id=agent.id,
+                action="agent_deleted",
+                details={
+                    "resource_id": str(agent.id),
+                    "tenant_id": (
+                        str(agent.tenant_id) if agent.tenant_id else None
+                    ),
+                    "name": agent.name,
+                    "deletion_mode": "logical",
+                },
+            )
+        )
+        await db.commit()
+
+    if agent.tenant_id is not None:
+        run_result = await db.execute(
+            select(AgentRun.id)
+            .where(
+                AgentRun.tenant_id == agent.tenant_id,
+                AgentRun.agent_id == agent.id,
+                ~exists().where(
+                    AgentRunEvent.run_id == AgentRun.id,
+                    AgentRunEvent.event_type.in_(
+                        ("run_completed", "run_failed", "run_cancelled")
+                    ),
+                ),
+            )
+            .order_by(AgentRun.created_at, AgentRun.id)
+        )
+        for run_id in run_result.scalars().all():
+            await enqueue_cancel(
+                db,
+                tenant_id=agent.tenant_id,
+                run_id=run_id,
+                idempotency_key=f"agent-delete:{agent.id}:run:{run_id}",
+                reason="agent_deleted",
+                actor_user_id=current_user.id,
+            )
+
+    await db.execute(
+        delete(WorkspaceEditLock).where(WorkspaceEditLock.agent_id == agent.id)
     )
     await db.commit()
 
-    # Phase 2 performs strict external cleanup while every execution validator
-    # sees the durable stopped/deletion fence.
-    archive_dir: Path | None = None
     try:
-        container_removed = await agent_manager.remove_container(agent)
-    except Exception as exc:
-        logger.error(
-            "Agent container cleanup failed error_type={}",
-            type(exc).__name__,
+        removed = await agent_manager.remove_container(agent)
+        if not removed:
+            logger.warning(
+                "Container removal requires retry for logically deleted Agent {}",
+                agent.id,
+            )
+    except Exception:
+        logger.exception(
+            "Container removal failed for logically deleted Agent {}",
+            agent.id,
         )
-        container_removed = False
-    if not container_removed:
-        raise HTTPException(
-            status_code=409,
-            detail="Agent runtime cleanup could not be verified; deletion remains fenced",
-        )
-    try:
-        archive_dir = await agent_manager.archive_agent_files(agent.id)
-    except Exception as exc:
-        logger.error(
-            "Agent workspace archive failed error_type={}",
-            type(exc).__name__,
-        )
-        raise HTTPException(
-            status_code=409,
-            detail="Agent workspace archive failed; deletion remains fenced",
-        ) from exc
-    if archive_dir is not None:
-        try:
-            await _archive_agent_task_history(db, agent.id, archive_dir)
-        except Exception as exc:
-            logger.error(
-                "Agent task-history archive failed error_type={}",
-                type(exc).__name__,
-            )
-            await db.rollback()
-            raise HTTPException(
-                status_code=409,
-                detail="Agent task history archive failed; deletion remains fenced",
-            ) from exc
-    await db.rollback()
-
-    from app.services.agentbay_client import agentbay_agent_deletion_fence
-
-    # Delete related records only after every provider sandbox has reached a
-    # confirmed terminal state. Any ambiguity leaves both Agent and ledger in
-    # place for the platform-admin reconcile workflow.
-    cleanup_tables = [
-        "agent_activity_logs",
-        "agent_schedules",
-        "agent_triggers",
-        "channel_configs",
-        "agent_permissions",
-        "agent_tools",
-        "agent_relationships",
-        "published_pages",
-        "notifications",
-        "daily_token_usage",
-    ]
-
-    secondary_fk_cleanups = [
-        "DELETE FROM task_logs WHERE task_id IN (SELECT id FROM tasks WHERE agent_id = :aid)",
-        "DELETE FROM tasks WHERE agent_id = :aid",
-    ]
-    try:
-        async with agentbay_agent_deletion_fence(agent_id=agent_id):
-            from app.services.media_generation import (
-                delete_private_media_recovery_assets_for_agent,
-            )
-
-            # Object storage is not transactional. The helper first commits a
-            # durable deletion intent in its own short transaction, performs
-            # idempotent object deletion without SQL locks, and then records
-            # the acknowledgement. A later Agent-row failure cannot erase the
-            # evidence or turn the deletion into an unexplained asset loss.
-            await delete_private_media_recovery_assets_for_agent(agent_id)
-
-            # Re-lock the parent before child deletes. The durable phase-1
-            # fence must still exist; start/recover cannot clear it.
-            locked_agent = (
-                await db.execute(
-                    select(Agent)
-                    .where(Agent.id == agent_id)
-                    .execution_options(populate_existing=True)
-                    .with_for_update()
-                )
-            ).scalar_one_or_none()
-            if locked_agent is None:
-                return Response(status_code=status.HTTP_204_NO_CONTENT)
-            if (
-                locked_agent.deletion_requested_at is None
-                or locked_agent.status != "stopped"
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="Agent deletion fence is no longer valid",
-                )
-
-            blockers = await _agent_deletion_blockers(db, locked_agent.id)
-            if blockers:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "Agent acquired new in-flight work while deletion was "
-                        f"being fenced: {', '.join(blockers)}"
-                    ),
-                )
-
-            # Keep financial and external-side-effect ledgers.  Non-started
-            # Douyin work is explicitly cancelled by the delete request;
-            # completed/ambiguous rows retain their status for reconciliation.
-            await db.execute(
-                text("UPDATE audit_logs SET agent_id = NULL WHERE agent_id = :aid"),
-                {"aid": agent_id},
-            )
-            await db.execute(
-                text(
-                    "UPDATE credit_transactions SET agent_id = NULL "
-                    "WHERE agent_id = :aid"
-                ),
-                {"aid": agent_id},
-            )
-            await db.execute(
-                text(
-                    "UPDATE credit_reservations SET agent_id = NULL "
-                    "WHERE agent_id = :aid"
-                ),
-                {"aid": agent_id},
-            )
-            await db.execute(
-                text(
-                    "UPDATE media_generation_tasks SET agent_id = NULL "
-                    "WHERE agent_id = :aid"
-                ),
-                {"aid": agent_id},
-            )
-            await db.execute(
-                text(
-                    "UPDATE douyin_accounts SET primary_agent_id = NULL "
-                    "WHERE primary_agent_id = :aid"
-                ),
-                {"aid": agent_id},
-            )
-            await db.execute(
-                text(
-                    "UPDATE douyin_publish_jobs "
-                    "SET status = CASE WHEN status IN "
-                    "('approval_required', 'awaiting_user_publish', "
-                    "'user_confirmed_waiting_verification') "
-                    "THEN 'cancelled_agent_deleted' ELSE status END, "
-                    "approval_status = CASE WHEN status IN "
-                    "('approval_required', 'awaiting_user_publish', "
-                    "'user_confirmed_waiting_verification') "
-                    "THEN 'cancelled' ELSE approval_status END, "
-                    "agent_id = NULL "
-                    "WHERE agent_id = :aid"
-                ),
-                {"aid": agent_id},
-            )
-            await db.execute(
-                text(
-                    "UPDATE douyin_operations "
-                    "SET status = CASE WHEN status = 'pending_approval' "
-                    "THEN 'cancelled_agent_deleted' ELSE status END, "
-                    "approval_status = CASE WHEN status = 'pending_approval' "
-                    "THEN 'cancelled' ELSE approval_status END, "
-                    "agent_id = NULL "
-                    "WHERE agent_id = :aid"
-                ),
-                {"aid": agent_id},
-            )
-            await db.execute(
-                text(
-                    "UPDATE approval_requests "
-                    "SET status = 'rejected', resolved_at = now(), "
-                    "execution_status = 'not_required', "
-                    "execution_claim_token = NULL, "
-                    "execution_claimed_at = NULL, "
-                    "execution_finished_at = NULL, "
-                    "execution_attempts = 0, "
-                    "execution_result_summary = "
-                    "'{\"reason\":\"agent_deleted_before_approval\"}'::json, "
-                    "execution_error_code = NULL "
-                    "WHERE agent_id = :aid AND status = 'pending'"
-                ),
-                {"aid": agent_id},
-            )
-            await db.execute(
-                text(
-                    "UPDATE approval_requests "
-                    "SET execution_status = 'legacy', "
-                    "execution_claim_token = NULL, "
-                    "execution_claimed_at = NULL, "
-                    "execution_finished_at = NULL, "
-                    "execution_attempts = 0, "
-                    "execution_result_summary = "
-                    "'{\"reason\":\"agent_deleted_execution_cancelled\"}'::json, "
-                    "execution_error_code = NULL "
-                    "WHERE agent_id = :aid AND status = 'approved' "
-                    "AND execution_status = 'pending'"
-                ),
-                {"aid": agent_id},
-            )
-            await db.execute(
-                text(
-                    "UPDATE approval_requests SET agent_id = NULL "
-                    "WHERE agent_id = :aid"
-                ),
-                {"aid": agent_id},
-            )
-
-            # Preserve conversation and Group history as tombstones.  Agent
-            # deletion removes future routing authority, not the user's
-            # historical messages or collaboration audit trail.
-            await db.execute(
-                text("UPDATE chat_messages SET agent_id = NULL WHERE agent_id = :aid"),
-                {"aid": agent_id},
-            )
-            await db.execute(
-                text(
-                    "UPDATE chat_sessions SET agent_id = NULL, is_primary = false, "
-                    "deleted_at = COALESCE(deleted_at, now()) WHERE agent_id = :aid"
-                ),
-                {"aid": agent_id},
-            )
-            await db.execute(
-                text(
-                    "UPDATE chat_sessions SET peer_agent_id = NULL, is_primary = false, "
-                    "deleted_at = COALESCE(deleted_at, now()) WHERE peer_agent_id = :aid"
-                ),
-                {"aid": agent_id},
-            )
-            await db.execute(
-                text(
-                    "UPDATE group_members SET removed_at = COALESCE(removed_at, now()) "
-                    "WHERE participant_id IN (SELECT id FROM participants "
-                    "WHERE type = 'agent' AND ref_id = :aid)"
-                ),
-                {"aid": agent_id},
-            )
-
-            # A2A sessions are canonicalized on the lower Agent UUID.  Deleting
-            # the peer must retire the entire conversation and every queued
-            # Gateway delivery before either session or participant is removed.
-            await db.execute(
-                text(
-                    "DELETE FROM gateway_messages "
-                    "WHERE agent_id = :aid OR sender_agent_id = :aid "
-                    "OR authorization_source_agent_id = :aid "
-                    "OR conversation_id IN ("
-                    "SELECT id::text FROM chat_sessions "
-                    "WHERE agent_id = :aid OR peer_agent_id = :aid)"
-                ),
-                {"aid": agent_id},
-            )
-            await db.execute(
-                text(
-                    "DELETE FROM chat_messages "
-                    "WHERE agent_id = :aid OR conversation_id IN ("
-                    "SELECT id::text FROM chat_sessions "
-                    "WHERE agent_id = :aid OR peer_agent_id = :aid)"
-                ),
-                {"aid": agent_id},
-            )
-            await db.execute(
-                text(
-                    "DELETE FROM chat_sessions "
-                    "WHERE agent_id = :aid OR peer_agent_id = :aid"
-                ),
-                {"aid": agent_id},
-            )
-
-            for table in cleanup_tables:
-                await db.execute(
-                    text(f"DELETE FROM {table} WHERE agent_id = :aid"),
-                    {"aid": agent_id},
-                )
-            for sql in secondary_fk_cleanups:
-                await db.execute(text(sql), {"aid": agent_id})
-
-            await db.execute(
-                text("DELETE FROM agent_agent_relationships WHERE agent_id = :aid OR target_agent_id = :aid"),
-                {"aid": agent_id},
-            )
-            await db.execute(text("DELETE FROM plaza_posts WHERE author_id = :aid"), {"aid": str(agent_id)})
-            await db.delete(locked_agent)
-            await db.commit()
-    except HTTPException:
-        await db.rollback()
-        raise
-    except Exception as exc:
-        await db.rollback()
-        logger.error(
-            "Agent deletion cleanup could not be verified error_type={}",
-            type(exc).__name__,
-        )
-        raise HTTPException(
-            status_code=409,
-            detail="Agent provider or database cleanup is incomplete; deletion remains fenced",
-        ) from exc
 
 
 @router.post("/{agent_id}/start", response_model=AgentOut)

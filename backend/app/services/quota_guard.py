@@ -266,7 +266,12 @@ async def check_agent_expired(agent_id: uuid.UUID) -> None:
     from app.models.agent import Agent
 
     async with async_session() as db:
-        result = await db.execute(select(Agent).where(Agent.id == agent_id))
+        result = await db.execute(
+            select(Agent).where(
+                Agent.id == agent_id,
+                Agent.deleted_at.is_(None),
+            )
+        )
         agent = result.scalar_one_or_none()
         if not agent:
             return
@@ -316,7 +321,12 @@ async def check_agent_llm_quota(agent_id: uuid.UUID, model_tier: str | None = No
     from app.models.agent import Agent
 
     async with async_session() as db:
-        result = await db.execute(select(Agent).where(Agent.id == agent_id))
+        result = await db.execute(
+            select(Agent).where(
+                Agent.id == agent_id,
+                Agent.deleted_at.is_(None),
+            )
+        )
         agent = result.scalar_one_or_none()
         if not agent or not agent.tenant_id:
             return
@@ -643,6 +653,7 @@ async def enforce_heartbeat_floor(tenant_id: uuid.UUID, floor: int | None = None
             select(Agent).where(
                 Agent.tenant_id == tenant_id,
                 Agent.heartbeat_interval_minutes < floor_val,
+                Agent.deleted_at.is_(None),
             )
         )
         agents = agents_result.scalars().all()

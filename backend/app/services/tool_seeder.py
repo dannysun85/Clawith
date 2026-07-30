@@ -27,7 +27,6 @@ from app.services.tool_capability_policy import (
 )
 
 SYNC_IS_DEFAULT_TOOL_NAMES = {
-    "finish",
     "read_webpage",
     "duckduckgo_search",
     "jina_search",

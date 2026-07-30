@@ -49,6 +49,41 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/enterprise", tags=["enterprise"])
 settings = get_settings()
 
+_CAPABILITY_PROBE_TOOL_DEFINITION = {
+    "type": "function",
+    "function": {
+        "name": "capability_probe",
+        "description": "Return the fixed value through a native structured tool call.",
+        "parameters": {
+            "type": "object",
+            "properties": {"value": {"type": "string", "enum": ["ok"]}},
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+def _has_valid_capability_probe(tool_calls: list[dict]) -> bool:
+    for call in tool_calls:
+        function = call.get("function")
+        if not isinstance(function, dict) or function.get("name") != "capability_probe":
+            continue
+        raw_arguments = function.get("arguments", "{}")
+        try:
+            arguments = (
+                json.loads(raw_arguments)
+                if isinstance(raw_arguments, str)
+                else dict(raw_arguments)
+                if isinstance(raw_arguments, dict)
+                else None
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if arguments == {"value": "ok"}:
+            return True
+    return False
+
 
 def _validate_provider_token_limit(provider: str, value: int | None) -> None:
     if value is None:
@@ -283,7 +318,10 @@ async def _resolve_llm_test_target(
         raise ValueError("model_id must be a valid UUID") from exc
     async with async_session() as session:
         result = await session.execute(
-            select(LLMModel).where(LLMModel.id == model_id)
+            select(LLMModel).where(
+                LLMModel.id == model_id,
+                LLMModel.deleted_at.is_(None),
+            )
         )
         existing = result.scalar_one_or_none()
     if existing is None:
@@ -327,7 +365,10 @@ async def _record_llm_tool_capability(
     async with async_session() as session:
         result = await session.execute(
             select(LLMModel)
-            .where(LLMModel.id == target.model_id)
+            .where(
+                LLMModel.id == target.model_id,
+                LLMModel.deleted_at.is_(None),
+            )
             .with_for_update()
         )
         existing = result.scalar_one_or_none()
@@ -350,7 +391,7 @@ async def test_llm_model(
     data: LLMTestRequest,
     current_user: User = Depends(get_current_admin),
 ):
-    """Test connectivity and native ``finish`` tool calling independently."""
+    """Test connectivity and native structured tool calling independently."""
     import time
 
     _require_platform_model_admin(current_user)
@@ -406,32 +447,27 @@ async def test_llm_model(
                         role="system",
                         content=(
                             "This is a native tool-calling protocol test. Call the "
-                            "provided finish tool exactly once and do not answer in text."
+                            "provided capability_probe tool with value set to ok."
                         ),
                     ),
                     LLMMessage(
                         role="user",
-                        content="Call finish now with content set to ok.",
+                        content="Call capability_probe now with value set to ok.",
                     ),
                 ],
-                tools=[FINISH_TOOL_DEFINITION],
+                tools=[_CAPABILITY_PROBE_TOOL_DEFINITION],
                 max_tokens=128,
             )
             tool_calls = list(tool_response.tool_calls or [])
-            finish_call = find_finish_call(tool_calls)
-            tool_supported = bool(
-                len(tool_calls) == 1
-                and finish_call is not None
-                and finish_call.valid
-            )
+            tool_supported = _has_valid_capability_probe(tool_calls)
             if not tool_supported:
                 tool_error = (
                     "Model returned plain text or an invalid tool call instead of "
-                    "exactly one valid finish tool call."
+                    "a valid capability_probe(value=ok) tool call."
                 )
         except Exception as exc:
             tool_supported = None
-            tool_error = f"Native finish tool probe failed: {type(exc).__name__}: {exc}"[:500]
+            tool_error = f"Native tool probe failed: {type(exc).__name__}: {exc}"[:500]
         tool_latency_ms = int((time.time() - tool_start) * 1000)
         capability_recorded = await _record_llm_tool_capability(
             target,
@@ -551,7 +587,12 @@ async def set_default_llm_model(
     db: AsyncSession = Depends(get_db),
 ):
     """Mark this model as the tenant's default for new agents."""
-    result = await db.execute(select(LLMModel).where(LLMModel.id == model_id))
+    result = await db.execute(
+        select(LLMModel).where(
+            LLMModel.id == model_id,
+            LLMModel.deleted_at.is_(None),
+        )
+    )
     model = result.scalar_one_or_none()
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
@@ -602,7 +643,12 @@ async def remove_llm_model(
     current_user: User = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Remove an LLM model from the pool."""
+    """Remove an LLM model from the pool.
+
+    ``force`` remains accepted for API compatibility but never bypasses SaaS
+    route-integrity checks.
+    """
+    del force
     result = await db.execute(
         select(LLMModel).where(LLMModel.id == model_id).with_for_update()
     )
@@ -621,34 +667,23 @@ async def remove_llm_model(
             },
         )
 
-    # Check if any agents reference this model
-    from sqlalchemy import or_
-    ref_result = await db.execute(
-        select(Agent.name).where(
-            or_(Agent.primary_model_id == model_id, Agent.fallback_model_id == model_id)
+    if model.deleted_at is None:
+        model.deleted_at = datetime.now(UTC)
+        model.enabled = False
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                action="llm_model_deleted",
+                details={
+                    "resource_id": str(model.id),
+                    "tenant_id": str(model.tenant_id) if model.tenant_id else None,
+                    "label": model.label,
+                    "provider": model.provider,
+                    "model": model.model,
+                },
+            )
         )
-    )
-    agent_names = [row[0] for row in ref_result.all()]
-
-    if agent_names and not force:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "message": f"This model is used by {len(agent_names)} agent(s)",
-                "agents": agent_names,
-            },
-        )
-
-    # Nullify FK references in agents before deleting
-    if agent_names:
-        await db.execute(
-            update(Agent).where(Agent.primary_model_id == model_id).values(primary_model_id=None)
-        )
-        await db.execute(
-            update(Agent).where(Agent.fallback_model_id == model_id).values(fallback_model_id=None)
-        )
-    await db.delete(model)
-    await db.commit()
+        await db.commit()
 
 
 @router.put("/llm-models/{model_id}", response_model=LLMModelOut)
@@ -1115,7 +1150,7 @@ async def _runtime_model_settings_payload(db: AsyncSession, *, tenant_id: uuid.U
         .where(
             or_(LLMModel.tenant_id.is_(None), LLMModel.tenant_id == tenant_id),
             LLMModel.enabled.is_(True),
-            LLMModel.supports_tool_calling.is_(True),
+            LLMModel.deleted_at.is_(None),
         )
         .order_by(LLMModel.created_at.desc())
     )
@@ -1164,7 +1199,12 @@ async def update_runtime_model_settings(
     resolved_tenant_id = _runtime_settings_tenant_id(current_user, tenant_id)
 
     requested_ids = {data.planning_model_id, data.compact_model_id}
-    result = await db.execute(select(LLMModel).where(LLMModel.id.in_(requested_ids)))
+    result = await db.execute(
+        select(LLMModel).where(
+            LLMModel.id.in_(requested_ids),
+            LLMModel.deleted_at.is_(None),
+        )
+    )
     models = {model.id: model for model in result.scalars().all()}
     for model_id in requested_ids:
         model = models.get(model_id)
@@ -1174,12 +1214,6 @@ async def update_runtime_model_settings(
             raise HTTPException(status_code=422, detail=f"Model {model_id} belongs to another tenant")
         if not model.enabled:
             raise HTTPException(status_code=422, detail=f"Model {model_id} is disabled")
-        if model.supports_tool_calling is not True:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Model {model_id} has not passed the native tool-calling test",
-            )
-
     result = await db.execute(
         select(SystemSetting).where(
             SystemSetting.key == runtime_model_setting_key(resolved_tenant_id)
