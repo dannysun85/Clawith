@@ -184,6 +184,159 @@ async def test_temp_workspace_materializes_only_requested_paths(monkeypatch):
         temp_ws.cleanup()
 
 
+@pytest.mark.asyncio
+async def test_presentation_conversion_materializes_cross_directory_images(
+    monkeypatch,
+):
+    agent_id = uuid.uuid4()
+    source_path = "workspace/deliverables/request-new/slides.html"
+    image_path = "workspace/deliverables/request-old/hero.jpg"
+    storage = MemoryStorageBackend(
+        {
+            f"{agent_id}/{source_path}": (
+                b'<html><body><img src="../request-old/hero.jpg"></body></html>'
+            ),
+            f"{agent_id}/{image_path}": b"image",
+        }
+    )
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+
+    paths = await agent_tools._document_conversion_materialization_paths(
+        agent_id,
+        None,
+        {
+            "source_path": source_path,
+            "target_path": "workspace/deliverables/request-new/slides.pptx",
+        },
+    )
+
+    assert paths == [
+        source_path,
+        "workspace/deliverables/request-new/slides.pptx",
+        image_path,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_presentation_materialization_accepts_provider_image_above_default_limit(
+    monkeypatch,
+):
+    agent_id = uuid.uuid4()
+    image_path = "workspace/deliverables/request-new/assets/storyboard.png"
+    storage = MemoryStorageBackend(
+        {
+            f"{agent_id}/{image_path}": b"provider-image",
+        }
+    )
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+    monkeypatch.setattr(agent_tools, "TOOL_MATERIALIZE_MAX_FILE_BYTES", 4)
+
+    default_temp_ws = await agent_tools._prepare_temp_workspace(
+        agent_id,
+        paths=[image_path],
+    )
+    try:
+        assert not (default_temp_ws.root / image_path).exists()
+    finally:
+        default_temp_ws.cleanup()
+
+    presentation_temp_ws = await agent_tools._prepare_temp_workspace(
+        agent_id,
+        paths=[image_path],
+        max_file_bytes=len(b"provider-image"),
+    )
+    try:
+        assert (
+            presentation_temp_ws.root / image_path
+        ).read_bytes() == b"provider-image"
+    finally:
+        presentation_temp_ws.cleanup()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("converter", "target_name", "mode_name", "mode_value"),
+    [
+        ("_convert_html_to_pptx", "presentation.pptx", "render_mode", "hybrid_editable"),
+        ("_convert_html_to_pdf", "presentation.pdf", "pdf_mode", "pages"),
+    ],
+)
+async def test_managed_presentation_conversion_requires_planning_contract(
+    tmp_path,
+    converter,
+    target_name,
+    mode_name,
+    mode_value,
+):
+    agent_id = uuid.uuid4()
+    source = tmp_path / "workspace" / "deliverables" / "request-1" / "presentation.html"
+    source.parent.mkdir(parents=True)
+    source.write_text("<html><body></body></html>", encoding="utf-8")
+
+    convert = getattr(agent_tools, converter)
+    missing_contract = await convert(
+        agent_id,
+        tmp_path,
+        {
+            "source_path": "workspace/deliverables/request-1/presentation.html",
+            "target_path": f"workspace/deliverables/request-1/{target_name}",
+            mode_name: mode_value,
+        },
+    )
+
+    assert "requires expected_page_count, outline_path, slide_spec_path" in missing_contract
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("converter", "target_name", "mode_name", "wrong_mode", "expected_message"),
+    [
+        (
+            "_convert_html_to_pptx",
+            "presentation.pptx",
+            "render_mode",
+            "editable",
+            "render_mode='hybrid_editable'",
+        ),
+        (
+            "_convert_html_to_pdf",
+            "presentation.pdf",
+            "pdf_mode",
+            "single",
+            "pdf_mode='pages'",
+        ),
+    ],
+)
+async def test_managed_presentation_conversion_requires_delivery_render_mode(
+    tmp_path,
+    converter,
+    target_name,
+    mode_name,
+    wrong_mode,
+    expected_message,
+):
+    agent_id = uuid.uuid4()
+    source = tmp_path / "workspace" / "deliverables" / "request-1" / "presentation.html"
+    source.parent.mkdir(parents=True)
+    source.write_text("<html><body></body></html>", encoding="utf-8")
+
+    convert = getattr(agent_tools, converter)
+    result = await convert(
+        agent_id,
+        tmp_path,
+        {
+            "source_path": "workspace/deliverables/request-1/presentation.html",
+            "target_path": f"workspace/deliverables/request-1/{target_name}",
+            "expected_page_count": 6,
+            "outline_path": "workspace/deliverables/request-1/outline.json",
+            "slide_spec_path": "workspace/deliverables/request-1/slide_spec.json",
+            mode_name: wrong_mode,
+        },
+    )
+
+    assert expected_message in result
+
+
 def test_explicit_media_paths_ignore_data_urls_and_never_fall_back_to_workspace():
     assert agent_tools._explicit_media_workspace_paths(
         "data:image/png;base64,AAAA",
@@ -193,6 +346,16 @@ def test_explicit_media_paths_ignore_data_urls_and_never_fall_back_to_workspace(
     assert agent_tools._explicit_media_workspace_paths(None, "", "data:video/mp4;base64,AAAA") == []
     assert agent_tools._media_workspace_input_paths("uploads/product.png") == [
         "workspace/uploads/product.png"
+    ]
+    assert agent_tools._media_workspace_input_paths(
+        "images/approved-first-frame.png",
+        "videos/source.mp4",
+    ) == [
+        "workspace/images/approved-first-frame.png",
+        "workspace/videos/source.mp4",
+    ]
+    assert agent_tools._media_workspace_input_paths("../images/outside.png") == [
+        "../images/outside.png"
     ]
     assert agent_tools._explicit_media_workspace_paths(
         "uploads/product.png",
@@ -643,6 +806,93 @@ async def test_flush_temp_workspace_fails_on_conflict(monkeypatch):
 
     assert result["conflicted"] == ["workspace/input.md"]
     assert storage.files[f"{agent_id}/workspace/input.md"] == b"# Remote change\n"
+
+
+@pytest.mark.asyncio
+async def test_flush_temp_workspace_overwrites_tracked_oversized_output(monkeypatch):
+    agent_id = uuid.uuid4()
+    output_path = "workspace/deliverables/request/slides.pdf"
+    storage = MemoryStorageBackend({
+        f"{agent_id}/{output_path}": b"existing-large-output",
+    })
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+
+    temp_ws = await agent_tools._prepare_temp_workspace(
+        agent_id,
+        paths=[output_path],
+        max_file_bytes=4,
+    )
+    try:
+        assert not (temp_ws.root / output_path).exists()
+        assert temp_ws.manifest[output_path].materialized is False
+        target = temp_ws.root / output_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"replacement")
+        result = await agent_tools.flush_temp_workspace(temp_ws)
+    finally:
+        temp_ws.cleanup()
+
+    assert result["conflicted"] == []
+    assert result["updated"] == [output_path]
+    assert storage.files[f"{agent_id}/{output_path}"] == b"replacement"
+
+
+@pytest.mark.asyncio
+async def test_flush_temp_workspace_does_not_delete_unmaterialized_large_input(monkeypatch):
+    agent_id = uuid.uuid4()
+    input_path = "workspace/assets/large.png"
+    storage = MemoryStorageBackend({
+        f"{agent_id}/{input_path}": b"existing-large-input",
+    })
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+
+    temp_ws = await agent_tools._prepare_temp_workspace(
+        agent_id,
+        paths=[input_path],
+        max_file_bytes=4,
+    )
+    try:
+        result = await agent_tools.flush_temp_workspace(temp_ws)
+    finally:
+        temp_ws.cleanup()
+
+    assert result["deleted"] == []
+    assert result["conflicted"] == []
+    assert storage.files[f"{agent_id}/{input_path}"] == b"existing-large-input"
+
+
+@pytest.mark.asyncio
+async def test_typed_temp_workspace_sync_includes_new_artifact_output(monkeypatch):
+    agent_id = uuid.uuid4()
+    source_path = "workspace/videos/source.mp4"
+    output_path = "workspace/videos/composed.mp4"
+    storage = MemoryStorageBackend({
+        f"{agent_id}/{source_path}": b"source-video",
+    })
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+
+    async def runner(root):
+        target = root / output_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"composed-video")
+        artifact_ref = agent_tools._workspace_artifact_ref(agent_id, output_path)
+        return agent_tools._typed_success(
+            "composed",
+            result_ref=artifact_ref,
+            artifact_refs=(artifact_ref,),
+        )
+
+    outcome = await agent_tools._run_with_temp_workspace_outcome(
+        agent_id,
+        None,
+        runner,
+        paths=[source_path],
+        sync_back=True,
+    )
+
+    assert outcome.status == "succeeded"
+    assert storage.files[f"{agent_id}/{output_path}"] == b"composed-video"
+    assert agent_tools._workspace_artifact_ref(agent_id, output_path) in outcome.artifact_refs
 
 
 @pytest.mark.asyncio

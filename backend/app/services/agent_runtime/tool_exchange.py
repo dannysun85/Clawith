@@ -386,7 +386,7 @@ def _resolve_incomplete_exchange(
             blocked=True,
             requires_confirmation=True,
         )
-    if any(status in {"started", "unknown", "failed"} for status in missing_statuses.values()):
+    if any(status in {"started", "unknown"} for status in missing_statuses.values()):
         return MessageBlock(
             kind="pending_tool_exchange",
             messages=messages,
@@ -398,10 +398,30 @@ def _resolve_incomplete_exchange(
             blocked=True,
         )
 
+    if any(status == "failed" for status in missing_statuses.values()):
+        summary = _summary_for_exchange(
+            assistant_message_id=assistant_message_id,
+            calls=calls,
+            results=results,
+            ledger=ledger,
+            reason="failed_result_missing",
+        )
+        return MessageBlock(
+            kind="pending_tool_exchange",
+            messages=messages,
+            message_ids=message_ids,
+            assistant_message_id=assistant_message_id,
+            call_ids=call_ids,
+            missing_call_ids=missing_call_ids,
+            action="summarize_then_retry_model",
+            retry_model=True,
+            compaction_summary=summary,
+        )
+
     invalid_statuses = {
         status
         for status in missing_statuses.values()
-        if status not in {"not_started", "succeeded"}
+        if status not in {"not_started", "succeeded", "failed"}
     }
     if invalid_statuses:
         return MessageBlock(

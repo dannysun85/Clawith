@@ -11,18 +11,21 @@ from PIL import Image, ImageDraw, ImageFont, ImageStat
 from app.services.agent_tools import _read_file
 from app.services import media_assets
 from app.services.media_assets import (
+    AudioMixReceipt,
     MediaContractError,
     OverlayReceipt,
     apply_image_brand_overlays,
     apply_image_text_overlay,
     apply_video_brand_overlays,
+    compose_video_audio_tracks,
     image_asset_from_bytes,
     image_reference_for_provider,
     validate_generated_audio,
-    validate_generated_video,
     validate_generated_image,
+    validate_generated_video,
     validate_overlay_text,
     validate_uploaded_video,
+    validate_video_delivery_contract,
 )
 
 
@@ -310,6 +313,72 @@ async def test_unbranded_video_is_normalized_to_browser_safe_mp4(tmp_path):
     assert receipt == OverlayReceipt()
 
 
+def test_video_delivery_contract_accepts_matching_duration_ratio_and_audio():
+    accepted = media_assets.VideoInfo(
+        width=768,
+        height=1366,
+        duration_seconds=10.125,
+        codec_name="h264",
+        pixel_format="yuv420p",
+        audio_codec_name="aac",
+        fast_start=True,
+    )
+
+    assert (
+        validate_video_delivery_contract(
+            accepted,
+            expected_duration_seconds=10,
+            expected_aspect_ratio="9:16",
+            require_audio=True,
+        )
+        is accepted
+    )
+
+
+def test_image_delivery_contract_accepts_matching_ratio_and_rejects_mismatch():
+    assert media_assets.validate_image_delivery_contract(
+        1440,
+        2560,
+        expected_aspect_ratio="9:16",
+    ) == (1440, 2560)
+
+    with pytest.raises(
+        MediaContractError,
+        match="aspect ratio is 2560:1440, expected 9:16",
+    ):
+        media_assets.validate_image_delivery_contract(
+            2560,
+            1440,
+            expected_aspect_ratio="9:16",
+        )
+
+
+def test_video_delivery_contract_rejects_customer_visible_mismatch():
+    rejected = media_assets.VideoInfo(
+        width=1366,
+        height=768,
+        duration_seconds=5.875,
+        codec_name="h264",
+        pixel_format="yuv420p",
+        audio_codec_name=None,
+        fast_start=True,
+    )
+
+    with pytest.raises(
+        MediaContractError,
+        match=(
+            "duration is 5.875s.*aspect ratio is 1366:768.*"
+            "audio stream is required but missing"
+        ),
+    ):
+        validate_video_delivery_contract(
+            rejected,
+            expected_duration_seconds=10,
+            expected_aspect_ratio="9:16",
+            require_audio=True,
+        )
+
+
 @pytest.mark.asyncio
 async def test_real_video_decodes_and_contains_exact_copy_and_protected_product(tmp_path):
     source = _real_mp4(tmp_path)
@@ -364,6 +433,51 @@ async def test_real_video_decodes_and_contains_exact_copy_and_protected_product(
         for x in range(0, 640, 4)
         for y in range(250, 360, 4)
     )
+
+
+@pytest.mark.asyncio
+async def test_silent_video_can_be_finished_with_voiceover_and_music(tmp_path):
+    source = _real_mp4(tmp_path)
+    voice_dir = tmp_path / "voice"
+    music_dir = tmp_path / "music"
+    voice_dir.mkdir()
+    music_dir.mkdir()
+    voiceover = _real_audio(voice_dir, "mp3")
+    music = _real_audio(music_dir, "wav")
+
+    result, receipt = await compose_video_audio_tracks(
+        source,
+        voiceover_raw=voiceover,
+        voiceover_format="mp3",
+        music_raw=music,
+        music_format="wav",
+        voiceover_start_seconds=0.1,
+        voiceover_gain=1.0,
+        music_gain=0.12,
+    )
+    info = await validate_generated_video(result)
+
+    assert isinstance(receipt, AudioMixReceipt)
+    assert receipt.voiceover_sha256
+    assert receipt.music_sha256
+    assert receipt.source_audio_retained is False
+    assert receipt.output_video_codec == "h264"
+    assert receipt.output_audio_codec == "aac"
+    assert receipt.output_width == 640
+    assert receipt.output_height == 360
+    assert receipt.browser_safe is True
+    assert receipt.fast_start is True
+    assert info.audio_codec_name == "aac"
+    assert info.width == 640
+    assert info.height == 360
+    assert abs(info.duration_seconds - 1.2) <= 0.1
+    assert info.fast_start is True
+
+
+@pytest.mark.asyncio
+async def test_video_audio_composition_requires_an_actual_audio_track(tmp_path):
+    with pytest.raises(MediaContractError, match="At least one"):
+        await compose_video_audio_tracks(_real_mp4(tmp_path))
 
 
 @pytest.mark.asyncio

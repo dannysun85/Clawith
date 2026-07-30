@@ -183,7 +183,10 @@ async def test_runtime_state_returns_exact_waiting_lane_holder() -> None:
 
 
 @pytest.mark.asyncio
-async def test_runtime_state_exposes_unknown_write_and_blocks_plain_resume() -> None:
+@pytest.mark.parametrize("tool_name", ["write_file", "convert_html_to_pdf"])
+async def test_runtime_state_exposes_unknown_write_and_blocks_plain_resume(
+    tool_name: str,
+) -> None:
     agent, user, session, run = _records()
     reader = SimpleNamespace(get_run_state=AsyncMock(return_value=_view(run)))
     execution = AgentToolExecution(
@@ -191,7 +194,7 @@ async def test_runtime_state_exposes_unknown_write_and_blocks_plain_resume() -> 
         tenant_id=run.tenant_id,
         run_id=run.id,
         tool_call_id="call-write-1",
-        tool_name="write_file",
+        tool_name=tool_name,
         assistant_message_id="assistant-1",
         arguments_hash="hash",
         sanitized_arguments={},
@@ -234,7 +237,7 @@ async def test_runtime_state_exposes_unknown_write_and_blocks_plain_resume() -> 
     assert len(response.active_run.pending_tool_reconciliations) == 1
     pending = response.active_run.pending_tool_reconciliations[0]
     assert pending.execution_id == str(execution.id)
-    assert pending.tool_name == "write_file"
+    assert pending.tool_name == tool_name
     assert pending.can_reconcile is True
 
 

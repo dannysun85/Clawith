@@ -98,6 +98,26 @@ class AudioInfo:
     container_format: str
 
 
+@dataclass(frozen=True, slots=True)
+class AudioMixReceipt:
+    voiceover_sha256: str | None
+    music_sha256: str | None
+    voiceover_start_seconds: float
+    voiceover_gain: float
+    music_gain: float
+    source_audio_retained: bool
+    output_duration_seconds: float
+    output_video_codec: str
+    output_audio_codec: str
+    output_width: int
+    output_height: int
+    browser_safe: bool
+    fast_start: bool
+
+    def as_dict(self) -> dict:
+        return asdict(self)
+
+
 def _validate_image_bytes(
     raw: bytes,
     *,
@@ -186,6 +206,36 @@ def validate_generated_image(raw: bytes) -> tuple[int, int]:
     """Reject empty or corrupt provider output before storage and settlement."""
     asset = image_asset_from_bytes(raw, label="Generated image")
     return asset.width, asset.height
+
+
+def validate_image_delivery_contract(
+    width: int,
+    height: int,
+    *,
+    expected_aspect_ratio: str | None = None,
+) -> tuple[int, int]:
+    """Reject a valid image whose visible shape violates the user request."""
+
+    ratio_targets = {
+        "16:9": 16 / 9,
+        "9:16": 9 / 16,
+        "1:1": 1.0,
+        "4:3": 4 / 3,
+        "3:4": 3 / 4,
+        "3:2": 3 / 2,
+        "2:3": 2 / 3,
+    }
+    normalized_ratio = str(expected_aspect_ratio or "").strip()
+    target_ratio = ratio_targets.get(normalized_ratio)
+    if target_ratio is None:
+        return width, height
+    actual_ratio = width / height
+    if abs(actual_ratio - target_ratio) / target_ratio > 0.03:
+        raise MediaContractError(
+            "Image delivery contract invalid: "
+            f"aspect ratio is {width}:{height}, expected {normalized_ratio}"
+        )
+    return width, height
 
 
 def _decode_image_data_url(value: str, *, label: str) -> bytes:
@@ -752,6 +802,53 @@ async def validate_generated_video(
     return info
 
 
+def validate_video_delivery_contract(
+    info: VideoInfo,
+    *,
+    expected_duration_seconds: int | float | None = None,
+    expected_aspect_ratio: str | None = None,
+    require_audio: bool = False,
+) -> VideoInfo:
+    """Enforce user-visible duration, orientation, and audio requirements."""
+
+    failures: list[str] = []
+    if expected_duration_seconds is not None:
+        expected_duration = float(expected_duration_seconds)
+        duration_tolerance = max(0.5, expected_duration * 0.05)
+        if abs(info.duration_seconds - expected_duration) > duration_tolerance:
+            failures.append(
+                f"duration is {info.duration_seconds:.3f}s, expected "
+                f"{expected_duration:.3f}s ± {duration_tolerance:.3f}s"
+            )
+
+    ratio_targets = {
+        "16:9": 16 / 9,
+        "9:16": 9 / 16,
+        "1:1": 1.0,
+        "4:3": 4 / 3,
+        "3:4": 3 / 4,
+        "21:9": 21 / 9,
+    }
+    normalized_ratio = str(expected_aspect_ratio or "").strip()
+    target_ratio = ratio_targets.get(normalized_ratio)
+    if target_ratio is not None:
+        actual_ratio = info.width / info.height
+        if abs(actual_ratio - target_ratio) / target_ratio > 0.03:
+            failures.append(
+                f"aspect ratio is {info.width}:{info.height}, expected "
+                f"{normalized_ratio}"
+            )
+
+    if require_audio and info.audio_codec_name is None:
+        failures.append("audio stream is required but missing")
+
+    if failures:
+        raise MediaContractError(
+            "Video delivery contract invalid: " + "; ".join(failures)
+        )
+    return info
+
+
 async def validate_uploaded_video(
     raw: bytes,
     *,
@@ -954,6 +1051,195 @@ async def validate_generated_audio(
         sample_rate=detected_rate,
         channels=channels,
         container_format=container_format,
+    )
+
+
+async def compose_video_audio_tracks(
+    video_raw: bytes,
+    *,
+    voiceover_raw: bytes | None = None,
+    voiceover_format: str | None = None,
+    music_raw: bytes | None = None,
+    music_format: str | None = None,
+    voiceover_start_seconds: float = 0.0,
+    voiceover_gain: float = 1.0,
+    music_gain: float = 0.16,
+    keep_source_audio: bool = False,
+) -> tuple[bytes, AudioMixReceipt]:
+    """Create one browser-safe MP4 from validated video and audio tracks.
+
+    This is deterministic post-production, not another generative provider
+    request.  A quiet music bed and an independently generated voice track let
+    a silent image-to-video provider participate in a complete ad workflow
+    without pretending that the provider generated synchronized audio.
+    """
+
+    if voiceover_raw is None and music_raw is None:
+        raise MediaContractError("At least one voiceover or music track is required")
+    video_info = await validate_generated_video(
+        video_raw,
+        label="Audio mix video input",
+        require_browser_safe=False,
+    )
+    start_seconds = float(voiceover_start_seconds)
+    if start_seconds < 0 or start_seconds >= video_info.duration_seconds:
+        raise MediaContractError(
+            "voiceover_start_seconds must fall within the video duration"
+        )
+    normalized_voice_gain = float(voiceover_gain)
+    normalized_music_gain = float(music_gain)
+    if not 0 < normalized_voice_gain <= 4:
+        raise MediaContractError("voiceover_gain must be greater than 0 and at most 4")
+    if not 0 < normalized_music_gain <= 1:
+        raise MediaContractError("music_gain must be greater than 0 and at most 1")
+
+    normalized_voice_format = str(voiceover_format or "").strip().lower().lstrip(".")
+    normalized_music_format = str(music_format or "").strip().lower().lstrip(".")
+    if voiceover_raw is not None:
+        await validate_generated_audio(
+            voiceover_raw,
+            audio_format=normalized_voice_format,
+            label="Voiceover input",
+        )
+    if music_raw is not None:
+        await validate_generated_audio(
+            music_raw,
+            audio_format=normalized_music_format,
+            label="Music input",
+        )
+
+    with tempfile.TemporaryDirectory(prefix="astra-video-audio-mix-") as temp_dir:
+        root = Path(temp_dir)
+        video_path = root / "video.mp4"
+        output_path = root / "output.mp4"
+        video_path.write_bytes(video_raw)
+        command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(video_path),
+        ]
+        audio_inputs: list[tuple[str, int]] = []
+        input_index = 1
+        if voiceover_raw is not None:
+            voice_path = root / f"voiceover.{normalized_voice_format}"
+            voice_path.write_bytes(voiceover_raw)
+            command.extend(["-i", str(voice_path)])
+            audio_inputs.append(("voiceover", input_index))
+            input_index += 1
+        if music_raw is not None:
+            music_path = root / f"music.{normalized_music_format}"
+            music_path.write_bytes(music_raw)
+            command.extend(["-stream_loop", "-1", "-i", str(music_path)])
+            audio_inputs.append(("music", input_index))
+
+        duration = video_info.duration_seconds
+        filters: list[str] = []
+        mix_labels: list[str] = []
+        if keep_source_audio and video_info.audio_codec_name:
+            filters.append(
+                f"[0:a:0]atrim=duration={duration:.6f},volume=0.55[source_audio]"
+            )
+            mix_labels.append("[source_audio]")
+        for kind, index in audio_inputs:
+            if kind == "voiceover":
+                delay_ms = round(start_seconds * 1000)
+                filters.append(
+                    f"[{index}:a:0]adelay={delay_ms}:all=1,apad,"
+                    f"atrim=duration={duration:.6f},volume={normalized_voice_gain:.4f}"
+                    "[voiceover]"
+                )
+                mix_labels.append("[voiceover]")
+            else:
+                filters.append(
+                    f"[{index}:a:0]atrim=duration={duration:.6f},"
+                    f"asetpts=N/SR/TB,volume={normalized_music_gain:.4f}[music]"
+                )
+                mix_labels.append("[music]")
+        if len(mix_labels) == 1:
+            filters.append(f"{mix_labels[0]}anull[aout]")
+        else:
+            filters.append(
+                "".join(mix_labels)
+                + f"amix=inputs={len(mix_labels)}:duration=longest:"
+                "dropout_transition=2:normalize=0,alimiter=limit=0.95[aout]"
+            )
+        command.extend(
+            [
+                "-filter_complex",
+                ";".join(filters),
+                "-map",
+                "0:v:0",
+                "-map",
+                "[aout]",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "fast",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-t",
+                f"{duration:.6f}",
+                "-movflags",
+                "+faststart",
+                str(output_path),
+            ]
+        )
+        await _run_process(
+            *command,
+            timeout=300,
+            label="Video audio composition",
+        )
+        if not output_path.is_file():
+            raise MediaContractError("Video audio composition did not create an output")
+        result = output_path.read_bytes()
+
+    output_info = await validate_generated_video(
+        result,
+        label="Video audio composition output",
+    )
+    validate_video_delivery_contract(
+        output_info,
+        expected_duration_seconds=video_info.duration_seconds,
+        require_audio=True,
+    )
+    return result, AudioMixReceipt(
+        voiceover_sha256=(
+            hashlib.sha256(voiceover_raw).hexdigest()
+            if voiceover_raw is not None
+            else None
+        ),
+        music_sha256=(
+            hashlib.sha256(music_raw).hexdigest()
+            if music_raw is not None
+            else None
+        ),
+        voiceover_start_seconds=start_seconds,
+        voiceover_gain=normalized_voice_gain,
+        music_gain=normalized_music_gain,
+        source_audio_retained=bool(
+            keep_source_audio and video_info.audio_codec_name
+        ),
+        output_duration_seconds=output_info.duration_seconds,
+        output_video_codec=output_info.codec_name,
+        output_audio_codec=str(output_info.audio_codec_name or ""),
+        output_width=output_info.width,
+        output_height=output_info.height,
+        browser_safe=(
+            output_info.codec_name == "h264"
+            and output_info.audio_codec_name == "aac"
+            and output_info.pixel_format == "yuv420p"
+        ),
+        fast_start=output_info.fast_start,
     )
 
 

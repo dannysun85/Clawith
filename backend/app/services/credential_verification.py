@@ -8,6 +8,10 @@ from typing import Mapping
 import httpx
 
 from app.services.llm.utils import get_credential_api_key
+from app.services.volcengine_agent_plan import (
+    PROVIDER as VOLCENGINE_AGENT_PLAN_PROVIDER,
+    normalize_base_url as normalize_volcengine_agent_plan_base_url,
+)
 
 
 @dataclass(frozen=True)
@@ -60,6 +64,12 @@ def build_credential_probe_request(
             url=_models_url(base_url or "https://generativelanguage.googleapis.com/v1beta"),
             headers={"x-goog-api-key": api_key},
         )
+    if normalized_provider == VOLCENGINE_AGENT_PLAN_PROVIDER:
+        normalized_base = normalize_volcengine_agent_plan_base_url(base_url)
+        return CredentialProbeRequest(
+            url=f"{normalized_base}/contents/generations/tasks?page_num=1&page_size=1",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
 
     default_base_url = _OPENAI_COMPATIBLE_BASE_URLS.get(normalized_provider)
     if normalized_provider == "custom" and not base_url:
@@ -77,6 +87,8 @@ def _model_count(payload: object) -> int | None:
         value = payload.get(key)
         if isinstance(value, list):
             return len(value)
+    if isinstance(payload.get("items"), list):
+        return len(payload["items"])
     return None
 
 

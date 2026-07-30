@@ -25,6 +25,12 @@ from app.schemas.credentials import (
 from app.services.credential_verification import verify_provider_credential
 from app.services.llm.load_balancer import get_credential_health
 from app.services.llm.utils import get_credential_api_key
+from app.services.volcengine_agent_plan import (
+    ALLOWED_PLAN_TIERS,
+    PROVIDER as VOLCENGINE_AGENT_PLAN_PROVIDER,
+    VIDEO_CAPABLE_PLAN_TIERS,
+    normalize_base_url as normalize_volcengine_agent_plan_base_url,
+)
 
 router = APIRouter(prefix="/credentials", tags=["credentials"])
 
@@ -41,6 +47,47 @@ def _to_out(cred: LLMCredential) -> CredentialOut:
     out = CredentialOut.model_validate(cred)
     out.api_key_masked = _mask_key(cred)
     return out
+
+
+def _validate_provider_account_contract(
+    *,
+    provider: str,
+    base_url: str | None,
+    plan_tier: str | None,
+    capabilities: list[str] | None,
+) -> tuple[str | None, str | None]:
+    if provider != VOLCENGINE_AGENT_PLAN_PROVIDER:
+        if plan_tier is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="plan_tier is only valid for volcengine_agent_plan",
+            )
+        return base_url, None
+    normalized_plan = str(plan_tier or "").strip().lower()
+    if normalized_plan not in ALLOWED_PLAN_TIERS:
+        raise HTTPException(
+            status_code=422,
+            detail="volcengine_agent_plan requires plan_tier: small, medium, large, or max",
+        )
+    supported = set(capabilities or ())
+    if not supported or supported.difference({"text", "image", "audio", "video"}):
+        raise HTTPException(
+            status_code=422,
+            detail="volcengine_agent_plan requires explicit text/image/audio/video capabilities",
+        )
+    if "video" in supported and normalized_plan not in VIDEO_CAPABLE_PLAN_TIERS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Agent Plan video requires Medium, Large, or Max; "
+                "Medium uses Seedance 1.5 Pro and Large/Max use Seedance 2.0"
+            ),
+        )
+    try:
+        normalized_base_url = normalize_volcengine_agent_plan_base_url(base_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return normalized_base_url, normalized_plan
 
 
 @router.get("", response_model=list[CredentialOut], dependencies=[_SAAS_OWNER])
@@ -81,11 +128,18 @@ async def credentials_health():
 @router.post("", response_model=CredentialOut, status_code=status.HTTP_201_CREATED, dependencies=[_SAAS_OWNER])
 async def create_credential(data: CredentialCreateIn, db: AsyncSession = Depends(get_db)):
     """Add an API-key account to the pool."""
+    base_url, plan_tier = _validate_provider_account_contract(
+        provider=data.provider,
+        base_url=data.base_url,
+        plan_tier=data.plan_tier,
+        capabilities=data.capabilities,
+    )
     cred = LLMCredential(
         provider=data.provider,
         label=data.label,
         api_key_encrypted=encrypt_data(data.api_key, settings.SECRET_KEY),
-        base_url=data.base_url,
+        base_url=base_url,
+        plan_tier=plan_tier,
         capabilities=data.capabilities,
         daily_quota=data.daily_quota,
         weight=data.weight,
@@ -112,12 +166,26 @@ async def update_credential(credential_id: uuid.UUID, data: CredentialUpdateIn, 
     if new_api_key is not None and not new_api_key.strip():
         raise HTTPException(status_code=422, detail="API key cannot be empty")
     api_key_changed = new_api_key is not None
+    effective_base_url, effective_plan_tier = _validate_provider_account_contract(
+        provider=cred.provider,
+        base_url=updates.get("base_url", cred.base_url),
+        plan_tier=updates.get("plan_tier", getattr(cred, "plan_tier", None)),
+        capabilities=updates.get("capabilities", cred.capabilities),
+    )
+    if "base_url" in updates or cred.provider == VOLCENGINE_AGENT_PLAN_PROVIDER:
+        updates["base_url"] = effective_base_url
+    if "plan_tier" in updates or cred.provider == VOLCENGINE_AGENT_PLAN_PROVIDER:
+        updates["plan_tier"] = effective_plan_tier
     base_url_changed = "base_url" in updates and updates["base_url"] != cred.base_url
+    plan_tier_changed = (
+        "plan_tier" in updates
+        and updates["plan_tier"] != getattr(cred, "plan_tier", None)
+    )
     for k, v in updates.items():
         setattr(cred, k, v)
     if api_key_changed:
         cred.api_key_encrypted = encrypt_data(new_api_key.strip(), settings.SECRET_KEY)
-    if base_url_changed or api_key_changed:
+    if base_url_changed or plan_tier_changed or api_key_changed:
         cred.status = "unverified"
         cred.error_count = 0
     if api_key_changed:

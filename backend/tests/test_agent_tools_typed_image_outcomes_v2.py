@@ -227,7 +227,11 @@ async def _execute_generate(
         return _ready_config(requested_name)
 
     async def prepare(*args, **kwargs):
-        return SimpleNamespace(root=workspace, cleanup=lambda: None)
+        return SimpleNamespace(
+            root=workspace,
+            selected_paths=[],
+            cleanup=lambda: None,
+        )
 
     async def flush(*args, **kwargs):
         calls["flush"] += 1
@@ -729,7 +733,11 @@ async def test_generate_success_returns_workspace_artifact_and_content_hash(
         return _ready_config(requested_name)
 
     async def prepare(*args, **kwargs):
-        return SimpleNamespace(root=workspace, cleanup=lambda: None)
+        return SimpleNamespace(
+            root=workspace,
+            selected_paths=[],
+            cleanup=lambda: None,
+        )
 
     async def flush(*args, **kwargs):
         calls["flush"] += 1

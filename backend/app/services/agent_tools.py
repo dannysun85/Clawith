@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional, cast
 import re
 from urllib.parse import parse_qsl, urlencode, urlsplit
+from urllib.parse import unquote
 
 from loguru import logger
 from sqlalchemy import select, or_
@@ -64,6 +65,7 @@ from app.services.document_conversion import (
     convert_html_to_pdf as convert_html_file_to_pdf,
     convert_html_to_pptx as convert_html_file_to_pptx,
 )
+from app.services.document_conversion.presentation_contract import local_image_sources
 from app.services.focus_service import (
     complete_focus_item,
     ensure_focus_item,
@@ -114,6 +116,7 @@ _settings = get_settings()
 WORKSPACE_ROOT = Path(_settings.STORAGE_LOCAL_ROOT or _settings.AGENT_DATA_DIR)
 TOOL_MATERIALIZE_MAX_FILE_BYTES = 10 * 1024 * 1024
 TOOL_MATERIALIZE_MAX_TOTAL_BYTES = 100 * 1024 * 1024
+PRESENTATION_MATERIALIZE_MAX_FILE_BYTES = 25 * 1024 * 1024
 TEMP_WORKSPACE_DEFAULT_PATHS = ["workspace", "memory", "skills", "focus.md", "soul.md", "HEARTBEAT.md"]
 MAX_EXEC_STDOUT_CAPTURE_BYTES = 1_000_000
 MAX_EXEC_STDERR_CAPTURE_BYTES = 500_000
@@ -181,7 +184,11 @@ def _minimax_operation_log_level(error: Exception) -> str:
 
     from app.services.llm.failover import MINIMAX_QUOTA_CODES, extract_minimax_code
 
-    error_code = extract_minimax_code(str(error)) or "unknown"
+    error_code = (
+        str(getattr(error, "provider_code", "") or "")
+        or extract_minimax_code(str(error))
+        or "unknown"
+    )
     return "warning" if error_code in MINIMAX_QUOTA_CODES else "error"
 
 
@@ -784,6 +791,7 @@ RUNTIME_TYPED_APPLICATION_TOOL_NAMES = frozenset(
         *_IMAGE_GENERATION_TOOL_NAMES,
         "generate_speech_minimax",
         "generate_music_minimax",
+        "compose_video_audio",
         "generate_video_minimax",
         "check_video_minimax",
         "publish_page",
@@ -1584,6 +1592,7 @@ class TempWorkspaceManifestEntry:
     base_version_token: str
     base_hash: str
     size: int
+    materialized: bool
 
 
 @dataclass
@@ -1624,6 +1633,7 @@ async def _prepare_temp_workspace(
     agent_id: uuid.UUID,
     tenant_id: str | None = None,
     paths: list[str] | None = None,
+    max_file_bytes: int | None = None,
 ) -> TempWorkspace:
     tmp = tempfile.TemporaryDirectory(prefix=f"clawith-agent-{str(agent_id)[:8]}-")
     temp_ws = Path(tmp.name)
@@ -1632,13 +1642,26 @@ async def _prepare_temp_workspace(
 
     storage = get_storage_backend()
     budget = {"total": 0}
+    effective_max_file_bytes = (
+        TOOL_MATERIALIZE_MAX_FILE_BYTES
+        if max_file_bytes is None
+        else max_file_bytes
+    )
     selected = TEMP_WORKSPACE_DEFAULT_PATHS if paths is None else [path for path in paths if path]
     manifest: dict[str, TempWorkspaceManifestEntry] = {}
     for rel_path in selected:
         storage_key, normalized, is_enterprise = _tool_storage_key(agent_id, rel_path, tenant_id)
         if is_enterprise:
             continue
-        await _materialize_storage_path_with_budget(storage, storage_key, normalized, temp_ws, budget, manifest)
+        await _materialize_storage_path_with_budget(
+            storage,
+            storage_key,
+            normalized,
+            temp_ws,
+            budget,
+            manifest,
+            max_file_bytes=effective_max_file_bytes,
+        )
     return TempWorkspace(
         temp_dir=tmp,
         root=temp_ws,
@@ -1656,12 +1679,36 @@ async def _materialize_storage_path_with_budget(
     local_root: Path,
     budget: dict,
     manifest: dict[str, TempWorkspaceManifestEntry],
+    *,
+    max_file_bytes: int | None = None,
 ) -> None:
+    effective_max_file_bytes = (
+        TOOL_MATERIALIZE_MAX_FILE_BYTES
+        if max_file_bytes is None
+        else max_file_bytes
+    )
     if await storage.is_file(storage_key):
         version = await storage.get_version(storage_key)
-        if version.size > TOOL_MATERIALIZE_MAX_FILE_BYTES:
+        normalized_rel = normalize_workspace_path(rel_path)
+        if version.size > effective_max_file_bytes:
+            manifest[normalized_rel] = TempWorkspaceManifestEntry(
+                rel_path=normalized_rel,
+                storage_key=storage_key,
+                base_version_token=version.token,
+                base_hash=version.content_hash or "",
+                size=version.size,
+                materialized=False,
+            )
             return
         if budget["total"] + version.size > TOOL_MATERIALIZE_MAX_TOTAL_BYTES:
+            manifest[normalized_rel] = TempWorkspaceManifestEntry(
+                rel_path=normalized_rel,
+                storage_key=storage_key,
+                base_version_token=version.token,
+                base_hash=version.content_hash or "",
+                size=version.size,
+                materialized=False,
+            )
             return
         target = (local_root / rel_path).resolve()
         if not target.is_relative_to(local_root.resolve()):
@@ -1669,13 +1716,13 @@ async def _materialize_storage_path_with_budget(
         target.parent.mkdir(parents=True, exist_ok=True)
         data = await storage.read_bytes(storage_key)
         target.write_bytes(data)
-        normalized_rel = normalize_workspace_path(rel_path)
         manifest[normalized_rel] = TempWorkspaceManifestEntry(
             rel_path=normalized_rel,
             storage_key=storage_key,
             base_version_token=version.token,
             base_hash=content_hash_bytes(data),
             size=version.size,
+            materialized=True,
         )
         budget["total"] += version.size
         return
@@ -1683,7 +1730,15 @@ async def _materialize_storage_path_with_budget(
         (local_root / rel_path).mkdir(parents=True, exist_ok=True)
         for entry in await storage.list_dir(storage_key):
             child_rel = f"{rel_path.rstrip('/')}/{entry.name}" if rel_path else entry.name
-            await _materialize_storage_path_with_budget(storage, entry.key, child_rel, local_root, budget, manifest)
+            await _materialize_storage_path_with_budget(
+                storage,
+                entry.key,
+                child_rel,
+                local_root,
+                budget,
+                manifest,
+                max_file_bytes=effective_max_file_bytes,
+            )
 
 
 async def _sync_tasks_to_file(agent_id: uuid.UUID, ws: Path):
@@ -1757,6 +1812,8 @@ async def flush_temp_workspace(temp_workspace: TempWorkspace, conflict_mode: str
             updated.append(rel_path)
 
         for rel_path, entry in manifest.items():
+            if not entry.materialized:
+                continue
             if rel_path in local_files:
                 continue
             result = await storage.delete_if_match(
@@ -1959,19 +2016,87 @@ def _non_empty_paths(*paths: str | None) -> list[str] | None:
     return selected or None
 
 
+async def _document_conversion_materialization_paths(
+    agent_id: uuid.UUID,
+    tenant_id: str | None,
+    arguments: Mapping[str, Any],
+) -> list[str] | None:
+    """Materialize HTML plus every local image it references.
+
+    Conversion tools run in a bounded temporary workspace. Materializing only
+    the HTML previously turned valid cross-directory image references into
+    silent gray placeholders in both PPTX and PDF output.
+    """
+
+    source_path = arguments.get("source_path")
+    target_path = arguments.get("target_path")
+    selected = _non_empty_paths(
+        source_path if isinstance(source_path, str) else None,
+        target_path if isinstance(target_path, str) else None,
+        arguments.get("outline_path") if isinstance(arguments.get("outline_path"), str) else None,
+        arguments.get("slide_spec_path") if isinstance(arguments.get("slide_spec_path"), str) else None,
+    )
+    if not isinstance(source_path, str) or Path(source_path).suffix.lower() not in {
+        ".htm",
+        ".html",
+    }:
+        return selected
+
+    storage = get_storage_backend()
+    storage_key, normalized_source, is_enterprise = _tool_storage_key(
+        agent_id,
+        source_path,
+        tenant_id,
+    )
+    if is_enterprise or not await storage.is_file(storage_key):
+        return selected
+    version = await storage.get_version(storage_key)
+    if version.size > TOOL_MATERIALIZE_MAX_FILE_BYTES:
+        return selected
+    try:
+        html = (await storage.read_bytes(storage_key)).decode("utf-8")
+    except (UnicodeDecodeError, OSError):
+        return selected
+
+    source_parent = Path(normalized_source).parent
+    for image_src in local_image_sources(html):
+        if not image_src:
+            continue
+        parsed = urlsplit(image_src)
+        if parsed.scheme or parsed.netloc:
+            continue
+        image_path = normalize_workspace_path(
+            (source_parent / unquote(parsed.path)).as_posix()
+        )
+        if image_path and image_path not in (selected or []):
+            if selected is None:
+                selected = []
+            selected.append(image_path)
+    return selected
+
+
 def _canonical_media_workspace_path(value: str) -> str:
-    """Map the legacy upload shorthand to the canonical workspace path.
+    """Map bounded UI media shorthands to the canonical workspace path.
 
     Chat uploads are stored below ``workspace/uploads``. Models occasionally
-    preserve the filename while shortening that path to ``uploads/...`` when
-    they call a media tool. Accept only that exact, bounded shorthand; do not
-    rewrite arbitrary relative paths or traversal-shaped input.
+    preserve the visible attachment path while dropping the leading
+    ``workspace/`` when they call a media tool. Accept only known media roots;
+    do not rewrite arbitrary relative paths or traversal-shaped input.
     """
 
     candidate = value.strip().replace("\\", "/")
     while candidate.startswith("./"):
         candidate = candidate[2:]
-    if candidate.startswith("uploads/"):
+    shorthand_root = candidate.partition("/")[0]
+    if shorthand_root in {
+        "uploads",
+        "images",
+        "audio",
+        "videos",
+        "commercial",
+        "deliverables",
+        "media_tasks",
+    } and "/" in candidate:
         return f"workspace/{candidate}"
     return candidate
 
@@ -1995,9 +2120,15 @@ async def _run_with_temp_workspace(
     *,
     paths: list[str] | None = None,
     sync_back: bool = False,
+    materialize_max_file_bytes: int | None = None,
 ) -> str:
     """Materialize a temporary workspace for tools that require local files."""
-    temp_workspace = await _prepare_temp_workspace(agent_id, tenant_id=tenant_id, paths=paths)
+    temp_workspace = await _prepare_temp_workspace(
+        agent_id,
+        tenant_id=tenant_id,
+        paths=paths,
+        max_file_bytes=materialize_max_file_bytes,
+    )
     try:
         result = await runner(temp_workspace.root)
         if sync_back:
@@ -2014,6 +2145,19 @@ def _workspace_artifact_ref(agent_id: uuid.UUID, path: str) -> str:
     return f"workspace://{agent_id}/{normalize_workspace_path(path)}"
 
 
+def _workspace_artifact_path(agent_id: uuid.UUID, artifact_ref: str) -> str | None:
+    """Return an owned workspace path from an exact internal artifact ref."""
+
+    prefix = f"workspace://{agent_id}/"
+    if not isinstance(artifact_ref, str) or not artifact_ref.startswith(prefix):
+        return None
+    raw_path = artifact_ref.removeprefix(prefix)
+    normalized = normalize_workspace_path(raw_path)
+    if normalized != raw_path or not normalized.startswith("workspace/"):
+        return None
+    return normalized
+
+
 async def _run_with_temp_workspace_outcome(
     agent_id: uuid.UUID,
     tenant_id: str | None,
@@ -2022,6 +2166,7 @@ async def _run_with_temp_workspace_outcome(
     paths: list[str] | None = None,
     sync_back: bool = False,
     sync_back_on_non_success: bool = False,
+    materialize_max_file_bytes: int | None = None,
 ) -> ToolExecutionOutcome:
     """Run a typed local-content tool and preserve explicit sync facts."""
     try:
@@ -2029,6 +2174,7 @@ async def _run_with_temp_workspace_outcome(
             agent_id,
             tenant_id=tenant_id,
             paths=paths,
+            max_file_bytes=materialize_max_file_bytes,
         )
     except Exception as exc:
         return _typed_failure(
@@ -2044,6 +2190,17 @@ async def _run_with_temp_workspace_outcome(
             )
         if not sync_back or (outcome.status != "succeeded" and not sync_back_on_non_success):
             return outcome
+        # Explicit input materialization intentionally keeps large workspaces
+        # bounded. Add only owned, locally-created artifact paths before the
+        # flush so new outputs are not mistaken for durable workspace files.
+        for artifact_ref in outcome.artifact_refs:
+            artifact_path = _workspace_artifact_path(agent_id, artifact_ref)
+            if (
+                artifact_path
+                and artifact_path not in temp_workspace.selected_paths
+                and (temp_workspace.root / artifact_path).is_file()
+            ):
+                temp_workspace.selected_paths.append(artifact_path)
         try:
             flush_result = await flush_temp_workspace(
                 temp_workspace,
@@ -2056,8 +2213,15 @@ async def _run_with_temp_workspace_outcome(
             )
         if flush_result["conflicted"]:
             conflict_list = ", ".join(flush_result["conflicted"][:5])
+            if not flush_result["updated"] and not flush_result["deleted"]:
+                return _typed_failure(
+                    "Local execution completed, but no workspace changes were applied because "
+                    f"the stored version changed for: {conflict_list}",
+                    "workspace_sync_conflict",
+                    retryable=True,
+                )
             return _typed_unknown(
-                f"Local execution completed but workspace sync conflicted for: {conflict_list}",
+                f"Local execution partially synchronized before a workspace conflict for: {conflict_list}",
                 "workspace_sync_conflict",
             )
         changed_refs = tuple(_workspace_artifact_ref(agent_id, path) for path in flush_result["updated"])
@@ -2314,6 +2478,7 @@ def _minimax_tool_result(
     retryable: bool = False,
     halt_run: bool = False,
     runtime_metadata: Mapping[str, object] | None = None,
+    provider: str = "minimax",
 ) -> ToolExecutionOutcome | str:
     """Expose one explicit MiniMax lifecycle fact to legacy or Runtime callers.
 
@@ -2324,7 +2489,7 @@ def _minimax_tool_result(
     if not typed:
         return summary
     metadata = {
-        "provider": "minimax",
+        "provider": provider,
         "operation": f"{modality}_generation",
         "modality": modality,
         "model": model,
@@ -2368,6 +2533,7 @@ def _minimax_video_async_metadata(
     task_meta_path: str | None,
     state: str,
     pending: bool,
+    provider: str = "minimax",
 ) -> dict[str, object]:
     """Describe one durable MiniMax video operation to Runtime polling.
 
@@ -2380,7 +2546,7 @@ def _minimax_video_async_metadata(
     operation_id = str(record_id)
     operation_key = hashlib.sha256(
         json.dumps(
-            {"provider": "minimax", "modality": "video", "task_id": operation_id},
+            {"provider": provider, "modality": "video", "task_id": operation_id},
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
@@ -3148,6 +3314,16 @@ async def execute_builtin_tool_outcome(
         "convert_markdown_to_docx",
         "convert_markdown_to_pdf",
     }:
+        materialization_paths = await _document_conversion_materialization_paths(
+            agent_id,
+            tenant_id,
+            arguments,
+        )
+        materialize_limit = (
+            PRESENTATION_MATERIALIZE_MAX_FILE_BYTES
+            if tool_name in {"convert_html_to_pdf", "convert_html_to_pptx"}
+            else TOOL_MATERIALIZE_MAX_FILE_BYTES
+        )
         return await _run_with_temp_workspace_outcome(
             agent_id,
             tenant_id,
@@ -3157,11 +3333,9 @@ async def execute_builtin_tool_outcome(
                 arguments,
                 tool_name=tool_name,
             ),
-            paths=_non_empty_paths(
-                arguments.get("source_path"),
-                arguments.get("target_path"),
-            ),
+            paths=materialization_paths,
             sync_back=True,
+            materialize_max_file_bytes=materialize_limit,
         )
     if tool_name in {"execute_code", "execute_code_e2b"}:
         return await _run_with_temp_workspace_outcome(
@@ -3252,6 +3426,24 @@ async def execute_builtin_tool_outcome(
                 typed=True,
             ),
             sync_back=False,
+        )
+    if tool_name == "compose_video_audio":
+        return await _run_with_temp_workspace_outcome(
+            agent_id,
+            tenant_id,
+            lambda temp_ws: _compose_video_audio(
+                agent_id,
+                temp_ws,
+                arguments,
+                typed=True,
+            ),
+            paths=_media_workspace_input_paths(
+                arguments.get("video_path"),
+                arguments.get("voiceover_path"),
+                arguments.get("music_path"),
+                arguments.get("save_path"),
+            ),
+            sync_back=True,
         )
     if tool_name == "generate_video_minimax":
         return await _run_with_temp_workspace_outcome(
@@ -3837,20 +4029,32 @@ async def _execute_tool_impl(
                 sync_back=False,
             )
         elif tool_name == "convert_html_to_pdf":
+            materialization_paths = await _document_conversion_materialization_paths(
+                agent_id,
+                _agent_tenant_id,
+                arguments,
+            )
             result = await _run_with_temp_workspace(
                 agent_id,
                 _agent_tenant_id,
                 lambda temp_ws: _convert_html_to_pdf(agent_id, temp_ws, arguments),
-                paths=_non_empty_paths(arguments.get("source_path", ""), arguments.get("target_path", "")),
+                paths=materialization_paths,
                 sync_back=True,
+                materialize_max_file_bytes=PRESENTATION_MATERIALIZE_MAX_FILE_BYTES,
             )
         elif tool_name == "convert_html_to_pptx":
+            materialization_paths = await _document_conversion_materialization_paths(
+                agent_id,
+                _agent_tenant_id,
+                arguments,
+            )
             result = await _run_with_temp_workspace(
                 agent_id,
                 _agent_tenant_id,
                 lambda temp_ws: _convert_html_to_pptx(agent_id, temp_ws, arguments),
-                paths=_non_empty_paths(arguments.get("source_path", ""), arguments.get("target_path", "")),
+                paths=materialization_paths,
                 sync_back=True,
+                materialize_max_file_bytes=PRESENTATION_MATERIALIZE_MAX_FILE_BYTES,
             )
         elif tool_name == "convert_markdown_to_docx":
             result = await _run_with_temp_workspace(
@@ -4060,6 +4264,28 @@ async def _execute_tool_impl(
                     session_id=session_id,
                 ),
                 sync_back=False,
+            )
+        elif tool_name == "compose_video_audio":
+            compose_outcome = await _run_with_temp_workspace_outcome(
+                agent_id,
+                _agent_tenant_id,
+                lambda temp_ws: _compose_video_audio(
+                    agent_id,
+                    temp_ws,
+                    arguments,
+                    typed=True,
+                ),
+                paths=_media_workspace_input_paths(
+                    arguments.get("video_path"),
+                    arguments.get("voiceover_path"),
+                    arguments.get("music_path"),
+                    arguments.get("save_path"),
+                ),
+                sync_back=True,
+            )
+            result = _legacy_tool_outcome_text(
+                compose_outcome,
+                fallback="Video audio composition failed.",
             )
         elif tool_name == "generate_video_minimax":
             result = await _run_with_temp_workspace(
@@ -8088,13 +8314,28 @@ async def _convert_file_outcome(
             f"Conversion target could not be prepared: {type(exc).__name__}.",
             "conversion_target_unavailable",
         )
+    converter_message: str | None = None
+    failure_code = "conversion_artifact_invalid"
+    failure_summary: str | None = None
+    failure_metadata: dict[str, Any] = {}
     try:
-        await converter(agent_id, ws, arguments)
+        raw_converter_message = await converter(agent_id, ws, arguments)
+        if isinstance(raw_converter_message, str):
+            converter_message = " ".join(raw_converter_message.split()).strip()
+            if len(converter_message) > 500:
+                converter_message = converter_message[:497] + "..."
         valid = _validate_converted_artifact(target, kind)
     except Exception as exc:
         valid = False
         logger.exception("[Conversion] Typed conversion failed: {}", tool_name)
         failure_class = type(exc).__name__
+        failure_code = str(
+            getattr(exc, "code", None) or "conversion_artifact_invalid"
+        )[:200]
+        failure_summary = " ".join(str(exc).split()).strip()[:1000] or None
+        receipt = getattr(exc, "receipt", None)
+        if isinstance(receipt, Mapping):
+            failure_metadata["quality_receipt"] = dict(receipt)
     else:
         failure_class = None
     if not valid:
@@ -8111,9 +8352,22 @@ async def _convert_file_outcome(
         return _typed_failure(
             (
                 f"{tool_name} did not produce a valid {kind.upper()} artifact"
-                + (f" ({failure_class})." if failure_class else ".")
+                + (
+                    (
+                        f" ({failure_class}): {failure_summary}"
+                        if failure_summary
+                        else f" ({failure_class})."
+                    )
+                    if failure_class
+                    else (
+                        f". Converter response: {converter_message}"
+                        if converter_message
+                        else "."
+                    )
+                )
             ),
-            "conversion_artifact_invalid",
+            failure_code,
+            metadata=failure_metadata,
         )
     return _typed_success(
         f"Converted {source_path} to {target_path}.",
@@ -8166,11 +8420,61 @@ async def _convert_csv_to_xlsx(agent_id: uuid.UUID, ws: Path, arguments: dict) -
         return f"❌ Conversion failed: {e}"
 
 
+def _managed_presentation_contract_error(
+    target_path: str,
+    arguments: Mapping[str, Any],
+    *,
+    output_format: str,
+) -> str | None:
+    """Require deterministic quality inputs for managed deliverable presentations."""
+
+    normalized_parts = Path(target_path.replace("\\", "/")).parts
+    is_managed_deliverable = (
+        len(normalized_parts) >= 3
+        and normalized_parts[0] == "workspace"
+        and normalized_parts[1] == "deliverables"
+    )
+    if not is_managed_deliverable:
+        return None
+
+    required = ("expected_page_count", "outline_path", "slide_spec_path")
+    missing = [
+        name
+        for name in required
+        if arguments.get(name) in (None, "")
+    ]
+    if missing:
+        return (
+            "❌ Managed deliverable presentation conversion requires "
+            + ", ".join(missing)
+            + ". Rebuild the deck plan and retry; title-and-bullets output is not deliverable-ready."
+        )
+
+    if output_format == "pptx" and arguments.get("render_mode") != "hybrid_editable":
+        return (
+            "❌ Managed deliverable PPTX requires render_mode='hybrid_editable' "
+            "so complex visuals are preserved while important text remains editable."
+        )
+    if output_format == "pdf" and arguments.get("pdf_mode") != "pages":
+        return (
+            "❌ Managed deliverable PDF requires pdf_mode='pages' "
+            "so the preview matches the planned slide sequence."
+        )
+    return None
+
+
 async def _convert_html_to_pdf(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
     source_path = arguments.get("source_path")
     target_path = arguments.get("target_path")
     if not source_path or not target_path:
         return "❌ Missing 'source_path' or 'target_path'."
+    contract_error = _managed_presentation_contract_error(
+        str(target_path),
+        arguments,
+        output_format="pdf",
+    )
+    if contract_error:
+        return contract_error
     try:
         src_file = _resolve_tool_source_path(ws, source_path)
         tgt_file = _resolve_tool_target_path(ws, target_path)
@@ -8179,7 +8483,26 @@ async def _convert_html_to_pdf(agent_id: uuid.UUID, ws: Path, arguments: dict) -
     if not src_file.exists():
         return f"❌ Source file not found: {source_path}"
 
-    return await convert_html_file_to_pdf(src_file, tgt_file, str(target_path), arguments)
+    conversion_arguments = dict(arguments)
+    for argument_name, internal_name in (
+        ("outline_path", "_outline_file_path"),
+        ("slide_spec_path", "_slide_spec_file_path"),
+    ):
+        value = arguments.get(argument_name)
+        if value:
+            try:
+                conversion_arguments[internal_name] = str(
+                    _resolve_tool_source_path(ws, value)
+                )
+            except ValueError as exc:
+                return str(exc)
+
+    return await convert_html_file_to_pdf(
+        src_file,
+        tgt_file,
+        str(target_path),
+        conversion_arguments,
+    )
 
 
 async def _convert_html_to_pptx(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
@@ -8187,6 +8510,13 @@ async def _convert_html_to_pptx(agent_id: uuid.UUID, ws: Path, arguments: dict) 
     target_path = arguments.get("target_path")
     if not source_path or not target_path:
         return "❌ Missing paths."
+    contract_error = _managed_presentation_contract_error(
+        str(target_path),
+        arguments,
+        output_format="pptx",
+    )
+    if contract_error:
+        return contract_error
     try:
         src_file = _resolve_tool_source_path(ws, source_path)
         tgt_file = _resolve_tool_target_path(ws, target_path)
@@ -8195,7 +8525,27 @@ async def _convert_html_to_pptx(agent_id: uuid.UUID, ws: Path, arguments: dict) 
     if not src_file.exists():
         return "❌ Source file not found."
 
-    return await convert_html_file_to_pptx(src_file, tgt_file, str(target_path), ws, arguments)
+    conversion_arguments = dict(arguments)
+    for argument_name, internal_name in (
+        ("outline_path", "_outline_file_path"),
+        ("slide_spec_path", "_slide_spec_file_path"),
+    ):
+        value = arguments.get(argument_name)
+        if value:
+            try:
+                conversion_arguments[internal_name] = str(
+                    _resolve_tool_source_path(ws, value)
+                )
+            except ValueError as exc:
+                return str(exc)
+
+    return await convert_html_file_to_pptx(
+        src_file,
+        tgt_file,
+        str(target_path),
+        ws,
+        conversion_arguments,
+    )
 
 
 async def _convert_markdown_to_docx(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
@@ -27521,8 +27871,11 @@ async def _generate_image_minimax_durable(
     brand_position: str,
     brand_scale: float,
     typed: bool = False,
+    provider: str = "minimax",
+    provider_size: str | None = None,
+    allow_safe_fallback: bool = False,
 ) -> ToolExecutionOutcome | str:
-    """Run MiniMax image generation through the durable media state machine."""
+    """Run one provider image attempt through the durable media state machine."""
 
     from app.services.media_assets import MediaContractError, image_reference_for_provider
     from app.services.media_generation import (
@@ -27554,7 +27907,34 @@ async def _generate_image_minimax_durable(
             model=model,
             tier=tier,
         )
-    sanitize_generated_background = bool(brand_asset or (overlay_text.strip() and not reference_image))
+    aspect_ratio = str(arguments.get("aspect_ratio") or "1:1").strip()
+    agent_plan_size: str | None = None
+    if provider == "volcengine_agent_plan":
+        from app.services.volcengine_agent_plan import image_size_for_aspect_ratio
+
+        try:
+            agent_plan_size = image_size_for_aspect_ratio(
+                provider_size or "2K",
+                aspect_ratio,
+            )
+        except ValueError as exc:
+            return _minimax_tool_result(
+                f"❌ Image delivery contract is invalid: {exc}",
+                typed=typed,
+                status="failed",
+                error_code="brand_safe_media_contract_invalid",
+                agent_id=agent_id,
+                modality="image",
+                model=model,
+                tier=tier,
+                provider=provider,
+            )
+    # Keep the generated artwork crisp. Whole-frame blur used to be enabled
+    # whenever exact copy or a protected asset was composed, which destroyed
+    # otherwise usable commercial output. Background sanitization is now an
+    # explicit recovery operation after pseudo-text is detected, not a default
+    # part of brand-safe delivery.
+    sanitize_generated_background = False
     output_content_type = "image/jpeg" if output_extension in {".jpg", ".jpeg"} else "image/png"
     record_id = uuid.uuid4()
     save_path = _version_durable_media_output_path(save_path, record_id)
@@ -27571,6 +27951,7 @@ async def _generate_image_minimax_durable(
                 agent_id,
                 record_id,
                 brand_extension,
+                provider=provider,
             ),
             "brand_asset_extension": brand_extension,
             "brand_asset_sha256": brand_asset.sha256,
@@ -27603,9 +27984,12 @@ async def _generate_image_minimax_durable(
                 "overlay_position": overlay_position,
                 "brand_position": brand_position,
                 "brand_scale": brand_scale,
+                "aspect_ratio": aspect_ratio,
+                "provider_size": agent_plan_size or provider_size,
                 "sanitize_generated_background": sanitize_generated_background,
                 **brand_metadata,
             },
+            provider=provider,
         )
         recovery_key = str((created_task.request_metadata or {}).get("recovery_asset_storage_key") or "")
         task_created = True
@@ -27628,6 +28012,7 @@ async def _generate_image_minimax_durable(
                 model=model,
                 image_url=image_url,
                 save_path=save_path,
+                provider=provider,
             )
             await mark_minimax_sync_provider_accepted(
                 record_id,
@@ -27640,18 +28025,34 @@ async def _generate_image_minimax_durable(
             nonlocal provider_request_started
             provider_request_started = True
 
-        image_bytes = await _generate_image_minimax(
-            api_key=api_key,
-            base_url=base_url,
-            model=model,
-            prompt=provider_prompt,
-            aspect_ratio=arguments.get("aspect_ratio", "1:1"),
-            reference_image=reference_image,
-            on_provider_request_started=record_provider_request_started,
-            on_provider_accepted=lambda image_url: _finish_durable_media_side_effect(
-                record_provider_acceptance(image_url)
-            ),
-        )
+        if provider == "volcengine_agent_plan":
+            from app.services.volcengine_agent_plan import generate_image
+
+            image_bytes = await generate_image(
+                api_key=api_key,
+                base_url=base_url,
+                prompt=provider_prompt,
+                model=model,
+                size=agent_plan_size or provider_size or "2K",
+                reference_image=reference_image,
+                on_provider_request_started=record_provider_request_started,
+                on_provider_accepted=lambda image_url: _finish_durable_media_side_effect(
+                    record_provider_acceptance(image_url)
+                ),
+            )
+        else:
+            image_bytes = await _generate_image_minimax(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                prompt=provider_prompt,
+                aspect_ratio=aspect_ratio,
+                reference_image=reference_image,
+                on_provider_request_started=record_provider_request_started,
+                on_provider_accepted=lambda image_url: _finish_durable_media_side_effect(
+                    record_provider_acceptance(image_url)
+                ),
+            )
         if not provider_accepted:
             # Defensive fallback for compatible provider adapters that return
             # bytes directly without invoking the acceptance callback.
@@ -27671,9 +28072,10 @@ async def _generate_image_minimax_durable(
                 expected_key=recovery_key,
             )
         )
-        await _record_minimax_tool_success(
+        await _record_media_provider_success(
             agent_id,
             credential_id,
+            provider=provider,
             tier=tier,
             modality="image",
             model=model,
@@ -27688,7 +28090,6 @@ async def _generate_image_minimax_durable(
         if outcome.status == "succeeded":
             summary = (
                 f"✅ Image generated and durably delivered: {save_path}\n"
-                f"Provider: minimax | Model: {model}\n"
                 f"Task ID: {record_id}"
             )
             return _minimax_tool_result(
@@ -27701,36 +28102,39 @@ async def _generate_image_minimax_durable(
                 output_path=getattr(outcome, "output_path", None) or save_path,
                 model=model,
                 tier=tier,
+                provider=provider,
             )
         if outcome.status == "compensated":
             summary = (
-                "❌ MiniMax accepted the image request but no safe artifact could be recovered. Credits were refunded."
+                "❌ The image request was accepted, but no safe artifact could be recovered. Credits were refunded."
             )
             return _minimax_tool_result(
                 summary,
                 typed=typed,
                 status="failed",
-                error_code="minimax_image_compensated",
+                error_code="media_image_compensated",
                 agent_id=agent_id,
                 modality="image",
                 record_id=record_id,
                 model=model,
                 tier=tier,
+                provider=provider,
             )
         summary = (
-            "⏳ MiniMax accepted the image request. The durable media worker is "
+            "⏳ The image request was accepted. The durable media worker is "
             f"finishing delivery (task {record_id}); please do not submit it again."
         )
         return _minimax_tool_result(
             summary,
             typed=typed,
             status="unknown",
-            error_code="minimax_image_delivery_pending",
+            error_code="media_image_delivery_pending",
             agent_id=agent_id,
             modality="image",
             record_id=record_id,
             model=model,
             tier=tier,
+            provider=provider,
         )
     except asyncio.CancelledError as exc:
         await _complete_media_cancellation_transition(
@@ -27759,7 +28163,7 @@ async def _generate_image_minimax_durable(
                 model=model,
                 tier=tier,
             )
-        deterministic_rejection = _is_minimax_deterministic_rejection(exc)
+        deterministic_rejection = _is_media_deterministic_rejection(exc)
         if task_created:
             try:
                 # Provider acceptance evidence always outranks a missing local
@@ -27779,9 +28183,10 @@ async def _generate_image_minimax_durable(
                     record_id,
                 )
         if not provider_response_accepted:
-            await _mark_minimax_tool_credential_failure(
+            await _mark_media_provider_credential_failure(
                 credential_id,
                 exc,
+                provider=provider,
                 modality="image",
                 model=model,
             )
@@ -27793,26 +28198,38 @@ async def _generate_image_minimax_durable(
             tier=tier,
             user_id=user_id,
             recovery_path=(f"media-task:{record_id}" if task_created else None),
+            provider=provider,
         )
+        if (
+            allow_safe_fallback
+            and not provider_response_accepted
+            and _media_failover_is_safe(
+                exc,
+                provider_request_started=provider_request_started,
+                provider_accepted=provider_accepted,
+            )
+        ):
+            raise MediaProviderSafeFallback(provider, exc) from exc
         if provider_accepted:
             summary = (
-                "⏳ MiniMax accepted the image request. The result is held by the "
+                "⏳ The image request was accepted. The result is held by the "
                 f"durable recovery worker (task {record_id}); please do not retry."
             )
             return _minimax_tool_result(
                 summary,
                 typed=typed,
                 status="unknown",
-                error_code="minimax_image_recovery_pending",
+                error_code="media_image_recovery_pending",
                 agent_id=agent_id,
                 modality="image",
                 record_id=record_id,
                 model=model,
                 tier=tier,
+                provider=provider,
             )
         if provider_response_accepted:
             summary = (
-                "⏳ MiniMax accepted the image response. Its durable recovery worker "
+                "⏳ The image response was accepted. Its durable recovery worker "
                 f"is repairing the acceptance record (task {record_id}); please do "
                 "not retry."
             )
@@ -27820,48 +28237,52 @@ async def _generate_image_minimax_durable(
                 summary,
                 typed=typed,
                 status="unknown",
-                error_code="minimax_image_acceptance_repair_pending",
+                error_code="media_image_acceptance_repair_pending",
                 agent_id=agent_id,
                 modality="image",
                 record_id=record_id,
                 model=model,
                 tier=tier,
+                provider=provider,
             )
         if provider_request_started and not deterministic_rejection:
             summary = (
-                "❌ MiniMax image submission outcome is uncertain. Credits remain "
+                "❌ Image submission outcome is uncertain. Credits remain "
                 f"held for reconciliation (task {record_id}); please do not retry."
             )
             return _minimax_tool_result(
                 summary,
                 typed=typed,
                 status="unknown",
-                error_code="minimax_image_submission_unknown",
+                error_code="media_image_submission_unknown",
                 agent_id=agent_id,
                 modality="image",
                 record_id=record_id,
                 model=model,
                 tier=tier,
+                provider=provider,
             )
         from app.services.mcp_security import MCPURLPolicyError
 
         network_policy_failure = isinstance(exc, MCPURLPolicyError)
+        provider_label = "minimax" if provider == "minimax" else "platform media"
+        error_prefix = "minimax" if provider == "minimax" else "media"
         summary = (
             "❌ Image generation is blocked by the configured provider network "
             "policy. An administrator must repair the provider egress route; "
             "do not call this tool again in the current run. No provider request "
             "was made and the media Credits hold was released."
             if network_policy_failure
-            else _safe_media_failure_message("Image generation", "minimax", exc)
+            else _safe_media_failure_message("Image generation", provider_label, exc)
         )
         return _minimax_tool_result(
             summary,
             typed=typed,
             status="failed",
             error_code=(
-                "minimax_image_network_policy_blocked"
+                f"{error_prefix}_image_network_policy_blocked"
                 if network_policy_failure
-                else "minimax_image_provider_rejected"
+                else f"{error_prefix}_image_provider_rejected"
             ),
             agent_id=agent_id,
             modality="image",
@@ -27869,6 +28290,7 @@ async def _generate_image_minimax_durable(
             model=model,
             tier=tier,
             halt_run=network_policy_failure,
+            provider=provider,
         )
 
 
@@ -27985,9 +28407,16 @@ async def _check_minimax_credit_amount(tenant_id: uuid.UUID, credits: int) -> No
 def _minimax_image_acceptance_evidence_key(
     agent_id: uuid.UUID,
     recovery_id: uuid.UUID,
+    *,
+    provider: str = "minimax",
 ) -> str:
     """Build a service-private key that Agent workspace tools cannot address."""
-    return normalize_storage_key(f"_internal/provider_recovery/minimax/image/{agent_id}/{recovery_id}.json")
+    normalized_provider = str(provider or "").strip().lower()
+    if normalized_provider not in {"minimax", "volcengine_agent_plan"}:
+        raise ValueError("Unsupported media recovery provider")
+    return normalize_storage_key(
+        f"_internal/provider_recovery/{normalized_provider}/image/{agent_id}/{recovery_id}.json"
+    )
 
 
 async def _store_minimax_image_acceptance_evidence(
@@ -27997,13 +28426,18 @@ async def _store_minimax_image_acceptance_evidence(
     model: str,
     image_url: str | None,
     save_path: str,
+    provider: str = "minimax",
 ) -> tuple[str, str]:
     """Persist encrypted provider recovery evidence outside Agent-visible storage."""
-    key = _minimax_image_acceptance_evidence_key(agent_id, recovery_id)
+    key = _minimax_image_acceptance_evidence_key(
+        agent_id,
+        recovery_id,
+        provider=provider,
+    )
     storage = get_storage_backend()
     plaintext = json.dumps(
         {
-            "provider": "minimax",
+            "provider": provider,
             "model": model,
             "image_url": image_url,
             "save_path": save_path,
@@ -28022,22 +28456,30 @@ async def _store_minimax_image_acceptance_evidence(
         ).encode("utf-8"),
         content_type="application/json",
     )
-    return key, f"minimax-image-recovery:{recovery_id}"
+    return key, f"{provider}-image-recovery:{recovery_id}"
 
 
-async def _load_minimax_image_acceptance_evidence(key: str) -> dict[str, object]:
+async def _load_minimax_image_acceptance_evidence(
+    key: str,
+    *,
+    provider: str = "minimax",
+) -> dict[str, object]:
     """Load recovery evidence for an operator-only reconciliation workflow."""
     normalized_key = normalize_storage_key(key)
-    if not normalized_key.startswith("_internal/provider_recovery/minimax/image/"):
-        raise ValueError("MiniMax recovery evidence key is outside the private namespace")
+    normalized_provider = str(provider or "").strip().lower()
+    expected_prefix = f"_internal/provider_recovery/{normalized_provider}/image/"
+    if normalized_provider not in {"minimax", "volcengine_agent_plan"} or not normalized_key.startswith(
+        expected_prefix
+    ):
+        raise ValueError("Media recovery evidence key is outside the private namespace")
     storage = get_storage_backend()
     envelope = json.loads((await storage.read_bytes(normalized_key)).decode("utf-8"))
     if envelope.get("version") != 1 or not isinstance(envelope.get("ciphertext"), str):
         raise ValueError("MiniMax recovery evidence envelope is invalid")
     plaintext = decrypt_data(envelope["ciphertext"], get_settings().SECRET_KEY)
     payload = json.loads(plaintext)
-    if not isinstance(payload, dict) or payload.get("provider") != "minimax":
-        raise ValueError("MiniMax recovery evidence payload is invalid")
+    if not isinstance(payload, dict) or payload.get("provider") != normalized_provider:
+        raise ValueError("Media recovery evidence payload is invalid")
     return payload
 
 
@@ -28116,6 +28558,53 @@ async def _record_minimax_tool_success(
             pass
 
 
+async def _record_media_provider_success(
+    agent_id: uuid.UUID,
+    credential_id: uuid.UUID,
+    *,
+    provider: str,
+    tier: str | None,
+    modality: str,
+    model: str | None = None,
+) -> None:
+    """Record provider-independent media success without changing UX pricing."""
+
+    if provider == "minimax":
+        await _record_minimax_tool_success(
+            agent_id,
+            credential_id,
+            tier=tier,
+            modality=modality,
+            model=model,
+        )
+        return
+    from app.services.llm.load_balancer import record_credential_call
+    from app.services.quota_guard import consume_agent_llm_quota
+
+    try:
+        await record_credential_call(credential_id, tokens_used=0)
+        await consume_agent_llm_quota(agent_id, model_tier=tier)
+    except Exception as exc:
+        logger.warning(
+            "[MediaProvider] usage accounting failed provider={} error_type={}",
+            provider,
+            type(exc).__name__,
+        )
+        try:
+            await _record_minimax_tool_product_issue(
+                agent_id,
+                modality,
+                error=exc,
+                model=model,
+                tier=tier,
+                category="usage_accounting",
+                severity="critical",
+                provider=provider,
+            )
+        except Exception:
+            pass
+
+
 async def _mark_minimax_tool_credential_failure(
     credential_id: uuid.UUID,
     error: Exception,
@@ -28167,6 +28656,75 @@ async def _mark_minimax_tool_credential_failure(
         )
 
 
+async def _mark_media_provider_credential_failure(
+    credential_id: uuid.UUID,
+    error: Exception,
+    *,
+    provider: str,
+    modality: str,
+    model: str | None = None,
+) -> None:
+    if provider == "minimax":
+        await _mark_minimax_tool_credential_failure(
+            credential_id,
+            error,
+            modality=modality,
+            model=model,
+        )
+        return
+
+    from app.services.llm.load_balancer import (
+        mark_credential_degraded,
+        mark_credential_modality_quota_exceeded,
+        mark_credential_quota_exceeded,
+        mark_credential_rate_saturated,
+    )
+    from app.services.volcengine_agent_plan import PROVIDER
+
+    if provider != PROVIDER:
+        return
+    code = str(getattr(error, "provider_code", "") or "")
+    http_status = getattr(error, "http_status", None)
+    normalized = code.lower()
+    if http_status == 401 or normalized in {"authenticationerror", "invalidaccountstatus"}:
+        await mark_credential_degraded(credential_id, immediate=True)
+        return
+    if normalized in {
+        "accountoverdueerror",
+        "operationdenied.serviceoverdue",
+    }:
+        await mark_credential_quota_exceeded(credential_id)
+        return
+    if normalized in {"quotaexceeded", "setlimitexceeded"}:
+        await mark_credential_modality_quota_exceeded(
+            credential_id,
+            modality,
+            model=model,
+            error_code=code or "QuotaExceeded",
+        )
+        return
+    if normalized == "unsupportedmodel":
+        # Agent Plan entitlement is external provider state.  A credential can
+        # remain healthy for images while one declared video model is not
+        # actually authorized by the active subscription.  Open the existing
+        # model-scoped provider-evidence circuit so subsequent jobs fail over
+        # before submission instead of paying the same Fire-first latency on
+        # every customer request.  Explicit verification/provider success is
+        # still required to re-admit this exact model.
+        await mark_credential_modality_quota_exceeded(
+            credential_id,
+            modality,
+            model=model,
+            error_code=code or "UnsupportedModel",
+        )
+        return
+    if http_status == 429:
+        await mark_credential_rate_saturated(
+            credential_id,
+            error_code="rate_limit",
+        )
+
+
 async def _record_minimax_tool_product_issue(
     agent_id: uuid.UUID,
     modality: str,
@@ -28179,6 +28737,7 @@ async def _record_minimax_tool_product_issue(
     category: str = "media",
     severity: str = "error",
     recovery_path: str | None = None,
+    provider: str = "minimax",
 ) -> None:
     """Capture a failed media operation without storing prompt or response data."""
 
@@ -28192,6 +28751,7 @@ async def _record_minimax_tool_product_issue(
         tenant_id = None
     resolved_error_code = (
         error_code
+        or (str(getattr(error, "provider_code", "") or "") if error is not None else None)
         or (extract_minimax_code(str(error)) if error is not None else None)
         or (type(error).__name__ if error is not None else "media_operation_failed")
     )
@@ -28202,7 +28762,7 @@ async def _record_minimax_tool_product_issue(
         "usage_accounting": "Media usage accounting failed after provider completion",
     }
     await record_production_issue(
-        source="minimax_media_tool",
+        source="media_provider_tool",
         category=category,
         summary=summary_by_category.get(
             category,
@@ -28216,7 +28776,7 @@ async def _record_minimax_tool_product_issue(
         agent_id=agent_id,
         trace_id=get_trace_id(),
         metadata={
-            "provider": "minimax",
+            "provider": provider,
             "model": model,
             "modality": modality,
             "saas_tier": tier,
@@ -28230,7 +28790,11 @@ def _minimax_operation_log_level(error: Exception) -> str:
     """Return the operational log level for a MiniMax media failure."""
     from app.services.llm.failover import MINIMAX_QUOTA_CODES, extract_minimax_code
 
-    error_code = extract_minimax_code(str(error)) or "unknown"
+    error_code = (
+        str(getattr(error, "provider_code", "") or "")
+        or extract_minimax_code(str(error))
+        or "unknown"
+    )
     return "warning" if error_code in MINIMAX_QUOTA_CODES else "error"
 
 
@@ -28238,7 +28802,11 @@ def _log_minimax_operation_failure(component: str, error: Exception) -> None:
     """Keep expected provider-capacity limits out of the platform-error stream."""
     from app.services.llm.failover import extract_minimax_code
 
-    error_code = extract_minimax_code(str(error)) or "unknown"
+    error_code = (
+        str(getattr(error, "provider_code", "") or "")
+        or extract_minimax_code(str(error))
+        or "unknown"
+    )
     log = getattr(logger, _minimax_operation_log_level(error))
     log(
         "[{}] operation failed error_type={} error_code={}",
@@ -28271,6 +28839,20 @@ def _minimax_default_base_url(base_url: str | None = None) -> str:
     if normalized.lower().endswith("/v1"):
         normalized = normalized[:-3].rstrip("/")
     return normalized or "https://api.minimaxi.com"
+
+
+def _minimax_default_voice_id(text: str) -> str:
+    """Choose a reviewed system voice only when the operator left it on auto."""
+
+    has_cjk = any(
+        "\u3400" <= character <= "\u9fff"
+        for character in str(text or "")
+    )
+    return (
+        "Chinese (Mandarin)_Warm_Bestie"
+        if has_cjk
+        else "English_expressive_narrator"
+    )
 
 
 def _minimax_headers(api_key: str) -> dict[str, str]:
@@ -28416,6 +28998,39 @@ def _is_minimax_deterministic_rejection(error: BaseException) -> bool:
     return isinstance(error, MiniMaxProviderRejected)
 
 
+def _is_media_deterministic_rejection(error: BaseException) -> bool:
+    """Return true only for a reviewed provider response proving no acceptance."""
+
+    from app.services.volcengine_agent_plan import VolcengineAgentPlanRejected
+
+    return isinstance(error, (MiniMaxProviderRejected, VolcengineAgentPlanRejected))
+
+
+class MediaProviderSafeFallback(RuntimeError):
+    """One provider explicitly rejected work before acceptance; another may run."""
+
+    def __init__(self, provider: str, error: BaseException) -> None:
+        super().__init__(str(error))
+        self.provider = provider
+        self.error = error
+
+
+def _media_failover_is_safe(
+    error: BaseException,
+    *,
+    provider_request_started: bool,
+    provider_accepted: bool,
+) -> bool:
+    """Authorize failover only when no accepted/billable work can be duplicated."""
+
+    if provider_accepted:
+        return False
+    return (
+        not provider_request_started
+        or _is_media_deterministic_rejection(error)
+    )
+
+
 def _raise_for_minimax_base_resp(data: dict, default_label: str = "MiniMax API") -> None:
     base_resp = data.get("base_resp") or {}
     status_code = base_resp.get("status_code", 0)
@@ -28552,16 +29167,22 @@ def _public_only_async_client(
     )
 
     explicit_proxy = str(get_settings().HTTP_PROXY or "").strip()
-    minimax_proxy_hosts = {
+    credentialed_provider_proxy_hosts = {
         "api.minimaxi.com",
         "api.minimax.io",
         "api.minimax.chat",
+        # Agent Plan uses the same credentialed request path as MiniMax. The
+        # hostname is fixed by ``normalize_base_url`` and must use this narrow
+        # proxy path on operator networks whose TUN DNS returns fake IPs.
+        "ark.cn-beijing.volces.com",
+        # Agent Plan TTS uses a separate fixed ByteDance speech gateway.
+        "openspeech.bytedance.com",
     }
     request_hostname = str(urlsplit(url).hostname or "").lower()
-    if explicit_proxy and request_hostname in minimax_proxy_hosts:
+    if explicit_proxy and request_hostname in credentialed_provider_proxy_hosts:
         guard = TrustedProviderProxyHTTPGuard(
             url,
-            allowed_hostnames=minimax_proxy_hosts,
+            allowed_hostnames=credentialed_provider_proxy_hosts,
         )
         client_kwargs = guard.client_kwargs(proxy_url=explicit_proxy)
     else:
@@ -28680,8 +29301,10 @@ async def _generate_minimax_audio_durable(
         Awaitable[bytes],
     ],
     typed: bool = False,
+    provider: str = "minimax",
+    allow_safe_fallback: bool = False,
 ) -> ToolExecutionOutcome | str:
-    """Run MiniMax speech/music through one restart-safe settlement state machine."""
+    """Run provider speech/music through one restart-safe settlement state machine."""
 
     from app.services.media_generation import (
         create_minimax_sync_media_task_record,
@@ -28719,6 +29342,7 @@ async def _generate_minimax_audio_durable(
                 "output_content_type": content_type,
                 "sample_rate": sample_rate,
             },
+            provider=provider,
         )
         recovery_key = str((created_task.request_metadata or {}).get("recovery_asset_storage_key") or "")
         task_created = True
@@ -28759,9 +29383,10 @@ async def _generate_minimax_audio_durable(
             )
             provider_response_accepted = True
             provider_accepted = True
-        await _record_minimax_tool_success(
+        await _record_media_provider_success(
             agent_id,
             credential.id,
+            provider=provider,
             tier=tier,
             modality=modality,
             model=model,
@@ -28774,7 +29399,7 @@ async def _generate_minimax_audio_durable(
         if outcome.status == "succeeded":
             summary = (
                 f"✅ {label} generated and durably delivered: {save_path}\n"
-                f"Provider: minimax | Model: {model}\n"
+                f"Provider: {provider} | Model: {model}\n"
                 f"Task ID: {record_id}"
             )
             return _minimax_tool_result(
@@ -28787,37 +29412,40 @@ async def _generate_minimax_audio_durable(
                 output_path=getattr(outcome, "output_path", None) or save_path,
                 model=model,
                 tier=tier,
+                provider=provider,
             )
         if outcome.status == "compensated":
             summary = (
-                f"❌ MiniMax accepted the {label.lower()} request but no safe "
+                f"❌ {provider} accepted the {label.lower()} request but no safe "
                 "artifact could be recovered. Credits were refunded."
             )
             return _minimax_tool_result(
                 summary,
                 typed=typed,
                 status="failed",
-                error_code=f"minimax_{modality}_compensated",
+                error_code=f"media_{modality}_compensated",
                 agent_id=agent_id,
                 modality=modality,
                 record_id=record_id,
                 model=model,
                 tier=tier,
+                provider=provider,
             )
         summary = (
-            f"⏳ MiniMax accepted the {label.lower()} request. The durable media "
+            f"⏳ {provider} accepted the {label.lower()} request. The durable media "
             f"worker is finishing delivery (task {record_id}); do not submit it again."
         )
         return _minimax_tool_result(
             summary,
             typed=typed,
             status="unknown",
-            error_code=f"minimax_{modality}_delivery_pending",
+            error_code=f"media_{modality}_delivery_pending",
             agent_id=agent_id,
             modality=modality,
             record_id=record_id,
             model=model,
             tier=tier,
+            provider=provider,
         )
     except asyncio.CancelledError as exc:
         await _complete_media_cancellation_transition(
@@ -28846,7 +29474,7 @@ async def _generate_minimax_audio_durable(
                 model=model,
                 tier=tier,
             )
-        deterministic_rejection = _is_minimax_deterministic_rejection(exc)
+        deterministic_rejection = _is_media_deterministic_rejection(exc)
         if task_created:
             try:
                 if provider_response_accepted and not provider_accepted:
@@ -28859,13 +29487,14 @@ async def _generate_minimax_audio_durable(
                     await mark_media_generation_submission_ambiguous(record_id, exc)
             except Exception:
                 logger.exception(
-                    "[MiniMaxAudio] durable failure transition failed task_id={}",
+                    "[MediaAudio] durable failure transition failed task_id={}",
                     record_id,
                 )
         if not provider_response_accepted:
-            await _mark_minimax_tool_credential_failure(
+            await _mark_media_provider_credential_failure(
                 credential.id,
                 exc,
+                provider=provider,
                 modality=modality,
                 model=model,
             )
@@ -28877,27 +29506,39 @@ async def _generate_minimax_audio_durable(
             tier=tier,
             user_id=user_id,
             recovery_path=(f"media-task:{record_id}" if task_created else None),
+            provider=provider,
         )
+        if (
+            allow_safe_fallback
+            and not provider_response_accepted
+            and _media_failover_is_safe(
+                exc,
+                provider_request_started=provider_request_started,
+                provider_accepted=provider_accepted,
+            )
+        ):
+            raise MediaProviderSafeFallback(provider, exc) from exc
         label = "Speech" if modality == "audio" else "Music"
         if provider_accepted:
             summary = (
-                f"⏳ MiniMax accepted the {label.lower()} request. The result is held "
+                f"⏳ {provider} accepted the {label.lower()} request. The result is held "
                 f"by durable recovery (task {record_id}); do not retry."
             )
             return _minimax_tool_result(
                 summary,
                 typed=typed,
                 status="unknown",
-                error_code=f"minimax_{modality}_recovery_pending",
+                error_code=f"media_{modality}_recovery_pending",
                 agent_id=agent_id,
                 modality=modality,
                 record_id=record_id,
                 model=model,
                 tier=tier,
+                provider=provider,
             )
         if provider_response_accepted:
             summary = (
-                f"⏳ MiniMax accepted the {label.lower()} response. Its durable "
+                f"⏳ {provider} accepted the {label.lower()} response. Its durable "
                 f"recovery worker is repairing the acceptance record (task {record_id}); "
                 "do not retry."
             )
@@ -28905,40 +29546,43 @@ async def _generate_minimax_audio_durable(
                 summary,
                 typed=typed,
                 status="unknown",
-                error_code=f"minimax_{modality}_acceptance_repair_pending",
+                error_code=f"media_{modality}_acceptance_repair_pending",
                 agent_id=agent_id,
                 modality=modality,
                 record_id=record_id,
                 model=model,
                 tier=tier,
+                provider=provider,
             )
         if provider_request_started and not deterministic_rejection:
             summary = (
-                f"❌ MiniMax {label.lower()} submission outcome is uncertain. Credits "
+                f"❌ {provider} {label.lower()} submission outcome is uncertain. Credits "
                 f"remain held for reconciliation (task {record_id}); do not retry."
             )
             return _minimax_tool_result(
                 summary,
                 typed=typed,
                 status="unknown",
-                error_code=f"minimax_{modality}_submission_unknown",
+                error_code=f"media_{modality}_submission_unknown",
                 agent_id=agent_id,
                 modality=modality,
                 record_id=record_id,
                 model=model,
                 tier=tier,
+                provider=provider,
             )
-        summary = _safe_media_failure_message(f"{label} generation", "minimax", exc)
+        summary = _safe_media_failure_message(f"{label} generation", provider, exc)
         return _minimax_tool_result(
             summary,
             typed=typed,
             status="failed",
-            error_code=f"minimax_{modality}_provider_rejected",
+            error_code=f"media_{modality}_provider_rejected",
             agent_id=agent_id,
             modality=modality,
             record_id=record_id if task_created else None,
             model=model,
             tier=tier,
+            provider=provider,
         )
 
 
@@ -28969,15 +29613,31 @@ async def _generate_speech_minimax(
     profile = await load_platform_minimax_media_profile("audio", tier)
     if not profile.enabled:
         return _minimax_tool_result(
-            f"❌ MiniMax speech generation is disabled for the {tier} tier.",
+            f"❌ Speech generation is disabled for the {tier} tier.",
             typed=typed,
             status="failed",
-            error_code="minimax_audio_tier_disabled",
+            error_code="media_audio_tier_disabled",
             agent_id=agent_id,
             modality="audio",
             tier=tier,
         )
-    model = profile.model
+    billing_model = profile.model
+    quota_error = await _check_minimax_tool_allowed(
+        agent_id,
+        modality="audio",
+        tier=tier,
+    )
+    if quota_error:
+        return _minimax_tool_result(
+            quota_error,
+            typed=typed,
+            status="failed",
+            error_code="media_audio_quota_exceeded",
+            agent_id=agent_id,
+            modality="audio",
+            model=billing_model,
+            tier=tier,
+        )
     try:
         tenant_id = await _get_minimax_tenant_uuid(agent_id)
     except MinimaxBillingContextError as exc:
@@ -28985,29 +29645,11 @@ async def _generate_speech_minimax(
             f"❌ {exc}",
             typed=typed,
             status="failed",
-            error_code="minimax_billing_context_unavailable",
+            error_code="media_billing_context_unavailable",
             agent_id=agent_id,
             modality="audio",
             tier=tier,
         )
-    credential, error = await _prepare_minimax_tool_credential(
-        agent_id,
-        modality="audio",
-        tier=tier,
-        model=model,
-    )
-    if error:
-        return _minimax_tool_result(
-            error,
-            typed=typed,
-            status="failed",
-            error_code="minimax_audio_credential_unavailable",
-            agent_id=agent_id,
-            modality="audio",
-            model=model,
-            tier=tier,
-        )
-    assert credential is not None
 
     audio_format = (arguments.get("format") or config.get("format") or "mp3").strip().lower()
     if audio_format not in {"mp3", "wav", "flac"}:
@@ -29018,13 +29660,16 @@ async def _generate_speech_minimax(
             error_code="invalid_tool_arguments",
             agent_id=agent_id,
             modality="audio",
-            model=model,
+            model=billing_model,
             tier=tier,
         )
 
     from app.services.provider_pricing import minimax_tts_credits
 
-    credit_cost = minimax_tts_credits(model, characters=len(text))
+    # Credits remain the stable Astra product contract while the execution
+    # provider is selected server-side. Provider-specific supplier economics
+    # are measured separately during the Agent Plan canary.
+    credit_cost = minimax_tts_credits(billing_model, characters=len(text))
     try:
         await _check_minimax_credit_amount(tenant_id, credit_cost)
     except Exception as exc:
@@ -29035,10 +29680,10 @@ async def _generate_speech_minimax(
                 f"⚠️ {exc.message}",
                 typed=typed,
                 status="failed",
-                error_code="minimax_audio_quota_exceeded",
+                error_code="media_audio_quota_exceeded",
                 agent_id=agent_id,
                 modality="audio",
-                model=model,
+                model=billing_model,
                 tier=tier,
             )
         raise
@@ -29055,38 +29700,134 @@ async def _generate_speech_minimax(
         "wav": "audio/wav",
         "flac": "audio/flac",
     }[audio_format]
-    sample_rate = int(profile.sample_rate or 32000)
-    return await _generate_minimax_audio_durable(
-        agent_id=agent_id,
-        user_id=user_id,
-        session_id=session_id,
-        tenant_id=tenant_id,
-        credential=credential,
-        modality="audio",
-        tier=tier,
-        model=model,
-        credit_cost=credit_cost,
-        save_path=save_path,
-        audio_format=audio_format,
-        content_type=content_type,
-        sample_rate=sample_rate,
-        provider_call=lambda on_accepted, on_request_started: _minimax_tts_http(
-            api_key=credential.api_key,
-            base_url=credential.base_url,
-            model=model,
-            text=text,
-            voice_id=(arguments.get("voice_id") or config.get("voice_id") or "English_expressive_narrator"),
-            audio_format=audio_format,
-            speed=float(config.get("speed") or 1.0),
-            volume=float(config.get("volume") or config.get("vol") or 1.0),
-            pitch=int(config.get("pitch") or 0),
-            sample_rate=sample_rate,
-            bitrate=int(profile.bitrate or 128000),
-            language_boost=config.get("language_boost") or "auto",
-            on_provider_request_started=on_request_started,
-            on_provider_accepted=on_accepted,
-        ),
+    minimax_sample_rate = int(profile.sample_rate or 32000)
+    requested_voice_id = str(arguments.get("voice_id") or "").strip()
+    configured_voice_id = str(config.get("voice_id") or "").strip()
+    if requested_voice_id:
+        voice_id = requested_voice_id
+    elif configured_voice_id.lower() not in {
+        "",
+        "auto",
+        "english_expressive_narrator",
+    }:
+        voice_id = configured_voice_id
+    else:
+        # ``English_expressive_narrator`` was the historical global default.
+        # Treat it as auto only when the caller did not explicitly request it,
+        # so existing Chinese tenants stop receiving an English persona.
+        voice_id = _minimax_default_voice_id(text)
+
+    from app.services.llm.load_balancer import NoCredentialAvailable
+    from app.services.media_provider_routing import (
+        DEFAULT_MEDIA_PROVIDER_ORDER,
+        prepare_media_provider,
+    )
+    from app.services.volcengine_agent_plan import (
+        PROVIDER as VOLCENGINE_AGENT_PLAN_PROVIDER,
+        TTS_DEFAULT_SPEAKER,
+        generate_speech as generate_volcengine_speech,
+    )
+
+    provider_errors: list[str] = []
+    for index, candidate in enumerate(DEFAULT_MEDIA_PROVIDER_ORDER):
+        try:
+            credential = await prepare_media_provider(
+                candidate,
+                modality="audio",
+                saas_tier=tier,
+                minimax_model=billing_model,
+            )
+        except (NoCredentialAvailable, ValueError) as exc:
+            provider_errors.append(f"{candidate}:{type(exc).__name__}")
+            await _record_minimax_tool_product_issue(
+                agent_id,
+                "audio",
+                error=exc,
+                model=billing_model,
+                tier=tier,
+                user_id=user_id,
+                category="credential",
+                provider=candidate,
+            )
+            continue
+
+        provider = credential.provider
+        if provider == VOLCENGINE_AGENT_PLAN_PROVIDER:
+            configured_fire_speaker = str(config.get("volcengine_voice_id") or "").strip()
+            fire_speaker = (
+                requested_voice_id
+                if requested_voice_id.endswith("bigtts")
+                else configured_fire_speaker or TTS_DEFAULT_SPEAKER
+            )
+            provider_sample_rate = 24000
+
+            def provider_call(on_accepted, on_request_started):
+                return generate_volcengine_speech(
+                    api_key=credential.api_key,
+                    text=text,
+                    speaker=fire_speaker,
+                    audio_format=audio_format,
+                    sample_rate=provider_sample_rate,
+                    on_provider_request_started=on_request_started,
+                    on_provider_accepted=on_accepted,
+                )
+        else:
+            provider_sample_rate = minimax_sample_rate
+
+            def provider_call(on_accepted, on_request_started):
+                return _minimax_tts_http(
+                    api_key=credential.api_key,
+                    base_url=credential.base_url,
+                    model=credential.model,
+                    text=text,
+                    voice_id=voice_id,
+                    audio_format=audio_format,
+                    speed=float(config.get("speed") or 1.0),
+                    volume=float(config.get("volume") or config.get("vol") or 1.0),
+                    pitch=int(config.get("pitch") or 0),
+                    sample_rate=provider_sample_rate,
+                    bitrate=int(profile.bitrate or 128000),
+                    language_boost=config.get("language_boost") or "auto",
+                    on_provider_request_started=on_request_started,
+                    on_provider_accepted=on_accepted,
+                )
+        try:
+            return await _generate_minimax_audio_durable(
+                agent_id=agent_id,
+                user_id=user_id,
+                session_id=session_id,
+                tenant_id=tenant_id,
+                credential=credential,
+                modality="audio",
+                tier=tier,
+                model=credential.model,
+                credit_cost=credit_cost,
+                save_path=save_path,
+                audio_format=audio_format,
+                content_type=content_type,
+                sample_rate=provider_sample_rate,
+                provider_call=provider_call,
+                typed=typed,
+                provider=provider,
+                allow_safe_fallback=index < len(DEFAULT_MEDIA_PROVIDER_ORDER) - 1,
+            )
+        except MediaProviderSafeFallback as exc:
+            provider_errors.append(f"{candidate}:{type(exc.error).__name__}")
+            continue
+
+    logger.warning(
+        "[GenerateSpeech] no platform media provider available routes={}",
+        provider_errors,
+    )
+    return _minimax_tool_result(
+        "❌ Speech generation is temporarily unavailable. No provider accepted the request and no Credits were consumed.",
         typed=typed,
+        status="failed",
+        error_code="media_audio_provider_unavailable",
+        agent_id=agent_id,
+        modality="audio",
+        model=billing_model,
+        tier=tier,
     )
 
 
@@ -29240,6 +29981,118 @@ async def _generate_music_minimax(
     )
 
 
+async def _compose_video_audio(
+    agent_id: uuid.UUID,
+    ws: Path,
+    arguments: dict,
+    *,
+    typed: bool = False,
+) -> ToolExecutionOutcome | str:
+    """Mix workspace speech/music into a real browser-safe MP4."""
+
+    video_path = _canonical_media_workspace_path(
+        str(arguments.get("video_path") or "")
+    )
+    voiceover_path = _canonical_media_workspace_path(
+        str(arguments.get("voiceover_path") or "")
+    )
+    music_path = _canonical_media_workspace_path(
+        str(arguments.get("music_path") or "")
+    )
+    if not video_path:
+        outcome = _typed_failure(
+            "compose_video_audio requires video_path.",
+            "invalid_tool_arguments",
+        )
+        return outcome if typed else _legacy_tool_outcome_text(
+            outcome,
+            fallback="Video audio composition failed.",
+        )
+    if not voiceover_path and not music_path:
+        outcome = _typed_failure(
+            "compose_video_audio requires voiceover_path or music_path.",
+            "invalid_tool_arguments",
+        )
+        return outcome if typed else _legacy_tool_outcome_text(
+            outcome,
+            fallback="Video audio composition failed.",
+        )
+
+    try:
+        source_video = _resolve_workspace_read_path(ws, video_path)
+        if not source_video.is_file() or source_video.suffix.lower() != ".mp4":
+            raise ValueError("video_path must point to an existing workspace .mp4 file")
+
+        def audio_input(path_value: str, label: str) -> tuple[Path, str] | None:
+            if not path_value:
+                return None
+            path = _resolve_workspace_read_path(ws, path_value)
+            audio_format = path.suffix.lower().lstrip(".")
+            if not path.is_file() or audio_format not in {"mp3", "wav", "flac"}:
+                raise ValueError(
+                    f"{label} must point to an existing workspace MP3, WAV, or FLAC file"
+                )
+            return path, audio_format
+
+        voice_input = audio_input(voiceover_path, "voiceover_path")
+        music_input = audio_input(music_path, "music_path")
+        output_rel, output_path = _resolve_workspace_output_path(
+            ws,
+            arguments.get("save_path"),
+            "workspace/videos",
+            "composed_video",
+            "mp4",
+            source_video.stem,
+        )
+        from app.services.media_assets import compose_video_audio_tracks
+
+        result, receipt = await compose_video_audio_tracks(
+            source_video.read_bytes(),
+            voiceover_raw=voice_input[0].read_bytes() if voice_input else None,
+            voiceover_format=voice_input[1] if voice_input else None,
+            music_raw=music_input[0].read_bytes() if music_input else None,
+            music_format=music_input[1] if music_input else None,
+            voiceover_start_seconds=float(
+                arguments.get("voiceover_start_seconds") or 0
+            ),
+            voiceover_gain=float(arguments.get("voiceover_gain") or 1),
+            music_gain=float(arguments.get("music_gain") or 0.16),
+            keep_source_audio=bool(arguments.get("keep_source_audio", False)),
+        )
+        output_path.write_bytes(result)
+    except Exception as error:
+        outcome = _typed_failure(
+            f"Video audio composition failed: {type(error).__name__}.",
+            "video_audio_composition_failed",
+            metadata={"operation": "video_audio_composition"},
+        )
+        return outcome if typed else _legacy_tool_outcome_text(
+            outcome,
+            fallback="Video audio composition failed.",
+        )
+
+    artifact_ref = _workspace_artifact_ref(agent_id, output_rel)
+    receipt_payload = {
+        "status": "succeeded",
+        "workspace_path": output_rel,
+        **receipt.as_dict(),
+    }
+    outcome = _typed_success(
+        json.dumps(receipt_payload, ensure_ascii=False, sort_keys=True),
+        result_ref=artifact_ref,
+        artifact_refs=(artifact_ref,),
+        metadata={
+            "operation": "video_audio_composition",
+            "modality": "video",
+            "workspace_path": output_rel,
+            "audio_mix_receipt": receipt.as_dict(),
+        },
+    )
+    if typed:
+        return outcome
+    return f"✅ Composed video saved to {output_rel}"
+
+
 def _write_minimax_video_metadata_best_effort(
     path: Path,
     metadata: dict[str, Any],
@@ -29267,6 +30120,7 @@ async def _generate_video_minimax(
     saas_tier: str | None = None,
     session_id: str = "",
     typed: bool = False,
+    _provider_index: int = 0,
 ) -> ToolExecutionOutcome | str:
     prompt = (arguments.get("prompt") or "").strip()
     if not prompt:
@@ -29431,11 +30285,35 @@ async def _generate_video_minimax(
         prompt_optimizer = True
     if overlay_text.strip() or brand_asset:
         prompt_optimizer = False
+    video_ratio = str(
+        arguments.get("aspect_ratio")
+        or arguments.get("ratio")
+        or "16:9"
+    ).strip()
+    if video_ratio not in {
+        "16:9",
+        "9:16",
+        "1:1",
+        "4:3",
+        "3:4",
+        "21:9",
+        "adaptive",
+    }:
+        return _minimax_tool_result(
+            "❌ Unsupported video aspect ratio",
+            typed=typed,
+            status="failed",
+            error_code="invalid_tool_arguments",
+            agent_id=agent_id,
+            modality="video",
+            tier=tier,
+        )
 
     # MiniMax documents first+last frame mode only for Hailuo-02. Resolve the
     # concrete model before account selection so one exhausted video model does
     # not unnecessarily block another.
     model = "MiniMax-Hailuo-02" if last_frame_image else profile.model
+    billing_model = model
     try:
         tenant_id = await _get_minimax_tenant_uuid(agent_id)
     except MinimaxBillingContextError as exc:
@@ -29449,24 +30327,80 @@ async def _generate_video_minimax(
             model=model,
             tier=tier,
         )
-    credential, error = await _prepare_minimax_tool_credential(
-        agent_id,
-        modality="video",
-        tier=tier,
-        model=model,
+    from app.services.llm.load_balancer import NoCredentialAvailable
+    from app.services.media_provider_routing import (
+        DEFAULT_MEDIA_PROVIDER_ORDER,
+        prepare_media_provider,
     )
-    if error:
+
+    credential = None
+    selected_provider_index = max(int(_provider_index), 0)
+    provider_route_errors: list[str] = []
+    for candidate_index in range(selected_provider_index, len(DEFAULT_MEDIA_PROVIDER_ORDER)):
+        candidate = DEFAULT_MEDIA_PROVIDER_ORDER[candidate_index]
+        try:
+            credential = await prepare_media_provider(
+                candidate,
+                modality="video",
+                saas_tier=tier,
+                minimax_model=billing_model,
+            )
+            selected_provider_index = candidate_index
+            break
+        except (NoCredentialAvailable, ValueError) as exc:
+            provider_route_errors.append(f"{candidate}:{type(exc).__name__}")
+            await _record_minimax_tool_product_issue(
+                agent_id,
+                "video",
+                error=exc,
+                model=billing_model,
+                tier=tier,
+                user_id=user_id,
+                category="credential",
+                provider=candidate,
+            )
+    if credential is None:
+        logger.warning(
+            "[GenerateVideo] no platform media provider available routes={}",
+            provider_route_errors,
+        )
         return _minimax_tool_result(
-            error,
+            "❌ Video generation is temporarily unavailable. No provider accepted the request and no Credits were consumed.",
             typed=typed,
             status="failed",
-            error_code="minimax_credential_unavailable",
+            error_code="media_video_provider_unavailable",
             agent_id=agent_id,
             modality="video",
-            model=model,
+            model=billing_model,
             tier=tier,
         )
-    assert credential is not None
+    media_provider = credential.provider
+    model = credential.model
+    if media_provider == "minimax":
+        from app.services.media_provider_routing import (
+            minimax_video_requires_first_frame,
+        )
+
+        if minimax_video_requires_first_frame(
+            video_ratio,
+            first_frame_image,
+        ):
+            return _minimax_tool_result(
+                "❌ MiniMax cannot guarantee this video aspect ratio from text alone. "
+                "Generate or provide a first-frame image with the requested dimensions, "
+                "then retry as image-to-video. No Credits were consumed.",
+                typed=typed,
+                status="failed",
+                error_code="media_video_requires_first_frame_for_aspect_ratio",
+                agent_id=agent_id,
+                modality="video",
+                model=model,
+                tier=tier,
+                provider=media_provider,
+                runtime_metadata={
+                    "requested_aspect_ratio": video_ratio,
+                },
+            )
 
     duration, resolution = constrain_minimax_video_request(
         tier,
@@ -29474,6 +30408,9 @@ async def _generate_video_minimax(
         arguments.get("duration"),
         arguments.get("resolution"),
     )
+    billing_resolution = resolution
+    if media_provider == "volcengine_agent_plan":
+        resolution = credential.resolution or resolution
     wait_for_completion = bool(arguments.get("wait_for_completion") or config.get("wait_for_completion") or False)
     poll_timeout_seconds = int(arguments.get("poll_timeout_seconds") or config.get("poll_timeout_seconds") or 180)
     provider_prompt = prompt
@@ -29483,9 +30420,7 @@ async def _generate_video_minimax(
             "watermarks, product packaging, or product replicas. Leave clear negative space for Astra to add "
             "the exact copy and protected brand asset after generation."
         )
-    sanitize_generated_background = bool(
-        brand_asset or (overlay_text.strip() and not first_frame_image and not last_frame_image)
-    )
+    sanitize_generated_background = False
 
     reservation_id: uuid.UUID | None = None
     record_id: uuid.UUID | None = None
@@ -29512,7 +30447,11 @@ async def _generate_video_minimax(
         )
         from app.services.provider_pricing import minimax_video_credits
 
-        credit_cost = minimax_video_credits(model, duration=duration, resolution=resolution)
+        credit_cost = minimax_video_credits(
+            billing_model,
+            duration=duration,
+            resolution=billing_resolution,
+        )
         await validate_media_origin_session(
             origin_session_id=session_id,
             agent_id=agent_id,
@@ -29531,6 +30470,7 @@ async def _generate_video_minimax(
                 agent_id,
                 record_id,
                 extension,
+                provider=media_provider,
             )
         output_path, _ = _resolve_workspace_output_path(
             ws,
@@ -29559,6 +30499,8 @@ async def _generate_video_minimax(
             "prompt": prompt,
             "duration": duration,
             "resolution": resolution,
+            "aspect_ratio": video_ratio,
+            "require_audio": bool(arguments.get("require_audio")),
             "created_at": created_at,
             "generation_mode": "first_last_frame"
             if last_frame_image
@@ -29594,6 +30536,7 @@ async def _generate_video_minimax(
             metadata_path=meta_path,
             output_path=output_path,
             request_metadata=request_metadata,
+            provider=media_provider,
         )
         reservation_id = created_task.reservation_id
         if brand_asset and frozen_brand_key:
@@ -29609,18 +30552,35 @@ async def _generate_video_minimax(
             nonlocal provider_request_started
             provider_request_started = True
 
-        provider_task_id = await _minimax_create_video_task(
-            api_key=credential.api_key,
-            base_url=credential.base_url,
-            model=model,
-            prompt=provider_prompt,
-            duration=duration,
-            resolution=resolution,
-            first_frame_image=first_frame_image,
-            last_frame_image=last_frame_image,
-            prompt_optimizer=bool(prompt_optimizer),
-            on_provider_request_started=record_provider_request_started,
-        )
+        if media_provider == "volcengine_agent_plan":
+            from app.services.volcengine_agent_plan import create_video_task
+
+            provider_task_id = await create_video_task(
+                api_key=credential.api_key,
+                base_url=credential.base_url,
+                model=model,
+                prompt=provider_prompt,
+                duration=duration,
+                resolution=resolution,
+                ratio=video_ratio,
+                first_frame_image=first_frame_image,
+                last_frame_image=last_frame_image,
+                generate_audio=bool(arguments.get("require_audio")),
+                on_provider_request_started=record_provider_request_started,
+            )
+        else:
+            provider_task_id = await _minimax_create_video_task(
+                api_key=credential.api_key,
+                base_url=credential.base_url,
+                model=model,
+                prompt=provider_prompt,
+                duration=duration,
+                resolution=resolution,
+                first_frame_image=first_frame_image,
+                last_frame_image=last_frame_image,
+                prompt_optimizer=bool(prompt_optimizer),
+                on_provider_request_started=record_provider_request_started,
+            )
         try:
             await _finish_durable_media_side_effect(
                 store_minimax_video_provider_identity_evidence(
@@ -29630,6 +30590,7 @@ async def _generate_video_minimax(
                     credential_id=credential.id,
                     model=model,
                     provider_task_id=provider_task_id,
+                    provider=media_provider,
                 )
             )
         except Exception as evidence_exc:
@@ -29646,11 +30607,12 @@ async def _generate_video_minimax(
                     user_id=user_id,
                     category="provider_identity_recovery",
                     severity="critical",
+                    provider=media_provider,
                 )
             except Exception:
                 pass
         metadata = {
-            "provider": "minimax",
+            "provider": "platform_media",
             "task_record_id": str(record_id),
             "task_id": provider_task_id,
             "credential_id": str(credential.id),
@@ -29674,6 +30636,7 @@ async def _generate_video_minimax(
             durable_task = await find_media_generation_task(
                 agent_id=agent_id,
                 provider_task_id=provider_task_id,
+                provider=media_provider,
             )
             if durable_task:
                 metadata["credential_id"] = str(durable_task.credential_id or "")
@@ -29681,9 +30644,10 @@ async def _generate_video_minimax(
                 metadata["save_path"] = durable_task.output_path
                 reservation_id = durable_task.reservation_id
 
-        await _record_minimax_tool_success(
+        await _record_media_provider_success(
             agent_id,
             credential.id,
+            provider=media_provider,
             tier=tier,
             modality="video",
             model=model,
@@ -29696,12 +30660,25 @@ async def _generate_video_minimax(
         downloaded_path = None
         status = "submitted"
         if wait_for_completion:
-            status_data = await _poll_minimax_video_until_done(
-                credential,
-                provider_task_id,
-                timeout_seconds=poll_timeout_seconds,
-            )
-            status = _minimax_video_status(status_data)
+            if media_provider == "volcengine_agent_plan":
+                from app.services.volcengine_agent_plan import (
+                    normalized_video_status,
+                )
+
+                status_data = await _poll_volcengine_agent_plan_video_until_done(
+                    api_key=credential.api_key,
+                    base_url=credential.base_url,
+                    task_id=provider_task_id,
+                    timeout_seconds=poll_timeout_seconds,
+                )
+                status = normalized_video_status(status_data)
+            else:
+                status_data = await _poll_minimax_video_until_done(
+                    credential,
+                    provider_task_id,
+                    timeout_seconds=poll_timeout_seconds,
+                )
+                status = _minimax_video_status(status_data)
             metadata["status"] = status
             metadata["last_response"] = status_data
             outcome = await reconcile_minimax_video_task(
@@ -29719,7 +30696,7 @@ async def _generate_video_minimax(
                 status = "Fail"
                 metadata["status"] = "Fail"
                 metadata["reservation_status"] = "released" if reservation_id else "not_required"
-                metadata["error"] = outcome.error or "MiniMax video generation failed"
+                metadata["error"] = outcome.error or "Video generation failed"
 
         metadata_persisted = _write_minimax_video_metadata_best_effort(
             full_meta_path,
@@ -29747,11 +30724,12 @@ async def _generate_video_minimax(
                         credential_id=credential.id,
                         model=model,
                         provider_task_id=provider_task_id,
+                        provider=media_provider,
                     )
                 except Exception:
                     logger.exception("[MiniMaxVideo] cancellation identity evidence write failed")
                 accepted_metadata = {
-                    "provider": "minimax",
+                    "provider": "platform_media",
                     "task_record_id": str(record_id),
                     "task_id": provider_task_id,
                     "credential_id": str(credential.id),
@@ -29789,18 +30767,20 @@ async def _generate_video_minimax(
             tier=tier,
             user_id=user_id,
             severity="critical",
+            provider=media_provider,
         )
         return _minimax_tool_result(
             "⚠️ Video provider task identity could not be bound safely. The Credits hold was retained "
             "and an operator incident was opened; do not retry this request yet.",
             typed=typed,
             status="unknown",
-            error_code="minimax_video_identity_collision",
+            error_code="media_video_identity_collision",
             agent_id=agent_id,
             modality="video",
             record_id=record_id,
             model=model,
             tier=tier,
+            provider=media_provider,
         )
     except Exception as exc:
         from app.services.quota_guard import QuotaExceeded
@@ -29817,7 +30797,7 @@ async def _generate_video_minimax(
                 model=model,
                 tier=tier,
             )
-        provider_rejected = _is_minimax_deterministic_rejection(exc)
+        provider_rejected = _is_media_deterministic_rejection(exc)
 
         # Once the provider returned a task id, never release the reservation
         # on a transient poll/storage error. The durable worker owns recovery.
@@ -29853,9 +30833,10 @@ async def _generate_video_minimax(
                     metadata_persisted = True
                 except Exception:
                     logger.exception("[MiniMaxVideo] Failed to persist recovery metadata")
-            await _mark_minimax_tool_credential_failure(
+            await _mark_media_provider_credential_failure(
                 credential.id,
                 exc,
+                provider=media_provider,
                 modality="video",
                 model=model,
             )
@@ -29866,10 +30847,10 @@ async def _generate_video_minimax(
                 else "Workspace metadata is unavailable; durable database recovery is continuing."
             )
             return _minimax_tool_result(
-                f"⏳ MiniMax video task was submitted and automatic recovery is continuing. {metadata_notice}",
+                f"⏳ The video task was submitted and automatic recovery is continuing. {metadata_notice}",
                 typed=typed,
                 status="pending" if typed else "unknown",
-                error_code="minimax_video_recovery_pending",
+                error_code="media_video_recovery_pending",
                 agent_id=agent_id,
                 modality="video",
                 record_id=record_id,
@@ -29881,6 +30862,7 @@ async def _generate_video_minimax(
                         task_meta_path=meta_path,
                         state="retrying",
                         pending=True,
+                        provider=media_provider,
                     )
                     if typed
                     else None
@@ -29928,9 +30910,10 @@ async def _generate_video_minimax(
                 )
             except Exception:
                 pass
-        await _mark_minimax_tool_credential_failure(
+        await _mark_media_provider_credential_failure(
             credential.id,
             exc,
+            provider=media_provider,
             modality="video",
             model=model,
         )
@@ -29942,33 +30925,55 @@ async def _generate_video_minimax(
                 model=model,
                 tier=tier,
                 user_id=user_id,
+                provider=media_provider,
             )
         _log_minimax_operation_failure("MiniMaxVideo", exc)
+        if (
+            not provider_task_id
+            and _media_failover_is_safe(
+                exc,
+                provider_request_started=provider_request_started,
+                provider_accepted=bool(provider_task_id),
+            )
+            and selected_provider_index + 1 < len(DEFAULT_MEDIA_PROVIDER_ORDER)
+        ):
+            return await _generate_video_minimax(
+                agent_id,
+                ws,
+                arguments,
+                user_id=user_id,
+                saas_tier=saas_tier,
+                session_id=session_id,
+                typed=typed,
+                _provider_index=selected_provider_index + 1,
+            )
         if record_id and provider_request_started and not provider_task_id:
             return _minimax_tool_result(
-                "⚠️ MiniMax video submission outcome is uncertain. The system retained "
+                "⚠️ Video submission outcome is uncertain. The system retained "
                 "the Credits hold and opened an operator alert to prevent duplicate generation. "
                 "Please do not retry this request yet.",
                 typed=typed,
                 status="unknown",
-                error_code="minimax_video_submission_unknown",
+                error_code="media_video_submission_unknown",
                 agent_id=agent_id,
                 modality="video",
                 record_id=record_id,
                 model=model,
                 tier=tier,
+                provider=media_provider,
             )
         return _minimax_tool_result(
-            _safe_media_failure_message("Video generation", "minimax", exc),
+            _safe_media_failure_message("Video generation", "platform media", exc),
             typed=typed,
             status="failed",
-            error_code="minimax_video_generation_failed",
+            error_code="media_video_generation_failed",
             agent_id=agent_id,
             modality="video",
             record_id=record_id,
             model=model,
             tier=tier,
             retryable=not provider_rejected,
+            provider=media_provider,
         )
     finally:
         if frozen_brand_key and (not provider_request_started or provider_rejected):
@@ -29995,26 +31000,28 @@ async def _generate_video_minimax(
             output_path=downloaded_path,
             model=model,
             tier=tier,
+            provider=media_provider,
         )
     if wait_for_completion and status == "Fail":
         return _minimax_tool_result(
             _safe_media_failure_message(
                 "Video generation",
-                "minimax",
+                "platform media",
                 metadata.get("error") or "provider reported failure",
             ),
             typed=typed,
             status="failed",
-            error_code="minimax_video_generation_failed",
+            error_code="media_video_generation_failed",
             agent_id=agent_id,
             modality="video",
             record_id=record_id,
             model=model,
             tier=tier,
+            provider=media_provider,
         )
     if wait_for_completion and status != "Success":
         return _minimax_tool_result(
-            f"⏳ MiniMax video task is still {status}. {metadata_notice}\n"
+            f"⏳ The video task is still {status}. {metadata_notice}\n"
             "The system will keep checking automatically and save the video when it is ready.",
             typed=typed,
             status="pending" if typed and record_id else "succeeded",
@@ -30029,13 +31036,15 @@ async def _generate_video_minimax(
                     task_meta_path=meta_path,
                     state=str(status or "processing"),
                     pending=True,
+                    provider=media_provider,
                 )
                 if typed and record_id
                 else None
             ),
+            provider=media_provider,
         )
     return _minimax_tool_result(
-        f"✅ MiniMax video task submitted. task_id={provider_task_id}\n"
+        f"✅ Video task submitted. task_id={provider_task_id}\n"
         f"{metadata_notice}\n"
         "The system will keep checking automatically and save the video when it is ready.",
         typed=typed,
@@ -30051,10 +31060,12 @@ async def _generate_video_minimax(
                 task_meta_path=meta_path,
                 state="submitted",
                 pending=True,
+                provider=media_provider,
             )
             if typed and record_id
             else None
         ),
+        provider=media_provider,
     )
 
 
@@ -30090,7 +31101,7 @@ async def _check_video_minimax(
                 record_uuid = uuid.UUID(task_record_id)
             except ValueError:
                 return _minimax_tool_result(
-                    "❌ Invalid MiniMax video task_record_id",
+                    "❌ Invalid video task_record_id",
                     typed=typed,
                     status="failed",
                     error_code="invalid_tool_arguments",
@@ -30103,7 +31114,7 @@ async def _check_video_minimax(
             )
             if durable_task is None:
                 return _minimax_tool_result(
-                    "❌ MiniMax video task is unavailable in this Agent workspace.",
+                    "❌ Video task is unavailable in this Agent workspace.",
                     typed=typed,
                     status="failed",
                     error_code="minimax_video_task_unavailable",
@@ -30118,7 +31129,7 @@ async def _check_video_minimax(
                 full_meta_path = _resolve_workspace_read_path(ws, task_meta_path)
                 loaded = json.loads(full_meta_path.read_text(encoding="utf-8"))
                 if not isinstance(loaded, dict):
-                    raise ValueError("MiniMax video metadata must be an object")
+                    raise ValueError("Video task metadata must be an object")
                 metadata = loaded
             except Exception:
                 if durable_task is None:
@@ -30142,7 +31153,7 @@ async def _check_video_minimax(
         task_id = str(metadata.get("task_id") or "").strip()
         if durable_task is None and not task_id:
             return _minimax_tool_result(
-                "❌ Invalid MiniMax video metadata: missing task_id",
+                "❌ Invalid video metadata: missing task_id",
                 typed=typed,
                 status="failed",
                 error_code="minimax_video_metadata_invalid",
@@ -30153,9 +31164,15 @@ async def _check_video_minimax(
             )
 
         if durable_task is None:
+            metadata_provider = str(metadata.get("provider") or "").strip().lower()
             durable_task = await find_media_generation_task(
                 agent_id=agent_id,
                 provider_task_id=task_id,
+                provider=(
+                    metadata_provider
+                    if metadata_provider in {"minimax", "volcengine_agent_plan"}
+                    else None
+                ),
             )
         elif (
             task_id
@@ -30163,7 +31180,7 @@ async def _check_video_minimax(
             and task_id != durable_task.provider_task_id
         ):
             return _minimax_tool_result(
-                "❌ MiniMax video metadata does not match the durable task.",
+                "❌ Video metadata does not match the durable task.",
                 typed=typed,
                 status="failed",
                 error_code="minimax_video_metadata_mismatch",
@@ -30213,7 +31230,7 @@ async def _check_video_minimax(
                     encoding="utf-8",
                 )
             return _minimax_tool_result(
-                f"✅ MiniMax video is ready and saved to: {output_path}\n\n"
+                f"✅ Video is ready and saved to: {output_path}\n\n"
                 f"▶️ Play the video:\n![]({_agent_file_download_url(agent_id, output_path)})",
                 typed=typed,
                 status="succeeded",
@@ -30233,6 +31250,7 @@ async def _check_video_minimax(
                     if typed
                     else None
                 ),
+                provider=durable_task.provider,
             )
         if outcome.status == "failed":
             metadata["status"] = "Fail"
@@ -30243,7 +31261,7 @@ async def _check_video_minimax(
                     encoding="utf-8",
                 )
             return _minimax_tool_result(
-                _safe_media_failure_message("Video task", "minimax", outcome.error),
+                _safe_media_failure_message("Video task", "platform media", outcome.error),
                 typed=typed,
                 status="failed",
                 error_code="minimax_video_generation_failed",
@@ -30262,6 +31280,7 @@ async def _check_video_minimax(
                     if typed
                     else None
                 ),
+                provider=durable_task.provider,
             )
 
         metadata["status"] = outcome.status
@@ -30271,7 +31290,7 @@ async def _check_video_minimax(
                 encoding="utf-8",
             )
         return _minimax_tool_result(
-            "⏳ MiniMax video task is still processing. The system will continue checking automatically.",
+            "⏳ Video task is still processing. The system will continue checking automatically.",
             typed=typed,
             status="pending" if typed else "succeeded",
             agent_id=agent_id,
@@ -30289,6 +31308,7 @@ async def _check_video_minimax(
                 if typed
                 else None
             ),
+            provider=durable_task.provider,
         )
     except Exception as exc:
         await _record_minimax_tool_product_issue(
@@ -30537,6 +31557,35 @@ async def _poll_minimax_video_until_done(
     while True:
         last_response = await _minimax_query_video_task(credential.api_key, credential.base_url, task_id)
         if _minimax_video_status(last_response) in {"Success", "Fail"}:
+            return last_response
+        if datetime.now(timezone.utc) >= deadline:
+            return last_response
+        await asyncio.sleep(5)
+
+
+async def _poll_volcengine_agent_plan_video_until_done(
+    *,
+    api_key: str,
+    base_url: str,
+    task_id: str,
+    timeout_seconds: int,
+) -> dict:
+    from app.services.volcengine_agent_plan import (
+        normalized_video_status,
+        query_video_task,
+    )
+
+    deadline = datetime.now(timezone.utc) + timedelta(
+        seconds=max(timeout_seconds, 0)
+    )
+    last_response: dict = {}
+    while True:
+        last_response = await query_video_task(
+            api_key=api_key,
+            base_url=base_url,
+            task_id=task_id,
+        )
+        if normalized_video_status(last_response) in {"Success", "Fail"}:
             return last_response
         if datetime.now(timezone.utc) >= deadline:
             return last_response
@@ -31174,7 +32223,6 @@ async def _generate_image(
     model = config.get("model", "")
     api_key = config.get("api_key", "")
     base_url = config.get("base_url", "")
-    minimax_cred_id: uuid.UUID | None = None
     minimax_tier: str | None = None
     minimax_tenant_id: uuid.UUID | None = None
     minimax_credit_cost = 0
@@ -31182,8 +32230,6 @@ async def _generate_image(
 
     # MiniMax uses the central credential pool (账号池) instead of per-tool config
     if provider == "minimax":
-        from app.services.llm.load_balancer import NoCredentialAvailable, no_credential_user_message, pick_credential
-        from app.services.llm.utils import get_credential_api_key
         from app.services.minimax_media_profiles import load_platform_minimax_media_profile
         from app.services.provider_pricing import minimax_image_credits
 
@@ -31246,37 +32292,6 @@ async def _generate_image(
                     tier=minimax_tier,
                 )
             raise
-        try:
-            cred = await pick_credential(
-                "minimax",
-                modality="image",
-                quota_modality="image",
-                quota_model=model,
-            )
-            minimax_cred_id = cred.id
-            api_key = get_credential_api_key(cred)
-            base_url = _minimax_default_base_url(cred.base_url)
-        except NoCredentialAvailable as exc:
-            await _record_minimax_tool_product_issue(
-                agent_id,
-                "image",
-                error_code=exc.reason_code.value,
-                model=model,
-                tier=minimax_tier,
-                user_id=user_id,
-                category="credential",
-                severity="critical" if exc.reason_code.value == "all_unhealthy" else "error",
-            )
-            return _minimax_tool_result(
-                f"❌ {no_credential_user_message(exc)}",
-                typed=typed,
-                status="failed",
-                error_code="minimax_image_credential_unavailable",
-                agent_id=agent_id,
-                modality="image",
-                model=model,
-                tier=minimax_tier,
-            )
     elif not api_key:
         return (
             "❌ Image generation API key not configured. "
@@ -31284,30 +32299,80 @@ async def _generate_image(
         )
 
     if provider == "minimax":
-        assert minimax_cred_id is not None
         assert minimax_tenant_id is not None
-        return await _generate_image_minimax_durable(
-            agent_id=agent_id,
-            ws=ws,
-            arguments=arguments,
-            user_id=user_id,
-            session_id=session_id,
-            tenant_id=minimax_tenant_id,
-            credential_id=minimax_cred_id,
-            api_key=api_key,
-            base_url=base_url,
-            model=model or "image-01",
-            tier=minimax_tier or "lite",
-            credit_cost=minimax_credit_cost,
-            provider_prompt=provider_prompt,
-            save_path=save_path,
-            output_extension=full_save_path.suffix.lower(),
-            overlay_text=overlay_text,
-            overlay_position=overlay_position,
-            brand_asset=brand_asset,
-            brand_position=brand_position,
-            brand_scale=brand_scale,
+        from app.services.llm.load_balancer import NoCredentialAvailable
+        from app.services.media_provider_routing import (
+            DEFAULT_MEDIA_PROVIDER_ORDER,
+            prepare_media_provider,
+        )
+
+        provider_errors: list[str] = []
+        for index, candidate in enumerate(DEFAULT_MEDIA_PROVIDER_ORDER):
+            try:
+                prepared = await prepare_media_provider(
+                    candidate,
+                    modality="image",
+                    saas_tier=minimax_tier or "lite",
+                    minimax_model=model or "image-01",
+                )
+            except (NoCredentialAvailable, ValueError) as exc:
+                provider_errors.append(f"{candidate}:{type(exc).__name__}")
+                await _record_minimax_tool_product_issue(
+                    agent_id,
+                    "image",
+                    error=exc,
+                    model=model,
+                    tier=minimax_tier,
+                    user_id=user_id,
+                    category="credential",
+                    severity="error",
+                    provider=candidate,
+                )
+                continue
+            try:
+                return await _generate_image_minimax_durable(
+                    agent_id=agent_id,
+                    ws=ws,
+                    arguments=arguments,
+                    user_id=user_id,
+                    session_id=session_id,
+                    tenant_id=minimax_tenant_id,
+                    credential_id=prepared.credential_id,
+                    api_key=prepared.api_key,
+                    base_url=prepared.base_url,
+                    model=prepared.model,
+                    tier=minimax_tier or "lite",
+                    credit_cost=minimax_credit_cost,
+                    provider_prompt=provider_prompt,
+                    save_path=save_path,
+                    output_extension=full_save_path.suffix.lower(),
+                    overlay_text=overlay_text,
+                    overlay_position=overlay_position,
+                    brand_asset=brand_asset,
+                    brand_position=brand_position,
+                    brand_scale=brand_scale,
+                    typed=typed,
+                    provider=prepared.provider,
+                    provider_size=prepared.size,
+                    allow_safe_fallback=index < len(DEFAULT_MEDIA_PROVIDER_ORDER) - 1,
+                )
+            except MediaProviderSafeFallback as exc:
+                provider_errors.append(f"{candidate}:{type(exc.error).__name__}")
+                continue
+
+        logger.warning(
+            "[GenerateImage] no platform media provider available routes={}",
+            provider_errors,
+        )
+        return _minimax_tool_result(
+            "❌ Image generation is temporarily unavailable. No provider accepted the request and no Credits were consumed.",
             typed=typed,
+            status="failed",
+            error_code="media_image_provider_unavailable",
+            agent_id=agent_id,
+            modality="image",
+            model=model,
+            tier=minimax_tier,
         )
 
     try:
@@ -31365,7 +32430,7 @@ async def _generate_image(
             brand_position=brand_position,
             brand_scale=brand_scale,
             output_format=full_save_path.suffix,
-            sanitize_generated_background=bool(overlay_text.strip() or brand_asset),
+            sanitize_generated_background=False,
         )
         validate_generated_image(image_bytes)
 

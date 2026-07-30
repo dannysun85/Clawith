@@ -70,6 +70,7 @@ from .utils import (
     get_provider_spec,
 )
 from .load_balancer import (
+    CredentialUnavailableReason,
     NoCredentialAvailable,
     no_credential_user_message,
     record_credential_call,
@@ -527,6 +528,31 @@ def is_retryable_error(result: str) -> bool:
         return False
 
     return classify_error(Exception(result)) != FailoverErrorType.NON_RETRYABLE
+
+
+_CREDENTIAL_UNAVAILABLE_RETRYABLE_PREFIX = (
+    "[LLM call error] credential unavailable before provider request: "
+)
+
+
+def _credential_unavailable_result(error: NoCredentialAvailable) -> str:
+    """Encode a pre-request pool miss so the route fallback can run safely."""
+
+    return (
+        f"{_CREDENTIAL_UNAVAILABLE_RETRYABLE_PREFIX}{error.reason_code.value}|"
+        f"{no_credential_user_message(error)}"
+    )
+
+
+def _user_facing_llm_error_result(result: str) -> str:
+    """Hide internal retry signaling when no configured fallback succeeds."""
+
+    if result.startswith(_CREDENTIAL_UNAVAILABLE_RETRYABLE_PREFIX):
+        _metadata, separator, message = result.partition("|")
+        if separator and message:
+            return f"⚠️ {message}"
+        return "⚠️ 平台供应商账号暂时不可用，请稍后重试。"
+    return result
 
 
 def is_llm_error_result(result: str) -> bool:
@@ -1457,7 +1483,10 @@ async def call_llm(
             route_meta=route_meta,
             severity=("critical" if exc.reason_code.value == "all_unhealthy" else "error"),
         )
-        return f"⚠️ {no_credential_user_message(exc)}"
+        # Credential selection failed before any provider request was sent.
+        # Preserve that distinction so a configured provider fallback can run
+        # without risking duplicate model work.
+        return _credential_unavailable_result(exc)
     provider_spec = get_provider_spec(model.provider)
     if not _api_key and (provider_spec is None or provider_spec.requires_api_key):
         return "⚠️ 未配置 API key"
@@ -2023,7 +2052,7 @@ async def call_llm_with_failover(
     # No fallback available
     if fallback_model is None:
         logger.warning("[Failover] No fallback model available")
-        return primary_result
+        return _user_facing_llm_error_result(primary_result)
 
     # Runtime failover: retry with fallback model
     logger.info(f"[Failover] Retrying with fallback model: {fallback_model.provider}/{fallback_model.model}")
@@ -2076,7 +2105,12 @@ async def call_llm_with_failover(
 
     # Combine error messages if fallback also failed
     if _is_llm_error_result(fallback_result):
-        return f"⚠️ 调用模型出错: Primary: {primary_result[:80]} | Fallback: {fallback_result[:80]}"
+        primary_display = _user_facing_llm_error_result(primary_result)
+        fallback_display = _user_facing_llm_error_result(fallback_result)
+        return (
+            "⚠️ 调用模型出错: "
+            f"Primary: {primary_display[:80]} | Fallback: {fallback_display[:80]}"
+        )
 
     return fallback_result
 

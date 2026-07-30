@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Sequence
 from urllib.parse import quote
 import uuid
 
@@ -12,17 +13,34 @@ from fastapi.responses import Response
 from sqlalchemy import inspect as sa_inspect, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
+from app.config import get_settings
 from app.core.permissions import check_agent_access
 from app.core.security import get_current_user, get_current_user_from_bearer_or_browser_session
 from app.database import get_db
 from app.models.chat_session import ChatSession
-from app.models.deliverable import DeliverableArtifactRevision, DeliverableRequest
+from app.models.audit import AuditLog
+from app.models.deliverable import (
+    DeliverableArtifactRevision,
+    DeliverableQualityReview,
+    DeliverableQualityReviewAssignment,
+    DeliverableQualityReviewEvidence,
+    DeliverableRequest,
+)
 from app.models.user import User
 from app.schemas.deliverable import (
     DeliverableActionIn,
+    DeliverableApprovalReadinessOut,
     DeliverableArtifactOut,
     DeliverablePreflightIn,
+    DeliverableQualityReviewerOut,
+    DeliverableQualityReviewArtifactOut,
+    DeliverableQualityReviewAssignmentOut,
+    DeliverableQualityReviewCreate,
+    DeliverableQualityReviewEvidenceIn,
+    DeliverableQualityReviewOut,
+    DeliverableQualityReviewSubmissionIn,
     DeliverableRequestCreate,
     DeliverableRequestOut,
     DeliverableRequestUpdate,
@@ -31,6 +49,23 @@ from app.services.deliverable_artifacts import (
     DeliverableArtifactError,
     approve_deliverable_artifacts,
     read_deliverable_artifact_snapshot,
+)
+from app.services.deliverable_quality_gate import (
+    creative_quality_gate_required_for_request,
+    deliverable_approval_readiness,
+    selected_deliverable_artifacts,
+)
+from app.services.deliverable_quality_reviews import (
+    DeliverableQualityReviewError,
+    build_managed_evidence_receipt,
+    build_managed_review_contract,
+    build_reviewer_batch,
+    canonical_payload_sha256,
+    finalize_managed_review,
+    required_evidence_kinds,
+    review_creation_fingerprint,
+    reviewer_submission_fingerprint,
+    selected_artifact_hashes,
 )
 from app.services.deliverable_workflows import (
     DeliverableWorkflowError,
@@ -91,11 +126,36 @@ async def _request_out(db: AsyncSession, request: DeliverableRequest) -> Deliver
             DeliverableArtifactRevision.revision_number.desc(),
         )
     )
+    artifact_models = tuple(result.scalars().all())
     artifacts = [
         DeliverableArtifactOut.model_validate(artifact)
-        for artifact in result.scalars().all()
+        for artifact in artifact_models
     ]
-    return DeliverableRequestOut.model_validate(request).model_copy(update={"artifacts": artifacts})
+    settings = get_settings()
+    quality_gate_required = creative_quality_gate_required_for_request(
+        request,
+        enabled=settings.DELIVERABLE_CREATIVE_QUALITY_GATE_REQUIRED,
+        tenant_ids=settings.DELIVERABLE_CREATIVE_QUALITY_GATE_TENANT_IDS,
+        agent_ids=settings.DELIVERABLE_CREATIVE_QUALITY_GATE_AGENT_IDS,
+    )
+    readiness = deliverable_approval_readiness(
+        request,
+        artifact_models,
+        require_creative_quality_gate=quality_gate_required,
+    )
+    return DeliverableRequestOut.model_validate(
+        {
+            **{
+                field: getattr(request, field)
+                for field in DeliverableRequestOut.model_fields
+                if field not in {"artifacts", "approval_readiness"}
+            },
+            "artifacts": artifacts,
+            "approval_readiness": DeliverableApprovalReadinessOut(
+                **readiness.model_dump()
+            ),
+        }
+    )
 
 
 async def _owned_request(
@@ -118,6 +178,261 @@ async def _owned_request(
         raise HTTPException(status_code=404, detail="Deliverable request not found")
     await check_agent_access(db, user, request.agent_id)
     return request
+
+
+def _is_company_admin(user: User) -> bool:
+    return user.role in {"platform_admin", "org_admin"} or bool(
+        getattr(getattr(user, "identity", None), "is_platform_admin", False)
+    )
+
+
+def _quality_review_error(exc: DeliverableQualityReviewError) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"code": exc.code, "message": str(exc)},
+    )
+
+
+async def _manageable_request(
+    db: AsyncSession,
+    *,
+    request_id: uuid.UUID,
+    user: User,
+    lock: bool = False,
+) -> DeliverableRequest:
+    query = select(DeliverableRequest).where(
+        DeliverableRequest.id == request_id,
+        DeliverableRequest.tenant_id == user.tenant_id,
+    )
+    if not _is_company_admin(user):
+        query = query.where(DeliverableRequest.created_by_user_id == user.id)
+    if lock:
+        query = query.with_for_update()
+    result = await db.execute(query)
+    request = result.scalar_one_or_none()
+    if request is None:
+        raise HTTPException(status_code=404, detail="Deliverable request not found")
+    await check_agent_access(db, user, request.agent_id)
+    return request
+
+
+def _ensure_quality_review_allowlisted(request: DeliverableRequest) -> None:
+    settings = get_settings()
+    if not creative_quality_gate_required_for_request(
+        request,
+        enabled=settings.DELIVERABLE_CREATIVE_QUALITY_GATE_REQUIRED,
+        tenant_ids=settings.DELIVERABLE_CREATIVE_QUALITY_GATE_TENANT_IDS,
+        agent_ids=settings.DELIVERABLE_CREATIVE_QUALITY_GATE_AGENT_IDS,
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "deliverable_quality_review_not_allowlisted",
+                "message": "Managed quality review is not enabled for this tenant or Agent",
+            },
+        )
+
+
+async def _request_artifacts(
+    db: AsyncSession,
+    request: DeliverableRequest,
+    *,
+    lock: bool = False,
+) -> tuple[DeliverableArtifactRevision, ...]:
+    query = (
+        select(DeliverableArtifactRevision)
+        .where(
+            DeliverableArtifactRevision.tenant_id == request.tenant_id,
+            DeliverableArtifactRevision.request_id == request.id,
+        )
+        .order_by(
+            DeliverableArtifactRevision.artifact_key,
+            DeliverableArtifactRevision.revision_number.desc(),
+        )
+    )
+    if lock:
+        query = query.with_for_update()
+    result = await db.execute(query)
+    return selected_deliverable_artifacts(request, tuple(result.scalars().all()))
+
+
+async def _review_rows(
+    db: AsyncSession,
+    review: DeliverableQualityReview,
+    *,
+    lock: bool = False,
+) -> tuple[
+    tuple[DeliverableQualityReviewAssignment, ...],
+    tuple[DeliverableQualityReviewEvidence, ...],
+]:
+    assignment_query = (
+        select(DeliverableQualityReviewAssignment)
+        .where(
+            DeliverableQualityReviewAssignment.tenant_id == review.tenant_id,
+            DeliverableQualityReviewAssignment.review_id == review.id,
+        )
+        .order_by(DeliverableQualityReviewAssignment.created_at, DeliverableQualityReviewAssignment.id)
+    )
+    evidence_query = (
+        select(DeliverableQualityReviewEvidence)
+        .where(
+            DeliverableQualityReviewEvidence.tenant_id == review.tenant_id,
+            DeliverableQualityReviewEvidence.review_id == review.id,
+        )
+        .order_by(DeliverableQualityReviewEvidence.created_at, DeliverableQualityReviewEvidence.id)
+    )
+    if lock:
+        assignment_query = assignment_query.with_for_update()
+        evidence_query = evidence_query.with_for_update()
+    assignment_result = await db.execute(assignment_query)
+    evidence_result = await db.execute(evidence_query)
+    return (
+        tuple(assignment_result.scalars().all()),
+        tuple(evidence_result.scalars().all()),
+    )
+
+
+async def _review_access(
+    db: AsyncSession,
+    *,
+    review_id: uuid.UUID,
+    user: User,
+    lock: bool = False,
+) -> tuple[
+    DeliverableQualityReview,
+    DeliverableRequest,
+    tuple[DeliverableArtifactRevision, ...],
+    tuple[DeliverableQualityReviewAssignment, ...],
+    tuple[DeliverableQualityReviewEvidence, ...],
+]:
+    review_query = select(DeliverableQualityReview).where(
+        DeliverableQualityReview.id == review_id,
+        DeliverableQualityReview.tenant_id == user.tenant_id,
+    )
+    if lock:
+        review_query = review_query.with_for_update()
+    review_result = await db.execute(review_query)
+    review = review_result.scalar_one_or_none()
+    if review is None:
+        raise HTTPException(status_code=404, detail="Quality review not found")
+    request = await db.get(DeliverableRequest, review.request_id)
+    if request is None or request.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=404, detail="Quality review not found")
+    assignments, evidence = await _review_rows(db, review, lock=lock)
+    is_manager = (
+        review.created_by_user_id == user.id
+        or request.created_by_user_id == user.id
+        or _is_company_admin(user)
+    )
+    is_reviewer = any(item.reviewer_user_id == user.id for item in assignments)
+    if not is_manager and not is_reviewer:
+        raise HTTPException(status_code=404, detail="Quality review not found")
+    artifacts = await _request_artifacts(db, request, lock=lock)
+    return review, request, artifacts, assignments, evidence
+
+
+def _quality_review_out(
+    *,
+    review: DeliverableQualityReview,
+    request: DeliverableRequest,
+    artifacts: Sequence[DeliverableArtifactRevision],
+    assignments: Sequence[DeliverableQualityReviewAssignment],
+    evidence: Sequence[DeliverableQualityReviewEvidence],
+    current_user: User,
+) -> DeliverableQualityReviewOut:
+    scenario = review.scenario
+    is_manager = (
+        review.created_by_user_id == current_user.id
+        or request.created_by_user_id == current_user.id
+        or _is_company_admin(current_user)
+    )
+    visible_assignments = (
+        tuple(assignments)
+        if is_manager
+        else tuple(
+            item for item in assignments if item.reviewer_user_id == current_user.id
+        )
+    )
+    current_assignment = next(
+        (
+            item
+            for item in assignments
+            if item.reviewer_user_id == current_user.id
+        ),
+        None,
+    )
+    require_av_sync = bool((scenario.get("metadata") or {}).get("require_av_sync"))
+    receipt = review.receipt or {}
+    return DeliverableQualityReviewOut(
+        id=review.id,
+        request_id=review.request_id,
+        modality=review.modality,  # type: ignore[arg-type]
+        status=review.status,  # type: ignore[arg-type]
+        version=review.version,
+        minimum_reviewers=review.minimum_reviewers,
+        assigned_reviewer_count=review.assigned_reviewer_count,
+        submitted_reviewer_count=sum(
+            item.status == "submitted" for item in assignments
+        ),
+        artifact_hashes=dict(review.artifact_hashes),
+        brief=str(scenario.get("brief") or request.goal),
+        requirements=list(scenario.get("requirements") or []),
+        hard_gates=list(scenario.get("hard_gates") or []),
+        quality_dimensions=list(scenario.get("quality_dimensions") or []),
+        required_evidence_kinds=list(
+            required_evidence_kinds(
+                review.modality,
+                require_av_sync=require_av_sync,
+            )
+        ),
+        automated_evidence=[
+            {
+                "kind": item.kind,
+                "status": item.status,
+                "source_ref": item.source_ref if is_manager else None,
+                "findings": list((item.receipt or {}).get("findings") or []),
+            }
+            for item in evidence
+        ],
+        assignments=[
+            DeliverableQualityReviewAssignmentOut(
+                reviewer_user_id=item.reviewer_user_id,
+                reviewer_display_name=item.reviewer_display_name if is_manager else None,
+                reviewer_role=item.reviewer_role if is_manager else None,
+                status=item.status,  # type: ignore[arg-type]
+                is_current_user=item.reviewer_user_id == current_user.id,
+                submitted_at=item.submitted_at,
+            )
+            for item in visible_assignments
+        ],
+        artifacts=[
+            DeliverableQualityReviewArtifactOut(
+                id=artifact.id,
+                artifact_key=artifact.artifact_key,
+                artifact_type=artifact.artifact_type,
+                content_hash=artifact.content_hash,
+                revision_number=artifact.revision_number,
+                download_url=(
+                    f"/api/deliverables/quality-reviews/{review.id}/"
+                    f"artifacts/{artifact.id}/download"
+                ),
+            )
+            for artifact in artifacts
+            if review.artifact_hashes.get(artifact.artifact_key) == artifact.content_hash
+        ],
+        current_user_can_manage=is_manager,
+        current_user_can_submit=bool(
+            review.status == "open"
+            and current_assignment is not None
+            and current_assignment.status == "assigned"
+        ),
+        current_user_can_add_evidence=bool(
+            review.status == "open" and _is_company_admin(current_user)
+        ),
+        receipt_ref=str(receipt.get("receipt_ref")) if receipt.get("receipt_ref") else None,
+        created_at=review.created_at,
+        sealed_at=review.sealed_at,
+    )
 
 
 @router.get("/workflows")
@@ -294,6 +609,638 @@ async def get_deliverable_request(
 ):
     request = await _owned_request(db, request_id=request_id, user=current_user)
     return await _request_out(db, request)
+
+
+@router.get(
+    "/requests/{request_id}/quality-reviewers",
+    response_model=list[DeliverableQualityReviewerOut],
+)
+async def list_deliverable_quality_reviewers(
+    request_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    request = await _manageable_request(
+        db,
+        request_id=request_id,
+        user=current_user,
+    )
+    _ensure_quality_review_allowlisted(request)
+    result = await db.execute(
+        select(User)
+        .options(selectinload(User.identity))
+        .where(
+            User.tenant_id == request.tenant_id,
+            User.is_active.is_(True),
+        )
+        .order_by(User.display_name, User.id)
+    )
+    reviewers = []
+    for user in result.scalars().all():
+        reason = None
+        if user.id == request.created_by_user_id:
+            reason = "deliverable_creator_cannot_review"
+        elif user.identity_id is None or user.identity is None or not user.identity.is_active:
+            reason = "reviewer_identity_unavailable"
+        reviewers.append(
+            DeliverableQualityReviewerOut(
+                user_id=user.id,
+                display_name=user.display_name,
+                role=user.role,
+                eligible=reason is None,
+                ineligible_reason=reason,
+            )
+        )
+    return reviewers
+
+
+@router.post(
+    "/requests/{request_id}/quality-reviews",
+    response_model=DeliverableQualityReviewOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_deliverable_quality_review(
+    request_id: uuid.UUID,
+    data: DeliverableQualityReviewCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    request = await _manageable_request(
+        db,
+        request_id=request_id,
+        user=current_user,
+        lock=True,
+    )
+    _ensure_quality_review_allowlisted(request)
+    if request.version != data.expected_request_version:
+        raise HTTPException(
+            status_code=409,
+            detail="Deliverable request changed; reload before starting review",
+        )
+    if request.status != "waiting_approval" or request.current_stage != "output_review":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "deliverable_quality_review_not_ready",
+                "message": "Deliverable must be in final output review",
+            },
+        )
+    artifacts = await _request_artifacts(db, request, lock=True)
+    if len(artifacts) != len(set(request.output_contract)):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "deliverable_artifact_missing",
+                "message": "The complete artifact set is required before review can start",
+            },
+        )
+    existing_readiness = deliverable_approval_readiness(
+        request,
+        artifacts,
+        require_creative_quality_gate=True,
+    )
+    if existing_readiness.quality_status == "blocked":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "deliverable_quality_block_requires_revision",
+                "message": "A blocked artifact set must be revised before a new review",
+            },
+        )
+    if existing_readiness.quality_status in {"passed", "invalid"}:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": f"deliverable_quality_review_{existing_readiness.quality_status}",
+                "message": "The current artifact quality receipt does not permit a new review",
+            },
+        )
+
+    review_id = uuid.uuid4()
+    try:
+        scenario, package, artifact_hashes = build_managed_review_contract(
+            request,
+            artifacts,
+            review_id=str(review_id),
+        )
+    except DeliverableQualityReviewError as exc:
+        raise _quality_review_error(exc) from exc
+    fingerprint = review_creation_fingerprint(
+        request=request,
+        artifact_hashes=artifact_hashes,
+        reviewer_user_ids=[str(item) for item in data.reviewer_user_ids],
+    )
+    existing_result = await db.execute(
+        select(DeliverableQualityReview).where(
+            DeliverableQualityReview.tenant_id == request.tenant_id,
+            DeliverableQualityReview.request_id == request.id,
+            DeliverableQualityReview.client_review_id == data.client_review_id,
+        )
+    )
+    existing = existing_result.scalar_one_or_none()
+    if existing is not None:
+        if existing.request_fingerprint != fingerprint:
+            raise HTTPException(
+                status_code=409,
+                detail="client_review_id was already used for a different review",
+            )
+        review, request, artifacts, assignments, evidence = await _review_access(
+            db,
+            review_id=existing.id,
+            user=current_user,
+        )
+        return _quality_review_out(
+            review=review,
+            request=request,
+            artifacts=artifacts,
+            assignments=assignments,
+            evidence=evidence,
+            current_user=current_user,
+        )
+    open_result = await db.execute(
+        select(DeliverableQualityReview.id).where(
+            DeliverableQualityReview.request_id == request.id,
+            DeliverableQualityReview.status == "open",
+        )
+    )
+    if open_result.scalar_one_or_none() is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "deliverable_quality_review_already_open",
+                "message": "This deliverable already has an open review",
+            },
+        )
+
+    reviewer_result = await db.execute(
+        select(User)
+        .options(selectinload(User.identity))
+        .where(User.id.in_(data.reviewer_user_ids))
+    )
+    reviewer_users = tuple(reviewer_result.scalars().all())
+    if len(reviewer_users) != len(data.reviewer_user_ids):
+        raise HTTPException(status_code=422, detail="One or more reviewers do not exist")
+    by_id = {user.id: user for user in reviewer_users}
+    ordered_reviewers = tuple(by_id[item] for item in data.reviewer_user_ids)
+    identity_ids: list[uuid.UUID] = []
+    for reviewer in ordered_reviewers:
+        if (
+            reviewer.tenant_id != request.tenant_id
+            or not reviewer.is_active
+            or reviewer.identity_id is None
+            or reviewer.identity is None
+            or not reviewer.identity.is_active
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="Every reviewer must be an active user with an active identity in this tenant",
+            )
+        if reviewer.id == request.created_by_user_id:
+            raise HTTPException(
+                status_code=422,
+                detail="The deliverable creator cannot count as an independent reviewer",
+            )
+        identity_ids.append(reviewer.identity_id)
+    if len(set(identity_ids)) != len(identity_ids):
+        raise HTTPException(
+            status_code=422,
+            detail="Every reviewer must have a distinct physical identity",
+        )
+
+    review = DeliverableQualityReview(
+        id=review_id,
+        tenant_id=request.tenant_id,
+        request_id=request.id,
+        created_by_user_id=current_user.id,
+        client_review_id=data.client_review_id,
+        request_fingerprint=fingerprint,
+        modality=scenario.modality,
+        status="open",
+        minimum_reviewers=3,
+        assigned_reviewer_count=len(ordered_reviewers),
+        artifact_hashes=artifact_hashes,
+        scenario=scenario.model_dump(mode="json"),
+        review_package=package.model_dump(mode="json"),
+        version=1,
+    )
+    assignments = tuple(
+        DeliverableQualityReviewAssignment(
+            tenant_id=request.tenant_id,
+            review_id=review.id,
+            reviewer_user_id=reviewer.id,
+            reviewer_identity_id=reviewer.identity_id,
+            reviewer_display_name=reviewer.display_name,
+            reviewer_role=reviewer.role,
+            reviewer_receipt_ref=f"managed-reviewer:{review.id}:{reviewer.identity_id}",
+            status="assigned",
+        )
+        for reviewer in ordered_reviewers
+    )
+    db.add(review)
+    db.add_all(assignments)
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            agent_id=request.agent_id,
+            action="deliverable.quality_review.created",
+            details={
+                "tenant_id": str(request.tenant_id),
+                "request_id": str(request.id),
+                "review_id": str(review.id),
+                "artifact_hashes": artifact_hashes,
+                "reviewer_user_ids": [str(item.reviewer_user_id) for item in assignments],
+            },
+        )
+    )
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="A concurrent review creation changed this deliverable",
+        ) from exc
+    return _quality_review_out(
+        review=review,
+        request=request,
+        artifacts=artifacts,
+        assignments=assignments,
+        evidence=(),
+        current_user=current_user,
+    )
+
+
+@router.get(
+    "/requests/{request_id}/quality-reviews/latest",
+    response_model=DeliverableQualityReviewOut | None,
+)
+async def get_latest_deliverable_quality_review(
+    request_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    request = await _manageable_request(
+        db,
+        request_id=request_id,
+        user=current_user,
+    )
+    result = await db.execute(
+        select(DeliverableQualityReview)
+        .where(
+            DeliverableQualityReview.tenant_id == request.tenant_id,
+            DeliverableQualityReview.request_id == request.id,
+        )
+        .order_by(
+            DeliverableQualityReview.created_at.desc(),
+            DeliverableQualityReview.id.desc(),
+        )
+        .limit(1)
+    )
+    review = result.scalar_one_or_none()
+    if review is None:
+        return None
+    review, request, artifacts, assignments, evidence = await _review_access(
+        db,
+        review_id=review.id,
+        user=current_user,
+    )
+    return _quality_review_out(
+        review=review,
+        request=request,
+        artifacts=artifacts,
+        assignments=assignments,
+        evidence=evidence,
+        current_user=current_user,
+    )
+
+
+@router.get(
+    "/quality-reviews/{review_id}",
+    response_model=DeliverableQualityReviewOut,
+)
+async def get_deliverable_quality_review(
+    review_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    review, request, artifacts, assignments, evidence = await _review_access(
+        db,
+        review_id=review_id,
+        user=current_user,
+    )
+    return _quality_review_out(
+        review=review,
+        request=request,
+        artifacts=artifacts,
+        assignments=assignments,
+        evidence=evidence,
+        current_user=current_user,
+    )
+
+
+@router.post(
+    "/quality-reviews/{review_id}/submissions",
+    response_model=DeliverableQualityReviewOut,
+)
+async def submit_deliverable_quality_review(
+    review_id: uuid.UUID,
+    data: DeliverableQualityReviewSubmissionIn,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    review, request, artifacts, assignments, evidence = await _review_access(
+        db,
+        review_id=review_id,
+        user=current_user,
+        lock=True,
+    )
+    assignment = next(
+        (
+            item
+            for item in assignments
+            if item.reviewer_user_id == current_user.id
+        ),
+        None,
+    )
+    if assignment is None:
+        raise HTTPException(status_code=404, detail="Quality review not found")
+    fingerprint = reviewer_submission_fingerprint(data)
+    if assignment.status == "submitted":
+        if (
+            assignment.client_submission_id == data.client_submission_id
+            and assignment.submission_fingerprint == fingerprint
+        ):
+            return _quality_review_out(
+                review=review,
+                request=request,
+                artifacts=artifacts,
+                assignments=assignments,
+                evidence=evidence,
+                current_user=current_user,
+            )
+        raise HTTPException(
+            status_code=409,
+            detail="This reviewer has already sealed a submission",
+        )
+    if review.status != "open":
+        raise HTTPException(status_code=409, detail="Quality review is already sealed")
+    if review.version != data.expected_version:
+        raise HTTPException(
+            status_code=409,
+            detail="Quality review changed; reload before submitting",
+        )
+    if selected_artifact_hashes(artifacts) != dict(review.artifact_hashes):
+        review.status = "superseded"
+        review.sealed_at = datetime.now(UTC)
+        review.version += 1
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                agent_id=request.agent_id,
+                action="deliverable.quality_review.superseded",
+                details={
+                    "tenant_id": str(request.tenant_id),
+                    "request_id": str(request.id),
+                    "review_id": str(review.id),
+                    "reason": "artifact_hash_changed",
+                },
+            )
+        )
+        await db.flush()
+        return _quality_review_out(
+            review=review,
+            request=request,
+            artifacts=artifacts,
+            assignments=assignments,
+            evidence=evidence,
+            current_user=current_user,
+        )
+    try:
+        batch = build_reviewer_batch(review, assignment, data)
+    except DeliverableQualityReviewError as exc:
+        raise _quality_review_error(exc) from exc
+
+    assignment.client_submission_id = data.client_submission_id
+    assignment.submission_fingerprint = fingerprint
+    assignment.submission = batch.model_dump(mode="json")
+    assignment.status = "submitted"
+    assignment.submitted_at = datetime.now(UTC)
+    review.version += 1
+    try:
+        receipt = finalize_managed_review(
+            review,
+            artifacts,
+            assignments,
+            evidence,
+        )
+    except DeliverableQualityReviewError as exc:
+        raise _quality_review_error(exc) from exc
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            agent_id=request.agent_id,
+            action="deliverable.quality_review.submitted",
+            details={
+                "tenant_id": str(request.tenant_id),
+                "request_id": str(request.id),
+                "review_id": str(review.id),
+                "reviewer_user_id": str(current_user.id),
+                "client_submission_id": str(data.client_submission_id),
+                "sealed_status": receipt.status if receipt else None,
+            },
+        )
+    )
+    await db.flush()
+    return _quality_review_out(
+        review=review,
+        request=request,
+        artifacts=artifacts,
+        assignments=assignments,
+        evidence=evidence,
+        current_user=current_user,
+    )
+
+
+@router.post(
+    "/quality-reviews/{review_id}/evidence",
+    response_model=DeliverableQualityReviewOut,
+)
+async def add_deliverable_quality_review_evidence(
+    review_id: uuid.UUID,
+    data: DeliverableQualityReviewEvidenceIn,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    if not _is_company_admin(current_user):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    review, request, artifacts, assignments, evidence = await _review_access(
+        db,
+        review_id=review_id,
+        user=current_user,
+        lock=True,
+    )
+    fingerprint = canonical_payload_sha256(
+        data.model_dump(mode="json", exclude={"expected_version"})
+    )
+    existing = next(
+        (
+            item
+            for item in evidence
+            if item.submitted_by_user_id == current_user.id
+            and item.client_evidence_id == data.client_evidence_id
+        ),
+        None,
+    )
+    if existing is not None:
+        if existing.evidence_fingerprint != fingerprint:
+            raise HTTPException(
+                status_code=409,
+                detail="client_evidence_id was already used for different evidence",
+            )
+        return _quality_review_out(
+            review=review,
+            request=request,
+            artifacts=artifacts,
+            assignments=assignments,
+            evidence=evidence,
+            current_user=current_user,
+        )
+    if review.status != "open":
+        raise HTTPException(status_code=409, detail="Quality review is already sealed")
+    if review.version != data.expected_version:
+        raise HTTPException(
+            status_code=409,
+            detail="Quality review changed; reload before adding evidence",
+        )
+    if selected_artifact_hashes(artifacts) != dict(review.artifact_hashes):
+        review.status = "superseded"
+        review.sealed_at = datetime.now(UTC)
+        review.version += 1
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                agent_id=request.agent_id,
+                action="deliverable.quality_review.superseded",
+                details={
+                    "tenant_id": str(request.tenant_id),
+                    "request_id": str(request.id),
+                    "review_id": str(review.id),
+                    "reason": "artifact_hash_changed",
+                },
+            )
+        )
+        await db.flush()
+        return _quality_review_out(
+            review=review,
+            request=request,
+            artifacts=artifacts,
+            assignments=assignments,
+            evidence=evidence,
+            current_user=current_user,
+        )
+    receipt_ref = f"managed-evidence:{review.id}:{data.kind}:{data.client_evidence_id}"
+    try:
+        receipt = build_managed_evidence_receipt(
+            review,
+            kind=data.kind,
+            status=data.status,
+            source_ref=data.source_ref,
+            findings=data.findings,
+            receipt_ref=receipt_ref,
+        )
+    except DeliverableQualityReviewError as exc:
+        raise _quality_review_error(exc) from exc
+    evidence_row = DeliverableQualityReviewEvidence(
+        tenant_id=review.tenant_id,
+        review_id=review.id,
+        submitted_by_user_id=current_user.id,
+        client_evidence_id=data.client_evidence_id,
+        evidence_fingerprint=fingerprint,
+        receipt_ref=receipt_ref,
+        kind=data.kind,
+        status=data.status,
+        source_ref=data.source_ref,
+        receipt=receipt.model_dump(mode="json"),
+    )
+    db.add(evidence_row)
+    next_evidence = (*evidence, evidence_row)
+    review.version += 1
+    try:
+        quality_receipt = finalize_managed_review(
+            review,
+            artifacts,
+            assignments,
+            next_evidence,
+        )
+    except DeliverableQualityReviewError as exc:
+        raise _quality_review_error(exc) from exc
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            agent_id=request.agent_id,
+            action="deliverable.quality_review.evidence_added",
+            details={
+                "tenant_id": str(request.tenant_id),
+                "request_id": str(request.id),
+                "review_id": str(review.id),
+                "kind": data.kind,
+                "status": data.status,
+                "source_ref": data.source_ref,
+                "sealed_status": quality_receipt.status if quality_receipt else None,
+            },
+        )
+    )
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Evidence for this review kind already exists",
+        ) from exc
+    return _quality_review_out(
+        review=review,
+        request=request,
+        artifacts=artifacts,
+        assignments=assignments,
+        evidence=next_evidence,
+        current_user=current_user,
+    )
+
+
+@router.get("/quality-reviews/{review_id}/artifacts/{artifact_id}/download")
+async def download_quality_review_artifact(
+    review_id: uuid.UUID,
+    artifact_id: uuid.UUID,
+    inline: bool = False,
+    current_user: User = Depends(get_current_user_from_bearer_or_browser_session),
+    db: AsyncSession = Depends(get_db),
+):
+    review, _request, artifacts, _assignments, _evidence = await _review_access(
+        db,
+        review_id=review_id,
+        user=current_user,
+    )
+    artifact = next((item for item in artifacts if item.id == artifact_id), None)
+    if (
+        artifact is None
+        or review.artifact_hashes.get(artifact.artifact_key) != artifact.content_hash
+    ):
+        raise HTTPException(status_code=404, detail="Review artifact not found")
+    storage = get_storage_backend()
+    try:
+        data = await read_deliverable_artifact_snapshot(storage, artifact=artifact)
+    except DeliverableArtifactError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+    filename = Path(artifact.workspace_path).name or f"deliverable.{artifact.artifact_type}"
+    disposition = "inline" if inline else "attachment"
+    encoded_filename = quote(filename, safe="")
+    return Response(
+        content=data,
+        media_type=artifact.mime_type or guess_content_type(filename),
+        headers={"Content-Disposition": f"{disposition}; filename*=UTF-8''{encoded_filename}"},
+    )
 
 
 @router.get("/artifacts/{artifact_id}/download")

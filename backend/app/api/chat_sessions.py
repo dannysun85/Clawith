@@ -35,6 +35,7 @@ from app.services.agent_runtime.run_state_reader import (
 )
 from app.services.agent_runtime.tool_execution import (
     ToolExecutionError,
+    can_user_reconcile_unknown_execution,
     reconcile_unknown_tool_execution,
 )
 from app.services.participant_identity import get_or_create_user_participant
@@ -602,10 +603,14 @@ async def get_session_runtime_state(
         resume_inflight = inflight_resume_result.scalar_one_or_none() is not None
         reconciliation_result = await db.execute(
             select(AgentToolExecution)
+            .join(AgentRun, AgentRun.id == AgentToolExecution.run_id)
             .where(
                 AgentToolExecution.tenant_id == tenant_id,
-                AgentToolExecution.run_id == run.id,
                 AgentToolExecution.status == "unknown",
+                AgentRun.tenant_id == tenant_id,
+                AgentRun.agent_id == agent_id,
+                AgentRun.session_id == session_id,
+                AgentRun.runtime_thread_id == str(session_id),
             )
             .order_by(AgentToolExecution.started_at, AgentToolExecution.id)
         )
@@ -656,11 +661,7 @@ async def get_session_runtime_state(
                         and isinstance(execution.result_metadata.get("error_code"), str)
                         else None
                     ),
-                    can_reconcile=(
-                        execution.tool_name == "write_file"
-                        and execution.effect == "write"
-                        and execution.retry_policy == "conditional"
-                    ),
+                    can_reconcile=can_user_reconcile_unknown_execution(execution),
                 )
                 for execution in pending_reconciliations
             ],
@@ -735,11 +736,27 @@ async def reconcile_direct_tool_execution(
     note = body.note.strip()
     if not note:
         raise HTTPException(status_code=422, detail="reconciliation_note_required")
+    execution_result = await db.execute(
+        select(AgentToolExecution)
+        .join(AgentRun, AgentRun.id == AgentToolExecution.run_id)
+        .where(
+            AgentToolExecution.id == execution_id,
+            AgentToolExecution.tenant_id == tenant_id,
+            AgentToolExecution.status == "unknown",
+            AgentRun.tenant_id == tenant_id,
+            AgentRun.agent_id == agent_id,
+            AgentRun.session_id == session_id,
+            AgentRun.runtime_thread_id == str(session_id),
+        )
+    )
+    pending_execution = execution_result.scalar_one_or_none()
+    if pending_execution is None:
+        raise HTTPException(status_code=404, detail="Tool execution not found")
     try:
         execution = await reconcile_unknown_tool_execution(
             db,
             tenant_id=tenant_id,
-            run_id=run_id,
+            run_id=pending_execution.run_id,
             execution_id=execution_id,
             confirmed_status=(
                 "succeeded" if body.outcome == "applied" else "failed"
@@ -760,6 +777,7 @@ async def reconcile_direct_tool_execution(
                 "tenant_id": str(tenant_id),
                 "session_id": str(session_id),
                 "run_id": str(run_id),
+                "execution_run_id": str(execution.run_id),
                 "execution_id": str(execution_id),
                 "tool_name": execution.tool_name,
                 "confirmed_outcome": body.outcome,

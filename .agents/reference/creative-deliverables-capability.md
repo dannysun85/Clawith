@@ -2,7 +2,7 @@
 
 ## 文档性质
 
-本文记录 2026-07-25 仓库实现基线和已决定的目标方案。它不表示目标能力已经上线；完成状态必须按 `.agents/rules/capability-and-agent-governance.md` 分级报告。
+本文记录 2026-07-26 仓库实现基线和已决定的目标方案。它不表示目标能力已经上线；完成状态必须按 `.agents/rules/capability-and-agent-governance.md` 分级报告。
 
 底座决策：当前定制线继续以既有 v1.11.0 底座为基础，本阶段不合并新的上游 Clawith 版本；先独立完成图片、视频和 PPT 的产品能力闭环。
 
@@ -11,7 +11,7 @@
 ### 共用产品入口
 
 - `backend/app/services/deliverable_workflows.py` 已定义 `builtin.presentation.v1`、`builtin.poster.v1`、`builtin.video.v1`。
-- PPT 的 `launch_policy` 是 `agent_runtime`；海报和视频仍是 `dry_run`，当前只能保存工作说明和完成预检，不能视为正式执行闭环。
+- PPT 和视频的 `launch_policy` 是 `agent_runtime`；海报仍是 `dry_run`，当前只能保存工作说明和完成预检，不能视为正式执行闭环。视频虽然已允许启动，但仍必须以最终 MP4 Artifact 校验成功为完成条件，不能把 storyboard、Provider 拒绝或无产物的 Runtime 结束视为交付成功。
 - 用户合同不包含 provider/model；运行时根据 tenant、tier、能力和健康状态路由。
 - 请求、运行、批准、Credits 和 Workspace Artifact 应继续作为 durable truth。
 
@@ -29,7 +29,7 @@
 ### 视频
 
 - 当前已有 MiniMax Hailuo 文生视频/图生视频相关 Tool、异步任务检查、Credits 和文件验证路径。
-- 当前交付物工作流尚未开放正式 launch。
+- 当前交付物工作流已开放正式 launch，但只有 Provider 接受、媒体任务完成且最终 MP4 Artifact 通过校验时才算成功；缺失 MP4 必须 fail closed。
 - 主要缺口是 storyboard compiler、多参考/关键帧一致性、逐镜头状态、质量评分、剪辑包装和镜头级重做，不只是替换模型。
 
 ### PPT
@@ -142,11 +142,366 @@ PPT 精美的核心是“叙事结构 + 版式系统 + 可编辑数据视觉 + �
 - MiniMax 在观察期保留为可控 fallback。
 - 未达到评测门槛前不切默认路由，不因已购买套餐而倒推产品选择。
 
+### 官方 Skill 的采用边界（2026-07-26 已核验）
+
+已从 `https://skills.volces.com/skills/volcengine/agentplan` 隔离下载并审查：
+
+- `byted-ark-seedream-skill` v3.0.0，lock hash
+  `4a150ace8b7d8ffa28e7fab87ec0398e5dff72221a032ee41a3013a617329798`；
+- `byted-ark-seedance-skill` v4.0.0，lock hash
+  `cc4b905b8fbec7cc7c9fe94f16c94353a986001df03bebfcba38871b7c86b82d`。
+
+采用的是经过复核的协议和能力矩阵，不直接执行下载脚本。官方脚本会从 chat/env/OpenClaw/Hermes
+读取或保存 API Key、写用户目录、保存本地偏好并用本地文件/cron 管理任务，这些行为不适用于多租户 SaaS。
+Astra 适配必须替换为：
+
+- SaaS credential vault 和 tenant/provider capability；
+- `MediaGenerationTask`、Credits、幂等和 durable recovery；
+- tenant workspace/storage 和不可变 Artifact；
+- AgentTemplate 的最小 Skill/Tool grant；
+- server-owned provider/model routing 和审计回执。
+
+已识别并修复的关键协议差异：
+
+- Agent-facing 产品合同继续使用 `doubao-seedance-2.0` 等公开模型名；官方 Skill v4.0.0 在提交前将
+  公开名映射为版本化 Provider ID。Astra 已把该映射收进 server-owned adapter，不向 Agent 暴露，
+  也不再把低套餐返回的 `UnsupportedModel` 错判为“版本化 ID 无效”；
+- 当前 adapter 支持 `doubao-seedance-1.5-pro`、`doubao-seedance-2.0`、
+  `doubao-seedance-2.0-fast` 和 `doubao-seedance-2.0-mini`。Medium 显式路由到 1.5 Pro，
+  Large/Max 的商用质量默认使用标准 `2.0`，fast/mini 仅在速度、成本或套餐策略明确时使用；
+- `doubao-seedance-1.5-pro` 在官方套餐矩阵中已标记“即将下线”；它是当前 Medium 套餐的兼容路线，
+  不是长期商用依赖；
+- 2.0 系列仅属于 Large/Max 视频权益；本地 `plan_tier` 是管理员声明，不能替代火山控制台的真实套餐
+  权益。`UnsupportedModel` 必须进入 credential/entitlement 诊断并安全降级，不能靠猜模型名重试；
+- Seedream 连贯组图不仅需要开 `sequential_image_generation`，prompt 还必须明确张数、逐张内容和一致性约束；
+- Seedance 根据参考图/视频/音频、首尾帧、联网、draft/flex、分辨率、时长和速度需求做能力路由，
+  不是从 prompt 关键词猜模型；
+- 图片支持 1–14 张参考图和 `reference_strength`；视频首帧/尾帧必须使用明确的 `role`；
+- 整图模糊不是默认质量优化。只有检测到 Provider 伪文字且用户接受恢复处理时才可启用，
+  并必须在 receipt 中记录 `background_sanitized=true`。
+
+#### Skill、API 与 Astra Tool 的完整边界
+
+| 能力 | 官方 Skill/API | Astra 当前 Agent Tool | 决策 |
+| --- | --- | --- | --- |
+| Seedream 单图、单参考、2K/3K/4K | 支持 | 支持，按 SaaS tier server-route | 当前正式使用 |
+| Seedream 1–15 连贯组图、最多 14 参考图、`reference_strength` | 支持 | adapter 已理解；Agent Tool 仍是单 Artifact/单创意参考 | 等 multi-artifact Credits、恢复、选择和交付合同后再开放 |
+| Seedream web search、stream、prompt optimize、水印开关 | 支持 | 不作为 Agent 参数 | 保持 server-owned，交付固定无水印 |
+| Seedance 文生、首帧、首尾帧、生成音频 | 1.5/2.0 均支持 | 支持 | 当前正式协议 |
+| Seedance 1.5 Pro | 4–12 秒；480/720/1080p；固定六种比例；支持 draft/flex；不支持联网、多图/视频/音频参考、编辑/延长 | Medium 路由；已做 server-side 能力校验；Agent Tool 暂不暴露 draft/flex | 兼容接入，等待真实 Medium 权益验证 |
+| Seedance 2.0 标准 | 最长 15 秒；最高 4K；支持多模态参考、联网、编辑/延长；不支持 draft/flex | Large/Max 默认模型；当前 Tool 只开放与 1.5 共同的稳定子集 | 后续按可恢复执行单元逐项扩展 |
+| Seedance 2.0 Fast/Mini | 最长 15 秒、最高 720p；高级参考能力与 2.0 对齐 | adapter 支持但不由 Agent 猜模型 | 仅按管理员速度/成本策略路由 |
+
+图片和视频 Skill 都必须定制，但定制位置不同：
+
+- **Skill 层**：补商业 brief、真人/产品一致性、分镜、确定性文字/品牌层、实际 Artifact 质检和不可重试边界；
+- **Tool/Provider 层**：保留凭据、套餐 entitlement、模型能力矩阵、Credits、幂等、异步 task、存储和 fallback；
+- **不能复制的官方行为**：chat/env API Key 搜索、用户目录下载、偏好文件、本地 pending queue 和 cron；
+- **不能只改 prompt 的能力**：多图参考、连贯组图、视频参考、edit/extend、draft/flex。没有 Tool schema、
+  durable state、Credits 和 Artifact 合同，Skill 文案不得声称可用。
+
+本轮已把 `require_audio=false` 从 Agent Tool 一致传到 Agent Plan 请求，避免静音/旁白任务被 Provider
+隐式开启音频；同时按公开模型名先校验 1.5 Pro 能力，再映射到官方 Skill v4.0.0 的版本化 Provider ID，
+避免映射后通过字符串判断遗漏 1.5 限制。
+
+### 本地 Provider 实证（2026-07-26）
+
+以下只代表当前本地密钥和本地运行库，不代表生产已配置或已验证：
+
+- Agent Plan 文字网关已用真实调用验证三档模型：
+  `doubao-seed-2.0-mini`、`doubao-seed-2.1-turbo`、
+  `doubao-seed-evolving` 均能通过 Anthropic-compatible API 返回结构化 Tool Call；
+- SaaS 文字路由已经落成 `Agent Plan primary -> MiniMax-M3 fallback`。当本地火山凭证暂时不声明
+  `text` 能力时，同一无副作用请求在 Provider 请求前自动切换到 MiniMax 并返回成功结果；凭证能力随后恢复；
+- Agent Plan TTS 已按官方 `doubao-seed-tts-2.0` HTTP 流协议真实返回 MP3。
+  本地 Agent 完整业务流由火山文字模型规划并调用火山 TTS，`AgentRun`
+  `465c2531-31d9-4aa9-a553-be0a3458cda2` 已 `delivered`，媒体任务
+  `ad74f949-4277-4e22-adf8-6aeb11065f00` 已 `succeeded`，交付文件为
+  `workspace/audio/agent_plan_tts_business_flow_v2_ad74f9494277.mp3`；
+- 兼容期工具内部名仍是 `generate_speech_minimax`，但其产品语义已经是 provider-neutral managed route；
+  Runtime receipt 必须显示实际 `provider` 和 `model`，不得按工具名推断供应商；
+- Agent Plan 只读任务列表验证成功，说明密钥可访问 `/api/plan/v3`；
+- `doubao-seedream-5.0-lite` 真实图片生成成功，图片能力可参与本地路由；
+- 公开名和官方 Skill 版本化 ID 均已做最小 4 秒、480p 提交前探测：
+  `doubao-seedance-1.5-pro`、`doubao-seedance-2.0`、`doubao-seedance-2.0-fast`、
+  `doubao-seedance-2.0-mini` 全部返回 `UnsupportedModel`，没有创建 Provider task、没有生成费用；
+- 官方当前套餐矩阵显示：Small 无视频；Medium 仅有即将下线的 1.5 Pro；Large/Max 才有
+  Seedance 2.0/fast/mini。当前 Key 的文字、Seedream、TTS 成功且所有视频模型拒绝，与 Small 权益
+  完全一致，因此本地按 provider behavior 将账号纠正为 `plan_tier=small`、
+  `capabilities=text/image/audio`，不再保留虚假的视频 capability 或无意义 model circuit；
+- 2026-07-26 17:31 从正式“制作交付物 → 短视频”入口创建了 6 秒、9:16、真人使用产品、
+  中文旁白的 ULTRA 请求 `6e50d404-a0f5-48f8-a4ef-a0a20eab32ca`。Runtime 正确创建了
+  request-scoped storyboard，并由 provider-neutral Tool 依次检查火山和 MiniMax；火山三个
+  Seedance 2.0 model circuit 均已打开，MiniMax video circuit 为 provider error `2056`，
+  因此没有 Provider 接受、没有创建任务、没有扣 Credits、没有 MP4；
+- 同一次浏览器流暴露的“无 MP4 仍显示可批准”已修复：presentation/video Runtime 完成后统一执行
+  Artifact reconciliation。上述请求现在为 `failed/artifact_verification_failed`，
+  `last_error_code=deliverable_artifact_missing`，不再出现批准入口；
+- 视频执行 prompt 现在只允许调用一次 provider-neutral 生成 Tool，由 Tool 自己完成 Provider fallback；
+  Provider 均不接受时禁止 Agent 自行连点重试、创建 Trigger 或把 storyboard 当成交付结果；
+- 本地管理员原填写的 `plan=large` 与上述真实权益冲突，已纠正。Plan Key 本身的只读任务接口不返回
+  套餐名称；若要获得“订单级 SKU/有效期”而不是行为级判断，仍需登录控制台或使用需要火山 AK/SK
+  签名的 `GetPersonalPlan` 管理 API。再次点击通用鉴权验证不能扩大模型权益；
+- 同题 MiniMax `MiniMax-Hailuo-2.3` 文字生成视频返回 10.125 秒、1366×768、无音轨，
+  未满足 9:16 + 音频的广告硬门槛。这证明“有 fallback”不等于“fallback 能满足同一交付合同”。
+
+配置一致性边界：
+
+- 新建 Agent Plan 凭证默认声明 `text/image/audio`；Medium、Large、Max 可声明 `video`，但 Medium
+  只能路由到即将下线的 1.5 Pro，且声明值仍必须经过 Provider 实证；
+- 迁移只创建 provider model 和 SaaS route，不擅自扩大管理员已有凭证的 capabilities；
+- 本地凭证已按真实 Provider 行为收敛为 `small + text/image/audio`；
+- 生产仍需在发布变更窗口内显式配置/核验凭证 capability、套餐、额度和真实调用，当前不得标记
+  `production_verified`。
+
+### 受管 Seedream / Seedance Skill（2026-07-26 本地落地）
+
+- 新增 `volcengine-seedream-commercial`：采用官方 Seedream v3.0.0 的触发、参考图、连贯一致性和
+  提示词方法，但只允许调用 Astra 的 provider-neutral `generate_image_minimax`；
+- 新增 `volcengine-seedance-commercial`：采用官方 Seedance v4.0.0 的模型能力路由意图、首尾帧、
+  音频与异步任务规范，并补充真人广告的 timed shot plan 和实际 MP4 商用质检；
+- 两个 Skill 都保留 source/version/lock hash/reference，不复制 API Key 检测、用户目录、本地 cron、
+  pending queue 或直接 JavaScript 执行；
+- `Douyin Operations Manager` 模板已获得这两个 Skill，同时保留原有
+  `brand-safe-media` 和显式媒体 Tool grant；Skill 不授予 Tool；
+- 当前“抖音运营经理”工作区已真实同步两个 Skill 的 `SKILL.md` 与 provenance reference；
+- 当前 Small 账号下 Seedream Skill 可执行；Seedance Skill 会先服从运行时 capability，火山视频不入选，
+  MiniMax 只有在健康可用且在 Provider 接受前才可自动兜底。
+- 2026-07-26 18:45 已通过真实 Agent 会话执行 `volcengine-seedream-commercial`：
+  `volcengine_agent_plan / doubao-seedream-5.0-lite` 成功交付
+  `workspace/images/agent_plan_skill_real_person_ad_bd78482be7cb.png`。样张为 9:16 真人持杯场景，
+  无模型文字、Logo、水印和整图模糊；人物、双手和杯体可读，但杯体被模型画成带把手的智能杯，
+  说明 Skill 明显改善了商用构图和污染控制，仍不能替代真实产品参考图或品牌资产的一致性约束。
+- 同轮视频验证暴露了两项本地缺口：UI 附件标签 `images/...` 未物化为规范
+  `workspace/images/...` 路径，以及 Agent 把本地参数校验失败误当成可重试。当前已让媒体输入只接受并
+  规范化受限的 workspace 媒体根目录，同时把“任何失败均计入单次 Tool invocation budget”写入
+  Seedance Skill。重启同步后复验只运行 1 次 `generate_video_minimax`，返回
+  `media_video_provider_unavailable`；数据库 20 分钟窗口内新增视频 Provider task 数为 0，
+  Credits 消耗为 0，也没有 Trigger。
+
+### 同题豆包 Benchmark 结论（2026-07-26）
+
+固定题目、结构化验收项和样本路径记录在
+`tmp/creative-benchmark/2026-07-26-agent-plan/benchmark-plan.json`。该次结果不是“选一个总冠军”，
+而是把各交付合同的真实差距拆开：
+
+- 图片：豆包样本视觉信息更丰富，但带可见水印；其中一个版本还违反“不要出现手”的明确约束。
+  Agent Plan Seedream 能真实生成无水印图片，但仍需在同一组任务中继续量化构图、人物/产品一致性、
+  文字污染和指令遵循，不能因 Provider 可调用就宣布商用品质达标。
+- 人物广告视频：豆包 Seedance 2.0 Mini 样本为 720×1280、约 10 秒、H.264/AAC，具有连贯多镜头、
+  原生音频和更好的角色连续性，但带水印。本地 MiniMax fallback 原始视频无音轨且未直接满足竖版合同；
+  通过 `generate_speech_minimax + compose_video_audio` 可交付 768×1366、10.125 秒、H.264/AAC 的
+  旁白广告，但它不等于人物原生对白或口型同步。逐帧复核还发现：豆包样本没有表现温度显示、结尾退化为
+  单独产品陈列且存在“豆包AI生成”水印；MiniMax 样本从城市窗景跳到纯蓝摄影棚，未遵循咖啡店场景，
+  也没有温度显示。两者都不是可直接投放的商用成片；豆包只是在镜头叙事和原生声音上形成当前上界，
+  不能把“整体更好”写成“已达标”。
+- PPT：本地 8 页 PPTX 可编辑、无文本 overflow、视觉偏暗、素材少、版式重复；2026-07-27
+  逐页复核进一步发现第 5 页仍虚构材质和交互属性，因此不能再标记为“事实口径安全”。
+  豆包 8 页样本包含 67 个媒体对象、视觉更丰富，却虚构 NTC、316 不锈钢、12/24 小时保温、
+  Bluetooth 5.0、APP、渠道/KOL 等未提供事实，而且第 2–7 页发生 overflow。
+  因此本地赢在事实和结构安全，豆包赢在视觉密度；二者都未同时达到“精美 + 事实可信 + 无溢出 +
+  可编辑”的商用门槛。
+
+后续优化必须围绕上述可测差距，不允许把固定 prompt、隐藏水印、整图模糊或手工挑一张最好结果包装成
+“全面提升”。
+
+### PPT 自适应视觉合同（2026-07-28 本地第一阶段）
+
+- 正式 PPT Runtime 现在生成 server-owned `PRESENTATION_VISUAL_POLICY`，按页数、档位和 brief
+  计算最低独立图片数、最低版式数、单张图片复用上限和最低可编辑信息设计页数，不向用户暴露模板或
+  Provider 选择；
+- `slide_spec.json` 的 `adaptive-v1` 计划要求每页声明 `slide_type`、`visual_kind` 和
+  `asset_ref`。图片页必须实际渲染所声明的本地素材，可编辑图表、流程、表格和信息设计不得伪装成图片；
+- 校验器会拒绝连续重复版式、素材数量不足、图片超限复用、声明素材未出现在对应页面，以及可编辑视觉页
+  不足。旧 `slide_spec` 没有 `visual_plan_version` 时继续按 v1 合同校验，避免破坏已启动的历史 Run；
+- 8 页 Pro 图文商业提案的当前策略示例是：至少 3 张独立图片、4 种版式、单图最多用于 3 页、至少
+  2 页采用可编辑图表/流程/表格/信息设计。它是随合同计算的下限，不是固定题材或固定页面模板；
+- 本阶段只建立 `tool_ready + tests_pass` 的动态编排和 fail-closed 合同，没有再次调用付费 Provider，
+  也尚未证明任意开放场景达到商用门槛。
+
+该组同题样本只保留为**历史回归锚点**，不能成为产品支持的模式清单，也不能作为整体质量结论。
+商业产品的持续评测必须同时使用：
+
+- 滚动抽样的已授权、匿名化真实客户 brief，保留自然分布和长尾需求；
+- 按行业、目标、渠道、受众、语言、输入素材、约束类型、画幅和风格动态组合的开放场景；
+- 与开发集隔离的留出集，评测前只公开数量和 SHA-256 commitment，不公开题目正文；
+- 隐藏 Provider、model、文件路径的盲评包，评分完成后才用私有 key 归因；
+- 图片、视频和 PPT 各自的结构硬门禁，加上需求遵循、事实/身份一致性和商用可用性评分。
+
+本地 provider-free 实现位于：
+
+- `backend/app/services/creative_evaluation.py`
+- `backend/app/services/creative_sample_ingestion.py`
+- `backend/app/services/creative_artifact_evaluation.py`
+- `backend/app/services/creative_blind_review.py`
+- `backend/scripts/generate_creative_evaluation_suite.py`
+- `backend/scripts/anonymize_creative_brief_export.py`
+- `backend/scripts/inspect_creative_artifacts.py`
+- `backend/scripts/prepare_creative_blind_review.py`
+- `backend/scripts/score_creative_blind_review.py`
+- `backend/tests/test_creative_evaluation.py`
+
+2026-07-27 已完成一次只读生产抽样和历史回归盲评链路实证：
+
+- 生产 release 仍为 `1.11.8 / 1d7dd40a50bb32a0917cb66a1a7fc0a0609bdd1e`；本轮只读查询，
+  未修改生产配置或数据；
+- 最近 30 天抽样看到 PPT deliverable 2 个，以及图片/视频 Tool 执行的成功与失败记录；真实需求主要
+  仍落在 quick Tool/Media 路径，不能只抽正式 Deliverable 表；
+- 19 条生产候选 brief 已在 SSH stdout→本地 stdin 流中脱敏，原文未落盘；10 条图片、7 条视频、
+  2 条 PPT 全部保持 `pending_review`，在人工隐私/内容审核前不得进入评测集；
+- 历史同题回归按隐藏清单 provider/model/原文件名的方式打包。图片 3 个、人物广告视频 2 个、PPT
+  2 个候选均通过文件结构检查；但这只是 `manifest_and_filename_only`，二进制 metadata、可见水印、
+  文档文字和音频不会被篡改，因此历史样本不能宣称感知层完全盲；
+- 单人初审封存后再解盲：Agent Plan 图片为 `83.33/100`、达到本轮暂定 80 分线；MiniMax 图片为
+  `45.83/100`；豆包图片因可见水印被硬门禁阻断。该结果只证明一个历史 brief 上的明确差距，
+  不能外推为整体模型排名；
+- 两个视频都不商用：MiniMax 成片因虚构杯身文字阻断，豆包 Seedance 2.0 Mini 因全程水印阻断；
+  两者的对白可懂度、口型和混音仍需具备听音条件的人审；
+- 两个 PPT 都不商用：豆包样本因虚构事实、2–7 页 overflow 和无来源阻断；本地可编辑样本无
+  overflow，但仍因虚构材质/功能及无来源阻断。
+
+上述单人结果是缺陷定位证据，不是正式 Benchmark 放行。正式周期仍要求滚动已批准真实 brief、动态场景、
+隔离 holdout 和至少 3 人独立评审。
+
+固定的是同一轮比较时的 brief、硬约束、输入素材 hash、候选预算和评分合同，不固定用户题材、创意模式、
+模板或输出风格。不同 seed 必须生成不同组合；当前固定样本只能检测已知缺陷是否回归，不能被用于针对性
+调 prompt 后宣称“全面提升”。本地 `restricted-holdout.json` 的 `chmod 0600` 只证明文件分离，
+生产评测仍必须使用独立访问控制和不可由优化执行者读取的存储。
+
+商业视频必须先选择音频模式：
+
+- 镜头内人物同步对白：只允许有原生音轨能力的 Provider 路由，当前本地火山视频权益未恢复前不得承诺；
+- 旁白广告：先用竖版首帧约束图生视频，再用语音工具生成旁白，最后通过
+  `compose_video_audio` 做本地确定性混音并验证最终 MP4；
+- 静音素材：显式交付静音，不得让用户误以为语音生成失败或丢失。
+
+### 正式多人评审与感知证据（2026-07-27 本地 shadow）
+
+- 新增 `creative_review_panel.py`，把历史单人缺陷定位评分与正式商用放行分开；
+- 正式 panel 默认至少 3 名独立评审，每名评审必须完整评价所有匿名候选，评审 receipt 不能重复；
+- 硬门禁只有全体一致通过或一致失败才形成结论；缺失或分歧保持 `incomplete`，不能按多数意见静默通过；
+- 维度评分使用评审均值，但分差超过 1.5 分时保持 `incomplete` 并要求人工裁决；
+- 图片要求 `OCR + 每位评审 human_visual`，视频要求
+  `逐帧 OCR + 每位评审 human_visual + 每位评审 human_audio`，PPT 要求
+  `document_semantic + 每位评审 human_visual`；
+- 所有证据 receipt 必须绑定匿名候选的实际 Artifact SHA-256；旧文件、替换文件或 hash 不一致会
+  fail closed；
+- 新增 `collect_creative_ocr_evidence.py`，只做本地图片/视频逐帧 OCR 和私有 receipt，不调用 Provider，
+  也不自动判定商用通过；
+- 当前本机已安装 Tesseract `chi_sim`。OCR 使用稀疏文本模式、全图增强和四角增强，并对中文字符间
+  空格/符号及单字符误识别做 exact/possible 两级禁用词检查；低置信度 possible match 只进入人审，
+  exact prohibited match 会直接使 `no_unrequested_watermark` 硬门禁失败；
+- 对滚动样本重扫后，豆包图片由原先 0 token 提升为 69 token，并命中
+  `prohibited_term_possible_match=AI生成`；豆包视频 10 帧、60 个增强视图中明确命中 `豆包`，
+  同时疑似命中 `AI生成`。MiniMax 图片/视频和 Agent Plan 图片未命中同组平台水印词。这个结果同时
+  证明了“有中文语言包”仍不等于 OCR 可替代视觉人审；
+- 新增 `prepare_creative_review_panel.py`、`assemble_creative_review_panel.py` 和
+  `record_creative_human_evidence.py`。图片、视频、PPT 已分别生成 3 份隔离的 provider-free
+  评审模板，共 9 份；模板不是实际评审结果，不得冒充 3 名独立评审已经完成；
+- 对人物同步对白视频可额外要求 `human_av_sync` receipt；旁白广告不强制口型同步，但仍要求
+  `human_audio` 检查听感、失真、混音和文案一致性；
+- 新增 `score_creative_blind_review_panel.py`，只有 panel、感知证据和评分同时完整时才输出正式
+  `commercially_usable=true`。
+
+### Artifact 审批质量门禁（2026-07-27 本地 shadow）
+
+- 新增 `deliverable_quality_gate.py`，把正式 panel 结论封装为版本化 receipt，并绑定整组交付文件的
+  `artifact_key -> SHA-256`；receipt digest、文件 hash 或多文件 receipt 不一致时均拒绝批准；
+- 只有至少 3 名独立评审、所需证据齐全、无硬门禁失败、无分歧且
+  `commercially_usable=true` 的 panel 才能形成 `passed`；
+- 自动 OCR 只能把 exact prohibited finding 转成 `blocked`，不能用“未识别到水印”或
+  possible match 形成 `passed`；
+- Artifact approval 已读取该 receipt。显式 `blocked/incomplete/invalid` 即使 rollout flag 关闭
+  也会阻断；没有 receipt 时由 `DELIVERABLE_CREATIVE_QUALITY_GATE_REQUIRED=false` 加 tenant/Agent
+  双 allowlist 保持旧流程兼容。开关打开但 allowlist 为空时仍不影响任何客户；
+- API 新增 additive `approval_readiness`，前端会解释质量状态并在阻断时禁用“批准交付”；
+- 本地历史豆包视频 OCR receipt 已演练生成 hash-bound `blocked` receipt，命中硬门禁
+  `no_unrequested_watermark`；该演练不调用 Provider，也不产生付费；
+- 配置键已同步到本地 `.env.example`、部署 `.env.example` 和现有三个 compose 文件，默认均为
+  `false + empty allowlists`，尚未修改生产环境。
+
+2026-07-27 后续已补齐本地受管评审层：
+
+- 新增评审批次、分配和 evidence 持久化模型与 Alembic migration；
+- reviewers/create/latest/get/submit/evidence API 在服务端执行 tenant、assignment、交付创建者排除、
+  `Identity` 去重、完整性和幂等约束；
+- 每份评审绑定 Artifact 版本和 SHA-256；相同提交可安全重放，不同提交不能覆盖已封存判断；
+- 管理员可写入受审计的私有 evidence ref；自动 finding 只能阻断，不能单独产生 `passed`；
+- 前端交付卡片和独立评审工作台已接入，rollout 仍受
+  `DELIVERABLE_CREATIVE_QUALITY_GATE_REQUIRED` 与 tenant/Agent 双 allowlist 控制。
+
+真实浏览器验证使用原开发库的隔离副本，不消耗 Provider Credits：
+
+- PPT 批次由三名不同 Identity 的非创建者逐一登录，状态从 `0/3 open` 到
+  `3/3 passed`，并生成 `managed-panel:<review_id>:<version>` 服务端 receipt；
+- 视频批次在 0 名人工提交时绑定精确
+  `prohibited_term_detected=sample-watermark` 的逐帧 OCR evidence，立即进入
+  `0/3 blocked`，证明自动证据只负责 fail closed；
+- 随后应用切回原开发库，确认原库 `deliverable_quality_reviews` 仍为 0；隔离数据库、SQL seed 和
+  dump 均已删除；
+- 原开发组织实际只有两名合格非创建者，页面显示创建者不可选择、
+  `创建评审 (2)` disabled、`批准交付` disabled。这是当前真实组织配置的正确阻断，不得通过复用账号
+  或伪造评审 receipt 绕过。
+
+因此当前可以分别标记：
+
+- `code_exists=true`
+- `tests_pass=true`
+- `migration_smoke_passed=true`
+- `local_review_state_transitions_proven=true`
+- `local_main_tenant_full_approval_clickthrough=false`
+- `provider_verified` 沿用既有单项 Provider 证据，本阶段没有新付费调用
+- `production_verified=false`
+
+仍未完成的是生产隔离 evidence 服务和签名存储、生产 allowlist/迁移、真实生产评审人配置、创建者最终
+批准 clickthrough、告警/回滚演练和生产灰度。当前管理员 evidence 写入是受审计的内部 attestation；
+它可以阻断，但在接入独立 evaluator 身份、不可变对象存储和签名摘要前，不能被描述为第三方或机器独立
+证明。
+
+### 生产派生滚动 Pilot（2026-07-27 第二轮）
+
+本轮把 19 条已脱敏生产候选从 `pending_review` 进入显式人工审核：
+
+- 8 条批准、11 条需要补充信息；
+- 图片为 `7 approved / 3 needs_clarification`，视频为
+  `1 approved / 6 needs_clarification`，PPT 为
+  `0 approved / 2 needs_clarification`；
+- 重复尝试按语义 `benchmark_cluster` 去重；缺参考素材、品牌授权、受众、目标、来源或私有主体资料
+  的需求不得进入 Provider 对比；
+- 本轮只从批准集抽取一个图片 cluster 和一个视频 cluster，各 Provider 一个候选、零自动重试。
+  它是缺陷定位 pilot，不满足正式 Benchmark 的样本量和 3 人独立盲评门槛。
+
+真实同题结果：
+
+- Agent Plan `doubao-seedream-5.0-lite` 的图片细节、空间层次和 prompt 遵循明显强于
+  MiniMax `image-01`；旧 benchmark harness 将 `4K` 直接作为 size，Provider 实际返回 2:3，
+  因此该候选只能证明 Provider 画质，不能计入 3:4 正式同题分数。harness 已改为
+  `quality + aspect_ratio -> explicit pixels`；
+- 豆包 4.5 同题返回 1728×2304 的 3:4 PNG，构图和细节较强，但下载文件带可见水印；
+- 当前 Agent Plan 凭证的视频预检稳定为 `capability_mismatch`，没有 Provider task，继续证明行为级
+  `Small` 无视频权益；
+- MiniMax `MiniMax-Hailuo-2.3` 同题实得 1366×768、10.125 秒、无音轨，违反 9:16 + 音频合同；
+- 豆包 `Seedance 2.0 Mini` 同题实得 720×1280、10.08 秒、H.264/AAC，画幅和音轨满足，但带
+  “豆包AI生成”水印。
+
+MiniMax 文字生视频官方请求没有画幅字段。生产路由现在把非 16:9 视为交付合同，不再只把
+`aspect_ratio` 写入 metadata：当实际 fallback 为 MiniMax 且没有同画幅首帧时，在 Provider 提交和
+Credits 检查前返回 `media_video_requires_first_frame_for_aspect_ratio`。下一阶段应实现受管的
+`brief -> 同画幅首帧 -> I2V -> 实测画幅/音轨/水印 -> 必要时 TTS 混音 -> Artifact` 组合链，
+而不是让 Agent 自由重试或向客户隐藏错误画幅。
+
+两个生产 PPT brief 都缺少受众、目标和来源材料，其中一个还缺私有主体的可核验资料，因此本轮没有
+PPT Provider 对比。拒绝凭空补齐 brief 是评测正确性，不是 PPT 能力失败。
+
+详细私有证据保存在
+`tmp/creative-evaluation/rolling-cycle-2026-07-27/RESULTS.md`，该目录不得提交或作为公开 fixture。
+
 ## 六、验收与后续扩展
 
 图片、视频、PPT 必须用真实匿名化客户样本分别建立基线，并追踪：
 
 - 任务完成率和首轮可用率；
+- 动态场景各维度覆盖率、长尾分桶和留出集表现；
 - brief/品牌/事实遵循；
 - 人工修改次数；
 - 平均时间与单位可用 Artifact 成本；

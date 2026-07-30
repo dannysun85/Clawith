@@ -119,6 +119,7 @@ async def _sync_managed_skill(
     skill: Any,
     *,
     provisioning: str = "automatic",
+    accepted_legacy_hashes: frozenset[str] = frozenset(),
 ) -> tuple[str, int]:
     """Safely sync one registry Skill into an Agent workspace.
 
@@ -171,9 +172,13 @@ async def _sync_managed_skill(
         if actual_paths:
             if actual_paths != set(target_paths):
                 return "conflict", 0
-            if await _stored_skill_hash(storage, prefix, target_paths) != target_hash:
+            actual_hash = await _stored_skill_hash(storage, prefix, target_paths)
+            if (
+                actual_hash != target_hash
+                and actual_hash not in accepted_legacy_hashes
+            ):
                 return "conflict", 0
-            status = "adopted"
+            status = "adopted" if actual_hash == target_hash else "updated"
         else:
             status = "created"
 
@@ -192,7 +197,7 @@ async def _sync_managed_skill(
                 encoding="utf-8",
             )
             return status, 0
-        old_paths = []
+        old_paths = target_paths if status == "updated" else []
 
     for obsolete_path in sorted(set(old_paths) - set(target_paths)):
         obsolete_key = f"{prefix}/{obsolete_path}"

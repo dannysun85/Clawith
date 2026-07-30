@@ -55,6 +55,7 @@ class _Session:
         self.results = deque(results)
         self.added: list[object] = []
         self.flushes = 0
+        self.operations: list[str] = []
 
     async def get(self, model, identity):
         if model is ChatMessage and self.existing_message is not None:
@@ -63,6 +64,7 @@ class _Session:
         return None
 
     async def execute(self, _statement):
+        self.operations.append("execute")
         return _ScalarResult(self.results.popleft() if self.results else None)
 
     def add(self, value: object) -> None:
@@ -70,6 +72,7 @@ class _Session:
 
     async def flush(self) -> None:
         self.flushes += 1
+        self.operations.append("flush")
 
 
 def _settings(*, enabled: bool) -> Settings:
@@ -231,6 +234,10 @@ async def test_deliverable_request_is_server_augmented_and_linked_to_one_run() -
     )
     prepared = SimpleNamespace(request=request, prompt="SERVER_OWNED_DELIVERABLE_CONTRACT")
 
+    async def prepare_after_message_flush(*_args, **_kwargs):
+        db.operations.append("prepare")
+        return prepared
+
     with (
         patch(
             "app.services.agent_runtime.chat_intake.get_or_create_user_participant",
@@ -238,7 +245,7 @@ async def test_deliverable_request_is_server_augmented_and_linked_to_one_run() -
         ),
         patch(
             "app.services.agent_runtime.chat_intake.prepare_deliverable_launch",
-            new=AsyncMock(return_value=prepared),
+            new=AsyncMock(side_effect=prepare_after_message_flush),
         ) as prepare,
         patch(
             "app.services.agent_runtime.chat_intake.attach_deliverable_run",
@@ -283,6 +290,7 @@ async def test_deliverable_request_is_server_augmented_and_linked_to_one_run() -
     message = db.added[0]
     assert isinstance(message, ChatMessage)
     assert message.content == "开始制作这个 PPT"
+    assert db.operations[:3] == ["execute", "flush", "prepare"]
     attach.assert_called_once()
     assert attach.call_args.kwargs["run_id"] == handle.run_id
 
@@ -302,9 +310,15 @@ async def test_deliverable_request_rejects_route_tier_drift() -> None:
         prompt="SERVER_OWNED_DELIVERABLE_CONTRACT",
     )
 
-    with patch(
-        "app.services.agent_runtime.chat_intake.prepare_deliverable_launch",
-        new=AsyncMock(return_value=prepared),
+    with (
+        patch(
+            "app.services.agent_runtime.chat_intake.get_or_create_user_participant",
+            new=AsyncMock(return_value=SimpleNamespace(id=uuid.uuid4())),
+        ),
+        patch(
+            "app.services.agent_runtime.chat_intake.prepare_deliverable_launch",
+            new=AsyncMock(return_value=prepared),
+        ),
     ):
         with pytest.raises(ChatRuntimeIntakeError) as error:
             await enqueue_chat_runtime(

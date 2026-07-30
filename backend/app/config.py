@@ -282,6 +282,12 @@ class Settings(BaseSettings):
     MEDIA_GENERATION_RECONCILIATION_CONCURRENCY: int = 1
     MEDIA_GENERATION_TASK_LEASE_SECONDS: int = 30 * 60
     MEDIA_GENERATION_BRAND_RECOVERY_RETENTION_DAYS: int = 30
+    # Shadow quality-review gate for creative deliverables. Keep disabled until
+    # formal reviewer operations are ready; an explicitly attached failed or
+    # incomplete receipt remains fail-closed regardless of this rollout flag.
+    DELIVERABLE_CREATIVE_QUALITY_GATE_REQUIRED: bool = False
+    DELIVERABLE_CREATIVE_QUALITY_GATE_TENANT_IDS: str = ""
+    DELIVERABLE_CREATIVE_QUALITY_GATE_AGENT_IDS: str = ""
     PRODUCTION_ISSUE_MONITOR_ENABLED: bool = True
     PRODUCTION_ISSUE_MONITOR_INTERVAL_SECONDS: int = 30
     PRODUCTION_ISSUE_ALERT_THRESHOLD: int = 1

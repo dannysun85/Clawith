@@ -91,6 +91,7 @@ async def test_public_media_metadata_never_exposes_private_recovery_identity(mon
     assert payload["status"] == "Success"
     assert payload["prompt"] == "public prompt"
     assert payload["task_id"] == "provider-task"
+    assert payload["provider"] == "platform_media"
     assert not {
         "credential_id",
         "reservation_id",

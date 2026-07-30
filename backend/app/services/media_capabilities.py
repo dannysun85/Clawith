@@ -1,4 +1,4 @@
-"""Safe product capability view for MiniMax media generation."""
+"""Safe product capability view for platform media generation."""
 
 from __future__ import annotations
 
@@ -15,6 +15,10 @@ from app.services.minimax_media_profiles import resolve_minimax_media_profile
 from app.services.llm.load_balancer import credential_modality_is_blocked
 from app.services.modalities import canonicalize_modalities
 from app.services.tool_visibility import tool_enabled_for_agent
+from app.services.volcengine_agent_plan import (
+    PROVIDER as VOLCENGINE_AGENT_PLAN_PROVIDER,
+    plan_tier_supports_modality,
+)
 
 
 MEDIA_TOOL_NAMES: dict[str, str] = {
@@ -131,7 +135,7 @@ async def get_agent_media_capabilities(
 
     credentials_result = await db.execute(
         select(LLMCredential).where(
-            LLMCredential.provider == "minimax",
+            LLMCredential.provider.in_(("minimax", VOLCENGINE_AGENT_PLAN_PROVIDER)),
             LLMCredential.tenant_id.is_(None),
             LLMCredential.enabled == True,  # noqa: E712
             LLMCredential.status == "healthy",
@@ -144,6 +148,15 @@ async def get_agent_media_capabilities(
     pool_modalities: set[str] = set()
     for credential in credentials_result.scalars().all():
         supported = _credential_media_modalities(credential)
+        if credential.provider == VOLCENGINE_AGENT_PLAN_PROVIDER:
+            supported = {
+                modality
+                for modality in supported
+                if plan_tier_supports_modality(
+                    getattr(credential, "plan_tier", None),
+                    modality,
+                )
+            }
         pool_modalities.update(
             modality
             for modality in supported

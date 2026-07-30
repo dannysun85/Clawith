@@ -31,6 +31,7 @@ const OAuthCallback = lazy(() => import('./pages/OAuthCallback'));
 const SSOEntry = lazy(() => import('./pages/SSOEntry'));
 const OKR = lazy(() => import('./pages/OKR'));
 const GroupsPage = lazy(() => import('./pages/groups/GroupsPage'));
+const QualityReview = lazy(() => import('./pages/QualityReview'));
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
     const token = useAuthStore((s) => s.token);
@@ -337,6 +338,7 @@ export default function App() {
                     <Route path="agents/:id/chat" element={<TenantWorkspaceRoute><AgentDetail /></TenantWorkspaceRoute>} />
                     <Route path="agents/:id/directory" element={<TenantWorkspaceRoute><AgentDetail /></TenantWorkspaceRoute>} />
                     <Route path="agents/:id/settings" element={<TenantWorkspaceRoute><AgentDetail /></TenantWorkspaceRoute>} />
+                    <Route path="quality-reviews/:reviewId" element={<TenantWorkspaceRoute><QualityReview /></TenantWorkspaceRoute>} />
                     <Route path="groups" element={<TenantWorkspaceRoute><GroupsPage /></TenantWorkspaceRoute>} />
                     <Route path="groups/:groupId" element={<TenantWorkspaceRoute><GroupsPage /></TenantWorkspaceRoute>} />
                     <Route path="groups/:groupId/:sessionId" element={<TenantWorkspaceRoute><GroupsPage /></TenantWorkspaceRoute>} />

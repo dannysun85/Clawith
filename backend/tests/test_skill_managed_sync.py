@@ -180,6 +180,45 @@ async def test_managed_skill_adopts_an_exact_legacy_copy() -> None:
 
 
 @pytest.mark.asyncio
+async def test_managed_skill_upgrades_only_a_reviewed_historical_copy() -> None:
+    prefix = "agents/a/skills/example"
+    files = {"SKILL.md": "reviewed historical bytes"}
+    storage = MemoryStorage(
+        {f"{prefix}/{path}": content for path, content in files.items()}
+    )
+
+    status, changed = await _sync_managed_skill(
+        storage,
+        prefix,
+        _skill("current registry"),
+        accepted_legacy_hashes=frozenset({_skill_content_hash(files)}),
+    )
+
+    assert (status, changed) == ("updated", 1)
+    assert storage.files[f"{prefix}/SKILL.md"] == "current registry"
+    assert f"{prefix}/.astra-managed.json" in storage.files
+
+
+@pytest.mark.asyncio
+async def test_managed_skill_does_not_upgrade_unreviewed_historical_bytes() -> None:
+    prefix = "agents/a/skills/example"
+    storage = MemoryStorage({f"{prefix}/SKILL.md": "user-authored bytes"})
+
+    status, changed = await _sync_managed_skill(
+        storage,
+        prefix,
+        _skill("current registry"),
+        accepted_legacy_hashes=frozenset(
+            {_skill_content_hash({"SKILL.md": "different reviewed bytes"})}
+        ),
+    )
+
+    assert (status, changed) == ("conflict", 0)
+    assert storage.files[f"{prefix}/SKILL.md"] == "user-authored bytes"
+    assert f"{prefix}/.astra-managed.json" not in storage.files
+
+
+@pytest.mark.asyncio
 async def test_managed_skill_does_not_adopt_a_partial_folder() -> None:
     prefix = "agents/a/skills/example"
     storage = MemoryStorage({f"{prefix}/SKILL.md": "registry"})

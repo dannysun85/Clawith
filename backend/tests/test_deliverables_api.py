@@ -173,6 +173,8 @@ async def test_request_out_refreshes_expired_server_updated_fields(monkeypatch) 
 
     assert result.id == request.id
     assert result.artifacts[0].id == artifact.id
+    assert result.approval_readiness.approvable is False
+    assert result.approval_readiness.blockers == ["deliverable_artifact_missing"]
     assert db.refresh_count == 1
 
 

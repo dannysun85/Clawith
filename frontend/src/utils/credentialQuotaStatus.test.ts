@@ -13,6 +13,7 @@ describe('summarizeCredentialQuota', () => {
         })).toEqual({
             blockedLabels: ['plan', 'video (MiniMax-Hailuo-02)'],
             sharedPlanBlocked: true,
+            unsupportedModelLabels: [],
         });
     });
 
@@ -23,5 +24,19 @@ describe('summarizeCredentialQuota', () => {
                 model: 'MiniMax-Hailuo-02',
             },
         }).sharedPlanBlocked).toBe(false);
+    });
+
+    it('distinguishes an unentitled model from exhausted provider quota', () => {
+        expect(summarizeCredentialQuota({
+            'video:doubao-seedance-2.0': {
+                status: 'quota_exceeded',
+                model: 'doubao-seedance-2.0',
+                error_code: 'UnsupportedModel',
+            },
+        })).toEqual({
+            blockedLabels: ['video (doubao-seedance-2.0)'],
+            sharedPlanBlocked: false,
+            unsupportedModelLabels: ['video (doubao-seedance-2.0)'],
+        });
     });
 });

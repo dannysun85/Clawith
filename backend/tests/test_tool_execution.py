@@ -175,13 +175,15 @@ def _sql(statement) -> str:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("confirmed_status", "expected_error_code"),
+    ("tool_name", "confirmed_status", "expected_error_code"),
     [
-        ("failed", "externally_confirmed_not_applied"),
-        ("succeeded", "externally_confirmed_applied"),
+        ("write_file", "failed", "externally_confirmed_not_applied"),
+        ("write_file", "succeeded", "externally_confirmed_applied"),
+        ("convert_html_to_pdf", "failed", "externally_confirmed_not_applied"),
     ],
 )
 async def test_unknown_conditional_write_can_be_reconciled_by_user(
+    tool_name: str,
     confirmed_status: str,
     expected_error_code: str,
 ) -> None:
@@ -195,7 +197,7 @@ async def test_unknown_conditional_write_can_be_reconciled_by_user(
         effect="write",
         retry_policy="conditional",
     )
-    execution.tool_name = "write_file"
+    execution.tool_name = tool_name
     execution.completed_at = _NOW
     db = _FakeSession(execution)
 
@@ -234,7 +236,7 @@ async def test_unknown_reconciliation_rejects_unsupported_tool() -> None:
 
     with pytest.raises(
         tool_execution.ToolExecutionError,
-        match="only supported for conditional write_file",
+        match="only supported for bounded conditional workspace writes",
     ):
         await tool_execution.reconcile_unknown_tool_execution(
             db,  # type: ignore[arg-type]
