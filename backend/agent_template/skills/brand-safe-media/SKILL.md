@@ -25,6 +25,12 @@ Never use the static product-layer workaround for outcome 2 and describe it as a
 
 ## Choose the delivery contract
 
+The Agent chooses the user outcome and calls the product-level media Tool. It must not choose a Provider, expose an
+API key, invoke a downloaded vendor script, or promise a specific model. Astra resolves the tenant's eligible
+Agent Plan/MiniMax account, compatible model, health, quota and failover path at the server boundary. A provider may
+only be retried or changed before acceptance, or after an explicit reviewed rejection; ambiguous timeouts enter
+reconciliation so the same paid work is not submitted twice.
+
 ### Brand-safe delivery
 
 Use brand-safe delivery when the user supplies exact Chinese/English copy or requires a product, logo, packaging,
@@ -63,6 +69,37 @@ When the user provides a product photo and asks for a moving advertisement:
 Use `reference_image`, `first_frame_image`, or `last_frame_image` when generative motion or redraw is part of the
 request. Explain that spelling, packaging, logos, and product geometry may vary unless the request already makes that
 trade-off clear. Do not describe creative delivery as exact or brand-safe.
+
+For a coherent image set, the prompt must explicitly state the number of images, the content of each image, the
+shared subject/product/style constraints, and the required continuity. A sequential-generation flag by itself is not
+a continuity plan.
+
+For video, compile capability requirements from the brief before submission: text/image/video/audio references,
+first/last-frame control, duration, resolution, generated audio, web search, draft/flex mode and speed preference.
+Do not select a model by matching marketing words in the prompt. If the chosen route cannot satisfy a required
+capability, fail preflight or choose a compatible provider before any paid task is accepted.
+
+### Commercial video audio modes
+
+Choose the audio contract before submitting the visual task:
+
+1. **On-camera synchronized dialogue** — set `require_audio=true`. This requires a provider route that returns a real
+   audio stream and can attempt lip synchronization. If no eligible route exists, stop at capability preflight; do
+   not relabel a silent video plus unrelated voiceover as lip-synced dialogue.
+2. **Narrated advertisement / voiceover** — create the visual with `require_audio=false`, create the exact narration
+   with `generate_speech_minimax`, optionally create or supply a music bed, then call `compose_video_audio`. The final
+   MP4, not the silent intermediate, is the customer deliverable.
+3. **Silent motion asset** — keep `require_audio=false` and disclose that the delivered MP4 is silent.
+
+For portrait ads on a provider whose text-to-video default is landscape, generate or obtain an approved portrait key
+visual first and pass it as `first_frame_image`. Never claim a requested 9:16 deliverable from prompt wording alone;
+the completed artifact contract must verify its real dimensions.
+
+`compose_video_audio` is deterministic local post-production. Pass workspace paths returned by the completed video,
+speech and music tools. Keep the voiceover at normal gain and the music bed low enough for intelligibility; do not
+claim lip sync unless it came from an audio-capable provider route and passed visual review. Its successful structured
+receipt is the verification source for the final workspace path, H.264/AAC codecs, dimensions, duration and browser
+safety. Do not call `read_file` or `read_document` on the resulting MP4; those tools intentionally reject binary media.
 
 ## Copy rules
 

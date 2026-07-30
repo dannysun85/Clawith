@@ -7,6 +7,12 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.services.modalities import CANONICAL_MODALITIES, canonicalize_modalities
+from app.services.volcengine_agent_plan import (
+    ALLOWED_PLAN_TIERS,
+    PROVIDER as VOLCENGINE_AGENT_PLAN_PROVIDER,
+    VIDEO_CAPABLE_PLAN_TIERS,
+    normalize_base_url as normalize_volcengine_agent_plan_base_url,
+)
 
 
 SUPPORTED_CREDENTIAL_PROVIDERS = {
@@ -18,6 +24,7 @@ SUPPORTED_CREDENTIAL_PROVIDERS = {
     "minimax",
     "openai",
     "qwen",
+    VOLCENGINE_AGENT_PLAN_PROVIDER,
     "zhipu",
 }
 
@@ -62,6 +69,7 @@ class CredentialCreateIn(BaseModel):
     label: str
     api_key: str
     base_url: str | None = None
+    plan_tier: str | None = None
     capabilities: list[str] | None = None  # None = all; [] is invalid
     daily_quota: int | None = Field(default=None, ge=1)
     weight: int = Field(default=1, ge=1, le=1000)
@@ -76,6 +84,12 @@ class CredentialCreateIn(BaseModel):
     _normalize_required_text = field_validator("label", "api_key")(_validate_required_text)
     _normalize_base_url = field_validator("base_url")(_validate_base_url)
 
+    @field_validator("plan_tier")
+    @classmethod
+    def normalize_plan_tier(cls, value: str | None) -> str | None:
+        normalized = str(value or "").strip().lower()
+        return normalized or None
+
     @field_validator("provider")
     @classmethod
     def normalize_provider(cls, value: str) -> str:
@@ -88,6 +102,28 @@ class CredentialCreateIn(BaseModel):
     def require_custom_base_url(self):
         if self.provider == "custom" and not self.base_url:
             raise ValueError("custom provider requires base_url")
+        if self.provider == VOLCENGINE_AGENT_PLAN_PROVIDER:
+            if self.plan_tier not in ALLOWED_PLAN_TIERS:
+                raise ValueError("volcengine_agent_plan requires plan_tier: small, medium, large, or max")
+            if self.base_url:
+                self.base_url = normalize_volcengine_agent_plan_base_url(self.base_url)
+            if not self.capabilities:
+                raise ValueError(
+                    "volcengine_agent_plan requires explicit text/image/audio/video capabilities"
+                )
+            supported = set(self.capabilities)
+            unsupported = supported.difference({"text", "image", "audio", "video"})
+            if unsupported:
+                raise ValueError(
+                    "volcengine_agent_plan supports only text/image/audio/video capabilities"
+                )
+            if "video" in supported and self.plan_tier not in VIDEO_CAPABLE_PLAN_TIERS:
+                raise ValueError(
+                    "Agent Plan video requires Medium, Large, or Max; "
+                    "Medium uses Seedance 1.5 Pro and Large/Max use Seedance 2.0"
+                )
+        elif self.plan_tier is not None:
+            raise ValueError("plan_tier is only valid for volcengine_agent_plan")
         return self
 
 
@@ -95,6 +131,7 @@ class CredentialUpdateIn(BaseModel):
     api_key: str | None = None
     label: str | None = None
     base_url: str | None = None
+    plan_tier: str | None = None
     capabilities: list[str] | None = None
     daily_quota: int | None = Field(default=None, ge=1)
     weight: int | None = Field(default=None, ge=1, le=1000)
@@ -108,6 +145,12 @@ class CredentialUpdateIn(BaseModel):
 
     _normalize_capabilities = field_validator("capabilities")(_validate_capabilities)
     _normalize_base_url = field_validator("base_url")(_validate_base_url)
+
+    @field_validator("plan_tier")
+    @classmethod
+    def normalize_plan_tier(cls, value: str | None) -> str | None:
+        normalized = str(value or "").strip().lower()
+        return normalized or None
 
     @model_validator(mode="before")
     @classmethod
@@ -145,6 +188,7 @@ class CredentialOut(BaseModel):
     provider: str
     label: str
     base_url: str | None = None
+    plan_tier: str | None = None
     api_key_masked: str = ""
     capabilities: list[str] | None = None
     modality_status: dict[str, dict[str, str]] | None = None

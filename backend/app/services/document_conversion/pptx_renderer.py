@@ -7,6 +7,11 @@ from typing import Any
 from loguru import logger
 
 from app.services.document_conversion.chrome_renderer import collect_browser_layout
+from app.services.document_conversion.presentation_contract import (
+    PresentationVisualQualityError,
+    validate_browser_slide_visual_quality,
+    validate_presentation_html_contract,
+)
 
 
 async def render_html_to_pptx(src_file: Path, tgt_file: Path, target_path: str, ws: Path, arguments: dict[str, Any]) -> str:
@@ -21,6 +26,26 @@ async def render_html_to_pptx(src_file: Path, tgt_file: Path, target_path: str, 
         from pptx.util import Inches, Pt
         
         html_content = src_file.read_text(encoding="utf-8")
+        expected_page_count_value = arguments.get("expected_page_count")
+        expected_page_count = (
+            int(expected_page_count_value)
+            if expected_page_count_value is not None
+            else None
+        )
+        validate_presentation_html_contract(
+            src_file,
+            expected_page_count=expected_page_count,
+            outline_file=(
+                Path(str(arguments["_outline_file_path"]))
+                if arguments.get("_outline_file_path")
+                else None
+            ),
+            slide_spec_file=(
+                Path(str(arguments["_slide_spec_file_path"]))
+                if arguments.get("_slide_spec_file_path")
+                else None
+            ),
+        )
         soup = BeautifulSoup(html_content, "html.parser")
 
         design_w_px = int(arguments.get("design_width") or 1280)
@@ -231,10 +256,13 @@ async def render_html_to_pptx(src_file: Path, tgt_file: Path, target_path: str, 
             tf.margin_bottom = Inches(min(css_px_to_inches(style.get("padding-bottom"), design_w_px), max(h * 0.35, 0)))
             p = tf.paragraphs[0]
             p.alignment = text_align(style)
+            p.space_before = Pt(0)
+            p.space_after = Pt(0)
             run = p.add_run()
             run.text = text
             font = run.font
-            font.size = Pt(font_size_pt(style, default_size))
+            font_scale = float(style.get("_font-scale") or 1.0)
+            font.size = Pt(font_size_pt(style, default_size) * font_scale)
             font.bold = bold or (style.get("font-weight") or "").lower() in ("bold", "600", "700", "800", "900")
             color = parse_color(style.get("color"), style.get("_backdrop-color"))
             text_fill = (style.get("-webkit-text-fill-color") or "").lower()
@@ -422,9 +450,23 @@ async def render_html_to_pptx(src_file: Path, tgt_file: Path, target_path: str, 
                     offset_y = 0.0
                 slide = prs.slides.add_slide(blank_layout)
                 add_background(slide, {"background-color": slide_bg_value})
+                content_screenshots = layout.get("contentScreenshots") or []
+                content_screenshot = (
+                    content_screenshots[len(prs.slides) - 1]
+                    if len(content_screenshots) >= len(prs.slides)
+                    else None
+                )
                 bg_screenshots = layout.get("backgroundScreenshots") or []
                 bg_screenshot = bg_screenshots[len(prs.slides) - 1] if len(bg_screenshots) >= len(prs.slides) else None
-                if bg_screenshot and Path(bg_screenshot).exists():
+                if content_screenshot and Path(content_screenshot).exists():
+                    slide.shapes.add_picture(
+                        content_screenshot,
+                        Inches(offset_x),
+                        Inches(offset_y),
+                        width=Inches(root_w * sx),
+                        height=Inches(root_h * sy),
+                    )
+                elif bg_screenshot and Path(bg_screenshot).exists():
                     slide.shapes.add_picture(
                         bg_screenshot,
                         Inches(offset_x),
@@ -469,6 +511,8 @@ async def render_html_to_pptx(src_file: Path, tgt_file: Path, target_path: str, 
                         "_backdrop-color": slide_bg_value,
                     }
                     kind = item.get("kind")
+                    if content_screenshot and kind != "text":
+                        continue
                     if kind == "shape":
                         shape_screenshots = layout.get("shapeScreenshots") or {}
                         shape_screenshot = shape_screenshots.get(str(item.get("itemId") or ""))
@@ -486,6 +530,20 @@ async def render_html_to_pptx(src_file: Path, tgt_file: Path, target_path: str, 
                         if not text:
                             continue
                         tag = item.get("tag") or ""
+                        if tag in ("b", "strong", "span", "code", "a"):
+                            available_width = max(
+                                0.05,
+                                offset_x + root_w * sx - x,
+                            )
+                            w = min(
+                                available_width,
+                                w + max(0.12, w * 0.12),
+                            )
+                        ppt_style["_font-scale"] = (
+                            "1.0"
+                            if tag in ("h1", "h2", "h3")
+                            else "0.94"
+                        )
                         default = 38 if tag == "h1" else 28 if tag == "h2" else 22 if tag == "h3" else 18
                         add_textbox(slide, text, x, y, w, h, ppt_style, default, tag in ("h1", "h2", "h3", "strong"))
             return True
@@ -520,11 +578,44 @@ async def render_html_to_pptx(src_file: Path, tgt_file: Path, target_path: str, 
             return True
 
         browser_layout = await collect_browser_layout(src_file, design_w_px, design_h_px, render_mode, render_scale)
+        if browser_layout and expected_page_count is not None:
+            browser_slides = browser_layout.get("slides") or []
+            if len(browser_slides) != expected_page_count:
+                raise ValueError(
+                    "Presentation browser layout contract invalid: "
+                    f"expected {expected_page_count} slides, found {len(browser_slides)}"
+                )
+            wrong_size = [
+                index
+                for index, slide in enumerate(browser_slides, start=1)
+                if abs(float(slide.get("width") or 0) - design_w_px) > 1
+                or abs(float(slide.get("height") or 0) - design_h_px) > 1
+            ]
+            if wrong_size:
+                raise ValueError(
+                    "Presentation browser layout contract invalid: "
+                    f"slides {wrong_size} do not measure {design_w_px}x{design_h_px}"
+                )
+        if browser_layout or expected_page_count is not None:
+            screenshot_key = (
+                "screenshots"
+                if render_mode in ("visual", "screenshot", "image", "hybrid")
+                else "contentScreenshots"
+                if render_mode == "hybrid_editable"
+                else None
+            )
+            validate_browser_slide_visual_quality(
+                browser_layout or {},
+                screenshot_key=screenshot_key,
+            )
         if browser_layout:
             for value in browser_layout.get("screenshots") or []:
                 if value:
                     temporary_render_files.add(Path(value))
             for value in browser_layout.get("backgroundScreenshots") or []:
+                if value:
+                    temporary_render_files.add(Path(value))
+            for value in browser_layout.get("contentScreenshots") or []:
                 if value:
                     temporary_render_files.add(Path(value))
             for value in (browser_layout.get("shapeScreenshots") or {}).values():
@@ -579,6 +670,8 @@ async def render_html_to_pptx(src_file: Path, tgt_file: Path, target_path: str, 
             "Note: common typography, colors, cards, lists, images, and simple absolute positioning are preserved; "
             "complex CSS such as flex/grid effects, shadows, filters, and animations may still need manual adjustment."
         )
+    except PresentationVisualQualityError:
+        raise
     except Exception as e:
         logger.exception(f"Convert HTML to PPTX failed: {e}")
         return f"❌ Conversion failed: {e}"

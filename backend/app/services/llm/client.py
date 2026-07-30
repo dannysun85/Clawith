@@ -2541,6 +2541,14 @@ PROVIDER_REGISTRY: dict[str, ProviderSpec] = {
         supports_tool_choice=False,
         default_max_tokens=8192,
     ),
+    "volcengine_agent_plan": ProviderSpec(
+        provider="volcengine_agent_plan",
+        display_name="Volcengine Agent Plan",
+        protocol="anthropic",
+        default_base_url="https://ark.cn-beijing.volces.com/api/plan",
+        supports_tool_choice=False,
+        default_max_tokens=8192,
+    ),
     "openai": ProviderSpec(
         provider="openai",
         display_name="OpenAI",
@@ -2741,12 +2749,17 @@ def get_provider_base_url(provider: str, custom_base_url: str | None = None) -> 
     If a custom base_url is provided, it takes precedence.
     Otherwise falls back to the default URL for the provider.
     """
+    normalized_provider = normalize_provider(provider)
+    if normalized_provider == "volcengine_agent_plan":
+        from app.services.volcengine_agent_plan import normalize_text_base_url
+
+        return normalize_text_base_url(custom_base_url)
     if custom_base_url:
         return custom_base_url
     spec = get_provider_spec(provider)
     if spec:
         return spec.default_base_url
-    return PROVIDER_URLS.get(normalize_provider(provider))
+    return PROVIDER_URLS.get(normalized_provider)
 
 
 def get_max_tokens(provider: str, model: str | None = None, max_output_tokens: int | None = None) -> int:

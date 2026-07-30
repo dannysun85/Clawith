@@ -23,18 +23,24 @@ def test_revision_ids_fit_the_default_alembic_version_column() -> None:
 
 
 def test_release_migration_graph_has_one_expected_head() -> None:
-    assert _script_directory().get_heads() == ["reconcile_m3_runtime_caps"]
+    assert _script_directory().get_heads() == ["add_deliverable_quality_reviews"]
 
 
 def test_release_head_preserves_both_upgrade_lineages() -> None:
     script = _script_directory()
-    release_head = script.get_revision("reconcile_m3_runtime_caps")
+    release_head = script.get_revision("add_deliverable_quality_reviews")
+    agent_plan_text_revision = script.get_revision("seed_agent_plan_text_routes")
+    provider_plan_revision = script.get_revision("add_provider_plan_tier")
+    media_plan_revision = script.get_revision("reconcile_m3_runtime_caps")
     template_tools_revision = script.get_revision("agent_template_default_tools")
     deliverable_revision = script.get_revision("add_deliverable_workbench")
     task_status_revision = script.get_revision("align_task_failed_status")
     merge_revision = script.get_revision("merge_v111_astra_heads")
 
-    assert release_head._normalized_down_revisions == ("agent_template_default_tools",)
+    assert release_head._normalized_down_revisions == ("seed_agent_plan_text_routes",)
+    assert agent_plan_text_revision._normalized_down_revisions == ("add_provider_plan_tier",)
+    assert provider_plan_revision._normalized_down_revisions == ("reconcile_m3_runtime_caps",)
+    assert media_plan_revision._normalized_down_revisions == ("agent_template_default_tools",)
     assert template_tools_revision._normalized_down_revisions == ("add_deliverable_workbench",)
     assert deliverable_revision._normalized_down_revisions == ("align_task_failed_status",)
     assert task_status_revision._normalized_down_revisions == ("merge_v111_astra_heads",)
@@ -50,7 +56,20 @@ def test_postgres_migration_smoke_targets_the_release_head() -> None:
         encoding="utf-8"
     )
 
-    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-reconcile_m3_runtime_caps' in smoke
+    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-add_deliverable_quality_reviews' in smoke
+
+
+def test_agent_plan_text_route_migration_preserves_credential_ownership_and_fallback() -> None:
+    migration = (
+        BACKEND_ROOT
+        / "alembic/versions/202607261500_seed_agent_plan_text_routes.py"
+    ).read_text(encoding="utf-8")
+
+    assert "capabilities remain administrator-owned" in migration
+    assert "UPDATE llm_credentials" not in migration
+    assert "model.provider <> 'volcengine_agent_plan'" in migration
+    assert "fallback_route_id" in migration
+    assert "'builtin_registry'" in migration
 
 
 def test_sso_password_migration_is_fail_closed_and_non_destructive() -> None:

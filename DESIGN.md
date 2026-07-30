@@ -3,9 +3,9 @@
 ## Source of truth
 
 - Status: Active
-- Last refreshed: 2026-07-20
-- Primary product surfaces: Agent direct chat, Group collaboration, deliverable brief drawer, deliverable run timeline, Workspace artifact preview, Enterprise Settings, SaaS Admin.
-- Evidence reviewed: `frontend/src/index.css`, `frontend/src/styles/atlas.css`, `frontend/src/pages/agent-detail/AgentDetailPage.tsx`, `frontend/src/components/AgentSidePanel.tsx`, `frontend/src/components/WorkspaceOperationPanel.tsx`, `frontend/src/pages/enterprise-settings/tabs/SkillsTab.tsx`, `frontend/public/logo.svg`, `.omx/plans/2026-07-20-v1.11.1-creative-workbench-optimization-plan.md`, and the Qwen feature-entry screenshot supplied by the product owner.
+- Last refreshed: 2026-07-28
+- Primary product surfaces: Workbench, personal assistant, Agent direct chat, Group collaboration, deliverable brief drawer, deliverable run timeline, Workspace artifact preview, Enterprise Settings, SaaS Admin.
+- Evidence reviewed: `frontend/src/index.css`, `frontend/src/styles/atlas.css`, `frontend/src/pages/Layout.tsx`, `frontend/src/pages/Onboarding.tsx`, `frontend/src/pages/agent-detail/AgentDetailPage.tsx`, `frontend/src/components/AgentSidePanel.tsx`, `frontend/src/components/WorkspaceOperationPanel.tsx`, `frontend/src/components/deliverables/DeliverableWorkbench.tsx`, `frontend/src/pages/enterprise-settings/tabs/SkillsTab.tsx`, `backend/app/api/onboarding.py`, `backend/app/api/tasks.py`, `backend/app/models/agent.py`, `backend/app/models/onboarding.py`, `backend/app/services/deliverable_workflows.py`, `backend/app/services/tool_capability_policy.py`, `backend/app/services/tool_visibility.py`, `backend/app/services/skill_scope.py`, `backend/agent_templates/private-assistant/`, `backend/agent_template/skills/brand-safe-media/SKILL.md`, `.omx/plans/2026-07-24-image-video-ppt-provider-evaluation-plan.md`, the supplied WorkBuddy entry screenshot, and the previously reviewed feature-entry references.
 - Authority: this file governs product/UI decisions. Runtime, security, billing, and data-model facts remain governed by `SKILL.md`, code, migrations, and tests.
 
 ## Brand
@@ -28,19 +28,74 @@
 
 ## Information architecture
 
-- Primary navigation: keep the existing product navigation. Add work discovery inside the existing Agent/Group composer, not as a competing top-level application.
-- Core routes/screens: existing Agent chat remains the start surface; `交付物` opens a right-side Brief Drawer; after confirmation, the chat timeline shows a request card and the existing side panel exposes stages and Workspace artifacts.
+- Primary navigation: add `工作台` as the first tenant-level task entry. Keep `仪表盘`, `OKR`, `广场`, and `Groups` as company-level destinations. Move the current user's private assistant into a dedicated `我的助理` row between company navigation and the `数字员工` roster; it must not remain mixed into the employee list.
+- Core routes/screens: `/work` is the default post-onboarding task entry; `/dashboard` remains the company overview. Existing Agent chat remains the execution/conversation surface for named employees. `交付物` opens a right-side Brief Drawer; after confirmation, the chat timeline shows a request card and the existing side panel exposes stages and Workspace artifacts.
 - Content hierarchy: current Agent/team and session first; conversation/run state second; composer and work entry third; structured brief and capability/cost preflight fourth; artifact preview and version actions in the side panel.
 - Work-entry hierarchy: `交付物`, `调研分析`, `自动化`, `团队协作`. Under `交付物`: `PPT`, `海报/图片`, `短视频`, then reports/spreadsheets as later workflows. Modality is an implementation capability, not the user's primary task taxonomy.
+
+## Workbench and personal-assistant architecture
+
+- Naming: the top-level surface is `工作台`, not `助手`, `超级助手`, or `AI 助手`. It is a product entry and work index, not another person. The persistent private role is labelled `我的助理`; its user-chosen name appears as secondary identity.
+- Workbench responsibility: accept natural-language intent and attachments, expose outcome-oriented shortcuts, recover recent/in-progress work, clarify the brief, perform capability/cost preflight, and route the confirmed work. It owns no personality, private memory, provider choice, or independent execution authority.
+- Personal-assistant responsibility: private coordination, personal memory, follow-ups, lightweight planning, drafting, reminders, and helping the user find or dispatch work they are authorized to access. It remains one persistent Agent per `(tenant, user)` so identities and memory never cross companies.
+- Digital-employee responsibility: named, persistent business ownership with role-specific memory, Skills, minimal Tool grants, triggers, channels, relationships, autonomy, KPI, and escalation. Employees are company/private/custom resources and remain in the `数字员工` roster.
+- Task-scoped experts: one-off specialist work should normally use a task-scoped expert selected by the platform. Do not force users to hire a permanent employee or turn the personal assistant into every profession.
+- Routing policy:
+  - personal coordination or follow-up → `我的助理`;
+  - one-off specialist outcome → task-scoped expert;
+  - durable named responsibility → an existing or newly hired digital employee;
+  - multi-party planning or visible collaboration → Group;
+  - PPT/image/video/report/spreadsheet → the registered Deliverable workflow, with the producing Agent attached to the result.
+- The Workbench may aggregate `Task`, `DeliverableRequest`, Agent Run, Group Run, approval, and Artifact facts into one read model, but it must not invent a second scheduler or copy mutable execution state into the client.
+- Custom shortcuts are saved task/work templates, not exposed Skills or Tools. A user may save a successful brief as `我的快捷工作`; an administrator may publish `公司工作模板`. Each template declares understandable inputs, output, scope, approval, and capability requirements.
+
+## Workbench interaction model
+
+- Hero prompt: `今天想完成什么？`, with attachments and voice where already supported. Do not expose a model selector, Provider logo, API Key, Skill picker, or raw permission level.
+- Primary categories: `我的常用`, `公司模板`, `制作交付物`, `调研分析`, `文档与数据`, `协作与自动化`. Category chips filter work templates; they are not execution modes.
+- Suggested shortcuts come from registered workflow/capability manifests and tenant entitlements. Disabled shortcuts explain plan or configuration requirements without showing infrastructure details.
+- Before launch, show a compact confirmation: expected output, selected work scope, proposed executor, estimated Credits/range, approval points, and degraded/unavailable differences. `由谁处理` is an understandable confirmation field, not a required first choice.
+- Below the composer show `等待我处理`, `进行中`, `最近完成`, and saved shortcuts. Each item links to its real Agent/Group conversation, detail drawer, or Artifact; the Workbench does not duplicate those full surfaces.
+- Work scope uses existing product boundaries: `我的私有工作`, a selected `数字员工`, or a selected `协作群组`. Company-wide file access must never be implied where only Agent or Group Workspace access exists.
+
+## Personal-assistant onboarding
+
+- Do not ask a new user to design an Agent role. The product-owned role is fixed as `personal_assistant`; users only customise identity and working preferences.
+- Provision one private assistant for every user in every tenant, not one shared assistant for the whole company. A user belonging to two companies receives two isolated assistants because tenant context, files, memory, permissions, and billing differ.
+- Recommended onboarding sequence: company created/joined → idempotently provision assistant → optional quick setup → enter Workbench. Quick setup asks optional display name, how to address the user, response style, proactive level, timezone/working hours, and explicit boundaries.
+- The visible default is `我的助理`; a custom name is optional and can be changed later. Skipping customisation must create/use the safe default and must not masquerade as a no-op.
+- Personal assistants are a product companion slot, not a hired employee seat. They consume normal model/Tool/Credits usage and obey Plan entitlements, but should not reduce the tenant's digital-employee headcount quota.
+- Assistant creation must be idempotent under `(tenant_id, user_id)`, private by construction, excluded from Plaza and Groups, and recoverable if provisioning fails. A provisioning failure must not block entry to the Workbench.
+- The assistant never inherits all company Tools or all future capabilities. Delegation, external messages, calendar writes, paid generation, publishing, and destructive actions still pass tenant, grant, entitlement, Credits, autonomy, and approval gates.
 
 ## Design principles
 
 - Intent before implementation: ask what the user wants to deliver, then let the backend choose Skills, tools, and provider routes.
+- Task first, expert second, Skill hidden, Agent persistent only when the work needs memory, triggers, channels, or recurring ownership. A user asks for an outcome; the product selects the capable worker and execution path.
 - Progressive structure: free-form chat stays available; a structured brief appears only after choosing a work type and may be prefilled from natural language and attachments.
 - Durable truth: request, run, approval, cost, and artifact state must come from persisted backend facts, never from an optimistic-only client timeline.
 - Safe evolution: retain current direct media shortcuts until the new workflows prove parity; mark them as quick generation rather than silently changing their behavior.
 - Local recovery: show the failed stage and allow targeted correction or retry; never force a whole expensive workflow to restart when only one page or shot failed.
 - Tradeoffs: the first workbench favors clarity, traceability, and output validity over maximum visual density or a fully customizable workflow canvas.
+
+## Capability delivery model
+
+- User flow: `提出任务 → 补齐关键约束 → 确认工作说明/费用 → 分阶段执行 → 验收/修改 → 归档产物`. Do not make ordinary users choose a Skill, Tool, provider, or model.
+- Worker selection: use a task-scoped expert for one-off work. Use or create a persistent Agent employee only when the responsibility needs durable memory, scheduled/event triggers, communication channels, or named accountability.
+- Execution gates: an Agent may execute only when Skill resolution, Tool visibility/grant, tenant scope, plan entitlement, provider readiness, Credits, autonomy/approval, and durable workflow state all pass. Skill possession never grants Tool permission.
+- Availability states:
+  - `available`: the confirmed contract can be executed.
+  - `degraded`: a materially different quality, cost, format, or turnaround is available and must be disclosed before execution.
+  - `unavailable`: preserve the brief and create useful planning/source artifacts, but never claim that the requested media was generated.
+- Provider routing is platform-owned. Equivalent healthy routes may replace a provider only before dispatch or after an explicit rejection. `acceptance_unknown` enters reconciliation and must not trigger a second paid generation.
+- Every capability produces inspectable intermediate state and a final Artifact. Partial failure retries the smallest failed page, shot, candidate, or conversion stage.
+
+## Creative quality contracts
+
+- Image/poster: structured creative brief, reference inventory, provider-specific prompt compilation, candidate policy, deterministic exact-copy/logo/product composition, automated quality checks, selection receipt, approval, and revision. Exact text and logos must not depend on a generative model drawing them correctly.
+- Video: approved script/storyboard and shot specifications precede paid generation; references and keyframes anchor identity; generation, validation, editing, captions/audio, and packaging are separate stages; failed shots can be redone without regenerating the whole video.
+- PPT: source inventory and fact references precede outline approval; pages are built from `DeckOutline`/`SlideSpec`, theme and layout rules, editable charts/tables/shapes, and selectively generated decorative visuals; PPTX/PDF parity, overflow, alignment, contrast, fonts, citations, and page-level revision are part of the delivery contract.
+- A clean text/shape/chart PPT without generated imagery is a valid professional fallback. Broken image placeholders, invented facts, unlabelled raster-only pages, and “file created” without structural validation are not.
 
 ## Visual language
 
@@ -54,7 +109,7 @@
 ## Components
 
 - Existing components to reuse: `TierSelector`, `AgentSidePanel`, `WorkspaceOperationPanel`, `FileBrowser`, Toast/Dialog providers, chat attachment pills, status badges, buttons, inputs, and design tokens.
-- New/changed components: `DeliverableBriefDrawer`, work-type cards, `DeliverableRequestCard`, capability preflight panel, stage timeline, approval controls, artifact revision list.
+- New/changed components: `WorkbenchPage`, `WorkComposer`, `WorkTemplateRail`, `WorkItemList`, `ExecutorConfirmation`, dedicated `PersonalAssistantNavItem`, separated `DigitalEmployeeRoster`, `PersonalAssistantSetup`, `DeliverableBriefDrawer`, work-type cards, `DeliverableRequestCard`, capability preflight panel, stage timeline, approval controls, artifact revision list.
 - Variants and states: PPT/poster/video workflow manifests; Lite/Pro/Ultra policy summaries; draft/ready/running/waiting approval/succeeded/failed/cancelled request states; available/degraded/unavailable preflight; no-artifact/previewable/download-only artifacts.
 - Token/component ownership: global visual primitives remain in `frontend/src/index.css`; deliverable-specific layout classes use a `deliverable-` prefix; product schemas and transitions are backend-owned and typed in the frontend API layer.
 
@@ -81,6 +136,17 @@
 - Disabled: explain whether the cause is plan, Agent tool, platform capability, or an in-progress request using user-facing terms rather than API-key details.
 - Offline/slow network: block duplicate submission, retain the local brief until persistence succeeds, reload request state on reconnect, and derive the final state from the backend.
 
+## Deliverable review experience
+
+- A completed deliverable belongs to the Agent that produced it. The chat timeline renders its compact result summary as an attachment in that Agent's message row: deliverable type, current outcome/status, direct preview/download shortcuts, and one `查看交付详情` action. The composer may contain only the user's next input and a pre-send `DeliverableRequestCard`; it must never render a completed result.
+- The chat timeline must not contain reviewer assignment, quality forms, approval controls, or a full workflow panel that displaces conversation and the composer.
+- The right-side deliverable detail drawer is the customer handoff surface. It presents the three understandable stages `预览文件 → 质量检查 → 确认交付`, highlights the current stage, and contains quality progress, reviewer assignment, revision, and approval actions without mixing them into the conversation stream.
+- Customers see outcome language: `正在生成`, `等待质量检查`, `检查中`, `需要修改`, `可以交付`, and `已交付`. They do not see raw lifecycle values such as `candidate`, `open`, `blocked`, provider terms, hashes, or evidence implementation details.
+- File actions describe the user intent (`在线预览`, `下载 PPTX`, `查看视频`, `下载图片`) rather than exposing artifact internals. Revision and hash details remain available only in a secondary technical disclosure.
+- A creator or manager can arrange independent reviewers and see completion progress. Ineligible-reviewer reasons are translated into an actionable explanation; when fewer than three eligible colleagues exist, the UI points to enterprise member management instead of leaving a disabled button unexplained.
+- An assigned reviewer enters a separate guided flow: `查看文件 → 逐项检查 → 评分并提交`. Only one step is primary at a time, unfinished fields are counted, and the final irreversible submission clearly states that the result cannot be edited.
+- Automated OCR/frame evidence, storage references, artifact hashes, immutable receipt identifiers, and other audit details are administrator-only progressive disclosures. They remain persisted and inspectable without dominating the reviewer or customer workflow.
+
 ## Content voice
 
 - Tone: direct, calm, operational, and outcome-oriented. Chinese is the default product language; English strings remain complete and equivalent.
@@ -100,4 +166,6 @@
 - [ ] Product owner: choose and approve the first three built-in PPT visual themes before Phase 2 quality acceptance; impacts visual benchmark fixtures, not the Phase 1 contract.
 - [ ] Product/finance: define how much of an execution estimate may be shown as a range before provider reservation; impacts estimate copy but not exactly-once settlement.
 - [ ] Product owner: decide when legacy direct media shortcuts may move under `快速生成`; they remain visible until workflow parity is proven.
+- [ ] Product/finance: approve the personal-assistant companion slot as excluded from digital-employee headcount while retaining normal usage/Credits accounting.
+- [ ] Product/admin: define who may publish or retire company work templates and whether approval is required for templates containing paid or external-write steps.
 - [ ] Security/legal: approve any external segmentation/PPT engine and its model-weight licenses before Phase 3 or dependency adoption.

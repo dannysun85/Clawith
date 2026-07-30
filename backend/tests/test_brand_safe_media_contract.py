@@ -114,6 +114,55 @@ def test_brand_safe_media_skill_is_role_scoped_with_explicit_media_grants():
         assert metadata["default_tools"]
 
 
+def test_douyin_operator_receives_managed_volcengine_commercial_skills():
+    templates_root = Path(__file__).parents[1] / "agent_templates"
+    metadata = yaml.safe_load(
+        (templates_root / "douyin-operator" / "meta.yaml").read_text()
+    )
+    expected = {
+        "volcengine-seedream-commercial",
+        "volcengine-seedance-commercial",
+    }
+
+    assert expected <= set(metadata["default_skills"])
+    assert {
+        "generate_image_minimax",
+        "generate_video_minimax",
+        "check_video_minimax",
+        "generate_speech_minimax",
+        "compose_video_audio",
+    } <= set(metadata["default_tools"])
+
+    registry = {
+        skill["folder_name"]: skill
+        for skill in skill_seeder.BUILTIN_SKILLS
+    }
+    for folder in expected:
+        assert registry[folder]["is_default"] is False
+        skill_root = (
+            Path(__file__).parents[1]
+            / "agent_template"
+            / "skills"
+            / folder
+        )
+        content = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+        assert "This Skill" in content
+        assert "does not grant" in content
+        assert "Never" in content
+        assert (
+            skill_root / "references" / "official-agent-plan-contract.md"
+        ).is_file()
+    seedance_content = (
+        templates_root.parent
+        / "agent_template"
+        / "skills"
+        / "volcengine-seedance-commercial"
+        / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    assert "Seedance 1.5 Pro compatibility mode" in seedance_content
+    assert "`require_audio=false` is the default product contract" in seedance_content
+
+
 def test_video_brand_asset_is_frozen_outside_agent_workspace():
     agent_id = uuid.uuid4()
     task_id = uuid.uuid4()

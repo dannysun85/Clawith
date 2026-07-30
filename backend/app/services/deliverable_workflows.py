@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 from datetime import UTC, datetime
 from typing import Any, Literal, Mapping
 import uuid
@@ -13,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.agent_run import AgentRun
 from app.models.deliverable import DeliverableRequest
 from app.models.tool import AgentTool, Tool
 from app.services.deliverable_artifacts import reconcile_runtime_deliverable_artifacts
@@ -112,8 +114,8 @@ _WORKFLOWS = (
         work_type="poster",
         label_zh="海报 / 图片",
         label_en="Poster / Image",
-        description_zh="保存商品、品牌和精确文案要求；本阶段只做能力与费用预检。",
-        description_en="Capture product, brand, and exact-copy requirements; this phase performs preflight only.",
+        description_zh="确认商品、品牌和精确文案要求，再生成可直接预览的商业图片。",
+        description_en="Confirm product, brand, and exact-copy requirements before generating a previewable commercial image.",
         fields=[
             WorkflowField(
                 key="channel", label_zh="使用渠道", label_en="Channel", kind="select", required=True,
@@ -135,7 +137,7 @@ _WORKFLOWS = (
         approval_policy=["composition", "final"],
         output_contract=["png"],
         required_capability="image",
-        launch_policy="dry_run",
+        launch_policy="agent_runtime",
     ),
     WorkflowManifest(
         workflow_id="builtin.video.v1",
@@ -143,8 +145,8 @@ _WORKFLOWS = (
         work_type="video",
         label_zh="短视频",
         label_en="Short video",
-        description_zh="保存分镜、比例和时长要求；本阶段只做能力与费用预检。",
-        description_en="Capture storyboard, ratio, and duration requirements; this phase performs preflight only.",
+        description_zh="制作带人物、分镜和旁白的可审核广告短视频。",
+        description_en="Create a reviewable short ad with people, storyboard, and voiceover.",
         fields=[
             WorkflowField(
                 key="channel", label_zh="发布渠道", label_en="Channel", kind="select", required=True,
@@ -159,14 +161,31 @@ _WORKFLOWS = (
                 default="6", options=["6", "10"],
             ),
             WorkflowField(
+                key="audience", label_zh="目标受众", label_en="Audience", kind="text", required=True,
+                default="潜在消费者", placeholder_zh="例如：25–35 岁都市白领",
+                placeholder_en="e.g. urban professionals aged 25–35",
+            ),
+            WorkflowField(
+                key="language", label_zh="语言", label_en="Language", kind="select", required=True,
+                default="zh-CN", options=["zh-CN", "en-US"],
+            ),
+            WorkflowField(
+                key="audio_mode", label_zh="声音模式", label_en="Audio mode", kind="select", required=True,
+                default="voiceover", options=["voiceover", "silent"],
+            ),
+            WorkflowField(
                 key="story", label_zh="故事与镜头要求", label_en="Story and shots", kind="textarea", required=True,
                 placeholder_zh="产品、场景、镜头运动、字幕和声音要求", placeholder_en="Product, scene, camera, captions, and audio",
+            ),
+            WorkflowField(
+                key="cta", label_zh="行动号召", label_en="Call to action", kind="text",
+                placeholder_zh="例如：立即了解更多", placeholder_en="e.g. Learn more today",
             ),
         ],
         approval_policy=["storyboard", "final"],
         output_contract=["mp4"],
         required_capability="video",
-        launch_policy="dry_run",
+        launch_policy="agent_runtime",
     ),
 )
 
@@ -207,6 +226,20 @@ async def list_agent_launchable_workflows(
         if (
             workflow.required_capability == "presentation"
             and not await _presentation_tool_available(db, agent_id)
+        ):
+            continue
+        if (
+            workflow.required_capability == "image"
+            and not await _agent_tool_available(
+                db,
+                agent_id=agent_id,
+                tool_name="generate_image_minimax",
+            )
+        ):
+            continue
+        if (
+            workflow.required_capability == "video"
+            and not await _video_post_production_tools_available(db, agent_id)
         ):
             continue
         available.append(workflow)
@@ -271,6 +304,110 @@ def request_fingerprint(payload: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _presentation_media_roles(request: DeliverableRequest) -> tuple[str, ...]:
+    """Compile an explicit media contract for image-led commercial decks."""
+
+    brief = " ".join(
+        (
+            str(request.goal or ""),
+            json.dumps(request.spec or {}, ensure_ascii=False, sort_keys=True),
+        )
+    ).casefold()
+    image_led = any(
+        keyword in brief
+        for keyword in (
+            "图文并茂",
+            "图片",
+            "照片",
+            "摄影",
+            "主视觉",
+            "人物广告",
+            "故事板",
+            "商业风",
+            "image-rich",
+            "image rich",
+            "photography",
+            "photo-led",
+            "photo led",
+            "storyboard",
+            "commercial visual",
+        )
+    )
+    if not image_led:
+        return ()
+
+    roles: list[str] = []
+    if any(
+        keyword in brief
+        for keyword in (
+            "产品",
+            "商品",
+            "新品",
+            "包装",
+            "保温杯",
+            "product",
+            "packaging",
+            "launch",
+        )
+    ):
+        roles.append("product_hero")
+    if any(
+        keyword in brief
+        for keyword in (
+            "人物",
+            "真人",
+            "人像",
+            "模特",
+            "用户场景",
+            "person",
+            "people",
+            "actor",
+            "portrait",
+            "lifestyle",
+        )
+    ):
+        roles.append("people_lifestyle")
+    if any(keyword in brief for keyword in ("故事板", "分镜", "storyboard", "shot plan")):
+        roles.append("people_storyboard")
+
+    page_count = int((request.spec or {}).get("page_count") or 8)
+    tier_bonus = 1 if str(request.tier or "").lower() == "ultra" else 0
+    desired_assets = min(5, max(2, math.ceil(page_count / 3) + tier_bonus))
+    for fallback_role in (
+        "commercial_hero",
+        "context_scene",
+        "detail_texture",
+        "audience_moment",
+        "closing_hero",
+    ):
+        if len(roles) >= desired_assets:
+            break
+        if fallback_role not in roles:
+            roles.append(fallback_role)
+    return tuple(roles)
+
+
+def _presentation_visual_policy(
+    request: DeliverableRequest,
+    media_roles: tuple[str, ...],
+) -> dict[str, int | str]:
+    """Build a server-owned, page-count-aware visual variety contract."""
+
+    page_count = int((request.spec or {}).get("page_count") or 8)
+    minimum_distinct_images = len(media_roles)
+    return {
+        "version": "adaptive-v1",
+        "minimum_distinct_layouts": min(page_count, max(3, math.ceil(page_count / 2))),
+        "minimum_distinct_images": minimum_distinct_images,
+        "maximum_uses_per_image": (
+            max(2, math.ceil(page_count / minimum_distinct_images))
+            if minimum_distinct_images
+            else 0
+        ),
+        "minimum_editable_compositions": max(1, page_count // 4),
+    }
+
+
 def build_deliverable_prompt(request: DeliverableRequest) -> str:
     """Build server-owned execution context; provider/model choice is intentionally absent."""
 
@@ -286,13 +423,213 @@ def build_deliverable_prompt(request: DeliverableRequest) -> str:
         "approval_policy": request.approval_policy,
         "output_contract": request.output_contract,
     }
+    if request.work_type == "poster":
+        return (
+            "You are executing a persisted Astra Deliverable Request. Treat the following JSON as "
+            "the authoritative product brief. Do not choose or reveal a provider/model. Use only enabled "
+            "tools and keep every artifact under workspace/deliverables/"
+            f"{request.id}/. Create one polished commercial image with generate_image_minimax exactly once, "
+            "using save_path='workspace/deliverables/"
+            f"{request.id}/final.png' and aspect_ratio=spec.aspect_ratio. The composition must match the "
+            "requested channel and style, use a clear visual hierarchy, and contain no generated words, "
+            "captions, logos, watermarks, signatures, UI chrome, or placeholder text. If exact_copy is "
+            "non-empty, reserve clean negative space for that copy and report that deterministic typography "
+            "still needs composition; never ask the image model to spell exact copy. Call the generation "
+            "Tool exactly once because it owns provider fallback and durable recovery. If no provider accepts "
+            "the request, stop without retrying or claiming delivery. Do not read the binary image. The final "
+            "response must report the exact versioned PNG workspace path returned by the Tool, and never claim "
+            "success until the registered artifact contract confirms it.\n"
+            f"DELIVERABLE_REQUEST={json.dumps(contract, ensure_ascii=False, sort_keys=True)}"
+        )
+    if request.work_type == "video":
+        first_frame_path = f"workspace/deliverables/{request.id}/first_frame.png"
+        return (
+            "You are executing a persisted Astra Deliverable Request. Treat the following JSON as "
+            "the authoritative product brief. Do not choose or reveal a provider/model. Use only enabled "
+            "tools, keep every artifact under workspace/deliverables/"
+            f"{request.id}/, and never claim success until every output_contract file exists and validates. "
+            "This is a real people-led advertising video, not a slideshow, product spin, storyboard-only "
+            "deliverable, or empty MP4. First write workspace/deliverables/"
+            f"{request.id}/storyboard.json with a concise hook, three visual beats, adult actor direction, "
+            "product interaction, CTA, narration, and shot timing. Then generate one coherent continuous "
+            "clip with an adult on-camera actor visibly using or presenting the product. Before submitting "
+            "video, call generate_image_minimax exactly once to create a clean commercial first frame with "
+            f"save_path='{first_frame_path}' and aspect_ratio=spec.aspect_ratio. The first frame must match "
+            "the storyboard opening shot, show the same adult actor and product interaction required by the "
+            "brief, and contain no generated words, captions, logos, watermarks, or CTA. Use the exact "
+            "versioned workspace output_path returned by that successful image Tool call as first_frame_image "
+            "for the video Tool; never assume the unversioned requested file name and never submit video if "
+            "the first-frame Tool did not succeed. Preserve the requested aspect ratio and duration and use "
+            "generate_video_minimax with save_path='workspace/deliverables/"
+            f"{request.id}/visual.mp4', aspect_ratio=spec.aspect_ratio, duration=spec.duration, "
+            "first_frame_image=<exact returned first-frame output_path>, require_audio=false, "
+            "wait_for_completion=true, and poll_timeout_seconds=300. Call each generation Tool exactly once "
+            "because each Tool owns provider fallback and durable recovery. If no provider accepts the "
+            "request, stop without "
+            "retrying, scheduling a trigger, or claiming partial delivery. Do not attempt to read binary "
+            "video files. "
+            "When the visual task completes, if spec.audio_mode is 'voiceover', call generate_speech_minimax "
+            "with the approved concise narration and save_path='workspace/deliverables/"
+            f"{request.id}/voiceover.mp3', then call compose_video_audio with the completed visual path, "
+            "that voiceover path, and save_path='workspace/deliverables/"
+            f"{request.id}/final.mp4'. If spec.audio_mode is 'silent', generate directly to "
+            f"'workspace/deliverables/{request.id}/final.mp4' and do not claim audio exists. "
+            "The final response must report the exact final.mp4 workspace path. A provider task id, "
+            "storyboard, prompt, visual-only intermediate, or voiceover-only file is not the final deliverable.\n"
+            f"DELIVERABLE_REQUEST={json.dumps(contract, ensure_ascii=False, sort_keys=True)}"
+        )
+    presentation_media_roles = _presentation_media_roles(request)
+    presentation_visual_policy = _presentation_visual_policy(
+        request,
+        presentation_media_roles,
+    )
+    presentation_media_contract = {
+        "required": bool(presentation_media_roles),
+        "asset_roles": list(presentation_media_roles),
+        "minimum_distinct_images": len(presentation_media_roles),
+    }
+    media_instructions = (
+        "PRESENTATION_MEDIA_CONTRACT="
+        f"{json.dumps(presentation_media_contract, ensure_ascii=False, sort_keys=True)} "
+    )
+    if presentation_media_roles:
+        role_instructions: list[str] = []
+        for role in presentation_media_roles:
+            if role == "product_hero":
+                role_instructions.append(
+                    "For product_hero, call generate_image_minimax exactly once with a polished "
+                    "16:9 product advertising prompt, no generated words/logos/watermarks, and "
+                    f"save_path='workspace/deliverables/{request.id}/assets/product_hero.png'."
+                )
+            elif role == "people_storyboard":
+                role_instructions.append(
+                    "For people_storyboard, call generate_image_minimax exactly once with a "
+                    "single coherent three-panel people-led storyboard image, no generated "
+                    "words/logos/watermarks, and "
+                    f"save_path='workspace/deliverables/{request.id}/assets/people_storyboard.png'. "
+                    "If product_hero was generated, pass its exact versioned output_path as "
+                    "reference_image so the product remains recognizable."
+                )
+            elif role == "people_lifestyle":
+                role_instructions.append(
+                    "For people_lifestyle, call generate_image_minimax exactly once with a "
+                    "single coherent people-led commercial lifestyle scene, no generated "
+                    "words/logos/watermarks, and "
+                    f"save_path='workspace/deliverables/{request.id}/assets/people_lifestyle.png'. "
+                    "If product_hero was generated, pass its exact versioned output_path as "
+                    "reference_image so the product remains recognizable."
+                )
+            elif role == "context_scene":
+                role_instructions.append(
+                    "For context_scene, call generate_image_minimax exactly once with a "
+                    "distinct environmental scene that supports the deck story without "
+                    "generated words/logos/watermarks, and "
+                    f"save_path='workspace/deliverables/{request.id}/assets/context_scene.png'. "
+                    "Use product_hero as reference_image when product identity matters."
+                )
+            elif role == "detail_texture":
+                role_instructions.append(
+                    "For detail_texture, call generate_image_minimax exactly once with a "
+                    "macro detail or material-led composition, no generated words/logos/"
+                    "watermarks, and "
+                    f"save_path='workspace/deliverables/{request.id}/assets/detail_texture.png'. "
+                    "Use product_hero as reference_image when product identity matters."
+                )
+            else:
+                role_instructions.append(
+                    f"For {role}, call generate_image_minimax exactly once with a polished 16:9 "
+                    "commercial hero prompt, no generated words/logos/watermarks, and "
+                    f"save_path='workspace/deliverables/{request.id}/assets/{role}.png'."
+                )
+        media_instructions = (
+            "The server-owned PRESENTATION_MEDIA_CONTRACT below requires real generated imagery. "
+            "Complete every required asset role before writing presentation.html. "
+            + " ".join(role_instructions)
+            + " Use the exact versioned workspace output_path returned by each successful Tool "
+            "call to derive slide_spec.asset_ref and reference it from presentation.html with the "
+            "same path relative to presentation.html (for example assets/<versioned-file>.png). "
+            "Keep slide_spec.visual_asset as a human-readable description. Embed every "
+            "required image in at least one visible <img> or CSS background-image region and crop "
+            "it intentionally; decorative CSS silhouettes, gradients, icons, and emoji do not "
+            "satisfy this media contract. Do not use emoji as a substitute for photography or "
+            "illustration. Each generation Tool call owns provider fallback, so call it only once "
+            "per role and never manually retry. If any required image Tool call fails or is "
+            "unavailable, stop without converting or claiming a commercial-quality deck; report "
+            "the missing asset role and request supplied imagery instead. "
+            f"PRESENTATION_MEDIA_CONTRACT={json.dumps(presentation_media_contract, ensure_ascii=False, sort_keys=True)} "
+        )
     return (
         "You are executing a persisted Astra Deliverable Request. Treat the following JSON as "
         "the authoritative product brief. Do not choose or reveal a provider/model. Use only enabled "
         "tools, keep every artifact under workspace/deliverables/"
         f"{request.id}/, and never claim success until every output_contract file exists and validates. "
-        "For presentation requests, create one structurally valid PPTX with convert_html_to_pptx and "
-        "one matching PDF with convert_html_to_pdf; report both exact workspace paths.\n"
+        "For presentation requests, first write workspace/deliverables/"
+        f"{request.id}/outline.json with deck_title, audience, core_message, and exactly "
+        "spec.page_count ordered slides. Every outline slide must contain slide_id, purpose, headline, "
+        "evidence, and visual_intent; evidence may be one non-empty sentence or an array of evidence "
+        "sentences. Then write workspace/deliverables/"
+        f"{request.id}/slide_spec.json with the same ordered slide_ids and a headline, layout, body_points, "
+        "visual_asset, and source_refs for every slide. The top-level slide_spec must include "
+        "visual_plan_version='adaptive-v1' and visual_policy exactly matching PRESENTATION_VISUAL_POLICY. "
+        "Every slide must also declare slide_type and visual_kind. visual_kind must be one of "
+        "generated_image, supplied_image, editable_chart, editable_diagram, editable_table, or "
+        "editable_typography. Image slides must declare asset_ref using the exact relative path rendered "
+        "by that slide; editable compositions must use an empty asset_ref. source_refs must be an array whose entries are "
+        "either non-empty reference strings or objects with a non-empty ref field. The outline, "
+        "slide_spec, and final visible slide "
+        "titles must agree exactly; never fabricate evidence or a source reference. source_refs must point "
+        "to the user brief, a supplied workspace file, or a real URL and must never cite an internal "
+        "workflow id. "
+        f"{media_instructions}"
+        "PRESENTATION_VISUAL_POLICY="
+        f"{json.dumps(presentation_visual_policy, ensure_ascii=False, sort_keys=True)}. "
+        "Treat it as a minimum quality contract, not a list of templates: choose layouts from each "
+        "slide's purpose and information shape, do not repeat the same layout on consecutive slides, "
+        "respect the image reuse cap, and reserve the required number of slides for editable charts, "
+        "diagrams, tables, or typography compositions. "
+        "Avoid one oversized write_file call: the first presentation.html write_file call MUST stay "
+        "under 3500 characters and contain only shared CSS plus one unique placeholder section "
+        "for every requested slide. Do not put complete slide bodies in that first call. Then replace "
+        "exactly one placeholder per edit_file call so no tool call contains the whole deck. Read the "
+        "finished source back before conversion and "
+        "confirm it contains exactly spec.page_count HTML sections matching `.slide[data-slide]`, "
+        "with exactly one visible `[data-slide-title]` in every section matching slide_spec.headline, "
+        "a `data-layout` value matching slide_spec.layout, and at least one `[data-visual]` region that "
+        "actually implements the declared visual_asset. A title plus bullet list, an empty frame, a "
+        "descriptive placeholder, or unused visual_intent is not an implemented visual. Use CSS/HTML "
+        "diagrams, timelines, comparison matrices, process lanes, metric compositions, or real supplied/"
+        "generated images as appropriate, while keeping all important text editable. "
+        "Treat visual fit as a hard contract: every visible text node must remain fully inside its "
+        "1280x720 slide with at least 24px bottom safety. Never rely on overflow:hidden to hide dense "
+        "content. Reduce card padding, gaps, image height, or copy density before conversion when a "
+        "slide approaches the canvas edge. "
+        "Do not invent star ratings, scores, percentages, ROI claims, price support, market rankings, "
+        "performance thresholds, or other quantified judgments unless they are present in the brief or "
+        "a supplied source. When data is absent, label the statement as a hypothesis to validate and use "
+        "qualitative decision criteria instead of fabricated numbers. Never emit unresolved placeholder "
+        "copy such as [Your Brand Logo], TODO, TBD, 待替换, 待补充, 请填写, or 占位符; the deterministic "
+        "presentation contract rejects placeholders and rating glyphs even if the rest of the deck renders. "
+        "each fixed at 1280x720 pixels with overflow hidden and a print page break after every slide "
+        "except the last. Do not invent a brand, organization, team, author, "
+        "or internal-use label that is absent from the brief. When the brief calls for commercial "
+        "product or people imagery, use supplied or generated image assets rather than empty frames "
+        "or diagram placeholders. For several images of the same product, create one canonical hero "
+        "asset first and pass its exact workspace path as reference_image for every later scene. If "
+        "the available generator cannot preserve the product identity, reuse and crop the canonical "
+        "asset instead of independently inventing a different product. Convert that single HTML "
+        "source to PPTX using convert_html_to_pptx "
+        "with design_width=1280, design_height=720, render_mode='hybrid_editable', render_scale=2, "
+        "expected_page_count=spec.page_count, outline_path='workspace/deliverables/"
+        f"{request.id}/outline.json', and slide_spec_path='workspace/deliverables/"
+        f"{request.id}/slide_spec.json'. "
+        "Convert the same source to PDF using convert_html_to_pdf with design_width=1280, "
+        "design_height=720, pdf_mode='pages', scale=1, paper_width=13.333333, paper_height=7.5, "
+        "expected_page_count=spec.page_count, outline_path='workspace/deliverables/"
+        f"{request.id}/outline.json', and slide_spec_path='workspace/deliverables/"
+        f"{request.id}/slide_spec.json'. "
+        "The PPTX and PDF must each contain exactly spec.page_count 16:9 pages. Report both exact "
+        "workspace paths and do not claim visual consistency, no-overflow, or page-count success "
+        "unless the registered artifact contract confirms it.\n"
         f"DELIVERABLE_REQUEST={json.dumps(contract, ensure_ascii=False, sort_keys=True)}"
     )
 
@@ -339,6 +676,36 @@ async def _presentation_tool_available(db: AsyncSession, agent_id: uuid.UUID) ->
     )
 
 
+async def _video_post_production_tools_available(
+    db: AsyncSession,
+    agent_id: uuid.UUID,
+) -> bool:
+    return all(
+        [
+            await _agent_tool_available(
+                db,
+                agent_id=agent_id,
+                tool_name="generate_image_minimax",
+            ),
+            await _agent_tool_available(
+                db,
+                agent_id=agent_id,
+                tool_name="generate_video_minimax",
+            ),
+            await _agent_tool_available(
+                db,
+                agent_id=agent_id,
+                tool_name="generate_speech_minimax",
+            ),
+            await _agent_tool_available(
+                db,
+                agent_id=agent_id,
+                tool_name="compose_video_audio",
+            ),
+        ]
+    )
+
+
 def _credit_estimate(workflow: WorkflowManifest, tier: str, spec: dict[str, Any]) -> dict[str, Any]:
     if workflow.work_type == "presentation":
         return {
@@ -348,13 +715,12 @@ def _credit_estimate(workflow: WorkflowManifest, tier: str, spec: dict[str, Any]
             "billing_unit": "actual_usage",
         }
     if workflow.work_type == "poster":
-        candidates = {"lite": 1, "pro": 3, "ultra": 5}[tier]
-        credits = minimax_image_credits("image-01", images=candidates)
+        credits = minimax_image_credits("image-01", images=1)
         return {
             "mode": "estimate",
             "minimum": credits,
             "maximum": credits,
-            "billing_unit": f"{candidates}_candidate_images",
+            "billing_unit": "one_final_image",
         }
     if workflow.work_type == "video":
         profile = resolve_minimax_media_profile("video", tier)
@@ -367,12 +733,14 @@ def _credit_estimate(workflow: WorkflowManifest, tier: str, spec: dict[str, Any]
             duration = 6
         elif tier == "ultra" and duration == 10:
             resolution = "768P"
-        credits = minimax_video_credits(profile.model, duration=duration, resolution=resolution)
+        first_frame_credits = minimax_image_credits("image-01", images=1)
+        video_credits = minimax_video_credits(profile.model, duration=duration, resolution=resolution)
+        credits = first_frame_credits + video_credits
         return {
             "mode": "estimate",
             "minimum": credits,
             "maximum": credits,
-            "billing_unit": f"{duration}s_{resolution.lower()}_clip",
+            "billing_unit": f"one_first_frame_plus_{duration}s_{resolution.lower()}_clip",
         }
     return {"mode": "usage_based", "minimum": None, "maximum": None, "billing_unit": "actual_usage"}
 
@@ -411,6 +779,21 @@ async def preflight_workflow(
         row = next((item for item in media if item["modality"] == workflow.required_capability), None)
         if row is None or not row["available"]:
             reasons.append(str((row or {}).get("reason") or "media_capability_unavailable"))
+        if (
+            workflow.required_capability == "image"
+            and not await _agent_tool_available(
+                db,
+                agent_id=agent_id,
+                tool_name="generate_image_minimax",
+            )
+        ):
+            reasons.append("image_generation_tool_unavailable")
+        if (
+            workflow.required_capability == "video"
+            and normalized_spec.get("audio_mode") == "voiceover"
+            and not await _video_post_production_tools_available(db, agent_id)
+        ):
+            reasons.append("video_post_production_tool_unavailable")
 
     if workflow.launch_policy == "dry_run":
         reasons.append("workflow_execution_not_enabled")
@@ -534,14 +917,111 @@ async def sync_deliverable_lifecycle(
         .with_for_update()
     )
     request = result.scalar_one_or_none()
+    normalized_lifecycle_status = str(lifecycle_status or "").strip().lower()
     if not isinstance(request, DeliverableRequest):
+        if normalized_lifecycle_status not in {"completed", "cancelled"}:
+            return None
+        run_result = await db.execute(
+            select(AgentRun).where(
+                AgentRun.tenant_id == tenant_id,
+                AgentRun.id == run_id,
+            )
+        )
+        run = run_result.scalar_one_or_none()
+        if (
+            not isinstance(run, AgentRun)
+            or run.session_id is None
+            or run.agent_id is None
+        ):
+            return None
+        candidates_result = await db.execute(
+            select(DeliverableRequest)
+            .where(
+                DeliverableRequest.tenant_id == tenant_id,
+                DeliverableRequest.session_id == run.session_id,
+                DeliverableRequest.agent_id == run.agent_id,
+                DeliverableRequest.work_type.in_(
+                    ("poster", "presentation", "video"),
+                ),
+                DeliverableRequest.status.in_(
+                    ("running", "waiting_approval", "failed", "cancelled"),
+                ),
+                DeliverableRequest.current_stage != "changes_requested",
+            )
+            .order_by(
+                DeliverableRequest.created_at.desc(),
+                DeliverableRequest.id.desc(),
+            )
+            .with_for_update()
+        )
+        for candidate in candidates_result.scalars().all():
+            reconciliation = await reconcile_runtime_deliverable_artifacts(
+                db,
+                request=candidate,
+                run_id=run_id,
+            )
+            attempted_types = tuple(
+                getattr(reconciliation, "attempted_types", ()) or (),
+            )
+            if not attempted_types:
+                continue
+            if reconciliation.complete:
+                created_types = tuple(
+                    getattr(reconciliation, "created_types", ()) or (),
+                )
+                changed = bool(created_types) or (
+                    candidate.status != "waiting_approval"
+                    or candidate.current_stage != "output_review"
+                    or candidate.last_error_code is not None
+                    or candidate.completed_at is not None
+                )
+                if not changed:
+                    return candidate
+                candidate.status = "waiting_approval"
+                candidate.current_stage = "output_review"
+                candidate.completed_at = None
+                candidate.last_error_code = None
+                candidate.version += 1
+                return candidate
+            if normalized_lifecycle_status == "cancelled":
+                continue
+            failure_codes = tuple(
+                getattr(reconciliation, "failure_codes", ()) or (),
+            )
+            if failure_codes:
+                next_error_code = str(failure_codes[0][1])[:100]
+            elif reconciliation.unavailable_types:
+                next_error_code = "deliverable_artifact_verification_unavailable"
+            elif reconciliation.invalid_types:
+                next_error_code = "deliverable_artifact_invalid"
+            else:
+                next_error_code = "deliverable_artifact_missing"
+            changed = (
+                candidate.status != "failed"
+                or candidate.current_stage != "artifact_verification_failed"
+                or candidate.last_error_code != next_error_code
+            )
+            if not changed:
+                return candidate
+            candidate.status = "failed"
+            candidate.current_stage = "artifact_verification_failed"
+            candidate.completed_at = now or datetime.now(UTC)
+            candidate.last_error_code = next_error_code
+            candidate.version += 1
+            return candidate
         return None
-    if request.status in {"succeeded", "cancelled"}:
+    # A provider write may settle after the user has cancelled a stalled model
+    # turn. Re-run artifact reconciliation for cancelled creative requests so
+    # a valid, paid output is not hidden from review.
+    if request.status == "succeeded":
         return request
     if request.status == "failed" and request.current_stage == "changes_requested":
         return request
-    normalized_lifecycle_status = str(lifecycle_status or "").strip().lower()
-    if normalized_lifecycle_status == "completed" and request.work_type == "presentation":
+    if normalized_lifecycle_status in {"completed", "cancelled"} and request.work_type in {
+        "poster",
+        "presentation",
+        "video",
+    }:
         reconciliation = await reconcile_runtime_deliverable_artifacts(
             db,
             request=request,
@@ -552,6 +1032,14 @@ async def sync_deliverable_lifecycle(
                 "waiting_approval",
                 "output_review",
                 None,
+            )
+        elif normalized_lifecycle_status == "cancelled":
+            next_status = next_stage = next_error_code = None
+        elif getattr(reconciliation, "failure_codes", ()):
+            next_status, next_stage, next_error_code = (
+                "failed",
+                "artifact_verification_failed",
+                str(reconciliation.failure_codes[0][1])[:100],
             )
         elif reconciliation.unavailable_types:
             next_status, next_stage, next_error_code = (
@@ -571,18 +1059,19 @@ async def sync_deliverable_lifecycle(
                 "artifact_verification_failed",
                 "deliverable_artifact_missing",
             )
-        if (
-            request.status == next_status
-            and request.current_stage == next_stage
-            and request.last_error_code == next_error_code
-        ):
+        if next_status is not None and next_stage is not None:
+            if (
+                request.status == next_status
+                and request.current_stage == next_stage
+                and request.last_error_code == next_error_code
+            ):
+                return request
+            request.status = next_status
+            request.current_stage = next_stage
+            request.completed_at = now or datetime.now(UTC) if next_status == "failed" else None
+            request.last_error_code = next_error_code
+            request.version += 1
             return request
-        request.status = next_status
-        request.current_stage = next_stage
-        request.completed_at = now or datetime.now(UTC) if next_status == "failed" else None
-        request.last_error_code = next_error_code
-        request.version += 1
-        return request
     terminal_mapping = {
         # A completed Runtime only proves that the agent stopped normally. The
         # deliverable still needs an artifact revision and evaluator evidence.

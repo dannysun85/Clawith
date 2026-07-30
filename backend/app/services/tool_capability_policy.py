@@ -13,6 +13,7 @@ GLOBAL_DEFAULT_MEDIA_TOOL_NAMES = frozenset(
     {
         "generate_image_minimax",
         "generate_speech_minimax",
+        "compose_video_audio",
         "generate_video_minimax",
         "check_video_minimax",
     }
@@ -45,9 +46,9 @@ EXPLICIT_GRANT_TOOL_NAMES = frozenset(
 # ``LLMCredential`` pool. Tool visibility may come from the global product
 # default or an explicit Agent assignment; neither path may become an
 # object-level or tenant BYOK credential binding for MiniMax.
-CENTRAL_CREDENTIAL_POOL_TOOL_NAMES = GLOBAL_DEFAULT_MEDIA_TOOL_NAMES | {
-    "generate_music_minimax",
-}
+CENTRAL_CREDENTIAL_POOL_TOOL_NAMES = (
+    GLOBAL_DEFAULT_MEDIA_TOOL_NAMES - {"compose_video_audio"}
+) | {"generate_music_minimax"}
 
 
 # v1.11 replaced the AI-posting Plaza.  Keep the names registered for old

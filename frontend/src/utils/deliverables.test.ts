@@ -2,10 +2,12 @@ import { describe, expect, it } from 'vitest';
 
 import type { DeliverableRequest } from '../services/api';
 import {
+    deliverableApprovalBlocked,
+    deliverableApprovalStatusMessage,
     deliverableLaunchMessage,
     deliverableRouteTier,
     latestPendingDeliverable,
-    latestTrackedDeliverable,
+    latestTrackedDeliverables,
     requestCanLaunchFromComposer,
 } from './deliverables';
 
@@ -44,7 +46,12 @@ function request(overrides: Partial<DeliverableRequest> = {}): DeliverableReques
 describe('deliverable composer selection', () => {
     it('fails closed for dry-run and unknown workflow versions', () => {
         expect(requestCanLaunchFromComposer(request())).toBe(true);
-        expect(requestCanLaunchFromComposer(request({ workflow_id: 'builtin.poster.v1', work_type: 'poster' }))).toBe(false);
+        expect(requestCanLaunchFromComposer(request({
+            workflow_id: 'builtin.video.v1',
+            work_type: 'video',
+            output_contract: ['mp4'],
+        }))).toBe(true);
+        expect(requestCanLaunchFromComposer(request({ workflow_id: 'builtin.poster.v1', work_type: 'poster' }))).toBe(true);
         expect(requestCanLaunchFromComposer(request({ workflow_version: '2.0.0' }))).toBe(false);
         expect(requestCanLaunchFromComposer(request({ status: 'running' }))).toBe(false);
     });
@@ -58,13 +65,27 @@ describe('deliverable composer selection', () => {
         expect(latestPendingDeliverable([running], new Set())).toBeNull();
     });
 
-    it('shows only launched non-cancelled work in the delivery status card', () => {
+    it('shows the latest launched non-cancelled work for each deliverable type', () => {
         const ready = request({ id: 'ready' });
         const cancelled = request({ id: 'cancelled', status: 'cancelled', agent_run_id: 'run-cancelled' });
-        const completed = request({ id: 'completed', status: 'succeeded', agent_run_id: 'run-completed' });
+        const newestPresentation = request({ id: 'new-ppt', status: 'succeeded', agent_run_id: 'run-new-ppt' });
+        const olderPresentation = request({ id: 'old-ppt', status: 'succeeded', agent_run_id: 'run-old-ppt' });
+        const video = request({
+            id: 'video',
+            work_type: 'video',
+            workflow_id: 'builtin.video.v1',
+            status: 'waiting_approval',
+            agent_run_id: 'run-video',
+        });
 
-        expect(latestTrackedDeliverable([ready, cancelled, completed])?.id).toBe('completed');
-        expect(latestTrackedDeliverable([ready, cancelled])).toBeNull();
+        expect(latestTrackedDeliverables([
+            ready,
+            cancelled,
+            newestPresentation,
+            olderPresentation,
+            video,
+        ]).map((item) => item.id)).toEqual(['new-ppt', 'video']);
+        expect(latestTrackedDeliverables([ready, cancelled])).toEqual([]);
     });
 
     it('builds equivalent Chinese and English launch copy from the persisted goal', () => {
@@ -78,5 +99,33 @@ describe('deliverable composer selection', () => {
         expect(deliverableRouteTier(request({ tier: 'ultra' }), 'lite')).toBe('ultra');
         expect(deliverableRouteTier(request({ status: 'running', tier: 'ultra' }), 'lite')).toBe('lite');
         expect(deliverableRouteTier(null, 'pro')).toBe('pro');
+    });
+
+    it('keeps legacy output review approvable when readiness is absent', () => {
+        const legacy = request({
+            status: 'waiting_approval',
+            current_stage: 'output_review',
+        });
+
+        expect(deliverableApprovalBlocked(legacy)).toBe(false);
+        expect(deliverableApprovalStatusMessage(legacy, true)).toContain('结构校验');
+    });
+
+    it('blocks approval copy when the hash-bound quality receipt failed', () => {
+        const blocked = request({
+            status: 'waiting_approval',
+            current_stage: 'output_review',
+            approval_readiness: {
+                approvable: false,
+                quality_gate_required: false,
+                quality_status: 'blocked',
+                blockers: ['deliverable_creative_quality_blocked'],
+                receipt_ref: 'receipt-1',
+            },
+        });
+
+        expect(deliverableApprovalBlocked(blocked)).toBe(true);
+        expect(deliverableApprovalStatusMessage(blocked, true)).toContain('明确问题');
+        expect(deliverableApprovalStatusMessage(blocked, false)).toContain('cannot be approved');
     });
 });

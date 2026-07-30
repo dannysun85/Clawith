@@ -43,7 +43,7 @@ import {
     deliverableLaunchMessage,
     deliverableRouteTier,
     latestPendingDeliverable,
-    latestTrackedDeliverable,
+    latestTrackedDeliverables,
     requestCanLaunchFromComposer,
 } from '../../utils/deliverables';
 import {
@@ -131,6 +131,7 @@ import {
     type SessionActiveRun,
     type ToolReconciliation,
     waitingSessionActiveRunHint,
+    waitingRunResumePayload,
 } from './sessionRuntimeState';
 import { onboardingKickoffKey, shouldKickoffOnboarding } from './onboardingKickoff';
 import { fetchAuth } from './utils/fetchAuth';
@@ -3909,6 +3910,11 @@ export default function AgentDetailPage() {
                     isWaiting: false,
                     isStreaming: endStreaming ? false : nextStreaming,
                 });
+                if (endStreaming && d.runtime_status !== 'waiting_user') {
+                    void queryClient.invalidateQueries({
+                        queryKey: ['deliverable-requests', agentId, sessionId],
+                    });
+                }
             }
             if (d.type === 'runtime_status') {
                 // A queued Run is not the Session lane holder. Re-read the
@@ -5122,6 +5128,7 @@ export default function AgentDetailPage() {
             workRequestId: pendingDeliverable?.launchable
                 ? pendingDeliverable.request.id
                 : undefined,
+            ...waitingRunResumePayload(currentRun),
         };
 
         setChatInput('');
@@ -5464,7 +5471,7 @@ export default function AgentDetailPage() {
             query.state.data?.some((request) => request.status === 'running') ? 3000 : false
         ),
     });
-    const trackedDeliverable = latestTrackedDeliverable(sessionDeliverableRequests);
+    const trackedDeliverables = latestTrackedDeliverables(sessionDeliverableRequests);
     useEffect(() => {
         if (!activeSession?.id) {
             setPendingDeliverable(null);
@@ -7988,6 +7995,29 @@ export default function AgentDetailPage() {
                                                     });
                                                 })()
                                                 }
+                                                {trackedDeliverables.map((request) => (
+                                                    <div className="chat-msg-row chat-msg-row--deliverable" key={request.id}>
+                                                        <div className="chat-msg-avatar">
+                                                            {(((agent as any)?.name || 'Agent')[0])}
+                                                        </div>
+                                                        <div className="chat-msg-col chat-msg-col--deliverable">
+                                                            <div className="chat-msg-sender">
+                                                                {(agent as any)?.name || 'Agent'}
+                                                            </div>
+                                                            <DeliverableReviewCard
+                                                                request={request}
+                                                                onUpdated={(updated) => {
+                                                                    queryClient.setQueryData<DeliverableRequest[]>(
+                                                                        ['deliverable-requests', id, activeSession?.id],
+                                                                        (current = []) => current.map((request) => (
+                                                                            request.id === updated.id ? updated : request
+                                                                        )),
+                                                                    );
+                                                                }}
+                                                            />
+                                                        </div>
+                                                    </div>
+                                                ))}
                                                 {showDirectRunThinking && (
                                                     <div className="chat-msg-row">
                                                         <div className="chat-msg-avatar">A</div>
@@ -8076,19 +8106,6 @@ export default function AgentDetailPage() {
                                                             )}
                                                         </div>
                                                     ))}
-                                                    {trackedDeliverable && (
-                                                        <DeliverableReviewCard
-                                                            request={trackedDeliverable}
-                                                            onUpdated={(updated) => {
-                                                                queryClient.setQueryData<DeliverableRequest[]>(
-                                                                    ['deliverable-requests', id, activeSession?.id],
-                                                                    (current = []) => current.map((request) => (
-                                                                        request.id === updated.id ? updated : request
-                                                                    )),
-                                                                );
-                                                            }}
-                                                        />
-                                                    )}
                                                     {pendingDeliverable && (
                                                         <DeliverableRequestCard
                                                             request={pendingDeliverable.request}

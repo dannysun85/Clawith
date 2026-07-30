@@ -10,10 +10,12 @@ import uuid
 import pytest
 from pydantic import ValidationError
 
+from app.models.agent_run import AgentRun
 from app.models.deliverable import DeliverableRequest
 from app.schemas.deliverable import DeliverableInput
 from app.services.deliverable_workflows import (
     DeliverableWorkflowError,
+    _credit_estimate,
     attach_deliverable_run,
     build_deliverable_prompt,
     list_agent_launchable_workflows,
@@ -34,6 +36,12 @@ class _ScalarResult:
     def scalar_one_or_none(self):
         return self.value
 
+    def scalars(self):
+        return self
+
+    def all(self):
+        return self.value if isinstance(self.value, list) else [self.value]
+
 
 class _Session:
     def __init__(self, value: object) -> None:
@@ -41,6 +49,14 @@ class _Session:
 
     async def execute(self, _statement):
         return _ScalarResult(self.value)
+
+
+class _SequenceSession:
+    def __init__(self, *values: object) -> None:
+        self.values = iter(values)
+
+    async def execute(self, _statement):
+        return _ScalarResult(next(self.values))
 
 
 def _request(**overrides):
@@ -92,7 +108,8 @@ def test_builtin_workflow_manifests_are_versioned_and_unique() -> None:
     assert len({workflow.workflow_id for workflow in workflows}) == len(workflows)
     assert all(workflow.workflow_version == "1.0.0" for workflow in workflows)
     assert require_workflow("presentation").launch_policy == "agent_runtime"
-    assert require_workflow("poster").launch_policy == "dry_run"
+    assert require_workflow("poster").launch_policy == "agent_runtime"
+    assert require_workflow("video").launch_policy == "agent_runtime"
 
 
 @pytest.mark.asyncio
@@ -106,6 +123,16 @@ async def test_launcher_lists_only_workflows_executable_by_this_agent(monkeypatc
         "app.services.deliverable_workflows._presentation_tool_available",
         available,
     )
+    video_available = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows._video_post_production_tools_available",
+        video_available,
+    )
+    image_tool_available = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows._agent_tool_available",
+        image_tool_available,
+    )
     agent_id = uuid.uuid4()
 
     workflows = await list_agent_launchable_workflows(
@@ -115,8 +142,14 @@ async def test_launcher_lists_only_workflows_executable_by_this_agent(monkeypatc
         tier="pro",
     )
 
-    assert [workflow.work_type for workflow in workflows] == ["presentation"]
+    assert [workflow.work_type for workflow in workflows] == ["presentation", "poster", "video"]
     available.assert_awaited_once_with(ANY, agent_id)
+    image_tool_available.assert_awaited_once_with(
+        ANY,
+        agent_id=agent_id,
+        tool_name="generate_image_minimax",
+    )
+    video_available.assert_awaited_once_with(ANY, agent_id)
 
 
 @pytest.mark.asyncio
@@ -127,6 +160,14 @@ async def test_launcher_hides_workflow_when_agent_lacks_its_tool(monkeypatch) ->
     )
     monkeypatch.setattr(
         "app.services.deliverable_workflows._presentation_tool_available",
+        AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows._video_post_production_tools_available",
+        AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows._agent_tool_available",
         AsyncMock(return_value=False),
     )
 
@@ -188,8 +229,142 @@ def test_execution_prompt_contains_contract_but_never_provider_selection() -> No
     assert "builtin.presentation.v1" in prompt
     assert "workspace/deliverables/" in prompt
     assert '"tier": "pro"' in prompt
+    assert "render_mode='hybrid_editable'" in prompt
+    assert "every visible text node must remain fully inside its 1280x720 slide" in prompt
+    assert "one unique placeholder" in prompt
+    assert "under 3500 characters" in prompt
+    assert "exactly one placeholder per edit_file call" in prompt
+    assert "outline.json" in prompt
+    assert "slide_spec.json" in prompt
+    assert "visual_plan_version='adaptive-v1'" in prompt
+    assert "PRESENTATION_VISUAL_POLICY=" in prompt
+    assert "do not repeat the same layout on consecutive slides" in prompt
+    assert "editable_chart, editable_diagram, editable_table" in prompt
+    assert "evidence may be one non-empty sentence or an array" in prompt
+    assert "objects with a non-empty ref field" in prompt
+    assert "[data-slide-title]" in prompt
+    assert "The outline, slide_spec, and final visible slide titles must agree exactly" in prompt
+    assert "expected_page_count=spec.page_count" in prompt
+    assert "paper_width=13.333333" in prompt
+    assert "paper_height=7.5" in prompt
+    assert "exactly spec.page_count 16:9 pages" in prompt
+    assert "Do not invent a brand" in prompt
+    assert "one canonical hero asset first" in prompt
+    assert "reference_image" in prompt
+    assert '"required": false' in prompt
+    assert "Do not invent star ratings, scores, percentages, ROI claims" in prompt
+    assert "label the statement as a hypothesis to validate" in prompt
     assert '"provider"' not in prompt
     assert '"model"' not in prompt
+
+
+def test_image_led_commercial_presentation_compiles_required_media_contract() -> None:
+    request = _request(
+        goal=(
+            "制作一份高端智能保温杯新品发布提案，图文并茂，"
+            "包含人物广告创意与三镜头故事板。"
+        ),
+        spec={
+            "audience": "品牌与增长决策者",
+            "page_count": 8,
+            "language": "zh-CN",
+            "style": "深海军蓝、暖金和银色的高端商业风",
+        },
+    )
+
+    prompt = build_deliverable_prompt(request)
+
+    assert '"required": true' in prompt
+    assert '"asset_roles": ["product_hero", "people_lifestyle", "people_storyboard"]' in prompt
+    assert '"minimum_distinct_images": 3' in prompt
+    assert '"minimum_distinct_layouts": 4' in prompt
+    assert '"maximum_uses_per_image": 3' in prompt
+    assert '"minimum_editable_compositions": 2' in prompt
+    assert "generate_image_minimax exactly once" in prompt
+    assert f"workspace/deliverables/{request.id}/assets/product_hero.png" in prompt
+    assert f"workspace/deliverables/{request.id}/assets/people_lifestyle.png" in prompt
+    assert f"workspace/deliverables/{request.id}/assets/people_storyboard.png" in prompt
+    assert "pass its exact versioned output_path as reference_image" in prompt
+    assert "Do not use emoji as a substitute" in prompt
+    assert "stop without converting or claiming a commercial-quality deck" in prompt
+
+
+def test_long_image_led_deck_scales_visual_budget_without_weakening_lite_contract() -> None:
+    prompt = build_deliverable_prompt(
+        _request(
+            goal="制作一份图文并茂的 15 页商业发布方案",
+            tier="lite",
+            spec={
+                "audience": "客户决策者",
+                "page_count": 15,
+                "language": "zh-CN",
+                "style": "专业商业风",
+            },
+        )
+    )
+
+    assert '"minimum_distinct_images": 5' in prompt
+    assert '"minimum_distinct_layouts": 8' in prompt
+    assert '"maximum_uses_per_image": 3' in prompt
+    assert '"minimum_editable_compositions": 3' in prompt
+
+
+def test_video_workflow_compiles_people_led_voiceover_delivery_contract() -> None:
+    request = _request(
+        work_type="video",
+        workflow_id="builtin.video.v1",
+        spec={
+            "channel": "social",
+            "aspect_ratio": "9:16",
+            "duration": "10",
+            "audience": "都市白领",
+            "language": "zh-CN",
+            "audio_mode": "voiceover",
+            "story": "人物在通勤场景中使用产品",
+            "cta": "立即了解更多",
+        },
+        approval_policy=["storyboard", "final"],
+        output_contract=["mp4"],
+    )
+
+    prompt = build_deliverable_prompt(request)
+
+    assert "people-led advertising video" in prompt
+    assert "storyboard.json" in prompt
+    assert "adult on-camera actor" in prompt
+    assert "generate_image_minimax exactly once" in prompt
+    assert f"workspace/deliverables/{request.id}/first_frame.png" in prompt
+    assert "exact versioned workspace output_path" in prompt
+    assert "first_frame_image=<exact returned first-frame output_path>" in prompt
+    assert "generate_video_minimax" in prompt
+    assert "generate_speech_minimax" in prompt
+    assert "compose_video_audio" in prompt
+    assert "Call each generation Tool exactly once" in prompt
+    assert "scheduling a trigger" in prompt
+    assert f"workspace/deliverables/{request.id}/final.mp4" in prompt
+    assert prompt.index("generate_image_minimax") < prompt.index("generate_video_minimax")
+    assert '"provider"' not in prompt
+    assert '"model"' not in prompt
+
+
+def test_video_credit_estimate_includes_one_managed_first_frame() -> None:
+    workflow = require_workflow("video")
+
+    estimate = _credit_estimate(
+        workflow,
+        "pro",
+        {
+            "duration": "6",
+            "aspect_ratio": "9:16",
+        },
+    )
+
+    assert estimate == {
+        "mode": "estimate",
+        "minimum": 284,
+        "maximum": 284,
+        "billing_unit": "one_first_frame_plus_6s_768p_clip",
+    }
 
 
 @pytest.mark.asyncio
@@ -274,8 +449,7 @@ async def test_prepare_launch_rechecks_capability_without_mutating_blocked_reque
     assert request.version == 1
 
 
-@pytest.mark.asyncio
-async def test_dry_run_workflow_cannot_be_launched() -> None:
+def test_poster_workflow_compiles_one_image_delivery_contract() -> None:
     request = _request(
         work_type="poster",
         workflow_id="builtin.poster.v1",
@@ -283,16 +457,14 @@ async def test_dry_run_workflow_cannot_be_launched() -> None:
         output_contract=["png"],
     )
 
-    with pytest.raises(DeliverableWorkflowError, match="planning only"):
-        await prepare_deliverable_launch(
-            _Session(request),  # type: ignore[arg-type]
-            request_id=request.id,
-            tenant_id=request.tenant_id,
-            user_id=request.created_by_user_id,
-            agent_id=request.agent_id,
-            session_id=request.session_id,
-            message_id=uuid.uuid4(),
-        )
+    prompt = build_deliverable_prompt(request)
+
+    assert "generate_image_minimax exactly once" in prompt
+    assert f"workspace/deliverables/{request.id}/final.png" in prompt
+    assert "reserve clean negative space" in prompt
+    assert "never ask the image model to spell exact copy" in prompt
+    assert '"provider"' not in prompt
+    assert '"model"' not in prompt
 
 
 def test_attach_run_is_idempotent_only_for_the_same_run() -> None:
@@ -310,7 +482,7 @@ def test_attach_run_is_idempotent_only_for_the_same_run() -> None:
 
 
 @pytest.mark.asyncio
-async def test_poster_preflight_is_available_but_not_launchable_in_phase_one(monkeypatch) -> None:
+async def test_poster_preflight_is_available_and_launchable(monkeypatch) -> None:
     workflow = require_workflow("poster")
     monkeypatch.setattr(
         "app.services.deliverable_workflows.resolve_route",
@@ -328,6 +500,10 @@ async def test_poster_preflight_is_available_but_not_launchable_in_phase_one(mon
             ]
         ),
     )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows._agent_tool_available",
+        AsyncMock(return_value=True),
+    )
 
     result = await preflight_workflow(
         SimpleNamespace(),  # type: ignore[arg-type]
@@ -339,13 +515,13 @@ async def test_poster_preflight_is_available_but_not_launchable_in_phase_one(mon
     )
 
     assert result["available"] is True
-    assert result["launchable"] is False
-    assert result["reasons"] == ["workflow_execution_not_enabled"]
+    assert result["launchable"] is True
+    assert result["reasons"] == []
     assert result["credit_estimate"] == {
         "mode": "estimate",
-        "minimum": 11,
-        "maximum": 11,
-        "billing_unit": "3_candidate_images",
+        "minimum": 4,
+        "maximum": 4,
+        "billing_unit": "one_final_image",
     }
     assert result["creates_reservation"] is False
 
@@ -366,13 +542,13 @@ async def test_runtime_terminal_state_closes_the_linked_deliverable(
     monkeypatch,
 ) -> None:
     request = _request(status="running", current_stage="running", agent_run_id=uuid.uuid4())
-    if lifecycle_status == "completed":
+    if lifecycle_status in {"completed", "cancelled"}:
         monkeypatch.setattr(
             "app.services.deliverable_workflows.reconcile_runtime_deliverable_artifacts",
             AsyncMock(
                 return_value=SimpleNamespace(
-                    complete=True,
-                    missing_types=(),
+                    complete=lifecycle_status == "completed",
+                    missing_types=(() if lifecycle_status == "completed" else ("pdf",)),
                     invalid_types=(),
                     unavailable_types=(),
                 )
@@ -406,14 +582,356 @@ async def test_runtime_terminal_state_closes_the_linked_deliverable(
 
 
 @pytest.mark.asyncio
-async def test_completed_runtime_fails_deliverable_when_required_artifact_is_missing(monkeypatch) -> None:
-    request = _request(status="running", current_stage="running", agent_run_id=uuid.uuid4())
+async def test_cancelled_creative_request_can_recover_when_artifact_settles_late(
+    monkeypatch,
+) -> None:
+    request = _request(
+        work_type="poster",
+        workflow_id="builtin.poster.v1",
+        spec={"channel": "social", "aspect_ratio": "16:9", "style": "commercial"},
+        output_contract=["png"],
+        status="cancelled",
+        current_stage="cancelled",
+        agent_run_id=uuid.uuid4(),
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.reconcile_runtime_deliverable_artifacts",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                complete=True,
+                missing_types=(),
+                invalid_types=(),
+                unavailable_types=(),
+            )
+        ),
+    )
+
+    result = await sync_deliverable_lifecycle(
+        _Session(request),  # type: ignore[arg-type]
+        tenant_id=request.tenant_id,
+        run_id=request.agent_run_id,
+        lifecycle_status="cancelled",
+        lifecycle={},
+    )
+
+    assert result is request
+    assert request.status == "waiting_approval"
+    assert request.current_stage == "output_review"
+    assert request.completed_at is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_runtime_keeps_verified_artifacts_reviewable(monkeypatch) -> None:
+    request = _request(
+        status="running",
+        current_stage="running",
+        agent_run_id=uuid.uuid4(),
+        work_type="presentation",
+        output_contract=["pptx", "pdf"],
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.reconcile_runtime_deliverable_artifacts",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                complete=True,
+                missing_types=(),
+                invalid_types=(),
+                unavailable_types=(),
+            )
+        ),
+    )
+
+    result = await sync_deliverable_lifecycle(
+        _Session(request),  # type: ignore[arg-type]
+        tenant_id=request.tenant_id,
+        run_id=request.agent_run_id,
+        lifecycle_status="cancelled",
+    )
+
+    assert result is request
+    assert request.status == "waiting_approval"
+    assert request.current_stage == "output_review"
+    assert request.last_error_code is None
+    assert request.completed_at is None
+
+
+@pytest.mark.asyncio
+async def test_followup_run_recovers_failed_deliverable_from_same_session(
+    monkeypatch,
+) -> None:
+    tenant_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    session_id = uuid.uuid4()
+    followup_run_id = uuid.uuid4()
+    request = _request(
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        session_id=session_id,
+        status="failed",
+        current_stage="artifact_verification_failed",
+        last_error_code="deliverable_artifact_missing",
+        agent_run_id=uuid.uuid4(),
+    )
+    followup_run = AgentRun(
+        id=followup_run_id,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        session_id=session_id,
+        source_type="chat",
+        goal="Repair the missing PDF",
+        run_kind="foreground",
+        model_id=uuid.uuid4(),
+        runtime_type="langgraph",
+        runtime_thread_id=f"direct:{session_id}",
+        graph_name="agent_runtime",
+        graph_version="1",
+        model_turn_limit=50,
+        delivery_status="pending",
+    )
+    reconcile = AsyncMock(
+        return_value=SimpleNamespace(
+            complete=True,
+            missing_types=(),
+            invalid_types=(),
+            unavailable_types=(),
+            attempted_types=("pdf",),
+            created_types=("pdf",),
+            failure_codes=(),
+        )
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.reconcile_runtime_deliverable_artifacts",
+        reconcile,
+    )
+
+    result = await sync_deliverable_lifecycle(
+        _SequenceSession(None, followup_run, [request]),  # type: ignore[arg-type]
+        tenant_id=tenant_id,
+        run_id=followup_run_id,
+        lifecycle_status="completed",
+    )
+
+    assert result is request
+    assert request.status == "waiting_approval"
+    assert request.current_stage == "output_review"
+    assert request.last_error_code is None
+    assert request.completed_at is None
+    reconcile.assert_awaited_once_with(
+        ANY,
+        request=request,
+        run_id=followup_run_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_followup_run_registers_new_revision_for_waiting_approval_request(
+    monkeypatch,
+) -> None:
+    tenant_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    session_id = uuid.uuid4()
+    followup_run_id = uuid.uuid4()
+    request = _request(
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        session_id=session_id,
+        status="waiting_approval",
+        current_stage="output_review",
+        agent_run_id=uuid.uuid4(),
+        version=4,
+    )
+    followup_run = AgentRun(
+        id=followup_run_id,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        session_id=session_id,
+        source_type="chat",
+        goal="Repair presentation layout",
+        run_kind="foreground",
+        model_id=uuid.uuid4(),
+        runtime_type="langgraph",
+        runtime_thread_id=f"direct:{session_id}",
+        graph_name="agent_runtime",
+        graph_version="1",
+        model_turn_limit=50,
+        delivery_status="pending",
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.reconcile_runtime_deliverable_artifacts",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                complete=True,
+                missing_types=(),
+                invalid_types=(),
+                unavailable_types=(),
+                attempted_types=("pptx", "pdf"),
+                created_types=("pptx", "pdf"),
+                failure_codes=(),
+            )
+        ),
+    )
+
+    result = await sync_deliverable_lifecycle(
+        _SequenceSession(None, followup_run, [request]),  # type: ignore[arg-type]
+        tenant_id=tenant_id,
+        run_id=followup_run_id,
+        lifecycle_status="completed",
+    )
+
+    assert result is request
+    assert request.status == "waiting_approval"
+    assert request.current_stage == "output_review"
+    assert request.version == 5
+
+
+@pytest.mark.asyncio
+async def test_followup_failed_render_closes_previous_review_state(
+    monkeypatch,
+) -> None:
+    tenant_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    session_id = uuid.uuid4()
+    followup_run_id = uuid.uuid4()
+    request = _request(
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        session_id=session_id,
+        status="waiting_approval",
+        current_stage="output_review",
+        agent_run_id=uuid.uuid4(),
+        version=4,
+    )
+    followup_run = AgentRun(
+        id=followup_run_id,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        session_id=session_id,
+        source_type="chat",
+        goal="Repair presentation layout",
+        run_kind="foreground",
+        model_id=uuid.uuid4(),
+        runtime_type="langgraph",
+        runtime_thread_id=f"direct:{session_id}",
+        graph_name="agent_runtime",
+        graph_version="1",
+        model_turn_limit=50,
+        delivery_status="pending",
+    )
     monkeypatch.setattr(
         "app.services.deliverable_workflows.reconcile_runtime_deliverable_artifacts",
         AsyncMock(
             return_value=SimpleNamespace(
                 complete=False,
-                missing_types=("pdf",),
+                missing_types=("pptx",),
+                invalid_types=("pdf",),
+                unavailable_types=(),
+                attempted_types=("pptx", "pdf"),
+                created_types=(),
+                failure_codes=(("pdf", "presentation_visual_quality_failed"),),
+            )
+        ),
+    )
+
+    result = await sync_deliverable_lifecycle(
+        _SequenceSession(None, followup_run, [request]),  # type: ignore[arg-type]
+        tenant_id=tenant_id,
+        run_id=followup_run_id,
+        lifecycle_status="completed",
+    )
+
+    assert result is request
+    assert request.status == "failed"
+    assert request.current_stage == "artifact_verification_failed"
+    assert request.last_error_code == "presentation_visual_quality_failed"
+    assert request.completed_at is not None
+    assert request.version == 5
+
+
+@pytest.mark.asyncio
+async def test_unrelated_followup_run_does_not_mutate_deliverable(monkeypatch) -> None:
+    tenant_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    session_id = uuid.uuid4()
+    followup_run_id = uuid.uuid4()
+    request = _request(
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        session_id=session_id,
+        status="waiting_approval",
+        current_stage="output_review",
+        agent_run_id=uuid.uuid4(),
+        version=4,
+    )
+    followup_run = AgentRun(
+        id=followup_run_id,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        session_id=session_id,
+        source_type="chat",
+        goal="Answer a normal question",
+        run_kind="foreground",
+        model_id=uuid.uuid4(),
+        runtime_type="langgraph",
+        runtime_thread_id=f"direct:{session_id}",
+        graph_name="agent_runtime",
+        graph_version="1",
+        model_turn_limit=50,
+        delivery_status="pending",
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.reconcile_runtime_deliverable_artifacts",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                complete=True,
+                missing_types=(),
+                invalid_types=(),
+                unavailable_types=(),
+                attempted_types=(),
+                created_types=(),
+                failure_codes=(),
+            )
+        ),
+    )
+
+    result = await sync_deliverable_lifecycle(
+        _SequenceSession(None, followup_run, [request]),  # type: ignore[arg-type]
+        tenant_id=tenant_id,
+        run_id=followup_run_id,
+        lifecycle_status="completed",
+    )
+
+    assert result is None
+    assert request.status == "waiting_approval"
+    assert request.version == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("work_type", "output_contract", "missing_types"),
+    [
+        ("presentation", ["pptx", "pdf"], ("pdf",)),
+        ("video", ["mp4"], ("mp4",)),
+    ],
+)
+async def test_completed_runtime_fails_deliverable_when_required_artifact_is_missing(
+    monkeypatch,
+    work_type: str,
+    output_contract: list[str],
+    missing_types: tuple[str, ...],
+) -> None:
+    request = _request(
+        status="running",
+        current_stage="running",
+        agent_run_id=uuid.uuid4(),
+        work_type=work_type,
+        output_contract=output_contract,
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.reconcile_runtime_deliverable_artifacts",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                complete=False,
+                missing_types=missing_types,
                 invalid_types=(),
                 unavailable_types=(),
             )

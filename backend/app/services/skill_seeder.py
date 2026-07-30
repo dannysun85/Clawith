@@ -32,6 +32,10 @@ LEGACY_AMBIENT_SKILL_HASHES: dict[str, frozenset[str]] = {
     ),
     "brand-safe-media": frozenset(
         {
+            # First reviewed package shipped in 22984c5d. Older workspaces
+            # predate the managed provenance marker, so the byte-exact hash is
+            # the only safe proof that this is not a user-authored Skill.
+            "011c738e322d2698a6bdfc252986553c1127e33f69155ac1cc006bffb77566f9",
             "63468e3dac198a61b292e5bcae657302efa6fe9ac7f29d8b69779087a74f6b0f",
             "33544bfb7bd148b0744b209a09789a6148bd7196b6f07d10678e45814c696f16",
         }
@@ -609,6 +613,24 @@ Plan would be:
         "is_default": False,
         "files": [],  # populated from agent_template/skills/brand-safe-media/SKILL.md
     },
+    {
+        "name": "Volcengine Seedream Commercial",
+        "description": "Commercial image planning and prompt protocol adapted from the official Volcengine Agent Plan Seedream Skill",
+        "category": "creation",
+        "icon": "🎨",
+        "folder_name": "volcengine-seedream-commercial",
+        "is_default": False,
+        "files": [],
+    },
+    {
+        "name": "Volcengine Seedance Commercial",
+        "description": "Commercial real-person and product video workflow adapted from the official Volcengine Agent Plan Seedance Skill",
+        "category": "creation",
+        "icon": "🎬",
+        "folder_name": "volcengine-seedance-commercial",
+        "is_default": False,
+        "files": [],
+    },
     # ─── Market Data (trading agents) ──────────────
     {
         "name": "Market Data",
@@ -1046,12 +1068,25 @@ async def seed_skills():
                 s["files"] = [{"path": "SKILL.md", "content": mcp_file.read_text(encoding="utf-8")}]
             else:
                 logger.warning("[SkillSeeder] mcp-installer/SKILL.md not found in agent_template/skills/")
-        elif s["folder_name"] == "brand-safe-media" and not s["files"]:
-            media_file = _template_skills_dir / "brand-safe-media" / "SKILL.md"
-            if media_file.exists():
-                s["files"] = [{"path": "SKILL.md", "content": media_file.read_text(encoding="utf-8")}]
+        elif s["folder_name"] in {
+            "brand-safe-media",
+            "volcengine-seedream-commercial",
+            "volcengine-seedance-commercial",
+        } and not s["files"]:
+            skill_root = _template_skills_dir / s["folder_name"]
+            if skill_root.exists():
+                s["files"] = [
+                    {
+                        "path": path.relative_to(skill_root).as_posix(),
+                        "content": path.read_text(encoding="utf-8"),
+                    }
+                    for path in sorted(skill_root.rglob("*"))
+                    if path.is_file()
+                ]
             else:
-                logger.warning("[SkillSeeder] brand-safe-media/SKILL.md not found in agent_template/skills/")
+                logger.warning(
+                    "[SkillSeeder] managed creation Skill not found in agent_template/skills/"
+                )
 
     async with async_session() as db:
         for skill_data in BUILTIN_SKILLS:
@@ -1253,6 +1288,10 @@ async def push_default_skills_to_existing_agents():
                     storage,
                     skill_prefix,
                     skill,
+                    accepted_legacy_hashes=LEGACY_AMBIENT_SKILL_HASHES.get(
+                        skill.folder_name,
+                        frozenset(),
+                    ),
                 )
                 if status == "conflict":
                     conflicts += 1

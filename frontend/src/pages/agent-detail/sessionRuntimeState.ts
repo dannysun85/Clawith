@@ -163,3 +163,19 @@ export const waitingSessionActiveRunHint = ({
     canCancel: false,
     pendingToolReconciliations: current?.pendingToolReconciliations || [],
 });
+
+export const waitingRunResumePayload = (
+    activeRun: SessionActiveRun | null,
+): { resumeRunId?: string; resumeCorrelationId?: string } => {
+    if (
+        activeRun?.status !== 'waiting_user'
+        || !activeRun.canResume
+        || !activeRun.correlationId
+    ) {
+        return {};
+    }
+    return {
+        resumeRunId: activeRun.runId,
+        resumeCorrelationId: activeRun.correlationId,
+    };
+};

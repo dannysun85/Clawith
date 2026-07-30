@@ -11,7 +11,51 @@ import pytest
 
 from app.services import agent_tools
 from app.services.builtin_tool_definitions import builtin_model_definition
+from app.services.document_conversion.presentation_contract import (
+    PresentationVisualQualityError,
+)
 from app.services.platform_service import platform_service
+
+
+@pytest.mark.asyncio
+async def test_temp_workspace_conflict_without_partial_writes_is_retryable_failure(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    agent_id = uuid.uuid4()
+    temp_workspace = SimpleNamespace(
+        root=tmp_path,
+        selected_paths=[],
+        cleanup=lambda: None,
+    )
+
+    async def prepare(*_args, **_kwargs):
+        return temp_workspace
+
+    async def flush(*_args, **_kwargs):
+        return {
+            "updated": [],
+            "deleted": [],
+            "conflicted": ["workspace/output.pdf"],
+            "skipped": [],
+        }
+
+    async def runner(_root):
+        return agent_tools._typed_success("Converted output.")
+
+    monkeypatch.setattr(agent_tools, "_prepare_temp_workspace", prepare)
+    monkeypatch.setattr(agent_tools, "flush_temp_workspace", flush)
+
+    outcome = await agent_tools._run_with_temp_workspace_outcome(
+        agent_id,
+        None,
+        runner,
+        sync_back=True,
+    )
+
+    assert outcome.status == "failed"
+    assert outcome.error_code == "workspace_sync_conflict"
+    assert outcome.retryable is True
 
 
 @pytest.mark.asyncio
@@ -68,6 +112,22 @@ async def test_conversion_uses_validated_artifact_not_converter_text(
     )
     assert failed.status == "failed"
     assert failed.error_code == "conversion_artifact_invalid"
+    assert failed.result_summary is not None
+    assert "Converter response: success" in failed.result_summary
+
+    async def explicit_failure(_agent_id, _ws, _arguments):
+        return "❌ Conversion failed: local browser could not start"
+
+    monkeypatch.setattr(agent_tools, "_convert_csv_to_xlsx", explicit_failure)
+    explicit = await agent_tools._convert_file_outcome(
+        agent_id,
+        tmp_path,
+        {"source_path": "source.csv", "target_path": "result.xlsx"},
+        tool_name="convert_csv_to_xlsx",
+    )
+    assert explicit.status == "failed"
+    assert explicit.result_summary is not None
+    assert "local browser could not start" in explicit.result_summary
 
     async def validated_artifact(_agent_id, ws, arguments):
         target = ws / arguments["target_path"]
@@ -85,6 +145,46 @@ async def test_conversion_uses_validated_artifact_not_converter_text(
     )
     assert succeeded.status == "succeeded"
     assert succeeded.artifact_refs == (f"workspace://{agent_id}/result.xlsx",)
+
+
+@pytest.mark.asyncio
+async def test_conversion_preserves_structured_visual_quality_failure(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    agent_id = uuid.uuid4()
+    (tmp_path / "source.html").write_text("<html></html>", encoding="utf-8")
+
+    async def visual_quality_failure(_agent_id, _ws, _arguments):
+        raise PresentationVisualQualityError(
+            [
+                {
+                    "code": "title_orphan_line",
+                    "slide": 2,
+                    "message": "slide 2 title leaves an orphan final line",
+                }
+            ]
+        )
+
+    monkeypatch.setattr(
+        agent_tools,
+        "_convert_html_to_pptx",
+        visual_quality_failure,
+    )
+    outcome = await agent_tools._convert_file_outcome(
+        agent_id,
+        tmp_path,
+        {"source_path": "source.html", "target_path": "result.pptx"},
+        tool_name="convert_html_to_pptx",
+    )
+
+    assert outcome.status == "failed"
+    assert outcome.error_code == "presentation_visual_quality_failed"
+    assert outcome.metadata["quality_receipt"]["status"] == "failed"
+    assert (
+        outcome.metadata["quality_receipt"]["failures"][0]["code"]
+        == "title_orphan_line"
+    )
 
 
 @pytest.mark.asyncio

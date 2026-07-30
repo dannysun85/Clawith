@@ -36,6 +36,7 @@ SYNC_IS_DEFAULT_TOOL_NAMES = {
     "generate_image_minimax",
     "generate_speech_minimax",
     "generate_music_minimax",
+    "compose_video_audio",
     "generate_video_minimax",
     "check_video_minimax",
     # v1.11 removed AI social posting from Plaza. Sync historical rows back to
@@ -358,6 +359,7 @@ BUILTIN_TOOLS = [
                 "scale": {"type": "number", "description": "Optional Chrome PDF scale for paginated output, default 0.64"},
                 "paper_width": {"type": "number", "description": "Optional paper width in inches for paginated output, default 8.27"},
                 "paper_height": {"type": "number", "description": "Optional paper height in inches for paginated output, default 11.69"},
+                "expected_page_count": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Optional hard page-count contract. When set, conversion rejects incomplete HTML, missing .slide[data-slide] nodes, duplicate slide identifiers, and missing local images before rendering."},
             },
             "required": ["source_path", "target_path"],
         },
@@ -380,6 +382,7 @@ BUILTIN_TOOLS = [
                 "design_height": {"type": "number", "description": "Optional source design height in pixels, default 720"},
                 "render_mode": {"type": "string", "enum": ["editable", "visual"], "description": "visual preserves styling with Chrome-rendered screenshots; editable maps HTML/CSS into editable PPT elements using browser layout sampling. Default: visual"},
                 "render_scale": {"type": "number", "description": "Optional Chrome raster scale for screenshots and complex CSS captures. Higher values improve sharpness but increase PPTX size. Default: 2, clamped between 1 and 4"},
+                "expected_page_count": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Optional hard slide-count contract. When set, conversion rejects incomplete HTML, wrong .slide[data-slide] counts, duplicate slide identifiers, missing local images, and browser layouts with the wrong size."},
             },
             "required": ["source_path", "target_path"],
         },
@@ -1364,8 +1367,8 @@ BUILTIN_TOOLS = [
     },
     {
         "name": "generate_image_minimax",
-        "display_name": "Generate Image (MiniMax)",
-        "description": "Generate an image via the MiniMax credential pool. Model quality is selected from the active Lite, Pro, or Ultra product tier. Generate exactly the number of outputs requested. When one request requires both an uploaded product/reference and exact visible copy, pass brand_asset or reference_image together with overlay_text in the same single call; never split them into separate variants unless the user explicitly asks for multiple outputs.",
+        "display_name": "Generate Image",
+        "description": "Generate an image through Astra's managed media route. Model quality is selected from the active Lite, Pro, or Ultra product tier, and provider failover is automatic before a request is accepted. Generate exactly the number of outputs requested. When one request requires both an uploaded product/reference and exact visible copy, pass brand_asset or reference_image together with overlay_text in the same single call; never split them into separate variants unless the user explicitly asks for multiple outputs.",
         "category": "media",
         "icon": "🎨",
         "is_default": True,
@@ -1423,12 +1426,12 @@ BUILTIN_TOOLS = [
         },
         "config": {
             "model": "speech-2.8-turbo",
-            "voice_id": "English_expressive_narrator",
+            "voice_id": "auto",
             "format": "mp3",
         },
         "config_schema": {
             "fields": [
-                {"key": "voice_id", "label": "Voice ID", "type": "text", "default": "English_expressive_narrator"},
+                {"key": "voice_id", "label": "Voice ID", "type": "text", "default": "auto"},
                 {"key": "format", "label": "Format", "type": "select", "default": "mp3", "options": ["mp3", "wav", "flac"]},
                 {"key": "language_boost", "label": "Language Boost", "type": "text", "default": "auto", "advanced": True},
             ]
@@ -1462,9 +1465,61 @@ BUILTIN_TOOLS = [
         },
     },
     {
+        "name": "compose_video_audio",
+        "display_name": "Compose Video Audio",
+        "description": "Deterministically mix a generated workspace voiceover and/or music track into an existing workspace MP4. It performs local post-production only, never submits another generative provider job, and returns a structured receipt confirming the durable workspace path, H.264/AAC codecs, dimensions, duration, and browser safety. Trust that receipt instead of trying to read the binary MP4 with read_file or read_document.",
+        "category": "media",
+        "icon": "🎚️",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "video_path": {
+                    "type": "string",
+                    "description": "Required workspace path to the completed MP4 video.",
+                },
+                "voiceover_path": {
+                    "type": "string",
+                    "description": "Optional workspace MP3, WAV, or FLAC voiceover path.",
+                },
+                "music_path": {
+                    "type": "string",
+                    "description": "Optional workspace MP3, WAV, or FLAC music path. The track is looped and trimmed to the video duration.",
+                },
+                "voiceover_start_seconds": {
+                    "type": "number",
+                    "description": "Voiceover start offset within the video. Default: 0.",
+                },
+                "voiceover_gain": {
+                    "type": "number",
+                    "description": "Voiceover gain from greater than 0 through 4. Default: 1.",
+                },
+                "music_gain": {
+                    "type": "number",
+                    "description": "Music bed gain from greater than 0 through 1. Default: 0.16.",
+                },
+                "keep_source_audio": {
+                    "type": "boolean",
+                    "description": "Retain an existing provider audio stream at reduced gain. Default: false.",
+                },
+                "save_path": {
+                    "type": "string",
+                    "description": "Output workspace .mp4 path. Default: auto.",
+                },
+            },
+            "required": ["video_path"],
+            "anyOf": [
+                {"required": ["voiceover_path"]},
+                {"required": ["music_path"]},
+            ],
+        },
+        "config": {},
+        "config_schema": {},
+    },
+    {
         "name": "generate_video_minimax",
-        "display_name": "Generate Video (MiniMax)",
-        "description": "Create a MiniMax text-to-video task with the active Lite, Pro, or Ultra quality profile and save task metadata for later polling.",
+        "display_name": "Generate Video",
+        "description": "Create a managed text-to-video or image-to-video task with the active Lite, Pro, or Ultra quality profile. Astra selects a healthy provider before submission and keeps an accepted task on that provider for idempotent polling and delivery. The completed file is rejected if its actual duration or aspect ratio differs from the request, or if require_audio=true and no audio stream exists.",
         "category": "media",
         "icon": "🎬",
         "is_default": True,
@@ -1474,9 +1529,18 @@ BUILTIN_TOOLS = [
                 "prompt": {"type": "string", "description": "Text description of the video."},
                 "duration": {"type": "integer", "description": "Video duration in seconds. Default: 6."},
                 "resolution": {"type": "string", "description": "Video resolution, e.g. 1080P or 768P. Default: 1080P."},
+                "aspect_ratio": {
+                    "type": "string",
+                    "enum": ["16:9", "9:16", "1:1", "4:3", "3:4", "21:9", "adaptive"],
+                    "description": "Video aspect ratio. Default: 16:9.",
+                },
+                "require_audio": {
+                    "type": "boolean",
+                    "description": "Require a real provider audio stream in the completed video. Set true for on-camera synchronized dialogue. For a narrated ad, keep false and finish the silent visual with generate_speech_minimax plus compose_video_audio. Default: false.",
+                },
                 "first_frame_image": {"type": "string", "description": "Optional workspace image path or image data URL for creative image-to-video guidance. The model may redraw text, logos, packaging, and geometry; use brand_asset for an unchanged static product/logo layer."},
                 "last_frame_image": {"type": "string", "description": "Optional workspace image path or image data URL for creative last-frame guidance. The model may redraw text, logos, packaging, and geometry. Requires first_frame_image."},
-                "prompt_optimizer": {"type": "boolean", "description": "Whether MiniMax may optimize the motion prompt. Default: true."},
+                "prompt_optimizer": {"type": "boolean", "description": "Whether the selected provider may optimize the motion prompt when supported. Default: true."},
                 "overlay_text": {"type": "string", "description": "Optional exact Chinese/English copy rendered deterministically after download."},
                 "overlay_position": {"type": "string", "enum": ["top", "center", "bottom"], "description": "Position for overlay_text. Default: bottom."},
                 "brand_asset": {"type": "string", "description": "Workspace image path frozen and composited over every frame as the protected product/logo layer. Do not combine with frame references."},
@@ -1501,8 +1565,8 @@ BUILTIN_TOOLS = [
     },
     {
         "name": "check_video_minimax",
-        "display_name": "Check Video (MiniMax)",
-        "description": "Check a MiniMax video task metadata file and download the video when it is ready.",
+        "display_name": "Check Video",
+        "description": "Check a managed video task and download the video when it is ready. The durable task keeps the original accepted provider private and prevents duplicate submission.",
         "category": "media",
         "icon": "▶",
         "is_default": True,

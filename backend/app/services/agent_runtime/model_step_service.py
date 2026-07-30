@@ -17,6 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import Agent
+from app.models.agent_run import AgentRun
 from app.models.agent_run_command import AgentRunCommand
 from app.models.agent_tool_execution import AgentToolExecution
 from app.models.llm import LLMModel
@@ -456,6 +457,23 @@ def _prior_incomplete_tool_calls(
     return {run_id: tuple(calls) for run_id, calls in unresolved.items()}
 
 
+def _thread_tool_result_call_ids(state: RuntimeGraphState) -> tuple[str, ...]:
+    """Return visible Tool call identities whose durable receipts must be loaded."""
+
+    return tuple(
+        dict.fromkeys(
+            str(call_id)
+            for message in runtime_messages_as_json(state)
+            if message.get("role") in {"tool", "tool_result"}
+            and isinstance(
+                call_id := message.get("tool_call_id") or message.get("call_id"),
+                str,
+            )
+            and call_id
+        )
+    )
+
+
 def _not_empty(value: JsonValue) -> bool:
     return value not in (None, "", [], {})
 
@@ -731,6 +749,56 @@ def _repair(
     )
 
 
+def _normalize_tool_call_arguments(
+    calls: Sequence[JsonObject],
+) -> str | None:
+    """Normalize provider argument wrappers before routing tool calls.
+
+    Some OpenAI-compatible providers return a parsed tool call as
+    ``{"raw_arguments": "<original JSON>"}``. A complete inner object is safe
+    to unwrap. An incomplete inner string must be repaired by the model instead
+    of reaching the business tool and being retried as an ordinary tool error.
+    """
+
+    for call in calls:
+        function = call.get("function")
+        if not isinstance(function, dict):
+            continue
+        raw_arguments = function.get("arguments")
+        try:
+            arguments = parse_tool_arguments(raw_arguments)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return (
+                "Tool arguments were truncated or are not one valid JSON object. "
+                "Retry with a smaller tool call. For large files, write a short "
+                "skeleton first and then use bounded edits for each section."
+            )
+
+        if set(arguments) != {"raw_arguments"}:
+            continue
+        wrapped_arguments = arguments.get("raw_arguments")
+        if not isinstance(wrapped_arguments, str):
+            return (
+                "Tool arguments contain an invalid `raw_arguments` wrapper. "
+                "Retry with one valid JSON object."
+            )
+        try:
+            unwrapped = json.loads(wrapped_arguments)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return (
+                "Tool arguments were truncated inside a `raw_arguments` wrapper. "
+                "Retry with a smaller tool call. For large files, write a short "
+                "skeleton first and then use bounded edits for each section."
+            )
+        if not isinstance(unwrapped, dict):
+            return (
+                "Tool arguments inside `raw_arguments` must be one JSON object. "
+                "Retry with valid object arguments."
+            )
+        function["arguments"] = json.dumps(unwrapped, ensure_ascii=False)
+    return None
+
+
 def _parse_step(
     state: RuntimeGraphState,
     context: RuntimeContext,
@@ -780,6 +848,15 @@ def _parse_step(
         )
 
     calls = [cast(JsonObject, deepcopy(call)) for call in step.tool_calls]
+    argument_error = _normalize_tool_call_arguments(calls)
+    if argument_error is not None:
+        return _repair(
+            state,
+            context,
+            step,
+            argument_error,
+            repair_code="invalid_tool_call",
+        )
     finish = find_finish_call(
         cast(list[dict], calls),
         allow_group_mentions=allow_group_handoff,
@@ -971,6 +1048,7 @@ class RuntimeModelStepService:
                 "Runtime Context contains an invalid UUID",
             ) from exc
         prior_incomplete = _prior_incomplete_tool_calls(state, current_run_id=run_id)
+        thread_result_call_ids = _thread_tool_result_call_ids(state)
         async with self._session_factory() as db:
             model_result = await db.execute(select(LLMModel).where(LLMModel.id == model_id))
             model = model_result.scalar_one_or_none()
@@ -988,6 +1066,31 @@ class RuntimeModelStepService:
                 )
             )
             executions = list(ledger_result.scalars().all())
+            if thread_result_call_ids:
+                thread_result = await db.execute(
+                    select(AgentRun.runtime_thread_id).where(
+                        AgentRun.tenant_id == tenant_id,
+                        AgentRun.id == run_id,
+                    )
+                )
+                runtime_thread_id = thread_result.scalar_one()
+                prior_result = await db.execute(
+                    select(AgentToolExecution)
+                    .join(AgentRun, AgentRun.id == AgentToolExecution.run_id)
+                    .where(
+                        AgentToolExecution.tenant_id == tenant_id,
+                        AgentToolExecution.run_id != run_id,
+                        AgentToolExecution.tool_call_id.in_(thread_result_call_ids),
+                        AgentRun.tenant_id == tenant_id,
+                        AgentRun.runtime_thread_id == runtime_thread_id,
+                    )
+                )
+                known_call_ids = {execution.tool_call_id for execution in executions}
+                executions.extend(
+                    execution
+                    for execution in prior_result.scalars().all()
+                    if execution.tool_call_id not in known_call_ids
+                )
             cancelled_run_ids: set[uuid.UUID] = set()
             if prior_incomplete:
                 cancelled_result = await db.execute(

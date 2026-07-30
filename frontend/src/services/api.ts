@@ -579,6 +579,14 @@ export interface DeliverableArtifactRevision {
     created_at: string;
 }
 
+export interface DeliverableApprovalReadiness {
+    approvable: boolean;
+    quality_gate_required: boolean;
+    quality_status: 'not_required' | 'pending' | 'passed' | 'blocked' | 'incomplete' | 'invalid';
+    blockers: string[];
+    receipt_ref: string | null;
+}
+
 export interface DeliverableRequest {
     id: string;
     tenant_id: string;
@@ -605,6 +613,64 @@ export interface DeliverableRequest {
     created_at: string;
     updated_at: string;
     artifacts: DeliverableArtifactRevision[];
+    // Optional during rolling frontend/backend deployments. New backends
+    // always return it; old backends keep the legacy approval behavior.
+    approval_readiness?: DeliverableApprovalReadiness;
+}
+
+export interface DeliverableQualityReviewer {
+    user_id: string;
+    display_name: string;
+    role: string;
+    eligible: boolean;
+    ineligible_reason: string | null;
+}
+
+export interface DeliverableQualityReviewAssignment {
+    reviewer_user_id: string;
+    reviewer_display_name: string | null;
+    reviewer_role: string | null;
+    status: 'assigned' | 'submitted';
+    is_current_user: boolean;
+    submitted_at: string | null;
+}
+
+export interface DeliverableQualityReview {
+    id: string;
+    request_id: string;
+    modality: 'image' | 'video' | 'presentation';
+    status: 'open' | 'passed' | 'blocked' | 'incomplete' | 'superseded';
+    version: number;
+    minimum_reviewers: number;
+    assigned_reviewer_count: number;
+    submitted_reviewer_count: number;
+    artifact_hashes: Record<string, string>;
+    brief: string;
+    requirements: string[];
+    hard_gates: string[];
+    quality_dimensions: string[];
+    required_evidence_kinds: string[];
+    automated_evidence: Array<{
+        kind: string;
+        status: 'complete' | 'partial' | 'unavailable';
+        source_ref: string | null;
+        findings: string[];
+    }>;
+    assignments: DeliverableQualityReviewAssignment[];
+    artifacts: Array<{
+        id: string;
+        artifact_key: string;
+        artifact_type: string;
+        content_hash: string;
+        revision_number: number;
+        download_url: string;
+    }>;
+    current_user_can_manage: boolean;
+    current_user_can_submit: boolean;
+    current_user_can_add_evidence: boolean;
+    receipt_ref: string | null;
+    created_at: string;
+    sealed_at: string | null;
 }
 
 export const deliverableApi = {
@@ -656,6 +722,69 @@ export const deliverableApi = {
             method: 'POST',
             body: JSON.stringify({ action, expected_version: expectedVersion }),
         }),
+    qualityReviewers: (requestId: string) =>
+        request<DeliverableQualityReviewer[]>(
+            `/deliverables/requests/${requestId}/quality-reviewers`,
+        ),
+    latestQualityReview: (requestId: string) =>
+        request<DeliverableQualityReview | null>(
+            `/deliverables/requests/${requestId}/quality-reviews/latest`,
+        ),
+    createQualityReview: (
+        requestId: string,
+        data: {
+            client_review_id: string;
+            expected_request_version: number;
+            reviewer_user_ids: string[];
+        },
+    ) => request<DeliverableQualityReview>(
+        `/deliverables/requests/${requestId}/quality-reviews`,
+        {
+            method: 'POST',
+            body: JSON.stringify(data),
+        },
+    ),
+    qualityReview: (reviewId: string) =>
+        request<DeliverableQualityReview>(
+            `/deliverables/quality-reviews/${reviewId}`,
+        ),
+    submitQualityReview: (
+        reviewId: string,
+        data: {
+            client_submission_id: string;
+            expected_version: number;
+            hard_gates: Record<string, { passed: boolean; evidence: string[] }>;
+            dimensions: Record<string, { score: number; evidence: string[] }>;
+            human_evidence: Record<string, {
+                status: 'complete' | 'partial' | 'unavailable';
+                findings: string[];
+            }>;
+            notes: string[];
+        },
+    ) => request<DeliverableQualityReview>(
+        `/deliverables/quality-reviews/${reviewId}/submissions`,
+        {
+            method: 'POST',
+            body: JSON.stringify(data),
+        },
+    ),
+    addQualityReviewEvidence: (
+        reviewId: string,
+        data: {
+            client_evidence_id: string;
+            expected_version: number;
+            kind: 'ocr' | 'frame_ocr';
+            status: 'complete' | 'partial' | 'unavailable';
+            source_ref: string;
+            findings: string[];
+        },
+    ) => request<DeliverableQualityReview>(
+        `/deliverables/quality-reviews/${reviewId}/evidence`,
+        {
+            method: 'POST',
+            body: JSON.stringify(data),
+        },
+    ),
 };
 
 // ─── Messages ─────────────────────────────────────────

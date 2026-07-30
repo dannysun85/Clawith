@@ -171,6 +171,50 @@ async def collect_browser_layout(
     return clip.includes('text') || fill === 'transparent' || fill === 'rgba(0, 0, 0, 0)';
   }
 
+  function textLineBoxes(el, rootRect) {
+    const groups = [];
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    let node;
+    let measuredCharacters = 0;
+    while ((node = walker.nextNode()) && measuredCharacters < 1200) {
+      const value = node.textContent || '';
+      for (let index = 0; index < value.length && measuredCharacters < 1200; index += 1) {
+        const character = value[index];
+        const range = document.createRange();
+        range.setStart(node, index);
+        range.setEnd(node, index + 1);
+        const rect = range.getBoundingClientRect();
+        measuredCharacters += 1;
+        if (rect.width <= 0 || rect.height <= 0) continue;
+        let group = groups.find(candidate => Math.abs(candidate.top - rect.top) <= Math.max(2, rect.height * 0.2));
+        if (!group) {
+          group = {
+            text: '',
+            left: rect.left,
+            top: rect.top,
+            right: rect.right,
+            bottom: rect.bottom,
+          };
+          groups.push(group);
+        }
+        group.text += character;
+        group.left = Math.min(group.left, rect.left);
+        group.top = Math.min(group.top, rect.top);
+        group.right = Math.max(group.right, rect.right);
+        group.bottom = Math.max(group.bottom, rect.bottom);
+      }
+    }
+    return groups
+      .sort((left, right) => left.top - right.top || left.left - right.left)
+      .map(group => ({
+        text: group.text.replace(/\s+/g, ' ').trim(),
+        x: group.left - rootRect.left,
+        y: group.top - rootRect.top,
+        w: group.right - group.left,
+        h: group.bottom - group.top,
+      }));
+  }
+
   function itemFor(el, rootRect, kind, text) {
     const cs = getComputedStyle(el);
     const r = el.getBoundingClientRect();
@@ -186,6 +230,12 @@ async def collect_browser_layout(
       y: r.top - rootRect.top,
       w: r.width,
       h: r.height,
+      clientWidth: el.clientWidth,
+      clientHeight: el.clientHeight,
+      scrollWidth: el.scrollWidth,
+      scrollHeight: el.scrollHeight,
+      allowOverlap: el.getAttribute('data-allow-overlap') === 'true',
+      lines: kind === 'text' ? textLineBoxes(el, rootRect) : [],
       style: {
 color: cs.color,
 backgroundColor: cs.backgroundColor,
@@ -237,6 +287,10 @@ height: rootRectRaw.height || viewport.height,
       const text = directText(el);
       const hasBlockChildren = children.some(child => !isInlineTag(child.tagName.toLowerCase()));
 
+      // SVG is preserved by the hybrid visual layer. Mapping its internal
+      // <text> nodes again would duplicate labels over the screenshot.
+      if (tag === 'svg') return;
+
       if (el !== root && hasPaint(cs) && !isTextClipBackground(cs)) {
 items.push(itemFor(el, rootRect, 'shape'));
       }
@@ -245,6 +299,11 @@ items.push(itemFor(el, rootRect, 'image'));
 return;
       }
       if (isBlockTextTag(tag) && !hasBlockChildren) {
+const content = fullText(el);
+if (content) items.push(itemFor(el, rootRect, 'text', content));
+return;
+      }
+      if (children.length && !hasBlockChildren) {
 const content = fullText(el);
 if (content) items.push(itemFor(el, rootRect, 'text', content));
 return;
@@ -288,7 +347,10 @@ roots = [body];
   }
   if (!roots.length) roots = [document.body || document.documentElement];
   roots.forEach((root, index) => root.setAttribute('data-clawith-slide-root', String(index)));
-  return { viewport, pageBackground: pageBg, slides: roots.map(collectRoot) };
+  const brokenImages = Array.from(document.images || [])
+    .filter(img => !img.complete || img.naturalWidth < 1 || img.naturalHeight < 1)
+    .map(img => img.currentSrc || img.getAttribute('src') || '<empty>');
+  return { viewport, pageBackground: pageBg, brokenImages, slides: roots.map(collectRoot) };
 })()
 """
 
@@ -321,12 +383,32 @@ roots = [body];
                 if message.get("method") == "Page.loadEventFired":
                     break
             await asyncio.sleep(0.25)
+            await send(
+                "Runtime.evaluate",
+                {
+                    "expression": (
+                        "Promise.all(Array.from(document.images || []).map(img => "
+                        "img.complete ? Promise.resolve() : new Promise(resolve => {"
+                        "const done=()=>resolve(); img.addEventListener('load',done,{once:true}); "
+                        "img.addEventListener('error',done,{once:true}); setTimeout(done,3000);"
+                        "})))"
+                    ),
+                    "returnByValue": True,
+                    "awaitPromise": True,
+                },
+            )
             result = await send("Runtime.evaluate", {
                 "expression": expression,
                 "returnByValue": True,
                 "awaitPromise": True,
             })
             layout = result.get("result", {}).get("result", {}).get("value")
+            broken_images = list((layout or {}).get("brokenImages") or [])
+            if broken_images:
+                raise ValueError(
+                    "Presentation browser could not load image assets: "
+                    + ", ".join(str(path) for path in broken_images[:5])
+                )
             if layout and render_mode in ("visual", "screenshot", "image", "hybrid"):
                 import base64
                 screenshots: list[str | None] = []
@@ -357,6 +439,7 @@ roots = [body];
             if layout and render_mode in ("editable", "hybrid_editable"):
                 import base64
                 background_screenshots: list[str | None] = []
+                content_screenshots: list[str | None] = []
                 shape_screenshots: dict[str, str] = {}
                 page_bg_value = str(layout.get("pageBackground") or "")
                 for idx, slide_data in enumerate(layout.get("slides") or []):
@@ -371,47 +454,104 @@ roots = [body];
                     )
                     if not needs_bg:
                         background_screenshots.append(None)
-                        continue
-                    clip_w = root_w
-                    clip_h = root_h
-                    hide_expr = (
-                        "(() => {"
-                        "const id='clawith-bg-capture-style';"
-                        "document.getElementById(id)?.remove();"
-                        "const style=document.createElement('style');"
-                        "style.id=id;"
-                        f"style.textContent='[data-clawith-slide-root=\"{idx}\"] > * {{ visibility: hidden !important; }}';"
-                        "document.head.appendChild(style);"
-                        "})()"
-                    )
-                    restore_expr = "document.getElementById('clawith-bg-capture-style')?.remove()"
-                    await send("Runtime.evaluate", {"expression": hide_expr, "awaitPromise": True})
-                    try:
-                        screenshot_result = await send("Page.captureScreenshot", {
-                            "format": "png",
-                            "captureBeyondViewport": True,
-                            "fromSurface": True,
-                            "clip": {
-                                "x": max(0.0, float(slide_data.get("x") or 0)),
-                                "y": max(0.0, float(slide_data.get("y") or 0)),
-                                "width": clip_w,
-                                "height": clip_h,
-                                "scale": 1,
-                            },
-                        })
-                    finally:
-                        await send("Runtime.evaluate", {"expression": restore_expr})
-                    data = screenshot_result.get("result", {}).get("data")
-                    if not data:
-                        background_screenshots.append(None)
-                        continue
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=f"-slide-bg-{idx + 1}.png") as image_tmp:
-                        image_file = Path(image_tmp.name)
-                    image_file.write_bytes(base64.b64decode(data))
-                    background_screenshots.append(str(image_file))
+                    else:
+                        hide_expr = (
+                            "(() => {"
+                            "const id='clawith-bg-capture-style';"
+                            "document.getElementById(id)?.remove();"
+                            "const style=document.createElement('style');"
+                            "style.id=id;"
+                            f"style.textContent='[data-clawith-slide-root=\"{idx}\"] > * {{ visibility: hidden !important; }}';"
+                            "document.head.appendChild(style);"
+                            "})()"
+                        )
+                        restore_expr = "document.getElementById('clawith-bg-capture-style')?.remove()"
+                        await send("Runtime.evaluate", {"expression": hide_expr, "awaitPromise": True})
+                        try:
+                            screenshot_result = await send("Page.captureScreenshot", {
+                                "format": "png",
+                                "captureBeyondViewport": True,
+                                "fromSurface": True,
+                                "clip": {
+                                    "x": max(0.0, float(slide_data.get("x") or 0)),
+                                    "y": max(0.0, float(slide_data.get("y") or 0)),
+                                    "width": root_w,
+                                    "height": root_h,
+                                    "scale": 1,
+                                },
+                            })
+                        finally:
+                            await send("Runtime.evaluate", {"expression": restore_expr})
+                        data = screenshot_result.get("result", {}).get("data")
+                        if not data:
+                            background_screenshots.append(None)
+                        else:
+                            with tempfile.NamedTemporaryFile(
+                                delete=False,
+                                suffix=f"-slide-bg-{idx + 1}.png",
+                            ) as image_tmp:
+                                image_file = Path(image_tmp.name)
+                            image_file.write_bytes(base64.b64decode(data))
+                            background_screenshots.append(str(image_file))
                     # Root background capture temporarily hides direct
                     # children; after it is restored, item-level captures
                     # can preserve shadows/backdrop effects for cards.
+                    if render_mode == "hybrid_editable":
+                        text_item_ids = [
+                            str(item.get("itemId"))
+                            for item in slide_data.get("items") or []
+                            if item.get("kind") == "text" and item.get("itemId")
+                        ]
+                        selectors = ",".join(
+                            f'[data-clawith-item-id="{item_id}"]'
+                            for item_id in text_item_ids
+                        )
+                        hide_text_expr = (
+                            "(() => {"
+                            "const id='clawith-text-capture-style';"
+                            "document.getElementById(id)?.remove();"
+                            "const style=document.createElement('style');"
+                            "style.id=id;"
+                            f"style.textContent={json.dumps(selectors + ' { color: transparent !important; -webkit-text-fill-color: transparent !important; text-shadow: none !important; }')};"
+                            "document.head.appendChild(style);"
+                            "})()"
+                        )
+                        restore_text_expr = (
+                            "document.getElementById('clawith-text-capture-style')?.remove()"
+                        )
+                        await send(
+                            "Runtime.evaluate",
+                            {"expression": hide_text_expr, "awaitPromise": True},
+                        )
+                        try:
+                            screenshot_result = await send("Page.captureScreenshot", {
+                                "format": "png",
+                                "captureBeyondViewport": True,
+                                "fromSurface": True,
+                                "clip": {
+                                    "x": max(0.0, float(slide_data.get("x") or 0)),
+                                    "y": max(0.0, float(slide_data.get("y") or 0)),
+                                    "width": root_w,
+                                    "height": root_h,
+                                    "scale": 1,
+                                },
+                            })
+                        finally:
+                            await send(
+                                "Runtime.evaluate",
+                                {"expression": restore_text_expr},
+                            )
+                        data = screenshot_result.get("result", {}).get("data")
+                        if not data:
+                            content_screenshots.append(None)
+                        else:
+                            with tempfile.NamedTemporaryFile(
+                                delete=False,
+                                suffix=f"-slide-content-{idx + 1}.png",
+                            ) as image_tmp:
+                                image_file = Path(image_tmp.name)
+                            image_file.write_bytes(base64.b64decode(data))
+                            content_screenshots.append(str(image_file))
                 for slide_idx, slide_data in enumerate(layout.get("slides") or []):
                     for item in slide_data.get("items") or []:
                         if item.get("kind") != "shape":
@@ -470,6 +610,7 @@ roots = [body];
                         image_file.write_bytes(base64.b64decode(data))
                         shape_screenshots[item_id] = str(image_file)
                 layout["backgroundScreenshots"] = background_screenshots
+                layout["contentScreenshots"] = content_screenshots
                 layout["shapeScreenshots"] = shape_screenshots
             return layout
     except Exception as layout_exc:

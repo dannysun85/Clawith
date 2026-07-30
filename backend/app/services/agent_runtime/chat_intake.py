@@ -577,34 +577,13 @@ async def enqueue_chat_runtime(
     )
     prepared_deliverable: PreparedDeliverableLaunch | None = None
     runtime_content = content
-    if work_request_id is not None:
-        if resume_run_id is not None:
-            raise ChatRuntimeIntakeError(
-                "deliverable_resume_not_supported",
-                "A deliverable request can only start a new run",
-            )
-        try:
-            prepared_deliverable = await prepare_deliverable_launch(
-                db,
-                request_id=work_request_id,
-                tenant_id=tenant_id,
-                user_id=user.id,
-                agent_id=agent.id,
-                session_id=session.id,
-                message_id=resolved_message_id,
-            )
-        except DeliverableWorkflowError as exc:
-            raise ChatRuntimeIntakeError(exc.code, str(exc)) from exc
-        request_tier = str(prepared_deliverable.request.tier or "").strip().lower()
-        if normalized_saas_tier != request_tier:
-            raise ChatRuntimeIntakeError(
-                "deliverable_tier_mismatch",
-                "Deliverable requests must run with the tier saved in their work brief",
-            )
-        runtime_content = (
-            f"{prepared_deliverable.prompt}\n\n"
-            f"USER_MESSAGE={json.dumps(content, ensure_ascii=False)}"
+    if work_request_id is not None and resume_run_id is not None:
+        raise ChatRuntimeIntakeError(
+            "deliverable_resume_not_supported",
+            "A deliverable request can only start a new run",
         )
+
+    persisted_message: ChatMessage | None = None
     resumed_run: AgentRun | None = None
     if resume_run_id is not None:
         resumed_run = await _require_resume_run(
@@ -635,8 +614,7 @@ async def enqueue_chat_runtime(
             run_state_reader=run_state_reader,
         )
 
-    persisted_message: ChatMessage | None = None
-    if persist_user_message:
+    if persisted_message is None and persist_user_message:
         persisted_message = await _persist_user_message(
             db,
             message_id=resolved_message_id,
@@ -644,6 +622,33 @@ async def enqueue_chat_runtime(
             user=user,
             session=session,
             content=saved_content,
+        )
+
+    if work_request_id is not None:
+        # The DeliverableRequest references this already-flushed message
+        # through launch_message_id. Claiming the brief before message
+        # persistence lets an unrelated query autoflush a dangling FK.
+        try:
+            prepared_deliverable = await prepare_deliverable_launch(
+                db,
+                request_id=work_request_id,
+                tenant_id=tenant_id,
+                user_id=user.id,
+                agent_id=agent.id,
+                session_id=session.id,
+                message_id=resolved_message_id,
+            )
+        except DeliverableWorkflowError as exc:
+            raise ChatRuntimeIntakeError(exc.code, str(exc)) from exc
+        request_tier = str(prepared_deliverable.request.tier or "").strip().lower()
+        if normalized_saas_tier != request_tier:
+            raise ChatRuntimeIntakeError(
+                "deliverable_tier_mismatch",
+                "Deliverable requests must run with the tier saved in their work brief",
+            )
+        runtime_content = (
+            f"{prepared_deliverable.prompt}\n\n"
+            f"USER_MESSAGE={json.dumps(content, ensure_ascii=False)}"
         )
 
     adapter = RuntimeCommandIntake(db, settings=runtime_settings)

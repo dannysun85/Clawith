@@ -525,6 +525,61 @@ def test_client_creation_failure_can_still_use_fallback():
     ) is True
 
 
+def test_credential_pool_miss_is_retryable_but_user_facing_message_is_clean():
+    error = llm_caller.NoCredentialAvailable(
+        "volcengine_agent_plan",
+        "text",
+        reason_code=llm_caller.CredentialUnavailableReason.CAPABILITY_MISMATCH,
+    )
+    result = llm_caller._credential_unavailable_result(error)
+
+    assert llm_caller.is_retryable_error(result) is True
+    assert llm_caller._user_facing_llm_error_result(result) == (
+        "⚠️ 平台尚未配置当前功能所需的模型能力，请联系管理员。"
+    )
+    assert "credential unavailable before provider request" not in (
+        llm_caller._user_facing_llm_error_result(result)
+    )
+
+
+@pytest.mark.asyncio
+async def test_credential_pool_miss_uses_configured_fallback(monkeypatch):
+    primary = SimpleNamespace(
+        provider="volcengine_agent_plan",
+        model="doubao-seed-2.1-turbo",
+    )
+    fallback = SimpleNamespace(
+        provider="minimax",
+        model="MiniMax-M3",
+        supports_vision=False,
+    )
+    calls = []
+
+    async def fake_call(model, *_args, **_kwargs):
+        calls.append(model)
+        if model is primary:
+            error = llm_caller.NoCredentialAvailable(
+                "volcengine_agent_plan",
+                "text",
+                reason_code=llm_caller.CredentialUnavailableReason.CAPABILITY_MISMATCH,
+            )
+            return llm_caller._credential_unavailable_result(error)
+        return "fallback result"
+
+    monkeypatch.setattr(llm_caller, "call_llm", fake_call)
+
+    result = await llm_caller.call_llm_with_failover(
+        primary,
+        fallback,
+        messages=[],
+        agent_name="agent",
+        role_description="worker",
+    )
+
+    assert result == "fallback result"
+    assert calls == [primary, fallback]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("guard_state", ["ambiguous", "work_started"])
 async def test_failover_is_blocked_when_primary_provider_cannot_be_safely_replayed(

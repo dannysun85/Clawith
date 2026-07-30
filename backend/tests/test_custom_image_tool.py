@@ -48,6 +48,7 @@ from app.api import tools as tools_api
 from app.services.quota_guard import QuotaExceeded
 from app.services.minimax_media_profiles import resolve_minimax_media_profile
 from app.services.mcp_security import MCPURLPolicyError
+from app.services.llm.load_balancer import NoCredentialAvailable
 
 
 def _valid_png_bytes() -> bytes:
@@ -63,6 +64,73 @@ def _media_config_schema() -> dict:
             {"key": "base_url", "type": "text"},
         ]
     }
+
+
+def test_minimax_portrait_t2v_contract_requires_first_frame():
+    from app.services.media_provider_routing import (
+        minimax_video_requires_first_frame,
+    )
+
+    assert minimax_video_requires_first_frame("9:16", None) is True
+    assert minimax_video_requires_first_frame(
+        "9:16",
+        "data:image/png;base64,FRAME",
+    ) is False
+    assert minimax_video_requires_first_frame("16:9", None) is False
+
+
+@pytest.mark.asyncio
+async def test_generate_video_blocks_portrait_minimax_t2v_before_credit_check(
+    tmp_path,
+):
+    credential = SimpleNamespace(
+        provider="minimax",
+        model="MiniMax-Hailuo-2.3",
+    )
+
+    with (
+        patch(
+            "app.services.agent_tools._get_tool_config",
+            AsyncMock(return_value={}),
+        ),
+        patch(
+            "app.services.agent_tools._resolve_minimax_tool_tier",
+            AsyncMock(return_value="pro"),
+        ),
+        patch(
+            "app.services.minimax_media_profiles.load_platform_minimax_media_profile",
+            AsyncMock(return_value=resolve_minimax_media_profile("video", "pro")),
+        ),
+        patch(
+            "app.services.agent_tools._get_minimax_tenant_uuid",
+            AsyncMock(return_value=uuid.uuid4()),
+        ),
+        patch(
+            "app.services.media_provider_routing.prepare_media_provider",
+            AsyncMock(return_value=credential),
+        ),
+        patch(
+            "app.services.agent_tools._check_minimax_credit_amount",
+            AsyncMock(),
+        ) as credit_check,
+    ):
+        result = await _generate_video_minimax(
+            uuid.uuid4(),
+            tmp_path,
+            {
+                "prompt": "portrait commercial",
+                "aspect_ratio": "9:16",
+            },
+            typed=True,
+        )
+
+    assert isinstance(result, ToolExecutionOutcome)
+    assert result.status == "failed"
+    assert result.error_code == (
+        "media_video_requires_first_frame_for_aspect_ratio"
+    )
+    assert "No Credits were consumed" in result.result_summary
+    credit_check.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -128,6 +196,51 @@ async def test_public_provider_client_uses_allowlisted_explicit_proxy():
             "api.minimaxi.com",
             "api.minimax.io",
             "api.minimax.chat",
+            "ark.cn-beijing.volces.com",
+            "openspeech.bytedance.com",
+        },
+    )
+    request_hooks = client_class.call_args.kwargs["event_hooks"]["request"]
+    assert request_hooks[0] is policy_hook
+    await request_hooks[0](MagicMock())
+    started.assert_not_called()
+    await request_hooks[1](MagicMock())
+    started.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_volcengine_agent_plan_client_uses_allowlisted_explicit_proxy():
+    policy_hook = AsyncMock()
+    guard = MagicMock()
+    guard.client_kwargs.return_value = {
+        "proxy": "http://127.0.0.1:7890",
+        "event_hooks": {"request": [policy_hook]},
+    }
+    started = MagicMock()
+    settings = SimpleNamespace(HTTP_PROXY="http://127.0.0.1:7890")
+
+    with (
+        patch("app.services.agent_tools.get_settings", return_value=settings),
+        patch(
+            "app.services.mcp_security.TrustedProviderProxyHTTPGuard",
+            return_value=guard,
+        ) as guard_class,
+        patch("httpx.AsyncClient", return_value=MagicMock()) as client_class,
+    ):
+        agent_tools._public_only_async_client(
+            "https://ark.cn-beijing.volces.com/api/plan/v3/images/generations",
+            timeout=180,
+            on_request_started=started,
+        )
+
+    guard_class.assert_called_once_with(
+        "https://ark.cn-beijing.volces.com/api/plan/v3/images/generations",
+        allowed_hostnames={
+            "api.minimaxi.com",
+            "api.minimax.io",
+            "api.minimax.chat",
+            "ark.cn-beijing.volces.com",
+            "openspeech.bytedance.com",
         },
     )
     request_hooks = client_class.call_args.kwargs["event_hooks"]["request"]
@@ -967,10 +1080,83 @@ async def test_generate_image_minimax_missing_reference_is_typed_failure_before_
         )
 
     assert isinstance(result, ToolExecutionOutcome)
-    assert result.status == "failed"
-    assert result.error_code == "brand_safe_media_contract_invalid"
-    assert "was not found in the workspace" in result.result_summary
-    create_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_agent_plan_durable_image_preserves_ratio_in_provider_and_recovery_contract(
+    tmp_path,
+):
+    generated = _valid_png_bytes()
+    record_id = uuid.uuid4()
+    created_task = SimpleNamespace(
+        request_metadata={"recovery_asset_storage_key": "_internal/recovery/image.bin"}
+    )
+
+    async def provider(**kwargs):
+        kwargs["on_provider_request_started"]()
+        await kwargs["on_provider_accepted"]("https://asset.example/portrait.png")
+        return generated
+
+    with (
+        patch("app.services.volcengine_agent_plan.generate_image", side_effect=provider) as generate,
+        patch(
+            "app.services.media_generation.create_minimax_sync_media_task_record",
+            AsyncMock(return_value=created_task),
+        ) as create_task,
+        patch(
+            "app.services.agent_tools._store_minimax_image_acceptance_evidence",
+            AsyncMock(return_value=("_internal/provider-recovery.json", "opaque")),
+        ),
+        patch(
+            "app.services.media_generation.mark_minimax_sync_provider_accepted",
+            AsyncMock(),
+        ),
+        patch(
+            "app.services.media_generation.store_minimax_sync_recovery_asset",
+            AsyncMock(),
+        ),
+        patch(
+            "app.services.media_generation.reconcile_minimax_sync_media_task",
+            AsyncMock(
+                return_value=SimpleNamespace(
+                    status="succeeded",
+                    output_path="workspace/images/portrait.png",
+                )
+            ),
+        ),
+        patch("app.services.agent_tools._record_media_provider_success", AsyncMock()),
+        patch("uuid.uuid4", return_value=record_id),
+    ):
+        result = await agent_tools._generate_image_minimax_durable(
+            agent_id=uuid.UUID(int=1),
+            ws=tmp_path,
+            arguments={"aspect_ratio": "9:16"},
+            user_id=None,
+            session_id="session-1",
+            tenant_id=uuid.UUID(int=2),
+            credential_id=uuid.UUID(int=3),
+            api_key="plan-key",
+            base_url="https://ark.cn-beijing.volces.com/api/plan/v3",
+            model="doubao-seedream-5.0-lite",
+            tier="lite",
+            credit_cost=4,
+            provider_prompt="portrait ad",
+            save_path="workspace/images/portrait.png",
+            output_extension=".png",
+            overlay_text="",
+            overlay_position="bottom",
+            brand_asset=None,
+            brand_position="center",
+            brand_scale=0.42,
+            provider="volcengine_agent_plan",
+            provider_size="2K",
+        )
+
+    assert "✅ Image generated" in result
+    assert generate.call_args.kwargs["size"] == "1440x2560"
+    metadata = create_task.await_args.kwargs["request_metadata"]
+    assert metadata["aspect_ratio"] == "9:16"
+    assert metadata["provider_size"] == "1440x2560"
 
 
 @pytest.mark.asyncio
@@ -1572,6 +1758,8 @@ async def test_generate_speech_minimax_records_success(tmp_path):
         id=cred_id,
         api_key="sk-test",
         base_url="https://api.minimax.test",
+        provider="minimax",
+        model="speech-2.8-turbo",
     )
     generated = _valid_mp3_bytes()
 
@@ -1585,6 +1773,7 @@ async def test_generate_speech_minimax_records_success(tmp_path):
             AsyncMock(return_value={"model": "speech-2.8-turbo", "voice_id": "v1", "format": "mp3"}),
         ),
         patch("app.services.agent_tools._resolve_minimax_tool_tier", AsyncMock(return_value="pro")),
+        patch("app.services.agent_tools._check_minimax_tool_allowed", AsyncMock(return_value=None)),
         patch(
             "app.services.minimax_media_profiles.load_platform_minimax_media_profile",
             AsyncMock(return_value=resolve_minimax_media_profile("audio", "pro")),
@@ -1592,8 +1781,13 @@ async def test_generate_speech_minimax_records_success(tmp_path):
         patch("app.services.agent_tools._check_minimax_credit_amount", AsyncMock()) as check_credits,
         patch("app.services.agent_tools._get_minimax_tenant_uuid", AsyncMock(return_value=tenant_id)),
         patch(
-            "app.services.agent_tools._prepare_minimax_tool_credential",
-            AsyncMock(return_value=(credential, None)),
+            "app.services.media_provider_routing.prepare_media_provider",
+            AsyncMock(
+                side_effect=[
+                    NoCredentialAvailable("volcengine_agent_plan", "audio"),
+                    credential,
+                ]
+            ),
         ),
         patch("app.services.agent_tools._minimax_tts_http", AsyncMock(side_effect=provider)) as provider_call,
         patch(

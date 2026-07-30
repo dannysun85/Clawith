@@ -3,19 +3,25 @@
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
+import json
 from unittest.mock import AsyncMock, patch
 import uuid
 
 import pytest
 
 from app.models.agent import Agent
+from app.models.agent_tool_execution import AgentToolExecution
 from app.models.llm import LLMModel
 from app.services.agent_runtime.context_builder import RuntimeContextBuild
 from app.services.agent_runtime.group_handoff import GroupAgentHandoffIntent
 from app.services.agent_runtime.group_handoff import GroupAgentHandoffError
-from app.services.agent_runtime.model_step_service import RuntimeModelStepService
+from app.services.agent_runtime.model_step_service import (
+    RuntimeModelStepService,
+    _thread_tool_result_call_ids,
+)
 from app.services.agent_runtime.model_step_service import (
     _estimate_tokens,
+    _parse_step,
     _visible_mention_names,
 )
 from app.services.agent_runtime.state import (
@@ -35,6 +41,11 @@ class _Result:
 
     def scalar_one_or_none(self):
         return self.values[0] if self.values else None
+
+    def scalar_one(self):
+        if len(self.values) != 1:
+            raise AssertionError(f"expected one scalar, got {len(self.values)}")
+        return self.values[0]
 
     def scalars(self):
         return self
@@ -248,6 +259,101 @@ def _context(state: RuntimeGraphState) -> RuntimeContext:
         parent_run_id=registry.parent_run_id,
         root_run_id=registry.root_run_id,
     )
+
+
+def test_parse_step_unwraps_complete_raw_arguments() -> None:
+    tenant_id = uuid.uuid4()
+    model = _model(tenant_id)
+    agent = _agent(tenant_id)
+    state = _state(tenant_id, model, agent)
+    step = LLMCompletionStep(
+        content="",
+        tool_calls=(
+            {
+                "id": "write-1",
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "arguments": json.dumps(
+                        {
+                            "raw_arguments": json.dumps(
+                                {
+                                    "path": "workspace/presentation.html",
+                                    "content": "<main></main>",
+                                }
+                            )
+                        }
+                    ),
+                },
+            },
+        ),
+        reasoning_content=None,
+        retry_instruction=None,
+        usage=TokenUsage(total_tokens=12),
+    )
+
+    result = _parse_step(
+        state,
+        _context(state),
+        step,
+        allowed_tool_names=frozenset({"write_file"}),
+        allow_user_wait=True,
+        allow_group_handoff=False,
+    )
+
+    assert result.intent == "tool_calls"
+    assert len(result.tool_calls) == 1
+    function = result.tool_calls[0]["function"]
+    assert isinstance(function, dict)
+    assert json.loads(function["arguments"]) == {
+        "path": "workspace/presentation.html",
+        "content": "<main></main>",
+    }
+
+
+def test_parse_step_repairs_truncated_raw_arguments_before_tool_execution() -> None:
+    tenant_id = uuid.uuid4()
+    model = _model(tenant_id)
+    agent = _agent(tenant_id)
+    state = _state(tenant_id, model, agent)
+    step = LLMCompletionStep(
+        content="",
+        tool_calls=(
+            {
+                "id": "write-1",
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "arguments": json.dumps(
+                        {
+                            "raw_arguments": (
+                                '{"path":"workspace/presentation.html",'
+                                '"content":"<main>'
+                            )
+                        }
+                    ),
+                },
+            },
+        ),
+        reasoning_content=None,
+        retry_instruction=None,
+        usage=TokenUsage(total_tokens=12),
+    )
+
+    result = _parse_step(
+        state,
+        _context(state),
+        step,
+        allowed_tool_names=frozenset({"write_file"}),
+        allow_user_wait=True,
+        allow_group_handoff=False,
+    )
+
+    assert result.intent == "text"
+    assert result.repair_code == "invalid_tool_call"
+    assert result.repair_instruction is not None
+    assert "truncated" in result.repair_instruction
+    assert "smaller tool call" in result.repair_instruction
 
 
 def test_runtime_budget_does_not_count_inline_image_bytes_as_text_tokens() -> None:
@@ -2370,3 +2476,95 @@ async def test_explicit_run_snapshot_without_fallback_ignores_later_agent_change
 
     assert result.intent == "wait"
     assert calls == 4
+def test_thread_tool_result_call_ids_include_visible_prior_run_receipts() -> None:
+    state = {
+        "messages": [
+            {"role": "assistant", "content": "working"},
+            {"role": "tool", "tool_call_id": "call-prior", "content": "unknown"},
+            {"role": "tool_result", "call_id": "call-prior", "content": "duplicate"},
+            {"role": "tool", "tool_call_id": "call-current", "content": "done"},
+        ],
+        "lifecycle": {},
+    }
+
+    assert _thread_tool_result_call_ids(state) == (
+        "call-prior",
+        "call-current",
+    )
+
+
+@pytest.mark.asyncio
+async def test_load_resolves_visible_prior_run_receipt_by_current_run_thread() -> None:
+    tenant_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    prior_run_id = uuid.uuid4()
+    model = _model(tenant_id)
+    agent = _agent(tenant_id)
+    state = _state(tenant_id, model, agent)
+    state["messages"] = [
+        {
+            "role": "tool",
+            "tool_call_id": "call-prior",
+            "content": "prior result",
+        }
+    ]
+    context = replace(
+        _context(state),
+        run_id=str(run_id),
+    )
+    execution = AgentToolExecution(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        run_id=prior_run_id,
+        tool_call_id="call-prior",
+        tool_name="read_file",
+        assistant_message_id="assistant-prior",
+        arguments_hash="hash",
+        sanitized_arguments={
+            "__clawith_tool_execution__": {
+                "side_effect_classification": "read",
+                "retry_policy": "safe",
+            }
+        },
+        status="succeeded",
+        result_summary="loaded from the durable prior Run",
+        result_ref=None,
+        result_metadata={},
+    )
+
+    class _PriorThreadReceiptDB:
+        def __init__(self) -> None:
+            self.results = iter(
+                (
+                    _Result([model]),
+                    _Result([agent]),
+                    _Result(),
+                    _Result(["thread-1"]),
+                    _Result([execution]),
+                )
+            )
+
+        async def execute(self, statement):
+            del statement
+            return next(self.results)
+
+    @asynccontextmanager
+    async def session_factory():
+        yield _PriorThreadReceiptDB()
+
+    service = RuntimeModelStepService(
+        session_factory=session_factory,
+        context_builder=_ContextBuilder(_build()),  # type: ignore[arg-type]
+        completion=AsyncMock(),
+        tool_provider=_tools,
+        prompt_builder=_prompt,
+    )
+
+    loaded_model, loaded_agent, ledger = await service._load(context, state)
+
+    assert loaded_model is model
+    assert loaded_agent is agent
+    assert ledger["call-prior"]["status"] == "succeeded"
+    assert ledger["call-prior"]["result_summary"] == (
+        "loaded from the durable prior Run"
+    )

@@ -70,6 +70,167 @@ class DeliverableActionIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class DeliverableQualityReviewCreate(BaseModel):
+    client_review_id: uuid.UUID
+    expected_request_version: int = Field(ge=1)
+    reviewer_user_ids: list[uuid.UUID] = Field(min_length=3, max_length=7)
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("reviewer_user_ids")
+    @classmethod
+    def validate_distinct_reviewers(
+        cls,
+        value: list[uuid.UUID],
+    ) -> list[uuid.UUID]:
+        if len(set(value)) != len(value):
+            raise ValueError("reviewer_user_ids must contain distinct users")
+        return value
+
+
+class DeliverableReviewerHardGateIn(BaseModel):
+    passed: bool
+    evidence: list[str] = Field(min_length=1, max_length=12)
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("evidence")
+    @classmethod
+    def validate_evidence(cls, value: list[str]) -> list[str]:
+        cleaned = [item.strip() for item in value]
+        if any(len(item) < 3 or len(item) > 500 for item in cleaned):
+            raise ValueError("each evidence item must contain 3 to 500 characters")
+        return cleaned
+
+
+class DeliverableReviewerDimensionIn(BaseModel):
+    score: float = Field(ge=1, le=5)
+    evidence: list[str] = Field(min_length=1, max_length=12)
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("evidence")
+    @classmethod
+    def validate_evidence(cls, value: list[str]) -> list[str]:
+        cleaned = [item.strip() for item in value]
+        if any(len(item) < 3 or len(item) > 500 for item in cleaned):
+            raise ValueError("each evidence item must contain 3 to 500 characters")
+        return cleaned
+
+
+class DeliverableReviewerEvidenceIn(BaseModel):
+    status: Literal["complete", "partial", "unavailable"]
+    findings: list[str] = Field(min_length=1, max_length=30)
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("findings")
+    @classmethod
+    def validate_findings(cls, value: list[str]) -> list[str]:
+        cleaned = [item.strip() for item in value]
+        if any(len(item) < 3 or len(item) > 500 for item in cleaned):
+            raise ValueError("each finding must contain 3 to 500 characters")
+        return cleaned
+
+
+class DeliverableQualityReviewSubmissionIn(BaseModel):
+    client_submission_id: uuid.UUID
+    expected_version: int = Field(ge=1)
+    hard_gates: dict[str, DeliverableReviewerHardGateIn] = Field(min_length=1)
+    dimensions: dict[str, DeliverableReviewerDimensionIn] = Field(min_length=1)
+    human_evidence: dict[str, DeliverableReviewerEvidenceIn] = Field(min_length=1)
+    notes: list[str] = Field(default_factory=list, max_length=20)
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("notes")
+    @classmethod
+    def validate_notes(cls, value: list[str]) -> list[str]:
+        cleaned = [item.strip() for item in value if item.strip()]
+        if any(len(item) > 1000 for item in cleaned):
+            raise ValueError("each note must contain at most 1000 characters")
+        return cleaned
+
+
+class DeliverableQualityReviewEvidenceIn(BaseModel):
+    client_evidence_id: uuid.UUID
+    expected_version: int = Field(ge=1)
+    kind: Literal["ocr", "frame_ocr"]
+    status: Literal["complete", "partial", "unavailable"]
+    source_ref: str = Field(min_length=3, max_length=500)
+    findings: list[str] = Field(default_factory=list, max_length=100)
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("source_ref")
+    @classmethod
+    def validate_source_ref(cls, value: str) -> str:
+        cleaned = value.strip()
+        if "://" in cleaned or cleaned.startswith(("/", "~")) or ".." in cleaned.split("/"):
+            raise ValueError("source_ref must be a private, relative evidence reference")
+        return cleaned
+
+    @field_validator("findings")
+    @classmethod
+    def validate_findings(cls, value: list[str]) -> list[str]:
+        cleaned = [item.strip() for item in value if item.strip()]
+        if any(len(item) > 500 for item in cleaned):
+            raise ValueError("each finding must contain at most 500 characters")
+        return cleaned
+
+
+class DeliverableQualityReviewerOut(BaseModel):
+    user_id: uuid.UUID
+    display_name: str
+    role: str
+    eligible: bool
+    ineligible_reason: str | None = None
+
+
+class DeliverableQualityReviewAssignmentOut(BaseModel):
+    reviewer_user_id: uuid.UUID
+    reviewer_display_name: str | None = None
+    reviewer_role: str | None = None
+    status: Literal["assigned", "submitted"]
+    is_current_user: bool
+    submitted_at: datetime | None = None
+
+
+class DeliverableQualityReviewArtifactOut(BaseModel):
+    id: uuid.UUID
+    artifact_key: str
+    artifact_type: str
+    content_hash: str
+    revision_number: int
+    download_url: str
+
+
+class DeliverableQualityReviewOut(BaseModel):
+    id: uuid.UUID
+    request_id: uuid.UUID
+    modality: Literal["image", "video", "presentation"]
+    status: Literal["open", "passed", "blocked", "incomplete", "superseded"]
+    version: int
+    minimum_reviewers: int
+    assigned_reviewer_count: int
+    submitted_reviewer_count: int
+    artifact_hashes: dict[str, str]
+    brief: str
+    requirements: list[str]
+    hard_gates: list[str]
+    quality_dimensions: list[str]
+    required_evidence_kinds: list[str]
+    automated_evidence: list[dict[str, Any]]
+    assignments: list[DeliverableQualityReviewAssignmentOut]
+    artifacts: list[DeliverableQualityReviewArtifactOut]
+    current_user_can_manage: bool
+    current_user_can_submit: bool
+    current_user_can_add_evidence: bool
+    receipt_ref: str | None = None
+    created_at: datetime
+    sealed_at: datetime | None = None
+
+
 class DeliverableArtifactOut(BaseModel):
     id: uuid.UUID
     request_id: uuid.UUID
@@ -88,6 +249,22 @@ class DeliverableArtifactOut(BaseModel):
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class DeliverableApprovalReadinessOut(BaseModel):
+    approvable: bool
+    quality_gate_required: bool
+    quality_status: Literal[
+        "not_required",
+        "pending",
+        "passed",
+        "blocked",
+        "incomplete",
+        "invalid",
+    ]
+    blockers: list[str] = Field(default_factory=list)
+    receipt_ref: str | None = None
+
 
 class DeliverableRequestOut(BaseModel):
     id: uuid.UUID
@@ -115,5 +292,6 @@ class DeliverableRequestOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     artifacts: list[DeliverableArtifactOut] = Field(default_factory=list)
+    approval_readiness: DeliverableApprovalReadinessOut
 
     model_config = ConfigDict(from_attributes=True)

@@ -2,9 +2,26 @@
 
 ## 0. 文档状态
 
-- 日期：2026-07-25
-- 状态：`implementation_ready`
-- 当前只授权方案固化和后续任务拆分；不授权写入火山凭据、调用付费 API、修改生产配置、生产灰度或发布。
+- 日期：2026-07-26
+- 状态：`local_implementation_and_benchmark_authorized`
+- 当前已授权本地火山 Agent Plan 配置、受成本护栏约束的真实 Provider 调用、本地业务流和豆包同题
+  Benchmark；仍不授权修改生产配置、生产灰度或发布。
+- 当前完成分层：
+  - `provider_verified`：Agent Plan 文字、图片、语音；MiniMax 图片、视频、语音；
+  - `business_flow_proven`：Agent Plan 文字规划 + Tool Call + Agent Plan 语音持久化交付，
+    MiniMax 视频 + 旁白确定性合成，以及正式视频 brief → Runtime → Provider failover →
+    Artifact fail-closed 的浏览器失败流；正式视频 Artifact 成功流仍未完成；
+  - `historical_benchmark_complete`：同题图片、人物广告视频和 PPT 的本地/豆包样本与缺陷对照；
+    它只是一组回归锚点，不代表开放商业场景整体达标；
+  - `evaluation_foundation_local`：动态场景、覆盖统计、独立 holdout commitment、生产 brief
+    流式脱敏、Artifact 结构观察、清单/文件名去标识、先封存评分后解盲和 fail-closed 统一评分已本地
+    落地；19 条生产候选已完成第一轮显式隐私/信息充分性审核（8 条批准、11 条需补充），但尚未完成
+    滚动真实客户样本的正式多人盲评；
+  - `blocked_by_provider_entitlement`：当前 Agent Plan Key 的行为级套餐为 Small；1.5 Pro 与
+    Seedance 2.0/fast/mini（公开名及官方 Skill 版本化 ID）均在提交前返回 `UnsupportedModel`；
+  - `tool_ready`：Seedance 1.5 Pro 的 Medium 路由、官方版本化 ID、4–12 秒/分辨率/比例/联网/
+    draft/flex 能力校验、首尾帧和显式音频意图已在本地 adapter 与测试中落地；
+  - `production_verified`：否，生产配置与发布未获授权。
 - 底座边界：继续基于当前 v1.11.0 衍生定制线演进，本阶段不合并新的上游 Clawith。
 - 本文是图片、视频、PPT 实施阶段的强制工作流；同时遵守：
   - `.agents/rules/capability-and-agent-governance.md`
@@ -62,9 +79,12 @@
 
 - `builtin.presentation.v1`：`agent_runtime`
 - `builtin.poster.v1`：`dry_run`
-- `builtin.video.v1`：`dry_run`
+- `builtin.video.v1`：`agent_runtime`
 
-`GET /api/deliverables/workflows` 只返回当前 Agent 真正可启动的 workflow，主动过滤 `dry_run`（`backend/app/services/deliverable_workflows.py:183-213`）。因此，当前正式 UI 实际只展示 PPT，不得把“manifest 已存在”误报为图片/视频已可执行。
+`GET /api/deliverables/workflows` 只返回当前 Agent 真正可启动的 workflow，主动过滤 `dry_run`。
+视频还必须同时具备 `generate_video_minimax`、`generate_speech_minimax` 和
+`compose_video_audio`；当前正式 UI 可展示 PPT 和视频，图片仍保持 `dry_run`，不得把
+“manifest 已存在”误报为图片已可执行。
 
 现有 preflight：
 
@@ -106,7 +126,9 @@ Direct chat 本身还有单 lane、waiting reply 和 reconnect 约束。新交�
 - 只跟踪最新一个已关联 Run 的 Deliverable；
 - 发送前把 pending request 移到 inflight，WebSocket 断线时排队并自动重发。
 
-现有可启动判断硬编码为 `builtin.presentation.v1@1.0.0`（`frontend/src/utils/deliverables.ts:4-9`）。新增能力时不得继续扩散硬编码；应由服务端返回 `launchable/next_action`，但旧判断在 v1 兼容期必须继续通过。
+兼容期可启动判断当前允许 `builtin.presentation.v1@1.0.0` 和
+`builtin.video.v1@1.0.0`（`frontend/src/utils/deliverables.ts`）。后续不得继续扩散硬编码；
+应由服务端返回 `launchable/next_action`，但旧判断在 v1 兼容期必须继续通过。
 
 ### 2.5 图片/视频快捷入口
 
@@ -142,7 +164,18 @@ Provider 完成后先把确切债务写为 `settlement_ready`，再释放结果�
 
 ### 2.7 Artifact 与审批
 
-当前 PPT Artifact 只接受本次 request 目录下、来自成功 Agent Tool execution 的 PPTX/PDF；验证文件签名、大小、路径、hash，并保存不可变快照。Artifact revision 已支持 candidate/approved/rejected/superseded 和 parent revision（`backend/app/models/deliverable.py:146-217`）。
+当前 Artifact 只接受本次 request 目录下、来自成功 Agent Tool execution 的输出：
+PPT 接受 PPTX/PDF，视频优先接受 `compose_video_audio` 的 MP4，silent 合同才允许
+`generate_video_minimax` 的 MP4。系统验证文件签名、大小、路径、hash；视频额外验证时长、
+分辨率、画幅、H.264/yuv420p 浏览器兼容、fast-start 和声音合同，并保存不可变快照。
+Artifact revision 已支持 candidate/approved/rejected/superseded 和 parent revision
+（`backend/app/models/deliverable.py:146-217`）。
+
+2026-07-26 的真实浏览器视频任务
+`6e50d404-a0f5-48f8-a4ef-a0a20eab32ca` 暴露并修复了一个生命周期缺口：Runtime 正常停止但
+没有 MP4 时，旧通用分支仍会进入 `waiting_approval/output_review`。当前 presentation/video
+均必须先完成 Artifact reconciliation；缺少 MP4 会落为
+`failed/artifact_verification_failed` 和 `deliverable_artifact_missing`，批准按钮不会出现。
 
 当前检查主要是结构检查，不是内容、视觉、来源和可编辑性检查。
 
@@ -641,6 +674,9 @@ Request 映射为 `ready/capability_blocked`，不得产生“最终图片”Art
 ### 8.5 按页修订
 
 - revision 指令解析为受影响 slide ids；
+- 用户明确限定了页面、元素、文件或字段时，该范围是硬边界。QA 如果发现范围外问题，
+  本次修订必须保留失败回执并请求用户授权扩大范围；不得为了通过质量门禁擅自修改范围外
+  的文案、字号、布局、素材或事实；
 - 重新计算 dependency hash；
 - 只 supersede 受影响页及 deck assembly/PPTX/PDF；
 - 来源、主题未变时复用其他页；
@@ -735,6 +771,9 @@ Request 映射为 `ready/capability_blocked`，不得产生“最终图片”Art
 - `DELIVERABLE_PRESENTATION_V2_ENABLED=false`
 - `DELIVERABLE_IMAGE_V2_ENABLED=false`
 - `DELIVERABLE_VIDEO_V2_ENABLED=false`
+- `DELIVERABLE_CREATIVE_QUALITY_GATE_REQUIRED=false`
+- `DELIVERABLE_CREATIVE_QUALITY_GATE_TENANT_IDS=""`
+- `DELIVERABLE_CREATIVE_QUALITY_GATE_AGENT_IDS=""`
 - `MEDIA_PROVIDER_VOLCENGINE_ENABLED=false`
 - `MEDIA_PROVIDER_VOLCENGINE_SHADOW_ENABLED=false`
 
@@ -903,11 +942,89 @@ Request 映射为 `ready/capability_blocked`，不得产生“最终图片”Art
 
 ## 14. 质量基准和进入默认路由门槛
 
+### 14.0 开放场景评测合同
+
+这里的 Benchmark 不是固定用户只能做某一种图片、视频或 PPT，也不是为几条 prompt 做定向优化。
+评测由四层组成：
+
+1. **历史回归锚点**：少量固定题仅验证已知缺陷是否复发，不参与“全面能力”结论；
+2. **动态开放场景**：按 modality、行业、目标、渠道、受众、语言、输入素材、约束、画幅和风格做
+   均衡组合；每轮更换 seed，不能把模板或某个商品固化为能力边界；
+3. **真实需求滚动样本**：只使用已授权、匿名化的客户 brief，保留原始需求分布和长尾，不把客户数据
+   复制到公共 fixture；
+4. **隔离留出集**：开发者和 prompt 优化执行者在结果冻结前不能读取题目或 Provider 映射；公开清单只
+   保存数量和 SHA-256 commitment。
+
+同一轮 Provider 比较时，必须固定的是用户合同、输入素材 hash、候选/重试预算和评分表；不得固定创意
+表达、画面模板、分镜模板或视觉风格。结果必须按场景分桶报告分布、失败率和置信区间，不能只报单一均分，
+也不能用手工挑选的最佳候选替代首轮可用率。
+
+provider-free 本地底座：
+
+- `backend/app/services/creative_evaluation.py`：动态场景、覆盖统计、留出 commitment、盲评和统一评分；
+- `backend/app/services/creative_sample_ingestion.py`：授权导出输入、HMAC 假名化、敏感信息清理和
+  强制人工审核；
+- `backend/app/services/creative_artifact_evaluation.py`：图片、视频、PPT 的文件结构和交付合同观察；
+- `backend/app/services/creative_blind_review.py`：候选复制、公开清单去标识、评审封存和事后解盲；
+- `backend/scripts/generate_creative_evaluation_suite.py`：生成公开 manifest 和独立
+  `restricted-holdout.json`，不调用真实 Provider；
+- `backend/scripts/anonymize_creative_brief_export.py`：从 JSONL stdin 接收授权导出，避免生产原文落盘；
+- `backend/scripts/inspect_creative_artifacts.py`：不调用 Provider 的本地 Artifact 结构检查；
+- `backend/scripts/prepare_creative_blind_review.py`：生成公开 review package 和私有 attribution key；
+- `backend/scripts/score_creative_blind_review.py`：先写 provider-free sealed score，再按私钥解盲；
+- `backend/tests/test_creative_evaluation.py`：验证 seed 可复现、seed 轮换、覆盖、留出隔离、Provider
+  去标识、缺失证据不乐观通过和硬门禁 fail-closed。
+
+`prepare_creative_blind_review.py` 只保证公开 JSON 和文件名不含 provider/model/原路径。它不会篡改
+候选二进制中的 AIGC metadata、画面水印、PPT 文本/页脚或音频内容，因此公开包必须声明
+`masking_scope=manifest_and_filename_only` 和 `embedded_identity_review_required=true`。若样本存在
+可见来源标识，正式评审必须使用无标识原始导出重新生成，不能通过模糊、裁切水印或后期修图伪造盲测。
+
+正式评审不得继续复用单份 `BlindCandidateReviewSubmission` 作为放行依据。当前本地 shadow 已增加：
+
+- `creative_review_panel.py`：至少 3 名独立评审、候选全集覆盖、唯一 reviewer receipt、分歧
+  fail-closed、Artifact hash 绑定、modality-specific 感知证据，以及明确禁用水印 OCR 命中时
+  强制硬门禁失败；
+- `collect_creative_ocr_evidence.py`：图片 OCR 和视频逐帧 OCR 私有 receipt；缺少目标语言包时为
+  `partial`，不会把“未识别到”写成“无水印”；当前本地已补 `chi_sim`，并增加全图/四角增强、
+  稀疏文本识别和 exact/possible 两级禁用词检查；
+- `prepare_creative_review_panel.py`：为每种 modality 生成至少 3 份相互隔离、权限为 `0600` 的
+  provider-free 空白评审模板；
+- `record_creative_human_evidence.py`：把 visual/audio/AV-sync/document 结论绑定到候选 Artifact
+  hash；人物同步对白视频可强制要求 `human_av_sync`；
+- `assemble_creative_review_panel.py`：拒绝 placeholder receipt、空评分和不足 3 名真实评审的提交，
+  只在每名评审完成候选全集后封存 panel；
+- `score_creative_blind_review_panel.py`：先封存 panel 结果，再可选解盲 Provider；只有结构、感知、
+  独立评审和商业评分全部完成才能输出正式商用候选。
+
+当前三类历史包已各生成 3 份模板，共 9 份；这只证明评审输入与隔离流程已准备好，不表示 9 份真实判断
+已经存在。
+
+本地审批 shadow 已增加 `deliverable_quality_gate.py`，并接入 Artifact approval/read model：
+
+- receipt 必须绑定本次整组 Artifact 的 `artifact_key -> SHA-256`，任一文件替换或 digest 篡改都
+  fail closed；
+- 只有完整的至少 3 人 blind panel 能签发 `passed`；自动 OCR/结构证据只能签发明确
+  `blocked`，不能签发商用通过；
+- `blocked`、`incomplete`、无效或 hash 不一致的已附 receipt 始终阻断批准；
+- 没有 receipt 时由 `DELIVERABLE_CREATIVE_QUALITY_GATE_REQUIRED` 加 tenant/Agent 双 allowlist
+  共同控制是否强制等待正式评审。开关打开但 allowlist 为空时仍不影响任何客户；配置在本地和三个
+  部署 compose 合同中默认 `false + empty`，所以历史客户流程保持兼容；
+- API 以 additive `approval_readiness` 暴露状态，前端在阻断时禁用“批准交付”，但保留“退回重做”；
+- `build_deliverable_quality_receipt.py` 可把 exact prohibited OCR finding 转成私有、hash-bound
+  blocked receipt；possible match 仍只进入人审。
+
+这仍不是生产发布：正式开启 flag 前还必须完成真实独立评审、视频听音/口型条件、评审身份与审批审计、
+生产隔离存储/访问控制、receipt 受管写入 API、内部 allowlist 和回滚演练。
+
+本地 holdout 文件权限不是生产隔离。正式评测必须把 holdout 和盲评私钥放在优化执行者无读权限的独立
+存储/服务中，评审提交锁定后才能解盲。
+
 ### 14.1 图片
 
-- 36 个匿名化真实 brief；
+- 每个评测周期至少 36 个已授权匿名化真实 brief，并加入同量级动态开放场景；
 - `MM-current / MM-optimized / Volc-optimized` 同题；
-- 每组固定候选数、参数、reference hash；
+- 每轮比较固定候选预算、合同参数和 reference hash，不固定用户创意模式；
 - 至少 3 人盲评；
 - 评分：需求、构图、主体/品牌、文字、伪影、安全、首轮可用、成本。
 
@@ -920,7 +1037,7 @@ Request 映射为 `ready/capability_blocked`，不得产生“最终图片”Art
 
 ### 14.2 视频
 
-- 18 个匿名化真实 brief；
+- 每个评测周期至少 18 个已授权匿名化真实 brief，并加入同量级动态开放场景；
 - 覆盖 T2V、I2V、多参考、商品广告、编辑/延长；
 - 实际时长误差不超过 0.2 秒；
 - 无连续黑帧超过 200ms；
@@ -930,7 +1047,7 @@ Request 映射为 `ready/capability_blocked`，不得产生“最终图片”Art
 
 ### 14.3 PPT
 
-- 10 个真实 brief，中文/英文、8–15 页；
+- 每个评测周期至少 10 个已授权匿名化真实 brief，并加入中文/英文、8–15 页动态开放场景；
 - PPTX/PDF 打开、页数、标题、语言和明确要求 100%；
 - 无 overflow、越界、严重遮挡、空白页和缺失字体；
 - 重要事实和数字可追溯；
@@ -954,6 +1071,7 @@ Request 映射为 `ready/capability_blocked`，不得产生“最终图片”Art
 产出：
 
 - 三类真实匿名化 fixture；
+- 动态开放场景 public manifest、独立 holdout commitment 和盲评去标识合同；
 - 当前 UI/API/Runtime/Tool/Credits/Artifact 回归测试；
 - 当前生产样本的质量分类；
 - Provider 调用前的授权清单。
@@ -968,7 +1086,14 @@ Request 映射为 `ready/capability_blocked`，不得产生“最终图片”Art
 仓库内 provider-free 冻结门禁：
 
 - `cd backend && .venv/bin/python scripts/validate_creative_v1_contracts.py`
+- `cd backend && .venv/bin/python scripts/generate_creative_evaluation_suite.py --seed <cycle-seed> --count 24`
+- `cd backend && <authorized-export-command> | .venv/bin/python scripts/anonymize_creative_brief_export.py --output <private-pending-review.json> --source-ref <receipt>`
+- `cd backend && .venv/bin/python scripts/inspect_creative_artifacts.py --modality <image|video|presentation> ...`
+- `cd backend && .venv/bin/python scripts/prepare_creative_blind_review.py --batch-spec <private-spec.json> --output-dir <private-cycle-dir>`
+- `cd backend && .venv/bin/python scripts/score_creative_blind_review.py --batch-spec <private-spec.json> --review-package <public/review-package.json> --review-submissions <sealed-submissions.json> --output-dir <results-dir> --private-key <private/review-key.json>`
 - 该命令保护 v1 workflow、普通聊天/WebSocket、quick media、brand-safe media、typed Tool receipt 和 Artifact 合同，不调用真实 Provider。
+- 动态评测生成命令只生成 provider-neutral 场景和 holdout commitment，也不调用真实 Provider；
+  `restricted-holdout.json` 必须按评测环境的独立权限保存，不能提交到仓库或交给优化执行者。
 - Agent 模板如果承诺创意能力，还必须通过 `scripts/validate_agent_capabilities.py`；当前仅允许复用已存在的 quick media/brand-safe 合同。
 
 停门：无代表性样本或 v1 回归未锁定，不做 Provider 切换。
@@ -1007,6 +1132,10 @@ Request 映射为 `ready/capability_blocked`，不得产生“最终图片”Art
 - structural/semantic/visual/parity QA；
 - per-slide revision。
 
+2026-07-28 已完成第一段 provider-free 基础：`adaptive-v1` 页级视觉计划、按页数/档位计算的独立素材
+预算、版式多样性、单素材复用上限、可编辑信息设计配额，以及 HTML 与 `slide_spec` 的逐页素材对账。
+该段保持旧 `slide_spec` 兼容，尚未完成 outline approval、按页 revision、真实开放场景批次或生产灰度。
+
 停门：10 个基准、v1 并行保留、内部浏览器业务流和 Artifact 通过。
 
 ### P3 — MiniMax 图片优化 shadow
@@ -1020,7 +1149,7 @@ Request 映射为 `ready/capability_blocked`，不得产生“最终图片”Art
 
 停门：得到 `MM-optimized - MM-current` 的真实增量。
 
-### P4 — 火山账号/API 资格与 Adapter 验证
+### P4 — 火山账号/API 资格与 Adapter 验证（本地 Provider 行为已完成，订单信息仍待控制台）
 
 先只读/低成本验证：
 
@@ -1034,7 +1163,21 @@ Request 映射为 `ready/capability_blocked`，不得产生“最终图片”Art
 
 任何凭据写入、真实付费批量 A/B 和生产配置变更都需单独确认。
 
-停门：真实 API receipt、错误语义、Credits 和恢复证据齐全。
+当前本地结果：
+
+- Plan Key 鉴权、文字、Seedream 5.0 Lite、Seed TTS 2.0 已验证；
+- 所有当前官方视频路线均在 Provider 接受前拒绝，行为与 Small 套餐一致；
+- 本地配置已从误填 Large 收敛为 `small + text/image/audio`；
+- 订单级 SKU、有效期、AFP 余量仍需要控制台登录态或火山 AK/SK 管理 API；
+- 官方 Seedream/Seedance Skill 已完成 Astra 受管适配并分配给 Douyin Operations Manager。
+- Seedance 1.5 Pro 已完成本地协议级兼容接入；当前 Key 仍是行为级 Small，故不能把
+  `tool_ready` 写成 `provider_verified`。换成控制台确认的 Medium-or-up Key 后，先做一条
+  4 秒 480p T2V 和一条首帧 I2V，再进入正式浏览器成功流与豆包同题 Benchmark。
+- 真实 Agent Skill 验证已完成：Seedream 5.0 Lite 生成 9:16 真人广告首帧；Seedance 在 Small
+  权益下执行一次后稳定返回 unavailable，没有创建 Provider task 或扣 Credits。媒体附件短路径
+  规范化和“本地校验失败也禁止自动重试”的执行边界已补齐。
+
+停门：订单级信息、真实 API receipt、错误语义、Credits 和恢复证据齐全。
 
 ### P5 — 图片 A/B、allowlist 和 canary
 
@@ -1049,6 +1192,10 @@ Request 映射为 `ready/capability_blocked`，不得产生“最终图片”Art
 ### P6 — 视频 storyboard、逐镜头执行和 A/B
 
 - 先完成 provider-independent storyboard/shot pipeline；
+- 当 fallback 为 MiniMax 且目标不是 16:9 时，必须先生成并验证同画幅首帧再走 I2V；
+- Provider 返回后必须用文件实测画幅、时长、音轨和水印；请求 metadata 不能代替交付验收；
+- 当前已加入 `media_video_requires_first_frame_for_aspect_ratio` 付费前停门，直到自动首帧组合链
+  完成前，不允许非 16:9 MiniMax T2V 被标记为成功；
 - MiniMax optimized shadow；
 - 火山 video adapter shadow；
 - shot-level Credits/recovery；
@@ -1074,6 +1221,45 @@ Request 映射为 `ready/capability_blocked`，不得产生“最终图片”Art
 - capability recertification。
 
 停门：依赖能力未达到 `business_flow_proven`，不得对客户承诺。
+
+### P9 — 受管质量评审和 Artifact 放行
+
+本阶段把离线 panel 文件提升为产品内的受管评审对象，但不改变现有 Deliverable 创建、产物下载、
+退回重做和审批状态机：
+
+- 评审批次、评审分配、自动证据和人工判断必须持久化；
+- 每个批次绑定完整 Artifact 清单、版本和 SHA-256，文件变化后旧批次自动失效；
+- 同一租户内至少 3 名非交付创建者参与，按底层 `Identity` 去重，账号别名不能重复计数；
+- 每位评审只能封存一次完整判断；相同 payload 可幂等重放，不同 payload 不可覆盖；
+- 图片、视频和 PPT 使用服务端固定的 modality 合同、硬门禁、评分维度和感知证据要求；
+- 自动证据只能阻断；没有发现问题不能代替三人盲审签发 `passed`；
+- 管理员证据写入必须记录提交人、私有 evidence ref、Artifact hash、findings 和 audit log；
+- `blocked`、评审分歧、缺失字段、证据不完整和 hash 变化都 fail closed；
+- rollout 仍使用全局开关加 tenant/Agent 双 allowlist，默认关闭且空 allowlist。
+
+2026-07-27 本地实现和验证状态：
+
+- Alembic head 已扩展为 `add_deliverable_quality_reviews`，fresh、历史升级和 downgrade/upgrade
+  PostgreSQL smoke 均通过；
+- 受管 reviewers/create/latest/get/submit/evidence/read-only artifact download API 已接入；
+- 前端交付卡片可配置评审人、显示服务端状态并进入独立评审工作台；
+- 隔离临时数据库中的真实浏览器流程完成一条 PPT `0/3 open -> 3/3 passed`，三名不同
+  Identity 逐一登录、完整填写并封存；同库另一条视频通过精确
+  `prohibited_term_detected=...` 自动证据变为 `0/3 blocked`；
+- 应用随后切回原开发数据库，原库评审记录仍为 0；临时数据库和转储已删除；
+- 原开发数据只有两名合格非创建者，页面正确显示 `创建评审 (2)` 和 `批准交付` disabled，
+  没有为了演示修改真实账号或伪造第三名评审；
+- 本阶段没有修改生产配置、没有调用付费图片/视频 Provider，也没有产生模型 Credits。
+
+当前停门：
+
+- 代码、迁移、API 和本地真实评审状态转换已验证；
+- 尚未在原开发数据上完成创建者点击“批准交付”的完整浏览器 clickthrough，因为真实组织没有第三名
+  独立评审人；服务/API 层验证不能替代该页面证据；
+- 管理员 evidence ref 当前是受审计的内部 attestation，不是独立 evaluator 的签名回执。进入生产前
+  必须接入隔离执行身份、私有对象存储、不可变签名/摘要和保留策略；
+- 生产 allowlist、生产迁移、生产真实评审人、告警和回滚演练均未授权，状态仍不是
+  `production_verified`。
 
 ## 16. 每个阶段的发布检查
 
@@ -1109,12 +1295,12 @@ Request 映射为 `ready/capability_blocked`，不得产生“最终图片”Art
 
 ## 17. 开始写代码前必须确认的剩余外部事实
 
-这些问题不能从仓库推断，进入 P4 前必须用已购买火山账号实测：
+这些问题不能只从仓库推断，进入 P4 时必须用已购买火山账号实测。当前进展：
 
-1. Agent Plan 的准确 SKU 和有效期；
-2. API Key 是否允许 Astra 服务器调用；
-3. Seedream/Seedance 的真实 model ids；
-4. endpoint、区域和网络；
+1. Agent Plan 的订单级 SKU 和有效期：`pending_console_or_GetPersonalPlan`；行为级判定为 Small；
+2. API Key 是否允许 Astra 服务器调用：`verified_local`；
+3. Seedream/Seedance 的真实 model ids：Seedream `verified`；Seedance 当前账号 `entitlement_denied`；
+4. endpoint、区域和网络：`verified_local`；
 5. AFP 抵扣、超额和耗尽语义；
 6. RPM、并发、排队和最大任务；
 7. 图片/视频输入、输出、时长、分辨率和参考数量；

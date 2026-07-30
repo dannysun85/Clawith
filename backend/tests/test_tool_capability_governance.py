@@ -81,6 +81,7 @@ def test_image_speech_and_video_are_global_defaults_with_agent_opt_out() -> None
     assert GLOBAL_DEFAULT_MEDIA_TOOL_NAMES == {
         "generate_image_minimax",
         "generate_speech_minimax",
+        "compose_video_audio",
         "generate_video_minimax",
         "check_video_minimax",
     }

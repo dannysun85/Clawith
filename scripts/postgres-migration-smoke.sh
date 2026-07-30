@@ -7,7 +7,7 @@ fresh_db_name="${db_name}_fresh"
 db_user="${PGUSER:-$USER}"
 db_host="${PGHOST:-127.0.0.1}"
 db_port="${PGPORT:-5432}"
-release_head="${MIGRATION_SMOKE_EXPECTED_HEAD:-reconcile_m3_runtime_caps}"
+release_head="${MIGRATION_SMOKE_EXPECTED_HEAD:-add_deliverable_quality_reviews}"
 
 assert_at_release_head() {
   .venv/bin/alembic current | grep -F "${release_head} (head)"
@@ -1894,6 +1894,14 @@ BEGIN
       AND column_name = 'modality_status'
   ) THEN
     RAISE EXCEPTION 'missing credential modality circuit state';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'llm_credentials'
+      AND column_name = 'plan_tier'
+      AND data_type = 'character varying'
+  ) THEN
+    RAISE EXCEPTION 'missing provider subscription plan tier';
   END IF;
   IF NOT EXISTS (
     SELECT 1 FROM information_schema.columns

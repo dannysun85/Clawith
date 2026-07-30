@@ -50,7 +50,9 @@ from app.services.media_assets import (
     valid_mp4,
     validate_generated_audio,
     validate_generated_image,
+    validate_image_delivery_contract,
     validate_generated_video,
+    validate_video_delivery_contract,
 )
 from app.services.storage import agent_storage_key, get_storage_backend, normalize_storage_key
 
@@ -90,8 +92,7 @@ class ProviderTaskIdentityCollision(RuntimeError):
     """A provider task identity was already owned by another security scope."""
 
 
-_PRIVATE_VIDEO_BRAND_PREFIX = "_internal/provider_recovery/minimax/video"
-_PRIVATE_SYNC_MEDIA_PREFIX = "_internal/provider_recovery/minimax/sync"
+_MEDIA_RECOVERY_PROVIDERS = frozenset({"minimax", "volcengine_agent_plan"})
 _SYNC_MEDIA_MODALITIES = {"image", "audio", "music"}
 _SYNC_MEDIA_EXTENSIONS = {
     "image": {"bin"},
@@ -129,6 +130,21 @@ _PUBLIC_MEDIA_METADATA_KEYS = frozenset(
         "error",
     }
 )
+
+
+def _media_provider_slug(provider: str | None) -> str:
+    normalized = str(provider or "minimax").strip().lower()
+    if normalized not in _MEDIA_RECOVERY_PROVIDERS:
+        raise ValueError("Unsupported media recovery provider")
+    return normalized
+
+
+def _private_video_prefix(provider: str | None) -> str:
+    return f"_internal/provider_recovery/{_media_provider_slug(provider)}/video"
+
+
+def _private_sync_prefix(provider: str | None) -> str:
+    return f"_internal/provider_recovery/{_media_provider_slug(provider)}/sync"
 
 
 def _media_completion_notification_link(
@@ -171,6 +187,8 @@ def minimax_video_brand_asset_key(
     agent_id: uuid.UUID,
     record_id: uuid.UUID,
     extension: str,
+    *,
+    provider: str = "minimax",
 ) -> str:
     """Return an Agent-inaccessible, task-bound brand-asset key."""
 
@@ -178,16 +196,18 @@ def minimax_video_brand_asset_key(
     if normalized_extension not in {"jpg", "png", "webp"}:
         raise ValueError("Unsupported private video brand asset extension")
     return normalize_storage_key(
-        f"{_PRIVATE_VIDEO_BRAND_PREFIX}/{agent_id}/{record_id}/brand.{normalized_extension}"
+        f"{_private_video_prefix(provider)}/{agent_id}/{record_id}/brand.{normalized_extension}"
     )
 
 
 def minimax_video_provider_identity_evidence_key(
     agent_id: uuid.UUID,
     record_id: uuid.UUID,
+    *,
+    provider: str = "minimax",
 ) -> str:
     return normalize_storage_key(
-        f"{_PRIVATE_VIDEO_BRAND_PREFIX}/{agent_id}/{record_id}/provider_identity.json"
+        f"{_private_video_prefix(provider)}/{agent_id}/{record_id}/provider_identity.json"
     )
 
 
@@ -196,6 +216,8 @@ def minimax_sync_recovery_asset_key(
     record_id: uuid.UUID,
     modality: str,
     extension: str,
+    *,
+    provider: str = "minimax",
 ) -> str:
     """Return a deterministic private key for a synchronous provider result."""
 
@@ -206,7 +228,7 @@ def minimax_sync_recovery_asset_key(
     if normalized_extension not in _SYNC_MEDIA_EXTENSIONS[normalized_modality]:
         raise ValueError("Unsupported synchronous MiniMax recovery extension")
     return normalize_storage_key(
-        f"{_PRIVATE_SYNC_MEDIA_PREFIX}/{normalized_modality}/{agent_id}/{record_id}"
+        f"{_private_sync_prefix(provider)}/{normalized_modality}/{agent_id}/{record_id}"
         f"/provider.{normalized_extension}"
     )
 
@@ -215,6 +237,8 @@ def minimax_sync_brand_asset_key(
     agent_id: uuid.UUID,
     record_id: uuid.UUID,
     extension: str,
+    *,
+    provider: str = "minimax",
 ) -> str:
     """Return a task-bound private key for image post-processing inputs."""
 
@@ -222,7 +246,7 @@ def minimax_sync_brand_asset_key(
     if normalized_extension not in {"jpg", "png", "webp"}:
         raise ValueError("Unsupported private image brand asset extension")
     return normalize_storage_key(
-        f"{_PRIVATE_SYNC_MEDIA_PREFIX}/image/{agent_id}/{record_id}"
+        f"{_private_sync_prefix(provider)}/image/{agent_id}/{record_id}"
         f"/brand.{normalized_extension}"
     )
 
@@ -238,6 +262,7 @@ def _validated_sync_recovery_asset_key(task: MediaGenerationTask) -> str | None:
         task.id,
         task.modality,
         extension,
+        provider=getattr(task, "provider", "minimax"),
     )
     normalized_key = normalize_storage_key(raw_key)
     if normalized_key != expected:
@@ -253,7 +278,12 @@ def _validated_sync_brand_asset_key(task: MediaGenerationTask) -> str | None:
     if not raw_key:
         return None
     extension = str(metadata.get("brand_asset_extension") or "")
-    expected = minimax_sync_brand_asset_key(task.agent_id, task.id, extension)
+    expected = minimax_sync_brand_asset_key(
+        task.agent_id,
+        task.id,
+        extension,
+        provider=getattr(task, "provider", "minimax"),
+    )
     normalized_key = normalize_storage_key(raw_key)
     if normalized_key != expected:
         raise MediaContractError(
@@ -268,7 +298,7 @@ def _validated_video_brand_asset_key(task: MediaGenerationTask) -> str | None:
         return None
     normalized_key = normalize_storage_key(raw_key)
     expected_prefix = normalize_storage_key(
-        f"{_PRIVATE_VIDEO_BRAND_PREFIX}/{task.agent_id}/{task.id}/"
+        f"{_private_video_prefix(getattr(task, 'provider', 'minimax'))}/{task.agent_id}/{task.id}/"
     )
     if not normalized_key.startswith(expected_prefix):
         raise MediaContractError("Frozen video brand asset key is outside the task-private namespace")
@@ -290,6 +320,7 @@ def _validated_video_provider_identity_evidence_key(
     expected_key = minimax_video_provider_identity_evidence_key(
         task.agent_id,
         task.id,
+        provider=getattr(task, "provider", "minimax"),
     )
     if normalized_key != expected_key:
         raise MediaContractError(
@@ -306,6 +337,7 @@ async def store_minimax_video_provider_identity_evidence(
     credential_id: uuid.UUID,
     model: str,
     provider_task_id: str,
+    provider: str = "minimax",
 ) -> str:
     """Freeze an accepted video provider identity before its SQL attachment.
 
@@ -316,10 +348,15 @@ async def store_minimax_video_provider_identity_evidence(
     normalized_provider_task_id = str(provider_task_id or "").strip()
     if not normalized_provider_task_id:
         raise ValueError("Provider task identity is empty")
-    key = minimax_video_provider_identity_evidence_key(agent_id, record_id)
+    normalized_provider = _media_provider_slug(provider)
+    key = minimax_video_provider_identity_evidence_key(
+        agent_id,
+        record_id,
+        provider=normalized_provider,
+    )
     plaintext = json.dumps(
         {
-            "provider": "minimax",
+            "provider": normalized_provider,
             "record_id": str(record_id),
             "agent_id": str(agent_id),
             "tenant_id": str(tenant_id) if tenant_id else "",
@@ -345,9 +382,12 @@ async def store_minimax_video_provider_identity_evidence(
 
 async def _load_minimax_video_provider_identity_evidence(
     key: str,
+    *,
+    provider: str = "minimax",
 ) -> dict[str, object]:
     normalized_key = normalize_storage_key(key)
-    if not normalized_key.startswith(f"{_PRIVATE_VIDEO_BRAND_PREFIX}/"):
+    normalized_provider = _media_provider_slug(provider)
+    if not normalized_key.startswith(f"{_private_video_prefix(normalized_provider)}/"):
         raise MediaContractError(
             "MiniMax video provider identity evidence is outside the private namespace"
         )
@@ -366,7 +406,7 @@ async def _load_minimax_video_provider_identity_evidence(
         get_settings().SECRET_KEY,
     )
     payload = json.loads(plaintext)
-    if not isinstance(payload, dict) or payload.get("provider") != "minimax":
+    if not isinstance(payload, dict) or payload.get("provider") != normalized_provider:
         raise MediaContractError(
             "MiniMax video provider identity evidence payload is invalid"
         )
@@ -495,7 +535,8 @@ def _private_media_recovery_entries(
     if evidence_key:
         normalized_evidence_key = normalize_storage_key(evidence_key)
         expected_evidence_key = normalize_storage_key(
-            f"_internal/provider_recovery/minimax/image/{task.agent_id}/{task.id}.json"
+            f"_internal/provider_recovery/{_media_provider_slug(getattr(task, 'provider', 'minimax'))}"
+            f"/image/{task.agent_id}/{task.id}.json"
         )
         if modality != "image" or normalized_evidence_key != expected_evidence_key:
             raise MediaContractError(
@@ -918,12 +959,14 @@ async def create_minimax_sync_media_task_record(
     credit_cost: int,
     output_path: str,
     request_metadata: dict,
+    provider: str = "minimax",
 ) -> MediaGenerationTask:
     """Atomically persist a sync media task and its pre-provider Credits hold."""
 
     normalized_modality = str(modality or "").strip().lower()
     if normalized_modality not in _SYNC_MEDIA_MODALITIES:
         raise ValueError("Unsupported synchronous MiniMax modality")
+    normalized_provider = _media_provider_slug(provider)
     metadata = dict(request_metadata or {})
     recovery_extension = str(metadata.get("recovery_extension") or "").lower()
     # Validate the deterministic recovery namespace before reserving Credits.
@@ -932,11 +975,12 @@ async def create_minimax_sync_media_task_record(
         record_id,
         normalized_modality,
         recovery_extension,
+        provider=normalized_provider,
     )
     metadata["recovery_asset_storage_key"] = recovery_key
     if normalized_modality == "image":
         metadata["acceptance_evidence_storage_key"] = normalize_storage_key(
-            f"_internal/provider_recovery/minimax/image/{agent_id}/{record_id}.json"
+            f"_internal/provider_recovery/{normalized_provider}/image/{agent_id}/{record_id}.json"
         )
     metadata["credit_cost"] = max(int(credit_cost or 0), 0)
     metadata["tier"] = str(tier or "").strip().lower()
@@ -958,7 +1002,7 @@ async def create_minimax_sync_media_task_record(
                 action=normalized_modality,
                 modality=normalized_modality,
                 saas_tier=metadata["tier"],
-                provider="minimax",
+                provider=normalized_provider,
                 model=model,
                 amount=metadata["credit_cost"],
                 ref_type="media_task",
@@ -974,12 +1018,12 @@ async def create_minimax_sync_media_task_record(
             credential_id=credential_id,
             reservation_id=reservation.id if reservation else None,
             origin_session_id=validated_session_id,
-            provider="minimax",
+            provider=normalized_provider,
             modality=normalized_modality,
             model=model,
             status="submitting",
             metadata_path=(
-                f"workspace/media_tasks/minimax_{normalized_modality}_{record_id}.json"
+                f"workspace/media_tasks/{normalized_provider}_{normalized_modality}_{record_id}.json"
             ),
             output_path=output_path,
             request_metadata=metadata,
@@ -1012,7 +1056,12 @@ async def store_minimax_sync_brand_asset(
         key = _validated_sync_brand_asset_key(task)
         if not key:
             raise MediaContractError("Synchronous image brand asset intent is missing")
-        expected_key = minimax_sync_brand_asset_key(task.agent_id, task.id, extension)
+        expected_key = minimax_sync_brand_asset_key(
+            task.agent_id,
+            task.id,
+            extension,
+            provider=getattr(task, "provider", "minimax"),
+        )
         if key != expected_key:
             raise MediaContractError("Synchronous image brand asset identity changed")
     asset = image_asset_from_bytes(raw, label="Frozen image brand asset")
@@ -1053,7 +1102,8 @@ async def mark_minimax_sync_provider_accepted(
         if evidence_key:
             normalized_evidence_key = normalize_storage_key(evidence_key)
             expected_evidence_key = normalize_storage_key(
-                f"_internal/provider_recovery/minimax/image/{task.agent_id}/{task.id}.json"
+                f"_internal/provider_recovery/{_media_provider_slug(getattr(task, 'provider', 'minimax'))}"
+                f"/image/{task.agent_id}/{task.id}.json"
             )
             if task.modality != "image" or normalized_evidence_key != expected_evidence_key:
                 raise MediaContractError(
@@ -1178,6 +1228,7 @@ async def store_minimax_sync_recovery_asset(
                 task.id,
                 task.modality,
                 str(metadata.get("recovery_extension") or ""),
+                provider=getattr(task, "provider", "minimax"),
             )
     await get_storage_backend().write_bytes(key, raw, content_type=content_type)
     digest = hashlib.sha256(raw).hexdigest()
@@ -1332,11 +1383,17 @@ async def create_minimax_video_task_record(
     metadata_path: str,
     output_path: str,
     request_metadata: dict,
+    provider: str = "minimax",
 ) -> MediaGenerationTask:
     """Create the durable row before asking the paid provider to start work."""
+    normalized_provider = _media_provider_slug(provider)
     metadata = dict(request_metadata or {})
     metadata["provider_identity_evidence_storage_key"] = (
-        minimax_video_provider_identity_evidence_key(agent_id, record_id)
+        minimax_video_provider_identity_evidence_key(
+            agent_id,
+            record_id,
+            provider=normalized_provider,
+        )
     )
     async with async_session() as db:
         validated_session_id = await _validated_origin_session_id(
@@ -1355,7 +1412,7 @@ async def create_minimax_video_task_record(
                 action="video",
                 modality="video",
                 saas_tier=str(tier or "").strip().lower(),
-                provider="minimax",
+                provider=normalized_provider,
                 model=model,
                 amount=int(credit_cost),
                 ref_type="media_task",
@@ -1371,7 +1428,7 @@ async def create_minimax_video_task_record(
             credential_id=credential_id,
             reservation_id=reservation.id if reservation else None,
             origin_session_id=validated_session_id,
-            provider="minimax",
+            provider=normalized_provider,
             modality="video",
             model=model,
             status="submitting",
@@ -1408,7 +1465,8 @@ async def mark_minimax_video_task_submitted(
                 existing_result = await db.execute(
                     select(MediaGenerationTask)
                     .where(
-                        MediaGenerationTask.provider == "minimax",
+                        MediaGenerationTask.provider
+                        == getattr(task, "provider", "minimax"),
                         MediaGenerationTask.provider_task_id == normalized_provider_task_id,
                         MediaGenerationTask.id != record_id,
                     )
@@ -1486,9 +1544,12 @@ async def _recover_minimax_video_provider_identity(
     storage = get_storage_backend()
     if not await storage.exists(evidence_key):
         return task
-    evidence = await _load_minimax_video_provider_identity_evidence(evidence_key)
+    evidence = await _load_minimax_video_provider_identity_evidence(
+        evidence_key,
+        provider=getattr(task, "provider", "minimax"),
+    )
     expected = {
-        "provider": "minimax",
+        "provider": getattr(task, "provider", "minimax"),
         "record_id": str(task.id),
         "agent_id": str(task.agent_id),
         "tenant_id": str(task.tenant_id) if task.tenant_id else "",
@@ -1508,7 +1569,7 @@ async def _recover_minimax_video_provider_identity(
         )
     metadata = {
         **dict(task.request_metadata or {}),
-        "provider": "minimax",
+        "provider": getattr(task, "provider", "minimax"),
         "task_record_id": str(task.id),
         "task_id": provider_task_id,
         "status": "submitted",
@@ -1729,16 +1790,21 @@ async def find_media_generation_task(
     *,
     agent_id: uuid.UUID,
     provider_task_id: str,
+    provider: str | None = None,
 ) -> MediaGenerationTask | None:
     async with async_session() as db:
-        result = await db.execute(
-            select(MediaGenerationTask).where(
-                MediaGenerationTask.agent_id == agent_id,
-                MediaGenerationTask.provider == "minimax",
-                MediaGenerationTask.provider_task_id == provider_task_id,
+        conditions = [
+            MediaGenerationTask.agent_id == agent_id,
+            MediaGenerationTask.provider_task_id == provider_task_id,
+        ]
+        if provider:
+            conditions.append(
+                MediaGenerationTask.provider == _media_provider_slug(provider)
             )
+        result = await db.execute(
+            select(MediaGenerationTask).where(*conditions)
         )
-        return result.scalar_one_or_none()
+        return result.scalars().first()
 
 
 async def find_media_generation_task_by_id(
@@ -1753,7 +1819,7 @@ async def find_media_generation_task_by_id(
             select(MediaGenerationTask).where(
                 MediaGenerationTask.id == record_id,
                 MediaGenerationTask.agent_id == agent_id,
-                MediaGenerationTask.provider == "minimax",
+                MediaGenerationTask.provider.in_(_MEDIA_RECOVERY_PROVIDERS),
                 MediaGenerationTask.modality == "video",
             )
         )
@@ -1905,7 +1971,8 @@ async def _cleanup_sync_private_assets(
         if evidence_key:
             normalized_evidence_key = normalize_storage_key(evidence_key)
             expected_evidence_key = normalize_storage_key(
-                f"_internal/provider_recovery/minimax/image/{task.agent_id}/{task.id}.json"
+                f"_internal/provider_recovery/{_media_provider_slug(getattr(task, 'provider', 'minimax'))}"
+                f"/image/{task.agent_id}/{task.id}.json"
             )
             if normalized_evidence_key != expected_evidence_key:
                 raise MediaContractError(
@@ -2021,7 +2088,8 @@ async def _compensate_unrecoverable_sync_task(
                 return _MediaCompensationAttempt("asset_appeared", task)
             if task.modality == "image":
                 expected_evidence_key = normalize_storage_key(
-                    f"_internal/provider_recovery/minimax/image/{task.agent_id}/{task.id}.json"
+                    f"_internal/provider_recovery/{_media_provider_slug(getattr(task, 'provider', 'minimax'))}"
+                    f"/image/{task.agent_id}/{task.id}.json"
                 )
                 metadata = dict(task.request_metadata or {})
                 configured_evidence_key = str(
@@ -2168,7 +2236,12 @@ async def _validate_authoritative_media_bytes(
     if modality == "video":
         await validate_generated_video(raw, label="Stored MiniMax video")
     elif modality == "image":
-        validate_generated_image(raw)
+        width, height = validate_generated_image(raw)
+        validate_image_delivery_contract(
+            width,
+            height,
+            expected_aspect_ratio=metadata.get("aspect_ratio"),
+        )
     elif modality in {"audio", "music"}:
         await validate_generated_audio(
             raw,
@@ -2293,11 +2366,12 @@ async def _finalize_verified_success(
 
 
 async def _recover_sync_image_url(task: MediaGenerationTask) -> bytes | None:
-    """Recover MiniMax's short-lived signed URL without exposing it in the DB."""
+    """Recover a provider's short-lived signed URL without exposing it in the DB."""
 
     storage = get_storage_backend()
     expected_evidence_key = normalize_storage_key(
-        f"_internal/provider_recovery/minimax/image/{task.agent_id}/{task.id}.json"
+        f"_internal/provider_recovery/{_media_provider_slug(getattr(task, 'provider', 'minimax'))}"
+        f"/image/{task.agent_id}/{task.id}.json"
     )
     metadata = dict(task.request_metadata or {})
     evidence_key = str(
@@ -2314,7 +2388,10 @@ async def _recover_sync_image_url(task: MediaGenerationTask) -> bytes | None:
         _load_minimax_image_acceptance_evidence,
     )
 
-    evidence = await _load_minimax_image_acceptance_evidence(expected_evidence_key)
+    evidence = await _load_minimax_image_acceptance_evidence(
+        expected_evidence_key,
+        provider=getattr(task, "provider", "minimax"),
+    )
     if (
         str(evidence.get("save_path") or "") != task.output_path
         or str(evidence.get("model") or "") != str(task.model or "")
@@ -2468,7 +2545,12 @@ async def reconcile_minimax_sync_media_task(
         content_type = str(metadata.get("output_content_type") or "application/octet-stream")
         output_bytes = raw
         if task.modality == "image":
-            validate_generated_image(raw)
+            width, height = validate_generated_image(raw)
+            validate_image_delivery_contract(
+                width,
+                height,
+                expected_aspect_ratio=metadata.get("aspect_ratio"),
+            )
             overlay_text = str(metadata.get("overlay_text") or "")
             expected_text_sha256 = str(metadata.get("overlay_text_sha256") or "")
             if expected_text_sha256 and not hmac.compare_digest(
@@ -2503,7 +2585,12 @@ async def reconcile_minimax_sync_media_task(
                     metadata.get("sanitize_generated_background")
                 ),
             )
-            validate_generated_image(output_bytes)
+            width, height = validate_generated_image(output_bytes)
+            validate_image_delivery_contract(
+                width,
+                height,
+                expected_aspect_ratio=metadata.get("aspect_ratio"),
+            )
             status_data["_astra_media_contract"] = receipt.as_dict()
         else:
             await validate_generated_audio(
@@ -2759,24 +2846,57 @@ async def reconcile_minimax_video_task(
     provider_succeeded = False
     processing_lease_token: str | None = None
     try:
-        # Runtime import avoids a module cycle while keeping one MiniMax protocol implementation.
+        # Runtime imports avoid a module cycle while keeping provider protocol
+        # adapters separate from the durable settlement state machine.
         from app.services.agent_tools import (
             _load_minimax_tool_credential_by_id,
-            _mark_minimax_tool_credential_failure,
+            _mark_media_provider_credential_failure,
             _minimax_download_file,
             _minimax_query_video_task,
             _minimax_retrieve_file_download_url,
             _minimax_video_file_id,
         )
-
-        credential = await _load_minimax_tool_credential_by_id(task.credential_id)
-        if status_data is None:
-            status_data = await _minimax_query_video_task(
-                credential.api_key,
-                credential.base_url,
-                task.provider_task_id,
+        provider = _media_provider_slug(task.provider)
+        if provider == "volcengine_agent_plan":
+            from app.models.llm import LLMCredential
+            from app.services.llm.utils import get_credential_api_key
+            from app.services.volcengine_agent_plan import (
+                download_video,
+                normalize_base_url,
+                normalized_video_status,
+                query_video_task,
+                video_url_from_response,
             )
-        provider_status = _provider_status(status_data)
+
+            async with async_session() as db:
+                provider_credential = await db.get(LLMCredential, task.credential_id)
+            if (
+                not provider_credential
+                or provider_credential.provider != provider
+                or provider_credential.tenant_id is not None
+                or not provider_credential.enabled
+            ):
+                raise ValueError("Media provider credential is unavailable for this task")
+            provider_api_key = get_credential_api_key(provider_credential)
+            if not provider_api_key:
+                raise ValueError("Media provider credential is missing an API key")
+            provider_base_url = normalize_base_url(provider_credential.base_url)
+            if status_data is None:
+                status_data = await query_video_task(
+                    api_key=provider_api_key,
+                    base_url=provider_base_url,
+                    task_id=task.provider_task_id,
+                )
+            provider_status = normalized_video_status(status_data)
+        else:
+            credential = await _load_minimax_tool_credential_by_id(task.credential_id)
+            if status_data is None:
+                status_data = await _minimax_query_video_task(
+                    credential.api_key,
+                    credential.base_url,
+                    task.provider_task_id,
+                )
+            provider_status = _provider_status(status_data)
 
         if provider_status == "Success":
             provider_succeeded = True
@@ -2792,18 +2912,24 @@ async def reconcile_minimax_video_task(
             processing_lease_token = str(
                 request_metadata.get("processing_lease_token") or ""
             )
-            file_id = _minimax_video_file_id(status_data)
-            if not file_id:
-                raise ValueError("Completed MiniMax video response has no file_id")
-            download_url = await _minimax_retrieve_file_download_url(
-                credential.api_key,
-                credential.base_url,
-                file_id,
-            )
-            video_bytes = await _minimax_download_file(download_url)
+            if provider == "volcengine_agent_plan":
+                download_url = video_url_from_response(status_data)
+                if not download_url:
+                    raise ValueError("Completed video response has no video URL")
+                video_bytes = await download_video(download_url)
+            else:
+                file_id = _minimax_video_file_id(status_data)
+                if not file_id:
+                    raise ValueError("Completed MiniMax video response has no file_id")
+                download_url = await _minimax_retrieve_file_download_url(
+                    credential.api_key,
+                    credential.base_url,
+                    file_id,
+                )
+                video_bytes = await _minimax_download_file(download_url)
             await validate_generated_video(
                 video_bytes,
-                label="MiniMax video download",
+                label="Provider video download",
                 require_browser_safe=False,
             )
             overlay_text = str(request_metadata.get("overlay_text") or "")
@@ -2859,7 +2985,16 @@ async def reconcile_minimax_video_task(
                     **(status_data or {}),
                     "_astra_media_contract": overlay_receipt.as_dict(),
                 }
-            await validate_generated_video(video_bytes, label="Final brand-safe video")
+            final_video_info = await validate_generated_video(
+                video_bytes,
+                label="Final brand-safe video",
+            )
+            validate_video_delivery_contract(
+                final_video_info,
+                expected_duration_seconds=request_metadata.get("duration"),
+                expected_aspect_ratio=request_metadata.get("aspect_ratio"),
+                require_audio=bool(request_metadata.get("require_audio")),
+            )
             status_data = {
                 **(status_data or {}),
                 "_astra_output_sha256": hashlib.sha256(video_bytes).hexdigest(),
@@ -3066,9 +3201,10 @@ async def reconcile_minimax_video_task(
             )
         try:
             if task.credential_id:
-                await _mark_minimax_tool_credential_failure(
+                await _mark_media_provider_credential_failure(
                     task.credential_id,
                     exc,
+                    provider=task.provider,
                     modality="video",
                     model=(
                         str(
@@ -3554,7 +3690,9 @@ async def _write_task_metadata(task: MediaGenerationTask, updates: dict) -> None
         }
     )
     payload.update({
-        "provider": task.provider,
+        # The concrete route is an operator concern stored in SQL. Workspace
+        # compatibility metadata remains stable across transparent failover.
+        "provider": "platform_media",
         "task_record_id": str(task.id),
         "task_id": task.provider_task_id or payload.get("task_id") or "",
         "save_path": task.output_path,

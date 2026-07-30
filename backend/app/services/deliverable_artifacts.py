@@ -7,29 +7,48 @@ import hashlib
 from io import BytesIO
 from pathlib import Path
 import re
-from typing import Mapping
+from typing import Any, Mapping
 from urllib.parse import unquote, urlsplit
 import uuid
 import zipfile
+from xml.etree import ElementTree
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent_tool_execution import AgentToolExecution
 from app.models.deliverable import DeliverableArtifactRevision, DeliverableRequest
+from app.config import get_settings
+from app.services.deliverable_quality_gate import (
+    DeliverableQualityGateError,
+    creative_quality_gate_required_for_request,
+    enforce_deliverable_quality_gate,
+)
+from app.services.document_conversion.presentation_contract import (
+    validate_presentation_visible_text,
+)
 from app.services.storage import agent_storage_key, get_storage_backend, normalize_storage_key
 from app.services.storage_runtime.base import StorageBackend, WriteCondition
 
 
 MAX_DELIVERABLE_ARTIFACT_BYTES = 200 * 1024 * 1024
-PRESENTATION_TOOL_BY_TYPE = {
-    "pptx": "convert_html_to_pptx",
-    "pdf": "convert_html_to_pdf",
+ARTIFACT_TOOLS_BY_TYPE = {
+    "pptx": ("convert_html_to_pptx",),
+    "pdf": ("convert_html_to_pdf",),
+    "png": ("generate_image_minimax",),
+    # Prefer the deterministic post-production result when it exists. Silent
+    # contracts may legitimately finish at the provider-neutral generation
+    # tool without an audio composition step.
+    "mp4": ("compose_video_audio", "generate_video_minimax"),
 }
 MIME_BY_TYPE = {
     "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     "pdf": "application/pdf",
+    "mp4": "video/mp4",
+    "png": "image/png",
 }
+PRESENTATION_ASPECT_RATIO = 16 / 9
+PRESENTATION_ASPECT_RATIO_TOLERANCE = 0.015
 
 
 class DeliverableArtifactError(ValueError):
@@ -44,6 +63,10 @@ class DeliverableArtifactReconciliation:
     missing_types: tuple[str, ...] = ()
     invalid_types: tuple[str, ...] = ()
     unavailable_types: tuple[str, ...] = ()
+    attempted_types: tuple[str, ...] = ()
+    failed_types: tuple[str, ...] = ()
+    created_types: tuple[str, ...] = ()
+    failure_codes: tuple[tuple[str, str], ...] = ()
 
     @property
     def complete(self) -> bool:
@@ -58,6 +81,131 @@ class _VerifiedArtifact:
     size_bytes: int
     tool_call_id: str
     data: bytes
+
+
+def _pptx_facts(data: bytes) -> dict[str, int | float]:
+    with zipfile.ZipFile(BytesIO(data)) as archive:
+        root = ElementTree.fromstring(archive.read("ppt/presentation.xml"))
+        slide_text = " ".join(
+            node.text or ""
+            for name in archive.namelist()
+            if re.fullmatch(r"ppt/slides/slide\d+\.xml", name)
+            for node in ElementTree.fromstring(archive.read(name)).iter()
+            if node.tag.endswith("}t")
+        )
+    validate_presentation_visible_text(slide_text)
+    namespace = {"p": "http://schemas.openxmlformats.org/presentationml/2006/main"}
+    slide_ids = root.findall("./p:sldIdLst/p:sldId", namespace)
+    slide_size = root.find("./p:sldSz", namespace)
+    if not slide_ids or slide_size is None:
+        raise ValueError("PPTX has no slides or slide size")
+    width = int(slide_size.attrib["cx"])
+    height = int(slide_size.attrib["cy"])
+    if width <= 0 or height <= 0:
+        raise ValueError("PPTX slide size is invalid")
+    return {
+        "page_count": len(slide_ids),
+        "width": width,
+        "height": height,
+        "aspect_ratio": width / height,
+    }
+
+
+def _pdf_facts(data: bytes) -> dict[str, int | float]:
+    import fitz
+
+    with fitz.open(stream=data, filetype="pdf") as document:
+        if document.page_count <= 0:
+            raise ValueError("PDF has no pages")
+        page_sizes = [(float(page.rect.width), float(page.rect.height)) for page in document]
+        page_text = " ".join(page.get_text("text") for page in document)
+    validate_presentation_visible_text(page_text)
+    width, height = page_sizes[0]
+    if width <= 0 or height <= 0:
+        raise ValueError("PDF page size is invalid")
+    if any(abs(other_width - width) > 0.5 or abs(other_height - height) > 0.5 for other_width, other_height in page_sizes):
+        raise ValueError("PDF page sizes are inconsistent")
+    return {
+        "page_count": len(page_sizes),
+        "width": width,
+        "height": height,
+        "aspect_ratio": width / height,
+    }
+
+
+def _presentation_contract_facts(
+    request: DeliverableRequest,
+    verified_by_type: Mapping[str, _VerifiedArtifact],
+) -> tuple[dict[str, dict[str, int | float]], set[str]]:
+    facts: dict[str, dict[str, int | float]] = {}
+    invalid_types: set[str] = set()
+    inspectors = {"pptx": _pptx_facts, "pdf": _pdf_facts}
+    for artifact_type, inspector in inspectors.items():
+        verified = verified_by_type.get(artifact_type)
+        if verified is None:
+            continue
+        try:
+            facts[artifact_type] = inspector(verified.data)
+        except (KeyError, OSError, ValueError, zipfile.BadZipFile):
+            invalid_types.add(artifact_type)
+
+    expected_page_count = request.spec.get("page_count") if isinstance(request.spec, Mapping) else None
+    if not isinstance(expected_page_count, int) or isinstance(expected_page_count, bool):
+        invalid_types.update(facts)
+        return facts, invalid_types
+    for artifact_type, artifact_facts in facts.items():
+        if artifact_facts["page_count"] != expected_page_count:
+            invalid_types.add(artifact_type)
+        if abs(float(artifact_facts["aspect_ratio"]) - PRESENTATION_ASPECT_RATIO) > PRESENTATION_ASPECT_RATIO_TOLERANCE:
+            invalid_types.add(artifact_type)
+    if {"pptx", "pdf"} <= facts.keys() and facts["pptx"]["page_count"] != facts["pdf"]["page_count"]:
+        invalid_types.update(("pptx", "pdf"))
+    return facts, invalid_types
+
+
+async def _video_contract_facts(
+    request: DeliverableRequest,
+    verified_by_type: Mapping[str, _VerifiedArtifact],
+) -> tuple[dict[str, dict[str, Any]], set[str]]:
+    verified = verified_by_type.get("mp4")
+    if verified is None:
+        return {}, set()
+    try:
+        from app.services.media_assets import (
+            validate_generated_video,
+            validate_video_delivery_contract,
+        )
+
+        info = await validate_generated_video(
+            verified.data,
+            label="Deliverable video",
+            require_browser_safe=True,
+        )
+        spec = request.spec if isinstance(request.spec, Mapping) else {}
+        audio_mode = str(spec.get("audio_mode") or "voiceover").strip().lower()
+        validate_video_delivery_contract(
+            info,
+            expected_duration_seconds=spec.get("duration"),
+            expected_aspect_ratio=str(spec.get("aspect_ratio") or ""),
+            require_audio=audio_mode == "voiceover",
+        )
+    except (OSError, TypeError, ValueError):
+        return {}, {"mp4"}
+    return (
+        {
+            "mp4": {
+                "width": info.width,
+                "height": info.height,
+                "duration_seconds": info.duration_seconds,
+                "video_codec": info.codec_name,
+                "pixel_format": info.pixel_format,
+                "audio_codec": info.audio_codec_name,
+                "fast_start": info.fast_start,
+                "audio_mode": audio_mode,
+            }
+        },
+        set(),
+    )
 
 
 def deliverable_artifact_snapshot_key(artifact: DeliverableArtifactRevision) -> str:
@@ -111,6 +259,19 @@ def _valid_artifact_bytes(artifact_type: str, data: bytes) -> bool:
         return False
     if artifact_type == "pdf":
         return data.startswith(b"%PDF-") and b"%%EOF" in data[-2048:]
+    if artifact_type == "mp4":
+        from app.services.media_assets import valid_mp4
+
+        return valid_mp4(data)
+    if artifact_type == "png":
+        try:
+            from PIL import Image
+
+            with Image.open(BytesIO(data)) as image:
+                image.verify()
+                return image.format == "PNG"
+        except (OSError, ValueError):
+            return False
     if artifact_type != "pptx":
         return False
     try:
@@ -248,6 +409,41 @@ def _artifact_refs(execution: AgentToolExecution) -> tuple[str, ...]:
     return tuple(ref for ref in refs if isinstance(ref, str) and ref)
 
 
+def _execution_targets_request_artifact(
+    execution: AgentToolExecution,
+    *,
+    request_id: uuid.UUID,
+    artifact_type: str,
+) -> bool:
+    """Return whether the execution explicitly targeted this deliverable output."""
+
+    arguments = execution.sanitized_arguments
+    if not isinstance(arguments, Mapping):
+        return False
+    expected_prefix = f"workspace/deliverables/{request_id}/"
+    for field in ("target_path", "output_path"):
+        raw_value = arguments.get(field)
+        if not isinstance(raw_value, str) or not raw_value.strip():
+            continue
+        raw_path = raw_value.strip().replace("\\", "/")
+        if raw_path.startswith("workspace://"):
+            try:
+                parsed = urlsplit(raw_path)
+                raw_path = unquote(parsed.path).lstrip("/")
+            except (TypeError, ValueError):
+                continue
+        try:
+            normalized = normalize_storage_key(raw_path.lstrip("/"))
+        except ValueError:
+            continue
+        if (
+            normalized.startswith(expected_prefix)
+            and Path(normalized).suffix.lower() == f".{artifact_type}"
+        ):
+            return True
+    return False
+
+
 async def reconcile_runtime_deliverable_artifacts(
     db: AsyncSession,
     *,
@@ -258,14 +454,21 @@ async def reconcile_runtime_deliverable_artifacts(
     """Persist structurally verified output revisions from this request's Runtime ledger."""
 
     required_types = tuple(dict.fromkeys(str(item).strip().lower() for item in request.output_contract))
+    execution_query = select(AgentToolExecution).where(
+        AgentToolExecution.tenant_id == request.tenant_id,
+        AgentToolExecution.run_id == run_id,
+        AgentToolExecution.tool_name.in_(
+            tuple(
+                dict.fromkeys(
+                    tool_name
+                    for tool_names in ARTIFACT_TOOLS_BY_TYPE.values()
+                    for tool_name in tool_names
+                )
+            )
+        ),
+    )
     execution_result = await db.execute(
-        select(AgentToolExecution)
-        .where(
-            AgentToolExecution.tenant_id == request.tenant_id,
-            AgentToolExecution.run_id == run_id,
-            AgentToolExecution.status == "succeeded",
-            AgentToolExecution.tool_name.in_(tuple(PRESENTATION_TOOL_BY_TYPE.values())),
-        )
+        execution_query
         .order_by(
             AgentToolExecution.completed_at.desc().nullslast(),
             AgentToolExecution.id.desc(),
@@ -288,34 +491,84 @@ async def reconcile_runtime_deliverable_artifacts(
 
     verified_by_type: dict[str, _VerifiedArtifact] = {}
     observed_errors: dict[str, set[str]] = {artifact_type: set() for artifact_type in required_types}
+    attempted_types: set[str] = set()
+    failed_types: set[str] = set()
+    failure_codes: dict[str, str] = {}
     for artifact_type in required_types:
-        expected_tool = PRESENTATION_TOOL_BY_TYPE.get(artifact_type)
-        if expected_tool is None:
-            continue
+        expected_tools = ARTIFACT_TOOLS_BY_TYPE.get(artifact_type) or ()
         for execution in executions:
-            if execution.tool_name != expected_tool:
+            if execution.tool_name not in expected_tools:
                 continue
-            for reference in _artifact_refs(execution):
-                workspace_path = _workspace_artifact_path(
+            scoped_reference = any(
+                _workspace_artifact_path(
                     reference,
                     agent_id=request.agent_id,
                     request_id=request.id,
                     artifact_type=artifact_type,
                 )
-                if workspace_path is None:
+                is not None
+                for reference in _artifact_refs(execution)
+            )
+            scoped_target = _execution_targets_request_artifact(
+                execution,
+                request_id=request.id,
+                artifact_type=artifact_type,
+            )
+            if not (scoped_reference or scoped_target):
+                continue
+            attempted_types.add(artifact_type)
+            if execution.status == "succeeded":
+                continue
+            failed_types.add(artifact_type)
+            metadata = (
+                execution.result_metadata
+                if isinstance(execution.result_metadata, Mapping)
+                else {}
+            )
+            error_code = str(metadata.get("error_code") or "").strip()
+            if error_code:
+                failure_codes.setdefault(artifact_type, error_code[:200])
+            observed_errors[artifact_type].add(
+                "unavailable"
+                if execution.status in {"started", "unknown"}
+                else "invalid"
+            )
+
+    for artifact_type in required_types:
+        expected_tools = ARTIFACT_TOOLS_BY_TYPE.get(artifact_type)
+        if expected_tools is None:
+            continue
+        # Tool order is a quality contract, not just a filter. In particular,
+        # a voiceover workflow can expose both the silent provider output and
+        # the later composed MP4; the composed result must win regardless of
+        # execution timestamps.
+        for expected_tool in expected_tools:
+            for execution in executions:
+                if execution.tool_name != expected_tool or execution.status != "succeeded":
                     continue
-                verified, error = await _verify_storage_artifact(
-                    storage_backend,
-                    agent_id=request.agent_id,
-                    artifact_type=artifact_type,
-                    workspace_path=workspace_path,
-                    tool_call_id=execution.tool_call_id,
-                )
-                if verified is not None:
-                    verified_by_type[artifact_type] = verified
+                for reference in _artifact_refs(execution):
+                    workspace_path = _workspace_artifact_path(
+                        reference,
+                        agent_id=request.agent_id,
+                        request_id=request.id,
+                        artifact_type=artifact_type,
+                    )
+                    if workspace_path is None:
+                        continue
+                    verified, error = await _verify_storage_artifact(
+                        storage_backend,
+                        agent_id=request.agent_id,
+                        artifact_type=artifact_type,
+                        workspace_path=workspace_path,
+                        tool_call_id=execution.tool_call_id,
+                    )
+                    if verified is not None:
+                        verified_by_type[artifact_type] = verified
+                        break
+                    if error is not None:
+                        observed_errors[artifact_type].add(error)
+                if artifact_type in verified_by_type:
                     break
-                if error is not None:
-                    observed_errors[artifact_type].add(error)
             if artifact_type in verified_by_type:
                 break
 
@@ -323,8 +576,60 @@ async def reconcile_runtime_deliverable_artifacts(
     for artifact in existing:
         latest_by_key.setdefault(artifact.artifact_key, artifact)
 
+    # A repair run may regenerate only the broken member of a multi-file
+    # contract. Reuse an untouched candidate only after revalidating both its
+    # mutable workspace copy and immutable snapshot. Never reuse the previous
+    # candidate for a type that this run explicitly attempted, because doing so
+    # would hide a failed repair behind stale success.
+    for artifact_type in required_types:
+        if artifact_type in attempted_types or artifact_type in verified_by_type:
+            continue
+        latest = latest_by_key.get(artifact_type)
+        if latest is None or latest.status != "candidate":
+            continue
+        verified, error = await _verify_storage_artifact(
+            storage_backend,
+            agent_id=request.agent_id,
+            artifact_type=artifact_type,
+            workspace_path=latest.workspace_path,
+            tool_call_id=str(
+                (latest.evaluation or {}).get("tool_call_id")
+                if isinstance(latest.evaluation, Mapping)
+                else "repair_reuse"
+            ),
+        )
+        if (
+            verified is not None
+            and verified.content_hash == latest.content_hash
+            and await _verify_immutable_snapshot(storage_backend, artifact=latest)
+        ):
+            verified_by_type[artifact_type] = verified
+        elif error is not None:
+            observed_errors[artifact_type].add(error)
+        else:
+            observed_errors[artifact_type].add("invalid")
+
+    contract_facts: dict[str, dict[str, Any]] = {}
+    if request.work_type == "presentation":
+        contract_facts, contract_invalid_types = _presentation_contract_facts(
+            request,
+            verified_by_type,
+        )
+        for artifact_type in contract_invalid_types:
+            observed_errors.setdefault(artifact_type, set()).add("invalid")
+            verified_by_type.pop(artifact_type, None)
+    elif request.work_type == "video":
+        contract_facts, contract_invalid_types = await _video_contract_facts(
+            request,
+            verified_by_type,
+        )
+        for artifact_type in contract_invalid_types:
+            observed_errors.setdefault(artifact_type, set()).add("invalid")
+            verified_by_type.pop(artifact_type, None)
+
     persisted: list[DeliverableArtifactRevision] = []
     snapshotted_types: set[str] = set()
+    created_types: set[str] = set()
     for artifact_type, verified in verified_by_type.items():
         latest = latest_by_key.get(artifact_type)
         if (
@@ -350,7 +655,7 @@ async def reconcile_runtime_deliverable_artifacts(
                 evaluation={
                     "version": 1,
                     "verified": True,
-                    "verification_level": "structural",
+                    "verification_level": "contract",
                     "source": "runtime_tool_execution",
                     "run_id": str(run_id),
                     "tool_call_id": verified.tool_call_id,
@@ -360,8 +665,22 @@ async def reconcile_runtime_deliverable_artifacts(
                         "request_path",
                         "storage_file",
                         "file_signature",
+                        "aspect_ratio",
                         "immutable_snapshot",
+                        *(
+                            ["page_count", "page_size"]
+                            if request.work_type == "presentation"
+                            else [
+                                "duration",
+                                "resolution",
+                                "browser_codec",
+                                "audio_contract",
+                            ]
+                            if request.work_type == "video"
+                            else []
+                        ),
                     ],
+                    "facts": contract_facts.get(artifact_type, {}),
                 },
             )
         try:
@@ -378,6 +697,7 @@ async def reconcile_runtime_deliverable_artifacts(
                 if prior.artifact_key == artifact_type and prior.status == "candidate":
                     prior.status = "superseded"
             db.add(artifact)
+            created_types.add(artifact_type)
         persisted.append(artifact)
         snapshotted_types.add(artifact_type)
 
@@ -399,6 +719,26 @@ async def reconcile_runtime_deliverable_artifacts(
         missing_types=tuple(missing),
         invalid_types=tuple(invalid),
         unavailable_types=tuple(unavailable),
+        attempted_types=tuple(
+            artifact_type
+            for artifact_type in required_types
+            if artifact_type in attempted_types
+        ),
+        failed_types=tuple(
+            artifact_type
+            for artifact_type in required_types
+            if artifact_type in failed_types
+        ),
+        created_types=tuple(
+            artifact_type
+            for artifact_type in required_types
+            if artifact_type in created_types
+        ),
+        failure_codes=tuple(
+            (artifact_type, failure_codes[artifact_type])
+            for artifact_type in required_types
+            if artifact_type in failure_codes
+        ),
     )
 
 
@@ -407,6 +747,7 @@ async def approve_deliverable_artifacts(
     *,
     request: DeliverableRequest,
     storage: StorageBackend | None = None,
+    require_creative_quality_gate: bool | None = None,
 ) -> tuple[DeliverableArtifactRevision, ...]:
     """Revalidate and approve the latest complete artifact set without trusting mutable paths."""
 
@@ -437,6 +778,25 @@ async def approve_deliverable_artifacts(
 
     storage_backend = storage or get_storage_backend()
     selected = tuple(latest_candidates[item] for item in required_types)
+    if require_creative_quality_gate is None:
+        settings = get_settings()
+        quality_gate_required = creative_quality_gate_required_for_request(
+            request,
+            enabled=settings.DELIVERABLE_CREATIVE_QUALITY_GATE_REQUIRED,
+            tenant_ids=settings.DELIVERABLE_CREATIVE_QUALITY_GATE_TENANT_IDS,
+            agent_ids=settings.DELIVERABLE_CREATIVE_QUALITY_GATE_AGENT_IDS,
+        )
+    else:
+        quality_gate_required = require_creative_quality_gate
+    try:
+        enforce_deliverable_quality_gate(
+            request,
+            selected,
+            require_creative_quality_gate=quality_gate_required,
+        )
+    except DeliverableQualityGateError as exc:
+        raise DeliverableArtifactError(exc.code, str(exc)) from exc
+    verified_by_type: dict[str, _VerifiedArtifact] = {}
     for artifact in selected:
         if not isinstance(artifact.evaluation, Mapping) or artifact.evaluation.get("verified") is not True:
             raise DeliverableArtifactError(
@@ -455,10 +815,27 @@ async def approve_deliverable_artifacts(
                 "deliverable_artifact_changed",
                 f"Artifact {artifact.artifact_key} changed or became unavailable before approval",
             )
+        verified_by_type[artifact.artifact_type] = verified
         if not await _verify_immutable_snapshot(storage_backend, artifact=artifact):
             raise DeliverableArtifactError(
                 "deliverable_artifact_snapshot_changed",
                 f"Artifact {artifact.artifact_key} immutable snapshot is unavailable or invalid",
+            )
+    if request.work_type == "presentation":
+        _, invalid_types = _presentation_contract_facts(request, verified_by_type)
+        if invalid_types:
+            raise DeliverableArtifactError(
+                "deliverable_artifact_contract_invalid",
+                "Presentation artifacts fail structure or visible-content policy checks: "
+                + ", ".join(sorted(invalid_types)),
+            )
+    elif request.work_type == "video":
+        _, invalid_types = await _video_contract_facts(request, verified_by_type)
+        if invalid_types:
+            raise DeliverableArtifactError(
+                "deliverable_artifact_contract_invalid",
+                "Video artifact fails duration, aspect-ratio, browser-codec, or audio checks: "
+                + ", ".join(sorted(invalid_types)),
             )
     return selected
 

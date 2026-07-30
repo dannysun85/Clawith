@@ -100,6 +100,11 @@ class LLMCredential(Base):
     label: Mapped[str] = mapped_column(String(200), nullable=False)  # "MiniMax code plan A"
     api_key_encrypted: Mapped[str] = mapped_column(String(1024), nullable=False)
     base_url: Mapped[str | None] = mapped_column(String(500))  # override provider default
+    # Subscription tier belongs to the provider account, not Astra's
+    # Lite/Pro/Ultra product tier. It is currently required for Agent Plan so
+    # a Small/Medium key is never routed to a Seedance 2.0 request it cannot
+    # serve.
+    plan_tier: Mapped[str | None] = mapped_column(String(20), nullable=True)
     capabilities: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # ["text","voice","image","video"]
     # Provider quota circuits live outside credential authentication health.
     # MiniMax's current plan allowance is shared under ``plan``; named model

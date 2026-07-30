@@ -11,6 +11,7 @@ interface Credential {
     provider: string;
     label: string;
     base_url?: string | null;
+    plan_tier?: string | null;
     api_key_masked: string;
     capabilities?: string[] | null;
     modality_status?: Record<string, { status: string; error_code?: string; reset_scope?: string; model?: string | null }> | null;
@@ -63,6 +64,7 @@ const STATUS_COLOR: Record<string, string> = {
 
 const emptyForm = {
     provider: 'minimax', label: '', api_key: '', base_url: '',
+    plan_tier: '',
     capabilities: [...MODALITIES] as string[],
     daily_quota: '', weight: '1', priority: '0',
     rpm_limit: '', tpm_limit: '',
@@ -129,6 +131,7 @@ export default function AccountManagement() {
             label: credential.label,
             api_key: '',
             base_url: credential.base_url || '',
+            plan_tier: credential.plan_tier || '',
             capabilities: credential.capabilities ? [...credential.capabilities] : [...MODALITIES],
             daily_quota: credential.daily_quota == null ? '' : String(credential.daily_quota),
             weight: String(credential.weight || 1),
@@ -144,6 +147,7 @@ export default function AccountManagement() {
             setFormError(t('account.capabilitiesRequired', '至少选择一种能力；空能力不会参与任何模型调用。'));
             return;
         }
+        const replacingApiKey = !!editingId && form.api_key.trim().length > 0;
         const mutableFields: Record<string, unknown> = {
             label: form.label,
             base_url: form.base_url || null,
@@ -154,6 +158,9 @@ export default function AccountManagement() {
             weight: Number(form.weight) || 1,
             priority: Number(form.priority) || 0,
         };
+        if (form.provider === 'volcengine_agent_plan') {
+            mutableFields.plan_tier = form.plan_tier;
+        }
         if (editingId && form.api_key.trim()) mutableFields.api_key = form.api_key.trim();
         setFormError('');
         try {
@@ -167,7 +174,12 @@ export default function AccountManagement() {
                 });
             }
             closeForm();
-            if (!editingId) {
+            if (replacingApiKey) {
+                setPoolNotice(t(
+                    'account.reverifyAfterKeyReplacement',
+                    'API key 已安全替换，原模型熔断已清除；请先点击“验证”，验证成功后才会重新参与路由。',
+                ));
+            } else if (!editingId) {
                 setPoolNotice(t('account.verifyRequired', '账号已安全保存，但在验证成功前不会参与模型路由。'));
             }
         } catch (error) {
@@ -208,25 +220,81 @@ export default function AccountManagement() {
             {showForm && (
                 <div className="card" style={{ marginBottom: 16, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
                     <div className="form-group"><label className="form-label">provider</label>
-                        <select className="form-input" value={form.provider} disabled={!!editingId} onChange={(e) => setForm({ ...form, provider: e.target.value })}>
-                            {['minimax', 'openai', 'anthropic', 'deepseek', 'qwen', 'zhipu', 'gemini', 'kimi', 'custom'].map((p) => <option key={p} value={p}>{p}</option>)}
+                        <select
+                            className="form-input"
+                            value={form.provider}
+                            disabled={!!editingId}
+                            onChange={(e) => {
+                                const provider = e.target.value;
+                                setForm({
+                                    ...form,
+                                    provider,
+                                    base_url: provider === 'volcengine_agent_plan'
+                                        ? 'https://ark.cn-beijing.volces.com/api/plan/v3'
+                                        : '',
+                                    // Agent Plan does not expose a cheap read-only
+                                    // endpoint that proves the purchased tier. Never
+                                    // predeclare Large or grant video on behalf of the
+                                    // operator; the selected value must match the
+                                    // current Volcano Engine console.
+                                    plan_tier: '',
+                                    capabilities: provider === 'volcengine_agent_plan'
+                                        ? ['text', 'image', 'audio']
+                                        : [...MODALITIES],
+                                });
+                            }}
+                        >
+                            {['volcengine_agent_plan', 'minimax', 'openai', 'anthropic', 'deepseek', 'qwen', 'zhipu', 'gemini', 'kimi', 'custom'].map((p) => <option key={p} value={p}>{p}</option>)}
                         </select>
                     </div>
                     <div className="form-group"><label className="form-label">label</label><input className="form-input" value={form.label} onChange={(e) => setForm({ ...form, label: e.target.value })} placeholder="MiniMax PAYG Production A" /></div>
-                    {editingId ? (
-                        <div className="form-group" style={{ gridColumn: 'span 2' }}>
-                            <label className="form-label">API key</label>
-                            <div style={{ fontSize: 12, color: 'var(--text-tertiary)', padding: '9px 0' }}>
-                                {t('account.editKeepsKey', '编辑能力和限额不会读取或覆盖现有 API key。')}
+                    <div className="form-group" style={{ gridColumn: 'span 2' }}>
+                        <label className="form-label">API key</label>
+                        <input
+                            className="form-input"
+                            type="password"
+                            autoComplete="new-password"
+                            value={form.api_key}
+                            onChange={(e) => setForm({ ...form, api_key: e.target.value })}
+                            placeholder={editingId ? '留空保持原 Key；填写后需重新验证' : 'sk-...'}
+                        />
+                        {editingId && (
+                            <div style={{ marginTop: 4, fontSize: 11, color: 'var(--text-tertiary)' }}>
+                                {t(
+                                    'account.editKeepsKey',
+                                    '系统不会读取或回显现有 API key。留空仅修改配置；填写新值会替换密钥、清除旧账号的模型熔断，并暂停路由直到重新验证成功。',
+                                )}
+                            </div>
+                        )}
+                    </div>
+                    <div className="form-group"><label className="form-label">base_url (可选)</label><input className="form-input" value={form.base_url} onChange={(e) => setForm({ ...form, base_url: e.target.value })} /></div>
+                    {form.provider === 'volcengine_agent_plan' && (
+                        <div className="form-group">
+                            <label className="form-label">Agent Plan 套餐</label>
+                            <select
+                                className="form-input"
+                                value={form.plan_tier}
+                                onChange={(e) => {
+                                    const planTier = e.target.value;
+                                    setForm({
+                                        ...form,
+                                        plan_tier: planTier,
+                                        capabilities: planTier === 'small'
+                                            ? form.capabilities.filter((item) => item !== 'video')
+                                            : form.capabilities,
+                                    });
+                                }}
+                            >
+                                <option value="" disabled>请选择控制台显示的实际套餐</option>
+                                {['small', 'medium', 'large', 'max'].map((tier) => (
+                                    <option key={tier} value={tier}>{tier}</option>
+                                ))}
+                            </select>
+                            <div style={{ marginTop: 4, fontSize: 11, color: 'var(--text-tertiary)' }}>
+                                必须与火山控制台当前生效套餐一致；系统不会猜测套餐。文字、Seedream 图片和 Seed TTS 语音支持全部套餐；Medium 可使用即将下线的 Seedance 1.5 Pro，Large / Max 使用 Seedance 2.0 系列。
                             </div>
                         </div>
-                    ) : (
-                        <div className="form-group" style={{ gridColumn: 'span 2' }}>
-                            <label className="form-label">API key</label>
-                            <input className="form-input" type="password" value={form.api_key} onChange={(e) => setForm({ ...form, api_key: e.target.value })} placeholder={editingId ? '留空保持原 Key；填写后需重新验证' : 'sk-...'} />
-                        </div>
                     )}
-                    <div className="form-group"><label className="form-label">base_url (可选)</label><input className="form-input" value={form.base_url} onChange={(e) => setForm({ ...form, base_url: e.target.value })} /></div>
                     <div className="form-group"><label className="form-label">每日配额 (可选)</label><input className="form-input" type="number" value={form.daily_quota} onChange={(e) => setForm({ ...form, daily_quota: e.target.value })} placeholder="留空=不限" /></div>
                     <div className="form-group"><label className="form-label" title="每分钟最大请求数">RPM 限流 (每分钟请求数)</label><input className="form-input" type="number" value={form.rpm_limit} onChange={(e) => setForm({ ...form, rpm_limit: e.target.value })} placeholder="留空=不限, e.g. 200" /></div>
                     <div className="form-group"><label className="form-label" title="每分钟最大 token 数">TPM 限流 (每分钟 tokens)</label><input className="form-input" type="number" value={form.tpm_limit} onChange={(e) => setForm({ ...form, tpm_limit: e.target.value })} placeholder="留空=不限, e.g. 10000000" /></div>
@@ -244,9 +312,14 @@ export default function AccountManagement() {
                     <div className="form-group" style={{ gridColumn: 'span 2' }}>
                         <label className="form-label">{t('account.capabilities', '能力 (可调用的 modality)')}</label>
                         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                            {MODALITIES.map((m) => (
+                            {(form.provider === 'volcengine_agent_plan' ? ['text', 'image', 'audio', 'video'] : MODALITIES).map((m) => (
                                 <label key={m} style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, padding: '2px 8px', border: '1px solid var(--border-subtle)', borderRadius: 4, cursor: 'pointer', background: form.capabilities.includes(m) ? 'var(--bg-secondary)' : 'transparent' }}>
-                                    <input type="checkbox" checked={form.capabilities.includes(m)} onChange={() => toggleCap(m)} />{m}
+                                    <input
+                                        type="checkbox"
+                                        checked={form.capabilities.includes(m)}
+                                        disabled={form.provider === 'volcengine_agent_plan' && m === 'video' && form.plan_tier === 'small'}
+                                        onChange={() => toggleCap(m)}
+                                    />{m}
                                 </label>
                             ))}
                         </div>
@@ -254,7 +327,7 @@ export default function AccountManagement() {
                     {formError && <div style={{ gridColumn: 'span 2', color: 'var(--error)', fontSize: 12 }}>{formError}</div>}
                     <div style={{ gridColumn: 'span 2', display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
                         <button className="btn btn-secondary" onClick={closeForm}>{t('common.cancel')}</button>
-                        <button className="btn btn-primary" disabled={!form.label || (!editingId && !form.api_key) || createMut.isPending || updateMut.isPending} onClick={() => void submit()}>{t('common.save')}</button>
+                        <button className="btn btn-primary" disabled={!form.label || (!editingId && !form.api_key) || (form.provider === 'volcengine_agent_plan' && !form.plan_tier) || createMut.isPending || updateMut.isPending} onClick={() => void submit()}>{t('common.save')}</button>
                     </div>
                 </div>
             )}
@@ -271,6 +344,7 @@ export default function AccountManagement() {
                     const {
                         blockedLabels: blockedModalities,
                         sharedPlanBlocked,
+                        unsupportedModelLabels,
                     } = summarizeCredentialQuota(c.modality_status);
                     return (
                         <div key={c.id} className="card" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
@@ -287,6 +361,7 @@ export default function AccountManagement() {
                                                 : t('account.noCapabilities', '未配置能力')
                                     }
                                     {c.base_url && ` · ${c.base_url}`}
+                                    {c.plan_tier && ` · plan=${c.plan_tier}`}
                                 </div>
                                 <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 2, display: 'flex', flexWrap: 'wrap', gap: 10 }}>
                                     <span>{t('account.usedToday', '今日用量')}: {c.used_today}{c.daily_quota ? `/${c.daily_quota}` : ''}</span>
@@ -300,6 +375,8 @@ export default function AccountManagement() {
                                     <div role="status" style={{ fontSize: 11, color: 'var(--warning)', marginTop: 4 }}>
                                         {sharedPlanBlocked
                                             ? t('account.sharedPlanQuotaLimited', 'MiniMax Token Plan 共享额度已达上限，该账号的所有调用能力均暂停')
+                                            : unsupportedModelLabels.length > 0
+                                                ? <>{t('account.providerModelUnavailable', '供应商当前套餐未授权模型')}: {unsupportedModelLabels.join(' / ')} · {t('account.otherModalitiesAvailable', '其他能力仍可正常调用')}</>
                                             : <>{t('account.modalityQuotaLimited', '供应商独立配额已达上限')}: {blockedModalities.join(' / ')} · {t('account.otherModalitiesAvailable', '其他能力仍可正常调用')}</>}
                                     </div>
                                 )}

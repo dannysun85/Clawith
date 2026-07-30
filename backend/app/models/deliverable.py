@@ -215,3 +215,285 @@ class DeliverableArtifactRevision(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+class DeliverableQualityReview(Base):
+    """One immutable-artifact review batch managed by the Astra control plane."""
+
+    __tablename__ = "deliverable_quality_reviews"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('open', 'passed', 'blocked', 'incomplete', 'superseded')",
+            name="ck_deliverable_quality_reviews_status",
+        ),
+        CheckConstraint(
+            "modality IN ('image', 'video', 'presentation')",
+            name="ck_deliverable_quality_reviews_modality",
+        ),
+        CheckConstraint(
+            "minimum_reviewers >= 3",
+            name="ck_deliverable_quality_reviews_minimum_reviewers",
+        ),
+        CheckConstraint(
+            "assigned_reviewer_count >= minimum_reviewers",
+            name="ck_deliverable_quality_reviews_assigned_reviewers",
+        ),
+        CheckConstraint(
+            "version > 0",
+            name="ck_deliverable_quality_reviews_version_positive",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "request_id",
+            "client_review_id",
+            name="uq_deliverable_quality_reviews_client_identity",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "id",
+            name="uq_deliverable_quality_reviews_tenant_id_id",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "request_id"],
+            ["deliverable_requests.tenant_id", "deliverable_requests.id"],
+            name="fk_deliverable_quality_reviews_tenant_request",
+            ondelete="CASCADE",
+        ),
+        Index(
+            "uq_deliverable_quality_reviews_open_request",
+            "request_id",
+            unique=True,
+            postgresql_where=text("status = 'open'"),
+            sqlite_where=text("status = 'open'"),
+        ),
+        Index(
+            "ix_deliverable_quality_reviews_tenant_created",
+            "tenant_id",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "tenants.id",
+            name="fk_deliverable_quality_reviews_tenant",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
+    request_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    created_by_user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "users.id",
+            name="fk_deliverable_quality_reviews_creator",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    client_review_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    modality: Mapped[str] = mapped_column(String(24), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="open", server_default=text("'open'")
+    )
+    minimum_reviewers: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=3, server_default=text("3")
+    )
+    assigned_reviewer_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    artifact_hashes: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    scenario: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    review_package: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    receipt: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    receipt_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=text("1")
+    )
+    sealed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class DeliverableQualityReviewAssignment(Base):
+    """A reviewer identity bound to exactly one sealed panel submission."""
+
+    __tablename__ = "deliverable_quality_review_assignments"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('assigned', 'submitted')",
+            name="ck_deliverable_quality_review_assignments_status",
+        ),
+        UniqueConstraint(
+            "review_id",
+            "reviewer_user_id",
+            name="uq_deliverable_quality_review_assignment_user",
+        ),
+        UniqueConstraint(
+            "review_id",
+            "reviewer_identity_id",
+            name="uq_deliverable_quality_review_assignment_identity",
+        ),
+        UniqueConstraint(
+            "reviewer_receipt_ref",
+            name="uq_deliverable_quality_review_assignment_receipt",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "review_id"],
+            ["deliverable_quality_reviews.tenant_id", "deliverable_quality_reviews.id"],
+            name="fk_deliverable_quality_review_assignments_tenant_review",
+            ondelete="CASCADE",
+        ),
+        Index(
+            "uq_deliverable_quality_review_submission_client_identity",
+            "tenant_id",
+            "reviewer_user_id",
+            "client_submission_id",
+            unique=True,
+            postgresql_where=text("client_submission_id IS NOT NULL"),
+            sqlite_where=text("client_submission_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_deliverable_quality_review_assignments_reviewer",
+            "tenant_id",
+            "reviewer_user_id",
+            "status",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "tenants.id",
+            name="fk_deliverable_quality_review_assignments_tenant",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
+    review_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    reviewer_user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "users.id",
+            name="fk_deliverable_quality_review_assignments_user",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    reviewer_identity_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "identities.id",
+            name="fk_deliverable_quality_review_assignments_identity",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    reviewer_display_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    reviewer_role: Mapped[str] = mapped_column(String(32), nullable=False)
+    reviewer_receipt_ref: Mapped[str] = mapped_column(String(240), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="assigned", server_default=text("'assigned'")
+    )
+    client_submission_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    submission_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    submission: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class DeliverableQualityReviewEvidence(Base):
+    """Trusted operator evidence bound by the server to one review snapshot."""
+
+    __tablename__ = "deliverable_quality_review_evidence"
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN ('ocr', 'frame_ocr')",
+            name="ck_deliverable_quality_review_evidence_kind",
+        ),
+        CheckConstraint(
+            "status IN ('complete', 'partial', 'unavailable')",
+            name="ck_deliverable_quality_review_evidence_status",
+        ),
+        UniqueConstraint(
+            "review_id",
+            "kind",
+            name="uq_deliverable_quality_review_evidence_kind",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "submitted_by_user_id",
+            "client_evidence_id",
+            name="uq_deliverable_quality_review_evidence_client_identity",
+        ),
+        UniqueConstraint(
+            "receipt_ref",
+            name="uq_deliverable_quality_review_evidence_receipt",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "review_id"],
+            ["deliverable_quality_reviews.tenant_id", "deliverable_quality_reviews.id"],
+            name="fk_deliverable_quality_review_evidence_tenant_review",
+            ondelete="CASCADE",
+        ),
+        Index(
+            "ix_deliverable_quality_review_evidence_review",
+            "review_id",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "tenants.id",
+            name="fk_deliverable_quality_review_evidence_tenant",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
+    review_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    submitted_by_user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "users.id",
+            name="fk_deliverable_quality_review_evidence_user",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    client_evidence_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    evidence_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    receipt_ref: Mapped[str] = mapped_column(String(240), nullable=False)
+    kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False)
+    source_ref: Mapped[str] = mapped_column(String(500), nullable=False)
+    receipt: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

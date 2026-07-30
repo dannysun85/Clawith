@@ -40,6 +40,16 @@ SAFE_READ_MAX_ATTEMPTS = 3
 _PERSISTED_STATUSES = frozenset({"started", "succeeded", "failed", "unknown"})
 _SIDE_EFFECT_CLASSIFICATIONS = frozenset({"read", "write", "external_write"})
 _RETRY_POLICIES = frozenset({"safe", "conditional", "never"})
+_USER_RECONCILABLE_CONDITIONAL_WRITE_TOOLS = frozenset(
+    {
+        "write_file",
+        "convert_csv_to_xlsx",
+        "convert_html_to_pdf",
+        "convert_html_to_pptx",
+        "convert_markdown_to_docx",
+        "convert_markdown_to_pdf",
+    }
+)
 _METADATA_KEY = "__clawith_tool_execution__"
 _METADATA_VERSION = 1
 _RESULT_METADATA_MAX_BYTES = 16 * 1024
@@ -726,6 +736,17 @@ def _execution_metadata(execution: AgentToolExecution) -> tuple[str, str]:
 def execution_policy(execution: AgentToolExecution) -> tuple[str, str]:
     """Read explicit policy columns with conservative legacy fallback."""
     return _execution_metadata(execution)
+
+
+def can_user_reconcile_unknown_execution(execution: AgentToolExecution) -> bool:
+    """Allow settlement only for bounded workspace writes with conditional retry."""
+
+    effect, retry_policy = _execution_metadata(execution)
+    return (
+        execution.tool_name in _USER_RECONCILABLE_CONDITIONAL_WRITE_TOOLS
+        and effect == "write"
+        and retry_policy == "conditional"
+    )
 
 
 def _execution_arguments(execution: AgentToolExecution) -> dict[str, Any]:
@@ -1855,15 +1876,10 @@ async def reconcile_unknown_tool_execution(
             "tool_execution_scope_mismatch",
             "tool execution does not belong to the requested run",
         )
-    effect, retry_policy = _execution_metadata(execution)
-    if (
-        execution.tool_name != "write_file"
-        or effect != "write"
-        or retry_policy != "conditional"
-    ):
+    if not can_user_reconcile_unknown_execution(execution):
         raise ToolExecutionError(
             "tool_execution_reconciliation_not_supported",
-            "manual reconciliation is only supported for conditional write_file receipts",
+            "manual reconciliation is only supported for bounded conditional workspace writes",
         )
 
     prior_metadata = (
