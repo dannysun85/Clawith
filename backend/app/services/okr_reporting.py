@@ -129,7 +129,13 @@ async def _resolve_report_models(tenant_id: uuid.UUID) -> ResolvedReportModels:
                 route_meta=None,
             )
 
-        agent_result = await db.execute(select(Agent).where(Agent.id == settings.okr_agent_id))
+        agent_result = await db.execute(
+            select(Agent).where(
+                Agent.id == settings.okr_agent_id,
+                Agent.tenant_id == tenant_id,
+                Agent.deleted_at.is_(None),
+            )
+        )
         agent = agent_result.scalar_one_or_none()
         if not agent:
             return ResolvedReportModels(
@@ -167,6 +173,7 @@ async def list_company_members(tenant_id: uuid.UUID) -> list[CompanyMember]:
                 Agent.tenant_id == tenant_id,
                 Agent.is_system == False,  # noqa: E712
                 Agent.status.notin_(["stopped", "error"]),
+                Agent.deleted_at.is_(None),
             )
         )
 
@@ -223,6 +230,7 @@ async def list_tracked_okr_members(tenant_id: uuid.UUID) -> list[CompanyMember]:
                 AgentAgentRelationship.agent_id == settings.okr_agent_id,
                 Agent.is_system == False,  # noqa: E712
                 Agent.status.notin_(["stopped", "error"]),
+                Agent.deleted_at.is_(None),
             )
         )
 

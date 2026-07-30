@@ -465,11 +465,11 @@ async def test_invalid_finish_does_not_stop_and_is_returned_as_tool_error(monkey
 
 
 @pytest.mark.asyncio
-async def test_repeated_malformed_tool_json_trips_billable_circuit_breaker(monkeypatch):
+async def test_repeated_malformed_non_write_tool_stops_after_one_repair(monkeypatch):
     from app.services.llm import caller
 
     malformed = _finish_response_with_arguments('{"content":"unterminated')
-    fake_client = FakeStreamClient([malformed, malformed, malformed])
+    fake_client = FakeStreamClient([malformed, malformed])
 
     monkeypatch.setattr(caller, "_get_agent_config", lambda _agent_id: _async_return((50, None)))
     monkeypatch.setattr(caller, "_get_user_name", lambda _user_id: _async_return("Ray"))
@@ -490,9 +490,9 @@ async def test_repeated_malformed_tool_json_trips_billable_circuit_breaker(monke
         user_id=uuid.uuid4(),
     )
 
-    assert "连续 3 次无效" in result
-    assert "已发生的模型调用已正常结算" in result
-    assert len(fake_client.messages_seen) == 3
+    assert "invalid_tool_call_protocol_violation" in result
+    assert "after 1 bounded repair" in result
+    assert len(fake_client.messages_seen) == 2
     assert fake_client.closed is True
 
 

@@ -4,7 +4,8 @@
 
 本文记录 2026-07-26 仓库实现基线和已决定的目标方案。它不表示目标能力已经上线；完成状态必须按 `.agents/rules/capability-and-agent-governance.md` 分级报告。
 
-底座决策：当前定制线继续以既有 v1.11.0 底座为基础，本阶段不合并新的上游 Clawith 版本；先独立完成图片、视频和 PPT 的产品能力闭环。
+底座决策：Astra v1.11.9 已完成对上游 Clawith v1.11.3 的语义升级；图片、视频和 PPT 继续使用
+Astra 自有 Deliverable、Credits、Approval、Provider 路由和质量门禁，不以覆盖式上游合并替代这些业务合同。
 
 ## 一、已核验的当前实现
 

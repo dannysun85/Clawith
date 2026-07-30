@@ -47,9 +47,10 @@ def test_migrated_tools_are_runtime_visible_only_after_typed_migration() -> None
     default_application_tools = {
         definition["name"]
         for definition in BUILTIN_TOOL_DEFINITIONS
-        if definition["is_default"] and definition["name"] != "finish"
+        if definition["is_default"]
     }
-    assert default_application_tools <= (
+    assert "finish" in {definition["name"] for definition in BUILTIN_TOOL_DEFINITIONS}
+    assert default_application_tools - {"finish"} <= (
         agent_tools.RUNTIME_TYPED_APPLICATION_TOOL_NAMES
     )
 

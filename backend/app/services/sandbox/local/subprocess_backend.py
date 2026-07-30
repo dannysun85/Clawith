@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import signal
 import shutil
 import time
 from pathlib import Path
@@ -15,6 +16,7 @@ from app.services.workspace_paths import WorkspacePathError, resolve_path_within
 
 MAX_STDOUT_CAPTURE_BYTES = 1_000_000
 MAX_STDERR_CAPTURE_BYTES = 500_000
+VENV_CREATION_TIMEOUT_SECONDS = 120
 
 _BWRAP_NAMESPACE_FAILURE_MARKERS = (
     "no permissions to create new namespace",
@@ -209,18 +211,48 @@ class SubprocessBackend(BaseSandboxBackend):
         bind_flag = "--ro-bind" if read_only else "--bind"
         return [bind_flag, str(host), target]
 
-    def _ensure_workspace_venv(self, venv_path: Path) -> None:
+    async def _ensure_workspace_venv(self, venv_path: Path) -> None:
         venv_python = venv_path / "bin" / "python"
         if not venv_python.exists():
-            import subprocess
-
             # Use uv to create the virtual environment for extreme speed
             # --seed ensures pip is still present in the venv
-            subprocess.run(
-                ["uv", "venv", "--seed", str(venv_path)],
-                check=True,
+            proc = await asyncio.create_subprocess_exec(
+                "uv",
+                "venv",
+                "--seed",
+                str(venv_path),
                 cwd=str(venv_path.parent),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
             )
+            try:
+                _, stderr = await asyncio.wait_for(
+                    proc.communicate(),
+                    timeout=VENV_CREATION_TIMEOUT_SECONDS,
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+                if proc.returncode is None:
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                    except (ProcessLookupError, PermissionError):
+                        proc.kill()
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=5)
+                    except asyncio.TimeoutError:
+                        proc.kill()
+                        await proc.wait()
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                raise RuntimeError(
+                    "Timed out while creating the execute_code virtual environment"
+                ) from exc
+            if proc.returncode != 0:
+                detail = stderr.decode("utf-8", errors="replace").strip()[:500]
+                raise RuntimeError(
+                    "Failed to create the execute_code virtual environment"
+                    + (f": {detail}" if detail else "")
+                )
 
         # Fix shebang lines in pip scripts to use bwrap-visible path
         # venv creates scripts with absolute paths to the host Python,
@@ -446,7 +478,7 @@ class SubprocessBackend(BaseSandboxBackend):
         reader_tasks: list[asyncio.Task] = []
 
         try:
-            self._ensure_workspace_venv(venv_path)
+            await self._ensure_workspace_venv(venv_path)
             script_path.write_text(code, encoding="utf-8")
 
             sandbox_command = self._build_command(language, f"/workspace/{script_path.name}")

@@ -1,6 +1,5 @@
 """Agent collaboration service — Agent-to-Agent communication."""
 
-import json
 import uuid
 from datetime import datetime, timezone
 
@@ -103,6 +102,7 @@ class CollaborationService:
             ).where(
                 Agent.id != agent.id,
                 Agent.status.in_(["running", "stopped"]),
+                Agent.deleted_at.is_(None),
             ).order_by(Agent.name)
         )
         agents = collaborators_result.scalars().all()

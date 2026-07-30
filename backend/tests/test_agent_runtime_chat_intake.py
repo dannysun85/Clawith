@@ -31,6 +31,13 @@ from app.services.agent_runtime.contracts import (
 )
 
 
+_TINY_PNG_DATA_URL = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/"
+    "x8AAusB9Wl2ZQAAAABJRU5ErkJggg=="
+)
+
+
 class _ScalarResult:
     def __init__(self, value: object) -> None:
         self.value = value

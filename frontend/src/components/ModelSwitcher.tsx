@@ -1,8 +1,10 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { IconAlertTriangle, IconChevronDown, IconCheck } from '@tabler/icons-react';
 import { useLlmModels, type LlmModelInfo } from '../hooks/useLlmModels';
+import { subscribeModelCacheInvalidation } from '../services/modelCacheEvents';
 
 interface Props {
     // Current selection — parent-controlled so the override persists across re-renders
@@ -16,6 +18,7 @@ interface Props {
 
 export default function ModelSwitcher({ value, onChange, tenantDefaultId, disabled }: Props) {
     const { t } = useTranslation();
+    const queryClient = useQueryClient();
     const [open, setOpen] = useState(false);
     const [hovered, setHovered] = useState(false);
     const ref = useRef<HTMLDivElement>(null);
@@ -31,10 +34,21 @@ export default function ModelSwitcher({ value, onChange, tenantDefaultId, disabl
     >(null);
 
     const { models, blockedCurrentId } = useLlmModels({ keepModelId: value ?? undefined });
+    const refetchModels = useCallback(
+        () => queryClient.refetchQueries({ queryKey: ['llm-models'] }),
+        [queryClient],
+    );
+    useEffect(
+        () => subscribeModelCacheInvalidation(() => {
+            void refetchModels();
+        }),
+        [refetchModels],
+    );
 
-    const selected = models.find(m => m.id === value)
-        || models.find(m => tenantDefaultId && m.id === tenantDefaultId)
-        || models[0]
+    const enabled = models.filter(m => m.enabled !== false);
+    const selected = enabled.find(m => m.id === value)
+        || enabled.find(m => tenantDefaultId && m.id === tenantDefaultId)
+        || enabled[0]
         || null;
 
     // Click-outside to close. Includes the popover so clicking inside doesn't
@@ -93,7 +107,7 @@ export default function ModelSwitcher({ value, onChange, tenantDefaultId, disabl
         };
     }, [open]);
 
-    if (models.length === 0) return null;
+    if (enabled.length === 0) return null;
 
     const labelFor = (m: LlmModelInfo) => m.label || `${m.provider} · ${m.model}`;
 
@@ -155,7 +169,7 @@ export default function ModelSwitcher({ value, onChange, tenantDefaultId, disabl
                         zIndex: 10001, padding: '4px',
                     }}
                 >
-                    {models.map(m => {
+                    {enabled.map(m => {
                         const isSelected = selected?.id === m.id;
                         const isDefault = tenantDefaultId && m.id === tenantDefaultId;
                         const isBlocked = blockedCurrentId === m.id;

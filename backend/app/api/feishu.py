@@ -440,7 +440,12 @@ async def _accept_feishu_runtime_message(
     from app.services.channel_session import find_or_create_channel_session
 
     async with _async_session() as db:
-        agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
+        agent_result = await db.execute(
+            select(Agent).where(
+                Agent.id == agent_id,
+                Agent.deleted_at.is_(None),
+            )
+        )
         agent = agent_result.scalar_one_or_none()
         if agent is None:
             raise RuntimeError(f"Feishu Agent {agent_id} not found")

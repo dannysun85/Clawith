@@ -16,6 +16,7 @@ from app.config import get_settings
 from app.models.agent import Agent, AgentTemplate
 from app.models.llm import LLMModel
 from app.services.llm import get_model_api_key
+from app.services.llm.model_resolution import resolve_active_agent_model
 from app.services.storage import get_storage_backend, normalize_storage_key
 
 settings = get_settings()
@@ -314,10 +315,7 @@ class AgentManager:
         agent_dir = await self._materialize_agent_dir(agent.id)
 
         # Get model config
-        model = None
-        if agent.primary_model_id:
-            result = await db.execute(select(LLMModel).where(LLMModel.id == agent.primary_model_id))
-            model = result.scalar_one_or_none()
+        model = await resolve_active_agent_model(db, agent)
 
         # Generate OpenClaw config
         config = self._generate_openclaw_config(agent, model)

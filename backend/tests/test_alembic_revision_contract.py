@@ -23,12 +23,15 @@ def test_revision_ids_fit_the_default_alembic_version_column() -> None:
 
 
 def test_release_migration_graph_has_one_expected_head() -> None:
-    assert _script_directory().get_heads() == ["add_deliverable_quality_reviews"]
+    assert _script_directory().get_heads() == ["merge_v1113_astra_heads"]
 
 
 def test_release_head_preserves_both_upgrade_lineages() -> None:
     script = _script_directory()
-    release_head = script.get_revision("add_deliverable_quality_reviews")
+    release_head = script.get_revision("merge_v1113_astra_heads")
+    deliverable_quality_revision = script.get_revision("add_deliverable_quality_reviews")
+    checkpoint_delivery_revision = script.get_revision("allow_checkpoint_deliveries")
+    logical_delete_revision = script.get_revision("add_agent_model_deleted_at")
     agent_plan_text_revision = script.get_revision("seed_agent_plan_text_routes")
     provider_plan_revision = script.get_revision("add_provider_plan_tier")
     media_plan_revision = script.get_revision("reconcile_m3_runtime_caps")
@@ -37,7 +40,19 @@ def test_release_head_preserves_both_upgrade_lineages() -> None:
     task_status_revision = script.get_revision("align_task_failed_status")
     merge_revision = script.get_revision("merge_v111_astra_heads")
 
-    assert release_head._normalized_down_revisions == ("seed_agent_plan_text_routes",)
+    assert set(release_head._normalized_down_revisions) == {
+        "add_deliverable_quality_reviews",
+        "allow_checkpoint_deliveries",
+    }
+    assert deliverable_quality_revision._normalized_down_revisions == (
+        "seed_agent_plan_text_routes",
+    )
+    assert checkpoint_delivery_revision._normalized_down_revisions == (
+        "add_agent_model_deleted_at",
+    )
+    assert logical_delete_revision._normalized_down_revisions == (
+        "add_experience_revision_drafts",
+    )
     assert agent_plan_text_revision._normalized_down_revisions == ("add_provider_plan_tier",)
     assert provider_plan_revision._normalized_down_revisions == ("reconcile_m3_runtime_caps",)
     assert media_plan_revision._normalized_down_revisions == ("agent_template_default_tools",)
@@ -56,7 +71,7 @@ def test_postgres_migration_smoke_targets_the_release_head() -> None:
         encoding="utf-8"
     )
 
-    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-add_deliverable_quality_reviews' in smoke
+    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-merge_v1113_astra_heads' in smoke
 
 
 def test_agent_plan_text_route_migration_preserves_credential_ownership_and_fallback() -> None:

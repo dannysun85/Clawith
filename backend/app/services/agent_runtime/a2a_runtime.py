@@ -367,6 +367,7 @@ async def _resolve_target(
                 Agent.tenant_id == source_agent.tenant_id,
                 Agent.id != source_agent.id,
                 Agent.id == target_agent_id,
+                Agent.deleted_at.is_(None),
             )
         )
         target = target_result.scalar_one_or_none()
@@ -377,6 +378,7 @@ async def _resolve_target(
                 Agent.tenant_id == source_agent.tenant_id,
                 Agent.id != source_agent.id,
                 Agent.name == target_name,
+                Agent.deleted_at.is_(None),
             )
         )
         target = exact_result.scalars().first()
@@ -389,6 +391,7 @@ async def _resolve_target(
                 Agent.tenant_id == source_agent.tenant_id,
                 Agent.id != source_agent.id,
                 Agent.name.ilike(f"%{safe_name}%"),
+                Agent.deleted_at.is_(None),
             )
             .limit(2)
         )
@@ -807,6 +810,7 @@ class RuntimeA2AService:
                         select(Agent).where(
                             Agent.tenant_id == tenant_id,
                             Agent.id == source_agent_id,
+                            Agent.deleted_at.is_(None),
                         )
                     )
                     source_agent = source_result.scalar_one_or_none()

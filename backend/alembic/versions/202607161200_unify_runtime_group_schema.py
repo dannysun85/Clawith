@@ -164,11 +164,6 @@ RUNTIME_UNIQUES = {
     "agent_run_commands": {"uq_agent_run_commands_run_idempotency": ("run_id", "idempotency_key")},
     "agent_run_events": {
         "uq_agent_run_events_run_idempotency": ("run_id", "idempotency_key"),
-        "uq_agent_run_events_checkpoint_type": (
-            "run_id",
-            "source_checkpoint_id",
-            "event_type",
-        ),
     },
     "agent_tool_executions": {"uq_agent_tool_executions_run_tool_call": ("run_id", "tool_call_id")},
     "session_context_states": {"uq_session_context_states_session_id": ("session_id",)},
@@ -260,6 +255,10 @@ RUNTIME_INDEXES = {
     "ix_agent_run_events_tenant_type_created": (
         "agent_run_events",
         ("tenant_id", "event_type", "created_at"),
+    ),
+    "uq_agent_run_events_checkpoint_type_non_delivery": (
+        "agent_run_events",
+        ("run_id", "source_checkpoint_id", "event_type"),
     ),
     "ix_agent_tool_executions_tenant_status_started": (
         "agent_tool_executions",
@@ -2144,12 +2143,6 @@ def _create_agent_run_events() -> None:
             "idempotency_key",
             name="uq_agent_run_events_run_idempotency",
         ),
-        sa.UniqueConstraint(
-            "run_id",
-            "source_checkpoint_id",
-            "event_type",
-            name="uq_agent_run_events_checkpoint_type",
-        ),
     )
 
 
@@ -2398,6 +2391,15 @@ def _create_runtime_indexes() -> None:
         ],
         unique=False,
         postgresql_where=sa.text("scheduling_lane_key IS NOT NULL"),
+    )
+    op.create_index(
+        "uq_agent_run_events_checkpoint_type_non_delivery",
+        "agent_run_events",
+        ["run_id", "source_checkpoint_id", "event_type"],
+        unique=True,
+        postgresql_where=sa.text(
+            "event_type NOT IN ('delivery_succeeded', 'delivery_failed')"
+        ),
     )
     for name, table_name, columns in (
         (
