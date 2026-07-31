@@ -21,6 +21,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging_config import privacy_safe_shape
+from app.core.permissions import can_manage_agent
 from app.config import get_settings
 from app.models.agent import Agent
 from app.models.audit import ApprovalRequest, AuditLog
@@ -789,20 +790,13 @@ class AutonomyService:
             raise ValueError("Approval already resolved")
         runtime_resume = self._runtime_resume_details(approval)
 
-        # Permission check: only agent creator or platform admin can resolve
+        # Use the same object-level management boundary as Agent configuration.
         agent_result = await db.execute(select(Agent).where(Agent.id == approval.agent_id))
         agent = agent_result.scalar_one_or_none()
         if not agent:
             raise ValueError("Approval Agent not found")
-        same_tenant_org_admin = bool(
-            agent
-            and user.role == "org_admin"
-            and user.tenant_id
-            and agent.tenant_id == user.tenant_id
-        )
-        identity_is_platform_admin = bool(getattr(getattr(user, "identity", None), "is_platform_admin", False))
-        if agent and agent.creator_id != user.id and user.role != "platform_admin" and not identity_is_platform_admin and not same_tenant_org_admin:
-            raise ValueError("Only the agent creator or platform admin can resolve approvals")
+        if not await can_manage_agent(db, user, agent):
+            raise ValueError("Only an Agent manager can resolve approvals")
 
         if action == "approve":
             if (

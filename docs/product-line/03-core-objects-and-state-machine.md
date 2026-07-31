@@ -166,7 +166,7 @@ intent origin ── task owner ── run/session
 3. Work projection 已把 `Task done` 和 `Deliverable delivered` 分开显示，并提供权威对象深链。
 4. 临时专家以 Task/Run 级角色快照实现，不创建可见长期员工；Group Task 使用真实 Group runtime correlation。
 5. OKR 进度可选择已完成 Task，或已成功且存在批准 Artifact 的 Deliverable，并保存不可变证据快照；未完成工作和未批准产物被服务端拒绝。
-6. 仍需完成整库测试、迁移 smoke、浏览器对象链核验和独立代码/架构评审；这些通过前不能称为本地业务流已证明。
+6. PostgreSQL fresh/historical migration smoke、主要浏览器对象链和本轮整库门禁已通过；仍需完成独立代码/架构复审，并在新 candidate SHA 上重启复验，完成前不能称为 SHA-bound 本地业务流已证明。
 
 ## 8. 完成标准
 

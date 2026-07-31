@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.core import permissions
-from app.core.permissions import build_visible_agents_query
+from app.core.permissions import build_manageable_agents_query, build_visible_agents_query
 from app.services.access_relationships import ensure_access_granted_platform_relationships
 
 
@@ -54,6 +54,22 @@ def test_build_visible_agents_query_platform_admin_still_uses_visibility_filters
 
     assert "agents.tenant_id" in sql
     assert "agents.access_mode" in sql
+
+
+def test_build_manageable_agents_query_includes_explicit_manage_only():
+    user = make_user(role="agent_admin")
+
+    stmt = build_manageable_agents_query(user)
+    compiled = stmt.compile()
+    sql = str(compiled)
+    parameters = set(compiled.params.values())
+
+    assert "agents.tenant_id" in sql
+    assert "agents.creator_id" in sql
+    assert "agents.deleted_at IS NULL" in sql
+    assert "agent_permissions" in sql
+    assert "manage" in parameters
+    assert "use" not in parameters
 
 
 class _ScalarResult:

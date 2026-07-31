@@ -5,9 +5,9 @@
 - 日期：2026-08-01
 - 基线版本：Astra `v1.11.9`，本轮工作树起点 `f2e03a1fe624`
 - 上游基线：Clawith `v1.11.3`
-- 状态：`local_candidate_ready`
+- 状态：`candidate_commit_pending`
 - 事实来源：`docs/product-line/01-06`、`DESIGN.md`、当前模型/API/前端路由和测试
-- 非完成声明：实现、完整回归、PostgreSQL 迁移 smoke、主要非付费浏览器流程与独立代码/架构评审已有证据；候选 SHA 以承载本文件的 Git commit 为准。真实 Provider、豆包 Benchmark、发布和生产验证未执行。
+- 非完成声明：旧候选 `1276da37` 已因角色入口和迁移兼容问题失效；修复后的 PostgreSQL migration smoke、多角色工作树浏览器矩阵和完整自动化门禁已有证据，独立代码复审为 `APPROVE / 0 issues`，独立架构复审为 `APPROVE / CLEAR`。新 SHA 的提交与重启复验尚未完成；真实 Provider、豆包 Benchmark、发布和生产验证未执行。
 
 ## 1. 本轮目标
 
@@ -25,7 +25,7 @@
 | --- | --- | --- | --- | --- |
 | PL-001 | P0 | 已新增 `/work`，租户根路径默认进入工作台；`/dashboard` 保留 | 无租户和全新用户首次任务浏览器流 | `local_browser_verified` |
 | PL-002 | P0 | Onboarding 已使用“私人协调者”，创建或恢复后进入 `/work` | 全新公司、创建失败、幂等恢复浏览器流 | `worktree_implemented` |
-| PL-003 | P0 | `Layout.tsx` 按 onboarding 关系拆分“我的助理”和长期 `Agent 员工` | 普通成员与 agent_admin 角色负向测试 | `local_browser_verified` |
+| PL-003 | P0 | `Layout.tsx` 按 onboarding 关系拆分“我的助理”和长期 `Agent 员工`；`private_assistant_access` 精确修复旧 company-wide 助手权限 | 新 candidate SHA 上复验 | `worktree_browser_verified` |
 | PL-004 | P0 | Onboarding companion 不执行员工配额检查；员工 `max_agents` 统计排除全部 onboarding assistant ID | 订阅生命周期与账单展示；免费/数量/超限价格待产品财务批准 | `code_gate_exists + external_policy` |
 | PL-005 | P0 | 临时专家使用 `executor_kind=temporary_expert` 与不可变角色快照，不创建花名册员工 | 权限负向、执行失败恢复 | `local_browser_verified` |
 | PL-006 | P0 | Task additive 增加 tenant、intent、origin、executor、Group、work statement、confirmation 与幂等字段；PostgreSQL upgrade/downgrade/upgrade smoke 已通过 | IDOR 与旧 API 全量回归随最终完整门禁收口 | `migration_smoke_pass` |
@@ -37,10 +37,11 @@
 | PL-012 | P0 | MiniMax-only 图片/视频已分类为非等价 `degraded`；正式 Deliverable 默认不提交付费任务，用户显式接受后才允许应急线路；Runtime 有同一门禁和 reason code | 真实主线路故障/恢复与付费对账需授权验证 | `local_browser_verified` |
 | PL-013 | P0 | 凭据写入、能力池和 Runtime 均校验 Agent Plan `plan_tier`；Small 不贡献/选择视频能力 | 当前账号真实资格仍未获授权复验；Provider submit=0 的浏览器/集成证据待补 | `code_gate_exists + external_account` |
 | PL-014 | P1 | SaaS media routes 已统一显示目标顺序、当前 Provider、主线路、正式/降级/不可用状态、建议动作与成本 | 最后一次真实 Provider 验证时间和 receipt 仍未持久展示 | `local_browser_verified_with_evidence_gap` |
-| PL-015 | P1 | 导航已分为工作、协作角色、组织；Dashboard、OKR、发现中心和账户菜单已按职责改名/分层；desktop 与窄视口已验证 | 三类角色权限负向矩阵 | `local_browser_verified` |
-| PL-016 | P0 | 后端 4023 项、前端 Node 95 项/Vitest 139 项、构建、Ruff、能力合同、创意合同、Alembic head、PostgreSQL migration smoke、非付费浏览器矩阵与两路独立评审已通过 | 冻结候选 SHA | `local_candidate_ready` |
+| PL-015 | P1 | 导航已分为工作、协作角色、组织；`/enterprise` 和 `/invitations` 统一受公司管理员守卫；普通成员、`agent_admin`、公司管理员矩阵已实跑 | 新 candidate SHA 上的 release-identity 复验 | `worktree_browser_verified` |
+| PL-016 | P0 | 后端 `4088 passed`；前端 Node `97 passed`、Vitest `142 passed`；production build、Ruff、creative v1 `87 passed`、能力合同、Alembic 单一 head、完整 PostgreSQL migration smoke 和两路独立复审均通过 | 冻结并复验新 SHA | `independent_reviews_pass` |
 | PL-017 | P0 | 工作台已实现 preflight → confirmation fingerprint → 持久 Task；Group 等待参与者终态并聚合结果 | stale confirmation、重复提交、Group 部分失败与刷新恢复的完整门禁 | `targeted_tests_pass` |
 | PL-018 | P1 | OKR 可引用完成 Task 或带批准 Artifact 的成功 Deliverable，并保存不可变 evidence snapshot；本地 UI 已完成真实证据关联和来源回跳 | Artifact 替换、权限负向浏览器流 | `local_browser_verified` |
+| PL-019 | P0 | Agent 对象级 `manage` 已统一控制配置、审批查看/处理和 OpenClaw API Key；企业审批队列复用同一可管理对象查询，私人助手保持 owner-only | 新 candidate SHA 上的 `agent_admin` 正负 API/浏览器复验 | `tests_pass` |
 
 ## 3. 不属于“靠代码直接修好”的外部门禁
 
@@ -66,7 +67,7 @@
 ## 5. 分阶段实施顺序
 
 1. **已完成实现批次**：文字 Primary、私人助手边界、工作台与对象链、Group 关联执行、Experience 来源、导航职责和 OKR 证据已进入本地工作树。
-2. **当前验证批次**：完整后端/前端门禁、PostgreSQL 迁移 smoke、非付费浏览器矩阵、旧深链与角色负向验证。
+2. **已完成验证批次**：完整后端/前端门禁、PostgreSQL 迁移 smoke、非付费工作树浏览器矩阵、旧深链与角色负向验证。
 3. **已完成修复批次**：PL-012 的媒体降级语义和付费前重新确认已落到 preflight、Runtime 与 SaaS UI；PL-014 已统一当前 readiness 解释，但“最后真实验证 receipt”仍作为显式证据缺口保留。
 4. **独立收口批次**：反冗余清理、代码审查、架构审查、重新验证，再形成 immutable candidate SHA。
 5. **授权后批次**：真实 Provider 与豆包 Benchmark、发布、生产迁移和生产业务流均需单独费用/生产授权。

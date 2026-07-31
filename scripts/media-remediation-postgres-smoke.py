@@ -10,16 +10,27 @@ from sqlalchemy import delete, func, select
 
 from app.database import async_session, engine
 from app.models.agent import Agent  # noqa: F401 - registers FK target metadata
+from app.models.agent_run import AgentRun  # noqa: F401 - registers FK target metadata
+from app.models.agent_tool_execution import (  # noqa: F401 - registers FK target metadata
+    AgentToolExecution,
+)
 from app.models.audit import ChatMessage  # noqa: F401 - registers FK target metadata
 from app.models.chat_session import ChatSession  # noqa: F401 - registers FK target metadata
+from app.models.deliverable import (  # noqa: F401 - registers FK target metadata
+    DeliverableExecution,
+    DeliverableExecutionUnit,
+)
+from app.models.group import Group  # noqa: F401 - registers FK target metadata
 from app.models.llm import LLMCredential, LLMModel  # noqa: F401 - registers FK targets
 from app.models.media_generation import MediaGenerationTask
+from app.models.participant import Participant  # noqa: F401 - registers FK target metadata
 from app.models.subscription import (
     CreditBalance,
     CreditReservation,
     CreditTransaction,
 )
 from app.models.tenant import Tenant
+from app.models.task import Task  # noqa: F401 - registers FK target metadata
 from app.models.user import User  # noqa: F401 - registers FK target metadata
 from app.services.media_incident_remediation import resolve_media_provider_debt
 

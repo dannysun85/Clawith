@@ -7,10 +7,78 @@ fresh_db_name="${db_name}_fresh"
 db_user="${PGUSER:-$USER}"
 db_host="${PGHOST:-127.0.0.1}"
 db_port="${PGPORT:-5432}"
-release_head="${MIGRATION_SMOKE_EXPECTED_HEAD:-deliverable_execution_shadow}"
+release_head="${MIGRATION_SMOKE_EXPECTED_HEAD:-media_task_agent_retention}"
 
 assert_at_release_head() {
   .venv/bin/alembic current | grep -F "${release_head} (head)"
+}
+
+restore_runtime_chat_foreign_key() {
+  psql --host "$db_host" --port "$db_port" --username "$db_user" \
+    --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+DO $$
+BEGIN
+  IF to_regclass('public.agent_runs') IS NOT NULL
+     AND NOT EXISTS (
+       SELECT 1
+       FROM pg_constraint
+       WHERE conrelid = 'agent_runs'::regclass
+         AND conname = 'fk_agent_runs_tenant_session_chat_sessions'
+     ) THEN
+    ALTER TABLE agent_runs
+      ADD CONSTRAINT fk_agent_runs_tenant_session_chat_sessions
+      FOREIGN KEY (tenant_id, session_id)
+      REFERENCES chat_sessions (tenant_id, id);
+  END IF;
+END $$;
+SQL
+}
+
+assert_product_line_release_repairs() {
+  psql --host "$db_host" --port "$db_port" --username "$db_user" \
+    --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM user_tenant_onboardings AS onboarding
+    JOIN agents AS agent ON agent.id = onboarding.personal_assistant_agent_id
+    WHERE onboarding.id = '07500000-0000-4000-8000-000000000240'
+      AND agent.access_mode = 'private'
+      AND agent.company_access_level = 'use'
+  ) OR (
+    SELECT count(*)
+    FROM agent_permissions
+    WHERE agent_id = '07500000-0000-4000-8000-000000000061'
+      AND scope_type = 'user'
+      AND scope_id = '07500000-0000-4000-8000-000000000060'
+      AND access_level = 'manage'
+  ) <> 1 OR (
+    SELECT count(*)
+    FROM agent_permissions
+    WHERE agent_id = '07500000-0000-4000-8000-000000000061'
+  ) <> 1 THEN
+    RAISE EXCEPTION 'private assistant repair did not enforce exact owner-only access';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'media_generation_tasks'
+      AND column_name = 'agent_id'
+      AND is_nullable = 'YES'
+  ) OR (
+    SELECT count(*)
+    FROM pg_constraint
+    WHERE conrelid = 'media_generation_tasks'::regclass
+      AND confrelid = 'agents'::regclass
+      AND contype = 'f'
+      AND confdeltype = 'n'
+  ) <> 1 THEN
+    RAISE EXCEPTION 'media task repair did not enforce nullable ON DELETE SET NULL retention';
+  END IF;
+END $$;
+SQL
 }
 
 cleanup() {
@@ -357,6 +425,12 @@ SQL
 # unified-chat revision must perform its real backfill instead of taking the
 # metadata-precreated shortcut.
 psql --host "$db_host" --port "$db_port" --username "$db_user" --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+-- The bootstrap imports current ORM metadata, so this future Runtime foreign
+-- key exists before the historical chat fixture is reconstructed. Remove only
+-- that dependency here; restore_runtime_chat_foreign_key recreates it after
+-- the unified-chat migration has restored the referenced unique constraint.
+ALTER TABLE agent_runs
+DROP CONSTRAINT IF EXISTS fk_agent_runs_tenant_session_chat_sessions;
 ALTER TABLE chat_sessions
 DROP CONSTRAINT IF EXISTS fk_chat_sessions_tenant_id_tenants,
 DROP CONSTRAINT IF EXISTS fk_chat_sessions_group_id_groups,
@@ -1083,7 +1157,124 @@ WHERE id IN (
 );
 SQL
 
+.venv/bin/alembic upgrade deliverable_execution_shadow
+psql --host "$db_host" --port "$db_port" --username "$db_user" \
+  --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+INSERT INTO user_tenant_onboardings (
+  id, user_id, tenant_id, status, current_step, entry_mode,
+  personal_assistant_agent_id
+) VALUES (
+  '07500000-0000-4000-8000-000000000240',
+  '07500000-0000-4000-8000-000000000060',
+  '07500000-0000-4000-8000-000000000002',
+  'completed', 'completed', 'create',
+  '07500000-0000-4000-8000-000000000061'
+);
+INSERT INTO agent_permissions (
+  id, agent_id, scope_type, scope_id, access_level
+) VALUES (
+  '07500000-0000-4000-8000-000000000241',
+  '07500000-0000-4000-8000-000000000061',
+  'company', '07500000-0000-4000-8000-000000000002', 'manage'
+);
+DO $$
+DECLARE
+  foreign_key record;
+BEGIN
+  FOR foreign_key IN
+    SELECT conname
+    FROM pg_constraint
+    WHERE conrelid = 'media_generation_tasks'::regclass
+      AND confrelid = 'agents'::regclass
+      AND contype = 'f'
+  LOOP
+    EXECUTE format(
+      'ALTER TABLE media_generation_tasks DROP CONSTRAINT %I',
+      foreign_key.conname
+    );
+  END LOOP;
+END $$;
+ALTER TABLE media_generation_tasks
+  ALTER COLUMN agent_id SET NOT NULL,
+  ADD CONSTRAINT migration_smoke_media_agent_legacy_fkey
+    FOREIGN KEY (agent_id) REFERENCES agents (id) ON DELETE CASCADE;
+SQL
 .venv/bin/alembic upgrade head
+assert_product_line_release_repairs
+.venv/bin/alembic downgrade deliverable_execution_shadow
+psql --host "$db_host" --port "$db_port" --username "$db_user" \
+  --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM agents
+    WHERE id = '07500000-0000-4000-8000-000000000061'
+      AND access_mode = 'company'
+      AND company_access_level = 'use'
+  ) OR NOT EXISTS (
+    SELECT 1
+    FROM agent_permissions
+    WHERE id = '07500000-0000-4000-8000-000000000241'
+      AND agent_id = '07500000-0000-4000-8000-000000000061'
+      AND scope_type = 'company'
+      AND scope_id = '07500000-0000-4000-8000-000000000002'
+      AND access_level = 'manage'
+  ) OR (
+    SELECT count(*)
+    FROM agent_permissions
+    WHERE agent_id = '07500000-0000-4000-8000-000000000061'
+  ) <> 1 THEN
+    RAISE EXCEPTION 'private assistant downgrade did not restore exact legacy access';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'media_generation_tasks'
+      AND column_name = 'agent_id'
+      AND is_nullable = 'NO'
+  ) OR NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conrelid = 'media_generation_tasks'::regclass
+      AND conname = 'migration_smoke_media_agent_legacy_fkey'
+      AND confdeltype = 'c'
+  ) THEN
+    RAISE EXCEPTION 'media task downgrade did not restore exact legacy retention policy';
+  END IF;
+END $$;
+UPDATE agents
+SET tenant_id = NULL
+WHERE id = '07500000-0000-4000-8000-000000000061';
+SQL
+set +e
+invalid_private_assistant_output="$(.venv/bin/alembic upgrade private_assistant_access 2>&1)"
+invalid_private_assistant_status=$?
+set -e
+if [ "$invalid_private_assistant_status" -eq 0 ]; then
+  echo "private assistant repair accepted a tenantless onboarding link" >&2
+  exit 1
+fi
+case "$invalid_private_assistant_output" in
+  *'unowned, cross-tenant, or deleted onboarding link'*) ;;
+  *)
+    echo "private assistant repair did not report its ownership blocker" >&2
+    printf '%s\n' "$invalid_private_assistant_output" >&2
+    exit 1
+    ;;
+esac
+unset invalid_private_assistant_output invalid_private_assistant_status
+.venv/bin/alembic current | grep -F "deliverable_execution_shadow"
+psql --host "$db_host" --port "$db_port" --username "$db_user" \
+  --dbname "$db_name" --set ON_ERROR_STOP=1 <<'SQL'
+UPDATE agents
+SET tenant_id = '07500000-0000-4000-8000-000000000002'
+WHERE id = '07500000-0000-4000-8000-000000000061';
+SQL
+.venv/bin/alembic upgrade head
+assert_product_line_release_repairs
+restore_runtime_chat_foreign_key
 assert_at_release_head
 assert_sso_password_security
 

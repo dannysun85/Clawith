@@ -136,9 +136,9 @@ known_gaps:
 - 本地通过、已部署、生产验证和商业流程证明被分别记录。
 - 未具备的能力保持关闭或明确 degraded，不向客户展示假完成。
 
-## 9. 2026-08-01 本地候选前验收记录
+## 9. 2026-08-01 本地工作树验收记录
 
-本节绑定的是提交前工作树与本地 `v1.11.9` 开发环境；最终 candidate SHA 只能在完整门禁和独立评审后回填。未调用新的付费 Provider，也没有部署或生产验证。
+本节绑定的是提交前工作树与本地 `v1.11.9` 开发环境，不是 immutable candidate 证据。浏览器中的前端热更新已包含本轮路由修复，但当时后端 release identity 仍为失效候选 `1276da37`；最终 candidate SHA 只能在完整门禁、独立评审、提交和前后端重启后重新验证。未调用新的付费 Provider，也没有部署或生产验证。
 
 | 场景 | 当前证据 | 结论 | 尚未证明 |
 |---|---|---|---|
@@ -148,7 +148,8 @@ known_gaps:
 | PPT-01（流程） | PPT Brief preflight、工作说明、正式交付入口、已有 PPTX/PDF 深链和右侧工作现场可达；抽样存量交付为 PPTX 8 页/8 个媒体文件、PDF 8 页 | `local_browser_verified` | 本候选上的新一轮付费生成与豆包盲评 |
 | DEL-01/02 | 工作台读取服务端工作索引；正式结果留在 Agent 消息中，详情在右侧抽屉，输入框没有完成面板；历史 PPT/图片/视频按已验证 Artifact 投影为 18/18、10/10、13/13 制作步骤完成 | `local_browser_verified` | 高并发刷新与断网重连 |
 | OKR evidence | 创建本地验收 OKR，选择已批准正式 Deliverable 作为证据，进度达到 100%，来源深链可达 | `local_browser_verified` | Artifact 替换后旧证据的浏览器 supersede 流 |
-| 导航/权限入口 | 工作、协作角色、组织、账户运营入口均可达；desktop 与 390×844 窄视口通过 | `local_browser_verified` | 普通成员和 agent_admin 的完整负向矩阵 |
+| AST-01/AGT-02 | 迁移后管理员自己的私人助手只出现在“我的助理”；普通成员看不到他人私人助手；`agent_admin` 只能编辑被显式授予 `user/manage` 的 Agent，未授权 Agent 设置只读 | `worktree_browser_verified` | 新 candidate SHA 上的同路径复验、跨租户 IDOR API 专项 |
+| 导航/权限入口 | 普通成员与 `agent_admin` 均无法进入 `/enterprise`、`/invitations`、`/account`、`/admin/saas`；平台页面服务端/页面守卫拒绝非平台管理员；公司管理员正向入口可达；desktop 与 390×844 窄视口通过 | `worktree_browser_verified` | 新 candidate SHA 上的 release-identity 绑定复验 |
 | SaaS readiness | 文本路由显示 MiniMax-M3 的优先级高于火山文本兼容路由；媒体页区分已配置、账号验证、生成验证和人工质量，并在缺少当前配置 receipt 时不宣称可用 | `local_browser_verified` | 最后一次真实 Provider 验证 receipt 的持久展示 |
 
-已覆盖页面包括工作台、公司概览、OKR、发现中心、Groups、企业设置、订阅、平台运营、SaaS 模型路由与媒体路由。REG-01/02、完整权限负向、Provider 真实调用、豆包 Benchmark、发布和生产验收仍保持未完成，不能从本记录外推。
+已覆盖页面包括工作台、公司概览、OKR、发现中心、Groups、企业设置、邀请、订阅、平台运营、SaaS 模型路由与媒体路由。测试中临时创建的 `agent_admin` 授权 Agent 和权限行已删除，测试成员角色已恢复为 `member`。REG-01/02、运行中断网恢复、跨租户 API IDOR 专项、Provider 真实调用、豆包 Benchmark、发布和生产验收仍保持未完成，不能从本记录外推。

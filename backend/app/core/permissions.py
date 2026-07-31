@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Tuple
 
 from fastapi import HTTPException, status
-from sqlalchemy import false, or_, select, exists
+from sqlalchemy import and_, exists, false, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import Agent, AgentPermission
@@ -247,6 +247,44 @@ def build_visible_agents_query(
         Agent.tenant_id == target_tenant_id,
         Agent.deleted_at.is_(None),
         or_(*visible_conditions),
+    )
+
+
+def build_manageable_agents_query(
+    user: User,
+    *,
+    tenant_id: uuid.UUID | None = None,
+):
+    """Build the active-Agent query that matches ``can_manage_agent``.
+
+    Creators manage their own Agents. Tenant administrators manage non-private
+    Agents, while any active tenant member can manage a custom Agent only when
+    an explicit user-level ``manage`` permission exists.
+    """
+    stmt = select(Agent)
+    target_tenant_id = tenant_id if tenant_id is not None else user.tenant_id
+    if target_tenant_id is None or not getattr(user, "is_active", True):
+        return stmt.where(false())
+
+    manageable_conditions = [
+        Agent.creator_id == user.id,
+        and_(
+            Agent.access_mode == "custom",
+            exists().where(
+                AgentPermission.agent_id == Agent.id,
+                AgentPermission.scope_type == "user",
+                AgentPermission.scope_id == user.id,
+                AgentPermission.access_level == "manage",
+            ),
+        ),
+    ]
+    if _is_admin(user):
+        manageable_conditions.append(Agent.access_mode != "private")
+
+    return stmt.where(
+        Agent.tenant_id == target_tenant_id,
+        Agent.deleted_at.is_(None),
+        or_(*manageable_conditions),
     )
 
 

@@ -1538,11 +1538,12 @@ async def list_agent_approvals(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """List approval requests for a specific agent. Only creator or admin can view."""
-    agent, access_level = await check_agent_access(db, current_user, agent_id)
-    if not is_agent_creator(current_user, agent) and current_user.role not in ("platform_admin", "org_admin"):
+    """List approval requests for an Agent the user can manage."""
+    _agent, access_level = await check_agent_access(db, current_user, agent_id)
+    if access_level != "manage":
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="Only agent creator or admin can view approvals"
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only an Agent manager can view approvals",
         )
 
     from app.models.audit import ApprovalRequest
@@ -1573,7 +1574,12 @@ async def resolve_agent_approval(
     db: AsyncSession = Depends(get_db),
 ):
     """Approve or reject a pending approval for a specific agent."""
-    agent, _access = await check_agent_access(db, current_user, agent_id)
+    agent, access_level = await check_agent_access(db, current_user, agent_id)
+    if access_level != "manage":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only an Agent manager can resolve approvals",
+        )
 
     from app.services.autonomy_service import autonomy_service
 
@@ -1603,9 +1609,12 @@ async def generate_or_reset_api_key(
     db: AsyncSession = Depends(get_db),
 ):
     """Generate or regenerate API key for an OpenClaw agent."""
-    agent, _access = await check_agent_access(db, current_user, agent_id)
-    if not is_agent_creator(current_user, agent) and current_user.role not in ("platform_admin", "org_admin"):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only creator or admin can manage API keys")
+    agent, access_level = await check_agent_access(db, current_user, agent_id)
+    if access_level != "manage":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only an Agent manager can manage API keys",
+        )
     if getattr(agent, "agent_type", "native") != "openclaw":
         raise HTTPException(status_code=400, detail="API keys are only available for OpenClaw agents")
 

@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.config import get_settings
+from app.core.permissions import build_manageable_agents_query
 from app.core.security import encrypt_data, get_current_admin, get_current_user
 from app.database import async_session, get_db
 from app.models.org import OrgDepartment, OrgMember
@@ -814,15 +815,14 @@ async def list_approvals(
     if tid:
         tenant_agent_ids = select(Agent.id).where(Agent.tenant_id == tid)
         query = query.where(ApprovalRequest.agent_id.in_(tenant_agent_ids))
-    # Organization administrators can resolve requests for every Agent in
-    # their own tenant. Other users only see requests for Agents they created.
-    same_tenant_org_admin = current_user.role == "org_admin" and tid == (
-        str(current_user.tenant_id) if current_user.tenant_id else None
-    )
-    if not _is_platform_admin_user(current_user) and not same_tenant_org_admin:
-        query = query.where(ApprovalRequest.agent_id.in_(
-            select(Agent.id).where(Agent.creator_id == current_user.id)
-        ))
+    # Platform operators may audit the queue. Tenant users only see approvals
+    # for Agents they can manage; this keeps private assistants owner-only.
+    if not _is_platform_admin_user(current_user):
+        manageable_agent_ids = build_manageable_agents_query(
+            current_user,
+            tenant_id=current_user.tenant_id,
+        ).with_only_columns(Agent.id)
+        query = query.where(ApprovalRequest.agent_id.in_(manageable_agent_ids))
     if status_filter:
         query = query.where(ApprovalRequest.status == status_filter)
     response.headers["Cache-Control"] = "no-store"

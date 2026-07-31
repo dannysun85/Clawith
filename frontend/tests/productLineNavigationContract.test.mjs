@@ -28,6 +28,17 @@ test('navigation names communicate distinct product responsibilities', () => {
   assert.match(layout, /'Agent 员工'/);
 });
 
+test('company administration routes stay behind the company-admin boundary', () => {
+  assert.match(
+    app,
+    /path="enterprise" element={<TenantWorkspaceRoute><CompanyAdminRoute><EnterpriseSettings \/><\/CompanyAdminRoute><\/TenantWorkspaceRoute>}/,
+  );
+  assert.match(
+    app,
+    /path="invitations" element={<TenantWorkspaceRoute><CompanyAdminRoute><InvitationCodes \/><\/CompanyAdminRoute><\/TenantWorkspaceRoute>}/,
+  );
+});
+
 test('ordinary users choose business executors without provider or model controls', () => {
   assert.match(work, /executorKind/);
   assert.match(work, /personal_assistant/);

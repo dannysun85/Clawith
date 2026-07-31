@@ -347,7 +347,7 @@ export default function App() {
                     <Route path="messages" element={<TenantWorkspaceRoute><Messages /></TenantWorkspaceRoute>} />
                     <Route path="enterprise" element={<TenantWorkspaceRoute><CompanyAdminRoute><EnterpriseSettings /></CompanyAdminRoute></TenantWorkspaceRoute>} />
                     <Route path="okr" element={<TenantWorkspaceRoute><OKR /></TenantWorkspaceRoute>} />
-                    <Route path="invitations" element={<TenantWorkspaceRoute><InvitationCodes /></TenantWorkspaceRoute>} />
+                    <Route path="invitations" element={<TenantWorkspaceRoute><CompanyAdminRoute><InvitationCodes /></CompanyAdminRoute></TenantWorkspaceRoute>} />
                     <Route path="admin/platform-settings" element={<AdminCompanies />} />
                     <Route path="account" element={<SaasAdminRoute><AccountManagement /></SaasAdminRoute>} />
                     <Route path="account/subscription" element={<TenantWorkspaceRoute><SubscriptionDetail /></TenantWorkspaceRoute>} />

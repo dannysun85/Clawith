@@ -1,5 +1,7 @@
 # 产品线已知问题实施与本地验收记录
 
+> 历史快照：本文保留 2026-07-31 候选冻结前的证据，不再代表当前工作树。当前计划、修复状态和候选门禁以 `docs/product-line/06-browser-business-acceptance-matrix.md`、`07-known-issues-and-execution-baseline.md` 与 `08-remaining-work-master-plan.md` 为准。
+
 ## 0. 结论与证据边界
 
 - 日期：2026-07-31（2026-08-01 候选冻结前复核）

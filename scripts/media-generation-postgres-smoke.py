@@ -20,12 +20,23 @@ from sqlalchemy import func, select
 from app.database import async_session
 from app.models.activity_log import AgentActivityLog
 from app.models.agent import Agent
+from app.models.agent_run import AgentRun  # noqa: F401 - registers FK target metadata
+from app.models.agent_tool_execution import (  # noqa: F401 - registers FK target metadata
+    AgentToolExecution,
+)
 from app.models.audit import ChatMessage
 from app.models.chat_session import ChatSession
+from app.models.deliverable import (  # noqa: F401 - registers FK target metadata
+    DeliverableExecution,
+    DeliverableExecutionUnit,
+)
+from app.models.group import Group  # noqa: F401 - registers FK target metadata
 from app.models.llm import LLMCredential
 from app.models.media_generation import MediaGenerationTask
 from app.models.notification import Notification
+from app.models.participant import Participant  # noqa: F401 - registers FK target metadata
 from app.models.subscription import CreditBalance, CreditReservation, CreditTransaction
+from app.models.task import Task  # noqa: F401 - registers FK target metadata
 from app.models.tenant import Tenant
 from app.models.user import User
 from app.services import agent_tools, media_generation

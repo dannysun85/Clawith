@@ -3,7 +3,7 @@
 ## 0. 计划基线
 
 - 日期：2026-08-01
-- 本地基线：`35693e9321b3660eb6aedc84df320552d1a5d946`
+- 当前已提交基线：`1276da37daaa6e0bb2bb551f24943523cc08d9df`（已被后续浏览器发现失效，不可发布）
 - 分支：`main`（仅本地，未推送、未发布）
 - 事实来源：`docs/product-line/01-07`、当前代码、测试、迁移与既有本地浏览器证据
 - 总目标：把“私人助手是默认任务入口、Agent 是长期执行员工、Deliverable 是正式产物、Workspace 是工作现场”落实为可恢复、可审计、可验收的完整产品链路。
@@ -75,12 +75,12 @@
 
 | 目标 | 当前状态 | 已取得证据 | 尚未包含 |
 |---|---|---|---|
-| R1 身份、Onboarding 与角色合同 | `local_verified` | 私人助手幂等创建/重用、注册路径保持、管理员保护与服务端负向权限合同已进入全量测试；平台管理员登录后可切换租户，导航将“我的助理”和“Agent 员工”分区展示 | 生产身份提供方、生产多租户浏览器验收 |
+| R1 身份、Onboarding 与角色合同 | `worktree_browser_verified` | 新迁移只修复 onboarding 明确关联但权限不一致的私人助手，并精确保存/恢复旧 Agent policy 与 permission UUID；普通成员、`agent_admin`、公司管理员正负入口已实跑；“我的助理”和“Agent 员工”分区成立 | 新 candidate SHA 上复验、全新 tenant、生产身份提供方与生产多租户验收 |
 | R2 任务恢复与 Group 协作 | `local_verified` | Work 草稿跨页面恢复且清理成功；Group 页面保留成员/Agent、会话与 `@` 唤醒入口；Group handoff/planning/task completion 合同进入全量测试 | Docker 不可用，本机未新起真实 Agent 容器执行一轮 Group 任务 |
 | R3 产物、审批、OKR 与 Experience | `local_verified` | Work、Agent 对话、交付抽屉、OKR、团队经验库页面边界成立；旧产物 review/approval/evidence supersede 合同与来源回跳进入全量测试 | 生产通知、真实人工评审队列 |
 | R4 Provider readiness 治理 | `code_and_local_ui_verified` | SaaS 页面严格区分已配置、账号验证、生成验证、人工质量；文本路由显示 MiniMax-M3 优先，图片/视频/语音显示火山 Agent Plan 主线路，音乐仅 MiniMax；普通 Agent 页面不暴露 Key/Provider | 当前账号 receipt 仍未建立；未做任何付费生成或外部连接验证 |
 | R5 创意交付闭环 | `local_artifact_verified` | PPT/图片/视频在 Agent 消息中展示，详情在右侧抽屉；历史执行影子按已验证 Artifact 投影；PPT 可按页、视频可按镜头创建新修订且不覆盖旧版；真实存量文件 hash/size 与数据库一致 | 真实 Provider 新生成、豆包盲评、商用质量结论 |
-| R6 非付费浏览器与候选冻结 | `local_verified` | 管理员登录、租户切换、Work、私人助理、Agent 员工、Group、Dashboard、OKR、发现中心、企业设置、订阅、文本/媒体路由、Skill/Tool、PPT/图片/视频交付均已走查；本地 API 代理已固定 IPv4；反冗余检查完成，独立代码与架构审查均为 APPROVE | 普通成员与 `agent_admin` 的完整浏览器负向矩阵；本文件所在 Git commit 作为 immutable candidate SHA |
+| R6 非付费浏览器与候选冻结 | `independent_reviews_pass` | 管理员、普通成员和 `agent_admin` 的入口/授权矩阵已实跑；`/invitations` 与 `/enterprise` 均受公司管理员守卫；媒体任务 `agent_id` 已修复为 nullable + `ON DELETE SET NULL`；对象级 `manage` 已贯通审批和 OpenClaw Key；当前开发库、完整 PostgreSQL smoke、整库测试、前端构建、代码复审和架构复审均通过 | 提交并重启前后端后绑定新 SHA |
 
 本地文件证据：
 
@@ -89,9 +89,11 @@
 - PPT：PPTX 8 页、8 个媒体文件；对应 PDF 8 页；
 - 四个存量产物均重新从私有不可变快照读取，实际 `sha256` 和字节数与数据库记录一致。
 
-当前完整门禁：后端 `4074 passed`；前端 Node 合同 `96 passed`、Vitest `142 passed`；
-creative v1 合同 `87 passed`；Ruff、TypeScript/Vite build、`git diff --check` 和 Alembic 单一 head 均通过。
-PostgreSQL fresh upgrade 与 downgrade/upgrade smoke 已通过，升级前本地数据库有效备份已校验。
+本轮新鲜门禁为：后端 `4088 passed`；前端 Node 合同 `97 passed`、Vitest `142 passed`；production build
+完成 `7040` modules；creative v1 合同 `87 passed`；Agent 能力合同为 `30` 个模板、`17` 个 Skill、`140` 个 Tool；
+Ruff、`git diff --check` 与 Alembic 单一 head `media_task_agent_retention` 均通过。当前开发库精确 downgrade/upgrade、
+完整 PostgreSQL fresh/historical migration smoke、两个媒体 PostgreSQL smoke 和升级前备份校验均已通过。
+这些仍是提交前工作树证据，不能替代独立复审与新 candidate SHA 绑定复验。
 历史交付 lazy adoption 的真实浏览器验证还确认：生成 Execution/Unit 投影时保留原请求时间，
 且本轮验收曾触发的 4 条本地时间变化已按备份中的精确微秒值恢复。
 
