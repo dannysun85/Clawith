@@ -170,3 +170,6 @@ SHA 绑定复验：
 凭据不应被擅自重置，本轮没有伪造“新 SHA 上重复登录”的浏览器证据。该项保持为
 `tests_pass + prior_worktree_browser_verified`，不是 `candidate_browser_verified`。REG-01/02、断网恢复、
 真实 Provider、豆包盲评、发布与生产验证继续保持未完成。
+
+本文件所在的最终证据提交不能在自身内容中写入自己的 SHA；其精确 SHA、`/api/version` 返回值和浏览器
+页脚对照由提交后的收口记录绑定。该 release-identity 对照属于候选冻结证据，不再反写成新的提交。

@@ -38,7 +38,7 @@
 | PL-013 | P0 | 凭据写入、能力池和 Runtime 均校验 Agent Plan `plan_tier`；Small 不贡献/选择视频能力 | 当前账号真实资格仍未获授权复验；Provider submit=0 的浏览器/集成证据待补 | `code_gate_exists + external_account` |
 | PL-014 | P1 | SaaS media routes 已统一显示目标顺序、当前 Provider、主线路、正式/降级/不可用状态、建议动作与成本 | 最后一次真实 Provider 验证时间和 receipt 仍未持久展示 | `local_browser_verified_with_evidence_gap` |
 | PL-015 | P1 | 导航已分为工作、协作角色、组织；`/enterprise` 和 `/invitations` 统一受公司管理员守卫；普通成员、`agent_admin`、公司管理员矩阵已实跑；实现候选上公司管理员正向入口和 release identity 已复验 | 新候选上普通成员/`agent_admin` 再次登录 | `candidate_admin_browser_verified + prior_role_browser_verified` |
-| PL-016 | P0 | 后端 `4088 passed`；前端 Node `97 passed`、Vitest `142 passed`；production build、Ruff、creative v1 `87 passed`、能力合同、Alembic 单一 head、完整 PostgreSQL migration smoke 和两路独立复审均通过；`cc6affe7` 已提交并重启复验 | 仅剩文档证据提交后的最终 release identity 复验 | `local_candidate_verified` |
+| PL-016 | P0 | 后端 `4088 passed`；前端 Node `97 passed`、Vitest `142 passed`；production build、Ruff、creative v1 `87 passed`、能力合同、Alembic 单一 head、完整 PostgreSQL migration smoke 和两路独立复审均通过；`cc6affe7` 已提交并重启复验 | 本文件所在证据提交的精确 SHA 由提交后 API/浏览器收口记录绑定；无本地代码缺口 | `local_candidate_verified` |
 | PL-017 | P0 | 工作台已实现 preflight → confirmation fingerprint → 持久 Task；Group 等待参与者终态并聚合结果 | stale confirmation、重复提交、Group 部分失败与刷新恢复的完整门禁 | `targeted_tests_pass` |
 | PL-018 | P1 | OKR 可引用完成 Task 或带批准 Artifact 的成功 Deliverable，并保存不可变 evidence snapshot；本地 UI 已完成真实证据关联和来源回跳 | Artifact 替换、权限负向浏览器流 | `local_browser_verified` |
 | PL-019 | P0 | Agent 对象级 `manage` 已统一控制配置、审批查看/处理和 OpenClaw API Key；企业审批队列复用同一可管理对象查询，私人助手保持 owner-only；候选完整测试和定向 API 测试通过 | 新候选上 `agent_admin` 浏览器再次登录 | `candidate_tests_pass + prior_worktree_browser_verified` |

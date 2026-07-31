@@ -80,7 +80,7 @@
 | R3 产物、审批、OKR 与 Experience | `local_verified` | Work、Agent 对话、交付抽屉、OKR、团队经验库页面边界成立；旧产物 review/approval/evidence supersede 合同与来源回跳进入全量测试 | 生产通知、真实人工评审队列 |
 | R4 Provider readiness 治理 | `code_and_local_ui_verified` | SaaS 页面严格区分已配置、账号验证、生成验证、人工质量；文本路由显示 MiniMax-M3 优先，图片/视频/语音显示火山 Agent Plan 主线路，音乐仅 MiniMax；普通 Agent 页面不暴露 Key/Provider | 当前账号 receipt 仍未建立；未做任何付费生成或外部连接验证 |
 | R5 创意交付闭环 | `local_artifact_verified` | PPT/图片/视频在 Agent 消息中展示，详情在右侧抽屉；历史执行影子按已验证 Artifact 投影；PPT 可按页、视频可按镜头创建新修订且不覆盖旧版；真实存量文件 hash/size 与数据库一致 | 真实 Provider 新生成、豆包盲评、商用质量结论 |
-| R6 非付费浏览器与候选冻结 | `local_candidate_verified` | 管理员、普通成员和 `agent_admin` 的入口/授权矩阵已实跑；`/invitations` 与 `/enterprise` 均受公司管理员守卫；媒体任务 `agent_id` 已修复为 nullable + `ON DELETE SET NULL`；对象级 `manage` 已贯通审批和 OpenClaw Key；当前开发库、完整 PostgreSQL smoke、整库测试、前端构建、代码复审和架构复审均通过；`cc6affe7` 已提交并重启，API 与管理员浏览器 release identity 一致 | 最终证据提交后的 identity 复验；普通成员/`agent_admin` 因不擅自重置凭据而未在新 SHA 重复登录 |
+| R6 非付费浏览器与候选冻结 | `local_candidate_verified` | 管理员、普通成员和 `agent_admin` 的入口/授权矩阵已实跑；`/invitations` 与 `/enterprise` 均受公司管理员守卫；媒体任务 `agent_id` 已修复为 nullable + `ON DELETE SET NULL`；对象级 `manage` 已贯通审批和 OpenClaw Key；当前开发库、完整 PostgreSQL smoke、整库测试、前端构建、代码复审和架构复审均通过；`cc6affe7` 已提交并重启，API 与管理员浏览器 release identity 一致 | 最终证据提交的 SHA 由提交后收口记录绑定；普通成员/`agent_admin` 因不擅自重置凭据而未在新 SHA 重复登录 |
 
 本地文件证据：
 
