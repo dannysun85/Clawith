@@ -308,16 +308,18 @@ async def _heartbeat_tick():
                     await db.commit()
                 except HeartbeatRuntimeIntakeError as exc:
                     logger.error(
-                        "Heartbeat Runtime intake failed agent_id={} code={} error_type={}",
+                        "Heartbeat Runtime intake failed agent_id={} agent_name={} code={} error_type={}",
                         agent_id,
+                        agent_name,
                         exc.code,
                         type(exc).__name__,
                     )
                     continue
                 except Exception as exc:
                     logger.exception(
-                        "Heartbeat claim failed agent_id={} error_type={}",
+                        "Heartbeat claim failed agent_id={} agent_name={} error_type={}",
                         agent_id,
+                        agent_name,
                         type(exc).__name__,
                     )
                     continue

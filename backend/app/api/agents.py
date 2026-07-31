@@ -1,7 +1,6 @@
 """Agent (Digital Employee) API routes."""
 
 import hashlib
-import json
 import re
 import secrets
 import uuid
@@ -9,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response, status
 from loguru import logger
-from sqlalchemy import String, cast, delete, exists, func, select, text
+from sqlalchemy import String, cast, delete, exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 

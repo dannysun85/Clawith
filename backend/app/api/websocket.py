@@ -959,10 +959,6 @@ class WebSocketChatHandler:
             await self._route_openclaw(saved_content)
             return None
         if effective_llm_model is None:
-            message = (
-                f"{self.agent_name} has no enabled LLM model configured. "
-                "Select a model in Agent Settings."
-            )
             await self.websocket.send_json(
                 {
                     "type": "error",

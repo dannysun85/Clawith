@@ -36,7 +36,6 @@ from app.schemas.schemas import (
 from app.services.autonomy_service import approval_to_public_dict, autonomy_service
 from app.services.enterprise_sync import enterprise_sync_service
 from app.services.llm import get_provider_manifest, get_model_api_key, get_provider_spec, create_llm_client, LLMMessage
-from app.services.llm.finish import FINISH_TOOL_DEFINITION, find_finish_call
 from app.services.modalities import model_supports_modality
 from app.services.platform_service import platform_service
 from app.services.sso_service import sso_service

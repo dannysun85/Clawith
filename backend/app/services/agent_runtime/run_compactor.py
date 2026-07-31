@@ -37,7 +37,6 @@ from app.services.llm.single_step import LLMCompletionStep, complete_llm_once
 from app.services.llm.failover import FailoverErrorType, classify_error
 from app.services.llm.multimodal_content import (
     MultimodalContentError,
-    estimate_multimodal_tokens,
     project_multimodal_for_summary,
 )
 from app.services.llm.utils import get_max_tokens

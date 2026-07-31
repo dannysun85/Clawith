@@ -18,7 +18,6 @@ from app.models.chat_session import ChatSession
 from app.models.group import Group, GroupMember
 from app.models.llm import LLMModel
 from app.models.participant import Participant
-from app.models.tenant import Tenant
 from app.models.user import User
 from app.services.agent_runtime.adapter import (
     RuntimeAdapterError,

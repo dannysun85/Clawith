@@ -51,7 +51,6 @@ from app.services.token_tracker import (
     estimate_token_usage_from_chars,
 )
 from app.services.llm.multimodal_content import estimate_multimodal_tokens
-from app.services.llm.model_resolution import active_agent_model_candidates
 
 from .client import LLMError, llm_provider_may_have_accepted
 from .failover import (
@@ -72,7 +71,7 @@ from .utils import (
     get_provider_spec,
 )
 from .load_balancer import (
-    CredentialUnavailableReason,
+    CredentialUnavailableReason,  # noqa: F401 - compatibility export
     NoCredentialAvailable,
     no_credential_user_message,
     record_credential_call,
@@ -684,11 +683,6 @@ def _convert_messages_for_vision(
     """Convert image/video markers to multimodal format if supported, or strip them."""
     import re as _re_v
     import copy
-
-    from app.services.llm.multimodal_content import (
-        parse_multimodal_content,
-        text_only_multimodal_content,
-    )
 
     new_messages = copy.deepcopy(api_messages)
 
@@ -1652,7 +1646,6 @@ async def call_llm(
         return provider_may_have_accepted
 
     # Tool-calling loop
-    consecutive_invalid_tool_calls = 0
     for round_i in range(_max_tool_rounds):
         # Dynamic tool-call limit warning
         _warn_threshold_80 = int(_max_tool_rounds * 0.8)
@@ -1943,7 +1936,6 @@ async def call_llm(
             )
             api_messages.append(LLMMessage(role="user", content=retry_instruction))
             continue
-        consecutive_invalid_tool_calls = 0
 
         finish_call = find_finish_call(sanitized_tool_calls)
         if finish_call:
