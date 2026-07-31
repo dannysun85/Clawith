@@ -153,3 +153,20 @@ known_gaps:
 | SaaS readiness | 文本路由显示 MiniMax-M3 的优先级高于火山文本兼容路由；媒体页区分已配置、账号验证、生成验证和人工质量，并在缺少当前配置 receipt 时不宣称可用 | `local_browser_verified` | 最后一次真实 Provider 验证 receipt 的持久展示 |
 
 已覆盖页面包括工作台、公司概览、OKR、发现中心、Groups、企业设置、邀请、订阅、平台运营、SaaS 模型路由与媒体路由。测试中临时创建的 `agent_admin` 授权 Agent 和权限行已删除，测试成员角色已恢复为 `member`。REG-01/02、运行中断网恢复、跨租户 API IDOR 专项、Provider 真实调用、豆包 Benchmark、发布和生产验收仍保持未完成，不能从本记录外推。
+
+## 10. `cc6affe7` 实现候选复验
+
+本轮实现已固化为本地提交 `cc6affe7aa1ad35f5bc1e4be0ab4a7247067b248`。在前后端重启后，
+`/api/version` 返回 `cc6affe7`，浏览器页面页脚也显示同一 release identity。管理员身份完成了以下
+SHA 绑定复验：
+
+- `/work` 可打开，导航分别显示一个“我的助理”和“Agent 员工”分区；
+- `/invitations` 与 `/enterprise` 在公司管理员身份下可进入，`/admin/saas` 在平台管理员身份下可进入；
+- 从工作台打开正式交付抽屉，可以看到 PPTX/PDF Artifact 下载入口；
+- 交付状态和操作位于 Agent 消息与右侧工作现场，composer 中不存在“文件已生成，等待质量检查”完成面板。
+
+普通成员与 `agent_admin` 的负向浏览器矩阵是在同一实现工作树提交前完成；提交后未修改相关实现，且
+候选上的完整后端 `4088 passed` 和对象级授权定向测试仍覆盖这些拒绝路径。由于现有普通成员测试账号的
+凭据不应被擅自重置，本轮没有伪造“新 SHA 上重复登录”的浏览器证据。该项保持为
+`tests_pass + prior_worktree_browser_verified`，不是 `candidate_browser_verified`。REG-01/02、断网恢复、
+真实 Provider、豆包盲评、发布与生产验证继续保持未完成。

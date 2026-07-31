@@ -3,7 +3,7 @@
 ## 0. 计划基线
 
 - 日期：2026-08-01
-- 当前已提交基线：`1276da37daaa6e0bb2bb551f24943523cc08d9df`（已被后续浏览器发现失效，不可发布）
+- 当前实现候选：`cc6affe7aa1ad35f5bc1e4be0ab4a7247067b248`（本地已验证；本文件随最终证据提交固化）
 - 分支：`main`（仅本地，未推送、未发布）
 - 事实来源：`docs/product-line/01-07`、当前代码、测试、迁移与既有本地浏览器证据
 - 总目标：把“私人助手是默认任务入口、Agent 是长期执行员工、Deliverable 是正式产物、Workspace 是工作现场”落实为可恢复、可审计、可验收的完整产品链路。
@@ -75,12 +75,12 @@
 
 | 目标 | 当前状态 | 已取得证据 | 尚未包含 |
 |---|---|---|---|
-| R1 身份、Onboarding 与角色合同 | `worktree_browser_verified` | 新迁移只修复 onboarding 明确关联但权限不一致的私人助手，并精确保存/恢复旧 Agent policy 与 permission UUID；普通成员、`agent_admin`、公司管理员正负入口已实跑；“我的助理”和“Agent 员工”分区成立 | 新 candidate SHA 上复验、全新 tenant、生产身份提供方与生产多租户验收 |
+| R1 身份、Onboarding 与角色合同 | `candidate_admin_browser_verified + tests_pass` | 新迁移只修复 onboarding 明确关联但权限不一致的私人助手，并精确保存/恢复旧 Agent policy 与 permission UUID；普通成员、`agent_admin`、公司管理员正负入口已实跑；实现候选上“我的助理”和“Agent 员工”分区、管理员正向入口及 release identity 已复验 | 全新 tenant、普通成员/`agent_admin` 在最终候选上的再次登录、生产身份提供方与生产多租户验收 |
 | R2 任务恢复与 Group 协作 | `local_verified` | Work 草稿跨页面恢复且清理成功；Group 页面保留成员/Agent、会话与 `@` 唤醒入口；Group handoff/planning/task completion 合同进入全量测试 | Docker 不可用，本机未新起真实 Agent 容器执行一轮 Group 任务 |
 | R3 产物、审批、OKR 与 Experience | `local_verified` | Work、Agent 对话、交付抽屉、OKR、团队经验库页面边界成立；旧产物 review/approval/evidence supersede 合同与来源回跳进入全量测试 | 生产通知、真实人工评审队列 |
 | R4 Provider readiness 治理 | `code_and_local_ui_verified` | SaaS 页面严格区分已配置、账号验证、生成验证、人工质量；文本路由显示 MiniMax-M3 优先，图片/视频/语音显示火山 Agent Plan 主线路，音乐仅 MiniMax；普通 Agent 页面不暴露 Key/Provider | 当前账号 receipt 仍未建立；未做任何付费生成或外部连接验证 |
 | R5 创意交付闭环 | `local_artifact_verified` | PPT/图片/视频在 Agent 消息中展示，详情在右侧抽屉；历史执行影子按已验证 Artifact 投影；PPT 可按页、视频可按镜头创建新修订且不覆盖旧版；真实存量文件 hash/size 与数据库一致 | 真实 Provider 新生成、豆包盲评、商用质量结论 |
-| R6 非付费浏览器与候选冻结 | `independent_reviews_pass` | 管理员、普通成员和 `agent_admin` 的入口/授权矩阵已实跑；`/invitations` 与 `/enterprise` 均受公司管理员守卫；媒体任务 `agent_id` 已修复为 nullable + `ON DELETE SET NULL`；对象级 `manage` 已贯通审批和 OpenClaw Key；当前开发库、完整 PostgreSQL smoke、整库测试、前端构建、代码复审和架构复审均通过 | 提交并重启前后端后绑定新 SHA |
+| R6 非付费浏览器与候选冻结 | `local_candidate_verified` | 管理员、普通成员和 `agent_admin` 的入口/授权矩阵已实跑；`/invitations` 与 `/enterprise` 均受公司管理员守卫；媒体任务 `agent_id` 已修复为 nullable + `ON DELETE SET NULL`；对象级 `manage` 已贯通审批和 OpenClaw Key；当前开发库、完整 PostgreSQL smoke、整库测试、前端构建、代码复审和架构复审均通过；`cc6affe7` 已提交并重启，API 与管理员浏览器 release identity 一致 | 最终证据提交后的 identity 复验；普通成员/`agent_admin` 因不擅自重置凭据而未在新 SHA 重复登录 |
 
 本地文件证据：
 
@@ -93,7 +93,10 @@
 完成 `7040` modules；creative v1 合同 `87 passed`；Agent 能力合同为 `30` 个模板、`17` 个 Skill、`140` 个 Tool；
 Ruff、`git diff --check` 与 Alembic 单一 head `media_task_agent_retention` 均通过。当前开发库精确 downgrade/upgrade、
 完整 PostgreSQL fresh/historical migration smoke、两个媒体 PostgreSQL smoke 和升级前备份校验均已通过。
-这些仍是提交前工作树证据，不能替代独立复审与新 candidate SHA 绑定复验。
+自动化门禁、数据库 smoke 和多角色浏览器矩阵最初在提交前工作树完成；实现候选 `cc6affe7` 与该工作树
+内容一致，独立复审、提交后重启、API version 和管理员浏览器 identity 已补齐。普通成员与 `agent_admin`
+的提交后重复登录没有执行，因此只能引用候选自动化拒绝路径和同实现工作树浏览器证据，不能写成
+“最终候选多角色浏览器全部通过”。
 历史交付 lazy adoption 的真实浏览器验证还确认：生成 Execution/Unit 投影时保留原请求时间，
 且本轮验收曾触发的 4 条本地时间变化已按备份中的精确微秒值恢复。
 
