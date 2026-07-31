@@ -3,9 +3,9 @@
 ## Source of truth
 
 - Status: Active
-- Last refreshed: 2026-07-28
+- Last refreshed: 2026-07-31
 - Primary product surfaces: Workbench, personal assistant, Agent direct chat, Group collaboration, deliverable brief drawer, deliverable run timeline, Workspace artifact preview, Enterprise Settings, SaaS Admin.
-- Evidence reviewed: `frontend/src/index.css`, `frontend/src/styles/atlas.css`, `frontend/src/pages/Layout.tsx`, `frontend/src/pages/Onboarding.tsx`, `frontend/src/pages/agent-detail/AgentDetailPage.tsx`, `frontend/src/components/AgentSidePanel.tsx`, `frontend/src/components/WorkspaceOperationPanel.tsx`, `frontend/src/components/deliverables/DeliverableWorkbench.tsx`, `frontend/src/pages/enterprise-settings/tabs/SkillsTab.tsx`, `backend/app/api/onboarding.py`, `backend/app/api/tasks.py`, `backend/app/models/agent.py`, `backend/app/models/onboarding.py`, `backend/app/services/deliverable_workflows.py`, `backend/app/services/tool_capability_policy.py`, `backend/app/services/tool_visibility.py`, `backend/app/services/skill_scope.py`, `backend/agent_templates/private-assistant/`, `backend/agent_template/skills/brand-safe-media/SKILL.md`, `.omx/plans/2026-07-24-image-video-ppt-provider-evaluation-plan.md`, the supplied WorkBuddy entry screenshot, and the previously reviewed feature-entry references.
+- Evidence reviewed: `frontend/src/App.tsx`, `frontend/src/index.css`, `frontend/src/styles/atlas.css`, `frontend/src/pages/Layout.tsx`, `frontend/src/pages/Onboarding.tsx`, `frontend/src/pages/agent-detail/AgentDetailPage.tsx`, `frontend/src/components/AgentSidePanel.tsx`, `frontend/src/components/WorkspaceOperationPanel.tsx`, `frontend/src/components/deliverables/DeliverableWorkbench.tsx`, `frontend/src/pages/enterprise-settings/tabs/SkillsTab.tsx`, `backend/app/api/onboarding.py`, `backend/app/api/tasks.py`, `backend/app/models/agent.py`, `backend/app/models/onboarding.py`, `backend/app/models/task.py`, `backend/app/models/group.py`, `backend/app/models/deliverable.py`, `backend/app/models/okr.py`, `backend/app/models/experience.py`, `backend/app/models/subscription.py`, `backend/app/services/deliverable_workflows.py`, `backend/app/services/tool_capability_policy.py`, `backend/app/services/tool_visibility.py`, `backend/app/services/skill_scope.py`, `backend/agent_templates/private-assistant/`, `backend/agent_template/skills/brand-safe-media/SKILL.md`, `docs/multimodal-product-flow-ledger.md`, `docs/agent-roster/organization-roster-business-prd-v2.md`, `.omx/plans/2026-07-24-image-video-ppt-provider-evaluation-plan.md`, the supplied WorkBuddy entry screenshot, and the previously reviewed feature-entry references.
 - Authority: this file governs product/UI decisions. Runtime, security, billing, and data-model facts remain governed by `SKILL.md`, code, migrations, and tests.
 
 ## Brand
@@ -19,6 +19,129 @@
 - Goals: let a user start from natural language or a structured brief; turn PPT, poster, video, report, and spreadsheet requests into durable, inspectable work; reuse Agent/Group Runtime, Skills, Workspace, Credits, and monitoring; make advanced configuration progressive rather than mandatory.
 - Non-goals: a full PowerPoint editor in the first release; a node-based workflow builder for ordinary users; direct provider/model selection; a second task scheduler; automatic provider submission before a user confirms the brief.
 - Success signals: users can discover the right work type without knowing tool names; a request survives refresh/reconnect; tenant boundaries remain intact; repeated actions are idempotent; every launched request links to one durable run; artifacts and approval decisions are traceable.
+
+## Current-state baseline
+
+This section records current implementation facts. Everything labelled `target` later in this file is a product decision for the next line and must not be reported as already shipped.
+
+- The production release identity is `v1.11.9`. The repository root still redirects to `/dashboard`; `frontend/src/App.tsx` has no `/work` route or `WorkbenchPage`.
+- Onboarding already provisions one private Assistant Agent and records it on `UserTenantOnboarding`, but the completed flow redirects directly into that Agent's chat.
+- `Layout.tsx` currently renders the private assistant in the same searchable `智能体` list as company digital employees; the company tour explicitly describes that mixed placement.
+- Agent chat, Agent-scoped tasks, Groups, OKR, Plaza/Experience, Enterprise Settings, subscription/Credits, Workspace artifacts, deliverable requests, quality reviews, and SaaS Admin already exist as separate runtime or management surfaces.
+- Creative delivery now has provider-neutral image/audio/video routing controls, registered presentation/voiceover Skills, durable deliverable state, artifact preview/download, three-reviewer quality state, and creator delivery confirmation in the local `main` candidate. This proves the product state machine and local interaction path, not independent commercial-quality acceptance or a production release.
+- The product problem is therefore not a missing collection of menu items. It is the lack of one user-facing work lifecycle connecting intent, responsible worker, execution, review, delivery, reuse, and organization governance.
+
+## Product-line system map
+
+The next product line is organized into seven layers. Each layer has one primary responsibility; a layer may read linked state from another layer but must not duplicate its authority.
+
+| Layer | User-facing responsibility | Owns | Must not become |
+|---|---|---|---|
+| Workbench | Start, resume, and find work | intent capture, work-template selection, cross-runtime work index | another Agent, scheduler, provider console, or file store |
+| My Assistant | Private coordination for one user in one tenant | personal context, follow-ups, drafts, lightweight delegation | the company employee roster or an all-powerful expert |
+| Digital Employees | Persistent named business responsibility | role memory, granted Skills/Tools, triggers, channels, KPI, escalation | a flat collection of generic chatbots |
+| Collaboration | Multi-party visible work | Group membership, shared sessions, handoffs, approvals | a duplicate company directory or hidden A2A graph |
+| Work and Deliverables | Durable execution result | run linkage, request stages, artifacts, versions, review, approval, delivery | content embedded only in chat or composer-local state |
+| Organization Governance | Configure who and what the company can use | members, employee visibility/management, templates, entitlements, credentials, policies | an ordinary-member work entry |
+| Platform Operations | Operate the SaaS safely | provider accounts, routes, plans, Credits policy, health, audit and release evidence | a tenant-facing model playground |
+
+Product entry names follow these boundaries:
+
+- `工作台` is the default task entry and cross-runtime work index.
+- `我的助理` is one private, persistent coordination relationship per `(tenant, user)`.
+- `数字员工` is the company/private/custom roster of persistent business roles.
+- `Groups` is visible collaboration; it is not a substitute for selecting one accountable executor.
+- `工作与交付` is the result lifecycle surfaced from Workbench, Agent chat, Group sessions, and Workspace rather than a disconnected file gallery.
+- `企业设置` and `SaaS 管理` remain role-gated control planes.
+
+## Core product objects and authority
+
+These are product objects, not a proposal to rename every existing database model. Existing models remain the implementation source of truth.
+
+| Product object | Authoritative responsibility | Primary owner | Primary entry/consumer |
+|---|---|---|---|
+| Tenant | company boundary, plan, policy, branding | company administrator | all tenant surfaces |
+| User identity and membership | person, tenant membership, role, onboarding state | user plus company administrator | Workbench, My Assistant, Enterprise Settings |
+| Personal-assistant slot | idempotent link from one user in one tenant to one private Agent | current user | `我的助理`, onboarding |
+| Agent | persistent worker identity, role, memory and granted capabilities | creator/authorized manager | digital-employee roster, direct chat |
+| Task and Run | durable execution intent and runtime progress | selected Agent or Group runtime | Workbench index, chat/session timeline |
+| Deliverable request | structured output contract and stage machine | producing Agent plus requester | chat result card, detail drawer |
+| Artifact and revision | generated file, preview, version and integrity metadata | deliverable request | Workspace and delivery detail |
+| Quality review and approval | independent evidence, reviewer decisions and delivery readiness | assigned reviewers and creator/manager | reviewer flow and delivery detail |
+| Group and Group Run | shared membership, collaboration context and visible execution | group members/manager | Groups |
+| Skill, Tool and credential grant | know-how, executable authority and secret scope | company administrator/platform policy | Agent configuration and runtime preflight |
+| Route and provider account | platform-owned modality routing and readiness | SaaS operator | runtime only; summarized to tenant users |
+| OKR | objectives, key results and progress evidence | company roles defined by OKR policy | OKR surface; linked work may provide evidence |
+| Experience/Plaza entry | discoverable reusable Agent or company experience | publisher plus moderation policy | Plaza |
+| Subscription, entitlement and Credits | allowed capability, quota, reservation and settlement | tenant billing owner/platform | preflight, account subscription, SaaS Admin |
+| Audit and operational receipt | immutable explanation of sensitive or paid actions | platform and authorized administrators | progressive disclosure and operations |
+
+Authority rules:
+
+- Chat messages describe work; they do not replace `Task`, Run, Deliverable, Artifact, review, Credits, or approval state.
+- A Skill supplies procedure, a Tool supplies executable capability, a grant supplies authority, and a provider route supplies infrastructure. None implies the others.
+- The Workbench aggregates stable identifiers and links. It never copies mutable runtime state into a second client-owned workflow.
+- Files remain owned by Workspace/storage and linked by Artifact records. They are not reconstructed from chat text.
+- OKR may consume approved work evidence, but OKR state must not be inferred from an Agent claiming success.
+
+## Primary business lifecycle
+
+The common lifecycle across research, documents, media, automation, and collaboration is:
+
+`提出意图 → 识别工作类型 → 选择责任主体 → 能力/权限/费用预检 → 用户确认 → 持久化任务/请求 → 分阶段执行 → 检查与修订 → 批准/确认交付 → 归档与复用`
+
+Lifecycle rules:
+
+1. `提出意图`: a user may start in Workbench, My Assistant, an Agent chat, or a Group. The origin is preserved.
+2. `识别工作类型`: the platform resolves a registered work contract; ordinary users do not choose a Skill, Tool, provider, or model.
+3. `选择责任主体`: personal coordination stays with My Assistant; one-off specialist work uses a task-scoped expert; durable responsibility uses a digital employee; multi-party work uses a Group.
+4. `预检`: tenant scope, grants, entitlement, provider readiness, Credits, autonomy, approval points, expected output, and degradation are resolved before paid or external execution.
+5. `确认`: the user confirms material cost, external writes, publishing, or changed quality/format. Confirmation creates or advances durable backend state.
+6. `执行`: the selected runtime owns progress. Long-running provider acceptance enters reconciliation; it must not silently issue a second paid request.
+7. `检查与修订`: automated checks and independent human review are different evidence. A failed page, shot, or artifact revision retries at the smallest safe unit.
+8. `交付`: the producing Agent or Group reports the result in its timeline; the right-side detail surface owns review and delivery controls; the composer never displays completed work.
+9. `归档与复用`: approved artifacts remain in Workspace; a successful contract may become a private shortcut or administrator-published company template without exposing internal Skills or provider configuration.
+
+Every work item must retain deep links to its origin, responsible worker, runtime session, durable result, approval state, and artifact. Workbench filters are views over those facts, not new execution records.
+
+## Entry and ownership matrix
+
+| Entry | Ordinary member | Agent manager | Company administrator | SaaS operator |
+|---|---|---|---|---|
+| Workbench | create/resume authorized work | same, including managed employees | publish company templates and inspect tenant-wide policy state | no tenant work impersonation |
+| My Assistant | use and configure own assistant preferences | no access to another user's assistant | no content access by default; policy/audit only where authorized | infrastructure health only |
+| Digital Employees | use visible employees | configure explicitly managed employees | manage tenant roster, grants and lifecycle | platform policy only |
+| Groups | join/use authorized groups | manage owned groups | company policy and membership administration | no ordinary participation |
+| Work and Deliverables | view own/authorized results, review when assigned | revise/approve managed work | tenant-wide governance where policy permits | operational receipts, not business approval |
+| OKR and Plaza | use according to their existing permissions | publish/link according to policy | configure tenant policy and moderation | global moderation/operations where applicable |
+| Enterprise Settings | no access except explicitly delegated areas | scoped Agent management | members, templates, credentials, policies, subscription | no business-content ownership |
+| SaaS Admin | none | none | tenant-facing subscription/account summary only | providers, routes, plans, health, release and audit |
+
+## Next-version boundary and migration
+
+Release boundaries must remain explicit:
+
+- `v1.11.9` is the current production release.
+- The provider-neutral creative-delivery work after `v1.11.9` is a local clean candidate. It needs an immutable release preflight, production configuration parity check, authorized deployment, release-identity verification, and fresh browser business flow before it can be called released.
+- The product-line restructuring is the proposed `v1.12.0` scope. It must not be mixed into a patch release merely because both are present on local `main`.
+
+Recommended implementation sequence:
+
+1. **Stabilize the creative candidate**: publish only after release authorization and prove actual production routes, Credits settlement, artifacts, review, and delivery with the deployed release identity.
+2. **Separate identities in navigation**: expose `我的助理` independently from `数字员工`; preserve all existing Agent IDs, chats, permissions, and deep links.
+3. **Add the Workbench read model and `/work` route**: aggregate existing Tasks, Runs, Deliverables, approvals, and artifacts; keep `/dashboard` as company overview and retain old entry routes.
+4. **Register work contracts and templates**: surface task outcomes, required inputs, executor policy, approvals, entitlement and cost; keep provider and raw Skill/Tool selection out of ordinary-user flows.
+5. **Unify result discovery**: add `等待我处理`, `进行中`, `最近完成`, and reusable shortcuts without moving authoritative state out of the existing runtimes.
+6. **Complete organization governance**: define roster/visibility, template publishing, reviewer eligibility, role permissions, and external organization mapping only after current Agent access semantics are reconciled with the retained roster PRD.
+
+No-flow-break guards:
+
+- Existing `/agents/:id/*`, `/groups/*`, `/quality-reviews/:reviewId`, `/okr`, `/plaza`, `/enterprise`, Workspace artifact URLs, and session identifiers remain valid.
+- Do not migrate or merge personal-assistant content into a company employee; only change presentation and routing.
+- Root/default-route changes are feature-gated and reversible; onboarding failure to provision an assistant cannot block Workbench access.
+- Provider selection, grants, entitlement, approval and Credits settlement stay server-owned.
+- Old direct media shortcuts remain as `快速生成` until registered workflows pass feature parity and production evidence.
+- Each slice requires tenant-isolation, permission, idempotency, state-transition, TypeScript/build, desktop, narrow-viewport, and fresh browser business-flow evidence.
 
 ## Personas and jobs
 
