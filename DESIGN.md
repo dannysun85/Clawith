@@ -8,6 +8,24 @@
 - Evidence reviewed: `frontend/src/App.tsx`, `frontend/src/index.css`, `frontend/src/styles/atlas.css`, `frontend/src/pages/Layout.tsx`, `frontend/src/pages/Onboarding.tsx`, `frontend/src/pages/agent-detail/AgentDetailPage.tsx`, `frontend/src/components/AgentSidePanel.tsx`, `frontend/src/components/WorkspaceOperationPanel.tsx`, `frontend/src/components/deliverables/DeliverableWorkbench.tsx`, `frontend/src/pages/enterprise-settings/tabs/SkillsTab.tsx`, `backend/app/api/onboarding.py`, `backend/app/api/tasks.py`, `backend/app/models/agent.py`, `backend/app/models/onboarding.py`, `backend/app/models/task.py`, `backend/app/models/group.py`, `backend/app/models/deliverable.py`, `backend/app/models/okr.py`, `backend/app/models/experience.py`, `backend/app/models/subscription.py`, `backend/app/services/deliverable_workflows.py`, `backend/app/services/tool_capability_policy.py`, `backend/app/services/tool_visibility.py`, `backend/app/services/skill_scope.py`, `backend/agent_templates/private-assistant/`, `backend/agent_template/skills/brand-safe-media/SKILL.md`, `docs/multimodal-product-flow-ledger.md`, `docs/agent-roster/organization-roster-business-prd-v2.md`, `.omx/plans/2026-07-24-image-video-ppt-provider-evaluation-plan.md`, the supplied WorkBuddy entry screenshot, and the previously reviewed feature-entry references.
 - Authority: this file governs product/UI decisions. Runtime, security, billing, and data-model facts remain governed by `SKILL.md`, code, migrations, and tests.
 
+### Product-line fact documents
+
+The following six documents turn this design direction into auditable current-state and target-state contracts. They must be reviewed before navigation or work-entry implementation changes:
+
+1. [`docs/product-line/01-product-role-system.md`](docs/product-line/01-product-role-system.md)
+2. [`docs/product-line/02-product-entry-system.md`](docs/product-line/02-product-entry-system.md)
+3. [`docs/product-line/03-core-objects-and-state-machine.md`](docs/product-line/03-core-objects-and-state-machine.md)
+4. [`docs/product-line/04-navigation-and-page-ownership.md`](docs/product-line/04-navigation-and-page-ownership.md)
+5. [`docs/product-line/05-capability-governance-and-provider-policy.md`](docs/product-line/05-capability-governance-and-provider-policy.md)
+6. [`docs/product-line/06-browser-business-acceptance-matrix.md`](docs/product-line/06-browser-business-acceptance-matrix.md)
+
+The four non-negotiable product boundaries are:
+
+- `我的助理` is the private coordination relationship and default personal dispatcher.
+- `数字员工` are persistent accountable executors; one-off work uses a task-scoped expert.
+- `Deliverable` is the formal result contract with Artifact, review, approval, and delivery evidence.
+- `Workspace` is the work site for sources, drafts, intermediate files, and revisions; it is not the delivery authority.
+
 ## Brand
 
 - Personality: calm, capable, enterprise-grade, and collaborative. Astra should feel like a dependable digital-employee workspace rather than a model playground.
@@ -212,6 +230,19 @@ No-flow-break guards:
   - `unavailable`: preserve the brief and create useful planning/source artifacts, but never claim that the requested media was generated.
 - Provider routing is platform-owned. Equivalent healthy routes may replace a provider only before dispatch or after an explicit rejection. `acceptance_unknown` enters reconciliation and must not trigger a second paid generation.
 - Every capability produces inspectable intermediate state and a final Artifact. Partial failure retries the smallest failed page, shot, candidate, or conversion stage.
+
+### Target provider policy for the next implementation phase
+
+This is a target decision, not a claim about the currently deployed route:
+
+- text reasoning and writing: `MiniMax-M3` primary; a compatible Volcengine text route may be fallback;
+- image/poster: Volcengine Seedream primary; MiniMax is degraded/emergency rather than silently equivalent;
+- video: Volcengine Seedance primary once the Agent Plan entitlement is Medium or higher and behaviorally verified; the current Small account does not make Volcengine video available;
+- speech/TTS: Volcengine primary, MiniMax fallback when voice identity remains compatible;
+- music: MiniMax only;
+- PPT: provider-neutral workflow using M3 for planning, the image policy for visuals, and deterministic PPTX/PDF generation and QA.
+
+Current code still seeds Agent Plan text routes above the non-Agent-Plan fallback. Changing the text primary therefore requires a real route migration, integrity tests, control-plane verification, and fresh runtime evidence; UI copy alone is insufficient.
 
 ## Creative quality contracts
 
