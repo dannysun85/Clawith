@@ -229,11 +229,12 @@ async def _heartbeat_tick():
 
             triggered = 0
             for agent in agents:
-                # Capture diagnostic identity before a nested transaction can
-                # roll back and expire ORM attributes. Exception handlers must
-                # never lazy-load from an expired async ORM instance.
+                # Force-load identity fields before a nested transaction can
+                # roll back and expire ORM attributes. Exception handlers log
+                # only the stable ID so user-controlled names never enter
+                # operational logs.
                 agent_id = agent.id
-                agent_name = agent.name
+                _agent_name = agent.name
                 # Skip expired agents
                 if agent.is_expired:
                     continue
@@ -308,18 +309,16 @@ async def _heartbeat_tick():
                     await db.commit()
                 except HeartbeatRuntimeIntakeError as exc:
                     logger.error(
-                        "Heartbeat Runtime intake failed agent_id={} agent_name={} code={} error_type={}",
+                        "Heartbeat Runtime intake failed agent_id={} code={} error_type={}",
                         agent_id,
-                        agent_name,
                         exc.code,
                         type(exc).__name__,
                     )
                     continue
                 except Exception as exc:
                     logger.exception(
-                        "Heartbeat claim failed agent_id={} agent_name={} error_type={}",
+                        "Heartbeat claim failed agent_id={} error_type={}",
                         agent_id,
-                        agent_name,
                         type(exc).__name__,
                     )
                     continue
