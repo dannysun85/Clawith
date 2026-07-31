@@ -2329,6 +2329,12 @@ export default function AgentDetailPage() {
         () => new URLSearchParams(location.search).get('session_id') || '',
         [location.search],
     );
+    const requestedTaskId = useMemo(() => {
+        const value = new URLSearchParams(location.search).get('task_id') || '';
+        return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
+            ? value
+            : '';
+    }, [location.search]);
     const requestedWorkspacePath = useMemo(
         () => safeWorkspaceMediaPath(
             new URLSearchParams(location.search).get('workspace_path'),
@@ -8325,6 +8331,7 @@ export default function AgentDetailPage() {
                                                         <DeliverableLauncher
                                                             agentId={id!}
                                                             sessionId={activeSession?.id ? String(activeSession.id) : undefined}
+                                                            taskId={requestedTaskId || undefined}
                                                             tier={effectiveChatTier || 'lite'}
                                                             attachments={attachedFiles.map((file) => ({ name: file.name, path: file.path }))}
                                                             disabled={chatInputDisabled || !wsConnected || !effectiveChatTier || isWaiting || isStreaming || (agent as any)?.agent_type === 'openclaw'}

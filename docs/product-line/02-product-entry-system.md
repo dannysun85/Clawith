@@ -1,22 +1,22 @@
 # 产品入口体系事实基线
 
-- 状态：`active-design-baseline`
-- 日期：2026-07-31
+- 状态：`implementation-candidate`
+- 日期：2026-08-01
 - 核心决策：任务优先，员工其次；普通用户从业务结果进入，平台内部完成能力与执行者路由
 
 ## 1. 当前入口事实
 
 | 当前入口 | 代码事实 | 当前主要职责 | 问题 |
 |---|---|---|---|
-| `/` | `App.tsx` 重定向到 `/dashboard` | 公司概况 | 不是用户“今天要完成什么”的入口 |
-| Onboarding | 创建私人助手后进入 `/plaza?tour=company...`，导览结束进入助手聊天 | 注册、创建助手、公司导览 | 首次任务被导航导览打断；助手与员工混淆 |
-| Dashboard | 展示 Agent、活动、Token/任务概况和新增 Agent | 运营概览 | 同时承担员工管理入口，和工作入口重叠 |
-| Plaza | 路径仍为 `/plaza`，实际是团队/我的 Experience Library | 经验沉淀 | 名称仍像社交广场；员工发现另藏在 Talent Market 弹窗 |
-| Groups | 群组树、会话、消息、成员、群 Workspace | 可见多人协作 | 与 Agent A2A、公司目录和任务责任人边界不够直观 |
-| Agent chat | 对话、Task、媒体快捷入口、Deliverable、Workspace | 指定员工执行现场 | 承载过多入口和设置；必须先知道找哪个 Agent |
+| `/` 与 `/work` | `App.tsx` 的租户根路径进入 `/work` | 默认任务入口与跨运行时工作索引 | 本地代码已实现；仍需真实浏览器覆盖首次任务、刷新和回退 |
+| Onboarding | 创建/恢复私人协调者后进入 `/work` | 注册、创建私人助手、进入首个任务 | 创建故障恢复与全新公司流程仍需浏览器验证 |
+| Dashboard | 使用服务端 Work index 展示长期员工、运营活动和任务概况 | 公司运营概览 | 已不再是默认入口；仍保留创建员工辅助动作 |
+| Plaza | `/plaza` 明确显示团队经验库/我的经验，并保留员工市场入口 | 经验沉淀与员工发现 | 路径名保持兼容；Experience 与招聘数据模型仍分离 |
+| Groups | 群组树、会话、消息、成员、群 Workspace；工作台可发起关联 Group Task | 可见多人协作 | 真实执行已关联，但交接/失败/审批体验待浏览器验证 |
+| Agent chat | 对话、专业执行、媒体快捷入口、Deliverable、Workspace | 指定员工执行现场 | 保留专业直达入口，不再要求用户必须先找到 Agent 才能开始 |
 | Enterprise | 成员、组织、Tools、Skills、审批、审计、订阅等 | 公司控制面 | 内容庞大，部分平台控制面已开始跳转 SaaS Admin |
 | Subscription | `/account/subscription` + Enterprise Subscription | 用量、账单、升级 | 两个表面存在职责重叠 |
-| Deliverable | Agent chat 内工作说明、结果卡和右侧详情 | 正式交付 | 不是独立可发现入口，也没有跨 Agent 结果索引 |
+| Deliverable | Agent chat 内工作说明、结果卡和右侧详情；工作台聚合并深链 | 正式交付 | 不做孤立文件库；正式媒体仍执行独立 preflight/审批 |
 
 ## 2. 目标入口定义
 
@@ -76,7 +76,7 @@
 - `经验库`：已审核发布、可供人和 Agent 复用的公司经验；
 - `员工市场`：发现公司模板、内置角色和可招聘数字员工。
 
-当前 `/plaza` 只实现经验库，员工发现仍是 `TalentMarketModal`。第一阶段可保留路径和弹窗，但必须在信息架构上给出统一入口，不能继续让两个“发现”概念分散。
+当前 `/plaza` 已把页面标题收敛为团队经验库，并通过发现中心保留 `TalentMarketModal` 员工市场入口。两者共享发现入口但不共享数据模型：发布 Experience 不会创建 Agent，招聘员工也不会自动发布经验。
 
 ## 3. 目标任务路径
 
@@ -112,24 +112,27 @@
 
 该观察不能被夸大为 WorkBuddy 已证明完整商业交付；先前测试没有形成可独立验收的最终交付物。Astra 的差异化应是把任务优先入口与现有企业 Agent、Group、权限、Credits、Workspace 和可审计交付结合起来，而不是复制一个通用聊天首页。
 
-## 6. 导航层级目标
+## 6. 当前导航层级
 
 ```text
 工作
   工作台
+  协作群组
+
+协作角色
   我的助理
-  Groups
+  Agent 员工
 
 组织
-  数字员工
-  仪表盘
+  公司概览
   OKR
-  广场（经验库 / 员工市场）
+  发现中心（经验库 / 员工市场）
+  企业设置（管理员）
 
 治理（按角色显示）
-  企业设置
   套餐与用量
-  SaaS 管理
+  平台运营
+  SaaS 能力治理
 ```
 
 Deliverable 和 Workspace 不需要成为与工作台同级的孤立一级菜单：
@@ -139,14 +142,14 @@ Deliverable 和 Workspace 不需要成为与工作台同级的孤立一级菜单
 - Deliverable 详情提供正式交付；
 - Workspace 提供文件和中间过程。
 
-## 7. 无破坏迁移顺序
+## 7. 无破坏迁移状态
 
-1. 先分离导航中的“我的助理”和“数字员工”，不改任何 Agent ID 或路由。
-2. 新增只读 `/work` 聚合页，读取现有 Task、Run、Deliverable、Approval 和 Artifact。
-3. Onboarding 完成后默认进入 `/work`；助手创建失败时仍允许进入工作台并显示可恢复状态。
-4. 保留 `/dashboard`、`/plaza`、`/agents/:id/*`、`/groups/*` 和现有深链。
-5. 把 Talent Market 作为广场“员工市场”分区复用，而不是重写招聘流程。
-6. 只有在新工作流证明功能等价后，才把聊天中的图片/视频/音乐快捷键归入“快速生成”。
+1. 已分离导航中的“我的助理”和 `Agent 员工`，没有改写任何 Agent ID 或旧路由。
+2. 已新增 `/work` 服务端读模型和页面，聚合 Task、Run、Deliverable、Approval 与 Artifact；Dashboard 也消费同一 Work index。
+3. Onboarding 完成或恢复后已默认进入 `/work`；创建失败仍保留错误与重试，不会假装成功。
+4. `/dashboard`、`/plaza`、`/agents/:id/*`、`/groups/*` 和既有深链继续保留。
+5. Talent Market 已作为发现中心里的员工市场复用，没有重写招聘流程。
+6. 图片/视频/PPT 正式交付仍与聊天快捷生成分层；在完整浏览器和 Provider 门禁通过前不删除旧入口。
 
 ## 8. 完成标准
 

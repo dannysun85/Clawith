@@ -23,12 +23,15 @@ def test_revision_ids_fit_the_default_alembic_version_column() -> None:
 
 
 def test_release_migration_graph_has_one_expected_head() -> None:
-    assert _script_directory().get_heads() == ["backfill_private_assistant"]
+    assert _script_directory().get_heads() == ["okr_evidence_links"]
 
 
 def test_release_head_preserves_both_upgrade_lineages() -> None:
     script = _script_directory()
-    release_head = script.get_revision("backfill_private_assistant")
+    release_head = script.get_revision("okr_evidence_links")
+    evidence_revision = script.get_revision("okr_evidence_links")
+    confirmation_revision = script.get_revision("task_confirmation_contract")
+    private_assistant_revision = script.get_revision("backfill_private_assistant")
     experience_revision = script.get_revision("add_experience_provenance")
     work_context_revision = script.get_revision("add_task_work_context")
     m3_primary_revision = script.get_revision("promote_m3_text_primary")
@@ -44,7 +47,10 @@ def test_release_head_preserves_both_upgrade_lineages() -> None:
     task_status_revision = script.get_revision("align_task_failed_status")
     merge_revision = script.get_revision("merge_v111_astra_heads")
 
-    assert release_head._normalized_down_revisions == ("add_experience_provenance",)
+    assert release_head == evidence_revision
+    assert evidence_revision._normalized_down_revisions == ("task_confirmation_contract",)
+    assert confirmation_revision._normalized_down_revisions == ("backfill_private_assistant",)
+    assert private_assistant_revision._normalized_down_revisions == ("add_experience_provenance",)
     assert experience_revision._normalized_down_revisions == ("add_task_work_context",)
     assert work_context_revision._normalized_down_revisions == ("promote_m3_text_primary",)
     assert m3_primary_revision._normalized_down_revisions == ("merge_v1113_astra_heads",)
@@ -79,7 +85,7 @@ def test_postgres_migration_smoke_targets_the_release_head() -> None:
         encoding="utf-8"
     )
 
-    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-backfill_private_assistant' in smoke
+    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-okr_evidence_links' in smoke
 
 
 def test_agent_plan_text_route_migration_preserves_credential_ownership_and_fallback() -> None:
@@ -151,6 +157,37 @@ def test_private_assistant_backfill_is_unambiguous_owned_and_reversible() -> Non
     assert "template.name = 'Private Assistant'" in migration
     assert "HAVING count(*) = 1" in migration
     assert "personal_assistant_agent_id = NULL" in migration
+
+
+def test_task_confirmation_contract_is_additive_and_reversible() -> None:
+    migration = (
+        BACKEND_ROOT
+        / "alembic/versions/202608011100_add_task_confirmation_contract.py"
+    ).read_text(encoding="utf-8")
+
+    assert "backfill_private_assistant" in migration
+    assert "work_statement" in migration
+    assert "confirmation_fingerprint" in migration
+    assert "confirmed_at" in migration
+    assert "Partial Task confirmation schema requires manual repair" in migration
+    assert "get_columns(\"tasks\")" in migration
+    assert "DROP TABLE tasks" not in migration
+
+
+def test_okr_evidence_links_are_additive_and_reversible() -> None:
+    migration = (
+        BACKEND_ROOT
+        / "alembic/versions/202608011200_add_okr_evidence_links.py"
+    ).read_text(encoding="utf-8")
+
+    assert "task_confirmation_contract" in migration
+    assert "source_task_id" in migration
+    assert "source_deliverable_request_id" in migration
+    assert "evidence_snapshot" in migration
+    assert "ondelete=\"SET NULL\"" in migration
+    assert "Partial OKR evidence schema requires manual repair" in migration
+    assert "get_foreign_keys" in migration
+    assert "DROP TABLE okr_progress_logs" not in migration
 
 
 def test_sso_password_migration_is_fail_closed_and_non_destructive() -> None:

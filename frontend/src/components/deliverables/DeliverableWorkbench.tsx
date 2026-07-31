@@ -39,6 +39,7 @@ export interface DeliverableAttachmentInput {
 interface DeliverableLauncherProps {
     agentId: string;
     sessionId?: string;
+    taskId?: string;
     tier: SaasTier;
     attachments: DeliverableAttachmentInput[];
     disabled?: boolean;
@@ -75,6 +76,7 @@ function preflightReasonLabel(reason: string, isZh: boolean) {
         text_route_unavailable: ['当前没有可用的文本模型线路', 'No text-model route is available'],
         presentation_tool_unavailable: ['当前数字员工没有可用的 PPT 工具', 'The Agent has no presentation tool'],
         media_capability_unavailable: ['当前没有可用的媒体生成能力', 'No media-generation capability is available'],
+        degraded_route_requires_confirmation: ['当前只有应急质量线路，需要明确确认质量降级', 'Only an emergency-quality route is available and requires explicit confirmation'],
         video_post_production_tool_unavailable: ['当前数字员工缺少视频后期工具', 'The Agent lacks a video post-production tool'],
         workflow_execution_not_enabled: ['该工作流尚未开放执行', 'Workflow execution is not enabled'],
     };
@@ -91,9 +93,22 @@ function initialSpec(workflow?: DeliverableWorkflow): Record<string, string | nu
     );
 }
 
+function workflowOptionLabel(fieldKey: string, option: string, isZh: boolean) {
+    if (fieldKey === 'fallback_policy') {
+        if (option === 'primary_only') {
+            return isZh ? '正式质量优先（推荐）' : 'Formal quality first (recommended)';
+        }
+        if (option === 'allow_degraded') {
+            return isZh ? '允许应急质量（需明确接受差异）' : 'Allow emergency quality (accept differences)';
+        }
+    }
+    return option;
+}
+
 export function DeliverableLauncher({
     agentId,
     sessionId,
+    taskId,
     tier,
     attachments,
     disabled = false,
@@ -237,8 +252,19 @@ export function DeliverableLauncher({
                 <label key={field.key} className="deliverable-field">
                     <span>{label} {field.required && <em>*</em>}</span>
                     <select value={value} onChange={(event) => updateField(field.key, event.target.value)}>
-                        {field.options.map((option) => <option key={option} value={option}>{option}</option>)}
+                        {field.options.map((option) => (
+                            <option key={option} value={option}>
+                                {workflowOptionLabel(field.key, option, isZh)}
+                            </option>
+                        ))}
                     </select>
+                    {field.key === 'fallback_policy' && (
+                        <small>
+                            {isZh
+                                ? '图片和视频仅有应急线路时，正式质量优先会保存工作说明但不提交付费任务。'
+                                : 'When only an emergency image/video route remains, formal-quality mode saves the brief without submitting a paid task.'}
+                        </small>
+                    )}
                 </label>
             );
         }
@@ -312,6 +338,7 @@ export function DeliverableLauncher({
                 client_request_id: clientRequestId,
                 agent_id: agentId,
                 session_id: sessionId,
+                ...(taskId ? { task_id: taskId } : {}),
                 work_type: selectedWorkflow.work_type,
                 workflow_id: selectedWorkflow.workflow_id,
                 workflow_version: selectedWorkflow.workflow_version,
@@ -332,9 +359,13 @@ export function DeliverableLauncher({
             setOpen(false);
             setClientRequestId(crypto.randomUUID());
             toast.success(
-                result.launchable
-                    ? (isZh ? '工作说明已保存，可在对话中确认启动' : 'Brief saved and ready to launch in chat')
-                    : (isZh ? '工作说明已保存；当前阶段不会调用生成服务' : 'Brief saved; generation is not started in this phase'),
+                result.capability_status === 'degraded'
+                    ? result.launchable
+                        ? (isZh ? '已按你确认的应急质量策略保存，可在对话中启动' : 'Saved with your confirmed emergency-quality policy and ready to launch in chat')
+                        : (isZh ? '工作说明已保存；当前只有应急质量线路，正式执行将等待主线路' : 'Brief saved; only emergency quality is available, so formal execution will wait for the primary route')
+                    : result.launchable
+                        ? (isZh ? '工作说明已保存，可在对话中确认启动' : 'Brief saved and ready to launch in chat')
+                        : (isZh ? '工作说明已保存；当前阶段不会调用生成服务' : 'Brief saved; generation is not started in this phase'),
             );
             window.setTimeout(() => triggerRef.current?.focus(), 0);
         } catch (nextError) {

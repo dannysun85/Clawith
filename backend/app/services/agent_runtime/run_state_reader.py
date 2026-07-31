@@ -66,6 +66,7 @@ def runtime_run_record(run: AgentRun) -> RuntimeRunRecord:
         root_run_id=str(run.root_run_id) if run.root_run_id is not None else None,
         model_turn_limit=run.model_turn_limit,
         source_id=run.source_id,
+        correlation_id=run.correlation_id,
         scheduling_position_created_at=run.scheduling_position_created_at,
         scheduling_position_id=run.scheduling_position_id,
     )

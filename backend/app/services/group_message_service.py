@@ -477,6 +477,8 @@ def _single_mention_command(
     message: ChatMessage,
     mentions: tuple[ResolvedGroupMention, ...],
     target: ResolvedGroupMention,
+    correlation_id: str | None = None,
+    work_task_id: uuid.UUID | None = None,
 ) -> StartRunCommand:
     if target.agent is None or target.model is None or message.created_at is None:
         raise GroupMessageServiceError(
@@ -493,6 +495,7 @@ def _single_mention_command(
         source_type="chat",
         source_id=str(message.id),
         source_execution_id=source_execution_id,
+        correlation_id=correlation_id,
         goal=message.content,
         run_kind="foreground",
         model_id=target.model.id,
@@ -525,6 +528,7 @@ def _single_mention_command(
             ),
             "saas_tier": target.saas_tier,
             "model_modality": target.model_modality,
+            "work_task_id": str(work_task_id) if work_task_id is not None else None,
         },
         origin_user_id=origin_user_id,
         origin_agent_id=origin_agent_id,
@@ -541,6 +545,8 @@ def _planning_command(
     mentions: tuple[ResolvedGroupMention, ...],
     targets: tuple[ResolvedGroupMention, ...],
     model: LLMModel,
+    correlation_id: str | None = None,
+    work_task_id: uuid.UUID | None = None,
 ) -> StartRunCommand:
     if message.created_at is None:
         raise GroupMessageServiceError(
@@ -555,6 +561,7 @@ def _planning_command(
         source_type="chat",
         source_id=str(message.id),
         source_execution_id=source_execution_id,
+        correlation_id=correlation_id,
         goal=message.content,
         run_kind="orchestration",
         system_role="group_planning",
@@ -587,6 +594,7 @@ def _planning_command(
                 if target.agent is not None
             ],
             "source_channel": scope.session.source_channel,
+            "work_task_id": str(work_task_id) if work_task_id is not None else None,
         },
         origin_user_id=scope.user_id,
         origin_agent_id=scope.agent_id,
@@ -643,6 +651,8 @@ async def enqueue_group_message(
     content: str,
     mention_participant_ids: list[uuid.UUID] | None = None,
     message_id: uuid.UUID | None = None,
+    correlation_id: str | None = None,
+    work_task_id: uuid.UUID | None = None,
     settings_override: Settings | None = None,
     clock: datetime | None = None,
 ) -> GroupMessageIntake:
@@ -700,6 +710,8 @@ async def enqueue_group_message(
                     mentions=mentions,
                     targets=agent_mentions,
                     model=planning_model,
+                    correlation_id=correlation_id,
+                    work_task_id=work_task_id,
                 )
             )
         except (
@@ -754,6 +766,8 @@ async def enqueue_group_message(
                 message=message,
                 mentions=mentions,
                 target=agent_mentions[0],
+                correlation_id=correlation_id,
+                work_task_id=work_task_id,
             )
         )
     except (RuntimeAdapterError, RuntimePersistenceError) as exc:

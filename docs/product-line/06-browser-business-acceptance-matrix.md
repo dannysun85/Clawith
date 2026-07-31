@@ -135,3 +135,20 @@ known_gaps:
 - 图片、视频、PPT 的“能调用”与“达到商用”分别有真实 Artifact 和盲评证据。
 - 本地通过、已部署、生产验证和商业流程证明被分别记录。
 - 未具备的能力保持关闭或明确 degraded，不向客户展示假完成。
+
+## 9. 2026-08-01 本地候选前验收记录
+
+本节绑定的是提交前工作树与本地 `v1.11.9` 开发环境；最终 candidate SHA 只能在完整门禁和独立评审后回填。未调用新的付费 Provider，也没有部署或生产验证。
+
+| 场景 | 当前证据 | 结论 | 尚未证明 |
+|---|---|---|---|
+| WORK-01/02 | `/work` 依次完成普通任务、指定 Agent、临时专家和 Group 的 preflight；工作说明确认与执行分离 | `local_browser_verified` | 全新用户首次任务、断网恢复 |
+| GRP-01 | 选择现有双 Agent Group 后，服务端因 planning/compact 模型未配置而 fail-closed，未创建虚假运行 | `local_browser_verified` | 模型配置完成后的真实多人终态聚合 |
+| IMG-02/VID-01 | SaaS 媒体路由显示图片火山主线路可用；视频只有 MiniMax 时显示“仅降级可用”；正式交付默认不提交应急付费任务 | `local_browser_verified` | 新的真实 Provider Artifact 与商业质量 |
+| PPT-01（流程） | PPT Brief preflight、工作说明、正式交付入口、已有 PPTX/PDF 深链和右侧工作现场可达 | `local_browser_verified` | 本候选上的新一轮付费生成与豆包盲评 |
+| DEL-01/02 | 工作台读取服务端工作索引；正式结果留在 Agent/工作现场，输入框没有完成面板 | `local_browser_verified` | 高并发刷新与断网重连 |
+| OKR evidence | 创建本地验收 OKR，选择已批准正式 Deliverable 作为证据，进度达到 100%，来源深链可达 | `local_browser_verified` | Artifact 替换后旧证据的浏览器 supersede 流 |
+| 导航/权限入口 | 工作、协作角色、组织、账户运营入口均可达；desktop 与 390×844 窄视口通过 | `local_browser_verified` | 普通成员和 agent_admin 的完整负向矩阵 |
+| SaaS readiness | 媒体页显示主线路、可用 Provider、降级状态和建议动作；页面 console warning/error 为 0 | `local_browser_verified` | 最后一次真实 Provider 验证 receipt 的持久展示 |
+
+已覆盖页面包括工作台、公司概览、OKR、发现中心、Groups、企业设置、订阅、平台运营、SaaS 模型路由与媒体路由。REG-01/02、完整权限负向、Provider 真实调用、豆包 Benchmark、发布和生产验收仍保持未完成，不能从本记录外推。

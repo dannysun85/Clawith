@@ -1,7 +1,7 @@
 # 核心对象与状态机事实基线
 
-- 状态：`active-design-baseline`
-- 日期：2026-07-31
+- 状态：`implementation-candidate`
+- 日期：2026-08-01
 - 目标链路：`Intent → Task → Run → Artifact → Review → Approval → Delivery → Experience`
 
 ## 1. 原则
@@ -14,14 +14,14 @@
 
 | 产品对象 | 当前实现 | 当前状态/能力 | 主要缺口 |
 |---|---|---|---|
-| Intent | 聊天输入、附件、Deliverable goal/spec | 无统一持久 ID | 自由意图无法跨入口稳定追踪 |
-| Task | `Task`，路径 `/agents/{agent_id}/tasks` | `pending/doing/done/failed`，类型 `todo/supervision` | 强绑定 Agent；无 Group/临时专家；supervision 暂停 |
-| Run | `AgentRun` 与 Group runtime | 有持久运行、事件、模型路由快照 | 工作台无跨 runtime 统一索引 |
+| Intent | `Task.intent`、`origin_type`、工作台输入和 Deliverable goal/spec | 工作台确认后进入稳定 Task；确认前仍是页面草稿 | 尚未拆成独立 Intent 表，澄清历史主要留在会话 |
+| Task | `Task` + `/api/work` | `pending/doing/done/failed`；含 tenant、origin、executor、Group、work statement、确认指纹与幂等字段 | 仍保留一个真实 `agent_id` 作为 Runtime owner；普通 Task 产物未必是正式交付 |
+| Run | `AgentRun` 与 Group runtime | 有持久运行、事件、模型路由快照；工作台用 correlation 和 Deliverable 关联聚合 | 直接 Agent chat 的历史 Run 只能在可追溯关联存在时投影 |
 | Artifact | Workspace 文件 + `DeliverableArtifactRevision` | 候选/批准/拒绝/被替代，含 hash、版本和路径 | 普通 Task 产物未必登记为 Artifact |
 | Review | `DeliverableQualityReview` 与 assignments/evidence | `open/passed/blocked/incomplete/superseded` | 目前主要覆盖图片、视频、PPT |
 | Approval | Deliverable approval policy/actions、Tool approvals | 人工批准、请求修改、工具审批 | 业务批准与工具执行批准需要产品上区分 |
-| Delivery | `DeliverableRequest.status/current_stage`、聊天结果和下载 | 有输出确认和正式 artifact | 缺少跨 Agent 的交付索引与统一用户语言 |
-| Experience | `ExperienceEntry` | `draft/published/retired`，人工发布后 Agent 可检索 | 与成功任务/交付物的来源关联尚未统一呈现 |
+| Delivery | `DeliverableRequest.status/current_stage`、聊天结果和下载 | 有输出确认、正式 Artifact，并由 Work index 跨 Agent 聚合 | Task `done` 仍不等于正式交付；这是刻意保留的边界 |
+| Experience | `ExperienceEntry` | `draft/published/retired`，可保存 `source_task_id` / `source_deliverable_request_id`，人工发布后 Agent 可检索 | 来源链接已具备，真实发布/权限浏览器回归待完成 |
 
 ## 3. 规范对象合同
 
@@ -50,7 +50,7 @@ Task 是已经确认的责任与工作范围，至少关联：
 - 来源会话和可见范围；
 - 当前业务状态。
 
-现有 `Task.agent_id` 在第一阶段保留；Group/临时专家通过新关联或工作索引适配，不能让前端伪造一个 Agent ID。
+现有 `Task.agent_id` 保留为真实 Runtime owner；Group 另外固定 `group_id`、session 和有序参与者快照，临时专家固定角色快照。前端不能伪造 Agent ID，服务端会在租户、权限、Group 成员和可执行状态上重新解析。
 
 ### 3.3 Run
 
@@ -159,13 +159,14 @@ intent origin ── task owner ── run/session
                                      └── experience draft/published entry
 ```
 
-## 7. 当前优先修复
+## 7. 当前实现与剩余门禁
 
-1. 为工作台建立服务端聚合读模型，而不是前端拼接多套 API 状态。
-2. 给普通 Task 增加稳定 `intent/origin/run/artifact` 关联，保持现有 API 兼容。
-3. 把 `Task done` 与 `Deliverable delivered` 分开显示。
-4. 定义临时专家为 Task/Run 级执行快照，不创建可见长期员工。
-5. 统一用户态文案，但保留原始状态和审计证据供管理员查看。
+1. 已建立租户级 Work read model；前端工作台和 Dashboard 不再逐 Agent 拼接任务状态。
+2. 已为 Task additive 增加 tenant、intent、origin、executor、Group、work statement、confirmation 和客户端幂等关联，旧 Agent Task API 保持兼容。
+3. Work projection 已把 `Task done` 和 `Deliverable delivered` 分开显示，并提供权威对象深链。
+4. 临时专家以 Task/Run 级角色快照实现，不创建可见长期员工；Group Task 使用真实 Group runtime correlation。
+5. OKR 进度可选择已完成 Task，或已成功且存在批准 Artifact 的 Deliverable，并保存不可变证据快照；未完成工作和未批准产物被服务端拒绝。
+6. 仍需完成整库测试、迁移 smoke、浏览器对象链核验和独立代码/架构评审；这些通过前不能称为本地业务流已证明。
 
 ## 8. 完成标准
 

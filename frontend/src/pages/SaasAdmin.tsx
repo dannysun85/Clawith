@@ -31,6 +31,12 @@ type MediaRoute = {
     routing_mode: 'automatic_failover';
     provider_order: string[];
     available_providers: string[];
+    primary_provider: string;
+    degraded_providers: string[];
+    capability_status: 'available' | 'degraded' | 'unavailable';
+    reason_code?: string | null;
+    recommended_action: string;
+    evaluation_source: 'live_platform_credential_pool';
     fallback_provider: string;
     tool_name: string;
     model: string;
@@ -433,8 +439,8 @@ function MediaRoutesTab() {
             <div className="card" style={{ marginBottom: 16, padding: 16 }}>
                 <div style={{ fontSize: 14, fontWeight: 650, marginBottom: 6 }}>媒体生成路由（平台统一配置）</div>
                 <div style={{ color: 'var(--text-secondary)', fontSize: 12, lineHeight: 1.7 }}>
-                    文本模型和媒体生成模型是两条独立链路。图片、语音和视频会按“火山 Agent Plan → MiniMax”自动选择可用供应商，并且只在供应商尚未接受任务时安全切换；音乐目前使用 MiniMax。
-                    下表的模型和质量参数只配置 MiniMax 兜底路径；火山账号级别与实时可用能力来自“账号池”，不会在这里被伪装成可编辑模型。
+                    文本模型和媒体生成模型是两条独立链路。图片、语音和视频按“火山 Agent Plan → MiniMax”检查可用线路，并且只在供应商尚未接受任务时切换；音乐目前使用 MiniMax。
+                    图片和视频仅剩 MiniMax 时属于非等价降级，正式交付默认等待主线路，只有用户明确接受应急质量后才可执行。下表的模型和质量参数只配置 MiniMax 应急路径；火山账号级别与实时可用能力来自“账号池”，不会在这里被伪装成可编辑模型。
                 </div>
             </div>
             {error && (
@@ -445,7 +451,7 @@ function MediaRoutesTab() {
             <DataTable
                 rows={routes}
                 empty={isLoading ? '正在读取生产媒体路由…' : '暂无媒体路由'}
-                renderHeader={() => <><th>能力与路由</th><th>Tier</th><th>MiniMax 兜底模型</th><th>兜底质量参数</th><th>MiniMax 预计费用</th><th>可用性</th><th>兜底配置来源</th><th /></>}
+                renderHeader={() => <><th>能力与路由</th><th>Tier</th><th>MiniMax 应急模型</th><th>应急质量参数</th><th>MiniMax 预计费用</th><th>可用性</th><th>应急配置来源</th><th /></>}
                 renderRow={(route) => <MediaRouteRow route={route} />}
             />
         </div>
@@ -482,6 +488,16 @@ function MediaRouteRow({ route }: { route: MediaRoute }) {
         : provider === 'minimax'
             ? 'MiniMax'
             : provider;
+    const statusLabel = route.capability_status === 'available'
+        ? '正式可用'
+        : route.capability_status === 'degraded'
+            ? '仅降级可用'
+            : '不可用';
+    const statusColor = route.capability_status === 'available'
+        ? 'var(--success)'
+        : route.capability_status === 'degraded'
+            ? 'var(--warning)'
+            : 'var(--error)';
 
     return (
         <>
@@ -495,6 +511,14 @@ function MediaRouteRow({ route }: { route: MediaRoute }) {
                         ? route.available_providers.map(providerLabel).join('、')
                         : '无'}
                 </div>
+                <div style={{ color: statusColor, fontSize: 11, fontWeight: 650, marginTop: 4 }}>
+                    {statusLabel} · 主线路 {providerLabel(route.primary_provider)}
+                </div>
+                {route.capability_status !== 'available' && (
+                    <div role="status" style={{ color: 'var(--text-secondary)', fontSize: 10, lineHeight: 1.5, marginTop: 3 }}>
+                        {route.recommended_action}
+                    </div>
+                )}
             </td>
             <td style={{ textTransform: 'uppercase' }}>{route.tier}</td>
             <td style={{ minWidth: 190 }}>
@@ -512,9 +536,9 @@ function MediaRouteRow({ route }: { route: MediaRoute }) {
                 <label style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
                     <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} /> 路由启用
                 </label>
-                <div style={{ color: route.available ? 'var(--success)' : 'var(--error)', fontSize: 11 }}>
+                <div style={{ color: statusColor, fontSize: 11 }}>
                     {route.available
-                        ? `${route.available_providers.length} 个供应商路径就绪`
+                        ? `${route.available_providers.length} 个供应商路径就绪 · ${statusLabel}`
                         : !route.pool_available
                             ? '所有供应商账号池均不可用'
                             : !route.tool_enabled

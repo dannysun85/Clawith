@@ -29134,6 +29134,15 @@ class MediaProviderSafeFallback(RuntimeError):
         self.error = error
 
 
+def _allow_degraded_media_fallback(arguments: dict) -> bool:
+    """Preserve quick-generation compatibility while formal contracts opt out."""
+
+    value = arguments.get("allow_degraded_fallback")
+    if value is None:
+        return True
+    return value is True
+
+
 def _media_failover_is_safe(
     error: BaseException,
     *,
@@ -30285,6 +30294,7 @@ async def _generate_video_minimax(
             agent_id=agent_id,
             modality="video",
         )
+    allow_degraded_fallback = _allow_degraded_media_fallback(arguments)
 
     config = await _get_tool_config(agent_id, "generate_video_minimax") or {}
     tier = await _resolve_minimax_tool_tier(agent_id, config, saas_tier)
@@ -30489,8 +30499,13 @@ async def _generate_video_minimax(
     credential = None
     selected_provider_index = max(int(_provider_index), 0)
     provider_route_errors: list[str] = []
+    degraded_fallback_blocked = False
     for candidate_index in range(selected_provider_index, len(DEFAULT_MEDIA_PROVIDER_ORDER)):
         candidate = DEFAULT_MEDIA_PROVIDER_ORDER[candidate_index]
+        if candidate == "minimax" and not allow_degraded_fallback:
+            degraded_fallback_blocked = True
+            provider_route_errors.append("minimax:degraded_confirmation_required")
+            break
         try:
             credential = await prepare_media_provider(
                 candidate,
@@ -30518,10 +30533,19 @@ async def _generate_video_minimax(
             provider_route_errors,
         )
         return _minimax_tool_result(
-            "❌ Video generation is temporarily unavailable. No provider accepted the request and no Credits were consumed.",
+            (
+                "⚠️ Formal video quality is temporarily unavailable. The emergency-quality route was not "
+                "authorized, so no provider task was submitted and no Credits were consumed."
+                if degraded_fallback_blocked
+                else "❌ Video generation is temporarily unavailable. No provider accepted the request and no Credits were consumed."
+            ),
             typed=typed,
             status="failed",
-            error_code="media_video_provider_unavailable",
+            error_code=(
+                "media_video_degraded_confirmation_required"
+                if degraded_fallback_blocked
+                else "media_video_provider_unavailable"
+            ),
             agent_id=agent_id,
             modality="video",
             model=billing_model,
@@ -30671,6 +30695,7 @@ async def _generate_video_minimax(
             "brand_position": brand_position,
             "brand_scale": brand_scale,
             "sanitize_generated_background": sanitize_generated_background,
+            "degraded_fallback_allowed": allow_degraded_fallback,
             # Runtime waits on the durable async operation and emits the one
             # terminal Agent message. Legacy callers keep the media daemon's
             # existing completion delivery behavior.
@@ -31083,6 +31108,7 @@ async def _generate_video_minimax(
         _log_minimax_operation_failure("MiniMaxVideo", exc)
         if (
             not provider_task_id
+            and allow_degraded_fallback
             and _media_failover_is_safe(
                 exc,
                 provider_request_started=provider_request_started,
@@ -32247,6 +32273,7 @@ async def _generate_image(
             agent_id=agent_id,
             modality="image",
         )
+    allow_degraded_fallback = _allow_degraded_media_fallback(arguments)
 
     size = arguments.get("size", "1024x1024")
     save_path = arguments.get("save_path", "")
@@ -32460,7 +32487,12 @@ async def _generate_image(
         )
 
         provider_errors: list[str] = []
+        degraded_fallback_blocked = False
         for index, candidate in enumerate(DEFAULT_MEDIA_PROVIDER_ORDER):
+            if candidate == "minimax" and not allow_degraded_fallback:
+                degraded_fallback_blocked = True
+                provider_errors.append("minimax:degraded_confirmation_required")
+                break
             try:
                 prepared = await prepare_media_provider(
                     candidate,
@@ -32507,7 +32539,10 @@ async def _generate_image(
                     typed=typed,
                     provider=prepared.provider,
                     provider_size=prepared.size,
-                    allow_safe_fallback=index < len(DEFAULT_MEDIA_PROVIDER_ORDER) - 1,
+                    allow_safe_fallback=(
+                        allow_degraded_fallback
+                        and index < len(DEFAULT_MEDIA_PROVIDER_ORDER) - 1
+                    ),
                 )
             except MediaProviderSafeFallback as exc:
                 provider_errors.append(f"{candidate}:{type(exc.error).__name__}")
@@ -32518,10 +32553,19 @@ async def _generate_image(
             provider_errors,
         )
         return _minimax_tool_result(
-            "❌ Image generation is temporarily unavailable. No provider accepted the request and no Credits were consumed.",
+            (
+                "⚠️ Formal image quality is temporarily unavailable. The emergency-quality route was not "
+                "authorized, so no provider task was submitted and no Credits were consumed."
+                if degraded_fallback_blocked
+                else "❌ Image generation is temporarily unavailable. No provider accepted the request and no Credits were consumed."
+            ),
             typed=typed,
             status="failed",
-            error_code="media_image_provider_unavailable",
+            error_code=(
+                "media_image_degraded_confirmation_required"
+                if degraded_fallback_blocked
+                else "media_image_provider_unavailable"
+            ),
             agent_id=agent_id,
             modality="image",
             model=model,

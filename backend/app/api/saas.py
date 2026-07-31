@@ -83,7 +83,10 @@ from app.services.minimax_media_profiles import (
     minimax_media_override_snapshot,
     resolve_minimax_media_profile,
 )
-from app.services.media_capabilities import get_platform_media_provider_modalities
+from app.services.media_capabilities import (
+    get_platform_media_provider_modalities,
+    media_route_capability_status,
+)
 from app.services.media_provider_routing import (
     MINIMAX_PROVIDER,
     media_provider_order_for_modality,
@@ -476,6 +479,21 @@ def _media_route_out(
         for provider in provider_order
         if modality in provider_modalities.get(provider, set())
     ]
+    capability_status, reason_code, recommended_action = (
+        media_route_capability_status(modality, available_providers)
+    )
+    primary_provider = (
+        MINIMAX_PROVIDER
+        if modality == "music"
+        else str(provider_order[0])
+        if provider_order
+        else ""
+    )
+    degraded_providers = (
+        [MINIMAX_PROVIDER]
+        if modality in {"image", "video"}
+        else []
+    )
     pool_available = bool(available_providers)
     tool_enabled = bool(tool and tool.enabled)
     estimated_credits, billing_unit = _media_route_billing(profile)
@@ -486,6 +504,12 @@ def _media_route_out(
         routing_mode="automatic_failover",
         provider_order=list(provider_order),
         available_providers=available_providers,
+        primary_provider=primary_provider,
+        degraded_providers=degraded_providers,
+        capability_status=capability_status,
+        reason_code=reason_code,
+        recommended_action=recommended_action,
+        evaluation_source="live_platform_credential_pool",
         fallback_provider=MINIMAX_PROVIDER,
         tool_name=MINIMAX_MEDIA_TOOL_NAMES[modality],
         model=profile.model,

@@ -122,6 +122,12 @@ class MediaRouteOut(BaseModel):
     routing_mode: str
     provider_order: list[str]
     available_providers: list[str]
+    primary_provider: str
+    degraded_providers: list[str]
+    capability_status: str
+    reason_code: str | None = None
+    recommended_action: str
+    evaluation_source: str
     fallback_provider: str
     tool_name: str
     model: str

@@ -7,7 +7,7 @@ fresh_db_name="${db_name}_fresh"
 db_user="${PGUSER:-$USER}"
 db_host="${PGHOST:-127.0.0.1}"
 db_port="${PGPORT:-5432}"
-release_head="${MIGRATION_SMOKE_EXPECTED_HEAD:-backfill_private_assistant}"
+release_head="${MIGRATION_SMOKE_EXPECTED_HEAD:-okr_evidence_links}"
 
 assert_at_release_head() {
   .venv/bin/alembic current | grep -F "${release_head} (head)"

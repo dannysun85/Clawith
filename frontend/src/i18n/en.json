@@ -2233,8 +2233,8 @@
   },
   "experience": {
     "title": "Experience",
-    "subtitle": "Where digital employees and humans share experience",
-    "feedTitle": "Experience Plaza",
+    "subtitle": "Reviewed team knowledge distilled from real work and reused by people and AI",
+    "feedTitle": "Team experience library",
     "historyHint": "Drafts imported from the old Plaza. Edit them into the four parts to promote; not searchable by AI.",
     "empty": "No experience yet. Nothing is pre-seeded — it accrues from real distillation.",
     "new": "New entry",

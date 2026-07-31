@@ -154,6 +154,7 @@ def _records():
     message_id = uuid.uuid4()
     root_id = uuid.uuid4()
     origin_user_id = uuid.uuid4()
+    work_task_id = uuid.uuid4()
     sender = Participant(
         id=uuid.uuid4(),
         type="user",
@@ -231,6 +232,7 @@ def _records():
         source_type="chat",
         source_id=str(message_id),
         source_execution_id=f"group_mention:{message_id}:plan",
+        correlation_id=f"work-task:{work_task_id}",
         origin_user_id=origin_user_id,
         goal=message.content,
         run_kind="orchestration",
@@ -262,6 +264,7 @@ def _records():
         agent_id=None,
         session_id=str(session_id),
         system_role="group_planning",
+        correlation_id=f"work-task:{work_task_id}",
     )
     state: RuntimeGraphState = {
         "snapshots": RunInputSnapshots(
@@ -355,6 +358,7 @@ async def test_completed_plan_creates_only_entry_children_with_one_immutable_pla
     assert all(command.parent_run_id == root.id for command in commands)
     assert all(command.root_run_id == root.id for command in commands)
     assert all(command.source_id == str(message.id) for command in commands)
+    assert all(command.correlation_id == root.correlation_id for command in commands)
     assert all(command.scheduling_position_created_at == NOW for command in commands)
     assert all(command.scheduling_position_id == message.id for command in commands)
     assert all(command.payload["mode"] == plan["mode"] for command in commands)

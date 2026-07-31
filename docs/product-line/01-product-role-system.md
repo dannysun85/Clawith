@@ -1,18 +1,19 @@
 # 产品角色体系事实基线
 
-- 状态：`active-design-baseline`
-- 日期：2026-07-31
+- 状态：`implementation-candidate`
+- 日期：2026-08-01
 - 范围：下一产品线角色、责任、权限边界与迁移约束
-- 非完成声明：本文是基于当前代码的产品决策，不代表对应界面或权限迁移已经发布
+- 非完成声明：本文同时记录已进入本地工作树的实现与仍受外部门禁约束的事项；不代表已发布、生产验证或商用质量达标
 
 ## 1. 当前代码事实
 
 1. 人类成员角色由 `backend/app/models/user.py` 定义为 `platform_admin`、`org_admin`、`agent_admin`、`member`。`Identity` 表达跨租户自然人，`User` 表达该自然人在一个租户内的成员身份。
 2. 私人助手没有独立 Agent 类型。它由 `backend/app/api/onboarding.py` 以普通 `Agent` 创建，通过 `role_description="Private Assistant"`、`access_mode="private"` 和当前用户的 `manage` 权限表达，并由 `UserTenantOnboarding.personal_assistant_agent_id` 建立 `(tenant, user)` 关联。
-3. 注册页允许用户设置私人助手名称、性格、办事风格和边界，但把它称为“第一位员工”；`Layout.tsx` 又把它放进普通“智能体”列表。
+3. 注册页已把私人助手称为“私人协调者”，完成或恢复 Onboarding 后进入 `/work`；`Layout.tsx` 通过 `personal_assistant_agent_id` 把“我的助理”和长期 `Agent 员工` 分组展示。
 4. 长期 Agent 员工由 `Agent`、`AgentTemplate`、`AgentPermission`、Skill、Tool、Trigger、Channel、Workspace 等对象共同表达。Skill 只提供做事方法，Tool 才是可执行能力。
-5. 当前没有独立的“临时专家”持久模型。一次性专业工作要么被迫交给私人助手，要么要求用户先创建长期 Agent，要么直接使用某个现有 Agent。
-6. Group 是租户内长期群聊对象，成员是 `Participant`，群成员角色只有 `manager` 和 `member`；Group 不是人类组织架构，也不是一个新的 Agent。
+5. 临时专家没有被实现成新的长期 Agent 类型；工作台用 `Task.executor_kind="temporary_expert"` 和 `executor_snapshot` 固定本次角色，并由一个真实、租户可用的 Agent 承担 Runtime 执行，因此不会污染员工花名册。
+6. Group 是租户内长期协作空间，成员是 `Participant`，群成员角色只有 `manager` 和 `member`；工作台可选择一个 Group session 和有序 Agent 参与者，创建带 `work-task:{task_id}` correlation 的真实 Group 运行，但 Group 本身仍不是人类组织架构或新的 Agent。
+7. 私人助手使用每个 `(tenant, user)` 的 companion slot：Onboarding 创建不执行普通员工 `max_agents` 检查，员工配额统计也按 onboarding 关联 ID 排除私人助手；具体免费政策和超限价格仍是外部产品/财务决策。
 
 ## 2. 已确认的目标角色
 
@@ -75,13 +76,13 @@
 | 业务审批/验收 | 被指派时 | 按公司政策 | 管理对象内 | 否 | 可提醒 | 可提交 | 可提交 | 被指派时 |
 | 访问 Group Workspace | 仅成员 | 按成员/政策 | 仅成员 | 否 | 仅被显式加入且政策允许 | 仅成员 | 仅本次任务范围 | 是 |
 
-## 6. 当前主要问题
+## 6. 当前剩余问题
 
-1. **身份概念冲突**：注册称私人助手为“第一位员工”，导航把它与公司 Agent 混排，用户无法理解谁是私人关系、谁是公司资源。
-2. **一次性任务被员工化**：没有临时专家对象，迫使用户先理解 Agent 和 Skill，再完成一次任务。
-3. **权限角色与产品称谓不一致**：`agent_admin` 是真实用户角色，但产品中缺乏清晰的“管理哪些员工”说明。
-4. **Group 容易被误解为编排器**：当前 Group 的真实权威是成员和会话，不应宣传成自动分工的万能团队。
-5. **私人助手席位语义未固化**：当前创建会执行普通 Agent 配额检查，和“不占员工席位”的目标存在实现差距。
+1. **浏览器证据尚未补齐**：角色分组和 Onboarding 落点已实现，但需要覆盖新公司、已有助手、折叠导航、移动端和旧深链的真实浏览器回归。
+2. **临时专家仍复用真实 Agent Runtime**：本次角色快照已经稳定，但专家目录、选择理由和最小能力授权仍需持续治理；不能把“临时”误解为绕过权限的隐藏 Agent。
+3. **权限角色与产品称谓仍需解释**：`agent_admin` 是真实用户角色，界面还需持续明确“只能管理被授权员工”，不能让它看起来等同公司管理员。
+4. **Group 的工作边界需要业务验证**：真实多 Agent Group 运行已接入，但其顺序、失败聚合、交接和审批体验仍需浏览器矩阵验证，不能宣传为万能自动团队。
+5. **私人助手商业政策未批准**：技术上已独立于员工席位，但“是否免费、套餐含几个 companion slot、超限如何收费”仍不能由代码自行决定。
 
 ## 7. 无破坏迁移规则
 
@@ -90,7 +91,7 @@
 - 迁移前检测一名用户是否有多个候选私人助手；冲突进入管理员修复队列，不自动合并内容。
 - 临时专家第一阶段作为 Task/Run 的执行策略和快照实现，不先新增可见员工记录。
 - 现有 `agent_admin` 权限不扩大；新增界面必须基于服务端 `manage` 关系判定。
-- 私人助手的员工席位豁免需要产品/财务批准和服务端配额改造后才生效。
+- 私人助手的员工席位豁免已在服务端实现；具体商业价格、套餐数量和账单展示仍需产品/财务批准后才可对外承诺。
 
 ## 8. 完成标准
 

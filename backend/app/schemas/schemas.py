@@ -414,6 +414,10 @@ class TaskOut(BaseModel):
     origin_type: str = "legacy_agent_task"
     executor_kind: str = "agent_employee"
     executor_snapshot: dict = Field(default_factory=dict)
+    work_type: str = "general"
+    work_statement: dict = Field(default_factory=dict)
+    confirmation_fingerprint: str | None = None
+    confirmed_at: datetime | None = None
     group_id: uuid.UUID | None = None
     client_request_id: uuid.UUID | None = None
     type: str

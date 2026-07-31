@@ -17,6 +17,10 @@ from app.services.agent_runtime.model_route import (
     RuntimeModelRouteError,
     resolve_runtime_model_route,
 )
+from app.services.group_message_service import (
+    GroupMessageServiceError,
+    enqueue_group_message,
+)
 
 settings = get_settings()
 AUTOMATIC_TASK_EXECUTION_ENABLED = settings.USER_TASK_EXECUTION_ENABLED
@@ -37,6 +41,17 @@ def _task_goal(task: Task) -> str:
         goal = f"[任务执行] {task.title}"
     if task.description:
         goal += f"\n任务描述: {task.description}"
+    statement = dict(task.work_statement or {})
+    if statement:
+        goal += (
+            f"\n已确认工作类型: {statement.get('work_type') or task.work_type}"
+            f"\n已确认交付边界: {statement.get('expected_output') or 'task_result'}"
+        )
+        criteria = statement.get("completion_criteria")
+        if isinstance(criteria, list):
+            normalized_criteria = [str(item).strip() for item in criteria if str(item).strip()]
+            if normalized_criteria:
+                goal += "\n完成标准:\n- " + "\n- ".join(normalized_criteria)
     if task.executor_kind == "temporary_expert":
         expert_role = str((task.executor_snapshot or {}).get("expert_role") or "").strip()
         if expert_role:
@@ -65,6 +80,13 @@ async def enqueue_task_runtime(
         raise TaskRuntimeIntakeError(
             "task_type_unsupported",
             f"Runtime does not support Task type {task.type!r}",
+        )
+    if task.origin_type == "workbench" and (
+        not task.confirmation_fingerprint or task.confirmed_at is None
+    ):
+        raise TaskRuntimeIntakeError(
+            "task_confirmation_required",
+            "A workbench Task must preserve explicit user confirmation before execution",
         )
     decision = decide_runtime_v2(
         agent_id=agent.id,
@@ -119,6 +141,10 @@ async def enqueue_task_runtime(
                 "description": task.description,
                 "executor_kind": task.executor_kind,
                 "executor_snapshot": dict(task.executor_snapshot or {}),
+                "work_type": task.work_type,
+                "work_statement": dict(task.work_statement or {}),
+                "confirmation_fingerprint": task.confirmation_fingerprint,
+                "confirmed_at": task.confirmed_at.isoformat() if task.confirmed_at else None,
                 "saas_tier": route.saas_tier,
                 "model_modality": route.modality,
                 "fallback_model_id": (
@@ -137,6 +163,101 @@ async def enqueue_task_runtime(
             TaskLog(
                 task_id=task.id,
                 content=f"🤖 已进入持久化执行队列（Run {handle.run_id}）",
+            )
+        )
+    return handle
+
+
+def _snapshot_uuid(snapshot: dict, field: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(str(snapshot[field]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TaskRuntimeIntakeError(
+            "group_task_snapshot_invalid",
+            f"Group Task executor snapshot has no valid {field}",
+        ) from exc
+
+
+async def enqueue_group_task_runtime(
+    db: AsyncSession,
+    *,
+    task: Task,
+    primary_agent: Agent,
+    settings_override: Settings | None = None,
+) -> RunHandle:
+    """Start one confirmed Work task through the native Group Runtime."""
+    if task.origin_type != "workbench" or task.executor_kind != "group":
+        raise TaskRuntimeIntakeError(
+            "group_task_contract_invalid",
+            "Only a confirmed Group workbench Task may use Group Runtime intake",
+        )
+    if not task.confirmation_fingerprint or task.confirmed_at is None:
+        raise TaskRuntimeIntakeError(
+            "task_confirmation_required",
+            "A Group workbench Task must preserve explicit user confirmation",
+        )
+    if task.agent_id != primary_agent.id or task.tenant_id != primary_agent.tenant_id:
+        raise TaskRuntimeIntakeError(
+            "task_agent_mismatch",
+            "Group Task primary owner does not match its confirmed Agent",
+        )
+    snapshot = dict(task.executor_snapshot or {})
+    participants = snapshot.get("participants")
+    if not isinstance(participants, list) or not participants:
+        raise TaskRuntimeIntakeError(
+            "group_task_snapshot_invalid",
+            "Group Task has no confirmed Agent participants",
+        )
+    try:
+        mention_participant_ids = [
+            uuid.UUID(str(participant["participant_id"]))
+            for participant in participants
+            if isinstance(participant, dict)
+        ]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TaskRuntimeIntakeError(
+            "group_task_snapshot_invalid",
+            "Group Task contains an invalid Agent participant",
+        ) from exc
+    if len(mention_participant_ids) != len(participants):
+        raise TaskRuntimeIntakeError(
+            "group_task_snapshot_invalid",
+            "Group Task contains an invalid Agent participant",
+        )
+
+    try:
+        intake = await enqueue_group_message(
+            db,
+            tenant_id=task.tenant_id,
+            group_id=_snapshot_uuid(snapshot, "group_id"),
+            session_id=_snapshot_uuid(snapshot, "group_session_id"),
+            sender_participant_id=_snapshot_uuid(snapshot, "sender_participant_id"),
+            content=_task_goal(task),
+            mention_participant_ids=mention_participant_ids,
+            message_id=uuid.uuid5(task.id, "group-work-task-message"),
+            correlation_id=f"work-task:{task.id}",
+            work_task_id=task.id,
+            settings_override=settings_override,
+        )
+    except GroupMessageServiceError as exc:
+        raise TaskRuntimeIntakeError(exc.code, str(exc)) from exc
+    if intake.error_code is not None or not intake.run_handles:
+        raise TaskRuntimeIntakeError(
+            intake.error_code or "group_task_dispatch_failed",
+            intake.error_message or "Group Task did not create a Runtime Run",
+        )
+
+    task.status = "doing"
+    handle = intake.run_handles[0]
+    if handle.created:
+        db.add(
+            TaskLog(
+                task_id=task.id,
+                content=(
+                    "👥 已进入 Group 协作现场"
+                    f"（{snapshot.get('group_name') or snapshot['group_id']} / "
+                    f"Run {handle.run_id}）"
+                ),
             )
         )
     return handle

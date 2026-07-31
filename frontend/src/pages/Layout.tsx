@@ -315,8 +315,8 @@ function CompanyTourOverlay({ assistantId, isChinese, onDone }: { assistantId: s
         },
         {
             selector: '[data-tour-target="main-nav"]',
-            title: isChinese ? '三个主要功能' : 'Three main rooms',
-            body: isChinese ? '经验库沉淀团队私有经验供 AI 复用，Dashboard 看公司概况，OKR 用来设定和追踪目标。' : 'Experience is the team’s curated knowledge base for AI reuse, Dashboard shows company activity, and OKR tracks goals.',
+            title: isChinese ? '从工作开始' : 'Start with work',
+            body: isChinese ? '工作台是默认任务入口；需要多人可见讨论、交接或联合审批时，再进入协作群组。' : 'The workbench is the default task entry. Use collaboration groups when discussion, hand-offs, or joint approval must stay visible to everyone.',
             pad: 8,
             radius: 14,
         },
@@ -333,6 +333,13 @@ function CompanyTourOverlay({ assistantId, isChinese, onDone }: { assistantId: s
             body: isChinese ? '点击加号可以从 Talent Market 增加新的 agent 员工。' : 'Use the plus button to add new agent employees from the Talent Market.',
             pad: 7,
             radius: 10,
+        },
+        {
+            selector: '[data-tour-target="organization-nav"]',
+            title: isChinese ? '组织管理' : 'Organization management',
+            body: isChinese ? '公司概览只看运营状态，OKR 管目标与结果证据，发现中心用于沉淀经验和招聘长期 Agent 员工。' : 'Company overview shows operating health, OKR owns goals and result evidence, and Discover holds reusable experience and long-term Agent hiring.',
+            pad: 8,
+            radius: 14,
         },
     ], [isChinese]);
     const current = steps[step];
@@ -1237,30 +1244,12 @@ export default function Layout() {
 
 
                     {hasTenantContext && <div className="sidebar-section" data-tour-target="main-nav">
+                        {!isSidebarCollapsed && (
+                            <div className="sidebar-section-title">{isChinese ? '工作' : 'Work'}</div>
+                        )}
                         <NavLink to="/work" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
                             <span className="sidebar-item-icon" style={{ display: 'flex' }}><IconBriefcase size={16} stroke={1.5} /></span>
                             <span className="sidebar-item-text">{isChinese ? '工作台' : 'Work'}</span>
-                        </NavLink>
-                        <NavLink to="/dashboard" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
-                            <span className="sidebar-item-icon" style={{ display: 'flex' }}>{SidebarIcons.home}</span>
-                            <span className="sidebar-item-text">{isChinese ? '公司概览' : 'Company overview'}</span>
-                        </NavLink>
-                        <NavLink to="/okr" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
-                            <span className="sidebar-item-icon" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
-                                {/* OKR target icon */}
-                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                                    <circle cx="12" cy="12" r="10"/>
-                                    <circle cx="12" cy="12" r="6"/>
-                                    <circle cx="12" cy="12" r="2"/>
-                                </svg>
-                            </span>
-                            <span className="sidebar-item-text">{t('nav.okr', 'OKR')}</span>
-                        </NavLink>
-                        <NavLink to="/plaza" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
-                            <span className="sidebar-item-icon" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
-                                <IconBuildingMonument size={14} stroke={1.5} />
-                            </span>
-                            <span className="sidebar-item-text">{isChinese ? '发现中心' : 'Discover'}</span>
                         </NavLink>
                         <NavLink to="/groups" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
                             <span className="sidebar-item-icon" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
@@ -1285,6 +1274,40 @@ export default function Layout() {
                         <div className="sidebar-section-title">{isChinese ? '协作角色' : 'Collaboration roles'}</div>
                     )}
                     {agentListContent()}
+                </div>
+                <div className="sidebar-divider" />
+                <div className="sidebar-section" data-tour-target="organization-nav">
+                    {!isSidebarCollapsed && (
+                        <div className="sidebar-section-title">{isChinese ? '组织' : 'Organization'}</div>
+                    )}
+                    <NavLink to="/dashboard" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
+                        <span className="sidebar-item-icon" style={{ display: 'flex' }}>{SidebarIcons.home}</span>
+                        <span className="sidebar-item-text">{isChinese ? '公司概览' : 'Company overview'}</span>
+                    </NavLink>
+                    <NavLink to="/okr" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
+                        <span className="sidebar-item-icon" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                                <circle cx="12" cy="12" r="10"/>
+                                <circle cx="12" cy="12" r="6"/>
+                                <circle cx="12" cy="12" r="2"/>
+                            </svg>
+                        </span>
+                        <span className="sidebar-item-text">{t('nav.okr', 'OKR')}</span>
+                    </NavLink>
+                    <NavLink to="/plaza" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
+                        <span className="sidebar-item-icon" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
+                            <IconBuildingMonument size={14} stroke={1.5} />
+                        </span>
+                        <span className="sidebar-item-text">{isChinese ? '发现中心' : 'Discover'}</span>
+                    </NavLink>
+                    {canAccessCompanySettings && (
+                        <NavLink to="/enterprise" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
+                            <span className="sidebar-item-icon" style={{ display: 'flex' }}>
+                                <IconSettings size={15} stroke={1.5} />
+                            </span>
+                            <span className="sidebar-item-text">{isChinese ? '企业设置' : 'Company settings'}</span>
+                        </NavLink>
+                    )}
                 </div>
                 </>}
 
@@ -1355,18 +1378,18 @@ export default function Layout() {
                                     </button>
                                     <button className="account-dropdown-item" onClick={() => { navigate('/account/subscription'); setShowAccountMenu(false); }}>
                                         <IconReceipt size={15} stroke={1.5} />
-                                        <span>{t('nav.subscriptionDetail', '套餐详情')}</span>
+                                        <span>{isChinese ? '套餐与用量' : 'Plan and usage'}</span>
                                     </button>
                                     {canAccessPlatformSettings && (
                                         <button className="account-dropdown-item" onClick={() => { navigate('/admin/platform-settings'); setShowAccountMenu(false); }}>
                                             <IconSettings size={15} stroke={1.5} />
-                                            <span>{t('nav.platformSettings', 'Platform Settings')}</span>
+                                            <span>{isChinese ? '平台运营' : 'Platform operations'}</span>
                                         </button>
                                     )}
                                     {canAccessSaas && (
                                         <button className="account-dropdown-item" onClick={() => { navigate('/admin/saas'); setShowAccountMenu(false); }}>
                                             <IconKey size={15} stroke={1.5} />
-                                            <span>{t('nav.saasAdmin', 'SaaS 后台')}</span>
+                                            <span>{isChinese ? 'SaaS 能力治理' : 'SaaS capability governance'}</span>
                                         </button>
                                     )}
                                     <div style={{ height: '1px', background: 'var(--border-subtle)', margin: '4px 0' }} />

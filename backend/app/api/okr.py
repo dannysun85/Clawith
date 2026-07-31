@@ -20,14 +20,17 @@ POST      /api/okr/trigger-member-outreach         (P4 onboarding: fire OKR Agen
 import uuid
 from datetime import date, datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from loguru import logger
 from pydantic import BaseModel
-from sqlalchemy import select, delete
+from sqlalchemy import delete, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import get_current_user
 from app.config import get_settings
 from app.database import async_session
+from app.models.agent import Agent
+from app.models.deliverable import DeliverableArtifactRevision, DeliverableRequest
 from app.models.identity import IdentityProvider
 from app.models.okr import (
     CompanyReport,
@@ -37,6 +40,7 @@ from app.models.okr import (
     OKRSettings,
     WorkReport,
 )
+from app.models.task import Task
 from app.models.user import User
 
 router = APIRouter(prefix="/api/okr", tags=["okr"])
@@ -370,6 +374,7 @@ class KeyResultOut(BaseModel):
     created_at: str
     # Alignment refs (read-only summary)
     alignments: list[dict] = []
+    latest_evidence: dict | None = None
 
 
 class ObjectiveOut(BaseModel):
@@ -424,6 +429,22 @@ class ProgressUpdate(BaseModel):
     note: str | None = None
     # Optional explicit status override; when omitted, auto-computed from progress ratio
     status: str | None = None
+    source_task_id: uuid.UUID | None = None
+    source_deliverable_request_id: uuid.UUID | None = None
+
+
+class OKREvidenceOut(BaseModel):
+    id: str
+    kind: str
+    source_task_id: str | None = None
+    source_deliverable_request_id: str | None = None
+    title: str
+    summary: str
+    work_type: str
+    owner_name: str
+    completed_at: str
+    deep_link: str
+    artifact: dict | None = None
 
 
 class PeriodOut(BaseModel):
@@ -483,6 +504,182 @@ class CompanyReportOut(BaseModel):
 class CompanyReportRegenerate(BaseModel):
     report_type: str
     period_start: str
+
+
+def _task_deep_link(task: Task) -> str:
+    snapshot = dict(task.executor_snapshot or {})
+    session_id = snapshot.get("group_session_id")
+    if task.executor_kind == "group" and task.group_id and session_id:
+        return f"/groups/{task.group_id}/{session_id}"
+    return f"/agents/{task.agent_id}/chat?task_id={task.id}"
+
+
+def _deliverable_deep_link(request: DeliverableRequest) -> str:
+    suffix = f"&task_id={request.task_id}" if request.task_id else ""
+    return f"/agents/{request.agent_id}/chat?session_id={request.session_id}{suffix}"
+
+
+def _approved_artifact_snapshot(
+    artifact: DeliverableArtifactRevision | None,
+) -> dict | None:
+    if artifact is None:
+        return None
+    filename = artifact.workspace_path.rsplit("/", 1)[-1]
+    return {
+        "id": str(artifact.id),
+        "name": filename,
+        "artifact_type": artifact.artifact_type,
+        "mime_type": artifact.mime_type,
+        "content_hash": artifact.content_hash,
+        "approved_at": artifact.approved_at.isoformat() if artifact.approved_at else None,
+        "download_url": (
+            f"/api/deliverables/artifacts/{artifact.id}/download?inline=true"
+        ),
+    }
+
+
+async def _latest_approved_artifact(
+    db: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    request_id: uuid.UUID,
+) -> DeliverableArtifactRevision | None:
+    result = await db.execute(
+        select(DeliverableArtifactRevision)
+        .where(
+            DeliverableArtifactRevision.tenant_id == tenant_id,
+            DeliverableArtifactRevision.request_id == request_id,
+            DeliverableArtifactRevision.status == "approved",
+        )
+        .order_by(
+            DeliverableArtifactRevision.approved_at.desc(),
+            DeliverableArtifactRevision.created_at.desc(),
+            DeliverableArtifactRevision.id.desc(),
+        )
+        .limit(1)
+    )
+    return result.scalars().first()
+
+
+async def _resolve_progress_evidence(
+    db: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    body: ProgressUpdate,
+) -> tuple[uuid.UUID | None, uuid.UUID | None, dict]:
+    """Validate tenant-owned evidence and freeze the facts used for this update."""
+    if body.source_task_id is None and body.source_deliverable_request_id is None:
+        return None, None, {}
+
+    task: Task | None = None
+    if body.source_task_id is not None:
+        task = (
+            await db.execute(
+                select(Task).where(
+                    Task.id == body.source_task_id,
+                    Task.tenant_id == tenant_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if task is None:
+            raise HTTPException(status_code=404, detail="Task evidence not found")
+        if task.status != "done":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "task_evidence_not_completed",
+                    "message": "Only completed tasks can support an OKR progress update",
+                },
+            )
+
+    request: DeliverableRequest | None = None
+    artifact: DeliverableArtifactRevision | None = None
+    if body.source_deliverable_request_id is not None:
+        request = (
+            await db.execute(
+                select(DeliverableRequest).where(
+                    DeliverableRequest.id == body.source_deliverable_request_id,
+                    DeliverableRequest.tenant_id == tenant_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if request is None:
+            raise HTTPException(status_code=404, detail="Deliverable evidence not found")
+        if request.status != "succeeded":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "deliverable_evidence_not_delivered",
+                    "message": "Only succeeded deliverables can support an OKR progress update",
+                },
+            )
+        artifact = await _latest_approved_artifact(
+            db,
+            tenant_id=tenant_id,
+            request_id=request.id,
+        )
+        if artifact is None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "deliverable_evidence_not_approved",
+                    "message": "A succeeded deliverable needs an approved artifact before it can support OKR progress",
+                },
+            )
+        if task is not None and request.task_id != task.id:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "evidence_source_mismatch",
+                    "message": "The selected task and deliverable do not belong to the same work chain",
+                },
+            )
+
+    agent_id = request.agent_id if request is not None else task.agent_id  # type: ignore[union-attr]
+    owner_name = (
+        await db.execute(
+            select(Agent.name).where(
+                Agent.id == agent_id,
+                Agent.tenant_id == tenant_id,
+            )
+        )
+    ).scalar_one_or_none() or ""
+
+    if request is not None:
+        title = request.goal[:500]
+        completed_at = request.completed_at or request.updated_at
+        snapshot = {
+            "kind": "deliverable",
+            "title": title,
+            "summary": request.goal,
+            "work_type": request.work_type,
+            "owner_name": owner_name,
+            "task_id": str(task.id) if task else (str(request.task_id) if request.task_id else None),
+            "deliverable_request_id": str(request.id),
+            "completed_at": completed_at.isoformat() if completed_at else None,
+            "deep_link": _deliverable_deep_link(request),
+            "artifact": _approved_artifact_snapshot(artifact),
+        }
+    else:
+        assert task is not None
+        completed_at = task.completed_at or task.updated_at
+        snapshot = {
+            "kind": "task",
+            "title": task.title,
+            "summary": task.description or task.intent,
+            "work_type": task.work_type,
+            "owner_name": owner_name,
+            "task_id": str(task.id),
+            "deliverable_request_id": None,
+            "completed_at": completed_at.isoformat() if completed_at else None,
+            "deep_link": _task_deep_link(task),
+            "artifact": None,
+        }
+    return (
+        task.id if task is not None else None,
+        request.id if request is not None else None,
+        snapshot,
+    )
 
 
 # ─── Settings ─────────────────────────────────────────────────────────────────
@@ -696,7 +893,10 @@ async def list_periods(user=Depends(get_current_user)):
 # ─── Objectives ───────────────────────────────────────────────────────────────
 
 
-def _kr_to_out(kr: OKRKeyResult) -> KeyResultOut:
+def _kr_to_out(
+    kr: OKRKeyResult,
+    latest_evidence: dict | None = None,
+) -> KeyResultOut:
     return KeyResultOut(
         id=str(kr.id),
         objective_id=str(kr.objective_id),
@@ -708,6 +908,7 @@ def _kr_to_out(kr: OKRKeyResult) -> KeyResultOut:
         status=kr.status,
         last_updated_at=kr.last_updated_at.isoformat() if kr.last_updated_at else "",
         created_at=kr.created_at.isoformat() if kr.created_at else "",
+        latest_evidence=latest_evidence,
     )
 
 
@@ -715,6 +916,7 @@ def _obj_to_out(
     obj: OKRObjective,
     krs: list[OKRKeyResult] | None = None,
     owner_name: str | None = None,
+    evidence_by_kr: dict[uuid.UUID, dict] | None = None,
 ) -> ObjectiveOut:
     return ObjectiveOut(
         id=str(obj.id),
@@ -727,8 +929,117 @@ def _obj_to_out(
         period_end=obj.period_end.isoformat(),
         status=obj.status,
         created_at=obj.created_at.isoformat() if obj.created_at else "",
-        key_results=[_kr_to_out(kr) for kr in (krs or [])],
+        key_results=[
+            _kr_to_out(kr, (evidence_by_kr or {}).get(kr.id))
+            for kr in (krs or [])
+        ],
     )
+
+
+@router.get("/evidence", response_model=list[OKREvidenceOut])
+async def list_okr_evidence(
+    limit: int = Query(default=50, ge=1, le=100),
+    user=Depends(get_current_user),
+):
+    """List tenant-owned, terminal work that an admin may cite as OKR evidence."""
+    if not _is_okr_admin(user):
+        raise _dashboard_write_forbidden()
+
+    async with async_session() as db:
+        task_rows = list(
+            (
+                await db.execute(
+                    select(Task, Agent)
+                    .join(Agent, Agent.id == Task.agent_id)
+                    .where(
+                        Task.tenant_id == user.tenant_id,
+                        Agent.tenant_id == user.tenant_id,
+                        Task.status == "done",
+                    )
+                    .order_by(Task.completed_at.desc(), Task.updated_at.desc())
+                    .limit(limit)
+                )
+            ).all()
+        )
+        request_rows = list(
+            (
+                await db.execute(
+                    select(DeliverableRequest, Agent)
+                    .join(Agent, Agent.id == DeliverableRequest.agent_id)
+                    .where(
+                        DeliverableRequest.tenant_id == user.tenant_id,
+                        Agent.tenant_id == user.tenant_id,
+                        DeliverableRequest.status == "succeeded",
+                    )
+                    .order_by(
+                        DeliverableRequest.completed_at.desc(),
+                        DeliverableRequest.updated_at.desc(),
+                    )
+                    .limit(limit)
+                )
+            ).all()
+        )
+
+        request_ids = [request.id for request, _agent in request_rows]
+        approved_by_request: dict[uuid.UUID, DeliverableArtifactRevision] = {}
+        if request_ids:
+            artifact_rows = (
+                await db.execute(
+                    select(DeliverableArtifactRevision)
+                    .where(
+                        DeliverableArtifactRevision.tenant_id == user.tenant_id,
+                        DeliverableArtifactRevision.request_id.in_(request_ids),
+                        DeliverableArtifactRevision.status == "approved",
+                    )
+                    .order_by(
+                        DeliverableArtifactRevision.request_id,
+                        DeliverableArtifactRevision.approved_at.desc(),
+                        DeliverableArtifactRevision.created_at.desc(),
+                        DeliverableArtifactRevision.id.desc(),
+                    )
+                )
+            ).scalars().all()
+            for artifact in artifact_rows:
+                approved_by_request.setdefault(artifact.request_id, artifact)
+
+        options: list[OKREvidenceOut] = []
+        for task, agent in task_rows:
+            completed_at = task.completed_at or task.updated_at
+            options.append(
+                OKREvidenceOut(
+                    id=f"task:{task.id}",
+                    kind="task",
+                    source_task_id=str(task.id),
+                    title=task.title,
+                    summary=task.description or task.intent,
+                    work_type=task.work_type,
+                    owner_name=agent.name,
+                    completed_at=completed_at.isoformat() if completed_at else "",
+                    deep_link=_task_deep_link(task),
+                )
+            )
+        for request, agent in request_rows:
+            artifact = approved_by_request.get(request.id)
+            if artifact is None:
+                continue
+            completed_at = request.completed_at or request.updated_at
+            options.append(
+                OKREvidenceOut(
+                    id=f"deliverable:{request.id}",
+                    kind="deliverable",
+                    source_deliverable_request_id=str(request.id),
+                    title=request.goal[:500],
+                    summary=request.goal,
+                    work_type=request.work_type,
+                    owner_name=agent.name,
+                    completed_at=completed_at.isoformat() if completed_at else "",
+                    deep_link=_deliverable_deep_link(request),
+                    artifact=_approved_artifact_snapshot(artifact),
+                )
+            )
+
+        options.sort(key=lambda option: (option.completed_at, option.id), reverse=True)
+        return options[:limit]
 
 
 @router.get("/objectives", response_model=list[ObjectiveOut])
@@ -777,6 +1088,32 @@ async def list_objectives(
             .order_by(OKRKeyResult.created_at)
         )
         all_krs = krs_result.scalars().all()
+
+        latest_evidence_by_kr: dict[uuid.UUID, dict] = {}
+        kr_ids = [kr.id for kr in all_krs]
+        if kr_ids:
+            evidence_logs = (
+                await db.execute(
+                    select(OKRProgressLog)
+                    .where(
+                        OKRProgressLog.kr_id.in_(kr_ids),
+                        or_(
+                            OKRProgressLog.source_task_id.is_not(None),
+                            OKRProgressLog.source_deliverable_request_id.is_not(None),
+                        ),
+                    )
+                    .order_by(
+                        OKRProgressLog.created_at.desc(),
+                        OKRProgressLog.id.desc(),
+                    )
+                )
+            ).scalars().all()
+            for log in evidence_logs:
+                if log.evidence_snapshot:
+                    latest_evidence_by_kr.setdefault(
+                        log.kr_id,
+                        dict(log.evidence_snapshot),
+                    )
 
         # Group KRs by objective
         krs_by_obj: dict[uuid.UUID, list[OKRKeyResult]] = {}
@@ -830,7 +1167,12 @@ async def list_objectives(
             return None
 
         return [
-            _obj_to_out(o, krs_by_obj.get(o.id, []), owner_name=_resolve_name(o))
+            _obj_to_out(
+                o,
+                krs_by_obj.get(o.id, []),
+                owner_name=_resolve_name(o),
+                evidence_by_kr=latest_evidence_by_kr,
+            )
             for o in objectives
         ]
 
@@ -1116,6 +1458,14 @@ async def update_kr_progress_endpoint(
             raise HTTPException(404, "Key Result not found")
         kr, _ = row
 
+        source_task_id, source_deliverable_request_id, evidence_snapshot = (
+            await _resolve_progress_evidence(
+                db,
+                tenant_id=user.tenant_id,
+                body=body,
+            )
+        )
+
         prev_value = kr.current_value
         kr.current_value = body.value
         kr.last_updated_at = datetime.utcnow()
@@ -1140,11 +1490,14 @@ async def update_kr_progress_endpoint(
             new_value=body.value,
             source="manual",
             note=body.note,
+            source_task_id=source_task_id,
+            source_deliverable_request_id=source_deliverable_request_id,
+            evidence_snapshot=evidence_snapshot,
         )
         db.add(log)
         await db.commit()
         await db.refresh(kr)
-        return _kr_to_out(kr)
+        return _kr_to_out(kr, evidence_snapshot or None)
 
 
 @router.delete("/key-results/{kr_id}")

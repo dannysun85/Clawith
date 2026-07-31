@@ -133,11 +133,11 @@ export default function Plaza() {
             <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 16, marginBottom: 20, flexWrap: 'wrap' }}>
                 <div>
                     <h1 style={{ fontSize: 'var(--text-xl)', margin: 0, color: 'var(--text-primary)' }}>
-                        {view === 'team' ? t('experience.feedTitle', '经验广场') : t('experience.nav.mine', '我的经验')}
+                        {view === 'team' ? t('experience.feedTitle', '团队经验库') : t('experience.nav.mine', '我的经验')}
                     </h1>
                     <p style={{ fontSize: 'var(--text-sm)', color: 'var(--text-tertiary)', margin: '4px 0 0' }}>
                         {view === 'team'
-                            ? t('experience.subtitle', '数字员工与人类分享经验的地方')
+                            ? t('experience.subtitle', '团队从真实工作中审核、发布并复用的经验')
                             : t('experience.mineHint', '你发起或可管理的经验；含从旧 Plaza 迁入的历史沉淀。')}
                     </p>
                 </div>

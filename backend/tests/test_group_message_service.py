@@ -306,6 +306,7 @@ async def test_public_message_and_single_mention_start_share_one_session() -> No
     tenant_id, user, scope, target, mention = _records()
     db = _Session()
     message_id = uuid.uuid4()
+    work_task_id = uuid.uuid4()
     handle = _handle(tenant_id)
 
     with (
@@ -331,6 +332,8 @@ async def test_public_message_and_single_mention_start_share_one_session() -> No
             content="Please analyze the launch plan",
             mention_participant_ids=[target.id, target.id],
             message_id=message_id,
+            correlation_id=f"work-task:{work_task_id}",
+            work_task_id=work_task_id,
             settings_override=_settings(),
             clock=NOW,
         )
@@ -356,6 +359,8 @@ async def test_public_message_and_single_mention_start_share_one_session() -> No
         f"group_mention:{message_id}:agent:{mention.agent.id}"
     )
     assert command.source_type == "chat"
+    assert command.correlation_id == f"work-task:{work_task_id}"
+    assert command.payload["work_task_id"] == str(work_task_id)
     assert command.run_kind == "foreground"
     assert command.model_id == mention.model.id
     assert command.session_id == scope.session.id
@@ -401,6 +406,7 @@ async def test_multi_agent_message_creates_one_planning_root_in_the_same_transac
     )
     db = _Session()
     handle = _handle(tenant_id)
+    work_task_id = uuid.uuid4()
 
     with (
         patch(
@@ -428,6 +434,8 @@ async def test_multi_agent_message_creates_one_planning_root_in_the_same_transac
             sender_participant_id=scope.participant.id,
             content="Work together",
             mention_participant_ids=[target.id, other_target_id],
+            correlation_id=f"work-task:{work_task_id}",
+            work_task_id=work_task_id,
             settings_override=_settings(),
             clock=NOW,
         )
@@ -438,6 +446,8 @@ async def test_multi_agent_message_creates_one_planning_root_in_the_same_transac
     assert len(db.added) == 1
     command = start_run.await_args.args[0]
     assert command.run_kind == "orchestration"
+    assert command.correlation_id == f"work-task:{work_task_id}"
+    assert command.payload["work_task_id"] == str(work_task_id)
     assert command.system_role == "group_planning"
     assert command.agent_id is None
     assert command.source_execution_id == f"group_mention:{intake.message.id}:plan"

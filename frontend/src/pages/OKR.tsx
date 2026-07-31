@@ -46,6 +46,38 @@ interface KeyResult {
     status: string; // on_track | at_risk | behind | completed
     last_updated_at: string;
     created_at: string;
+    latest_evidence?: OKREvidenceSnapshot | null;
+}
+
+interface OKREvidenceSnapshot {
+    kind: 'task' | 'deliverable';
+    title: string;
+    summary: string;
+    work_type: string;
+    owner_name: string;
+    task_id?: string | null;
+    deliverable_request_id?: string | null;
+    completed_at?: string | null;
+    deep_link: string;
+    artifact?: {
+        id: string;
+        name: string;
+        download_url: string;
+    } | null;
+}
+
+interface OKREvidenceOption {
+    id: string;
+    kind: 'task' | 'deliverable';
+    source_task_id?: string | null;
+    source_deliverable_request_id?: string | null;
+    title: string;
+    summary: string;
+    work_type: string;
+    owner_name: string;
+    completed_at: string;
+    deep_link: string;
+    artifact?: OKREvidenceSnapshot['artifact'];
 }
 
 interface Objective {
@@ -217,12 +249,20 @@ function KRCard({
     onUpdateProgress,
     onDelete,
     canEdit,
+    evidenceOptions,
 }: {
     kr: KeyResult;
     isChinese: boolean;
-    onUpdateProgress: (krId: string, value: number, status: string, note: string) => void;
+    onUpdateProgress: (
+        krId: string,
+        value: number,
+        status: string,
+        note: string,
+        evidence?: OKREvidenceOption,
+    ) => Promise<void>;
     onDelete?: (krId: string) => void;
     canEdit: boolean;
+    evidenceOptions: OKREvidenceOption[];
 }) {
     const dialog = useDialog();
     const pct = progressPercent(kr);
@@ -230,6 +270,7 @@ function KRCard({
     const [editValue, setEditValue] = useState(String(kr.current_value));
     const [editStatus, setEditStatus] = useState('auto');
     const [editNote, setEditNote] = useState('');
+    const [editEvidenceId, setEditEvidenceId] = useState('');
     const [saving, setSaving] = useState(false);
 
     async function handleSave() {
@@ -237,9 +278,11 @@ function KRCard({
         if (isNaN(val)) return;
         setSaving(true);
         try {
-            await onUpdateProgress(kr.id, val, editStatus, editNote);
+            const evidence = evidenceOptions.find(option => option.id === editEvidenceId);
+            await onUpdateProgress(kr.id, val, editStatus, editNote, evidence);
             setEditing(false);
             setEditNote('');
+            setEditEvidenceId('');
         } finally {
             setSaving(false);
         }
@@ -262,7 +305,11 @@ function KRCard({
                     {canEdit && !editing && (
                         <button
                             id={`kr-edit-${kr.id}`}
-                            onClick={() => { setEditing(true); setEditValue(String(kr.current_value)); }}
+                            onClick={() => {
+                                setEditing(true);
+                                setEditValue(String(kr.current_value));
+                                setEditEvidenceId('');
+                            }}
                             style={{
                                 background: 'none', border: '1px solid var(--border-subtle)',
                                 borderRadius: '4px', padding: '2px 8px',
@@ -323,6 +370,36 @@ function KRCard({
                     {kr.unit ? ` ${kr.unit}` : ''} ({pct}%)
                 </span>
             </div>
+
+            {kr.latest_evidence && (
+                <div style={{
+                    display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap',
+                    padding: '7px 9px', borderRadius: '6px',
+                    border: '1px solid var(--border-subtle)', background: 'var(--bg-primary)',
+                    fontSize: '11px', color: 'var(--text-tertiary)',
+                }}>
+                    <span>{isChinese ? '已关联证据' : 'Linked evidence'}</span>
+                    <a
+                        href={kr.latest_evidence.deep_link}
+                        style={{ color: 'var(--accent-primary)', fontWeight: 600, textDecoration: 'none' }}
+                    >
+                        {kr.latest_evidence.kind === 'deliverable'
+                            ? (isChinese ? '正式交付' : 'Formal delivery')
+                            : (isChinese ? '已完成任务' : 'Completed task')}
+                        {' · '}{kr.latest_evidence.title}
+                    </a>
+                    {kr.latest_evidence.artifact?.download_url && (
+                        <a
+                            href={kr.latest_evidence.artifact.download_url}
+                            target="_blank"
+                            rel="noreferrer"
+                            style={{ color: 'var(--text-secondary)' }}
+                        >
+                            {isChinese ? '查看产物' : 'Open artifact'}
+                        </a>
+                    )}
+                </div>
+            )}
 
             {/* Inline editing form */}
             {editing && (
@@ -386,6 +463,39 @@ function KRCard({
                             fontSize: '12px',
                         }}
                     />
+                    <label style={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
+                        <span style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>
+                            {isChinese ? '关联完成证据（可选）' : 'Link completed evidence (optional)'}
+                        </span>
+                        <select
+                            value={editEvidenceId}
+                            onChange={e => setEditEvidenceId(e.target.value)}
+                            style={{
+                                padding: '6px 10px',
+                                background: 'var(--bg-primary)',
+                                border: '1px solid var(--border-subtle)',
+                                borderRadius: '4px', color: 'var(--text-primary)',
+                                fontSize: '12px',
+                            }}
+                        >
+                            <option value="">
+                                {isChinese ? '不关联证据' : 'No evidence'}
+                            </option>
+                            {evidenceOptions.map(option => (
+                                <option key={option.id} value={option.id}>
+                                    {option.kind === 'deliverable'
+                                        ? (isChinese ? '正式交付' : 'Formal delivery')
+                                        : (isChinese ? '已完成任务' : 'Completed task')}
+                                    {' · '}{option.title} · {option.owner_name}
+                                </option>
+                            ))}
+                        </select>
+                        <span style={{ fontSize: '11px', color: 'var(--text-quaternary)' }}>
+                            {isChinese
+                                ? '仅显示已完成任务和包含已批准产物的正式交付。'
+                                : 'Only completed tasks and formal deliveries with approved artifacts are available.'}
+                        </span>
+                    </label>
                     <div style={{ display: 'flex', gap: '6px', justifyContent: 'flex-end' }}>
                         <button
                             onClick={() => setEditing(false)}
@@ -532,12 +642,14 @@ function ObjectiveCard({
     obj,
     isChinese,
     canEdit,
+    evidenceOptions,
     onInvalidate,
     onDelete,
 }: {
     obj: Objective;
     isChinese: boolean;
     canEdit: boolean;
+    evidenceOptions: OKREvidenceOption[];
     onInvalidate: () => void;
     onDelete?: (objId: string) => void;
 }) {
@@ -548,10 +660,22 @@ function ObjectiveCard({
     const overallStatus = obj.status === 'completed' ? 'completed' : deriveStatus(pct);
 
     // Update KR progress
-    async function handleKRProgressUpdate(krId: string, value: number, status: string, note: string) {
+    async function handleKRProgressUpdate(
+        krId: string,
+        value: number,
+        status: string,
+        note: string,
+        evidence?: OKREvidenceOption,
+    ) {
         await fetchJson(`/okr/key-results/${krId}/progress`, {
             method: 'POST',
-            body: JSON.stringify({ value, status: status === 'auto' ? undefined : status, note: note || undefined }),
+            body: JSON.stringify({
+                value,
+                status: status === 'auto' ? undefined : status,
+                note: note || undefined,
+                source_task_id: evidence?.source_task_id || undefined,
+                source_deliverable_request_id: evidence?.source_deliverable_request_id || undefined,
+            }),
         });
         onInvalidate();
     }
@@ -651,6 +775,7 @@ function ObjectiveCard({
                                 onInvalidate();
                             }}
                             canEdit={canEdit}
+                            evidenceOptions={evidenceOptions}
                         />
                     ))}
                     {obj.key_results.length === 0 && !addingKR && (
@@ -884,6 +1009,14 @@ export default function OKR() {
             `/okr/objectives?period_start=${selectedPeriod!.start}&period_end=${selectedPeriod!.end}`
         ),
         enabled: !!settings?.enabled && !!selectedPeriod,
+        staleTime: 0,
+        refetchOnWindowFocus: true,
+    });
+
+    const { data: evidenceOptions = [] } = useQuery<OKREvidenceOption[]>({
+        queryKey: ['okr-evidence'],
+        queryFn: () => fetchJson<OKREvidenceOption[]>('/okr/evidence?limit=100'),
+        enabled: !!settings?.enabled && !!isAdmin,
         staleTime: 0,
         refetchOnWindowFocus: true,
     });
@@ -1177,6 +1310,7 @@ export default function OKR() {
                                         obj={obj}
                                         isChinese={isChinese}
                                         canEdit={!!isAdmin}
+                                        evidenceOptions={evidenceOptions}
                                         onInvalidate={invalidateObjectives}
                                         onDelete={async (id) => {
                                             await fetchJson(`/okr/objectives/${id}`, { method: 'DELETE' });
@@ -1261,6 +1395,7 @@ export default function OKR() {
                                                     obj={obj}
                                                     isChinese={isChinese}
                                                     canEdit={!!isAdmin}
+                                                    evidenceOptions={evidenceOptions}
                                                     onInvalidate={invalidateObjectives}
                                                     onDelete={async (id) => {
                                                         await fetchJson(`/okr/objectives/${id}`, { method: 'DELETE' });

@@ -134,6 +134,104 @@ async def test_generate_video_blocks_portrait_minimax_t2v_before_credit_check(
 
 
 @pytest.mark.asyncio
+async def test_formal_video_does_not_enter_unconfirmed_degraded_route(tmp_path):
+    prepare = AsyncMock(
+        side_effect=NoCredentialAvailable("volcengine_agent_plan", "video")
+    )
+    with (
+        patch("app.services.agent_tools._get_tool_config", AsyncMock(return_value={})),
+        patch(
+            "app.services.agent_tools._resolve_minimax_tool_tier",
+            AsyncMock(return_value="pro"),
+        ),
+        patch(
+            "app.services.minimax_media_profiles.load_platform_minimax_media_profile",
+            AsyncMock(return_value=resolve_minimax_media_profile("video", "pro")),
+        ),
+        patch(
+            "app.services.agent_tools._get_minimax_tenant_uuid",
+            AsyncMock(return_value=uuid.uuid4()),
+        ),
+        patch(
+            "app.services.media_provider_routing.prepare_media_provider",
+            prepare,
+        ),
+        patch(
+            "app.services.agent_tools._record_minimax_tool_product_issue",
+            AsyncMock(),
+        ),
+    ):
+        result = await _generate_video_minimax(
+            uuid.uuid4(),
+            tmp_path,
+            {
+                "prompt": "formal people-led commercial",
+                "allow_degraded_fallback": False,
+            },
+            typed=True,
+        )
+
+    assert isinstance(result, ToolExecutionOutcome)
+    assert result.status == "failed"
+    assert result.error_code == "media_video_degraded_confirmation_required"
+    assert "no Credits were consumed" in result.result_summary
+    assert prepare.await_count == 1
+    assert prepare.await_args.args == ("volcengine_agent_plan",)
+
+
+@pytest.mark.asyncio
+async def test_formal_image_does_not_enter_unconfirmed_degraded_route(tmp_path):
+    prepare = AsyncMock(
+        side_effect=NoCredentialAvailable("volcengine_agent_plan", "image")
+    )
+    with (
+        patch("app.services.agent_tools._get_tool_config", AsyncMock(return_value={})),
+        patch(
+            "app.services.agent_tools._resolve_minimax_tool_tier",
+            AsyncMock(return_value="pro"),
+        ),
+        patch(
+            "app.services.minimax_media_profiles.load_platform_minimax_media_profile",
+            AsyncMock(return_value=resolve_minimax_media_profile("image", "pro")),
+        ),
+        patch(
+            "app.services.agent_tools._check_minimax_tool_allowed",
+            AsyncMock(return_value=None),
+        ),
+        patch(
+            "app.services.agent_tools._get_minimax_tenant_uuid",
+            AsyncMock(return_value=uuid.uuid4()),
+        ),
+        patch("app.services.agent_tools._check_minimax_credit_amount", AsyncMock()),
+        patch(
+            "app.services.media_provider_routing.prepare_media_provider",
+            prepare,
+        ),
+        patch(
+            "app.services.agent_tools._record_minimax_tool_product_issue",
+            AsyncMock(),
+        ),
+    ):
+        result = await _generate_image(
+            uuid.uuid4(),
+            tmp_path,
+            {
+                "prompt": "formal product hero",
+                "allow_degraded_fallback": False,
+            },
+            "minimax",
+            typed=True,
+        )
+
+    assert isinstance(result, ToolExecutionOutcome)
+    assert result.status == "failed"
+    assert result.error_code == "media_image_degraded_confirmation_required"
+    assert "no Credits were consumed" in result.result_summary
+    assert prepare.await_count == 1
+    assert prepare.await_args.args == ("volcengine_agent_plan",)
+
+
+@pytest.mark.asyncio
 async def test_public_provider_client_marks_started_after_public_origin_preflight():
     policy_error = MCPURLPolicyError(
         "MCP endpoint must resolve only to public addresses"

@@ -116,6 +116,7 @@ class RuntimeRunRecord:
     root_run_id: str | None = None
     model_turn_limit: int | None = None
     source_id: str | None = None
+    correlation_id: str | None = None
     scheduling_position_created_at: datetime | None = None
     scheduling_position_id: uuid.UUID | None = None
 
@@ -425,6 +426,7 @@ class RuntimeCommandWorker:
                     root_run_id=str(run.root_run_id) if run.root_run_id is not None else None,
                     model_turn_limit=run.model_turn_limit,
                     source_id=run.source_id,
+                    correlation_id=run.correlation_id,
                     scheduling_position_created_at=(
                         run.scheduling_position_created_at
                     ),

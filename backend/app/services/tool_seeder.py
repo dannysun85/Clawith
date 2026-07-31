@@ -1367,7 +1367,7 @@ BUILTIN_TOOLS = [
     {
         "name": "generate_image_minimax",
         "display_name": "Generate Image",
-        "description": "Generate an image through Astra's managed media route. Model quality is selected from the active Lite, Pro, or Ultra product tier, and provider failover is automatic before a request is accepted. Generate exactly the number of outputs requested. When one request requires both an uploaded product/reference and exact visible copy, pass brand_asset or reference_image together with overlay_text in the same single call; never split them into separate variants unless the user explicitly asks for multiple outputs.",
+        "description": "Generate an image through Astra's managed media route. Model quality is selected from the active Lite, Pro, or Ultra product tier. Provider failover is safe only before a request is accepted, and a formal delivery must pass allow_degraded_fallback=false unless the user explicitly accepted emergency quality. Generate exactly the number of outputs requested. When one request requires both an uploaded product/reference and exact visible copy, pass brand_asset or reference_image together with overlay_text in the same single call; never split them into separate variants unless the user explicitly asks for multiple outputs.",
         "category": "media",
         "icon": "🎨",
         "is_default": True,
@@ -1395,6 +1395,7 @@ BUILTIN_TOOLS = [
                 "brand_asset": {"type": "string", "description": "Canonical workspace image path or data URL composited unchanged as a product/logo layer. For a chat upload use workspace/uploads/<filename>. When exact copy is also requested, include overlay_text in this same call. Do not combine with reference_image."},
                 "brand_position": {"type": "string", "enum": ["top_left", "top_right", "center", "bottom_left", "bottom_right"]},
                 "brand_scale": {"type": "number", "description": "Canvas width fraction from 0.1 to 0.8. Default: 0.42."},
+                "allow_degraded_fallback": {"type": "boolean", "description": "Whether a known non-equivalent emergency provider may be used when the commercial primary route is unavailable. Formal delivery contracts default to false and may set true only after explicit user confirmation. Legacy quick-generation calls default to true."},
                 "save_path": {"type": "string", "description": "Save path in workspace. Default: auto."},
             },
             "required": ["prompt"],
@@ -1524,7 +1525,7 @@ BUILTIN_TOOLS = [
     {
         "name": "generate_video_minimax",
         "display_name": "Generate Video",
-        "description": "Create a managed text-to-video or image-to-video task with the active Lite, Pro, or Ultra quality profile. Astra selects a healthy provider before submission and keeps an accepted task on that provider for idempotent polling and delivery. The completed file is rejected if its actual duration or aspect ratio differs from the request, or if require_audio=true and no audio stream exists.",
+        "description": "Create a managed text-to-video or image-to-video task with the active Lite, Pro, or Ultra quality profile. Astra selects a healthy provider before submission and keeps an accepted task on that provider for idempotent polling and delivery. A formal delivery must pass allow_degraded_fallback=false unless the user explicitly accepted emergency quality. The completed file is rejected if its actual duration or aspect ratio differs from the request, or if require_audio=true and no audio stream exists.",
         "category": "media",
         "icon": "🎬",
         "is_default": True,
@@ -1551,6 +1552,7 @@ BUILTIN_TOOLS = [
                 "brand_asset": {"type": "string", "description": "Workspace image path frozen and composited over every frame as the protected product/logo layer. Do not combine with frame references."},
                 "brand_position": {"type": "string", "enum": ["top_left", "top_right", "center", "bottom_left", "bottom_right"]},
                 "brand_scale": {"type": "number", "description": "Video width fraction from 0.1 to 0.8. Default: 0.42."},
+                "allow_degraded_fallback": {"type": "boolean", "description": "Whether a known non-equivalent emergency provider may be used when the commercial primary route is unavailable. Formal delivery contracts default to false and may set true only after explicit user confirmation. Legacy quick-generation calls default to true."},
                 "wait_for_completion": {"type": "boolean", "description": "Poll and download if completed before timeout. Default: false."},
                 "poll_timeout_seconds": {"type": "integer", "description": "Maximum wait time when wait_for_completion=true. Default: 180."},
                 "save_path": {"type": "string", "description": "Save path for the completed video. Default: auto."},

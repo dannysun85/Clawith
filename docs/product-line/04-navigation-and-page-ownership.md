@@ -1,46 +1,47 @@
 # 导航与页面归属事实基线
 
-- 状态：`active-design-baseline`
-- 日期：2026-07-31
+- 状态：`implementation-candidate`
+- 日期：2026-08-01
 - 目的：给每个一级入口一个唯一职责，清除“功能都有，但用户不知道从哪里开始”的问题
 
 ## 1. 当前路由事实
 
-`frontend/src/App.tsx` 当前没有 `/work`：根路径进入 `/dashboard`；主要租户路由包括 `/dashboard`、`/plaza`、`/agents/*`、`/groups/*`、`/quality-reviews/*`、`/enterprise`、`/okr`、`/account/subscription`。
+`frontend/src/App.tsx` 已注册 `/work`，有租户上下文的根路径默认进入 `/work`；`/dashboard`、`/plaza`、`/agents/*`、`/groups/*`、`/quality-reviews/*`、`/enterprise`、`/okr`、`/account/subscription` 等旧路由继续保留。
 
-`Layout.tsx` 当前一级导航显示 Dashboard、OKR、Plaza、Groups；其下是一整块“智能体”列表，私人助手和数字员工混在其中。企业设置、套餐和 SaaS 管理位于账户菜单。
+`Layout.tsx` 当前按三层呈现：`工作`（工作台、协作群组）、`协作角色`（我的助理、Agent 员工）和 `组织`（公司概览、OKR、发现中心、管理员可见企业设置）。账户菜单承载账户设置、套餐与用量、平台运营和 SaaS 能力治理；后两项只对对应平台角色显示。
 
 ## 2. 页面逐项审查
 
 | 页面/入口 | 当前真实职责 | 重叠/错位 | 目标归属 | 处理决定 |
 |---|---|---|---|---|
-| Dashboard | Agent 状态、任务摘要、Token、全局活动、新增 Agent | 像员工监控台，也像首页 | 公司运营概览 | 保留；不再作为默认任务入口；招聘入口降级为辅助动作 |
-| OKR | 目标、KR、看板、日报和管理员设置链接 | 与 Dashboard 的绩效概览重叠 | 目标与结果管理 | 保留一级组织入口；只消费已批准工作证据，不执行任务 |
-| Plaza | 团队/我的经验，draft/published/retired | 名称像社交广场；员工发现另在弹窗 | 发现中心：经验库 + 员工市场 | 保留 `/plaza`；增加明确分区，不混合经验与招聘数据模型 |
-| Groups | 群组树、会话、消息、成员、Workspace | 容易被当成万能 Agent 团队或通讯录 | 可见多人协作 | 保留；工作仍需要责任主体和 Task/Run |
-| Agents | 左侧列表 + chat/directory/settings，详情内部 Tab 很多 | 私人助手混入；执行、文件、配置和招聘入口集中 | 数字员工花名册与员工执行现场 | 拆分“我的助理”导航；长期员工保留；高级配置渐进显示 |
+| Workbench | 任务捕获、工作说明确认、执行者/能力预检、跨 Runtime 工作索引 | 新入口，不能演变为第二套 Runtime | 默认任务入口 | `/` 默认进入；只创建/读取真实 Task、Run、Deliverable 与 Artifact |
+| Dashboard | 长期 Agent 状态、服务端 Work 摘要、Token、全局活动、新增 Agent | 仍有部分员工管理辅助动作 | 公司运营概览 | 保留 `/dashboard`；不再作为默认任务入口；私人助手不计入员工统计 |
+| OKR | 目标、KR、看板、日报和管理员设置链接；进度可引用已完成工作证据 | 不能从 Agent 自述自动完成 KR | 目标与结果证据 | 保留一级组织入口；仅接受完成 Task 或带批准 Artifact 的成功 Deliverable |
+| Plaza | 团队/我的 Experience；发现中心可进入员工市场 | 经验与招聘共享入口但不共享生命周期 | 发现中心：经验库 + 员工市场 | 保留 `/plaza` 和 Talent Market；不混合 Experience 与 Agent 模板数据模型 |
+| Groups | 群组树、会话、消息、成员、Workspace；可接收工作台 Group Task | 不应被当成组织架构或无责任人的黑盒编排 | 可见多人协作 | 保留；每项工作固定 Task、owner Agent、session、参与者与 correlation |
+| Agents | 分离后的我的助理、Agent 员工列表及 chat/directory/settings | Agent 详情仍承载较多专业设置 | 长期角色与执行现场 | 私人关系和长期员工已分组；旧 Agent 深链、权限与设置保持 |
 | Enterprise | info/users/invites/org/tools/skills/approvals/audit/okr/subscription 等 | 租户治理与平台路由曾混在一起；页面过宽 | 公司治理控制面 | 保留管理员入口；Provider/model 永远跳 SaaS Admin |
 | Subscription | `/account/subscription` 用量/流水/订单；Enterprise 有购买/计划 | 两处都叫套餐 | 成员可见“套餐与用量” + 管理员“购买与配置” | 共享数据源；前者读用量与账单，后者管理订阅；互相深链 |
-| Deliverable | chat 中发起、结果卡、右侧详情、独立 reviewer 路由 | 缺少跨员工索引；曾错误挤入 composer | 正式产物生命周期 | 不做孤立文件库；由工作台聚合，Agent/Group 时间线报告，右侧详情交付 |
+| Deliverable | chat 中发起、结果卡、右侧详情、独立 reviewer 路由，并由工作台跨员工聚合 | 必须保持结果属于产出者，不能再次挤入 composer | 正式产物生命周期 | 不做孤立文件库；Agent/Group 时间线报告，右侧详情检查与交付 |
 | Workspace | Agent/Group 侧栏文件、预览、编辑和版本 | 用户易误认为正式交付或公司网盘 | 工作现场 | 保留现有所有权；Artifact 指向 Workspace 文件；不替代 Deliverable |
 
-## 3. 目标导航
+## 3. 当前导航
 
 ### 3.1 普通成员
 
 ```text
-工作台
-我的助理 · <自定义名称>
-Groups
+工作
+  工作台
+  协作群组
 
-数字员工
-  搜索员工
-  最近使用
+协作角色
+  我的助理 · <自定义名称>
+  Agent 员工
 
 组织
-  仪表盘
+  公司概览
   OKR
-  广场
+  发现中心
 
 账户
   套餐与用量
@@ -50,25 +51,25 @@ Groups
 ### 3.2 公司管理员增加
 
 ```text
-企业设置
-  公司与成员
-  数字员工治理
-  工作模板
-  Skills 与 Tools
-  审批与审计
-  套餐管理
+组织
+  企业设置
+
+账户
+  套餐与用量
 ```
 
 ### 3.3 平台管理员增加
 
 ```text
-SaaS 管理
+平台运营
+  租户与注册码
+  生产问题与发布证据
+
+SaaS 能力治理
   套餐/Credits
   模型路由
   媒体路由
   Provider 账号池
-  租户与注册码
-  生产问题与发布证据
 ```
 
 平台管理员没有租户时直接进入 SaaS 控制台，不经过租户 Onboarding，也不伪装成租户成员。
@@ -120,22 +121,22 @@ SaaS 管理
 5. 完成交付后：结果仍属于产出者的消息；输入框只用于下一条输入。
 6. 工作台显示跨 Agent 的摘要和状态，不复制整个交付面板。
 
-## 6. 路由兼容策略
+## 6. 路由兼容状态
 
-- 新增 `/work`，第一阶段 `/` 通过 feature flag 选择 `/dashboard` 或 `/work`。
+- `/work` 已新增，租户根路径固定进入 `/work`；`/dashboard` 继续作为公司概览深链存在。
 - 保留 `/agents/:id/chat|directory|settings`、`/groups/*`、`/quality-reviews/:id`、`/okr`、`/plaza`、`/enterprise`、`/account/subscription`。
 - 旧链接永不因导航改名失效；新页面只产生到旧权威页面的深链。
-- Onboarding 先变更落点，不改变已有助手 Agent ID。
+- Onboarding 已变更落点到 `/work`，没有改变已有助手 Agent ID。
 - 狭窄屏幕上工作台、审批和 Deliverable 详情必须可用；复杂管理员页面仍可声明 desktop-first。
 
-## 7. 当前最严重的定位问题
+## 7. 当前剩余的定位与验证问题
 
-1. 产品以“已有页面集合”组织，而不是以用户任务生命周期组织。
-2. 默认首页偏公司/员工监控，普通成员没有清晰的首次任务入口。
-3. 私人助手既是注册关系又被展示为普通员工，破坏了私人协调与公司资源边界。
-4. Plaza 的旧名字、Experience 新语义和 Talent Market 分散入口造成发现逻辑割裂。
-5. Workspace、聊天附件和 Deliverable 都能展示文件，但正式产物权威没有在导航层明确。
-6. 企业设置、套餐详情、SaaS 后台虽然权限已分层，用户仍缺少清晰的“谁管理什么”解释。
+1. 新导航和默认工作入口已经进入代码，但尚未完成普通成员、公司管理员和平台管理员三种角色的真实浏览器矩阵。
+2. Agent 详情仍包含较多 Tab；需要通过用户任务而不是继续加一级栏目来渐进暴露高级设置。
+3. 发现中心同时承载经验与员工入口，浏览器验证必须证明用户不会把“发布经验”和“招聘员工”当作同一动作。
+4. Workspace、聊天附件和 Deliverable 已有文案与深链边界，但图片、视频、PPT 的真实右侧预览和正式交付仍需逐类核验。
+5. 企业设置、套餐与用量、平台运营和 SaaS 能力治理已经改名分层，仍需角色负向测试证明普通成员看不到平台能力和 Provider Key。
+6. OKR 证据链已实现，但需要验证审批 Artifact 更新、证据快照和旧进度路径不会互相覆盖。
 
 ## 8. 完成标准
 

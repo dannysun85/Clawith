@@ -9,7 +9,9 @@ import uuid
 
 from sqlalchemy import select
 
+from app.models.audit import ChatMessage
 from app.models.agent_run import AgentRun
+from app.models.agent_run_event import AgentRunEvent
 from app.models.task import Task, TaskLog
 from app.services.agent_runtime.command_worker import (
     CheckpointObservation,
@@ -19,6 +21,8 @@ from app.services.agent_runtime.command_worker import (
 
 
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+_TERMINAL_EVENTS = frozenset({"run_completed", "run_failed", "run_cancelled"})
+_GROUP_TASK_CORRELATION_PREFIX = "work-task:"
 
 
 class TaskRuntimeCompletionError(RuntimeError):
@@ -31,6 +35,19 @@ class TaskRuntimeCompletionError(RuntimeError):
 
 def _task_log_id(run_id: uuid.UUID, checkpoint_id: str) -> uuid.UUID:
     return uuid.uuid5(run_id, f"task-terminal:{checkpoint_id}")
+
+
+def _group_task_log_id(task_id: uuid.UUID) -> uuid.UUID:
+    return uuid.uuid5(task_id, "group-task-terminal")
+
+
+def _group_task_id(correlation_id: str | None) -> uuid.UUID | None:
+    if not correlation_id or not correlation_id.startswith(_GROUP_TASK_CORRELATION_PREFIX):
+        return None
+    try:
+        return uuid.UUID(correlation_id.removeprefix(_GROUP_TASK_CORRELATION_PREFIX))
+    except ValueError:
+        return None
 
 
 def _terminal_detail(checkpoint: CheckpointObservation) -> str:
@@ -71,10 +88,17 @@ class TaskRuntimeCompletionHandler:
         run: RuntimeRunRecord,
         checkpoint: CheckpointObservation,
     ) -> None:
-        if run.source_type != "task":
+        group_task_id = _group_task_id(run.correlation_id)
+        if run.source_type != "task" and group_task_id is None:
             return
         status = checkpoint.state["lifecycle"]["status"]
         if status not in _TERMINAL_STATUSES:
+            return
+        if group_task_id is not None:
+            await self._handle_group_task(
+                run=run,
+                task_id=group_task_id,
+            )
             return
         try:
             agent_id = uuid.UUID(run.agent_id or "")
@@ -160,6 +184,211 @@ class TaskRuntimeCompletionHandler:
                     )
                 )
                 await db.flush()
+
+    async def _handle_group_task(
+        self,
+        *,
+        run: RuntimeRunRecord,
+        task_id: uuid.UUID,
+    ) -> None:
+        correlation_id = f"{_GROUP_TASK_CORRELATION_PREFIX}{task_id}"
+        async with self._session_factory() as db:
+            async with db.begin():
+                stored_run = (
+                    await db.execute(
+                        select(AgentRun).where(
+                            AgentRun.tenant_id == run.tenant_id,
+                            AgentRun.id == run.run_id,
+                            AgentRun.source_type == "chat",
+                            AgentRun.correlation_id == correlation_id,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if stored_run is None:
+                    raise TaskRuntimeCompletionError(
+                        "group_task_run_missing",
+                        "terminal Group Task Run is not linked to its confirmed Task",
+                    )
+
+                task = (
+                    await db.execute(
+                        select(Task)
+                        .where(
+                            Task.id == task_id,
+                            Task.tenant_id == run.tenant_id,
+                            Task.executor_kind == "group",
+                        )
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if task is None:
+                    return
+                receipt_id = _group_task_log_id(task.id)
+                existing_receipt = (
+                    await db.execute(
+                        select(TaskLog.id).where(TaskLog.id == receipt_id)
+                    )
+                ).scalar_one_or_none()
+                if existing_receipt is not None:
+                    return
+
+                participant_runs = list(
+                    (
+                        await db.execute(
+                            select(AgentRun).where(
+                                AgentRun.tenant_id == run.tenant_id,
+                                AgentRun.correlation_id == correlation_id,
+                                AgentRun.system_role.is_(None),
+                            )
+                        )
+                    ).scalars().all()
+                )
+                if not participant_runs:
+                    await self._reconcile_group_planning_failure(
+                        db=db,
+                        task=task,
+                        root_run=stored_run,
+                        receipt_id=receipt_id,
+                    )
+                    return
+
+                participant_run_ids = [candidate.id for candidate in participant_runs]
+                terminal_events = list(
+                    (
+                        await db.execute(
+                            select(AgentRunEvent).where(
+                                AgentRunEvent.tenant_id == run.tenant_id,
+                                AgentRunEvent.run_id.in_(participant_run_ids),
+                                AgentRunEvent.event_type.in_(tuple(_TERMINAL_EVENTS)),
+                            )
+                        )
+                    ).scalars().all()
+                )
+                terminal_by_run = {event.run_id: event for event in terminal_events}
+                if set(terminal_by_run) != set(participant_run_ids):
+                    return
+
+                result_by_run = await self._group_result_messages(
+                    db=db,
+                    tenant_id=run.tenant_id,
+                    run_ids=participant_run_ids,
+                )
+                event_types = {event.event_type for event in terminal_by_run.values()}
+                if "run_failed" in event_types:
+                    task.status = "pending"
+                    task.completed_at = None
+                    headline = "❌ Group 协作任务未完成"
+                elif "run_cancelled" in event_types:
+                    task.status = "pending"
+                    task.completed_at = None
+                    headline = "⏹️ Group 协作任务已取消"
+                else:
+                    task.status = "done"
+                    task.completed_at = self._clock()
+                    headline = "✅ Group 协作任务完成"
+
+                participant_snapshot = list(
+                    dict(task.executor_snapshot or {}).get("participants") or []
+                )
+                name_by_agent = {
+                    str(entry.get("agent_id")): str(entry.get("agent_name") or "Agent")
+                    for entry in participant_snapshot
+                    if isinstance(entry, Mapping)
+                }
+                result_sections = []
+                for participant_run in participant_runs:
+                    name = name_by_agent.get(str(participant_run.agent_id), "Agent")
+                    result = result_by_run.get(participant_run.id)
+                    if result:
+                        result_sections.append(f"{name}\n{result}")
+                detail = (
+                    "\n\n".join(result_sections)
+                    if result_sections
+                    else "协作结果已写入 Group 会话，请打开协作现场查看完整记录。"
+                )
+                db.add(
+                    TaskLog(
+                        id=receipt_id,
+                        task_id=task.id,
+                        content=f"{headline}\n\n{detail}",
+                    )
+                )
+                await db.flush()
+
+    async def _reconcile_group_planning_failure(
+        self,
+        *,
+        db,
+        task: Task,
+        root_run: AgentRun,
+        receipt_id: uuid.UUID,
+    ) -> None:
+        result_by_run = await self._group_result_messages(
+            db=db,
+            tenant_id=root_run.tenant_id,
+            run_ids=[root_run.id],
+        )
+        failure = result_by_run.get(root_run.id)
+        if not failure:
+            return
+        task.status = "pending"
+        task.completed_at = None
+        db.add(
+            TaskLog(
+                id=receipt_id,
+                task_id=task.id,
+                content=f"❌ Group 任务规划未完成\n\n{failure}",
+            )
+        )
+        await db.flush()
+
+    @staticmethod
+    async def _group_result_messages(
+        *,
+        db,
+        tenant_id: uuid.UUID,
+        run_ids: list[uuid.UUID],
+    ) -> dict[uuid.UUID, str]:
+        delivery_events = list(
+            (
+                await db.execute(
+                    select(AgentRunEvent)
+                    .where(
+                        AgentRunEvent.tenant_id == tenant_id,
+                        AgentRunEvent.run_id.in_(run_ids),
+                        AgentRunEvent.event_type == "delivery_succeeded",
+                    )
+                    .order_by(AgentRunEvent.created_at.desc(), AgentRunEvent.id.desc())
+                )
+            ).scalars().all()
+        )
+        message_id_by_run: dict[uuid.UUID, uuid.UUID] = {}
+        for event in delivery_events:
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            if payload.get("delivery_kind") != "terminal":
+                continue
+            try:
+                message_id = uuid.UUID(str(payload.get("message_id")))
+            except (TypeError, ValueError):
+                continue
+            message_id_by_run.setdefault(event.run_id, message_id)
+        if not message_id_by_run:
+            return {}
+        messages = list(
+            (
+                await db.execute(
+                    select(ChatMessage).where(
+                        ChatMessage.id.in_(list(message_id_by_run.values()))
+                    )
+                )
+            ).scalars().all()
+        )
+        content_by_message = {message.id: message.content for message in messages}
+        return {
+            run_id: content_by_message[message_id]
+            for run_id, message_id in message_id_by_run.items()
+            if message_id in content_by_message
+        }
 
 
 __all__ = [

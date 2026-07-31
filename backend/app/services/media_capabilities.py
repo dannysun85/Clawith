@@ -32,6 +32,49 @@ SAAS_TIERS = ("lite", "pro", "ultra")
 MEDIA_PROVIDERS = ("volcengine_agent_plan", "minimax")
 
 
+def media_route_capability_status(
+    modality: str,
+    available_providers: set[str] | list[str] | tuple[str, ...],
+) -> tuple[str, str | None, str]:
+    """Classify a provider pool without treating known quality loss as equivalent.
+
+    Image and video use Agent Plan as their commercial-quality primary route.
+    MiniMax remains an implemented emergency route, but when it is the only
+    available provider the product contract is ``degraded`` and requires an
+    explicit business-level quality decision before a formal delivery starts.
+    Speech may fail over between the two managed providers, while music is a
+    MiniMax-only capability by design.
+    """
+
+    normalized_modality = str(modality or "").strip().lower()
+    providers = {
+        str(provider or "").strip().lower()
+        for provider in available_providers
+        if str(provider or "").strip()
+    }
+    if not providers:
+        return (
+            "unavailable",
+            "provider_pool_unavailable",
+            "保留工作说明并等待可用的生成线路，未提交供应商任务。",
+        )
+    if (
+        normalized_modality in {"image", "video"}
+        and VOLCENGINE_AGENT_PLAN_PROVIDER not in providers
+        and "minimax" in providers
+    ):
+        return (
+            "degraded",
+            "commercial_primary_unavailable",
+            "正式质量优先时等待主线路恢复；如接受应急质量，再明确确认降级执行。",
+        )
+    return (
+        "available",
+        None,
+        "按当前工作合同执行；供应商选择由平台托管。",
+    )
+
+
 def _credential_media_modalities(credential: LLMCredential) -> set[str]:
     """Mirror load-balancer semantics for None versus an explicit empty list."""
 
@@ -184,9 +227,34 @@ async def get_agent_media_capabilities(
     provider_modalities = await get_platform_media_provider_modalities(db)
     pool_modalities = set().union(*provider_modalities.values())
 
-    return evaluate_media_capabilities(
+    rows = evaluate_media_capabilities(
         entitlements,
         tier=tier,
         enabled_tools=enabled_tools,
         pool_modalities=pool_modalities,
     )
+    for row in rows:
+        modality = str(row["modality"])
+        available_providers = {
+            provider
+            for provider, modalities in provider_modalities.items()
+            if modality in modalities
+        }
+        if row["available"]:
+            capability_status, reason_code, next_action = media_route_capability_status(
+                modality,
+                available_providers,
+            )
+        else:
+            capability_status = "unavailable"
+            reason_code = str(row.get("reason") or "media_capability_unavailable")
+            next_action = "保留工作说明并修复套餐、工具或账号池配置后重试。"
+        row.update(
+            {
+                "capability_status": capability_status,
+                "available_providers": sorted(available_providers),
+                "route_reason": reason_code,
+                "next_action": next_action,
+            }
+        )
+    return rows

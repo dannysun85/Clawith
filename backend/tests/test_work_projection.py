@@ -4,9 +4,13 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
-from app.api.work import _fingerprint
+from app.api.work import (
+    _build_work_statement,
+    _confirmation_fingerprint,
+    _fingerprint,
+)
 from app.core.permissions import is_agent_executable
-from app.schemas.work import WorkTaskCreate
+from app.schemas.work import WorkTaskCreate, WorkTaskPreflight
 from app.services.work_projection import project_execution_status, project_user_stage
 
 
@@ -73,15 +77,86 @@ def test_temporary_expert_requires_an_immutable_role_snapshot_input() -> None:
         )
 
 
+def test_group_executor_requires_a_session_and_ordered_agent_participants() -> None:
+    with pytest.raises(ValidationError):
+        WorkTaskPreflight(
+            title="Launch campaign",
+            intent="Coordinate the campaign launch",
+            executor_kind="group",
+        )
+
+    first = uuid.uuid4()
+    draft = WorkTaskPreflight(
+        title="Launch campaign",
+        intent="Coordinate the campaign launch",
+        executor_kind="group",
+        group_id=uuid.uuid4(),
+        group_session_id=uuid.uuid4(),
+        group_agent_participant_ids=[first, uuid.uuid4()],
+    )
+
+    assert draft.group_agent_participant_ids[0] == first
+
+
+def test_group_executor_rejects_duplicate_agent_participants() -> None:
+    participant_id = uuid.uuid4()
+    with pytest.raises(ValidationError):
+        WorkTaskPreflight(
+            title="Launch campaign",
+            intent="Coordinate the campaign launch",
+            executor_kind="group",
+            group_id=uuid.uuid4(),
+            group_session_id=uuid.uuid4(),
+            group_agent_participant_ids=[participant_id, participant_id],
+        )
+
+
 def test_workbench_idempotency_ignores_only_the_client_request_id() -> None:
     first = WorkTaskCreate(
         client_request_id=uuid.uuid4(),
+        confirmation_fingerprint="0" * 64,
         title="Review contract",
         intent="Review the current contract",
     )
-    replay = first.model_copy(update={"client_request_id": uuid.uuid4()})
+    replay = first.model_copy(
+        update={
+            "client_request_id": uuid.uuid4(),
+            "confirmation_fingerprint": "1" * 64,
+        }
+    )
 
     assert _fingerprint(first) == _fingerprint(replay)
+
+
+def test_confirmation_fingerprint_binds_the_resolved_executor() -> None:
+    draft = WorkTaskPreflight(
+        title="Review contract",
+        intent="Review the current contract",
+    )
+
+    assert _confirmation_fingerprint(draft, agent_id=uuid.uuid4()) != (
+        _confirmation_fingerprint(draft, agent_id=uuid.uuid4())
+    )
+
+
+def test_creative_work_statement_preserves_task_only_boundary() -> None:
+    agent_id = uuid.uuid4()
+    agent = SimpleNamespace(id=agent_id, name="Creative coordinator")
+    draft = WorkTaskPreflight(
+        title="Prepare the campaign",
+        intent="Prepare a commercial video brief",
+        work_type="video",
+    )
+
+    statement = _build_work_statement(
+        draft,
+        agent=agent,
+        executor_snapshot={},
+    )
+
+    assert statement["delivery_mode"] == "task_only"
+    assert statement["expected_output"] == "confirmed_video_brief"
+    assert statement["cost"]["formal_media_requires_separate_preflight"] is True
 
 
 def test_idle_native_agent_is_available_for_workbench_execution() -> None:

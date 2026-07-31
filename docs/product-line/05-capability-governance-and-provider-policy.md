@@ -1,7 +1,7 @@
 # 能力治理与 Provider 策略事实基线
 
-- 状态：`active-design-baseline`
-- 日期：2026-07-31
+- 状态：`local-implementation-verified`
+- 日期：2026-08-01
 - 重要边界：本文同时记录“当前实现”与“目标策略”；两者不能互相冒充
 
 ## 1. 用户只选择业务能力
@@ -36,9 +36,9 @@ Skill、Tool、Provider、模型、套餐和故障切换不得出现在普通用
 
 ### 2.2 文字
 
-- 当前迁移 `202607261500_seed_agent_plan_text_routes.py` 为 Lite/Pro/Ultra 建立更高优先级的 Agent Plan 文字路由，并把非 Agent Plan 文字路由作为 fallback。
-- MiniMax-M3 也有受保护的三档文字/理解路由和运行能力校验。
-- 因此当前实现与本次确认的目标存在差异：当前是 Agent Plan 文字优先；目标改为 MiniMax-M3 文字优先。
+- 历史迁移 `202607261500_seed_agent_plan_text_routes.py` 曾为 Lite/Pro/Ultra 建立更高优先级的 Agent Plan 文字路由。
+- 当前工作树中的 `202607311330_promote_m3_text_primary.py` 已把三档 MiniMax-M3 路由提升为 Primary，Agent Plan 文字路由保留为兼容 fallback。
+- 路由完整性测试、迁移 smoke 与本地 SaaS 路由界面已经验证这一顺序；尚未进行新的付费 Provider 实际调用，因此这不是生产或账号实时可用性的证明。
 
 ## 3. 已确认的目标 Provider 策略
 
@@ -51,7 +51,7 @@ Skill、Tool、Provider、模型、套餐和故障切换不得出现在普通用
 | 音乐 | MiniMax | 无 | 不伪造备用 Provider；不可用时保留 brief 并明确等待/失败 |
 | PPT | Provider-neutral workflow | 文字规划走 M3，视觉走图片策略，必要配音/视频走各自策略，PPTX/PDF 由确定性工具生成 | Provider Skill 不是 PPT 质量替代品；版式、结构、可编辑性和 QA 独立治理 |
 
-这张表是下一实施阶段的目标策略，不是当前部署证明。
+这张表中的文字 Primary、媒体顺序和图片/视频降级语义已进入本地实现并通过自动化与浏览器检查；它仍不是已部署、生产验证或商业质量证明。
 
 ## 4. 等价、降级与不可用
 
@@ -130,13 +130,15 @@ Agent 只有同时满足以下条件才可执行：
 - 路由变更需要版本化、可回滚、可审计，并在本地/预发布/生产分别验证。
 - 正式商业工作流和“快速生成”可使用不同降级政策，但必须在产品合同中明确。
 
-## 8. 下一实施阶段
+## 8. 当前落地与剩余门禁
 
-1. 把 MiniMax-M3 提升为三档文字 Primary，Agent Plan 文字调整为兼容 fallback；增加迁移与 route-integrity 测试。
-2. 不改变现有媒体顺序，但把 MiniMax 图片/视频从“默认等价 fallback”改为按工作合同判定的 degraded 路线。
-3. 在 SaaS Admin 显示目标策略、当前就绪 Provider、套餐级能力和最后验证证据；普通用户只看到 `可用/降级/不可用`。
-4. 当前 Small 账号先用于 Seedream 和 TTS；火山视频保持 unavailable。升级 Medium+ 后用一条受控真实任务验证，再开放对应路线。
-5. 给 PPT、图片、视频、语音、音乐工作合同补齐 route policy、quality gate 和 fallback policy。
+1. MiniMax-M3 三档文字 Primary、Agent Plan 兼容 fallback 已在本地实现，并有迁移、route-integrity 和浏览器路由证据。
+2. 图片/视频的 MiniMax-only 路线已分类为 `degraded`。正式 Deliverable 默认 `primary_only`：可以保存工作说明，但不会提交付费任务；只有用户显式选择 `allow_degraded` 才允许应急线路。
+3. SaaS Admin 已显示目标顺序、当前就绪 Provider、主线路、`正式可用/仅降级可用/不可用` 和建议动作。当前视频只有 MiniMax 时明确显示“仅降级可用”，没有伪装成火山视频可用。
+4. Runtime 对正式图片/视频执行同一降级门禁，并返回可操作的 reason code；旧快速生成在未声明正式合同的兼容路径上保持原行为，避免破坏旧流程。
+5. 运营控制面仍缺“最后一次真实 Provider 验证”的持久时间、账号/套餐摘要和 receipt 关联；当前 readiness 来自实时账号池解析，不等于真实生成质量证据。
+6. 当前 Small 账号继续只把已验证的 Seedream/TTS 能力贡献给火山池。升级 Medium+ 后仍需经授权的受控视频调用与质量评审，才能开放火山正式视频。
+7. 真实 Provider、豆包盲评、发布和生产配置一致性都属于后续授权门禁，本地测试通过不能替代这些证据。
 
 ## 9. 完成标准
 

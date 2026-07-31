@@ -291,6 +291,14 @@ async def test_media_routes_expose_complete_matrix_without_credentials():
     ]
     assert by_modality["music"].available_providers == ["minimax"]
     assert by_modality["video"].available_providers == ["minimax"]
+    assert by_modality["image"].capability_status == "available"
+    assert by_modality["audio"].capability_status == "available"
+    assert by_modality["music"].capability_status == "available"
+    assert by_modality["video"].capability_status == "degraded"
+    assert by_modality["video"].reason_code == "commercial_primary_unavailable"
+    assert by_modality["video"].primary_provider == "volcengine_agent_plan"
+    assert by_modality["video"].degraded_providers == ["minimax"]
+    assert by_modality["video"].evaluation_source == "live_platform_credential_pool"
     assert all(route.fallback_provider == "minimax" for route in routes)
     serialized = " ".join(str(route.model_dump()) for route in routes)
     assert "must-not-leak" not in serialized

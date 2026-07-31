@@ -8,6 +8,7 @@ from app.services.media_capabilities import (
     evaluate_media_capabilities,
     get_agent_media_capabilities,
     get_platform_media_provider_modalities,
+    media_route_capability_status,
 )
 from app.services.media_provider_routing import (
     media_provider_order_for_modality,
@@ -127,6 +128,20 @@ def test_media_provider_order_matches_implemented_runtime_modalities():
     assert media_provider_order_for_modality("video") == automatic
     assert media_provider_order_for_modality("music") == ("minimax",)
     assert media_provider_order_for_modality("unknown") == ()
+
+
+def test_media_route_status_never_treats_minimax_only_visuals_as_equivalent():
+    assert media_route_capability_status("image", {"minimax"})[:2] == (
+        "degraded",
+        "commercial_primary_unavailable",
+    )
+    assert media_route_capability_status("video", {"minimax"})[:2] == (
+        "degraded",
+        "commercial_primary_unavailable",
+    )
+    assert media_route_capability_status("audio", {"minimax"})[0] == "available"
+    assert media_route_capability_status("music", {"minimax"})[0] == "available"
+    assert media_route_capability_status("image", set())[0] == "unavailable"
 
 
 def test_explicit_voice_identity_never_silently_crosses_provider_namespaces():

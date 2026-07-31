@@ -3,14 +3,14 @@
 ## Source of truth
 
 - Status: Active
-- Last refreshed: 2026-07-31
+- Last refreshed: 2026-08-01
 - Primary product surfaces: Workbench, personal assistant, Agent direct chat, Group collaboration, deliverable brief drawer, deliverable run timeline, Workspace artifact preview, Enterprise Settings, SaaS Admin.
 - Evidence reviewed: `frontend/src/App.tsx`, `frontend/src/index.css`, `frontend/src/styles/atlas.css`, `frontend/src/pages/Layout.tsx`, `frontend/src/pages/Onboarding.tsx`, `frontend/src/pages/agent-detail/AgentDetailPage.tsx`, `frontend/src/components/AgentSidePanel.tsx`, `frontend/src/components/WorkspaceOperationPanel.tsx`, `frontend/src/components/deliverables/DeliverableWorkbench.tsx`, `frontend/src/pages/enterprise-settings/tabs/SkillsTab.tsx`, `backend/app/api/onboarding.py`, `backend/app/api/tasks.py`, `backend/app/models/agent.py`, `backend/app/models/onboarding.py`, `backend/app/models/task.py`, `backend/app/models/group.py`, `backend/app/models/deliverable.py`, `backend/app/models/okr.py`, `backend/app/models/experience.py`, `backend/app/models/subscription.py`, `backend/app/services/deliverable_workflows.py`, `backend/app/services/tool_capability_policy.py`, `backend/app/services/tool_visibility.py`, `backend/app/services/skill_scope.py`, `backend/agent_templates/private-assistant/`, `backend/agent_template/skills/brand-safe-media/SKILL.md`, `docs/multimodal-product-flow-ledger.md`, `docs/agent-roster/organization-roster-business-prd-v2.md`, `.omx/plans/2026-07-24-image-video-ppt-provider-evaluation-plan.md`, the supplied WorkBuddy entry screenshot, and the previously reviewed feature-entry references.
 - Authority: this file governs product/UI decisions. Runtime, security, billing, and data-model facts remain governed by `SKILL.md`, code, migrations, and tests.
 
 ### Product-line fact documents
 
-The following six documents turn this design direction into auditable current-state and target-state contracts. They must be reviewed before navigation or work-entry implementation changes:
+The following seven documents turn this design direction into auditable current-state, implementation, and verification contracts. They must be reviewed before navigation or work-entry implementation changes:
 
 1. [`docs/product-line/01-product-role-system.md`](docs/product-line/01-product-role-system.md)
 2. [`docs/product-line/02-product-entry-system.md`](docs/product-line/02-product-entry-system.md)
@@ -18,6 +18,7 @@ The following six documents turn this design direction into auditable current-st
 4. [`docs/product-line/04-navigation-and-page-ownership.md`](docs/product-line/04-navigation-and-page-ownership.md)
 5. [`docs/product-line/05-capability-governance-and-provider-policy.md`](docs/product-line/05-capability-governance-and-provider-policy.md)
 6. [`docs/product-line/06-browser-business-acceptance-matrix.md`](docs/product-line/06-browser-business-acceptance-matrix.md)
+7. [`docs/product-line/07-known-issues-and-execution-baseline.md`](docs/product-line/07-known-issues-and-execution-baseline.md)
 
 The four non-negotiable product boundaries are:
 
@@ -40,14 +41,15 @@ The four non-negotiable product boundaries are:
 
 ## Current-state baseline
 
-This section records current implementation facts. Everything labelled `target` later in this file is a product decision for the next line and must not be reported as already shipped.
+This section records current local implementation facts. Everything labelled `target` later in this file remains a product decision; local implementation must not be reported as released, browser-proven, provider-verified, or commercially usable without the corresponding evidence.
 
-- The production release identity is `v1.11.9`. The repository root still redirects to `/dashboard`; `frontend/src/App.tsx` has no `/work` route or `WorkbenchPage`.
-- Onboarding already provisions one private Assistant Agent and records it on `UserTenantOnboarding`, but the completed flow redirects directly into that Agent's chat.
-- `Layout.tsx` currently renders the private assistant in the same searchable `智能体` list as company digital employees; the company tour explicitly describes that mixed placement.
+- The production release identity remains `v1.11.9`. The current local worktree has `/work` as the tenant root/default task entry while retaining `/dashboard` as the company overview and preserving all existing deep routes.
+- Onboarding provisions one private Assistant Agent, records it on `UserTenantOnboarding`, calls the role a private coordinator, and enters `/work` after creation or recovery.
+- `Layout.tsx` now separates the onboarding-linked `我的助理` from long-term `Agent 员工`; the companion is also excluded from long-term employee quota and Dashboard roster statistics.
 - Agent chat, Agent-scoped tasks, Groups, OKR, Plaza/Experience, Enterprise Settings, subscription/Credits, Workspace artifacts, deliverable requests, quality reviews, and SaaS Admin already exist as separate runtime or management surfaces.
-- Creative delivery now has provider-neutral image/audio/video routing controls, registered presentation/voiceover Skills, durable deliverable state, artifact preview/download, three-reviewer quality state, and creator delivery confirmation in the local `main` candidate. This proves the product state machine and local interaction path, not independent commercial-quality acceptance or a production release.
-- The product problem is therefore not a missing collection of menu items. It is the lack of one user-facing work lifecycle connecting intent, responsible worker, execution, review, delivery, reuse, and organization governance.
+- The local worktree adds a tenant-scoped Work read model, confirmed work statements, task-scoped experts, real Group task correlation, Experience provenance, OKR work evidence, and page-ownership navigation without replacing Runtime, Deliverable, Workspace, Credits, or Approval authorities.
+- Creative delivery has provider-neutral image/audio/video routing controls, registered presentation/voiceover Skills, durable deliverable state, artifact preview/download, three-reviewer quality state, and creator delivery confirmation. MiniMax-only image/video routes are now exposed as non-equivalent degraded capacity and formal Deliverables require explicit acceptance before paid dispatch. This still does not prove independent commercial quality; persisted last-real-verification receipts and paid Provider/benchmark evidence remain incomplete.
+- The primary implementation problem has shifted from missing task-first structure to verification and boundary hardening: full automated gates, migrations, browser roles/object chains, independent review, and an immutable candidate SHA are still required.
 
 ## Product-line system map
 
@@ -140,23 +142,22 @@ Every work item must retain deep links to its origin, responsible worker, runtim
 Release boundaries must remain explicit:
 
 - `v1.11.9` is the current production release.
-- The provider-neutral creative-delivery work after `v1.11.9` is a local clean candidate. It needs an immutable release preflight, production configuration parity check, authorized deployment, release-identity verification, and fresh browser business flow before it can be called released.
-- The product-line restructuring is the proposed `v1.12.0` scope. It must not be mixed into a patch release merely because both are present on local `main`.
+- The provider-neutral creative-delivery and product-line work after `v1.11.9` currently coexist in an uncommitted local verification worktree. Neither is an immutable candidate until the complete gate and independent reviews pass.
+- The product-line restructuring is the intended `v1.12.0` scope. It must not be described as a patch release or as deployed merely because it exists on local `main`.
 
 Recommended implementation sequence:
 
-1. **Stabilize the creative candidate**: publish only after release authorization and prove actual production routes, Credits settlement, artifacts, review, and delivery with the deployed release identity.
-2. **Separate identities in navigation**: expose `我的助理` independently from `数字员工`; preserve all existing Agent IDs, chats, permissions, and deep links.
-3. **Add the Workbench read model and `/work` route**: aggregate existing Tasks, Runs, Deliverables, approvals, and artifacts; keep `/dashboard` as company overview and retain old entry routes.
-4. **Register work contracts and templates**: surface task outcomes, required inputs, executor policy, approvals, entitlement and cost; keep provider and raw Skill/Tool selection out of ordinary-user flows.
-5. **Unify result discovery**: add `等待我处理`, `进行中`, `最近完成`, and reusable shortcuts without moving authoritative state out of the existing runtimes.
-6. **Complete organization governance**: define roster/visibility, template publishing, reviewer eligibility, role permissions, and external organization mapping only after current Agent access semantics are reconciled with the retained roster PRD.
+1. **Complete local verification**: run backend/frontend gates, fresh and downgrade/upgrade migrations, and the non-paid browser business matrix; correct every related failure.
+2. **Review boundaries independently**: verify Workbench does not duplicate Runtime state, Group work keeps one accountable owner, OKR accepts only valid evidence, and role navigation cannot expose privileged control planes.
+3. **Keep capability evidence explicit**: PL-012 now enforces explicit degraded-media consent locally; PL-014 exposes live readiness but still lacks a persisted last-real-provider verification receipt. Do not hide that remaining evidence gap behind unrelated test success.
+4. **Freeze one immutable candidate**: after cleanup and re-verification, record one local SHA and bind all evidence to it.
+5. **Publish only after authorization**: production configuration parity, paid Provider/Doubao Benchmark, deployment, release identity, migration, and fresh production flows remain separately authorized stages.
 
 No-flow-break guards:
 
 - Existing `/agents/:id/*`, `/groups/*`, `/quality-reviews/:reviewId`, `/okr`, `/plaza`, `/enterprise`, Workspace artifact URLs, and session identifiers remain valid.
 - Do not migrate or merge personal-assistant content into a company employee; only change presentation and routing.
-- Root/default-route changes are feature-gated and reversible; onboarding failure to provision an assistant cannot block Workbench access.
+- Root/default-route changes preserve `/dashboard` and all old deep links; onboarding failure must remain recoverable and cannot be represented as a successful provision.
 - Provider selection, grants, entitlement, approval and Credits settlement stay server-owned.
 - Old direct media shortcuts remain as `快速生成` until registered workflows pass feature parity and production evidence.
 - Each slice requires tenant-isolation, permission, idempotency, state-transition, TypeScript/build, desktop, narrow-viewport, and fresh browser business-flow evidence.
@@ -169,7 +170,7 @@ No-flow-break guards:
 
 ## Information architecture
 
-- Primary navigation: add `工作台` as the first tenant-level task entry. Keep `仪表盘`, `OKR`, `广场`, and `Groups` as company-level destinations. Move the current user's private assistant into a dedicated `我的助理` row between company navigation and the `数字员工` roster; it must not remain mixed into the employee list.
+- Primary navigation: `工作` contains `工作台` and `协作群组`; `协作角色` separates `我的助理` from `Agent 员工`; `组织` contains `公司概览`, `OKR`, `发现中心`, and role-gated `企业设置`. Account controls hold plan/usage and platform-only operations.
 - Core routes/screens: `/work` is the default post-onboarding task entry; `/dashboard` remains the company overview. Existing Agent chat remains the execution/conversation surface for named employees. `交付物` opens a right-side Brief Drawer; after confirmation, the chat timeline shows a request card and the existing side panel exposes stages and Workspace artifacts.
 - Content hierarchy: current Agent/team and session first; conversation/run state second; composer and work entry third; structured brief and capability/cost preflight fourth; artifact preview and version actions in the side panel.
 - Work-entry hierarchy: `交付物`, `调研分析`, `自动化`, `团队协作`. Under `交付物`: `PPT`, `海报/图片`, `短视频`, then reports/spreadsheets as later workflows. Modality is an implementation capability, not the user's primary task taxonomy.
@@ -242,7 +243,7 @@ This is a target decision, not a claim about the currently deployed route:
 - music: MiniMax only;
 - PPT: provider-neutral workflow using M3 for planning, the image policy for visuals, and deterministic PPTX/PDF generation and QA.
 
-Current code still seeds Agent Plan text routes above the non-Agent-Plan fallback. Changing the text primary therefore requires a real route migration, integrity tests, control-plane verification, and fresh runtime evidence; UI copy alone is insufficient.
+The local migration now promotes `MiniMax-M3` to the Lite/Pro/Ultra text primary and keeps compatible Agent Plan text routes as fallback. Migration smoke, route-integrity tests, and local SaaS control-plane checks cover that policy; a real Provider snapshot and production release evidence remain separate authorization gates.
 
 ## Creative quality contracts
 

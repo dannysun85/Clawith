@@ -322,6 +322,7 @@ def _entry_command(
         source_type="chat",
         source_id=str(message.id),
         source_execution_id=source_execution_id,
+        correlation_id=root.correlation_id,
         goal=instruction,
         run_kind="foreground",
         model_id=target.model.id,

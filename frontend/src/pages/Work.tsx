@@ -14,11 +14,18 @@ import {
     IconVideo,
 } from '@tabler/icons-react';
 
-import { agentApi, workApi, type WorkItem } from '../services/api';
+import {
+    agentApi,
+    workApi,
+    type WorkItem,
+    type WorkTaskDraft,
+    type WorkTaskPreflight,
+} from '../services/api';
 import { useAuthStore } from '../stores';
 import { createRandomUUID } from '../utils/randomUUID';
 import { partitionAgentRoles } from '../utils/productRoles';
 import { useToast } from '../components/Toast/ToastProvider';
+import { groupApi } from '../services/groupApi';
 import './Work.css';
 
 
@@ -28,7 +35,21 @@ const QUICK_STARTS = [
     { id: 'video', zh: '视频 Brief', en: 'Video brief', icon: IconVideo, prompt: '请整理一份带人物商业视频的制作 brief：确认受众、平台、时长、人物、脚本、镜头、声音和交付格式。本任务只整理 brief，不调用视频生成、不声称已经交付正式产物；brief 确认后应进入 Agent 对话的正式交付流程。' },
     { id: 'presentation', zh: 'PPT Brief', en: 'PPT brief', icon: IconPresentation, prompt: '请整理一份正式汇报 PPT 的制作 brief：确认受众、场景、页数、品牌、内容约束、版式与配图要求。本任务只整理 brief，不调用 PPT 生成、不声称已经交付 PPTX；brief 确认后应进入 Agent 对话的正式交付流程。' },
     { id: 'document', zh: '报告 Brief', en: 'Report brief', icon: IconFileDescription, prompt: '请整理一份正式报告的制作 brief：确认用途、读者、篇幅、格式、证据来源和审批要求。本任务只整理 brief，不声称已经交付正式文档。' },
-];
+] satisfies Array<{
+    id: WorkTaskDraft['work_type'];
+    zh: string;
+    en: string;
+    icon: typeof IconSparkles;
+    prompt: string;
+}>;
+
+const EXPECTED_OUTPUT_LABELS: Record<string, { zh: string; en: string }> = {
+    task_result: { zh: '可直接查看的任务结果', en: 'A visible task result' },
+    confirmed_image_brief: { zh: '经确认的商业图片 Brief', en: 'A confirmed commercial image brief' },
+    confirmed_video_brief: { zh: '经确认的商业视频 Brief', en: 'A confirmed commercial video brief' },
+    confirmed_presentation_brief: { zh: '经确认的 PPT Brief', en: 'A confirmed presentation brief' },
+    confirmed_document_brief: { zh: '经确认的报告 Brief', en: 'A confirmed document brief' },
+};
 
 const STAGE_LABELS: Record<string, { zh: string; en: string }> = {
     task: { zh: '任务已登记', en: 'Task registered' },
@@ -49,9 +70,14 @@ function stageLabel(stage: string, isChinese: boolean) {
 
 function WorkCard({ item, isChinese }: { item: WorkItem; isChinese: boolean }) {
     const navigate = useNavigate();
+    const isFormal = item.delivery_mode === 'formal_deliverable';
+    const canContinueAsFormal = item.kind === 'task'
+        && item.user_stage === 'completed'
+        && ['image', 'video', 'presentation'].includes(String(item.work_statement?.work_type || ''))
+        && !item.deliverable_id;
     return (
         <article className="work-card">
-            <button type="button" className="work-card-main" onClick={() => navigate(item.deep_link)}>
+            <div className="work-card-main">
                 <div className="work-card-heading">
                     <span className={`work-stage work-stage--${item.user_stage}`}>
                         {stageLabel(item.user_stage, isChinese)}
@@ -68,10 +94,24 @@ function WorkCard({ item, isChinese }: { item: WorkItem; isChinese: boolean }) {
                 <div className="work-card-meta">
                     <span>{item.executor_kind === 'temporary_expert'
                         ? (isChinese ? `临时专家 · ${item.executor_snapshot.expert_role || ''}` : `Temporary expert · ${item.executor_snapshot.expert_role || ''}`)
-                        : `${item.agent_name}`}</span>
+                        : item.executor_kind === 'group'
+                            ? (isChinese
+                                ? `Group · ${item.executor_snapshot.group_name || ''} · 责任人 ${item.agent_name}`
+                                : `Group · ${item.executor_snapshot.group_name || ''} · Owner ${item.agent_name}`)
+                            : `${item.agent_name}`}</span>
                     <span>{new Date(item.updated_at).toLocaleString()}</span>
                 </div>
-            </button>
+            </div>
+            {item.latest_update && (
+                <details className="work-result" open={item.user_stage === 'completed'}>
+                    <summary>
+                        {item.user_stage === 'completed'
+                            ? (isChinese ? '查看任务结果' : 'View task result')
+                            : (isChinese ? '查看最新进展' : 'View latest update')}
+                    </summary>
+                    <div>{item.latest_update}</div>
+                </details>
+            )}
             {item.artifacts.length > 0 && (
                 <div className="work-artifacts">
                     {item.artifacts.slice(0, 3).map((artifact) => (
@@ -86,8 +126,23 @@ function WorkCard({ item, isChinese }: { item: WorkItem; isChinese: boolean }) {
                     ))}
                 </div>
             )}
-            {(item.task_id || item.deliverable_id) && item.user_stage === 'delivery' && (
-                <div className="work-card-actions">
+            <div className="work-card-actions">
+                <button type="button" onClick={() => navigate(item.deep_link)}>
+                    {item.executor_kind === 'group'
+                        ? (isChinese ? '打开协作现场' : 'Open Group workspace')
+                        : isFormal
+                        ? (isChinese ? '打开交付现场' : 'Open delivery workspace')
+                        : (isChinese ? '打开执行者' : 'Open executor')}
+                </button>
+                {canContinueAsFormal && (
+                    <button
+                        type="button"
+                        onClick={() => navigate(item.formal_delivery_link || item.deep_link)}
+                    >
+                        {isChinese ? '继续正式交付' : 'Continue to formal delivery'}
+                    </button>
+                )}
+                {(item.task_id || item.deliverable_id) && item.user_stage === 'delivery' && (
                     <button
                         type="button"
                         onClick={() => {
@@ -99,8 +154,8 @@ function WorkCard({ item, isChinese }: { item: WorkItem; isChinese: boolean }) {
                     >
                         {isChinese ? '沉淀为团队经验' : 'Distill as team experience'}
                     </button>
-                </div>
-            )}
+                )}
+            </div>
         </article>
     );
 }
@@ -114,10 +169,19 @@ export default function Work() {
     const toast = useToast();
     const [title, setTitle] = useState('');
     const [intent, setIntent] = useState('');
+    const [workType, setWorkType] = useState<WorkTaskDraft['work_type']>('general');
     const [priority, setPriority] = useState<'low' | 'medium' | 'high' | 'urgent'>('medium');
-    const [executorKind, setExecutorKind] = useState<'personal_assistant' | 'agent_employee' | 'temporary_expert'>('personal_assistant');
+    const [executorKind, setExecutorKind] = useState<WorkTaskDraft['executor_kind']>('personal_assistant');
     const [agentId, setAgentId] = useState('');
     const [expertRole, setExpertRole] = useState('');
+    const [groupId, setGroupId] = useState('');
+    const [groupSessionId, setGroupSessionId] = useState('');
+    const [groupAgentParticipantIds, setGroupAgentParticipantIds] = useState<string[]>([]);
+    const [clientRequestId, setClientRequestId] = useState(() => createRandomUUID());
+    const [preflight, setPreflight] = useState<{
+        draftKey: string;
+        result: WorkTaskPreflight;
+    } | null>(null);
 
     const workQuery = useQuery({
         queryKey: ['work-index', user?.tenant_id],
@@ -129,6 +193,21 @@ export default function Work() {
         queryFn: () => agentApi.list(user?.tenant_id || undefined),
         enabled: !!user?.tenant_id,
     });
+    const groupsQuery = useQuery({
+        queryKey: ['work-groups', user?.tenant_id],
+        queryFn: () => groupApi.list(),
+        enabled: !!user?.tenant_id && executorKind === 'group',
+    });
+    const groupSessionsQuery = useQuery({
+        queryKey: ['work-group-sessions', groupId],
+        queryFn: () => groupApi.sessions(groupId),
+        enabled: executorKind === 'group' && !!groupId,
+    });
+    const groupMembersQuery = useQuery({
+        queryKey: ['work-group-members', groupId],
+        queryFn: () => groupApi.members(groupId),
+        enabled: executorKind === 'group' && !!groupId,
+    });
     const roles = useMemo(
         () => partitionAgentRoles(
             agentsQuery.data || [],
@@ -137,33 +216,85 @@ export default function Work() {
         [agentsQuery.data, workQuery.data?.personal_assistant_agent_id],
     );
 
-    const createTask = useMutation({
-        mutationFn: () => workApi.createTask({
-            client_request_id: createRandomUUID(),
-            title: title.trim() || intent.trim().split(/\n/)[0].slice(0, 80),
-            intent: intent.trim(),
-            priority,
-            executor_kind: executorKind,
-            ...(executorKind === 'agent_employee' ? { agent_id: agentId } : {}),
-            ...(executorKind === 'temporary_expert' ? { expert_role: expertRole.trim() } : {}),
+    const taskDraft = useMemo<WorkTaskDraft>(() => ({
+        title: title.trim() || intent.trim().split(/\n/)[0].slice(0, 80),
+        intent: intent.trim(),
+        work_type: workType,
+        priority,
+        executor_kind: executorKind,
+        ...(executorKind === 'agent_employee' ? { agent_id: agentId } : {}),
+        ...(executorKind === 'temporary_expert' ? { expert_role: expertRole.trim() } : {}),
+        ...(executorKind === 'group' ? {
+            group_id: groupId,
+            group_session_id: groupSessionId,
+            group_agent_participant_ids: groupAgentParticipantIds,
+        } : {}),
+    }), [
+        agentId,
+        executorKind,
+        expertRole,
+        groupAgentParticipantIds,
+        groupId,
+        groupSessionId,
+        intent,
+        priority,
+        title,
+        workType,
+    ]);
+    const taskDraftKey = JSON.stringify(taskDraft);
+    const confirmedPreflight = preflight?.draftKey === taskDraftKey ? preflight.result : null;
+
+    const preflightTask = useMutation({
+        mutationFn: async ({ draft, draftKey }: { draft: WorkTaskDraft; draftKey: string }) => ({
+            draftKey,
+            result: await workApi.preflightTask(draft),
         }),
+        onSuccess: ({ draftKey, result }) => setPreflight({ draftKey, result }),
+        onError: (error: any) => {
+            toast.error(isChinese ? '无法生成工作说明' : 'Could not prepare the work statement', {
+                details: error?.message || String(error),
+            });
+        },
+    });
+
+    const createTask = useMutation({
+        mutationFn: () => {
+            if (!confirmedPreflight) throw new Error('The work statement must be reviewed before execution');
+            return workApi.createTask({
+                ...taskDraft,
+                client_request_id: clientRequestId,
+                confirmation_fingerprint: confirmedPreflight.confirmation_fingerprint,
+            });
+        },
         onSuccess: async () => {
             setTitle('');
             setIntent('');
+            setWorkType('general');
             setExpertRole('');
+            setPreflight(null);
+            setClientRequestId(createRandomUUID());
             await queryClient.invalidateQueries({ queryKey: ['work-index'] });
-            toast.success(isChinese ? '任务已进入执行队列' : 'Task entered the execution queue');
+            toast.success(isChinese ? '工作说明已确认，任务已进入执行队列' : 'Work statement confirmed; task queued');
         },
         onError: (error: any) => {
+            if (String(error?.message || '').includes('work_confirmation_stale')) setPreflight(null);
             toast.error(isChinese ? '任务创建失败' : 'Could not create task', {
                 details: error?.message || String(error),
             });
         },
     });
 
-    const canSubmit = intent.trim().length >= 3
+    const canPrepare = intent.trim().length >= 3
         && (executorKind !== 'agent_employee' || !!agentId)
         && (executorKind !== 'temporary_expert' || expertRole.trim().length >= 3)
+        && (executorKind !== 'group' || (
+            !!groupId
+            && !!groupSessionId
+            && groupAgentParticipantIds.length > 0
+        ))
+        && !preflightTask.isPending;
+    const canSubmit = !!confirmedPreflight
+        && confirmedPreflight.capability_status !== 'unavailable'
         && !createTask.isPending;
 
     return (
@@ -179,7 +310,9 @@ export default function Work() {
                         <button
                             type="button"
                             key={id}
+                            className={workType === id ? 'is-active' : ''}
                             onClick={() => {
+                                setWorkType(id);
                                 if (prompt) setIntent(prompt);
                             }}
                         >
@@ -189,6 +322,13 @@ export default function Work() {
                     ))}
                 </div>
                 <div className="work-composer">
+                    <div className="work-composer-mode">
+                        {isChinese ? '当前工作类型' : 'Work type'} · {
+                            isChinese
+                                ? QUICK_STARTS.find((item) => item.id === workType)?.zh
+                                : QUICK_STARTS.find((item) => item.id === workType)?.en
+                        }
+                    </div>
                     <input
                         value={title}
                         onChange={(event) => setTitle(event.target.value)}
@@ -207,6 +347,7 @@ export default function Work() {
                                 <option value="personal_assistant">{isChinese ? '我的助理协调' : 'My assistant coordinates'}</option>
                                 <option value="agent_employee">{isChinese ? '指定 Agent 员工' : 'Choose an Agent employee'}</option>
                                 <option value="temporary_expert">{isChinese ? '临时专家' : 'Temporary expert'}</option>
+                                <option value="group">{isChinese ? 'Group 多人协作' : 'Group collaboration'}</option>
                             </select>
                         </label>
                         {executorKind === 'agent_employee' && (
@@ -240,13 +381,170 @@ export default function Work() {
                         <button
                             type="button"
                             className="work-submit"
-                            disabled={!canSubmit}
-                            onClick={() => createTask.mutate()}
+                            disabled={!canPrepare || !!confirmedPreflight}
+                            onClick={() => preflightTask.mutate({ draft: taskDraft, draftKey: taskDraftKey })}
                         >
-                            {createTask.isPending ? '…' : (isChinese ? '开始任务' : 'Start task')}
+                            {preflightTask.isPending
+                                ? '…'
+                                : confirmedPreflight
+                                    ? (isChinese ? '工作说明已生成' : 'Statement ready')
+                                    : (isChinese ? '检查工作说明' : 'Review work statement')}
                             <IconArrowRight size={17} stroke={1.8} />
                         </button>
                     </div>
+                    {executorKind === 'group' && (
+                        <section className="work-group-config">
+                            <div className="work-group-selectors">
+                                <label>
+                                    <span>{isChinese ? '协作 Group' : 'Group'}</span>
+                                    <select
+                                        value={groupId}
+                                        onChange={(event) => {
+                                            setGroupId(event.target.value);
+                                            setGroupSessionId('');
+                                            setGroupAgentParticipantIds([]);
+                                        }}
+                                    >
+                                        <option value="">{isChinese ? '选择已有 Group' : 'Choose an existing Group'}</option>
+                                        {(groupsQuery.data || []).map((group) => (
+                                            <option key={group.id} value={group.id}>{group.name}</option>
+                                        ))}
+                                    </select>
+                                </label>
+                                <label>
+                                    <span>{isChinese ? '协作会话' : 'Session'}</span>
+                                    <select
+                                        value={groupSessionId}
+                                        disabled={!groupId}
+                                        onChange={(event) => setGroupSessionId(event.target.value)}
+                                    >
+                                        <option value="">{isChinese ? '选择工作现场' : 'Choose a workspace'}</option>
+                                        {(groupSessionsQuery.data || []).map((session) => (
+                                            <option key={session.id} value={session.id}>{session.title}</option>
+                                        ))}
+                                    </select>
+                                </label>
+                            </div>
+                            <div className="work-group-agents">
+                                <div>
+                                    <strong>{isChinese ? '参与协作的 Agent' : 'Participating Agents'}</strong>
+                                    <span>{isChinese
+                                        ? '按选择顺序确定责任：第一个是第一责任人，其余为协作者。'
+                                        : 'Selection order sets responsibility: the first is the owner; the rest collaborate.'}</span>
+                                </div>
+                                <div className="work-group-agent-grid">
+                                    {(groupMembersQuery.data || [])
+                                        .filter((member) => member.participant_type === 'agent' && !member.is_deleted)
+                                        .map((member) => {
+                                            const selectedIndex = groupAgentParticipantIds.indexOf(member.participant_id);
+                                            return (
+                                                <button
+                                                    type="button"
+                                                    key={member.participant_id}
+                                                    className={selectedIndex >= 0 ? 'is-selected' : ''}
+                                                    onClick={() => setGroupAgentParticipantIds((current) => (
+                                                        current.includes(member.participant_id)
+                                                            ? current.filter((id) => id !== member.participant_id)
+                                                            : [...current, member.participant_id]
+                                                    ))}
+                                                >
+                                                    <span>{selectedIndex >= 0 ? selectedIndex + 1 : '+'}</span>
+                                                    <div>
+                                                        <strong>{member.display_name}</strong>
+                                                        <small>{member.role_description || (isChinese ? 'Group Agent' : 'Group Agent')}</small>
+                                                    </div>
+                                                </button>
+                                            );
+                                        })}
+                                </div>
+                                {groupId && groupMembersQuery.isSuccess && !groupMembersQuery.data.some(
+                                    (member) => member.participant_type === 'agent' && !member.is_deleted,
+                                ) && (
+                                    <p>{isChinese
+                                        ? '这个 Group 还没有可执行的 Agent，请先到 Group 成员管理中添加。'
+                                        : 'This Group has no executable Agent members. Add them in Group member management first.'}</p>
+                                )}
+                            </div>
+                        </section>
+                    )}
+                    {confirmedPreflight && (
+                        <section className="work-confirmation" aria-label={isChinese ? '待确认工作说明' : 'Work statement awaiting confirmation'}>
+                            <div className="work-confirmation-heading">
+                                <div>
+                                    <span>{isChinese ? '执行前确认' : 'BEFORE EXECUTION'}</span>
+                                    <h2>{isChinese ? '请确认这份工作说明' : 'Confirm this work statement'}</h2>
+                                </div>
+                                <span className={`work-capability work-capability--${confirmedPreflight.capability_status}`}>
+                                    <IconCheck size={15} />
+                                    {confirmedPreflight.capability_status === 'available'
+                                        ? (isChinese ? '执行者可用' : 'Executor available')
+                                        : confirmedPreflight.capability_status}
+                                </span>
+                            </div>
+                            <div className="work-confirmation-objective">
+                                <strong>{confirmedPreflight.work_statement.title}</strong>
+                                <p>{confirmedPreflight.work_statement.objective}</p>
+                            </div>
+                            <dl className="work-confirmation-grid">
+                                <div>
+                                    <dt>{isChinese ? '交付边界' : 'Output boundary'}</dt>
+                                    <dd>{
+                                        EXPECTED_OUTPUT_LABELS[confirmedPreflight.work_statement.expected_output]?.[
+                                            isChinese ? 'zh' : 'en'
+                                        ] || confirmedPreflight.work_statement.expected_output
+                                    }</dd>
+                                </div>
+                                <div>
+                                    <dt>{isChinese ? '责任人' : 'Owner'}</dt>
+                                    <dd>{confirmedPreflight.work_statement.executor.expert_role
+                                        || confirmedPreflight.work_statement.executor.group_name
+                                        || confirmedPreflight.work_statement.executor.agent_name}</dd>
+                                </div>
+                                <div>
+                                    <dt>{isChinese ? '费用说明' : 'Cost'}</dt>
+                                    <dd>{confirmedPreflight.estimated_credits == null
+                                        ? (isChinese
+                                            ? '按实际任务用量结算；正式媒体生成将再次预检'
+                                            : 'Usage based; formal media is preflighted separately')
+                                        : `${confirmedPreflight.estimated_credits} Credits`}</dd>
+                                </div>
+                                <div>
+                                    <dt>{isChinese ? '审批' : 'Approval'}</dt>
+                                    <dd>{confirmedPreflight.approval_required
+                                        ? (isChinese ? '启动前需要审批' : 'Required before launch')
+                                        : (isChinese ? '可启动；高风险动作仍单独审批' : 'Launchable; risky actions remain gated')}</dd>
+                                </div>
+                            </dl>
+                            {confirmedPreflight.work_statement.cost.formal_media_requires_separate_preflight && (
+                                <p className="work-confirmation-note">
+                                    {isChinese
+                                        ? '当前确认的是 Brief/任务执行，不代表图片、视频或 PPT 已经生成。正式交付会绑定本任务，并继续经过能力、Credits、质量检查和业务批准。'
+                                        : 'This confirms brief/task execution, not a finished creative artifact. Formal delivery will link back to this task and run its own capability, Credits, quality and approval gates.'}
+                                </p>
+                            )}
+                            {confirmedPreflight.capability_status === 'unavailable' && (
+                                <p className="work-confirmation-note work-confirmation-note--blocked">
+                                    {isChinese
+                                        ? '当前执行者没有可用的文字执行线路，任务尚未创建，也不会扣除 Credits。请联系公司管理员检查套餐或平台路由。'
+                                        : 'The executor has no available text route. No task was created and no Credits were charged. Ask a company administrator to check the plan or route.'}
+                                </p>
+                            )}
+                            <div className="work-confirmation-actions">
+                                <button type="button" onClick={() => setPreflight(null)} disabled={createTask.isPending}>
+                                    {isChinese ? '返回修改' : 'Edit'}
+                                </button>
+                                <button
+                                    type="button"
+                                    className="work-confirm"
+                                    disabled={!canSubmit}
+                                    onClick={() => createTask.mutate()}
+                                >
+                                    {createTask.isPending ? '…' : (isChinese ? '确认并开始执行' : 'Confirm and start')}
+                                    <IconArrowRight size={17} stroke={1.8} />
+                                </button>
+                            </div>
+                        </section>
+                    )}
                 </div>
             </section>
 

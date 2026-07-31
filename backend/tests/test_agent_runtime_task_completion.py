@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import replace
 from datetime import UTC, datetime
 import uuid
 
 import pytest
 
 from app.models.agent_run import AgentRun
+from app.models.agent_run_event import AgentRunEvent
+from app.models.audit import ChatMessage
 from app.models.task import Task, TaskLog
 from app.services.agent_runtime.command_worker import (
     CheckpointObservation,
@@ -29,7 +32,15 @@ class _ScalarResult:
         self.value = value
 
     def scalar_one_or_none(self) -> object:
+        if isinstance(self.value, list):
+            return self.value[0] if self.value else None
         return self.value
+
+    def scalars(self) -> "_ScalarResult":
+        return self
+
+    def all(self) -> list[object]:
+        return list(self.value) if isinstance(self.value, list) else [self.value]
 
 
 class _Transaction:
@@ -239,6 +250,86 @@ async def test_completed_supervision_returns_to_pending_and_logs_result() -> Non
     assert task.completed_at is None
     assert isinstance(session.added[0], TaskLog)
     assert session.added[0].content == "✅ 督办执行完成\n\nReport completed"
+
+
+@pytest.mark.asyncio
+async def test_completed_group_run_waits_for_all_participants_and_projects_results() -> None:
+    run, checkpoint, stored_run, task = _records(source_type="chat")
+    task.executor_kind = "group"
+    task.group_id = uuid.uuid4()
+    task.executor_snapshot = {
+        "participants": [
+            {
+                "agent_id": str(task.agent_id),
+                "agent_name": "Researcher",
+                "responsibility": "primary_owner",
+            }
+        ]
+    }
+    correlation_id = f"work-task:{task.id}"
+    run = replace(run, correlation_id=correlation_id)
+    stored_run.source_type = "chat"
+    stored_run.source_id = str(uuid.uuid4())
+    stored_run.correlation_id = correlation_id
+    stored_run.delivery_status = "pending"
+    terminal_event = AgentRunEvent(
+        id=uuid.uuid4(),
+        tenant_id=run.tenant_id,
+        run_id=run.run_id,
+        agent_id=task.agent_id,
+        event_type="run_completed",
+        summary="completed",
+        payload={"status": "completed"},
+        artifact_refs=[],
+        idempotency_key="terminal",
+    )
+    result_message = ChatMessage(
+        id=uuid.uuid4(),
+        agent_id=task.agent_id,
+        role="assistant",
+        content="Research complete with three verified findings.",
+        conversation_id=str(uuid.uuid4()),
+        mentions=[],
+    )
+    delivery_event = AgentRunEvent(
+        id=uuid.uuid4(),
+        tenant_id=run.tenant_id,
+        run_id=run.run_id,
+        agent_id=task.agent_id,
+        event_type="delivery_succeeded",
+        summary="delivered",
+        payload={
+            "delivery_kind": "terminal",
+            "message_id": str(result_message.id),
+        },
+        artifact_refs=[],
+        idempotency_key="delivery",
+    )
+    session = _Session(
+        stored_run,
+        task,
+        None,
+        [stored_run],
+        [terminal_event],
+        [delivery_event],
+        [result_message],
+    )
+    completed_at = datetime(2026, 8, 1, 16, 0, tzinfo=UTC)
+    handler = TaskRuntimeCompletionHandler(
+        session_factory=_SessionFactory(session),  # type: ignore[arg-type]
+        clock=lambda: completed_at,
+    )
+
+    await handler.handle(run=run, checkpoint=checkpoint)
+
+    assert task.status == "done"
+    assert task.completed_at == completed_at
+    log = session.added[0]
+    assert isinstance(log, TaskLog)
+    assert log.id == uuid.uuid5(task.id, "group-task-terminal")
+    assert "Group 协作任务完成" in log.content
+    assert "Researcher" in log.content
+    assert "three verified findings" in log.content
 
 
 @pytest.mark.asyncio

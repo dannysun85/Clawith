@@ -33,6 +33,6 @@ test('v1.11 Groups and Experience Library have complete Chinese namespaces', () 
   }
 
   assert.equal(zh.groups.title, '群聊');
-  assert.equal(zh.experience.feedTitle, '经验广场');
+  assert.equal(zh.experience.feedTitle, '团队经验库');
   assert.equal(zh.experience.nav.team, '团队经验');
 });

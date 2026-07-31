@@ -319,10 +319,13 @@ export type WorkItem = {
     origin_type: string;
     executor_kind: string;
     executor_snapshot: Record<string, any>;
+    work_statement: Record<string, any>;
+    confirmed_at?: string | null;
     agent_id: string;
     agent_name: string;
     task_id?: string | null;
     task_status?: string | null;
+    priority?: string | null;
     run_id?: string | null;
     execution_status: string;
     deliverable_id?: string | null;
@@ -335,9 +338,75 @@ export type WorkItem = {
     delivery_mode: 'task_only' | 'formal_deliverable';
     user_stage: string;
     artifacts: WorkArtifact[];
+    latest_update?: string | null;
+    latest_update_at?: string | null;
     deep_link: string;
+    formal_delivery_link?: string | null;
     created_at: string;
     updated_at: string;
+};
+
+export type WorkTaskDraft = {
+    title: string;
+    intent: string;
+    work_type: 'general' | 'image' | 'video' | 'presentation' | 'document';
+    priority: 'low' | 'medium' | 'high' | 'urgent';
+    executor_kind: 'personal_assistant' | 'agent_employee' | 'temporary_expert' | 'group';
+    agent_id?: string;
+    expert_role?: string;
+    group_id?: string;
+    group_session_id?: string;
+    group_agent_participant_ids?: string[];
+};
+
+export type WorkTaskPreflight = {
+    confirmation_fingerprint: string;
+    capability_status: 'available' | 'degraded' | 'unavailable';
+    estimated_credits?: number | null;
+    cost_note: string;
+    approval_required: boolean;
+    reasons: string[];
+    next_action?: string | null;
+    work_statement: {
+        version: number;
+        objective: string;
+        title: string;
+        work_type: WorkTaskDraft['work_type'];
+        expected_output: string;
+        delivery_mode: 'task_only';
+        priority: WorkTaskDraft['priority'];
+        executor: {
+            kind: WorkTaskDraft['executor_kind'];
+            agent_id: string;
+            agent_name: string;
+            expert_role?: string | null;
+            group_id?: string | null;
+            group_name?: string | null;
+            group_session_id?: string | null;
+            group_session_title?: string | null;
+            participants?: Array<{
+                participant_id: string;
+                agent_id: string;
+                agent_name: string;
+                responsibility: 'primary_owner' | 'collaborator';
+            }>;
+        };
+        capability_preflight: {
+            status: 'available' | 'degraded' | 'unavailable';
+            scope: string;
+            provider_selection: 'platform_managed';
+        };
+        cost: {
+            estimated_credits?: number | null;
+            basis: string;
+            formal_media_requires_separate_preflight: boolean;
+        };
+        approval: {
+            required_to_start: boolean;
+            runtime_actions_checked_separately: boolean;
+        };
+        completion_criteria: string[];
+    };
 };
 
 export type WorkIndex = {
@@ -349,14 +418,14 @@ export type WorkIndex = {
 export const workApi = {
     list: (limit = 50) => request<WorkIndex>(`/work?limit=${limit}`),
 
-    createTask: (data: {
+    preflightTask: (data: WorkTaskDraft) => request<WorkTaskPreflight>('/work/tasks/preflight', {
+        method: 'POST',
+        body: JSON.stringify(data),
+    }),
+
+    createTask: (data: WorkTaskDraft & {
         client_request_id: string;
-        title: string;
-        intent: string;
-        priority: 'low' | 'medium' | 'high' | 'urgent';
-        executor_kind: 'personal_assistant' | 'agent_employee' | 'temporary_expert';
-        agent_id?: string;
-        expert_role?: string;
+        confirmation_fingerprint: string;
     }) => request<{ item: WorkItem; created: boolean }>('/work/tasks', {
         method: 'POST',
         body: JSON.stringify(data),
@@ -585,6 +654,8 @@ export interface DeliverablePreflight {
     available: boolean;
     launchable: boolean;
     reasons: string[];
+    capability_status: 'available' | 'degraded' | 'unavailable';
+    next_action: string;
     tier: 'lite' | 'pro' | 'ultra';
     normalized_spec: Record<string, string | number>;
     credit_estimate: DeliverableCreditEstimate;
@@ -722,6 +793,7 @@ export const deliverableApi = {
         client_request_id: string;
         agent_id: string;
         session_id: string;
+        task_id?: string;
         work_type: DeliverableWorkType;
         workflow_id: string;
         workflow_version: string;

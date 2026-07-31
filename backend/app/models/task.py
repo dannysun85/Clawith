@@ -61,6 +61,14 @@ class Task(Base):
     executor_snapshot: Mapped[dict] = mapped_column(
         JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
     )
+    work_type: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="general", server_default=text("'general'")
+    )
+    work_statement: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    confirmation_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     group_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("groups.id", name="fk_tasks_group_id_groups", ondelete="SET NULL"),

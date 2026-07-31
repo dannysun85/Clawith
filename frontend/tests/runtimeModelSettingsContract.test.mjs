@@ -70,12 +70,15 @@ test('chat routes through enabled SaaS tiers instead of stale direct model ids',
   assert.doesNotMatch(agentDetail, /const effectiveChatModelId = overrideModelId/);
 });
 
-test('media admin separates automatic provider routing from MiniMax fallback settings', () => {
+test('media admin separates managed routing from non-equivalent emergency quality', () => {
   assert.match(saasAdminSource, /routing_mode: 'automatic_failover'/);
   assert.match(saasAdminSource, /provider_order: string\[\]/);
   assert.match(saasAdminSource, /available_providers: string\[\]/);
-  assert.match(saasAdminSource, /图片、语音和视频会按“火山 Agent Plan → MiniMax”/);
+  assert.match(saasAdminSource, /capability_status: 'available' \| 'degraded' \| 'unavailable'/);
+  assert.match(saasAdminSource, /图片、语音和视频按“火山 Agent Plan → MiniMax”/);
   assert.match(saasAdminSource, /音乐目前使用 MiniMax/);
-  assert.match(saasAdminSource, /MiniMax 兜底模型/);
-  assert.match(saasAdminSource, /只配置 MiniMax 兜底路径/);
+  assert.match(saasAdminSource, /MiniMax 应急路径/);
+  assert.match(saasAdminSource, /仅剩 MiniMax 时属于非等价降级/);
+  assert.match(saasAdminSource, /正式可用/);
+  assert.match(saasAdminSource, /仅降级可用/);
 });

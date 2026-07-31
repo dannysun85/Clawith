@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 import uuid
 
@@ -13,6 +15,7 @@ from app.models.task import Task, TaskLog
 from app.services.agent_runtime.contracts import RunHandle, StartRunCommand
 from app.services.task_executor import (
     TaskRuntimeIntakeError,
+    enqueue_group_task_runtime,
     enqueue_task_runtime,
     execute_task,
 )
@@ -141,6 +144,87 @@ async def test_temporary_expert_role_reaches_runtime_goal_and_audit_payload() ->
     assert command.payload["executor_snapshot"]["expert_role"] == (
         "Enterprise contract risk reviewer"
     )
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_workbench_task_cannot_enter_runtime() -> None:
+    task, agent = _records()
+    task.origin_type = "workbench"
+
+    with pytest.raises(TaskRuntimeIntakeError) as raised:
+        await enqueue_task_runtime(
+            _Session(),  # type: ignore[arg-type]
+            task=task,
+            agent=agent,
+            settings_override=_settings(enabled=True),
+        )
+
+    assert raised.value.code == "task_confirmation_required"
+
+
+@pytest.mark.asyncio
+async def test_confirmed_group_task_enters_native_group_runtime_with_stable_identity() -> None:
+    task, agent = _records()
+    task.origin_type = "workbench"
+    task.executor_kind = "group"
+    task.confirmation_fingerprint = "a" * 64
+    task.confirmed_at = datetime(2026, 8, 1, tzinfo=UTC)
+    group_id = uuid.uuid4()
+    session_id = uuid.uuid4()
+    sender_participant_id = uuid.uuid4()
+    agent_participant_id = uuid.uuid4()
+    task.group_id = group_id
+    task.executor_snapshot = {
+        "group_id": str(group_id),
+        "group_name": "Campaign Group",
+        "group_session_id": str(session_id),
+        "sender_participant_id": str(sender_participant_id),
+        "participants": [
+            {
+                "participant_id": str(agent_participant_id),
+                "agent_id": str(agent.id),
+                "agent_name": agent.name,
+                "responsibility": "primary_owner",
+            }
+        ],
+    }
+    handle = RunHandle(
+        tenant_id=agent.tenant_id,
+        run_id=uuid.uuid4(),
+        thread_id=str(uuid.uuid4()),
+        command_id=uuid.uuid4(),
+        runtime_type="langgraph",
+        created=True,
+    )
+    session = _Session()
+
+    with patch(
+        "app.services.task_executor.enqueue_group_message",
+        new=AsyncMock(
+            return_value=SimpleNamespace(
+                error_code=None,
+                error_message=None,
+                run_handles=(handle,),
+            )
+        ),
+    ) as enqueue:
+        result = await enqueue_group_task_runtime(
+            session,  # type: ignore[arg-type]
+            task=task,
+            primary_agent=agent,
+        )
+
+    assert result == handle
+    assert task.status == "doing"
+    assert isinstance(session.added[0], TaskLog)
+    kwargs = enqueue.await_args.kwargs
+    assert kwargs["group_id"] == group_id
+    assert kwargs["session_id"] == session_id
+    assert kwargs["sender_participant_id"] == sender_participant_id
+    assert kwargs["mention_participant_ids"] == [agent_participant_id]
+    assert kwargs["message_id"] == uuid.uuid5(task.id, "group-work-task-message")
+    assert kwargs["correlation_id"] == f"work-task:{task.id}"
+    assert kwargs["work_task_id"] == task.id
 
 
 @pytest.mark.asyncio

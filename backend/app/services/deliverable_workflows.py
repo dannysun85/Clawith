@@ -72,6 +72,19 @@ class WorkflowManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+def _fallback_policy_field() -> WorkflowField:
+    return WorkflowField(
+        key="fallback_policy",
+        label_zh="质量降级策略",
+        label_en="Quality fallback policy",
+        kind="select",
+        default="primary_only",
+        options=["primary_only", "allow_degraded"],
+        placeholder_zh="正式质量优先，或明确允许应急质量",
+        placeholder_en="Prefer formal quality or explicitly allow emergency quality",
+    )
+
+
 _WORKFLOWS = (
     WorkflowManifest(
         workflow_id="builtin.presentation.v1",
@@ -102,6 +115,7 @@ _WORKFLOWS = (
                 key="key_points", label_zh="必须覆盖", label_en="Required points", kind="textarea",
                 placeholder_zh="逐条写出必须出现的数据、观点或文案", placeholder_en="List required data, claims, or copy",
             ),
+            _fallback_policy_field(),
         ],
         approval_policy=["outline", "final"],
         output_contract=["pptx", "pdf"],
@@ -133,6 +147,7 @@ _WORKFLOWS = (
                 key="style", label_zh="视觉风格", label_en="Visual style", kind="text", required=True,
                 default="commercial", placeholder_zh="例如：高端商业广告", placeholder_en="e.g. premium commercial campaign",
             ),
+            _fallback_policy_field(),
         ],
         approval_policy=["composition", "final"],
         output_contract=["png"],
@@ -181,6 +196,7 @@ _WORKFLOWS = (
                 key="cta", label_zh="行动号召", label_en="Call to action", kind="text",
                 placeholder_zh="例如：立即了解更多", placeholder_en="e.g. Learn more today",
             ),
+            _fallback_policy_field(),
         ],
         approval_policy=["storyboard", "final"],
         output_contract=["mp4"],
@@ -423,6 +439,11 @@ def build_deliverable_prompt(request: DeliverableRequest) -> str:
         "approval_policy": request.approval_policy,
         "output_contract": request.output_contract,
     }
+    allow_degraded_fallback = (
+        str((request.spec or {}).get("fallback_policy") or "primary_only")
+        == "allow_degraded"
+    )
+    allow_degraded_literal = str(allow_degraded_fallback).lower()
     if request.work_type == "poster":
         return (
             "You are executing a persisted Astra Deliverable Request. Treat the following JSON as "
@@ -430,7 +451,8 @@ def build_deliverable_prompt(request: DeliverableRequest) -> str:
             "tools and keep every artifact under workspace/deliverables/"
             f"{request.id}/. Create one polished commercial image with generate_image_minimax exactly once, "
             "using save_path='workspace/deliverables/"
-            f"{request.id}/final.png' and aspect_ratio=spec.aspect_ratio. The composition must match the "
+            f"{request.id}/final.png', aspect_ratio=spec.aspect_ratio, and "
+            f"allow_degraded_fallback={allow_degraded_literal}. The composition must match the "
             "requested channel and style, use a clear visual hierarchy, and contain no generated words, "
             "captions, logos, watermarks, signatures, UI chrome, or placeholder text. If exact_copy is "
             "non-empty, reserve clean negative space for that copy and report that deterministic typography "
@@ -463,7 +485,9 @@ def build_deliverable_prompt(request: DeliverableRequest) -> str:
             "generate_video_minimax with save_path='workspace/deliverables/"
             f"{request.id}/visual.mp4', aspect_ratio=spec.aspect_ratio, duration=spec.duration, "
             "first_frame_image=<exact returned first-frame output_path>, require_audio=false, "
-            "wait_for_completion=true, and poll_timeout_seconds=300. Call each generation Tool exactly once "
+            f"wait_for_completion=true, poll_timeout_seconds=300, and allow_degraded_fallback={allow_degraded_literal}. "
+            "The first-frame generate_image_minimax call must use the same allow_degraded_fallback value. "
+            "Call each generation Tool exactly once "
             "because each Tool owns provider fallback and durable recovery. If no provider accepts the "
             "request, stop without "
             "retrying, scheduling a trigger, or claiming partial delivery. Do not attempt to read binary "
@@ -499,7 +523,8 @@ def build_deliverable_prompt(request: DeliverableRequest) -> str:
                 role_instructions.append(
                     "For product_hero, call generate_image_minimax exactly once with a polished "
                     "16:9 product advertising prompt, no generated words/logos/watermarks, and "
-                    f"save_path='workspace/deliverables/{request.id}/assets/product_hero.png'."
+                    f"save_path='workspace/deliverables/{request.id}/assets/product_hero.png', and "
+                    f"allow_degraded_fallback={allow_degraded_literal}."
                 )
             elif role == "people_storyboard":
                 role_instructions.append(
@@ -507,6 +532,7 @@ def build_deliverable_prompt(request: DeliverableRequest) -> str:
                     "single coherent three-panel people-led storyboard image, no generated "
                     "words/logos/watermarks, and "
                     f"save_path='workspace/deliverables/{request.id}/assets/people_storyboard.png'. "
+                    f"Use allow_degraded_fallback={allow_degraded_literal}. "
                     "If product_hero was generated, pass its exact versioned output_path as "
                     "reference_image so the product remains recognizable."
                 )
@@ -516,6 +542,7 @@ def build_deliverable_prompt(request: DeliverableRequest) -> str:
                     "single coherent people-led commercial lifestyle scene, no generated "
                     "words/logos/watermarks, and "
                     f"save_path='workspace/deliverables/{request.id}/assets/people_lifestyle.png'. "
+                    f"Use allow_degraded_fallback={allow_degraded_literal}. "
                     "If product_hero was generated, pass its exact versioned output_path as "
                     "reference_image so the product remains recognizable."
                 )
@@ -525,6 +552,7 @@ def build_deliverable_prompt(request: DeliverableRequest) -> str:
                     "distinct environmental scene that supports the deck story without "
                     "generated words/logos/watermarks, and "
                     f"save_path='workspace/deliverables/{request.id}/assets/context_scene.png'. "
+                    f"Use allow_degraded_fallback={allow_degraded_literal}. "
                     "Use product_hero as reference_image when product identity matters."
                 )
             elif role == "detail_texture":
@@ -533,13 +561,15 @@ def build_deliverable_prompt(request: DeliverableRequest) -> str:
                     "macro detail or material-led composition, no generated words/logos/"
                     "watermarks, and "
                     f"save_path='workspace/deliverables/{request.id}/assets/detail_texture.png'. "
+                    f"Use allow_degraded_fallback={allow_degraded_literal}. "
                     "Use product_hero as reference_image when product identity matters."
                 )
             else:
                 role_instructions.append(
                     f"For {role}, call generate_image_minimax exactly once with a polished 16:9 "
                     "commercial hero prompt, no generated words/logos/watermarks, and "
-                    f"save_path='workspace/deliverables/{request.id}/assets/{role}.png'."
+                    f"save_path='workspace/deliverables/{request.id}/assets/{role}.png', and "
+                    f"allow_degraded_fallback={allow_degraded_literal}."
                 )
         media_instructions = (
             "The server-owned PRESENTATION_MEDIA_CONTRACT below requires real generated imagery. "
@@ -759,6 +789,8 @@ async def preflight_workflow(
         raise DeliverableWorkflowError("invalid_tier", "Tier must be lite, pro, or ultra")
     normalized_spec = validate_workflow_spec(workflow, spec)
     reasons: list[str] = []
+    capability_status = "available"
+    next_action = "确认工作说明后，由平台按正式质量合同选择执行线路。"
 
     try:
         await resolve_route(tenant_id, normalized_tier, "text")
@@ -779,6 +811,23 @@ async def preflight_workflow(
         row = next((item for item in media if item["modality"] == workflow.required_capability), None)
         if row is None or not row["available"]:
             reasons.append(str((row or {}).get("reason") or "media_capability_unavailable"))
+            capability_status = "unavailable"
+            next_action = str(
+                (row or {}).get("next_action")
+                or "保留工作说明并修复套餐、工具或账号池配置后重试。"
+            )
+        else:
+            capability_status = str(row.get("capability_status") or "available")
+            next_action = str(row.get("next_action") or next_action)
+            if (
+                capability_status == "degraded"
+                and normalized_spec.get("fallback_policy") != "allow_degraded"
+            ):
+                reasons.append("degraded_route_requires_confirmation")
+                next_action = (
+                    "当前只有应急质量线路。保持正式质量优先可保存工作说明并等待；"
+                    "如接受质量差异，请在高级设置中明确允许应急质量。"
+                )
         if (
             workflow.required_capability == "image"
             and not await _agent_tool_available(
@@ -797,11 +846,17 @@ async def preflight_workflow(
 
     if workflow.launch_policy == "dry_run":
         reasons.append("workflow_execution_not_enabled")
-    hard_reasons = [reason for reason in reasons if reason != "workflow_execution_not_enabled"]
+    soft_reasons = {
+        "workflow_execution_not_enabled",
+        "degraded_route_requires_confirmation",
+    }
+    hard_reasons = [reason for reason in reasons if reason not in soft_reasons]
     return {
         "available": not hard_reasons,
         "launchable": not reasons and workflow.launch_policy == "agent_runtime",
         "reasons": reasons,
+        "capability_status": capability_status,
+        "next_action": next_action,
         "tier": normalized_tier,
         "normalized_spec": normalized_spec,
         "credit_estimate": _credit_estimate(workflow, normalized_tier, normalized_spec),

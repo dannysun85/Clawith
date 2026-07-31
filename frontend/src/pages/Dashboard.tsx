@@ -2,14 +2,23 @@ import { useState, useEffect } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useNavigate, useOutletContext } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
-import { agentApi, taskApi, activityApi, fetchJson, tenantApi } from '../services/api';
-import type { Agent, Task } from '../types';
+import {
+    activityApi,
+    agentApi,
+    fetchJson,
+    onboardingApi,
+    tenantApi,
+    workApi,
+    type WorkItem,
+} from '../services/api';
+import type { Agent } from '../types';
 import { useToast } from '../components/Toast/ToastProvider';
 import {
     SUBSCRIPTION_UPGRADE_PATH,
     agentLimitMessage,
     useAgentCreationLimit,
 } from '../hooks/useAgentCreationLimit';
+import { partitionAgentRoles } from '../utils/productRoles';
 
 type LayoutOutletContext = {
     openTalentMarket?: () => void;
@@ -251,15 +260,15 @@ function OKRSummaryCard() {
 
 /* ────── Summary Stats Bar ────── */
 
-function StatsBar({ agents, allTasks, tokenUsage }: { agents: Agent[]; allTasks: Task[]; tokenUsage?: any }) {
+function StatsBar({ agents, workItems, tokenUsage }: { agents: Agent[]; workItems: WorkItem[]; tokenUsage?: any }) {
     const { t } = useTranslation();
     const totalAgents = agents.length;
     const activeAgents = agents.filter(a => a.status === 'running' || a.status === 'idle').length;
-    const pendingTasks = allTasks.filter(t => t.status === 'pending' || t.status === 'doing').length;
-    const completedToday = allTasks.filter(t => {
-        if (t.status !== 'done' || !t.completed_at) return false;
+    const pendingTasks = workItems.filter(item => ['task', 'execution'].includes(item.user_stage)).length;
+    const completedToday = workItems.filter(item => {
+        if (!['completed', 'delivery'].includes(item.user_stage)) return false;
         const today = new Date();
-        const completed = new Date(t.completed_at);
+        const completed = new Date(item.latest_update_at || item.updated_at);
         return completed.toDateString() === today.toDateString();
     }).length;
     const totalTokensToday = tokenUsage?.today?.total_tokens ?? agents.reduce((sum, a) => sum + (a.tokens_used_today || 0), 0);
@@ -315,12 +324,12 @@ function StatsBar({ agents, allTasks, tokenUsage }: { agents: Agent[]; allTasks:
 
 function AgentRow({ agent, tasks, recentActivity }: {
     agent: Agent;
-    tasks: Task[];
+    tasks: WorkItem[];
     recentActivity: any[];
 }) {
     const { t } = useTranslation();
     const navigate = useNavigate();
-    const pendingTasks = tasks.filter(t => t.status === 'pending' || t.status === 'doing');
+    const pendingTasks = tasks.filter(item => ['task', 'execution'].includes(item.user_stage));
     const latestActivity = recentActivity[0];
 
     // Token usage bar
@@ -405,7 +414,7 @@ function AgentRow({ agent, tasks, recentActivity }: {
                                 overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                                 display: 'inline-flex', alignItems: 'center', gap: '3px',
                             }}>
-                                <span style={{ width: '4px', height: '4px', borderRadius: '50%', background: priorityColor(t.priority), flexShrink: 0 }} />
+                                <span style={{ width: '4px', height: '4px', borderRadius: '50%', background: priorityColor(t.priority || 'medium'), flexShrink: 0 }} />
                                 {t.title}
                             </span>
                         ))}
@@ -520,7 +529,15 @@ export default function Dashboard() {
         queryFn: () => agentApi.list(currentTenant || undefined),
         refetchInterval: 15000,
     });
-    const agentCreationLimit = useAgentCreationLimit(agents as any[]);
+    const { data: onboardingStatus } = useQuery({
+        queryKey: ['onboarding-status', currentTenant],
+        queryFn: () => onboardingApi.status(),
+    });
+    const { employees: employeeAgents } = partitionAgentRoles(
+        agents,
+        onboardingStatus?.personal_assistant_agent_id,
+    );
+    const agentCreationLimit = useAgentCreationLimit(employeeAgents as any[]);
 
     const { data: tokenUsage } = useQuery({
         queryKey: ['tenant-token-usage', currentTenant],
@@ -528,30 +545,33 @@ export default function Dashboard() {
         refetchInterval: 15000,
     });
 
-    // Fetch tasks & activities for all agents
-    const [allTasks, setAllTasks] = useState<Task[]>([]);
+    const { data: workIndex } = useQuery({
+        queryKey: ['work-index', currentTenant, 'dashboard'],
+        queryFn: () => workApi.list(100),
+        refetchInterval: 15000,
+    });
+    const workItems = workIndex?.items || [];
+
+    // Activities remain Agent-scoped; work state comes from the authoritative Work projection.
     const [allActivities, setAllActivities] = useState<any[]>([]);
     const [agentActivities, setAgentActivities] = useState<Record<string, any[]>>({});
 
 
     useEffect(() => {
-        if (agents.length === 0) return;
+        if (employeeAgents.length === 0) {
+            setAllActivities([]);
+            setAgentActivities({});
+            return;
+        }
         const fetchData = async () => {
             try {
-                const taskResults = await Promise.allSettled(agents.map(a => taskApi.list(a.id)));
-                const tasks: Task[] = [];
-                taskResults.forEach(r => { if (r.status === 'fulfilled') tasks.push(...r.value); });
-                setAllTasks(tasks);
-            } catch (e) { console.error('Failed to fetch tasks:', e); }
-
-            try {
-                const actResults = await Promise.allSettled(agents.map(a => activityApi.list(a.id, 5)));
+                const actResults = await Promise.allSettled(employeeAgents.map(a => activityApi.list(a.id, 5)));
                 const activities: any[] = [];
                 const perAgent: Record<string, any[]> = {};
                 actResults.forEach((r, i) => {
                     if (r.status === 'fulfilled') {
-                        perAgent[agents[i].id] = r.value;
-                        activities.push(...r.value.map((v: any) => ({ ...v, agent_id: agents[i].id })));
+                        perAgent[employeeAgents[i].id] = r.value;
+                        activities.push(...r.value.map((v: any) => ({ ...v, agent_id: employeeAgents[i].id })));
                     }
                 });
                 activities.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
@@ -562,11 +582,11 @@ export default function Dashboard() {
         fetchData();
         const interval = setInterval(fetchData, 30000);
         return () => clearInterval(interval);
-    }, [agents.map(a => a.id).join(',')]);
+    }, [employeeAgents.map(a => a.id).join(',')]);
 
     // Group tasks by agent
-    const tasksByAgent = new Map<string, Task[]>();
-    allTasks.forEach(t => {
+    const tasksByAgent = new Map<string, WorkItem[]>();
+    workItems.forEach(t => {
         if (!tasksByAgent.has(t.agent_id)) tasksByAgent.set(t.agent_id, []);
         tasksByAgent.get(t.agent_id)!.push(t);
     });
@@ -584,19 +604,22 @@ export default function Dashboard() {
             }}>
                 <div>
                     <h1 style={{ fontSize: '20px', fontWeight: 600, margin: 0, marginBottom: '2px', letterSpacing: '-0.02em' }}>
-                        {greeting}
+                        {i18n.language.startsWith('zh') ? '公司概览' : 'Company overview'}
                     </h1>
                     <p style={{ fontSize: '13px', color: 'var(--text-tertiary)', margin: 0 }}>
-                        {t('dashboard.totalAgents', { count: agents.length })}
+                        {greeting} · {t('dashboard.totalAgents', { count: employeeAgents.length })}
                     </p>
                 </div>
+                <button className="btn btn-secondary" onClick={() => navigate('/work')}>
+                    {i18n.language.startsWith('zh') ? '进入工作台' : 'Open workbench'}
+                </button>
             </div>
 
             {isLoading ? (
                 <div style={{ textAlign: 'center', padding: '60px', color: 'var(--text-tertiary)', fontSize: '13px' }}>
                     {t('common.loading')}
                 </div>
-            ) : agents.length === 0 ? (
+            ) : employeeAgents.length === 0 ? (
                 <div style={{ textAlign: 'center', padding: '80px' }}>
                     <div style={{ color: 'var(--text-tertiary)', marginBottom: '4px', fontSize: '32px' }}>
                         {Icons.bot}
@@ -628,7 +651,7 @@ export default function Dashboard() {
             ) : (
                 <>
                     {/* Stats Bar */}
-                    <StatsBar agents={agents} allTasks={allTasks} tokenUsage={tokenUsage} />
+                    <StatsBar agents={employeeAgents} workItems={workItems} tokenUsage={tokenUsage} />
 
                     {/* OKR Summary (P3) — only shown when OKR is enabled */}
                     <OKRSummaryCard />
@@ -657,7 +680,7 @@ export default function Dashboard() {
 
                         {/* Agent Rows (scrollable) */}
                         <div style={{ maxHeight: '350px', overflowY: 'auto' }}>
-                            {agents
+                            {[...employeeAgents]
                                 .sort((a, b) => {
                                     const aActive = a.status === 'running' || a.status === 'idle' ? 1 : 0;
                                     const bActive = b.status === 'running' || b.status === 'idle' ? 1 : 0;
@@ -697,7 +720,7 @@ export default function Dashboard() {
                             <span style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>{t('dashboard.recentCount', { count: 20 })}</span>
                         </div>
                         <div style={{ padding: '4px', maxHeight: '320px', overflowY: 'auto' }}>
-                            <ActivityFeed activities={allActivities} agents={agents} />
+                            <ActivityFeed activities={allActivities} agents={employeeAgents} />
                         </div>
                     </div>
                 </>

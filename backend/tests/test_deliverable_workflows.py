@@ -337,6 +337,7 @@ def test_video_workflow_compiles_people_led_voiceover_delivery_contract() -> Non
     assert "exact versioned workspace output_path" in prompt
     assert "first_frame_image=<exact returned first-frame output_path>" in prompt
     assert "generate_video_minimax" in prompt
+    assert "allow_degraded_fallback=false" in prompt
     assert "generate_speech_minimax" in prompt
     assert "compose_video_audio" in prompt
     assert "Call each generation Tool exactly once" in prompt
@@ -524,6 +525,84 @@ async def test_poster_preflight_is_available_and_launchable(monkeypatch) -> None
         "billing_unit": "one_final_image",
     }
     assert result["creates_reservation"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fallback_policy", "expected_launchable", "expected_reasons"),
+    [
+        ("primary_only", False, ["degraded_route_requires_confirmation"]),
+        ("allow_degraded", True, []),
+    ],
+)
+async def test_visual_preflight_requires_explicit_confirmation_for_degraded_route(
+    monkeypatch,
+    fallback_policy,
+    expected_launchable,
+    expected_reasons,
+) -> None:
+    workflow = require_workflow("poster")
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.resolve_route",
+        AsyncMock(return_value=SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.get_tenant_entitlements",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.get_agent_media_capabilities",
+        AsyncMock(
+            return_value=[
+                {
+                    "modality": "image",
+                    "available": True,
+                    "reason": None,
+                    "capability_status": "degraded",
+                    "next_action": "confirm emergency quality",
+                },
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows._agent_tool_available",
+        AsyncMock(return_value=True),
+    )
+
+    result = await preflight_workflow(
+        SimpleNamespace(),  # type: ignore[arg-type]
+        tenant_id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        workflow=workflow,
+        tier="pro",
+        spec={
+            "channel": "social",
+            "aspect_ratio": "3:4",
+            "style": "commercial",
+            "fallback_policy": fallback_policy,
+        },
+    )
+
+    assert result["available"] is True
+    assert result["launchable"] is expected_launchable
+    assert result["capability_status"] == "degraded"
+    assert result["reasons"] == expected_reasons
+
+
+def test_explicit_degraded_policy_is_compiled_into_formal_tool_contract() -> None:
+    request = _request(
+        work_type="poster",
+        workflow_id="builtin.poster.v1",
+        spec={
+            "channel": "social",
+            "aspect_ratio": "3:4",
+            "style": "commercial",
+            "fallback_policy": "allow_degraded",
+        },
+        output_contract=["png"],
+    )
+
+    assert "allow_degraded_fallback=true" in build_deliverable_prompt(request)
 
 
 @pytest.mark.asyncio
