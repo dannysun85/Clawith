@@ -329,6 +329,30 @@ Astra 适配必须替换为：
 - 兼容期内部 Tool 名仍为 `generate_speech_minimax`，但模型和用户可见的展示、说明已改为
   provider-neutral `Generate Speech`。
 
+本地无新增 Provider 消耗的证据复核（2026-07-31）：
+
+- `local_text_provider_flow_proven=true`：`Doubao Seed 2.0 Mini Lite`、`Doubao Seed 2.1 Turbo Pro`
+  和 `Doubao Seed Evolving Ultra` 均存在真实 `delivered` Agent Run；当前三档文字路由均为
+  `Agent Plan primary -> MiniMax fallback`，Tool Ledger 和 Credits 必须记录实际 Provider，不能由模型名或
+  内部 Tool 名推断；
+- `local_voice_provider_flow_proven=true`：当前抖音运营经理有 6 条成功语音媒体任务，其中
+  `volcengine_agent_plan / doubao-seed-tts-2.0` 5 条、`minimax / speech-2.8-turbo` 1 条；所有任务均有
+  非空版本化 `output_path`、可解码 MP3 和匹配的本地文件；
+- `local_voice_credit_settlement_proven=true`：上述 6 条任务的 reservation 全部为 `finalized`，并分别存在
+  一条匹配 Provider、model、modality 和 reservation ID 的负向 `consume` 交易，没有悬空 hold；
+- `local_voice_preview_playback_proven=true`：历史 Agent 会话重新加载火山 TTS 文件后，右侧 Workspace
+  `<audio>` 使用版本化下载 URL，`readyState=4`、`duration=2.256`、无媒体错误；同一文件通过 macOS
+  `afplay` 完整听音。MiniMax 文件恢复原版本化引用后也在 Workspace 中显示，`readyState=4`、
+  `duration=4.342156`、无媒体错误；
+- 复核发现一条历史 MiniMax 语音产物在成功后被 Agent 通过 `move_file` 改名，导致
+  `media_generation_tasks.output_path` 和 Tool Ledger 指向已不存在的旧路径。旧样本已通过保留改名副本并
+  恢复相同 SHA-256 字节到原版本化路径完成无损修复；运行时现在禁止 Agent 修改、移动、替换或删除任何
+  被媒体任务引用的版本化输出，并返回 `durable_media_output_immutable`，防止再次产生悬空回执；真人显式
+  数据管理仍由独立产品流程负责；
+- 本轮只读取既有 Agent Run、任务、Credits 和文件并执行本地播放/修复，没有发起新的 Provider 请求，
+  没有新增模型 Credits，也没有修改生产配置。以上均为 `local business_flow_proven`，不替代生产发布后的
+  路由、计费、存储、浏览器和真人听审验证。
+
 ### 同题豆包 Benchmark 结论（2026-07-26）
 
 固定题目、结构化验收项和样本路径记录在

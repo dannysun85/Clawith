@@ -3025,7 +3025,10 @@ async def _move_file_outcome(
                 overwrite=bool(arguments.get("overwrite", False)),
             )
             if not result.ok:
-                return _typed_failure(result.message, "workspace_move_rejected")
+                return _typed_failure(
+                    result.message,
+                    result.error_code or "workspace_move_rejected",
+                )
             await db.commit()
     except Exception as exc:
         if mutation_started:

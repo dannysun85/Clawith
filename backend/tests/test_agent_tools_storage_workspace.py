@@ -1050,6 +1050,68 @@ async def test_move_workspace_path_fails_when_source_changes(monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_move_workspace_path_rejects_durable_media_output(monkeypatch, tmp_path):
+    agent_id = uuid.uuid4()
+    source_path = "workspace/audio/voice_1234.mp3"
+    destination_path = "workspace/audio/voice.mp3"
+    storage = MemoryStorageBackend({
+        f"{agent_id}/{source_path}": b"generated-audio",
+    })
+    monkeypatch.setattr(workspace_collaboration, "get_storage_backend", lambda: storage)
+    db = AsyncMock()
+    media_lookup = Mock()
+    media_lookup.scalar_one_or_none.return_value = source_path
+    db.execute.return_value = media_lookup
+
+    result = await workspace_collaboration.move_workspace_path(
+        db=db,
+        agent_id=agent_id,
+        base_dir=tmp_path / str(agent_id),
+        source_path=source_path,
+        destination_path=destination_path,
+        actor_type="agent",
+        actor_id=agent_id,
+        enforce_human_lock=False,
+    )
+
+    assert result.ok is False
+    assert result.error_code == "durable_media_output_immutable"
+    assert "Agent cannot move generated media output" in result.message
+    assert "run history, Credits, and recovery receipts" in result.message
+    assert storage.files[f"{agent_id}/{source_path}"] == b"generated-audio"
+    assert f"{agent_id}/{destination_path}" not in storage.files
+
+
+@pytest.mark.asyncio
+async def test_delete_workspace_path_rejects_agent_durable_media_output(monkeypatch, tmp_path):
+    agent_id = uuid.uuid4()
+    source_path = "workspace/audio/voice_1234.mp3"
+    storage = MemoryStorageBackend({
+        f"{agent_id}/{source_path}": b"generated-audio",
+    })
+    monkeypatch.setattr(workspace_collaboration, "get_storage_backend", lambda: storage)
+    db = AsyncMock()
+    media_lookup = Mock()
+    media_lookup.scalar_one_or_none.return_value = source_path
+    db.execute.return_value = media_lookup
+
+    result = await workspace_collaboration.delete_workspace_file(
+        db=db,
+        agent_id=agent_id,
+        base_dir=tmp_path / str(agent_id),
+        path=source_path,
+        actor_type="agent",
+        actor_id=agent_id,
+        enforce_human_lock=False,
+    )
+
+    assert result.ok is False
+    assert result.error_code == "durable_media_output_immutable"
+    assert "Agent cannot delete generated media output" in result.message
+    assert storage.files[f"{agent_id}/{source_path}"] == b"generated-audio"
+
+
+@pytest.mark.asyncio
 async def test_delete_workspace_directory_uses_prefix_existence(monkeypatch, tmp_path):
     agent_id = uuid.uuid4()
     storage = MemoryStorageBackend({

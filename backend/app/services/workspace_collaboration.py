@@ -20,6 +20,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import Agent
+from app.models.media_generation import MediaGenerationTask
 from app.models.workspace import WorkspaceEditLock, WorkspaceFileRevision
 from app.services.storage import get_storage_backend, normalize_storage_key
 from app.services.storage_runtime.base import WriteCondition
@@ -72,6 +73,7 @@ class WorkspaceWriteResult:
     message: str
     revision_id: str | None = None
     locked_by_user_id: str | None = None
+    error_code: str | None = None
 
 
 def _should_mirror_to_local_filesystem(storage) -> bool:
@@ -578,6 +580,15 @@ async def write_workspace_file(
     if not normalized:
         return WorkspaceWriteResult(False, normalized, "Missing file path")
 
+    if actor_type != "user":
+        media_output = await _durable_media_output_at_or_below(
+            db,
+            agent_id=agent_id,
+            path=normalized,
+        )
+        if media_output:
+            return _immutable_media_output_result(normalized, media_output, "modify")
+
     if enforce_human_lock and actor_type != "user":
         lock = await get_active_lock(db, agent_id=agent_id, path=normalized)
         if lock:
@@ -693,6 +704,14 @@ async def delete_workspace_file(
     local_target_exists = target is not None and target.exists()
     if not storage_exists and not storage_is_dir and not local_target_exists:
         return WorkspaceWriteResult(False, normalized, f"File not found: {normalized}")
+    if actor_type != "user":
+        media_output = await _durable_media_output_at_or_below(
+            db,
+            agent_id=agent_id,
+            path=normalized,
+        )
+        if media_output:
+            return _immutable_media_output_result(normalized, media_output, "delete")
     if storage_exists and await storage.is_file(storage_key):
         before = await storage.read_text(storage_key, encoding="utf-8", errors="replace")
     elif target is not None and target.is_file():
@@ -783,6 +802,31 @@ async def move_workspace_path(
         return WorkspaceWriteResult(False, source_normalized, "Source and destination are the same")
     if source_is_dir and (destination_normalized == source_normalized or destination_normalized.startswith(source_normalized + "/")):
         return WorkspaceWriteResult(False, source_normalized, "Cannot move a folder into itself")
+
+    if actor_type != "user":
+        source_media_output = await _durable_media_output_at_or_below(
+            db,
+            agent_id=agent_id,
+            path=source_normalized,
+        )
+        if source_media_output:
+            return _immutable_media_output_result(
+                source_normalized,
+                source_media_output,
+                "move",
+            )
+
+        destination_media_output = await _durable_media_output_at_or_below(
+            db,
+            agent_id=agent_id,
+            path=destination_normalized,
+        )
+        if destination_media_output:
+            return _immutable_media_output_result(
+                destination_normalized,
+                destination_media_output,
+                "replace",
+            )
 
     if enforce_human_lock and actor_type != "user":
         for locked_path in (source_normalized, destination_normalized):
@@ -892,6 +936,49 @@ async def move_workspace_path(
         destination_normalized,
         f"Moved {source_normalized} to {destination_normalized}",
         revision_id=str(revision.id) if revision else None,
+    )
+
+
+async def _durable_media_output_at_or_below(
+    db: AsyncSession | None,
+    *,
+    agent_id: uuid.UUID,
+    path: str,
+) -> str | None:
+    """Return a media output whose immutable path would be affected by a move."""
+
+    if db is None:
+        return None
+    prefix = path.rstrip("/") + "/"
+    result = await db.execute(
+        select(MediaGenerationTask.output_path)
+        .where(
+            MediaGenerationTask.agent_id == agent_id,
+            (
+                (MediaGenerationTask.output_path == path)
+                | MediaGenerationTask.output_path.startswith(prefix, autoescape=True)
+            ),
+        )
+        .order_by(MediaGenerationTask.created_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+def _immutable_media_output_result(
+    requested_path: str,
+    media_output: str,
+    operation: str,
+) -> WorkspaceWriteResult:
+    return WorkspaceWriteResult(
+        False,
+        requested_path,
+        (
+            f"Agent cannot {operation} generated media output: {media_output}. "
+            "Its versioned path is referenced by run history, Credits, and recovery receipts. "
+            "Keep the original path and choose a different save_path for a future generation."
+        ),
+        error_code="durable_media_output_immutable",
     )
 
 
