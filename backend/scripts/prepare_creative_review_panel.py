@@ -16,7 +16,7 @@ if str(BACKEND_DIR) not in sys.path:
 from app.services.creative_blind_review import BlindReviewPackage  # noqa: E402
 from app.services.creative_review_panel import (  # noqa: E402
     create_reviewer_submission_template,
-    required_evidence_kinds_for_modality,
+    required_evidence_kinds_for_scenario,
 )
 
 
@@ -35,7 +35,7 @@ def main() -> int:
     package = BlindReviewPackage.model_validate_json(
         args.review_package.read_text(encoding="utf-8")
     )
-    required_evidence = required_evidence_kinds_for_modality(package.modality)
+    required_evidence = required_evidence_kinds_for_scenario(package)
     output_paths: list[str] = []
     for index in range(1, args.reviewer_count + 1):
         reviewer_ref = f"reviewer-{index:02d}-replace-with-independent-receipt"

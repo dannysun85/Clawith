@@ -60,7 +60,9 @@ def main() -> int:
         raise ValueError("Complete human evidence requires at least one finding")
     candidate = matches[0]
     receipt = CreativeEvidenceReceipt(
-        receipt_ref=args.reviewer_receipt_ref,
+        receipt_ref=(
+            f"{args.reviewer_receipt_ref}:{args.candidate_label}:{args.kind}"
+        ),
         kind=args.kind,
         status=args.status,
         artifact_hashes={

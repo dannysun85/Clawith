@@ -987,7 +987,9 @@ provider-free 本地底座：
 - `backend/scripts/audit_creative_benchmark_run.py`：从整轮层面核对 modality 覆盖、公开 Artifact hash、
   provider 去标识、三人模板和正式 panel 结果；provisional 单人结果永远不能形成商用通过；
 - `score_creative_blind_review_panel.py` 的正式输出绑定 batch spec、public package 和候选 Artifact
-  SHA-256；审计器拒绝跨批次复制或产物替换后的旧评分；
+  SHA-256；同时绑定实际 `panel-submissions.json` SHA-256、评审人 receipt 列表和该场景必需的感知
+  证据种类。审计器从原始 panel 重新计算评分，拒绝跨批次复制、产物替换、panel 替换或手工篡改
+  `commercially_usable` 的旧评分；
 - `backend/tests/test_creative_evaluation.py`：验证 seed 可复现、seed 轮换、覆盖、留出隔离、Provider
   去标识、缺失证据不乐观通过和硬门禁 fail-closed。
 
@@ -1022,6 +1024,12 @@ provider-free 本地底座：
 - 三类各有 3 份 reviewer 模板，完成数均为 0，正式 panel result 均不存在；
 - 旧单人/自动评分均被标记为 provisional，不参与 `commercial_ready`；
 - 整轮状态为 `awaiting_human_review`，不是 `commercial_ready`，也不是包损坏。
+
+本轮又补齐正式封存的防篡改边界：评审根 receipt、候选判断 receipt 和人工证据 receipt 必须按同一
+评审人绑定，人工证据来源只能是独立评审或 Astra 受管身份评审；相同人工证据 receipt 不能跨候选或
+跨评审复用。明确包含 `lip sync`、`口型同步` 或同步对白的质量合同会自动要求
+`human_av_sync`。`commercial_ready` 在该审计器中只证明所评 Artifact 的质量结论，不证明成本、耗时
+或默认路由资格；后者仍需单独的执行/Credits receipt 和路由门槛审计。
 
 本地审批 shadow 已增加 `deliverable_quality_gate.py`，并接入 Artifact approval/read model：
 

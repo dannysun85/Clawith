@@ -60,6 +60,7 @@ def _panel(
 ):
     reviewer_batches = []
     for reviewer_index in range(reviewer_count):
+        reviewer_ref = f"reviewer-{reviewer_index}"
         candidate_submissions = []
         for candidate in package.candidates:
             hashes = {
@@ -77,7 +78,9 @@ def _panel(
             }
             evidence = [
                 CreativeEvidenceReceipt(
-                    receipt_ref=f"human-{reviewer_index}-{candidate.label}",
+                    receipt_ref=(
+                        f"{reviewer_ref}:{candidate.label}:human_visual"
+                    ),
                     kind="human_visual",
                     status="complete",
                     artifact_hashes=hashes,
@@ -100,7 +103,7 @@ def _panel(
                     review=BlindCandidateReviewSubmission(
                         label=candidate.label,
                         reviewer_receipt_ref=(
-                            f"review-{reviewer_index}-{candidate.label}"
+                            f"{reviewer_ref}:{candidate.label}"
                         ),
                         hard_gates=hard_gates,
                         dimensions={
@@ -116,7 +119,7 @@ def _panel(
             )
         reviewer_batches.append(
             BlindPanelReviewerBatch(
-                reviewer_receipt_ref=f"reviewer-{reviewer_index}",
+                reviewer_receipt_ref=reviewer_ref,
                 candidates=tuple(candidate_submissions),
             )
         )
@@ -346,3 +349,93 @@ async def test_stale_evidence_hash_is_rejected(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="hashes"):
         score_blind_review_panel(scenario, package, stale_panel)
+
+
+@pytest.mark.asyncio
+async def test_unbound_candidate_review_receipt_is_rejected(tmp_path) -> None:
+    scenario, package, _ = await _image_package(tmp_path)
+    panel = _panel(scenario, package)
+    reviewer = panel.reviewers[0]
+    candidate = reviewer.candidates[0]
+    changed_candidate = candidate.model_copy(
+        update={
+            "review": candidate.review.model_copy(
+                update={"reviewer_receipt_ref": "different-reviewer:A"}
+            )
+        }
+    )
+    changed_reviewer = reviewer.model_copy(
+        update={"candidates": (changed_candidate, *reviewer.candidates[1:])}
+    )
+    changed_panel = panel.model_copy(
+        update={"reviewers": (changed_reviewer, *panel.reviewers[1:])}
+    )
+
+    with pytest.raises(ValueError, match="not bound"):
+        score_blind_review_panel(scenario, package, changed_panel)
+
+
+@pytest.mark.asyncio
+async def test_cloned_human_evidence_receipt_is_rejected(tmp_path) -> None:
+    scenario, package, _ = await _image_package(tmp_path)
+    panel = _panel(scenario, package)
+    reviewer = panel.reviewers[0]
+    first, second = reviewer.candidates
+    first_human = next(
+        receipt
+        for receipt in first.evidence_receipts
+        if receipt.kind == "human_visual"
+    )
+    cloned_second_receipts = tuple(
+        receipt.model_copy(update={"receipt_ref": first_human.receipt_ref})
+        if receipt.kind == "human_visual"
+        else receipt
+        for receipt in second.evidence_receipts
+    )
+    changed_second = second.model_copy(
+        update={"evidence_receipts": cloned_second_receipts}
+    )
+    changed_reviewer = reviewer.model_copy(
+        update={"candidates": (first, changed_second)}
+    )
+    changed_panel = panel.model_copy(
+        update={"reviewers": (changed_reviewer, *panel.reviewers[1:])}
+    )
+
+    with pytest.raises(ValueError, match="not bound|must be unique"):
+        score_blind_review_panel(scenario, package, changed_panel)
+
+
+@pytest.mark.asyncio
+async def test_lip_sync_video_contract_requires_av_sync_evidence(tmp_path) -> None:
+    from app.services.creative_review_panel import (
+        required_evidence_kinds_for_scenario,
+    )
+
+    scenario = next(
+        item
+        for item in generate_evaluation_bundle(
+            seed=20260727
+        ).manifest.public_scenarios
+        if item.modality == "video"
+    )
+    explicit_lip_sync = scenario.model_copy(
+        update={
+            "quality_dimensions": (
+                *scenario.quality_dimensions,
+                "spoken-line intelligibility and lip sync",
+            )
+        }
+    )
+
+    assert required_evidence_kinds_for_scenario(scenario) == (
+        "frame_ocr",
+        "human_visual",
+        "human_audio",
+    )
+    assert required_evidence_kinds_for_scenario(explicit_lip_sync) == (
+        "frame_ocr",
+        "human_visual",
+        "human_audio",
+        "human_av_sync",
+    )

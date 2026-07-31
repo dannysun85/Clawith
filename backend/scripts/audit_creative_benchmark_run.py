@@ -30,7 +30,10 @@ from app.services.creative_blind_review import (  # noqa: E402
 from app.services.creative_evaluation import CreativeScenario  # noqa: E402
 from app.services.creative_review_panel import (  # noqa: E402
     BlindCandidatePanelResult,
+    BlindPanelSubmission,
     BlindPanelReviewerBatch,
+    required_evidence_kinds_for_scenario,
+    score_blind_review_panel,
 )
 
 
@@ -105,7 +108,11 @@ def _provider_identity_tokens(key: BlindReviewKey) -> tuple[str, ...]:
     return tuple(sorted(tokens))
 
 
-def _reviewer_file_state(path: Path) -> tuple[str, bool]:
+def _reviewer_file_state(
+    path: Path,
+) -> tuple[str, bool, BlindPanelReviewerBatch]:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("reviewer submission must be a regular file")
     payload = json.loads(path.read_text(encoding="utf-8"))
     scenario_id = str(payload["scenario_id"])
     reviewer = BlindPanelReviewerBatch.model_validate(payload["reviewer"])
@@ -125,7 +132,27 @@ def _reviewer_file_state(path: Path) -> tuple[str, bool]:
         raise ValueError(
             f"completed reviewer file still uses placeholder receipt: {path.name}"
         )
-    return scenario_id, complete
+    if complete:
+        reviewer = reviewer.model_copy(
+            update={
+                "candidates": tuple(
+                    candidate.model_copy(
+                        update={
+                            "review": candidate.review.model_copy(
+                                update={
+                                    "reviewer_receipt_ref": (
+                                        f"{reviewer.reviewer_receipt_ref}:"
+                                        f"{candidate.review.label}"
+                                    )
+                                }
+                            )
+                        }
+                    )
+                    for candidate in reviewer.candidates
+                )
+            }
+        )
+    return scenario_id, complete, reviewer
 
 
 def _audit_modality(run_dir: Path, modality: str) -> ModalityBenchmarkAudit:
@@ -229,15 +256,24 @@ def _audit_modality(run_dir: Path, modality: str) -> ModalityBenchmarkAudit:
         (run_dir / modality / "panel").glob("reviewer-*/submission.json")
     )
     completed_reviewer_count = 0
+    completed_reviewer_refs: set[str] = set()
+    completed_reviewers: dict[str, BlindPanelReviewerBatch] = {}
     reviewer_scenario_ids: set[str] = set()
     for reviewer_path in reviewer_paths:
         try:
-            reviewer_scenario_id, complete = _reviewer_file_state(reviewer_path)
+            reviewer_scenario_id, complete, reviewer = _reviewer_file_state(
+                reviewer_path
+            )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             issues.append(f"invalid reviewer file {reviewer_path.name}: {exc}")
             continue
         reviewer_scenario_ids.add(reviewer_scenario_id)
         completed_reviewer_count += int(complete)
+        if complete:
+            if reviewer.reviewer_receipt_ref in completed_reviewers:
+                issues.append("completed reviewer receipt refs must be unique")
+            completed_reviewer_refs.add(reviewer.reviewer_receipt_ref)
+            completed_reviewers[reviewer.reviewer_receipt_ref] = reviewer
     if len(reviewer_paths) < 3:
         issues.append("formal review requires at least 3 reviewer files")
     if reviewer_scenario_ids and reviewer_scenario_ids != {scenario_id}:
@@ -254,8 +290,12 @@ def _audit_modality(run_dir: Path, modality: str) -> ModalityBenchmarkAudit:
         )
 
     formal_result_path = results_dir / "sealed-panel-results.json"
+    formal_panel_path = run_dir / modality / "panel" / "panel-submissions.json"
     formal_results: tuple[BlindCandidatePanelResult, ...] = ()
-    if formal_result_path.is_file():
+    if formal_result_path.is_symlink():
+        issues.append("formal panel results must be a regular file")
+    elif formal_result_path.is_file():
+        formal_panel: BlindPanelSubmission | None = None
         try:
             formal_payload = json.loads(
                 formal_result_path.read_text(encoding="utf-8")
@@ -267,6 +307,21 @@ def _audit_modality(run_dir: Path, modality: str) -> ModalityBenchmarkAudit:
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             issues.append(f"invalid formal panel results: {exc}")
         else:
+            if formal_payload.get("scenario_id") != scenario_id:
+                issues.append("formal panel results target a different scenario")
+            if formal_panel_path.is_symlink():
+                issues.append("formal panel submissions must be a regular file")
+            elif not formal_panel_path.is_file():
+                issues.append(
+                    "formal panel results are missing panel/panel-submissions.json"
+                )
+            else:
+                try:
+                    formal_panel = BlindPanelSubmission.model_validate_json(
+                        formal_panel_path.read_text(encoding="utf-8")
+                    )
+                except (ValueError, json.JSONDecodeError) as exc:
+                    issues.append(f"invalid formal panel submissions: {exc}")
             expected_artifact_hashes = {
                 candidate.label: {
                     artifact_type: observation.content_sha256
@@ -291,6 +346,70 @@ def _audit_modality(run_dir: Path, modality: str) -> ModalityBenchmarkAudit:
                 issues.append(
                     "formal panel results are not bound to current artifact hashes"
                 )
+            if formal_panel is not None:
+                if formal_payload.get(
+                    "panel_submissions_sha256"
+                ) != _sha256_file(formal_panel_path):
+                    issues.append(
+                        "formal panel results are not bound to current panel submissions"
+                    )
+                panel_reviewer_refs = tuple(
+                    reviewer.reviewer_receipt_ref
+                    for reviewer in formal_panel.reviewers
+                )
+                if tuple(
+                    formal_payload.get("reviewer_receipt_refs", ())
+                ) != panel_reviewer_refs:
+                    issues.append(
+                        "formal panel results are not bound to panel reviewer receipts"
+                    )
+                if set(panel_reviewer_refs) != completed_reviewer_refs:
+                    issues.append(
+                        "formal panel reviewers differ from completed reviewer files"
+                    )
+                elif any(
+                    reviewer != completed_reviewers[reviewer.reviewer_receipt_ref]
+                    for reviewer in formal_panel.reviewers
+                ):
+                    issues.append(
+                        "formal panel judgments differ from completed reviewer files"
+                    )
+                expected_evidence_kinds = (
+                    required_evidence_kinds_for_scenario(scenario)
+                )
+                if tuple(
+                    formal_payload.get("required_evidence_kinds", ())
+                ) != expected_evidence_kinds:
+                    issues.append(
+                        "formal panel results use the wrong required evidence contract"
+                    )
+                minimum_reviewers = formal_payload.get("minimum_reviewers")
+                if (
+                    not isinstance(minimum_reviewers, int)
+                    or isinstance(minimum_reviewers, bool)
+                    or minimum_reviewers < 3
+                ):
+                    issues.append(
+                        "formal panel minimum_reviewers must be an integer of at least 3"
+                    )
+                else:
+                    try:
+                        recomputed_results = score_blind_review_panel(
+                            scenario,
+                            package,
+                            formal_panel,
+                            minimum_reviewers=minimum_reviewers,
+                            required_evidence_kinds=expected_evidence_kinds,
+                        )
+                    except ValueError as exc:
+                        issues.append(
+                            f"formal panel submissions fail validation: {exc}"
+                        )
+                    else:
+                        if tuple(formal_results) != tuple(recomputed_results):
+                            issues.append(
+                                "formal panel results differ from recomputed panel scores"
+                            )
             result_labels = {item.label for item in formal_results}
             if result_labels != package_labels:
                 issues.append(
@@ -365,6 +484,8 @@ def audit_benchmark_run(
         notes=(
             "Only sealed multi-reviewer panel results can produce "
             "commercial_ready.",
+            "commercial_ready attests the reviewed artifacts only; cost, latency, "
+            "and default-route eligibility require separate execution receipts.",
             "The audit does not call a provider or alter benchmark artifacts.",
         ),
     )

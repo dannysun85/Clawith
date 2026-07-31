@@ -21,6 +21,7 @@ from app.services.creative_blind_review import (  # noqa: E402
 from app.services.creative_evaluation import CreativeScenario  # noqa: E402
 from app.services.creative_review_panel import (  # noqa: E402
     BlindPanelSubmission,
+    required_evidence_kinds_for_scenario,
     reveal_panel_results,
     score_blind_review_panel,
 )
@@ -76,26 +77,32 @@ def main() -> int:
     panel = BlindPanelSubmission.model_validate_json(
         args.panel_submissions.read_text(encoding="utf-8")
     )
+    required_evidence_kinds = list(required_evidence_kinds_for_scenario(scenario))
+    for kind in args.required_evidence_kind or ():
+        if kind not in required_evidence_kinds:
+            required_evidence_kinds.append(kind)
+    required_evidence_kinds_tuple = tuple(required_evidence_kinds)
     results = score_blind_review_panel(
         scenario,
         package,
         panel,
         minimum_reviewers=args.minimum_reviewers,
-        required_evidence_kinds=(
-            tuple(args.required_evidence_kind)
-            if args.required_evidence_kind
-            else None
-        ),
+        required_evidence_kinds=required_evidence_kinds_tuple,
     )
     sealed_path = args.output_dir / "sealed-panel-results.json"
     _write_private_json(
         sealed_path,
         {
-            "schema_version": "1.0.0",
+            "schema_version": "1.1.0",
             "scenario_id": scenario.scenario_id,
             "minimum_reviewers": args.minimum_reviewers,
             "batch_spec_sha256": _sha256_file(args.batch_spec),
             "review_package_sha256": _sha256_file(args.review_package),
+            "panel_submissions_sha256": _sha256_file(args.panel_submissions),
+            "reviewer_receipt_refs": [
+                reviewer.reviewer_receipt_ref for reviewer in panel.reviewers
+            ],
+            "required_evidence_kinds": required_evidence_kinds_tuple,
             "artifact_hashes": {
                 candidate.label: {
                     artifact_type: observation.content_sha256

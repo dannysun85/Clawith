@@ -41,6 +41,15 @@ PanelStatus = Literal["blocked", "incomplete", "scored"]
 _HUMAN_EVIDENCE_KINDS = frozenset(
     {"human_visual", "human_audio", "human_av_sync", "document_semantic"}
 )
+_PLACEHOLDER_MARKER = "replace-with-independent-receipt"
+_AV_SYNC_CONTRACT_MARKERS = (
+    "lip sync",
+    "lip-sync",
+    "synchronized dialogue",
+    "synchronised dialogue",
+    "口型同步",
+    "同步对白",
+)
 
 
 class CreativeEvidenceReceipt(BaseModel):
@@ -128,6 +137,21 @@ def required_evidence_kinds_for_modality(
     raise ValueError(f"Unsupported creative modality: {modality}")
 
 
+def required_evidence_kinds_for_scenario(
+    scenario: CreativeScenario | BlindReviewPackage,
+) -> tuple[EvidenceKind, ...]:
+    """Add contract-specific evidence without making every video a lip-sync task."""
+
+    kinds = list(required_evidence_kinds_for_modality(scenario.modality))
+    if scenario.modality == "video":
+        contract_text = "\n".join(
+            (*scenario.requirements, *scenario.quality_dimensions)
+        ).lower()
+        if any(marker in contract_text for marker in _AV_SYNC_CONTRACT_MARKERS):
+            kinds.append("human_av_sync")
+    return tuple(kinds)
+
+
 def create_reviewer_submission_template(
     package: BlindReviewPackage,
     *,
@@ -194,6 +218,15 @@ def _validate_panel_shape(
             f"Formal panel requires at least {minimum_reviewers} reviewers"
         )
     reviewer_refs = [item.reviewer_receipt_ref for item in panel.reviewers]
+    if any(
+        not reviewer_ref.strip()
+        or reviewer_ref != reviewer_ref.strip()
+        or _PLACEHOLDER_MARKER in reviewer_ref
+        for reviewer_ref in reviewer_refs
+    ):
+        raise ValueError(
+            "Panel reviewer receipt refs must be non-placeholder canonical refs"
+        )
     if len(set(reviewer_refs)) != len(reviewer_refs):
         raise ValueError("Panel reviewer receipt refs must be unique")
 
@@ -206,7 +239,43 @@ def _validate_panel_shape(
         if set(reviewer_labels) != expected_labels:
             raise ValueError("Every reviewer must assess every masked candidate")
         for candidate in reviewer.candidates:
+            expected_review_ref = (
+                f"{reviewer.reviewer_receipt_ref}:{candidate.review.label}"
+            )
+            if candidate.review.reviewer_receipt_ref != expected_review_ref:
+                raise ValueError(
+                    "Candidate review receipt is not bound to its panel reviewer"
+                )
+            for receipt in candidate.evidence_receipts:
+                if receipt.kind not in _HUMAN_EVIDENCE_KINDS:
+                    continue
+                independent_source = receipt.source == "independent_human_review"
+                managed_source = (
+                    receipt.source.startswith("managed_reviewer:")
+                    and receipt.source != "managed_reviewer:"
+                    and reviewer.reviewer_receipt_ref.startswith("managed-reviewer:")
+                )
+                if not (independent_source or managed_source):
+                    raise ValueError(
+                        "Human evidence must use an independent or managed reviewer source"
+                    )
+                if not receipt.receipt_ref.startswith(
+                    f"{reviewer.reviewer_receipt_ref}:"
+                ):
+                    raise ValueError(
+                        "Human evidence receipt is not bound to its panel reviewer"
+                    )
             by_label[candidate.review.label].append(candidate)
+
+    human_evidence_refs = [
+        receipt.receipt_ref
+        for reviewer in panel.reviewers
+        for candidate in reviewer.candidates
+        for receipt in candidate.evidence_receipts
+        if receipt.kind in _HUMAN_EVIDENCE_KINDS
+    ]
+    if len(set(human_evidence_refs)) != len(human_evidence_refs):
+        raise ValueError("Human evidence receipt refs must be unique")
     return {label: tuple(items) for label, items in by_label.items()}
 
 
@@ -356,7 +425,7 @@ def score_blind_review_panel(
     expected_hashes = _expected_artifact_hashes(package)
     required_kinds = tuple(
         required_evidence_kinds
-        or required_evidence_kinds_for_modality(scenario.modality)
+        or required_evidence_kinds_for_scenario(scenario)
     )
 
     results: list[BlindCandidatePanelResult] = []
@@ -470,6 +539,7 @@ __all__ = [
     "RevealedBlindCandidatePanelResult",
     "create_reviewer_submission_template",
     "required_evidence_kinds_for_modality",
+    "required_evidence_kinds_for_scenario",
     "reveal_panel_results",
     "score_blind_review_panel",
 ]

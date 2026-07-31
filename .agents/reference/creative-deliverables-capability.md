@@ -649,7 +649,9 @@ PPT Provider 对比。拒绝凭空补齐 brief 是评测正确性，不是 PPT �
 - 只有覆盖全部候选、每项绑定原 Artifact hash、至少 3 名真实评审并已经封存的
   `sealed-panel-results.json`，且所有候选通过商用门槛时，整轮才可能返回 `commercial_ready`；
 - 正式评分输出同时绑定 batch spec SHA-256、public review package SHA-256 和逐候选 Artifact
-  hash；把评分文件复制到另一批次或替换产物会被整轮审计拒绝；
+  hash；现在还绑定 `panel-submissions.json` SHA-256、评审 receipt 列表和必需感知证据种类，并由
+  审计器从原始 panel 重新计算评分。把评分文件复制到另一批次、替换产物/panel 或直接修改商用结论
+  都会被整轮审计拒绝；
 - 工具只读本地文件，不调用 Provider、不消耗 Credits，也不修改评测产物。
 
 对 `tmp/creative-evaluation/blind-review-2026-07-27` 的实际审计结果为
@@ -662,6 +664,12 @@ PPT Provider 对比。拒绝凭空补齐 brief 是评测正确性，不是 PPT �
 
 因此现有包已经达到“可交给真实评审人执行”的工程准备状态，但准确结论仍是
 `commercially_usable_proven=false`。
+
+正式评审 receipt 现在要求三层一致绑定：panel 评审根 receipt、候选判断 receipt、人工视觉/听音/
+口型/文档证据 receipt。人工证据只接受独立评审来源或 Astra 受管身份评审来源，且同一 receipt 不得
+跨候选或评审复用；明确包含 `lip sync`、`口型同步` 或同步对白的场景会自动追加
+`human_av_sync`。这里的 `commercial_ready` 仅表示被评 Artifact 通过正式质量 panel，成本、耗时和
+默认 Provider 路由资格仍需独立执行/Credits receipt，不得由质量分数代替。
 
 ## 六、验收与后续扩展
 
