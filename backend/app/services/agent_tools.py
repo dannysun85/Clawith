@@ -29399,6 +29399,7 @@ async def _generate_minimax_audio_durable(
     audio_format: str,
     content_type: str,
     sample_rate: int,
+    requested_duration_seconds: float | None = None,
     provider_call: Callable[
         [Callable[[bytes | None], Awaitable[None]], Callable[[], None]],
         Awaitable[bytes],
@@ -29444,6 +29445,7 @@ async def _generate_minimax_audio_durable(
                 "output_extension": f".{audio_format}",
                 "output_content_type": content_type,
                 "sample_rate": sample_rate,
+                "duration": requested_duration_seconds,
             },
             provider=provider,
         )
@@ -29500,9 +29502,14 @@ async def _generate_minimax_audio_durable(
         )
         label = "Speech" if modality == "audio" else "Music"
         if outcome.status == "succeeded":
+            duration_summary = (
+                f" | Duration: {requested_duration_seconds:g}s"
+                if requested_duration_seconds is not None
+                else ""
+            )
             summary = (
                 f"✅ {label} generated and durably delivered: {save_path}\n"
-                f"Provider: {provider} | Model: {model}\n"
+                f"Provider: {provider} | Model: {model}{duration_summary}\n"
                 f"Task ID: {record_id}"
             )
             return _minimax_tool_result(
@@ -29516,6 +29523,9 @@ async def _generate_minimax_audio_durable(
                 model=model,
                 tier=tier,
                 provider=provider,
+                runtime_metadata={
+                    "duration_seconds": requested_duration_seconds,
+                },
             )
         if outcome.status == "compensated":
             summary = (
@@ -29964,6 +29974,26 @@ async def _generate_music_minimax(
             modality="music",
         )
 
+    requested_duration_seconds: float | None = None
+    if arguments.get("duration_seconds") is not None:
+        try:
+            requested_duration_seconds = float(arguments["duration_seconds"])
+        except (TypeError, ValueError):
+            requested_duration_seconds = None
+        if (
+            requested_duration_seconds is None
+            or not math.isfinite(requested_duration_seconds)
+            or not 5 <= requested_duration_seconds <= 180
+        ):
+            return _minimax_tool_result(
+                "❌ Music duration_seconds must be a finite number between 5 and 180.",
+                typed=typed,
+                status="failed",
+                error_code="invalid_tool_arguments",
+                agent_id=agent_id,
+                modality="music",
+            )
+
     config = await _get_tool_config(agent_id, "generate_music_minimax") or {}
     tier = await _resolve_minimax_tool_tier(agent_id, config, saas_tier)
     from app.services.minimax_media_profiles import load_platform_minimax_media_profile
@@ -30068,6 +30098,7 @@ async def _generate_music_minimax(
         audio_format=audio_format,
         content_type=content_type,
         sample_rate=sample_rate,
+        requested_duration_seconds=requested_duration_seconds,
         provider_call=lambda on_accepted, on_request_started: _minimax_music_http(
             api_key=credential.api_key,
             base_url=credential.base_url,

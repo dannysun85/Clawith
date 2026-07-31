@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
     appendUniqueById,
+    latestCompletedWorkspaceMediaPath,
     safeMediaCompletionTool,
     safeWorkspaceMediaPath,
     workspaceMediaPathFromArtifactRefs,
@@ -50,5 +51,75 @@ describe('media completion helpers', () => {
 
     it('uses a generic activity for an unknown completion modality', () => {
         expect(safeMediaCompletionTool('document', 'generate_video_minimax')).toBe('media_generation');
+    });
+
+    it('recovers the latest successful media artifact from durable tool history', () => {
+        expect(latestCompletedWorkspaceMediaPath([
+            {
+                role: 'tool_call',
+                toolName: 'generate_image_minimax',
+                toolStatus: 'done',
+                toolResult: '✅ Saved to workspace/generated/hero image.png',
+            },
+            {
+                role: 'tool_call',
+                toolName: 'generate_video_minimax',
+                toolStatus: 'done',
+                toolResult: '视频已完成：workspace/deliverables/campaign/final.mp4\n可直接预览。',
+            },
+        ])).toBe('workspace/deliverables/campaign/final.mp4');
+    });
+
+    it('ignores unfinished, non-media, and unsafe durable tool rows', () => {
+        expect(latestCompletedWorkspaceMediaPath([
+            {
+                role: 'tool_call',
+                toolName: 'generate_video_minimax',
+                toolStatus: 'running',
+                toolResult: 'workspace/videos/running.mp4',
+            },
+            {
+                role: 'tool_call',
+                toolName: 'write_file',
+                toolStatus: 'done',
+                toolResult: 'workspace/videos/not-media-tool.mp4',
+            },
+            {
+                role: 'tool_call',
+                toolName: 'generate_music_minimax',
+                toolStatus: 'done',
+                toolResult: 'workspace/../secret.mp3',
+            },
+        ])).toBeNull();
+    });
+
+    it('uses the final assistant receipt to choose the delivered artifact within one run', () => {
+        expect(latestCompletedWorkspaceMediaPath([
+            {
+                role: 'tool_call',
+                toolName: 'generate_video_minimax',
+                toolStatus: 'done',
+                toolResult: 'workspace/videos/commercial.mp4',
+            },
+            {
+                role: 'tool_call',
+                toolName: 'generate_image_minimax',
+                toolStatus: 'done',
+                toolResult: 'workspace/images/first-frame.png',
+            },
+            {
+                role: 'assistant',
+                content: '视频已完成：`workspace/videos/commercial.mp4`',
+            },
+        ])).toBe('workspace/videos/commercial.mp4');
+    });
+
+    it('does not trust an assistant-only media path without a successful tool receipt', () => {
+        expect(latestCompletedWorkspaceMediaPath([
+            {
+                role: 'assistant',
+                content: '已生成：workspace/videos/fabricated.mp4',
+            },
+        ])).toBeNull();
     });
 });

@@ -1054,6 +1054,85 @@ async def validate_generated_audio(
     )
 
 
+async def trim_generated_audio(
+    raw: bytes,
+    *,
+    audio_format: str,
+    duration_seconds: float,
+    label: str = "Generated audio",
+) -> tuple[bytes, AudioInfo]:
+    """Trim provider audio to the customer-visible duration contract.
+
+    Music providers may return a full song even when the customer needs a
+    short commercial clip.  The provider response remains the durable recovery
+    source; this deterministic post-processing step produces the exact
+    customer-facing artifact before Credits settlement.
+    """
+
+    normalized_format = str(audio_format or "").strip().lower().lstrip(".")
+    if normalized_format not in {"mp3", "wav"}:
+        raise MediaContractError(f"{label} trim format is unsupported")
+    requested_duration = float(duration_seconds)
+    if not 0 < requested_duration <= 180:
+        raise MediaContractError(f"{label} duration must be between 0 and 180 seconds")
+
+    source_info = await validate_generated_audio(
+        raw,
+        audio_format=normalized_format,
+        label=label,
+    )
+    tolerance = 0.15
+    if source_info.duration_seconds + tolerance < requested_duration:
+        raise MediaContractError(
+            f"{label} is {source_info.duration_seconds:.3f}s, shorter than the "
+            f"requested {requested_duration:.3f}s"
+        )
+    if source_info.duration_seconds <= requested_duration + tolerance:
+        return raw, source_info
+
+    with tempfile.TemporaryDirectory(prefix="astra-media-audio-trim-") as temp_dir:
+        root = Path(temp_dir)
+        input_path = root / f"input.{normalized_format}"
+        output_path = root / f"output.{normalized_format}"
+        input_path.write_bytes(raw)
+        codec_args = (
+            ("-c:a", "libmp3lame", "-b:a", "256k")
+            if normalized_format == "mp3"
+            else ("-c:a", "pcm_s16le")
+        )
+        await _run_process(
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(input_path),
+            "-t",
+            f"{requested_duration:.3f}",
+            "-vn",
+            *codec_args,
+            str(output_path),
+            timeout=120,
+            label=f"{label} duration trim",
+        )
+        if not output_path.is_file():
+            raise MediaContractError(f"{label} duration trim did not create an output file")
+        result = output_path.read_bytes()
+
+    output_info = await validate_generated_audio(
+        result,
+        audio_format=normalized_format,
+        label=f"{label} trimmed output",
+    )
+    if abs(output_info.duration_seconds - requested_duration) > tolerance:
+        raise MediaContractError(
+            f"{label} trimmed duration is {output_info.duration_seconds:.3f}s, "
+            f"expected {requested_duration:.3f}s"
+        )
+    return result, output_info
+
+
 async def compose_video_audio_tracks(
     video_raw: bytes,
     *,

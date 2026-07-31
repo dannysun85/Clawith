@@ -47,6 +47,7 @@ from app.services.media_assets import (
     apply_image_brand_overlays,
     apply_video_brand_overlays,
     image_asset_from_bytes,
+    trim_generated_audio,
     valid_mp4,
     validate_generated_audio,
     validate_generated_image,
@@ -2593,12 +2594,33 @@ async def reconcile_minimax_sync_media_task(
             )
             status_data["_astra_media_contract"] = receipt.as_dict()
         else:
-            await validate_generated_audio(
+            audio_format = str(metadata.get("output_extension") or "").lstrip(".")
+            audio_info = await validate_generated_audio(
                 raw,
-                audio_format=str(metadata.get("output_extension") or "").lstrip("."),
+                audio_format=audio_format,
                 sample_rate=int(metadata.get("sample_rate") or 0) or None,
                 label=f"MiniMax {task.modality} recovery output",
             )
+            requested_duration = metadata.get("duration")
+            if task.modality == "music" and requested_duration is not None:
+                output_bytes, audio_info = await trim_generated_audio(
+                    raw,
+                    audio_format=audio_format,
+                    duration_seconds=float(requested_duration),
+                    label="MiniMax music recovery output",
+                )
+            status_data["_astra_media_contract"] = {
+                "duration_seconds": round(audio_info.duration_seconds, 3),
+                "requested_duration_seconds": (
+                    float(requested_duration)
+                    if requested_duration is not None
+                    else None
+                ),
+                "codec_name": audio_info.codec_name,
+                "sample_rate": audio_info.sample_rate,
+                "channels": audio_info.channels,
+                "container_format": audio_info.container_format,
+            }
 
         status_data["_astra_output_sha256"] = hashlib.sha256(output_bytes).hexdigest()
         await _store_authoritative_media_output(

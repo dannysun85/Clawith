@@ -1902,6 +1902,7 @@ async def test_generate_music_minimax_records_success(tmp_path):
             {
                 "prompt": "bright pop",
                 "lyrics": "verse one",
+                "duration_seconds": 12,
                 "save_path": "workspace/audio/song.mp3",
             },
         )
@@ -1915,6 +1916,7 @@ async def test_generate_music_minimax_records_success(tmp_path):
     assert creation["tier"] == "pro"
     assert creation["model"] == "music-2.6"
     assert creation["credit_cost"] == 150
+    assert creation["request_metadata"]["duration"] == 12
     assert creation["output_path"].startswith("workspace/audio/song_")
     record_id = creation["record_id"]
     provider_call.assert_awaited_once()
@@ -1933,6 +1935,35 @@ async def test_generate_music_minimax_records_success(tmp_path):
         modality="music",
         model="music-2.6",
     )
+
+
+@pytest.mark.asyncio
+async def test_generate_music_rejects_invalid_duration_before_provider_or_credits(tmp_path):
+    with (
+        patch(
+            "app.services.agent_tools._get_tool_config",
+            AsyncMock(),
+        ) as get_config,
+        patch(
+            "app.services.agent_tools._check_minimax_credit_amount",
+            AsyncMock(),
+        ) as check_credits,
+    ):
+        result = await _generate_music_minimax(
+            uuid.uuid4(),
+            tmp_path,
+            {
+                "prompt": "bright pop",
+                "lyrics": "verse one",
+                "duration_seconds": "not-a-number",
+            },
+            typed=True,
+        )
+
+    assert result.status == "failed"
+    assert result.error_code == "invalid_tool_arguments"
+    get_config.assert_not_awaited()
+    check_credits.assert_not_awaited()
 
 
 @pytest.mark.parametrize("modality", ["audio", "music"])

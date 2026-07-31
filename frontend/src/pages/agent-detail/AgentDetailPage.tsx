@@ -48,6 +48,7 @@ import {
 } from '../../utils/deliverables';
 import {
     appendUniqueById,
+    latestCompletedWorkspaceMediaPath,
     safeMediaCompletionTool,
     safeWorkspaceMediaPath,
     workspaceMediaPathFromArtifactRefs,
@@ -2546,6 +2547,10 @@ export default function AgentDetailPage() {
                 }),
             }));
             setChatMessages(parsed);
+            const recoveredMediaPath = latestCompletedWorkspaceMediaPath(parsed);
+            if (recoveredMediaPath && !workspaceLockedPathRef.current) {
+                setWorkspaceActivePath(recoveredMediaPath);
+            }
             // Round-trip the backend's compound `<created_at>|<id>` cursor. A bare
             // created_at cannot page past a batch of messages that share one timestamp
             // (e.g. a burst of tool_call rows), so older messages would never load.
@@ -3108,7 +3113,6 @@ export default function AgentDetailPage() {
                     runtimeError: normalizeRuntimeError({ error: m.runtime_error }),
                 }),
             }));
-
             const historyCursor = resolveChatHistoryCursor(
                 responseHeaders || new Headers(),
                 msgs,
@@ -3427,6 +3431,36 @@ export default function AgentDetailPage() {
         setSessionListCollapsed(true);
         useAppStore.setState({ sidebarCollapsed: true });
     }, []);
+    useEffect(() => {
+        if (!id || !activeSession?.id) return;
+        const runtimeKey = buildSessionRuntimeKey(id, String(activeSession.id));
+        if (chatHistoryReadyRuntimeKey !== runtimeKey) return;
+        const visibleMessages = isWritableSession(activeSession, chatScope)
+            ? chatMessages
+            : historyMsgs;
+        const recoveredMediaPath = latestCompletedWorkspaceMediaPath(visibleMessages);
+        if (
+            !recoveredMediaPath
+            || !allowWorkspaceAutoSwitch(recoveredMediaPath)
+            || !allowLivePanelAutoFocus()
+        ) {
+            return;
+        }
+        setWorkspaceActivePath(recoveredMediaPath);
+        setSidePanelTab('workspace');
+        setLivePanelVisible(true);
+        collapseSidebarsForLivePanel();
+    }, [
+        activeSession?.id,
+        allowLivePanelAutoFocus,
+        allowWorkspaceAutoSwitch,
+        chatHistoryReadyRuntimeKey,
+        chatMessages,
+        chatScope,
+        collapseSidebarsForLivePanel,
+        historyMsgs,
+        id,
+    ]);
     useEffect(() => {
         if (!id || activeTab !== 'chat' || !requestedWorkspacePath) return;
         if (!activeSessionMatchesRequestedSession(requestedSessionId, activeSession?.id)) return;

@@ -1,3 +1,49 @@
+# v1.11.9 — Clawith v1.11.3 Runtime Upgrade and Creative Delivery Release
+
+## Runtime and Product Foundation
+
+- Semantically integrated upstream Clawith v1.11.3 Runtime, Group, error
+  protocol, model-routing, logical-deletion, approval-resume, scheduling, and
+  migration fixes while preserving Astra's governed `finish`, SaaS routing,
+  Credits, media, Deliverable, approval, and production-release contracts.
+- The merged Alembic lineage has one release head,
+  `merge_v1113_astra_heads`. Agent schedules enter the Durable Runtime behind
+  the existing operator gate, Group workspaces use the shared typed file
+  contract, and history pagination retains its compound cursor.
+- The frontend lock now carries the patched PostCSS and Nano ID transitive
+  releases, removing the source-map path-disclosure advisory from the
+  production build chain.
+
+## Commercial Media and Deliverable Reliability
+
+- Agent Plan and MiniMax remain provider-neutral routes behind Astra's
+  credential, entitlement, Credits, durable-task, storage, and failover
+  boundaries. The customer and Agent continue to request capabilities rather
+  than provider model IDs.
+- Historical image, video, speech, and music results now reconstruct the
+  authenticated right-side Workspace preview after reload. The selected path
+  must appear both in a successful durable media Tool receipt and, when
+  present, the final assistant delivery receipt; assistant-only paths cannot
+  create a preview.
+- Music accepts an optional exact `duration_seconds` contract. A longer
+  provider track is deterministically trimmed and revalidated before durable
+  storage and Credits settlement; a shorter-than-requested result fails closed
+  instead of being misrepresented as the requested length.
+- Platform operators can dry-run or apply evidence-backed resolution of exact
+  ambiguous `llm_round` Credits holds. Reconciliation is reservation-ID and
+  tenant fenced, requires an incident/evidence reference, validates the exact
+  settlement amount, and writes an audit record.
+
+## Validation
+
+- Complete backend suite: `3963 passed`; changed Python files passed Ruff and
+  byte-code compilation.
+- Frontend Node contracts: `90 passed`; Vitest: `137 passed`; TypeScript/Vite
+  production build completed with `7036` transformed modules.
+- PostgreSQL migration cycles, deployment contract checks, `git diff --check`,
+  and authenticated local/production browser business-flow evidence are
+  required on the reviewed release commit before production cutover.
+
 # v1.11.8 — Browser-safe Provider Video Delivery Hotfix
 
 ## Provider Output Normalization

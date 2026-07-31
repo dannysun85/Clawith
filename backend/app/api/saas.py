@@ -41,6 +41,7 @@ from app.schemas.saas import (
     GrantCreditsIn,
     InitializeFreeSubscriptionsIn,
     InitializeFreeSubscriptionsOut,
+    LLMCreditHoldResolutionIn,
     MediaRouteOut,
     MediaRouteUpdateIn,
     MediaFailureRemediationIn,
@@ -66,6 +67,7 @@ from app.services.media_incident_remediation import (
     remediate_media_tasks,
     resolve_media_provider_debt,
 )
+from app.services.llm_credit_reconciliation import resolve_llm_credit_holds
 from app.services.entitlements import get_active_subscription, get_tenant_entitlements
 from app.services.agent_plan_selection import reconcile_tenant_agent_plan_selections
 from app.services.subscription_lifecycle import (
@@ -1329,6 +1331,28 @@ async def resolve_provider_media_debt(
             incident_key=data.incident_key,
             evidence_ref=data.evidence_ref,
             resolution=data.resolution,
+            actor_user_id=current_user.id,
+            apply=data.apply,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return result.to_dict()
+
+
+@router.post("/credits/resolve-llm-holds")
+async def resolve_ambiguous_llm_credit_holds(
+    data: LLMCreditHoldResolutionIn,
+    current_user: User = Depends(get_platform_admin),
+):
+    """Preview/apply an evidence-backed resolution for exact LLM holds."""
+    try:
+        result = await resolve_llm_credit_holds(
+            reservation_ids=tuple(data.reservation_ids),
+            expected_tenant_id=data.expected_tenant_id,
+            incident_key=data.incident_key,
+            evidence_ref=data.evidence_ref,
+            resolution=data.resolution,
+            settlement_amount=data.settlement_amount,
             actor_user_id=current_user.id,
             apply=data.apply,
         )

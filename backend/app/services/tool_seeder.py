@@ -1448,6 +1448,12 @@ BUILTIN_TOOLS = [
             "properties": {
                 "prompt": {"type": "string", "description": "Music style and mood prompt."},
                 "lyrics": {"type": "string", "description": "Lyrics for the song."},
+                "duration_seconds": {
+                    "type": "number",
+                    "minimum": 5,
+                    "maximum": 180,
+                    "description": "Optional exact customer-facing clip duration in seconds. Full provider songs are deterministically trimmed before delivery.",
+                },
                 "format": {"type": "string", "description": "Audio format: mp3 or wav. Default: mp3."},
                 "save_path": {"type": "string", "description": "Save path in workspace. Default: auto."},
             },

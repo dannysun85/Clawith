@@ -12,6 +12,9 @@ Astra 自有 Deliverable、Credits、Approval、Provider 路由和质量门禁�
 ### 共用产品入口
 
 - `backend/app/services/deliverable_workflows.py` 已定义 `builtin.presentation.v1`、`builtin.poster.v1`、`builtin.video.v1`。
+- 图片、视频、语音和音乐的 durable Tool 回执会在历史会话重新载入时恢复右侧 Workspace
+  预览。恢复路径必须来自成功媒体 Tool 回执；当最终助手回执也包含路径时，两者必须匹配，
+  不能仅凭助手文本创建预览。
 - PPT 和视频的 `launch_policy` 是 `agent_runtime`；海报仍是 `dry_run`，当前只能保存工作说明和完成预检，不能视为正式执行闭环。视频虽然已允许启动，但仍必须以最终 MP4 Artifact 校验成功为完成条件，不能把 storyboard、Provider 拒绝或无产物的 Runtime 结束视为交付成功。
 - 用户合同不包含 provider/model；运行时根据 tenant、tier、能力和健康状态路由。
 - 请求、运行、批准、Credits 和 Workspace Artifact 应继续作为 durable truth。
@@ -32,6 +35,14 @@ Astra 自有 Deliverable、Credits、Approval、Provider 路由和质量门禁�
 - 当前已有 MiniMax Hailuo 文生视频/图生视频相关 Tool、异步任务检查、Credits 和文件验证路径。
 - 当前交付物工作流已开放正式 launch，但只有 Provider 接受、媒体任务完成且最终 MP4 Artifact 通过校验时才算成功；缺失 MP4 必须 fail closed。
 - 主要缺口是 storyboard compiler、多参考/关键帧一致性、逐镜头状态、质量评分、剪辑包装和镜头级重做，不只是替换模型。
+
+### 语音和音乐
+
+- 语音与音乐沿用同一 durable media task、Credits、Provider failover、Workspace Artifact
+  和浏览器播放合同。
+- 音乐 Tool 可声明 5–180 秒的精确 `duration_seconds`。Provider 返回更长的完整曲目时，
+  在 durable storage 和 Credits settlement 前执行确定性裁切并重新校验；Provider 输出
+  短于请求时 fail closed，不得把实际长音频或短音频声称为请求时长。
 
 ### PPT
 

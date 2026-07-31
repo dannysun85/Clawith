@@ -20,6 +20,7 @@ from app.services.media_assets import (
     compose_video_audio_tracks,
     image_asset_from_bytes,
     image_reference_for_provider,
+    trim_generated_audio,
     validate_generated_audio,
     validate_generated_image,
     validate_generated_video,
@@ -81,7 +82,12 @@ def _real_mp4(tmp_path: Path) -> bytes:
     return path.read_bytes()
 
 
-def _real_audio(tmp_path: Path, audio_format: str) -> bytes:
+def _real_audio(
+    tmp_path: Path,
+    audio_format: str,
+    *,
+    duration_seconds: float = 0.25,
+) -> bytes:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         pytest.skip("ffmpeg is required for the real audio contract test")
@@ -96,7 +102,7 @@ def _real_audio(tmp_path: Path, audio_format: str) -> bytes:
             "-f",
             "lavfi",
             "-i",
-            "sine=frequency=440:duration=0.25",
+            f"sine=frequency=440:duration={duration_seconds}",
             str(path),
         ],
         check=True,
@@ -520,6 +526,42 @@ async def test_audio_container_must_match_requested_format(
         await validate_generated_audio(
             _real_audio(tmp_path, actual_format),
             audio_format=requested_format,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("audio_format", ["mp3", "wav"])
+async def test_full_music_track_is_trimmed_to_customer_duration(tmp_path, audio_format):
+    source = _real_audio(
+        tmp_path,
+        audio_format,
+        duration_seconds=2.0,
+    )
+
+    result, info = await trim_generated_audio(
+        source,
+        audio_format=audio_format,
+        duration_seconds=0.8,
+        label="Commercial music clip",
+    )
+
+    assert result != source
+    assert abs(info.duration_seconds - 0.8) <= 0.15
+    assert (
+        await validate_generated_audio(result, audio_format=audio_format)
+    ).duration_seconds == info.duration_seconds
+
+
+@pytest.mark.asyncio
+async def test_music_duration_contract_rejects_short_provider_output(tmp_path):
+    source = _real_audio(tmp_path, "mp3", duration_seconds=0.5)
+
+    with pytest.raises(MediaContractError, match="shorter than the requested"):
+        await trim_generated_audio(
+            source,
+            audio_format="mp3",
+            duration_seconds=1.5,
+            label="Commercial music clip",
         )
 
 

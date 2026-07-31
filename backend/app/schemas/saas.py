@@ -363,6 +363,28 @@ class MediaProviderDebtResolutionIn(BaseModel):
         return normalized
 
 
+class LLMCreditHoldResolutionIn(BaseModel):
+    """Evidence-backed resolution for ambiguous LLM provider holds."""
+
+    reservation_ids: list[uuid.UUID] = Field(min_length=1, max_length=100)
+    expected_tenant_id: uuid.UUID
+    incident_key: str = Field(min_length=1, max_length=200)
+    evidence_ref: str = Field(min_length=1, max_length=500)
+    resolution: str
+    settlement_amount: int | None = Field(default=None, ge=0)
+    apply: bool = False
+
+    @field_validator("resolution")
+    @classmethod
+    def validate_resolution(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"provider_completed", "provider_not_accepted"}:
+            raise ValueError(
+                "resolution must be provider_completed or provider_not_accepted"
+            )
+        return normalized
+
+
 class MarkOrderPaidIn(BaseModel):
     """Platform admin marks an order as paid (mock payment in phase 1)."""
 

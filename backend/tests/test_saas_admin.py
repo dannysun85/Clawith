@@ -9,7 +9,11 @@ from fastapi import HTTPException
 
 from app.api import admin as admin_api
 from app.api import saas as saas_api
-from app.schemas.saas import InitializeFreeSubscriptionsIn, MediaRouteUpdateIn
+from app.schemas.saas import (
+    InitializeFreeSubscriptionsIn,
+    LLMCreditHoldResolutionIn,
+    MediaRouteUpdateIn,
+)
 
 
 class DummyResult:
@@ -107,6 +111,45 @@ async def test_saas_admin_rejects_owner_email_without_platform_admin_role():
         await saas_api.get_saas_admin(user)
 
     assert exc.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_saas_llm_hold_resolution_forwards_exact_scope_and_evidence():
+    reservation_id = uuid.uuid4()
+    tenant_id = uuid.uuid4()
+    admin = _admin_user()
+    request = LLMCreditHoldResolutionIn(
+        reservation_ids=[reservation_id],
+        expected_tenant_id=tenant_id,
+        incident_key="INC-LLM-001",
+        evidence_ref="chat-message:tool-call-returned",
+        resolution="provider_completed",
+        settlement_amount=2,
+        apply=False,
+    )
+    result = SimpleNamespace(to_dict=lambda: {"applied": False})
+
+    with patch.object(
+        saas_api,
+        "resolve_llm_credit_holds",
+        AsyncMock(return_value=result),
+    ) as resolve:
+        response = await saas_api.resolve_ambiguous_llm_credit_holds(
+            request,
+            current_user=admin,
+        )
+
+    assert response == {"applied": False}
+    resolve.assert_awaited_once_with(
+        reservation_ids=(reservation_id,),
+        expected_tenant_id=tenant_id,
+        incident_key="INC-LLM-001",
+        evidence_ref="chat-message:tool-call-returned",
+        resolution="provider_completed",
+        settlement_amount=2,
+        actor_user_id=admin.id,
+        apply=False,
+    )
 
 
 @pytest.mark.asyncio
