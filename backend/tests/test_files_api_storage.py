@@ -206,6 +206,31 @@ def test_file_kind_recognizes_browser_playable_media():
 
 
 @pytest.mark.asyncio
+async def test_preview_image_returns_stream_url_without_embedding_binary(monkeypatch):
+    agent_id = uuid.uuid4()
+    storage = PrefixOnlyStorage({f"{agent_id}/workspace/images/demo.png": b"\x89PNG\r\n\x1a\nimage"})
+    monkeypatch.setattr(files, "get_storage_backend", lambda: storage)
+
+    async def allow_access(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(files, "check_agent_access", allow_access)
+    user = SimpleNamespace(tenant_id=None)
+
+    result = await files.preview_file(
+        agent_id,
+        path="workspace/images/demo.png",
+        current_user=user,
+        db=None,
+    )
+
+    assert result["kind"] == "image"
+    assert result["mime_type"] == "image/png"
+    assert result["url"].endswith("path=workspace/images/demo.png")
+    assert "base64_sample" not in result
+
+
+@pytest.mark.asyncio
 async def test_preview_video_returns_stream_url_without_embedding_binary(monkeypatch):
     agent_id = uuid.uuid4()
     storage = PrefixOnlyStorage({f"{agent_id}/workspace/videos/demo.mp4": b"\x00\x00\x00\x18ftypmp42video"})

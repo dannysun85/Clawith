@@ -631,6 +631,24 @@ Plan would be:
         "is_default": False,
         "files": [],
     },
+    {
+        "name": "Commercial Presentation",
+        "description": "Create or revise customer-facing slide decks with editable PPTX/PDF, sourced claims, intentional layouts, real visuals, and governed quality review",
+        "category": "creation",
+        "icon": "📊",
+        "folder_name": "commercial-presentation",
+        "is_default": False,
+        "files": [],
+    },
+    {
+        "name": "Commercial Voiceover",
+        "description": "Create or revise customer-facing narration and voice tracks with exact scripts, pronunciation control, durable audio, provider-safe routing, and listening review",
+        "category": "creation",
+        "icon": "🔊",
+        "folder_name": "commercial-voiceover",
+        "is_default": False,
+        "files": [],
+    },
     # ─── Market Data (trading agents) ──────────────
     {
         "name": "Market Data",
@@ -1070,6 +1088,8 @@ async def seed_skills():
                 logger.warning("[SkillSeeder] mcp-installer/SKILL.md not found in agent_template/skills/")
         elif s["folder_name"] in {
             "brand-safe-media",
+            "commercial-presentation",
+            "commercial-voiceover",
             "volcengine-seedream-commercial",
             "volcengine-seedance-commercial",
         } and not s["files"]:

@@ -233,13 +233,23 @@ async def test_media_routes_expose_complete_matrix_without_credentials():
         SimpleNamespace(name=name, config={}, enabled=True)
         for name in saas_api.MINIMAX_MEDIA_TOOL_NAMES.values()
     ]
-    credential = SimpleNamespace(
+    agent_plan_credential = SimpleNamespace(
+        provider="volcengine_agent_plan",
+        plan_tier="small",
+        capabilities=["image", "audio", "video"],
+        modality_status={},
+        api_key="agent-plan-key-must-not-leak",
+    )
+    minimax_credential = SimpleNamespace(
+        provider="minimax",
+        plan_tier=None,
         capabilities=["text", "image", "audio", "music", "video"],
+        modality_status={},
         api_key="must-not-leak",
     )
     db = RecordingDB([
         DummyResult(values=tools),
-        DummyResult(values=[credential]),
+        DummyResult(values=[agent_plan_credential, minimax_credential]),
     ])
 
     routes = await saas_api.list_media_routes(current_user=_admin_user(), db=db)
@@ -251,8 +261,40 @@ async def test_media_routes_expose_complete_matrix_without_credentials():
         for tier in ("lite", "pro", "ultra")
     }
     assert all(route.available for route in routes)
+    assert all(route.provider == "automatic" for route in routes)
+    assert all(route.routing_mode == "automatic_failover" for route in routes)
+    by_modality = {
+        route.modality: route
+        for route in routes
+        if route.tier == "lite"
+    }
+    assert by_modality["image"].provider_order == [
+        "volcengine_agent_plan",
+        "minimax",
+    ]
+    assert by_modality["audio"].provider_order == [
+        "volcengine_agent_plan",
+        "minimax",
+    ]
+    assert by_modality["video"].provider_order == [
+        "volcengine_agent_plan",
+        "minimax",
+    ]
+    assert by_modality["music"].provider_order == ["minimax"]
+    assert by_modality["image"].available_providers == [
+        "volcengine_agent_plan",
+        "minimax",
+    ]
+    assert by_modality["audio"].available_providers == [
+        "volcengine_agent_plan",
+        "minimax",
+    ]
+    assert by_modality["music"].available_providers == ["minimax"]
+    assert by_modality["video"].available_providers == ["minimax"]
+    assert all(route.fallback_provider == "minimax" for route in routes)
     serialized = " ".join(str(route.model_dump()) for route in routes)
     assert "must-not-leak" not in serialized
+    assert "agent-plan-key-must-not-leak" not in serialized
     assert "api_key" not in serialized
     statements = "\n".join(str(statement) for statement in db.statements)
     assert "tools.tenant_id IS NULL" in statements
@@ -262,7 +304,12 @@ async def test_media_routes_expose_complete_matrix_without_credentials():
 @pytest.mark.asyncio
 async def test_media_route_update_writes_only_tier_scoped_platform_config():
     tool = SimpleNamespace(name="generate_video_minimax", config={"voice_id": "unchanged"}, enabled=True)
-    credential = SimpleNamespace(capabilities=["video"])
+    credential = SimpleNamespace(
+        provider="minimax",
+        plan_tier=None,
+        capabilities=["video"],
+        modality_status={},
+    )
     db = RecordingDB([
         DummyResult(scalar=tool),
         DummyResult(values=[credential]),

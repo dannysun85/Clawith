@@ -7,6 +7,11 @@ from app.services.media_capabilities import (
     _credential_media_modalities,
     evaluate_media_capabilities,
     get_agent_media_capabilities,
+    get_platform_media_provider_modalities,
+)
+from app.services.media_provider_routing import (
+    media_provider_order_for_modality,
+    media_provider_order_for_voice_id,
 )
 
 
@@ -113,3 +118,65 @@ def test_media_capability_view_matches_pool_semantics_for_empty_capabilities():
         "music",
         "video",
     }
+
+
+def test_media_provider_order_matches_implemented_runtime_modalities():
+    automatic = ("volcengine_agent_plan", "minimax")
+    assert media_provider_order_for_modality("image") == automatic
+    assert media_provider_order_for_modality("audio") == automatic
+    assert media_provider_order_for_modality("video") == automatic
+    assert media_provider_order_for_modality("music") == ("minimax",)
+    assert media_provider_order_for_modality("unknown") == ()
+
+
+def test_explicit_voice_identity_never_silently_crosses_provider_namespaces():
+    automatic = ("volcengine_agent_plan", "minimax")
+    assert media_provider_order_for_voice_id(None) == automatic
+    assert media_provider_order_for_voice_id("") == automatic
+    assert media_provider_order_for_voice_id("auto") == automatic
+    assert media_provider_order_for_voice_id("zh_female_shuangkuaisisi_moon_bigtts") == (
+        "volcengine_agent_plan",
+    )
+    assert media_provider_order_for_voice_id("Chinese (Mandarin)_Warm_Bestie") == (
+        "minimax",
+    )
+
+
+@pytest.mark.asyncio
+async def test_platform_media_pool_reports_provider_specific_plan_capabilities():
+    class _Result:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [
+                type(
+                    "Credential",
+                    (),
+                    {
+                        "provider": "volcengine_agent_plan",
+                        "plan_tier": "small",
+                        "capabilities": ["image", "audio", "video"],
+                        "modality_status": {},
+                    },
+                )(),
+                type(
+                    "Credential",
+                    (),
+                    {
+                        "provider": "minimax",
+                        "plan_tier": None,
+                        "capabilities": ["image", "audio", "music", "video"],
+                        "modality_status": {},
+                    },
+                )(),
+            ]
+
+    class _DB:
+        async def execute(self, statement):
+            return _Result()
+
+    provider_modalities = await get_platform_media_provider_modalities(_DB())
+
+    assert provider_modalities["volcengine_agent_plan"] == {"image", "audio"}
+    assert provider_modalities["minimax"] == {"image", "audio", "music", "video"}

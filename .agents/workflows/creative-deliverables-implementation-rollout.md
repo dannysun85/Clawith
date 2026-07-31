@@ -9,8 +9,9 @@
 - 当前完成分层：
   - `provider_verified`：Agent Plan 文字、图片、语音；MiniMax 图片、视频、语音；
   - `business_flow_proven`：Agent Plan 文字规划 + Tool Call + Agent Plan 语音持久化交付，
-    MiniMax 视频 + 旁白确定性合成，以及正式视频 brief → Runtime → Provider failover →
-    Artifact fail-closed 的浏览器失败流；正式视频 Artifact 成功流仍未完成；
+    MiniMax 视频 + 旁白确定性合成，以及正式图片、视频、PPT 的 brief → Runtime →
+    Provider route/failover → Artifact candidate 浏览器成功流；三类候选均尚未完成真实多人质量评审
+    和创建者批准；
   - `historical_benchmark_complete`：同题图片、人物广告视频和 PPT 的本地/豆包样本与缺陷对照；
     它只是一组回归锚点，不代表开放商业场景整体达标；
   - `evaluation_foundation_local`：动态场景、覆盖统计、独立 holdout commitment、生产 brief
@@ -21,7 +22,13 @@
     Seedance 2.0/fast/mini（公开名及官方 Skill 版本化 ID）均在提交前返回 `UnsupportedModel`；
   - `tool_ready`：Seedance 1.5 Pro 的 Medium 路由、官方版本化 ID、4–12 秒/分辨率/比例/联网/
     draft/flex 能力校验、首尾帧和显式音频意图已在本地 adapter 与测试中落地；
-  - `production_verified`：否，生产配置与发布未获授权。
+  - `skill_ready`：图片 `volcengine-seedream-commercial`、视频
+    `volcengine-seedance-commercial`、语音 `commercial-voiceover` 与 provider-neutral PPT
+    `commercial-presentation` 已注册并按角色授权；本地 `Douyin Operations Manager`
+    workspace 通过受管 seeder 同步这些 Skill；
+  - `production_release_verified`：v1.11.9 已发布并核验 release identity、容器健康和生产 smoke；
+  - `production_agent_plan_media_verified`：否，生产图片/视频媒体池仍只核验到 MiniMax，
+    未获得本轮生产配置变更授权。
 - 底座边界：当前 Astra v1.11.9 已吸收上游 Clawith v1.11.3；后续上游升级仍必须按
   `.agents/reference/clawith-v1.11.3-upgrade.md` 的语义合并方式执行，禁止覆盖自有 Deliverable、
   Credits、Approval、Provider 路由和质量门禁。
@@ -80,20 +87,22 @@
 当前 manifests 已有：
 
 - `builtin.presentation.v1`：`agent_runtime`
-- `builtin.poster.v1`：`dry_run`
+- `builtin.poster.v1`：`agent_runtime`
 - `builtin.video.v1`：`agent_runtime`
 
-`GET /api/deliverables/workflows` 只返回当前 Agent 真正可启动的 workflow，主动过滤 `dry_run`。
-视频还必须同时具备 `generate_video_minimax`、`generate_speech_minimax` 和
-`compose_video_audio`；当前正式 UI 可展示 PPT 和视频，图片仍保持 `dry_run`，不得把
-“manifest 已存在”误报为图片已可执行。
+`GET /api/deliverables/workflows` 只返回当前 Agent 真正可启动的 workflow。视频必须同时具备
+`generate_image_minimax`、`generate_video_minimax`、`generate_speech_minimax` 和
+`compose_video_audio`，先生成同画幅首帧，再生成视觉片段和旁白并合成最终 MP4；图片正式工作流
+只允许一次 provider-neutral 图片 Tool 调用并把实际 PNG 注册为 Artifact。PPT、图片和视频虽然
+都能生成候选 Artifact，仍不得把“候选存在”误报为“质量批准完成”。
 
 现有 preflight：
 
 - 校验 workflow spec；
 - 校验文本路由；
 - PPT 校验两个转换 Tool；
-- 图片/视频校验 entitlement、Agent Tool 和 MiniMax 凭据池；
+- 图片/视频校验 entitlement、Agent Tool 和 provider-neutral 平台凭据池；当前运行时按
+  Agent Plan → MiniMax 的安全顺序选择，并只在 Provider 接受前切换；
 - 返回 Credits 估算；
 - `dry_run` 返回不可启动。
 
@@ -136,7 +145,8 @@ Direct chat 本身还有单 lane、waiting reply 和 reconnect 约束。新交�
 
 当前图片、视频按钮属于“快速生成”路径：
 
-- 后端能力查询只识别 MiniMax Tool、Plan 和平台凭据池；
+- 后端能力查询保留兼容期 MiniMax Tool 名称，但按 Agent Plan 与 MiniMax 的健康账号、
+  套餐能力、quota circuit、Plan 和 Agent Tool 共同计算可用性；
 - 前端只渲染 `available=true` 的按钮；
 - 点击按钮只把结构化提示开头插入输入框，不自动发送（`frontend/src/pages/agent-detail/AgentDetailPage.tsx:5483-5515,8267-8296`）；
 - 随后仍走普通聊天与现有媒体 Tool。
@@ -1253,11 +1263,22 @@ provider-free 本地底座：
   没有为了演示修改真实账号或伪造第三名评审；
 - 本阶段没有修改生产配置、没有调用付费图片/视频 Provider，也没有产生模型 Credits。
 
+2026-07-31 主开发租户的后续 QA 状态机验证：
+
+- 新增三名来源明确标记为 `local_quality_gate_qa` 的本地 QA Identity；它们只能证明身份去重、一次性
+  封存、receipt、创建者批准和 Artifact 状态转换，不能被称为三名真实独立质量评审人；
+- 创建者在真实聊天交付卡片中创建三人批次，三个 QA Identity 分别提交并在备注中声明 QA 性质，
+  状态为 `0/3 open -> 3/3 passed`；
+- 创建者在真实浏览器中看到“3/3 位评审人已完成”，点击“确认交付”后页面显示“交付已确认”；
+- 数据库最终为 request `succeeded / delivered`、review `passed`、3 份 sealed submission、
+  两份 Artifact `approved`；
+- 该轮没有新 Provider 请求、Credits 或生产变更。
+
 当前停门：
 
 - 代码、迁移、API 和本地真实评审状态转换已验证；
-- 尚未在原开发数据上完成创建者点击“批准交付”的完整浏览器 clickthrough，因为真实组织没有第三名
-  独立评审人；服务/API 层验证不能替代该页面证据；
+- 主开发租户的 QA 身份状态机和创建者最终批准 clickthrough 已验证，但 QA 身份不能代替三名真实
+  独立人员的质量结论；
 - 管理员 evidence ref 当前是受审计的内部 attestation，不是独立 evaluator 的签名回执。进入生产前
   必须接入隔离执行身份、私有对象存储、不可变签名/摘要和保留策略；
 - 生产 allowlist、生产迁移、生产真实评审人、告警和回滚演练均未授权，状态仍不是

@@ -15,13 +15,17 @@ Astra 自有 Deliverable、Credits、Approval、Provider 路由和质量门禁�
 - 图片、视频、语音和音乐的 durable Tool 回执会在历史会话重新载入时恢复右侧 Workspace
   预览。恢复路径必须来自成功媒体 Tool 回执；当最终助手回执也包含路径时，两者必须匹配，
   不能仅凭助手文本创建预览。
-- PPT 和视频的 `launch_policy` 是 `agent_runtime`；海报仍是 `dry_run`，当前只能保存工作说明和完成预检，不能视为正式执行闭环。视频虽然已允许启动，但仍必须以最终 MP4 Artifact 校验成功为完成条件，不能把 storyboard、Provider 拒绝或无产物的 Runtime 结束视为交付成功。
+- PPT、海报和视频的 `launch_policy` 均为 `agent_runtime`。三者都必须以最终 Artifact
+  校验成功为生成闭环，以质量评审和创建者批准为交付闭环；不能把 storyboard、Provider
+  拒绝、无产物的 Runtime 结束或仅生成候选文件视为已交付。
 - 用户合同不包含 provider/model；运行时根据 tenant、tier、能力和健康状态路由。
 - 请求、运行、批准、Credits 和 Workspace Artifact 应继续作为 durable truth。
 
 ### 图片
 
-- 当前生产媒体执行以 MiniMax `image-01` 为主，已有平台凭据池、entitlement、Credits、Agent Tool 开关、资产保存和品牌安全处理。
+- 当前已核验的生产媒体执行以 MiniMax `image-01` 为主；本地统一路由已接入 Agent Plan 与
+  MiniMax。两者都复用平台凭据池、entitlement、Credits、Agent Tool 开关、资产保存和品牌安全处理，
+  但本地接入不能替代生产 Provider 配置验证。
 - 当前主要短板不是单一因素：
   - 编排层仍接近一次 prompt、单候选、首个结果；
   - 缺少系统化 prompt compiler、候选比较、质量评分、选择回执和基于失败项的修订；
@@ -33,13 +37,19 @@ Astra 自有 Deliverable、Credits、Approval、Provider 路由和质量门禁�
 ### 视频
 
 - 当前已有 MiniMax Hailuo 文生视频/图生视频相关 Tool、异步任务检查、Credits 和文件验证路径。
-- 当前交付物工作流已开放正式 launch，但只有 Provider 接受、媒体任务完成且最终 MP4 Artifact 通过校验时才算成功；缺失 MP4 必须 fail closed。
+- 当前交付物工作流已开放正式 launch，但只有 Provider 接受、媒体任务完成且最终 MP4 Artifact
+  通过校验时才算生成成功；缺失 MP4 必须 fail closed。
 - 主要缺口是 storyboard compiler、多参考/关键帧一致性、逐镜头状态、质量评分、剪辑包装和镜头级重做，不只是替换模型。
 
 ### 语音和音乐
 
 - 语音与音乐沿用同一 durable media task、Credits、Provider failover、Workspace Artifact
   和浏览器播放合同。
+- `commercial-voiceover` 是 provider-neutral 商用配音 Skill：约束精确脚本、发音、声音身份、
+  持久化音频、真人听审和视频混音。它不授予 Tool、Provider、Credits 或审批权限。
+- `generate_speech_minimax` 保留兼容期内部名称，但 Tool 对 Agent 和用户展示为
+  `Generate Speech`。未指定 `voice_id` 时按 Agent Plan → MiniMax 自动路由；显式声音 ID
+  属于 Provider 命名空间，只允许在对应 Provider 内执行，禁止 fallback 时静默换声。
 - 音乐 Tool 可声明 5–180 秒的精确 `duration_seconds`。Provider 返回更长的完整曲目时，
   在 durable storage 和 Credits settlement 前执行确定性裁切并重新校验；Provider 输出
   短于请求时 fail closed，不得把实际长音频或短音频声称为请求时长。
@@ -47,7 +57,9 @@ Astra 自有 Deliverable、Credits、Approval、Provider 路由和质量门禁�
 ### PPT
 
 - 已有 `convert_html_to_pptx`、`convert_html_to_pdf` 和 `builtin.presentation.v1`；正式合同要求同时生成结构有效的 PPTX 和匹配 PDF。
-- 当前缺少统一 `PresentationBrief`、`DeckOutline`、`SlideSpec`、主题/版式系统、事实引用、溢出/对齐/对比度检查、PPTX/PDF 视觉一致性检查和按页修订。
+- 当前已生成 server-owned `PresentationBrief`、`DeckOutline`、adaptive-v1 `SlideSpec`、
+  主题/版式下限、页数/素材/重复版式/溢出等结构门禁，并同时交付 PPTX/PDF。事实引用、字体替换、
+  PPTX/PDF 像素级一致性、按页局部修订和真实多人视觉评审仍未形成完整商用闭环。
 - 图片/视频 Provider 只应提供 PPT 中的装饰或场景视觉，不负责事实正确性、叙事结构、图表数据和可编辑性。
 
 ## 二、谁可以调用
@@ -291,6 +303,32 @@ Astra 适配必须替换为：
   `media_video_provider_unavailable`；数据库 20 分钟窗口内新增视频 Provider task 数为 0，
   Credits 消耗为 0，也没有 Trigger。
 
+### 受管 Commercial Presentation Skill（2026-07-31 本地落地）
+
+- 新增 provider-neutral `commercial-presentation`，覆盖 PPT 任务触发、自然语言 brief 推断、
+  来源/事实合同、叙事结构、自适应版式、真实素材、PPTX/PDF 双格式、结构检查、人工评审和局部修订边界；
+- Skill 明确不授予 Tool、Provider、Credits、tenant 或批准权限；正式客户交付只服从
+  `builtin.presentation.v1` 的 server-owned brief、路径、输出合同和审批状态；
+- `convert_html_to_pptx` 与 `convert_html_to_pdf` 继续作为 product-wide 默认 Tool，并已具备 Durable
+  Runtime typed adapter；不为 PPT Skill 建立重复的角色 Tool grant；
+- Skill 只分配给职责真实需要演示文稿的 `Content Creator`、`Douyin Operations Manager`、
+  `Growth Hacker`、`Product Manager`、`Project Manager` 和 `Chief of Staff`，没有全局推送给
+  `Private Assistant` 或所有未来 Agent；
+- 本地 `Douyin Operations Manager` 实例
+  `b4f0f5d8-4fb8-40d1-b10c-3fb7bdab6864` 已完成 registry、模板和 workspace 三层同步；
+  这证明 `skill_ready` 与本地 Agent 授权，不等于 PPT 商用质量批准或生产发布。
+
+### 受管 Commercial Voiceover Skill（2026-07-31 本地落地）
+
+- 新增 provider-neutral `commercial-voiceover`，覆盖旁白、口播广告、讲解、无障碍音频和视频配音；
+- Skill 固化精确脚本、发音、时长约束、声音身份、持久化音频回执、真人听审和视频混音边界；
+- 未指定声音 ID 时保留 Agent Plan → MiniMax 自动路由；显式 `voice_id` 只在对应 Provider
+  命名空间中执行，禁止自动兜底时静默换成另一种声音；
+- Skill 按最小职责分配给 `Content Creator`、`Douyin Operations Manager` 和
+  `TikTok Strategist`，没有全局推送给私人助手或所有 Agent；
+- 兼容期内部 Tool 名仍为 `generate_speech_minimax`，但模型和用户可见的展示、说明已改为
+  provider-neutral `Generate Speech`。
+
 ### 同题豆包 Benchmark 结论（2026-07-26）
 
 固定题目、结构化验收项和样本路径记录在
@@ -455,18 +493,31 @@ Astra 适配必须替换为：
   `创建评审 (2)` disabled、`批准交付` disabled。这是当前真实组织配置的正确阻断，不得通过复用账号
   或伪造评审 receipt 绕过。
 
+2026-07-31 又在原开发库增加了三名明确标记为 `local_quality_gate_qa` 的本地 QA Identity，只用于
+证明主租户的产品状态机，不把这些账号冒充为三名真实独立质量评审人：
+
+- 创建者从聊天流中的 PPT 交付卡片选择三名不同 QA Identity 并创建受管评审批次；
+- 三个 QA Identity 分别封存完整提交，提交备注明确声明“仅用于状态机验证，不构成真实独立商业
+  质量结论”，批次从 `0/3 open` 变为 `3/3 passed` 并生成 hash-bound receipt；
+- 创建者回到同一真实浏览器会话，看到“质量检查已通过 / 3/3 位评审人已完成”，点击“确认交付”；
+- 浏览器随后显示“交付已确认”，数据库请求进入 `succeeded / delivered`，两份最终 Artifact 均为
+  `approved`；
+- 该流程未调用付费 Provider、未修改生产环境，也没有改变正式 Benchmark 仍需三名真实独立人员的
+  门槛。
+
 因此当前可以分别标记：
 
 - `code_exists=true`
 - `tests_pass=true`
 - `migration_smoke_passed=true`
 - `local_review_state_transitions_proven=true`
-- `local_main_tenant_full_approval_clickthrough=false`
+- `local_main_tenant_full_approval_clickthrough=true`
+- `independent_human_quality_approval_complete=false`
 - `provider_verified` 沿用既有单项 Provider 证据，本阶段没有新付费调用
 - `production_verified=false`
 
-仍未完成的是生产隔离 evidence 服务和签名存储、生产 allowlist/迁移、真实生产评审人配置、创建者最终
-批准 clickthrough、告警/回滚演练和生产灰度。当前管理员 evidence 写入是受审计的内部 attestation；
+仍未完成的是生产隔离 evidence 服务和签名存储、生产 allowlist/迁移、真实生产评审人配置、真实独立
+人员的质量判断、告警/回滚演练和生产灰度。当前管理员 evidence 写入是受审计的内部 attestation；
 它可以阻断，但在接入独立 evaluator 身份、不可变对象存储和签名摘要前，不能被描述为第三方或机器独立
 证明。
 
@@ -507,6 +558,57 @@ PPT Provider 对比。拒绝凭空补齐 brief 是评测正确性，不是 PPT �
 
 详细私有证据保存在
 `tmp/creative-evaluation/rolling-cycle-2026-07-27/RESULTS.md`，该目录不得提交或作为公开 fixture。
+
+### v1.11.9 本地真实交付复核（2026-07-31）
+
+本轮使用 `admin@reeftotem.ai` 的真实本地会话和原开发数据库复核，没有新增付费 Provider 调用：
+
+- 图片 quick Tool：`volcengine_agent_plan / doubao-seedream-5.0-lite` 已生成
+  `3072×1728` PNG，历史会话刷新后可在聊天右侧 Workspace 恢复预览；
+- 图片正式工作流：`builtin.poster.v1` 已生成 `4096×2304` PNG Artifact，请求状态为
+  `waiting_approval / output_review`；
+- 视频 quick Tool：同画幅首帧由 Agent Plan Seedream 生成，Small 套餐不具备火山视频权益，
+  运行时在 Provider 接受前切换到 MiniMax Hailuo，生成 `768×1364`、`5.875s`、H.264 静音 MP4；
+- 视频正式工作流：已有两条通过结构校验的最终 MP4 Artifact，分别为竖屏和横屏，
+  均包含 H.264 视频与 AAC 旁白音轨，状态为 `waiting_approval / output_review`；
+- PPT 正式工作流：5 页 Astra 商业演示已生成 2 张真实图片、5 种版式、PPTX/PDF 双格式。
+  逐页渲染未发现裁切、重叠、黑块或乱码，但第 3 页信息密度偏低、正文偏小，当前仍是候选版，
+  状态为 `waiting_approval / output_review`；
+- PPT 的 provider-neutral `commercial-presentation` Skill 已注册并同步到本轮
+  `Douyin Operations Manager`，转换 Tool 仍由 product-wide 默认策略授权；该同步没有重新消耗
+  Provider Credits，也没有改变现有 Deliverable、Artifact 或批准状态；
+- 语音的 provider-neutral `commercial-voiceover` Skill 已加入同一角色合同；其受管 seeder
+  已同步到本轮 `Douyin Operations Manager` 的 registry、模板与 workspace，workspace 文件与
+  仓库源文件 SHA-256 一致，Runtime Skill 索引已能解析该 Skill；
+- 交付卡片已位于生成 Agent 的聊天消息流，不在输入框中。右侧图片预览曾因把预览元数据请求
+  当作显示前置条件而在恢复会话后显示 unavailable；本地已改为按 durable 文件路径直接显示，
+  并让图片预览接口只返回流式 URL，不再读取并嵌入整份二进制。
+- 同一批正式海报、竖版最终视频和 PPT 已通过 provider-free 自动检查：文件可解码、图片比例与
+  identity、视频时长/比例/音轨合同、PPTX/PDF 结构与页数均通过；图片 1 帧 6 个 OCR 变体、
+  视频 6 帧 36 个 OCR 变体未命中本轮禁止平台词。该结果只证明自动门禁未发现问题，事实安全、
+  水印视觉判断、溢出细节和来源追溯仍需独立人工评审。
+- 本地 SaaS“媒体路由”现按真实运行时展示：图片、语音为
+  `volcengine_agent_plan -> minimax` 且两条路径就绪；当前 Small Agent Plan 不具备视频权益，
+  所以视频仍显示相同自动顺序但实际可用 Provider 只有 MiniMax；音乐明确为 MiniMax-only。
+  可编辑模型与质量参数只属于 MiniMax 兜底配置，不再伪装成整条统一路由。
+
+因此当前准确状态是：
+
+- `code_exists=true`
+- `tests_pass=true`
+- `local_provider_flow_proven=true`
+- `local_browser_generation_flow_proven=true`
+- `local_candidate_artifacts_exist=true`
+- `presentation_skill_ready=true`
+- `voiceover_skill_ready=true`
+- `local_main_tenant_full_approval_clickthrough=true`
+- `local_quality_approval_complete=false`
+- `commercially_usable_proven=false`
+- `production_release_v1_11_9=true`
+- `production_agent_plan_media_route_verified=false`
+
+不能再写成“图片/视频/PPT 没做”，也不能写成“已经全部完成”。下一阶段的核心不是继续增加生成按钮，
+而是把正式质量评审、批准、修订、生产 Provider 配置和滚动 Benchmark 收成一个可运营产品闭环。
 
 ## 六、验收与后续扩展
 

@@ -10,6 +10,8 @@ default_skills:
   - "web-research"
   - "content-writing"
   - "brand-safe-media"
+  - "commercial-voiceover"
+  - "commercial-presentation"
 default_tools:
   - "generate_image_minimax"
   - "generate_speech_minimax"

@@ -28,6 +28,10 @@ type MediaRoute = {
     modality: 'image' | 'audio' | 'music' | 'video';
     tier: 'lite' | 'pro' | 'ultra';
     provider: string;
+    routing_mode: 'automatic_failover';
+    provider_order: string[];
+    available_providers: string[];
+    fallback_provider: string;
     tool_name: string;
     model: string;
     settings: Record<string, string | number | boolean>;
@@ -429,8 +433,8 @@ function MediaRoutesTab() {
             <div className="card" style={{ marginBottom: 16, padding: 16 }}>
                 <div style={{ fontSize: 14, fontWeight: 650, marginBottom: 6 }}>媒体生成路由（平台统一配置）</div>
                 <div style={{ color: 'var(--text-secondary)', fontSize: 12, lineHeight: 1.7 }}>
-                    文本模型和媒体生成模型是两条独立链路。这里管理 MiniMax 图片、语音、音乐、视频在 Lite / Pro / Ultra 下的真实模型与质量参数；API Key 仍由“账号池”统一提供，不绑定到模型对象。
-                    预计 Credits 按供应商实际模型和参数动态计算，计费规则页中的固定规则不覆盖 MiniMax 媒体调用。
+                    文本模型和媒体生成模型是两条独立链路。图片、语音和视频会按“火山 Agent Plan → MiniMax”自动选择可用供应商，并且只在供应商尚未接受任务时安全切换；音乐目前使用 MiniMax。
+                    下表的模型和质量参数只配置 MiniMax 兜底路径；火山账号级别与实时可用能力来自“账号池”，不会在这里被伪装成可编辑模型。
                 </div>
             </div>
             {error && (
@@ -441,7 +445,7 @@ function MediaRoutesTab() {
             <DataTable
                 rows={routes}
                 empty={isLoading ? '正在读取生产媒体路由…' : '暂无媒体路由'}
-                renderHeader={() => <><th>能力</th><th>Tier</th><th>模型</th><th>质量参数</th><th>预计费用</th><th>可用性</th><th>来源</th><th /></>}
+                renderHeader={() => <><th>能力与路由</th><th>Tier</th><th>MiniMax 兜底模型</th><th>兜底质量参数</th><th>MiniMax 预计费用</th><th>可用性</th><th>兜底配置来源</th><th /></>}
                 renderRow={(route) => <MediaRouteRow route={route} />}
             />
         </div>
@@ -473,10 +477,25 @@ function MediaRouteRow({ route }: { route: MediaRoute }) {
         setSettings((current) => ({ ...current, [key]: value }));
     };
     const payload: Record<string, unknown> = { model, enabled, ...settings };
+    const providerLabel = (provider: string) => provider === 'volcengine_agent_plan'
+        ? '火山 Agent Plan'
+        : provider === 'minimax'
+            ? 'MiniMax'
+            : provider;
 
     return (
         <>
-            <td><strong>{MEDIA_LABELS[route.modality]}</strong><div style={{ color: 'var(--text-tertiary)', fontSize: 10 }}>{route.provider}</div></td>
+            <td style={{ minWidth: 180 }}>
+                <strong>{MEDIA_LABELS[route.modality]}</strong>
+                <div style={{ color: 'var(--text-secondary)', fontSize: 11, marginTop: 4 }}>
+                    自动路由：{route.provider_order.map(providerLabel).join(' → ')}
+                </div>
+                <div style={{ color: 'var(--text-tertiary)', fontSize: 10, marginTop: 2 }}>
+                    当前可用：{route.available_providers.length > 0
+                        ? route.available_providers.map(providerLabel).join('、')
+                        : '无'}
+                </div>
+            </td>
             <td style={{ textTransform: 'uppercase' }}>{route.tier}</td>
             <td style={{ minWidth: 190 }}>
                 <select className="form-input" value={model} onChange={(e) => setModel(e.target.value)}>
@@ -494,7 +513,13 @@ function MediaRouteRow({ route }: { route: MediaRoute }) {
                     <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} /> 路由启用
                 </label>
                 <div style={{ color: route.available ? 'var(--success)' : 'var(--error)', fontSize: 11 }}>
-                    {route.available ? '账号池与工具就绪' : !route.pool_available ? '账号池不可用' : !route.tool_enabled ? '工具已停用' : '路由已停用'}
+                    {route.available
+                        ? `${route.available_providers.length} 个供应商路径就绪`
+                        : !route.pool_available
+                            ? '所有供应商账号池均不可用'
+                            : !route.tool_enabled
+                                ? '工具已停用'
+                                : '路由已停用'}
                 </div>
             </td>
             <td>{route.source === 'override' ? '后台覆盖' : '系统默认'}</td>

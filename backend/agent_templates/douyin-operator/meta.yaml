@@ -13,6 +13,8 @@ default_skills:
   - "brand-safe-media"
   - "volcengine-seedream-commercial"
   - "volcengine-seedance-commercial"
+  - "commercial-voiceover"
+  - "commercial-presentation"
 default_tools:
   - "generate_image_minimax"
   - "generate_speech_minimax"

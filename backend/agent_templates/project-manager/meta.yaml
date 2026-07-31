@@ -21,6 +21,7 @@ default_skills:
   - "complex-task-executor"
   - "meeting-notes"
   - "data-analysis"
+  - "commercial-presentation"
 default_autonomy_policy:
   read_files: "L1"
   write_workspace_files: "L1"

@@ -29815,6 +29815,8 @@ async def _generate_speech_minimax(
     }[audio_format]
     minimax_sample_rate = int(profile.sample_rate or 32000)
     requested_voice_id = str(arguments.get("voice_id") or "").strip()
+    if requested_voice_id.lower() == "auto":
+        requested_voice_id = ""
     configured_voice_id = str(config.get("voice_id") or "").strip()
     if requested_voice_id:
         voice_id = requested_voice_id
@@ -29832,7 +29834,7 @@ async def _generate_speech_minimax(
 
     from app.services.llm.load_balancer import NoCredentialAvailable
     from app.services.media_provider_routing import (
-        DEFAULT_MEDIA_PROVIDER_ORDER,
+        media_provider_order_for_voice_id,
         prepare_media_provider,
     )
     from app.services.volcengine_agent_plan import (
@@ -29842,7 +29844,8 @@ async def _generate_speech_minimax(
     )
 
     provider_errors: list[str] = []
-    for index, candidate in enumerate(DEFAULT_MEDIA_PROVIDER_ORDER):
+    provider_order = media_provider_order_for_voice_id(requested_voice_id)
+    for index, candidate in enumerate(provider_order):
         try:
             credential = await prepare_media_provider(
                 candidate,
@@ -29922,7 +29925,7 @@ async def _generate_speech_minimax(
                 provider_call=provider_call,
                 typed=typed,
                 provider=provider,
-                allow_safe_fallback=index < len(DEFAULT_MEDIA_PROVIDER_ORDER) - 1,
+                allow_safe_fallback=index < len(provider_order) - 1,
             )
         except MediaProviderSafeFallback as exc:
             provider_errors.append(f"{candidate}:{type(exc.error).__name__}")

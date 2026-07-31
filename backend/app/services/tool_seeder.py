@@ -1408,8 +1408,8 @@ BUILTIN_TOOLS = [
     },
     {
         "name": "generate_speech_minimax",
-        "display_name": "Generate Speech (MiniMax)",
-        "description": "Generate speech audio via the MiniMax credential pool using the active Lite, Pro, or Ultra quality profile.",
+        "display_name": "Generate Speech",
+        "description": "Generate speech audio through Astra's managed media route using the active Lite, Pro, or Ultra quality profile. Astra selects an eligible provider before submission and falls back only while no provider has accepted the request. Omit voice_id for managed automatic routing; an explicit provider-specific voice_id may restrict failover so the requested voice identity is never changed silently.",
         "category": "media",
         "icon": "🔊",
         "is_default": True,
@@ -1417,7 +1417,7 @@ BUILTIN_TOOLS = [
             "type": "object",
             "properties": {
                 "text": {"type": "string", "description": "Text to synthesize."},
-                "voice_id": {"type": "string", "description": "MiniMax voice_id. Default: tool config."},
+                "voice_id": {"type": "string", "description": "Optional provider-specific voice identifier supplied by an authorized user or tenant configuration. Omit it for the managed default and automatic provider failover; never invent or translate voice IDs across providers."},
                 "format": {"type": "string", "description": "Browser-playable audio format: mp3, wav, or flac. Default: mp3."},
                 "save_path": {"type": "string", "description": "Save path in workspace. Default: auto."},
             },

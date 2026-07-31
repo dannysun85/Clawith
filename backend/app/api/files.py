@@ -531,7 +531,7 @@ async def preview_file(
             "rows": rows[:500],
             "download_url": download_url,
         }
-    if kind in {"pdf", "video", "audio"}:
+    if kind in {"image", "pdf", "video", "audio"}:
         return {
             "path": path,
             "kind": kind,

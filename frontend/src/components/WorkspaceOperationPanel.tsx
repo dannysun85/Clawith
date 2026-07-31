@@ -442,6 +442,9 @@ export default function WorkspaceOperationPanel({
     const canEdit = !!activePath && EDITABLE_EXTS.has(ext) && canModifyPath(activePath);
     const isHtml = ext === '.html' || ext === '.htm';
     const isImage = IMAGE_EXTS.has(ext);
+    const isVideo = VIDEO_EXTS.has(ext);
+    const isAudio = AUDIO_EXTS.has(ext);
+    const isPdf = ext === '.pdf';
     const activityKey = activities.map((item) => `${item.action}:${item.path}`).join('|');
     const treeTargetDir = normalizeWritableDir(canModifyPath(selectedDirPath) ? selectedDirPath : directoryOf(activePath));
     const panelSideWidth = activityOpen ? Math.max(sideWidth, DEFAULT_HISTORY_WIDTH) : sideWidth;
@@ -979,6 +982,55 @@ export default function WorkspaceOperationPanel({
                 </div>
             );
         }
+        // Browser-native media previews only need the durable file path. Do not
+        // hide a valid generated asset when the optional metadata request races,
+        // fails, or is unavailable after restoring a historical session.
+        if (isImage) {
+            return (
+                <div className="workspace-op-image-preview">
+                    <img
+                        src={fileApi.downloadUrl(agentId, activePath, { inline: true })}
+                        alt={fileName(activePath)}
+                        className="workspace-op-image"
+                    />
+                </div>
+            );
+        }
+        if (isVideo) {
+            return (
+                <div className="workspace-op-media-preview">
+                    <video
+                        src={fileApi.downloadUrl(agentId, activePath, { inline: true })}
+                        className="workspace-op-video"
+                        controls
+                        playsInline
+                        preload="metadata"
+                    >
+                        Your browser does not support video playback.
+                    </video>
+                </div>
+            );
+        }
+        if (isAudio) {
+            return (
+                <div className="workspace-op-media-preview">
+                    <audio
+                        src={fileApi.downloadUrl(agentId, activePath, { inline: true })}
+                        className="workspace-op-audio"
+                        controls
+                        preload="metadata"
+                    >
+                        Your browser does not support audio playback.
+                    </audio>
+                </div>
+            );
+        }
+        if (isPdf) {
+            if (isSideResizing) {
+                return <div className="workspace-op-empty workspace-op-preview-paused">Release to refresh PDF preview.</div>;
+            }
+            return <iframe className="workspace-op-pdf" src={fileApi.downloadUrl(agentId, activePath, { inline: true })} title={fileName(activePath)} />;
+        }
         if (!preview) {
             return <div className="workspace-op-empty">Preview is not available for this file.</div>;
         }
@@ -1053,52 +1105,6 @@ export default function WorkspaceOperationPanel({
                 return <div className="workspace-op-empty workspace-op-preview-paused">Release to refresh HTML preview.</div>;
             }
             return <HtmlPreviewFrame content={content || ''} title={fileName(activePath)} src={htmlPreviewSrc || undefined} suspendAutoFit={isSideResizing} />;
-        }
-        if (isImage) {
-            return (
-                <div className="workspace-op-image-preview">
-                    <img
-                        src={fileApi.downloadUrl(agentId, activePath, { inline: true })}
-                        alt={fileName(activePath)}
-                        className="workspace-op-image"
-                    />
-                </div>
-            );
-        }
-        if (previewType === 'video') {
-            return (
-                <div className="workspace-op-media-preview">
-                    <video
-                        src={fileApi.downloadUrl(agentId, activePath, { inline: true })}
-                        className="workspace-op-video"
-                        controls
-                        playsInline
-                        preload="metadata"
-                    >
-                        Your browser does not support video playback.
-                    </video>
-                </div>
-            );
-        }
-        if (previewType === 'audio') {
-            return (
-                <div className="workspace-op-media-preview">
-                    <audio
-                        src={fileApi.downloadUrl(agentId, activePath, { inline: true })}
-                        className="workspace-op-audio"
-                        controls
-                        preload="metadata"
-                    >
-                        Your browser does not support audio playback.
-                    </audio>
-                </div>
-            );
-        }
-        if (previewType === 'pdf') {
-            if (isSideResizing) {
-                return <div className="workspace-op-empty workspace-op-preview-paused">Release to refresh PDF preview.</div>;
-            }
-            return <iframe className="workspace-op-pdf" src={fileApi.downloadUrl(agentId, activePath, { inline: true })} title={fileName(activePath)} />;
         }
         if (previewType === 'docx') {
             return <pre className="workspace-op-text-preview">{preview.content || preview.text}</pre>;

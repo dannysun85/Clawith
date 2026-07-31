@@ -11,13 +11,13 @@ from io import StringIO
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import get_saas_admin
 from app.database import get_db
 from app.models.audit import AuditLog
-from app.models.llm import LLMCredential, LLMModel
+from app.models.llm import LLMModel
 from app.models.subscription import (
     BillingRule,
     CreditBalance,
@@ -83,7 +83,12 @@ from app.services.minimax_media_profiles import (
     minimax_media_override_snapshot,
     resolve_minimax_media_profile,
 )
-from app.services.modalities import canonicalize_modalities, canonicalize_modality, model_supports_modality
+from app.services.media_capabilities import get_platform_media_provider_modalities
+from app.services.media_provider_routing import (
+    MINIMAX_PROVIDER,
+    media_provider_order_for_modality,
+)
+from app.services.modalities import canonicalize_modality, model_supports_modality
 from app.services.provider_pricing import (
     minimax_image_credits,
     minimax_music_credits,
@@ -427,38 +432,7 @@ async def update_model_route(
     return route
 
 
-# ── MiniMax Media Routes ───────────────────────────────────────────
-
-
-async def _minimax_pool_modalities(db: AsyncSession) -> set[str]:
-    from app.services.llm.load_balancer import credential_modality_is_blocked
-
-    result = await db.execute(
-        select(LLMCredential).where(
-            LLMCredential.provider == "minimax",
-            LLMCredential.tenant_id.is_(None),
-            LLMCredential.enabled == True,  # noqa: E712
-            LLMCredential.status == "healthy",
-            or_(
-                LLMCredential.daily_quota.is_(None),
-                LLMCredential.used_today < LLMCredential.daily_quota,
-            ),
-        )
-    )
-    pool_modalities: set[str] = set()
-    for credential in result.scalars().all():
-        capabilities = canonicalize_modalities(credential.capabilities)
-        if credential.capabilities is None or "multimodal" in capabilities:
-            supported = set(MINIMAX_MEDIA_TOOL_NAMES)
-        else:
-            supported = set(capabilities)
-        pool_modalities.update(
-            modality
-            for modality in supported
-            if modality in MINIMAX_MEDIA_TOOL_NAMES
-            and not credential_modality_is_blocked(credential, modality)
-        )
-    return pool_modalities
+# ── Automatic Media Routes ────────────────────────────────────────
 
 
 def _media_route_billing(profile) -> tuple[int | None, str]:
@@ -485,7 +459,7 @@ def _media_route_out(
     modality: str,
     tier: str,
     tool: Tool | None,
-    pool_modalities: set[str],
+    provider_modalities: dict[str, set[str]],
 ) -> MediaRouteOut:
     config = dict(tool.config or {}) if tool else {}
     profile = resolve_minimax_media_profile(modality, tier, config)
@@ -496,13 +470,23 @@ def _media_route_out(
         if field not in {"model", "enabled"} and getattr(profile, field) is not None
     }
     overridden = bool(minimax_media_override_snapshot(modality, tier, config))
-    pool_available = modality in pool_modalities
+    provider_order = media_provider_order_for_modality(modality)
+    available_providers = [
+        provider
+        for provider in provider_order
+        if modality in provider_modalities.get(provider, set())
+    ]
+    pool_available = bool(available_providers)
     tool_enabled = bool(tool and tool.enabled)
     estimated_credits, billing_unit = _media_route_billing(profile)
     return MediaRouteOut(
         modality=modality,
         tier=tier,
-        provider="minimax",
+        provider="automatic",
+        routing_mode="automatic_failover",
+        provider_order=list(provider_order),
+        available_providers=available_providers,
+        fallback_provider=MINIMAX_PROVIDER,
         tool_name=MINIMAX_MEDIA_TOOL_NAMES[modality],
         model=profile.model,
         settings=settings,
@@ -533,15 +517,15 @@ async def list_media_routes(
     current_user: User = Depends(get_platform_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """List the 4 x 3 effective media routing matrix without credentials."""
+    """List the 4 x 3 automatic media routing matrix without credentials."""
     tools = await _media_tool_map(db)
-    pool_modalities = await _minimax_pool_modalities(db)
+    provider_modalities = await get_platform_media_provider_modalities(db)
     return [
         _media_route_out(
             modality=modality,
             tier=tier,
             tool=tools.get(tool_name),
-            pool_modalities=pool_modalities,
+            provider_modalities=provider_modalities,
         )
         for modality, tool_name in MINIMAX_MEDIA_TOOL_NAMES.items()
         for tier in ("lite", "pro", "ultra")
@@ -581,7 +565,7 @@ async def update_media_route(
     current_user: User = Depends(get_platform_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Update one platform media route; credentials remain in the shared pool."""
+    """Update one MiniMax fallback profile; provider failover stays automatic."""
     canonical = canonicalize_modality(modality) or ""
     normalized_tier = tier.strip().lower()
     if canonical not in MINIMAX_MEDIA_TOOL_NAMES or normalized_tier not in {"lite", "pro", "ultra"}:
@@ -630,12 +614,12 @@ async def update_media_route(
         },
     ))
     await db.commit()
-    pool_modalities = await _minimax_pool_modalities(db)
+    provider_modalities = await get_platform_media_provider_modalities(db)
     return _media_route_out(
         modality=canonical,
         tier=normalized_tier,
         tool=tool,
-        pool_modalities=pool_modalities,
+        provider_modalities=provider_modalities,
     )
 
 

@@ -114,11 +114,15 @@ class ModelRouteUpdateIn(BaseModel):
 
 
 class MediaRouteOut(BaseModel):
-    """Effective platform-owned MiniMax generation route."""
+    """Effective platform media route plus MiniMax fallback profile."""
 
     modality: str
     tier: str
     provider: str
+    routing_mode: str
+    provider_order: list[str]
+    available_providers: list[str]
+    fallback_provider: str
     tool_name: str
     model: str
     settings: dict[str, str | int | bool]
@@ -134,7 +138,7 @@ class MediaRouteOut(BaseModel):
 
 
 class MediaRouteUpdateIn(BaseModel):
-    """Update one tier-specific media route without exposing credentials."""
+    """Update one tier-specific MiniMax fallback profile."""
 
     model: str | None = None
     sample_rate: int | None = Field(default=None, ge=8000, le=48000)

@@ -29,6 +29,7 @@ MEDIA_TOOL_NAMES: dict[str, str] = {
 }
 MEDIA_MODALITIES = tuple(MEDIA_TOOL_NAMES)
 SAAS_TIERS = ("lite", "pro", "ultra")
+MEDIA_PROVIDERS = ("volcengine_agent_plan", "minimax")
 
 
 def _credential_media_modalities(credential: LLMCredential) -> set[str]:
@@ -40,6 +41,53 @@ def _credential_media_modalities(credential: LLMCredential) -> set[str]:
     if "multimodal" in capabilities:
         return set(MEDIA_MODALITIES)
     return capabilities.intersection(MEDIA_MODALITIES)
+
+
+async def get_platform_media_provider_modalities(
+    db: AsyncSession,
+) -> dict[str, set[str]]:
+    """Return usable platform-pool modalities grouped by media provider.
+
+    This is the control-plane view of the same credential constraints enforced
+    by runtime selection: only healthy, enabled, in-quota platform credentials
+    count, Agent Plan account tiers must support the modality, and provider
+    quota circuits must still be open.
+    """
+
+    credentials_result = await db.execute(
+        select(LLMCredential).where(
+            LLMCredential.provider.in_(MEDIA_PROVIDERS),
+            LLMCredential.tenant_id.is_(None),
+            LLMCredential.enabled == True,  # noqa: E712
+            LLMCredential.status == "healthy",
+            or_(
+                LLMCredential.daily_quota.is_(None),
+                LLMCredential.used_today < LLMCredential.daily_quota,
+            ),
+        )
+    )
+    provider_modalities = {provider: set() for provider in MEDIA_PROVIDERS}
+    for credential in credentials_result.scalars().all():
+        provider = str(getattr(credential, "provider", "") or "").strip().lower()
+        if provider not in provider_modalities:
+            continue
+        supported = _credential_media_modalities(credential)
+        if provider == VOLCENGINE_AGENT_PLAN_PROVIDER:
+            supported = {
+                modality
+                for modality in supported
+                if plan_tier_supports_modality(
+                    getattr(credential, "plan_tier", None),
+                    modality,
+                )
+            }
+        provider_modalities[provider].update(
+            modality
+            for modality in supported
+            if modality in MEDIA_MODALITIES
+            and not credential_modality_is_blocked(credential, modality)
+        )
+    return provider_modalities
 
 
 def evaluate_media_capabilities(
@@ -133,35 +181,8 @@ async def get_agent_media_capabilities(
         if enabled and route_enabled:
             enabled_tools.add(tool.name)
 
-    credentials_result = await db.execute(
-        select(LLMCredential).where(
-            LLMCredential.provider.in_(("minimax", VOLCENGINE_AGENT_PLAN_PROVIDER)),
-            LLMCredential.tenant_id.is_(None),
-            LLMCredential.enabled == True,  # noqa: E712
-            LLMCredential.status == "healthy",
-            or_(
-                LLMCredential.daily_quota.is_(None),
-                LLMCredential.used_today < LLMCredential.daily_quota,
-            ),
-        )
-    )
-    pool_modalities: set[str] = set()
-    for credential in credentials_result.scalars().all():
-        supported = _credential_media_modalities(credential)
-        if credential.provider == VOLCENGINE_AGENT_PLAN_PROVIDER:
-            supported = {
-                modality
-                for modality in supported
-                if plan_tier_supports_modality(
-                    getattr(credential, "plan_tier", None),
-                    modality,
-                )
-            }
-        pool_modalities.update(
-            modality
-            for modality in supported
-            if modality in MEDIA_MODALITIES and not credential_modality_is_blocked(credential, modality)
-        )
+    provider_modalities = await get_platform_media_provider_modalities(db)
+    pool_modalities = set().union(*provider_modalities.values())
 
     return evaluate_media_capabilities(
         entitlements,

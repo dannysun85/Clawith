@@ -25,6 +25,34 @@ DEFAULT_MEDIA_PROVIDER_ORDER = (
 )
 
 
+def media_provider_order_for_modality(modality: str) -> tuple[str, ...]:
+    """Return the providers implemented by the runtime for one modality."""
+
+    normalized = str(modality or "").strip().lower()
+    if normalized == "music":
+        return (MINIMAX_PROVIDER,)
+    if normalized in {"image", "audio", "video"}:
+        return DEFAULT_MEDIA_PROVIDER_ORDER
+    return ()
+
+
+def media_provider_order_for_voice_id(voice_id: str | None) -> tuple[str, ...]:
+    """Keep an explicit provider voice identity stable across routing.
+
+    Automatic/default speech may use the normal Agent Plan -> MiniMax route.
+    Provider voice identifiers are not interchangeable, so an explicit
+    identifier pins the request to the provider that owns its namespace instead
+    of silently changing the customer's selected voice during fallback.
+    """
+
+    normalized = str(voice_id or "").strip()
+    if not normalized or normalized.lower() == "auto":
+        return DEFAULT_MEDIA_PROVIDER_ORDER
+    if normalized.endswith("bigtts"):
+        return (VOLCENGINE_AGENT_PLAN_PROVIDER,)
+    return (MINIMAX_PROVIDER,)
+
+
 def minimax_video_requires_first_frame(
     aspect_ratio: str,
     first_frame_image: object | None,
@@ -183,6 +211,8 @@ __all__ = [
     "DEFAULT_MEDIA_PROVIDER_ORDER",
     "MINIMAX_PROVIDER",
     "PreparedMediaProvider",
+    "media_provider_order_for_voice_id",
+    "media_provider_order_for_modality",
     "minimax_video_requires_first_frame",
     "prepare_media_provider",
 ]

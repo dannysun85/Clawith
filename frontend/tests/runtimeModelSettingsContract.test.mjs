@@ -69,3 +69,13 @@ test('chat routes through enabled SaaS tiers instead of stale direct model ids',
   assert.match(agentDetail, /queryKey: \['agent-media-capabilities', id, effectiveChatTier\]/);
   assert.doesNotMatch(agentDetail, /const effectiveChatModelId = overrideModelId/);
 });
+
+test('media admin separates automatic provider routing from MiniMax fallback settings', () => {
+  assert.match(saasAdminSource, /routing_mode: 'automatic_failover'/);
+  assert.match(saasAdminSource, /provider_order: string\[\]/);
+  assert.match(saasAdminSource, /available_providers: string\[\]/);
+  assert.match(saasAdminSource, /图片、语音和视频会按“火山 Agent Plan → MiniMax”/);
+  assert.match(saasAdminSource, /音乐目前使用 MiniMax/);
+  assert.match(saasAdminSource, /MiniMax 兜底模型/);
+  assert.match(saasAdminSource, /只配置 MiniMax 兜底路径/);
+});
