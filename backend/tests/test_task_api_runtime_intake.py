@@ -32,7 +32,12 @@ async def test_create_todo_registers_runtime_before_committing_business_fact() -
     timeline: list[str] = []
     db = _Session(timeline)
     user = SimpleNamespace(id=uuid.uuid4())
-    resolved_agent = SimpleNamespace(id=uuid.uuid4())
+    resolved_agent = SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        name="Research Agent",
+        role_description="Research and reporting",
+    )
     data = SimpleNamespace(
         title="Prepare report",
         description="Use workspace evidence",

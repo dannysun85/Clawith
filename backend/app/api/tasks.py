@@ -77,9 +77,18 @@ async def create_task(
             ),
         )
     task = Task(
+        tenant_id=agent.tenant_id,
         agent_id=agent_id,
         title=data.title,
         description=data.description,
+        intent=(data.description or data.title).strip(),
+        origin_type="agent_page",
+        executor_kind="agent_employee",
+        executor_snapshot={
+            "agent_id": str(agent.id),
+            "agent_name": agent.name,
+            "role_description": agent.role_description or "",
+        },
         type=data.type,
         priority=data.priority,
         due_date=data.due_date,

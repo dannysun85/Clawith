@@ -16,6 +16,7 @@ const CompanySetup = lazy(() => import('./pages/CompanySetup'));
 const Onboarding = lazy(() => import('./pages/Onboarding'));
 const Layout = lazy(() => import('./pages/Layout'));
 const Dashboard = lazy(() => import('./pages/Dashboard'));
+const Work = lazy(() => import('./pages/Work'));
 const Plaza = lazy(() => import('./pages/Plaza'));
 const AgentDetail = lazy(() => import('./pages/AgentDetail'));
 const AgentCreate = lazy(() => import('./pages/AgentCreate'));
@@ -330,7 +331,8 @@ export default function App() {
                 <Route path="/admin/saas" element={<SaasAdminRoute><SaasAdmin /></SaasAdminRoute>} />
                 <Route path="/onboarding" element={<ProtectedRoute><TenantWorkspaceRoute><Onboarding /></TenantWorkspaceRoute></ProtectedRoute>} />
                 <Route path="/" element={<ProtectedRoute><Layout /></ProtectedRoute>}>
-                    <Route index element={<Navigate to="/dashboard" replace />} />
+                    <Route index element={<Navigate to="/work" replace />} />
+                    <Route path="work" element={<TenantWorkspaceRoute><Work /></TenantWorkspaceRoute>} />
                     <Route path="dashboard" element={<TenantWorkspaceRoute><Dashboard /></TenantWorkspaceRoute>} />
                     <Route path="plaza" element={<TenantWorkspaceRoute><Plaza /></TenantWorkspaceRoute>} />
                     <Route path="agents/new" element={<TenantWorkspaceRoute><AgentCreate /></TenantWorkspaceRoute>} />

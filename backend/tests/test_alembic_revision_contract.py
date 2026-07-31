@@ -23,12 +23,16 @@ def test_revision_ids_fit_the_default_alembic_version_column() -> None:
 
 
 def test_release_migration_graph_has_one_expected_head() -> None:
-    assert _script_directory().get_heads() == ["merge_v1113_astra_heads"]
+    assert _script_directory().get_heads() == ["backfill_private_assistant"]
 
 
 def test_release_head_preserves_both_upgrade_lineages() -> None:
     script = _script_directory()
-    release_head = script.get_revision("merge_v1113_astra_heads")
+    release_head = script.get_revision("backfill_private_assistant")
+    experience_revision = script.get_revision("add_experience_provenance")
+    work_context_revision = script.get_revision("add_task_work_context")
+    m3_primary_revision = script.get_revision("promote_m3_text_primary")
+    v1113_merge_revision = script.get_revision("merge_v1113_astra_heads")
     deliverable_quality_revision = script.get_revision("add_deliverable_quality_reviews")
     checkpoint_delivery_revision = script.get_revision("allow_checkpoint_deliveries")
     logical_delete_revision = script.get_revision("add_agent_model_deleted_at")
@@ -40,7 +44,11 @@ def test_release_head_preserves_both_upgrade_lineages() -> None:
     task_status_revision = script.get_revision("align_task_failed_status")
     merge_revision = script.get_revision("merge_v111_astra_heads")
 
-    assert set(release_head._normalized_down_revisions) == {
+    assert release_head._normalized_down_revisions == ("add_experience_provenance",)
+    assert experience_revision._normalized_down_revisions == ("add_task_work_context",)
+    assert work_context_revision._normalized_down_revisions == ("promote_m3_text_primary",)
+    assert m3_primary_revision._normalized_down_revisions == ("merge_v1113_astra_heads",)
+    assert set(v1113_merge_revision._normalized_down_revisions) == {
         "add_deliverable_quality_reviews",
         "allow_checkpoint_deliveries",
     }
@@ -71,7 +79,7 @@ def test_postgres_migration_smoke_targets_the_release_head() -> None:
         encoding="utf-8"
     )
 
-    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-merge_v1113_astra_heads' in smoke
+    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-backfill_private_assistant' in smoke
 
 
 def test_agent_plan_text_route_migration_preserves_credential_ownership_and_fallback() -> None:
@@ -85,6 +93,64 @@ def test_agent_plan_text_route_migration_preserves_credential_ownership_and_fall
     assert "model.provider <> 'volcengine_agent_plan'" in migration
     assert "fallback_route_id" in migration
     assert "'builtin_registry'" in migration
+
+
+def test_m3_primary_migration_is_owned_reversible_and_cycle_safe() -> None:
+    migration = (
+        BACKEND_ROOT
+        / "alembic/versions/202607311330_promote_m3_text_primary.py"
+    ).read_text(encoding="utf-8")
+
+    assert "merge_v1113_astra_heads" in migration
+    assert "__promote_m3_text_primary_route_state" in migration
+    assert "seed_minimax_m3_understanding" in migration
+    assert "seed_agent_plan_text_routes" in migration
+    assert "administrator has changed" in migration
+    assert "fallback cycle" in migration
+    assert "UPDATE llm_credentials" not in migration
+
+
+def test_task_work_context_migration_is_additive_tenant_scoped_and_idempotent() -> None:
+    migration = (
+        BACKEND_ROOT
+        / "alembic/versions/202607311530_add_task_work_context.py"
+    ).read_text(encoding="utf-8")
+
+    assert "promote_m3_text_primary" in migration
+    assert "fk_tasks_tenant_id_tenants" in migration
+    assert "uq_tasks_workbench_client_identity" in migration
+    assert "ck_tasks_client_fingerprint" in migration
+    assert "temporary_expert" in migration
+    assert "fk_deliverable_requests_tenant_task" in migration
+    assert "DROP TABLE tasks" not in migration
+
+
+def test_experience_provenance_migration_is_additive_and_reversible() -> None:
+    migration = (
+        BACKEND_ROOT
+        / "alembic/versions/202607311700_add_experience_provenance.py"
+    ).read_text(encoding="utf-8")
+
+    assert "add_task_work_context" in migration
+    assert "source_task_id" in migration
+    assert "source_deliverable_request_id" in migration
+    assert "ondelete=\"SET NULL\"" in migration
+    assert "drop_column" in migration
+    assert "DROP TABLE experience_entries" not in migration
+
+
+def test_private_assistant_backfill_is_unambiguous_owned_and_reversible() -> None:
+    migration = (
+        BACKEND_ROOT
+        / "alembic/versions/202607312050_backfill_personal_assistant.py"
+    ).read_text(encoding="utf-8")
+
+    assert "add_experience_provenance" in migration
+    assert "agent.creator_id = onboarding.user_id" in migration
+    assert "agent.tenant_id = onboarding.tenant_id" in migration
+    assert "template.name = 'Private Assistant'" in migration
+    assert "HAVING count(*) = 1" in migration
+    assert "personal_assistant_agent_id = NULL" in migration
 
 
 def test_sso_password_migration_is_fail_closed_and_non_destructive() -> None:

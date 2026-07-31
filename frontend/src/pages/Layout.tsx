@@ -41,11 +41,13 @@ import {
     IconKey,
     IconReceipt,
     IconMenu2,
+    IconBriefcase,
 } from '@tabler/icons-react';
 import { useAppStore } from '../stores';
 import TalentMarketModal from '../components/TalentMarketModal';
 import { AstraWordmark } from '../components/atlas';
 import { normalizeTenantRedirectUrl } from '../utils/authTransport';
+import { partitionAgentRoles } from '../utils/productRoles';
 
 const MOBILE_NAV_MEDIA_QUERY = '(max-width: 768px)';
 
@@ -320,8 +322,8 @@ function CompanyTourOverlay({ assistantId, isChinese, onDone }: { assistantId: s
         },
         {
             selector: '[data-tour-target="agent-list"]',
-            title: isChinese ? '员工列表' : 'Employee list',
-            body: isChinese ? '这里是公司员工和你可见的 agent。你的私人助理也会在这里。' : 'This is the employee and agent list you can access. Your private assistant appears here too.',
+            title: isChinese ? '助理与员工' : 'Assistant and employees',
+            body: isChinese ? '私人助理负责协调你的工作；长期 Agent 员工在独立列表中负责专业执行。' : 'Your private assistant coordinates your work; long-term Agent employees are listed separately for specialist execution.',
             pad: 8,
             radius: 14,
         },
@@ -448,7 +450,7 @@ function CompanyTourOverlay({ assistantId, isChinese, onDone }: { assistantId: s
                     {step >= steps.length - 1 ? (isChinese ? '完成' : 'Finish') : (isChinese ? '下一个' : 'Next')} →
                 </button>
             </div>
-            {assistantId && <div className="company-tour-hint">{isChinese ? '导览结束后，会进入你的私人助理对话页。' : 'After the tour, you will land in your private assistant chat.'}</div>}
+            {assistantId && <div className="company-tour-hint">{isChinese ? '导览结束后，会进入任务工作台。' : 'After the tour, you will land in the task workbench.'}</div>}
         </div>
     );
 }
@@ -771,7 +773,19 @@ export default function Layout() {
         refetchInterval: 30000,
         enabled: hasTenantContext,
     });
-    const agentCreationLimit = useAgentCreationLimit(agents as any[]);
+    const { data: onboardingStatus } = useQuery({
+        queryKey: ['onboarding-status', currentTenant],
+        queryFn: () => onboardingApi.status(),
+        enabled: hasTenantContext,
+    });
+    const { personalAssistant, employees: employeeAgents } = useMemo(
+        () => partitionAgentRoles(
+            agents as any[],
+            onboardingStatus?.personal_assistant_agent_id,
+        ),
+        [agents, onboardingStatus?.personal_assistant_agent_id],
+    );
+    const agentCreationLimit = useAgentCreationLimit(employeeAgents as any[]);
 
     const handleAgentLimitReached = useCallback(() => {
         toast.warning(
@@ -1018,9 +1032,16 @@ export default function Layout() {
     );
 
     const q = sidebarSearch.trim().toLowerCase();
-    const sortedAgents = [...agents].filter((a: any) => {
-        if (!q) return true;
-        return (a.name || '').toLowerCase().includes(q) || (a.role_description || '').toLowerCase().includes(q);
+    const matchesAgentSearch = (agent: any) => (
+        !q
+        || (agent.name || '').toLowerCase().includes(q)
+        || (agent.role_description || '').toLowerCase().includes(q)
+    );
+    const visiblePersonalAssistant = personalAssistant && matchesAgentSearch(personalAssistant)
+        ? personalAssistant
+        : null;
+    const sortedAgents = [...employeeAgents].filter((a: any) => {
+        return matchesAgentSearch(a);
     }).sort((a: any, b: any) => {
         const ap = pinnedAgents.has(a.id) ? 1 : 0;
         const bp = pinnedAgents.has(b.id) ? 1 : 0;
@@ -1101,13 +1122,36 @@ export default function Layout() {
 
     const agentListContent = (drawer = false) => (
         <>
-            {sortedAgents.map(agent => renderAgent(agent, { drawer }))}
-            {agents.length === 0 && (
-                <div className="sidebar-section">
-                    <div className="sidebar-section-title">{t('nav.myAgents')}</div>
+            <div className="sidebar-agent-header">
+                <span>{isChinese ? '我的助理' : 'My assistant'}</span>
+            </div>
+            {visiblePersonalAssistant && renderAgent(visiblePersonalAssistant, { drawer })}
+            {!personalAssistant && !q && (
+                <div className="sidebar-agent-empty">
+                    {isChinese ? '尚未创建私人助理' : 'No private assistant yet'}
                 </div>
             )}
-            {agents.length > 0 && sortedAgents.length === 0 && q && (
+            <div className="sidebar-agent-header">
+                <span>{isChinese ? 'Agent 员工' : 'Agent employees'}</span>
+                <button
+                    type="button"
+                    data-tour-target="hire-agent"
+                    onClick={() => handleOpenTalentMarket()}
+                    title={agentCreationLimit.isLimited
+                        ? agentLimitMessage(!!isChinese, agentCreationLimit.activeCount, agentCreationLimit.maxAgents)
+                        : t('nav.hire', t('nav.newAgent'))}
+                >
+                    <IconPlus size={15} stroke={1.7} />
+                </button>
+            </div>
+            {agentSearchBox(drawer)}
+            {sortedAgents.map(agent => renderAgent(agent, { drawer }))}
+            {employeeAgents.length === 0 && !q && (
+                <div className="sidebar-agent-empty">
+                    {isChinese ? '还没有长期 Agent 员工' : 'No long-term Agent employees yet'}
+                </div>
+            )}
+            {agents.length > 0 && !visiblePersonalAssistant && sortedAgents.length === 0 && q && (
                 <div className="sidebar-agent-empty">
                     {isChinese ? '无匹配结果' : 'No matches'}
                 </div>
@@ -1122,21 +1166,8 @@ export default function Layout() {
             onMouseLeave={scheduleCloseAgentDrawer}
         >
             <div className="sidebar-agent-drawer-header">
-                <span>{isChinese ? '智能体' : 'Agents'}</span>
-                <button
-                    type="button"
-                    onClick={() => {
-                        handleOpenTalentMarket();
-                        setAgentDrawerOpen(false);
-                    }}
-                    title={agentCreationLimit.isLimited
-                        ? agentLimitMessage(!!isChinese, agentCreationLimit.activeCount, agentCreationLimit.maxAgents)
-                        : t('nav.hire', t('nav.newAgent'))}
-                >
-                    <IconPlus size={16} stroke={1.7} />
-                </button>
+                <span>{isChinese ? '助理与员工' : 'Assistant and employees'}</span>
             </div>
-            {agentSearchBox(true)}
             <div className="sidebar-agent-drawer-list">
                 {agentListContent(true)}
             </div>
@@ -1206,9 +1237,13 @@ export default function Layout() {
 
 
                     {hasTenantContext && <div className="sidebar-section" data-tour-target="main-nav">
+                        <NavLink to="/work" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
+                            <span className="sidebar-item-icon" style={{ display: 'flex' }}><IconBriefcase size={16} stroke={1.5} /></span>
+                            <span className="sidebar-item-text">{isChinese ? '工作台' : 'Work'}</span>
+                        </NavLink>
                         <NavLink to="/dashboard" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
                             <span className="sidebar-item-icon" style={{ display: 'flex' }}>{SidebarIcons.home}</span>
-                            <span className="sidebar-item-text">{t('nav.dashboard')}</span>
+                            <span className="sidebar-item-text">{isChinese ? '公司概览' : 'Company overview'}</span>
                         </NavLink>
                         <NavLink to="/okr" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
                             <span className="sidebar-item-icon" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
@@ -1225,13 +1260,13 @@ export default function Layout() {
                             <span className="sidebar-item-icon" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
                                 <IconBuildingMonument size={14} stroke={1.5} />
                             </span>
-                            <span className="sidebar-item-text">{t('nav.plaza', 'Plaza')}</span>
+                            <span className="sidebar-item-text">{isChinese ? '发现中心' : 'Discover'}</span>
                         </NavLink>
                         <NavLink to="/groups" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
                             <span className="sidebar-item-icon" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
                                 <IconUsersGroup size={14} stroke={1.5} />
                             </span>
-                            <span className="sidebar-item-text">{t('nav.groups', 'Groups')}</span>
+                            <span className="sidebar-item-text">{isChinese ? '协作群组' : 'Collaboration groups'}</span>
                             {groupUnread > 0 && (
                                 <span className="sidebar-item-badge">{groupUnread > 99 ? '99+' : groupUnread}</span>
                             )}
@@ -1247,21 +1282,8 @@ export default function Layout() {
                     onMouseLeave={scheduleCloseAgentDrawer}
                 >
                     {!isSidebarCollapsed && (
-                        <div className="sidebar-agent-header">
-                            <span>{isChinese ? '智能体' : 'Agents'}</span>
-                            <button
-                                type="button"
-                                data-tour-target="hire-agent"
-                                onClick={() => handleOpenTalentMarket()}
-                                title={agentCreationLimit.isLimited
-                                    ? agentLimitMessage(!!isChinese, agentCreationLimit.activeCount, agentCreationLimit.maxAgents)
-                                    : t('nav.hire', t('nav.newAgent'))}
-                            >
-                                <IconPlus size={15} stroke={1.7} />
-                            </button>
-                        </div>
+                        <div className="sidebar-section-title">{isChinese ? '协作角色' : 'Collaboration roles'}</div>
                     )}
-                    {!isSidebarCollapsed && agentSearchBox()}
                     {agentListContent()}
                 </div>
                 </>}
@@ -1581,7 +1603,7 @@ export default function Layout() {
                     isChinese={!!isChinese}
                     onDone={async () => {
                         try { await onboardingApi.complete(); } catch { }
-                        navigate(tourAssistantId ? `/agents/${tourAssistantId}/chat?onboarding=1` : '/plaza', { replace: true });
+                        navigate('/work', { replace: true });
                     }}
                 />
             )}

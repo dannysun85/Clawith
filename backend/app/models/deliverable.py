@@ -57,6 +57,12 @@ class DeliverableRequest(Base):
         ),
         UniqueConstraint("agent_run_id", name="uq_deliverable_requests_agent_run"),
         UniqueConstraint("launch_message_id", name="uq_deliverable_requests_launch_message"),
+        ForeignKeyConstraint(
+            ["tenant_id", "task_id"],
+            ["tasks.tenant_id", "tasks.id"],
+            name="fk_deliverable_requests_tenant_task",
+            ondelete="RESTRICT",
+        ),
         Index(
             "ix_deliverable_requests_tenant_agent_created",
             "tenant_id",
@@ -68,6 +74,7 @@ class DeliverableRequest(Base):
             "session_id",
             "created_at",
         ),
+        Index("ix_deliverable_requests_task_created", "task_id", "created_at"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -103,6 +110,7 @@ class DeliverableRequest(Base):
         ForeignKey("chat_messages.id", name="fk_deliverable_requests_launch_message", ondelete="SET NULL"),
         nullable=True,
     )
+    task_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     client_request_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
 

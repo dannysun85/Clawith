@@ -406,9 +406,16 @@ class TaskCreate(BaseModel):
 
 class TaskOut(BaseModel):
     id: uuid.UUID
+    tenant_id: uuid.UUID | None = None
     agent_id: uuid.UUID
     title: str
     description: str | None = None
+    intent: str | None = None
+    origin_type: str = "legacy_agent_task"
+    executor_kind: str = "agent_employee"
+    executor_snapshot: dict = Field(default_factory=dict)
+    group_id: uuid.UUID | None = None
+    client_request_id: uuid.UUID | None = None
     type: str
     status: str
     priority: str

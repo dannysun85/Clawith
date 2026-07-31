@@ -3,8 +3,8 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, ForeignKey, String, Text, func
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import CheckConstraint, DateTime, Enum, ForeignKey, Index, String, Text, UniqueConstraint, func, text
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -14,11 +14,60 @@ class Task(Base):
     """Task assigned to or managed by a digital employee."""
 
     __tablename__ = "tasks"
+    __table_args__ = (
+        CheckConstraint(
+            "origin_type IN ('workbench', 'agent_page', 'agent_chat', 'group', "
+            "'trigger', 'api', 'legacy_agent_task')",
+            name="ck_tasks_origin_type",
+        ),
+        CheckConstraint(
+            "executor_kind IN ('personal_assistant', 'agent_employee', "
+            "'temporary_expert', 'group')",
+            name="ck_tasks_executor_kind",
+        ),
+        CheckConstraint(
+            "(client_request_id IS NULL AND request_fingerprint IS NULL) OR "
+            "(client_request_id IS NOT NULL AND request_fingerprint IS NOT NULL)",
+            name="ck_tasks_client_fingerprint",
+        ),
+        UniqueConstraint("tenant_id", "id", name="uq_tasks_tenant_id_id"),
+        Index(
+            "uq_tasks_workbench_client_identity",
+            "tenant_id",
+            "created_by",
+            "client_request_id",
+            unique=True,
+            postgresql_where=text("client_request_id IS NOT NULL"),
+        ),
+        Index("ix_tasks_tenant_creator_updated", "tenant_id", "created_by", "updated_at"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", name="fk_tasks_tenant_id_tenants", ondelete="CASCADE"),
+        nullable=False,
+    )
     agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("agents.id"), nullable=False)
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
+    intent: Mapped[str] = mapped_column(Text, nullable=False)
+    origin_type: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="legacy_agent_task", server_default=text("'legacy_agent_task'")
+    )
+    executor_kind: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="agent_employee", server_default=text("'agent_employee'")
+    )
+    executor_snapshot: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    group_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("groups.id", name="fk_tasks_group_id_groups", ondelete="SET NULL"),
+        nullable=True,
+    )
+    client_request_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    request_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     type: Mapped[str] = mapped_column(
         Enum("todo", "supervision", name="task_type_enum", create_constraint=False),
         default="todo",

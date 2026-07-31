@@ -40,7 +40,7 @@ export default function Onboarding() {
             .then((status) => {
                 if (cancelled) return;
                 if (status?.status === 'completed' && status.personal_assistant_agent_id) {
-                    navigate(`/agents/${status.personal_assistant_agent_id}/chat`, { replace: true });
+                    navigate('/work', { replace: true });
                     return;
                 }
                 if (status?.personal_assistant_agent_id) {
@@ -65,17 +65,20 @@ export default function Onboarding() {
         { id: 'steady', zh: '保守', en: 'Steady' },
     ], []);
 
-    const createAssistant = async () => {
+    const createAssistant = async (useSafeDefaults = false) => {
         setError('');
         setLoading(true);
         try {
+            const defaultName = isZh ? '私人助理' : 'Private Assistant';
+            const nextName = useSafeDefaults ? defaultName : assistantName.trim();
             const result = await onboardingApi.createPersonalAssistant({
-                name: assistantName.trim(),
-                personality: personalities.join(', ') || 'warm',
-                work_style: workStyle,
-                boundaries,
+                name: nextName,
+                personality: useSafeDefaults ? 'warm' : (personalities.join(', ') || 'warm'),
+                work_style: useSafeDefaults ? 'concise' : workStyle,
+                boundaries: useSafeDefaults ? '' : boundaries,
             });
             const nextId = result?.agent?.id || result?.onboarding?.personal_assistant_agent_id;
+            setAssistantName(nextName);
             setAssistantId(nextId);
             setStep('opening');
         } catch (err: any) {
@@ -85,9 +88,17 @@ export default function Onboarding() {
         }
     };
 
-    const enterOffice = () => {
+    const enterOffice = async () => {
         if (!assistantId) return;
-        navigate(`/plaza?tour=company&assistantId=${assistantId}`);
+        setLoading(true);
+        setError('');
+        try {
+            await onboardingApi.complete();
+            navigate('/work', { replace: true });
+        } catch (err: any) {
+            setError(err.message || 'Failed to complete onboarding');
+            setLoading(false);
+        }
     };
 
     const toggleLang = () => i18n.changeLanguage(isZh ? 'en' : 'zh');
@@ -120,9 +131,9 @@ export default function Onboarding() {
                     <div className="atlas-screen-form atlas-screen-form--padded">
                         <h1 className="atlas-h1">
                             {isZh ? (
-                                <>见见你的<em>第一位员工</em>。</>
+                                <>认识你的<em>私人协调者</em>。</>
                             ) : (
-                                <>Meet your <em>first employee.</em></>
+                                <>Meet your <em>private coordinator.</em></>
                             )}
                         </h1>
                         <p className="atlas-body atlas-body--muted">{isZh
@@ -198,19 +209,19 @@ export default function Onboarding() {
                         <div className="atlas-cta-row">
                             <button
                                 className="atlas-btn atlas-btn--primary"
-                                onClick={createAssistant}
+                                onClick={() => createAssistant(false)}
                                 disabled={loading || !assistantName.trim()}
                             >
-                                {loading ? '…' : (isZh ? '欢迎入职' : 'Welcome aboard')}
+                                {loading ? '…' : (isZh ? '创建我的助理' : 'Create my assistant')}
                                 <IconArrowRight size={14} stroke={1.5} />
                             </button>
                             <button
-                                className="atlas-btn atlas-btn--ghost"
+                                className="atlas-btn"
                                 type="button"
-                                onClick={createAssistant}
+                                onClick={() => createAssistant(true)}
                                 disabled={loading}
                             >
-                                {isZh ? '暂时跳过' : 'Skip for now'}
+                                {isZh ? '暂时跳过，使用默认助理' : 'Skip for now, use defaults'}
                             </button>
                         </div>
                     </div>
@@ -250,7 +261,7 @@ export default function Onboarding() {
                         </li>
                         <li>
                             <span className="atlas-roster-mark" aria-hidden="true">○</span>
-                            <span className="atlas-roster-label">{isZh ? '1 号员工' : 'NO. 1 EMPLOYEE'}</span>
+                            <span className="atlas-roster-label">{isZh ? '私人协调者' : 'PRIVATE COORDINATOR'}</span>
                             <span className="atlas-roster-value">{displayName}</span>
                         </li>
                         <li>
@@ -268,7 +279,7 @@ export default function Onboarding() {
                             onClick={enterOffice}
                             disabled={!assistantId}
                         >
-                            {isZh ? '进入你的宇宙' : 'Enter your universe'}
+                            {loading ? '…' : (isZh ? '开始第一项工作' : 'Start your first task')}
                             <IconArrowRight size={14} stroke={1.5} />
                         </button>
                     </div>

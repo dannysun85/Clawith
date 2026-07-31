@@ -13,15 +13,17 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import cast, desc, func, or_, select
 from sqlalchemy.dialects.postgresql import JSONB
 
 from app.api.auth import get_current_user
 from app.database import async_session
 from app.models.agent import Agent
+from app.models.deliverable import DeliverableRequest
 from app.models.experience import ExperienceEntry
 from app.models.experience_reference import ExperienceReference
+from app.models.task import Task
 from app.models.user import User
 from app.services.llm.model_resolution import resolve_active_agent_model
 
@@ -46,6 +48,8 @@ class EntryCreate(BaseModel):
     visibility_scope_id: uuid.UUID | None = None
     origin_session_id: uuid.UUID | None = None
     origin_agent_id: uuid.UUID | None = None
+    source_task_id: uuid.UUID | None = None
+    source_deliverable_request_id: uuid.UUID | None = None
 
 
 class DraftFromContent(BaseModel):
@@ -78,6 +82,8 @@ class EntryOut(BaseModel):
     origin: str
     origin_session_id: uuid.UUID | None
     origin_agent_id: uuid.UUID | None
+    source_task_id: uuid.UUID | None
+    source_deliverable_request_id: uuid.UUID | None
     created_by: uuid.UUID
     reviewed_by: uuid.UUID | None
     last_reviewed_at: datetime | None
@@ -92,8 +98,7 @@ class EntryOut(BaseModel):
     # UI can hide actions the user can't perform. None in list responses.
     can_manage: bool | None = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ReferenceStats(BaseModel):
@@ -117,6 +122,57 @@ async def _agent_creator_id(db, agent_id: uuid.UUID | None) -> uuid.UUID | None:
     if not agent_id:
         return None
     return (await db.execute(select(Agent.creator_id).where(Agent.id == agent_id))).scalar_one_or_none()
+
+
+async def _validate_work_provenance(
+    db,
+    payload: EntryCreate,
+    current_user: User,
+) -> tuple[uuid.UUID | None, uuid.UUID | None]:
+    """Resolve optional source links without exposing another member's work.
+
+    Company administrators govern the library but do not implicitly gain access
+    to a member's private task history, so ownership is required for every role.
+    A delivery-linked Task is authoritative and must agree with an explicitly
+    supplied Task id.
+    """
+    tenant_id = current_user.tenant_id
+    task = None
+    delivery = None
+    if payload.source_task_id:
+        task = (
+            await db.execute(
+                select(Task).where(
+                    Task.id == payload.source_task_id,
+                    Task.tenant_id == tenant_id,
+                    Task.created_by == current_user.id,
+                )
+            )
+        ).scalar_one_or_none()
+        if not task:
+            raise HTTPException(404, "Source task not found")
+
+    if payload.source_deliverable_request_id:
+        delivery = (
+            await db.execute(
+                select(DeliverableRequest).where(
+                    DeliverableRequest.id == payload.source_deliverable_request_id,
+                    DeliverableRequest.tenant_id == tenant_id,
+                    DeliverableRequest.created_by_user_id == current_user.id,
+                )
+            )
+        ).scalar_one_or_none()
+        if not delivery:
+            raise HTTPException(404, "Source delivery not found")
+        if task and delivery.task_id and delivery.task_id != task.id:
+            raise HTTPException(409, "Source task does not match the delivery")
+        if not task and delivery.task_id:
+            task_id = delivery.task_id
+        else:
+            task_id = task.id if task else None
+        return task_id, delivery.id
+
+    return task.id if task else None, None
 
 
 # ── Management permissions (independent from tenant-wide published reads) ──
@@ -310,6 +366,9 @@ async def create_entry(payload: EntryCreate, current_user: User = Depends(get_cu
     """
     eff = _effective_tenant_id(current_user)
     async with async_session() as db:
+        source_task_id, source_delivery_id = await _validate_work_provenance(
+            db, payload, current_user
+        )
         dupe = await _find_identical(db, eff, payload)
         if dupe:
             raise HTTPException(409, f"内容完全相同的经验已存在（“{dupe.title or '未命名'}”），无需重复沉淀。")
@@ -327,6 +386,8 @@ async def create_entry(payload: EntryCreate, current_user: User = Depends(get_cu
             origin="chat",
             origin_session_id=payload.origin_session_id,
             origin_agent_id=payload.origin_agent_id,
+            source_task_id=source_task_id,
+            source_deliverable_request_id=source_delivery_id,
             created_by=current_user.id,
         )
         db.add(entry)
@@ -557,6 +618,8 @@ async def create_revision_draft(
             origin="chat" if source.origin == "legacy_plaza" else source.origin,
             origin_session_id=source.origin_session_id,
             origin_agent_id=source.origin_agent_id,
+            source_task_id=source.source_task_id,
+            source_deliverable_request_id=source.source_deliverable_request_id,
             created_by=current_user.id,
         )
         db.add(revision)

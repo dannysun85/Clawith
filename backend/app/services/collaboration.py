@@ -48,9 +48,19 @@ class CollaborationService:
 
         # Create task for target agent
         task = Task(
+            tenant_id=to_agent.tenant_id,
             agent_id=to_agent_id,
             title=f"[委托自 {from_agent.name}] {task_title}",
             description=task_description,
+            intent=task_description.strip() or task_title.strip(),
+            origin_type="agent_chat",
+            executor_kind="agent_employee",
+            executor_snapshot={
+                "agent_id": str(to_agent.id),
+                "agent_name": to_agent.name,
+                "role_description": to_agent.role_description or "",
+                "delegated_by_agent_id": str(from_agent.id),
+            },
             type="todo",
             priority="medium",
             created_by=requester.id,

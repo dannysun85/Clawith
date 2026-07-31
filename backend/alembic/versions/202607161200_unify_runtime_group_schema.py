@@ -465,6 +465,8 @@ _PRECREATED_PHASE_OBJECTS = {
         "index:ix_experience_entries_visibility_scope",
         "index:ix_experience_entries_origin",
         "index:ix_experience_entries_created_at",
+        "index:ix_experience_entries_source_task_id",
+        "index:ix_experience_entries_source_delivery_id",
         "index:ix_experience_references_entry_id",
         "index:ix_experience_references_kind",
         "index:ix_experience_references_tenant_id",
@@ -1199,6 +1201,12 @@ def _upgrade_experience_library() -> None:
         sa.Column("origin", sa.String(length=20), nullable=False),
         sa.Column("origin_session_id", postgresql.UUID(as_uuid=True), nullable=True),
         sa.Column("origin_agent_id", postgresql.UUID(as_uuid=True), nullable=True),
+        sa.Column("source_task_id", postgresql.UUID(as_uuid=True), nullable=True),
+        sa.Column(
+            "source_deliverable_request_id",
+            postgresql.UUID(as_uuid=True),
+            nullable=True,
+        ),
         sa.Column("created_by", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("reviewed_by", postgresql.UUID(as_uuid=True), nullable=True),
         sa.Column("last_reviewed_at", sa.DateTime(timezone=True), nullable=True),
@@ -1221,6 +1229,12 @@ def _upgrade_experience_library() -> None:
             name="fk_experience_entries_draft_of_id",
             ondelete="SET NULL",
         ),
+        sa.ForeignKeyConstraint(
+            ["source_task_id"],
+            ["tasks.id"],
+            name="fk_experience_entries_source_task",
+            ondelete="SET NULL",
+        ),
         sa.PrimaryKeyConstraint("id"),
     )
     for name, columns in {
@@ -1230,6 +1244,10 @@ def _upgrade_experience_library() -> None:
         "ix_experience_entries_visibility_scope": ["visibility_scope"],
         "ix_experience_entries_origin": ["origin"],
         "ix_experience_entries_created_at": ["created_at"],
+        "ix_experience_entries_source_task_id": ["source_task_id"],
+        "ix_experience_entries_source_delivery_id": [
+            "source_deliverable_request_id"
+        ],
     }.items():
         op.create_index(name, "experience_entries", columns, unique=False)
 

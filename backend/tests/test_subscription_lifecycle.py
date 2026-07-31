@@ -151,6 +151,11 @@ async def test_enforce_noop_when_under_limit():
     assert all(a.status == "running" for a in agents)
     fake_db.commit.assert_not_called()
 
+    statement = str(fake_db.execute.await_args.args[0])
+    assert "user_tenant_onboarding" in statement
+    assert "personal_assistant_agent_id" in statement
+    assert "agents.role_description" not in statement.split("WHERE", 1)[1]
+
 
 # ── restore_stopped_agents ──────────────────────────────────────────
 

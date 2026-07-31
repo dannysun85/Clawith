@@ -17,7 +17,7 @@ import uuid
 from datetime import datetime, timezone
 
 from loguru import logger
-from sqlalchemy import case, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import async_session
@@ -152,28 +152,29 @@ async def enforce_agent_limit(tenant_id: uuid.UUID) -> int:
     agents are not deleted — data/config preserved; quota_guard blocks their LLM
     calls. Returns count stopped.
     """
-    from app.models.agent import Agent, AgentTemplate
+    from app.models.agent import Agent
+    from app.models.onboarding import UserTenantOnboarding
 
     max_agents = await _effective_max_agents(tenant_id)
-    assistant_priority = case(
-        (Agent.access_mode == "private", 0),
-        (Agent.role_description == "Private Assistant", 0),
-        (AgentTemplate.name == "Private Assistant", 0),
-        else_=1,
+    personal_assistant_ids = select(
+        UserTenantOnboarding.personal_assistant_agent_id
+    ).where(
+        UserTenantOnboarding.tenant_id == tenant_id,
+        UserTenantOnboarding.personal_assistant_agent_id.isnot(None),
     )
     async with async_session() as db:
         active = (
             (
                 await db.execute(
                     select(Agent)
-                    .outerjoin(AgentTemplate, Agent.template_id == AgentTemplate.id)
                     .where(
                         Agent.tenant_id == tenant_id,
                         Agent.status.notin_(("stopped", "error")),
                         Agent.is_expired == False,  # noqa: E712
                         Agent.is_system == False,  # noqa: E712
+                        ~Agent.id.in_(personal_assistant_ids),
                     )
-                    .order_by(assistant_priority.asc(), Agent.created_at.asc(), Agent.id.asc())
+                    .order_by(Agent.created_at.asc(), Agent.id.asc())
                 )
             )
             .scalars()
@@ -190,14 +191,15 @@ async def enforce_agent_limit(tenant_id: uuid.UUID) -> int:
 
 async def restore_stopped_agents(tenant_id: uuid.UUID) -> int:
     """Restore stopped agents to idle when the limit allows (after upgrade/renewal)."""
-    from app.models.agent import Agent, AgentTemplate
+    from app.models.agent import Agent
+    from app.models.onboarding import UserTenantOnboarding
 
     max_agents = await _effective_max_agents(tenant_id)
-    assistant_priority = case(
-        (Agent.access_mode == "private", 0),
-        (Agent.role_description == "Private Assistant", 0),
-        (AgentTemplate.name == "Private Assistant", 0),
-        else_=1,
+    personal_assistant_ids = select(
+        UserTenantOnboarding.personal_assistant_agent_id
+    ).where(
+        UserTenantOnboarding.tenant_id == tenant_id,
+        UserTenantOnboarding.personal_assistant_agent_id.isnot(None),
     )
     async with async_session() as db:
         active = (
@@ -208,6 +210,7 @@ async def restore_stopped_agents(tenant_id: uuid.UUID) -> int:
                         Agent.status.notin_(("stopped", "error")),
                         Agent.is_expired == False,  # noqa: E712
                         Agent.is_system == False,  # noqa: E712
+                        ~Agent.id.in_(personal_assistant_ids),
                     )
                 )
             )
@@ -221,14 +224,14 @@ async def restore_stopped_agents(tenant_id: uuid.UUID) -> int:
             (
                 await db.execute(
                     select(Agent)
-                    .outerjoin(AgentTemplate, Agent.template_id == AgentTemplate.id)
                     .where(
                         Agent.tenant_id == tenant_id,
                         Agent.status == "stopped",
                         Agent.is_expired == False,  # noqa: E712
                         Agent.is_system == False,  # noqa: E712
+                        ~Agent.id.in_(personal_assistant_ids),
                     )
-                    .order_by(assistant_priority.asc(), Agent.created_at.asc(), Agent.id.asc())
+                    .order_by(Agent.created_at.asc(), Agent.id.asc())
                 )
             )
             .scalars()

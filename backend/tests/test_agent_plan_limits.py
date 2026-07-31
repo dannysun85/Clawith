@@ -57,6 +57,20 @@ def _many_result(values):
 
 
 @pytest.mark.asyncio
+async def test_employee_seat_count_excludes_only_onboarding_linked_assistants():
+    tenant_id = uuid.uuid4()
+    db = MagicMock()
+    db.execute = AsyncMock(return_value=_scalars_result([SimpleNamespace(id=uuid.uuid4())]))
+
+    assert await quota_guard._count_active_tenant_agents(tenant_id, db) == 1
+
+    statement = str(db.execute.await_args.args[0])
+    assert "user_tenant_onboarding" in statement
+    assert "personal_assistant_agent_id" in statement
+    assert "agents.role_description" not in statement.split("WHERE", 1)[1]
+
+
+@pytest.mark.asyncio
 async def test_agent_creation_quota_blocks_org_admin_when_tenant_limit_is_full():
     tenant_id = uuid.uuid4()
     user_id = uuid.uuid4()

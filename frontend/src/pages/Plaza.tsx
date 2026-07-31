@@ -7,10 +7,10 @@
  * Draft review drawer sets the four parts + tags + visibility before publish.
  */
 import React, { useMemo, useState, useEffect } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useOutletContext, useSearchParams } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { IconBuildingMonument } from '@tabler/icons-react';
+import { IconBuildingMonument, IconRobot } from '@tabler/icons-react';
 import { experienceApi, type ExperienceEntry } from '../services/api';
 import { DraftEditor, Drawer, bodyExcerpt, secondaryBtn, type Draft } from '../components/ExperienceDraftEditor';
 import { EntryDrawer, Badge, CreatorLine, freshness, retiredDaysLeft } from '../components/ExperienceDetailDrawer';
@@ -37,6 +37,10 @@ export default function Plaza() {
     const [teamTag, setTeamTag] = useState<string | null>(null);
     const [openId, setOpenId] = useState<string | null>(null);
     const [editing, setEditing] = useState<Draft | null>(null);
+    const { openTalentMarket } = useOutletContext<{
+        openTalentMarket?: (options?: { initialSearchQuery?: string }) => void;
+    }>();
+    const section = params.get('section') === 'talent' ? 'talent' : 'experience';
 
     const teamQ = useQuery({ queryKey: ['experience', 'team'], queryFn: () => experienceApi.list({ view: 'team' }), enabled: view === 'team' });
     const taggedTeamQ = useQuery({
@@ -66,7 +70,17 @@ export default function Plaza() {
     const refreshAll = () => { qc.invalidateQueries({ queryKey: ['experience'] }); qc.invalidateQueries({ queryKey: ['experience-stats'] }); };
     // Drafts open the editor; published & retired open the read/action drawer (retired → 重新发布).
     const openEntry = (e: ExperienceEntry) => (e.status === 'draft' ? setEditing(e) : setOpenId(e.id));
-    const newEntry = () => setEditing({ tags: [] });
+    const newEntry = () => setEditing({
+        tags: [],
+        source_task_id: params.get('task'),
+        source_deliverable_request_id: params.get('delivery'),
+    });
+    const changeSection = (next: 'experience' | 'talent') => {
+        const updated = new URLSearchParams(params);
+        if (next === 'talent') updated.set('section', 'talent');
+        else updated.delete('section');
+        setParams(updated, { replace: true });
+    };
 
     const unfilteredTeamEntries = teamQ.data ?? [];
     const teamEntries = teamTag ? (taggedTeamQ.data ?? []) : unfilteredTeamEntries;
@@ -94,6 +108,27 @@ export default function Plaza() {
 
     return (
         <div style={{ padding: 24, maxWidth: 1120, margin: '0 auto' }}>
+            <div style={{ display: 'flex', gap: 8, marginBottom: 18 }} aria-label={t('experience.discoverySections', '发现中心分区')}>
+                <button className={section === 'experience' ? 'btn btn-primary' : 'btn btn-secondary'} onClick={() => changeSection('experience')}>
+                    {t('experience.librarySection', '经验库')}
+                </button>
+                <button className={section === 'talent' ? 'btn btn-primary' : 'btn btn-secondary'} onClick={() => changeSection('talent')}>
+                    {t('experience.talentSection', '员工市场')}
+                </button>
+            </div>
+
+            {section === 'talent' ? (
+                <div style={{ border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-lg)', padding: '48px 24px', textAlign: 'center' }}>
+                    <IconRobot size={36} stroke={1.4} style={{ color: 'var(--text-tertiary)', marginBottom: 12 }} />
+                    <h1 style={{ fontSize: 'var(--text-xl)', margin: '0 0 8px', color: 'var(--text-primary)' }}>{t('experience.talentTitle', '发现长期 Agent 员工')}</h1>
+                    <p style={{ color: 'var(--text-tertiary)', maxWidth: 560, margin: '0 auto 20px', lineHeight: 1.6 }}>
+                        {t('experience.talentHint', '这里用于寻找和招聘可长期协作的 Agent 员工。一次性专业任务请回到工作台选择临时专家。')}
+                    </p>
+                    <button className="btn btn-primary" onClick={() => openTalentMarket?.()}>
+                        {t('experience.openTalentMarket', '打开员工市场')}
+                    </button>
+                </div>
+            ) : <>
             {/* Header: title + right controls (toggle + new). No left sidebar — the global nav already exists. */}
             <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 16, marginBottom: 20, flexWrap: 'wrap' }}>
                 <div>
@@ -137,6 +172,7 @@ export default function Plaza() {
                     onSaved={() => { setEditing(null); refreshAll(); }}
                     onDeleted={() => { setEditing(null); refreshAll(); }} />
             )}
+            </>}
         </div>
     );
 }

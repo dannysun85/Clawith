@@ -303,6 +303,66 @@ export const agentApi = {
         request<any[]>(`/agents/${id}/gateway-messages`),
 };
 
+export type WorkArtifact = {
+    id: string;
+    artifact_type: string;
+    status: string;
+    workspace_path: string;
+    revision_number: number;
+};
+
+export type WorkItem = {
+    id: string;
+    kind: 'task' | 'deliverable';
+    title: string;
+    intent: string;
+    origin_type: string;
+    executor_kind: string;
+    executor_snapshot: Record<string, any>;
+    agent_id: string;
+    agent_name: string;
+    task_id?: string | null;
+    task_status?: string | null;
+    run_id?: string | null;
+    execution_status: string;
+    deliverable_id?: string | null;
+    work_type?: string | null;
+    deliverable_status?: string | null;
+    artifact_status?: string | null;
+    review_status?: string | null;
+    approval_status?: string | null;
+    delivery_status: string;
+    delivery_mode: 'task_only' | 'formal_deliverable';
+    user_stage: string;
+    artifacts: WorkArtifact[];
+    deep_link: string;
+    created_at: string;
+    updated_at: string;
+};
+
+export type WorkIndex = {
+    items: WorkItem[];
+    personal_assistant_agent_id?: string | null;
+    next_cursor?: string | null;
+};
+
+export const workApi = {
+    list: (limit = 50) => request<WorkIndex>(`/work?limit=${limit}`),
+
+    createTask: (data: {
+        client_request_id: string;
+        title: string;
+        intent: string;
+        priority: 'low' | 'medium' | 'high' | 'urgent';
+        executor_kind: 'personal_assistant' | 'agent_employee' | 'temporary_expert';
+        agent_id?: string;
+        expert_role?: string;
+    }) => request<{ item: WorkItem; created: boolean }>('/work/tasks', {
+        method: 'POST',
+        body: JSON.stringify(data),
+    }),
+};
+
 // ─── Tasks ────────────────────────────────────────────
 export const taskApi = {
     list: (agentId: string, status?: string, type?: string) => {
@@ -908,6 +968,8 @@ export interface ExperienceEntry {
     origin: 'chat' | 'legacy_plaza';
     origin_session_id: string | null;
     origin_agent_id: string | null;
+    source_task_id: string | null;
+    source_deliverable_request_id: string | null;
     created_by: string;
     reviewed_by: string | null;
     last_reviewed_at: string | null;

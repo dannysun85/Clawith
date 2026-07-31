@@ -419,12 +419,14 @@ def test_m3_post_migration_gate_requires_verified_runtime_tool_calling():
     assert "model.tool_calling_checked_at IS NULL" in postflight
     assert "model.tool_calling_error IS NOT NULL" in postflight
     assert "top_route.id <> expected.top_route_id" in postflight
-    assert "top_route.fallback_route_id <> expected.route_id" in postflight
-    assert "top_model.provider <> 'volcengine_agent_plan'" in postflight
+    assert "top_route.fallback_route_id <> expected.fallback_route_id" in postflight
+    assert "top_model.provider <> 'minimax'" in postflight
+    assert "fallback_model.provider <> 'volcengine_agent_plan'" in postflight
     assert (
         "COALESCE(top_model.capabilities::jsonb ->> 'seed_revision', '')"
         in postflight
     )
+    assert "seed_minimax_m3_understanding" in postflight
     assert "seed_agent_plan_text_routes" in postflight
 
 

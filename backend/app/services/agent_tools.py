@@ -9170,10 +9170,23 @@ async def _manage_tasks(
     async with async_session() as db:
         if action == "create":
             task_type = args.get("task_type", "todo")
+            agent = await db.get(AgentModel, agent_id)
+            if agent is None or agent.tenant_id is None:
+                return "❌ Agent has no company context; task was not created"
+            description = args.get("description")
             task = Task(
+                tenant_id=agent.tenant_id,
                 agent_id=agent_id,
                 title=title,
-                description=args.get("description"),
+                description=description,
+                intent=(description or title).strip(),
+                origin_type="agent_chat",
+                executor_kind="agent_employee",
+                executor_snapshot={
+                    "agent_id": str(agent.id),
+                    "agent_name": agent.name,
+                    "role_description": agent.role_description or "",
+                },
                 type=task_type,
                 priority=args.get("priority", "medium"),
                 created_by=user_id,

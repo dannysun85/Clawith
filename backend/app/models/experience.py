@@ -16,7 +16,7 @@ problem→solution story).
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, func
+from sqlalchemy import DateTime, ForeignKey, Index, String, Text, func
 from sqlalchemy.dialects.postgresql import JSON, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -33,6 +33,13 @@ class ExperienceEntry(Base):
     """
 
     __tablename__ = "experience_entries"
+    __table_args__ = (
+        Index("ix_experience_entries_source_task_id", "source_task_id"),
+        Index(
+            "ix_experience_entries_source_delivery_id",
+            "source_deliverable_request_id",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     # A draft created while editing a published/retired entry. Publishing the
@@ -69,6 +76,19 @@ class ExperienceEntry(Base):
     # ── Provenance & governance ──
     origin_session_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))  # source conversation
     origin_agent_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))    # agent present when distilled
+    # Optional immutable provenance into the task-first product chain. These do
+    # not make Experience a task log: the human still curates and publishes the
+    # entry, while the links let readers inspect the originating work.
+    source_task_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tasks.id", name="fk_experience_entries_source_task", ondelete="SET NULL"),
+    )
+    source_deliverable_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        # The Alembic revision adds the FK after the Deliverable tables exist.
+        # Keeping this as a scalar avoids precreating the newer Deliverable
+        # schema from the metadata-based bootstrap revision.
+    )
     created_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)  # initiator (chat participant)
     reviewed_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))          # who approved publish
     last_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # P1-3

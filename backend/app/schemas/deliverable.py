@@ -29,6 +29,7 @@ class DeliverableRequestCreate(BaseModel):
     client_request_id: uuid.UUID
     agent_id: uuid.UUID
     session_id: uuid.UUID
+    task_id: uuid.UUID | None = None
     work_type: Literal["presentation", "poster", "video", "report", "spreadsheet"]
     workflow_id: str = Field(min_length=1, max_length=120)
     workflow_version: str = Field(min_length=1, max_length=32)
@@ -273,6 +274,7 @@ class DeliverableRequestOut(BaseModel):
     agent_id: uuid.UUID
     session_id: uuid.UUID
     agent_run_id: uuid.UUID | None = None
+    task_id: uuid.UUID | None = None
     client_request_id: uuid.UUID
     work_type: str
     workflow_id: str

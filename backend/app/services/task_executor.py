@@ -37,6 +37,13 @@ def _task_goal(task: Task) -> str:
         goal = f"[任务执行] {task.title}"
     if task.description:
         goal += f"\n任务描述: {task.description}"
+    if task.executor_kind == "temporary_expert":
+        expert_role = str((task.executor_snapshot or {}).get("expert_role") or "").strip()
+        if expert_role:
+            goal += (
+                f"\n临时专家角色（仅本任务）: {expert_role}"
+                "\n请在此任务范围内以该专业角色分析和执行，不建立长期员工身份或长期记忆。"
+            )
     if task.type == "supervision":
         if task.supervision_target_name:
             goal += f"\n督办对象: {task.supervision_target_name}"
@@ -110,6 +117,8 @@ async def enqueue_task_runtime(
                 "task_type": task.type,
                 "title": task.title,
                 "description": task.description,
+                "executor_kind": task.executor_kind,
+                "executor_snapshot": dict(task.executor_snapshot or {}),
                 "saas_tier": route.saas_tier,
                 "model_modality": route.modality,
                 "fallback_model_id": (
@@ -167,7 +176,7 @@ async def _try_enqueue_runtime_task(
                 )
             from app.core.permissions import (
                 get_agent_access_level_for_user_id,
-                is_agent_expired,
+                is_agent_executable,
             )
             from app.models.user import User
 
@@ -192,11 +201,7 @@ async def _try_enqueue_runtime_task(
                     "requester_unauthorized",
                     "Task requester is no longer authorized",
                 )
-            if (
-                agent.status != "running"
-                or agent.deletion_requested_at is not None
-                or is_agent_expired(agent)
-            ):
+            if not is_agent_executable(agent):
                 raise TaskRuntimeIntakeError(
                     "agent_not_executable",
                     "Task Agent is not executable",

@@ -457,3 +457,40 @@ async def test_publish_normalizes_legacy_visibility_to_company(monkeypatch):
     assert entry.status == "published"
     assert entry.visibility_scope == "company"
     assert entry.visibility_scope_id is None
+
+
+@pytest.mark.asyncio
+async def test_work_provenance_accepts_only_owned_consistent_sources():
+    current_user = _user()
+    task = SimpleNamespace(id=uuid.uuid4())
+    delivery = SimpleNamespace(id=uuid.uuid4(), task_id=task.id)
+    db = RecordingDB(DummyResult([task]), DummyResult([delivery]))
+    payload = experience_api.EntryCreate(
+        source_task_id=task.id,
+        source_deliverable_request_id=delivery.id,
+    )
+
+    source_task_id, source_delivery_id = await experience_api._validate_work_provenance(
+        db, payload, current_user
+    )
+
+    assert (source_task_id, source_delivery_id) == (task.id, delivery.id)
+    assert "tasks.created_by" in _sql(db.statements[0])
+    assert "deliverable_requests.created_by_user_id" in _sql(db.statements[1])
+
+
+@pytest.mark.asyncio
+async def test_work_provenance_rejects_a_delivery_from_another_task():
+    current_user = _user()
+    task = SimpleNamespace(id=uuid.uuid4())
+    delivery = SimpleNamespace(id=uuid.uuid4(), task_id=uuid.uuid4())
+    db = RecordingDB(DummyResult([task]), DummyResult([delivery]))
+    payload = experience_api.EntryCreate(
+        source_task_id=task.id,
+        source_deliverable_request_id=delivery.id,
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await experience_api._validate_work_provenance(db, payload, current_user)
+
+    assert error.value.status_code == 409

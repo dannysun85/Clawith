@@ -25,7 +25,6 @@ from app.services.agent_plan_selection import (
     resolve_agent_plan_selection,
 )
 from app.services.entitlements import get_tenant_entitlements
-from app.services.quota_guard import QuotaExceeded, check_agent_creation_quota
 from app.services.skill_scope import resolve_agent_skills, scope_skill_query
 
 router = APIRouter(prefix="/onboarding", tags=["onboarding"])
@@ -267,18 +266,10 @@ async def create_personal_assistant(
             await db.commit()
             return {"agent": {"id": str(existing.id), "name": existing.name}, "onboarding": _status_payload(row)}
 
-    try:
-        await check_agent_creation_quota(current_user.id, tenant_id=current_user.tenant_id, db=db)
-    except QuotaExceeded as e:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail={
-                "code": e.quota_type,
-                "message": e.message,
-                "upgrade_url": "/account/subscription",
-            },
-        )
-
+    # A user's one onboarding-linked private assistant is a companion, not a
+    # purchased long-term Agent employee seat.  The onboarding row is the
+    # authoritative identity boundary; ordinary Agent creation continues to
+    # enforce max_agents in app.api.agents.
     agent = await _create_personal_assistant(db, current_user, data)
     row.personal_assistant_agent_id = agent.id
     row.current_step = "opening"

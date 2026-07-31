@@ -570,20 +570,30 @@ async def check_plan_generation_entitlement(
 
 
 async def _count_active_tenant_agents(tenant_id: uuid.UUID, db=None) -> int:
-    """Count active, non-expired user Agents that consume max_agents quota.
+    """Count active long-term Agent employees that consume max_agents quota.
 
     System agents such as OKR Agent are platform infrastructure. They must not
-    consume a tenant's purchased Agent seats.
+    consume a tenant's purchased Agent seats. A personal assistant linked by
+    UserTenantOnboarding is a per-user companion slot and is excluded by ID;
+    names, templates and free-form role descriptions are not trusted.
     """
     from app.models.agent import Agent
+    from app.models.onboarding import UserTenantOnboarding
 
     async def _count(session) -> int:
+        personal_assistant_ids = select(
+            UserTenantOnboarding.personal_assistant_agent_id
+        ).where(
+            UserTenantOnboarding.tenant_id == tenant_id,
+            UserTenantOnboarding.personal_assistant_agent_id.isnot(None),
+        )
         result = await session.execute(
             select(Agent).where(
                 Agent.tenant_id == tenant_id,
                 Agent.status.notin_(("stopped", "error")),
                 Agent.is_expired == False,  # noqa: E712
                 Agent.is_system == False,  # noqa: E712
+                ~Agent.id.in_(personal_assistant_ids),
             )
         )
         return len(result.scalars().all())

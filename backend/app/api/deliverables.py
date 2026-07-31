@@ -29,6 +29,7 @@ from app.models.deliverable import (
     DeliverableRequest,
 )
 from app.models.user import User
+from app.models.task import Task
 from app.schemas.deliverable import (
     DeliverableActionIn,
     DeliverableApprovalReadinessOut,
@@ -509,6 +510,7 @@ async def create_deliverable_request(
     fingerprint_payload = {
         "agent_id": str(data.agent_id),
         "session_id": str(data.session_id),
+        "task_id": str(data.task_id) if data.task_id else None,
         "work_type": data.work_type,
         "workflow_id": workflow.workflow_id,
         "workflow_version": workflow.workflow_version,
@@ -520,6 +522,19 @@ async def create_deliverable_request(
         "output_contract": output_contract,
     }
     fingerprint = request_fingerprint(fingerprint_payload)
+    if data.task_id is not None:
+        linked_task = (
+            await db.execute(
+                select(Task).where(
+                    Task.id == data.task_id,
+                    Task.tenant_id == agent.tenant_id,
+                    Task.created_by == current_user.id,
+                    Task.agent_id == agent.id,
+                )
+            )
+        ).scalar_one_or_none()
+        if linked_task is None:
+            raise HTTPException(status_code=404, detail="Task not found")
     existing_result = await db.execute(
         select(DeliverableRequest).where(
             DeliverableRequest.tenant_id == agent.tenant_id,
@@ -538,6 +553,7 @@ async def create_deliverable_request(
         created_by_user_id=current_user.id,
         agent_id=agent.id,
         session_id=data.session_id,
+        task_id=data.task_id,
         client_request_id=data.client_request_id,
         request_fingerprint=fingerprint,
         work_type=data.work_type,

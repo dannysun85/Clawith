@@ -127,6 +127,10 @@ export function DraftEditor({ draft, onClose, onSaved, onDeleted, docked, autoEx
         title: form.title, body: form.body, applicability: form.applicability, tags: form.tags,
         // Provenance (chat-sourced drafts): records the source agent + conversation.
         origin_agent_id: form.origin_agent_id, origin_session_id: form.origin_session_id,
+        // Work provenance is immutable after creation and remains hidden from
+        // the content editor; the source is selected in the workbench.
+        source_task_id: form.source_task_id,
+        source_deliverable_request_id: form.source_deliverable_request_id,
     });
 
     const save = useMutation({

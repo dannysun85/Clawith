@@ -533,6 +533,16 @@ def is_agent_expired(agent: Agent) -> bool:
     return False
 
 
+def is_agent_executable(agent: Agent) -> bool:
+    """Return whether an Agent may accept new interactive or task work."""
+    return (
+        getattr(agent, "status", None) in {"running", "idle"}
+        and getattr(agent, "deleted_at", None) is None
+        and getattr(agent, "deletion_requested_at", None) is None
+        and not is_agent_expired(agent)
+    )
+
+
 def can_auto_contact_company_agent(source_agent: Agent, target_agent: Agent) -> bool:
     """Return whether source can contact target via the phase-1 company-agent rule."""
     if not source_agent or not target_agent:

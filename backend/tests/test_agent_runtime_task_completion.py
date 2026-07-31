@@ -85,8 +85,10 @@ def _records(
     run_id = uuid.uuid4()
     task = Task(
         id=uuid.uuid4(),
+        tenant_id=tenant_id,
         agent_id=agent_id,
         title="Complete report",
+        intent="Complete report",
         type="todo",
         status="doing",
         priority="medium",

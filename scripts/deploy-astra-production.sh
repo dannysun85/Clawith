@@ -2712,17 +2712,17 @@ m3_route_post_migration_preflight() {
             "$COMPOSE_PROJECT" "$release/.env" "$release/$COMPOSE_FILE" \
             exec -T postgres psql -v ON_ERROR_STOP=1 -At \
             -U "$postgres_user" -d "$postgres_db" <<'SQL_M3_ROUTE_POSTFLIGHT'
-WITH expected(tier, modality, route_id, model_id, top_route_id) AS (
+WITH expected(tier, modality, route_id, model_id, top_route_id, fallback_route_id) AS (
     VALUES
-      ('lite', 'text',  '09300000-0000-4000-8000-000000000101'::uuid, '09300000-0000-4000-8000-000000000001'::uuid, '10700000-0000-4000-8000-000000000101'::uuid),
-      ('lite', 'image', '09300000-0000-4000-8000-000000000102'::uuid, '09300000-0000-4000-8000-000000000001'::uuid, '09300000-0000-4000-8000-000000000102'::uuid),
-      ('lite', 'video', '09300000-0000-4000-8000-000000000103'::uuid, '09300000-0000-4000-8000-000000000001'::uuid, '09300000-0000-4000-8000-000000000103'::uuid),
-      ('pro', 'text',   '09300000-0000-4000-8000-000000000104'::uuid, '09300000-0000-4000-8000-000000000002'::uuid, '10700000-0000-4000-8000-000000000102'::uuid),
-      ('pro', 'image',  '09300000-0000-4000-8000-000000000105'::uuid, '09300000-0000-4000-8000-000000000002'::uuid, '09300000-0000-4000-8000-000000000105'::uuid),
-      ('pro', 'video',  '09300000-0000-4000-8000-000000000106'::uuid, '09300000-0000-4000-8000-000000000002'::uuid, '09300000-0000-4000-8000-000000000106'::uuid),
-      ('ultra', 'text', '09300000-0000-4000-8000-000000000107'::uuid, '09300000-0000-4000-8000-000000000003'::uuid, '10700000-0000-4000-8000-000000000103'::uuid),
-      ('ultra', 'image','09300000-0000-4000-8000-000000000108'::uuid, '09300000-0000-4000-8000-000000000003'::uuid, '09300000-0000-4000-8000-000000000108'::uuid),
-      ('ultra', 'video','09300000-0000-4000-8000-000000000109'::uuid, '09300000-0000-4000-8000-000000000003'::uuid, '09300000-0000-4000-8000-000000000109'::uuid)
+      ('lite', 'text',  '09300000-0000-4000-8000-000000000101'::uuid, '09300000-0000-4000-8000-000000000001'::uuid, '09300000-0000-4000-8000-000000000101'::uuid, '10700000-0000-4000-8000-000000000101'::uuid),
+      ('lite', 'image', '09300000-0000-4000-8000-000000000102'::uuid, '09300000-0000-4000-8000-000000000001'::uuid, '09300000-0000-4000-8000-000000000102'::uuid, NULL::uuid),
+      ('lite', 'video', '09300000-0000-4000-8000-000000000103'::uuid, '09300000-0000-4000-8000-000000000001'::uuid, '09300000-0000-4000-8000-000000000103'::uuid, NULL::uuid),
+      ('pro', 'text',   '09300000-0000-4000-8000-000000000104'::uuid, '09300000-0000-4000-8000-000000000002'::uuid, '09300000-0000-4000-8000-000000000104'::uuid, '10700000-0000-4000-8000-000000000102'::uuid),
+      ('pro', 'image',  '09300000-0000-4000-8000-000000000105'::uuid, '09300000-0000-4000-8000-000000000002'::uuid, '09300000-0000-4000-8000-000000000105'::uuid, NULL::uuid),
+      ('pro', 'video',  '09300000-0000-4000-8000-000000000106'::uuid, '09300000-0000-4000-8000-000000000002'::uuid, '09300000-0000-4000-8000-000000000106'::uuid, NULL::uuid),
+      ('ultra', 'text', '09300000-0000-4000-8000-000000000107'::uuid, '09300000-0000-4000-8000-000000000003'::uuid, '09300000-0000-4000-8000-000000000107'::uuid, '10700000-0000-4000-8000-000000000103'::uuid),
+      ('ultra', 'image','09300000-0000-4000-8000-000000000108'::uuid, '09300000-0000-4000-8000-000000000003'::uuid, '09300000-0000-4000-8000-000000000108'::uuid, NULL::uuid),
+      ('ultra', 'video','09300000-0000-4000-8000-000000000109'::uuid, '09300000-0000-4000-8000-000000000003'::uuid, '09300000-0000-4000-8000-000000000109'::uuid, NULL::uuid)
 ), ranked AS (
     SELECT route.*,
            row_number() OVER (
@@ -2741,6 +2741,10 @@ WITH expected(tier, modality, route_id, model_id, top_route_id) AS (
      AND top_route.modality = expected.modality
      AND top_route.rank = 1
     LEFT JOIN llm_models AS top_model ON top_model.id = top_route.llm_model_id
+    LEFT JOIN model_routes AS fallback_route
+      ON fallback_route.id = top_route.fallback_route_id
+    LEFT JOIN llm_models AS fallback_model
+      ON fallback_model.id = fallback_route.llm_model_id
     WHERE route.id IS NULL
        OR route.enabled IS NOT TRUE
        OR route.saas_tier <> expected.tier
@@ -2750,11 +2754,21 @@ WITH expected(tier, modality, route_id, model_id, top_route_id) AS (
        OR (
             expected.modality = 'text'
             AND (
-                top_route.fallback_route_id <> expected.route_id
-                OR top_model.provider <> 'volcengine_agent_plan'
+                top_route.fallback_route_id <> expected.fallback_route_id
+                OR top_model.provider <> 'minimax'
                 OR top_model.enabled IS NOT TRUE
                 OR top_model.tenant_id IS NOT NULL
+                OR top_model.model <> 'MiniMax-M3'
                 OR COALESCE(top_model.capabilities::jsonb ->> 'seed_revision', '')
+                    <> 'seed_minimax_m3_understanding'
+                OR fallback_route.id <> expected.fallback_route_id
+                OR fallback_route.enabled IS NOT TRUE
+                OR fallback_route.saas_tier <> expected.tier
+                OR fallback_route.modality <> 'text'
+                OR fallback_model.provider <> 'volcengine_agent_plan'
+                OR fallback_model.enabled IS NOT TRUE
+                OR fallback_model.tenant_id IS NOT NULL
+                OR COALESCE(fallback_model.capabilities::jsonb ->> 'seed_revision', '')
                     <> 'seed_agent_plan_text_routes'
             )
        )

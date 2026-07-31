@@ -1,4 +1,5 @@
 import uuid
+import inspect
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -50,6 +51,13 @@ async def test_onboarding_personal_assistant_uses_active_plan_default_tier():
         AsyncMock(return_value=_ent()),
     ):
         assert await onboarding_api._tenant_plan_selection(uuid.uuid4()) == ("lite", "text")
+
+
+def test_onboarding_personal_assistant_uses_a_companion_slot_not_employee_quota():
+    source = inspect.getsource(onboarding_api.create_personal_assistant)
+
+    assert "check_agent_creation_quota" not in source
+    assert "personal_assistant_agent_id" in source
 
 
 @pytest.mark.asyncio

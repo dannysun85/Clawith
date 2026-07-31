@@ -37,11 +37,14 @@ def _settings(*, enabled: bool) -> Settings:
 def _records(*, task_type: str = "todo") -> tuple[Task, Agent]:
     agent_id = uuid.uuid4()
     creator_id = uuid.uuid4()
+    tenant_id = uuid.uuid4()
     task = Task(
         id=uuid.uuid4(),
+        tenant_id=tenant_id,
         agent_id=agent_id,
         title="Prepare the report",
         description="Use the current workspace evidence",
+        intent="Use the current workspace evidence",
         type=task_type,
         status="pending",
         priority="medium",
@@ -49,7 +52,7 @@ def _records(*, task_type: str = "todo") -> tuple[Task, Agent]:
     )
     agent = Agent(
         id=agent_id,
-        tenant_id=uuid.uuid4(),
+        tenant_id=tenant_id,
         creator_id=creator_id,
         name="Analyst",
         role_description="Analyze evidence",
@@ -97,6 +100,47 @@ async def test_todo_registration_updates_task_in_same_caller_session() -> None:
     assert command.payload["model_modality"] == "text"
     assert command.delivery_status == "not_required"
     assert command.payload["task_id"] == str(task.id)
+
+
+@pytest.mark.asyncio
+async def test_temporary_expert_role_reaches_runtime_goal_and_audit_payload() -> None:
+    task, agent = _records()
+    task.executor_kind = "temporary_expert"
+    task.executor_snapshot = {
+        "agent_id": str(agent.id),
+        "agent_name": agent.name,
+        "expert_role": "Enterprise contract risk reviewer",
+        "scope": "task_run_only",
+        "inherits_long_term_memory": False,
+    }
+    session = _Session()
+    handle = RunHandle(
+        tenant_id=agent.tenant_id,
+        run_id=uuid.uuid4(),
+        thread_id=str(uuid.uuid4()),
+        command_id=uuid.uuid4(),
+        runtime_type="langgraph",
+        created=True,
+    )
+
+    with patch(
+        "app.services.task_executor.RuntimeCommandIntake.start_run",
+        new=AsyncMock(return_value=handle),
+    ) as start_run:
+        await enqueue_task_runtime(
+            session,  # type: ignore[arg-type]
+            task=task,
+            agent=agent,
+            settings_override=_settings(enabled=True),
+        )
+
+    command = start_run.await_args.args[0]
+    assert "Enterprise contract risk reviewer" in command.goal
+    assert "仅本任务" in command.goal
+    assert command.payload["executor_kind"] == "temporary_expert"
+    assert command.payload["executor_snapshot"]["expert_role"] == (
+        "Enterprise contract risk reviewer"
+    )
 
 
 @pytest.mark.asyncio
