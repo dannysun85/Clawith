@@ -148,7 +148,7 @@ class CodeSandboxBackend(BaseSandboxBackend):
 
         except Exception as e:
             duration_ms = int((time.time() - start_time) * 1000)
-            logger.exception(f"[CodeSandbox] Execution error")
+            logger.exception("[CodeSandbox] Execution error")
             return ExecutionResult(
                 success=False,
                 stdout="",

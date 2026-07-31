@@ -12,7 +12,6 @@ from sqlalchemy import and_, delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased, selectinload
 
-from app.config import get_settings
 from app.core.permissions import (
     build_visible_agents_query,
     check_agent_access,
@@ -25,10 +24,9 @@ from app.core.security import get_current_user
 from app.database import get_db
 from app.models.agent import Agent
 from app.models.org import AgentRelationship, AgentAgentRelationship, OrgMember
-from app.models.user import Identity, User
+from app.models.user import User
 from app.services.access_relationships import ensure_access_granted_platform_relationships
 from app.services.org_sync_adapter import derive_member_department_paths
-from app.services.storage import store_agent_bytes
 
 router = APIRouter(prefix="/agents/{agent_id}/relationships", tags=["legacy-relationships"])
 

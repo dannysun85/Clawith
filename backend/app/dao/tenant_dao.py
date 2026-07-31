@@ -34,7 +34,7 @@ class TenantDAO(BaseDAO[Tenant]):
             result = await db.execute(
                 select(Tenant).where(
                     Tenant.sso_domain == domain.lower(),
-                    Tenant.is_active == True,
+                    Tenant.is_active.is_(True),
                 )
             )
             return result.scalar_one_or_none()

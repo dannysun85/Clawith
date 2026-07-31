@@ -5,11 +5,9 @@ in chat_messages (via ChatSession with source_channel='agent').
 This API now queries chat_sessions + chat_messages for the inbox.
 """
 
-import uuid
-from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select, func
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import get_current_user

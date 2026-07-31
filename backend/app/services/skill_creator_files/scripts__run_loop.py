@@ -192,7 +192,7 @@ def run_loop(
 
         # Improve the description based on train results
         if verbose:
-            logger.info(f"\nImproving description...")
+            logger.info("\nImproving description...")
 
         t0 = time.time()
         # Strip test scores from history so improvement model can't see them

@@ -191,7 +191,7 @@ class SelfHostedBackend(BaseSandboxBackend):
 
         except Exception as e:
             duration_ms = int((time.time() - start_time) * 1000)
-            logger.exception(f"[SelfHosted] Execution error")
+            logger.exception("[SelfHosted] Execution error")
             return ExecutionResult(
                 success=False,
                 stdout="",

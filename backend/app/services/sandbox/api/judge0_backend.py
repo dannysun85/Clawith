@@ -186,7 +186,7 @@ class Judge0Backend(BaseSandboxBackend):
 
         except Exception as e:
             duration_ms = int((time.time() - start_time) * 1000)
-            logger.exception(f"[Judge0] Execution error")
+            logger.exception("[Judge0] Execution error")
             return ExecutionResult(
                 success=False,
                 stdout="",

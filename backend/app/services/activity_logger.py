@@ -1,7 +1,6 @@
 """Activity logger — simple async function to record agent actions."""
 
 import uuid
-from datetime import datetime, timezone
 
 from loguru import logger
 

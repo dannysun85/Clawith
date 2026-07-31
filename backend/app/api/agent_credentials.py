@@ -21,7 +21,6 @@ from app.models.agent_credential import AgentCredential
 from app.models.user import User
 from app.schemas.agent_credential import (
     AgentCredentialCreate,
-    AgentCredentialResponse,
     AgentCredentialUpdate,
 )
 

@@ -449,8 +449,8 @@ def main() -> None:
         port = server.server_address[1]
 
     url = f"http://localhost:{port}"
-    logger.info(f"\n  Eval Viewer")
-    logger.info(f"  ─────────────────────────────────")
+    logger.info("\n  Eval Viewer")
+    logger.info("  ─────────────────────────────────")
     logger.info(f"  URL:       {url}")
     logger.info(f"  Workspace: {workspace}")
     logger.info(f"  Feedback:  {feedback_path}")
@@ -458,7 +458,7 @@ def main() -> None:
         logger.info(f"  Previous:  {args.previous_workspace} ({len(previous)} runs)")
     if benchmark_path:
         logger.info(f"  Benchmark: {benchmark_path}")
-    logger.info(f"\n  Press Ctrl+C to stop.\n")
+    logger.info("\n  Press Ctrl+C to stop.\n")
 
     webbrowser.open(url)
 

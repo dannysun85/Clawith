@@ -382,7 +382,7 @@ def _build_company_daily_content(
 ) -> str:
     """Build a concise company daily report from member daily reports."""
     lines = [
-        f"# Company Daily Report",
+        "# Company Daily Report",
         f"Date: {period_day.isoformat()}",
         "",
         "## Submission Summary",

@@ -126,7 +126,7 @@ async def _get_okr_agent(db: AsyncSession, tenant_id: uuid.UUID) -> Agent | None
     res = await db.execute(
         select(Agent).where(
             Agent.tenant_id == tenant_id,
-            Agent.is_system == True,
+            Agent.is_system.is_(True),
             Agent.name == "OKR Agent",
             Agent.deleted_at.is_(None),
         ).limit(1)
