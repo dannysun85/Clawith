@@ -20,6 +20,10 @@
   credential, entitlement, Credits, durable-task, storage, and failover
   boundaries. The customer and Agent continue to request capabilities rather
   than provider model IDs.
+- The production route gate validates the intended live topology: Agent Plan
+  owns the top text route for Lite, Pro, and Ultra, each with its exact
+  MiniMax-M3 fallback; MiniMax-M3 remains the top image and video route. This
+  prevents the release gate from rejecting its own Agent Plan migration.
 - Historical image, video, speech, and music results now reconstruct the
   authenticated right-side Workspace preview after reload. The selected path
   must appear both in a successful durable media Tool receipt and, when

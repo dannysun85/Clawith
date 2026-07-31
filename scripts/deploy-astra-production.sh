@@ -2712,17 +2712,17 @@ m3_route_post_migration_preflight() {
             "$COMPOSE_PROJECT" "$release/.env" "$release/$COMPOSE_FILE" \
             exec -T postgres psql -v ON_ERROR_STOP=1 -At \
             -U "$postgres_user" -d "$postgres_db" <<'SQL_M3_ROUTE_POSTFLIGHT'
-WITH expected(tier, modality, route_id, model_id) AS (
+WITH expected(tier, modality, route_id, model_id, top_route_id) AS (
     VALUES
-      ('lite', 'text',  '09300000-0000-4000-8000-000000000101'::uuid, '09300000-0000-4000-8000-000000000001'::uuid),
-      ('lite', 'image', '09300000-0000-4000-8000-000000000102'::uuid, '09300000-0000-4000-8000-000000000001'::uuid),
-      ('lite', 'video', '09300000-0000-4000-8000-000000000103'::uuid, '09300000-0000-4000-8000-000000000001'::uuid),
-      ('pro', 'text',   '09300000-0000-4000-8000-000000000104'::uuid, '09300000-0000-4000-8000-000000000002'::uuid),
-      ('pro', 'image',  '09300000-0000-4000-8000-000000000105'::uuid, '09300000-0000-4000-8000-000000000002'::uuid),
-      ('pro', 'video',  '09300000-0000-4000-8000-000000000106'::uuid, '09300000-0000-4000-8000-000000000002'::uuid),
-      ('ultra', 'text', '09300000-0000-4000-8000-000000000107'::uuid, '09300000-0000-4000-8000-000000000003'::uuid),
-      ('ultra', 'image','09300000-0000-4000-8000-000000000108'::uuid, '09300000-0000-4000-8000-000000000003'::uuid),
-      ('ultra', 'video','09300000-0000-4000-8000-000000000109'::uuid, '09300000-0000-4000-8000-000000000003'::uuid)
+      ('lite', 'text',  '09300000-0000-4000-8000-000000000101'::uuid, '09300000-0000-4000-8000-000000000001'::uuid, '10700000-0000-4000-8000-000000000101'::uuid),
+      ('lite', 'image', '09300000-0000-4000-8000-000000000102'::uuid, '09300000-0000-4000-8000-000000000001'::uuid, '09300000-0000-4000-8000-000000000102'::uuid),
+      ('lite', 'video', '09300000-0000-4000-8000-000000000103'::uuid, '09300000-0000-4000-8000-000000000001'::uuid, '09300000-0000-4000-8000-000000000103'::uuid),
+      ('pro', 'text',   '09300000-0000-4000-8000-000000000104'::uuid, '09300000-0000-4000-8000-000000000002'::uuid, '10700000-0000-4000-8000-000000000102'::uuid),
+      ('pro', 'image',  '09300000-0000-4000-8000-000000000105'::uuid, '09300000-0000-4000-8000-000000000002'::uuid, '09300000-0000-4000-8000-000000000105'::uuid),
+      ('pro', 'video',  '09300000-0000-4000-8000-000000000106'::uuid, '09300000-0000-4000-8000-000000000002'::uuid, '09300000-0000-4000-8000-000000000106'::uuid),
+      ('ultra', 'text', '09300000-0000-4000-8000-000000000107'::uuid, '09300000-0000-4000-8000-000000000003'::uuid, '10700000-0000-4000-8000-000000000103'::uuid),
+      ('ultra', 'image','09300000-0000-4000-8000-000000000108'::uuid, '09300000-0000-4000-8000-000000000003'::uuid, '09300000-0000-4000-8000-000000000108'::uuid),
+      ('ultra', 'video','09300000-0000-4000-8000-000000000109'::uuid, '09300000-0000-4000-8000-000000000003'::uuid, '09300000-0000-4000-8000-000000000109'::uuid)
 ), ranked AS (
     SELECT route.*,
            row_number() OVER (
@@ -2740,12 +2740,24 @@ WITH expected(tier, modality, route_id, model_id) AS (
       ON top_route.saas_tier = expected.tier
      AND top_route.modality = expected.modality
      AND top_route.rank = 1
+    LEFT JOIN llm_models AS top_model ON top_model.id = top_route.llm_model_id
     WHERE route.id IS NULL
        OR route.enabled IS NOT TRUE
        OR route.saas_tier <> expected.tier
        OR route.modality <> expected.modality
        OR route.llm_model_id <> expected.model_id
-       OR top_route.id <> expected.route_id
+       OR top_route.id <> expected.top_route_id
+       OR (
+            expected.modality = 'text'
+            AND (
+                top_route.fallback_route_id <> expected.route_id
+                OR top_model.provider <> 'volcengine_agent_plan'
+                OR top_model.enabled IS NOT TRUE
+                OR top_model.tenant_id IS NOT NULL
+                OR COALESCE(top_model.capabilities::jsonb ->> 'seed_revision', '')
+                    <> 'seed_agent_plan_text_routes'
+            )
+       )
        OR model.provider <> 'minimax'
        OR model.model <> 'MiniMax-M3'
        OR model.enabled IS NOT TRUE
@@ -2768,7 +2780,7 @@ SQL_M3_ROUTE_POSTFLIGHT
             ;;
     esac
     if [ "$invalid_count" != "0" ]; then
-        echo "M3 post-migration preflight failed: invalid_exact_top_routes=$invalid_count" >&2
+        echo "M3/Agent Plan post-migration preflight failed: invalid_route_topology=$invalid_count" >&2
         return 1
     fi
 }
@@ -5057,7 +5069,7 @@ if ! model_route_credential_preflight "$RELEASE"; then
     abort_release "model-route or MiniMax credential contract failed after migration"
 fi
 if ! m3_route_post_migration_preflight "$RELEASE"; then
-    abort_release "MiniMax-M3 exact 3x3 top-route contract failed after migration"
+    abort_release "MiniMax-M3 fallback and Agent Plan text-route contract failed after migration"
 fi
 if ! compose_project "$CANDIDATE_PROJECT" "$RELEASE/.env" "$RELEASE/$COMPOSE_FILE" \
     run --rm --no-deps -T --entrypoint python backend \
