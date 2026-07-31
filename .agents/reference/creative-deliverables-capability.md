@@ -610,6 +610,35 @@ PPT Provider 对比。拒绝凭空补齐 brief 是评测正确性，不是 PPT �
 不能再写成“图片/视频/PPT 没做”，也不能写成“已经全部完成”。下一阶段的核心不是继续增加生成按钮，
 而是把正式质量评审、批准、修订、生产 Provider 配置和滚动 Benchmark 收成一个可运营产品闭环。
 
+### Benchmark 整轮就绪审计（2026-07-31）
+
+新增 `backend/scripts/audit_creative_benchmark_run.py`，将单候选/单评审的历史缺陷定位结果与正式商用
+结论明确隔离：
+
+- 同时检查图片、视频、PPT 三种 modality 的 batch、provider-free public package、私有解盲 key、
+  候选全集和至少 3 份独立评审模板；
+- 重新计算公开 Artifact SHA-256，并与结构观察 receipt 逐文件核对；文件替换、缺失、symlink、
+  目录逃逸或候选集合不一致均为 `invalid`；
+- 检查公开 JSON 是否泄漏私有 candidate/provider/model 标识；候选文件名仍保持 opaque；
+- `sealed-scored-reviews.json` 和旧 `*-review-submissions.json` 明确标记为 provisional，只能做缺陷
+  定位，不能签发 `commercial_ready`；
+- 只有覆盖全部候选、每项绑定原 Artifact hash、至少 3 名真实评审并已经封存的
+  `sealed-panel-results.json`，且所有候选通过商用门槛时，整轮才可能返回 `commercial_ready`；
+- 正式评分输出同时绑定 batch spec SHA-256、public review package SHA-256 和逐候选 Artifact
+  hash；把评分文件复制到另一批次或替换产物会被整轮审计拒绝；
+- 工具只读本地文件，不调用 Provider、不消耗 Credits，也不修改评测产物。
+
+对 `tmp/creative-evaluation/blind-review-2026-07-27` 的实际审计结果为
+`awaiting_human_review`、`issues=[]`：
+
+- 图片：3 个候选、3 个 Artifact hash 通过、3 份空白评审模板、0 份正式评审；
+- 视频：2 个候选、2 个 Artifact hash 通过、3 份空白评审模板、0 份正式评审；
+- PPT：2 个候选、PPTX/PDF 共 4 个 Artifact hash 通过、3 份空白评审模板、0 份正式评审；
+- 三类均存在 provisional 历史评分，但全部被审计器排除在正式商用证据之外。
+
+因此现有包已经达到“可交给真实评审人执行”的工程准备状态，但准确结论仍是
+`commercially_usable_proven=false`。
+
 ## 六、验收与后续扩展
 
 图片、视频、PPT 必须用真实匿名化客户样本分别建立基线，并追踪：

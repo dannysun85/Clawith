@@ -984,6 +984,10 @@ provider-free 本地底座：
 - `backend/scripts/inspect_creative_artifacts.py`：不调用 Provider 的本地 Artifact 结构检查；
 - `backend/scripts/prepare_creative_blind_review.py`：生成公开 review package 和私有 attribution key；
 - `backend/scripts/score_creative_blind_review.py`：先写 provider-free sealed score，再按私钥解盲；
+- `backend/scripts/audit_creative_benchmark_run.py`：从整轮层面核对 modality 覆盖、公开 Artifact hash、
+  provider 去标识、三人模板和正式 panel 结果；provisional 单人结果永远不能形成商用通过；
+- `score_creative_blind_review_panel.py` 的正式输出绑定 batch spec、public package 和候选 Artifact
+  SHA-256；审计器拒绝跨批次复制或产物替换后的旧评分；
 - `backend/tests/test_creative_evaluation.py`：验证 seed 可复现、seed 轮换、覆盖、留出隔离、Provider
   去标识、缺失证据不乐观通过和硬门禁 fail-closed。
 
@@ -1011,6 +1015,13 @@ provider-free 本地底座：
 
 当前三类历史包已各生成 3 份模板，共 9 份；这只证明评审输入与隔离流程已准备好，不表示 9 份真实判断
 已经存在。
+
+2026-07-31 使用整轮审计器复核 `blind-review-2026-07-27`：
+
+- 图片 3/3、视频 2/2、PPT 4/4 个公开 Artifact 文件的 SHA-256 与 package receipt 一致；
+- 三类各有 3 份 reviewer 模板，完成数均为 0，正式 panel result 均不存在；
+- 旧单人/自动评分均被标记为 provisional，不参与 `commercial_ready`；
+- 整轮状态为 `awaiting_human_review`，不是 `commercial_ready`，也不是包损坏。
 
 本地审批 shadow 已增加 `deliverable_quality_gate.py`，并接入 Artifact approval/read model：
 

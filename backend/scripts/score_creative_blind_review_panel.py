@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -57,6 +58,14 @@ def _write_private_json(path: Path, value: object) -> None:
     path.chmod(0o600)
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def main() -> int:
     args = parse_args()
     batch_payload = json.loads(args.batch_spec.read_text(encoding="utf-8"))
@@ -85,6 +94,16 @@ def main() -> int:
             "schema_version": "1.0.0",
             "scenario_id": scenario.scenario_id,
             "minimum_reviewers": args.minimum_reviewers,
+            "batch_spec_sha256": _sha256_file(args.batch_spec),
+            "review_package_sha256": _sha256_file(args.review_package),
+            "artifact_hashes": {
+                candidate.label: {
+                    artifact_type: observation.content_sha256
+                    for artifact_type, observation
+                    in candidate.structural_observation.files.items()
+                }
+                for candidate in package.candidates
+            },
             "results": [item.model_dump(mode="json") for item in results],
         },
     )
