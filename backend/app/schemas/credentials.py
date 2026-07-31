@@ -195,6 +195,8 @@ class CredentialOut(BaseModel):
     daily_quota: int | None = None
     used_today: int = 0
     status: str = "unverified"
+    last_verification_at: datetime | None = None
+    verification_receipt: dict[str, object] | None = None
     error_count: int = 0
     weight: int = 1
     priority: int = 0
@@ -215,6 +217,7 @@ class CredentialVerificationOut(BaseModel):
     provider_status: int | None = None
     model_count: int | None = None
     message: str | None = None
+    receipt: dict[str, object]
 
 
 class CredentialHealthOut(BaseModel):

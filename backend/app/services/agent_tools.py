@@ -27732,7 +27732,16 @@ async def _resolve_human_on_message_binding(
                 None,
             )
         watched_user = users[0]
-        if watched_user.id != requester.id and not can_audit_agent_chat_sessions(requester):
+        requester_access = await get_agent_access_level_for_user_id(
+            db,
+            requester.id,
+            agent,
+        )
+        if watched_user.id != requester.id and not can_audit_agent_chat_sessions(
+            requester,
+            agent=agent,
+            agent_access_level=requester_access,
+        ):
             return (
                 None,
                 "Watching another user's messages requires an Agent chat audit role",

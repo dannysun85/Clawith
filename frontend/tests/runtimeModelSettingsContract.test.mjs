@@ -39,7 +39,8 @@ test('the centralized SaaS owner can select planning and group context models pe
 
 test('runtime model choices use tenant-safe backend candidates without restoring tenant model CRUD', () => {
   assert.match(saasAdminSource, /settingsQuery\.data\?\.candidates/);
-  assert.match(saasAdminSource, /候选模型必须已启用并通过原生工具调用测试/);
+  assert.match(saasAdminSource, /候选模型必须已启用并保留当前配置的连接验证 evidence/);
+  assert.match(saasAdminSource, /原生工具调用是否支持属于独立诊断/);
   assert.match(saasAdminSource, /运行时模型配置已更新并立即生效/);
   assert.match(enterpriseSettingsSource, /navigate\(`\/admin\/saas\?tab=\$\{activeTab === 'llm' \? 'model-routes' : 'plans'\}`/);
 });
@@ -78,7 +79,9 @@ test('media admin separates managed routing from non-equivalent emergency qualit
   assert.match(saasAdminSource, /图片、语音和视频按“火山 Agent Plan → MiniMax”/);
   assert.match(saasAdminSource, /音乐目前使用 MiniMax/);
   assert.match(saasAdminSource, /MiniMax 应急路径/);
-  assert.match(saasAdminSource, /仅剩 MiniMax 时属于非等价降级/);
-  assert.match(saasAdminSource, /正式可用/);
-  assert.match(saasAdminSource, /仅降级可用/);
+  assert.match(saasAdminSource, /仅剩 MiniMax 时仍属于非等价降级/);
+  assert.match(saasAdminSource, /账号线路可路由/);
+  assert.match(saasAdminSource, /仅降级线路可路由/);
+  assert.match(saasAdminSource, /真实生成成功，质量未评审/);
+  assert.match(saasAdminSource, /商用质量已通过/);
 });

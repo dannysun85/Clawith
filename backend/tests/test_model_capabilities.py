@@ -1,6 +1,7 @@
 """Pure tests for cached model capability and platform-model resolution."""
 
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 
@@ -24,6 +25,8 @@ def _model(**overrides: object) -> LLMModel:
         "api_key_encrypted": "secret",
         "label": "Test model",
         "enabled": True,
+        "verification_status": "verified",
+        "last_verified_at": datetime.now(UTC),
     }
     values.update(overrides)
     return LLMModel(**values)
@@ -241,6 +244,10 @@ async def test_platform_model_resolution_requires_configuration() -> None:
         (None, "does not exist"),
         (_model(enabled=False), "is disabled"),
         (_model(tenant_id=uuid.uuid4()), "is tenant-scoped"),
+        (
+            _model(verification_status=None, last_verified_at=None),
+            "no current connection verification",
+        ),
     ],
 )
 async def test_platform_model_resolution_rejects_unusable_models(

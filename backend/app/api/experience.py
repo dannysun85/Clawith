@@ -18,6 +18,7 @@ from sqlalchemy import cast, desc, func, or_, select
 from sqlalchemy.dialects.postgresql import JSONB
 
 from app.api.auth import get_current_user
+from app.core.permissions import check_agent_access
 from app.database import async_session
 from app.models.agent import Agent
 from app.models.deliverable import DeliverableRequest
@@ -128,7 +129,7 @@ async def _validate_work_provenance(
     db,
     payload: EntryCreate,
     current_user: User,
-) -> tuple[uuid.UUID | None, uuid.UUID | None]:
+) -> tuple[uuid.UUID | None, uuid.UUID | None, uuid.UUID | None]:
     """Resolve optional source links without exposing another member's work.
 
     Company administrators govern the library but do not implicitly gain access
@@ -151,6 +152,8 @@ async def _validate_work_provenance(
         ).scalar_one_or_none()
         if not task:
             raise HTTPException(404, "Source task not found")
+        if task.status not in {"done", "failed"}:
+            raise HTTPException(409, "Source task is still in progress")
 
     if payload.source_deliverable_request_id:
         delivery = (
@@ -164,15 +167,36 @@ async def _validate_work_provenance(
         ).scalar_one_or_none()
         if not delivery:
             raise HTTPException(404, "Source delivery not found")
+        if delivery.status not in {"succeeded", "failed", "cancelled"}:
+            raise HTTPException(409, "Source delivery is still in progress")
         if task and delivery.task_id and delivery.task_id != task.id:
             raise HTTPException(409, "Source task does not match the delivery")
-        if not task and delivery.task_id:
-            task_id = delivery.task_id
-        else:
-            task_id = task.id if task else None
-        return task_id, delivery.id
 
-    return task.id if task else None, None
+    source_agent_ids = {
+        agent_id
+        for agent_id in (
+            getattr(task, "agent_id", None),
+            getattr(delivery, "agent_id", None),
+        )
+        if isinstance(agent_id, uuid.UUID)
+    }
+    if len(source_agent_ids) > 1:
+        raise HTTPException(409, "Source work belongs to different Agents")
+    source_agent_id = next(iter(source_agent_ids), None)
+    if (
+        payload.origin_agent_id is not None
+        and source_agent_id is not None
+        and payload.origin_agent_id != source_agent_id
+    ):
+        raise HTTPException(409, "Source Agent does not match the work provenance")
+    task_id = (
+        task.id
+        if task is not None
+        else delivery.task_id
+        if delivery is not None
+        else None
+    )
+    return task_id, delivery.id if delivery is not None else None, source_agent_id
 
 
 # ── Management permissions (independent from tenant-wide published reads) ──
@@ -366,9 +390,18 @@ async def create_entry(payload: EntryCreate, current_user: User = Depends(get_cu
     """
     eff = _effective_tenant_id(current_user)
     async with async_session() as db:
-        source_task_id, source_delivery_id = await _validate_work_provenance(
+        source_task_id, source_delivery_id, source_agent_id = await _validate_work_provenance(
             db, payload, current_user
         )
+        origin_agent_id = payload.origin_agent_id or source_agent_id
+        if origin_agent_id is not None:
+            origin_agent, _ = await check_agent_access(
+                db,
+                current_user,
+                origin_agent_id,
+            )
+            if origin_agent.tenant_id != current_user.tenant_id:
+                raise HTTPException(404, "Source Agent not found")
         dupe = await _find_identical(db, eff, payload)
         if dupe:
             raise HTTPException(409, f"内容完全相同的经验已存在（“{dupe.title or '未命名'}”），无需重复沉淀。")
@@ -385,7 +418,7 @@ async def create_entry(payload: EntryCreate, current_user: User = Depends(get_cu
             visibility_scope_id=None,
             origin="chat",
             origin_session_id=payload.origin_session_id,
-            origin_agent_id=payload.origin_agent_id,
+            origin_agent_id=origin_agent_id,
             source_task_id=source_task_id,
             source_deliverable_request_id=source_delivery_id,
             created_by=current_user.id,

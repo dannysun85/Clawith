@@ -14,6 +14,7 @@ from app.services.agent_runtime.command_worker import RuntimeSessionFactory
 from app.services.agent_runtime.model_capabilities import (
     ModelCapabilityError,
     ModelCapabilityResolver,
+    model_connection_verification,
 )
 from app.services.agent_runtime.node_executor import (
     RuntimeCancelSource,
@@ -402,6 +403,11 @@ class PlanningModelService:
             raise PlanningContractError(
                 "planning_model_unavailable",
                 "Pinned Planning model is not enabled for this Group tenant",
+            )
+        if model_connection_verification(model) is None:
+            raise PlanningContractError(
+                "planning_model_unavailable",
+                "Pinned Planning model has no current connection verification",
             )
         try:
             ModelCapabilityResolver.request_input_limit(

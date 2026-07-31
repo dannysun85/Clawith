@@ -668,6 +668,49 @@ def test_unified_chat_precreation_repairs_only_final_indexes() -> None:
         )
 
 
+def test_runtime_phase_accepts_only_the_exact_initial_schema_bootstrap_shape() -> None:
+    migration = _load_migration()
+    bootstrap = set(migration._RUNTIME_BOOTSTRAP_PRECREATED_OBJECTS)
+
+    assert migration._precreated_phase_state("runtime_schema", bootstrap) is False
+    with pytest.raises(RuntimeError, match="partially precreated runtime_schema"):
+        migration._precreated_phase_state(
+            "runtime_schema",
+            bootstrap - {next(iter(bootstrap))},
+        )
+
+
+def test_runtime_upgrade_adds_only_tables_missing_from_initial_schema(monkeypatch) -> None:
+    migration = _load_migration()
+    bootstrap = set(migration._RUNTIME_BOOTSTRAP_PRECREATED_OBJECTS)
+    created: list[str] = []
+    index_inputs: list[set[str]] = []
+
+    monkeypatch.setattr(migration.op, "execute", lambda _statement: None)
+    monkeypatch.setattr(migration.op, "get_bind", lambda: object())
+    monkeypatch.setattr(migration, "_schema_object_names", lambda _bind: bootstrap)
+    for table_name in migration.RUNTIME_TABLES:
+        monkeypatch.setitem(
+            migration._RUNTIME_CREATE,
+            table_name,
+            lambda table_name=table_name: created.append(table_name),
+        )
+    monkeypatch.setattr(
+        migration,
+        "_create_runtime_indexes",
+        lambda existing=None: index_inputs.append(set(existing or ())),
+    )
+
+    migration._upgrade_runtime_schema()
+
+    assert created == [
+        "agent_run_commands",
+        "agent_run_events",
+        "session_context_states",
+    ]
+    assert index_inputs == [bootstrap]
+
+
 def test_unified_chat_precreation_reconciliation_creates_safe_indexes() -> None:
     migration = _load_migration()
     bind = _RecordingBind()

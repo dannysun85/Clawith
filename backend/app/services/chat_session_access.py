@@ -18,9 +18,7 @@ from app.models.user import User
 from app.core.permissions import get_agent_access_level_for_user_id, is_agent_expired
 
 
-CHAT_SESSION_AUDIT_ROLES = frozenset(
-    {"platform_admin", "org_admin", "agent_admin"}
-)
+CHAT_SESSION_AUDIT_ROLES = frozenset({"platform_admin", "org_admin"})
 
 
 class ChatSessionAuthorizationError(PermissionError):
@@ -161,10 +159,24 @@ async def validate_active_user_chat_lane(
     return AuthorizedUserChatLane(session=session, agent=agent, owner=owner)
 
 
-def can_audit_agent_chat_sessions(user: User) -> bool:
-    """Return whether a user may cross another session owner's boundary."""
+def can_audit_agent_chat_sessions(
+    user: User,
+    *,
+    agent: Agent | None = None,
+    agent_access_level: str | None = None,
+) -> bool:
+    """Return whether a user may cross another session owner's boundary.
 
-    return user.role in CHAT_SESSION_AUDIT_ROLES
+    ``agent_admin`` is deliberately not a company-wide audit role. It only
+    gains this visibility for an Agent that has an explicit effective
+    ``manage`` grant. Agent creators retain the same per-Agent authority.
+    """
+
+    if user.role in CHAT_SESSION_AUDIT_ROLES:
+        return True
+    if agent is not None and str(agent.creator_id) == str(user.id):
+        return True
+    return user.role == "agent_admin" and agent_access_level == "manage"
 
 
 async def require_authorized_agent_chat_session(
@@ -183,6 +195,16 @@ async def require_authorized_agent_chat_session(
     from a missing session.
     """
 
+    agent_result = await db.execute(
+        select(Agent).where(
+            Agent.id == agent_id,
+            Agent.deleted_at.is_(None),
+        )
+    )
+    agent = agent_result.scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Session not found")
+
     result = await db.execute(
         select(ChatSession).where(
             ChatSession.id == session_id,
@@ -196,17 +218,23 @@ async def require_authorized_agent_chat_session(
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
+    access_level = await get_agent_access_level_for_user_id(db, user.id, agent)
+    if not access_level:
+        raise HTTPException(status_code=403, detail="Agent access was revoked")
+    can_audit = can_audit_agent_chat_sessions(
+        user,
+        agent=agent,
+        agent_access_level=access_level,
+    )
     requires_auditor = bool(getattr(session, "is_group", False)) or (
         session.source_channel == "trigger"
     )
-    if requires_auditor and not can_audit_agent_chat_sessions(user):
+    if requires_auditor and not can_audit:
         raise HTTPException(
             status_code=403,
             detail="Not authorized to view this managed session",
         )
-    if str(session.user_id) != str(user.id) and not can_audit_agent_chat_sessions(
-        user
-    ):
+    if str(session.user_id) != str(user.id) and not can_audit:
         raise HTTPException(
             status_code=403,
             detail="Not authorized to view this session",

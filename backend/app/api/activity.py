@@ -26,8 +26,12 @@ async def get_agent_activity(
     db: AsyncSession = Depends(get_db),
 ):
     """Get recent activity logs for an agent."""
-    await check_agent_access(db, current_user, agent_id)
-    can_audit_all = can_audit_agent_chat_sessions(current_user)
+    agent, access_level = await check_agent_access(db, current_user, agent_id)
+    can_audit_all = can_audit_agent_chat_sessions(
+        current_user,
+        agent=agent,
+        agent_access_level=access_level,
+    )
     safe_member_summaries = {
         "heartbeat": "Heartbeat completed",
         "oneshot_task": "One-time task completed",
@@ -84,13 +88,17 @@ async def list_conversations(
     most one preview row per selected conversation.  This avoids loading an
     Agent's complete chat history merely to render the activity sidebar.
     """
-    await check_agent_access(db, current_user, agent_id)
+    agent, access_level = await check_agent_access(db, current_user, agent_id)
 
     from app.models.audit import ChatMessage
     from app.models.agent import Agent
     from app.models.chat_session import ChatSession
 
-    can_audit_all = can_audit_agent_chat_sessions(current_user)
+    can_audit_all = can_audit_agent_chat_sessions(
+        current_user,
+        agent=agent,
+        agent_access_level=access_level,
+    )
     session_query = select(ChatSession).where(
         or_(
             ChatSession.agent_id == agent_id,
@@ -359,10 +367,14 @@ async def get_conversation_messages(
     db: AsyncSession = Depends(get_db),
 ):
     """Get messages for a specific conversation."""
-    await check_agent_access(db, current_user, agent_id)
+    agent, access_level = await check_agent_access(db, current_user, agent_id)
 
     messages = []
-    can_audit_all = can_audit_agent_chat_sessions(current_user)
+    can_audit_all = can_audit_agent_chat_sessions(
+        current_user,
+        agent=agent,
+        agent_access_level=access_level,
+    )
 
     legacy_prefixes = (
         "web_",

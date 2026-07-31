@@ -1,6 +1,7 @@
 """Unit tests for SaaS admin operations."""
 
 import uuid
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -81,6 +82,38 @@ def _admin_user(email="admin@reeftotem.ai", role="platform_admin", identity_is_p
         email=email,
         tenant_id=uuid.uuid4(),
         identity=SimpleNamespace(is_platform_admin=identity_is_platform_admin),
+    )
+
+
+def _verified_credential(
+    provider: str,
+    *,
+    plan_tier: str | None,
+    capabilities: list[str],
+):
+    credential_id = uuid.uuid4()
+    verified_at = datetime.now(timezone.utc)
+    return SimpleNamespace(
+        id=credential_id,
+        provider=provider,
+        plan_tier=plan_tier,
+        capabilities=capabilities,
+        modality_status={},
+        api_key="must-not-leak",
+        enabled=True,
+        status="healthy",
+        daily_quota=None,
+        used_today=0,
+        last_verification_at=verified_at,
+        verification_receipt={
+            "receipt_ref": f"credential-auth:{uuid.uuid4()}",
+            "kind": "credential_auth_probe",
+            "scope": "account_authentication",
+            "credential_id": str(credential_id),
+            "provider": provider,
+            "checked_at": verified_at.isoformat(),
+            "ok": True,
+        },
     )
 
 
@@ -233,19 +266,16 @@ async def test_media_routes_expose_complete_matrix_without_credentials():
         SimpleNamespace(name=name, config={}, enabled=True)
         for name in saas_api.MINIMAX_MEDIA_TOOL_NAMES.values()
     ]
-    agent_plan_credential = SimpleNamespace(
-        provider="volcengine_agent_plan",
+    agent_plan_credential = _verified_credential(
+        "volcengine_agent_plan",
         plan_tier="small",
         capabilities=["image", "audio", "video"],
-        modality_status={},
-        api_key="agent-plan-key-must-not-leak",
     )
-    minimax_credential = SimpleNamespace(
-        provider="minimax",
+    agent_plan_credential.api_key = "agent-plan-key-must-not-leak"
+    minimax_credential = _verified_credential(
+        "minimax",
         plan_tier=None,
         capabilities=["text", "image", "audio", "music", "video"],
-        modality_status={},
-        api_key="must-not-leak",
     )
     db = RecordingDB([
         DummyResult(values=tools),
@@ -298,7 +328,13 @@ async def test_media_routes_expose_complete_matrix_without_credentials():
     assert by_modality["video"].reason_code == "commercial_primary_unavailable"
     assert by_modality["video"].primary_provider == "volcengine_agent_plan"
     assert by_modality["video"].degraded_providers == ["minimax"]
-    assert by_modality["video"].evaluation_source == "live_platform_credential_pool"
+    assert by_modality["video"].evaluation_source == "persisted_account_and_generation_receipts"
+    assert by_modality["video"].readiness_status == "generation_unverified"
+    assert by_modality["video"].quality_evidence_status == "not_reviewed"
+    assert all(
+        not item.generation_observed
+        for item in by_modality["video"].provider_readiness
+    )
     assert all(route.fallback_provider == "minimax" for route in routes)
     serialized = " ".join(str(route.model_dump()) for route in routes)
     assert "must-not-leak" not in serialized
@@ -310,13 +346,63 @@ async def test_media_routes_expose_complete_matrix_without_credentials():
 
 
 @pytest.mark.asyncio
+async def test_media_routes_report_generation_evidence_without_claiming_quality():
+    tools = [
+        SimpleNamespace(name=name, config={}, enabled=True)
+        for name in saas_api.MINIMAX_MEDIA_TOOL_NAMES.values()
+    ]
+    credential = _verified_credential(
+        "minimax",
+        plan_tier=None,
+        capabilities=["image"],
+    )
+    completed_at = credential.last_verification_at + timedelta(seconds=1)
+    task = SimpleNamespace(
+        id=uuid.uuid4(),
+        credential_id=credential.id,
+        provider="minimax",
+        modality="image",
+        status="succeeded",
+        provider_task_id="provider-task-recorded",
+        output_size=4096,
+        completed_at=completed_at,
+        model="image-01",
+    )
+    db = RecordingDB(
+        [
+            DummyResult(values=tools),
+            DummyResult(values=[credential]),
+            DummyResult(values=[task]),
+        ]
+    )
+
+    routes = await saas_api.list_media_routes(current_user=_admin_user(), db=db)
+
+    image = next(
+        route for route in routes if route.modality == "image" and route.tier == "lite"
+    )
+    minimax = next(
+        item for item in image.provider_readiness if item.provider == "minimax"
+    )
+    assert image.readiness_status == "generation_observed"
+    assert image.quality_evidence_status == "not_reviewed"
+    assert minimax.account_verified is True
+    assert minimax.generation_observed is True
+    assert minimax.generation_receipt is not None
+    assert minimax.generation_receipt["evidence_level"] == "generation_observed"
+    assert minimax.generation_receipt["quality_reviewed"] is False
+    serialized = str(image.model_dump())
+    assert "provider-task-recorded" not in serialized
+    assert "must-not-leak" not in serialized
+
+
+@pytest.mark.asyncio
 async def test_media_route_update_writes_only_tier_scoped_platform_config():
     tool = SimpleNamespace(name="generate_video_minimax", config={"voice_id": "unchanged"}, enabled=True)
-    credential = SimpleNamespace(
-        provider="minimax",
+    credential = _verified_credential(
+        "minimax",
         plan_tier=None,
         capabilities=["video"],
-        modality_status={},
     )
     db = RecordingDB([
         DummyResult(scalar=tool),

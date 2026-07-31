@@ -523,6 +523,33 @@ _PRECREATED_PHASE_OBJECTS = {
     },
 }
 
+# ``001_initial_schema`` imports the ORM as it exists at migration runtime.
+# On a fresh install that bootstrap already creates the two original Runtime
+# tables, while this revision still owns the three newer coordination tables.
+# This exact shape is safe and expected; every other partial Runtime shape
+# remains fail-closed.
+_RUNTIME_BOOTSTRAP_TABLES = {"agent_runs", "agent_tool_executions"}
+_RUNTIME_BOOTSTRAP_PRECREATED_OBJECTS = {
+    *(f"table:{name}" for name in _RUNTIME_BOOTSTRAP_TABLES),
+    *(
+        f"index:{name}"
+        for name, (table_name, _columns) in RUNTIME_INDEXES.items()
+        if table_name in _RUNTIME_BOOTSTRAP_TABLES
+    ),
+    *(
+        f"constraint:{name}"
+        for table_name, checks in RUNTIME_CHECKS.items()
+        if table_name in _RUNTIME_BOOTSTRAP_TABLES
+        for name in checks
+    ),
+    *(
+        f"constraint:{name}"
+        for table_name, uniques in RUNTIME_UNIQUES.items()
+        if table_name in _RUNTIME_BOOTSTRAP_TABLES
+        for name in uniques
+    ),
+}
+
 # ``001_initial_schema`` creates tables from the current ORM metadata.  Builds
 # made before the final chat-session indexes were registered can therefore
 # arrive here with the complete unified-chat shape but without these indexes.
@@ -633,6 +660,11 @@ def _precreated_phase_state(phase: str, actual: set[str]) -> bool:
         return False
     if present == expected:
         return True
+    if (
+        phase == "runtime_schema"
+        and present == _RUNTIME_BOOTSTRAP_PRECREATED_OBJECTS
+    ):
+        return False
     missing = sorted(expected - present)
     repairable = _PRECREATED_REPAIRABLE_OBJECTS.get(phase, set())
     if set(missing).issubset(repairable):
@@ -2352,52 +2384,70 @@ _RUNTIME_CREATE = {
 }
 
 
-def _create_runtime_indexes() -> None:
-    op.create_index(
+def _create_runtime_indexes(existing: set[str] | None = None) -> None:
+    def create_index(
+        name: str,
+        table_name: str,
+        columns: list[object],
+        *,
+        unique: bool = False,
+        **kwargs: object,
+    ) -> None:
+        if existing is not None and f"index:{name}" in existing:
+            return
+        op.create_index(
+            name,
+            table_name,
+            columns,
+            unique=unique,
+            **kwargs,
+        )
+
+    create_index(
         "ix_agent_runs_tenant_thread_created_at",
         "agent_runs",
         ["tenant_id", "runtime_thread_id", "created_at", "id"],
         unique=False,
     )
-    op.create_index(
+    create_index(
         "ix_agent_runs_session_created_at",
         "agent_runs",
         ["session_id", sa.text("created_at DESC")],
         unique=False,
     )
-    op.create_index(
+    create_index(
         "ix_agent_runs_parent_run_id",
         "agent_runs",
         ["parent_run_id"],
         unique=False,
     )
-    op.create_index(
+    create_index(
         "ix_agent_runs_root_run_id",
         "agent_runs",
         ["root_run_id"],
         unique=False,
     )
-    op.create_index(
+    create_index(
         "ix_agent_runs_source",
         "agent_runs",
         ["source_type", "source_id"],
         unique=False,
     )
-    op.create_index(
+    create_index(
         "uq_agent_runs_source_execution",
         "agent_runs",
         ["source_type", "source_execution_id"],
         unique=True,
         postgresql_where=sa.text("source_execution_id IS NOT NULL"),
     )
-    op.create_index(
+    create_index(
         "uq_agent_runs_active_lane",
         "agent_runs",
         ["scheduling_lane_key"],
         unique=True,
         postgresql_where=sa.text("scheduling_lane_key IS NOT NULL AND lane_held IS true"),
     )
-    op.create_index(
+    create_index(
         "ix_agent_runs_lane_candidate_order",
         "agent_runs",
         [
@@ -2410,7 +2460,7 @@ def _create_runtime_indexes() -> None:
         unique=False,
         postgresql_where=sa.text("scheduling_lane_key IS NOT NULL"),
     )
-    op.create_index(
+    create_index(
         "uq_agent_run_events_checkpoint_type_non_delivery",
         "agent_run_events",
         ["run_id", "source_checkpoint_id", "event_type"],
@@ -2451,8 +2501,8 @@ def _create_runtime_indexes() -> None:
             ["status", "lease_expires_at"],
         ),
     ):
-        op.create_index(name, table_name, columns, unique=False)
-    op.create_index(
+        create_index(name, table_name, columns, unique=False)
+    create_index(
         "ix_session_context_states_tenant_agent_updated",
         "session_context_states",
         ["tenant_id", "agent_id", sa.text("updated_at DESC")],
@@ -2462,9 +2512,12 @@ def _create_runtime_indexes() -> None:
 
 def _upgrade_runtime_schema() -> None:
     op.execute(sa.text(f'CREATE SCHEMA IF NOT EXISTS "{_CHECKPOINT_SCHEMA}"'))
+    bind = op.get_bind()
+    existing = _schema_object_names(bind)
     for table_name in RUNTIME_TABLES:
-        _RUNTIME_CREATE[table_name]()
-    _create_runtime_indexes()
+        if f"table:{table_name}" not in existing:
+            _RUNTIME_CREATE[table_name]()
+    _create_runtime_indexes(existing)
 
 
 def _downgrade_runtime_schema() -> None:

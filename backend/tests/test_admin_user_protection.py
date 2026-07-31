@@ -80,6 +80,58 @@ async def test_org_admin_cannot_demote_platform_admin():
 
 
 @pytest.mark.asyncio
+async def test_org_admin_can_assign_agent_admin_inside_their_tenant():
+    tenant_id = uuid.uuid4()
+    actor = SimpleNamespace(id=uuid.uuid4(), role="org_admin", tenant_id=tenant_id)
+    target = SimpleNamespace(
+        id=uuid.uuid4(),
+        role="member",
+        tenant_id=tenant_id,
+        is_active=True,
+    )
+    db = FakeDB(target)
+
+    result = await users.update_user_role(
+        target.id,
+        users.RoleUpdate(role="agent_admin"),
+        actor,
+        db,
+    )
+
+    assert result["role"] == "agent_admin"
+    assert target.role == "agent_admin"
+    assert db.committed is True
+
+
+@pytest.mark.asyncio
+async def test_org_admin_cannot_assign_agent_admin_outside_their_tenant():
+    actor = SimpleNamespace(
+        id=uuid.uuid4(),
+        role="org_admin",
+        tenant_id=uuid.uuid4(),
+    )
+    target = SimpleNamespace(
+        id=uuid.uuid4(),
+        role="member",
+        tenant_id=uuid.uuid4(),
+        is_active=True,
+    )
+    db = FakeDB(target)
+
+    with pytest.raises(HTTPException) as exc:
+        await users.update_user_role(
+            target.id,
+            users.RoleUpdate(role="agent_admin"),
+            actor,
+            db,
+        )
+
+    assert exc.value.status_code == 403
+    assert target.role == "member"
+    assert db.committed is False
+
+
+@pytest.mark.asyncio
 async def test_disabled_admin_role_change_does_not_block_on_active_admin_count():
     tenant_id = uuid.uuid4()
     actor = SimpleNamespace(id=uuid.uuid4(), role="platform_admin", tenant_id=None)

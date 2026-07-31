@@ -8,8 +8,13 @@ from datetime import datetime, timezone
 import pytest
 from fastapi import HTTPException
 
-from app.api.okr import ProgressUpdate, _resolve_progress_evidence
+from app.api.okr import (
+    ProgressUpdate,
+    _evidence_snapshots_with_validity,
+    _resolve_progress_evidence,
+)
 from app.models.deliverable import DeliverableArtifactRevision, DeliverableRequest
+from app.models.okr import OKRProgressLog
 from app.models.task import Task
 
 
@@ -25,6 +30,9 @@ class _ScalarResult:
 
     def first(self):
         return self.value
+
+    def all(self):
+        return self.value if isinstance(self.value, list) else [self.value]
 
 
 class _Session:
@@ -214,3 +222,46 @@ async def test_task_cannot_be_paired_with_a_standalone_delivery() -> None:
 
     assert exc_info.value.status_code == 422
     assert exc_info.value.detail["code"] == "evidence_source_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_live_validity_marks_a_replaced_artifact_without_mutating_snapshot() -> None:
+    tenant_id = uuid.uuid4()
+    request_id = uuid.uuid4()
+    artifact_id = uuid.uuid4()
+    kr_id = uuid.uuid4()
+    frozen = {
+        "kind": "deliverable",
+        "deliverable_request_id": str(request_id),
+        "artifact": {"id": str(artifact_id), "content_hash": "a" * 64},
+    }
+    log = OKRProgressLog(
+        kr_id=kr_id,
+        previous_value=50,
+        new_value=80,
+        source="manual",
+        source_deliverable_request_id=request_id,
+        evidence_snapshot=dict(frozen),
+    )
+
+    current = await _evidence_snapshots_with_validity(
+        _Session(
+            [(request_id, "succeeded")],
+            [(artifact_id, "approved", "a" * 64)],
+        ),  # type: ignore[arg-type]
+        tenant_id=tenant_id,
+        logs_by_kr={kr_id: log},
+    )
+    superseded = await _evidence_snapshots_with_validity(
+        _Session(
+            [(request_id, "succeeded")],
+            [(artifact_id, "superseded", "a" * 64)],
+        ),  # type: ignore[arg-type]
+        tenant_id=tenant_id,
+        logs_by_kr={kr_id: log},
+    )
+
+    assert current[kr_id]["validity"] == "current"
+    assert superseded[kr_id]["validity"] == "superseded"
+    assert superseded[kr_id]["validity_reason"] == "source_artifact_superseded"
+    assert log.evidence_snapshot == frozen

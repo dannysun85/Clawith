@@ -44,6 +44,10 @@ class DeliverableRequest(Base):
             name="ck_deliverable_requests_status",
         ),
         CheckConstraint("version > 0", name="ck_deliverable_requests_version_positive"),
+        CheckConstraint(
+            "contract_revision > 0",
+            name="ck_deliverable_requests_contract_revision_positive",
+        ),
         UniqueConstraint(
             "tenant_id",
             "created_by_user_id",
@@ -110,6 +114,16 @@ class DeliverableRequest(Base):
         ForeignKey("chat_messages.id", name="fk_deliverable_requests_launch_message", ondelete="SET NULL"),
         nullable=True,
     )
+    current_execution_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "deliverable_executions.id",
+            name="fk_deliverable_requests_current_execution",
+            ondelete="SET NULL",
+            use_alter=True,
+        ),
+        nullable=True,
+    )
     task_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     client_request_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -140,6 +154,10 @@ class DeliverableRequest(Base):
     version: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1, server_default=text("1")
     )
+    contract_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=text("1")
+    )
+    latest_preflight: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     last_error_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
     launched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -201,6 +219,24 @@ class DeliverableArtifactRevision(Base):
         ),
         nullable=True,
     )
+    execution_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "deliverable_executions.id",
+            name="fk_deliverable_artifacts_execution",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+    unit_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "deliverable_execution_units.id",
+            name="fk_deliverable_artifacts_unit",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
     approved_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("users.id", name="fk_deliverable_artifacts_approver", ondelete="SET NULL"),
@@ -208,6 +244,8 @@ class DeliverableArtifactRevision(Base):
     )
     artifact_key: Mapped[str] = mapped_column(String(100), nullable=False)
     artifact_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    stage_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    unit_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
     workspace_path: Mapped[str] = mapped_column(String(1000), nullable=False)
     mime_type: Mapped[str | None] = mapped_column(String(160), nullable=True)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -220,6 +258,327 @@ class DeliverableArtifactRevision(Base):
         JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
     )
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class DeliverableExecution(Base):
+    """One immutable-contract execution batch for a stable customer brief."""
+
+    __tablename__ = "deliverable_executions"
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN ('initial', 'revision', 'recovery')",
+            name="ck_deliverable_executions_kind",
+        ),
+        CheckConstraint(
+            "status IN ('ready', 'running', 'blocked', 'reconciling', "
+            "'waiting_approval', 'succeeded', 'failed', 'cancelled')",
+            name="ck_deliverable_executions_status",
+        ),
+        CheckConstraint(
+            "execution_number > 0",
+            name="ck_deliverable_executions_number_positive",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "request_id"],
+            ["deliverable_requests.tenant_id", "deliverable_requests.id"],
+            name="fk_deliverable_executions_tenant_request",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "request_id",
+            "execution_number",
+            name="uq_deliverable_executions_request_number",
+        ),
+        UniqueConstraint(
+            "request_id",
+            "idempotency_key",
+            name="uq_deliverable_executions_request_idempotency",
+        ),
+        UniqueConstraint("tenant_id", "id", name="uq_deliverable_executions_tenant_id_id"),
+        UniqueConstraint(
+            "tenant_id",
+            "request_id",
+            "id",
+            name="uq_deliverable_executions_tenant_request_id",
+        ),
+        Index(
+            "uq_deliverable_executions_active_request",
+            "request_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('ready', 'running', 'blocked', 'reconciling', 'waiting_approval')"
+            ),
+            sqlite_where=text(
+                "status IN ('ready', 'running', 'blocked', 'reconciling', 'waiting_approval')"
+            ),
+        ),
+        Index(
+            "ix_deliverable_executions_request_created",
+            "request_id",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "tenants.id",
+            name="fk_deliverable_executions_tenant",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
+    request_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    execution_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="ready", server_default=text("'ready'")
+    )
+    current_stage: Mapped[str] = mapped_column(String(64), nullable=False)
+    intake_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "agent_runs.id",
+            name="fk_deliverable_executions_intake_run",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+        unique=True,
+    )
+    coordinator_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "agent_runs.id",
+            name="fk_deliverable_executions_coordinator_run",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+        unique=True,
+    )
+    launch_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "chat_messages.id",
+            name="fk_deliverable_executions_launch_message",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+        unique=True,
+    )
+    workflow_id: Mapped[str] = mapped_column(String(120), nullable=False)
+    workflow_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    contract_snapshot: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    preflight_snapshot: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    revision_instruction: Mapped[str | None] = mapped_column(Text, nullable=True)
+    idempotency_key: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    blocked_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    last_error_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    launched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class DeliverableExecutionUnit(Base):
+    """Smallest independently recoverable page, candidate, shot, or assembly step."""
+
+    __tablename__ = "deliverable_execution_units"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'running', 'blocked', 'reconciling', "
+            "'succeeded', 'failed', 'cancelled', 'superseded')",
+            name="ck_deliverable_execution_units_status",
+        ),
+        CheckConstraint(
+            "attempt_count >= 0",
+            name="ck_deliverable_execution_units_attempt_count",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "request_id", "execution_id"],
+            [
+                "deliverable_executions.tenant_id",
+                "deliverable_executions.request_id",
+                "deliverable_executions.id",
+            ],
+            name="fk_deliverable_units_tenant_request_execution",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "execution_id",
+            "stage_key",
+            "unit_key",
+            name="uq_deliverable_units_execution_stage_key",
+        ),
+        UniqueConstraint("tenant_id", "id", name="uq_deliverable_units_tenant_id_id"),
+        Index(
+            "ix_deliverable_units_execution_status",
+            "execution_id",
+            "status",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "tenants.id",
+            name="fk_deliverable_units_tenant",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
+    request_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    execution_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    stage_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    unit_key: Mapped[str] = mapped_column(String(120), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="pending", server_default=text("'pending'")
+    )
+    dependency_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    agent_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "agent_runs.id",
+            name="fk_deliverable_units_agent_run",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+    agent_tool_execution_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "agent_tool_executions.id",
+            name="fk_deliverable_units_tool_execution",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+    media_generation_task_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "media_generation_tasks.id",
+            name="fk_deliverable_units_media_task",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+        unique=True,
+    )
+    input_snapshot: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    result_snapshot: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    quality_evaluation: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    last_error_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class DeliverableApprovalReceipt(Base):
+    """Idempotent, immutable decision receipt for one execution stage."""
+
+    __tablename__ = "deliverable_approval_receipts"
+    __table_args__ = (
+        CheckConstraint(
+            "stage IN ('brief', 'outline', 'composition', 'storyboard', 'final')",
+            name="ck_deliverable_approval_receipts_stage",
+        ),
+        CheckConstraint(
+            "action IN ('approve', 'request_changes', 'cancel')",
+            name="ck_deliverable_approval_receipts_action",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "request_id"],
+            ["deliverable_requests.tenant_id", "deliverable_requests.id"],
+            name="fk_deliverable_approval_receipts_tenant_request",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "request_id",
+            "client_action_id",
+            name="uq_deliverable_approval_receipts_client_action",
+        ),
+        Index(
+            "ix_deliverable_approval_receipts_request_created",
+            "request_id",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "tenants.id",
+            name="fk_deliverable_approval_receipts_tenant",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
+    request_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    execution_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "deliverable_executions.id",
+            name="fk_deliverable_approval_receipts_execution",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
+    actor_user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "users.id",
+            name="fk_deliverable_approval_receipts_actor",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    client_action_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    stage: Mapped[str] = mapped_column(String(24), nullable=False)
+    action: Mapped[str] = mapped_column(String(24), nullable=False)
+    instruction: Mapped[str | None] = mapped_column(Text, nullable=True)
+    target_units: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    receipt: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

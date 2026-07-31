@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 import json
 from typing import cast
 import uuid
@@ -234,6 +235,8 @@ async def test_planning_model_uses_the_pinned_platform_model_without_tools() -> 
         api_key_encrypted="encrypted",
         label="Planning",
         enabled=True,
+        verification_status="verified",
+        last_verified_at=datetime.now(UTC),
         max_output_tokens=2048,
         max_input_tokens=64_000,
     )
@@ -306,6 +309,8 @@ async def test_simple_multi_agent_check_in_returns_a_fast_plan_without_calling_t
         api_key_encrypted="encrypted",
         label="Planning",
         enabled=True,
+        verification_status="verified",
+        last_verified_at=datetime.now(UTC),
         max_output_tokens=2048,
         max_input_tokens=64_000,
     )
@@ -366,6 +371,8 @@ async def test_greeting_with_a_real_task_still_uses_the_planning_model() -> None
         api_key_encrypted="encrypted",
         label="Planning",
         enabled=True,
+        verification_status="verified",
+        last_verified_at=datetime.now(UTC),
         max_output_tokens=2048,
         max_input_tokens=64_000,
     )
@@ -408,6 +415,8 @@ async def test_planning_model_accepts_a_model_owned_by_the_group_tenant() -> Non
         api_key_encrypted="encrypted",
         label="Tenant Planning",
         enabled=True,
+        verification_status="verified",
+        last_verified_at=datetime.now(UTC),
         max_output_tokens=2048,
         max_input_tokens=64_000,
     )
@@ -442,6 +451,8 @@ async def test_planning_model_rejects_a_model_owned_by_another_tenant() -> None:
         api_key_encrypted="encrypted",
         label="Foreign Planning",
         enabled=True,
+        verification_status="verified",
+        last_verified_at=datetime.now(UTC),
         max_output_tokens=2048,
         max_input_tokens=64_000,
     )

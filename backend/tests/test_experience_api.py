@@ -462,19 +462,33 @@ async def test_publish_normalizes_legacy_visibility_to_company(monkeypatch):
 @pytest.mark.asyncio
 async def test_work_provenance_accepts_only_owned_consistent_sources():
     current_user = _user()
-    task = SimpleNamespace(id=uuid.uuid4())
-    delivery = SimpleNamespace(id=uuid.uuid4(), task_id=task.id)
+    agent_id = uuid.uuid4()
+    task = SimpleNamespace(id=uuid.uuid4(), agent_id=agent_id, status="done")
+    delivery = SimpleNamespace(
+        id=uuid.uuid4(),
+        task_id=task.id,
+        agent_id=agent_id,
+        status="succeeded",
+    )
     db = RecordingDB(DummyResult([task]), DummyResult([delivery]))
     payload = experience_api.EntryCreate(
         source_task_id=task.id,
         source_deliverable_request_id=delivery.id,
     )
 
-    source_task_id, source_delivery_id = await experience_api._validate_work_provenance(
-        db, payload, current_user
+    source_task_id, source_delivery_id, source_agent_id = (
+        await experience_api._validate_work_provenance(
+            db,
+            payload,
+            current_user,
+        )
     )
 
-    assert (source_task_id, source_delivery_id) == (task.id, delivery.id)
+    assert (source_task_id, source_delivery_id, source_agent_id) == (
+        task.id,
+        delivery.id,
+        agent_id,
+    )
     assert "tasks.created_by" in _sql(db.statements[0])
     assert "deliverable_requests.created_by_user_id" in _sql(db.statements[1])
 
@@ -482,8 +496,14 @@ async def test_work_provenance_accepts_only_owned_consistent_sources():
 @pytest.mark.asyncio
 async def test_work_provenance_rejects_a_delivery_from_another_task():
     current_user = _user()
-    task = SimpleNamespace(id=uuid.uuid4())
-    delivery = SimpleNamespace(id=uuid.uuid4(), task_id=uuid.uuid4())
+    agent_id = uuid.uuid4()
+    task = SimpleNamespace(id=uuid.uuid4(), agent_id=agent_id, status="done")
+    delivery = SimpleNamespace(
+        id=uuid.uuid4(),
+        task_id=uuid.uuid4(),
+        agent_id=agent_id,
+        status="succeeded",
+    )
     db = RecordingDB(DummyResult([task]), DummyResult([delivery]))
     payload = experience_api.EntryCreate(
         source_task_id=task.id,
@@ -494,3 +514,48 @@ async def test_work_provenance_rejects_a_delivery_from_another_task():
         await experience_api._validate_work_provenance(db, payload, current_user)
 
     assert error.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_work_provenance_rejects_an_in_progress_source():
+    current_user = _user()
+    task = SimpleNamespace(
+        id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        status="doing",
+    )
+    payload = experience_api.EntryCreate(source_task_id=task.id)
+
+    with pytest.raises(HTTPException) as error:
+        await experience_api._validate_work_provenance(
+            RecordingDB(DummyResult([task])),
+            payload,
+            current_user,
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.detail == "Source task is still in progress"
+
+
+@pytest.mark.asyncio
+async def test_work_provenance_rejects_a_forged_origin_agent():
+    current_user = _user()
+    task = SimpleNamespace(
+        id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        status="done",
+    )
+    payload = experience_api.EntryCreate(
+        source_task_id=task.id,
+        origin_agent_id=uuid.uuid4(),
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await experience_api._validate_work_provenance(
+            RecordingDB(DummyResult([task])),
+            payload,
+            current_user,
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.detail == "Source Agent does not match the work provenance"

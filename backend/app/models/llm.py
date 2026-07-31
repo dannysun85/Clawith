@@ -122,6 +122,16 @@ class LLMCredential(Base):
     reset_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="unverified")
     # unverified / healthy / degraded / quota_exceeded / disabled
+    # A healthy status is only an operational circuit state.  These two
+    # fields preserve the last explicit, read-only provider authentication
+    # probe so control-plane readiness never has to infer verification from a
+    # configured key or a successful call that happened under older config.
+    last_verification_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    verification_receipt: Mapped[dict | None] = mapped_column(
+        JSON, nullable=True
+    )
     error_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     weight: Mapped[int] = mapped_column(Integer, nullable=False, default=1)  # weighted round-robin
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)  # higher = used first

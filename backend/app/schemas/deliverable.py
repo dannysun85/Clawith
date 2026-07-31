@@ -71,6 +71,53 @@ class DeliverableActionIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+def _validate_target_unit_keys(value: list[str]) -> list[str]:
+    cleaned = [item.strip() for item in value]
+    if any(
+        not item
+        or len(item) > 120
+        or any(
+            character not in "abcdefghijklmnopqrstuvwxyz0123456789-_"
+            for character in item
+        )
+        for item in cleaned
+    ):
+        raise ValueError("target_units must contain safe unit keys")
+    if len(set(cleaned)) != len(cleaned):
+        raise ValueError("target_units must be distinct")
+    return cleaned
+
+
+class DeliverableRevisionIn(BaseModel):
+    expected_version: int = Field(ge=1)
+    client_revision_id: uuid.UUID
+    instruction: str = Field(min_length=3, max_length=4000)
+    target_units: list[str] = Field(default_factory=list, max_length=50)
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("target_units")
+    @classmethod
+    def validate_target_units(cls, value: list[str]) -> list[str]:
+        return _validate_target_unit_keys(value)
+
+
+class DeliverableApprovalIn(BaseModel):
+    expected_version: int = Field(ge=1)
+    client_action_id: uuid.UUID
+    stage: Literal["brief", "outline", "composition", "storyboard", "final"]
+    action: Literal["approve", "request_changes", "cancel"]
+    instruction: str | None = Field(default=None, min_length=3, max_length=4000)
+    target_units: list[str] = Field(default_factory=list, max_length=50)
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("target_units")
+    @classmethod
+    def validate_target_units(cls, value: list[str]) -> list[str]:
+        return _validate_target_unit_keys(value)
+
+
 class DeliverableQualityReviewCreate(BaseModel):
     client_review_id: uuid.UUID
     expected_request_version: int = Field(ge=1)
@@ -236,8 +283,12 @@ class DeliverableArtifactOut(BaseModel):
     id: uuid.UUID
     request_id: uuid.UUID
     parent_revision_id: uuid.UUID | None = None
+    execution_id: uuid.UUID | None = None
+    unit_id: uuid.UUID | None = None
     artifact_key: str
     artifact_type: str
+    stage_key: str | None = None
+    unit_key: str | None = None
     workspace_path: str
     mime_type: str | None = None
     content_hash: str
@@ -267,6 +318,85 @@ class DeliverableApprovalReadinessOut(BaseModel):
     receipt_ref: str | None = None
 
 
+class DeliverableExecutionUnitOut(BaseModel):
+    id: uuid.UUID
+    execution_id: uuid.UUID
+    stage_key: str
+    unit_key: str
+    status: Literal[
+        "pending",
+        "running",
+        "blocked",
+        "reconciling",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "superseded",
+    ]
+    dependency_hash: str
+    attempt_count: int
+    input_snapshot: dict[str, Any]
+    result_snapshot: dict[str, Any]
+    quality_evaluation: dict[str, Any]
+    last_error_code: str | None = None
+    next_retry_at: datetime | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class DeliverableApprovalReceiptOut(BaseModel):
+    id: uuid.UUID
+    execution_id: uuid.UUID
+    actor_user_id: uuid.UUID
+    client_action_id: uuid.UUID
+    request_version: int
+    stage: Literal["brief", "outline", "composition", "storyboard", "final"]
+    action: Literal["approve", "request_changes", "cancel"]
+    instruction: str | None = None
+    target_units: list[str]
+    receipt: dict[str, Any]
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class DeliverableExecutionOut(BaseModel):
+    id: uuid.UUID
+    request_id: uuid.UUID
+    execution_number: int
+    kind: Literal["initial", "revision", "recovery"]
+    status: Literal[
+        "ready",
+        "running",
+        "blocked",
+        "reconciling",
+        "waiting_approval",
+        "succeeded",
+        "failed",
+        "cancelled",
+    ]
+    current_stage: str
+    workflow_id: str
+    workflow_version: str
+    contract_snapshot: dict[str, Any]
+    preflight_snapshot: dict[str, Any]
+    revision_instruction: str | None = None
+    blocked_reason: str | None = None
+    last_error_code: str | None = None
+    launched_at: datetime | None = None
+    completed_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+    units: list[DeliverableExecutionUnitOut] = Field(default_factory=list)
+    approvals: list[DeliverableApprovalReceiptOut] = Field(default_factory=list)
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class DeliverableRequestOut(BaseModel):
     id: uuid.UUID
     tenant_id: uuid.UUID
@@ -274,6 +404,7 @@ class DeliverableRequestOut(BaseModel):
     agent_id: uuid.UUID
     session_id: uuid.UUID
     agent_run_id: uuid.UUID | None = None
+    current_execution_id: uuid.UUID | None = None
     task_id: uuid.UUID | None = None
     client_request_id: uuid.UUID
     work_type: str
@@ -288,6 +419,8 @@ class DeliverableRequestOut(BaseModel):
     status: str
     current_stage: str
     version: int
+    contract_revision: int = 1
+    latest_preflight: dict[str, Any] | None = None
     last_error_code: str | None = None
     launched_at: datetime | None = None
     completed_at: datetime | None = None

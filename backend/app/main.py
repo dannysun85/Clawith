@@ -341,6 +341,9 @@ async def lifespan(app: FastAPI):
             import app.models.douyin         # noqa
             import app.models.subscription   # noqa
             import app.models.media_generation  # noqa
+            import app.models.agent_run      # noqa
+            import app.models.agent_tool_execution  # noqa
+            import app.models.deliverable    # noqa
             import app.models.production_issue  # noqa
 
             import app.models.identity       # noqa

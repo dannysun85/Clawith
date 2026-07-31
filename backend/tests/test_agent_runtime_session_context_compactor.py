@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from datetime import UTC, datetime
 import json
 import uuid
 
@@ -38,6 +39,8 @@ def _model(tenant_id: uuid.UUID, *, name: str, input_tokens: int = 100_000) -> L
         label=name,
         api_key_encrypted="encrypted",
         enabled=True,
+        verification_status="verified",
+        last_verified_at=datetime.now(UTC),
         max_input_tokens=input_tokens,
         max_output_tokens=256,
     )

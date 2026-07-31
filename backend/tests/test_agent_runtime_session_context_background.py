@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from collections import deque
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -60,6 +61,8 @@ def _model(
         label="Model",
         api_key_encrypted="encrypted",
         enabled=True,
+        verification_status="verified",
+        last_verified_at=datetime.now(UTC),
         max_input_tokens=input_tokens,
         max_output_tokens=256,
     )

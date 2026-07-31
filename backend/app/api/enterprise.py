@@ -43,6 +43,9 @@ from app.services.agent_runtime.runtime_model_settings import (
     resolve_runtime_model_settings,
     runtime_model_setting_key,
 )
+from app.services.agent_runtime.model_capabilities import (
+    model_connection_verification,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/enterprise", tags=["enterprise"])
@@ -377,9 +380,14 @@ async def _record_llm_tool_capability(
             != target.stored_config_fingerprint
         ):
             return False
+        checked_at = datetime.now(UTC)
+        existing.verification_status = "verified"
+        existing.last_verified_at = checked_at
+        existing.last_error_code = None
+        existing.last_error_message = None
         existing.supports_tool_calling = supported
         existing.tool_calling_capability_source = "probe"
-        existing.tool_calling_checked_at = datetime.now(UTC)
+        existing.tool_calling_checked_at = checked_at
         existing.tool_calling_error = error[:500] if error else None
         await session.commit()
         return True
@@ -739,6 +747,12 @@ async def update_llm_model(
             model.tier = data.tier
 
         if _llm_config_fingerprint(model) != original_config_fingerprint:
+            model.verification_status = "unverified"
+            model.last_verified_at = None
+            model.last_error_code = "configuration_changed"
+            model.last_error_message = (
+                "Model configuration changed; rerun the connection test."
+            )
             model.supports_tool_calling = None
             model.tool_calling_capability_source = None
             model.tool_calling_checked_at = None
@@ -1153,15 +1167,22 @@ async def _runtime_model_settings_payload(db: AsyncSession, *, tenant_id: uuid.U
         )
         .order_by(LLMModel.created_at.desc())
     )
-    candidates = [
-        {
-            "id": str(model.id),
-            "label": model.label,
-            "provider": model.provider,
-            "model": model.model,
-        }
-        for model in result.scalars().all()
-    ]
+    candidates = []
+    for model in result.scalars().all():
+        verification = model_connection_verification(model)
+        if verification is None:
+            continue
+        verification_source, verified_at = verification
+        candidates.append(
+            {
+                "id": str(model.id),
+                "label": model.label,
+                "provider": model.provider,
+                "model": model.model,
+                "verification_source": verification_source,
+                "verified_at": verified_at.isoformat(),
+            }
+        )
     return {
         "tenant_id": str(tenant_id),
         "planning_model_id": (
@@ -1213,6 +1234,11 @@ async def update_runtime_model_settings(
             raise HTTPException(status_code=422, detail=f"Model {model_id} belongs to another tenant")
         if not model.enabled:
             raise HTTPException(status_code=422, detail=f"Model {model_id} is disabled")
+        if model_connection_verification(model) is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Model {model_id} has no current connection verification",
+            )
     result = await db.execute(
         select(SystemSetting).where(
             SystemSetting.key == runtime_model_setting_key(resolved_tenant_id)

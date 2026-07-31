@@ -30,8 +30,10 @@ def _cred(
     capabilities=None,
     modality_status=None,
 ):
+    credential_id = uuid.uuid4()
+    verified_at = load_balancer.datetime.now(load_balancer.timezone.utc)
     return SimpleNamespace(
-        id=uuid.uuid4(),
+        id=credential_id,
         provider="minimax",
         label="c",
         api_key_encrypted="enc",
@@ -41,12 +43,36 @@ def _cred(
         daily_quota=daily_quota,
         used_today=used_today,
         status=status,
+        last_verification_at=verified_at,
+        verification_receipt={
+            "receipt_ref": f"credential-auth:{uuid.uuid4()}",
+            "kind": "credential_auth_probe",
+            "scope": "account_authentication",
+            "evidence_level": "account_verified",
+            "credential_id": str(credential_id),
+            "provider": "minimax",
+            "checked_at": verified_at.isoformat(),
+            "ok": True,
+        },
         error_count=error_count,
         weight=weight,
         priority=priority,
         last_used_at=None,
         enabled=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_media_pick_requires_current_explicit_account_verification():
+    credential = _cred(capabilities=["video"])
+    credential.last_verification_at = None
+    credential.verification_receipt = None
+    sess, _ = _patch_session(execute_result=[credential])
+
+    with sess, pytest.raises(NoCredentialAvailable) as exc:
+        await pick_credential("minimax", "video")
+
+    assert exc.value.reason_code == load_balancer.CredentialUnavailableReason.ALL_UNHEALTHY
 
 
 def _patch_session(execute_result=None, get_value=None):

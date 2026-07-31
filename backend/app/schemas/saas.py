@@ -113,6 +113,18 @@ class ModelRouteUpdateIn(BaseModel):
         return normalized
 
 
+class MediaProviderReadinessOut(BaseModel):
+    """One provider's evidence levels for a media modality."""
+
+    provider: str
+    configured: bool
+    account_verified: bool
+    generation_observed: bool
+    plan_tiers: list[str]
+    account_receipt: dict[str, object] | None = None
+    generation_receipt: dict[str, object] | None = None
+
+
 class MediaRouteOut(BaseModel):
     """Effective platform media route plus MiniMax fallback profile."""
 
@@ -128,6 +140,9 @@ class MediaRouteOut(BaseModel):
     reason_code: str | None = None
     recommended_action: str
     evaluation_source: str
+    readiness_status: str
+    quality_evidence_status: str
+    provider_readiness: list[MediaProviderReadinessOut]
     fallback_provider: str
     tool_name: str
     model: str

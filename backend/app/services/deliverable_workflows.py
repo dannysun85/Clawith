@@ -15,9 +15,15 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent_run import AgentRun
-from app.models.deliverable import DeliverableRequest
+from app.models.deliverable import DeliverableExecution, DeliverableRequest
 from app.models.tool import AgentTool, Tool
 from app.services.deliverable_artifacts import reconcile_runtime_deliverable_artifacts
+from app.services.deliverable_executions import (
+    bind_artifacts_to_current_execution,
+    current_execution,
+    project_execution_lifecycle,
+    record_execution_preflight,
+)
 from app.services.entitlements import get_tenant_entitlements
 from app.services.media_capabilities import get_agent_media_capabilities
 from app.services.minimax_media_profiles import resolve_minimax_media_profile
@@ -868,6 +874,7 @@ async def preflight_workflow(
 class PreparedDeliverableLaunch:
     request: DeliverableRequest
     prompt: str
+    execution: DeliverableExecution | None = None
 
 
 async def prepare_deliverable_launch(
@@ -922,6 +929,11 @@ async def prepare_deliverable_launch(
             tier=request.tier,
             spec=request.spec,
         )
+        execution = None
+        if request.current_execution_id is not None:
+            execution = await current_execution(db, request, lock=True)
+            if execution is not None:
+                record_execution_preflight(request, execution, preflight)
         if not preflight["launchable"]:
             reason = next(iter(preflight["reasons"]), "deliverable_capability_unavailable")
             raise DeliverableWorkflowError(
@@ -932,7 +944,17 @@ async def prepare_deliverable_launch(
         request.status = "running"
         request.current_stage = "execution_queued"
         request.version += 1
-    return PreparedDeliverableLaunch(request=request, prompt=build_deliverable_prompt(request))
+    else:
+        execution = (
+            await current_execution(db, request, lock=True)
+            if request.current_execution_id is not None
+            else None
+        )
+    return PreparedDeliverableLaunch(
+        request=request,
+        prompt=build_deliverable_prompt(request),
+        execution=execution,
+    )
 
 
 def attach_deliverable_run(
@@ -950,6 +972,18 @@ def attach_deliverable_run(
     request.agent_run_id = run_id
     request.launched_at = launched_at
     request.current_stage = "running"
+    execution = getattr(prepared, "execution", None)
+    if isinstance(execution, DeliverableExecution):
+        if execution.intake_run_id is not None and execution.intake_run_id != run_id:
+            raise DeliverableWorkflowError(
+                "deliverable_execution_run_mismatch",
+                "Deliverable execution is already linked to another run",
+            )
+        execution.intake_run_id = run_id
+        execution.launch_message_id = request.launch_message_id
+        execution.status = "running"
+        execution.current_stage = "running"
+        execution.launched_at = launched_at
 
 
 async def sync_deliverable_lifecycle(
@@ -973,6 +1007,24 @@ async def sync_deliverable_lifecycle(
     )
     request = result.scalar_one_or_none()
     normalized_lifecycle_status = str(lifecycle_status or "").strip().lower()
+
+    async def finish(
+        target: DeliverableRequest,
+        reconciliation: Any | None = None,
+    ) -> DeliverableRequest:
+        if target.current_execution_id is None:
+            return target
+        artifacts = tuple(getattr(reconciliation, "artifacts", ()) or ())
+        if artifacts:
+            await bind_artifacts_to_current_execution(
+                db,
+                target,
+                artifacts,
+                now=now,
+            )
+        await project_execution_lifecycle(db, target, now=now)
+        return target
+
     if not isinstance(request, DeliverableRequest):
         if normalized_lifecycle_status not in {"completed", "cancelled"}:
             return None
@@ -1031,13 +1083,13 @@ async def sync_deliverable_lifecycle(
                     or candidate.completed_at is not None
                 )
                 if not changed:
-                    return candidate
+                    return await finish(candidate, reconciliation)
                 candidate.status = "waiting_approval"
                 candidate.current_stage = "output_review"
                 candidate.completed_at = None
                 candidate.last_error_code = None
                 candidate.version += 1
-                return candidate
+                return await finish(candidate, reconciliation)
             if normalized_lifecycle_status == "cancelled":
                 continue
             failure_codes = tuple(
@@ -1057,21 +1109,21 @@ async def sync_deliverable_lifecycle(
                 or candidate.last_error_code != next_error_code
             )
             if not changed:
-                return candidate
+                return await finish(candidate, reconciliation)
             candidate.status = "failed"
             candidate.current_stage = "artifact_verification_failed"
             candidate.completed_at = now or datetime.now(UTC)
             candidate.last_error_code = next_error_code
             candidate.version += 1
-            return candidate
+            return await finish(candidate, reconciliation)
         return None
     # A provider write may settle after the user has cancelled a stalled model
     # turn. Re-run artifact reconciliation for cancelled creative requests so
     # a valid, paid output is not hidden from review.
     if request.status == "succeeded":
-        return request
+        return await finish(request)
     if request.status == "failed" and request.current_stage == "changes_requested":
-        return request
+        return await finish(request)
     if normalized_lifecycle_status in {"completed", "cancelled"} and request.work_type in {
         "poster",
         "presentation",
@@ -1120,13 +1172,13 @@ async def sync_deliverable_lifecycle(
                 and request.current_stage == next_stage
                 and request.last_error_code == next_error_code
             ):
-                return request
+                return await finish(request, reconciliation)
             request.status = next_status
             request.current_stage = next_stage
             request.completed_at = now or datetime.now(UTC) if next_status == "failed" else None
             request.last_error_code = next_error_code
             request.version += 1
-            return request
+            return await finish(request, reconciliation)
     terminal_mapping = {
         # A completed Runtime only proves that the agent stopped normally. The
         # deliverable still needs an artifact revision and evaluator evidence.
@@ -1136,7 +1188,7 @@ async def sync_deliverable_lifecycle(
     }
     transition = terminal_mapping.get(normalized_lifecycle_status)
     if transition is None:
-        return request
+        return await finish(request)
     next_status, next_stage = transition
     if next_status == "failed":
         error = lifecycle.get("error") if isinstance(lifecycle, Mapping) else None
@@ -1149,7 +1201,7 @@ async def sync_deliverable_lifecycle(
         and request.current_stage == next_stage
         and request.last_error_code == next_error_code
     ):
-        return request
+        return await finish(request)
     request.status = next_status
     request.current_stage = next_stage
     request.completed_at = (
@@ -1159,4 +1211,4 @@ async def sync_deliverable_lifecycle(
     )
     request.last_error_code = next_error_code
     request.version += 1
-    return request
+    return await finish(request)

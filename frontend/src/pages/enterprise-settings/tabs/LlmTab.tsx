@@ -19,6 +19,10 @@ interface LLMModel {
     max_tokens_per_day?: number;
     enabled: boolean;
     supports_vision?: boolean;
+    verification_status?: 'verified' | 'unverified' | 'failed' | null;
+    last_verified_at?: string | null;
+    last_error_code?: string | null;
+    last_error_message?: string | null;
     supports_tool_calling?: boolean | null;
     tool_calling_capability_source?: 'probe' | 'builtin_registry' | null;
     tool_calling_checked_at?: string | null;
@@ -48,7 +52,10 @@ interface RuntimeModelSettings {
     compact_model_id: string | null;
     planning_source: 'database' | 'environment' | 'unavailable';
     compact_source: 'database' | 'environment' | 'unavailable';
-    candidates: Array<Pick<LLMModel, 'id' | 'label' | 'provider' | 'model'>>;
+    candidates: Array<Pick<LLMModel, 'id' | 'label' | 'provider' | 'model'> & {
+        verification_source: 'connection_probe' | 'legacy_tool_probe';
+        verified_at: string;
+    }>;
 }
 
 const FALLBACK_LLM_PROVIDERS: LLMProviderSpec[] = [
@@ -332,12 +339,12 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
                             {t('enterprise.llm.runtimeModelsTitle', '多智能体运行时模型')}
                         </div>
                         <div style={{ marginTop: '4px', color: 'var(--text-tertiary)', fontSize: '12px' }}>
-                            {t('enterprise.llm.runtimeModelsHint', '可使用当前公司或平台已保存且启用的模型；工具测试结果仅作诊断，不影响选择。保存后立即生效。')}
+                            {t('enterprise.llm.runtimeModelsHint', '可使用当前公司或平台已保存、启用且有连接验证 evidence 的模型；工具测试结果仅作诊断，不影响规划/压缩选择。保存后立即生效。')}
                         </div>
                     </div>
                     {runtimeModelSettings.candidates.length === 0 ? (
                         <div style={{ color: 'var(--warning)', fontSize: '13px' }}>
-                            {t('enterprise.llm.noRuntimeModelCandidates', '暂无可用模型，请先为当前公司或平台创建模型并完成 Agent 兼容性测试。')}
+                            {t('enterprise.llm.noRuntimeModelCandidates', '暂无可用模型，请先为当前公司或平台创建模型并完成连接测试。')}
                         </div>
                     ) : (
                         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr)) auto', gap: '12px', alignItems: 'end' }}>
@@ -350,7 +357,7 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
                                 >
                                     <option value="" disabled>{t('enterprise.llm.selectRuntimeModel', '请选择模型')}</option>
                                     {runtimeModelSettings.candidates.map((model) => (
-                                        <option key={model.id} value={model.id}>{model.label} · {model.provider}/{model.model}</option>
+                                        <option key={model.id} value={model.id}>{model.label} · {model.provider}/{model.model} · 已验证 {new Date(model.verified_at).toLocaleString()}</option>
                                     ))}
                                 </select>
                             </label>
@@ -363,7 +370,7 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
                                 >
                                     <option value="" disabled>{t('enterprise.llm.selectRuntimeModel', '请选择模型')}</option>
                                     {runtimeModelSettings.candidates.map((model) => (
-                                        <option key={model.id} value={model.id}>{model.label} · {model.provider}/{model.model}</option>
+                                        <option key={model.id} value={model.id}>{model.label} · {model.provider}/{model.model} · 已验证 {new Date(model.verified_at).toLocaleString()}</option>
                                     ))}
                                 </select>
                             </label>
@@ -623,6 +630,31 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
                                             boxShadow: '0 1px 3px rgba(0,0,0,0.2)',
                                         }} />
                                     </button>
+                                    {m.verification_status === 'verified' && m.last_verified_at ? (
+                                        <span
+                                            className="badge"
+                                            title={`连接验证：${new Date(m.last_verified_at).toLocaleString()}`}
+                                            style={{ background: 'rgba(34,197,94,0.15)', color: 'rgb(34,197,94)', fontSize: '10px' }}
+                                        >
+                                            连接已验证
+                                        </span>
+                                    ) : m.tool_calling_capability_source === 'probe' && m.tool_calling_checked_at ? (
+                                        <span
+                                            className="badge"
+                                            title={`历史工具探测同时证明连接成功：${new Date(m.tool_calling_checked_at).toLocaleString()}`}
+                                            style={{ background: 'rgba(59,130,246,0.15)', color: 'rgb(59,130,246)', fontSize: '10px' }}
+                                        >
+                                            连接 evidence（历史）
+                                        </span>
+                                    ) : (
+                                        <span
+                                            className="badge"
+                                            title={m.last_error_message || '当前配置尚无连接验证 evidence，不能用于 Groups 规划或上下文压缩。'}
+                                            style={{ background: 'rgba(245,158,11,0.15)', color: 'rgb(245,158,11)', fontSize: '10px' }}
+                                        >
+                                            连接未验证
+                                        </span>
+                                    )}
                                     {m.supports_vision && <span className="badge" style={{ background: 'rgba(99,102,241,0.15)', color: 'rgb(99,102,241)', fontSize: '10px' }}>Vision</span>}
                                     {m.supports_tool_calling === true ? (
                                         <span

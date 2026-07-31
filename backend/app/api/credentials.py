@@ -6,6 +6,7 @@ multiple models/modalities of a provider) and shared across all tenants.
 """
 
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
@@ -47,6 +48,32 @@ def _to_out(cred: LLMCredential) -> CredentialOut:
     out = CredentialOut.model_validate(cred)
     out.api_key_masked = _mask_key(cred)
     return out
+
+
+def _verification_receipt(
+    credential: LLMCredential,
+    *,
+    checked_at: datetime,
+    ok: bool,
+    provider_status: int | None,
+    model_count: int | None,
+) -> dict[str, object]:
+    """Build a secret-free account-authentication receipt."""
+
+    return {
+        "receipt_ref": f"credential-auth:{uuid.uuid4()}",
+        "kind": "credential_auth_probe",
+        "scope": "account_authentication",
+        "evidence_level": "account_verified" if ok else "verification_failed",
+        "credential_id": str(credential.id),
+        "provider": str(credential.provider),
+        "plan_tier": getattr(credential, "plan_tier", None),
+        "capabilities": list(getattr(credential, "capabilities", None) or []),
+        "checked_at": checked_at.isoformat(),
+        "ok": ok,
+        "provider_status": provider_status,
+        "model_count": model_count,
+    }
 
 
 def _validate_provider_account_contract(
@@ -181,13 +208,19 @@ async def update_credential(credential_id: uuid.UUID, data: CredentialUpdateIn, 
         "plan_tier" in updates
         and updates["plan_tier"] != getattr(cred, "plan_tier", None)
     )
+    capabilities_changed = (
+        "capabilities" in updates
+        and updates["capabilities"] != cred.capabilities
+    )
     for k, v in updates.items():
         setattr(cred, k, v)
     if api_key_changed:
         cred.api_key_encrypted = encrypt_data(new_api_key.strip(), settings.SECRET_KEY)
-    if base_url_changed or plan_tier_changed or api_key_changed:
+    if base_url_changed or plan_tier_changed or capabilities_changed or api_key_changed:
         cred.status = "unverified"
         cred.error_count = 0
+        cred.last_verification_at = None
+        cred.verification_receipt = None
     if api_key_changed:
         # A replacement key is a different provider account, so inherited
         # model-quota circuits are no longer relevant. Changing only the API
@@ -206,7 +239,17 @@ async def verify_credential(credential_id: uuid.UUID, db: AsyncSession = Depends
         raise HTTPException(status_code=404, detail="Credential not found")
 
     result = await verify_provider_credential(cred)
+    checked_at = datetime.now(timezone.utc)
+    receipt = _verification_receipt(
+        cred,
+        checked_at=checked_at,
+        ok=result.ok,
+        provider_status=result.provider_status,
+        model_count=result.model_count,
+    )
     cred.status = "healthy" if result.ok else "unverified"
+    cred.last_verification_at = checked_at
+    cred.verification_receipt = receipt
     if result.ok:
         # Explicit administrator verification is the recovery boundary for a
         # degraded shared credential. Ordinary successful calls may clear a
@@ -222,6 +265,7 @@ async def verify_credential(credential_id: uuid.UUID, db: AsyncSession = Depends
         provider_status=result.provider_status,
         model_count=result.model_count,
         message=result.message,
+        receipt=receipt,
     )
 
 

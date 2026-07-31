@@ -83,6 +83,26 @@ class MediaGenerationTask(Base):
         ),
         nullable=True,
     )
+    deliverable_execution_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "deliverable_executions.id",
+            name="fk_media_generation_deliverable_execution",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+        index=True,
+    )
+    deliverable_unit_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "deliverable_execution_units.id",
+            name="fk_media_generation_deliverable_unit",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+        unique=True,
+    )
 
     provider: Mapped[str] = mapped_column(String(50), nullable=False)
     modality: Mapped[str] = mapped_column(String(20), nullable=False)

@@ -22,7 +22,9 @@ from app.database import get_db
 from app.models.chat_session import ChatSession
 from app.models.audit import AuditLog
 from app.models.deliverable import (
+    DeliverableApprovalReceipt,
     DeliverableArtifactRevision,
+    DeliverableExecution,
     DeliverableQualityReview,
     DeliverableQualityReviewAssignment,
     DeliverableQualityReviewEvidence,
@@ -32,8 +34,12 @@ from app.models.user import User
 from app.models.task import Task
 from app.schemas.deliverable import (
     DeliverableActionIn,
+    DeliverableApprovalIn,
     DeliverableApprovalReadinessOut,
+    DeliverableApprovalReceiptOut,
     DeliverableArtifactOut,
+    DeliverableExecutionOut,
+    DeliverableExecutionUnitOut,
     DeliverablePreflightIn,
     DeliverableQualityReviewerOut,
     DeliverableQualityReviewArtifactOut,
@@ -50,6 +56,15 @@ from app.services.deliverable_artifacts import (
     DeliverableArtifactError,
     approve_deliverable_artifacts,
     read_deliverable_artifact_snapshot,
+)
+from app.services.deliverable_executions import (
+    DeliverableExecutionError,
+    add_initial_execution_shadow,
+    bind_artifacts_to_current_execution,
+    create_revision_execution,
+    ensure_execution_shadow,
+    execution_units,
+    project_execution_lifecycle,
 )
 from app.services.deliverable_quality_gate import (
     creative_quality_gate_required_for_request,
@@ -87,6 +102,78 @@ def _workflow_error(exc: DeliverableWorkflowError) -> HTTPException:
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         detail={"code": exc.code, "message": str(exc)},
     )
+
+
+def _execution_error(exc: DeliverableExecutionError) -> HTTPException:
+    status_code = (
+        status.HTTP_422_UNPROCESSABLE_ENTITY
+        if exc.code in {
+            "deliverable_revision_instruction_required",
+            "deliverable_revision_target_invalid",
+        }
+        else status.HTTP_409_CONFLICT
+    )
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": exc.code, "message": str(exc)},
+    )
+
+
+async def _execution_out(
+    db: AsyncSession,
+    execution: DeliverableExecution,
+) -> DeliverableExecutionOut:
+    units = await execution_units(db, execution.id)
+    receipt_result = await db.execute(
+        select(DeliverableApprovalReceipt)
+        .where(DeliverableApprovalReceipt.execution_id == execution.id)
+        .order_by(
+            DeliverableApprovalReceipt.created_at,
+            DeliverableApprovalReceipt.id,
+        )
+    )
+    approvals = tuple(receipt_result.scalars().all())
+    return DeliverableExecutionOut.model_validate(
+        {
+            **{
+                field: getattr(execution, field)
+                for field in DeliverableExecutionOut.model_fields
+                if field not in {"units", "approvals"}
+            },
+            "units": [
+                DeliverableExecutionUnitOut.model_validate(unit)
+                for unit in units
+            ],
+            "approvals": [
+                DeliverableApprovalReceiptOut.model_validate(receipt)
+                for receipt in approvals
+            ],
+        }
+    )
+
+
+async def _supersede_quality_reviews_for_revision(
+    db: AsyncSession,
+    request: DeliverableRequest,
+    *,
+    now: datetime,
+) -> tuple[uuid.UUID, ...]:
+    result = await db.execute(
+        select(DeliverableQualityReview)
+        .where(
+            DeliverableQualityReview.tenant_id == request.tenant_id,
+            DeliverableQualityReview.request_id == request.id,
+            DeliverableQualityReview.status != "superseded",
+        )
+        .with_for_update()
+    )
+    superseded: list[uuid.UUID] = []
+    for review in result.scalars().all():
+        review.status = "superseded"
+        review.sealed_at = now
+        review.version += 1
+        superseded.append(review.id)
+    return tuple(superseded)
 
 
 async def _require_direct_session(
@@ -144,13 +231,19 @@ async def _request_out(db: AsyncSession, request: DeliverableRequest) -> Deliver
         artifact_models,
         require_creative_quality_gate=quality_gate_required,
     )
+    fields = {
+        field: getattr(request, field)
+        for field in DeliverableRequestOut.model_fields
+        if field not in {"artifacts", "approval_readiness"}
+    }
+    # Compatibility for model instances created by older tests or rolling
+    # workers before the shadow-execution migration is applied.
+    fields["contract_revision"] = int(fields.get("contract_revision") or 1)
+    fields["current_execution_id"] = fields.get("current_execution_id") or None
+    fields["latest_preflight"] = fields.get("latest_preflight") or None
     return DeliverableRequestOut.model_validate(
         {
-            **{
-                field: getattr(request, field)
-                for field in DeliverableRequestOut.model_fields
-                if field not in {"artifacts", "approval_readiness"}
-            },
+            **fields,
             "artifacts": artifacts,
             "approval_readiness": DeliverableApprovalReadinessOut(
                 **readiness.model_dump()
@@ -436,6 +529,23 @@ def _quality_review_out(
     )
 
 
+def _supersede_review_for_changed_artifacts(
+    review: DeliverableQualityReview,
+    artifacts: Sequence[DeliverableArtifactRevision],
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Project current Artifact hashes into a stale Review without erasing its receipt."""
+    if review.status == "superseded":
+        return False
+    if selected_artifact_hashes(artifacts) == dict(review.artifact_hashes):
+        return False
+    review.status = "superseded"
+    review.sealed_at = now or datetime.now(UTC)
+    review.version += 1
+    return True
+
+
 @router.get("/workflows")
 async def list_deliverable_workflows(
     agent_id: uuid.UUID = Query(...),
@@ -549,6 +659,7 @@ async def create_deliverable_request(
         return await _request_out(db, existing)
 
     request = DeliverableRequest(
+        id=uuid.uuid4(),
         tenant_id=agent.tenant_id,
         created_by_user_id=current_user.id,
         agent_id=agent.id,
@@ -567,10 +678,12 @@ async def create_deliverable_request(
         output_contract=output_contract,
         status="ready",
         current_stage="brief_confirmed",
+        contract_revision=1,
     )
     try:
         async with db.begin_nested():
             db.add(request)
+            add_initial_execution_shadow(db, request)
             await db.flush()
     except IntegrityError:
         concurrent_result = await db.execute(
@@ -624,6 +737,236 @@ async def get_deliverable_request(
     db: AsyncSession = Depends(get_db),
 ):
     request = await _owned_request(db, request_id=request_id, user=current_user)
+    return await _request_out(db, request)
+
+
+@router.get(
+    "/requests/{request_id}/executions",
+    response_model=list[DeliverableExecutionOut],
+)
+async def list_deliverable_executions(
+    request_id: uuid.UUID,
+    limit: int = Query(default=20, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    request = await _owned_request(
+        db,
+        request_id=request_id,
+        user=current_user,
+        lock=True,
+    )
+    adopting_legacy_execution = request.current_execution_id is None
+    preserved_request_updated_at = request.updated_at
+    # Older requests are upgraded lazily. This creates Provider-free execution
+    # facts only; it never launches a model or reserves credits.
+    await ensure_execution_shadow(db, request, lock=True)
+    # Historical requests predate execution/unit lineage. Bind their selected,
+    # already-verified artifacts to the lazily-created shadow before lifecycle
+    # projection. The artifact fact is what proves production completed; the
+    # request status alone is not enough to fabricate successful units.
+    selected_artifacts = await _request_artifacts(db, request, lock=True)
+    if selected_artifacts:
+        await bind_artifacts_to_current_execution(
+            db,
+            request,
+            selected_artifacts,
+        )
+    # A lazily-created shadow for a historical request starts with pending
+    # blueprint units. Project the already-authoritative v1 request lifecycle
+    # before returning it, otherwise a delivered artifact is rendered as
+    # "0/N production steps complete" in the current UI.
+    await project_execution_lifecycle(db, request)
+    if adopting_legacy_execution:
+        # Attaching the compatibility lineage is not a business event. Preserve
+        # the historical request timestamp so merely opening a drawer cannot
+        # reorder old work on the task index.
+        request.updated_at = preserved_request_updated_at
+    await db.flush()
+    result = await db.execute(
+        select(DeliverableExecution)
+        .where(
+            DeliverableExecution.tenant_id == request.tenant_id,
+            DeliverableExecution.request_id == request.id,
+        )
+        .order_by(
+            DeliverableExecution.execution_number.desc(),
+            DeliverableExecution.id.desc(),
+        )
+        .limit(limit)
+    )
+    return [
+        await _execution_out(db, execution)
+        for execution in result.scalars().all()
+    ]
+
+
+@router.post(
+    "/requests/{request_id}/approvals",
+    response_model=DeliverableRequestOut,
+)
+async def record_deliverable_approval(
+    request_id: uuid.UUID,
+    data: DeliverableApprovalIn,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    request = await _owned_request(
+        db,
+        request_id=request_id,
+        user=current_user,
+        lock=True,
+    )
+    normalized_instruction = data.instruction.strip() if data.instruction else None
+    action_payload = {
+        "stage": data.stage,
+        "action": data.action,
+        "instruction": normalized_instruction,
+        "target_units": data.target_units,
+    }
+    fingerprint = request_fingerprint(action_payload)
+    existing_result = await db.execute(
+        select(DeliverableApprovalReceipt).where(
+            DeliverableApprovalReceipt.tenant_id == request.tenant_id,
+            DeliverableApprovalReceipt.request_id == request.id,
+            DeliverableApprovalReceipt.client_action_id == data.client_action_id,
+        )
+    )
+    existing = existing_result.scalar_one_or_none()
+    if existing is not None:
+        if existing.request_fingerprint != fingerprint:
+            raise HTTPException(
+                status_code=409,
+                detail="client_action_id was already used for a different decision",
+            )
+        return await _request_out(db, request)
+
+    if request.version != data.expected_version:
+        raise HTTPException(
+            status_code=409,
+            detail="Deliverable request changed; reload before acting",
+        )
+    if data.stage != "final":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "deliverable_stage_approval_not_ready",
+                "message": "Only final delivery approval is enabled in this compatibility release",
+            },
+        )
+    if request.status != "waiting_approval" or request.current_stage != "output_review":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "deliverable_final_approval_not_ready",
+                "message": "Deliverable must be in final output review",
+            },
+        )
+
+    decision_execution = await ensure_execution_shadow(db, request, lock=True)
+    now = datetime.now(UTC)
+    next_execution_id: uuid.UUID | None = None
+    superseded_review_ids: tuple[uuid.UUID, ...] = ()
+    if data.action == "approve":
+        try:
+            artifacts = await approve_deliverable_artifacts(db, request=request)
+        except DeliverableArtifactError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": exc.code, "message": str(exc)},
+            ) from exc
+        for artifact in artifacts:
+            artifact.status = "approved"
+            artifact.approved_by_user_id = current_user.id
+            artifact.approved_at = now
+        request.status = "succeeded"
+        request.current_stage = "delivered"
+        request.completed_at = now
+        request.last_error_code = None
+        request.version += 1
+    elif data.action == "request_changes":
+        if normalized_instruction is None:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "deliverable_revision_instruction_required",
+                    "message": "Revision instructions are required",
+                },
+            )
+        try:
+            next_execution, _created = await create_revision_execution(
+                db,
+                request,
+                client_revision_id=data.client_action_id,
+                instruction=normalized_instruction,
+                target_units=data.target_units,
+            )
+        except DeliverableExecutionError as exc:
+            raise _execution_error(exc) from exc
+        next_execution_id = next_execution.id
+        superseded_review_ids = await _supersede_quality_reviews_for_revision(
+            db,
+            request,
+            now=now,
+        )
+    elif data.action == "cancel":
+        request.status = "cancelled"
+        request.current_stage = "cancelled"
+        request.completed_at = now
+        request.last_error_code = None
+        request.version += 1
+    else:  # pragma: no cover - constrained by the API schema
+        raise HTTPException(status_code=409, detail="Unsupported approval action")
+
+    await project_execution_lifecycle(db, request, now=now)
+    receipt = DeliverableApprovalReceipt(
+        id=uuid.uuid4(),
+        tenant_id=request.tenant_id,
+        request_id=request.id,
+        execution_id=decision_execution.id,
+        actor_user_id=current_user.id,
+        client_action_id=data.client_action_id,
+        request_fingerprint=fingerprint,
+        request_version=data.expected_version,
+        stage=data.stage,
+        action=data.action,
+        instruction=normalized_instruction,
+        target_units=list(data.target_units),
+        receipt={
+            "version": 1,
+            "decision_execution_id": str(decision_execution.id),
+            "next_execution_id": str(next_execution_id) if next_execution_id else None,
+            "result_request_version": request.version,
+            "recorded_at": now.isoformat(),
+        },
+    )
+    db.add(receipt)
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            agent_id=request.agent_id,
+            action=f"deliverable.approval.{data.action}",
+            details={
+                "tenant_id": str(request.tenant_id),
+                "request_id": str(request.id),
+                "execution_id": str(decision_execution.id),
+                "next_execution_id": str(next_execution_id) if next_execution_id else None,
+                "client_action_id": str(data.client_action_id),
+                "stage": data.stage,
+                "target_units": list(data.target_units),
+                "superseded_quality_review_ids": [
+                    str(review_id) for review_id in superseded_review_ids
+                ],
+            },
+        )
+    )
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="A concurrent delivery decision changed this request",
+        ) from exc
     return await _request_out(db, request)
 
 
@@ -918,7 +1261,10 @@ async def get_latest_deliverable_quality_review(
         db,
         review_id=review.id,
         user=current_user,
+        lock=True,
     )
+    if _supersede_review_for_changed_artifacts(review, artifacts):
+        await db.flush()
     return _quality_review_out(
         review=review,
         request=request,
@@ -942,7 +1288,10 @@ async def get_deliverable_quality_review(
         db,
         review_id=review_id,
         user=current_user,
+        lock=True,
     )
+    if _supersede_review_for_changed_artifacts(review, artifacts):
+        await db.flush()
     return _quality_review_out(
         review=review,
         request=request,
@@ -1354,25 +1703,21 @@ async def apply_deliverable_action(
             request.completed_at = now
             request.last_error_code = None
             request.version += 1
+            if request.current_execution_id is not None:
+                await project_execution_lifecycle(db, request, now=now)
             await db.flush()
             return await _request_out(db, request)
         if data.action == "request_changes":
-            artifact_result = await db.execute(
-                select(DeliverableArtifactRevision)
-                .where(
-                    DeliverableArtifactRevision.tenant_id == request.tenant_id,
-                    DeliverableArtifactRevision.request_id == request.id,
-                    DeliverableArtifactRevision.status == "candidate",
+            try:
+                await create_revision_execution(
+                    db,
+                    request,
+                    client_revision_id=uuid.uuid4(),
+                    instruction="用户通过兼容入口要求修改最终交付，请保留原工作说明并生成新版本。",
                 )
-                .with_for_update()
-            )
-            for artifact in artifact_result.scalars().all():
-                artifact.status = "rejected"
-            request.status = "failed"
-            request.current_stage = "changes_requested"
-            request.completed_at = now
-            request.last_error_code = "deliverable_changes_requested"
-            request.version += 1
+            except DeliverableExecutionError as exc:
+                raise _execution_error(exc) from exc
+            await _supersede_quality_reviews_for_revision(db, request, now=now)
             await db.flush()
             return await _request_out(db, request)
         raise HTTPException(status_code=409, detail="Only approve or request_changes is valid during output review")
@@ -1388,5 +1733,7 @@ async def apply_deliverable_action(
         raise HTTPException(status_code=409, detail="Action is not valid for the current request state")
     request.status, request.current_stage = transition
     request.version += 1
+    if request.current_execution_id is not None:
+        await project_execution_lifecycle(db, request)
     await db.flush()
     return await _request_out(db, request)

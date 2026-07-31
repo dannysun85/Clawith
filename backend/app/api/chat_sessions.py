@@ -30,6 +30,7 @@ from app.services.chat_session_service import (
     create_direct_session,
     soft_delete_direct_session,
 )
+from app.services.chat_session_access import can_audit_agent_chat_sessions
 from app.services.agent_runtime.run_state_reader import (
     RunStateReadError,
     open_run_state_reader as _open_run_state_reader,
@@ -49,9 +50,17 @@ from app.services.entitlements import get_tenant_entitlements
 router = APIRouter(prefix="/api/agents", tags=["chat-sessions"])
 
 
-def _can_view_all_agent_chat_sessions(user: User, agent: Agent) -> bool:
-    """Admins and the agent creator may inspect other users' direct sessions."""
-    return user.role in ("platform_admin", "org_admin", "agent_admin") or str(agent.creator_id) == str(user.id)
+def _can_view_all_agent_chat_sessions(
+    user: User,
+    agent: Agent,
+    access_level: str,
+) -> bool:
+    """Return per-Agent cross-owner session visibility."""
+    return can_audit_agent_chat_sessions(
+        user,
+        agent=agent,
+        agent_access_level=access_level,
+    )
 
 
 def _require_tenant_id(user: User) -> uuid.UUID:
@@ -103,16 +112,25 @@ async def _check_direct_agent_access(
     db: AsyncSession,
     current_user: User,
     agent_id: uuid.UUID,
-) -> tuple[Agent, uuid.UUID]:
+) -> tuple[Agent, uuid.UUID, str]:
     tenant_id = _require_tenant_id(current_user)
-    agent, _ = await check_agent_access(db, current_user, agent_id)
+    agent, access_level = await check_agent_access(db, current_user, agent_id)
     if agent.tenant_id != tenant_id:
         raise HTTPException(status_code=403, detail="No access to this agent")
-    return agent, tenant_id
+    return agent, tenant_id, access_level
 
 
-def _authorize_session_owner(current_user: User, agent: Agent, session: ChatSession) -> None:
-    if str(session.user_id) != str(current_user.id) and not _can_view_all_agent_chat_sessions(current_user, agent):
+def _authorize_session_owner(
+    current_user: User,
+    agent: Agent,
+    session: ChatSession,
+    access_level: str,
+) -> None:
+    if str(session.user_id) != str(current_user.id) and not _can_view_all_agent_chat_sessions(
+        current_user,
+        agent,
+        access_level,
+    ):
         raise HTTPException(status_code=403, detail="Not authorized")
 
 
@@ -279,10 +297,14 @@ async def list_sessions(
     db: AsyncSession = Depends(get_db),
 ):
     """List active sessions on the legacy Agent session surface."""
-    agent, tenant_id = await _check_direct_agent_access(db, current_user, agent_id)
+    agent, tenant_id, access_level = await _check_direct_agent_access(db, current_user, agent_id)
     if scope not in {"mine", "all"}:
         raise HTTPException(status_code=400, detail="scope must be 'mine' or 'all'")
-    if scope == "all" and not _can_view_all_agent_chat_sessions(current_user, agent):
+    if scope == "all" and not _can_view_all_agent_chat_sessions(
+        current_user,
+        agent,
+        access_level,
+    ):
         raise HTTPException(status_code=403, detail="Not authorized to view all sessions")
 
     if scope == "mine":
@@ -444,7 +466,7 @@ async def create_session(
     db: AsyncSession = Depends(get_db),
 ):
     """Create a direct session for the active current-tenant User."""
-    agent, tenant_id = await _check_direct_agent_access(db, current_user, agent_id)
+    agent, tenant_id, _access_level = await _check_direct_agent_access(db, current_user, agent_id)
     user_result = await db.execute(
         select(User).where(
             User.id == current_user.id,
@@ -516,7 +538,7 @@ async def get_session_runtime_state(
     db: AsyncSession = Depends(get_db),
 ) -> SessionRuntimeStateOut:
     """Return the one exact Direct Chat lane holder, if one exists."""
-    _agent, tenant_id = await _check_direct_agent_access(
+    _agent, tenant_id, _access_level = await _check_direct_agent_access(
         db,
         current_user,
         agent_id,
@@ -684,7 +706,7 @@ async def reconcile_direct_tool_execution(
     db: AsyncSession = Depends(get_db),
 ) -> ReconcileToolExecutionOut:
     """Settle a Direct Chat unknown receipt before the user resumes its Run."""
-    agent, tenant_id = await _check_direct_agent_access(db, current_user, agent_id)
+    agent, tenant_id, _access_level = await _check_direct_agent_access(db, current_user, agent_id)
     session_result = await db.execute(
         select(ChatSession).where(
             ChatSession.id == session_id,
@@ -804,7 +826,7 @@ async def rename_session(
     db: AsyncSession = Depends(get_db),
 ):
     """Rename one active direct session."""
-    agent, tenant_id = await _check_direct_agent_access(db, current_user, agent_id)
+    agent, tenant_id, access_level = await _check_direct_agent_access(db, current_user, agent_id)
     result = await db.execute(
         select(ChatSession).where(
             *_active_direct_filters(tenant_id, agent_id),
@@ -814,7 +836,7 @@ async def rename_session(
     session = result.scalar_one_or_none()
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
-    _authorize_session_owner(current_user, agent, session)
+    _authorize_session_owner(current_user, agent, session, access_level)
 
     selection_fields = {"model_tier", "model_modality"} & body.model_fields_set
     if selection_fields:
@@ -904,7 +926,7 @@ async def delete_session(
     db: AsyncSession = Depends(get_db),
 ):
     """Soft-delete a direct session and cancel only its foreground collaboration."""
-    agent, tenant_id = await _check_direct_agent_access(db, current_user, agent_id)
+    agent, tenant_id, access_level = await _check_direct_agent_access(db, current_user, agent_id)
     result = await db.execute(
         select(ChatSession).where(
             *_active_direct_filters(tenant_id, agent_id),
@@ -914,7 +936,7 @@ async def delete_session(
     session = result.scalar_one_or_none()
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
-    _authorize_session_owner(current_user, agent, session)
+    _authorize_session_owner(current_user, agent, session, access_level)
     if session.user_id is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
@@ -1007,7 +1029,7 @@ async def get_session_messages(
     db: AsyncSession = Depends(get_db),
 ):
     """Return associated session messages by authoritative `(created_at, id)` position."""
-    agent, tenant_id = await _check_direct_agent_access(db, current_user, agent_id)
+    agent, tenant_id, access_level = await _check_direct_agent_access(db, current_user, agent_id)
     result = await db.execute(
         select(ChatSession).where(
             *_active_agent_session_filters(tenant_id, agent_id),
@@ -1017,7 +1039,7 @@ async def get_session_messages(
     session = result.scalar_one_or_none()
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
-    _authorize_session_owner(current_user, agent, session)
+    _authorize_session_owner(current_user, agent, session, access_level)
 
     query = (
         select(ChatMessage)

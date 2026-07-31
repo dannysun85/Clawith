@@ -333,6 +333,162 @@ async def test_completed_group_run_waits_for_all_participants_and_projects_resul
 
 
 @pytest.mark.asyncio
+async def test_group_partial_failure_keeps_task_pending_and_names_each_outcome() -> None:
+    run, checkpoint, stored_run, task = _records(source_type="chat")
+    reviewer_id = uuid.uuid4()
+    task.executor_kind = "group"
+    task.group_id = uuid.uuid4()
+    task.executor_snapshot = {
+        "participants": [
+            {"agent_id": str(task.agent_id), "agent_name": "Researcher"},
+            {"agent_id": str(reviewer_id), "agent_name": "Reviewer"},
+        ]
+    }
+    correlation_id = f"work-task:{task.id}"
+    run = replace(run, correlation_id=correlation_id)
+    stored_run.source_type = "chat"
+    stored_run.source_id = str(uuid.uuid4())
+    stored_run.correlation_id = correlation_id
+    stored_run.delivery_status = "pending"
+    reviewer_run = AgentRun(
+        id=uuid.uuid4(),
+        tenant_id=run.tenant_id,
+        agent_id=reviewer_id,
+        source_type="chat",
+        source_id=str(uuid.uuid4()),
+        correlation_id=correlation_id,
+        goal="Review findings",
+        run_kind="delegated",
+        model_id=uuid.uuid4(),
+        runtime_type="langgraph",
+        runtime_thread_id=str(uuid.uuid4()),
+        graph_name="agent_runtime",
+        graph_version="v2",
+        delivery_status="pending",
+    )
+    completed = AgentRunEvent(
+        id=uuid.uuid4(),
+        tenant_id=run.tenant_id,
+        run_id=stored_run.id,
+        agent_id=task.agent_id,
+        event_type="run_completed",
+        summary="Runtime Run completed",
+        payload={"status": "completed"},
+        artifact_refs=[],
+        idempotency_key="research-terminal",
+    )
+    failed = AgentRunEvent(
+        id=uuid.uuid4(),
+        tenant_id=run.tenant_id,
+        run_id=reviewer_run.id,
+        agent_id=reviewer_id,
+        event_type="run_failed",
+        summary="Runtime Run failed",
+        payload={"status": "failed", "error_code": "model_call_failed"},
+        artifact_refs=[],
+        idempotency_key="review-terminal",
+    )
+    result_message = ChatMessage(
+        id=uuid.uuid4(),
+        agent_id=task.agent_id,
+        role="assistant",
+        content="Three source-backed findings are ready.",
+        conversation_id=str(uuid.uuid4()),
+        mentions=[],
+    )
+    delivery = AgentRunEvent(
+        id=uuid.uuid4(),
+        tenant_id=run.tenant_id,
+        run_id=stored_run.id,
+        agent_id=task.agent_id,
+        event_type="delivery_succeeded",
+        summary="delivered",
+        payload={"delivery_kind": "terminal", "message_id": str(result_message.id)},
+        artifact_refs=[],
+        idempotency_key="research-delivery",
+    )
+    session = _Session(
+        stored_run,
+        task,
+        None,
+        [stored_run, reviewer_run],
+        [completed, failed],
+        [delivery],
+        [result_message],
+    )
+    handler = TaskRuntimeCompletionHandler(
+        session_factory=_SessionFactory(session),  # type: ignore[arg-type]
+    )
+
+    await handler.handle(run=run, checkpoint=checkpoint)
+
+    assert task.status == "pending"
+    assert task.completed_at is None
+    log = session.added[0]
+    assert isinstance(log, TaskLog)
+    assert "Group 协作任务未完成" in log.content
+    assert "Researcher · 已完成" in log.content
+    assert "Three source-backed findings are ready." in log.content
+    assert "Reviewer · 执行失败" in log.content
+    assert "原因：model_call_failed" in log.content
+
+
+@pytest.mark.asyncio
+async def test_group_completion_waits_while_any_participant_is_non_terminal() -> None:
+    run, checkpoint, stored_run, task = _records(source_type="chat")
+    task.executor_kind = "group"
+    task.group_id = uuid.uuid4()
+    correlation_id = f"work-task:{task.id}"
+    run = replace(run, correlation_id=correlation_id)
+    stored_run.source_type = "chat"
+    stored_run.source_id = str(uuid.uuid4())
+    stored_run.correlation_id = correlation_id
+    second_run = AgentRun(
+        id=uuid.uuid4(),
+        tenant_id=run.tenant_id,
+        agent_id=uuid.uuid4(),
+        source_type="chat",
+        source_id=str(uuid.uuid4()),
+        correlation_id=correlation_id,
+        goal="Continue collaboration",
+        run_kind="delegated",
+        model_id=uuid.uuid4(),
+        runtime_type="langgraph",
+        runtime_thread_id=str(uuid.uuid4()),
+        graph_name="agent_runtime",
+        graph_version="v2",
+        delivery_status="pending",
+    )
+    completed = AgentRunEvent(
+        id=uuid.uuid4(),
+        tenant_id=run.tenant_id,
+        run_id=stored_run.id,
+        agent_id=task.agent_id,
+        event_type="run_completed",
+        summary="Runtime Run completed",
+        payload={"status": "completed"},
+        artifact_refs=[],
+        idempotency_key="only-one-terminal",
+    )
+    session = _Session(
+        stored_run,
+        task,
+        None,
+        [stored_run, second_run],
+        [completed],
+    )
+    handler = TaskRuntimeCompletionHandler(
+        session_factory=_SessionFactory(session),  # type: ignore[arg-type]
+    )
+
+    await handler.handle(run=run, checkpoint=checkpoint)
+
+    assert task.status == "doing"
+    assert session.added == []
+    assert session.flushes == 0
+
+
+@pytest.mark.asyncio
 async def test_non_task_run_is_ignored_without_opening_a_session() -> None:
     run, checkpoint, _, _ = _records(source_type="chat")
     factory = _SessionFactory()

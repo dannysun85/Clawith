@@ -762,6 +762,7 @@ def _handoff_child_command(
         source_type="chat",
         source_id=str(intent.trigger_message_id),
         source_execution_id=source_execution_id,
+        correlation_id=source_run.correlation_id,
         goal=current_responsibility,
         run_kind="delegated",
         model_id=target.model.id,

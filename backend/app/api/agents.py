@@ -1206,13 +1206,14 @@ async def update_agent(
     db: AsyncSession = Depends(get_db),
 ):
     """Update agent settings (creator or admin)."""
-    agent, _access = await check_agent_access(db, current_user, agent_id)
+    agent, access_level = await check_agent_access(db, current_user, agent_id)
 
     is_admin = current_user.role in ("platform_admin", "org_admin")
 
-    if not is_agent_creator(current_user, agent) and not is_admin:
+    if access_level != "manage":
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="Only creator or admin can update agent settings"
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Manage access is required to update agent settings",
         )
 
     update_data = data.model_dump(exclude_unset=True)
@@ -1538,7 +1539,7 @@ async def list_agent_approvals(
     db: AsyncSession = Depends(get_db),
 ):
     """List approval requests for a specific agent. Only creator or admin can view."""
-    agent, _access = await check_agent_access(db, current_user, agent_id)
+    agent, access_level = await check_agent_access(db, current_user, agent_id)
     if not is_agent_creator(current_user, agent) and current_user.role not in ("platform_admin", "org_admin"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="Only agent creator or admin can view approvals"
@@ -1622,13 +1623,17 @@ async def list_gateway_messages(
     db: AsyncSession = Depends(get_db),
 ):
     """List recent gateway messages for an OpenClaw agent."""
-    agent, _access = await check_agent_access(db, current_user, agent_id)
+    agent, access_level = await check_agent_access(db, current_user, agent_id)
 
     from app.models.gateway_message import GatewayMessage
     from app.services.chat_session_access import can_audit_agent_chat_sessions
 
     query = select(GatewayMessage).where(GatewayMessage.agent_id == agent_id)
-    if not can_audit_agent_chat_sessions(current_user):
+    if not can_audit_agent_chat_sessions(
+        current_user,
+        agent=agent,
+        agent_access_level=access_level,
+    ):
         query = query.where(GatewayMessage.sender_user_id == current_user.id)
     result = await db.execute(
         query

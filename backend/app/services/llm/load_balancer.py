@@ -26,6 +26,9 @@ from sqlalchemy import or_, select, text
 from app.core.events import get_redis
 from app.database import async_session
 from app.models.llm import LLMCredential
+from app.services.credential_readiness import (
+    current_credential_verification_receipt,
+)
 from app.services.modalities import canonicalize_modalities, modality_match_values
 
 
@@ -39,6 +42,7 @@ _TPM_WINDOW = 60                                # 60 second window for TPM
 PROVIDER_RATE_COOLDOWN_SECONDS = 30
 _PROVIDER_RATE_CODES = frozenset({"1002", "1041", "2045", "2062", "rate_limit"})
 PLAN_QUOTA_RESOURCE = "plan"
+_MEDIA_MODALITIES = frozenset({"image", "audio", "music", "video"})
 
 
 class CredentialUnavailableReason(str, Enum):
@@ -97,6 +101,12 @@ def _credential_supports_modality(credential: LLMCredential, modality: str | Non
 def _canonical_modality(modality: str) -> str:
     canonical = canonicalize_modalities([modality])
     return canonical[0] if canonical else str(modality).strip().lower()
+
+
+def _requires_explicit_account_verification(modality: str | None) -> bool:
+    if not modality:
+        return False
+    return _canonical_modality(modality) in _MEDIA_MODALITIES
 
 
 def _normalize_quota_resource(resource: str) -> str:
@@ -200,6 +210,14 @@ def _diagnose_base_filter_failure(
     enabled = [credential for credential in capable if credential.enabled]
     if not enabled:
         return CredentialUnavailableReason.ALL_UNHEALTHY
+    if _requires_explicit_account_verification(modality):
+        enabled = [
+            credential
+            for credential in enabled
+            if current_credential_verification_receipt(credential) is not None
+        ]
+        if not enabled:
+            return CredentialUnavailableReason.ALL_UNHEALTHY
     quota_available = [
         credential
         for credential in enabled
@@ -414,6 +432,8 @@ async def pick_credential(
             conditions.append(
                 or_(*capability_conditions)
             )
+            if _requires_explicit_account_verification(modality):
+                conditions.append(LLMCredential.last_verification_at.is_not(None))
 
         # Order by priority DESC, weight DESC for weighted pick
         query = select(LLMCredential).where(*conditions).order_by(
@@ -424,6 +444,10 @@ async def pick_credential(
         all_creds = [
             credential
             for credential in result.scalars().all()
+            if (
+                not _requires_explicit_account_verification(modality)
+                or current_credential_verification_receipt(credential) is not None
+            )
             if not credential_quota_is_blocked(
                 credential,
                 effective_quota_modality,

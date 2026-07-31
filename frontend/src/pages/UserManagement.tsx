@@ -168,7 +168,8 @@ export default function UserManagement() {
     const roleBadge = (role: string) => {
         const styles: Record<string, { bg: string; color: string; label: string; labelZh: string }> = {
             platform_admin: { bg: 'rgba(239,68,68,0.12)', color: '#ef4444', label: 'Platform Admin', labelZh: 'Platform Admin' },
-            org_admin:      { bg: 'rgba(168,85,247,0.12)', color: '#a855f7', label: 'Admin', labelZh: 'Admin' },
+            org_admin:      { bg: 'rgba(168,85,247,0.12)', color: '#a855f7', label: 'Company Admin', labelZh: '公司管理员' },
+            agent_admin:    { bg: 'rgba(59,130,246,0.12)', color: '#3b82f6', label: 'Agent Admin', labelZh: 'Agent 管理员' },
         };
         const s = styles[role];
         if (!s) return null;
@@ -309,21 +310,29 @@ export default function UserManagement() {
                                             disabled={changingRoleUserId === user.id}
                                             onChange={async e => {
                                                 const newRole = e.target.value;
+                                                const roleLabel = newRole === 'org_admin'
+                                                    ? (isChinese ? '公司管理员' : 'Company Admin')
+                                                    : newRole === 'agent_admin'
+                                                        ? (isChinese ? 'Agent 管理员' : 'Agent Admin')
+                                                        : (isChinese ? '普通成员' : 'Member');
                                                 const confirmMsg = isChinese
-                                                    ? `确认将 ${user.display_name || user.username} 的角色更改为 ${newRole === 'org_admin' ? 'Admin' : 'Member'}？`
-                                                    : `Change ${user.display_name || user.username}'s role to ${newRole === 'org_admin' ? 'Admin' : 'Member'}?`;
+                                                    ? `确认将 ${user.display_name || user.username} 的角色更改为${roleLabel}？`
+                                                    : `Change ${user.display_name || user.username}'s role to ${roleLabel}?`;
                                                 const ok = await dialog.confirm(confirmMsg, { title: isChinese ? '更改角色' : 'Change role' });
                                                 if (ok) handleRoleChange(user.id, newRole);
                                             }}
                                             style={{ fontSize: '11px', padding: '2px 4px', width: '100%', minWidth: 0 }}
                                         >
-                                            <option value="member">{isChinese ? 'Member' : 'Member'}</option>
-                                            <option value="org_admin">{isChinese ? 'Admin' : 'Admin'}</option>
+                                            <option value="member">{isChinese ? '普通成员' : 'Member'}</option>
+                                            <option value="agent_admin">{isChinese ? 'Agent 管理员' : 'Agent Admin'}</option>
+                                            <option value="org_admin">{isChinese ? '公司管理员' : 'Company Admin'}</option>
                                         </select>
                                     ) : (
                                         <span style={{ fontSize: '11px', color: 'var(--text-secondary)' }}>
                                             {user.role === 'platform_admin' ? 'Platform Admin'
-                                                : user.role === 'org_admin' ? 'Admin' : 'Member'}
+                                                : user.role === 'org_admin' ? (isChinese ? '公司管理员' : 'Company Admin')
+                                                    : user.role === 'agent_admin' ? (isChinese ? 'Agent 管理员' : 'Agent Admin')
+                                                        : (isChinese ? '普通成员' : 'Member')}
                                         </span>
                                     )}
                                 </div>

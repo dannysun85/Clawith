@@ -2498,7 +2498,8 @@ export default function AgentDetailPage() {
     const canViewAllAgentChatSessions =
         currentUser?.role === 'platform_admin' ||
         currentUser?.role === 'org_admin' ||
-        currentUser?.role === 'agent_admin';
+        agent?.creator_id === currentUser?.id ||
+        (currentUser?.role === 'agent_admin' && (agent as any)?.access_level === 'manage');
     type SessionRuntimeKey = string;
     const wsMapRef = useRef<Record<SessionRuntimeKey, WebSocket>>({});
     const reconnectTimerRef = useRef<Record<SessionRuntimeKey, ReturnType<typeof setTimeout> | null>>({});

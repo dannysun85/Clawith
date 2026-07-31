@@ -79,7 +79,7 @@ async def test_create_snapshots_cross_agent_user_tier_into_runtime_session(monke
     captured = {}
 
     async def access(_db, _user, _agent_id):
-        return agent, tenant_id
+        return agent, tenant_id, "owner"
 
     async def participant(*_args):
         return SimpleNamespace(id=uuid.uuid4())
@@ -130,7 +130,7 @@ async def test_patch_model_selection_updates_session_and_user_with_revision_cas(
     db = _DB(session, user)
 
     async def access(_db, _user, _agent_id):
-        return agent, tenant_id
+        return agent, tenant_id, "owner"
 
     async def resolve(_agent, tier, modality, *, strict):
         return (tier or "lite", modality or "text")
@@ -178,7 +178,7 @@ async def test_stale_model_selection_revision_fails_without_mutation(monkeypatch
     db = _DB(session, user)
 
     async def access(_db, _user, _agent_id):
-        return agent, tenant_id
+        return agent, tenant_id, "owner"
 
     async def resolve(_agent, tier, modality, *, strict):
         return (tier or "pro", modality or "text")

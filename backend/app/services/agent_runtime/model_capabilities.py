@@ -7,6 +7,7 @@ otherwise valid model requests.
 """
 
 from dataclasses import dataclass
+from datetime import datetime
 import uuid
 
 from sqlalchemy import select
@@ -52,6 +53,29 @@ class RuntimeTokenBudget:
     request_input_limit: int
     effective_runtime_budget: int
     compact_threshold: int
+
+
+def model_connection_verification(
+    model: LLMModel,
+) -> tuple[str, datetime] | None:
+    """Return the current model connection evidence source and timestamp.
+
+    New probes persist ``verification_status`` directly. A historical native
+    tool probe also proves that its preceding connection call succeeded. Tool
+    support itself is not required for Group planning or compaction.
+    """
+
+    if (
+        str(model.verification_status or "").strip().lower() == "verified"
+        and isinstance(model.last_verified_at, datetime)
+    ):
+        return "connection_probe", model.last_verified_at
+    if (
+        model.tool_calling_capability_source == "probe"
+        and isinstance(model.tool_calling_checked_at, datetime)
+    ):
+        return "legacy_tool_probe", model.tool_calling_checked_at
+    return None
 
 
 def _positive_optional(value: int | None, field_name: str) -> int | None:
@@ -229,6 +253,11 @@ async def resolve_platform_model(
             setting_name,
             f"model {model_id} is tenant-scoped; a platform model is required",
         )
+    if model_connection_verification(model) is None:
+        raise PlatformModelConfigurationError(
+            setting_name,
+            f"model {model_id} has no current connection verification",
+        )
     return model
 
 
@@ -258,6 +287,11 @@ async def resolve_group_model(
         raise PlatformModelConfigurationError(
             setting_name,
             f"model {model_id} belongs to another tenant",
+        )
+    if model_connection_verification(model) is None:
+        raise PlatformModelConfigurationError(
+            setting_name,
+            f"model {model_id} has no current connection verification",
         )
     return model
 

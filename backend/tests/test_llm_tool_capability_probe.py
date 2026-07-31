@@ -224,6 +224,10 @@ async def test_updating_model_identity_invalidates_prior_tool_probe(
         modality="text",
         tier="standard",
         supports_vision=False,
+        verification_status="verified",
+        last_verified_at=checked_at,
+        last_error_code=None,
+        last_error_message=None,
         supports_tool_calling=True,
         tool_calling_capability_source="probe",
         tool_calling_checked_at=checked_at,
@@ -248,5 +252,9 @@ async def test_updating_model_identity_invalidates_prior_tool_probe(
     assert updated.tool_calling_capability_source is None
     assert updated.tool_calling_checked_at is None
     assert "changed" in (updated.tool_calling_error or "").lower()
+    assert updated.verification_status == "unverified"
+    assert updated.last_verified_at is None
+    assert updated.last_error_code == "configuration_changed"
+    assert "changed" in (updated.last_error_message or "").lower()
     assert db.committed is True
     assert db.refreshed is True

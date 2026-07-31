@@ -1,6 +1,7 @@
 """Authorization and model-scope checks for shared Runtime model settings."""
 
 import uuid
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -52,6 +53,8 @@ def _model(model_id: uuid.UUID, **overrides: object) -> LLMModel:
         "api_key_encrypted": "secret",
         "enabled": True,
         "supports_tool_calling": True,
+        "verification_status": "verified",
+        "last_verified_at": datetime.now(UTC),
         "tenant_id": None,
     }
     values.update(overrides)
@@ -84,6 +87,7 @@ async def test_runtime_model_settings_are_company_admin_only() -> None:
     [
         {"tenant_id": uuid.uuid4()},
         {"enabled": False},
+        {"verification_status": None, "last_verified_at": None},
     ],
 )
 async def test_runtime_model_settings_reject_ineligible_models(
@@ -114,7 +118,7 @@ async def test_runtime_model_settings_reject_ineligible_models(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("supports_tool_calling", [None, False])
-async def test_runtime_model_settings_accept_saved_model_without_verified_tools(
+async def test_runtime_model_settings_accept_connection_verified_model_without_tools(
     supports_tool_calling: bool | None,
 ) -> None:
     model_id = uuid.uuid4()

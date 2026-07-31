@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timezone
 
 import pytest
 
@@ -159,32 +160,49 @@ def test_explicit_voice_identity_never_silently_crosses_provider_namespaces():
 
 @pytest.mark.asyncio
 async def test_platform_media_pool_reports_provider_specific_plan_capabilities():
+    def credential(provider, plan_tier, capabilities):
+        credential_id = uuid.uuid4()
+        verified_at = datetime.now(timezone.utc)
+        return type(
+            "Credential",
+            (),
+            {
+                "id": credential_id,
+                "provider": provider,
+                "plan_tier": plan_tier,
+                "capabilities": capabilities,
+                "modality_status": {},
+                "enabled": True,
+                "status": "healthy",
+                "daily_quota": None,
+                "used_today": 0,
+                "last_verification_at": verified_at,
+                "verification_receipt": {
+                    "kind": "credential_auth_probe",
+                    "credential_id": str(credential_id),
+                    "provider": provider,
+                    "checked_at": verified_at.isoformat(),
+                    "ok": True,
+                },
+            },
+        )()
+
     class _Result:
         def scalars(self):
             return self
 
         def all(self):
             return [
-                type(
-                    "Credential",
-                    (),
-                    {
-                        "provider": "volcengine_agent_plan",
-                        "plan_tier": "small",
-                        "capabilities": ["image", "audio", "video"],
-                        "modality_status": {},
-                    },
-                )(),
-                type(
-                    "Credential",
-                    (),
-                    {
-                        "provider": "minimax",
-                        "plan_tier": None,
-                        "capabilities": ["image", "audio", "music", "video"],
-                        "modality_status": {},
-                    },
-                )(),
+                credential(
+                    "volcengine_agent_plan",
+                    "small",
+                    ["image", "audio", "video"],
+                ),
+                credential(
+                    "minimax",
+                    None,
+                    ["image", "audio", "music", "video"],
+                ),
             ]
 
     class _DB:
@@ -195,3 +213,39 @@ async def test_platform_media_pool_reports_provider_specific_plan_capabilities()
 
     assert provider_modalities["volcengine_agent_plan"] == {"image", "audio"}
     assert provider_modalities["minimax"] == {"image", "audio", "music", "video"}
+
+
+@pytest.mark.asyncio
+async def test_platform_media_pool_does_not_treat_healthy_legacy_row_as_verified():
+    credential = type(
+        "Credential",
+        (),
+        {
+            "id": uuid.uuid4(),
+            "provider": "minimax",
+            "plan_tier": None,
+            "capabilities": ["image", "video"],
+            "modality_status": {},
+            "enabled": True,
+            "status": "healthy",
+            "daily_quota": None,
+            "used_today": 0,
+            "last_verification_at": None,
+            "verification_receipt": None,
+        },
+    )()
+
+    class _Result:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [credential]
+
+    class _DB:
+        async def execute(self, statement):
+            return _Result()
+
+    provider_modalities = await get_platform_media_provider_modalities(_DB())
+
+    assert provider_modalities["minimax"] == set()

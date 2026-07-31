@@ -18,6 +18,8 @@ import { useTranslation } from 'react-i18next';
 import { useToast } from '../Toast/ToastProvider';
 import {
     deliverableApi,
+    type DeliverableExecution,
+    type DeliverableExecutionUnit,
     type DeliverablePreflight,
     type DeliverableQualityReview,
     type DeliverableQualityReviewer,
@@ -599,6 +601,30 @@ function previewPriority(artifactType: string) {
 }
 
 
+function revisionUnitLabel(unitKey: string, isZh: boolean) {
+    const match = /^(slide|candidate|shot)-(\d+)$/.exec(unitKey);
+    if (!match) return unitKey;
+    const index = Number.parseInt(match[2], 10);
+    const labels = {
+        slide: isZh ? `第 ${index} 页` : `Slide ${index}`,
+        candidate: isZh ? `方案 ${index}` : `Option ${index}`,
+        shot: isZh ? `镜头 ${index}` : `Shot ${index}`,
+    };
+    return labels[match[1] as keyof typeof labels];
+}
+
+
+function uniqueRevisionUnits(units: DeliverableExecutionUnit[]) {
+    const byKey = new Map<string, DeliverableExecutionUnit>();
+    for (const unit of units) {
+        if (/^(slide|candidate|shot)-\d+$/.test(unit.unit_key) && !byKey.has(unit.unit_key)) {
+            byKey.set(unit.unit_key, unit);
+        }
+    }
+    return [...byKey.values()].sort((left, right) => left.unit_key.localeCompare(right.unit_key));
+}
+
+
 export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewCardProps) {
     const { i18n } = useTranslation();
     const isZh = i18n.language?.startsWith('zh');
@@ -612,8 +638,16 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
     const [qualityReviewError, setQualityReviewError] = useState('');
     const [creatingQualityReview, setCreatingQualityReview] = useState(false);
     const [detailsOpen, setDetailsOpen] = useState(false);
+    const [executions, setExecutions] = useState<DeliverableExecution[]>([]);
+    const [executionsLoading, setExecutionsLoading] = useState(false);
+    const [executionsError, setExecutionsError] = useState('');
+    const [revisionOpen, setRevisionOpen] = useState(false);
+    const [revisionInstruction, setRevisionInstruction] = useState('');
+    const [selectedRevisionUnits, setSelectedRevisionUnits] = useState<string[]>([]);
     const detailsTriggerRef = useRef<HTMLButtonElement>(null);
     const detailsDrawerRef = useRef<HTMLElement>(null);
+    const approvalActionIdRef = useRef(crypto.randomUUID());
+    const revisionActionRef = useRef<{ fingerprint: string; id: string } | null>(null);
     const artifacts = latestArtifacts(request);
     const previewArtifact = [...artifacts]
         .sort((left, right) => previewPriority(left.artifact_type) - previewPriority(right.artifact_type))
@@ -636,6 +670,19 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
     }[request.work_type];
     const eligibleReviewerCount = qualityReviewers.filter((reviewer) => reviewer.eligible).length;
     const qualityStatus = qualityReview?.status;
+    const currentExecution = executions.find((item) => item.id === request.current_execution_id)
+        || executions[0];
+    const revisionUnits = uniqueRevisionUnits(currentExecution?.units || []);
+    const unitProgress = (currentExecution?.units || []).reduce(
+        (summary, unit) => {
+            summary.total += 1;
+            if (unit.status === 'succeeded') summary.complete += 1;
+            if (unit.status === 'running' || unit.status === 'reconciling') summary.active += 1;
+            if (unit.status === 'blocked' || unit.status === 'failed') summary.blocked += 1;
+            return summary;
+        },
+        { total: 0, complete: 0, active: 0, blocked: 0 },
+    );
     const presentation = (() => {
         if (request.status === 'running') {
             return {
@@ -711,16 +758,17 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
         window.setTimeout(() => detailsTriggerRef.current?.focus(), 0);
     }, []);
 
-    const applyAction = async (action: 'approve' | 'request_changes') => {
-        setActing(action);
+    const approveDelivery = async () => {
+        setActing('approve');
         try {
-            const updated = await deliverableApi.action(request.id, action, request.version);
+            const updated = await deliverableApi.approval(request.id, {
+                expected_version: request.version,
+                client_action_id: approvalActionIdRef.current,
+                stage: 'final',
+                action: 'approve',
+            });
             onUpdated(updated);
-            toast.success(
-                action === 'approve'
-                    ? (isZh ? '交付已确认' : 'Delivery confirmed')
-                    : (isZh ? '已退回修改，任务内容仍会保留' : 'Returned for changes; the task brief is preserved'),
-            );
+            toast.success(isZh ? '交付已确认' : 'Delivery confirmed');
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             toast.error(isZh ? '交付操作失败' : 'Deliverable action failed', { details: message });
@@ -728,6 +776,69 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
             setActing(null);
         }
     };
+
+    const submitRevision = async () => {
+        const instruction = revisionInstruction.trim();
+        if (instruction.length < 3) {
+            toast.error(isZh ? '请说明需要修改的内容' : 'Describe the requested changes');
+            return;
+        }
+        const fingerprint = JSON.stringify([instruction, selectedRevisionUnits]);
+        if (revisionActionRef.current?.fingerprint !== fingerprint) {
+            revisionActionRef.current = { fingerprint, id: crypto.randomUUID() };
+        }
+        setActing('request_changes');
+        try {
+            const updated = await deliverableApi.approval(request.id, {
+                expected_version: request.version,
+                client_action_id: revisionActionRef.current.id,
+                stage: 'final',
+                action: 'request_changes',
+                instruction,
+                target_units: selectedRevisionUnits,
+            });
+            onUpdated(updated);
+            setRevisionOpen(false);
+            setRevisionInstruction('');
+            setSelectedRevisionUnits([]);
+            revisionActionRef.current = null;
+            toast.success(
+                isZh
+                    ? '已创建修订版本，原文件、工作说明和检查记录均已保留'
+                    : 'A revision was created; prior files, brief, and review records were preserved',
+            );
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            toast.error(isZh ? '无法创建修订版本' : 'Could not create revision', { details: message });
+        } finally {
+            setActing(null);
+        }
+    };
+
+    useEffect(() => {
+        approvalActionIdRef.current = crypto.randomUUID();
+        revisionActionRef.current = null;
+    }, [request.id, request.version]);
+
+    useEffect(() => {
+        if (!detailsOpen) return;
+        let active = true;
+        setExecutionsLoading(true);
+        deliverableApi.executions(request.id)
+            .then((items) => {
+                if (!active) return;
+                setExecutions(items);
+                setExecutionsError('');
+            })
+            .catch((error) => {
+                if (!active) return;
+                setExecutionsError(error instanceof Error ? error.message : String(error));
+            })
+            .finally(() => {
+                if (active) setExecutionsLoading(false);
+            });
+        return () => { active = false; };
+    }, [detailsOpen, request.id, request.version]);
 
     useEffect(() => {
         if (!managedReviewRequired) {
@@ -882,6 +993,42 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
                     </li>
                 ))}
             </ol>
+            <section className="deliverable-execution-progress" aria-label={isZh ? '本版制作进度' : 'Current revision progress'}>
+                <header>
+                    <div>
+                        <strong>
+                            {isZh ? `第 ${currentExecution?.execution_number || request.contract_revision || 1} 版` : `Revision ${currentExecution?.execution_number || request.contract_revision || 1}`}
+                        </strong>
+                        <small>
+                            {executionsLoading
+                                ? (isZh ? '正在读取制作进度…' : 'Loading production progress…')
+                                : unitProgress.total > 0
+                                    ? (isZh ? `${unitProgress.complete}/${unitProgress.total} 个制作步骤已完成` : `${unitProgress.complete}/${unitProgress.total} production steps complete`)
+                                    : (isZh ? '制作记录会随任务推进自动更新' : 'Production records update as the task advances')}
+                        </small>
+                    </div>
+                    {executions.length > 1 && (
+                        <span>{isZh ? `保留 ${executions.length} 个版本` : `${executions.length} versions retained`}</span>
+                    )}
+                </header>
+                {unitProgress.total > 0 && (
+                    <div className="deliverable-execution-progress__bar" aria-hidden="true">
+                        <span style={{ width: `${Math.round((unitProgress.complete / unitProgress.total) * 100)}%` }} />
+                    </div>
+                )}
+                {(unitProgress.active > 0 || unitProgress.blocked > 0) && (
+                    <small className="deliverable-execution-progress__status">
+                        {unitProgress.active > 0 && (isZh ? `${unitProgress.active} 项正在制作` : `${unitProgress.active} active`)}
+                        {unitProgress.active > 0 && unitProgress.blocked > 0 ? ' · ' : ''}
+                        {unitProgress.blocked > 0 && (isZh ? `${unitProgress.blocked} 项需要处理` : `${unitProgress.blocked} need attention`)}
+                    </small>
+                )}
+                {executionsError && (
+                    <small className="deliverable-execution-progress__error">
+                        {isZh ? '暂时无法读取详细进度，文件预览和交付操作不受影响。' : 'Detailed progress is temporarily unavailable; preview and delivery actions still work.'}
+                    </small>
+                )}
+            </section>
             {previewArtifact && (
                 <section className="deliverable-review-card__preview" aria-label={isZh ? '交付文件预览' : 'Deliverable preview'}>
                     {previewArtifactType === 'mp4' && (
@@ -1050,22 +1197,96 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
                     {isZh ? '暂时无法读取质量检查，请稍后重试。' : 'Quality review is temporarily unavailable. Please try again.'}
                 </div>
             )}
+            {awaitingReview && revisionOpen && (
+                <section className="deliverable-revision-form" aria-label={isZh ? '创建修订版本' : 'Create revision'}>
+                    <div>
+                        <strong>{isZh ? '说明需要修改的内容' : 'Describe the requested changes'}</strong>
+                        <small>
+                            {isZh
+                                ? '系统会创建新版本；当前文件、原工作说明和质量检查记录不会被覆盖。'
+                                : 'A new revision will be created; current files, the original brief, and quality records stay intact.'}
+                        </small>
+                    </div>
+                    <textarea
+                        value={revisionInstruction}
+                        maxLength={4000}
+                        rows={4}
+                        placeholder={isZh ? '例如：第 3 页减少文字并突出核心数据，第 5 页更换人物主视觉。' : 'For example: simplify slide 3 and emphasize the key metric; replace the hero image on slide 5.'}
+                        onChange={(event) => setRevisionInstruction(event.target.value)}
+                    />
+                    {revisionUnits.length > 0 && (
+                        <fieldset>
+                            <legend>
+                                {isZh ? '只修改指定部分（可选）' : 'Limit changes to selected items (optional)'}
+                            </legend>
+                            <div className="deliverable-revision-form__units">
+                                {revisionUnits.map((unit) => {
+                                    const checked = selectedRevisionUnits.includes(unit.unit_key);
+                                    return (
+                                        <label key={unit.unit_key}>
+                                            <input
+                                                type="checkbox"
+                                                checked={checked}
+                                                onChange={(event) => {
+                                                    setSelectedRevisionUnits((current) => (
+                                                        event.target.checked
+                                                            ? [...current, unit.unit_key]
+                                                            : current.filter((key) => key !== unit.unit_key)
+                                                    ));
+                                                }}
+                                            />
+                                            <span>{revisionUnitLabel(unit.unit_key, isZh)}</span>
+                                        </label>
+                                    );
+                                })}
+                            </div>
+                            <small>
+                                {selectedRevisionUnits.length > 0
+                                    ? (isZh ? `已选择 ${selectedRevisionUnits.length} 项，其余内容沿用当前版本。` : `${selectedRevisionUnits.length} selected; other content carries forward.`)
+                                    : (isZh ? '不选择则按修改说明更新整份交付。' : 'Leave empty to revise the whole deliverable according to the instruction.')}
+                            </small>
+                        </fieldset>
+                    )}
+                    <div className="deliverable-review-card__actions">
+                        <button
+                            type="button"
+                            className="btn btn-secondary"
+                            disabled={acting !== null}
+                            onClick={() => setRevisionOpen(false)}
+                        >
+                            {isZh ? '取消' : 'Cancel'}
+                        </button>
+                        <button
+                            type="button"
+                            className="btn btn-primary"
+                            disabled={acting !== null || revisionInstruction.trim().length < 3}
+                            onClick={() => void submitRevision()}
+                        >
+                            {acting === 'request_changes'
+                                ? (isZh ? '正在创建新版本…' : 'Creating revision…')
+                                : (isZh ? '创建修订版本' : 'Create revision')}
+                        </button>
+                    </div>
+                </section>
+            )}
             {awaitingReview && (
                 <div className="deliverable-review-card__actions">
                     <button
                         type="button"
                         className="btn btn-secondary"
                         disabled={acting !== null}
-                        onClick={() => void applyAction('request_changes')}
+                        onClick={() => setRevisionOpen((open) => !open)}
                     >
-                        {acting === 'request_changes' ? (isZh ? '正在退回…' : 'Returning…') : (isZh ? '退回修改' : 'Request changes')}
+                        {revisionOpen
+                            ? (isZh ? '收起修改说明' : 'Hide revision form')
+                            : (isZh ? '提出修改' : 'Request changes')}
                     </button>
                     {!approvalBlocked && (
                         <button
                             type="button"
                             className="btn btn-primary"
                             disabled={acting !== null}
-                            onClick={() => void applyAction('approve')}
+                            onClick={() => void approveDelivery()}
                         >
                             {acting === 'approve' ? (isZh ? '正在确认…' : 'Confirming…') : (isZh ? '确认交付' : 'Confirm delivery')}
                         </button>

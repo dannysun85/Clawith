@@ -62,6 +62,18 @@ from app.models.subscription import (  # noqa: F401
     TenantUsage,
 )
 from app.models.media_generation import MediaGenerationTask  # noqa: F401
+from app.models.agent_run import AgentRun  # noqa: F401
+from app.models.agent_tool_execution import AgentToolExecution  # noqa: F401
+from app.models.deliverable import (  # noqa: F401
+    DeliverableApprovalReceipt,
+    DeliverableArtifactRevision,
+    DeliverableExecution,
+    DeliverableExecutionUnit,
+    DeliverableQualityReview,
+    DeliverableQualityReviewAssignment,
+    DeliverableQualityReviewEvidence,
+    DeliverableRequest,
+)
 from app.models.notification import Notification  # noqa: F401
 from app.models.agentbay_session import AgentBaySessionLedger  # noqa: F401
 

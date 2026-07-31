@@ -21,6 +21,17 @@ interface Credential {
     window_5h_limit?: number | null;
     used_today: number;
     status: string;
+    last_verification_at?: string | null;
+    verification_receipt?: {
+        receipt_ref?: string;
+        kind?: string;
+        scope?: string;
+        evidence_level?: string;
+        checked_at?: string;
+        ok?: boolean;
+        provider_status?: number | null;
+        model_count?: number | null;
+    } | null;
     error_count: number;
     weight: number;
     priority: number;
@@ -52,6 +63,7 @@ interface CredentialVerification {
     provider_status?: number | null;
     model_count?: number | null;
     message?: string | null;
+    receipt: Record<string, unknown>;
 }
 
 const STATUS_COLOR: Record<string, string> = {
@@ -371,6 +383,15 @@ export default function AccountManagement() {
                                     {c.tpm_limit && h && <span>TPM: {fmtNum(h.tpm_current)}/{fmtNum(c.tpm_limit)}</span>}
                                     {c.last_used_at && <span>{t('account.lastUsed', '最后使用')}: {new Date(c.last_used_at).toLocaleString()}</span>}
                                 </div>
+                                <div style={{ fontSize: 11, color: c.verification_receipt?.ok ? 'var(--success)' : 'var(--warning)', marginTop: 3 }}>
+                                    {c.verification_receipt && c.last_verification_at
+                                        ? <>
+                                            账号鉴权：{c.verification_receipt.ok ? '已通过' : '失败'} · {new Date(c.last_verification_at).toLocaleString()}
+                                            {c.verification_receipt.provider_status != null && ` · HTTP ${c.verification_receipt.provider_status}`}
+                                            {' · 该 receipt 不证明媒体生成权限或商用质量'}
+                                        </>
+                                        : '账号鉴权：尚无当前配置的验证 receipt，不参与媒体就绪判断'}
+                                </div>
                                 {blockedModalities.length > 0 && (
                                     <div role="status" style={{ fontSize: 11, color: 'var(--warning)', marginTop: 4 }}>
                                         {sharedPlanBlocked
@@ -382,21 +403,19 @@ export default function AccountManagement() {
                                 )}
                             </div>
                             <div style={{ display: 'flex', gap: 6 }}>
-                                {(c.status === 'unverified' || c.status === 'degraded' || c.status === 'quota_exceeded' || blockedModalities.length > 0) && (
-                                    <button
-                                        className="btn btn-secondary"
-                                        style={{ fontSize: 12 }}
-                                        disabled={verifyMut.isPending && verifyMut.variables === c.id}
-                                        onClick={() => {
-                                            setPoolNotice('');
-                                            verifyMut.mutate(c.id);
-                                        }}
-                                    >
-                                        {verifyMut.isPending && verifyMut.variables === c.id
-                                            ? t('account.verifying', '验证中…')
-                                            : t('account.verify', '验证')}
-                                    </button>
-                                )}
+                                <button
+                                    className="btn btn-secondary"
+                                    style={{ fontSize: 12 }}
+                                    disabled={verifyMut.isPending && verifyMut.variables === c.id}
+                                    onClick={() => {
+                                        setPoolNotice('');
+                                        verifyMut.mutate(c.id);
+                                    }}
+                                >
+                                    {verifyMut.isPending && verifyMut.variables === c.id
+                                        ? t('account.verifying', '验证中…')
+                                        : t('account.verify', '只读验证')}
+                                </button>
                                 <button className="btn btn-ghost" style={{ fontSize: 12 }} onClick={() => startEdit(c)}>
                                     {t('common.edit', '编辑')}
                                 </button>

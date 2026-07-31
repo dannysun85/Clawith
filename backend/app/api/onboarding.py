@@ -5,8 +5,8 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -52,26 +52,39 @@ def _status_payload(row: UserTenantOnboarding | None) -> dict:
     }
 
 
-async def _get_row(db: AsyncSession, user: User) -> UserTenantOnboarding | None:
+async def _get_row(
+    db: AsyncSession,
+    user: User,
+    *,
+    for_update: bool = False,
+) -> UserTenantOnboarding | None:
     if not user.tenant_id:
         return None
-    result = await db.execute(
-        select(UserTenantOnboarding).where(
-            UserTenantOnboarding.user_id == user.id,
-            UserTenantOnboarding.tenant_id == user.tenant_id,
-        )
+    statement = select(UserTenantOnboarding).where(
+        UserTenantOnboarding.user_id == user.id,
+        UserTenantOnboarding.tenant_id == user.tenant_id,
     )
+    if for_update:
+        statement = statement.with_for_update()
+    result = await db.execute(statement)
     return result.scalar_one_or_none()
 
 
-async def _ensure_row(db: AsyncSession, user: User, entry_mode: str) -> UserTenantOnboarding:
+async def _ensure_row(
+    db: AsyncSession,
+    user: User,
+    entry_mode: str | None,
+    *,
+    lock: bool = False,
+) -> UserTenantOnboarding:
     if not user.tenant_id:
         raise HTTPException(status_code=400, detail="Company is required before onboarding")
-    row = await _get_row(db, user)
+    row = await _get_row(db, user, for_update=lock)
     if row:
         if row.status == "completed":
             return row
-        row.entry_mode = entry_mode
+        if entry_mode is not None:
+            row.entry_mode = entry_mode
         if row.current_step == "company":
             row.current_step = "assistant"
         return row
@@ -82,18 +95,19 @@ async def _ensure_row(db: AsyncSession, user: User, entry_mode: str) -> UserTena
             id=uuid.uuid4(),
             user_id=user.id,
             tenant_id=user.tenant_id,
-            entry_mode=entry_mode,
+            entry_mode=entry_mode or "join",
             current_step="assistant",
             status="in_progress",
         )
         .on_conflict_do_nothing(constraint="uq_user_tenant_onboarding")
     )
 
-    row = await _get_row(db, user)
+    row = await _get_row(db, user, for_update=lock)
     if not row:
         raise HTTPException(status_code=500, detail="Failed to start onboarding")
     if row.status != "completed":
-        row.entry_mode = entry_mode
+        if entry_mode is not None:
+            row.entry_mode = entry_mode
         if row.current_step == "company":
             row.current_step = "assistant"
     return row
@@ -252,7 +266,10 @@ async def create_personal_assistant(
     db: AsyncSession = Depends(get_db),
 ):
     """Create the user's private assistant and advance onboarding."""
-    row = await _ensure_row(db, current_user, "join")
+    # The onboarding row is the serialization boundary for one user's companion.
+    # It also preserves the entry mode recorded by /start instead of rewriting a
+    # company creator as a joining member.
+    row = await _ensure_row(db, current_user, None, lock=True)
     if row.personal_assistant_agent_id:
         result = await db.execute(
             select(Agent).where(

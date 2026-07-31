@@ -561,6 +561,122 @@ async def _latest_approved_artifact(
     return result.scalars().first()
 
 
+def _snapshot_uuid(snapshot: dict, field: str) -> uuid.UUID | None:
+    value = snapshot.get(field)
+    if value is None:
+        return None
+    try:
+        return uuid.UUID(str(value))
+    except ValueError:
+        return None
+
+
+async def _evidence_snapshots_with_validity(
+    db: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    logs_by_kr: dict[uuid.UUID, OKRProgressLog],
+) -> dict[uuid.UUID, dict]:
+    """Enrich frozen evidence with live validity while preserving its original facts."""
+    source_by_kr: dict[
+        uuid.UUID,
+        tuple[dict, uuid.UUID | None, uuid.UUID | None, uuid.UUID | None],
+    ] = {}
+    for kr_id, log in logs_by_kr.items():
+        snapshot = dict(log.evidence_snapshot or {})
+        if not snapshot:
+            continue
+        task_id = log.source_task_id
+        request_id = log.source_deliverable_request_id
+        if task_id is None and snapshot.get("kind") == "task":
+            task_id = _snapshot_uuid(snapshot, "task_id")
+        if request_id is None and snapshot.get("kind") == "deliverable":
+            request_id = _snapshot_uuid(snapshot, "deliverable_request_id")
+        artifact = snapshot.get("artifact")
+        artifact_id = (
+            _snapshot_uuid(artifact, "id")
+            if isinstance(artifact, dict)
+            else None
+        )
+        source_by_kr[kr_id] = (snapshot, task_id, request_id, artifact_id)
+
+    task_ids = {item[1] for item in source_by_kr.values() if item[1] is not None}
+    request_ids = {item[2] for item in source_by_kr.values() if item[2] is not None}
+    artifact_ids = {item[3] for item in source_by_kr.values() if item[3] is not None}
+
+    task_status: dict[uuid.UUID, str] = {}
+    if task_ids:
+        task_status = dict(
+            (
+                await db.execute(
+                    select(Task.id, Task.status).where(
+                        Task.tenant_id == tenant_id,
+                        Task.id.in_(task_ids),
+                    )
+                )
+            ).all()
+        )
+    request_status: dict[uuid.UUID, str] = {}
+    if request_ids:
+        request_status = dict(
+            (
+                await db.execute(
+                    select(DeliverableRequest.id, DeliverableRequest.status).where(
+                        DeliverableRequest.tenant_id == tenant_id,
+                        DeliverableRequest.id.in_(request_ids),
+                    )
+                )
+            ).all()
+        )
+    artifact_state: dict[uuid.UUID, tuple[str, str]] = {}
+    if artifact_ids:
+        artifact_state = {
+            artifact_id: (status, content_hash)
+            for artifact_id, status, content_hash in (
+                await db.execute(
+                    select(
+                        DeliverableArtifactRevision.id,
+                        DeliverableArtifactRevision.status,
+                        DeliverableArtifactRevision.content_hash,
+                    ).where(
+                        DeliverableArtifactRevision.tenant_id == tenant_id,
+                        DeliverableArtifactRevision.id.in_(artifact_ids),
+                    )
+                )
+            ).all()
+        }
+
+    enriched: dict[uuid.UUID, dict] = {}
+    for kr_id, (snapshot, task_id, request_id, artifact_id) in source_by_kr.items():
+        validity = "current"
+        reason: str | None = None
+        if task_id is not None and task_id not in task_status:
+            validity, reason = "unavailable", "source_task_unavailable"
+        elif task_id is not None and task_status[task_id] != "done":
+            validity, reason = "superseded", "source_task_not_completed"
+        if validity == "current" and request_id is not None:
+            if request_id not in request_status:
+                validity, reason = "unavailable", "source_deliverable_unavailable"
+            elif request_status[request_id] != "succeeded":
+                validity, reason = "superseded", "source_deliverable_not_delivered"
+        if validity == "current" and request_id is not None:
+            artifact = snapshot.get("artifact")
+            expected_hash = (
+                str(artifact.get("content_hash") or "")
+                if isinstance(artifact, dict)
+                else ""
+            )
+            current_artifact = artifact_state.get(artifact_id) if artifact_id else None
+            if current_artifact is None:
+                validity, reason = "unavailable", "source_artifact_unavailable"
+            elif current_artifact != ("approved", expected_hash):
+                validity, reason = "superseded", "source_artifact_superseded"
+        snapshot["validity"] = validity
+        snapshot["validity_reason"] = reason
+        enriched[kr_id] = snapshot
+    return enriched
+
+
 async def _resolve_progress_evidence(
     db: AsyncSession,
     *,
@@ -1108,12 +1224,15 @@ async def list_objectives(
                     )
                 )
             ).scalars().all()
+            latest_logs_by_kr: dict[uuid.UUID, OKRProgressLog] = {}
             for log in evidence_logs:
                 if log.evidence_snapshot:
-                    latest_evidence_by_kr.setdefault(
-                        log.kr_id,
-                        dict(log.evidence_snapshot),
-                    )
+                    latest_logs_by_kr.setdefault(log.kr_id, log)
+            latest_evidence_by_kr = await _evidence_snapshots_with_validity(
+                db,
+                tenant_id=user.tenant_id,
+                logs_by_kr=latest_logs_by_kr,
+            )
 
         # Group KRs by objective
         krs_by_obj: dict[uuid.UUID, list[OKRKeyResult]] = {}

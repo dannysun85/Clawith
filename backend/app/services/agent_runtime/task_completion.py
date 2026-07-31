@@ -70,6 +70,43 @@ def _terminal_detail(checkpoint: CheckpointObservation) -> str:
     return reason.strip() if isinstance(reason, str) and reason.strip() else status
 
 
+def _compact_status_detail(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    compact = " ".join(value.split())
+    return compact[:240] if compact else None
+
+
+def _group_terminal_summary(event: AgentRunEvent) -> tuple[str, str | None]:
+    """Return a user-safe participant status without exposing provider payloads."""
+    payload = event.payload if isinstance(event.payload, Mapping) else {}
+    if event.event_type == "run_completed":
+        return "已完成", None
+
+    error = payload.get("error")
+    nested_code = error.get("code") if isinstance(error, Mapping) else None
+    detail = next(
+        (
+            compact
+            for value in (
+                payload.get("error_code"),
+                payload.get("failure_code"),
+                nested_code,
+                payload.get("reason"),
+            )
+            if (compact := _compact_status_detail(value)) is not None
+        ),
+        None,
+    )
+    if detail is None:
+        detail = _compact_status_detail(event.summary)
+    return (
+        ("执行失败", detail)
+        if event.event_type == "run_failed"
+        else ("已取消", detail)
+    )
+
+
 class TaskRuntimeCompletionHandler:
     """Set Task status and append exactly one terminal log per checkpoint."""
 
@@ -235,11 +272,13 @@ class TaskRuntimeCompletionHandler:
                 participant_runs = list(
                     (
                         await db.execute(
-                            select(AgentRun).where(
+                            select(AgentRun)
+                            .where(
                                 AgentRun.tenant_id == run.tenant_id,
                                 AgentRun.correlation_id == correlation_id,
                                 AgentRun.system_role.is_(None),
                             )
+                            .order_by(AgentRun.created_at, AgentRun.id)
                         )
                     ).scalars().all()
                 )
@@ -295,17 +334,21 @@ class TaskRuntimeCompletionHandler:
                     for entry in participant_snapshot
                     if isinstance(entry, Mapping)
                 }
-                result_sections = []
+                result_sections: list[str] = []
                 for participant_run in participant_runs:
                     name = name_by_agent.get(str(participant_run.agent_id), "Agent")
+                    event = terminal_by_run[participant_run.id]
+                    status_label, failure_detail = _group_terminal_summary(event)
                     result = result_by_run.get(participant_run.id)
+                    section = [f"{name} · {status_label}"]
                     if result:
-                        result_sections.append(f"{name}\n{result}")
-                detail = (
-                    "\n\n".join(result_sections)
-                    if result_sections
-                    else "协作结果已写入 Group 会话，请打开协作现场查看完整记录。"
-                )
+                        section.append(result)
+                    elif failure_detail:
+                        section.append(f"原因：{failure_detail}")
+                    elif event.event_type == "run_completed":
+                        section.append("结果已写入 Group 会话，请打开协作现场查看。")
+                    result_sections.append("\n".join(section))
+                detail = "\n\n".join(result_sections)
                 db.add(
                     TaskLog(
                         id=receipt_id,

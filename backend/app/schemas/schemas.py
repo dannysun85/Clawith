@@ -504,6 +504,10 @@ class LLMModelOut(BaseModel):
     max_tokens_per_day: int | None = None
     enabled: bool
     supports_vision: bool = False
+    verification_status: str | None = None
+    last_verified_at: datetime | None = None
+    last_error_code: str | None = None
+    last_error_message: str | None = None
     supports_tool_calling: bool | None = None
     tool_calling_capability_source: str | None = None
     tool_calling_checked_at: datetime | None = None

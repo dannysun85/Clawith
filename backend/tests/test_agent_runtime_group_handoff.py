@@ -525,6 +525,7 @@ async def test_atomic_apply_creates_public_message_and_one_new_child_per_target(
     source_run, scope, context, state = _records()
     # Group start ACK delivery precedes the terminal handoff in production.
     source_run.delivery_status = "delivered"
+    source_run.correlation_id = f"work-task:{uuid.uuid4()}"
     first = _target(tenant_id=source_run.tenant_id)
     second = _target(tenant_id=source_run.tenant_id, name="Final Approver")
     ensure = AsyncMock(return_value=_cycle_check())
@@ -631,6 +632,7 @@ async def test_atomic_apply_creates_public_message_and_one_new_child_per_target(
     assert all(command.run_kind == "delegated" for command in commands)
     assert all(command.parent_run_id == source_run.id for command in commands)
     assert all(command.root_run_id == source_run.root_run_id for command in commands)
+    assert all(command.correlation_id == source_run.correlation_id for command in commands)
     assert all(command.source_id == str(message.id) for command in commands)
     assert all(command.goal == command.payload["current_responsibility"] for command in commands)
     assert first.display_name in commands[0].goal

@@ -13,11 +13,15 @@ import app.models.agent  # noqa: F401
 import app.models.audit  # noqa: F401
 import app.models.channel_config  # noqa: F401
 import app.models.chat_session  # noqa: F401
+import app.models.agent_run  # noqa: F401
+import app.models.agent_tool_execution  # noqa: F401
+import app.models.deliverable  # noqa: F401
 import app.models.experience  # noqa: F401
 import app.models.experience_reference  # noqa: F401
 import app.models.gateway_message  # noqa: F401
 import app.models.invitation_code  # noqa: F401
 import app.models.llm  # noqa: F401
+import app.models.media_generation  # noqa: F401
 import app.models.notification  # noqa: F401
 import app.models.onboarding  # noqa: F401
 import app.models.org  # noqa: F401

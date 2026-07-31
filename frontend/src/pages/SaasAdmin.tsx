@@ -36,7 +36,18 @@ type MediaRoute = {
     capability_status: 'available' | 'degraded' | 'unavailable';
     reason_code?: string | null;
     recommended_action: string;
-    evaluation_source: 'live_platform_credential_pool';
+    evaluation_source: 'persisted_account_and_generation_receipts';
+    readiness_status: 'unconfigured' | 'account_verification_required' | 'generation_unverified' | 'generation_observed';
+    quality_evidence_status: 'not_reviewed';
+    provider_readiness: Array<{
+        provider: string;
+        configured: boolean;
+        account_verified: boolean;
+        generation_observed: boolean;
+        plan_tiers: string[];
+        account_receipt?: Record<string, unknown> | null;
+        generation_receipt?: Record<string, unknown> | null;
+    }>;
     fallback_provider: string;
     tool_name: string;
     model: string;
@@ -89,6 +100,8 @@ type RuntimeModelCandidate = {
     label: string;
     provider: string;
     model: string;
+    verification_source: 'connection_probe' | 'legacy_tool_probe';
+    verified_at: string;
 };
 
 type RuntimeModelSettings = {
@@ -340,7 +353,7 @@ function RuntimeModelSettingsCard() {
         <div className="card" style={{ marginBottom: 16, padding: 16 }}>
             <div style={{ fontSize: 14, fontWeight: 650 }}>多智能体运行时模型（按租户）</div>
             <div style={{ marginTop: 6, color: 'var(--text-secondary)', fontSize: 12, lineHeight: 1.7 }}>
-                仅选择 Groups 的规划和上下文压缩模型；模型、API Key 与 Credits 仍由平台理解路由和账号池统一管理，不向租户下放模型对象或密钥。
+                仅选择 Groups 的规划和上下文压缩模型；候选项必须有当前连接验证 evidence。原生工具调用是否支持属于独立诊断，不是规划/压缩模型的必需条件。模型对象、API Key 与 Credits 均由平台治理，不向租户暴露模型对象或密钥。
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: 'minmax(180px, 0.8fr) repeat(2, minmax(240px, 1fr)) auto', gap: 10, alignItems: 'end', marginTop: 14 }}>
                 <Field label="租户">
@@ -367,7 +380,7 @@ function RuntimeModelSettingsCard() {
                     >
                         <option value="" disabled>请选择模型</option>
                         {candidates.map((model) => (
-                            <option key={model.id} value={model.id}>{model.label} · {model.provider}/{model.model}</option>
+                            <option key={model.id} value={model.id}>{model.label} · {model.provider}/{model.model} · 已验证 {new Date(model.verified_at).toLocaleString()}</option>
                         ))}
                     </select>
                 </Field>
@@ -380,7 +393,7 @@ function RuntimeModelSettingsCard() {
                     >
                         <option value="" disabled>请选择模型</option>
                         {candidates.map((model) => (
-                            <option key={model.id} value={model.id}>{model.label} · {model.provider}/{model.model}</option>
+                            <option key={model.id} value={model.id}>{model.label} · {model.provider}/{model.model} · 已验证 {new Date(model.verified_at).toLocaleString()}</option>
                         ))}
                     </select>
                 </Field>
@@ -401,7 +414,7 @@ function RuntimeModelSettingsCard() {
             )}
             {!settingsQuery.isLoading && selectedTenantId && candidates.length === 0 && !error && (
                 <div style={{ marginTop: 10, color: 'var(--warning)', fontSize: 12 }}>
-                    暂无可用候选模型。候选模型必须已启用并通过原生工具调用测试。
+                    暂无可用候选模型。候选模型必须已启用并保留当前配置的连接验证 evidence。
                 </div>
             )}
             {settingsQuery.data && (
@@ -440,7 +453,7 @@ function MediaRoutesTab() {
                 <div style={{ fontSize: 14, fontWeight: 650, marginBottom: 6 }}>媒体生成路由（平台统一配置）</div>
                 <div style={{ color: 'var(--text-secondary)', fontSize: 12, lineHeight: 1.7 }}>
                     文本模型和媒体生成模型是两条独立链路。图片、语音和视频按“火山 Agent Plan → MiniMax”检查可用线路，并且只在供应商尚未接受任务时切换；音乐目前使用 MiniMax。
-                    图片和视频仅剩 MiniMax 时属于非等价降级，正式交付默认等待主线路，只有用户明确接受应急质量后才可执行。下表的模型和质量参数只配置 MiniMax 应急路径；火山账号级别与实时可用能力来自“账号池”，不会在这里被伪装成可编辑模型。
+                    页面严格区分“已配置账号”“账号只读鉴权通过”“真实生成成功”和“人工质量通过”。图片和视频仅剩 MiniMax 时仍属于非等价降级；即使有生成成功 receipt，也不能据此显示为商用质量已通过。下表中的模型与质量参数仅控制 MiniMax 应急路径。
                 </div>
             </div>
             {error && (
@@ -489,15 +502,26 @@ function MediaRouteRow({ route }: { route: MediaRoute }) {
             ? 'MiniMax'
             : provider;
     const statusLabel = route.capability_status === 'available'
-        ? '正式可用'
+        ? '账号线路可路由'
         : route.capability_status === 'degraded'
-            ? '仅降级可用'
-            : '不可用';
+            ? '仅降级线路可路由'
+            : '不可路由';
     const statusColor = route.capability_status === 'available'
         ? 'var(--success)'
         : route.capability_status === 'degraded'
             ? 'var(--warning)'
             : 'var(--error)';
+    const readinessLabel = route.readiness_status === 'generation_observed'
+        ? '真实生成成功，质量未评审'
+        : route.readiness_status === 'generation_unverified'
+            ? '账号已验证，生成未验证'
+            : route.readiness_status === 'account_verification_required'
+                ? '已配置，等待账号验证'
+                : '尚未配置账号';
+    const receiptTime = (receipt: Record<string, unknown> | null | undefined, field: string) => {
+        const value = receipt?.[field];
+        return typeof value === 'string' && value ? new Date(value).toLocaleString() : null;
+    };
 
     return (
         <>
@@ -514,11 +538,23 @@ function MediaRouteRow({ route }: { route: MediaRoute }) {
                 <div style={{ color: statusColor, fontSize: 11, fontWeight: 650, marginTop: 4 }}>
                     {statusLabel} · 主线路 {providerLabel(route.primary_provider)}
                 </div>
-                {route.capability_status !== 'available' && (
-                    <div role="status" style={{ color: 'var(--text-secondary)', fontSize: 10, lineHeight: 1.5, marginTop: 3 }}>
-                        {route.recommended_action}
-                    </div>
-                )}
+                <div role="status" style={{ color: 'var(--text-secondary)', fontSize: 10, lineHeight: 1.5, marginTop: 3 }}>
+                    {readinessLabel}。{route.recommended_action}
+                </div>
+                <div style={{ marginTop: 5, display: 'grid', gap: 3 }}>
+                    {route.provider_readiness.map((item) => {
+                        const accountTime = receiptTime(item.account_receipt, 'checked_at');
+                        const generationTime = receiptTime(item.generation_receipt, 'completed_at');
+                        return (
+                            <div key={item.provider} style={{ color: 'var(--text-tertiary)', fontSize: 10 }}>
+                                {providerLabel(item.provider)}：{item.configured ? '已配置' : '未配置'} / {item.account_verified ? '账号已验证' : '账号未验证'} / {item.generation_observed ? '生成已观察' : '生成未验证'}
+                                {item.plan_tiers.length > 0 && ` / plan=${item.plan_tiers.join(',')}`}
+                                {accountTime && ` / 鉴权 ${accountTime}`}
+                                {generationTime && ` / 生成 ${generationTime}`}
+                            </div>
+                        );
+                    })}
+                </div>
             </td>
             <td style={{ textTransform: 'uppercase' }}>{route.tier}</td>
             <td style={{ minWidth: 190 }}>
@@ -538,9 +574,9 @@ function MediaRouteRow({ route }: { route: MediaRoute }) {
                 </label>
                 <div style={{ color: statusColor, fontSize: 11 }}>
                     {route.available
-                        ? `${route.available_providers.length} 个供应商路径就绪 · ${statusLabel}`
+                        ? `${route.available_providers.length} 个账号验证路径 · ${readinessLabel}`
                         : !route.pool_available
-                            ? '所有供应商账号池均不可用'
+                            ? readinessLabel
                             : !route.tool_enabled
                                 ? '工具已停用'
                                 : '路由已停用'}

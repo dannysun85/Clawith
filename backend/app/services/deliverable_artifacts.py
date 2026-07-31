@@ -634,6 +634,7 @@ async def reconcile_runtime_deliverable_artifacts(
         latest = latest_by_key.get(artifact_type)
         if (
             latest is not None
+            and latest.status == "candidate"
             and latest.workspace_path == verified.workspace_path
             and latest.content_hash == verified.content_hash
         ):
@@ -837,6 +838,10 @@ async def approve_deliverable_artifacts(
                 "Video artifact fails duration, aspect-ratio, browser-codec, or audio checks: "
                 + ", ".join(sorted(invalid_types)),
             )
+    selected_ids = {artifact.id for artifact in selected}
+    for artifact in artifacts:
+        if artifact.status == "approved" and artifact.id not in selected_ids:
+            artifact.status = "superseded"
     return selected
 
 

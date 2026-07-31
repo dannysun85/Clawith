@@ -575,8 +575,27 @@ async def test_approval_rechecks_content_hash_before_accepting_mutable_workspace
             commercially_usable=True,
         ),
     )
+    previous_approved = tuple(
+        DeliverableArtifactRevision(
+            id=uuid.uuid4(),
+            tenant_id=request.tenant_id,
+            request_id=request.id,
+            artifact_key=artifact.artifact_key,
+            artifact_type=artifact.artifact_type,
+            workspace_path=f"workspace/deliverables/{request.id}/previous.{artifact.artifact_type}",
+            mime_type=artifact.mime_type,
+            content_hash=("c" if artifact.artifact_type == "pptx" else "d") * 64,
+            size_bytes=artifact.size_bytes,
+            revision_number=1,
+            status="approved",
+            evaluation={"verified": True},
+        )
+        for artifact in reconciled.artifacts
+    )
+    for artifact in reconciled.artifacts:
+        artifact.revision_number = 2
     approved_with_quality = await approve_deliverable_artifacts(
-        _Session(list(reconciled.artifacts)),  # type: ignore[arg-type]
+        _Session([*reconciled.artifacts, *previous_approved]),  # type: ignore[arg-type]
         request=request,
         storage=storage,
         require_creative_quality_gate=True,
@@ -585,6 +604,7 @@ async def test_approval_rechecks_content_hash_before_accepting_mutable_workspace
         "pptx",
         "pdf",
     }
+    assert {artifact.status for artifact in previous_approved} == {"superseded"}
 
     request.spec = {**request.spec, "page_count": 7}
     with pytest.raises(DeliverableArtifactError) as contract_error:

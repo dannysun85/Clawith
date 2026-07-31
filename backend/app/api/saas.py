@@ -84,7 +84,9 @@ from app.services.minimax_media_profiles import (
     resolve_minimax_media_profile,
 )
 from app.services.media_capabilities import (
-    get_platform_media_provider_modalities,
+    PlatformMediaProviderState,
+    get_platform_media_generation_receipts,
+    get_platform_media_provider_state,
     media_route_capability_status,
 )
 from app.services.media_provider_routing import (
@@ -462,7 +464,8 @@ def _media_route_out(
     modality: str,
     tier: str,
     tool: Tool | None,
-    provider_modalities: dict[str, set[str]],
+    provider_state: PlatformMediaProviderState,
+    generation_receipts: dict[tuple[str, str], dict[str, object]],
 ) -> MediaRouteOut:
     config = dict(tool.config or {}) if tool else {}
     profile = resolve_minimax_media_profile(modality, tier, config)
@@ -477,7 +480,7 @@ def _media_route_out(
     available_providers = [
         provider
         for provider in provider_order
-        if modality in provider_modalities.get(provider, set())
+        if modality in provider_state.verified_modalities.get(provider, set())
     ]
     capability_status, reason_code, recommended_action = (
         media_route_capability_status(modality, available_providers)
@@ -496,6 +499,48 @@ def _media_route_out(
     )
     pool_available = bool(available_providers)
     tool_enabled = bool(tool and tool.enabled)
+    provider_readiness = []
+    for candidate_provider in provider_order:
+        key = (candidate_provider, modality)
+        provider_readiness.append(
+            {
+                "provider": candidate_provider,
+                "configured": modality
+                in provider_state.configured_modalities.get(candidate_provider, set()),
+                "account_verified": modality
+                in provider_state.verified_modalities.get(candidate_provider, set()),
+                "generation_observed": key in generation_receipts,
+                "plan_tiers": sorted(provider_state.plan_tiers.get(key, set())),
+                "account_receipt": provider_state.account_receipts.get(key),
+                "generation_receipt": generation_receipts.get(key),
+            }
+        )
+    any_configured = any(item["configured"] for item in provider_readiness)
+    any_account_verified = any(item["account_verified"] for item in provider_readiness)
+    any_generation_observed = any(item["generation_observed"] for item in provider_readiness)
+    if not any_configured:
+        readiness_status = "unconfigured"
+    elif not any_account_verified:
+        readiness_status = "account_verification_required"
+    elif not any_generation_observed:
+        readiness_status = "generation_unverified"
+    else:
+        readiness_status = "generation_observed"
+    evidence_action = ""
+    if readiness_status == "account_verification_required":
+        evidence_action = (
+            "账号已配置但没有当前配置对应的鉴权 receipt；请在账号池执行只读验证。"
+        )
+    elif readiness_status == "generation_unverified":
+        evidence_action = (
+            "账号鉴权已通过，但尚无当前配置下的真实生成 receipt；正式开放前需经授权执行受控生成。"
+        )
+    elif readiness_status == "generation_observed":
+        evidence_action = (
+            "已有真实生成成功 receipt，但尚未证明人工质量或商用门槛；仍需质量评审。"
+        )
+    if evidence_action:
+        recommended_action = f"{recommended_action} {evidence_action}"
     estimated_credits, billing_unit = _media_route_billing(profile)
     return MediaRouteOut(
         modality=modality,
@@ -509,7 +554,10 @@ def _media_route_out(
         capability_status=capability_status,
         reason_code=reason_code,
         recommended_action=recommended_action,
-        evaluation_source="live_platform_credential_pool",
+        evaluation_source="persisted_account_and_generation_receipts",
+        readiness_status=readiness_status,
+        quality_evidence_status="not_reviewed",
+        provider_readiness=provider_readiness,
         fallback_provider=MINIMAX_PROVIDER,
         tool_name=MINIMAX_MEDIA_TOOL_NAMES[modality],
         model=profile.model,
@@ -543,13 +591,17 @@ async def list_media_routes(
 ):
     """List the 4 x 3 automatic media routing matrix without credentials."""
     tools = await _media_tool_map(db)
-    provider_modalities = await get_platform_media_provider_modalities(db)
+    provider_state = await get_platform_media_provider_state(db)
+    generation_receipts = await get_platform_media_generation_receipts(
+        db, provider_state
+    )
     return [
         _media_route_out(
             modality=modality,
             tier=tier,
             tool=tools.get(tool_name),
-            provider_modalities=provider_modalities,
+            provider_state=provider_state,
+            generation_receipts=generation_receipts,
         )
         for modality, tool_name in MINIMAX_MEDIA_TOOL_NAMES.items()
         for tier in ("lite", "pro", "ultra")
@@ -638,12 +690,16 @@ async def update_media_route(
         },
     ))
     await db.commit()
-    provider_modalities = await get_platform_media_provider_modalities(db)
+    provider_state = await get_platform_media_provider_state(db)
+    generation_receipts = await get_platform_media_generation_receipts(
+        db, provider_state
+    )
     return _media_route_out(
         modality=canonical,
         tier=normalized_tier,
         tool=tool,
-        provider_modalities=provider_modalities,
+        provider_state=provider_state,
+        generation_receipts=generation_receipts,
     )
 
 

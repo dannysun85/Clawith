@@ -187,6 +187,51 @@ async def test_list_mine_remains_active_direct_sessions_only(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_agent_admin_with_use_access_cannot_list_other_users_sessions(monkeypatch):
+    current_user = _actor(role="agent_admin")
+    agent = _agent(current_user, creator_id=uuid.uuid4())
+    db = RecordingDB()
+
+    async def fake_check_agent_access(_db, _user, _agent_id):
+        return agent, "use"
+
+    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
+
+    with pytest.raises(chat_sessions_api.HTTPException) as error:
+        await chat_sessions_api.list_sessions(
+            agent_id=agent.id,
+            scope="all",
+            current_user=current_user,
+            db=db,
+        )
+
+    assert error.value.status_code == 403
+    assert db.statements == []
+
+
+@pytest.mark.asyncio
+async def test_agent_admin_with_manage_access_can_list_authorized_agent_sessions(monkeypatch):
+    current_user = _actor(role="agent_admin")
+    agent = _agent(current_user, creator_id=uuid.uuid4())
+    db = RecordingDB(DummyResult([]))
+
+    async def fake_check_agent_access(_db, _user, _agent_id):
+        return agent, "manage"
+
+    monkeypatch.setattr(chat_sessions_api, "check_agent_access", fake_check_agent_access)
+
+    sessions = await chat_sessions_api.list_sessions(
+        agent_id=agent.id,
+        scope="all",
+        current_user=current_user,
+        db=db,
+    )
+
+    assert sessions == []
+    assert len(db.statements) == 1
+
+
+@pytest.mark.asyncio
 async def test_list_mine_keeps_zero_message_session_with_saved_deliverable(monkeypatch):
     current_user = _actor()
     agent = _agent(current_user)

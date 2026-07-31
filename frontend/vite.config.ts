@@ -46,11 +46,11 @@ export default defineConfig({
         host: '0.0.0.0',
         proxy: {
             '/api': {
-                target: `http://localhost:${backendPort}`,
+                target: `http://127.0.0.1:${backendPort}`,
                 changeOrigin: true,
             },
             '/ws': {
-                target: `ws://localhost:${backendPort}`,
+                target: `ws://127.0.0.1:${backendPort}`,
                 ws: true,
             },
         },

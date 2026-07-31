@@ -59,6 +59,8 @@ interface OKREvidenceSnapshot {
     deliverable_request_id?: string | null;
     completed_at?: string | null;
     deep_link: string;
+    validity?: 'current' | 'superseded' | 'unavailable';
+    validity_reason?: string | null;
     artifact?: {
         id: string;
         name: string;
@@ -375,10 +377,20 @@ function KRCard({
                 <div style={{
                     display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap',
                     padding: '7px 9px', borderRadius: '6px',
-                    border: '1px solid var(--border-subtle)', background: 'var(--bg-primary)',
+                    border: kr.latest_evidence.validity && kr.latest_evidence.validity !== 'current'
+                        ? '1px solid rgba(245, 158, 11, 0.45)'
+                        : '1px solid var(--border-subtle)',
+                    background: 'var(--bg-primary)',
                     fontSize: '11px', color: 'var(--text-tertiary)',
                 }}>
                     <span>{isChinese ? '已关联证据' : 'Linked evidence'}</span>
+                    {kr.latest_evidence.validity && kr.latest_evidence.validity !== 'current' && (
+                        <span style={{ color: '#b45309', fontWeight: 700 }}>
+                            {kr.latest_evidence.validity === 'superseded'
+                                ? (isChinese ? '已被后续状态或版本替代' : 'Superseded by a later state or revision')
+                                : (isChinese ? '原始来源当前不可用' : 'Original source is currently unavailable')}
+                        </span>
+                    )}
                     <a
                         href={kr.latest_evidence.deep_link}
                         style={{ color: 'var(--accent-primary)', fontWeight: 600, textDecoration: 'none' }}

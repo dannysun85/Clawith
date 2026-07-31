@@ -172,7 +172,7 @@ async def update_user_role(
     """Change a user's role within the same company.
 
     Permissions:
-    - org_admin: can set roles to org_admin / member within own tenant.
+    - org_admin: can set roles to org_admin / agent_admin / member within own tenant.
       Cannot assign platform_admin.
     - platform_admin: can set any valid role.
 
@@ -184,9 +184,9 @@ async def update_user_role(
         raise HTTPException(status_code=403, detail="Admin access required")
 
     # Validate target role value
-    allowed_roles = ("org_admin", "member")
+    allowed_roles = ("org_admin", "agent_admin", "member")
     if current_user.role == "platform_admin":
-        allowed_roles = ("platform_admin", "org_admin", "member")
+        allowed_roles = ("platform_admin", "org_admin", "agent_admin", "member")
     if data.role not in allowed_roles:
         raise HTTPException(status_code=400, detail=f"Invalid role. Allowed: {', '.join(allowed_roles)}")
 

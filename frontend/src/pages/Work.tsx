@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
@@ -24,6 +24,12 @@ import {
 import { useAuthStore } from '../stores';
 import { createRandomUUID } from '../utils/randomUUID';
 import { partitionAgentRoles } from '../utils/productRoles';
+import {
+    clearWorkDraft,
+    loadWorkDraft,
+    saveWorkDraft,
+    workDraftStorageKey,
+} from '../utils/workDraftPersistence';
 import { useToast } from '../components/Toast/ToastProvider';
 import { groupApi } from '../services/groupApi';
 import './Work.css';
@@ -167,21 +173,88 @@ export default function Work() {
     const queryClient = useQueryClient();
     const navigate = useNavigate();
     const toast = useToast();
-    const [title, setTitle] = useState('');
-    const [intent, setIntent] = useState('');
-    const [workType, setWorkType] = useState<WorkTaskDraft['work_type']>('general');
-    const [priority, setPriority] = useState<'low' | 'medium' | 'high' | 'urgent'>('medium');
-    const [executorKind, setExecutorKind] = useState<WorkTaskDraft['executor_kind']>('personal_assistant');
-    const [agentId, setAgentId] = useState('');
-    const [expertRole, setExpertRole] = useState('');
-    const [groupId, setGroupId] = useState('');
-    const [groupSessionId, setGroupSessionId] = useState('');
-    const [groupAgentParticipantIds, setGroupAgentParticipantIds] = useState<string[]>([]);
-    const [clientRequestId, setClientRequestId] = useState(() => createRandomUUID());
+    const draftStorageKey = workDraftStorageKey(user?.id, user?.tenant_id);
+    const restoredDraft = useMemo(() => {
+        if (!draftStorageKey || typeof window === 'undefined') return null;
+        return loadWorkDraft(window.sessionStorage, draftStorageKey);
+    }, []); // The active tenant change is handled by the key-change effect below.
+    const [title, setTitle] = useState(restoredDraft?.title || '');
+    const [intent, setIntent] = useState(restoredDraft?.intent || '');
+    const [workType, setWorkType] = useState<WorkTaskDraft['work_type']>(restoredDraft?.workType || 'general');
+    const [priority, setPriority] = useState<'low' | 'medium' | 'high' | 'urgent'>(restoredDraft?.priority || 'medium');
+    const [executorKind, setExecutorKind] = useState<WorkTaskDraft['executor_kind']>(restoredDraft?.executorKind || 'personal_assistant');
+    const [agentId, setAgentId] = useState(restoredDraft?.agentId || '');
+    const [expertRole, setExpertRole] = useState(restoredDraft?.expertRole || '');
+    const [groupId, setGroupId] = useState(restoredDraft?.groupId || '');
+    const [groupSessionId, setGroupSessionId] = useState(restoredDraft?.groupSessionId || '');
+    const [groupAgentParticipantIds, setGroupAgentParticipantIds] = useState<string[]>(restoredDraft?.groupAgentParticipantIds || []);
+    const [clientRequestId, setClientRequestId] = useState(restoredDraft?.clientRequestId || createRandomUUID());
     const [preflight, setPreflight] = useState<{
         draftKey: string;
         result: WorkTaskPreflight;
     } | null>(null);
+    const previousDraftStorageKey = useRef(draftStorageKey);
+    const restoringTenantDraft = useRef(false);
+
+    useEffect(() => {
+        if (previousDraftStorageKey.current === draftStorageKey) return;
+        previousDraftStorageKey.current = draftStorageKey;
+        restoringTenantDraft.current = true;
+        const next = draftStorageKey && typeof window !== 'undefined'
+            ? loadWorkDraft(window.sessionStorage, draftStorageKey)
+            : null;
+        setTitle(next?.title || '');
+        setIntent(next?.intent || '');
+        setWorkType(next?.workType || 'general');
+        setPriority(next?.priority || 'medium');
+        setExecutorKind(next?.executorKind || 'personal_assistant');
+        setAgentId(next?.agentId || '');
+        setExpertRole(next?.expertRole || '');
+        setGroupId(next?.groupId || '');
+        setGroupSessionId(next?.groupSessionId || '');
+        setGroupAgentParticipantIds(next?.groupAgentParticipantIds || []);
+        setClientRequestId(next?.clientRequestId || createRandomUUID());
+        setPreflight(null);
+    }, [draftStorageKey]);
+
+    useEffect(() => {
+        if (!draftStorageKey || typeof window === 'undefined') return;
+        if (restoringTenantDraft.current) {
+            restoringTenantDraft.current = false;
+            return;
+        }
+        if (!title.trim() && !intent.trim()) {
+            clearWorkDraft(window.sessionStorage, draftStorageKey);
+            return;
+        }
+        saveWorkDraft(window.sessionStorage, draftStorageKey, {
+            version: 1,
+            title,
+            intent,
+            workType,
+            priority,
+            executorKind,
+            agentId,
+            expertRole,
+            groupId,
+            groupSessionId,
+            groupAgentParticipantIds,
+            clientRequestId,
+        });
+    }, [
+        agentId,
+        clientRequestId,
+        draftStorageKey,
+        executorKind,
+        expertRole,
+        groupAgentParticipantIds,
+        groupId,
+        groupSessionId,
+        intent,
+        priority,
+        title,
+        workType,
+    ]);
 
     const workQuery = useQuery({
         queryKey: ['work-index', user?.tenant_id],
@@ -267,6 +340,9 @@ export default function Work() {
             });
         },
         onSuccess: async () => {
+            if (draftStorageKey && typeof window !== 'undefined') {
+                clearWorkDraft(window.sessionStorage, draftStorageKey);
+            }
             setTitle('');
             setIntent('');
             setWorkType('general');

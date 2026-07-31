@@ -192,6 +192,29 @@ def _submission(
     )
 
 
+def test_changed_artifact_hash_supersedes_a_sealed_review_without_erasing_receipt() -> None:
+    request = _request()
+    artifacts = _artifacts(request)
+    review = _review(request, artifacts)
+    review.status = "passed"
+    review.receipt = {"receipt_ref": "panel:historical-pass"}
+    replacement = list(artifacts)
+    replacement[0].content_hash = "9" * 64
+    sealed_at = datetime(2026, 8, 1, 10, 0, tzinfo=UTC)
+
+    changed = deliverables._supersede_review_for_changed_artifacts(  # noqa: SLF001
+        review,
+        tuple(replacement),
+        now=sealed_at,
+    )
+
+    assert changed is True
+    assert review.status == "superseded"
+    assert review.sealed_at == sealed_at
+    assert review.version == 2
+    assert review.receipt == {"receipt_ref": "panel:historical-pass"}
+
+
 @pytest.mark.asyncio
 async def test_unassigned_same_tenant_user_cannot_discover_review() -> None:
     request = _request()

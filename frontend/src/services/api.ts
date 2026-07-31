@@ -666,8 +666,12 @@ export interface DeliverableArtifactRevision {
     id: string;
     request_id: string;
     parent_revision_id: string | null;
+    execution_id?: string | null;
+    unit_id?: string | null;
     artifact_key: string;
     artifact_type: string;
+    stage_key?: string | null;
+    unit_key?: string | null;
     workspace_path: string;
     mime_type: string | null;
     content_hash: string;
@@ -678,6 +682,61 @@ export interface DeliverableArtifactRevision {
     approved_by_user_id: string | null;
     approved_at: string | null;
     created_at: string;
+}
+
+export interface DeliverableExecutionUnit {
+    id: string;
+    execution_id: string;
+    stage_key: string;
+    unit_key: string;
+    status: 'pending' | 'running' | 'blocked' | 'reconciling' | 'succeeded' | 'failed' | 'cancelled' | 'superseded';
+    dependency_hash: string;
+    attempt_count: number;
+    input_snapshot: Record<string, unknown>;
+    result_snapshot: Record<string, unknown>;
+    quality_evaluation: Record<string, unknown>;
+    last_error_code: string | null;
+    next_retry_at: string | null;
+    started_at: string | null;
+    completed_at: string | null;
+    created_at: string;
+    updated_at: string;
+}
+
+export interface DeliverableApprovalReceipt {
+    id: string;
+    execution_id: string;
+    actor_user_id: string;
+    client_action_id: string;
+    request_version: number;
+    stage: 'brief' | 'outline' | 'composition' | 'storyboard' | 'final';
+    action: 'approve' | 'request_changes' | 'cancel';
+    instruction: string | null;
+    target_units: string[];
+    receipt: Record<string, unknown>;
+    created_at: string;
+}
+
+export interface DeliverableExecution {
+    id: string;
+    request_id: string;
+    execution_number: number;
+    kind: 'initial' | 'revision' | 'recovery';
+    status: 'ready' | 'running' | 'blocked' | 'reconciling' | 'waiting_approval' | 'succeeded' | 'failed' | 'cancelled';
+    current_stage: string;
+    workflow_id: string;
+    workflow_version: string;
+    contract_snapshot: Record<string, unknown>;
+    preflight_snapshot: Record<string, unknown>;
+    revision_instruction: string | null;
+    blocked_reason: string | null;
+    last_error_code: string | null;
+    launched_at: string | null;
+    completed_at: string | null;
+    created_at: string;
+    updated_at: string;
+    units: DeliverableExecutionUnit[];
+    approvals: DeliverableApprovalReceipt[];
 }
 
 export interface DeliverableApprovalReadiness {
@@ -695,6 +754,8 @@ export interface DeliverableRequest {
     agent_id: string;
     session_id: string;
     agent_run_id: string | null;
+    current_execution_id?: string | null;
+    task_id?: string | null;
     client_request_id: string;
     work_type: DeliverableWorkType;
     workflow_id: string;
@@ -708,6 +769,8 @@ export interface DeliverableRequest {
     status: 'draft' | 'ready' | 'running' | 'waiting_approval' | 'succeeded' | 'failed' | 'cancelled';
     current_stage: string;
     version: number;
+    contract_revision?: number;
+    latest_preflight?: Record<string, unknown> | null;
     last_error_code: string | null;
     launched_at: string | null;
     completed_at: string | null;
@@ -813,6 +876,9 @@ export const deliverableApi = {
         return request<DeliverableRequest[]>(`/deliverables/requests?${query.toString()}`);
     },
     get: (requestId: string) => request<DeliverableRequest>(`/deliverables/requests/${requestId}`),
+    executions: (requestId: string) => request<DeliverableExecution[]>(
+        `/deliverables/requests/${requestId}/executions`,
+    ),
     artifactDownloadUrl: (artifactId: string, options?: { inline?: boolean }) => {
         const query = new URLSearchParams();
         if (options?.inline) query.set('inline', 'true');
@@ -824,6 +890,20 @@ export const deliverableApi = {
             method: 'POST',
             body: JSON.stringify({ action, expected_version: expectedVersion }),
         }),
+    approval: (
+        requestId: string,
+        data: {
+            expected_version: number;
+            client_action_id: string;
+            stage: 'final';
+            action: 'approve' | 'request_changes' | 'cancel';
+            instruction?: string;
+            target_units?: string[];
+        },
+    ) => request<DeliverableRequest>(`/deliverables/requests/${requestId}/approvals`, {
+        method: 'POST',
+        body: JSON.stringify(data),
+    }),
     qualityReviewers: (requestId: string) =>
         request<DeliverableQualityReviewer[]>(
             `/deliverables/requests/${requestId}/quality-reviewers`,
