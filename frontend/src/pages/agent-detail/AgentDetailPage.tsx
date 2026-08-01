@@ -39,7 +39,13 @@ import {
 } from '../../utils/chatAttachmentPersistence';
 import { canAccessSaasAdmin } from '../../utils/saasAdmin';
 import { displaySessionTitle } from '../../utils/sessionDisplay';
-import { toolDisplayName } from '../../utils/toolDisplay';
+import {
+    customerSafeAssistantText,
+    customerSafeToolArgs,
+    customerSafeToolResult,
+    isManagedMediaTool,
+    toolDisplayName,
+} from '../../utils/toolDisplay';
 import {
     deliverableLaunchMessage,
     deliverableRouteTier,
@@ -1319,7 +1325,10 @@ function AnalysisCard({
                             const isLast = idx === items.length - 1;
                             if (item.type === 'tool' && (item as any).name === 'propose_experience_draft') return null;
                             if (item.type === 'thinking') {
-                                const itemPreview = item.content.length > 360 ? item.content.slice(0, 360).trimEnd() + '...' : item.content;
+                                const safeThinkingContent = customerSafeAssistantText(item.content);
+                                const itemPreview = safeThinkingContent.length > 360
+                                    ? safeThinkingContent.slice(0, 360).trimEnd() + '...'
+                                    : safeThinkingContent;
                                 return (
                                     <div key={idx} className="analysis-trace-row">
                                         <div className="analysis-trace-node-wrap">
@@ -1332,13 +1341,13 @@ function AnalysisCard({
                                             <div style={{ fontSize: '13px', lineHeight: 1.5, color: 'var(--text-secondary)', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
                                                 {itemPreview}
                                             </div>
-                                            {item.content.length > itemPreview.length && (
+                                            {safeThinkingContent.length > itemPreview.length && (
                                                 <details style={{ marginTop: '8px' }}>
                                                     <summary style={{ cursor: 'pointer', color: 'var(--text-tertiary)', fontSize: '12px', listStyle: 'none' }}>
                                                         {t('agent.chat.showMore')}
                                                     </summary>
                                                     <div style={{ marginTop: '8px', color: 'var(--text-secondary)', fontSize: '13px', lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-                                                        {item.content}
+                                                        {safeThinkingContent}
                                                     </div>
                                                 </details>
                                             )}
@@ -1352,8 +1361,11 @@ function AnalysisCard({
                             const meta = getToolMeta(tc);
                             const ToolIcon = getToolIcon(meta.kind);
                             const provider = getToolProvider(tc.name);
-                            const argsStr = tc.args && Object.keys(tc.args).length > 0
-                                ? JSON.stringify(tc.args, null, 2) : '';
+                            const managedMedia = isManagedMediaTool(tc.name);
+                            const safeArgs = customerSafeToolArgs(tc.name, tc.args);
+                            const safeResult = customerSafeToolResult(tc.name, tc.result || '');
+                            const argsStr = safeArgs && typeof safeArgs === 'object' && Object.keys(safeArgs).length > 0
+                                ? JSON.stringify(safeArgs, null, 2) : '';
                             const hasDetail = true;
                             return (
                                 <div key={idx} className={`analysis-trace-row${running ? ' analysis-trace-row--running' : ''}`}>
@@ -1431,19 +1443,21 @@ function AnalysisCard({
                                                 </summary>
                                                 <div style={{ marginTop: '8px' }}>
                                                     <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '6px', marginBottom: '8px' }}>
-                                                        <span style={{
-                                                            display: 'inline-flex',
-                                                            alignItems: 'center',
-                                                            height: '22px',
-                                                            padding: '0 8px',
-                                                            borderRadius: '6px',
-                                                            background: 'var(--bg-secondary)',
-                                                            color: 'var(--text-tertiary)',
-                                                            fontSize: '11px',
-                                                            lineHeight: 1,
-                                                        }}>
-                                                            {t('agent.chat.provider', 'Provider')}: {provider}
-                                                        </span>
+                                                        {!managedMedia && (
+                                                            <span style={{
+                                                                display: 'inline-flex',
+                                                                alignItems: 'center',
+                                                                height: '22px',
+                                                                padding: '0 8px',
+                                                                borderRadius: '6px',
+                                                                background: 'var(--bg-secondary)',
+                                                                color: 'var(--text-tertiary)',
+                                                                fontSize: '11px',
+                                                                lineHeight: 1,
+                                                            }}>
+                                                                {t('agent.chat.provider', 'Provider')}: {provider}
+                                                            </span>
+                                                        )}
                                                         <span style={{
                                                             display: 'inline-flex',
                                                             alignItems: 'center',
@@ -1460,7 +1474,7 @@ function AnalysisCard({
                                                             textOverflow: 'ellipsis',
                                                             whiteSpace: 'nowrap',
                                                         }}>
-                                                            {t('agent.chat.toolName', 'Tool')}: {tc.name || 'tool'}
+                                                            {t('agent.chat.toolName', 'Tool')}: {toolDisplayName(tc.name || 'tool')}
                                                         </span>
                                                     </div>
                                                     {argsStr && (
@@ -1469,10 +1483,10 @@ function AnalysisCard({
                                                             color: 'var(--text-tertiary)', whiteSpace: 'pre-wrap',
                                                             wordBreak: 'break-all', maxHeight: '80px', overflowY: 'auto',
                                                             background: 'var(--bg-secondary)', borderRadius: '4px',
-                                                            padding: '4px 6px', marginBottom: tc.result ? '4px' : 0,
+                                                            padding: '4px 6px', marginBottom: safeResult ? '4px' : 0,
                                                         }}>{argsStr}</div>
                                                     )}
-                                                    {tc.result && (
+                                                    {safeResult && (
                                                         <div style={{
                                                             fontSize: '10px', color: 'var(--text-secondary)',
                                                             whiteSpace: 'pre-wrap', wordBreak: 'break-all',
@@ -1480,7 +1494,7 @@ function AnalysisCard({
                                                             borderTop: argsStr ? '1px solid var(--border-subtle)' : 'none',
                                                             paddingTop: argsStr ? '4px' : 0,
                                                         }}>
-                                                            {tc.result.length > 500 ? tc.result.slice(0, 500) + '…' : tc.result}
+                                                            {safeResult.length > 500 ? safeResult.slice(0, 500) + '…' : safeResult}
                                                         </div>
                                                     )}
                                                 </div>
@@ -4872,6 +4886,9 @@ export default function AgentDetailPage() {
                 return ''; // always strip the marker from displayed text
             }).trim();
         }
+        if (msg.role === 'assistant') {
+            displayContent = customerSafeAssistantText(displayContent);
+        }
         const isSubscriptionQuotaError = !!msg.quotaError
             || displayContent.includes('套餐详情')
             || displayContent.includes('Credits 不足')
@@ -4890,8 +4907,8 @@ export default function AgentDetailPage() {
             return (
                 <div className="chat-msg-timestamp">
                     {timeStr}
-                    {msg.content && <CopyMessageButton text={msg.content} />}
-                    {msg.content && isLeft && !hideDistill && <DistillButton text={msg.content} sessionId={activeSessionIdRef.current} />}
+                    {displayContent && <CopyMessageButton text={displayContent} />}
+                    {displayContent && isLeft && !hideDistill && <DistillButton text={displayContent} sessionId={activeSessionIdRef.current} />}
                 </div>
             );
         })() : null;
@@ -6190,13 +6207,13 @@ export default function AgentDetailPage() {
             if (!msg) return '';
             if (msg.role === 'tool_call') {
                 const name = msg.toolName || (() => { try { return JSON.parse(msg.content || '{}').name; } catch { return ''; } })() || 'tool';
-                return isZh ? `调用工具：${name}` : `Tool call: ${name}`;
+                return isZh ? `调用工具：${toolDisplayName(name)}` : `Tool call: ${toolDisplayName(name)}`;
             }
             if (msg.role === 'tool_result') {
                 const name = msg.toolName || (() => { try { return JSON.parse(msg.content || '{}').name; } catch { return ''; } })() || 'result';
-                return isZh ? `工具结果：${name}` : `Tool result: ${name}`;
+                return isZh ? `工具结果：${toolDisplayName(name)}` : `Tool result: ${toolDisplayName(name)}`;
             }
-            return String(msg.content || '').replace(/\s+/g, ' ').trim();
+            return customerSafeAssistantText(msg.content).replace(/\s+/g, ' ').trim();
         };
         return (
             <div className="aware-side-preview">
@@ -6311,13 +6328,16 @@ export default function AgentDetailPage() {
                                             const toolName = isTool
                                                 ? (msg.toolName || (() => { try { return JSON.parse(msg.content || '{}').name; } catch { return ''; } })() || 'tool')
                                                 : '';
-                                            const toolArgs = isTool
+                                            const rawToolArgs = isTool
                                                 ? (msg.toolArgs || (() => { try { return JSON.parse(msg.content || '{}').args; } catch { return {}; } })())
                                                 : null;
-                                            const toolResult = isTool ? (msg.toolResult || '') : '';
+                                            const toolArgs = isTool ? customerSafeToolArgs(toolName, rawToolArgs) : null;
+                                            const toolResult = isTool ? customerSafeToolResult(toolName, msg.toolResult || '') : '';
                                             const argsText = typeof toolArgs === 'string' ? toolArgs : JSON.stringify(toolArgs || {}, null, 2);
                                             const resultText = typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult, null, 2);
-                                            const body = String(msg.content || '');
+                                            const body = msg.role === 'assistant'
+                                                ? customerSafeAssistantText(msg.content)
+                                                : String(msg.content || '');
                                             return (
                                                 <details key={index} className={`aware-side-reflection-message role-${msg.role}`}>
                                                     <summary style={{ display: 'flex', gap: '8px', alignItems: 'center', cursor: 'pointer', listStyle: 'none' } as any}>
@@ -6338,7 +6358,7 @@ export default function AgentDetailPage() {
                                                     }}>
                                                         {isTool ? (
                                                             <>
-                                                                <div style={{ color: 'var(--text-tertiary)', marginBottom: '4px' }}>{toolName}</div>
+                                                                <div style={{ color: 'var(--text-tertiary)', marginBottom: '4px' }}>{toolDisplayName(toolName)}</div>
                                                                 <div style={{ color: 'var(--text-tertiary)', marginBottom: '4px' }}>{isZh ? '参数' : 'Arguments'}</div>
                                                                 {argsText || '{}'}
                                                                 {resultText && (
@@ -7216,12 +7236,13 @@ export default function AgentDetailPage() {
                                                                         {msgs.map((msg: any, mi: number) => {
                                                                             if (msg.role === 'tool_call') {
                                                                                 const tName = msg.toolName || (() => { try { return JSON.parse(msg.content || '{}').name; } catch { return ''; } })() || 'tool';
-                                                                                const tArgs = msg.toolArgs || (() => { try { return JSON.parse(msg.content || '{}').args; } catch { return {}; } })();
+                                                                                const rawArgs = msg.toolArgs || (() => { try { return JSON.parse(msg.content || '{}').args; } catch { return {}; } })();
                                                                                 // Experience draft proposal renders as a human-gated review card, not a raw tool blob.
                                                                                 if (tName === 'propose_experience_draft') {
-                                                                                    return <ExperienceDraftCard key={mi} args={tArgs} sessionId={activeSessionIdRef.current} />;
+                                                                                    return <ExperienceDraftCard key={mi} args={rawArgs} sessionId={activeSessionIdRef.current} />;
                                                                                 }
-                                                                                const tResult = msg.toolResult || '';
+                                                                                const tArgs = customerSafeToolArgs(tName, rawArgs);
+                                                                                const tResult = customerSafeToolResult(tName, msg.toolResult || '');
                                                                                 const argsStr = typeof tArgs === 'string' ? tArgs : JSON.stringify(tArgs || {}, null, 2);
                                                                                 const resultStr = typeof tResult === 'string' ? tResult : JSON.stringify(tResult, null, 2);
                                                                                 return (
@@ -7239,7 +7260,7 @@ export default function AgentDetailPage() {
                                                                                                 padding: '1px 6px', borderRadius: '3px',
                                                                                                 background: 'var(--bg-tertiary, rgba(0,0,0,0.06))',
                                                                                                 flexShrink: 0, fontFamily: 'monospace',
-                                                                                            }}>{tName}</span>
+                                                                                            }}>{toolDisplayName(tName)}</span>
                                                                                             <span style={{
                                                                                                 color: 'var(--text-tertiary)', fontFamily: 'monospace', fontSize: '10px',
                                                                                                 overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
@@ -7268,8 +7289,7 @@ export default function AgentDetailPage() {
                                                                             }
                                                                             if (msg.role === 'tool_result') {
                                                                                 const tName = msg.toolName || (() => { try { return JSON.parse(msg.content || '{}').name; } catch { return ''; } })() || 'result';
-                                                                                const tResult = msg.toolResult || msg.content || '';
-                                                                                const resultStr = typeof tResult === 'string' ? tResult : JSON.stringify(tResult, null, 2);
+                                                                                const resultStr = customerSafeToolResult(tName, msg.toolResult || msg.content || '');
                                                                                 if (!resultStr) return null;
                                                                                 return (
                                                                                     <details key={mi} style={{ borderRadius: '6px', background: 'var(--bg-secondary)', overflow: 'hidden' }}>
@@ -7286,7 +7306,7 @@ export default function AgentDetailPage() {
                                                                                                 padding: '1px 6px', borderRadius: '3px',
                                                                                                 background: 'var(--bg-tertiary, rgba(0,0,0,0.06))',
                                                                                                 flexShrink: 0, fontFamily: 'monospace',
-                                                                                            }}>{tName}</span>
+                                                                                            }}>{toolDisplayName(tName)}</span>
                                                                                             <span style={{
                                                                                                 color: 'var(--text-tertiary)', fontFamily: 'monospace', fontSize: '10px',
                                                                                                 overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
@@ -7314,7 +7334,7 @@ export default function AgentDetailPage() {
                                                                                         whiteSpace: 'pre-wrap', lineHeight: '1.5',
                                                                                         maxHeight: '200px', overflow: 'auto',
                                                                                     }}>
-                                                                                        {msg.content}
+                                                                                        {customerSafeAssistantText(msg.content)}
                                                                                     </div>
                                                                                 );
                                                                             }
@@ -7780,18 +7800,23 @@ export default function AgentDetailPage() {
                                                             : m.role === 'assistant';
                                                         if (m.role === 'tool_call') {
                                                             const tName = m.toolName || (() => { try { return JSON.parse(m.content || '{}').name; } catch { return 'tool'; } })();
-                                                            const tArgs = m.toolArgs || (() => { try { return JSON.parse(m.content || '{}').args; } catch { return {}; } })();
+                                                            const rawArgs = m.toolArgs || (() => { try { return JSON.parse(m.content || '{}').args; } catch { return {}; } })();
                                                             if (tName === 'propose_experience_draft') {
-                                                                return <ExperienceDraftCard key={i} args={tArgs} sessionId={activeSessionIdRef.current} />;
+                                                                return <ExperienceDraftCard key={i} args={rawArgs} sessionId={activeSessionIdRef.current} />;
                                                             }
-                                                            const tResult = m.toolResult ?? (() => { try { return JSON.parse(m.content || '{}').result; } catch { return ''; } })();
+                                                            const tArgs = customerSafeToolArgs(tName, rawArgs);
+                                                            const tArgEntries = tArgs && typeof tArgs === 'object'
+                                                                ? Object.entries(tArgs)
+                                                                : [];
+                                                            const rawResult = m.toolResult ?? (() => { try { return JSON.parse(m.content || '{}').result; } catch { return ''; } })();
+                                                            const tResult = customerSafeToolResult(tName, rawResult);
                                                             return (
                                                                 <div key={i} style={{ display: 'flex', gap: '8px', marginBottom: '6px', paddingLeft: '36px', minWidth: 0 }}>
                                                                     <details style={{ flex: 1, minWidth: 0, borderRadius: '8px', background: 'var(--accent-subtle)', border: '1px solid var(--accent-subtle)', fontSize: '12px', overflow: 'hidden' }}>
                                                                         <summary style={{ padding: '6px 10px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px', userSelect: 'none', listStyle: 'none', overflow: 'hidden' }}>
                                                                             <IconBolt size={13} stroke={1.8} />
-                                                                            <span style={{ fontWeight: 600, color: 'var(--accent-text)' }}>{tName}</span>
-                                                                            {tArgs && typeof tArgs === 'object' && Object.keys(tArgs).length > 0 && <span style={{ color: 'var(--text-tertiary)', fontSize: '11px', fontFamily: 'var(--font-mono)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{`(${Object.entries(tArgs).map(([k, v]) => `${k}: ${typeof v === 'string' ? v.slice(0, 30) : JSON.stringify(v)}`).join(', ')})`}</span>}
+                                                                            <span style={{ fontWeight: 600, color: 'var(--accent-text)' }}>{toolDisplayName(tName)}</span>
+                                                                            {tArgEntries.length > 0 && <span style={{ color: 'var(--text-tertiary)', fontSize: '11px', fontFamily: 'var(--font-mono)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{`(${tArgEntries.map(([k, v]) => `${k}: ${typeof v === 'string' ? v.slice(0, 30) : JSON.stringify(v)}`).join(', ')})`}</span>}
                                                                         </summary>
                                                                         {tResult && <div style={{ padding: '4px 10px 8px' }}><div style={{ color: 'var(--text-secondary)', fontSize: '11px', fontFamily: 'var(--font-mono)', whiteSpace: 'pre-wrap', wordBreak: 'break-word', maxHeight: '240px', overflow: 'auto', background: 'rgba(0,0,0,0.15)', borderRadius: '4px', padding: '4px 6px' }}>{tResult}</div></div>}
                                                                     </details>
@@ -7803,7 +7828,7 @@ export default function AgentDetailPage() {
                                                         if (m.role === 'assistant' && !m.content?.trim()) {
                                                             if (m.thinking) {
                                                                 return (
-                                                                    <ThoughtDisclosure key={i} content={m.thinking} t={t} />
+                                                                    <ThoughtDisclosure key={i} content={customerSafeAssistantText(m.thinking)} t={t} />
                                                                 );
                                                             }
                                                             return null;
@@ -7811,7 +7836,7 @@ export default function AgentDetailPage() {
                                                         return (
                                                             <React.Fragment key={i}>
                                                                 {m.role === 'assistant' && m.thinking && (
-                                                                    <ThoughtDisclosure content={m.thinking} t={t} />
+                                                                    <ThoughtDisclosure content={customerSafeAssistantText(m.thinking)} t={t} />
                                                                 )}
                                                                 <ChatMessageItem
                                                                     msg={{ ...m, thinking: undefined }}
@@ -8029,7 +8054,7 @@ export default function AgentDetailPage() {
                                                             return (
                                                                 <React.Fragment key={i}>
                                                                     <ThoughtDisclosure
-                                                                        content={msg.thinking}
+                                                                        content={customerSafeAssistantText(msg.thinking)}
                                                                         t={t}
                                                                         streaming={!!((msg as any)._streaming && !contentText)}
                                                                     />
@@ -8146,7 +8171,7 @@ export default function AgentDetailPage() {
                                                                 {t('agent.chat.reconcileTitle', '工具执行结果需要确认')}
                                                             </div>
                                                             <div className="chat-tool-reconciliation__detail">
-                                                                <code>{reconciliation.toolName}</code>
+                                                                <code>{toolDisplayName(reconciliation.toolName)}</code>
                                                                 <span>{reconciliation.resultSummary || reconciliation.errorCode || t('agent.chat.reconcileUnknown', '该操作可能已生效，也可能未生效。')}</span>
                                                             </div>
                                                             {reconciliation.canReconcile ? (

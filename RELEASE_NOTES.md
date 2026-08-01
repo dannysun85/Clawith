@@ -1,3 +1,28 @@
+# v1.11.13 — Provider-neutral Media Trace Completion
+
+## Customer-facing Routing Abstraction
+
+- Complete the provider-neutral projection for managed image, speech, music,
+  and video traces. Expanded Tool details now use business capability names
+  and omit provider, model, credential, provider-task, and internal task fields
+  while keeping the customer prompt, requested format, output path, and result.
+- Apply the same projection to historical media receipts, autonomous reflection
+  views, read-only conversation views, copy actions, and experience-distillation
+  input. Persisted audit records and platform-admin routing evidence remain
+  unchanged.
+- Historical generated-media messages no longer expose Provider/model receipt
+  lines or legacy provider-suffixed Tool identifiers in the customer chat UI.
+  Provider comparisons that are not media delivery receipts remain unchanged.
+
+## Validation
+
+- Add regression coverage for nested argument redaction, durable artifact-path
+  retention, Task ID removal, historical receipt projection, and non-media
+  comparison preservation.
+- Require frontend contracts, Vitest, TypeScript/Vite production build, npm
+  security audits, backend full suite, exact production release identity, and
+  authenticated browser verification before cutover is accepted.
+
 # v1.11.12 — Production Dependency and Configuration Follow-up
 
 ## Frontend Dependency Baseline
