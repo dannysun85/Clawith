@@ -1,12 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { reportClientIssue, shouldReportWebSocketClose } from './productionIssueReporter';
+import {
+    installClientIssueReporting,
+    reportClientIssue,
+    shouldReportWebSocketClose,
+} from './productionIssueReporter';
 
+const windowEvents = new EventTarget();
 
 describe('production issue reporter', () => {
     beforeEach(() => {
         vi.useFakeTimers();
         vi.setSystemTime(new Date('2026-07-13T06:00:00Z'));
+        vi.stubGlobal('window', windowEvents);
         const values = new Map<string, string>();
         vi.stubGlobal('localStorage', {
             getItem: (key: string) => values.get(key) ?? null,
@@ -16,10 +22,12 @@ describe('production issue reporter', () => {
         });
         localStorage.clear();
         localStorage.setItem('token', 'header.payload.signature');
+        window.dispatchEvent(new Event('pageshow'));
     });
 
     afterEach(() => {
         localStorage.clear();
+        window.dispatchEvent(new Event('pageshow'));
         vi.unstubAllGlobals();
         vi.useRealTimers();
     });
@@ -83,5 +91,51 @@ describe('production issue reporter', () => {
         expect(shouldReportWebSocketClose(4003, false)).toBe(false);
         expect(shouldReportWebSocketClose(1005, false)).toBe(true);
         expect(shouldReportWebSocketClose(1006, false)).toBe(true);
+    });
+
+    it('suppresses page-teardown failures but resumes reporting after bfcache restore', () => {
+        const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+        vi.stubGlobal('fetch', fetchMock);
+        const addEventListenerSpy = vi.spyOn(window, 'addEventListener');
+        installClientIssueReporting();
+        const installedListenerCount = addEventListenerSpy.mock.calls.length;
+        installClientIssueReporting();
+        expect(addEventListenerSpy).toHaveBeenCalledTimes(installedListenerCount);
+        const report = {
+            category: 'api' as const,
+            error_code: 'TypeError',
+            route: '/api/groups/123/sessions',
+            operation: 'GET',
+            metadata: { component: 'fetch' },
+        };
+
+        window.dispatchEvent(new Event('pagehide'));
+        reportClientIssue(report);
+        expect(fetchMock).not.toHaveBeenCalled();
+
+        reportClientIssue({
+            ...report,
+            error_code: 'http_503',
+            metadata: { component: 'fetch', status_code: 503 },
+        });
+        reportClientIssue({
+            category: 'websocket',
+            error_code: 'close_1006',
+            route: '/ws/chat/agent-123',
+            operation: 'chat',
+            metadata: { component: 'AgentDetailPage', close_code: 1006 },
+        });
+        reportClientIssue({
+            category: 'runtime',
+            error_code: 'WindowError',
+            route: '/groups/123',
+            operation: 'render',
+            metadata: { component: 'window' },
+        });
+        expect(fetchMock).toHaveBeenCalledTimes(3);
+
+        window.dispatchEvent(new Event('pageshow'));
+        reportClientIssue(report);
+        expect(fetchMock).toHaveBeenCalledTimes(4);
     });
 });

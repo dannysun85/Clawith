@@ -1,3 +1,25 @@
+# v1.11.14 — Browser Lifecycle Incident Accuracy
+
+## Production Monitoring
+
+- Stop classifying browser-managed Fetch teardown during full-page navigation
+  as an API outage. Production requests that completed with HTTP 200 no longer
+  create a follow-up `TypeError` incident merely because the old document was
+  destroyed before its Promise continuation ran.
+- Keep genuine network errors, HTTP 5xx responses, runtime failures, and
+  WebSocket failures reportable. SPA navigation remains observable because it
+  does not enter the document `pagehide` lifecycle, while `pageshow` restores
+  reporting after a back-forward-cache resume.
+- Make client issue-report listener installation idempotent so development
+  remounts cannot duplicate browser-global reporters.
+
+## Validation
+
+- Add lifecycle regression coverage proving that teardown errors are skipped
+  and reporting resumes after `pageshow`.
+- Require the full frontend and backend release gates plus authenticated
+  production navigation and post-cutover issue-event verification.
+
 # v1.11.13 — Provider-neutral Media Trace Completion
 
 ## Customer-facing Routing Abstraction

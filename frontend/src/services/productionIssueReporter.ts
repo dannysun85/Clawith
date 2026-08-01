@@ -14,6 +14,8 @@ const REPORT_URL = '/api/production-issues/client-report';
 const REPORT_DEDUPE_WINDOW_MS = 30_000;
 const MAX_RECENT_FINGERPRINTS = 200;
 const recentReports = new Map<string, number>();
+let reportingInstalled = false;
+let pageLifecycleEnding = false;
 
 const routeWithoutQuery = (value: string) => value.split('?', 1)[0].slice(0, 500);
 
@@ -47,10 +49,19 @@ function isDuplicateReport(report: ClientIssueReport, now = Date.now()): boolean
     return false;
 }
 
+function isPageLifecycleFetchTeardown(report: ClientIssueReport): boolean {
+    return pageLifecycleEnding
+        && report.category === 'api'
+        && report.error_code === 'TypeError'
+        && report.metadata?.component === 'fetch'
+        && report.metadata?.status_code == null;
+}
+
 export function reportClientIssue(report: ClientIssueReport): void {
     const token = localStorage.getItem('token');
     if (
-        !token
+        isPageLifecycleFetchTeardown(report)
+        || !token
         || routeWithoutQuery(report.route || '') === REPORT_URL
         || isDuplicateReport(report)
     ) return;
@@ -70,6 +81,21 @@ export function reportClientIssue(report: ClientIssueReport): void {
 }
 
 export function installClientIssueReporting(): void {
+    if (reportingInstalled) return;
+    reportingInstalled = true;
+
+    // A full-page navigation tears down in-flight fetches even when the API
+    // already returned 200. Browsers surface that teardown as a TypeError, and
+    // keepalive would otherwise turn it into a false production incident. SPA
+    // route changes do not emit pagehide, so genuine network failures remain
+    // reportable. pageshow resets the flag for bfcache restores.
+    window.addEventListener('pagehide', () => {
+        pageLifecycleEnding = true;
+    });
+    window.addEventListener('pageshow', () => {
+        pageLifecycleEnding = false;
+    });
+
     window.addEventListener('error', (event) => {
         const file = event.filename ? event.filename.split('/').pop() : undefined;
         reportClientIssue({
