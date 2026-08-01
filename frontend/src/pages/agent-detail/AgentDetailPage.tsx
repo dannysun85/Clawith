@@ -39,6 +39,7 @@ import {
 } from '../../utils/chatAttachmentPersistence';
 import { canAccessSaasAdmin } from '../../utils/saasAdmin';
 import { displaySessionTitle } from '../../utils/sessionDisplay';
+import { toolDisplayName } from '../../utils/toolDisplay';
 import {
     deliverableLaunchMessage,
     deliverableRouteTier,
@@ -1148,12 +1149,7 @@ function getToolProvider(name: string): string {
 }
 
 function titleCaseToolName(name: string): string {
-    return (name || 'tool')
-        .replace(/^mcp[_:-]/i, '')
-        .replace(/[_-]+/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim()
-        .replace(/\b\w/g, ch => ch.toUpperCase());
+    return toolDisplayName(name);
 }
 
 function basename(path?: string): string {

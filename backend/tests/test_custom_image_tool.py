@@ -1110,6 +1110,9 @@ async def test_generate_image_minimax_records_success(tmp_path):
         )
 
     assert "✅ Image generated" in result
+    assert "minimax" not in result.lower()
+    assert "image-01" not in result
+    assert "Task ID" not in result
     check_credits.assert_awaited_once_with(tenant_id, 4)
     create_task.assert_awaited_once()
     creation = create_task.await_args.kwargs
@@ -1251,6 +1254,9 @@ async def test_agent_plan_durable_image_preserves_ratio_in_provider_and_recovery
         )
 
     assert "✅ Image generated" in result
+    assert "volcengine" not in result.lower()
+    assert "doubao-seedream" not in result
+    assert "Task ID" not in result
     assert generate.call_args.kwargs["size"] == "1440x2560"
     metadata = create_task.await_args.kwargs["request_metadata"]
     assert metadata["aspect_ratio"] == "9:16"
@@ -1825,7 +1831,8 @@ async def test_generate_image_minimax_auth_error_degrades_credential(tmp_path):
             brand_scale=0.42,
         )
 
-    assert "❌ Image generation failed (minimax). Provider code: 1004." in result
+    assert "❌ Image generation failed. Provider code: 1004." in result
+    assert "minimax" not in result.lower()
     assert "invalid api key" not in result
     record_id = create_task.await_args.kwargs["record_id"]
     mark_failed.assert_awaited_once_with(record_id, error)
@@ -1844,6 +1851,7 @@ def test_media_provider_failure_message_never_leaks_response_body():
     )
 
     assert "Provider code: 1004" in result
+    assert "minimax" not in result.lower()
     assert secret not in result
 
 
@@ -1914,6 +1922,9 @@ async def test_generate_speech_minimax_records_success(tmp_path):
         )
 
     assert "✅ Speech generated" in result
+    assert "minimax" not in result.lower()
+    assert "speech-2.8-turbo" not in result
+    assert "Task ID" not in result
     check_credits.assert_awaited_once_with(tenant_id, 1)
     creation = create_task.await_args.kwargs
     assert creation["tenant_id"] == tenant_id
@@ -2006,6 +2017,9 @@ async def test_generate_music_minimax_records_success(tmp_path):
         )
 
     assert "✅ Music generated" in result
+    assert "minimax" not in result.lower()
+    assert "music-2.6" not in result
+    assert "Task ID" not in result
     check_credits.assert_awaited_once_with(tenant_id, 150)
     creation = create_task.await_args.kwargs
     assert creation["tenant_id"] == tenant_id

@@ -3205,20 +3205,20 @@ async def execute_builtin_tool_outcome(
             "workspace_scope_unavailable",
         )
 
-    minimax_required_arguments = {
+    managed_media_required_arguments = {
         "generate_image_minimax": ("prompt",),
         "generate_speech_minimax": ("text",),
         "generate_music_minimax": ("prompt", "lyrics"),
         "generate_video_minimax": ("prompt",),
     }
-    missing_minimax_arguments = tuple(
+    missing_managed_media_arguments = tuple(
         name
-        for name in minimax_required_arguments.get(tool_name, ())
+        for name in managed_media_required_arguments.get(tool_name, ())
         if not isinstance(arguments.get(name), str) or not str(arguments.get(name)).strip()
     )
-    if missing_minimax_arguments:
+    if missing_managed_media_arguments:
         return _typed_failure(
-            f"{tool_name} requires: {', '.join(missing_minimax_arguments)}.",
+            f"The selected media capability requires: {', '.join(missing_managed_media_arguments)}.",
             "invalid_tool_arguments",
         )
     if tool_name == "check_video_minimax" and not any(
@@ -3227,7 +3227,7 @@ async def execute_builtin_tool_outcome(
         for name in ("task_meta_path", "task_record_id")
     ):
         return _typed_failure(
-            "check_video_minimax requires task_meta_path or task_record_id.",
+            "Video status checking requires task_meta_path or task_record_id.",
             "invalid_tool_arguments",
         )
 
@@ -12881,7 +12881,7 @@ async def _generate_image_outcome(
     content_hash = hashlib.sha256(image_bytes).hexdigest()
     api_image_path = f"/api/agents/{agent_id}/files/download?path={save_path}"
     return _typed_success(
-        f"Image generated and saved to {save_path} using {provider}.\n\n![generated image]({api_image_path})",
+        f"Image generated and saved to {save_path}.\n\n![generated image]({api_image_path})",
         result_ref=artifact_ref,
         artifact_refs=(artifact_ref,),
         metadata={
@@ -28216,10 +28216,7 @@ async def _generate_image_minimax_durable(
             deliver_completion=False,
         )
         if outcome.status == "succeeded":
-            summary = (
-                f"✅ Image generated and durably delivered: {save_path}\n"
-                f"Task ID: {record_id}"
-            )
+            summary = f"✅ Image generated and durably delivered: {save_path}"
             return _minimax_tool_result(
                 summary,
                 typed=typed,
@@ -28250,7 +28247,7 @@ async def _generate_image_minimax_durable(
             )
         summary = (
             "⏳ The image request was accepted. The durable media worker is "
-            f"finishing delivery (task {record_id}); please do not submit it again."
+            "finishing delivery; please do not submit it again."
         )
         return _minimax_tool_result(
             summary,
@@ -28341,7 +28338,7 @@ async def _generate_image_minimax_durable(
         if provider_accepted:
             summary = (
                 "⏳ The image request was accepted. The result is held by the "
-                f"durable recovery worker (task {record_id}); please do not retry."
+                "durable recovery worker; please do not retry."
             )
             return _minimax_tool_result(
                 summary,
@@ -28358,8 +28355,7 @@ async def _generate_image_minimax_durable(
         if provider_response_accepted:
             summary = (
                 "⏳ The image response was accepted. Its durable recovery worker "
-                f"is repairing the acceptance record (task {record_id}); please do "
-                "not retry."
+                "is repairing the acceptance record; please do not retry."
             )
             return _minimax_tool_result(
                 summary,
@@ -28376,7 +28372,7 @@ async def _generate_image_minimax_durable(
         if provider_request_started and not deterministic_rejection:
             summary = (
                 "❌ Image submission outcome is uncertain. Credits remain "
-                f"held for reconciliation (task {record_id}); please do not retry."
+                "held for reconciliation; please do not retry."
             )
             return _minimax_tool_result(
                 summary,
@@ -28393,7 +28389,7 @@ async def _generate_image_minimax_durable(
         from app.services.mcp_security import MCPURLPolicyError
 
         network_policy_failure = isinstance(exc, MCPURLPolicyError)
-        provider_label = "minimax" if provider == "minimax" else "platform media"
+        provider_label = "platform media"
         error_prefix = "minimax" if provider == "minimax" else "media"
         summary = (
             "❌ Image generation is blocked by the configured provider network "
@@ -28949,15 +28945,15 @@ def _safe_media_failure_message(
     provider: str,
     error: Exception | str | None = None,
 ) -> str:
-    """Return a stable customer message without provider bodies or secrets."""
-    error_code = None
-    if provider == "minimax" and error is not None:
+    """Return a stable customer message without provider identity, bodies, or secrets."""
+    error_code = str(getattr(error, "provider_code", "") or "") if error is not None else ""
+    if not error_code and error is not None:
         from app.services.llm.failover import extract_minimax_code
 
         error_code = extract_minimax_code(str(error))
     code_suffix = f" Provider code: {error_code}." if error_code else ""
     return (
-        f"❌ {operation} failed ({provider}).{code_suffix} "
+        f"❌ {operation} failed.{code_suffix} "
         "No usable asset was delivered. Please retry later or contact the administrator."
     )
 
@@ -29087,7 +29083,7 @@ async def _prepare_minimax_tool_credential(
             category="credential",
             severity="critical",
         )
-        return None, "❌ MiniMax credential is missing an API key. Ask your admin to re-save the credential."
+        return None, "❌ The platform media credential is incomplete. Ask your admin to re-save it."
 
     return (
         _MiniMaxToolCredential(
@@ -29537,14 +29533,13 @@ async def _generate_minimax_audio_durable(
         label = "Speech" if modality == "audio" else "Music"
         if outcome.status == "succeeded":
             duration_summary = (
-                f" | Duration: {requested_duration_seconds:g}s"
+                f"\nDuration: {requested_duration_seconds:g}s"
                 if requested_duration_seconds is not None
                 else ""
             )
             summary = (
                 f"✅ {label} generated and durably delivered: {save_path}\n"
-                f"Provider: {provider} | Model: {model}{duration_summary}\n"
-                f"Task ID: {record_id}"
+                f"The managed media route completed successfully.{duration_summary}"
             )
             return _minimax_tool_result(
                 summary,
@@ -29563,7 +29558,7 @@ async def _generate_minimax_audio_durable(
             )
         if outcome.status == "compensated":
             summary = (
-                f"❌ {provider} accepted the {label.lower()} request but no safe "
+                f"❌ The managed media route accepted the {label.lower()} request but no safe "
                 "artifact could be recovered. Credits were refunded."
             )
             return _minimax_tool_result(
@@ -29579,8 +29574,8 @@ async def _generate_minimax_audio_durable(
                 provider=provider,
             )
         summary = (
-            f"⏳ {provider} accepted the {label.lower()} request. The durable media "
-            f"worker is finishing delivery (task {record_id}); do not submit it again."
+            f"⏳ The managed media route accepted the {label.lower()} request. The durable media "
+            "worker is finishing delivery; do not submit it again."
         )
         return _minimax_tool_result(
             summary,
@@ -29668,8 +29663,8 @@ async def _generate_minimax_audio_durable(
         label = "Speech" if modality == "audio" else "Music"
         if provider_accepted:
             summary = (
-                f"⏳ {provider} accepted the {label.lower()} request. The result is held "
-                f"by durable recovery (task {record_id}); do not retry."
+                f"⏳ The managed media route accepted the {label.lower()} request. The result is held "
+                "by durable recovery; do not retry."
             )
             return _minimax_tool_result(
                 summary,
@@ -29685,8 +29680,8 @@ async def _generate_minimax_audio_durable(
             )
         if provider_response_accepted:
             summary = (
-                f"⏳ {provider} accepted the {label.lower()} response. Its durable "
-                f"recovery worker is repairing the acceptance record (task {record_id}); "
+                f"⏳ The managed media route accepted the {label.lower()} response. Its durable "
+                "recovery worker is repairing the acceptance record; "
                 "do not retry."
             )
             return _minimax_tool_result(
@@ -29703,8 +29698,8 @@ async def _generate_minimax_audio_durable(
             )
         if provider_request_started and not deterministic_rejection:
             summary = (
-                f"❌ {provider} {label.lower()} submission outcome is uncertain. Credits "
-                f"remain held for reconciliation (task {record_id}); do not retry."
+                f"❌ The managed {label.lower()} submission outcome is uncertain. Credits "
+                "remain held for reconciliation; do not retry."
             )
             return _minimax_tool_result(
                 summary,
@@ -29718,7 +29713,7 @@ async def _generate_minimax_audio_durable(
                 tier=tier,
                 provider=provider,
             )
-        summary = _safe_media_failure_message(f"{label} generation", provider, exc)
+        summary = _safe_media_failure_message(f"{label} generation", "platform media", exc)
         return _minimax_tool_result(
             summary,
             typed=typed,
@@ -29745,7 +29740,7 @@ async def _generate_speech_minimax(
     text = (arguments.get("text") or "").strip()
     if not text:
         return _minimax_tool_result(
-            "❌ Missing required argument 'text' for generate_speech_minimax",
+            "❌ Speech generation requires the 'text' argument.",
             typed=typed,
             status="failed",
             error_code="invalid_tool_arguments",
@@ -29994,7 +29989,7 @@ async def _generate_music_minimax(
     lyrics = (arguments.get("lyrics") or "").strip()
     if not prompt:
         return _minimax_tool_result(
-            "❌ Missing required argument 'prompt' for generate_music_minimax",
+            "❌ Music generation requires the 'prompt' argument.",
             typed=typed,
             status="failed",
             error_code="invalid_tool_arguments",
@@ -30003,7 +29998,7 @@ async def _generate_music_minimax(
         )
     if not lyrics:
         return _minimax_tool_result(
-            "❌ Missing required argument 'lyrics' for generate_music_minimax",
+            "❌ Music generation requires the 'lyrics' argument.",
             typed=typed,
             status="failed",
             error_code="invalid_tool_arguments",
@@ -30038,7 +30033,7 @@ async def _generate_music_minimax(
     profile = await load_platform_minimax_media_profile("music", tier)
     if not profile.enabled:
         return _minimax_tool_result(
-            f"❌ MiniMax music generation is disabled for the {tier} tier.",
+            f"❌ Music generation is disabled for the {tier} tier.",
             typed=typed,
             status="failed",
             error_code="minimax_music_tier_disabled",
@@ -30296,7 +30291,7 @@ async def _generate_video_minimax(
     prompt = (arguments.get("prompt") or "").strip()
     if not prompt:
         return _minimax_tool_result(
-            "❌ Missing required argument 'prompt' for generate_video_minimax",
+            "❌ Video generation requires the 'prompt' argument.",
             typed=typed,
             status="failed",
             error_code="invalid_tool_arguments",
@@ -30315,7 +30310,7 @@ async def _generate_video_minimax(
     profile = await load_platform_minimax_media_profile("video", tier)
     if not profile.enabled:
         return _minimax_tool_result(
-            f"❌ MiniMax video generation is disabled for the {tier} tier.",
+            f"❌ Video generation is disabled for the {tier} tier.",
             typed=typed,
             status="failed",
             error_code="minimax_video_tier_disabled",
@@ -30572,7 +30567,7 @@ async def _generate_video_minimax(
             first_frame_image,
         ):
             return _minimax_tool_result(
-                "❌ MiniMax cannot guarantee this video aspect ratio from text alone. "
+                "❌ The current fallback video route cannot guarantee this aspect ratio from text alone. "
                 "Generate or provide a first-frame image with the requested dimensions, "
                 "then retry as image-to-video. No Credits were consumed.",
                 typed=typed,
@@ -31268,7 +31263,7 @@ async def _check_video_minimax(
     task_record_id = str(arguments.get("task_record_id") or "").strip()
     if not task_meta_path and not task_record_id:
         return _minimax_tool_result(
-            "❌ check_video_minimax requires task_meta_path or task_record_id",
+            "❌ Video status checking requires task_meta_path or task_record_id.",
             typed=typed,
             status="failed",
             error_code="invalid_tool_arguments",
@@ -31508,7 +31503,7 @@ async def _check_video_minimax(
         )
         _log_minimax_operation_failure("MiniMaxVideoCheck", exc)
         return _minimax_tool_result(
-            _safe_media_failure_message("Video status check", "minimax", exc),
+            _safe_media_failure_message("Video status check", "platform media", exc),
             typed=typed,
             status="failed",
             error_code="minimax_video_check_failed",
@@ -32426,7 +32421,7 @@ async def _generate_image(
         profile = await load_platform_minimax_media_profile("image", minimax_tier)
         if not profile.enabled:
             return _minimax_tool_result(
-                f"❌ MiniMax image generation is disabled for the {minimax_tier} tier.",
+                f"❌ Image generation is disabled for the {minimax_tier} tier.",
                 typed=typed,
                 status="failed",
                 error_code="minimax_image_tier_disabled",
@@ -32620,7 +32615,7 @@ async def _generate_image(
                 size=size,
             )
         else:
-            return f"❌ Unknown image generation provider: {provider}. Supported: siliconflow, openai, google, custom, minimax"
+            return "❌ Image generation is unavailable because its platform route is misconfigured."
 
         if not image_bytes:
             return "❌ Image generation returned empty result. Please try a different prompt."
@@ -32658,7 +32653,7 @@ async def _generate_image(
 
         return (
             f"✅ Image generated and saved to: {save_path}\n"
-            f"Size: {size_kb:.1f} KB | Provider: {provider} | Model: {model or '(default)'}\n\n"
+            f"Size: {size_kb:.1f} KB\n\n"
             f"{contract_line}"
             f"Display this image to the user using this exact markdown:\n"
             f"![generated image]({api_image_path})"
@@ -32666,13 +32661,13 @@ async def _generate_image(
     except Exception as e:
         if isinstance(e, httpx.TimeoutException):
             logger.error(f"[GenerateImage] Timeout ({provider}): request or storage operation timed out.")
-            return f"❌ Image generation failed ({provider}): API request timed out after 120 seconds."
+            return "❌ Image generation failed: API request timed out after 120 seconds."
         logger.error(
             "[GenerateImage] Generation failed provider={} error_type={}",
             provider,
             type(e).__name__,
         )
-        return _safe_media_failure_message("Image generation", provider, e)
+        return _safe_media_failure_message("Image generation", "platform media", e)
 
 
 async def _generate_image_siliconflow(api_key: str, model: str, base_url: str, prompt: str, size: str) -> bytes:
