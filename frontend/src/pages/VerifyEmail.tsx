@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Link, useSearchParams, useNavigate, useLocation } from 'react-router-dom';
+import { Link, useSearchParams, useNavigate, useLocation } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { IconAlertTriangle, IconCheck, IconMail, IconX } from '@tabler/icons-react';
 import { authApi } from '../services/api';

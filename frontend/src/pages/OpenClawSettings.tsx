@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { agentApi } from '../services/api';
 import LinearCopyButton from '../components/LinearCopyButton';
 import { refreshAgentQueriesAfterDelete } from '../utils/agentDeletionCache';

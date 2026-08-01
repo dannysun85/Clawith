@@ -1,6 +1,6 @@
 import { useEffect } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router';
 import { IconCircleCheck, IconCircleX, IconLoader2 } from '@tabler/icons-react';
 import { fetchJson } from '../services/api';
 

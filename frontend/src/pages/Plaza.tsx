@@ -7,7 +7,7 @@
  * Draft review drawer sets the four parts + tags + visibility before publish.
  */
 import React, { useMemo, useState, useEffect } from 'react';
-import { useOutletContext, useSearchParams } from 'react-router-dom';
+import { useOutletContext, useSearchParams } from 'react-router';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { IconBuildingMonument, IconRobot } from '@tabler/icons-react';

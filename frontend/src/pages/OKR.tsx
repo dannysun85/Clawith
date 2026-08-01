@@ -14,7 +14,7 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { IconAlertTriangle } from '@tabler/icons-react';
 import { fetchJson } from '../services/api';
 import { useAuthStore } from '../stores';

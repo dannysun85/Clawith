@@ -1,7 +1,7 @@
 import { useMemo, useState, type ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router';
 import { IconCheck, IconShoppingCart } from '@tabler/icons-react';
 import { fetchJson } from '../utils/fetchJson';
 import { Entitlements } from '../../../hooks/useLlmModels';

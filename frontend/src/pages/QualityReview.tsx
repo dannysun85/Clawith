@@ -8,7 +8,7 @@ import {
     IconLock,
     IconShieldCheck,
 } from '@tabler/icons-react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router';
 import { useTranslation } from 'react-i18next';
 
 import { useToast } from '../components/Toast/ToastProvider';

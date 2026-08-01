@@ -1,3 +1,26 @@
+# v1.11.12 — Production Dependency and Configuration Follow-up
+
+## Frontend Dependency Baseline
+
+- Upgrade from the removed `react-router-dom` compatibility package to
+  `react-router@8.3.0`, the upstream release that fixes
+  `GHSA-qwww-vcr4-c8h2`. All declarative router imports and the Vite vendor
+  boundary now use the supported `react-router` package directly.
+- Align the required runtime baseline to `react@19.2.7`,
+  `react-dom@19.2.7`, `vite@7.3.6`, and the production frontend build image to
+  Node `22.22`. Exact dependency versions and the lockfile make the production
+  build reproducible.
+- Both production-only and complete npm security audits report zero known
+  vulnerabilities. Frontend Node contracts (`97`), Vitest (`149`), TypeScript,
+  and the Vite production build pass on the migrated baseline.
+
+## Production Acceptance
+
+- Revalidate the exact release identity, authenticated administrator routes,
+  encrypted credential pool, capability routes, database migration head,
+  worker health, rollback backup, and provider-neutral media presentation after
+  deployment.
+
 # v1.11.11 — Customer-safe Managed Media Presentation Hotfix
 
 ## Provider-neutral Customer Experience

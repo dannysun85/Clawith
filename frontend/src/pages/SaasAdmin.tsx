@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useSearchParams } from 'react-router-dom';
+import { useSearchParams } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { IconAlertTriangle, IconDatabase, IconKey, IconPhotoVideo, IconReceipt, IconRoute, IconStack2, IconUsers, IconWallet } from '@tabler/icons-react';
 import { fetchJson, enterpriseApi } from '../services/api';
