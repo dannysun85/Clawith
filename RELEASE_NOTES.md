@@ -1,3 +1,29 @@
+# v1.11.11 — Customer-safe Managed Media Presentation Hotfix
+
+## Provider-neutral Customer Experience
+
+- Customer-facing Agent execution traces now translate legacy managed-media
+  Tool identifiers into capability names such as `Generate Image`, `Generate
+  Speech`, and `Generate Video`. Protocol identifiers remain unchanged for
+  compatibility and auditability.
+- Image, speech, music, and video success, pending, reconciliation, and failure
+  summaries no longer expose Provider names, model IDs, credential details, or
+  internal task record IDs. Exact routing evidence remains available through
+  typed runtime metadata, durable media records, credential receipts, and
+  platform-admin views.
+- Error-code receipts remain bounded and customer-safe so support can correlate
+  a deterministic rejection without returning raw Provider response bodies or
+  secrets.
+
+## Validation
+
+- Complete backend suite: `4098 passed`; focused managed-media regression:
+  `149 passed`.
+- Frontend Node contracts: `97 passed`; Vitest: `149 passed`; TypeScript/Vite
+  production build completed with `7041` transformed modules.
+- Production release identity, credential-pool health, existing multimedia
+  artifacts, and authenticated browser flows remain mandatory after cutover.
+
 # v1.11.10 — Commercial Provider Routing and Task-first Product Release
 
 ## Provider Routing and Production Credential Governance
