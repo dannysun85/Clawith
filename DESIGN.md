@@ -43,13 +43,13 @@ The four non-negotiable product boundaries are:
 
 This section records current local implementation facts. Everything labelled `target` later in this file remains a product decision; local implementation must not be reported as released, browser-proven, provider-verified, or commercially usable without the corresponding evidence.
 
-- The production release identity remains `v1.11.9`. The current local worktree has `/work` as the tenant root/default task entry while retaining `/dashboard` as the company overview and preserving all existing deep routes.
+- The live production identity must be read from `/api/version` and matched to the backend, worker, frontend, and immutable release commit; this design file is not release evidence. The `v1.11.10` candidate has `/work` as the tenant root/default task entry while retaining `/dashboard` as the company overview and preserving all existing deep routes.
 - Onboarding provisions one private Assistant Agent, records it on `UserTenantOnboarding`, calls the role a private coordinator, and enters `/work` after creation or recovery.
 - `Layout.tsx` now separates the onboarding-linked `我的助理` from long-term `Agent 员工`; the companion is also excluded from long-term employee quota and Dashboard roster statistics.
 - Agent chat, Agent-scoped tasks, Groups, OKR, Plaza/Experience, Enterprise Settings, subscription/Credits, Workspace artifacts, deliverable requests, quality reviews, and SaaS Admin already exist as separate runtime or management surfaces.
 - The local worktree adds a tenant-scoped Work read model, confirmed work statements, task-scoped experts, real Group task correlation, Experience provenance, OKR work evidence, and page-ownership navigation without replacing Runtime, Deliverable, Workspace, Credits, or Approval authorities.
 - Creative delivery has provider-neutral image/audio/video routing controls, registered presentation/voiceover Skills, durable deliverable state, artifact preview/download, three-reviewer quality state, and creator delivery confirmation. MiniMax-only image/video routes are now exposed as non-equivalent degraded capacity and formal Deliverables require explicit acceptance before paid dispatch. This still does not prove independent commercial quality; persisted last-real-verification receipts and paid Provider/benchmark evidence remain incomplete.
-- The primary implementation problem has shifted from missing task-first structure to verification and boundary hardening: full automated gates, migrations, browser roles/object chains, independent review, and an immutable candidate SHA are still required.
+- The primary implementation problem has shifted from missing task-first structure to production verification and boundary hardening: local automated gates and migration cycles pass, while the immutable candidate SHA, production identity, browser roles/object chains, and real-provider evidence remain release-time facts.
 
 ## Product-line system map
 
@@ -141,9 +141,8 @@ Every work item must retain deep links to its origin, responsible worker, runtim
 
 Release boundaries must remain explicit:
 
-- `v1.11.9` is the current production release.
-- The provider-neutral creative-delivery and product-line work after `v1.11.9` currently coexist in an uncommitted local verification worktree. Neither is an immutable candidate until the complete gate and independent reviews pass.
-- The product-line restructuring is the intended `v1.12.0` scope. It must not be described as a patch release or as deployed merely because it exists on local `main`.
+- `v1.11.10` is the candidate line for the provider-neutral creative-delivery controls, task-first entry, role boundaries, and production credential/failover hardening described here. It is not deployed evidence until one exact commit passes cutover and fresh production verification.
+- `v1.12.0` remains the wider product-line restructuring scope. The patch release establishes compatible boundaries and routing safety; it does not claim that every later navigation, workflow, quality benchmark, or product simplification is complete.
 
 Recommended implementation sequence:
 
@@ -151,7 +150,7 @@ Recommended implementation sequence:
 2. **Review boundaries independently**: verify Workbench does not duplicate Runtime state, Group work keeps one accountable owner, OKR accepts only valid evidence, and role navigation cannot expose privileged control planes.
 3. **Keep capability evidence explicit**: PL-012 now enforces explicit degraded-media consent locally; PL-014 exposes live readiness but still lacks a persisted last-real-provider verification receipt. Do not hide that remaining evidence gap behind unrelated test success.
 4. **Freeze one immutable candidate**: after cleanup and re-verification, record one local SHA and bind all evidence to it.
-5. **Publish only after authorization**: production configuration parity, paid Provider/Doubao Benchmark, deployment, release identity, migration, and fresh production flows remain separately authorized stages.
+5. **Publish only after authorization**: production configuration parity, paid Provider/Doubao Benchmark, deployment, release identity, migration, and fresh production flows are distinct evidence stages even when the same operator authorizes them together.
 
 No-flow-break guards:
 

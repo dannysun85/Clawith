@@ -26,9 +26,19 @@ ALLOWED_PLAN_TIERS = frozenset({"small", "medium", "large", "max"})
 IMAGE_MODEL = "doubao-seedream-5.0-lite"
 VIDEO_MODEL = "doubao-seedance-2.0"
 VIDEO_MODEL_15_PRO = "doubao-seedance-1.5-pro"
+VIDEO_MODEL_MINI = "doubao-seedance-2.0-mini"
 VIDEO_CAPABLE_PLAN_TIERS = frozenset({"medium", "large", "max"})
+# Single source of truth for the operator-reviewed Agent Plan video policy.
+# Reviewed against the official 2026-06-07 Medium adjustment and 2026-07-24
+# model retirement notices.  Medium no longer includes Seedance 2.0 / Fast,
+# and Seedance 1.5 Pro is being retired in favour of Seedance 2.0 Mini.
+VIDEO_PLAN_POLICY_REVIEWED_AT = "2026-07-24"
+VIDEO_PLAN_POLICY_SOURCES = (
+    "https://docs.volcengine.com/docs/82379/2525064?lang=zh",
+    "https://docs.volcengine.com/docs/82379/2578673?lang=zh",
+)
 VIDEO_MODELS_BY_PLAN_TIER = {
-    "medium": VIDEO_MODEL_15_PRO,
+    "medium": VIDEO_MODEL_MINI,
     "large": VIDEO_MODEL,
     "max": VIDEO_MODEL,
 }
@@ -56,7 +66,7 @@ VIDEO_MODEL_ALIASES = {
     VIDEO_MODEL_15_PRO: "doubao-seedance-1-0-pro-250528",
     "doubao-seedance-2.0": "doubao-seedance-2-0-260128",
     "doubao-seedance-2.0-fast": "doubao-seedance-2-0-fast-260128",
-    "doubao-seedance-2.0-mini": "doubao-seedance-2-0-mini-260615",
+    VIDEO_MODEL_MINI: "doubao-seedance-2-0-mini-260615",
 }
 VIDEO_PROVIDER_MODELS = frozenset(VIDEO_MODEL_ALIASES.values())
 
@@ -162,7 +172,7 @@ VIDEO_MODEL_CAPABILITIES = {
         supports_draft=False,
         supports_flex_tier=False,
     ),
-    "doubao-seedance-2.0-mini": SeedanceModelCapabilities(
+    VIDEO_MODEL_MINI: SeedanceModelCapabilities(
         max_duration_seconds=15,
         supported_resolutions=frozenset({"480p", "720p"}),
         supported_ratios=_SEEDANCE_FIXED_RATIOS,
@@ -224,8 +234,8 @@ def resolve_video_model(plan_tier: str | None) -> str:
     model = VIDEO_MODELS_BY_PLAN_TIER.get(normalized_plan)
     if model is None:
         raise ValueError(
-            "Agent Plan video requires Medium, Large, or Max; "
-            "Medium uses Seedance 1.5 Pro and Large/Max use Seedance 2.0"
+            "Agent Plan video requires Medium, Large, or Max and a current "
+            "operator-reviewed model policy"
         )
     return model
 
@@ -811,9 +821,12 @@ __all__ = [
     "VIDEO_CAPABLE_PLAN_TIERS",
     "VIDEO_MODEL",
     "VIDEO_MODEL_15_PRO",
+    "VIDEO_MODEL_MINI",
     "VIDEO_MODEL_CAPABILITIES",
     "VIDEO_MODEL_ALIASES",
     "VIDEO_MODELS_BY_PLAN_TIER",
+    "VIDEO_PLAN_POLICY_REVIEWED_AT",
+    "VIDEO_PLAN_POLICY_SOURCES",
     "VIDEO_PROVIDER_MODELS",
     "SUPPORTED_VIDEO_MODELS",
     "TEXT_MODELS_BY_SAAS_TIER",

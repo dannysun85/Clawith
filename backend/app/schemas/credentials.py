@@ -66,7 +66,7 @@ def _validate_capabilities(value: list[str] | None) -> list[str] | None:
 
 class CredentialCreateIn(BaseModel):
     provider: str
-    label: str
+    label: str = Field(min_length=1, max_length=100)
     api_key: str
     base_url: str | None = None
     plan_tier: str | None = None
@@ -119,8 +119,8 @@ class CredentialCreateIn(BaseModel):
                 )
             if "video" in supported and self.plan_tier not in VIDEO_CAPABLE_PLAN_TIERS:
                 raise ValueError(
-                    "Agent Plan video requires Medium, Large, or Max; "
-                    "Medium uses Seedance 1.5 Pro and Large/Max use Seedance 2.0"
+                    "Agent Plan video requires Medium, Large, or Max and a current "
+                    "operator-reviewed model policy"
                 )
         elif self.plan_tier is not None:
             raise ValueError("plan_tier is only valid for volcengine_agent_plan")
@@ -129,7 +129,7 @@ class CredentialCreateIn(BaseModel):
 
 class CredentialUpdateIn(BaseModel):
     api_key: str | None = None
-    label: str | None = None
+    label: str | None = Field(default=None, min_length=1, max_length=100)
     base_url: str | None = None
     plan_tier: str | None = None
     capabilities: list[str] | None = None

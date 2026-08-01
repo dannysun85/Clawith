@@ -546,3 +546,57 @@ async def test_complete_once_reports_pinned_invocation_provider_failure(
         agent_id=None,
         user_id=None,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "provider_started", "expected_ambiguous", "expected_route_safe"),
+    [
+        ("invalid API key", False, False, True),
+        ("provider timeout", True, True, False),
+    ],
+)
+async def test_complete_once_marks_provider_replay_boundary(
+    monkeypatch,
+    message,
+    provider_started,
+    expected_ambiguous,
+    expected_route_safe,
+) -> None:
+    error = RuntimeError(message)
+    client = _Client(error)
+    client.provider_request_started = provider_started
+    _patch_client(monkeypatch, client)
+    model = _model()
+    invocation = AgentLLMInvocation(
+        model=model,
+        fallback_model=None,
+        route_meta=RouteMeta(saas_tier="ultra", modality="text"),
+        tenant_id=uuid.uuid4(),
+        api_key="secret",
+        base_url=model.base_url,
+        credential_id=uuid.uuid4(),
+    )
+    monkeypatch.setattr(
+        single_step,
+        "reserve_llm_round_credits",
+        AsyncMock(return_value=uuid.uuid4()),
+    )
+    release = AsyncMock()
+    monkeypatch.setattr(single_step, "release_llm_round_credits", release)
+    monkeypatch.setattr(
+        single_step,
+        "record_agent_llm_invocation_failure",
+        AsyncMock(),
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        await single_step.complete_llm_once(
+            model,
+            [LLMMessage(role="user", content="Hello")],
+            invocation=invocation,
+        )
+
+    assert error.provider_outcome_ambiguous is expected_ambiguous
+    assert error.route_failover_safe is expected_route_safe
+    assert release.await_args.kwargs["provider_failed"] is not expected_ambiguous

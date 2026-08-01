@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Mapping
 
 import httpx
@@ -26,6 +28,32 @@ class CredentialVerificationResult:
     provider_status: int | None = None
     model_count: int | None = None
     message: str | None = None
+
+
+def build_credential_verification_receipt(
+    credential,
+    *,
+    checked_at: datetime,
+    ok: bool,
+    provider_status: int | None,
+    model_count: int | None,
+) -> dict[str, object]:
+    """Build the persisted, secret-free receipt for an account-auth probe."""
+
+    return {
+        "receipt_ref": f"credential-auth:{uuid.uuid4()}",
+        "kind": "credential_auth_probe",
+        "scope": "account_authentication",
+        "evidence_level": "account_verified" if ok else "verification_failed",
+        "credential_id": str(credential.id),
+        "provider": str(credential.provider),
+        "plan_tier": getattr(credential, "plan_tier", None),
+        "capabilities": list(getattr(credential, "capabilities", None) or []),
+        "checked_at": checked_at.isoformat(),
+        "ok": ok,
+        "provider_status": provider_status,
+        "model_count": model_count,
+    }
 
 
 _OPENAI_COMPATIBLE_BASE_URLS = {

@@ -65,7 +65,12 @@ from app.services.media_message_content import (
 )
 from app.services.vision_inject import compress_bytes_to_base64
 from app.services.llm.client import LLMMessage
-from app.services.llm.failover import FailoverErrorType, classify_error
+from app.services.llm.failover import (
+    FailoverErrorType,
+    classify_error,
+    provider_outcome_is_ambiguous,
+    route_failover_is_safe,
+)
 from app.services.llm.finish import (
     content_claims_group_handoff,
     find_finish_call,
@@ -1328,7 +1333,7 @@ class RuntimeModelStepService:
             return None
         async with self._session_factory() as db:
             candidates = await active_agent_model_candidates(db, agent)
-        return next((model for model in candidates if model.id != primary_model.id), None)
+        return next((model for model in candidates if model.id == fallback_id), None)
 
     async def compact_inputs(
         self,
@@ -1662,7 +1667,8 @@ class RuntimeModelStepService:
             except Exception as exc:
                 classification = classify_error(exc)
                 if (
-                    classification != FailoverErrorType.RETRYABLE
+                    provider_outcome_is_ambiguous(exc)
+                    or classification != FailoverErrorType.RETRYABLE
                     or attempt >= total_attempts
                 ):
                     if classification == FailoverErrorType.RETRYABLE:
@@ -1730,6 +1736,30 @@ class RuntimeModelStepService:
                 ),
                 "correlation_id": f"model-provider-retry:{context.run_id}:{model.id}",
                 "error_code": "model_provider_unavailable",
+                "provider_error": _provider_error_facts(error),
+            },
+        )
+
+    def _provider_reconciliation_wait(
+        self,
+        *,
+        context: RuntimeContext,
+        model: LLMModel,
+        error: Exception,
+    ) -> ModelStepResult:
+        """Stop replay when the provider may already have accepted the call."""
+        return ModelStepResult(
+            intent="wait",
+            waiting_request={
+                "waiting_type": "external",
+                "reason": (
+                    "模型供应商可能已经接收本轮请求，系统已停止自动重试和切换，"
+                    "正在等待账务与调用结果核对。"
+                ),
+                "correlation_id": (
+                    f"model-provider-reconcile:{context.run_id}:{model.id}"
+                ),
+                "error_code": "model_provider_reconciliation_required",
                 "provider_error": _provider_error_facts(error),
             },
         )
@@ -1808,7 +1838,25 @@ class RuntimeModelStepService:
                 )
             except Exception as primary_error:
                 primary_classification = classify_error(primary_error)
-                if primary_classification != FailoverErrorType.RETRYABLE:
+                if provider_outcome_is_ambiguous(primary_error):
+                    logger.warning(
+                        "[RuntimeModelReconciliation] run_id={} agent_id={} "
+                        "stage=primary provider={} model={} error_type={}",
+                        context.run_id,
+                        agent.id,
+                        model.provider,
+                        model.model,
+                        type(primary_error).__name__,
+                    )
+                    return self._provider_reconciliation_wait(
+                        context=context,
+                        model=model,
+                        error=primary_error,
+                    )
+                if (
+                    primary_classification != FailoverErrorType.RETRYABLE
+                    and not route_failover_is_safe(primary_error)
+                ):
                     logger.error(
                         "[RuntimeModelFailure] run_id={} agent_id={} stage=primary "
                         "provider={} model={} classification={} http_status={} "
@@ -1834,6 +1882,11 @@ class RuntimeModelStepService:
                     state=state,
                 )
                 if fallback is None:
+                    if route_failover_is_safe(primary_error):
+                        raise RuntimeModelCallError(
+                            "model_route_unavailable",
+                            "No healthy equivalent model route is available.",
+                        ) from primary_error
                     return self._provider_retry_wait(
                         context=context,
                         model=model,
@@ -1898,6 +1951,21 @@ class RuntimeModelStepService:
                     )
                 except Exception as fallback_error:
                     fallback_classification = classify_error(fallback_error)
+                    if provider_outcome_is_ambiguous(fallback_error):
+                        logger.warning(
+                            "[RuntimeModelReconciliation] run_id={} agent_id={} "
+                            "stage=fallback provider={} model={} error_type={}",
+                            context.run_id,
+                            agent.id,
+                            fallback.provider,
+                            fallback.model,
+                            type(fallback_error).__name__,
+                        )
+                        return self._provider_reconciliation_wait(
+                            context=context,
+                            model=fallback,
+                            error=fallback_error,
+                        )
                     if fallback_classification == FailoverErrorType.RETRYABLE:
                         return self._provider_retry_wait(
                             context=context,

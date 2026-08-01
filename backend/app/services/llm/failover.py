@@ -224,6 +224,18 @@ def is_rate_limit_error(error: Exception) -> bool:
     return False
 
 
+def provider_outcome_is_ambiguous(error: BaseException) -> bool:
+    """Return whether replay could duplicate provider work or billing."""
+    return getattr(error, "provider_outcome_ambiguous", False) is True
+
+
+def route_failover_is_safe(error: BaseException) -> bool:
+    """Return whether this request may switch to an equivalent route now."""
+    if provider_outcome_is_ambiguous(error):
+        return False
+    return getattr(error, "route_failover_safe", False) is True
+
+
 def credential_failure_action(
     error: Exception,
     *,
@@ -263,6 +275,8 @@ __all__ = [
     "is_auth_error",
     "is_billing_or_quota_error",
     "is_rate_limit_error",
+    "provider_outcome_is_ambiguous",
+    "route_failover_is_safe",
     "MINIMAX_AUTH_CODES",
     "MINIMAX_BILLING_CODES",
     "MINIMAX_QUOTA_CODES",

@@ -51,10 +51,25 @@ For a commercial real-person ad, prefer an approved first frame. Text-only
 generation is acceptable for discovery but is not sufficient evidence of
 identity or product consistency.
 
-## Seedance 1.5 Pro compatibility mode
+## Current reviewed model policy
 
-When the operator-verified Agent Plan tier routes to Seedance 1.5 Pro, compile
-only requests inside the reviewed official v4.0.0 capability envelope:
+Agents never choose a model name. The server-side policy reviewed on
+2026-07-24 maps an eligible Medium plan to Seedance 2.0 Mini and Large / Max
+to Seedance 2.0. Small has no Agent Plan video entitlement. If that policy or
+the verified credential capability does not admit the request, Astra uses the
+provider-neutral pre-submission fallback instead of asking the Agent to change
+its prompt.
+
+Seedance 2.0 Mini is the current Medium migration target. Keep new requests
+inside its server-enforced envelope: up to 15 seconds, `480p` or `720p`, and a
+supported fixed aspect ratio. Do not copy model IDs into the prompt or assume
+that a future plan name guarantees the same model.
+
+## Seedance 1.5 Pro legacy-task compatibility
+
+Only an already accepted and provider-pinned legacy task may continue on
+Seedance 1.5 Pro. Compile such a task inside the reviewed official v4.0.0
+capability envelope:
 
 - text-to-video, first-frame image-to-video, or first-and-last-frame
   image-to-video;
@@ -71,11 +86,11 @@ Tool: silently losing them during MiniMax fallback would change cost and
 latency semantics. The normal commercial path therefore requests the final
 quality mode.
 
-Seedance 1.5 Pro is marked as retiring in the reviewed Agent Plan matrix. This
-compatibility route is suitable for the active Medium entitlement, not a
-long-term model dependency. Keep the public model name and the dated Provider
-ID inside server routing so a later entitlement migration does not require
-changing this Skill or the Agent prompt.
+Seedance 1.5 Pro stopped admitting new Agent Plan users on 2026-07-10 and is
+scheduled to stop service on 2026-09-21. Never select it for a new task. Keep
+the public model name and dated Provider ID only in the server compatibility
+table so an accepted legacy task can still be reconciled without changing this
+Skill or the Agent prompt.
 
 Before the single Tool invocation, use the exact canonical `workspace/...`
 path from the image Tool receipt. Do not pass the shortened attachment label

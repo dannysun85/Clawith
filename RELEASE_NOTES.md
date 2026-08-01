@@ -1,3 +1,52 @@
+# v1.11.10 — Commercial Provider Routing and Task-first Product Release
+
+## Provider Routing and Production Credential Governance
+
+- MiniMax-M3 is the primary text route for Lite, Pro, and Ultra. Each tier
+  keeps its exact Agent Plan text route as the managed fallback; the fallback
+  is selected by the immutable route snapshot rather than by whichever model
+  happens to be available later.
+- Image and automatic speech use Agent Plan first and MiniMax second when the
+  configured account tier supports the requested capability. Video follows the
+  same provider order, but a Small Agent Plan account is correctly excluded
+  from the video route, leaving MiniMax as the current executable provider.
+  Music remains MiniMax-only.
+- The dated Agent Plan video policy follows the current official retirement
+  notices: Medium routes new work to Seedance 2.0 Mini, Large / Max route to
+  Seedance 2.0, and Seedance 1.5 Pro remains compatibility-only for already
+  accepted legacy work until its announced service shutdown.
+- Platform credentials can be synchronized through a bounded stdin-only
+  operator command. The target environment encrypts the API key with its own
+  `SECRET_KEY`, verifies account authentication before reporting readiness,
+  and persists only secret-free audit and verification receipts.
+- Runtime failover now distinguishes a definite pre-provider rejection from an
+  ambiguous provider outcome. Only a provably safe rejection may switch to the
+  exact fallback route; an ambiguous result enters reconciliation without a
+  duplicate provider request or automatic Credits release.
+
+## Task-first Product Boundaries
+
+- The private assistant is the user's default coordinator and task entry,
+  long-term Agent employees remain specialist executors, Groups own visible
+  multi-party collaboration, Workspace is the working scene, and Deliverables
+  own formal preview, review, approval, and delivery.
+- Image, video, speech, music, and PPT continue through governed capability,
+  Tool, durable Run, Artifact, quality-review, and delivery contracts. Ordinary
+  users choose business capabilities while Provider, model, credential, plan,
+  and failover decisions stay in the platform control plane.
+
+## Validation
+
+- Complete backend suite: `4098 passed`; the changed Python files passed Ruff
+  and byte-code compilation.
+- Frontend Node contracts: `97 passed`; Vitest: `142 passed`; TypeScript/Vite
+  production build completed with `7040` transformed modules. Browser smoke
+  contracts: `2 passed`.
+- PostgreSQL fresh install, historical upgrade, downgrade, re-upgrade, secret
+  envelope, route-integrity, durable media, Credits, approval, A2A, and
+  concurrency smokes passed. Exact release identity and authenticated
+  production browser business flows remain mandatory after cutover.
+
 # v1.11.9 — Clawith v1.11.3 Runtime Upgrade and Creative Delivery Release
 
 ## Runtime and Product Foundation

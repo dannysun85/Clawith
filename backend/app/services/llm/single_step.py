@@ -28,6 +28,11 @@ from .client import (
     normalize_llm_finish_reason,
     normalize_textual_tool_protocol,
 )
+from .failover import (
+    is_auth_error,
+    is_billing_or_quota_error,
+    is_rate_limit_error,
+)
 from .utils import create_llm_client, get_max_tokens, get_model_api_key
 
 if TYPE_CHECKING:
@@ -97,6 +102,19 @@ async def complete_llm_once(
             **get_llm_request_options(effective_model),
         )
     except BaseException as exc:
+        provider_outcome_ambiguous = llm_provider_may_have_accepted(client)
+        if isinstance(exc, Exception):
+            # A transient error after request start is not replay-safe. Only
+            # explicit account/capacity rejection may switch provider now.
+            exc.provider_outcome_ambiguous = provider_outcome_ambiguous  # type: ignore[attr-defined]
+            exc.route_failover_safe = (  # type: ignore[attr-defined]
+                not provider_outcome_ambiguous
+                and (
+                    is_auth_error(exc)
+                    or is_billing_or_quota_error(exc)
+                    or is_rate_limit_error(exc)
+                )
+            )
         if invocation is not None:
             await release_llm_round_credits(
                 reservation_id,
@@ -105,7 +123,7 @@ async def complete_llm_once(
                 agent_id=agent_id,
                 user_id=user_id,
                 tenant_id=invocation.tenant_id,
-                provider_failed=not llm_provider_may_have_accepted(client),
+                provider_failed=not provider_outcome_ambiguous,
             )
             if isinstance(exc, Exception):
                 await record_agent_llm_invocation_failure(

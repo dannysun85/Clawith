@@ -67,6 +67,9 @@ class NoCredentialAvailable(Exception):
         self.modality = modality
         self.reason_code = reason_code
         self.reason = reason
+        # Pool selection failed before provider I/O or Credits reservation.
+        self.provider_outcome_ambiguous = False
+        self.route_failover_safe = True
         msg = (
             f"No credential available for provider={provider} modality={modality} "
             f"reason_code={reason_code.value}"

@@ -303,7 +303,7 @@ export default function AccountManagement() {
                                 ))}
                             </select>
                             <div style={{ marginTop: 4, fontSize: 11, color: 'var(--text-tertiary)' }}>
-                                必须与火山控制台当前生效套餐一致；系统不会猜测套餐。文字、Seedream 图片和 Seed TTS 语音支持全部套餐；Medium 可使用即将下线的 Seedance 1.5 Pro，Large / Max 使用 Seedance 2.0 系列。
+                                必须与火山控制台当前生效套餐一致；系统不会猜测套餐。文字、Seedream 图片和 Seed TTS 语音支持全部套餐；视频模型由平台依据火山当前公告统一治理，已下线模型不会进入新任务路由。
                             </div>
                         </div>
                     )}

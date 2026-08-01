@@ -23,7 +23,10 @@ from app.schemas.credentials import (
     CredentialUpdateIn,
     CredentialVerificationOut,
 )
-from app.services.credential_verification import verify_provider_credential
+from app.services.credential_verification import (
+    build_credential_verification_receipt,
+    verify_provider_credential,
+)
 from app.services.llm.load_balancer import get_credential_health
 from app.services.llm.utils import get_credential_api_key
 from app.services.volcengine_agent_plan import (
@@ -48,32 +51,6 @@ def _to_out(cred: LLMCredential) -> CredentialOut:
     out = CredentialOut.model_validate(cred)
     out.api_key_masked = _mask_key(cred)
     return out
-
-
-def _verification_receipt(
-    credential: LLMCredential,
-    *,
-    checked_at: datetime,
-    ok: bool,
-    provider_status: int | None,
-    model_count: int | None,
-) -> dict[str, object]:
-    """Build a secret-free account-authentication receipt."""
-
-    return {
-        "receipt_ref": f"credential-auth:{uuid.uuid4()}",
-        "kind": "credential_auth_probe",
-        "scope": "account_authentication",
-        "evidence_level": "account_verified" if ok else "verification_failed",
-        "credential_id": str(credential.id),
-        "provider": str(credential.provider),
-        "plan_tier": getattr(credential, "plan_tier", None),
-        "capabilities": list(getattr(credential, "capabilities", None) or []),
-        "checked_at": checked_at.isoformat(),
-        "ok": ok,
-        "provider_status": provider_status,
-        "model_count": model_count,
-    }
 
 
 def _validate_provider_account_contract(
@@ -106,8 +83,8 @@ def _validate_provider_account_contract(
         raise HTTPException(
             status_code=422,
             detail=(
-                "Agent Plan video requires Medium, Large, or Max; "
-                "Medium uses Seedance 1.5 Pro and Large/Max use Seedance 2.0"
+                "Agent Plan video requires Medium, Large, or Max and a current "
+                "operator-reviewed model policy"
             ),
         )
     try:
@@ -221,10 +198,12 @@ async def update_credential(credential_id: uuid.UUID, data: CredentialUpdateIn, 
         cred.error_count = 0
         cred.last_verification_at = None
         cred.verification_receipt = None
-    if api_key_changed:
-        # A replacement key is a different provider account, so inherited
-        # model-quota circuits are no longer relevant. Changing only the API
-        # host is not quota-recovery evidence for the same account.
+    if base_url_changed or plan_tier_changed or capabilities_changed or api_key_changed:
+        # Routing-relevant account configuration defines which provider
+        # resources the stored modality circuits describe.  Any such change
+        # invalidates those observations; keeping them would make a freshly
+        # synchronized tier/capability look unavailable until an old circuit
+        # happened to expire.
         cred.modality_status = {}
     await db.commit()
     await db.refresh(cred)
@@ -240,7 +219,7 @@ async def verify_credential(credential_id: uuid.UUID, db: AsyncSession = Depends
 
     result = await verify_provider_credential(cred)
     checked_at = datetime.now(timezone.utc)
-    receipt = _verification_receipt(
+    receipt = build_credential_verification_receipt(
         cred,
         checked_at=checked_at,
         ok=result.ok,

@@ -37,6 +37,10 @@ from app.services.agent_runtime.state import (
 )
 from app.services.llm.single_step import LLMCompletionStep
 from app.services.llm.finish import FINISH_PROTOCOL_REMINDER
+from app.services.llm.load_balancer import (
+    CredentialUnavailableReason,
+    NoCredentialAvailable,
+)
 from app.services.token_tracker import TokenUsage
 
 
@@ -100,6 +104,8 @@ def _failover_session_factory(
     model: LLMModel,
     agent: Agent,
     fallback: LLMModel,
+    *,
+    candidates: list[LLMModel] | None = None,
 ):
     calls = 0
 
@@ -113,7 +119,9 @@ def _failover_session_factory(
 
         class _FallbackDB:
             def __init__(self) -> None:
-                self.results = iter((_Result(), _Result([fallback])))
+                self.results = iter(
+                    (_Result(), _Result(candidates or [fallback]))
+                )
 
             async def execute(self, statement):
                 del statement
@@ -2824,6 +2832,166 @@ async def test_retryable_primary_error_recovers_on_same_model_before_fallback() 
     assert result.assistant_message is not None
     assert result.assistant_message["runtime_model_id"] == str(model.id)
     assert "runtime_failover_from_model_id" not in result.assistant_message
+
+
+@pytest.mark.asyncio
+async def test_pre_request_credential_pool_miss_uses_fallback_without_retry() -> None:
+    tenant_id = uuid.uuid4()
+    model = _model(tenant_id)
+    fallback = _model(tenant_id)
+    fallback.model = "fallback-model"
+    agent = _agent(tenant_id)
+    agent.fallback_model_id = fallback.id
+    state = _state(tenant_id, model, agent)
+    called_models: list[uuid.UUID] = []
+
+    async def complete(model_arg, *args, **kwargs):
+        del args, kwargs
+        called_models.append(model_arg.id)
+        if model_arg.id == model.id:
+            raise NoCredentialAvailable(
+                "volcengine_agent_plan",
+                "text",
+                CredentialUnavailableReason.NOT_CONFIGURED,
+            )
+        return LLMCompletionStep(
+            content="",
+            tool_calls=(
+                {
+                    "id": "finish-credential-fallback",
+                    "type": "function",
+                    "function": {
+                        "name": "finish",
+                        "arguments": '{"content":"Fallback answer"}',
+                    },
+                },
+            ),
+            reasoning_content=None,
+            retry_instruction=None,
+            usage=TokenUsage(total_tokens=12),
+        )
+
+    result = await _failover_service(
+        model,
+        fallback,
+        agent,
+        _ContextBuilder(_build()),
+        complete,
+    ).complete_once(state, _context(state))
+
+    assert result.intent == "finish"
+    assert result.finish_content == "Fallback answer"
+    assert called_models == [model.id, fallback.id]
+    assert result.assistant_message is not None
+    assert result.assistant_message["runtime_model_id"] == str(fallback.id)
+    assert result.assistant_message["runtime_failover_from_model_id"] == str(model.id)
+
+
+@pytest.mark.asyncio
+async def test_fallback_uses_the_immutable_snapshot_model_id() -> None:
+    tenant_id = uuid.uuid4()
+    model = _model(tenant_id)
+    distractor = _model(tenant_id)
+    distractor.model = "unrelated-candidate"
+    fallback = _model(tenant_id)
+    fallback.model = "configured-fallback"
+    agent = _agent(tenant_id)
+    agent.fallback_model_id = fallback.id
+    state = _state(tenant_id, model, agent)
+    state["snapshots"] = replace(
+        state["snapshots"],
+        initial_input={
+            **state["snapshots"].initial_input,
+            "fallback_model_id": str(fallback.id),
+        },
+    )
+    called_models: list[uuid.UUID] = []
+
+    async def complete(model_arg, *args, **kwargs):
+        del args, kwargs
+        called_models.append(model_arg.id)
+        if model_arg.id == model.id:
+            raise NoCredentialAvailable(
+                "volcengine_agent_plan",
+                "text",
+                CredentialUnavailableReason.NOT_CONFIGURED,
+            )
+        return LLMCompletionStep(
+            content="",
+            tool_calls=(
+                {
+                    "id": "finish-exact-fallback",
+                    "type": "function",
+                    "function": {
+                        "name": "finish",
+                        "arguments": '{"content":"Exact fallback answer"}',
+                    },
+                },
+            ),
+            reasoning_content=None,
+            retry_instruction=None,
+            usage=TokenUsage(total_tokens=12),
+        )
+
+    service = RuntimeModelStepService(
+        session_factory=_failover_session_factory(
+            model,
+            agent,
+            fallback,
+            candidates=[distractor, fallback],
+        ),
+        context_builder=_ContextBuilder(_build()),  # type: ignore[arg-type]
+        completion=complete,
+        tool_provider=_tools,
+        prompt_builder=_prompt,
+        model_retry_base_delay_seconds=0,
+        model_retry_jitter_ratio=0,
+    )
+
+    result = await service.complete_once(state, _context(state))
+
+    assert result.intent == "finish"
+    assert result.finish_content == "Exact fallback answer"
+    assert called_models == [model.id, fallback.id]
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_provider_outcome_blocks_retry_and_fallback() -> None:
+    tenant_id = uuid.uuid4()
+    model = _model(tenant_id)
+    fallback = _model(tenant_id)
+    agent = _agent(tenant_id)
+    agent.fallback_model_id = fallback.id
+    state = _state(tenant_id, model, agent)
+    called_models: list[uuid.UUID] = []
+
+    async def complete(model_arg, *args, **kwargs):
+        del args, kwargs
+        called_models.append(model_arg.id)
+        error = TimeoutError("provider timeout after request start")
+        error.provider_outcome_ambiguous = True
+        error.route_failover_safe = False
+        raise error
+
+    result = await _failover_service(
+        model,
+        fallback,
+        agent,
+        _ContextBuilder(_build()),
+        complete,
+    ).complete_once(state, _context(state))
+
+    assert result.intent == "wait"
+    assert result.waiting_request is not None
+    assert result.waiting_request["waiting_type"] == "external"
+    assert (
+        result.waiting_request["error_code"]
+        == "model_provider_reconciliation_required"
+    )
+    assert str(result.waiting_request["correlation_id"]).startswith(
+        "model-provider-reconcile:"
+    )
+    assert called_models == [model.id]
 
 
 @pytest.mark.asyncio

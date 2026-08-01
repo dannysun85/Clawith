@@ -29,6 +29,7 @@ from app.services.volcengine_agent_plan import (
     TTS_MODEL,
     VIDEO_MODEL,
     VIDEO_MODEL_15_PRO,
+    VIDEO_MODEL_MINI,
     VIDEO_MODEL_ALIASES,
     VolcengineAgentPlanError,
     VolcengineAgentPlanRejected,
@@ -80,7 +81,7 @@ def test_agent_plan_tier_and_product_quality_profiles_are_explicit():
     assert resolve_visual_profile("video", "pro").model == VIDEO_MODEL
     assert (
         resolve_visual_profile("video", "pro", plan_tier="medium").model
-        == VIDEO_MODEL_15_PRO
+        == VIDEO_MODEL_MINI
     )
     assert resolve_video_model("large") == VIDEO_MODEL
     with pytest.raises(ValueError, match="requires Medium"):
@@ -92,7 +93,7 @@ def test_agent_plan_tier_and_product_quality_profiles_are_explicit():
 
 
 @pytest.mark.asyncio
-async def test_medium_agent_plan_routes_video_to_seedance_15(monkeypatch):
+async def test_medium_agent_plan_routes_video_to_current_non_retiring_model(monkeypatch):
     credential = SimpleNamespace(
         id=uuid.uuid4(),
         provider="volcengine_agent_plan",
@@ -115,7 +116,7 @@ async def test_medium_agent_plan_routes_video_to_seedance_15(monkeypatch):
         minimax_model="MiniMax-Hailuo-02",
     )
 
-    assert prepared.model == VIDEO_MODEL_15_PRO
+    assert prepared.model == VIDEO_MODEL_MINI
     assert prepared.resolution == "720p"
     pick_credential.assert_awaited_once_with(
         "volcengine_agent_plan",

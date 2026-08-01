@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -9,9 +10,15 @@ from pydantic import ValidationError
 
 from app.api import credentials as credentials_api
 from app.core.security import encrypt_data, get_saas_admin
+from app.scripts.import_platform_credential import (
+    CredentialImportInputError,
+    _audit_details,
+    _load_payload,
+)
 from app.schemas.credentials import CredentialCreateIn, CredentialUpdateIn
 from app.services.credential_verification import (
     CredentialVerificationResult,
+    build_credential_verification_receipt,
     build_credential_probe_request,
 )
 
@@ -39,6 +46,85 @@ class _FakeCredentialDb:
         value.error_count = value.error_count or 0
         value.enabled = True if value.enabled is None else value.enabled
         value.status = value.status or "healthy"
+
+
+def test_secure_platform_import_accepts_config_but_never_echoes_a_bad_secret():
+    data, enabled = _load_payload(
+        b'{"provider":"volcengine_agent_plan","label":"Production A",'
+        b'"api_key":"secret-never-print","plan_tier":"small",'
+        b'"capabilities":["text","image","audio"],"enabled":true}'
+    )
+    assert enabled is True
+    assert data.plan_tier == "small"
+    assert data.capabilities == ["text", "image", "audio"]
+
+    submitted_secret = "secret-validation-value"
+    with pytest.raises(CredentialImportInputError) as exc_info:
+        _load_payload(
+            json.dumps(
+                {
+                    "provider": "volcengine_agent_plan",
+                    "label": "Production A",
+                    "api_key": submitted_secret,
+                    "plan_tier": "small",
+                    "capabilities": ["video"],
+                }
+            ).encode()
+        )
+    assert submitted_secret not in str(exc_info.value)
+
+    secret_in_label = "ark-example-secret-value-that-must-never-be-a-label"
+    with pytest.raises(CredentialImportInputError) as label_error:
+        _load_payload(
+            json.dumps(
+                {
+                    "provider": "volcengine_agent_plan",
+                    "label": secret_in_label,
+                    "api_key": "safe-test-key",
+                    "plan_tier": "small",
+                    "capabilities": ["text", "image", "audio"],
+                }
+            ).encode()
+        )
+    assert secret_in_label not in str(label_error.value)
+
+
+def test_platform_import_audit_and_verification_receipts_are_secret_free():
+    credential = SimpleNamespace(
+        id=uuid.uuid4(),
+        provider="volcengine_agent_plan",
+        label="Production A",
+        api_key_encrypted="encrypted-secret-value",
+        base_url="https://ark.cn-beijing.volces.com/api/plan/v3",
+        plan_tier="small",
+        capabilities=["text", "image", "audio"],
+        enabled=True,
+        priority=0,
+        weight=1,
+        daily_quota=None,
+        rpm_limit=None,
+        tpm_limit=None,
+        window_5h_limit=None,
+    )
+
+    audit = _audit_details(
+        credential,
+        operation="created",
+        provider_status=200,
+        verified=True,
+    )
+    receipt = build_credential_verification_receipt(
+        credential,
+        checked_at=datetime.now(timezone.utc),
+        ok=True,
+        provider_status=200,
+        model_count=None,
+    )
+
+    serialized = json.dumps({"audit": audit, "receipt": receipt})
+    assert "api_key" not in serialized
+    assert "label" not in audit
+    assert "encrypted-secret-value" not in serialized
 
 
 def test_credential_capabilities_reject_empty_and_unknown_values():
@@ -233,6 +319,78 @@ async def test_replacing_api_key_requires_explicit_reverification():
     assert result.status == "unverified"
     assert credential.error_count == 0
     assert credentials_api.get_credential_api_key(credential) == "sk-replacement"
+    assert db.commits == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("credential", "update"),
+    [
+        (
+            {
+                "provider": "minimax",
+                "base_url": "https://api.minimaxi.com/v1",
+                "plan_tier": None,
+                "capabilities": ["text"],
+            },
+            CredentialUpdateIn(base_url="https://api.minimax.io/v1"),
+        ),
+        (
+            {
+                "provider": "volcengine_agent_plan",
+                "base_url": "https://ark.cn-beijing.volces.com/api/plan/v3",
+                "plan_tier": "medium",
+                "capabilities": ["text", "image", "audio", "video"],
+            },
+            CredentialUpdateIn(plan_tier="large"),
+        ),
+        (
+            {
+                "provider": "volcengine_agent_plan",
+                "base_url": "https://ark.cn-beijing.volces.com/api/plan/v3",
+                "plan_tier": "small",
+                "capabilities": ["text", "image", "audio"],
+            },
+            CredentialUpdateIn(capabilities=["text", "image"]),
+        ),
+    ],
+)
+async def test_routing_config_changes_clear_stale_modality_circuits(credential, update):
+    credential_id = uuid.uuid4()
+    value = SimpleNamespace(
+        id=credential_id,
+        label="Production pool",
+        api_key_encrypted=encrypt_data("safe-test-key", credentials_api.settings.SECRET_KEY),
+        daily_quota=None,
+        used_today=0,
+        status="healthy",
+        modality_status={
+            "video:old-model": {"status": "quota_exceeded"},
+        },
+        error_count=3,
+        weight=1,
+        priority=0,
+        last_used_at=None,
+        enabled=True,
+        rpm_limit=None,
+        tpm_limit=None,
+        window_5h_limit=None,
+        tenant_id=None,
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+        last_verification_at=datetime.now(timezone.utc),
+        verification_receipt={"ok": True},
+        **credential,
+    )
+    db = _FakeCredentialDb(value)
+
+    result = await credentials_api.update_credential(credential_id, update, db=db)
+
+    assert result.status == "unverified"
+    assert value.modality_status == {}
+    assert value.error_count == 0
+    assert value.last_verification_at is None
+    assert value.verification_receipt is None
     assert db.commits == 1
 
 
