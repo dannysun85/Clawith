@@ -1,3 +1,21 @@
+# v1.11.16 — Simplified Chinese Poster Typeface Selection
+
+## Poster Typography
+
+- Select the Simplified Chinese (`SC`) face from regional Noto CJK font
+  collections for Chinese and Latin poster copy instead of silently taking the
+  collection's first Japanese (`JP`) face.
+- Preserve language-appropriate Japanese and Korean face selection when the
+  copy contains kana or Hangul.
+- Keep the production font receipt explicit so the selected family and face
+  index can be verified after deployment.
+
+## Validation
+
+- Add isolated regional-face regression tests, retain the full poster and
+  production-deployment contract suites, and require an in-container render
+  receipt proving the production release selected `Noto Sans CJK SC`.
+
 # v1.11.15 — Commercial Poster Typography and Safe Media Recovery
 
 ## Poster Typography

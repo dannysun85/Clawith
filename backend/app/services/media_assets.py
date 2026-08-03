@@ -486,7 +486,27 @@ def _font_for_text(text: str) -> FontSelection:
     for candidate in _FONT_CANDIDATES:
         if not Path(candidate).is_file():
             continue
-        for face_index, codepoints, family in _font_faces(candidate):
+        faces = _font_faces(candidate)
+        preferred_region = "SC"
+        if any("\u3040" <= character <= "\u30ff" for character in text):
+            preferred_region = "JP"
+        elif any(
+            "\u1100" <= character <= "\u11ff"
+            or "\u3130" <= character <= "\u318f"
+            or "\uac00" <= character <= "\ud7af"
+            for character in text
+        ):
+            preferred_region = "KR"
+        ordered_faces = sorted(
+            faces,
+            key=lambda face: (
+                0
+                if face[2].upper().endswith(f" {preferred_region}")
+                else 1,
+                face[0],
+            ),
+        )
+        for face_index, codepoints, family in ordered_faces:
             missing = required - codepoints
             if not missing:
                 return FontSelection(
