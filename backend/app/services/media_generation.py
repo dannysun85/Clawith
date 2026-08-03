@@ -94,6 +94,10 @@ class ProviderTaskIdentityCollision(RuntimeError):
     """A provider task identity was already owned by another security scope."""
 
 
+class InvalidSyncRecoveryIdentity(ValueError):
+    """A legacy synchronous task has unusable private recovery metadata."""
+
+
 _MEDIA_RECOVERY_PROVIDERS = frozenset({"minimax", "volcengine_agent_plan"})
 _SYNC_MEDIA_MODALITIES = {"image", "audio", "music"}
 _SYNC_MEDIA_EXTENSIONS = {
@@ -303,13 +307,18 @@ def _validated_sync_recovery_asset_key(task: MediaGenerationTask) -> str | None:
     if not raw_key:
         return None
     extension = str(metadata.get("recovery_extension") or "")
-    expected = minimax_sync_recovery_asset_key(
-        task.agent_id,
-        task.id,
-        task.modality,
-        extension,
-        provider=getattr(task, "provider", "minimax"),
-    )
+    try:
+        expected = minimax_sync_recovery_asset_key(
+            task.agent_id,
+            task.id,
+            task.modality,
+            extension,
+            provider=getattr(task, "provider", "minimax"),
+        )
+    except ValueError as exc:
+        raise InvalidSyncRecoveryIdentity(
+            "Synchronous media recovery metadata is invalid"
+        ) from exc
     normalized_key = normalize_storage_key(raw_key)
     if normalized_key != expected:
         raise MediaContractError(
@@ -2130,7 +2139,18 @@ async def _compensate_unrecoverable_sync_task(
             # A concurrent writer may have created the predeclared raw/evidence
             # object after this reconciler's earlier read but before this txn.
             storage = get_storage_backend()
-            raw_key = _validated_sync_recovery_asset_key(task)
+            try:
+                raw_key = _validated_sync_recovery_asset_key(task)
+            except InvalidSyncRecoveryIdentity:
+                # Legacy rows may contain an obsolete recovery key without a
+                # supported extension. Once the raw-capture window has closed,
+                # never read an untrusted key or retry compensation forever.
+                logger.warning(
+                    "[media] invalid sync recovery identity ignored during "
+                    "compensation task_id={}",
+                    task.id,
+                )
+                raw_key = None
             if raw_key and await storage.exists(raw_key):
                 return _MediaCompensationAttempt("asset_appeared", task)
             if task.modality == "image":
@@ -2146,60 +2166,90 @@ async def _compensate_unrecoverable_sync_task(
                     normalize_storage_key(configured_evidence_key)
                     != expected_evidence_key
                 ):
-                    return _MediaCompensationAttempt("invalid_evidence_identity", task)
+                    logger.warning(
+                        "[media] invalid sync evidence identity ignored during "
+                        "compensation task_id={}",
+                        task.id,
+                    )
                 if await storage.exists(expected_evidence_key):
                     return _MediaCompensationAttempt("asset_appeared", task)
         refunded = 0
+        invalid_reservation_error: str | None = None
         if task.reservation_id:
-            reservation = await _lock_owned_media_reservation(db, task)
-            refunded = int(reservation.amount or 0)
-            await mark_credit_reservation_settlement_ready_in_session(
-                db,
-                reservation.id,
-                amount=refunded,
-            )
-            if refunded > 0:
-                # Refund first inside this same transaction. A conservative
-                # provider-debt resize may exceed the current balance; the
-                # compensating grant guarantees the consume can then settle.
-                await grant_credits_in_session(
+            try:
+                reservation = await _lock_owned_media_reservation(db, task)
+            except MediaContractError as exc:
+                invalid_reservation_error = (
+                    "Unrecoverable media task has invalid Credits reservation "
+                    f"ownership: {_safe_error(exc)}"
+                )[:1000]
+            else:
+                refunded = int(reservation.amount or 0)
+                await mark_credit_reservation_settlement_ready_in_session(
                     db,
-                    tenant_id=reservation.tenant_id,
+                    reservation.id,
                     amount=refunded,
-                    reason="refund",
-                    granted_by=task.user_id,
-                    ref_type="media_task",
-                    ref_id=task.id,
                 )
-            await finalize_reserved_credits_in_session(db, reservation.id)
-        task.status = "compensated"
-        task.last_error = reason[:1000]
-        task.last_checked_at = now
-        task.completed_at = task.completed_at or now
-        task.next_poll_at = None
-        task.last_response = {
-            "status": "Compensated",
-            "refunded_credits": refunded,
-        }
-        task.completion_delivery_status = "not_applicable"
-        if task.user_id:
-            chinese_label, _english_label, _action_label = _media_labels(task)
-            db.add(
-                Notification(
-                    user_id=task.user_id,
-                    agent_id=task.agent_id,
-                    type="system",
-                    title=f"{chinese_label}生成结果已退款",
-                    body=(
-                        f"供应商已受理，但{chinese_label}结果无法安全恢复。"
-                        f"系统已退回 {refunded} Credits。"
-                    ),
-                    link=f"/agents/{task.agent_id}/chat",
-                    ref_id=task.id,
-                    sender_name="Astra",
+                if refunded > 0:
+                    # Refund first inside this same transaction. A conservative
+                    # provider-debt resize may exceed the current balance; the
+                    # compensating grant guarantees the consume can then settle.
+                    await grant_credits_in_session(
+                        db,
+                        tenant_id=reservation.tenant_id,
+                        amount=refunded,
+                        reason="refund",
+                        granted_by=task.user_id,
+                        ref_type="media_task",
+                        ref_id=task.id,
+                    )
+                await finalize_reserved_credits_in_session(db, reservation.id)
+        if invalid_reservation_error:
+            # Never refund or finalize a Credits hold that is owned by a
+            # different scope. Dead-letter the corrupt legacy task for
+            # operator review instead of retrying it forever.
+            task.status = "asset_delivery_failed"
+            task.last_error = invalid_reservation_error
+            task.last_checked_at = now
+            task.completed_at = task.completed_at or now
+            task.next_poll_at = None
+            task.last_response = {
+                "status": "AssetDeliveryFailed",
+                "refunded_credits": 0,
+            }
+            task.completion_delivery_status = "not_applicable"
+        else:
+            task.status = "compensated"
+            task.last_error = reason[:1000]
+            task.last_checked_at = now
+            task.completed_at = task.completed_at or now
+            task.next_poll_at = None
+            task.last_response = {
+                "status": "Compensated",
+                "refunded_credits": refunded,
+            }
+            task.completion_delivery_status = "not_applicable"
+            if task.user_id:
+                chinese_label, _english_label, _action_label = _media_labels(task)
+                db.add(
+                    Notification(
+                        user_id=task.user_id,
+                        agent_id=task.agent_id,
+                        type="system",
+                        title=f"{chinese_label}生成结果已退款",
+                        body=(
+                            f"供应商已受理，但{chinese_label}结果无法安全恢复。"
+                            f"系统已退回 {refunded} Credits。"
+                        ),
+                        link=f"/agents/{task.agent_id}/chat",
+                        ref_id=task.id,
+                        sender_name="Astra",
+                    )
                 )
-            )
         await db.commit()
+    if invalid_reservation_error:
+        await _record_media_failure_issue(task, task.last_error)
+        return _MediaCompensationAttempt("invalid_reservation_ownership", task)
     await _record_media_failure_issue(
         task,
         f"Provider result was unrecoverable; customer Credits compensated: {reason}",
@@ -2566,6 +2616,12 @@ async def reconcile_minimax_sync_media_task(
                 "Accepted provider response bytes were not durably recoverable",
             )
             if not compensation.compensated:
+                if compensation.task.status == "asset_delivery_failed":
+                    return MediaGenerationOutcome(
+                        status="asset_delivery_failed",
+                        error=compensation.task.last_error,
+                        retryable=False,
+                    )
                 if compensation.task.status == "succeeded":
                     return MediaGenerationOutcome(
                         status="succeeded",
@@ -2766,6 +2822,12 @@ async def reconcile_minimax_sync_media_task(
             if compensation.compensated:
                 return MediaGenerationOutcome(
                     status="compensated", error=compensation.task.last_error
+                )
+            if compensation.task.status == "asset_delivery_failed":
+                return MediaGenerationOutcome(
+                    status="asset_delivery_failed",
+                    error=compensation.task.last_error,
+                    retryable=False,
                 )
             return MediaGenerationOutcome(
                 status="retrying",

@@ -1061,6 +1061,181 @@ async def test_deterministic_asset_contract_failure_is_terminal_without_retry(mo
 
 
 @pytest.mark.asyncio
+async def test_expired_legacy_sync_recovery_identity_compensates_without_retry(monkeypatch):
+    now = datetime.now(timezone.utc)
+    task = SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        user_id=None,
+        reservation_id=None,
+        provider="minimax",
+        provider_task_id=None,
+        modality="image",
+        model="image-01",
+        status="asset_repairing",
+        request_metadata={
+            "recovery_asset_storage_key": "_internal/provider_recovery/minimax/sync/legacy/image.bin",
+        },
+        created_at=now - timedelta(days=3),
+        completed_at=None,
+        last_error=None,
+        last_checked_at=None,
+        next_poll_at=now,
+        last_response=None,
+        completion_delivery_status="pending",
+    )
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            return task
+
+        async def commit(self):
+            return None
+
+        def add(self, _value):
+            raise AssertionError("A task without user_id must not create a notification")
+
+    class Storage:
+        async def exists(self, _key):
+            return False
+
+    monkeypatch.setattr(media_generation, "async_session", lambda: Session())
+    monkeypatch.setattr(
+        media_generation,
+        "_load_task",
+        AsyncMock(return_value=task),
+    )
+    monkeypatch.setattr(media_generation, "get_storage_backend", lambda: Storage())
+    monkeypatch.setattr(media_generation, "_utcnow", lambda: now)
+    monkeypatch.setattr(
+        media_generation,
+        "get_settings",
+        lambda: SimpleNamespace(
+            MEDIA_GENERATION_MAX_AGE_SECONDS=48 * 3600,
+            MEDIA_GENERATION_SUBMISSION_TIMEOUT_SECONDS=60,
+        ),
+    )
+    record_issue = AsyncMock()
+    cleanup = AsyncMock()
+    monkeypatch.setattr(media_generation, "_record_media_failure_issue", record_issue)
+    monkeypatch.setattr(media_generation, "_cleanup_sync_private_assets", cleanup)
+
+    outcome = await media_generation.reconcile_minimax_sync_media_task(task.id)
+
+    assert outcome.status == "compensated"
+    assert task.status == "compensated"
+    assert task.next_poll_at is None
+    assert task.last_response == {"status": "Compensated", "refunded_credits": 0}
+    record_issue.assert_awaited_once()
+    cleanup.assert_awaited_once_with(task, delete_recovery_assets=True)
+
+
+@pytest.mark.asyncio
+async def test_expired_sync_task_with_foreign_reservation_is_dead_lettered(monkeypatch):
+    now = datetime.now(timezone.utc)
+    task = SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+        reservation_id=uuid.uuid4(),
+        provider="minimax",
+        provider_task_id=None,
+        modality="image",
+        model="image-01",
+        status="asset_repairing",
+        request_metadata={
+            "recovery_asset_storage_key": "_internal/provider_recovery/minimax/sync/legacy/image.bin",
+        },
+        created_at=now - timedelta(days=3),
+        completed_at=None,
+        last_error=None,
+        last_checked_at=None,
+        next_poll_at=now,
+        last_response=None,
+        completion_delivery_status="pending",
+    )
+    reservation = SimpleNamespace(
+        id=task.reservation_id,
+        tenant_id=uuid.uuid4(),
+        agent_id=task.agent_id,
+        user_id=task.user_id,
+        ref_type="media_task",
+        ref_id=task.id,
+        amount=1,
+    )
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, model, *_args, **_kwargs):
+            return task if model is MediaGenerationTask else reservation
+
+        async def commit(self):
+            return None
+
+    class Storage:
+        async def exists(self, _key):
+            return False
+
+    monkeypatch.setattr(media_generation, "async_session", lambda: Session())
+    monkeypatch.setattr(media_generation, "_load_task", AsyncMock(return_value=task))
+    monkeypatch.setattr(media_generation, "get_storage_backend", lambda: Storage())
+    monkeypatch.setattr(media_generation, "_utcnow", lambda: now)
+    monkeypatch.setattr(
+        media_generation,
+        "get_settings",
+        lambda: SimpleNamespace(
+            MEDIA_GENERATION_MAX_AGE_SECONDS=48 * 3600,
+            MEDIA_GENERATION_SUBMISSION_TIMEOUT_SECONDS=60,
+        ),
+    )
+    record_issue = AsyncMock()
+    mark_settlement_ready = AsyncMock()
+    finalize = AsyncMock()
+    grant = AsyncMock()
+    monkeypatch.setattr(media_generation, "_record_media_failure_issue", record_issue)
+    monkeypatch.setattr(
+        media_generation,
+        "mark_credit_reservation_settlement_ready_in_session",
+        mark_settlement_ready,
+    )
+    monkeypatch.setattr(
+        media_generation,
+        "finalize_reserved_credits_in_session",
+        finalize,
+    )
+    monkeypatch.setattr(media_generation, "grant_credits_in_session", grant)
+
+    outcome = await media_generation.reconcile_minimax_sync_media_task(task.id)
+
+    assert outcome.status == "asset_delivery_failed"
+    assert outcome.retryable is False
+    assert task.status == "asset_delivery_failed"
+    assert task.next_poll_at is None
+    assert task.last_response == {
+        "status": "AssetDeliveryFailed",
+        "refunded_credits": 0,
+    }
+    assert "reservation ownership" in task.last_error
+    mark_settlement_ready.assert_not_awaited()
+    finalize.assert_not_awaited()
+    grant.assert_not_awaited()
+    record_issue.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_tampered_exact_copy_holds_provider_debt_for_asset_repair(monkeypatch):
     task = SimpleNamespace(
         id=uuid.uuid4(),
