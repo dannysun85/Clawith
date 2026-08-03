@@ -1,3 +1,36 @@
+# v1.11.15 — Commercial Poster Typography and Safe Media Recovery
+
+## Poster Typography
+
+- Add production CJK font discovery and full-glyph coverage checks before any
+  paid image request. Exact Chinese and Latin copy remains a deterministic
+  Astra overlay instead of being delegated to the image model.
+- Upgrade structured poster overlays to `poster-v2` with clearer title depth,
+  readable secondary copy, and a bounded rose-to-violet CTA treatment while
+  retaining exact-copy hashes and font receipts.
+- Keep the production font layer deliberately bounded to Noto Sans CJK and WQY
+  fallbacks. The release does not include the unused broad Noto font bundles,
+  avoiding roughly 600 MB of unnecessary installed font data per backend image.
+
+## Media Recovery Safety
+
+- Terminate corrupt legacy synchronous recovery records without reading an
+  untrusted storage key or retrying forever.
+- Dead-letter a media task whose Credits reservation belongs to another scope;
+  never refund or finalize the foreign reservation, and emit an operator issue
+  for review.
+- Preserve the existing product routing boundary: text remains MiniMax-M3
+  primary, image and video remain Volcengine-primary with MiniMax fallback,
+  speech may use Volcengine, and music remains MiniMax-only.
+
+## Validation
+
+- Require focused poster rendering, media lifecycle, deployment-contract, and
+  frontend routing tests before the full release gates.
+- Require a clean immutable candidate, PostgreSQL migration smoke, complete
+  backend/frontend suites, production blue-green identity checks, and
+  authenticated browser business-flow verification before cutover is accepted.
+
 # v1.11.14 — Browser Lifecycle Incident Accuracy
 
 ## Production Monitoring

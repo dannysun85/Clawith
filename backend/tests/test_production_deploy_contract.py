@@ -1703,7 +1703,7 @@ def test_backend_image_uses_resilient_configurable_debian_package_source():
         assert "RUN sed -i 's|deb.debian.org" not in documentation
 
 
-def test_backend_production_image_installs_broad_font_families_and_refreshes_cache():
+def test_backend_production_image_installs_bounded_cjk_fonts_and_refreshes_cache():
     dockerfile = (ROOT / "backend/Dockerfile").read_text(encoding="utf-8")
 
     for package in (
@@ -1711,17 +1711,15 @@ def test_backend_production_image_installs_broad_font_families_and_refreshes_cac
         "fonts-wqy-microhei",
         "fonts-wqy-zenhei",
         "fonts-noto-cjk",
-        "fonts-noto-cjk-extra",
-        "fonts-noto-core",
-        "fonts-noto-extra",
-        "fonts-noto-color-emoji",
-        "fonts-noto-mono",
-        "fonts-dejavu-core",
-        "fonts-dejavu-extra",
-        "fonts-liberation2",
-        "fonts-freefont-ttf",
     ):
         assert package in dockerfile
+    for oversized_or_unused_package in (
+        "fonts-noto-cjk-extra",
+        "fonts-noto-extra",
+        "fonts-noto-color-emoji",
+        "fonts-freefont-ttf",
+    ):
+        assert oversized_or_unused_package not in dockerfile
     assert "fc-cache -f" in dockerfile
 
 
