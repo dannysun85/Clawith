@@ -270,6 +270,27 @@ def test_simplified_chinese_prefers_sc_face_from_cjk_collection(tmp_path, monkey
     assert selection.face_index == 2
 
 
+def test_chinese_poster_separator_does_not_select_japanese_face(tmp_path, monkeypatch):
+    collection = tmp_path / "NotoSansCJK.ttc"
+    collection.write_bytes(b"font-collection")
+    supported = frozenset(ord(character) for character in "中文排版・清晰可读")
+    monkeypatch.setattr(media_assets, "_FONT_CANDIDATES", (str(collection),))
+    monkeypatch.setattr(
+        media_assets,
+        "_font_faces",
+        lambda _path: (
+            (0, supported, "Noto Sans CJK JP"),
+            (2, supported, "Noto Sans CJK SC"),
+        ),
+    )
+    monkeypatch.setattr(media_assets, "_file_sha256", lambda _path: "0" * 64)
+
+    selection = media_assets._font_for_text("中文排版・清晰可读")
+
+    assert selection.family == "Noto Sans CJK SC"
+    assert selection.face_index == 2
+
+
 def test_japanese_copy_prefers_jp_face_from_cjk_collection(tmp_path, monkeypatch):
     collection = tmp_path / "NotoSansCJK.ttc"
     collection.write_bytes(b"font-collection")

@@ -488,7 +488,14 @@ def _font_for_text(text: str) -> FontSelection:
             continue
         faces = _font_faces(candidate)
         preferred_region = "SC"
-        if any("\u3040" <= character <= "\u30ff" for character in text):
+        if any(
+            "\u3041" <= character <= "\u3096"
+            or "\u309d" <= character <= "\u309f"
+            or "\u30a1" <= character <= "\u30fa"
+            or "\u30fd" <= character <= "\u30ff"
+            or "\uff66" <= character <= "\uff9d"
+            for character in text
+        ):
             preferred_region = "JP"
         elif any(
             "\u1100" <= character <= "\u11ff"

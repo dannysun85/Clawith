@@ -1,3 +1,18 @@
+# v1.11.17 — Chinese Poster Punctuation Classification
+
+## Poster Typography
+
+- Treat the commonly used Chinese design separator `・` as punctuation instead
+  of Japanese script so it cannot override the Simplified Chinese font face.
+- Detect actual Hiragana, Katakana, and half-width Katakana letters while
+  excluding ambiguous punctuation-only signals.
+
+## Validation
+
+- Add the exact production poster punctuation case to the regional-face
+  regression suite and require a fresh production-container receipt proving
+  the final face is `Noto Sans CJK SC`.
+
 # v1.11.16 — Simplified Chinese Poster Typeface Selection
 
 ## Poster Typography
