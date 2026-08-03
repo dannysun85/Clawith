@@ -1,6 +1,8 @@
 """HTML to PDF conversion service."""
 
 import asyncio
+import contextlib
+import io
 import json
 import sys
 import types
@@ -146,7 +148,11 @@ def _install_weasyprint_stub_if_unavailable() -> None:
     if "weasyprint" in sys.modules:
         return
     try:
-        __import__("weasyprint")
+        # WeasyPrint may print native-library diagnostics directly to stdout
+        # while importing.  Keep those diagnostics out of machine-readable
+        # CLI contracts such as ``validate_multimodal_capability_matrix --json``.
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            __import__("weasyprint")
         return
     except Exception as exc:
         unavailable_error = str(exc)
@@ -184,6 +190,9 @@ async def convert_html_to_pdf(src_file: Path, tgt_file: Path, target_path: str, 
                 Path(str(arguments["_slide_spec_file_path"]))
                 if arguments.get("_slide_spec_file_path")
                 else None
+            ),
+            require_adaptive_visual_plan=bool(
+                arguments.get("_require_adaptive_visual_plan")
             ),
         )
         tgt_file.parent.mkdir(parents=True, exist_ok=True)

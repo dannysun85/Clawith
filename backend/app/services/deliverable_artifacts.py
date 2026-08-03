@@ -27,6 +27,10 @@ from app.services.deliverable_quality_gate import (
 from app.services.document_conversion.presentation_contract import (
     validate_presentation_visible_text,
 )
+from app.services.presentation_visual_policy import (
+    MINIMUM_PICTURE_COVERAGE_RATIO,
+    presentation_brief_is_image_led,
+)
 from app.services.storage import agent_storage_key, get_storage_backend, normalize_storage_key
 from app.services.storage_runtime.base import StorageBackend, WriteCondition
 
@@ -86,11 +90,21 @@ class _VerifiedArtifact:
 def _pptx_facts(data: bytes) -> dict[str, int | float]:
     with zipfile.ZipFile(BytesIO(data)) as archive:
         root = ElementTree.fromstring(archive.read("ppt/presentation.xml"))
+        slide_names = sorted(
+            (
+                name
+                for name in archive.namelist()
+                if re.fullmatch(r"ppt/slides/slide\d+\.xml", name)
+            ),
+            key=lambda name: int(re.search(r"(\d+)", name).group(1)),
+        )
+        slide_roots = [
+            ElementTree.fromstring(archive.read(name)) for name in slide_names
+        ]
         slide_text = " ".join(
             node.text or ""
-            for name in archive.namelist()
-            if re.fullmatch(r"ppt/slides/slide\d+\.xml", name)
-            for node in ElementTree.fromstring(archive.read(name)).iter()
+            for slide_root in slide_roots
+            for node in slide_root.iter()
             if node.tag.endswith("}t")
         )
     validate_presentation_visible_text(slide_text)
@@ -103,11 +117,74 @@ def _pptx_facts(data: bytes) -> dict[str, int | float]:
     height = int(slide_size.attrib["cy"])
     if width <= 0 or height <= 0:
         raise ValueError("PPTX slide size is invalid")
+    picture_count_by_slide: list[int] = []
+    picture_coverage_ratio_by_slide: list[float] = []
+    picture_namespace = {
+        "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
+        "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+    }
+    slide_area = width * height
+    for slide_root in slide_roots:
+        picture_count = 0
+        picture_area = 0
+        for picture in slide_root.findall(".//p:pic", picture_namespace):
+            transform = picture.find("./p:spPr/a:xfrm", picture_namespace)
+            if transform is None:
+                continue
+            offset = transform.find("./a:off", picture_namespace)
+            extent = transform.find("./a:ext", picture_namespace)
+            if offset is None or extent is None:
+                continue
+            try:
+                left = int(offset.attrib["x"])
+                top = int(offset.attrib["y"])
+                picture_width = int(extent.attrib["cx"])
+                picture_height = int(extent.attrib["cy"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            right = left + picture_width
+            bottom = top + picture_height
+            visible_left = max(0, min(width, min(left, right)))
+            visible_top = max(0, min(height, min(top, bottom)))
+            visible_right = max(0, min(width, max(left, right)))
+            visible_bottom = max(0, min(height, max(top, bottom)))
+            if visible_right <= visible_left or visible_bottom <= visible_top:
+                continue
+            picture_count += 1
+            picture_area += (visible_right - visible_left) * (
+                visible_bottom - visible_top
+            )
+        picture_count_by_slide.append(picture_count)
+        picture_coverage_ratio_by_slide.append(
+            round(min(picture_area / slide_area, 1.0), 6)
+        )
+    while len(picture_count_by_slide) < len(slide_ids):
+        # A structurally minimal fixture may declare slide ids without
+        # shipping slide XML.  Preserve the existing page-count facts while
+        # treating its unobservable picture area as zero.
+        picture_count_by_slide.append(0)
+        picture_coverage_ratio_by_slide.append(0.0)
+    slide_count = len(slide_ids)
     return {
         "page_count": len(slide_ids),
         "width": width,
         "height": height,
         "aspect_ratio": width / height,
+        "picture_count": sum(picture_count_by_slide),
+        "picture_count_by_slide": picture_count_by_slide,
+        "slides_with_pictures": sum(
+            count > 0 for count in picture_count_by_slide
+        ),
+        "slides_with_pictures_ratio": round(
+            sum(count > 0 for count in picture_count_by_slide)
+            / slide_count,
+            6,
+        ),
+        "picture_coverage_ratio_by_slide": picture_coverage_ratio_by_slide,
+        "picture_coverage_ratio_mean": round(
+            sum(picture_coverage_ratio_by_slide) / slide_count,
+            6,
+        ),
     }
 
 
@@ -160,6 +237,24 @@ def _presentation_contract_facts(
             invalid_types.add(artifact_type)
     if {"pptx", "pdf"} <= facts.keys() and facts["pptx"]["page_count"] != facts["pdf"]["page_count"]:
         invalid_types.update(("pptx", "pdf"))
+    if "pptx" in facts and presentation_brief_is_image_led(
+        request.goal,
+        request.spec if isinstance(request.spec, Mapping) else {},
+    ):
+        pptx_facts = facts["pptx"]
+        observed_coverage = float(
+            pptx_facts.get("picture_coverage_ratio_mean") or 0.0
+        )
+        pptx_facts["minimum_picture_coverage_ratio"] = (
+            MINIMUM_PICTURE_COVERAGE_RATIO
+        )
+        pptx_facts["picture_coverage_gate"] = int(
+            observed_coverage >= MINIMUM_PICTURE_COVERAGE_RATIO
+        )
+        if observed_coverage < MINIMUM_PICTURE_COVERAGE_RATIO:
+            invalid_types.add("pptx")
+            if "pdf" in facts:
+                invalid_types.add("pdf")
     return facts, invalid_types
 
 
@@ -615,6 +710,14 @@ async def reconcile_runtime_deliverable_artifacts(
             request,
             verified_by_type,
         )
+        if (
+            contract_facts.get("pptx", {}).get("picture_coverage_gate") == 0
+        ):
+            for artifact_type in contract_invalid_types:
+                failure_codes.setdefault(
+                    artifact_type,
+                    "presentation_picture_coverage_below_minimum",
+                )
         for artifact_type in contract_invalid_types:
             observed_errors.setdefault(artifact_type, set()).add("invalid")
             verified_by_type.pop(artifact_type, None)

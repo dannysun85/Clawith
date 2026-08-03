@@ -22,6 +22,10 @@ const agentDetail = readFileSync(
   new URL('../src/pages/agent-detail/AgentDetailPage.tsx', import.meta.url),
   'utf8',
 );
+const appStyles = readFileSync(
+  new URL('../src/index.css', import.meta.url),
+  'utf8',
+);
 const source = readFileSync(
   new URL('../src/pages/enterprise-settings/tabs/LlmTab.tsx', import.meta.url),
   'utf8',
@@ -69,6 +73,13 @@ test('chat routes through enabled SaaS tiers instead of stale direct model ids',
   assert.match(agentDetail, /const effectiveTierReady = !!effectiveChatTier/);
   assert.match(agentDetail, /queryKey: \['agent-media-capabilities', id, effectiveChatTier\]/);
   assert.doesNotMatch(agentDetail, /const effectiveChatModelId = overrideModelId/);
+});
+
+test('degraded media controls expose a visible business-level warning without provider details', () => {
+  assert.match(agentDetail, /media-capability-launcher\$\{capability\.capability_status === 'degraded'/);
+  assert.match(agentDetail, /data-capability-state=\{state\.disabled \? 'unavailable' : \(capability\.capability_status \|\| 'available'\)\}/);
+  assert.match(appStyles, /\.chat-composer-btn\.media-capability-launcher\.is-degraded/);
+  assert.doesNotMatch(agentDetail, /available_providers.*media-capability-launcher/);
 });
 
 test('media admin separates managed routing from non-equivalent emergency quality', () => {

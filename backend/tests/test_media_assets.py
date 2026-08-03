@@ -24,6 +24,7 @@ from app.services.media_assets import (
     validate_generated_audio,
     validate_generated_image,
     validate_generated_video,
+    validate_overlay_blocks,
     validate_overlay_text,
     validate_uploaded_video,
     validate_video_delivery_contract,
@@ -269,6 +270,49 @@ def test_product_asset_is_composited_unchanged_and_receipted():
     with Image.open(BytesIO(result)) as image:
         red, green, blue = image.convert("RGB").getpixel((320, 180))
     assert red > 220 and green < 70 and blue < 80
+
+
+def test_role_aware_poster_blocks_render_without_legacy_black_panel():
+    blocks = [
+        {"role": "title", "text": "量化交易平台"},
+        {"role": "subtitle", "text": "智能策略・实时信号・数据驱动决策"},
+        {"role": "tagline", "text": "从复杂市场中，捕捉更清晰的交易方向"},
+        {"role": "cta", "text": "立即体验"},
+    ]
+
+    blocks_digest = validate_overlay_blocks(blocks)
+    assert blocks_digest is not None
+    result, receipt = apply_image_brand_overlays(
+        _image_bytes((720, 1280)),
+        None,
+        overlay_blocks=blocks,
+        output_format=".png",
+    )
+
+    assert validate_generated_image(result) == (720, 1280)
+    assert receipt.layout_version == "poster-v1"
+    assert receipt.block_count == 4
+    assert receipt.overlay_blocks_sha256 == blocks_digest
+    assert receipt.output_bytes == len(result)
+    with Image.open(BytesIO(result)) as image:
+        # The legacy renderer put an opaque black panel behind all copy. The
+        # structured poster renderer keeps the supplied background visible.
+        assert image.convert("RGB").getpixel((360, 640)) != (0, 0, 0)
+
+
+def test_bounded_encoder_downscales_only_when_encoded_result_exceeds_limit():
+    image = Image.effect_noise((720, 1280), 100).convert("RGBA")
+
+    result, output_size = media_assets._encode_bounded_image(
+        image,
+        "PNG",
+        max_bytes=220_000,
+    )
+
+    assert len(result) < 220_000
+    assert output_size[0] < 720
+    assert output_size[1] < 1280
+    assert output_size[0] / output_size[1] == pytest.approx(720 / 1280, rel=0.01)
 
 
 def test_brand_safe_image_suppresses_provider_background_pseudo_text():
@@ -623,6 +667,8 @@ def test_image_normalization_prevents_extension_content_mismatch():
 
     assert result.startswith(b"\x89PNG\r\n\x1a\n")
     assert validate_generated_image(result) == (512, 512)
+    with Image.open(BytesIO(result)) as image:
+        assert image.mode == "RGB"
 
 
 @pytest.mark.parametrize("output_format", [".png"])

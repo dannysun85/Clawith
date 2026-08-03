@@ -48,6 +48,7 @@ class DeliverablePreflightIn(BaseModel):
     work_type: Literal["presentation", "poster", "video", "report", "spreadsheet"]
     workflow_id: str = Field(min_length=1, max_length=120)
     workflow_version: str = Field(min_length=1, max_length=32)
+    goal: str = Field(default="", max_length=4000)
     spec: dict[str, Any] = Field(default_factory=dict)
     tier: Literal["lite", "pro", "ultra"]
 

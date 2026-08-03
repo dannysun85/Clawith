@@ -20,8 +20,8 @@
     滚动真实客户样本的正式多人盲评；
   - `blocked_by_provider_entitlement`：当前 Agent Plan Key 的行为级套餐为 Small；1.5 Pro 与
     Seedance 2.0/fast/mini（公开名及官方 Skill 版本化 ID）均在提交前返回 `UnsupportedModel`；
-  - `tool_ready`：Seedance 1.5 Pro 的 Medium 路由、官方版本化 ID、4–12 秒/分辨率/比例/联网/
-    draft/flex 能力校验、首尾帧和显式音频意图已在本地 adapter 与测试中落地；
+  - `tool_ready`：Medium 新任务到 Seedance 2.0 Mini、Large/Max 到标准 Seedance 2.0 的路由、
+    官方版本化 ID、15 秒/分辨率/比例/首尾帧和显式音频意图已在本地 adapter 与测试中落地；
   - `skill_ready`：图片 `volcengine-seedream-commercial`、视频
     `volcengine-seedance-commercial`、语音 `commercial-voiceover` 与 provider-neutral PPT
     `commercial-presentation` 已注册并按角色授权；本地 `Douyin Operations Manager`
@@ -609,7 +609,7 @@ Request 映射为 `ready/capability_blocked`，不得产生“最终图片”Art
 
 ### 8.1 先解决当前合同漂移
 
-当前 `render_html_to_pptx()` 实际默认 `render_mode="visual"`，即每页截图，高保真但不可直接编辑（`backend/app/services/document_conversion/pptx_renderer.py:26-37,493-540`）；editable 路径会把浏览器布局映射成 shapes/text/images，但复杂 CSS 存在差异（同文件 `401-491,542-580`）。
+当前 `render_html_to_pptx()` 实际默认 `render_mode="visual"`，即每页截图，高保真但不可直接编辑（`backend/app/services/document_conversion/pptx_renderer.py:26-37,493-540`）；editable 路径会把浏览器布局映射成 shapes/text/images。`hybrid_editable` 会将已测量的图片、简单形状、SVG/canvas 和文字分别写入 PPTX，只对无法测量的视觉区域使用局部截图；不得再把隐藏文字后的整页截图作为默认视觉层（同文件 `401-491,542-580`）。
 
 实施要求：
 
@@ -1201,8 +1201,8 @@ provider-free 本地底座：
 - 本地配置已从误填 Large 收敛为 `small + text/image/audio`；
 - 订单级 SKU、有效期、AFP 余量仍需要控制台登录态或火山 AK/SK 管理 API；
 - 官方 Seedream/Seedance Skill 已完成 Astra 受管适配并分配给 Douyin Operations Manager。
-- Seedance 1.5 Pro 已完成本地协议级兼容接入；当前 Key 仍是行为级 Small，故不能把
-  `tool_ready` 写成 `provider_verified`。换成控制台确认的 Medium-or-up Key 后，先做一条
+- Seedance 1.5 Pro 已完成本地旧任务协议级兼容接入；当前 Key 仍是行为级 Small，故不能把
+  `tool_ready` 写成 `provider_verified`。换成控制台确认的 Medium-or-up Key 后，先按当前策略做一条
   4 秒 480p T2V 和一条首帧 I2V，再进入正式浏览器成功流与豆包同题 Benchmark。
 - 真实 Agent Skill 验证已完成：Seedream 5.0 Lite 生成 9:16 真人广告首帧；Seedance 在 Small
   权益下执行一次后稳定返回 unavailable，没有创建 Provider task 或扣 Credits。媒体附件短路径

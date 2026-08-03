@@ -18,6 +18,9 @@ from app.services.creative_artifact_evaluation import (  # noqa: E402
     CreativeArtifactContract,
     observe_creative_artifacts,
 )
+from app.services.presentation_visual_policy import (  # noqa: E402
+    MINIMUM_PICTURE_COVERAGE_RATIO,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,6 +47,14 @@ def parse_args() -> argparse.Namespace:
         "--preview-required",
         action=argparse.BooleanOptionalAction,
         default=True,
+    )
+    parser.add_argument(
+        "--minimum-picture-coverage-ratio",
+        type=float,
+        help=(
+            "Optional mean PPTX picture coverage gate for image-led decks "
+            f"(commercial default: {MINIMUM_PICTURE_COVERAGE_RATIO:g})."
+        ),
     )
     parser.add_argument("--image", type=Path)
     parser.add_argument("--mp4", type=Path)
@@ -75,6 +86,7 @@ async def main() -> int:
             reference_identity_required=args.reference_identity_required,
             editable_required=args.editable_required,
             preview_required=args.preview_required,
+            minimum_picture_coverage_ratio=args.minimum_picture_coverage_ratio,
         ),
         artifacts,
     )

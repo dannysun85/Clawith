@@ -38,6 +38,11 @@ class CreativeArtifactContract(BaseModel):
     reference_identity_required: bool = False
     editable_required: bool = True
     preview_required: bool = True
+    minimum_picture_coverage_ratio: float | None = Field(
+        default=None,
+        ge=0,
+        le=1,
+    )
 
 
 class ObservedArtifactFile(BaseModel):
@@ -298,13 +303,53 @@ def _pptx_facts(data: bytes) -> dict[str, Any]:
     full_slide_image_only_slides = 0
     text_shape_count = 0
     picture_count = 0
+    picture_count_by_slide: list[int] = []
+    granular_picture_count_by_slide: list[int] = []
+    picture_coverage_ratio_by_slide: list[float] = []
+    picture_asset_hashes: set[str] = set()
+    full_slide_picture_slides = 0
+    slide_area = width * height
     for slide in presentation.slides:
         slide_has_editable_content = False
         slide_has_full_picture = False
         slide_has_other_visible_content = False
+        slide_picture_count = 0
+        slide_granular_picture_count = 0
+        slide_picture_area = 0
         for shape in slide.shapes:
             if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
                 picture_count += 1
+                slide_picture_count += 1
+                try:
+                    picture_asset_hashes.add(
+                        hashlib.sha256(shape.image.blob).hexdigest()
+                    )
+                except (AttributeError, KeyError, OSError, ValueError):
+                    pass
+                shape_left = int(shape.left)
+                shape_top = int(shape.top)
+                shape_right = shape_left + int(shape.width)
+                shape_bottom = shape_top + int(shape.height)
+                visible_left = max(
+                    0,
+                    min(width, min(shape_left, shape_right)),
+                )
+                visible_top = max(
+                    0,
+                    min(height, min(shape_top, shape_bottom)),
+                )
+                visible_right = max(
+                    0,
+                    min(width, max(shape_left, shape_right)),
+                )
+                visible_bottom = max(
+                    0,
+                    min(height, max(shape_top, shape_bottom)),
+                )
+                if visible_right > visible_left and visible_bottom > visible_top:
+                    slide_picture_area += (
+                        visible_right - visible_left
+                    ) * (visible_bottom - visible_top)
                 covers_slide = (
                     int(shape.left) <= width * 0.02
                     and int(shape.top) <= height * 0.02
@@ -312,6 +357,8 @@ def _pptx_facts(data: bytes) -> dict[str, Any]:
                     and int(shape.height) >= height * 0.96
                 )
                 slide_has_full_picture = slide_has_full_picture or covers_slide
+                if not covers_slide:
+                    slide_granular_picture_count += 1
                 continue
             text = ""
             if getattr(shape, "has_text_frame", False):
@@ -333,6 +380,13 @@ def _pptx_facts(data: bytes) -> dict[str, Any]:
             slide_has_editable_content or slide_has_other_visible_content
         ):
             full_slide_image_only_slides += 1
+        if slide_has_full_picture:
+            full_slide_picture_slides += 1
+        picture_count_by_slide.append(slide_picture_count)
+        granular_picture_count_by_slide.append(slide_granular_picture_count)
+        picture_coverage_ratio_by_slide.append(
+            round(min(slide_picture_area / slide_area, 1.0), 6)
+        )
     page_count = len(presentation.slides)
     return {
         "page_count": page_count,
@@ -346,6 +400,39 @@ def _pptx_facts(data: bytes) -> dict[str, Any]:
         ),
         "text_shape_count": text_shape_count,
         "picture_count": picture_count,
+        "picture_count_by_slide": picture_count_by_slide,
+        "granular_picture_count_by_slide": granular_picture_count_by_slide,
+        "distinct_picture_asset_count": len(picture_asset_hashes),
+        "slides_with_pictures": sum(
+            count > 0 for count in picture_count_by_slide
+        ),
+        "slides_with_pictures_ratio": round(
+            sum(count > 0 for count in picture_count_by_slide) / page_count,
+            6,
+        ),
+        "pictures_per_slide_mean": round(picture_count / page_count, 6),
+        "pictures_per_slide_min": min(picture_count_by_slide),
+        "pictures_per_slide_max": max(picture_count_by_slide),
+        "slides_with_granular_pictures": sum(
+            count > 0 for count in granular_picture_count_by_slide
+        ),
+        "slides_with_granular_pictures_ratio": round(
+            sum(count > 0 for count in granular_picture_count_by_slide)
+            / page_count,
+            6,
+        ),
+        "full_slide_picture_slides": full_slide_picture_slides,
+        "full_slide_picture_ratio": round(
+            full_slide_picture_slides / page_count,
+            6,
+        ),
+        "picture_coverage_ratio_by_slide": picture_coverage_ratio_by_slide,
+        "picture_coverage_ratio_mean": round(
+            sum(picture_coverage_ratio_by_slide) / page_count,
+            6,
+        ),
+        "picture_coverage_ratio_min": min(picture_coverage_ratio_by_slide),
+        "picture_coverage_ratio_max": max(picture_coverage_ratio_by_slide),
     }
 
 
@@ -449,39 +536,64 @@ def _observe_presentation(
             )
         )
 
+    picture_coverage_match: bool | None = None
+    if contract.minimum_picture_coverage_ratio is not None:
+        if pptx_valid:
+            observed_coverage = float(
+                facts["pptx"].get("picture_coverage_ratio_mean") or 0.0
+            )
+            picture_coverage_match = (
+                observed_coverage >= contract.minimum_picture_coverage_ratio
+            )
+            picture_coverage_evidence = (
+                f"observed_mean={observed_coverage:.6f}; "
+                f"required_mean={contract.minimum_picture_coverage_ratio:.6f}"
+            )
+        else:
+            picture_coverage_evidence = "PPTX facts unavailable"
+    else:
+        picture_coverage_evidence = "No minimum picture coverage requested"
+
+    hard_gates: dict[str, HardGateObservation] = {
+        "pptx_and_preview_valid": HardGateObservation(
+            passed=preview_contract_valid,
+            evidence=(
+                f"pptx_valid={pptx_valid}; pdf_valid={pdf_valid}; "
+                f"preview_required={contract.preview_required}",
+            ),
+        ),
+        "page_count_and_aspect_match": HardGateObservation(
+            passed=page_aspect_match,
+            evidence=(
+                f"expected_page_count={contract.page_count}; "
+                f"expected_aspect_ratio={contract.aspect_ratio}",
+            ),
+        ),
+        "fact_safety": _unknown_gate("Requires semantic/source review"),
+        "no_text_overflow": _unknown_gate(
+            "Requires rendered-slide geometry and visual review"
+        ),
+        "source_traceability": _unknown_gate(
+            "Requires source manifest and citation review"
+        ),
+        "editability": HardGateObservation(
+            passed=editable_match,
+            evidence=(
+                "Measured editable shapes and full-slide image-only ratio",
+            ),
+        ),
+    }
+    if contract.minimum_picture_coverage_ratio is not None:
+        hard_gates["minimum_picture_coverage"] = HardGateObservation(
+            passed=picture_coverage_match,
+            evidence=(picture_coverage_evidence,),
+        )
+
     return CreativeArtifactObservation(
         modality="presentation",
         files=files,
         facts=facts,
-        hard_gates={
-            "pptx_and_preview_valid": HardGateObservation(
-                passed=preview_contract_valid,
-                evidence=(
-                    f"pptx_valid={pptx_valid}; pdf_valid={pdf_valid}; "
-                    f"preview_required={contract.preview_required}",
-                ),
-            ),
-            "page_count_and_aspect_match": HardGateObservation(
-                passed=page_aspect_match,
-                evidence=(
-                    f"expected_page_count={contract.page_count}; "
-                    f"expected_aspect_ratio={contract.aspect_ratio}",
-                ),
-            ),
-            "fact_safety": _unknown_gate("Requires semantic/source review"),
-            "no_text_overflow": _unknown_gate(
-                "Requires rendered-slide geometry and visual review"
-            ),
-            "source_traceability": _unknown_gate(
-                "Requires source manifest and citation review"
-            ),
-            "editability": HardGateObservation(
-                passed=editable_match,
-                evidence=(
-                    "Measured editable shapes and full-slide image-only ratio",
-                ),
-            ),
-        },
+        hard_gates=hard_gates,
         warnings=tuple(warnings),
     )
 
@@ -517,8 +629,25 @@ def score_artifact_observation(
 
     if scenario.modality != observation.modality:
         raise ValueError("Scenario and artifact observation modalities differ")
+    scoring_scenario = scenario
+    if (
+        "minimum_picture_coverage" in observation.hard_gates
+        and "minimum_picture_coverage" not in scenario.hard_gates
+    ):
+        # The threshold is an optional artifact contract rather than a
+        # requirement of every presentation scenario.  When a caller opts
+        # into it, include the observed gate in scoring instead of silently
+        # dropping an enforceable structural failure.
+        scoring_scenario = scenario.model_copy(
+            update={
+                "hard_gates": (
+                    *scenario.hard_gates,
+                    "minimum_picture_coverage",
+                )
+            }
+        )
     return score_quality_evaluation(
-        scenario,
+        scoring_scenario,
         hard_gates=observation.hard_gates,
         dimensions={},
     )

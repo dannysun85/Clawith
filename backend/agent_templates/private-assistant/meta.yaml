@@ -8,6 +8,12 @@ capability_bullets:
   - "Follow-up memory — keep track of people, decisions, and pending tasks"
 default_skills:
   - "meeting-notes"
+  # The Private Assistant is the default task entry. Keep these contracts
+  # provider-neutral; Provider selection and credential routing stay in the
+  # platform runtime.
+  - "brand-safe-media"
+  - "commercial-presentation"
+  - "commercial-voiceover"
 default_autonomy_policy:
   read_files: "L1"
   write_workspace_files: "L1"

@@ -16,6 +16,7 @@ from app.services.llm import load_balancer
 from app.services.llm.client import AnthropicClient, create_llm_client, get_provider_base_url
 from app.services.credential_verification import build_credential_probe_request
 from app.services import media_provider_routing
+from app.services.llm.load_balancer import NoCredentialAvailable
 from app.services.media_provider_routing import (
     DEFAULT_MEDIA_PROVIDER_ORDER,
     prepare_media_provider,
@@ -124,6 +125,66 @@ async def test_medium_agent_plan_routes_video_to_current_non_retiring_model(monk
         quota_modality="video",
         quota_model=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_small_agent_plan_never_falls_through_to_a_video_call(monkeypatch):
+    """A Small account must fail before any provider request is attempted."""
+
+    credential = SimpleNamespace(
+        id=uuid.uuid4(),
+        provider="volcengine_agent_plan",
+        base_url=DEFAULT_BASE_URL,
+        plan_tier="small",
+        modality_status={},
+    )
+    pick_credential = AsyncMock(return_value=credential)
+    monkeypatch.setattr(load_balancer, "pick_credential", pick_credential)
+
+    def get_key(_credential):
+        return "secret-plan-key"
+
+    monkeypatch.setattr(media_provider_routing.llm_utils, "get_credential_api_key", get_key)
+
+    with pytest.raises(NoCredentialAvailable, match="plan tier does not support this modality"):
+        await prepare_media_provider(
+            "volcengine_agent_plan",
+            modality="video",
+            saas_tier="pro",
+            minimax_model="MiniMax-Hailuo-02",
+        )
+
+    pick_credential.assert_awaited_once_with(
+        "volcengine_agent_plan",
+        modality="video",
+        quota_modality="video",
+        quota_model=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_plan_route_rejects_a_non_agent_plan_credential(monkeypatch):
+    """A generic/legacy provider row cannot be reinterpreted as Agent Plan."""
+
+    credential = SimpleNamespace(
+        id=uuid.uuid4(),
+        provider="volcengine",
+        base_url="https://ark.cn-beijing.volces.com/api/v3",
+        plan_tier="large",
+        modality_status={},
+    )
+    pick_credential = AsyncMock(return_value=credential)
+    monkeypatch.setattr(load_balancer, "pick_credential", pick_credential)
+
+    with pytest.raises(NoCredentialAvailable, match="explicit Agent Plan account") as exc_info:
+        await prepare_media_provider(
+            "volcengine_agent_plan",
+            modality="image",
+            saas_tier="pro",
+            minimax_model="MiniMax-Hailuo-02",
+        )
+
+    assert exc_info.value.route_failover_safe is True
 
 
 def test_agent_plan_text_and_tts_contracts_use_official_gateways():
@@ -255,13 +316,22 @@ def test_agent_plan_skill_aliases_and_advanced_payloads_are_server_adapted():
     assert video_gateway_model_id(VIDEO_MODEL) == VIDEO_MODEL_ALIASES[VIDEO_MODEL]
     assert (
         video_gateway_model_id(VIDEO_MODEL_15_PRO)
-        == "doubao-seedance-1-0-pro-250528"
+        == "doubao-seedance-1-5-pro-251215"
     )
     assert (
         video_gateway_model_id("doubao-seedance-2-0-260128")
         == "doubao-seedance-2-0-260128"
     )
+    assert (
+        video_gateway_model_id("doubao-seedance-1-5-pro-251215")
+        == "doubao-seedance-1-5-pro-251215"
+    )
+    assert (
+        video_gateway_model_id("doubao-seedance-1-0-pro-250528")
+        == "doubao-seedance-1-5-pro-251215"
+    )
     assert stable_video_model_name("doubao-seedance-1-0-pro-250528") == VIDEO_MODEL_15_PRO
+    assert stable_video_model_name("doubao-seedance-1-5-pro-251215") == VIDEO_MODEL_15_PRO
     assert video_model_capabilities(VIDEO_MODEL_15_PRO).max_duration_seconds == 12
 
     image = image_request_payload(

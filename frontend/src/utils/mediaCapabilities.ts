@@ -9,6 +9,15 @@ export interface MediaCapability {
     tool_enabled: boolean;
     reason: 'plan_denied' | 'pool_unavailable' | 'agent_tool_disabled' | null;
     allowed_tiers: string[];
+    /**
+     * Technical availability and commercial-quality readiness are separate
+     * signals.  A degraded route may have a provider in the pool while still
+     * requiring an explicit quality decision before it can be used.
+     */
+    capability_status?: 'available' | 'degraded' | 'unavailable';
+    available_providers?: string[];
+    route_reason?: string | null;
+    next_action?: string | null;
 }
 
 export interface MediaCapabilitiesResponse {
@@ -53,6 +62,22 @@ export function mediaCapabilityState(
     capability: MediaCapability,
     language: 'zh' | 'en',
 ): { disabled: boolean; label: string; action: 'upgrade' | 'open_tools' | 'contact_admin' | null } {
+    if (capability.available && capability.capability_status === 'degraded') {
+        const actionLabel = mediaCapabilityShortLabel(capability.modality, language);
+        // Quick media generation is allowed to use the platform-managed
+        // fallback.  The formal Deliverable workflow still requires an
+        // explicit `allow_degraded` confirmation before it can be launched.
+        // Keep provider/tier details out of the customer-facing composer: the
+        // route is an internal platform decision and should not leak into the
+        // normal task entry point.
+        return {
+            disabled: false,
+            label: language === 'zh'
+                ? `生成${actionLabel}（当前仅有应急质量线路；正式交付需先确认质量差异）`
+                : `Generate ${actionLabel.toLowerCase()} (only an emergency-quality route is available; formal delivery requires confirming the quality difference)`,
+            action: null,
+        };
+    }
     if (capability.available) {
         const actionLabel = mediaCapabilityShortLabel(capability.modality, language);
         return {

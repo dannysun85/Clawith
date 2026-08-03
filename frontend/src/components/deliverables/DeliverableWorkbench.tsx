@@ -86,6 +86,25 @@ function preflightReasonLabel(reason: string, isZh: boolean) {
     return label ? label[isZh ? 0 : 1] : reason;
 }
 
+function deliverableErrorLabel(code: string, isZh: boolean) {
+    const labels: Record<string, [string, string]> = {
+        presentation_picture_coverage_below_minimum: [
+            'PPT 图片覆盖不足，请增加大幅主视觉或场景图后重新生成。',
+            'Presentation imagery is too sparse; add larger hero or scene images and regenerate.',
+        ],
+        presentation_visual_quality_failed: [
+            'PPT 视觉质量检查未通过，请根据检查项修订后重新生成。',
+            'Presentation visual quality checks failed; revise the listed issues and regenerate.',
+        ],
+        deliverable_artifact_invalid: [
+            '交付文件未通过结构检查，请重新生成。',
+            'The deliverable failed structural checks; regenerate it.',
+        ],
+    };
+    const label = labels[code];
+    return label ? label[isZh ? 0 : 1] : code;
+}
+
 function initialSpec(workflow?: DeliverableWorkflow): Record<string, string | number> {
     if (!workflow) return {};
     return Object.fromEntries(
@@ -298,6 +317,7 @@ export function DeliverableLauncher({
                 work_type: selectedWorkflow.work_type,
                 workflow_id: selectedWorkflow.workflow_id,
                 workflow_version: selectedWorkflow.workflow_version,
+                goal: goal.trim(),
                 spec,
                 tier,
             });
@@ -308,8 +328,8 @@ export function DeliverableLauncher({
                     : (isZh ? '当前账号没有可用的执行路由' : 'No execution route is available for this account');
                 setError(
                     isZh
-                        ? `当前账号或档位暂不支持这项交付，未创建任务、未扣 Credits。原因：${reasonText}`
-                        : `This account or tier cannot run this delivery. No task was created and no Credits were spent. Reason: ${reasonText}`,
+                        ? `当前账号或档位暂不支持立即启动这项交付；工作说明仍可保存，不会扣 Credits。原因：${reasonText}`
+                        : `This account or tier cannot start this delivery right now. The brief can still be saved and no Credits will be spent. Reason: ${reasonText}`,
                 );
             }
             return result;
@@ -335,7 +355,7 @@ export function DeliverableLauncher({
         setError('');
         try {
             const result = await checkCapability();
-            if (!result || !result.available) return;
+            if (!result) return;
             const request = await deliverableApi.create({
                 client_request_id: clientRequestId,
                 agent_id: agentId,
@@ -361,7 +381,9 @@ export function DeliverableLauncher({
             setOpen(false);
             setClientRequestId(crypto.randomUUID());
             toast.success(
-                result.capability_status === 'degraded'
+                !result.available
+                    ? (isZh ? '工作说明已保存；当前没有可用线路，未启动生成' : 'Brief saved; no execution route is available yet, so generation was not started')
+                    : result.capability_status === 'degraded'
                     ? result.launchable
                         ? (isZh ? '已按你确认的应急质量策略保存，可在对话中启动' : 'Saved with your confirmed emergency-quality policy and ready to launch in chat')
                         : (isZh ? '工作说明已保存；当前只有应急质量线路，正式执行将等待主线路' : 'Brief saved; only emergency quality is available, so formal execution will wait for the primary route')
@@ -644,6 +666,7 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
     const [revisionOpen, setRevisionOpen] = useState(false);
     const [revisionInstruction, setRevisionInstruction] = useState('');
     const [selectedRevisionUnits, setSelectedRevisionUnits] = useState<string[]>([]);
+    const [videoPreviewError, setVideoPreviewError] = useState(false);
     const detailsTriggerRef = useRef<HTMLButtonElement>(null);
     const detailsDrawerRef = useRef<HTMLElement>(null);
     const approvalActionIdRef = useRef(crypto.randomUUID());
@@ -656,6 +679,9 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
     const previewArtifactUrl = previewArtifact
         ? deliverableApi.artifactDownloadUrl(previewArtifact.id, { inline: true })
         : '';
+    useEffect(() => {
+        setVideoPreviewError(false);
+    }, [previewArtifactUrl]);
     const awaitingReview = request.status === 'waiting_approval' && request.current_stage === 'output_review';
     const approvalBlocked = deliverableApprovalBlocked(request);
     const managedReviewRequired = Boolean(
@@ -1032,9 +1058,20 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
             {previewArtifact && (
                 <section className="deliverable-review-card__preview" aria-label={isZh ? '交付文件预览' : 'Deliverable preview'}>
                     {previewArtifactType === 'mp4' && (
-                        <video controls playsInline preload="metadata" src={previewArtifactUrl}>
-                            {isZh ? '当前浏览器无法播放此视频。' : 'This browser cannot play the video.'}
-                        </video>
+                        <>
+                            <video
+                                controls
+                                playsInline
+                                preload="metadata"
+                                src={previewArtifactUrl}
+                                onError={() => setVideoPreviewError(true)}
+                            />
+                            {videoPreviewError && (
+                                <p role="status">
+                                    {isZh ? '当前浏览器无法播放此视频，请下载 MP4 审核。' : 'This browser cannot play the video; download the MP4 to review it.'}
+                                </p>
+                            )}
+                        </>
                     )}
                     {['png', 'jpg', 'jpeg'].includes(previewArtifactType || '') && (
                         <img
@@ -1068,7 +1105,9 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
                 </div>
             )}
             {request.status === 'failed' && request.last_error_code && (
-                <div className="deliverable-review-card__error">{request.last_error_code}</div>
+                <div className="deliverable-review-card__error">
+                    {deliverableErrorLabel(request.last_error_code, isZh)}
+                </div>
             )}
             {managedReviewRequired && (
                 <div className="deliverable-review-card__quality" data-status={qualityStatus || 'not_started'}>

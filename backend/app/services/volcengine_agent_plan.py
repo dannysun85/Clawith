@@ -63,12 +63,20 @@ SUPPORTED_VIDEO_MODELS = frozenset(
 )
 RETIRING_VIDEO_MODELS = frozenset({"doubao-seedance-1.5-pro"})
 VIDEO_MODEL_ALIASES = {
-    VIDEO_MODEL_15_PRO: "doubao-seedance-1-0-pro-250528",
+    VIDEO_MODEL_15_PRO: "doubao-seedance-1-5-pro-251215",
     "doubao-seedance-2.0": "doubao-seedance-2-0-260128",
     "doubao-seedance-2.0-fast": "doubao-seedance-2-0-fast-260128",
     VIDEO_MODEL_MINI: "doubao-seedance-2-0-mini-260615",
 }
-VIDEO_PROVIDER_MODELS = frozenset(VIDEO_MODEL_ALIASES.values())
+# Keep the previously shipped provider ID readable for already persisted tasks
+# and receipts.  New submissions must use the official Seedance 1.5 Pro ID
+# above; the legacy ID is only an inbound compatibility alias.
+VIDEO_MODEL_LEGACY_ALIASES = {
+    "doubao-seedance-1-0-pro-250528": VIDEO_MODEL_15_PRO,
+}
+VIDEO_PROVIDER_MODELS = frozenset(
+    (*VIDEO_MODEL_ALIASES.values(), *VIDEO_MODEL_LEGACY_ALIASES.keys())
+)
 
 # Agent Plan Seedream accepts either a quality preset (``2K``/``3K``/``4K``)
 # or an explicit ``WIDTHxHEIGHT`` value in the same ``size`` field.  A bare
@@ -477,6 +485,10 @@ def video_gateway_model_id(model: str) -> str:
     normalized = str(model or "").strip()
     if not normalized:
         raise ValueError("A Seedance model is required")
+    if normalized in VIDEO_MODEL_LEGACY_ALIASES:
+        # Canonicalize legacy persisted IDs before a new submission so a
+        # re-run cannot accidentally call the retired/wrong provider ID.
+        return VIDEO_MODEL_ALIASES[VIDEO_MODEL_LEGACY_ALIASES[normalized]]
     if normalized in VIDEO_PROVIDER_MODELS:
         return normalized
     if normalized not in SUPPORTED_VIDEO_MODELS:
@@ -493,6 +505,8 @@ def stable_video_model_name(model: str) -> str:
     for public_name, provider_name in VIDEO_MODEL_ALIASES.items():
         if normalized == provider_name:
             return public_name
+    if normalized in VIDEO_MODEL_LEGACY_ALIASES:
+        return VIDEO_MODEL_LEGACY_ALIASES[normalized]
     raise ValueError(f"Unsupported Agent Plan video model: {normalized}")
 
 
@@ -824,6 +838,7 @@ __all__ = [
     "VIDEO_MODEL_MINI",
     "VIDEO_MODEL_CAPABILITIES",
     "VIDEO_MODEL_ALIASES",
+    "VIDEO_MODEL_LEGACY_ALIASES",
     "VIDEO_MODELS_BY_PLAN_TIER",
     "VIDEO_PLAN_POLICY_REVIEWED_AT",
     "VIDEO_PLAN_POLICY_SOURCES",

@@ -109,6 +109,29 @@ async def ensure_smoke_platform_admin(email: str, password: str) -> dict[str, st
             identity = Identity(email=email, username=username)
             db.add(identity)
             await db.flush()
+        else:
+            # Never turn a real company member into a global smoke admin.  A
+            # previous local run accepted an arbitrary ``--admin-email`` and
+            # silently rebound the identity, which made browser validation
+            # enter the platform console instead of the intended tenant.
+            tenant_membership = (
+                await db.execute(
+                    select(User.id)
+                    .where(
+                        User.identity_id == identity.id,
+                        User.tenant_id.is_not(None),
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if tenant_membership is not None:
+                raise SmokeFailure(
+                    "smoke_admin_identity_safety",
+                    {
+                        "reason": "existing_identity_has_company_membership",
+                        "hint": "Use a dedicated smoke email or pass --no-admin-bootstrap with an existing platform admin.",
+                    },
+                )
 
         identity.username = username
         identity.password_hash = hash_password(password)

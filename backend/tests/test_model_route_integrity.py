@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from fastapi import HTTPException
@@ -86,6 +86,44 @@ async def test_disabled_primary_model_fails_closed_before_provider_use(monkeypat
         await model_router.resolve_route(uuid.uuid4(), "ultra", "text")
 
     load_model.assert_awaited_once_with(route.llm_model_id, enabled_only=True)
+
+
+@pytest.mark.asyncio
+async def test_text_route_keeps_minimax_m3_primary_and_agent_plan_fallback(monkeypatch):
+    primary_route = SimpleNamespace(
+        llm_model_id=uuid.uuid4(),
+        fallback_route_id=uuid.uuid4(),
+    )
+    fallback_route = SimpleNamespace(
+        saas_tier="pro",
+        modality="text",
+        llm_model_id=uuid.uuid4(),
+    )
+    primary_model = SimpleNamespace(provider="minimax", model="MiniMax-M3")
+    fallback_model = SimpleNamespace(
+        provider="volcengine_agent_plan",
+        model="doubao-seed-2.1-turbo",
+    )
+    monkeypatch.setattr(model_router, "_check_tier_entitlement", AsyncMock())
+    monkeypatch.setattr(model_router, "_pick_route", AsyncMock(return_value=primary_route))
+    monkeypatch.setattr(
+        model_router,
+        "_pick_route_by_id",
+        AsyncMock(return_value=fallback_route),
+    )
+    load_model = AsyncMock(side_effect=[primary_model, fallback_model])
+    monkeypatch.setattr(model_router, "_load_model", load_model)
+
+    resolved = await model_router.resolve_route(uuid.uuid4(), "pro", "text")
+
+    assert resolved.model is primary_model
+    assert resolved.fallback_model is fallback_model
+    assert resolved.provider == "minimax"
+    assert resolved.model_name == "MiniMax-M3"
+    assert load_model.await_args_list == [
+        call(primary_route.llm_model_id, enabled_only=True),
+        call(fallback_route.llm_model_id, enabled_only=True),
+    ]
 
 
 @pytest.mark.asyncio

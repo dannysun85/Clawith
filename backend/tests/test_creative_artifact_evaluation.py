@@ -61,6 +61,43 @@ def _write_screenshot_pptx(path: Path, image_path: Path) -> None:
     presentation.save(path)
 
 
+def _write_picture_mix_pptx(
+    path: Path,
+    image_path: Path,
+    *,
+    full_slide_first: bool,
+) -> None:
+    presentation = Presentation()
+    presentation.slide_width = Inches(13.333333)
+    presentation.slide_height = Inches(7.5)
+    for index in range(2):
+        slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+        if index == 0 and full_slide_first:
+            slide.shapes.add_picture(
+                str(image_path),
+                0,
+                0,
+                presentation.slide_width,
+                presentation.slide_height,
+            )
+        elif index == 0:
+            slide.shapes.add_picture(
+                str(image_path),
+                Inches(0.5),
+                Inches(0.5),
+                Inches(2),
+                Inches(1),
+            )
+        box = slide.shapes.add_textbox(
+            Inches(1),
+            Inches(1.5),
+            Inches(8),
+            Inches(1),
+        )
+        box.text = f"Slide {index + 1}"
+    presentation.save(path)
+
+
 @pytest.mark.asyncio
 async def test_image_observation_proves_structure_but_not_semantics(tmp_path) -> None:
     path = tmp_path / "candidate.png"
@@ -171,6 +208,12 @@ async def test_presentation_observation_accepts_editable_pptx_and_pdf(
     assert observation.hard_gates["editability"].passed is True
     assert observation.hard_gates["no_text_overflow"].passed is None
     assert observation.facts["pptx"]["editable_slide_ratio"] == 1
+    assert observation.facts["pptx"]["picture_count_by_slide"] == [0, 0]
+    assert observation.facts["pptx"]["granular_picture_count_by_slide"] == [0, 0]
+    assert observation.facts["pptx"]["slides_with_pictures"] == 0
+    assert observation.facts["pptx"]["slides_with_granular_pictures"] == 0
+    assert observation.facts["pptx"]["full_slide_picture_ratio"] == 0
+    assert observation.facts["pptx"]["picture_coverage_ratio_mean"] == 0
 
 
 @pytest.mark.asyncio
@@ -196,6 +239,13 @@ async def test_screenshot_only_presentation_fails_editability_contract(
 
     assert observation.hard_gates["editability"].passed is False
     assert observation.facts["pptx"]["full_slide_image_only_ratio"] == 1
+    assert observation.facts["pptx"]["picture_count_by_slide"] == [1]
+    assert observation.facts["pptx"]["granular_picture_count_by_slide"] == [0]
+    assert observation.facts["pptx"]["distinct_picture_asset_count"] == 1
+    assert observation.facts["pptx"]["full_slide_picture_ratio"] == 1
+    assert observation.facts["pptx"]["slides_with_granular_pictures_ratio"] == 0
+    assert observation.facts["pptx"]["slides_with_pictures_ratio"] == 1
+    assert observation.facts["pptx"]["picture_coverage_ratio_by_slide"] == [1]
 
 
 @pytest.mark.asyncio
@@ -215,3 +265,61 @@ async def test_missing_presentation_preview_fails_contract(tmp_path) -> None:
 
     assert observation.hard_gates["pptx_and_preview_valid"].passed is False
     assert "pdf_missing" in observation.warnings
+
+
+@pytest.mark.asyncio
+async def test_image_led_presentation_picture_coverage_gate_rejects_sparse_deck(
+    tmp_path,
+) -> None:
+    image_path = tmp_path / "asset.png"
+    pptx_path = tmp_path / "deck.pptx"
+    pdf_path = tmp_path / "deck.pdf"
+    _write_image(image_path, size=(1600, 900))
+    _write_picture_mix_pptx(pptx_path, image_path, full_slide_first=False)
+    _write_pdf(pdf_path)
+
+    observation = await observe_creative_artifacts(
+        CreativeArtifactContract(
+            modality="presentation",
+            aspect_ratio="16:9",
+            page_count=2,
+            minimum_picture_coverage_ratio=0.35,
+        ),
+        {"pptx": pptx_path, "pdf": pdf_path},
+    )
+
+    assert observation.hard_gates["minimum_picture_coverage"].passed is False
+    assert observation.facts["pptx"]["picture_coverage_ratio_mean"] < 0.35
+    scenario = next(
+        item
+        for item in generate_evaluation_bundle(seed=20260727).manifest.public_scenarios
+        if item.modality == "presentation"
+    )
+    evaluation = score_artifact_observation(scenario, observation)
+    assert evaluation.status == "blocked"
+    assert "minimum_picture_coverage" in evaluation.hard_gate_failures
+
+
+@pytest.mark.asyncio
+async def test_image_led_presentation_picture_coverage_gate_accepts_mean_threshold(
+    tmp_path,
+) -> None:
+    image_path = tmp_path / "asset.png"
+    pptx_path = tmp_path / "deck.pptx"
+    pdf_path = tmp_path / "deck.pdf"
+    _write_image(image_path, size=(1600, 900))
+    _write_picture_mix_pptx(pptx_path, image_path, full_slide_first=True)
+    _write_pdf(pdf_path)
+
+    observation = await observe_creative_artifacts(
+        CreativeArtifactContract(
+            modality="presentation",
+            aspect_ratio="16:9",
+            page_count=2,
+            minimum_picture_coverage_ratio=0.35,
+        ),
+        {"pptx": pptx_path, "pdf": pdf_path},
+    )
+
+    assert observation.hard_gates["minimum_picture_coverage"].passed is True
+    assert observation.facts["pptx"]["picture_coverage_ratio_mean"] == 0.5

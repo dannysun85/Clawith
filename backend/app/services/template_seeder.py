@@ -22,6 +22,7 @@ from app.services.agent_template_contract import (
     load_agent_template_manifest,
     validate_template_capability_references,
 )
+from app.services.agent_candidate_templates import load_candidate_template_seeds
 from app.services.agent_tools import RUNTIME_TYPED_APPLICATION_TOOL_NAMES
 from app.services.builtin_tool_definitions import BUILTIN_TOOL_DEFINITIONS
 from app.services.skill_seeder import BUILTIN_SKILLS
@@ -219,6 +220,7 @@ DEFAULT_TEMPLATES = [
 # backend/app/services/template_seeder.py → parents[2] is backend/
 _TEMPLATE_ROOT = Path(__file__).resolve().parents[2] / "agent_templates"
 
+
 def _load_folder_templates() -> list[dict]:
     """Return a list of template dicts matching DEFAULT_TEMPLATES shape."""
     if not _TEMPLATE_ROOT.exists():
@@ -250,10 +252,14 @@ def _load_folder_templates() -> list[dict]:
 
 
 def _merged_templates() -> list[dict]:
-    """Python legacy + folder templates, folder wins on name collision."""
+    """Merge legacy, enabled folder, and disabled candidate templates."""
     by_name: dict[str, dict] = {t["name"]: t for t in DEFAULT_TEMPLATES}
     for folder_tmpl in _load_folder_templates():
         by_name[folder_tmpl["name"]] = folder_tmpl
+    for candidate in load_candidate_template_seeds():
+        if candidate["name"] in by_name:
+            raise TemplateContractError(f"candidate template name collides with an existing role: {candidate['name']}")
+        by_name[candidate["name"]] = candidate
     return list(by_name.values())
 
 
@@ -269,23 +275,17 @@ async def seed_agent_templates():
             from sqlalchemy import func
 
             current_names = {t["name"] for t in templates}
-            result = await db.execute(
-                select(AgentTemplate).where(AgentTemplate.is_builtin.is_(True))
-            )
+            result = await db.execute(select(AgentTemplate).where(AgentTemplate.is_builtin.is_(True)))
             existing_builtins = result.scalars().all()
             for old in existing_builtins:
                 if old.name not in current_names:
                     # Check if any agents still reference this template
-                    ref_count = await db.execute(
-                        select(func.count(Agent.id)).where(Agent.template_id == old.id)
-                    )
+                    ref_count = await db.execute(select(func.count(Agent.id)).where(Agent.template_id == old.id))
                     if ref_count.scalar() == 0:
                         await db.delete(old)
                         logger.info("[TemplateSeeder] Removed old template")
                     else:
-                        logger.info(
-                            "[TemplateSeeder] Skipped deleting referenced old template"
-                        )
+                        logger.info("[TemplateSeeder] Skipped deleting referenced old template")
 
             # Upsert templates
             for tmpl in templates:
@@ -306,25 +306,56 @@ async def seed_agent_templates():
                     existing.default_mcp_servers = tmpl.get("default_mcp_servers", [])
                     existing.default_autonomy_policy = tmpl["default_autonomy_policy"]
                     existing.capability_bullets = tmpl["capability_bullets"]
+                    existing.role_key = tmpl.get("role_key")
+                    existing.role_revision = tmpl.get("role_revision", 1)
+                    existing.responsibilities = tmpl.get("responsibilities", [])
+                    existing.non_responsibilities = tmpl.get("non_responsibilities", [])
+                    existing.limitations = tmpl.get("limitations", [])
+                    existing.workflows = tmpl.get("workflows", [])
+                    existing.deliverables = tmpl.get("deliverables", [])
+                    existing.evaluation_criteria = tmpl.get("evaluation_criteria", [])
+                    existing.source_provenance = tmpl.get("source_provenance", {})
+                    existing.lifecycle_status = tmpl.get("lifecycle_status", "enabled")
+                    existing.activation_gate = tmpl.get("activation_gate")
+                    existing.workforce_source_role_id = tmpl.get("workforce_source_role_id")
+                    existing.workforce_decision = tmpl.get("workforce_decision")
+                    existing.workforce_pack = tmpl.get("workforce_pack")
                 else:
-                    db.add(AgentTemplate(
-                        name=tmpl["name"],
-                        description=tmpl["description"],
-                        icon=tmpl["icon"],
-                        category=tmpl["category"],
-                        is_builtin=True,
-                        soul_template=tmpl["soul_template"],
-                        default_skills=tmpl["default_skills"],
-                        default_tools=tmpl.get("default_tools", []),
-                        default_mcp_servers=tmpl.get("default_mcp_servers", []),
-                        default_autonomy_policy=tmpl["default_autonomy_policy"],
-                        capability_bullets=tmpl["capability_bullets"],
-                    ))
+                    db.add(
+                        AgentTemplate(
+                            name=tmpl["name"],
+                            description=tmpl["description"],
+                            icon=tmpl["icon"],
+                            category=tmpl["category"],
+                            is_builtin=True,
+                            soul_template=tmpl["soul_template"],
+                            default_skills=tmpl["default_skills"],
+                            default_tools=tmpl.get("default_tools", []),
+                            default_mcp_servers=tmpl.get("default_mcp_servers", []),
+                            default_autonomy_policy=tmpl["default_autonomy_policy"],
+                            capability_bullets=tmpl["capability_bullets"],
+                            role_key=tmpl.get("role_key"),
+                            role_revision=tmpl.get("role_revision", 1),
+                            responsibilities=tmpl.get("responsibilities", []),
+                            non_responsibilities=tmpl.get("non_responsibilities", []),
+                            limitations=tmpl.get("limitations", []),
+                            workflows=tmpl.get("workflows", []),
+                            deliverables=tmpl.get("deliverables", []),
+                            evaluation_criteria=tmpl.get("evaluation_criteria", []),
+                            source_provenance=tmpl.get("source_provenance", {}),
+                            lifecycle_status=tmpl.get("lifecycle_status", "enabled"),
+                            activation_gate=tmpl.get("activation_gate"),
+                            workforce_source_role_id=tmpl.get("workforce_source_role_id"),
+                            workforce_decision=tmpl.get("workforce_decision"),
+                            workforce_pack=tmpl.get("workforce_pack"),
+                        )
+                    )
                     logger.info("[TemplateSeeder] Created template")
             await db.commit()
-            logger.info(f"[TemplateSeeder] Seeded {len(templates)} templates "
-                        f"({len(DEFAULT_TEMPLATES)} legacy + "
-                        f"{len(templates) - len(DEFAULT_TEMPLATES)} folder)")
+            logger.info(
+                "[TemplateSeeder] Seeded {} templates including 92 disabled workforce candidates",
+                len(templates),
+            )
 
     # Tools are executable grants, separate from copied Skill instructions.
     # Reconciliation owns only source=template rows, so a removed role grant is
@@ -339,3 +370,4 @@ async def seed_agent_templates():
             "[TemplateSeeder] Reconciled template tool grants report={}",
             report.as_log_dict(),
         )
+    return report

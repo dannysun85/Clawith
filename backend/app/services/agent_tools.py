@@ -8575,6 +8575,7 @@ async def _convert_html_to_pdf(agent_id: uuid.UUID, ws: Path, arguments: dict) -
         return f"❌ Source file not found: {source_path}"
 
     conversion_arguments = dict(arguments)
+    conversion_arguments["_require_adaptive_visual_plan"] = True
     for argument_name, internal_name in (
         ("outline_path", "_outline_file_path"),
         ("slide_spec_path", "_slide_spec_file_path"),
@@ -8617,6 +8618,7 @@ async def _convert_html_to_pptx(agent_id: uuid.UUID, ws: Path, arguments: dict) 
         return "❌ Source file not found."
 
     conversion_arguments = dict(arguments)
+    conversion_arguments["_require_adaptive_visual_plan"] = True
     for argument_name, internal_name in (
         ("outline_path", "_outline_file_path"),
         ("slide_spec_path", "_slide_spec_file_path"),
@@ -27998,6 +28000,8 @@ async def _generate_image_minimax_durable(
     brand_asset,
     brand_position: str,
     brand_scale: float,
+    overlay_blocks: tuple[dict[str, str], ...] = (),
+    overlay_blocks_digest: str | None = None,
     typed: bool = False,
     provider: str = "minimax",
     provider_size: str | None = None,
@@ -28109,6 +28113,8 @@ async def _generate_image_minimax_durable(
                 "output_content_type": output_content_type,
                 "overlay_text": overlay_text,
                 "overlay_text_sha256": hashlib.sha256(overlay_text.encode("utf-8")).hexdigest(),
+                "overlay_blocks": list(overlay_blocks),
+                "overlay_blocks_sha256": overlay_blocks_digest,
                 "overlay_position": overlay_position,
                 "brand_position": brand_position,
                 "brand_scale": brand_scale,
@@ -28238,6 +28244,24 @@ async def _generate_image_minimax_durable(
                 typed=typed,
                 status="failed",
                 error_code="media_image_compensated",
+                agent_id=agent_id,
+                modality="image",
+                record_id=record_id,
+                model=model,
+                tier=tier,
+                provider=provider,
+            )
+        if outcome.status == "asset_delivery_failed":
+            summary = (
+                "❌ The image provider completed successfully, but Astra could not "
+                "produce an artifact that satisfies the local delivery contract. "
+                "The provider charge is retained for operator settlement; do not submit again."
+            )
+            return _minimax_tool_result(
+                summary,
+                typed=typed,
+                status="failed",
+                error_code="media_image_asset_delivery_failed",
                 agent_id=agent_id,
                 modality="image",
                 record_id=record_id,
@@ -32282,6 +32306,7 @@ async def _generate_image(
     size = arguments.get("size", "1024x1024")
     save_path = arguments.get("save_path", "")
     overlay_text = str(arguments.get("overlay_text") or "")
+    overlay_blocks_value = arguments.get("overlay_blocks")
     overlay_position = (arguments.get("overlay_position") or "bottom").strip().lower()
     brand_position = (arguments.get("brand_position") or "center").strip().lower()
     try:
@@ -32300,6 +32325,8 @@ async def _generate_image(
         MediaContractError,
         load_brand_asset,
         normalize_overlay_text,
+        normalize_overlay_blocks,
+        validate_overlay_blocks,
         validate_overlay_text,
     )
 
@@ -32341,7 +32368,11 @@ async def _generate_image(
         )
     try:
         overlay_text = normalize_overlay_text(overlay_text)
+        overlay_blocks = normalize_overlay_blocks(overlay_blocks_value)
+        if overlay_text and overlay_blocks:
+            raise MediaContractError("Use overlay_text or overlay_blocks, not both")
         validate_overlay_text(overlay_text)
+        overlay_blocks_digest = validate_overlay_blocks(overlay_blocks)
         brand_asset = load_brand_asset(ws, arguments.get("brand_asset"))
     except MediaContractError as exc:
         return _minimax_tool_result(
@@ -32394,9 +32425,15 @@ async def _generate_image(
     full_save_path.parent.mkdir(parents=True, exist_ok=True)
 
     provider_prompt = str(prompt)
-    if overlay_text.strip() or brand_asset:
+    if overlay_text.strip() or overlay_blocks or brand_asset:
+        reserved_copy = [overlay_text] if overlay_text.strip() else [
+            block["text"] for block in overlay_blocks
+        ]
+        background_prompt = provider_prompt
+        for exact_text in reserved_copy:
+            background_prompt = background_prompt.replace(exact_text, "")
         provider_prompt = (
-            f"{prompt}\nCreate only a clean visual background. Do not render words, letters, captions, logos, "
+            f"{background_prompt}\nCreate only a clean visual background. Do not render words, letters, captions, logos, "
             "watermarks, product packaging, or product replicas. Leave clear negative space for Astra to add "
             "the exact copy and protected brand asset after generation."
         )
@@ -32536,6 +32573,8 @@ async def _generate_image(
                     save_path=save_path,
                     output_extension=full_save_path.suffix.lower(),
                     overlay_text=overlay_text,
+                    overlay_blocks=overlay_blocks,
+                    overlay_blocks_digest=overlay_blocks_digest,
                     overlay_position=overlay_position,
                     brand_asset=brand_asset,
                     brand_position=brand_position,
@@ -32626,6 +32665,7 @@ async def _generate_image(
         image_bytes, overlay_receipt = apply_image_brand_overlays(
             image_bytes,
             overlay_text,
+            overlay_blocks=overlay_blocks,
             text_position=overlay_position,
             brand_asset=brand_asset,
             brand_position=brand_position,

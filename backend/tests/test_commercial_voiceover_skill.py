@@ -47,7 +47,6 @@ def test_commercial_voiceover_skill_is_managed_and_role_scoped() -> None:
     for folder in {
         "chief-of-staff",
         "growth-hacker",
-        "private-assistant",
         "xiaohongshu-operator",
     }:
         assert SKILL_FOLDER not in _template(folder)["default_skills"]

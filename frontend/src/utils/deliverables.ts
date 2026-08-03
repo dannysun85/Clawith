@@ -56,6 +56,31 @@ export function deliverableLaunchMessage(request: DeliverableRequest, isChinese:
         : `Start from the confirmed work brief: ${request.goal}`;
 }
 
+/**
+ * Keep the composer synchronized with the latest confirmed brief without
+ * overwriting text that the user has edited themselves.
+ *
+ * A newly saved brief replaces an empty composer, or the launch text that was
+ * generated for the previous pending brief. Anything else is treated as user
+ * authored content and is preserved.
+ */
+export function nextDeliverableComposerText(
+    currentText: string,
+    request: DeliverableRequest,
+    previousRequest: DeliverableRequest | null | undefined,
+    isChinese: boolean,
+): string {
+    const nextText = deliverableLaunchMessage(request, isChinese);
+    const previousText = previousRequest
+        ? deliverableLaunchMessage(previousRequest, isChinese)
+        : null;
+    const current = currentText.trim();
+    if (!current || (previousText && current === previousText.trim())) {
+        return nextText;
+    }
+    return currentText;
+}
+
 export function deliverableApprovalBlocked(request: DeliverableRequest): boolean {
     return request.status === 'waiting_approval'
         && request.current_stage === 'output_review'

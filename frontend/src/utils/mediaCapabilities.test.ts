@@ -36,4 +36,36 @@ describe('media capability helpers', () => {
             expect.objectContaining({ disabled: true, action: 'upgrade' }),
         );
     });
+
+    it('keeps a degraded route usable for quick generation while formal delivery gates remain separate', () => {
+        const state = mediaCapabilityState({
+            ...base,
+            modality: 'video',
+            tool_name: 'generate_video_minimax',
+            capability_status: 'degraded',
+            available_providers: ['minimax'],
+            route_reason: 'commercial_primary_unavailable',
+        }, 'zh');
+
+        expect(state).toEqual(expect.objectContaining({ disabled: false, action: null }));
+        expect(state.label).toContain('当前仅有应急质量线路');
+        expect(state.label).toContain('正式交付需先确认质量差异');
+    });
+
+    it('shows the server-provided account-tier explanation for a degraded route', () => {
+        const state = mediaCapabilityState({
+            ...base,
+            modality: 'video',
+            tool_name: 'generate_video_minimax',
+            capability_status: 'degraded',
+            available_providers: ['minimax'],
+            route_reason: 'commercial_primary_unavailable',
+            next_action: '火山 Agent Plan 当前为 plan=small，不包含视频资格；当前仅有 MiniMax 应急视频线路。',
+        }, 'zh');
+
+        expect(state.disabled).toBe(false);
+        expect(state.label).toContain('正式交付需先确认质量差异');
+        expect(state.label).not.toContain('plan=small');
+        expect(state.label).not.toContain('不包含视频资格');
+    });
 });

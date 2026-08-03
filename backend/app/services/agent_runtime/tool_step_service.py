@@ -122,37 +122,91 @@ _CHINESE_OUTPUT_NUMBERS = {
     "九": 9,
     "十": 10,
 }
-_EXACT_COPY_PATTERNS = (
-    re.compile(
-        r"(?:主标题|副标题|标题|文案|字幕|文字|一句话)"
-        r"[^。！？\n]{0,96}?[“\"「『]([^”\"」』\n]{1,200})[”\"」』]",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"(?:headline|title|caption|copy|visible text)"
-        r"[^.!?\n]{0,96}?(?:read|say|show|display|be)\s*[:：]?\s*"
-        r"[“\"]([^”\"\n]{1,200})[”\"]",
-        re.IGNORECASE,
-    ),
+_QUOTED_COPY_PATTERN = re.compile(
+    r"[【“\"「『](?P<text>[^】”\"」』\n]{1,300})[】”\"」』]"
 )
+_EXACT_COPY_CUES = (
+    ("主标题", "title"),
+    ("副标题", "subtitle"),
+    ("标语", "tagline"),
+    ("按钮文案", "cta"),
+    ("按钮文字", "cta"),
+    ("按钮内文字", "cta"),
+    ("按钮内白色文字", "cta"),
+    ("cta", "cta"),
+    ("headline", "title"),
+    ("visible text", "body"),
+    ("caption", "body"),
+    ("title", "title"),
+    ("copy", "body"),
+    ("标题", "title"),
+    ("文案", "body"),
+    ("字幕", "body"),
+    ("文字", "body"),
+    ("一句话", "body"),
+)
+
+
+def _required_exact_overlay_blocks(goal: str) -> list[dict[str, str]]:
+    """Return ordered, role-aware visible copy explicitly requested by the user."""
+
+    candidates: list[tuple[int, dict[str, str]]] = []
+    for match in _QUOTED_COPY_PATTERN.finditer(goal):
+        text = match.group("text").strip()
+        if not text:
+            continue
+        clause_start = max(
+            goal.rfind(separator, 0, match.start())
+            for separator in ("。", "！", "？", "\n", ".", "!", "?")
+        )
+        prefix = goal[max(clause_start + 1, match.start() - 120) : match.start()]
+        normalized_prefix = prefix.casefold()
+        cue_matches: list[tuple[int, int, str]] = []
+        for cue, role in _EXACT_COPY_CUES:
+            offset = normalized_prefix.rfind(cue.casefold())
+            if offset >= 0:
+                cue_matches.append((offset + len(cue), len(cue), role))
+        if not cue_matches:
+            continue
+        _offset, _cue_length, role = max(cue_matches)
+        if role == "body" and any(
+            marker in normalized_prefix for marker in ("按钮", "button")
+        ):
+            role = "cta"
+        candidates.append((match.start("text"), {"role": role, "text": text}))
+
+    ordered: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for _offset, block in sorted(candidates):
+        identity = (block["role"], block["text"])
+        if identity not in seen:
+            ordered.append(block)
+            seen.add(identity)
+    return ordered
 
 
 def _required_exact_overlay_text(goal: str) -> str | None:
     """Return user-specified visible copy only when the request is explicit."""
 
-    candidates: list[tuple[int, str]] = []
-    for pattern in _EXACT_COPY_PATTERNS:
-        for match in pattern.finditer(goal):
-            value = match.group(1).strip()
-            if value:
-                candidates.append((match.start(1), value))
-    if not candidates:
+    blocks = _required_exact_overlay_blocks(goal)
+    if not blocks:
         return None
-    ordered: list[str] = []
-    for _offset, value in sorted(candidates):
-        if value not in ordered:
-            ordered.append(value)
-    return "\n".join(ordered)
+    return "\n".join(block["text"] for block in blocks)
+
+
+def _normalized_overlay_blocks(value: object) -> list[dict[str, str]] | None:
+    if not isinstance(value, list):
+        return None
+    normalized: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            return None
+        role = str(item.get("role") or "").strip().casefold()
+        text = str(item.get("text") or "").strip()
+        if not role or not text:
+            return None
+        normalized.append({"role": role, "text": text})
+    return normalized
 
 
 def _media_reference_requirement(goal: str, modality: str) -> str | None:
@@ -242,15 +296,28 @@ def _media_contract_block(
     if modality not in {"image", "video"}:
         return None
 
-    exact_copy = _required_exact_overlay_text(goal)
+    exact_blocks = _required_exact_overlay_blocks(goal)
+    exact_copy = "\n".join(block["text"] for block in exact_blocks) or None
     overlay_text = str(arguments.get("overlay_text") or "").strip()
-    if exact_copy is not None and overlay_text != exact_copy:
+    supplied_blocks = _normalized_overlay_blocks(arguments.get("overlay_blocks"))
+    requires_structured_blocks = modality == "image" and len(exact_blocks) > 1
+    if requires_structured_blocks:
+        exact_copy_satisfied = supplied_blocks == exact_blocks
+    elif modality == "video":
+        exact_copy_satisfied = overlay_text == exact_copy
+    else:
+        exact_copy_satisfied = supplied_blocks == exact_blocks or overlay_text == exact_copy
+    if exact_copy is not None and not exact_copy_satisfied:
+        required_argument = (
+            f"overlay_blocks set exactly to {json.dumps(exact_blocks, ensure_ascii=False)}"
+            if requires_structured_blocks
+            else f"overlay_text set exactly to {json.dumps(exact_copy, ensure_ascii=False)}"
+        )
         return (
             "media_generation_contract_blocked",
             (
                 "[BLOCKED] This request requires exact visible copy. Retry one "
-                f"{modality} generation call with overlay_text set exactly to "
-                f"{json.dumps(exact_copy, ensure_ascii=False)}, together with every "
+                f"{modality} generation call with {required_argument}, together with every "
                 "required reference asset. No media provider request was made."
             ),
         )

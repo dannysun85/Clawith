@@ -20,6 +20,9 @@ MAX_REFERENCE_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_IMAGE_EDGE_PIXELS = 8192
 MAX_IMAGE_PIXELS = 40_000_000
 MAX_OVERLAY_TEXT_CHARS = 300
+MAX_OVERLAY_BLOCKS = 8
+MAX_OVERLAY_BLOCK_TEXT_CHARS = 300
+MAX_OVERLAY_BLOCK_TOTAL_CHARS = 600
 SUPPORTED_REFERENCE_FORMATS = {
     "JPEG": "image/jpeg",
     "PNG": "image/png",
@@ -30,9 +33,11 @@ _FONT_CANDIDATES = (
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
     "/System/Library/Fonts/PingFang.ttc",
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
     "/System/Library/Fonts/STHeiti Medium.ttc",
 )
 _TEXT_POSITIONS = {"top", "center", "bottom"}
+_OVERLAY_BLOCK_ROLES = {"title", "subtitle", "tagline", "body", "cta"}
 _BRAND_POSITIONS = {
     "top_left",
     "top_right",
@@ -73,6 +78,15 @@ class OverlayReceipt:
     font_face_index: int | None = None
     line_count: int = 0
     background_sanitized: bool = False
+    layout_version: str | None = None
+    block_count: int = 0
+    overlay_blocks_sha256: str | None = None
+    source_width: int | None = None
+    source_height: int | None = None
+    output_width: int | None = None
+    output_height: int | None = None
+    output_bytes: int | None = None
+    size_adjusted: bool = False
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -369,6 +383,61 @@ def normalize_overlay_text(text: str | None) -> str:
     return value.replace("\t", "    ")
 
 
+def normalize_overlay_blocks(value: object) -> tuple[dict[str, str], ...]:
+    """Validate role-aware exact copy for deterministic commercial poster layout."""
+
+    if value is None or value == "" or value == [] or value == ():
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise MediaContractError("overlay_blocks must be an array")
+    if not 1 <= len(value) <= MAX_OVERLAY_BLOCKS:
+        raise MediaContractError(
+            f"overlay_blocks must contain between 1 and {MAX_OVERLAY_BLOCKS} items"
+        )
+    normalized: list[dict[str, str]] = []
+    total_chars = 0
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise MediaContractError(f"overlay_blocks[{index}] must be an object")
+        role = str(item.get("role") or "").strip().casefold()
+        if role not in _OVERLAY_BLOCK_ROLES:
+            raise MediaContractError(
+                f"overlay_blocks[{index}].role must be one of: "
+                f"{', '.join(sorted(_OVERLAY_BLOCK_ROLES))}"
+            )
+        text = normalize_overlay_text(item.get("text"))
+        if not text:
+            raise MediaContractError(f"overlay_blocks[{index}].text must not be empty")
+        if len(text) > MAX_OVERLAY_BLOCK_TEXT_CHARS:
+            raise MediaContractError(
+                f"overlay_blocks[{index}].text must be at most "
+                f"{MAX_OVERLAY_BLOCK_TEXT_CHARS} characters"
+            )
+        total_chars += len(text)
+        normalized.append({"role": role, "text": text})
+    if total_chars > MAX_OVERLAY_BLOCK_TOTAL_CHARS:
+        raise MediaContractError(
+            f"overlay_blocks text must total at most {MAX_OVERLAY_BLOCK_TOTAL_CHARS} characters"
+        )
+    return tuple(normalized)
+
+
+def overlay_blocks_sha256(value: object) -> str | None:
+    blocks = normalize_overlay_blocks(value)
+    if not blocks:
+        return None
+    canonical = json.dumps(blocks, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def validate_overlay_blocks(value: object) -> str | None:
+    blocks = normalize_overlay_blocks(value)
+    if not blocks:
+        return None
+    _font_for_text("\n".join(block["text"] for block in blocks))
+    return overlay_blocks_sha256(blocks)
+
+
 @lru_cache(maxsize=32)
 def _font_faces(path: str) -> tuple[tuple[int, frozenset[int], str], ...]:
     from fontTools.ttLib import TTCollection, TTFont
@@ -572,10 +641,171 @@ def _render_text_layer(canvas, text: str, *, position: str) -> OverlayReceipt:
     )
 
 
+def _poster_block_layout(
+    draw,
+    text: str,
+    selection: FontSelection,
+    role: str,
+    width: int,
+    height: int,
+):
+    from PIL import ImageFont
+
+    short_edge = min(width, height)
+    role_scale = {
+        "title": 0.082,
+        "subtitle": 0.038,
+        "tagline": 0.029,
+        "body": 0.032,
+        "cta": 0.036,
+    }[role]
+    max_width_ratio = 0.82 if role != "cta" else 0.42
+    max_width = max(1, int(width * max_width_ratio))
+    largest_size = max(18, min(280, int(short_edge * role_scale)))
+    smallest_size = max(13, int(short_edge * 0.021))
+    for font_size in range(largest_size, smallest_size - 1, -1):
+        font = ImageFont.truetype(selection.path, font_size, index=selection.face_index)
+        lines = _wrapped_lines(draw, text, font, max_width)
+        boxes = [draw.textbbox((0, 0), line or " ", font=font) for line in lines]
+        widths = [box[2] - box[0] if line else 0 for line, box in zip(lines, boxes, strict=True)]
+        sample = draw.textbbox((0, 0), "国Ag", font=font)
+        default_height = max(sample[3] - sample[1], 1)
+        heights = [max(box[3] - box[1], default_height) for box in boxes]
+        spacing = max(3, font_size // 5)
+        if max(widths, default=0) <= max_width:
+            return font, lines, boxes, widths, heights, spacing
+    raise MediaContractError(
+        f"overlay_blocks {role} copy cannot fit without truncation"
+    )
+
+
+def _render_poster_blocks(canvas, blocks: tuple[dict[str, str], ...]) -> OverlayReceipt:
+    """Render a quiet, role-aware poster hierarchy without a generic black text box."""
+
+    from PIL import Image, ImageDraw, ImageFilter
+
+    all_text = "\n".join(block["text"] for block in blocks)
+    selection = _font_for_text(all_text)
+    width, height = canvas.size
+    draw = ImageDraw.Draw(canvas, "RGBA")
+    non_cta = [block for block in blocks if block["role"] != "cta"]
+    ctas = [block for block in blocks if block["role"] == "cta"]
+    layouts = [
+        (
+            block,
+            _poster_block_layout(
+                draw,
+                block["text"],
+                selection,
+                block["role"],
+                width,
+                height,
+            ),
+        )
+        for block in non_cta
+    ]
+    block_gap = max(10, int(height * 0.014))
+    layout_heights = [sum(layout[4]) + layout[5] * max(len(layout[1]) - 1, 0) for _block, layout in layouts]
+    group_height = sum(layout_heights) + block_gap * max(len(layouts) - 1, 0)
+    cursor_y = max(int(height * 0.31), (height - group_height) // 2)
+    total_lines = 0
+
+    for (block, layout), block_height in zip(layouts, layout_heights, strict=True):
+        font, lines, boxes, widths, heights, spacing = layout
+        font_size = int(font.size)
+        fill = {
+            "title": (255, 255, 255, 255),
+            "subtitle": (252, 250, 255, 245),
+            "tagline": (225, 216, 255, 235),
+            "body": (242, 238, 255, 240),
+        }[block["role"]]
+        line_y = cursor_y
+        for line, box, line_width, line_height in zip(lines, boxes, widths, heights, strict=True):
+            if line:
+                x = (width - line_width) // 2 - box[0]
+                if block["role"] == "title":
+                    glow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+                    glow_draw = ImageDraw.Draw(glow, "RGBA")
+                    glow_draw.text(
+                        (x, line_y - box[1]),
+                        line,
+                        font=font,
+                        fill=(210, 173, 255, 210),
+                        stroke_width=max(2, font_size // 18),
+                        stroke_fill=(160, 118, 255, 170),
+                    )
+                    canvas.alpha_composite(
+                        glow.filter(ImageFilter.GaussianBlur(max(2, font_size // 12)))
+                    )
+                draw.text(
+                    (x, line_y - box[1]),
+                    line,
+                    font=font,
+                    fill=fill,
+                    stroke_width=max(1, font_size // 48) if block["role"] == "title" else 0,
+                    stroke_fill=(255, 220, 255, 210),
+                )
+            line_y += line_height + spacing
+            total_lines += 1
+        cursor_y += block_height + block_gap
+
+    cta_y = max(cursor_y + block_gap, int(height * 0.62))
+    for block in ctas:
+        font, lines, boxes, widths, heights, spacing = _poster_block_layout(
+            draw,
+            block["text"],
+            selection,
+            "cta",
+            width,
+            height,
+        )
+        text_width = max(widths, default=0)
+        text_height = sum(heights) + spacing * max(len(lines) - 1, 0)
+        pad_x = max(24, int(font.size * 0.9))
+        pad_y = max(12, int(font.size * 0.42))
+        button_width = text_width + pad_x * 2
+        button_height = text_height + pad_y * 2
+        x = width - button_width - max(18, int(width * 0.08))
+        y = min(cta_y, height - button_height - max(18, int(height * 0.08)))
+        rect = (x, y, x + button_width, y + button_height)
+        radius = button_height // 2
+        draw.rounded_rectangle(rect, radius=radius, fill=(176, 103, 235, 235))
+        inset = max(2, int(font.size * 0.08))
+        draw.rounded_rectangle(
+            (x + inset, y + inset, x + button_width - inset, y + button_height - inset),
+            radius=max(1, radius - inset),
+            outline=(255, 221, 255, 230),
+            width=max(1, inset),
+        )
+        line_y = y + pad_y
+        for line, box, line_width, line_height in zip(lines, boxes, widths, heights, strict=True):
+            draw.text(
+                (x + (button_width - line_width) // 2 - box[0], line_y - box[1]),
+                line,
+                font=font,
+                fill=(255, 255, 255, 255),
+            )
+            line_y += line_height + spacing
+            total_lines += 1
+        cta_y = y + button_height + block_gap
+
+    return OverlayReceipt(
+        rendered_text_sha256=hashlib.sha256(all_text.encode("utf-8")).hexdigest(),
+        font_sha256=selection.sha256,
+        font_family=selection.family,
+        font_face_index=selection.face_index,
+        line_count=total_lines,
+        layout_version="poster-v1",
+        block_count=len(blocks),
+        overlay_blocks_sha256=overlay_blocks_sha256(blocks),
+    )
+
+
 def _compose_overlay_canvas(
     size: tuple[int, int],
     text: str | None,
     *,
+    overlay_blocks: tuple[dict[str, str], ...] = (),
     text_position: str,
     brand_asset: ImageAsset | None,
     brand_position: str,
@@ -594,6 +824,14 @@ def _compose_overlay_canvas(
         )
         receipt = OverlayReceipt(brand_asset_sha256=brand_asset.sha256)
     normalized_text = normalize_overlay_text(text)
+    if normalized_text and overlay_blocks:
+        raise MediaContractError("Use overlay_text or overlay_blocks, not both")
+    if overlay_blocks:
+        text_receipt = _render_poster_blocks(canvas, overlay_blocks)
+        receipt = replace(
+            text_receipt,
+            brand_asset_sha256=receipt.brand_asset_sha256,
+        )
     if normalized_text:
         text_receipt = _render_text_layer(canvas, normalized_text, position=text_position)
         receipt = OverlayReceipt(
@@ -607,6 +845,55 @@ def _compose_overlay_canvas(
     return canvas, receipt
 
 
+def _encode_bounded_image(
+    image,
+    normalized_format: str,
+    *,
+    max_bytes: int = MAX_REFERENCE_IMAGE_BYTES,
+) -> tuple[bytes, tuple[int, int]]:
+    """Encode below the delivery limit, downscaling only when compression is insufficient."""
+
+    from PIL import Image
+
+    alpha_extrema = image.getchannel("A").getextrema()
+    if normalized_format == "PNG" and alpha_extrema[0] < 255:
+        # Retain meaningful transparency without forcing every opaque PNG
+        # through a larger four-channel encoding.
+        working = image.convert("RGBA")
+    else:
+        flattened = Image.new("RGB", image.size, (255, 255, 255))
+        if "A" in image.getbands():
+            flattened.paste(image, mask=image.getchannel("A"))
+        else:
+            flattened.paste(image)
+        working = flattened
+    for _attempt in range(12):
+        quality_values = (95, 90, 85, 80) if normalized_format == "JPEG" else (None,)
+        last_size = 0
+        for quality in quality_values:
+            output = BytesIO()
+            save_kwargs: dict[str, object] = {"optimize": True}
+            if quality is not None:
+                save_kwargs["quality"] = quality
+            working.save(output, format=normalized_format, **save_kwargs)
+            result = output.getvalue()
+            last_size = len(result)
+            if last_size < max_bytes:
+                return result, working.size
+        ratio = max_bytes / max(last_size, 1)
+        scale = min(0.95, max(0.72, ratio**0.5 * 0.97))
+        next_size = (
+            max(1, int(working.width * scale)),
+            max(1, int(working.height * scale)),
+        )
+        if next_size == working.size:
+            break
+        working = working.resize(next_size, Image.Resampling.LANCZOS)
+    raise MediaContractError(
+        f"Generated image could not be encoded below {max_bytes} bytes"
+    )
+
+
 def _brand_safe_background_blur(size: tuple[int, int]) -> float:
     """Scale a text-suppressing blur without erasing the background motion."""
     return round(max(8.0, min(24.0, min(size) * 0.02)), 2)
@@ -616,6 +903,7 @@ def apply_image_brand_overlays(
     raw: bytes,
     text: str | None,
     *,
+    overlay_blocks: object = None,
     text_position: str = "bottom",
     brand_asset: ImageAsset | None = None,
     brand_position: str = "center",
@@ -625,7 +913,10 @@ def apply_image_brand_overlays(
 ) -> tuple[bytes, OverlayReceipt]:
     """Render exact copy and an immutable product/logo layer on one image."""
     normalized_text = normalize_overlay_text(text)
-    if not normalized_text and not brand_asset and not output_format:
+    normalized_blocks = normalize_overlay_blocks(overlay_blocks)
+    if normalized_text and normalized_blocks:
+        raise MediaContractError("Use overlay_text or overlay_blocks, not both")
+    if not normalized_text and not normalized_blocks and not brand_asset and not output_format:
         return raw, OverlayReceipt()
 
     from PIL import Image, ImageFilter, ImageOps
@@ -640,6 +931,7 @@ def apply_image_brand_overlays(
     overlay, receipt = _compose_overlay_canvas(
         image.size,
         normalized_text,
+        overlay_blocks=normalized_blocks,
         text_position=text_position,
         brand_asset=brand_asset,
         brand_position=brand_position,
@@ -649,23 +941,23 @@ def apply_image_brand_overlays(
     if sanitize_generated_background:
         receipt = replace(receipt, background_sanitized=True)
 
-    output = BytesIO()
     requested = str(output_format or "PNG").strip().upper().lstrip(".")
     if requested == "WEBP":
         # The supported production contract must not depend on an optional
         # Pillow/libwebp encoder that is absent from some release runtimes.
         raise MediaContractError("WebP output encoding is unavailable; use PNG or JPEG")
     normalized_format = {"JPG": "JPEG", "JPEG": "JPEG"}.get(requested, "PNG")
-    save_kwargs = {"optimize": True}
-    if normalized_format == "JPEG":
-        save_kwargs["quality"] = 95
-    if normalized_format == "JPEG":
-        flattened = Image.new("RGB", image.size, (255, 255, 255))
-        flattened.paste(image, mask=image.getchannel("A"))
-        flattened.save(output, format=normalized_format, **save_kwargs)
-    else:
-        image.save(output, format=normalized_format, **save_kwargs)
-    result = output.getvalue()
+    source_width, source_height = image.size
+    result, output_size = _encode_bounded_image(image, normalized_format)
+    receipt = replace(
+        receipt,
+        source_width=source_width,
+        source_height=source_height,
+        output_width=output_size[0],
+        output_height=output_size[1],
+        output_bytes=len(result),
+        size_adjusted=output_size != (source_width, source_height),
+    )
     validate_generated_image(result)
     return result, receipt
 

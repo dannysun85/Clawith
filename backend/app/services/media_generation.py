@@ -47,6 +47,7 @@ from app.services.media_assets import (
     apply_image_brand_overlays,
     apply_video_brand_overlays,
     image_asset_from_bytes,
+    overlay_blocks_sha256,
     trim_generated_audio,
     valid_mp4,
     validate_generated_audio,
@@ -129,8 +130,52 @@ _PUBLIC_MEDIA_METADATA_KEYS = frozenset(
         "output_extension",
         "sample_rate",
         "error",
+        "_astra_media_contract",
+        "_astra_output_sha256",
     }
 )
+_PUBLIC_MEDIA_CONTRACT_KEYS = frozenset(
+    {
+        "rendered_text_sha256",
+        "brand_asset_sha256",
+        "font_sha256",
+        "font_family",
+        "font_face_index",
+        "line_count",
+        "background_sanitized",
+        "layout_version",
+        "block_count",
+        "overlay_blocks_sha256",
+        "source_width",
+        "source_height",
+        "output_width",
+        "output_height",
+        "output_bytes",
+        "size_adjusted",
+        "duration_seconds",
+        "requested_duration_seconds",
+        "codec_name",
+        "sample_rate",
+        "channels",
+        "container_format",
+    }
+)
+
+
+def _public_media_metadata(values: dict) -> dict:
+    public = {
+        field: value
+        for field, value in values.items()
+        if field in _PUBLIC_MEDIA_METADATA_KEYS and field != "_astra_media_contract"
+    }
+    contract = values.get("_astra_media_contract")
+    if isinstance(contract, dict):
+        public["_astra_media_contract"] = {
+            field: value
+            for field, value in contract.items()
+            if field in _PUBLIC_MEDIA_CONTRACT_KEYS
+        }
+    return public
 
 
 def _media_provider_slug(provider: str | None) -> str:
@@ -1727,6 +1772,7 @@ async def _record_provider_success_asset_failure(
     *,
     expected_working_status: str,
     processing_lease_token: str,
+    retryable: bool = True,
 ) -> tuple[bool, MediaGenerationTask]:
     """Hold provider debt while bounded local asset repair is attempted.
 
@@ -1767,7 +1813,7 @@ async def _record_provider_success_asset_failure(
             f"Provider succeeded; local asset delivery failed: {_safe_error(error)}"
         )[:1000]
         task.last_checked_at = _utcnow()
-        if task.consecutive_error_count >= max_errors:
+        if not retryable or task.consecutive_error_count >= max_errors:
             # Durable manual-reconciliation state. It is intentionally neither
             # terminal nor daemon-due: Credits remain held and Agent deletion
             # is fenced until an operator repairs or settles the artifact.
@@ -2435,6 +2481,12 @@ async def reconcile_minimax_sync_media_task(
         return MediaGenerationOutcome(status="failed", error="Media task modality is not synchronous")
     if task.status == "compensated":
         return MediaGenerationOutcome(status="compensated", error=task.last_error)
+    if task.status == "asset_delivery_failed":
+        return MediaGenerationOutcome(
+            status="asset_delivery_failed",
+            error=task.last_error,
+            retryable=False,
+        )
     if task.status in {"failed", "closed_nonrefundable"}:
         return MediaGenerationOutcome(status="failed", error=task.last_error)
 
@@ -2475,6 +2527,7 @@ async def reconcile_minimax_sync_media_task(
     )
     processing_lease_token: str | None = None
     failure_expected_status = str(task.status or "")
+    status_data: dict | None = None
 
     try:
         raw = await _load_sync_recovery_bytes(task)
@@ -2542,7 +2595,7 @@ async def reconcile_minimax_sync_media_task(
         failure_expected_status = "sync_processing"
         metadata = dict(task.request_metadata or {})
         processing_lease_token = str(metadata.get("processing_lease_token") or "")
-        status_data: dict = {"status": "Success", "recovered": True}
+        status_data = {"status": "Success", "recovered": True}
         content_type = str(metadata.get("output_content_type") or "application/octet-stream")
         output_bytes = raw
         if task.modality == "image":
@@ -2559,6 +2612,16 @@ async def reconcile_minimax_sync_media_task(
                 hashlib.sha256(overlay_text.encode("utf-8")).hexdigest(),
             ):
                 raise MediaContractError("Frozen image copy hash changed")
+            overlay_blocks = metadata.get("overlay_blocks") or []
+            expected_blocks_sha256 = str(metadata.get("overlay_blocks_sha256") or "")
+            actual_blocks_sha256 = overlay_blocks_sha256(overlay_blocks)
+            if overlay_blocks and not expected_blocks_sha256:
+                raise MediaContractError("Frozen image overlay blocks hash is missing")
+            if expected_blocks_sha256 and (
+                not actual_blocks_sha256
+                or not hmac.compare_digest(expected_blocks_sha256, actual_blocks_sha256)
+            ):
+                raise MediaContractError("Frozen image overlay blocks hash changed")
             brand_asset = None
             brand_key = _validated_sync_brand_asset_key(task)
             if brand_key:
@@ -2577,6 +2640,7 @@ async def reconcile_minimax_sync_media_task(
             output_bytes, receipt = apply_image_brand_overlays(
                 raw,
                 overlay_text,
+                overlay_blocks=overlay_blocks,
                 text_position=str(metadata.get("overlay_position") or "bottom"),
                 brand_asset=brand_asset,
                 brand_position=str(metadata.get("brand_position") or "center"),
@@ -2673,6 +2737,20 @@ async def reconcile_minimax_sync_media_task(
         return MediaGenerationOutcome(status="succeeded", output_path=completed.output_path)
     except asyncio.CancelledError:
         raise
+    except MediaContractError as exc:
+        _recorded, failed_task = await _record_provider_success_asset_failure(
+            record_id,
+            exc,
+            status_data,
+            expected_working_status=failure_expected_status or "sync_processing",
+            processing_lease_token=processing_lease_token,
+            retryable=False,
+        )
+        return MediaGenerationOutcome(
+            status=failed_task.status,
+            error=failed_task.last_error or _safe_error(exc),
+            retryable=False,
+        )
     except Exception as exc:
         task = await _load_task(record_id) or task
         expiry_reason = _media_task_expiry_reason(task)
@@ -3696,21 +3774,11 @@ async def _write_task_metadata(task: MediaGenerationTask, updates: dict) -> None
             existing = json.loads(await storage.read_text(key, encoding="utf-8", errors="replace"))
             if isinstance(existing, dict):
                 payload.update(
-                    {
-                        field: value
-                        for field, value in existing.items()
-                        if field in _PUBLIC_MEDIA_METADATA_KEYS
-                    }
+                    _public_media_metadata(existing)
                 )
     except Exception:
         logger.warning("[media] invalid existing metadata ignored key={}", key)
-    payload.update(
-        {
-            field: value
-            for field, value in (task.request_metadata or {}).items()
-            if field in _PUBLIC_MEDIA_METADATA_KEYS
-        }
-    )
+    payload.update(_public_media_metadata(task.request_metadata or {}))
     payload.update({
         # The concrete route is an operator concern stored in SQL. Workspace
         # compatibility metadata remains stable across transparent failover.
@@ -3719,13 +3787,7 @@ async def _write_task_metadata(task: MediaGenerationTask, updates: dict) -> None
         "task_id": task.provider_task_id or payload.get("task_id") or "",
         "save_path": task.output_path,
     })
-    payload.update(
-        {
-            field: value
-            for field, value in updates.items()
-            if field in _PUBLIC_MEDIA_METADATA_KEYS
-        }
-    )
+    payload.update(_public_media_metadata(updates))
     await storage.write_text(key, json.dumps(payload, ensure_ascii=False, indent=2, default=str))
 
 
@@ -3979,11 +4041,45 @@ async def _backfill_one_legacy_minimax_video_task(record_id: uuid.UUID) -> bool:
             "Finalized legacy MiniMax task has no usable workspace video asset",
         )
         return False
+    try:
+        # Legacy workspace metadata is editable and therefore cannot itself
+        # prove that the referenced object is a deliverable.  Read and probe
+        # the bytes before importing the record into the durable success
+        # state.  Requiring the browser-safe contract prevents old H.265,
+        # truncated, or otherwise non-playable files from being surfaced as
+        # successful media tasks.
+        raw = await storage.read_bytes(output_key)
+        video_info = await validate_generated_video(
+            raw,
+            label="Legacy MiniMax video",
+        )
+        validate_video_delivery_contract(
+            video_info,
+            expected_duration_seconds=metadata.get("duration"),
+            expected_aspect_ratio=metadata.get("aspect_ratio"),
+            require_audio=bool(metadata.get("require_audio")),
+        )
+    except Exception as exc:
+        await _record_legacy_backfill_attention(
+            record_id,
+            f"Legacy MiniMax workspace video failed media validation: {_safe_error(exc)}",
+        )
+        return False
     request_metadata = {
         key: metadata[key]
-        for key in ("credit_cost", "model", "duration", "resolution", "created_at")
+        for key in (
+            "credit_cost",
+            "model",
+            "duration",
+            "resolution",
+            "aspect_ratio",
+            "require_audio",
+            "created_at",
+        )
         if key in metadata
     }
+    request_metadata["output_sha256"] = hashlib.sha256(raw).hexdigest()
+    request_metadata["output_content_type"] = "video/mp4"
 
     try:
         async with async_session() as db:
@@ -3999,6 +4095,7 @@ async def _backfill_one_legacy_minimax_video_task(record_id: uuid.UUID) -> bool:
             task.last_response = None
             task.last_error = None
             task.consecutive_error_count = 0
+            task.output_size = len(raw)
             task.completed_at = _utcnow()
             task.next_poll_at = None
             await db.commit()

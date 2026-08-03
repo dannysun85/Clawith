@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+
 from PIL import Image
 
 from app.services.creative_evidence_collection import (
@@ -173,3 +175,35 @@ def test_ocr_variants_cover_all_four_corners(tmp_path) -> None:
         "bottom-right-enhanced.png",
     }
     assert all(variant.is_file() for variant in variants)
+
+
+def test_tesseract_execution_failure_is_fail_closed(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "candidate.png"
+    Image.new("RGB", (128, 128), color=(255, 255, 255)).save(path)
+    monkeypatch.setattr(
+        "app.services.creative_evidence_collection.shutil.which",
+        lambda binary: f"/fake/{binary}",
+    )
+    monkeypatch.setattr(
+        "app.services.creative_evidence_collection._available_tesseract_languages",
+        lambda _path: ("eng",),
+    )
+    monkeypatch.setattr(
+        "app.services.creative_evidence_collection.subprocess.run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            subprocess.CalledProcessError(1, ["tesseract"])
+        ),
+    )
+
+    receipt = collect_ocr_evidence(
+        artifact_type="image",
+        path=path,
+        expected_languages=("en-US",),
+    )
+
+    assert receipt.status == "unavailable"
+    assert any("ocr_execution_failed=tesseract_exit_1" in item for item in receipt.findings)
+    assert any("absence_is_not_visual_proof" in item for item in receipt.findings)

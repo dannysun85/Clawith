@@ -82,6 +82,8 @@ spec:
           value: {{ .Values.backend.env.runtimeV2SourceTypes | quote }}
         - name: HEARTBEAT_ENABLED
           value: {{ .Values.backend.env.heartbeatEnabled | quote }}
+        - name: HTTP_PROXY
+          value: {{ .Values.backend.env.httpProxy | quote }}
         {{- if .Values.backend.hostCerts.enabled }}
         - name: SSL_CERT_FILE
           value: {{ .Values.backend.hostCerts.containerPaths.sslCertFile | quote }}

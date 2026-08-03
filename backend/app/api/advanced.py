@@ -16,11 +16,13 @@ from app.models.agent import Agent, AgentPermission, AgentTemplate
 from app.models.org import AgentRelationship, OrgMember
 from app.models.user import User
 from app.services.collaboration import collaboration_service
+from app.services.agent_template_contract import TEMPLATE_LIFECYCLE_ENABLED
 
 router = APIRouter(tags=["advanced"])
 
 
 # ─── Collaboration ──────────────────────────────────────
+
 
 class DelegateRequest(BaseModel):
     to_agent_id: uuid.UUID
@@ -100,6 +102,7 @@ async def send_inter_agent_message(
 
 # ─── Template Market ────────────────────────────────────
 
+
 class TemplateCreate(BaseModel):
     name: str
     description: str = ""
@@ -122,6 +125,20 @@ class TemplateOut(BaseModel):
     default_tools: list
     default_autonomy_policy: dict
     is_builtin: bool
+    role_key: str | None = None
+    role_revision: int = 1
+    responsibilities: list = Field(default_factory=list)
+    non_responsibilities: list = Field(default_factory=list)
+    limitations: list = Field(default_factory=list)
+    workflows: list = Field(default_factory=list)
+    deliverables: list = Field(default_factory=list)
+    evaluation_criteria: list = Field(default_factory=list)
+    source_provenance: dict = Field(default_factory=dict)
+    lifecycle_status: str = TEMPLATE_LIFECYCLE_ENABLED
+    activation_gate: str | None = None
+    workforce_source_role_id: str | None = None
+    workforce_decision: str | None = None
+    workforce_pack: str | None = None
     created_at: str | None = None
 
     model_config = {"from_attributes": True}
@@ -133,7 +150,11 @@ async def list_templates(
     db: AsyncSession = Depends(get_db),
 ):
     """List available agent templates."""
-    query = select(AgentTemplate).order_by(AgentTemplate.name)
+    query = (
+        select(AgentTemplate)
+        .where(AgentTemplate.lifecycle_status == TEMPLATE_LIFECYCLE_ENABLED)
+        .order_by(AgentTemplate.name)
+    )
     if category:
         query = query.where(AgentTemplate.category == category)
     result = await db.execute(query)
@@ -143,7 +164,12 @@ async def list_templates(
 @router.get("/templates/{template_id}", response_model=TemplateOut)
 async def get_template(template_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     """Get template details."""
-    result = await db.execute(select(AgentTemplate).where(AgentTemplate.id == template_id))
+    result = await db.execute(
+        select(AgentTemplate).where(
+            AgentTemplate.id == template_id,
+            AgentTemplate.lifecycle_status == TEMPLATE_LIFECYCLE_ENABLED,
+        )
+    )
     template = result.scalar_one_or_none()
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
@@ -175,6 +201,7 @@ async def create_template(
         default_skills=data.default_skills,
         default_tools=[],
         default_autonomy_policy={},
+        lifecycle_status=TEMPLATE_LIFECYCLE_ENABLED,
         created_by=current_user.id,
     )
     db.add(template)
@@ -198,6 +225,7 @@ async def delete_template(
 
 # ─── Agent Handover ─────────────────────────────────────
 
+
 class HandoverRequest(BaseModel):
     new_creator_id: uuid.UUID
 
@@ -214,11 +242,7 @@ async def handover_agent(
     from app.models.audit import AuditLog
 
     agent, _access = await check_agent_access(db, current_user, agent_id)
-    locked_agent = (
-        await db.execute(
-            select(Agent).where(Agent.id == agent_id).with_for_update()
-        )
-    ).scalar_one_or_none()
+    locked_agent = (await db.execute(select(Agent).where(Agent.id == agent_id).with_for_update())).scalar_one_or_none()
     if locked_agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
     if not is_agent_creator(current_user, locked_agent):
@@ -238,11 +262,7 @@ async def handover_agent(
         .with_for_update()
     )
     new_creator = new_creator_result.scalar_one_or_none()
-    if (
-        not new_creator
-        or new_creator.identity is None
-        or not new_creator.identity.is_active
-    ):
+    if not new_creator or new_creator.identity is None or not new_creator.identity.is_active:
         raise HTTPException(
             status_code=403,
             detail="Target user must be an active member of this tenant",
@@ -303,15 +323,17 @@ async def handover_agent(
             created_by_user_id=current_user.id,
         )
 
-    db.add(AuditLog(
-        user_id=current_user.id,
-        agent_id=agent_id,
-        action="agent:handover",
-        details={
-            "from_creator": str(old_creator_id),
-            "to_creator": str(data.new_creator_id),
-        },
-    ))
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            agent_id=agent_id,
+            action="agent:handover",
+            details={
+                "from_creator": str(old_creator_id),
+                "to_creator": str(data.new_creator_id),
+            },
+        )
+    )
     await db.flush()
 
     return {
@@ -322,6 +344,7 @@ async def handover_agent(
 
 
 # ─── Observability ──────────────────────────────────────
+
 
 @router.get("/agents/{agent_id}/metrics")
 async def get_agent_metrics(
@@ -338,9 +361,7 @@ async def get_agent_metrics(
 
     # Task stats
     total_tasks = await db.execute(select(func.count(Task.id)).where(Task.agent_id == agent_id))
-    done_tasks = await db.execute(
-        select(func.count(Task.id)).where(Task.agent_id == agent_id, Task.status == "done")
-    )
+    done_tasks = await db.execute(select(func.count(Task.id)).where(Task.agent_id == agent_id, Task.status == "done"))
     pending_tasks = await db.execute(
         select(func.count(Task.id)).where(Task.agent_id == agent_id, Task.status == "pending")
     )
@@ -357,15 +378,15 @@ async def get_agent_metrics(
 
     # Recent activity count (last 24h)
     from datetime import datetime, timedelta, timezone
+
     cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
     recent_actions = await db.execute(
-        select(func.count(AuditLog.id)).where(
-            AuditLog.agent_id == agent_id, AuditLog.created_at >= cutoff
-        )
+        select(func.count(AuditLog.id)).where(AuditLog.agent_id == agent_id, AuditLog.created_at >= cutoff)
     )
 
     # Container status
     from app.services.agent_manager import agent_manager
+
     container_status = agent_manager.get_container_status(agent)
 
     # Extract scalar values (each result can only be consumed once)
@@ -391,9 +412,15 @@ async def get_agent_metrics(
             "cache_creation_today": agent.cache_creation_tokens_today,
             "cache_creation_month": agent.cache_creation_tokens_month,
             "cache_creation_total": agent.cache_creation_tokens_total,
-            "cache_hit_rate_today": round((agent.cache_read_tokens_today or 0) / max(agent.tokens_used_today or 0, 1), 4),
-            "cache_hit_rate_month": round((agent.cache_read_tokens_month or 0) / max(agent.tokens_used_month or 0, 1), 4),
-            "cache_hit_rate_total": round((agent.cache_read_tokens_total or 0) / max(agent.tokens_used_total or 0, 1), 4),
+            "cache_hit_rate_today": round(
+                (agent.cache_read_tokens_today or 0) / max(agent.tokens_used_today or 0, 1), 4
+            ),
+            "cache_hit_rate_month": round(
+                (agent.cache_read_tokens_month or 0) / max(agent.tokens_used_month or 0, 1), 4
+            ),
+            "cache_hit_rate_total": round(
+                (agent.cache_read_tokens_total or 0) / max(agent.tokens_used_total or 0, 1), 4
+            ),
             "limit_day": agent.max_tokens_per_day,
             "limit_month": agent.max_tokens_per_month,
         },
@@ -401,9 +428,7 @@ async def get_agent_metrics(
             "total": _total_tasks,
             "done": _done_tasks,
             "pending": _pending_tasks,
-            "completion_rate": round(
-                _done_tasks / max(_total_tasks, 1) * 100, 1
-            ),
+            "completion_rate": round(_done_tasks / max(_total_tasks, 1) * 100, 1),
         },
         "approvals": {
             "total": _total_approvals,

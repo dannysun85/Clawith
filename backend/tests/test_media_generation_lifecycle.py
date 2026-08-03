@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock
 
 import pytest
 from sqlalchemy.dialects import postgresql
@@ -17,7 +17,7 @@ from app.models.notification import Notification
 from app.models.subscription import CreditReservation
 from app.services import media_generation
 from app.services import tool_seeder
-from app.services.media_assets import OverlayReceipt, VideoInfo
+from app.services.media_assets import MediaContractError, OverlayReceipt, VideoInfo
 
 
 def test_media_generation_task_has_durable_recovery_identity():
@@ -81,6 +81,17 @@ async def test_public_media_metadata_never_exposes_private_recovery_identity(mon
         task,
         {
             "status": "Success",
+            "_astra_output_sha256": "a" * 64,
+            "_astra_media_contract": {
+                "layout_version": "poster-v1",
+                "block_count": 4,
+                "overlay_blocks_sha256": "b" * 64,
+                "output_width": 2160,
+                "output_height": 3840,
+                "output_bytes": 19_000_000,
+                "size_adjusted": True,
+                "credential_id": "nested-secret",
+            },
             "credential_id": "update-credential",
             "reservation_id": "update-reservation",
             "acceptance_evidence_storage_key": "_internal/acceptance.json",
@@ -92,6 +103,16 @@ async def test_public_media_metadata_never_exposes_private_recovery_identity(mon
     assert payload["prompt"] == "public prompt"
     assert payload["task_id"] == "provider-task"
     assert payload["provider"] == "platform_media"
+    assert payload["_astra_output_sha256"] == "a" * 64
+    assert payload["_astra_media_contract"] == {
+        "layout_version": "poster-v1",
+        "block_count": 4,
+        "overlay_blocks_sha256": "b" * 64,
+        "output_width": 2160,
+        "output_height": 3840,
+        "output_bytes": 19_000_000,
+        "size_adjusted": True,
+    }
     assert not {
         "credential_id",
         "reservation_id",
@@ -198,6 +219,207 @@ def test_legacy_backfill_never_accepts_paths_outside_workspace():
         "workspace/videos/demo clip.mp4",
         "provider-task",
     ) == "workspace/videos/demo clip.mp4"
+
+
+@pytest.mark.asyncio
+async def test_legacy_backfill_requires_browser_safe_video_receipt(monkeypatch):
+    tenant_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    reservation_id = uuid.uuid4()
+    record_id = uuid.uuid4()
+    task = SimpleNamespace(
+        id=record_id,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        user_id=user_id,
+        reservation_id=reservation_id,
+        status="backfill_scanning",
+        output_size=None,
+        request_metadata={},
+        last_response={"legacy": True},
+        last_error=None,
+        consecutive_error_count=0,
+        completed_at=None,
+        next_poll_at=None,
+        credential_id=uuid.uuid4(),
+        provider_task_id="legacy-provider-task",
+        metadata_path="",
+        output_path="",
+    )
+    reservation = SimpleNamespace(
+        id=reservation_id,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        user_id=user_id,
+        status="finalized",
+    )
+    video_bytes = b"legacy-valid-video"
+    metadata = {
+        "reservation_id": str(reservation_id),
+        "task_id": "legacy-provider-task",
+        "downloaded_path": "workspace/videos/legacy.mp4",
+        "duration": 1,
+        "model": "MiniMax-Hailuo-2.3",
+    }
+    entry = SimpleNamespace(
+        is_dir=False,
+        name="legacy.json",
+        key=f"{agent_id}/workspace/videos/legacy.json",
+    )
+
+    class Storage:
+        async def list_dir(self, _key):
+            return [entry]
+
+        async def read_text(self, _key, **_kwargs):
+            return json.dumps(metadata)
+
+        async def exists(self, key):
+            return key.endswith("workspace/videos/legacy.mp4")
+
+        async def is_file(self, key):
+            return key.endswith("workspace/videos/legacy.mp4")
+
+        async def read_bytes(self, key):
+            assert key.endswith("workspace/videos/legacy.mp4")
+            return video_bytes
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, model, _record_id, **_kwargs):
+            if model is MediaGenerationTask:
+                return task
+            if model is CreditReservation:
+                return reservation
+            return None
+
+        async def commit(self):
+            return None
+
+    attention: list[str] = []
+    monkeypatch.setattr(media_generation, "async_session", lambda: Session())
+    monkeypatch.setattr(media_generation, "get_storage_backend", lambda: Storage())
+    monkeypatch.setattr(
+        media_generation,
+        "validate_generated_video",
+        AsyncMock(
+            return_value=VideoInfo(640, 360, 1.0, "h264", "yuv420p", "aac", True)
+        ),
+    )
+    monkeypatch.setattr(
+        media_generation,
+        "_record_legacy_backfill_attention",
+        AsyncMock(side_effect=lambda _record_id, reason: attention.append(reason)),
+    )
+
+    imported = await media_generation._backfill_one_legacy_minimax_video_task(record_id)
+
+    assert imported is True
+    assert task.status == "succeeded"
+    assert task.output_size == len(video_bytes)
+    assert task.request_metadata["output_sha256"] == hashlib.sha256(video_bytes).hexdigest()
+    assert task.request_metadata["output_content_type"] == "video/mp4"
+    assert attention == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_backfill_routes_invalid_video_to_attention(monkeypatch):
+    tenant_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    reservation_id = uuid.uuid4()
+    record_id = uuid.uuid4()
+    task = SimpleNamespace(
+        id=record_id,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        user_id=user_id,
+        reservation_id=reservation_id,
+        status="backfill_scanning",
+        output_size=None,
+        request_metadata={},
+        last_response=None,
+        last_error=None,
+        consecutive_error_count=0,
+        completed_at=None,
+        next_poll_at=None,
+    )
+    reservation = SimpleNamespace(
+        id=reservation_id,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        user_id=user_id,
+        status="finalized",
+    )
+    entry = SimpleNamespace(
+        is_dir=False,
+        name="legacy.json",
+        key=f"{agent_id}/workspace/videos/legacy.json",
+    )
+
+    class Storage:
+        async def list_dir(self, _key):
+            return [entry]
+
+        async def read_text(self, _key, **_kwargs):
+            return json.dumps(
+                {
+                    "reservation_id": str(reservation_id),
+                    "task_id": "legacy-provider-task",
+                    "downloaded_path": "workspace/videos/legacy.mp4",
+                }
+            )
+
+        async def exists(self, key):
+            return key.endswith("workspace/videos/legacy.mp4")
+
+        async def is_file(self, key):
+            return key.endswith("workspace/videos/legacy.mp4")
+
+        async def read_bytes(self, _key):
+            return b"not-an-mp4"
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, model, _record_id, **_kwargs):
+            if model is MediaGenerationTask:
+                return task
+            if model is CreditReservation:
+                return reservation
+            return None
+
+    attention: list[str] = []
+    monkeypatch.setattr(media_generation, "async_session", lambda: Session())
+    monkeypatch.setattr(media_generation, "get_storage_backend", lambda: Storage())
+    monkeypatch.setattr(
+        media_generation,
+        "validate_generated_video",
+        AsyncMock(side_effect=MediaContractError("not a valid MP4 payload")),
+    )
+    monkeypatch.setattr(
+        media_generation,
+        "_record_legacy_backfill_attention",
+        AsyncMock(side_effect=lambda _record_id, reason: attention.append(reason)),
+    )
+
+    imported = await media_generation._backfill_one_legacy_minimax_video_task(record_id)
+
+    assert imported is False
+    assert task.status == "backfill_scanning"
+    assert attention == [
+        "Legacy MiniMax workspace video failed media validation: not a valid MP4 payload"
+    ]
 
 
 @pytest.mark.asyncio
@@ -764,6 +986,78 @@ async def test_unrepairable_missing_asset_is_not_written_back_as_succeeded(monke
     assert task.next_poll_at is None
     assert "provider no longer retains the file" in task.last_error
     record_issue.assert_awaited_once_with(task, task.last_error)
+
+
+@pytest.mark.asyncio
+async def test_deterministic_asset_contract_failure_is_terminal_without_retry(monkeypatch):
+    task = SimpleNamespace(
+        id=uuid.uuid4(),
+        status="sync_processing",
+        reservation_id=uuid.uuid4(),
+        request_metadata={"processing_lease_token": "lease-a"},
+        consecutive_error_count=0,
+        last_response=None,
+        last_error=None,
+        last_checked_at=None,
+        next_poll_at=datetime.now(timezone.utc),
+    )
+    reservation = SimpleNamespace(id=task.reservation_id, amount=4)
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            return task
+
+        async def commit(self):
+            return None
+
+    mark_settlement_ready = AsyncMock()
+    record_issue = AsyncMock()
+    monkeypatch.setattr(media_generation, "async_session", lambda: Session())
+    monkeypatch.setattr(
+        media_generation,
+        "_lock_owned_media_reservation",
+        AsyncMock(return_value=reservation),
+    )
+    monkeypatch.setattr(
+        media_generation,
+        "mark_credit_reservation_settlement_ready_in_session",
+        mark_settlement_ready,
+    )
+    monkeypatch.setattr(media_generation, "_record_media_failure_issue", record_issue)
+    monkeypatch.setattr(
+        media_generation,
+        "get_settings",
+        lambda: SimpleNamespace(
+            MEDIA_GENERATION_MAX_CONSECUTIVE_ERRORS=8,
+            MEDIA_GENERATION_POLL_INTERVAL_SECONDS=5,
+        ),
+    )
+
+    recorded, result = await media_generation._record_provider_success_asset_failure(
+        task.id,
+        MediaContractError("Generated image must be smaller than 20MB"),
+        {"status": "Success"},
+        expected_working_status="sync_processing",
+        processing_lease_token="lease-a",
+        retryable=False,
+    )
+
+    assert recorded is True
+    assert result.status == "asset_delivery_failed"
+    assert result.next_poll_at is None
+    assert result.consecutive_error_count == 1
+    mark_settlement_ready.assert_awaited_once_with(
+        ANY,
+        reservation.id,
+        amount=4,
+    )
+    record_issue.assert_awaited_once()
 
 
 @pytest.mark.asyncio

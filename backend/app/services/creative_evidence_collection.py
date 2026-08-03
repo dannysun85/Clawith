@@ -37,6 +37,14 @@ _LANGUAGE_TO_TESSERACT = {
 }
 
 
+class _OcrExecutionError(RuntimeError):
+    """A bounded OCR/FFmpeg failure that must not become an API 500."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
 def _sha256_file(path: Path) -> str:
     if path.is_symlink() or not path.is_file():
         raise ValueError("OCR artifact must be a regular file")
@@ -112,14 +120,21 @@ def _run_tesseract(
     if languages:
         command.extend(["-l", "+".join(languages)])
     command.extend(["--psm", "11", "tsv"])
-    process = subprocess.run(
-        command,
-        check=True,
-        capture_output=True,
-        errors="replace",
-        text=True,
-        timeout=90,
-    )
+    try:
+        process = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            errors="replace",
+            text=True,
+            timeout=90,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise _OcrExecutionError(f"tesseract_exit_{exc.returncode}") from exc
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise _OcrExecutionError(
+            f"tesseract_{type(exc).__name__.lower()}"
+        ) from exc
     return parse_tesseract_tsv(
         process.stdout,
         minimum_confidence=minimum_confidence,
@@ -264,24 +279,31 @@ def _extract_video_frames(
     output_dir: Path,
 ) -> tuple[Path, ...]:
     output_pattern = output_dir / "frame-%03d.png"
-    subprocess.run(
-        [
-            ffmpeg_path,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            str(path),
-            "-vf",
-            "fps=1,scale='min(1280,iw)':-2",
-            "-frames:v",
-            str(MAX_VIDEO_OCR_FRAMES),
-            str(output_pattern),
-        ],
-        check=True,
-        capture_output=True,
-        timeout=180,
-    )
+    try:
+        subprocess.run(
+            [
+                ffmpeg_path,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(path),
+                "-vf",
+                "fps=1,scale='min(1280,iw)':-2",
+                "-frames:v",
+                str(MAX_VIDEO_OCR_FRAMES),
+                str(output_pattern),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=180,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise _OcrExecutionError(f"ffmpeg_exit_{exc.returncode}") from exc
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise _OcrExecutionError(
+            f"ffmpeg_{type(exc).__name__.lower()}"
+        ) from exc
     return tuple(sorted(output_dir.glob("frame-*.png")))
 
 
@@ -324,12 +346,26 @@ def collect_ocr_evidence(
     coverage_complete = set(required_languages) <= set(available_languages)
 
     if artifact_type == "image":
-        tokens, ocr_variant_count = _collect_path_ocr_tokens(
-            path,
-            tesseract_path=tesseract_path,
-            languages=usable_languages,
-            minimum_confidence=minimum_confidence,
-        )
+        try:
+            tokens, ocr_variant_count = _collect_path_ocr_tokens(
+                path,
+                tesseract_path=tesseract_path,
+                languages=usable_languages,
+                minimum_confidence=minimum_confidence,
+            )
+        except _OcrExecutionError as exc:
+            return CreativeEvidenceReceipt(
+                receipt_ref=f"ocr-{artifact_hash[:20]}",
+                kind="ocr",
+                status="unavailable",
+                artifact_hashes={"image": artifact_hash},
+                source="tesseract:tsv",
+                language_coverage=usable_languages,
+                findings=(
+                    f"ocr_execution_failed={exc.code}",
+                    "ocr_absence_is_not_visual_proof; independent human visual review remains required",
+                ),
+            )
         scanned_frame_count = 1
     else:
         ffmpeg_path = shutil.which(ffmpeg_binary)
@@ -343,30 +379,44 @@ def collect_ocr_evidence(
                 language_coverage=usable_languages,
                 findings=("FFmpeg executable was not found",),
             )
-        with tempfile.TemporaryDirectory(prefix="creative-frame-ocr-") as temp_dir:
-            frame_paths = _extract_video_frames(
-                path,
-                ffmpeg_path=ffmpeg_path,
-                output_dir=Path(temp_dir),
-            )
-            frame_results = tuple(
-                _collect_path_ocr_tokens(
-                    frame_path,
-                    tesseract_path=tesseract_path,
-                    languages=usable_languages,
-                    minimum_confidence=minimum_confidence,
+        try:
+            with tempfile.TemporaryDirectory(prefix="creative-frame-ocr-") as temp_dir:
+                frame_paths = _extract_video_frames(
+                    path,
+                    ffmpeg_path=ffmpeg_path,
+                    output_dir=Path(temp_dir),
                 )
-                for frame_path in frame_paths
+                frame_results = tuple(
+                    _collect_path_ocr_tokens(
+                        frame_path,
+                        tesseract_path=tesseract_path,
+                        languages=usable_languages,
+                        minimum_confidence=minimum_confidence,
+                    )
+                    for frame_path in frame_paths
+                )
+                tokens = tuple(
+                    token
+                    for frame_tokens, _variant_count in frame_results
+                    for token in frame_tokens
+                )
+                ocr_variant_count = sum(
+                    variant_count for _frame_tokens, variant_count in frame_results
+                )
+                scanned_frame_count = len(frame_paths)
+        except _OcrExecutionError as exc:
+            return CreativeEvidenceReceipt(
+                receipt_ref=f"frame-ocr-{artifact_hash[:20]}",
+                kind="frame_ocr",
+                status="unavailable",
+                artifact_hashes={"mp4": artifact_hash},
+                source="tesseract:tsv+ffmpeg",
+                language_coverage=usable_languages,
+                findings=(
+                    f"ocr_execution_failed={exc.code}",
+                    "ocr_absence_is_not_visual_proof; independent human visual review remains required",
+                ),
             )
-            tokens = tuple(
-                token
-                for frame_tokens, _variant_count in frame_results
-                for token in frame_tokens
-            )
-            ocr_variant_count = sum(
-                variant_count for _frame_tokens, variant_count in frame_results
-            )
-            scanned_frame_count = len(frame_paths)
 
     status = "complete" if coverage_complete and required_languages else "partial"
     return CreativeEvidenceReceipt(

@@ -4,7 +4,11 @@ import { Suspense, lazy, useEffect, useLayoutEffect, useState, useRef } from 're
 import { useTranslation } from 'react-i18next';
 import { authApi } from './services/api';
 import { canAccessSaasAdmin } from './utils/saasAdmin';
-import { consumeSessionTokenFromUrl, resolveBootstrapToken } from './utils/authTransport';
+import {
+    consumeSessionTokenFromUrl,
+    establishBrowserSession,
+    resolveBootstrapToken,
+} from './utils/authTransport';
 import { useQueryClient } from '@tanstack/react-query';
 import { authQueryScopeKey, tenantWorkspaceRedirect } from './utils/workspaceAccess';
 
@@ -285,11 +289,22 @@ export default function App() {
                 window.history.replaceState({}, '', cleanUrl);
             }
 
-            if (effectiveToken && !useAuthStore.getState().user) {
+            if (effectiveToken) {
                 try {
-                    const authenticatedUser = await authApi.me();
-                    if (!cancelled) {
-                        await setAuth(authenticatedUser, effectiveToken);
+                    const existingUser = useAuthStore.getState().user;
+                    if (existingUser) {
+                        // A user can survive a tenant/origin switch in the SPA
+                        // while the host-only HttpOnly cookie does not. Refresh
+                        // it even when the in-memory user is already populated;
+                        // otherwise native media URLs can receive a 401 while
+                        // fetch-based API calls still succeed with the bearer
+                        // token from localStorage.
+                        await establishBrowserSession(effectiveToken);
+                    } else {
+                        const authenticatedUser = await authApi.me();
+                        if (!cancelled) {
+                            await setAuth(authenticatedUser, effectiveToken);
+                        }
                     }
                 } catch {
                     if (!cancelled) {

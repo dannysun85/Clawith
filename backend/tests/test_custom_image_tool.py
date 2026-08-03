@@ -19,6 +19,7 @@ from app.services.agent_tools import (
     _custom_image_reference_to_bytes,
     _bounded_base64_decode,
     _check_video_minimax,
+    _allow_degraded_media_fallback,
     _resolve_minimax_tool_tier,
     _generate_image,
     _generate_image_minimax,
@@ -77,6 +78,14 @@ def test_minimax_portrait_t2v_contract_requires_first_frame():
         "data:image/png;base64,FRAME",
     ) is False
     assert minimax_video_requires_first_frame("16:9", None) is False
+
+
+def test_quick_media_calls_default_to_platform_managed_fallback():
+    """Chat shortcuts may fail over; formal contracts opt out explicitly."""
+
+    assert _allow_degraded_media_fallback({}) is True
+    assert _allow_degraded_media_fallback({"allow_degraded_fallback": True}) is True
+    assert _allow_degraded_media_fallback({"allow_degraded_fallback": False}) is False
 
 
 @pytest.mark.asyncio
@@ -177,6 +186,66 @@ async def test_formal_video_does_not_enter_unconfirmed_degraded_route(tmp_path):
     assert "no Credits were consumed" in result.result_summary
     assert prepare.await_count == 1
     assert prepare.await_args.args == ("volcengine_agent_plan",)
+
+
+@pytest.mark.asyncio
+async def test_quick_video_falls_back_to_minimax_when_agent_plan_is_unavailable(tmp_path):
+    """The chat shortcut must select the next route without submitting twice."""
+
+    minimax_credential = SimpleNamespace(
+        id=uuid.uuid4(),
+        provider="minimax",
+        model="MiniMax-Hailuo-2.3",
+        api_key="sk-test",
+        base_url="https://api.minimax.test",
+    )
+    prepare = AsyncMock(
+        side_effect=[
+            NoCredentialAvailable("volcengine_agent_plan", "video"),
+            minimax_credential,
+        ]
+    )
+    with (
+        patch("app.services.agent_tools._get_tool_config", AsyncMock(return_value={})),
+        patch(
+            "app.services.agent_tools._resolve_minimax_tool_tier",
+            AsyncMock(return_value="pro"),
+        ),
+        patch(
+            "app.services.minimax_media_profiles.load_platform_minimax_media_profile",
+            AsyncMock(return_value=resolve_minimax_media_profile("video", "pro")),
+        ),
+        patch(
+            "app.services.agent_tools._get_minimax_tenant_uuid",
+            AsyncMock(return_value=uuid.uuid4()),
+        ),
+        patch(
+            "app.services.media_provider_routing.prepare_media_provider",
+            prepare,
+        ),
+        patch(
+            "app.services.agent_tools._record_minimax_tool_product_issue",
+            AsyncMock(),
+        ),
+    ):
+        result = await _generate_video_minimax(
+            uuid.uuid4(),
+            tmp_path,
+            {
+                "prompt": "quick people-led commercial",
+                "aspect_ratio": "9:16",
+            },
+            typed=True,
+        )
+
+    assert isinstance(result, ToolExecutionOutcome)
+    assert result.status == "failed"
+    assert result.error_code == "media_video_requires_first_frame_for_aspect_ratio"
+    assert "No Credits were consumed" in result.result_summary
+    assert [call.args[0] for call in prepare.await_args_list] == [
+        "volcengine_agent_plan",
+        "minimax",
+    ]
 
 
 @pytest.mark.asyncio
@@ -1066,6 +1135,10 @@ async def test_generate_image_minimax_records_success(tmp_path):
     created_task = SimpleNamespace(
         request_metadata={"recovery_asset_storage_key": "_internal/recovery/image.bin"}
     )
+    overlay_blocks = [
+        {"role": "title", "text": "量化交易平台"},
+        {"role": "cta", "text": "立即体验"},
+    ]
 
     with (
         patch("app.services.agent_tools._get_tool_config", AsyncMock(return_value={"model": "image-01"})),
@@ -1105,7 +1178,11 @@ async def test_generate_image_minimax_records_success(tmp_path):
         result = await _generate_image(
             agent_id,
             tmp_path,
-            {"prompt": "cat", "save_path": "workspace/images/cat.png"},
+            {
+                "prompt": "星空海报，主标题量化交易平台，按钮立即体验",
+                "overlay_blocks": overlay_blocks,
+                "save_path": "workspace/images/cat.png",
+            },
             "minimax",
         )
 
@@ -1122,10 +1199,16 @@ async def test_generate_image_minimax_records_success(tmp_path):
     assert creation["tier"] == "pro"
     assert creation["model"] == "image-01"
     assert creation["credit_cost"] == 4
+    assert creation["request_metadata"]["overlay_blocks"] == overlay_blocks
+    assert creation["request_metadata"]["overlay_blocks_sha256"]
     assert creation["output_path"].startswith("workspace/images/cat_")
     assert creation["output_path"].endswith(".png")
     record_id = creation["record_id"]
     provider_call.assert_awaited_once()
+    submitted_prompt = provider_call.await_args.kwargs["prompt"]
+    assert "量化交易平台" not in submitted_prompt
+    assert "立即体验" not in submitted_prompt
+    assert "Do not render words" in submitted_prompt
     assert store_evidence.await_args.kwargs["recovery_id"] == record_id
     mark_accepted.assert_awaited_once_with(
         record_id,

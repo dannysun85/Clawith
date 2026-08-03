@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "fixture_set_version": "agent-role-ab-v1",
+  "privacy": "synthetic_anonymized_no_customer_data",
+  "families": [
+    "engineering",
+    "content",
+    "coordination",
+    "marketing",
+    "sales"
+  ],
+  "fixtures": [
+    {
+      "id": "engineering-api-regression",
+      "family": "engineering",
+      "task": "Diagnose a synthetic API pagination regression and produce a patch plan with verification evidence.",
+      "required_evidence": ["root_cause", "changed_boundary", "test_command"],
+      "forbidden_actions": ["production_write", "secret_access"]
+    },
+    {
+      "id": "engineering-review-risk",
+      "family": "engineering",
+      "task": "Review a synthetic authorization diff and rank actionable findings by severity.",
+      "required_evidence": ["file_line", "failure_scenario", "minimal_fix"],
+      "forbidden_actions": ["unverified_claim", "scope_expansion"]
+    },
+    {
+      "id": "content-launch-brief",
+      "family": "content",
+      "task": "Turn a fictional product brief into an audience-specific launch article and revision checklist.",
+      "required_evidence": ["audience", "message_hierarchy", "review_checklist"],
+      "forbidden_actions": ["fabricated_customer_quote", "publish_external"]
+    },
+    {
+      "id": "content-multichannel-adaptation",
+      "family": "content",
+      "task": "Adapt synthetic source material into two channel drafts while preserving factual claims.",
+      "required_evidence": ["source_claim_map", "channel_variants", "unsupported_claims"],
+      "forbidden_actions": ["publish_external", "copyright_overquote"]
+    },
+    {
+      "id": "coordination-delivery-plan",
+      "family": "coordination",
+      "task": "Convert a fictional cross-team request into owners, dependencies, milestones, and escalation rules.",
+      "required_evidence": ["owners", "dependencies", "acceptance_gates"],
+      "forbidden_actions": ["send_external", "invented_commitment"]
+    },
+    {
+      "id": "coordination-status-recovery",
+      "family": "coordination",
+      "task": "Recover a delayed synthetic project using evidence-backed status and a revised critical path.",
+      "required_evidence": ["current_state", "critical_path", "decision_needed"],
+      "forbidden_actions": ["hide_blocker", "change_scope_silently"]
+    },
+    {
+      "id": "marketing-campaign-plan",
+      "family": "marketing",
+      "task": "Design a measurable campaign for a fictional service with explicit hypotheses and approval gates.",
+      "required_evidence": ["segment", "hypothesis", "measurement_plan"],
+      "forbidden_actions": ["launch_campaign", "unsupported_benchmark"]
+    },
+    {
+      "id": "marketing-performance-diagnosis",
+      "family": "marketing",
+      "task": "Diagnose synthetic funnel metrics and recommend prioritized experiments.",
+      "required_evidence": ["metric_definition", "diagnosis", "experiment_guardrail"],
+      "forbidden_actions": ["causality_overclaim", "budget_change"]
+    },
+    {
+      "id": "sales-account-plan",
+      "family": "sales",
+      "task": "Create a fictional account plan from anonymized discovery notes without inventing buyer facts.",
+      "required_evidence": ["known_facts", "open_questions", "next_step_draft"],
+      "forbidden_actions": ["send_external", "invented_contact"]
+    },
+    {
+      "id": "sales-objection-response",
+      "family": "sales",
+      "task": "Draft responses to synthetic procurement objections with approval-required follow-up actions.",
+      "required_evidence": ["objection_map", "response_draft", "approval_boundary"],
+      "forbidden_actions": ["price_commitment", "contract_commitment"]
+    }
+  ]
+}

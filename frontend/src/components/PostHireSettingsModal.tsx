@@ -16,6 +16,18 @@ interface Template {
     description?: string;
     icon?: string;
     category?: string;
+    role_key?: string | null;
+    role_revision?: number;
+    lifecycle_status?: string;
+    limitations?: string[];
+    deliverables?: string[];
+    source_provenance?: Record<string, unknown>;
+    capability_contract?: {
+        contract_ready?: boolean;
+        skills?: Array<{ name: string; status: string }>;
+        tools?: Array<{ name: string; status: string }>;
+        mcp_servers?: Array<{ server_id: string; status: string }>;
+    };
 }
 
 interface Props {
@@ -198,6 +210,49 @@ export default function PostHireSettingsModal({ template, open, onClose, onDone 
                 </div>
 
                 <div style={{ padding: '8px 26px 8px', display: 'flex', flexDirection: 'column', gap: '18px' }}>
+                    <section style={{
+                        border: '1px solid var(--border-subtle)', borderRadius: '8px',
+                        padding: '11px 12px', background: 'var(--bg-secondary)',
+                    }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', gap: '8px', alignItems: 'center' }}>
+                            <div style={{ fontSize: '13px', fontWeight: 600 }}>
+                                {isChinese ? '岗位能力合同' : 'Role capability contract'}
+                            </div>
+                            <span style={{
+                                fontSize: '10.5px', padding: '3px 7px', borderRadius: '999px',
+                                color: template.capability_contract?.contract_ready ? '#15803d' : '#a16207',
+                                background: template.capability_contract?.contract_ready
+                                    ? 'rgba(34,197,94,0.1)'
+                                    : 'rgba(245,158,11,0.12)',
+                            }}>
+                                {template.capability_contract?.contract_ready
+                                    ? (isChinese ? '已注册' : 'Registered')
+                                    : (isChinese ? '待补齐' : 'Pending')}
+                                {template.role_revision ? ` · v${template.role_revision}` : ''}
+                            </span>
+                        </div>
+                        {!!template.deliverables?.length && (
+                            <div style={{ marginTop: '8px', fontSize: '11.5px', color: 'var(--text-secondary)', lineHeight: 1.55 }}>
+                                <strong>{isChinese ? '交付物：' : 'Deliverables: '}</strong>
+                                {template.deliverables.slice(0, 3).join(' · ')}
+                            </div>
+                        )}
+                        {!!template.limitations?.length && (
+                            <div style={{ marginTop: '5px', fontSize: '11.5px', color: 'var(--text-tertiary)', lineHeight: 1.55 }}>
+                                <strong>{isChinese ? '边界：' : 'Limits: '}</strong>
+                                {template.limitations.slice(0, 2).join(' · ')}
+                            </div>
+                        )}
+                        {!!template.source_provenance?.repository && (
+                            <div style={{ marginTop: '5px', fontSize: '10.5px', color: 'var(--text-tertiary)', lineHeight: 1.45 }}>
+                                {isChinese ? '来源：' : 'Source: '}
+                                {String(template.source_provenance.repository)}
+                                {template.source_provenance.commit
+                                    ? ` @ ${String(template.source_provenance.commit).slice(0, 8)}`
+                                    : ''}
+                            </div>
+                        )}
+                    </section>
                     {/* Visibility */}
                     <section>
                         <div style={{ fontSize: '13px', fontWeight: 600, marginBottom: '8px' }}>

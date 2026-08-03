@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -21,6 +21,7 @@ from app.services.entitlements import Entitlements
 from app.services.minimax_media_profiles import resolve_minimax_media_profile
 from app.services.llm.load_balancer import credential_modality_is_blocked
 from app.services.modalities import canonicalize_modalities
+from app.services.media_provider_routing import media_provider_order_for_modality
 from app.services.tool_visibility import tool_enabled_for_agent
 from app.services.volcengine_agent_plan import (
     PROVIDER as VOLCENGINE_AGENT_PLAN_PROVIDER,
@@ -39,6 +40,29 @@ SAAS_TIERS = ("lite", "pro", "ultra")
 MEDIA_PROVIDERS = ("volcengine_agent_plan", "minimax")
 
 
+def _ordered_available_providers(
+    modality: str,
+    available_providers: set[str] | list[str] | tuple[str, ...],
+) -> list[str]:
+    """Expose the same provider order that the runtime uses for this modality.
+
+    The capability endpoint is diagnostic/product-facing data, so a sorted set
+    is misleading when the runtime deliberately tries Agent Plan before
+    MiniMax.  Keep known providers in the route policy order and append any
+    unexpected provider names deterministically for forward compatibility.
+    """
+
+    normalized = {
+        str(provider or "").strip().lower()
+        for provider in available_providers
+        if str(provider or "").strip()
+    }
+    route_order = media_provider_order_for_modality(modality)
+    ordered = [provider for provider in route_order if provider in normalized]
+    ordered.extend(sorted(normalized.difference(ordered)))
+    return ordered
+
+
 @dataclass(frozen=True)
 class PlatformMediaProviderState:
     """Secret-free account readiness used by runtime and SaaS control plane."""
@@ -48,11 +72,17 @@ class PlatformMediaProviderState:
     plan_tiers: dict[tuple[str, str], set[str]]
     account_receipts: dict[tuple[str, str], dict[str, object]]
     verified_credentials: dict[uuid.UUID, LLMCredential]
+    # Keep the account's declared plan tier even when that tier filters a
+    # modality out of the routable pool (for example Agent Plan Small/video).
+    # This is explanation-only metadata and never grants a capability.
+    provider_plan_tiers: dict[str, set[str]] = field(default_factory=dict)
 
 
 def media_route_capability_status(
     modality: str,
     available_providers: set[str] | list[str] | tuple[str, ...],
+    *,
+    provider_plan_tiers: dict[str, set[str]] | None = None,
 ) -> tuple[str, str | None, str]:
     """Classify a provider pool without treating known quality loss as equivalent.
 
@@ -81,6 +111,23 @@ def media_route_capability_status(
         and VOLCENGINE_AGENT_PLAN_PROVIDER not in providers
         and "minimax" in providers
     ):
+        primary_plan_tiers = sorted(
+            (provider_plan_tiers or {}).get(VOLCENGINE_AGENT_PLAN_PROVIDER, set())
+        )
+        if normalized_modality == "video" and primary_plan_tiers and not any(
+            plan_tier_supports_modality(plan_tier, "video")
+            for plan_tier in primary_plan_tiers
+        ):
+            tier_text = "、".join(primary_plan_tiers)
+            return (
+                "degraded",
+                "commercial_primary_unavailable",
+                (
+                    f"火山 Agent Plan 当前为 plan={tier_text}，不包含视频资格；"
+                    "当前仅有 MiniMax 应急视频线路。正式质量优先时请升级到支持视频的火山套餐，"
+                    "或在正式交付中明确确认降级。"
+                ),
+            )
         return (
             "degraded",
             "commercial_primary_unavailable",
@@ -137,33 +184,51 @@ async def get_platform_media_provider_state(
     )
     configured_modalities = {provider: set() for provider in MEDIA_PROVIDERS}
     verified_modalities = {provider: set() for provider in MEDIA_PROVIDERS}
+    provider_plan_tiers: dict[str, set[str]] = {
+        provider: set() for provider in MEDIA_PROVIDERS
+    }
     plan_tiers: dict[tuple[str, str], set[str]] = {}
     account_receipts: dict[tuple[str, str], dict[str, object]] = {}
     account_receipt_times: dict[tuple[str, str], datetime] = {}
+    account_receipt_success: dict[tuple[str, str], bool] = {}
     verified_credentials: dict[uuid.UUID, LLMCredential] = {}
     for credential in credentials_result.scalars().all():
         provider = str(getattr(credential, "provider", "") or "").strip().lower()
         if provider not in configured_modalities:
             continue
+        plan_tier = str(getattr(credential, "plan_tier", "") or "").strip().lower()
+        if plan_tier:
+            provider_plan_tiers.setdefault(provider, set()).add(plan_tier)
         supported = _provider_supported_media_modalities(credential)
         configured_modalities[provider].update(supported)
         receipt = credential_verification_receipt(credential)
         verified_at = getattr(credential, "last_verification_at", None)
         for modality in supported:
             key = (provider, modality)
-            plan_tier = str(getattr(credential, "plan_tier", "") or "").strip().lower()
             if plan_tier:
                 plan_tiers.setdefault(key, set()).add(plan_tier)
-            if (
-                receipt is not None
-                and isinstance(verified_at, datetime)
-                and (
+            if receipt is not None and isinstance(verified_at, datetime):
+                # A provider can have multiple platform credentials for one
+                # modality.  Prefer a successful current-config probe over a
+                # newer failed probe from another credential; otherwise the
+                # SaaS control plane can show "account verified" beside a
+                # failed 401 receipt even though the route is backed by a
+                # different healthy credential.  When receipts have the same
+                # outcome, the newest one remains authoritative.
+                receipt_success = receipt.get("ok") is True
+                existing_success = account_receipt_success.get(key, False)
+                should_replace = (
                     key not in account_receipt_times
-                    or verified_at > account_receipt_times[key]
+                    or (receipt_success and not existing_success)
+                    or (
+                        receipt_success == existing_success
+                        and verified_at > account_receipt_times[key]
+                    )
                 )
-            ):
-                account_receipts[key] = receipt
-                account_receipt_times[key] = verified_at
+                if should_replace:
+                    account_receipts[key] = receipt
+                    account_receipt_times[key] = verified_at
+                    account_receipt_success[key] = receipt_success
 
         current_receipt = current_credential_verification_receipt(credential)
         daily_quota_available = (
@@ -190,6 +255,7 @@ async def get_platform_media_provider_state(
         plan_tiers=plan_tiers,
         account_receipts=account_receipts,
         verified_credentials=verified_credentials,
+        provider_plan_tiers=provider_plan_tiers,
     )
 
 
@@ -238,11 +304,17 @@ async def get_platform_media_generation_receipts(
         if key in receipts or modality not in state.verified_modalities.get(provider, set()):
             continue
         credential = state.verified_credentials.get(task.credential_id)
+        # A durable task must remain bound to the same provider as the
+        # credential that is currently verified.  Older rows or a corrupted
+        # provider field must never turn a MiniMax result into Agent Plan
+        # generation evidence (or the reverse) for the SaaS route.
+        credential_provider = str(getattr(credential, "provider", "") or "").strip().lower()
+        if credential is None or credential_provider != provider:
+            continue
         verified_at = getattr(credential, "last_verification_at", None)
         completed_at = getattr(task, "completed_at", None)
         if (
-            credential is None
-            or not isinstance(verified_at, datetime)
+            not isinstance(verified_at, datetime)
             or not isinstance(completed_at, datetime)
             or completed_at < verified_at
         ):
@@ -355,7 +427,8 @@ async def get_agent_media_capabilities(
         if enabled and route_enabled:
             enabled_tools.add(tool.name)
 
-    provider_modalities = await get_platform_media_provider_modalities(db)
+    provider_state = await get_platform_media_provider_state(db)
+    provider_modalities = provider_state.verified_modalities
     pool_modalities = set().union(*provider_modalities.values())
 
     rows = evaluate_media_capabilities(
@@ -375,6 +448,7 @@ async def get_agent_media_capabilities(
             capability_status, reason_code, next_action = media_route_capability_status(
                 modality,
                 available_providers,
+                provider_plan_tiers=provider_state.provider_plan_tiers,
             )
         else:
             capability_status = "unavailable"
@@ -383,7 +457,10 @@ async def get_agent_media_capabilities(
         row.update(
             {
                 "capability_status": capability_status,
-                "available_providers": sorted(available_providers),
+                "available_providers": _ordered_available_providers(
+                    modality,
+                    available_providers,
+                ),
                 "route_reason": reason_code,
                 "next_action": next_action,
             }

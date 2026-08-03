@@ -3851,6 +3851,13 @@ _BRAND_SAFE_IMAGE_GOAL = (
     "Attached file: workspace/uploads/product.jpg"
 )
 
+_QUANT_POSTER_GOAL = (
+    "竖版 9:16 商业宣传海报，画面中部居中放置发光渐变立体白色大标题"
+    "【量化交易平台】，标题下方小字副标题「智能策略・实时信号・数据驱动决策」，"
+    "再下方一行浅紫色小字标语「从复杂市场中，捕捉更清晰的交易方向」；"
+    "画面右下角有渐变粉紫发光圆角按钮，按钮内白色文字 “立即体验”。"
+)
+
 
 async def _media_tools(agent_id: uuid.UUID) -> list[dict]:
     del agent_id
@@ -3891,6 +3898,76 @@ def test_media_contract_extracts_only_explicit_requirements() -> None:
             "image",
         )
         == 3
+    )
+
+
+def test_media_contract_extracts_role_aware_copy_from_quant_poster() -> None:
+    assert tool_step_service._required_exact_overlay_blocks(_QUANT_POSTER_GOAL) == [
+        {"role": "title", "text": "量化交易平台"},
+        {"role": "subtitle", "text": "智能策略・实时信号・数据驱动决策"},
+        {"role": "tagline", "text": "从复杂市场中，捕捉更清晰的交易方向"},
+        {"role": "cta", "text": "立即体验"},
+    ]
+    assert tool_step_service._required_exact_overlay_text(_QUANT_POSTER_GOAL) == (
+        "量化交易平台\n智能策略・实时信号・数据驱动决策\n"
+        "从复杂市场中，捕捉更清晰的交易方向\n立即体验"
+    )
+
+
+def test_media_contract_requires_structured_blocks_for_multi_copy_poster() -> None:
+    blocked = tool_step_service._media_contract_block(
+        _QUANT_POSTER_GOAL,
+        "generate_image_minimax",
+        {
+            "prompt": "poster",
+            "overlay_text": (
+                "量化交易平台\n智能策略・实时信号・数据驱动决策\n"
+                "从复杂市场中，捕捉更清晰的交易方向\n立即体验"
+            ),
+        },
+    )
+
+    assert blocked is not None
+    assert blocked[0] == "media_generation_contract_blocked"
+    assert "overlay_blocks set exactly" in blocked[1]
+
+
+def test_media_contract_accepts_structured_blocks_for_multi_copy_poster() -> None:
+    assert (
+        tool_step_service._media_contract_block(
+            _QUANT_POSTER_GOAL,
+            "generate_image_minimax",
+            {
+                "prompt": "poster",
+                "overlay_blocks": [
+                    {"role": "title", "text": "量化交易平台"},
+                    {
+                        "role": "subtitle",
+                        "text": "智能策略・实时信号・数据驱动决策",
+                    },
+                    {
+                        "role": "tagline",
+                        "text": "从复杂市场中，捕捉更清晰的交易方向",
+                    },
+                    {"role": "cta", "text": "立即体验"},
+                ],
+            },
+        )
+        is None
+    )
+
+
+def test_video_contract_keeps_legacy_multiline_overlay_text_for_multi_copy() -> None:
+    exact_copy = tool_step_service._required_exact_overlay_text(_QUANT_POSTER_GOAL)
+
+    assert exact_copy is not None
+    assert (
+        tool_step_service._media_contract_block(
+            _QUANT_POSTER_GOAL,
+            "generate_video_minimax",
+            {"prompt": "poster motion", "overlay_text": exact_copy},
+        )
+        is None
     )
 
 

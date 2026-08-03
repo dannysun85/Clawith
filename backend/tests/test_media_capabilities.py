@@ -1,19 +1,24 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from app.services.entitlements import Entitlements
 from app.services.media_capabilities import (
     _credential_media_modalities,
+    _ordered_available_providers,
     evaluate_media_capabilities,
     get_agent_media_capabilities,
+    get_platform_media_generation_receipts,
+    get_platform_media_provider_state,
     get_platform_media_provider_modalities,
     media_route_capability_status,
+    PlatformMediaProviderState,
 )
 from app.services.media_provider_routing import (
     media_provider_order_for_modality,
     media_provider_order_for_voice_id,
+    validate_media_route_policy,
 )
 
 
@@ -131,6 +136,30 @@ def test_media_provider_order_matches_implemented_runtime_modalities():
     assert media_provider_order_for_modality("unknown") == ()
 
 
+def test_media_route_policy_matches_reviewed_provider_and_model_contract():
+    assert validate_media_route_policy() == ()
+
+
+def test_media_capability_display_order_matches_runtime_route_order():
+    providers = {"minimax", "volcengine_agent_plan"}
+    assert _ordered_available_providers("image", providers) == [
+        "volcengine_agent_plan",
+        "minimax",
+    ]
+    assert _ordered_available_providers("video", providers) == [
+        "volcengine_agent_plan",
+        "minimax",
+    ]
+    assert _ordered_available_providers("music", providers) == [
+        "minimax",
+        "volcengine_agent_plan",
+    ]
+    assert _ordered_available_providers("unknown", providers) == [
+        "minimax",
+        "volcengine_agent_plan",
+    ]
+
+
 def test_media_route_status_never_treats_minimax_only_visuals_as_equivalent():
     assert media_route_capability_status("image", {"minimax"})[:2] == (
         "degraded",
@@ -143,6 +172,19 @@ def test_media_route_status_never_treats_minimax_only_visuals_as_equivalent():
     assert media_route_capability_status("audio", {"minimax"})[0] == "available"
     assert media_route_capability_status("music", {"minimax"})[0] == "available"
     assert media_route_capability_status("image", set())[0] == "unavailable"
+
+
+def test_video_degraded_status_explains_agent_plan_tier_without_granting_access():
+    status, reason, next_action = media_route_capability_status(
+        "video",
+        {"minimax"},
+        provider_plan_tiers={"volcengine_agent_plan": {"small"}},
+    )
+
+    assert (status, reason) == ("degraded", "commercial_primary_unavailable")
+    assert "plan=small" in next_action
+    assert "不包含视频资格" in next_action
+    assert "MiniMax 应急视频线路" in next_action
 
 
 def test_explicit_voice_identity_never_silently_crosses_provider_namespaces():
@@ -209,10 +251,12 @@ async def test_platform_media_pool_reports_provider_specific_plan_capabilities()
         async def execute(self, statement):
             return _Result()
 
-    provider_modalities = await get_platform_media_provider_modalities(_DB())
+    state = await get_platform_media_provider_state(_DB())
+    provider_modalities = state.verified_modalities
 
     assert provider_modalities["volcengine_agent_plan"] == {"image", "audio"}
     assert provider_modalities["minimax"] == {"image", "audio", "music", "video"}
+    assert state.provider_plan_tiers["volcengine_agent_plan"] == {"small"}
 
 
 @pytest.mark.asyncio
@@ -249,3 +293,176 @@ async def test_platform_media_pool_does_not_treat_healthy_legacy_row_as_verified
     provider_modalities = await get_platform_media_provider_modalities(_DB())
 
     assert provider_modalities["minimax"] == set()
+
+
+@pytest.mark.asyncio
+async def test_platform_media_pool_prefers_successful_receipt_over_newer_failed_probe():
+    def credential(*, verified_at, ok, status="healthy"):
+        credential_id = uuid.uuid4()
+        return type(
+            "Credential",
+            (),
+            {
+                "id": credential_id,
+                "provider": "minimax",
+                "plan_tier": None,
+                "capabilities": ["video"],
+                "modality_status": {},
+                "enabled": True,
+                "status": status,
+                "daily_quota": None,
+                "used_today": 0,
+                "last_verification_at": verified_at,
+                "verification_receipt": {
+                    "kind": "credential_auth_probe",
+                    "credential_id": str(credential_id),
+                    "provider": "minimax",
+                    "checked_at": verified_at.isoformat(),
+                    "ok": ok,
+                    "provider_status": 200 if ok else 401,
+                },
+            },
+        )()
+
+    successful_at = datetime(2026, 8, 1, 17, 54, 46, tzinfo=timezone.utc)
+    failed_at = datetime(2026, 8, 1, 17, 54, 47, tzinfo=timezone.utc)
+    successful = credential(verified_at=successful_at, ok=True)
+    newer_failed = credential(
+        verified_at=failed_at,
+        ok=False,
+        status="unverified",
+    )
+
+    class _Result:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [successful, newer_failed]
+
+    class _DB:
+        async def execute(self, statement):
+            return _Result()
+
+    state = await get_platform_media_provider_state(_DB())
+
+    assert state.verified_modalities["minimax"] == {"video"}
+    assert state.account_receipts[("minimax", "video")]["ok"] is True
+    assert state.account_receipts[("minimax", "video")]["provider_status"] == 200
+
+
+@pytest.mark.asyncio
+async def test_generation_receipt_requires_task_provider_to_match_verified_credential():
+    credential_id = uuid.uuid4()
+    verified_at = datetime(2026, 8, 2, 10, 0, tzinfo=timezone.utc)
+    credential = type(
+        "Credential",
+        (),
+        {
+            "id": credential_id,
+            "provider": "minimax",
+            "last_verification_at": verified_at,
+            "verification_receipt": {
+                "kind": "credential_auth_probe",
+                "credential_id": str(credential_id),
+                "provider": "minimax",
+                "checked_at": verified_at.isoformat(),
+                "ok": True,
+            },
+        },
+    )()
+    task = type(
+        "Task",
+        (),
+        {
+            "id": uuid.uuid4(),
+            "credential_id": credential_id,
+            # Deliberately mismatched with the credential/provider binding.
+            "provider": "volcengine_agent_plan",
+            "modality": "image",
+            "status": "succeeded",
+            "provider_task_id": "stale-or-misbound-task",
+            "output_size": 4096,
+            "completed_at": verified_at,
+            "model": "doubao-seedream-5.0-lite",
+        },
+    )()
+
+    class _Result:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [task]
+
+    class _DB:
+        async def execute(self, statement):
+            return _Result()
+
+    state = PlatformMediaProviderState(
+        configured_modalities={"volcengine_agent_plan": {"image"}, "minimax": {"image"}},
+        verified_modalities={"volcengine_agent_plan": {"image"}, "minimax": {"image"}},
+        plan_tiers={},
+        account_receipts={},
+        verified_credentials={credential_id: credential},
+    )
+
+    assert await get_platform_media_generation_receipts(_DB(), state) == {}
+
+
+@pytest.mark.asyncio
+async def test_generation_receipt_ignores_output_completed_before_current_verification():
+    credential_id = uuid.uuid4()
+    verified_at = datetime(2026, 8, 2, 10, 0, tzinfo=timezone.utc)
+    credential = type(
+        "Credential",
+        (),
+        {
+            "id": credential_id,
+            "provider": "minimax",
+            "last_verification_at": verified_at,
+            "verification_receipt": {
+                "kind": "credential_auth_probe",
+                "credential_id": str(credential_id),
+                "provider": "minimax",
+                "checked_at": verified_at.isoformat(),
+                "ok": True,
+            },
+        },
+    )()
+    task = type(
+        "Task",
+        (),
+        {
+            "id": uuid.uuid4(),
+            "credential_id": credential_id,
+            "provider": "minimax",
+            "modality": "image",
+            "status": "succeeded",
+            "provider_task_id": "pre-verification-task",
+            "output_size": 4096,
+            "completed_at": verified_at - timedelta(seconds=1),
+            "model": "image-01",
+        },
+    )()
+
+    class _Result:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [task]
+
+    class _DB:
+        async def execute(self, statement):
+            return _Result()
+
+    state = PlatformMediaProviderState(
+        configured_modalities={"volcengine_agent_plan": set(), "minimax": {"image"}},
+        verified_modalities={"volcengine_agent_plan": set(), "minimax": {"image"}},
+        plan_tiers={},
+        account_receipts={},
+        verified_credentials={credential_id: credential},
+    )
+
+    assert await get_platform_media_generation_receipts(_DB(), state) == {}

@@ -31,7 +31,7 @@ Skill、Tool、Provider、模型、套餐和故障切换不得出现在普通用
 - `media_provider_order_for_modality()` 当前对 `image/audio/video` 返回 `volcengine_agent_plan → minimax`，对 `music` 只返回 `minimax`。
 - 语音在未指定 `voice_id` 时允许火山优先、MiniMax 回退；显式 Provider voice ID 会固定到对应 Provider，避免换声线。
 - 现有 Tool 内部名仍包含 `*_minimax`，但图片、语音和视频已是平台托管的 provider-neutral route；名称是兼容债务，不是用户承诺。
-- Agent Plan 代码支持 Small/Medium/Large/Max；Small 不具备视频，Medium 使用 Seedance 1.5 Pro，Large/Max 使用 Seedance 2.0。
+- Agent Plan 代码支持 Small/Medium/Large/Max；Small 不具备视频，当前经过运营复核的策略将 Medium 路由到 Seedance 2.0 Mini，Large/Max 路由到标准 Seedance 2.0。Seedance 1.5 Pro 仅保留已接受旧任务的兼容解析，不再用于新任务。
 - 先前行为级验证表明当前 Agent Plan Key 是 Small：文字、Seedream、TTS 可用，火山视频不可用。该事实不能被写成“火山视频已在当前账号可用”。
 
 ### 2.2 文字
@@ -67,7 +67,9 @@ Skill、Tool、Provider、模型、套餐和故障切换不得出现在普通用
 
 没有满足合同的路线。系统应保存 brief、脚本、分镜、版式或素材清单，告诉用户缺少的能力和恢复条件，绝不能把占位图、静音视频、文字提纲或损坏文件称为完成。
 
-“客户不能看出供应商切换”只适用于 `available` 的等价路线；当 MiniMax 图片/视频已知明显更差时，静默切换会直接破坏商用质量目标。
+“客户不能看出供应商切换”对正式商业交付仍要求等价的 `available` 路线；但聊天中的快速生成是一个独立的低承诺入口，
+可以在平台确认有可用 fallback 时自动切换且不暴露 Provider。该 Run 仍必须记录 `degraded`，并且不能直接被包装成
+正式商用交付；正式 Deliverable 继续执行 `allow_degraded` 确认和质量门禁。
 
 ## 5. Skill 是否需要定制
 
@@ -101,6 +103,7 @@ PPT 的质量核心不是换一个生成模型，而是：
 - 主题、网格、版式、多种页面结构；
 - 图表/表格/形状可编辑；
 - 图片按需要生成和裁切，不把所有页面做成整图；
+- 明确要求图片的提案还必须按页数自适应地把图片分布到多页（`minimum_image_slides`），不能把全部素材堆在单页后用空白页凑页数；纯文字/数据型 PPT 的该门禁为 `0`；
 - PPTX/PDF 一致性、溢出、字体、对齐、对比度和引用检查；
 - 页级修改而非全量重做。
 
@@ -136,14 +139,15 @@ Agent 只有同时满足以下条件才可执行：
 2. 图片/视频的 MiniMax-only 路线已分类为 `degraded`。正式 Deliverable 默认 `primary_only`：可以保存工作说明，但不会提交付费任务；只有用户显式选择 `allow_degraded` 才允许应急线路。
 3. SaaS Admin 已显示目标顺序、当前就绪 Provider、主线路、`正式可用/仅降级可用/不可用` 和建议动作。当前视频只有 MiniMax 时明确显示“仅降级可用”，没有伪装成火山视频可用。
 4. Runtime 对正式图片/视频执行同一降级门禁，并返回可操作的 reason code；旧快速生成在未声明正式合同的兼容路径上保持原行为，避免破坏旧流程。
-5. 运营控制面仍缺“最后一次真实 Provider 验证”的持久时间、账号/套餐摘要和 receipt 关联；当前 readiness 来自实时账号池解析，不等于真实生成质量证据。
+   当前 Agent 聊天工具栏也允许该快速路径插入视频需求，由平台自动选择可用线路；按钮不展示 Provider，正式交付入口仍要求显式质量确认。
+5. 运营控制面已经持久化账号鉴权与成功生成 receipt，并将生成任务绑定到当前已验证的同一 Provider、账号和时间窗口；错绑 Provider 或重新鉴权前的旧任务不会污染 readiness。该 receipt 只证明真实生成被观察到，不等于人工质量评审或商用就绪。
 6. 当前 Small 账号继续只把已验证的 Seedream/TTS 能力贡献给火山池。升级 Medium+ 后仍需经授权的受控视频调用与质量评审，才能开放火山正式视频。
 7. 真实 Provider、豆包盲评、发布和生产配置一致性都属于后续授权门禁，本地测试通过不能替代这些证据。
 
 ## 9. 完成标准
 
 - 文字实际路由、迁移、SaaS 控制台和测试都证明 MiniMax-M3 Primary，而非只改文案。
-- 图片/视频正式交付不会静默落到已知低质量路线。
-- 当前账号没有的火山视频能力被正确显示为 unavailable，不产生假成功。
+- 图片/视频正式交付不会静默落到已知低质量路线；快速生成可以使用内部标记为 `degraded` 的 fallback，但不能越过正式交付门禁。
+- 当前账号没有火山视频资格时，不会伪装成火山视频可用；快速视频入口只表示 MiniMax fallback 可提交，最终质量仍需独立评审。
 - Agent 的 Skill、Tool、权限、套餐、Provider、Credits 和质量证据可逐层审计。
 - 普通用户只理解业务结果、费用、进度、质量和下一步，不需要理解 Provider 内部结构。

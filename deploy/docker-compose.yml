@@ -91,6 +91,9 @@ services:
       # Required when deployed behind a reverse proxy (e.g. Nginx, Cloudflare).
       # If not set, the server infers the URL from the incoming request host.
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      # Explicit Provider egress proxy; empty is the safe default. This must be
+      # identical for API and worker processes when the deployment needs it.
+      HTTP_PROXY: ${HTTP_PROXY:-}
       # Password reset token lifetime in minutes (default: 30)
       PASSWORD_RESET_TOKEN_EXPIRE_MINUTES: ${PASSWORD_RESET_TOKEN_EXPIRE_MINUTES:-30}
     volumes:

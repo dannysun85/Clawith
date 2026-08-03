@@ -428,8 +428,9 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"[startup] Atlassian tools seed failed: {e}")
 
+        template_capability_report = None
         try:
-            await seed_agent_templates()
+            template_capability_report = await seed_agent_templates()
         except Exception as e:
             logger.warning(f"[startup] Agent templates seed failed: {e}")
 
@@ -462,8 +463,23 @@ async def lifespan(app: FastAPI):
         # skips repository Skill source packages.
         try:
             from app.services.skill_seeder import push_default_skills_to_existing_agents
+            from app.services.template_revision_sync import finalize_template_revision_sync
 
-            await push_default_skills_to_existing_agents()
+            skill_sync_state = await push_default_skills_to_existing_agents()
+            if template_capability_report is not None:
+                from app.database import async_session
+
+                async with async_session() as db:
+                    revision_sync = await finalize_template_revision_sync(
+                        db,
+                        tool_report=template_capability_report,
+                        skill_sync_state=skill_sync_state,
+                    )
+                    await db.commit()
+                logger.info(
+                    "[startup] Agent template revision sync report={}",
+                    revision_sync,
+                )
         except Exception as e:
             logger.warning(f"[startup] Effective Agent Skill sync failed: {e}")
     else:
@@ -669,6 +685,7 @@ app.add_middleware(
 # Register API routes
 from app.api.auth import router as auth_router
 from app.api.agents import router as agents_router
+from app.api.agent_workforce import router as agent_workforce_router
 from app.api.tasks import router as tasks_router
 from app.api.files import router as files_router
 from app.api.websocket import router as ws_router
@@ -724,6 +741,7 @@ from app.api.deliverables import router as deliverables_router  # noqa: E402
 from app.api.work import router as work_router  # noqa: E402
 
 app.include_router(auth_router, prefix=settings.API_PREFIX)
+app.include_router(agent_workforce_router, prefix=settings.API_PREFIX)
 app.include_router(agents_router, prefix=settings.API_PREFIX)
 app.include_router(tasks_router, prefix=settings.API_PREFIX)
 app.include_router(files_router, prefix=settings.API_PREFIX)

@@ -278,7 +278,10 @@ def test_image_led_commercial_presentation_compiles_required_media_contract() ->
     assert '"asset_roles": ["product_hero", "people_lifestyle", "people_storyboard"]' in prompt
     assert '"minimum_distinct_images": 3' in prompt
     assert '"minimum_distinct_layouts": 4' in prompt
+    assert '"minimum_image_slides": 4' in prompt
+    assert '"minimum_picture_coverage_ratio": 0.35' in prompt
     assert '"maximum_uses_per_image": 3' in prompt
+    assert "do not satisfy the image contract with tiny thumbnails" in prompt
     assert '"minimum_editable_compositions": 2' in prompt
     assert "generate_image_minimax exactly once" in prompt
     assert f"workspace/deliverables/{request.id}/assets/product_hero.png" in prompt
@@ -287,6 +290,30 @@ def test_image_led_commercial_presentation_compiles_required_media_contract() ->
     assert "pass its exact versioned output_path as reference_image" in prompt
     assert "Do not use emoji as a substitute" in prompt
     assert "stop without converting or claiming a commercial-quality deck" in prompt
+
+
+def test_customer_launch_brief_is_image_led_without_literal_image_word() -> None:
+    """Product launch decks must not silently fall back to sparse text cards."""
+
+    request = _request(
+        goal=(
+            "为高端智能保温杯创建一份面向品牌与增长决策者的客户级上市方案，"
+            "覆盖产品体验主张、外观与交互设计原则、人物广告创意与三镜头脚本、"
+            "渠道物料与发布节奏。"
+        ),
+        spec={
+            "audience": "品牌与增长决策者",
+            "page_count": 8,
+            "language": "zh-CN",
+            "style": "premium_editorial",
+        },
+    )
+
+    prompt = build_deliverable_prompt(request)
+
+    assert '"required": true' in prompt
+    assert '"asset_roles": ["product_hero", "people_lifestyle", "people_storyboard"]' in prompt
+    assert '"minimum_picture_coverage_ratio": 0.35' in prompt
 
 
 def test_long_image_led_deck_scales_visual_budget_without_weakening_lite_contract() -> None:
@@ -305,6 +332,8 @@ def test_long_image_led_deck_scales_visual_budget_without_weakening_lite_contrac
 
     assert '"minimum_distinct_images": 5' in prompt
     assert '"minimum_distinct_layouts": 8' in prompt
+    assert '"minimum_image_slides": 8' in prompt
+    assert '"minimum_picture_coverage_ratio": 0.35' in prompt
     assert '"maximum_uses_per_image": 3' in prompt
     assert '"minimum_editable_compositions": 3' in prompt
 
@@ -525,6 +554,123 @@ async def test_poster_preflight_is_available_and_launchable(monkeypatch) -> None
         "billing_unit": "one_final_image",
     }
     assert result["creates_reservation"] is False
+
+
+@pytest.mark.asyncio
+async def test_image_led_presentation_preflight_checks_the_image_route_before_launch(
+    monkeypatch,
+) -> None:
+    workflow = require_workflow("presentation")
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.resolve_route",
+        AsyncMock(return_value=SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows._presentation_tool_available",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.get_tenant_entitlements",
+        AsyncMock(return_value=None),
+    )
+    media_capabilities = AsyncMock(
+        return_value=[
+            {
+                "modality": "image",
+                "available": False,
+                "reason": "pool_unavailable",
+                "capability_status": "unavailable",
+                "next_action": "wait for a provider route",
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.get_agent_media_capabilities",
+        media_capabilities,
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows._agent_tool_available",
+        AsyncMock(return_value=True),
+    )
+
+    result = await preflight_workflow(
+        SimpleNamespace(),  # type: ignore[arg-type]
+        tenant_id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        workflow=workflow,
+        tier="pro",
+        goal="制作一份图文并茂的新品发布 PPT",
+        spec={
+            "audience": "客户",
+            "page_count": 8,
+            "language": "zh-CN",
+            "style": "商业风",
+        },
+    )
+
+    assert result["available"] is False
+    assert result["launchable"] is False
+    assert result["capability_status"] == "unavailable"
+    assert result["reasons"] == ["pool_unavailable"]
+    media_capabilities.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_image_led_presentation_preflight_requires_explicit_degraded_quality(
+    monkeypatch,
+) -> None:
+    workflow = require_workflow("presentation")
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.resolve_route",
+        AsyncMock(return_value=SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows._presentation_tool_available",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.get_tenant_entitlements",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.get_agent_media_capabilities",
+        AsyncMock(
+            return_value=[
+                {
+                    "modality": "image",
+                    "available": True,
+                    "reason": None,
+                    "capability_status": "degraded",
+                    "next_action": "confirm emergency quality",
+                },
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows._agent_tool_available",
+        AsyncMock(return_value=True),
+    )
+
+    result = await preflight_workflow(
+        SimpleNamespace(),  # type: ignore[arg-type]
+        tenant_id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        workflow=workflow,
+        tier="pro",
+        goal="制作一份图文并茂的新品发布 PPT",
+        spec={
+            "audience": "客户",
+            "page_count": 8,
+            "language": "zh-CN",
+            "style": "商业风",
+            "fallback_policy": "primary_only",
+        },
+    )
+
+    assert result["available"] is True
+    assert result["launchable"] is False
+    assert result["capability_status"] == "degraded"
+    assert result["reasons"] == ["degraded_route_requires_confirmation"]
 
 
 @pytest.mark.asyncio

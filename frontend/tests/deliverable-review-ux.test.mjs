@@ -25,7 +25,7 @@ test('agent message owns the compact result summary and the full workflow stays 
   assert.match(workbench, /'确认交付'/);
   assert.match(workbench, /'在线预览'/);
   assert.match(workbench, /className="deliverable-review-card__preview"/);
-  assert.match(workbench, /<video controls playsInline preload="metadata"/);
+  assert.match(workbench, /<video[\s\S]*?controls[\s\S]*?playsInline[\s\S]*?preload="metadata"/);
   assert.match(workbench, /title=\{isZh \? 'PPT 逐页预览'/);
   assert.match(workbench, /alt=\{isZh \? '交付图片预览'/);
   assert.match(workbench, /'下载 PPTX'/);
@@ -54,4 +54,10 @@ test('reviewer workspace guides one irreversible review through three steps', ()
   assert.match(reviewPage, /'提交后不能修改/);
   assert.match(reviewPage, /<details className="quality-review-page__admin">/);
   assert.match(reviewPage, /<details className="quality-review-page__technical">/);
+});
+
+test('creative artifact failures explain the actionable PPT coverage issue', () => {
+  assert.match(workbench, /presentation_picture_coverage_below_minimum/);
+  assert.match(workbench, /PPT 图片覆盖不足，请增加大幅主视觉或场景图后重新生成/);
+  assert.match(workbench, /deliverableErrorLabel\(request\.last_error_code, isZh\)/);
 });

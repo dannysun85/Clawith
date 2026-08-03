@@ -7395,6 +7395,11 @@ select:focus {
   background: rgba(245, 158, 11, 0.08);
 }
 
+.chat-tool-reconciliation--pending {
+  border-color: rgba(99, 102, 241, 0.3);
+  background: rgba(99, 102, 241, 0.07);
+}
+
 .chat-tool-reconciliation__title,
 .chat-tool-reconciliation__detail,
 .chat-tool-reconciliation__actions {
@@ -7493,6 +7498,11 @@ select:focus {
   background: var(--accent-subtle);
   font-size: 11px;
   font-weight: 600;
+}
+
+.chat-composer-btn.media-capability-launcher.is-degraded {
+  color: var(--warning);
+  background: var(--warning-subtle);
 }
 
 @media (max-width: 1100px) {

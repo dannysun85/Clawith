@@ -13,10 +13,12 @@
 ## Current official package matrix
 
 - Small: no video generation.
-- Medium: `doubao-seedance-1.5-pro` (officially marked as retiring).
-- Large / Max: `doubao-seedance-1.5-pro`,
-  `doubao-seedance-2.0`, `doubao-seedance-2.0-fast`, and
-  `doubao-seedance-2.0-mini`.
+- Astra's reviewed new-task policy (2026-07-24): Medium routes to
+  `doubao-seedance-2.0-mini`; Large / Max route to the standard
+  `doubao-seedance-2.0` model. The exact account entitlement still requires a
+  provider receipt.
+- `doubao-seedance-1.5-pro` is retained only for reconciling an already accepted
+  legacy task and must not be selected for a new task.
 
 ## Reviewed model/API capability matrix
 
@@ -40,10 +42,13 @@ not yet expose multi-modal reference, edit/extend, draft, flex, or web-search
 video generation as Agent arguments.
 
 The upstream wrapper maps public names to dated provider model IDs, including
-`doubao-seedance-1.5-pro -> doubao-seedance-1-0-pro-250528`. Astra keeps that
+`doubao-seedance-1.5-pro -> doubao-seedance-1-5-pro-251215`. Astra keeps that
 mapping and the capability validation inside its provider adapter rather than
-exposing either to an Agent. Entitlement is still decided by the provider
-response for the encrypted account credential.
+exposing either to an Agent. The previously shipped
+`doubao-seedance-1-0-pro-250528` ID remains readable only as a legacy alias for
+persisted tasks and receipts; new submissions use the official 1.5 Pro ID.
+Entitlement is still decided by the provider response for the encrypted account
+credential.
 
 ## Adaptation boundary
 

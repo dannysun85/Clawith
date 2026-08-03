@@ -583,6 +583,7 @@ async def preflight_deliverable(
             workflow=workflow,
             tier=data.tier,
             spec=data.spec,
+            goal=data.goal,
         )
     except DeliverableWorkflowError as exc:
         raise _workflow_error(exc) from exc
@@ -683,7 +684,16 @@ async def create_deliverable_request(
     try:
         async with db.begin_nested():
             db.add(request)
-            add_initial_execution_shadow(db, request)
+            # The execution shadow has a composite FK back to the request.
+            # Flush the parent first because SQLAlchemy cannot infer this
+            # dependency from the manually-managed tenant/request columns.
+            await db.flush()
+            execution = add_initial_execution_shadow(db, request)
+            await db.flush()
+            # The execution shadow owns the target row of
+            # ``current_execution_id``.  Link it only after the shadow and
+            # its units have been inserted so the FK cannot race its parent.
+            request.current_execution_id = execution.id
             await db.flush()
     except IntegrityError:
         concurrent_result = await db.execute(

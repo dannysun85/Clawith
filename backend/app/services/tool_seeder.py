@@ -1367,7 +1367,7 @@ BUILTIN_TOOLS = [
     {
         "name": "generate_image_minimax",
         "display_name": "Generate Image",
-        "description": "Generate an image through Astra's managed media route. Model quality is selected from the active Lite, Pro, or Ultra product tier. Provider failover is safe only before a request is accepted, and a formal delivery must pass allow_degraded_fallback=false unless the user explicitly accepted emergency quality. Generate exactly the number of outputs requested. When one request requires both an uploaded product/reference and exact visible copy, pass brand_asset or reference_image together with overlay_text in the same single call; never split them into separate variants unless the user explicitly asks for multiple outputs.",
+        "description": "Generate an image through Astra's managed media route. Model quality is selected from the active Lite, Pro, or Ultra product tier. Provider failover is safe only before a request is accepted, and a formal delivery must pass allow_degraded_fallback=false unless the user explicitly accepted emergency quality. Generate exactly the number of outputs requested. When one request requires both an uploaded product/reference and exact visible copy, pass brand_asset or reference_image together with overlay_text (one text block) or overlay_blocks (multi-level poster copy) in the same single call; never split them into separate variants unless the user explicitly asks for multiple outputs.",
         "category": "media",
         "icon": "🎨",
         "is_default": True,
@@ -1387,12 +1387,33 @@ BUILTIN_TOOLS = [
                     "type": "string",
                     "description": "Optional exact Chinese/English copy rendered after generation with a real font. If the user specifies exact copy, pass it here in the same call as the required brand/reference asset.",
                 },
+                "overlay_blocks": {
+                    "type": "array",
+                    "description": "Optional ordered commercial-poster copy blocks rendered after generation with real fonts and role-aware hierarchy. Use this instead of overlay_text when the user specifies multiple exact text elements.",
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "role": {
+                                "type": "string",
+                                "enum": ["title", "subtitle", "tagline", "body", "cta"],
+                            },
+                            "text": {
+                                "type": "string",
+                                "description": "Exact visible copy. Do not paraphrase, merge, or omit characters.",
+                            },
+                        },
+                        "required": ["role", "text"],
+                        "additionalProperties": False,
+                    },
+                },
                 "overlay_position": {
                     "type": "string",
                     "enum": ["top", "center", "bottom"],
                     "description": "Position for overlay_text. Default: bottom.",
                 },
-                "brand_asset": {"type": "string", "description": "Canonical workspace image path or data URL composited unchanged as a product/logo layer. For a chat upload use workspace/uploads/<filename>. When exact copy is also requested, include overlay_text in this same call. Do not combine with reference_image."},
+                "brand_asset": {"type": "string", "description": "Canonical workspace image path or data URL composited unchanged as a product/logo layer. For a chat upload use workspace/uploads/<filename>. When exact copy is also requested, include overlay_text or overlay_blocks in this same call. Do not combine with reference_image."},
                 "brand_position": {"type": "string", "enum": ["top_left", "top_right", "center", "bottom_left", "bottom_right"]},
                 "brand_scale": {"type": "number", "description": "Canvas width fraction from 0.1 to 0.8. Default: 0.42."},
                 "allow_degraded_fallback": {"type": "boolean", "description": "Whether a known non-equivalent emergency provider may be used when the commercial primary route is unavailable. Formal delivery contracts default to false and may set true only after explicit user confirmation. Legacy quick-generation calls default to true."},

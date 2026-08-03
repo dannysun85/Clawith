@@ -406,6 +406,7 @@ export default function WorkspaceOperationPanel({
     const [content, setContent] = useState('');
     const [draft, setDraft] = useState('');
     const [previewState, setPreviewState] = useState<'idle' | 'loading' | 'ready' | 'deleted'>('idle');
+    const [audioPreviewError, setAudioPreviewError] = useState(false);
     const [editing, setEditing] = useState(false);
     const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
         const [revisions, setRevisions] = useState<any[]>([]);
@@ -506,6 +507,7 @@ export default function WorkspaceOperationPanel({
             prevActivePathRef.current = activePath ?? null;
             manualTreeScopeRef.current = null;
             setEditing(false);
+            setAudioPreviewError(false);
             onEditingChange?.(false);
         }
         if (!activePath) {
@@ -513,6 +515,7 @@ export default function WorkspaceOperationPanel({
             setContent('');
             setDraft('');
             setRevisions([]);
+            setAudioPreviewError(false);
             setPreviewState('idle');
             return;
         }
@@ -1019,9 +1022,13 @@ export default function WorkspaceOperationPanel({
                         className="workspace-op-audio"
                         controls
                         preload="metadata"
-                    >
-                        Your browser does not support audio playback.
-                    </audio>
+                        onError={() => setAudioPreviewError(true)}
+                    />
+                    {audioPreviewError && (
+                        <p role="status">
+                            Audio preview is unavailable; download the file to review it.
+                        </p>
+                    )}
                 </div>
             );
         }

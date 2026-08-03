@@ -123,7 +123,93 @@ async def test_hybrid_editable_uses_visual_layer_and_editable_text(
     presentation = Presentation(tgt_file)
     assert len(presentation.slides) == 1
     assert len(presentation.slides[0].shapes) == 2
-    assert presentation.slides[0].shapes[0].shape_type == 13
-    assert presentation.slides[0].shapes[1].has_text_frame
-    assert presentation.slides[0].shapes[1].text == "可编辑标题"
+    assert presentation.slides[0].shapes[0].shape_type != 13
+    text_shapes = [
+        shape
+        for shape in presentation.slides[0].shapes
+        if shape.has_text_frame and shape.text.strip()
+    ]
+    assert len(text_shapes) == 1
+    assert text_shapes[0].text == "可编辑标题"
+    run_xml = text_shapes[0].text_frame.paragraphs[0].runs[0]._r.xml
+    assert '<a:ea typeface="Noto Sans CJK SC"' in run_xml
+    assert '<a:cs typeface="Noto Sans CJK SC"' in run_xml
+    assert not content_screenshot.exists()
+
+
+@pytest.mark.asyncio
+async def test_hybrid_editable_materializes_measured_image_instead_of_full_slide_screenshot(
+    monkeypatch,
+    tmp_path,
+):
+    src_file = tmp_path / "source.html"
+    tgt_file = tmp_path / "result.pptx"
+    image = tmp_path / "product.png"
+    content_screenshot = tmp_path / "content-without-text.png"
+    src_file.write_text(
+        '<html><body><section class="slide"><img src="product.png"></section></body></html>',
+        encoding="utf-8",
+    )
+    Image.new("RGB", (640, 480), color=(180, 80, 40)).save(image)
+    Image.new("RGB", (1280, 720), color=(24, 36, 52)).save(content_screenshot)
+
+    async def fake_collect_browser_layout(
+        _src,
+        width,
+        height,
+        render_mode,
+        render_scale,
+    ):
+        assert (width, height, render_mode, render_scale) == (
+            1280,
+            720,
+            "hybrid_editable",
+            2.0,
+        )
+        return {
+            "slides": [
+                {
+                    "width": 1280,
+                    "height": 720,
+                    "backgroundColor": "#ffffff",
+                    "items": [
+                        {
+                            "kind": "image",
+                            "src": "product.png",
+                            "x": 120,
+                            "y": 100,
+                            "w": 420,
+                            "h": 315,
+                            "style": {},
+                        },
+                    ],
+                }
+            ],
+            "contentScreenshots": [str(content_screenshot)],
+        }
+
+    monkeypatch.setattr(
+        pptx_renderer,
+        "collect_browser_layout",
+        fake_collect_browser_layout,
+    )
+
+    result = await pptx_renderer.render_html_to_pptx(
+        src_file,
+        tgt_file,
+        "workspace/result.pptx",
+        tmp_path,
+        {"render_mode": "hybrid_editable"},
+    )
+
+    assert result.startswith("✅ Successfully converted HTML to editable PPTX")
+    presentation = Presentation(tgt_file)
+    pictures = [
+        shape
+        for shape in presentation.slides[0].shapes
+        if shape.shape_type == 13
+    ]
+    assert len(pictures) == 1
+    assert pictures[0].width < presentation.slide_width * 0.6
+    assert pictures[0].height < presentation.slide_height * 0.6
     assert not content_screenshot.exists()

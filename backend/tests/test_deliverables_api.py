@@ -15,7 +15,7 @@ from app.api import deliverables
 from app.core.security import BROWSER_SESSION_COOKIE, create_access_token
 from app.database import get_db
 from app.models.deliverable import DeliverableArtifactRevision, DeliverableRequest
-from app.schemas.deliverable import DeliverableActionIn
+from app.schemas.deliverable import DeliverableActionIn, DeliverableRequestCreate
 from app.services.deliverable_artifacts import DeliverableArtifactError
 
 
@@ -49,6 +49,26 @@ class _Result:
         if self.value is None:
             return []
         return self.value if isinstance(self.value, list) else [self.value]
+
+
+class _NestedTransaction:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, _exc_type, _exc, _traceback) -> bool:
+        return False
+
+
+class _CreateSession(_Session):
+    def __init__(self) -> None:
+        super().__init__(None)
+        self.added: list[object] = []
+
+    def add(self, value: object) -> None:
+        self.added.append(value)
+
+    def begin_nested(self) -> _NestedTransaction:
+        return _NestedTransaction()
 
 
 class _Storage:
@@ -126,6 +146,58 @@ def _artifact(request: DeliverableRequest, artifact_type: str) -> DeliverableArt
         status="candidate",
         evaluation={"verified": True},
     )
+
+
+@pytest.mark.asyncio
+async def test_create_brief_does_not_require_a_provider_route(monkeypatch) -> None:
+    """Saving an unavailable media brief must not perform a paid preflight."""
+
+    tenant_id = uuid.uuid4()
+    user = SimpleNamespace(id=uuid.uuid4(), tenant_id=tenant_id)
+    agent_id = uuid.uuid4()
+    agent = SimpleNamespace(id=agent_id, tenant_id=tenant_id)
+    workflow = SimpleNamespace(
+        workflow_id="builtin.video.v1",
+        workflow_version="1.0.0",
+        approval_policy=["storyboard", "final"],
+        output_contract=["mp4"],
+    )
+    data = DeliverableRequestCreate(
+        client_request_id=uuid.uuid4(),
+        agent_id=agent_id,
+        session_id=uuid.uuid4(),
+        work_type="video",
+        workflow_id=workflow.workflow_id,
+        workflow_version=workflow.workflow_version,
+        goal="Prepare a people-led product advertisement",
+        spec={"aspect_ratio": "9:16", "duration": 6, "audio_mode": "voiceover"},
+        tier="lite",
+    )
+    db = _CreateSession()
+
+    monkeypatch.setattr(deliverables, "check_agent_access", AsyncMock(return_value=(agent, None)))
+    monkeypatch.setattr(deliverables, "_require_direct_session", AsyncMock())
+    monkeypatch.setattr(deliverables, "require_workflow", lambda *_args: workflow)
+    monkeypatch.setattr(
+        deliverables,
+        "validate_workflow_spec",
+        lambda _workflow, spec: dict(spec),
+    )
+    shadow = SimpleNamespace(id=uuid.uuid4())
+    monkeypatch.setattr(deliverables, "add_initial_execution_shadow", lambda *_args: shadow)
+    preflight = AsyncMock(side_effect=AssertionError("brief persistence must not call provider preflight"))
+    monkeypatch.setattr(deliverables, "preflight_workflow", preflight)
+    monkeypatch.setattr(deliverables, "_request_out", AsyncMock(side_effect=lambda _db, request: request))
+
+    request = await deliverables.create_deliverable_request(data, user, db)  # type: ignore[arg-type]
+
+    assert request.status == "ready"
+    assert request.current_stage == "brief_confirmed"
+    assert request.work_type == "video"
+    assert request.current_execution_id == shadow.id
+    assert db.flush_count == 3
+    assert db.added == [request]
+    preflight.assert_not_awaited()
 
 
 @pytest.mark.asyncio

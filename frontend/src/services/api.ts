@@ -295,6 +295,9 @@ export const agentApi = {
     templates: () =>
         request<any[]>('/agents/templates'),
 
+    capabilityReadiness: (id: string) =>
+        request<any>(`/agents/${id}/capability-readiness`),
+
     // OpenClaw gateway
     generateApiKey: (id: string) =>
         request<{ api_key: string; message: string }>(`/agents/${id}/api-key`, { method: 'POST' }),
@@ -846,6 +849,7 @@ export const deliverableApi = {
         work_type: DeliverableWorkType;
         workflow_id: string;
         workflow_version: string;
+        goal?: string;
         spec: Record<string, string | number>;
         tier: 'lite' | 'pro' | 'ultra';
     }) => request<DeliverablePreflight>('/deliverables/preflight', {

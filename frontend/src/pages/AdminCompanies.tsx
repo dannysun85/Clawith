@@ -1,12 +1,14 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
-import { adminApi, fetchJson } from '../services/api';
+import { adminApi, authApi, fetchJson } from '../services/api';
 import { useAuthStore } from '../stores';
 import { saveAccentColor, getSavedAccentColor } from '../utils/theme';
 import { IconFilter, IconShieldCheck } from '@tabler/icons-react';
 import PlatformDashboard from './PlatformDashboard';
 import LinearCopyButton from '../components/LinearCopyButton';
 import { useDialog } from '../components/Dialog/DialogProvider';
+import { normalizeTenantRedirectUrl } from '../utils/authTransport';
 // Format large token numbers with K/M/B suffixes
 function formatTokens(n: number | null | undefined): string {
     if (n == null) return '-';
@@ -26,6 +28,86 @@ type SortKey = 'name' | 'sso_enabled' | 'org_admin_email' | 'user_count' | 'agen
 type SortDir = 'asc' | 'desc';
 
 const PAGE_SIZE = 15;
+
+/**
+ * A global platform administrator may also have memberships in one or more
+ * companies.  The platform console is intentionally the default landing
+ * surface for that identity, so expose the explicit escape hatch into a
+ * tenant-scoped workspace here instead of requiring a second account.
+ */
+function PlatformTenantSwitcher() {
+    const navigate = useNavigate();
+    const setAuth = useAuthStore((state) => state.setAuth);
+    const [tenants, setTenants] = useState<any[]>([]);
+    const [loading, setLoading] = useState(false);
+    const [error, setError] = useState('');
+
+    useEffect(() => {
+        let cancelled = false;
+        authApi.getMyTenants()
+            .then((items) => {
+                if (!cancelled) setTenants(Array.isArray(items) ? items : []);
+            })
+            .catch(() => {
+                if (!cancelled) setTenants([]);
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, []);
+
+    if (tenants.length === 0) return null;
+
+    const handleChange = async (tenantId: string) => {
+        if (!tenantId || loading) return;
+        setLoading(true);
+        setError('');
+        try {
+            const result = await authApi.switchTenant(tenantId);
+            localStorage.setItem('current_tenant_id', tenantId);
+            if (result.redirect_url) {
+                window.location.href = normalizeTenantRedirectUrl(
+                    result.redirect_url,
+                    window.location.href,
+                );
+                return;
+            }
+            if (!result.access_token) throw new Error('No tenant access token returned');
+            const user = await authApi.me();
+            await setAuth(user, result.access_token);
+            navigate('/work', { replace: true });
+        } catch (err: any) {
+            setError(err?.message || '公司切换失败');
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    return (
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+            <label htmlFor="platform-tenant-switcher" style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>
+                进入公司工作区
+            </label>
+            <select
+                id="platform-tenant-switcher"
+                aria-label="进入公司工作区"
+                className="form-input"
+                value=""
+                disabled={loading}
+                onChange={(event) => void handleChange(event.target.value)}
+                style={{ width: '220px', height: '34px', fontSize: '12px' }}
+            >
+                <option value="">{loading ? '切换中…' : '选择公司'}</option>
+                {tenants.map((tenant) => (
+                    <option key={tenant.tenant_id} value={tenant.tenant_id}>
+                        {tenant.tenant_name}
+                    </option>
+                ))}
+            </select>
+            {error && <span role="alert" style={{ color: 'var(--error)', fontSize: '12px' }}>{error}</span>}
+        </div>
+    );
+}
 
 // Platform Admin — Platform Settings page with tabs
 export default function AdminCompanies() {
@@ -60,6 +142,7 @@ export default function AdminCompanies() {
                         {t('admin.platformSettingsDesc', 'Manage platform-wide settings and company tenants.')}
                     </p>
                 </div>
+                <PlatformTenantSwitcher />
             </div>
 
             <div className="tabs">

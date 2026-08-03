@@ -23,6 +23,7 @@ async def render_html_to_pptx(src_file: Path, tgt_file: Path, target_path: str, 
         from pptx.dml.color import RGBColor
         from pptx.enum.shapes import MSO_SHAPE
         from pptx.enum.text import MSO_ANCHOR, MSO_AUTO_SIZE, PP_ALIGN
+        from pptx.oxml.xmlchemy import OxmlElement
         from pptx.util import Inches, Pt
         
         html_content = src_file.read_text(encoding="utf-8")
@@ -44,6 +45,9 @@ async def render_html_to_pptx(src_file: Path, tgt_file: Path, target_path: str, 
                 Path(str(arguments["_slide_spec_file_path"]))
                 if arguments.get("_slide_spec_file_path")
                 else None
+            ),
+            require_adaptive_visual_plan=bool(
+                arguments.get("_require_adaptive_visual_plan")
             ),
         )
         soup = BeautifulSoup(html_content, "html.parser")
@@ -272,8 +276,27 @@ async def render_html_to_pptx(src_file: Path, tgt_file: Path, target_path: str, 
             if color:
                 font.color.rgb = color
             family = (style.get("font-family") or "").split(",")[0].strip().strip("\"'")
+            has_cjk = bool(re.search(r"[\u2e80-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]", text))
+            # Browser rendering on macOS commonly reports PingFang/Hiragino,
+            # while the server-side Office renderer is provisioned with Noto
+            # CJK.  python-pptx writes ``font.name`` as ``a:latin`` only, so
+            # CJK runs otherwise depend on an implicit client fallback and can
+            # render as blank glyphs.  Pin East Asian and complex-script faces
+            # for CJK text while retaining the browser family for Latin text.
+            cjk_family = "Noto Sans CJK SC"
             if family:
                 font.name = family
+            if has_cjk:
+                rpr = run._r.get_or_add_rPr()
+                for tag in ("a:ea", "a:cs"):
+                    existing = rpr.find(
+                        "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+                        f"{tag.split(':', 1)[1]}"
+                    )
+                    if existing is None:
+                        existing = OxmlElement(tag)
+                        rpr.append(existing)
+                    existing.set("typeface", cjk_family)
             return shape
 
         def add_background(slide, style: dict[str, str]):
@@ -456,9 +479,22 @@ async def render_html_to_pptx(src_file: Path, tgt_file: Path, target_path: str, 
                     if len(content_screenshots) >= len(prs.slides)
                     else None
                 )
+                visual_items = [
+                    item
+                    for item in (slide_data.get("items") or [])
+                    if item.get("kind") in {"image", "shape"}
+                ]
                 bg_screenshots = layout.get("backgroundScreenshots") or []
                 bg_screenshot = bg_screenshots[len(prs.slides) - 1] if len(bg_screenshots) >= len(prs.slides) else None
-                if content_screenshot and Path(content_screenshot).exists():
+                # Keep a whole-slide content screenshot only when there is no
+                # measured visual layer to materialize. If image/shape items
+                # exist, using this screenshot would hide the real assets in
+                # an effectively non-editable slide image.
+                if (
+                    content_screenshot
+                    and not visual_items
+                    and Path(content_screenshot).exists()
+                ):
                     slide.shapes.add_picture(
                         content_screenshot,
                         Inches(offset_x),
@@ -511,8 +547,6 @@ async def render_html_to_pptx(src_file: Path, tgt_file: Path, target_path: str, 
                         "_backdrop-color": slide_bg_value,
                     }
                     kind = item.get("kind")
-                    if content_screenshot and kind != "text":
-                        continue
                     if kind == "shape":
                         shape_screenshots = layout.get("shapeScreenshots") or {}
                         shape_screenshot = shape_screenshots.get(str(item.get("itemId") or ""))

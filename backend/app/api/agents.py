@@ -16,7 +16,11 @@ from app.config import get_settings
 from app.core.permissions import build_visible_agents_query, check_agent_access, is_agent_creator
 from app.core.security import get_current_user
 from app.database import async_session, get_db
-from app.models.agent import Agent, AgentPermission, AgentTemplate
+from app.models.agent import (
+    Agent,
+    AgentPermission,
+    AgentTemplate,
+)
 from app.models.agent_run import AgentRun
 from app.models.agent_run_event import AgentRunEvent
 from app.models.org import OrgMember
@@ -45,11 +49,19 @@ from app.services.resource_discovery import import_mcp_from_smithery
 from app.services.skill_scope import resolve_agent_skills, scope_skill_query
 from app.services.agent_runtime.persistence import enqueue_cancel
 from app.services.llm.model_resolution import load_active_model
+from app.services.agent_template_contract import TEMPLATE_LIFECYCLE_ENABLED
+from app.services.agent_capability_readiness import (
+    agent_runtime_capability_readiness,
+    template_capability_contract,
+)
 
 router = APIRouter(prefix="/agents", tags=["agents"])
 settings = get_settings()
 
-def _resolve_agent_plan_selection(ent, requested_tier: str | None, requested_modality: str | None) -> tuple[str | None, str | None]:
+
+def _resolve_agent_plan_selection(
+    ent, requested_tier: str | None, requested_modality: str | None
+) -> tuple[str | None, str | None]:
     """Resolve and validate the Agent's SaaS tier/modality selection."""
     try:
         return resolve_agent_plan_selection(ent, requested_tier, requested_modality)
@@ -62,9 +74,7 @@ def _resolve_agent_plan_selection(ent, requested_tier: str | None, requested_mod
 
 def _is_platform_admin(current_user: User) -> bool:
     identity = getattr(current_user, "identity", None)
-    return current_user.role == "platform_admin" or bool(
-        getattr(identity, "is_platform_admin", False)
-    )
+    return current_user.role == "platform_admin" or bool(getattr(identity, "is_platform_admin", False))
 
 
 async def _validate_agent_skill_selection(
@@ -131,9 +141,7 @@ async def _agent_deletion_blockers(
             select(CreditReservation.id)
             .where(
                 CreditReservation.agent_id == agent_id,
-                CreditReservation.status.in_(
-                    ("reserved", "provider_inflight", "settlement_ready")
-                ),
+                CreditReservation.status.in_(("reserved", "provider_inflight", "settlement_ready")),
             )
             .limit(1),
         ),
@@ -161,9 +169,7 @@ async def _agent_deletion_blockers(
             select(DouyinPublishJob.id)
             .where(
                 DouyinPublishJob.agent_id == agent_id,
-                DouyinPublishJob.status.in_(
-                    ("preparing_share_package", "creating")
-                ),
+                DouyinPublishJob.status.in_(("preparing_share_package", "creating")),
             )
             .limit(1),
         ),
@@ -261,11 +267,13 @@ async def list_templates(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """List all available agent templates."""
+    """List only templates that have passed their activation gate."""
     from app.models.agent import AgentTemplate
 
     result = await db.execute(
-        select(AgentTemplate).order_by(AgentTemplate.is_builtin.desc(), AgentTemplate.created_at.asc())
+        select(AgentTemplate)
+        .where(AgentTemplate.lifecycle_status == TEMPLATE_LIFECYCLE_ENABLED)
+        .order_by(AgentTemplate.is_builtin.desc(), AgentTemplate.created_at.asc())
     )
     templates = result.scalars().all()
     return [
@@ -281,9 +289,54 @@ async def list_templates(
             "default_tools": t.default_tools,
             "default_autonomy_policy": t.default_autonomy_policy,
             "capability_bullets": t.capability_bullets or [],
+            "role_key": t.role_key,
+            "role_revision": t.role_revision,
+            "responsibilities": t.responsibilities or [],
+            "non_responsibilities": t.non_responsibilities or [],
+            "limitations": t.limitations or [],
+            "workflows": t.workflows or [],
+            "deliverables": t.deliverables or [],
+            "evaluation_criteria": t.evaluation_criteria or [],
+            "source_provenance": t.source_provenance or {},
+            "lifecycle_status": t.lifecycle_status,
+            "activation_gate": t.activation_gate,
+            "workforce_source_role_id": t.workforce_source_role_id,
+            "workforce_decision": t.workforce_decision,
+            "workforce_pack": t.workforce_pack,
+            "capability_contract": template_capability_contract(t),
         }
         for t in templates
     ]
+
+
+@router.get("/{agent_id}/capability-readiness")
+async def get_agent_capability_readiness(
+    agent_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return secret-free, local-only readiness for one Agent's role contract."""
+    agent, _access = await check_agent_access(db, current_user, agent_id)
+    if agent.template_id is None:
+        return {
+            "agent_id": str(agent.id),
+            "role_key": None,
+            "runtime_status": "unmanaged",
+            "blockers": [],
+            "next_action": "Assign and review capabilities explicitly for this custom Agent.",
+        }
+    result = await db.execute(select(AgentTemplate).where(AgentTemplate.id == agent.template_id))
+    template = result.scalar_one_or_none()
+    if template is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "agent_template_missing"},
+        )
+    return await agent_runtime_capability_readiness(
+        db,
+        agent_id=agent.id,
+        template=template,
+    )
 
 
 async def _agent_to_out(
@@ -338,9 +391,7 @@ def _apply_release_capabilities(model: AgentOut) -> None:
             AUTOMATIC_TRIGGER_EXECUTION_ENABLED,
         )
     )
-    model.approval_execution_enabled = (
-        APPROVAL_AUTOMATIC_EXECUTION_ENABLED
-    )
+    model.approval_execution_enabled = APPROVAL_AUTOMATIC_EXECUTION_ENABLED
     model.execution_capabilities = {
         "schedule_execution": AUTOMATIC_SCHEDULE_EXECUTION_ENABLED,
         "task_execution": AUTOMATIC_TASK_EXECUTION_ENABLED,
@@ -351,11 +402,7 @@ def _apply_release_capabilities(model: AgentOut) -> None:
         # outbox identity makes timeout ambiguity non-replayable.
         "gateway_human_delivery": False,
     }
-    model.deletion_state = (
-        "cleanup_pending"
-        if model.deletion_requested_at is not None
-        else "active"
-    )
+    model.deletion_state = "cleanup_pending" if model.deletion_requested_at is not None else "active"
 
 
 def _format_agent_setup_error(stage: str, exc: Exception) -> str:
@@ -381,11 +428,15 @@ async def _record_agent_setup_error(
             agent = result.scalar_one_or_none()
             if agent:
                 agent_manager.mark_error(agent, _format_agent_setup_error(stage, exc))
+                if agent.template_id is not None:
+                    agent.template_sync_status = "failed"
+                    agent.template_sync_details = {
+                        "stage": stage,
+                        "error_type": type(exc).__name__,
+                    }
                 await db.commit()
     except Exception as persist_exc:
-        logger.exception(
-            f"Failed to persist setup error for agent {agent_id}: {persist_exc}"
-        )
+        logger.exception(f"Failed to persist setup error for agent {agent_id}: {persist_exc}")
 
 
 @router.get("/", response_model=list[AgentOut])
@@ -437,6 +488,7 @@ async def _background_agent_setup(
     template_skill_folder_names: list[str],
     template_tool_names: list[str],
     template_mcp_servers: list[str],
+    template_revision: int | None = None,
 ) -> None:
     """Run all creation tasks asynchronously with small, short-lived transactions."""
     agent_tenant_id: uuid.UUID | None = None
@@ -485,21 +537,16 @@ async def _background_agent_setup(
                 template_folders=template_skill_folder_names,
             )
             automatic_folders = set(template_skill_folder_names)
-            automatic_folders.update(
-                skill.folder_name for skill in visible_skills if skill.is_default
-            )
-            automatic_skills = [
-                skill for skill in skills if skill.folder_name in automatic_folders
-            ]
-            user_selected_skills = [
-                skill for skill in skills if skill.folder_name not in automatic_folders
-            ]
+            automatic_folders.update(skill.folder_name for skill in visible_skills if skill.is_default)
+            automatic_skills = [skill for skill in skills if skill.folder_name in automatic_folders]
+            user_selected_skills = [skill for skill in skills if skill.folder_name not in automatic_folders]
     except Exception as e:
         logger.exception(f"Error resolving skills for agent {agent_id}: {e}")
         await _record_agent_setup_error(agent_id, "skill_resolution", e)
         return
 
     # 3. Skills Copying (I/O only, NO db connection held!)
+    skill_conflict_count = 0
     if automatic_skills or user_selected_skills:
         try:
             from app.services.skill_workspace import deploy_skills_to_agent_workspace
@@ -518,6 +565,7 @@ async def _background_agent_setup(
                 )
                 stats["files"] += batch_stats["files"]
                 stats["conflicts"] += batch_stats["conflicts"]
+            skill_conflict_count = stats["conflicts"]
             logger.info(
                 "[_skills_copy] background agent={} files={} conflicts={}",
                 agent_id,
@@ -543,10 +591,7 @@ async def _background_agent_setup(
                 )
                 await db.commit()
             if unresolved:
-                raise RuntimeError(
-                    "Template Tool registry is incomplete: "
-                    + ", ".join(unresolved)
-                )
+                raise RuntimeError("Template Tool registry is incomplete: " + ", ".join(unresolved))
         except Exception as e:
             logger.exception(
                 "Error granting template tools agent={} error_type={}",
@@ -557,6 +602,7 @@ async def _background_agent_setup(
             return
 
     # 5. Install template MCP servers
+    mcp_failures: list[str] = []
     if template_mcp_servers:
         for server_id in template_mcp_servers:
             try:
@@ -566,9 +612,9 @@ async def _background_agent_setup(
                     config={},
                 )
                 if result_msg.startswith("❌"):
+                    mcp_failures.append(server_id)
                     logger.warning(
-                        "[create_agent] background MCP pre-install server={} agent={} "
-                        "reported error result_chars={}",
+                        "[create_agent] background MCP pre-install server={} agent={} reported error result_chars={}",
                         server_id,
                         agent_id,
                         len(result_msg),
@@ -578,9 +624,9 @@ async def _background_agent_setup(
                         f"[create_agent] background MCP pre-install '{server_id}' succeeded for agent {agent_id}"
                     )
             except Exception as e:
+                mcp_failures.append(server_id)
                 logger.warning(
-                    "[create_agent] background MCP pre-install failed "
-                    "server_id={} agent={} error_type={}",
+                    "[create_agent] background MCP pre-install failed server_id={} agent={} error_type={}",
                     server_id,
                     agent_id,
                     type(e).__name__,
@@ -600,9 +646,7 @@ async def _background_agent_setup(
                 logger.error(f"[background_agent_setup] Agent {agent_id} not found before starting container")
                 return
             if agent.deletion_requested_at is not None:
-                logger.info(
-                    "[background_agent_setup] Agent deletion is pending; startup skipped"
-                )
+                logger.info("[background_agent_setup] Agent deletion is pending; startup skipped")
                 return
 
             await agent_manager.start_container(db, agent)
@@ -613,6 +657,27 @@ async def _background_agent_setup(
 
             if agent.tenant_id:
                 await hook_new_agent(db, agent.id, agent.tenant_id)
+
+            if template_revision is not None:
+                if skill_conflict_count:
+                    agent.template_sync_status = "conflict"
+                    agent.template_sync_details = {
+                        "managed_skill_conflicts": skill_conflict_count
+                    }
+                    if mcp_failures:
+                        agent.template_sync_details["missing_mcp_servers"] = sorted(
+                            set(mcp_failures)
+                        )
+                elif mcp_failures:
+                    agent.template_sync_status = "pending"
+                    agent.template_sync_details = {
+                        "missing_mcp_servers": sorted(set(mcp_failures)),
+                    }
+                else:
+                    agent.template_revision_applied = template_revision
+                    agent.template_sync_status = "current"
+                    agent.template_sync_details = {}
+                    agent.template_synced_at = datetime.now(timezone.utc)
 
             await db.commit()
     except Exception as e:
@@ -649,14 +714,21 @@ async def create_agent(
 
     selected_template = None
     if data.template_id:
-        template_result = await db.execute(
-            select(AgentTemplate).where(AgentTemplate.id == data.template_id)
-        )
+        template_result = await db.execute(select(AgentTemplate).where(AgentTemplate.id == data.template_id))
         selected_template = template_result.scalar_one_or_none()
         if selected_template is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Agent template not found",
+            )
+        if selected_template.lifecycle_status != TEMPLATE_LIFECYCLE_ENABLED:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "agent_template_not_recruitable",
+                    "lifecycle_status": selected_template.lifecycle_status,
+                    "activation_gate": selected_template.activation_gate,
+                },
             )
 
     # Plan max_agents is a tenant-level commercial limit. Enforce it after the
@@ -730,6 +802,11 @@ async def create_agent(
         max_tokens_per_day=data.max_tokens_per_day,
         max_tokens_per_month=data.max_tokens_per_month,
         template_id=data.template_id,
+        template_revision_applied=None,
+        template_sync_status="pending" if selected_template else "current",
+        template_sync_details=(
+            {"stage": "background_setup"} if selected_template else {}
+        ),
         status="creating" if data.agent_type != "openclaw" else "idle",
         expires_at=expires_at,
         max_llm_calls_per_day=max_llm_calls,
@@ -740,11 +817,7 @@ async def create_agent(
     )
     if data.autonomy_policy:
         agent.autonomy_policy = data.autonomy_policy
-    elif (
-        selected_template
-        and selected_template.is_builtin
-        and selected_template.default_autonomy_policy
-    ):
+    elif selected_template and selected_template.is_builtin and selected_template.default_autonomy_policy:
         agent.autonomy_policy = dict(selected_template.default_autonomy_policy)
 
     db.add(agent)
@@ -832,6 +905,7 @@ async def create_agent(
         template_skill_folder_names=folder_names,
         template_tool_names=template_tool_names,
         template_mcp_servers=template_mcp_servers,
+        template_revision=(selected_template.role_revision if selected_template else None),
     )
 
     return out
@@ -907,6 +981,29 @@ async def get_media_capabilities(
         entitlements=entitlements,
         tier=selected_tier,
     )
+    if not _is_platform_admin(current_user):
+        # Provider, plan tier, and internal failover reasons are platform
+        # governance facts.  The Agent composer only needs business-level
+        # readiness; returning the raw route diagnostics here would leak
+        # provider/account details through a normal user's browser network
+        # response even though the UI intentionally hides them.
+        sanitized_capabilities = []
+        for capability in capabilities:
+            row = dict(capability)
+            row["tool_name"] = "media_generation"
+            row["available_providers"] = []
+            row["route_reason"] = None
+            if row.get("available") and row.get("capability_status") == "degraded":
+                row["next_action"] = (
+                    "当前仅有应急质量线路；正式交付需先确认质量差异，"
+                    "也可以先保存工作说明并等待主线路恢复。"
+                )
+            elif row.get("available"):
+                row["next_action"] = "按当前工作合同执行；供应商选择由平台托管。"
+            else:
+                row["next_action"] = "当前能力暂不可用，请稍后重试或联系管理员。"
+            sanitized_capabilities.append(row)
+        capabilities = sanitized_capabilities
     return {"tier": selected_tier, "capabilities": capabilities}
 
 
@@ -1034,9 +1131,7 @@ async def update_agent_permissions(
     # Serialize every ACL replacement with final-delivery authorization fences.
     # Deleting/reinserting AgentPermission rows alone does not conflict with the
     # Agent FOR SHARE locks used by A2A delivery and can otherwise cross a revoke.
-    locked_agent_result = await db.execute(
-        select(Agent).where(Agent.id == agent_id).with_for_update()
-    )
+    locked_agent_result = await db.execute(select(Agent).where(Agent.id == agent_id).with_for_update())
     locked_agent = locked_agent_result.scalar_one_or_none()
     if locked_agent is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
@@ -1361,8 +1456,7 @@ async def delete_agent(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
-                "System agents cannot be deleted. Disable the related feature "
-                "(e.g. OKR) in Company Settings instead."
+                "System agents cannot be deleted. Disable the related feature (e.g. OKR) in Company Settings instead."
             ),
         )
 
@@ -1371,10 +1465,7 @@ async def delete_agent(
         if blockers:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    "Agent has in-flight work that must be reconciled before "
-                    f"deletion: {', '.join(blockers)}"
-                ),
+                detail=(f"Agent has in-flight work that must be reconciled before deletion: {', '.join(blockers)}"),
             )
 
         now = datetime.now(timezone.utc)
@@ -1389,9 +1480,7 @@ async def delete_agent(
                 action="agent_deleted",
                 details={
                     "resource_id": str(agent.id),
-                    "tenant_id": (
-                        str(agent.tenant_id) if agent.tenant_id else None
-                    ),
+                    "tenant_id": (str(agent.tenant_id) if agent.tenant_id else None),
                     "name": agent.name,
                     "deletion_mode": "logical",
                 },
@@ -1407,9 +1496,7 @@ async def delete_agent(
                 AgentRun.agent_id == agent.id,
                 ~exists().where(
                     AgentRunEvent.run_id == AgentRun.id,
-                    AgentRunEvent.event_type.in_(
-                        ("run_completed", "run_failed", "run_cancelled")
-                    ),
+                    AgentRunEvent.event_type.in_(("run_completed", "run_failed", "run_cancelled")),
                 ),
             )
             .order_by(AgentRun.created_at, AgentRun.id)
@@ -1424,9 +1511,7 @@ async def delete_agent(
                 actor_user_id=current_user.id,
             )
 
-    await db.execute(
-        delete(WorkspaceEditLock).where(WorkspaceEditLock.agent_id == agent.id)
-    )
+    await db.execute(delete(WorkspaceEditLock).where(WorkspaceEditLock.agent_id == agent.id))
     await db.commit()
 
     try:
@@ -1489,9 +1574,7 @@ async def recover_agent(
         if agent.container_id:
             container_removed = await agent_manager.remove_container(agent)
             if not container_removed:
-                raise RuntimeError(
-                    "Existing Agent runtime cleanup could not be verified"
-                )
+                raise RuntimeError("Existing Agent runtime cleanup could not be verified")
         await agent_manager.initialize_agent_files(db, agent)
         await agent_manager.start_container(db, agent)
         if agent.status == "error":
@@ -1644,11 +1727,7 @@ async def list_gateway_messages(
         agent_access_level=access_level,
     ):
         query = query.where(GatewayMessage.sender_user_id == current_user.id)
-    result = await db.execute(
-        query
-        .order_by(GatewayMessage.created_at.desc())
-        .limit(50)
-    )
+    result = await db.execute(query.order_by(GatewayMessage.created_at.desc()).limit(50))
     messages = result.scalars().all()
 
     out = []

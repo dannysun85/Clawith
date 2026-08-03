@@ -48,6 +48,7 @@ _agents/
 !.agents/workflows/deploy-production.md
 !.agents/workflows/add-product-capability.md
 !.agents/workflows/creative-deliverables-implementation-rollout.md
+!.agents/workflows/agent-workforce-v2-rollout.md
 !.agents/reference/
 .agents/reference/*
 !.agents/reference/creative-deliverables-capability.md

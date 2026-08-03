@@ -287,7 +287,6 @@ def add_initial_execution_shadow(
         idempotency_key=request.client_request_id,
         current_stage="brief_confirmed",
     )
-    request.current_execution_id = execution.id
     request.contract_revision = int(getattr(request, "contract_revision", None) or 1)
     db.add(execution)
     db.add_all(units)
@@ -327,6 +326,12 @@ async def ensure_execution_shadow(
     if execution is not None:
         return execution
     execution = add_initial_execution_shadow(db, request)
+    await db.flush()
+    # ``deliverable_requests.current_execution_id`` points at the execution
+    # row.  The execution must be inserted before the request can safely be
+    # updated with that foreign key; assigning it before the first flush makes
+    # PostgreSQL reject the insert in the dual-write path.
+    request.current_execution_id = execution.id
     await db.flush()
     return execution
 

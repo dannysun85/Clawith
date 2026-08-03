@@ -313,7 +313,7 @@ _BUILTIN_TOOL_SOURCE = [
     {
         "name": "convert_html_to_pptx",
         "display_name": "HTML to PowerPoint",
-        "description": "Convert an HTML source file into a PowerPoint .pptx file. By default, render_mode='editable' opens the HTML in headless Chrome, samples real element positions/styles, and maps explicit .slide/data-slide nodes or top-level page sections into editable PPT elements. Use render_mode='hybrid_editable' to preserve SVG, gradients, and complex visual elements in a text-free slide background while keeping text editable. Use render_mode='visual' as a high-fidelity screenshot fallback when exact visual preservation is more important than editability.",
+        "description": "Convert an HTML source file into a PowerPoint .pptx file. By default, render_mode='editable' opens the HTML in headless Chrome, samples real element positions/styles, and maps explicit .slide/data-slide nodes or top-level page sections into editable PPT elements. Use render_mode='hybrid_editable' to materialize measured images, shapes, SVG/canvas regions, and editable text separately; only unsupported slides without a measurable visual layer use a text-free full-slide screenshot fallback. Use render_mode='visual' as a high-fidelity screenshot fallback when exact visual preservation is more important than editability.",
         "category": "file",
         "icon": "📽️",
         "is_default": True,
@@ -324,7 +324,7 @@ _BUILTIN_TOOL_SOURCE = [
                 "target_path": {"type": "string", "description": "Path for the output PowerPoint file (.pptx)"},
                 "design_width": {"type": "number", "description": "Optional source design width in pixels, default 1280"},
                 "design_height": {"type": "number", "description": "Optional source design height in pixels, default 720"},
-                "render_mode": {"type": "string", "enum": ["editable", "hybrid_editable", "visual"], "description": "editable maps HTML/CSS into editable PPT elements; hybrid_editable preserves complex visuals as a text-free background and overlays editable text; visual preserves the full slide as a screenshot. Default: editable"},
+                "render_mode": {"type": "string", "enum": ["editable", "hybrid_editable", "visual"], "description": "editable maps HTML/CSS into editable PPT elements; hybrid_editable keeps measured images/shapes/SVG regions separate and editable text as text, with a bounded fallback only when needed; visual preserves the full slide as a screenshot. Default: editable"},
                 "render_scale": {"type": "number", "description": "Optional Chrome raster scale for screenshots and complex CSS captures. Higher values improve sharpness but increase PPTX size. Default: 2, clamped between 1 and 4"},
                 "expected_page_count": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Optional hard slide-count contract. When set, conversion rejects incomplete HTML, wrong .slide[data-slide] counts, duplicate slide identifiers, missing local images, and browser layouts with the wrong size."},
                 "outline_path": {"type": "string", "description": "Optional workspace JSON deck outline. Must be supplied together with slide_spec_path; slide ids and headlines are validated against the HTML."},
@@ -3897,6 +3897,7 @@ _brand_safe_image_names = {
 }
 _brand_safe_fields = {
     "overlay_text",
+    "overlay_blocks",
     "overlay_position",
     "brand_asset",
     "brand_position",

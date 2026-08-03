@@ -51,6 +51,7 @@ import {
     deliverableRouteTier,
     latestPendingDeliverable,
     latestTrackedDeliverables,
+    nextDeliverableComposerText,
     requestCanLaunchFromComposer,
 } from '../../utils/deliverables';
 import {
@@ -132,6 +133,7 @@ import AgentDirectory from './AgentDirectory';
 import { useAgentDetailRoute } from './hooks/useAgentDetailRoute';
 import {
     failClosedSessionActiveRun,
+    isMediaDeliveryPending,
     mergeTerminalAssistantMessage,
     runtimeCompletionNeedsMessageRefresh,
     sessionActiveRunFromResponse,
@@ -8164,7 +8166,18 @@ export default function AgentDetailPage() {
                                             ) : null}
                                             <div ref={chatInputAreaRef} className="chat-input-area" style={{ flexShrink: 0 }}>
                                                 <div className="chat-composer">
-                                                    {activeRun?.pendingToolReconciliations.map((reconciliation) => (
+                                                    {activeRun?.pendingToolReconciliations.map((reconciliation) => isMediaDeliveryPending(reconciliation) ? (
+                                                        <div className="chat-tool-reconciliation chat-tool-reconciliation--pending" key={reconciliation.executionId}>
+                                                            <div className="chat-tool-reconciliation__title">
+                                                                <IconClock size={16} />
+                                                                {t('agent.chat.mediaDeliveryTitle', '媒体已生成，正在安全交付')}
+                                                            </div>
+                                                            <div className="chat-tool-reconciliation__detail">
+                                                                <code>{toolDisplayName(reconciliation.toolName)}</code>
+                                                                <span>{reconciliation.resultSummary || t('agent.chat.mediaDeliveryDetail', '后台正在完成媒体校验、处理与存储，无需重新提交。')}</span>
+                                                            </div>
+                                                        </div>
+                                                    ) : (
                                                         <div className="chat-tool-reconciliation" key={reconciliation.executionId}>
                                                             <div className="chat-tool-reconciliation__title">
                                                                 <IconAlertTriangle size={16} />
@@ -8362,11 +8375,12 @@ export default function AgentDetailPage() {
                                                                 setPendingDeliverable({ request, launchable });
                                                                 queryClient.invalidateQueries({ queryKey: ['deliverable-requests', id, activeSession?.id] });
                                                                 if (launchable) {
-                                                                    const launchText = deliverableLaunchMessage(
+                                                                    setChatInput((current) => nextDeliverableComposerText(
+                                                                        current,
                                                                         request,
+                                                                        pendingDeliverable?.request,
                                                                         i18n.language?.startsWith('zh'),
-                                                                    );
-                                                                    setChatInput((current) => current.trim() ? current : launchText);
+                                                                    ));
                                                                     window.setTimeout(() => {
                                                                         if (chatInputRef.current) {
                                                                             scheduleChatInputResize(chatInputRef.current);
@@ -8387,24 +8401,24 @@ export default function AgentDetailPage() {
                                                                 music: <IconMusic size={16} stroke={1.75} />,
                                                                 video: <IconVideo size={16} stroke={1.75} />,
                                                             };
-                                                            return (
-                                                                <button
-                                                                    key={capability.modality}
-                                                                    type="button"
-                                                                    className="chat-composer-btn media-capability-launcher"
-                                                                    onClick={() => handleMediaCapabilityClick(capability)}
-                                                                    disabled={chatInputDisabled || !wsConnected || mediaCapabilitiesLoading}
-                                                                    aria-label={state.label}
-                                                                    data-capability-state={state.disabled ? 'unavailable' : 'available'}
-                                                                    title={state.label}
-                                                                    style={state.disabled ? { opacity: 0.48 } : undefined}
-                                                                >
-                                                                    {mediaIcons[capability.modality]}
-                                                                    <span className="media-capability-label">
-                                                                        {mediaCapabilityShortLabel(capability.modality, language)}
-                                                                    </span>
-                                                                </button>
-                                                            );
+                                                                return (
+                                                                    <button
+                                                                        key={capability.modality}
+                                                                        type="button"
+                                                                        className={`chat-composer-btn media-capability-launcher${capability.capability_status === 'degraded' ? ' is-degraded' : ''}`}
+                                                                        onClick={() => handleMediaCapabilityClick(capability)}
+                                                                        disabled={chatInputDisabled || !wsConnected || mediaCapabilitiesLoading || state.disabled}
+                                                                        aria-label={state.label}
+                                                                        data-capability-state={state.disabled ? 'unavailable' : (capability.capability_status || 'available')}
+                                                                        title={state.label}
+                                                                        style={state.disabled ? { opacity: 0.48 } : undefined}
+                                                                    >
+                                                                        {mediaIcons[capability.modality]}
+                                                                        <span className="media-capability-label">
+                                                                            {mediaCapabilityShortLabel(capability.modality, language)}
+                                                                        </span>
+                                                                    </button>
+                                                                );
                                                         })}
                                                         <TierSelector
                                                             value={effectiveChatTier}

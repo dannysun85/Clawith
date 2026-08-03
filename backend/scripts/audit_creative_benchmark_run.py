@@ -27,6 +27,9 @@ from app.services.creative_blind_review import (  # noqa: E402
     BlindReviewKey,
     BlindReviewPackage,
 )
+from app.services.creative_artifact_evaluation import (  # noqa: E402
+    CreativeArtifactContract,
+)
 from app.services.creative_evaluation import CreativeScenario  # noqa: E402
 from app.services.creative_review_panel import (  # noqa: E402
     BlindCandidatePanelResult,
@@ -68,6 +71,7 @@ class BenchmarkRunAudit(BaseModel):
 
     schema_version: str = "1.0.0"
     run_dir: str
+    run_fingerprint_sha256: str | None = None
     status: AuditStatus
     expected_modalities: tuple[str, ...]
     modality_audits: tuple[ModalityBenchmarkAudit, ...]
@@ -80,6 +84,61 @@ def _sha256_file(path: Path) -> str:
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _run_fingerprint_sha256(
+    run_dir: Path,
+    modalities: Sequence[str],
+) -> str:
+    """Hash the content-addressed inputs of one benchmark run.
+
+    The fingerprint is deliberately independent of the absolute temporary
+    directory.  It includes the private attribution key as a digest only, so
+    the audit output can identify a run without exposing provider identities or
+    source paths.  This is a run-content identity, not a Git release SHA.
+    """
+
+    digest = hashlib.sha256()
+    logical_paths: set[Path] = set()
+    for modality in modalities:
+        logical_paths.update(
+            {
+                Path(f"{modality}-batch-spec.json"),
+                Path(modality) / "public" / "review-package.json",
+                Path(modality) / "private" / "review-key.json",
+            }
+        )
+        for relative_dir in (
+            Path(modality) / "public" / "assets",
+            Path(modality) / "panel",
+            Path(modality) / "results",
+        ):
+            absolute_dir = run_dir / relative_dir
+            if not absolute_dir.is_dir():
+                continue
+            logical_paths.update(
+                path.relative_to(run_dir)
+                for path in absolute_dir.rglob("*")
+                if path.is_file() or path.is_symlink()
+            )
+
+    for relative_path in sorted(logical_paths, key=lambda item: item.as_posix()):
+        encoded_path = relative_path.as_posix().encode("utf-8")
+        digest.update(len(encoded_path).to_bytes(8, "big"))
+        digest.update(encoded_path)
+        absolute_path = run_dir / relative_path
+        if absolute_path.is_symlink():
+            target = absolute_path.readlink().as_posix().encode("utf-8")
+            digest.update(b"symlink")
+            digest.update(len(target).to_bytes(8, "big"))
+            digest.update(target)
+            continue
+        if not absolute_path.is_file():
+            digest.update(b"missing")
+            continue
+        digest.update(b"file")
+        digest.update(_sha256_file(absolute_path).encode("ascii"))
     return digest.hexdigest()
 
 
@@ -179,6 +238,7 @@ def _audit_modality(run_dir: Path, modality: str) -> ModalityBenchmarkAudit:
     try:
         batch_payload = json.loads(batch_path.read_text(encoding="utf-8"))
         scenario = CreativeScenario.model_validate(batch_payload["scenario"])
+        contract = CreativeArtifactContract.model_validate(batch_payload["contract"])
         package = BlindReviewPackage.model_validate_json(
             package_path.read_text(encoding="utf-8")
         )
@@ -201,6 +261,30 @@ def _audit_modality(run_dir: Path, modality: str) -> ModalityBenchmarkAudit:
         issues.append(
             f"package modality mismatch: expected {modality}, got {package.modality}"
         )
+    if contract.modality != scenario.modality:
+        issues.append(
+            "artifact contract modality differs from the benchmark scenario"
+        )
+    if contract.aspect_ratio != scenario.aspect_ratio:
+        issues.append(
+            "artifact contract aspect ratio differs from the benchmark scenario"
+        )
+    # The public package is what reviewers actually see.  Bind every
+    # user-facing evaluation field to the same scenario used to produce the
+    # candidate artifacts; checking only scenario_id would allow a package to
+    # silently replace the brief or quality contract while keeping the same
+    # identifier.
+    package_contract_fields = (
+        "brief",
+        "requirements",
+        "hard_gates",
+        "quality_dimensions",
+    )
+    for field_name in package_contract_fields:
+        if getattr(package, field_name) != getattr(scenario, field_name):
+            issues.append(
+                f"public review package {field_name} differs from the benchmark scenario"
+            )
     if {scenario_id, package.scenario_id, key.scenario_id} != {scenario_id}:
         issues.append("scenario ids differ across batch, package, and private key")
     package_labels = {candidate.label for candidate in package.candidates}
@@ -477,6 +561,10 @@ def audit_benchmark_run(
         status = "awaiting_human_review"
     return BenchmarkRunAudit(
         run_dir=str(run_dir.resolve()),
+        run_fingerprint_sha256=_run_fingerprint_sha256(
+            run_dir,
+            normalized_modalities,
+        ),
         status=status,
         expected_modalities=normalized_modalities,
         modality_audits=audits,

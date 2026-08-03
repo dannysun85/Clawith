@@ -8,13 +8,28 @@ cannot silently reference a missing Skill or a catalog-only Tool.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 AUTONOMY_LEVELS = frozenset({"L1", "L2", "L3"})
+TEMPLATE_LIFECYCLE_ENABLED = "enabled"
+TEMPLATE_LIFECYCLE_STATUSES = frozenset({"enabled", "candidate_disabled", "conditional_disabled", "not_recruitable"})
+WORKFORCE_DECISIONS = frozenset({"upgrade_existing", "add_candidate", "conditional_pack", "merge_or_reject"})
+TemplateLifecycle = Literal[
+    "enabled",
+    "candidate_disabled",
+    "conditional_disabled",
+    "not_recruitable",
+]
+TemplateWorkforceDecision = Literal[
+    "upgrade_existing",
+    "add_candidate",
+    "conditional_pack",
+    "merge_or_reject",
+]
 SUPPORTED_TEMPLATE_CATEGORIES = frozenset(
     {
         "software-development",
@@ -64,16 +79,32 @@ class AgentTemplateManifest(BaseModel):
     capability_bullets: list[str] = Field(default_factory=list)
     responsibilities: list[str] = Field(default_factory=list)
     non_responsibilities: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    workflows: list[str] = Field(default_factory=list)
+    deliverables: list[str] = Field(default_factory=list)
+    evaluation_criteria: list[str] = Field(default_factory=list)
     default_skills: list[str] = Field(default_factory=list)
     default_tools: list[str] = Field(default_factory=list)
     default_mcp_servers: list[str] = Field(default_factory=list)
     default_autonomy_policy: dict[str, str] = Field(default_factory=dict)
     source_provenance: TemplateSourceProvenance | None = None
+    lifecycle_status: TemplateLifecycle = TEMPLATE_LIFECYCLE_ENABLED
+    activation_gate: str | None = None
+    workforce_source_role_id: str | None = Field(
+        default=None,
+        pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$",
+    )
+    workforce_decision: TemplateWorkforceDecision | None = None
+    workforce_pack: str | None = None
 
     @field_validator(
         "capability_bullets",
         "responsibilities",
         "non_responsibilities",
+        "limitations",
+        "workflows",
+        "deliverables",
+        "evaluation_criteria",
         "default_skills",
         "default_tools",
         "default_mcp_servers",
@@ -104,9 +135,7 @@ class AgentTemplateManifest(BaseModel):
             if not action_name:
                 raise ValueError("default_autonomy_policy contains a blank action")
             if level not in AUTONOMY_LEVELS:
-                raise ValueError(
-                    f"default_autonomy_policy[{action_name!r}] must be L1, L2, or L3"
-                )
+                raise ValueError(f"default_autonomy_policy[{action_name!r}] must be L1, L2, or L3")
             normalized[action_name] = level
         return normalized
 
@@ -121,16 +150,35 @@ class AgentTemplateManifest(BaseModel):
             missing.append("responsibilities")
         if not self.non_responsibilities:
             missing.append("non_responsibilities")
+        if not self.workflows:
+            missing.append("workflows")
+        if not self.deliverables:
+            missing.append("deliverables")
+        if not self.evaluation_criteria:
+            missing.append("evaluation_criteria")
         if self.source_provenance is None:
             missing.append("source_provenance")
         if missing:
+            raise ValueError("schema_version=2 requires " + ", ".join(missing))
+        if self.workforce_decision in {"upgrade_existing", "add_candidate"}:
+            if not self.workforce_source_role_id:
+                raise ValueError(f"workforce_decision={self.workforce_decision} requires workforce_source_role_id")
+        expected_lifecycle = {
+            "upgrade_existing": "enabled",
+            "add_candidate": "candidate_disabled",
+            "conditional_pack": "conditional_disabled",
+            "merge_or_reject": "not_recruitable",
+        }.get(self.workforce_decision)
+        if expected_lifecycle and self.lifecycle_status != expected_lifecycle:
             raise ValueError(
-                "schema_version=2 requires " + ", ".join(missing)
+                f"workforce_decision={self.workforce_decision} requires lifecycle_status={expected_lifecycle}"
             )
+        if self.lifecycle_status != TEMPLATE_LIFECYCLE_ENABLED and not self.activation_gate:
+            raise ValueError("disabled template lifecycle requires activation_gate")
         return self
 
     def to_seed_dict(self, *, soul_template: str) -> dict[str, Any]:
-        """Return only fields persisted by ``AgentTemplate``."""
+        """Return the reviewed fields persisted by ``AgentTemplate``."""
         return {
             "name": self.name,
             "description": self.description,
@@ -143,6 +191,20 @@ class AgentTemplateManifest(BaseModel):
             "default_tools": self.default_tools,
             "default_mcp_servers": self.default_mcp_servers,
             "default_autonomy_policy": self.default_autonomy_policy,
+            "role_key": self.role_key,
+            "role_revision": self.role_revision,
+            "responsibilities": self.responsibilities,
+            "non_responsibilities": self.non_responsibilities,
+            "limitations": self.limitations,
+            "workflows": self.workflows,
+            "deliverables": self.deliverables,
+            "evaluation_criteria": self.evaluation_criteria,
+            "source_provenance": (self.source_provenance.model_dump() if self.source_provenance else {}),
+            "lifecycle_status": self.lifecycle_status,
+            "activation_gate": self.activation_gate,
+            "workforce_source_role_id": self.workforce_source_role_id,
+            "workforce_decision": self.workforce_decision,
+            "workforce_pack": self.workforce_pack,
         }
 
 
@@ -172,9 +234,7 @@ def load_agent_template_manifest(slug_dir: Path) -> AgentTemplateManifest:
     try:
         raw = yaml.safe_load(meta_path.read_text(encoding="utf-8"))
     except yaml.YAMLError as exc:
-        raise TemplateContractError(
-            f"{slug_dir.name}: invalid meta.yaml: {type(exc).__name__}"
-        ) from exc
+        raise TemplateContractError(f"{slug_dir.name}: invalid meta.yaml: {type(exc).__name__}") from exc
     if not isinstance(raw, dict):
         raise TemplateContractError(f"{slug_dir.name}: meta.yaml must be a mapping")
 
@@ -183,9 +243,7 @@ def load_agent_template_manifest(slug_dir: Path) -> AgentTemplateManifest:
     except ValueError as exc:
         raise TemplateContractError(f"{slug_dir.name}: {exc}") from exc
     if manifest.schema_version >= 2 and manifest.role_key != slug_dir.name:
-        raise TemplateContractError(
-            f"{slug_dir.name}: role_key must match its template folder"
-        )
+        raise TemplateContractError(f"{slug_dir.name}: role_key must match its template folder")
 
     soul_template = soul_path.read_text(encoding="utf-8").strip()
     if not soul_template:
@@ -203,11 +261,7 @@ def validate_template_capability_references(
     """Fail closed when a role declares capability the runtime cannot provide."""
     missing_skills = sorted(set(manifest.default_skills) - set(known_skill_folders))
     missing_tools = sorted(set(manifest.default_tools) - set(known_tool_names))
-    untyped_tools = sorted(
-        set(manifest.default_tools)
-        & set(known_tool_names)
-        - set(runtime_typed_tool_names)
-    )
+    untyped_tools = sorted(set(manifest.default_tools) & set(known_tool_names) - set(runtime_typed_tool_names))
     problems: list[str] = []
     if missing_skills:
         problems.append(f"unknown Skills={missing_skills}")

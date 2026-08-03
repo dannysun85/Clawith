@@ -1,15 +1,28 @@
-# `agency-agents-zh` 首批角色来源与适配事实
+# `agency-agents-zh` 角色来源、筛选与适配事实
 
 ## 固定来源
 
 - 上游仓库：`https://github.com/jnMetaCode/agency-agents-zh`
-- 本次审查提交：`77f3f4c1477702e66ab56b1bf54e9b922c9d46db`
-- 固定日期：2026-07-23
+- 本次审查提交：`e7c3050dd94212832158e478f0f0af17409070f5`
+- 固定日期：2026-07-31
 - 许可证：MIT
 - 原英文版权：Copyright 2025 Michael Sitarzewski
 - 中文翻译与本地化版权：Copyright 2026 jnMetaCode
 
 仓库内新增角色是面向 Astra 对象模型、权限、就绪检查、执行回执和质量门禁的重写，不是把上游 Markdown 原样当作可执行权限。每个 `schema_version: 2` 模板在 `source_provenance` 中记录实际参考路径。
+
+## 完整清单与决策基线
+
+- 上游当前实际角色文件：268 个，19 个部门。
+- 合并升级现有角色：19 个。
+- 新增适配候选：92 个，默认生命周期为 `candidate_disabled`。
+- 条件行业包：142 个，默认生命周期为 `conditional_disabled`。
+- 合并、Skill 化、Task-scoped 或拒绝默认启用：15 个，均不可直接招聘。
+- 机器可校验事实源：`backend/app/data/agent_workforce_catalog.v1.json`。
+- 目录加载与严格校验：`backend/app/services/agent_workforce_catalog.py`。
+- 可重复生成脚本：`backend/scripts/generate_agent_workforce_catalog.py`；脚本要求上游 checkout 精确匹配固定提交，否则失败。
+
+上游 `package.json` 在该提交仍声明 267 个角色，而实际目录、`AGENT-LIST.md` 与本地逐文件核对均为 268 个；其 `scripts/check-counts.mjs` 因此失败。上游 `scripts/lint-agents.sh` 只扫描 253 个文件。Astra 不能把上游自报数量或 lint 通过当作本地上线证据。
 
 ## 首批映射
 

@@ -221,6 +221,22 @@ async def test_client_issue_report_rate_counter_uses_a_bounded_redis_window(monk
     assert script.index("if count >= limit") < script.index("redis.call('ZADD'")
 
 
+@pytest.mark.asyncio
+async def test_client_issue_report_rate_counter_falls_back_when_redis_is_unavailable(monkeypatch):
+    production_issues._fallback_client_report_timestamps.clear()
+
+    async def unavailable_redis():
+        raise RuntimeError("redis unavailable")
+
+    monkeypatch.setattr(production_issues, "get_redis", unavailable_redis)
+    user_id = uuid.uuid4()
+
+    assert await production_issues._record_and_count_client_reports(user_id) == 1
+    assert await production_issues._record_and_count_client_reports(user_id) == 2
+
+    production_issues._fallback_client_report_timestamps.clear()
+
+
 def test_issue_fingerprint_groups_same_failure_across_tenants():
     first = production_issue_monitor.issue_fingerprint(
         source="client_api",

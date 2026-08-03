@@ -30,6 +30,10 @@ from app.services.minimax_media_profiles import resolve_minimax_media_profile
 from app.services.model_router import resolve_route
 from app.services.provider_pricing import minimax_image_credits, minimax_video_credits
 from app.services.quota_guard import QuotaExceeded
+from app.services.presentation_visual_policy import (
+    MINIMUM_PICTURE_COVERAGE_RATIO,
+    presentation_brief_is_image_led,
+)
 from app.services.tool_visibility import tool_enabled_for_agent
 
 
@@ -326,36 +330,27 @@ def request_fingerprint(payload: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _presentation_media_roles(request: DeliverableRequest) -> tuple[str, ...]:
-    """Compile an explicit media contract for image-led commercial decks."""
+def presentation_media_roles_for_brief(
+    goal: str,
+    spec: Mapping[str, Any],
+    *,
+    tier: str | None = None,
+) -> tuple[str, ...]:
+    """Compile the image contract from the same brief used by the prompt.
 
+    Keeping this pure and request-independent lets the API preflight inspect
+    composite PPT dependencies before a Deliverable is launched.  The prompt
+    builder and the launch preflight must agree on whether a deck is
+    image-led; otherwise a missing image route is only discovered halfway
+    through execution.
+    """
     brief = " ".join(
         (
-            str(request.goal or ""),
-            json.dumps(request.spec or {}, ensure_ascii=False, sort_keys=True),
+            str(goal or ""),
+            json.dumps(dict(spec or {}), ensure_ascii=False, sort_keys=True),
         )
     ).casefold()
-    image_led = any(
-        keyword in brief
-        for keyword in (
-            "图文并茂",
-            "图片",
-            "照片",
-            "摄影",
-            "主视觉",
-            "人物广告",
-            "故事板",
-            "商业风",
-            "image-rich",
-            "image rich",
-            "photography",
-            "photo-led",
-            "photo led",
-            "storyboard",
-            "commercial visual",
-        )
-    )
-    if not image_led:
+    if not presentation_brief_is_image_led(goal, spec):
         return ()
 
     roles: list[str] = []
@@ -389,11 +384,13 @@ def _presentation_media_roles(request: DeliverableRequest) -> tuple[str, ...]:
         )
     ):
         roles.append("people_lifestyle")
-    if any(keyword in brief for keyword in ("故事板", "分镜", "storyboard", "shot plan")):
+    if any(keyword in brief for keyword in ("故事板", "分镜", "storyboard", "shot plan")) or (
+        "镜头" in brief and "脚本" in brief
+    ):
         roles.append("people_storyboard")
 
-    page_count = int((request.spec or {}).get("page_count") or 8)
-    tier_bonus = 1 if str(request.tier or "").lower() == "ultra" else 0
+    page_count = int((spec or {}).get("page_count") or 8)
+    tier_bonus = 1 if str(tier or "").lower() == "ultra" else 0
     desired_assets = min(5, max(2, math.ceil(page_count / 3) + tier_bonus))
     for fallback_role in (
         "commercial_hero",
@@ -409,10 +406,20 @@ def _presentation_media_roles(request: DeliverableRequest) -> tuple[str, ...]:
     return tuple(roles)
 
 
+def _presentation_media_roles(request: DeliverableRequest) -> tuple[str, ...]:
+    """Compile an explicit media contract for image-led commercial decks."""
+
+    return presentation_media_roles_for_brief(
+        request.goal,
+        request.spec or {},
+        tier=request.tier,
+    )
+
+
 def _presentation_visual_policy(
     request: DeliverableRequest,
     media_roles: tuple[str, ...],
-) -> dict[str, int | str]:
+) -> dict[str, float | int | str]:
     """Build a server-owned, page-count-aware visual variety contract."""
 
     page_count = int((request.spec or {}).get("page_count") or 8)
@@ -421,6 +428,20 @@ def _presentation_visual_policy(
         "version": "adaptive-v1",
         "minimum_distinct_layouts": min(page_count, max(3, math.ceil(page_count / 2))),
         "minimum_distinct_images": minimum_distinct_images,
+        # Image-led decks must distribute imagery across the narrative rather
+        # than hiding every generated asset on one page.  This is a page-count
+        # policy, not a fixed template; text/data-led decks keep this at zero.
+        "minimum_image_slides": (
+            min(page_count, max(1, math.ceil(page_count / 2)))
+            if minimum_distinct_images
+            else 0
+        ),
+        # This is enforced again against the final PPTX geometry.  Declaring
+        # it in the prompt/source contract makes the quality expectation
+        # visible to the Agent instead of silently applying a post-hoc rule.
+        "minimum_picture_coverage_ratio": (
+            MINIMUM_PICTURE_COVERAGE_RATIO if minimum_distinct_images else 0.0
+        ),
         "maximum_uses_per_image": (
             max(2, math.ceil(page_count / minimum_distinct_images))
             if minimum_distinct_images
@@ -622,7 +643,10 @@ def build_deliverable_prompt(request: DeliverableRequest) -> str:
         "Treat it as a minimum quality contract, not a list of templates: choose layouts from each "
         "slide's purpose and information shape, do not repeat the same layout on consecutive slides, "
         "respect the image reuse cap, and reserve the required number of slides for editable charts, "
-        "diagrams, tables, or typography compositions. "
+        "diagrams, tables, or typography compositions. For image-led decks, "
+        "the final PPTX must meet minimum_picture_coverage_ratio across the "
+        "whole deck; do not satisfy the image contract with tiny thumbnails "
+        "or decorative image chips. "
         "Avoid one oversized write_file call: the first presentation.html write_file call MUST stay "
         "under 3500 characters and contain only shared CSS plus one unique placeholder section "
         "for every requested slide. Do not put complete slide bodies in that first call. Then replace "
@@ -789,6 +813,7 @@ async def preflight_workflow(
     workflow: WorkflowManifest,
     tier: str,
     spec: dict[str, Any],
+    goal: str = "",
 ) -> dict[str, Any]:
     normalized_tier = str(tier or "lite").strip().lower()
     if normalized_tier not in SAAS_TIERS:
@@ -803,10 +828,26 @@ async def preflight_workflow(
     except QuotaExceeded as exc:
         reasons.append(str(getattr(exc, "quota_type", None) or "text_route_unavailable"))
 
+    presentation_image_required = False
     if workflow.required_capability == "presentation":
         if not await _presentation_tool_available(db, agent_id):
             reasons.append("presentation_tool_unavailable")
-    elif workflow.required_capability in {"image", "video"}:
+        presentation_image_required = bool(
+            presentation_media_roles_for_brief(
+                goal,
+                normalized_spec,
+                tier=normalized_tier,
+            )
+        )
+
+    media_modality = (
+        "image"
+        if presentation_image_required
+        else workflow.required_capability
+        if workflow.required_capability in {"image", "video"}
+        else None
+    )
+    if media_modality is not None:
         entitlements = await get_tenant_entitlements(tenant_id)
         media = await get_agent_media_capabilities(
             db,
@@ -814,7 +855,7 @@ async def preflight_workflow(
             entitlements=entitlements,
             tier=normalized_tier,
         )
-        row = next((item for item in media if item["modality"] == workflow.required_capability), None)
+        row = next((item for item in media if item["modality"] == media_modality), None)
         if row is None or not row["available"]:
             reasons.append(str((row or {}).get("reason") or "media_capability_unavailable"))
             capability_status = "unavailable"
@@ -835,7 +876,7 @@ async def preflight_workflow(
                     "如接受质量差异，请在高级设置中明确允许应急质量。"
                 )
         if (
-            workflow.required_capability == "image"
+            media_modality == "image"
             and not await _agent_tool_available(
                 db,
                 agent_id=agent_id,
@@ -844,7 +885,7 @@ async def preflight_workflow(
         ):
             reasons.append("image_generation_tool_unavailable")
         if (
-            workflow.required_capability == "video"
+            media_modality == "video"
             and normalized_spec.get("audio_mode") == "voiceover"
             and not await _video_post_production_tools_available(db, agent_id)
         ):
@@ -928,6 +969,7 @@ async def prepare_deliverable_launch(
             workflow=workflow,
             tier=request.tier,
             spec=request.spec,
+            goal=request.goal,
         )
         execution = None
         if request.current_execution_id is not None:

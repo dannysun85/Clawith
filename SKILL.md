@@ -205,6 +205,7 @@ Clawith/
 - `.agents/workflows/deploy-production.md` — 生产部署固定流程（`opc.reeftotem.ai` / `/opt/astra-poc`）
 - `.agents/workflows/add-product-capability.md` — 新增或升级产品能力、Skill、Tool、Provider 与 Agent 员工的统一流程
 - `.agents/workflows/creative-deliverables-implementation-rollout.md` — 图片、视频、PPT 的完整落地、兼容迁移、灰度、验收和回滚方案
+- `.agents/workflows/agent-workforce-v2-rollout.md` — 外部 268 个角色的 19/92/142/15 全量治理、迁移、能力注册、评测与回滚计划
 
 **参考（`.agents/reference/`）——纯事实性知识，按需拆分自本文件**
 

@@ -11,6 +11,8 @@ from urllib.parse import unquote, urlparse
 
 from bs4 import BeautifulSoup
 
+from app.services.presentation_visual_policy import MINIMUM_PICTURE_COVERAGE_RATIO
+
 
 _UNRESOLVED_PLACEHOLDER_PATTERNS = (
     re.compile(
@@ -291,7 +293,20 @@ def validate_browser_slide_visual_quality(
             scroll_height = float(item.get("scrollHeight") or 0)
             client_width = float(item.get("clientWidth") or item_width)
             client_height = float(item.get("clientHeight") or item_height)
-            if (
+            style = item.get("style")
+            overflow_values = {
+                str((style or {}).get(name) or "").strip().lower()
+                for name in ("overflow", "overflowX", "overflowY")
+            }
+            # Chromium can report extra scroll height for an auto-sized text
+            # element because glyph line boxes extend beyond the used line
+            # height. That is not clipping when the element's own overflow is
+            # visible (the default). Only treat the measurement as a defect
+            # when the text container actually clips or scrolls its contents.
+            clips_text = style is None or bool(
+                overflow_values & {"hidden", "clip", "auto", "scroll"}
+            )
+            if clips_text and (
                 scroll_width > client_width + tolerance_px
                 or scroll_height > client_height + tolerance_px
             ):
@@ -460,6 +475,32 @@ def _required_int(
     return normalized
 
 
+def _required_float(
+    value: Any,
+    *,
+    field: str,
+    minimum: float,
+    maximum: float,
+    failures: list[str],
+) -> float:
+    if isinstance(value, bool):
+        failures.append(f"{field} must be a number")
+        return minimum
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError):
+        failures.append(f"{field} must be a number")
+        return minimum
+    if not math.isfinite(normalized):
+        failures.append(f"{field} must be finite")
+        return minimum
+    if normalized < minimum or normalized > maximum:
+        failures.append(
+            f"{field} must be between {minimum:g} and {maximum:g}"
+        )
+    return normalized
+
+
 def _normalize_local_asset_ref(value: Any) -> str:
     normalized = str(value or "").strip()
     if not normalized:
@@ -492,12 +533,17 @@ def _validate_adaptive_visual_plan(
     spec_slides: list[dict[str, Any]],
     slides: list[Any],
     expected_page_count: int | None,
+    required: bool,
     failures: list[str],
 ) -> None:
     """Validate page-level visual variety without prescribing a fixed template."""
 
     version = str(slide_spec.get("visual_plan_version") or "").strip()
     if not version:
+        if required:
+            failures.append(
+                "slide_spec.visual_plan_version must be adaptive-v1 for managed deliverables"
+            )
         return
     if version != _ADAPTIVE_VISUAL_PLAN_VERSION:
         failures.append(
@@ -507,6 +553,10 @@ def _validate_adaptive_visual_plan(
 
     raw_policy = slide_spec.get("visual_policy")
     if not isinstance(raw_policy, dict):
+        if required:
+            failures.append(
+                "slide_spec.visual_policy must be an object for managed deliverables"
+            )
         failures.append("slide_spec.visual_policy must be an object")
         return
     page_count = expected_page_count or len(spec_slides)
@@ -522,6 +572,52 @@ def _validate_adaptive_visual_plan(
         minimum=0,
         failures=failures,
     )
+    raw_minimum_image_slides = raw_policy.get("minimum_image_slides")
+    if raw_minimum_image_slides is None and required:
+        failures.append(
+            "slide_spec.visual_policy.minimum_image_slides must be an integer "
+            "for managed deliverables"
+        )
+        minimum_image_slides = 0
+    elif raw_minimum_image_slides is None:
+        # Legacy/provider-free fixtures may omit the newer distribution field;
+        # production managed deliverables are required to include it above.
+        minimum_image_slides = 0
+    else:
+        minimum_image_slides = _required_int(
+            raw_minimum_image_slides,
+            field="slide_spec.visual_policy.minimum_image_slides",
+            minimum=0,
+            failures=failures,
+        )
+    raw_minimum_picture_coverage = raw_policy.get(
+        "minimum_picture_coverage_ratio"
+    )
+    coverage_policy_declared = raw_minimum_picture_coverage is not None
+    if raw_minimum_picture_coverage is None:
+        if required and minimum_distinct_images > 0:
+            failures.append(
+                "slide_spec.visual_policy.minimum_picture_coverage_ratio must be a number "
+                "for managed image-led deliverables"
+            )
+        minimum_picture_coverage_ratio = 0.0
+    else:
+        minimum_picture_coverage_ratio = _required_float(
+            raw_minimum_picture_coverage,
+            field="slide_spec.visual_policy.minimum_picture_coverage_ratio",
+            minimum=0.0,
+            maximum=1.0,
+            failures=failures,
+        )
+    if (
+        minimum_distinct_images > 0
+        and (coverage_policy_declared or required)
+        and minimum_picture_coverage_ratio < MINIMUM_PICTURE_COVERAGE_RATIO
+    ):
+        failures.append(
+            "slide_spec.visual_policy.minimum_picture_coverage_ratio "
+            f"must be at least {MINIMUM_PICTURE_COVERAGE_RATIO:g} for image-led decks"
+        )
     maximum_image_reuse = _required_int(
         raw_policy.get("maximum_uses_per_image"),
         field="slide_spec.visual_policy.maximum_uses_per_image",
@@ -554,6 +650,13 @@ def _validate_adaptive_visual_plan(
                 "slide_spec.visual_policy.minimum_distinct_images "
                 f"must be at least {required_images} when imagery is required"
             )
+        required_image_slides = min(page_count, max(1, math.ceil(page_count / 2)))
+        if minimum_image_slides < required_image_slides:
+            failures.append(
+                "slide_spec.visual_policy.minimum_image_slides "
+                f"must be at least {required_image_slides} for a {page_count}-slide "
+                "image-led deck"
+            )
         maximum_allowed_reuse = max(2, math.ceil(page_count / minimum_distinct_images))
         if maximum_image_reuse > maximum_allowed_reuse:
             failures.append(
@@ -563,6 +666,7 @@ def _validate_adaptive_visual_plan(
 
     layout_sequence: list[str] = []
     image_uses: dict[str, int] = {}
+    image_slide_count = 0
     editable_compositions = 0
     for index, (spec_slide, html_slide) in enumerate(
         zip(spec_slides, slides, strict=False),
@@ -592,6 +696,7 @@ def _validate_adaptive_visual_plan(
             )
 
         if visual_kind in _IMAGE_VISUAL_KINDS:
+            image_slide_count += 1
             asset_ref = _required_text(
                 spec_slide.get("asset_ref"),
                 field=f"{field_prefix}.asset_ref",
@@ -623,6 +728,11 @@ def _validate_adaptive_visual_plan(
         failures.append(
             f"slide_spec uses {len(image_uses)} distinct image assets; "
             f"visual_policy requires {minimum_distinct_images}"
+        )
+    if image_slide_count < minimum_image_slides:
+        failures.append(
+            f"slide_spec uses {image_slide_count} image slides; visual_policy "
+            f"requires {minimum_image_slides}"
         )
     overused_assets = sorted(
         asset for asset, uses in image_uses.items() if uses > maximum_image_reuse
@@ -708,6 +818,7 @@ def _validate_planning_contract(
     expected_page_count: int | None,
     outline_file: Path | None,
     slide_spec_file: Path | None,
+    require_adaptive_visual_plan: bool,
     failures: list[str],
 ) -> None:
     if (outline_file is None) != (slide_spec_file is None):
@@ -744,6 +855,7 @@ def _validate_planning_contract(
         spec_slides=spec_slides,
         slides=slides,
         expected_page_count=expected_page_count,
+        required=require_adaptive_visual_plan,
         failures=failures,
     )
     if expected_page_count is not None and expected_page_count >= 5:
@@ -809,6 +921,7 @@ def validate_presentation_html_contract(
     expected_page_count: int | None,
     outline_file: Path | None = None,
     slide_spec_file: Path | None = None,
+    require_adaptive_visual_plan: bool = False,
 ) -> None:
     """Reject incomplete or structurally invalid presentation source files."""
 
@@ -843,6 +956,7 @@ def validate_presentation_html_contract(
         expected_page_count=expected_page_count,
         outline_file=outline_file,
         slide_spec_file=slide_spec_file,
+        require_adaptive_visual_plan=require_adaptive_visual_plan,
         failures=failures,
     )
 

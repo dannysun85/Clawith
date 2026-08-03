@@ -214,6 +214,11 @@ async def test_audit_marks_hash_verified_templates_as_awaiting_humans(
 
     assert audit.status == "awaiting_human_review"
     assert audit.issues == ()
+    assert len(audit.run_fingerprint_sha256 or "") == 64
+    assert audit.run_fingerprint_sha256 == audit_benchmark_run(
+        tmp_path,
+        expected_modalities=("image",),
+    ).run_fingerprint_sha256
     image_audit = audit.modality_audits[0]
     assert image_audit.candidate_count == 2
     assert image_audit.verified_artifact_count == 2
@@ -247,6 +252,31 @@ async def test_audit_fails_closed_when_public_artifact_hash_changes(
 
     assert audit.status == "invalid"
     assert any("hash mismatch" in issue for issue in audit.issues)
+
+
+@pytest.mark.asyncio
+async def test_audit_rejects_public_package_contract_drift(tmp_path) -> None:
+    _scenario, package = await _prepare_image_run(tmp_path)
+    original_fingerprint = audit_benchmark_run(
+        tmp_path,
+        expected_modalities=("image",),
+    ).run_fingerprint_sha256
+    package_path = tmp_path / "image" / "public" / "review-package.json"
+    payload = json.loads(package_path.read_text(encoding="utf-8"))
+    payload["brief"] = "A different brief must not enter the same benchmark run"
+    package_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    audit = audit_benchmark_run(
+        tmp_path,
+        expected_modalities=("image",),
+    )
+
+    assert audit.status == "invalid"
+    assert audit.run_fingerprint_sha256 != original_fingerprint
+    assert any(
+        "public review package brief differs from the benchmark scenario" in issue
+        for issue in audit.issues
+    )
 
 
 @pytest.mark.asyncio

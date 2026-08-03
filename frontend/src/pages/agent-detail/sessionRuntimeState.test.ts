@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
     type SessionActiveRun,
+    isMediaDeliveryPending,
     waitingRunResumePayload,
 } from './sessionRuntimeState';
 
@@ -36,5 +37,26 @@ describe('waitingRunResumePayload', () => {
     it('does not attach resume identity to a non-waiting send', () => {
         expect(waitingRunResumePayload(activeRun({ status: 'running' }))).toEqual({});
         expect(waitingRunResumePayload(null)).toEqual({});
+    });
+});
+
+describe('isMediaDeliveryPending', () => {
+    const reconciliation = (errorCode: string | null) => ({
+        executionId: 'execution-1',
+        toolCallId: 'tool-call-1',
+        toolName: 'generate_image_minimax',
+        errorCode,
+        canReconcile: false,
+    });
+
+    it('classifies durable image delivery as background processing', () => {
+        expect(isMediaDeliveryPending(reconciliation('media_image_delivery_pending'))).toBe(true);
+        expect(isMediaDeliveryPending(reconciliation('media_image_recovery_pending'))).toBe(true);
+        expect(isMediaDeliveryPending(reconciliation('media_video_recovery_pending'))).toBe(true);
+    });
+
+    it('does not hide a genuinely unknown tool reconciliation', () => {
+        expect(isMediaDeliveryPending(reconciliation('tool_outcome_unknown'))).toBe(false);
+        expect(isMediaDeliveryPending(reconciliation(null))).toBe(false);
     });
 });

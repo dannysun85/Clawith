@@ -79,10 +79,11 @@ def test_browser_visual_quality_returns_structured_known_defect_receipt():
                         "h": 60,
                         "clientWidth": 300,
                         "clientHeight": 60,
-                        "scrollWidth": 300,
-                        "scrollHeight": 90,
-                        "lines": [{"text": "重叠说明文字"}],
-                    },
+                    "scrollWidth": 300,
+                    "scrollHeight": 90,
+                    "style": {"overflow": "hidden"},
+                    "lines": [{"text": "重叠说明文字"}],
+                },
                 ],
             }
         ]
@@ -156,6 +157,47 @@ def test_browser_visual_quality_accepts_measured_non_overlapping_layout():
 
     assert receipt["status"] == "passed"
     assert receipt["slide_count"] == 1
+
+
+def test_browser_visual_quality_ignores_scroll_height_for_visible_auto_sized_text():
+    layout = {
+        "slides": [
+            {
+                "width": 1280,
+                "height": 720,
+                "items": [
+                    {
+                        "kind": "text",
+                        "tag": "div",
+                        "text": "忙，也要喝口热的",
+                        "x": 80,
+                        "y": 220,
+                        "w": 736,
+                        "h": 92.390625,
+                        "clientWidth": 736,
+                        "clientHeight": 92,
+                        "scrollWidth": 736,
+                        "scrollHeight": 105,
+                        "style": {
+                            "height": "92.3906px",
+                            "overflow": "visible",
+                            "overflowX": "visible",
+                            "overflowY": "visible",
+                        },
+                        "lines": [{"text": "忙，也要喝口热的"}],
+                    }
+                ],
+            }
+        ],
+        "screenshots": ["/tmp/slide-1.png"],
+    }
+
+    receipt = validate_browser_slide_visual_quality(
+        layout,
+        screenshot_key="screenshots",
+    )
+
+    assert receipt["status"] == "passed"
 
 
 @pytest.mark.asyncio
@@ -527,6 +569,75 @@ def test_presentation_planning_contract_rejects_unimplemented_visual_intent(
         )
 
 
+def test_managed_presentation_contract_requires_adaptive_visual_plan(
+    tmp_path: Path,
+) -> None:
+    source = _write(
+        tmp_path / "slides.html",
+        """
+        <html><body>
+          <section class="slide" data-slide="1" data-layout="cover">
+            <h1 data-slide-title>商业方案</h1>
+            <div data-visual><strong>关键视觉</strong><span>行动路径</span></div>
+          </section>
+        </body></html>
+        """,
+    )
+    outline = _write(
+        tmp_path / "outline.json",
+        json.dumps(
+            {
+                "deck_title": "商业方案",
+                "audience": "客户",
+                "core_message": "开始试点",
+                "slides": [
+                    {
+                        "slide_id": "1",
+                        "purpose": "建立共识",
+                        "headline": "商业方案",
+                        "evidence": [],
+                        "visual_intent": "关键视觉",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+    )
+    slide_spec = _write(
+        tmp_path / "slide_spec.json",
+        json.dumps(
+            {
+                "slides": [
+                    {
+                        "slide_id": "1",
+                        "headline": "商业方案",
+                        "slide_type": "cover",
+                        "layout": "cover",
+                        "body_points": [],
+                        "visual_kind": "editable_typography",
+                        "visual_asset": "关键视觉",
+                        "asset_ref": "",
+                        "source_refs": [],
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="slide_spec.visual_plan_version must be adaptive-v1 for managed deliverables",
+    ):
+        validate_presentation_html_contract(
+            source,
+            expected_page_count=1,
+            outline_file=outline,
+            slide_spec_file=slide_spec,
+            require_adaptive_visual_plan=True,
+        )
+
+
 def test_presentation_planning_contract_rejects_descriptive_visual_placeholder(
     tmp_path: Path,
 ) -> None:
@@ -621,7 +732,7 @@ def _write_adaptive_visual_plan_fixture(
           </section>
           <section class="slide" data-slide="4" data-layout="decision_matrix">
             <h1 data-slide-title>核心判断</h1>
-            <div data-visual><strong>机会</strong><span>风险</span></div>
+            <div data-visual><img src="assets/hero-a.png"></div>
           </section>
           <section class="slide" data-slide="5" data-layout="cover">
             <h1 data-slide-title>验证矩阵</h1>
@@ -687,17 +798,17 @@ def _write_adaptive_visual_plan_fixture(
         "generated_image",
         "supplied_image",
         "generated_image",
+        "generated_image",
         "editable_typography",
         "editable_table",
         "editable_diagram",
         "editable_chart",
-        "editable_diagram",
     ]
     asset_refs = [
         "assets/hero-a.png",
         "assets/hero-b.png",
         "assets/hero-c.png",
-        "",
+        "assets/hero-a.png",
         "",
         "",
         "",
@@ -711,6 +822,8 @@ def _write_adaptive_visual_plan_fixture(
                 "visual_policy": {
                     "minimum_distinct_layouts": 4,
                     "minimum_distinct_images": 3,
+                    "minimum_image_slides": 4,
+                    "minimum_picture_coverage_ratio": 0.35,
                     "maximum_uses_per_image": 3,
                     "minimum_editable_compositions": 2,
                 },
@@ -748,6 +861,26 @@ def test_adaptive_visual_plan_accepts_varied_layouts_assets_and_editable_composi
     )
 
 
+def test_adaptive_visual_plan_rejects_weak_image_coverage_policy(
+    tmp_path: Path,
+) -> None:
+    source, outline, slide_spec = _write_adaptive_visual_plan_fixture(tmp_path)
+    spec = json.loads(slide_spec.read_text(encoding="utf-8"))
+    spec["visual_policy"]["minimum_picture_coverage_ratio"] = 0.2
+    slide_spec.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match="minimum_picture_coverage_ratio must be at least 0.35",
+    ):
+        validate_presentation_html_contract(
+            source,
+            expected_page_count=8,
+            outline_file=outline,
+            slide_spec_file=slide_spec,
+        )
+
+
 def test_adaptive_visual_plan_rejects_image_reuse_that_collapses_asset_variety(
     tmp_path: Path,
 ) -> None:
@@ -759,6 +892,29 @@ def test_adaptive_visual_plan_rejects_image_reuse_that_collapses_asset_variety(
     with pytest.raises(
         ValueError,
         match="slide_spec uses 2 distinct image assets; visual_policy requires 3",
+    ):
+        validate_presentation_html_contract(
+            source,
+            expected_page_count=8,
+            outline_file=outline,
+            slide_spec_file=slide_spec,
+        )
+
+
+def test_adaptive_visual_plan_rejects_images_clustered_on_too_few_slides(
+    tmp_path: Path,
+) -> None:
+    source, outline, slide_spec = _write_adaptive_visual_plan_fixture(tmp_path)
+    spec = json.loads(slide_spec.read_text(encoding="utf-8"))
+    spec["slides"][3]["visual_kind"] = "editable_typography"
+    spec["slides"][3]["asset_ref"] = ""
+    # Only the first three pages now declare image visuals; the remaining
+    # pages are deliberately editable compositions.
+    slide_spec.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match="slide_spec uses 3 image slides; visual_policy requires 4",
     ):
         validate_presentation_html_contract(
             source,

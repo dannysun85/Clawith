@@ -54,6 +54,10 @@ services:
       ALLOW_UNVERIFIED_LOCAL_SIGNUP: "false"
       CORS_ORIGINS: ${CORS_ORIGINS:?CORS_ORIGINS is required}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?PUBLIC_BASE_URL is required}
+      # Provider egress is an explicit release setting. Keep this value
+      # identical for the API and inherited worker environment; leave empty
+      # when the host has direct public DNS/egress.
+      HTTP_PROXY: ${HTTP_PROXY:-}
       ASTRA_RELEASE_VERSION: ${ASTRA_RELEASE_VERSION:-}
       ASTRA_RELEASE_COMMIT: ${ASTRA_RELEASE_COMMIT:-}
       ASTRA_RELEASE_ID: ${ASTRA_RELEASE_ID:-}

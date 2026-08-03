@@ -6,7 +6,7 @@ import uuid
 from dataclasses import asdict, dataclass
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import Agent, AgentTemplate
@@ -27,6 +27,7 @@ class TemplateToolReconcileReport:
     disabled_ambient: int
     preserved_opt_out: int
     preserved_ambiguous: int
+    missing_mcp_servers: tuple[str, ...] = ()
 
     @property
     def changed(self) -> bool:
@@ -65,7 +66,7 @@ async def grant_template_tools(
     result = await db.execute(
         select(Tool).where(
             Tool.name.in_(requested),
-            Tool.source == "builtin",
+            or_(Tool.source == "builtin", Tool.type == "mcp"),
         )
     )
     tools = list(result.scalars().all())
@@ -93,7 +94,11 @@ async def reconcile_template_tool_grants(
     user selection have ``source=user_selected`` and are therefore preserved.
     """
     result = await db.execute(
-        select(Agent.id, AgentTemplate.default_tools)
+        select(
+            Agent.id,
+            AgentTemplate.default_tools,
+            AgentTemplate.default_mcp_servers,
+        )
         .join(AgentTemplate, Agent.template_id == AgentTemplate.id)
         .where(
             Agent.deletion_requested_at.is_(None),
@@ -101,12 +106,29 @@ async def reconcile_template_tool_grants(
         )
     )
     desired_by_agent: dict[uuid.UUID, set[str]] = {}
-    for agent_id, tool_names in result.all():
+    desired_mcp_by_agent: dict[uuid.UUID, set[str]] = {}
+    for row in result.all():
+        agent_id, tool_names = row[0], row[1]
+        mcp_servers = row[2] if len(row) > 2 else []
         desired_by_agent[agent_id] = {
-            name.strip()
-            for name in (tool_names or [])
-            if isinstance(name, str) and name.strip()
+            name.strip() for name in (tool_names or []) if isinstance(name, str) and name.strip()
         }
+        desired_mcp_by_agent[agent_id] = {
+            server_id.strip() for server_id in (mcp_servers or []) if isinstance(server_id, str) and server_id.strip()
+        }
+    requested_mcp_servers = {server_id for server_ids in desired_mcp_by_agent.values() for server_id in server_ids}
+    missing_mcp_servers: set[str] = set()
+    if requested_mcp_servers:
+        mcp_result = await db.execute(select(Tool).where(Tool.type == "mcp"))
+        mcp_tools = list(mcp_result.scalars().all())
+        for agent_id, server_ids in desired_mcp_by_agent.items():
+            for server_id in server_ids:
+                prefix = "mcp_" + server_id.replace("/", "_").replace("@", "") + "_"
+                matched = {tool.name for tool in mcp_tools if tool.name.startswith(prefix)}
+                if matched:
+                    desired_by_agent[agent_id].update(matched)
+                else:
+                    missing_mcp_servers.add(server_id)
     # Older releases persisted every ambient default as ``source=system``.
     # Once a capability becomes role-specific, changing Tool.is_default does
     # not revoke those already-enabled AgentTool rows.  Migrate only that
@@ -159,9 +181,7 @@ async def reconcile_template_tool_grants(
         missing.update(unresolved)
 
     stale_result = await db.execute(
-        select(AgentTool, Tool.name)
-        .join(Tool, Tool.id == AgentTool.tool_id)
-        .where(AgentTool.source == "template")
+        select(AgentTool, Tool.name).join(Tool, Tool.id == AgentTool.tool_id).where(AgentTool.source == "template")
     )
     removed = 0
     for assignment, tool_name in stale_result.all():
@@ -175,12 +195,7 @@ async def reconcile_template_tool_grants(
             "[TemplateCapabilities] Ignored unknown builtin tools names={}",
             missing_tool_names,
         )
-    if (
-        migrated_to_template
-        or disabled_ambient
-        or preserved_opt_out
-        or preserved_ambiguous
-    ):
+    if migrated_to_template or disabled_ambient or preserved_opt_out or preserved_ambiguous:
         logger.info(
             "[TemplateCapabilities] Reconciled legacy system grants "
             "template_count={} disabled_ambient_count={} "
@@ -199,4 +214,5 @@ async def reconcile_template_tool_grants(
         disabled_ambient=disabled_ambient,
         preserved_opt_out=preserved_opt_out,
         preserved_ambiguous=preserved_ambiguous,
+        missing_mcp_servers=tuple(sorted(missing_mcp_servers)),
     )

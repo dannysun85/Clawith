@@ -49,9 +49,7 @@ def test_complete_persisted_catalog_matches_canonical_defaults() -> None:
     persisted = {item["name"]: item for item in tool_seeder.BUILTIN_TOOLS}
 
     assert persisted.keys() == canonical.keys()
-    assert {
-        name: definition["is_default"] for name, definition in persisted.items()
-    } == {
+    assert {name: definition["is_default"] for name, definition in persisted.items()} == {
         name: definition["is_default"] for name, definition in canonical.items()
     }
 
@@ -93,6 +91,26 @@ def test_image_speech_and_video_are_global_defaults_with_agent_opt_out() -> None
         tool = SimpleNamespace(name=name, source="builtin", is_default=True)
         assert tool_enabled_for_agent(tool, None) is True
         assert tool_enabled_for_agent(tool, SimpleNamespace(enabled=False)) is False
+
+
+def test_managed_image_tool_exposes_role_aware_poster_copy_contract() -> None:
+    canonical = {item["name"]: item for item in BUILTIN_TOOL_DEFINITIONS}
+    persisted = {item["name"]: item for item in tool_seeder.BUILTIN_TOOLS}
+
+    for definition in (
+        canonical["generate_image_minimax"],
+        persisted["generate_image_minimax"],
+    ):
+        blocks = definition["parameters_schema"]["properties"]["overlay_blocks"]
+        assert blocks["type"] == "array"
+        assert blocks["maxItems"] == 8
+        assert blocks["items"]["properties"]["role"]["enum"] == [
+            "title",
+            "subtitle",
+            "tagline",
+            "body",
+            "cta",
+        ]
 
 
 def test_core_default_tools_keep_product_policy_fallback() -> None:
@@ -310,11 +328,14 @@ async def test_legacy_builtin_migration_never_overwrites_existing_tenant_config(
     assert "stale" not in str(db.added[0].value)
 
     # A second startup sees no credential on the global row and is a no-op.
-    assert await tool_seeder._migrate_legacy_builtin_credentials(
-        db,
-        tool=tool,
-        sole_tenant=tenant,
-    ) == "ignored"
+    assert (
+        await tool_seeder._migrate_legacy_builtin_credentials(
+            db,
+            tool=tool,
+            sole_tenant=tenant,
+        )
+        == "ignored"
+    )
 
 
 @pytest.mark.asyncio
@@ -353,22 +374,16 @@ def test_builtin_role_skills_have_the_executable_grants_they_require() -> None:
         "devops-automator",
         "rapid-prototyper",
     }:
-        metadata = yaml.safe_load(
-            (templates_root / folder / "meta.yaml").read_text(encoding="utf-8")
-        )
+        metadata = yaml.safe_load((templates_root / folder / "meta.yaml").read_text(encoding="utf-8"))
         assert "vercel-full-stack-deploy" in metadata["default_skills"]
         assert {"execute_code", "publish_page"} <= set(metadata["default_tools"])
 
     for folder in {"devops-automator", "rapid-prototyper"}:
-        metadata = yaml.safe_load(
-            (templates_root / folder / "meta.yaml").read_text(encoding="utf-8")
-        )
+        metadata = yaml.safe_load((templates_root / folder / "meta.yaml").read_text(encoding="utf-8"))
         assert "mcp-installer" in metadata["default_skills"]
         assert "import_mcp_server" in metadata["default_tools"]
 
-    reviewer = yaml.safe_load(
-        (templates_root / "code-reviewer" / "meta.yaml").read_text(encoding="utf-8")
-    )
+    reviewer = yaml.safe_load((templates_root / "code-reviewer" / "meta.yaml").read_text(encoding="utf-8"))
     assert "execute_code" in reviewer["default_tools"]
 
 
@@ -385,9 +400,7 @@ def test_every_builtin_role_reference_resolves_to_a_real_skill_or_tool() -> None
 
 def test_role_skills_do_not_invent_missing_tool_or_deployment_authority() -> None:
     skill_files = {
-        skill["folder_name"]: "\n".join(
-            str(item.get("content") or "") for item in skill.get("files", [])
-        )
+        skill["folder_name"]: "\n".join(str(item.get("content") or "") for item in skill.get("files", []))
         for skill in BUILTIN_SKILLS
     }
 
@@ -635,19 +648,25 @@ async def test_template_reconciliation_removes_only_stale_template_grants(
         source="system",
         enabled=False,
     )
-    db = _Db([
-        _Result(rows=[(agent_id, ["execute_code"])]),
-        _Result(rows=[
-            (legacy_role, "execute_code"),
-            (legacy_ambient, "execute_code"),
-            (legacy_opt_out, "execute_code"),
-        ]),
-        _Result(rows=[
-            (keep, "execute_code"),
-            (stale, "publish_page"),
-            (detached, "generate_video_minimax"),
-        ]),
-    ])
+    db = _Db(
+        [
+            _Result(rows=[(agent_id, ["execute_code"])]),
+            _Result(
+                rows=[
+                    (legacy_role, "execute_code"),
+                    (legacy_ambient, "execute_code"),
+                    (legacy_opt_out, "execute_code"),
+                ]
+            ),
+            _Result(
+                rows=[
+                    (keep, "execute_code"),
+                    (stale, "publish_page"),
+                    (detached, "generate_video_minimax"),
+                ]
+            ),
+        ]
+    )
     grant = AsyncMock(return_value=(1, ()))
     monkeypatch.setattr(template_capabilities, "grant_template_tools", grant)
 
@@ -676,6 +695,55 @@ async def test_template_reconciliation_removes_only_stale_template_grants(
         agent_id=agent_id,
         tool_names=["execute_code"],
     )
+
+
+@pytest.mark.asyncio
+async def test_template_reconciliation_registers_already_imported_mcp_for_existing_agent(
+    monkeypatch,
+) -> None:
+    agent_id = uuid.uuid4()
+    mcp_tool = SimpleNamespace(name="mcp_shibui_finance_quote")
+    db = _Db(
+        [
+            _Result(rows=[(agent_id, [], ["shibui/finance"])]),
+            _Result(rows=[mcp_tool]),
+            _Result(rows=[]),
+            _Result(rows=[]),
+        ]
+    )
+    grant = AsyncMock(return_value=(1, ()))
+    monkeypatch.setattr(template_capabilities, "grant_template_tools", grant)
+
+    report = await template_capabilities.reconcile_template_tool_grants(db)
+
+    assert report.missing_mcp_servers == ()
+    grant.assert_awaited_once_with(
+        db,
+        agent_id=agent_id,
+        tool_names=["mcp_shibui_finance_quote"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_template_reconciliation_reports_mcp_that_still_needs_explicit_import(
+    monkeypatch,
+) -> None:
+    agent_id = uuid.uuid4()
+    db = _Db(
+        [
+            _Result(rows=[(agent_id, [], ["shibui/finance"])]),
+            _Result(rows=[]),
+            _Result(rows=[]),
+            _Result(rows=[]),
+        ]
+    )
+    grant = AsyncMock(return_value=(0, ()))
+    monkeypatch.setattr(template_capabilities, "grant_template_tools", grant)
+
+    report = await template_capabilities.reconcile_template_tool_grants(db)
+
+    assert report.missing_mcp_servers == ("shibui/finance",)
+    grant.assert_awaited_once_with(db, agent_id=agent_id, tool_names=[])
 
 
 @pytest.mark.asyncio

@@ -330,6 +330,10 @@ class AgentOut(BaseModel):
     llm_calls_today: int = 0
     max_llm_calls_per_day: int = 1000
     agent_type: str = "native"
+    template_revision_applied: int | None = None
+    template_sync_status: str = "current"
+    template_sync_details: dict = Field(default_factory=dict)
+    template_synced_at: datetime | None = None
     openclaw_last_seen: datetime | None = None
     deletion_requested_at: datetime | None = None
     deletion_state: str = "active"

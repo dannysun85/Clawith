@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections import deque
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from loguru import logger
 from sqlalchemy import distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,6 +36,8 @@ client_router = APIRouter(prefix="/production-issues", tags=["production-issues"
 admin_router = APIRouter(prefix="/saas/production-issues", tags=["saas-production-issues"])
 CLIENT_REPORT_RATE_LIMIT = 30
 CLIENT_REPORT_RATE_WINDOW_SECONDS = 60
+_FALLBACK_CLIENT_REPORT_MAX_USERS = 1000
+_fallback_client_report_timestamps: dict[str, deque[float]] = {}
 CLIENT_REPORT_RATE_SCRIPT = """
 redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[1])
 local count = redis.call('ZCARD', KEYS[1])
@@ -51,21 +55,47 @@ return count + 1
 async def _record_and_count_client_reports(user_id: uuid.UUID) -> int:
     """Return this authenticated user's rolling client-report count."""
 
-    redis = await get_redis()
     now = time.time()
-    key = f"production-issue-report:rate:{user_id}"
-    member = f"{now}:{uuid.uuid4().hex}"
-    count = await redis.eval(
-        CLIENT_REPORT_RATE_SCRIPT,
-        1,
-        key,
-        now - CLIENT_REPORT_RATE_WINDOW_SECONDS,
-        now,
-        member,
-        CLIENT_REPORT_RATE_LIMIT,
-        CLIENT_REPORT_RATE_WINDOW_SECONDS * 2,
-    )
-    return int(count)
+    try:
+        redis = await get_redis()
+        key = f"production-issue-report:rate:{user_id}"
+        member = f"{now}:{uuid.uuid4().hex}"
+        count = await redis.eval(
+            CLIENT_REPORT_RATE_SCRIPT,
+            1,
+            key,
+            now - CLIENT_REPORT_RATE_WINDOW_SECONDS,
+            now,
+            member,
+            CLIENT_REPORT_RATE_LIMIT,
+            CLIENT_REPORT_RATE_WINDOW_SECONDS * 2,
+        )
+        return int(count)
+    except Exception as exc:  # noqa: BLE001 - telemetry must not break the caller
+        # Redis is the shared limiter in normal operation.  During a short Redis
+        # outage, keep a bounded process-local window so the telemetry endpoint
+        # still returns its intended 202/429 response instead of a misleading 500.
+        logger.warning(
+            "[production-issues] redis rate limiter unavailable; using process-local fallback error_type={}",
+            type(exc).__name__,
+        )
+        key = str(user_id)
+        timestamps = _fallback_client_report_timestamps.setdefault(key, deque())
+        cutoff = time.monotonic() - CLIENT_REPORT_RATE_WINDOW_SECONDS
+        while timestamps and timestamps[0] < cutoff:
+            timestamps.popleft()
+        if len(timestamps) >= CLIENT_REPORT_RATE_LIMIT:
+            return len(timestamps) + 1
+        timestamps.append(time.monotonic())
+        if len(_fallback_client_report_timestamps) > _FALLBACK_CLIENT_REPORT_MAX_USERS:
+            stale_key = min(
+                _fallback_client_report_timestamps,
+                key=lambda candidate: _fallback_client_report_timestamps[candidate][-1]
+                if _fallback_client_report_timestamps[candidate]
+                else 0,
+            )
+            _fallback_client_report_timestamps.pop(stale_key, None)
+        return len(timestamps)
 
 
 async def _authorized_client_agent_id(

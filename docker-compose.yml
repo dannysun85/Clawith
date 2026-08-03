@@ -70,6 +70,9 @@ services:
       # Required when deployed behind a reverse proxy (e.g. Nginx, Cloudflare).
       # If not set, the server infers the URL from the incoming request host.
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      # Explicit Provider egress proxy; empty is the safe default. This must be
+      # identical for API and worker processes when the deployment needs it.
+      HTTP_PROXY: ${HTTP_PROXY:-}
       # Platform-scoped models used by native Group planning and threshold-only
       # shared Session Context compaction.
       MULTI_AGENT_PLANNING_MODEL_ID: ${MULTI_AGENT_PLANNING_MODEL_ID:-}

@@ -127,7 +127,7 @@ tenant 内有权使用对应 Agent/Group 的成员都可以提出图片、视频
 5. Theme/Layout Engine：标题、章节、图文、对比、流程、数据、案例、结尾等受控版式；统一网格、字号、留白、颜色、图标和品牌 token。
 6. 结构化内容优先：图表、表格、流程、关键数字使用可编辑 shapes/data；生成图片只用于无事实负担的插画、背景或氛围视觉。
 7. HTML/structured schema 渲染为 PPTX/PDF，默认可编辑；复杂视觉页栅格化必须显式标记并获得确认。
-8. 自动 QA：页数、overflow、最小字号、对齐、对比度、字体替换、图片分辨率、引用完整性、PPTX 结构和 PPTX/PDF 一致性。
+8. 自动 QA：页数、overflow、最小字号、对齐、对比度、字体替换、图片分辨率与每页素材覆盖、整页栅格化/局部图片对象比例、引用完整性、PPTX 结构和 PPTX/PDF 一致性。
 9. 人工/视觉 review：叙事、信息密度、视觉节奏、重复版式、数据可读性。
 10. 支持按页自然语言修订并保存 Artifact revision；只重做被修改的页。
 
@@ -191,12 +191,12 @@ Astra 适配必须替换为：
   公开名映射为版本化 Provider ID。Astra 已把该映射收进 server-owned adapter，不向 Agent 暴露，
   也不再把低套餐返回的 `UnsupportedModel` 错判为“版本化 ID 无效”；
 - 当前 adapter 支持 `doubao-seedance-1.5-pro`、`doubao-seedance-2.0`、
-  `doubao-seedance-2.0-fast` 和 `doubao-seedance-2.0-mini`。Medium 显式路由到 1.5 Pro，
-  Large/Max 的商用质量默认使用标准 `2.0`，fast/mini 仅在速度、成本或套餐策略明确时使用；
-- `doubao-seedance-1.5-pro` 在官方套餐矩阵中已标记“即将下线”；它是当前 Medium 套餐的兼容路线，
-  不是长期商用依赖；
-- 2.0 系列仅属于 Large/Max 视频权益；本地 `plan_tier` 是管理员声明，不能替代火山控制台的真实套餐
-  权益。`UnsupportedModel` 必须进入 credential/entitlement 诊断并安全降级，不能靠猜模型名重试；
+  `doubao-seedance-2.0-fast` 和 `doubao-seedance-2.0-mini`。按照 2026-07-24 的运营复核策略，
+  Medium 显式路由到 `2.0-mini`，Large/Max 的商用质量默认使用标准 `2.0`，fast 仅在速度/成本策略明确时使用；
+- `doubao-seedance-1.5-pro` 已进入退役兼容期，只允许已被 Provider 接受且已固定模型的旧任务继续对账，
+  不是新任务或长期商用依赖；
+- 2.0 系列的实际可用性仍必须以账号套餐和 Provider receipt 为准；本地 `plan_tier` 是管理员声明，不能替代
+  火山控制台的真实权益。`UnsupportedModel` 必须进入 credential/entitlement 诊断并安全降级，不能靠猜模型名重试；
 - Seedream 连贯组图不仅需要开 `sequential_image_generation`，prompt 还必须明确张数、逐张内容和一致性约束；
 - Seedance 根据参考图/视频/音频、首尾帧、联网、draft/flex、分辨率、时长和速度需求做能力路由，
   不是从 prompt 关键词猜模型；
@@ -212,9 +212,9 @@ Astra 适配必须替换为：
 | Seedream 1–15 连贯组图、最多 14 参考图、`reference_strength` | 支持 | adapter 已理解；Agent Tool 仍是单 Artifact/单创意参考 | 等 multi-artifact Credits、恢复、选择和交付合同后再开放 |
 | Seedream web search、stream、prompt optimize、水印开关 | 支持 | 不作为 Agent 参数 | 保持 server-owned，交付固定无水印 |
 | Seedance 文生、首帧、首尾帧、生成音频 | 1.5/2.0 均支持 | 支持 | 当前正式协议 |
-| Seedance 1.5 Pro | 4–12 秒；480/720/1080p；固定六种比例；支持 draft/flex；不支持联网、多图/视频/音频参考、编辑/延长 | Medium 路由；已做 server-side 能力校验；Agent Tool 暂不暴露 draft/flex | 兼容接入，等待真实 Medium 权益验证 |
+| Seedance 1.5 Pro | 4–12 秒；480/720/1080p；固定六种比例；支持 draft/flex；不支持联网、多图/视频/音频参考、编辑/延长 | 仅已接受旧任务的兼容对账；Agent Tool 不为新任务暴露该模型 | 兼容接入，不作为新任务路由 |
 | Seedance 2.0 标准 | 最长 15 秒；最高 4K；支持多模态参考、联网、编辑/延长；不支持 draft/flex | Large/Max 默认模型；当前 Tool 只开放与 1.5 共同的稳定子集 | 后续按可恢复执行单元逐项扩展 |
-| Seedance 2.0 Fast/Mini | 最长 15 秒、最高 720p；高级参考能力与 2.0 对齐 | adapter 支持但不由 Agent 猜模型 | 仅按管理员速度/成本策略路由 |
+| Seedance 2.0 Fast/Mini | 最长 15 秒、最高 720p；高级参考能力与 2.0 对齐 | Medium 默认使用 Mini；Fast 仅按管理员速度/成本策略路由 | 仍需目标账号真实权益和生成 receipt |
 
 图片和视频 Skill 都必须定制，但定制位置不同：
 
@@ -249,9 +249,9 @@ Astra 适配必须替换为：
 - 公开名和官方 Skill 版本化 ID 均已做最小 4 秒、480p 提交前探测：
   `doubao-seedance-1.5-pro`、`doubao-seedance-2.0`、`doubao-seedance-2.0-fast`、
   `doubao-seedance-2.0-mini` 全部返回 `UnsupportedModel`，没有创建 Provider task、没有生成费用；
-- 官方当前套餐矩阵显示：Small 无视频；Medium 仅有即将下线的 1.5 Pro；Large/Max 才有
-  Seedance 2.0/fast/mini。当前 Key 的文字、Seedream、TTS 成功且所有视频模型拒绝，与 Small 权益
-  完全一致，因此本地按 provider behavior 将账号纠正为 `plan_tier=small`、
+- 当前运营复核策略显示：Small 无视频，Medium 的新任务目标为 Seedance 2.0 Mini，Large/Max 默认标准
+  Seedance 2.0；1.5 Pro 仅保留旧任务兼容。当前 Key 的文字、Seedream、TTS 成功且所有视频模型拒绝，
+  与 Small 权益完全一致，因此本地按 provider behavior 将账号纠正为 `plan_tier=small`、
   `capabilities=text/image/audio`，不再保留虚假的视频 capability 或无意义 model circuit；
 - 2026-07-26 17:31 从正式“制作交付物 → 短视频”入口创建了 6 秒、9:16、真人使用产品、
   中文旁白的 ULTRA 请求 `6e50d404-a0f5-48f8-a4ef-a0a20eab32ca`。Runtime 正确创建了
@@ -271,8 +271,8 @@ Astra 适配必须替换为：
 
 配置一致性边界：
 
-- 新建 Agent Plan 凭证默认声明 `text/image/audio`；Medium、Large、Max 可声明 `video`，但 Medium
-  只能路由到即将下线的 1.5 Pro，且声明值仍必须经过 Provider 实证；
+- 新建 Agent Plan 凭证默认声明 `text/image/audio`；Medium、Large、Max 可声明 `video`，Medium 新任务
+  路由到 `2.0-mini`，且声明值仍必须经过 Provider 实证；
 - 迁移只创建 provider model 和 SaaS route，不擅自扩大管理员已有凭证的 capabilities；
 - 本地凭证已按真实 Provider 行为收敛为 `small + text/image/audio`；
 - 生产仍需在发布变更窗口内显式配置/核验凭证 capability、套餐、额度和真实调用，当前不得标记
@@ -413,6 +413,9 @@ Astra 适配必须替换为：
 - `backend/scripts/inspect_creative_artifacts.py`
 - `backend/scripts/prepare_creative_blind_review.py`
 - `backend/scripts/score_creative_blind_review.py`
+- `backend/scripts/validate_multimodal_capability_matrix.py`：核对文字、图片、视频、语音、音乐和 PPT
+  的入口模板、角色 Skill、Tool 注册、typed runtime adapter 与默认/显式授权路径；只证明本地治理合同，
+  不调用 Provider，也不替代账号资格或质量评审；
 - `backend/tests/test_creative_evaluation.py`
 
 2026-07-27 已完成一次只读生产抽样和历史回归盲评链路实证：

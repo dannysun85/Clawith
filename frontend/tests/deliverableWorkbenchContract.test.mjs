@@ -32,3 +32,24 @@ test('pointer and keyboard dismissal share the guarded drawer close action', () 
   assert.equal(workbench.match(/onClick=\{closeDrawer\}/g)?.length, 2);
   assert.match(workbench, /event\.key === 'Escape' && !saving/);
 });
+
+test('unavailable capability still persists the brief without starting generation', () => {
+  assert.doesNotMatch(workbench, /if \(!result \|\| !result\.available\) return;/);
+  assert.match(workbench, /if \(!result\) return;/);
+  assert.match(workbench, /工作说明仍可保存，不会扣 Credits/);
+  assert.match(workbench, /工作说明已保存；当前没有可用线路，未启动生成/);
+});
+
+test('presentation preflight receives the same business goal used by the deliverable brief', () => {
+  assert.match(
+    workbench,
+    /workflow_version:\s*selectedWorkflow\.workflow_version,[\s\S]*goal:\s*goal\.trim\(\),[\s\S]*spec,/,
+  );
+});
+
+test('video preview only exposes the fallback message after an actual media error', () => {
+  assert.match(workbench, /onError=\{\(\) => setVideoPreviewError\(true\)\}/);
+  assert.match(workbench, /videoPreviewError &&/);
+  assert.match(workbench, /请下载 MP4 审核/);
+  assert.doesNotMatch(workbench, /<video[\s\S]*>\s*\{isZh \? '当前浏览器无法播放此视频。'/);
+});

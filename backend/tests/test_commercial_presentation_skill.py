@@ -54,15 +54,32 @@ def test_reviewed_roles_receive_presentation_sop_without_broad_ambient_skill() -
         )
         assert SKILL_FOLDER in metadata["default_skills"]
 
-    for folder in {
-        "private-assistant",
-        "tiktok-strategist",
-        "xiaohongshu-operator",
-    }:
+    for folder in {"tiktok-strategist", "xiaohongshu-operator"}:
         metadata = yaml.safe_load(
             (templates_root / folder / "meta.yaml").read_text(encoding="utf-8")
         )
         assert SKILL_FOLDER not in metadata["default_skills"]
+
+
+def test_private_assistant_is_the_provider_neutral_multimodal_entrypoint() -> None:
+    metadata = yaml.safe_load(
+        (
+            Path(__file__).parents[1]
+            / "agent_templates"
+            / "private-assistant"
+            / "meta.yaml"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert {
+        "brand-safe-media",
+        "commercial-presentation",
+        "commercial-voiceover",
+    } <= set(metadata["default_skills"])
+    assert not any(
+        "volcengine" in skill or "minimax" in skill
+        for skill in metadata["default_skills"]
+    )
 
 
 def test_presentation_conversion_tools_are_product_defaults_with_typed_runtime() -> None:

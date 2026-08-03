@@ -52,9 +52,7 @@ class Agent(Base):
 
     # Durable deletion fence. Once set, start/recover and all execution lanes
     # must remain fail-closed until provider cleanup and final deletion finish.
-    deletion_requested_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True, index=True
-    )
+    deletion_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
 
     # Runtime
     status: Mapped[str] = mapped_column(
@@ -140,6 +138,16 @@ class Agent(Base):
 
     # Template
     template_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("agent_templates.id"))
+    template_revision_applied: Mapped[int | None] = mapped_column(Integer)
+    template_sync_status: Mapped[str] = mapped_column(
+        String(20), default="current", server_default="current", nullable=False
+    )
+    template_sync_details: Mapped[dict] = mapped_column(
+        JSON,
+        default=dict,
+        server_default=text("'{}'::json"),
+    )
+    template_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     # Heartbeat (proactive agent awareness)
     heartbeat_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -164,6 +172,7 @@ class Agent(Base):
     def has_api_key(self) -> bool:
         """Whether this agent has an API key configured."""
         return bool(self.api_key_hash)
+
     permissions: Mapped[list["AgentPermission"]] = relationship(back_populates="agent", cascade="all, delete-orphan")
     tasks: Mapped[list["Task"]] = relationship(back_populates="agent", cascade="all, delete-orphan")
     channel_config: Mapped["ChannelConfig | None"] = relationship(back_populates="agent", uselist=False)
@@ -214,9 +223,121 @@ class AgentTemplate(Base):
     default_autonomy_policy: Mapped[dict] = mapped_column(JSON, default=dict)
     # Talent Market card: 2-4 short capability bullets shown under the role
     capability_bullets: Mapped[list] = mapped_column(JSON, default=list)
+    # Versioned role identity and operating boundaries.  These are persisted
+    # rather than re-read from repository files so every API/runtime process
+    # observes the same reviewed contract.
+    role_key: Mapped[str | None] = mapped_column(String(100), index=True)
+    role_revision: Mapped[int] = mapped_column(
+        default=1,
+        server_default="1",
+        nullable=False,
+    )
+    responsibilities: Mapped[list] = mapped_column(
+        JSON,
+        default=list,
+        server_default=text("'[]'::json"),
+    )
+    non_responsibilities: Mapped[list] = mapped_column(
+        JSON,
+        default=list,
+        server_default=text("'[]'::json"),
+    )
+    limitations: Mapped[list] = mapped_column(
+        JSON,
+        default=list,
+        server_default=text("'[]'::json"),
+    )
+    workflows: Mapped[list] = mapped_column(
+        JSON,
+        default=list,
+        server_default=text("'[]'::json"),
+    )
+    deliverables: Mapped[list] = mapped_column(
+        JSON,
+        default=list,
+        server_default=text("'[]'::json"),
+    )
+    evaluation_criteria: Mapped[list] = mapped_column(
+        JSON,
+        default=list,
+        server_default=text("'[]'::json"),
+    )
+    source_provenance: Mapped[dict] = mapped_column(
+        JSON,
+        default=dict,
+        server_default=text("'{}'::json"),
+    )
+    # Only ``enabled`` templates may appear in the Talent Market or be used to
+    # create an Agent.  Candidate/conditional records remain inspectable by an
+    # admin without becoming executable employees by accident.
+    lifecycle_status: Mapped[str] = mapped_column(
+        String(32), default="enabled", server_default="enabled", nullable=False, index=True
+    )
+    activation_gate: Mapped[str | None] = mapped_column(Text)
+    workforce_source_role_id: Mapped[str | None] = mapped_column(String(100), index=True)
+    workforce_decision: Mapped[str | None] = mapped_column(String(32), index=True)
+    workforce_pack: Mapped[str | None] = mapped_column(String(100), index=True)
     is_builtin: Mapped[bool] = mapped_column(default=False)
     created_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AgentTemplateEvaluation(Base):
+    """Immutable A/B evidence used to gate a role-template activation."""
+
+    __tablename__ = "agent_template_evaluations"
+    __table_args__ = (
+        Index(
+            "ix_agent_template_evaluations_template_revision_created",
+            "template_id",
+            "role_revision",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    template_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("agent_templates.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    role_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    evaluator_version: Mapped[str] = mapped_column(String(50), nullable=False)
+    fixture_set_version: Mapped[str] = mapped_column(String(50), nullable=False)
+    role_family: Mapped[str] = mapped_column(String(40), nullable=False)
+    baseline_metrics: Mapped[dict] = mapped_column(JSON, nullable=False)
+    candidate_metrics: Mapped[dict] = mapped_column(JSON, nullable=False)
+    fixture_results: Mapped[list] = mapped_column(
+        JSON,
+        default=list,
+        server_default=text("'[]'::json"),
+        nullable=False,
+    )
+    safety_pass: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    capability_pass: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    gate_status: Mapped[str] = mapped_column(String(20), nullable=False)
+    gate_reasons: Mapped[list] = mapped_column(
+        JSON,
+        default=list,
+        server_default=text("'[]'::json"),
+        nullable=False,
+    )
+    created_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
+    )
+    promoted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    promoted_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id")
+    )
+    rolled_back_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    rolled_back_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class AgentUserOnboarding(Base):
@@ -231,13 +352,19 @@ class AgentUserOnboarding(Base):
     __tablename__ = "agent_user_onboardings"
 
     agent_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE"), primary_key=True,
+        UUID(as_uuid=True),
+        ForeignKey("agents.id", ondelete="CASCADE"),
+        primary_key=True,
     )
     user_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True,
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
     )
     onboarded_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False,
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
     )
     phase: Mapped[str] = mapped_column(String(32), default="completed", nullable=False)
 

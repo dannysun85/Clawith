@@ -16,6 +16,19 @@ interface Template {
     category: string;
     is_builtin: boolean;
     capability_bullets?: string[];
+    role_key?: string | null;
+    role_revision?: number;
+    lifecycle_status?: string;
+    limitations?: string[];
+    deliverables?: string[];
+    source_provenance?: Record<string, unknown>;
+    capability_contract?: {
+        contract_ready?: boolean;
+        activation_ready?: boolean;
+        skills?: Array<{ name: string; status: string }>;
+        tools?: Array<{ name: string; status: string }>;
+        mcp_servers?: Array<{ server_id: string; status: string }>;
+    };
 }
 
 interface Props {
@@ -366,6 +379,25 @@ function TemplateCard({ tpl, hiring, isChinese, onHire, limitReached }: {
                 letterSpacing: '0.04em',
             }}>
                 {tpl.icon || 'AI'}
+            </div>
+            <div style={{ display: 'flex', gap: '6px', alignItems: 'center', marginBottom: '8px', flexWrap: 'wrap' }}>
+                <span style={{
+                    padding: '3px 7px', borderRadius: '999px',
+                    background: tpl.capability_contract?.contract_ready
+                        ? 'rgba(34,197,94,0.1)'
+                        : 'rgba(245,158,11,0.12)',
+                    color: tpl.capability_contract?.contract_ready ? '#15803d' : '#a16207',
+                    fontSize: '10.5px', fontWeight: 600,
+                }}>
+                    {tpl.capability_contract?.contract_ready
+                        ? (isChinese ? '能力合同已注册' : 'Capability contract ready')
+                        : (isChinese ? '能力合同待补齐' : 'Capability contract pending')}
+                </span>
+                {tpl.role_revision && (
+                    <span style={{ fontSize: '10.5px', color: 'var(--text-tertiary)' }}>
+                        v{tpl.role_revision}
+                    </span>
+                )}
             </div>
             <div style={{ fontSize: '15px', fontWeight: 600, marginBottom: '2px' }}>
                 {localized.name}

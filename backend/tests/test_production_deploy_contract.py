@@ -159,6 +159,42 @@ def test_runtime_rollout_policy_reaches_every_supported_deployment_path():
     assert '"AGENT_RUNTIME_V2_SOURCE_TYPES": ""' in deploy_script
 
 
+def test_provider_egress_proxy_is_explicitly_propagated_to_every_backend_path():
+    compose_files = (
+        ROOT / "docker-compose.yml",
+        ROOT / "deploy/docker-compose.yml",
+        ROOT / "deploy/docker-compose-multi.yml",
+        ROOT / "docker-compose.ci.yml",
+        ROOT / "deploy/astra-poc/docker-compose.prod.yml",
+    )
+
+    for compose_file in compose_files:
+        compose = compose_file.read_text(encoding="utf-8")
+        assert "HTTP_PROXY: ${HTTP_PROXY:-}" in compose, compose_file
+
+    # The production worker inherits the anchored backend environment, so one
+    # declaration must serve both API and worker without a second divergent
+    # proxy setting.
+    production = (ROOT / "deploy/astra-poc/docker-compose.prod.yml").read_text(
+        encoding="utf-8"
+    )
+    assert production.count("HTTP_PROXY: ${HTTP_PROXY:-}") == 1
+    assert "<<: *backend-environment" in production
+
+    for env_example in (ROOT / ".env.example", ROOT / "deploy/.env.example"):
+        example = env_example.read_text(encoding="utf-8")
+        assert "HTTP_PROXY=" in example
+        assert "127.0.0.1:7890" not in example
+
+    helm_values = (ROOT / "helm/clawith/values.yaml").read_text(encoding="utf-8")
+    helm_backend = (ROOT / "helm/clawith/templates/backend.yaml").read_text(
+        encoding="utf-8"
+    )
+    assert 'httpProxy: ""' in helm_values
+    assert "name: HTTP_PROXY" in helm_backend
+    assert ".Values.backend.env.httpProxy" in helm_backend
+
+
 def test_production_code_execution_defaults_fail_closed():
     compose = (ROOT / "deploy/astra-poc/docker-compose.prod.yml").read_text(encoding="utf-8")
 

@@ -11,7 +11,11 @@ from app.services.llm.load_balancer import NoCredentialAvailable
 from app.services.llm.load_balancer import credential_quota_is_blocked
 from app.services.volcengine_agent_plan import (
     PROVIDER as VOLCENGINE_AGENT_PLAN_PROVIDER,
+    RETIRING_VIDEO_MODELS,
     TTS_MODEL,
+    VIDEO_MODEL,
+    VIDEO_MODEL_MINI,
+    VIDEO_MODELS_BY_PLAN_TIER,
     normalize_base_url as normalize_volcengine_agent_plan_base_url,
     plan_tier_supports_modality,
     resolve_visual_profile,
@@ -51,6 +55,56 @@ def media_provider_order_for_voice_id(voice_id: str | None) -> tuple[str, ...]:
     if normalized.endswith("bigtts"):
         return (VOLCENGINE_AGENT_PLAN_PROVIDER,)
     return (MINIMAX_PROVIDER,)
+
+
+def validate_media_route_policy() -> tuple[str, ...]:
+    """Validate the provider/model policy without touching credentials.
+
+    This is a static contract check for CI and local readiness diagnostics.  It
+    deliberately does not probe a Provider, inspect a key, or infer an account
+    entitlement.  Runtime selection must keep the quality-first order and the
+    reviewed Agent Plan tier-to-Seedance mapping in sync.
+    """
+
+    errors: list[str] = []
+    expected_order = {
+        "image": (VOLCENGINE_AGENT_PLAN_PROVIDER, MINIMAX_PROVIDER),
+        "audio": (VOLCENGINE_AGENT_PLAN_PROVIDER, MINIMAX_PROVIDER),
+        "video": (VOLCENGINE_AGENT_PLAN_PROVIDER, MINIMAX_PROVIDER),
+        "music": (MINIMAX_PROVIDER,),
+    }
+    for modality, expected in expected_order.items():
+        actual = media_provider_order_for_modality(modality)
+        if actual != expected:
+            errors.append(
+                f"{modality}: provider order {actual!r} does not match {expected!r}"
+            )
+
+    expected_video_models = {
+        "medium": VIDEO_MODEL_MINI,
+        "large": VIDEO_MODEL,
+        "max": VIDEO_MODEL,
+    }
+    for plan_tier, expected_model in expected_video_models.items():
+        actual_model = VIDEO_MODELS_BY_PLAN_TIER.get(plan_tier)
+        if actual_model != expected_model:
+            errors.append(
+                f"{plan_tier}: video model {actual_model!r} does not match "
+                f"{expected_model!r}"
+            )
+        if not plan_tier_supports_modality(plan_tier, "video"):
+            errors.append(f"{plan_tier}: video entitlement is unexpectedly disabled")
+
+    if plan_tier_supports_modality("small", "video"):
+        errors.append("small: video entitlement must remain disabled")
+    if VIDEO_MODEL_MINI in RETIRING_VIDEO_MODELS:
+        errors.append("current Medium video model is incorrectly marked retiring")
+    if any(model in RETIRING_VIDEO_MODELS for model in expected_video_models.values()):
+        errors.append("a new-tier video model is incorrectly marked retiring")
+    if VIDEO_MODEL in RETIRING_VIDEO_MODELS:
+        errors.append("Large/Max video model is incorrectly marked retiring")
+
+    return tuple(errors)
 
 
 def minimax_video_requires_first_frame(
@@ -215,4 +269,5 @@ __all__ = [
     "media_provider_order_for_modality",
     "minimax_video_requires_first_frame",
     "prepare_media_provider",
+    "validate_media_route_policy",
 ]

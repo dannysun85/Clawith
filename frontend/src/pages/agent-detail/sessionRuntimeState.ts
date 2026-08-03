@@ -21,6 +21,19 @@ export type SessionActiveRun = {
     pendingToolReconciliations: ToolReconciliation[];
 };
 
+const MEDIA_DELIVERY_PENDING_CODES = new Set([
+    'media_image_delivery_pending',
+    'media_image_recovery_pending',
+    'media_image_acceptance_repair_pending',
+    'media_video_delivery_pending',
+    'media_video_recovery_pending',
+    'media_video_acceptance_repair_pending',
+]);
+
+export const isMediaDeliveryPending = (
+    reconciliation: ToolReconciliation,
+): boolean => MEDIA_DELIVERY_PENDING_CODES.has(reconciliation.errorCode || '');
+
 const record = (value: unknown): Record<string, unknown> | null =>
     value !== null && typeof value === 'object'
         ? value as Record<string, unknown>

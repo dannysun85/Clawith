@@ -65,6 +65,10 @@ backend:
     runtimeCommandConcurrency: 10
     # Global kill switch for proactive Agent heartbeat. Explicit triggers are unaffected.
     heartbeatEnabled: false
+    # Optional explicit egress proxy for credentialed Provider API calls.
+    # Keep empty unless the cluster network requires it; do not commit proxy
+    # credentials in values files.
+    httpProxy: ""
     # Add custom environment variables here
     # custom: {}
 

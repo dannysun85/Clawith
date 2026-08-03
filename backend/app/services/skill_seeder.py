@@ -1261,7 +1261,7 @@ async def push_default_skills_to_existing_agents():
             and not setting.value.get("conflicts")
         ):
             logger.info(f"[SkillSeeder] Default skills sync hash '{current_hash}' matches, skipping sync for existing agents")
-            return
+            return dict(setting.value)
 
         pushed = 0
         adopted = 0
@@ -1269,6 +1269,8 @@ async def push_default_skills_to_existing_agents():
         removed = 0
         preserved = 0
         conflicts = 0
+        conflict_agent_ids: set[str] = set()
+        conflict_skill_folders_by_agent: dict[str, set[str]] = {}
         storage = get_storage_backend()
         for agent in agents:
             default_skills = resolve_agent_skills(
@@ -1293,6 +1295,9 @@ async def push_default_skills_to_existing_agents():
                     preserved += 1
                 elif cleanup_status == "conflict":
                     conflicts += 1
+                    agent_id = str(agent.id)
+                    conflict_agent_ids.add(agent_id)
+                    conflict_skill_folders_by_agent.setdefault(agent_id, set()).add(folder_name)
                     logger.warning(
                         "[SkillSeeder] Preserved ambiguous or user-edited stale Skill "
                         "folder agent_id={} skill_folder={}",
@@ -1315,6 +1320,9 @@ async def push_default_skills_to_existing_agents():
                 )
                 if status == "conflict":
                     conflicts += 1
+                    agent_id = str(agent.id)
+                    conflict_agent_ids.add(agent_id)
+                    conflict_skill_folders_by_agent.setdefault(agent_id, set()).add(skill.folder_name)
                     logger.warning(
                         "[SkillSeeder] Preserved user-edited Skill folder "
                         "agent_id={} skill_folder={}",
@@ -1334,6 +1342,11 @@ async def push_default_skills_to_existing_agents():
             "conflicts": conflicts,
             "removed": removed,
             "preserved": preserved,
+            "conflict_agent_ids": sorted(conflict_agent_ids),
+            "conflict_skill_folders_by_agent": {
+                agent_id: sorted(folders)
+                for agent_id, folders in sorted(conflict_skill_folders_by_agent.items())
+            },
         }
         if setting:
             setting.value = sync_state
@@ -1354,3 +1367,4 @@ async def push_default_skills_to_existing_agents():
             )
         else:
             logger.info("[SkillSeeder] All existing agents already have all default skills")
+        return sync_state

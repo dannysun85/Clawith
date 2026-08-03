@@ -11,6 +11,8 @@ import zipfile
 import fitz
 import pytest
 from PIL import Image
+from pptx import Presentation
+from pptx.util import Inches
 
 from app.models.agent_tool_execution import AgentToolExecution
 from app.models.deliverable import DeliverableArtifactRevision, DeliverableRequest
@@ -193,6 +195,47 @@ def _pptx_bytes(*, page_count: int = 8, width: int = 12_192_000, height: int = 6
     return output.getvalue()
 
 
+def _picture_pptx_bytes(*, sparse: bool) -> bytes:
+    image_output = BytesIO()
+    Image.new("RGB", (1600, 900), color=(28, 34, 46)).save(
+        image_output,
+        format="PNG",
+    )
+    presentation = Presentation()
+    presentation.slide_width = Inches(13.333333)
+    presentation.slide_height = Inches(7.5)
+    for index in range(8):
+        slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+        image_output.seek(0)
+        if not sparse or index == 0:
+            if sparse:
+                slide.shapes.add_picture(
+                    image_output,
+                    Inches(0.5),
+                    Inches(0.5),
+                    Inches(2),
+                    Inches(1),
+                )
+            else:
+                slide.shapes.add_picture(
+                    image_output,
+                    0,
+                    0,
+                    presentation.slide_width,
+                    presentation.slide_height,
+                )
+        box = slide.shapes.add_textbox(
+            Inches(1),
+            Inches(1.5),
+            Inches(8),
+            Inches(1),
+        )
+        box.text = f"Slide {index + 1}"
+    output = BytesIO()
+    presentation.save(output)
+    return output.getvalue()
+
+
 def _pdf_bytes(*, page_count: int = 8, width: float = 960, height: float = 540) -> bytes:
     document = fitz.open()
     for _ in range(page_count):
@@ -328,6 +371,82 @@ async def test_reconcile_persists_only_exact_request_scoped_structural_outputs(t
     for artifact in db.added:
         snapshot = await storage.read_bytes(deliverable_artifact_snapshot_key(artifact))
         assert artifact.content_hash == hashlib.sha256(snapshot).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_rejects_sparse_image_led_presentation(tmp_path) -> None:
+    request = _request()
+    request.goal = "制作一份图文并茂的新品发布方案"
+    storage = LocalStorageBackend(str(tmp_path))
+    pptx_path = f"workspace/deliverables/{request.id}/result.pptx"
+    pdf_path = f"workspace/deliverables/{request.id}/result.pdf"
+    await storage.write_bytes(
+        agent_storage_key(request.agent_id, pptx_path),
+        _picture_pptx_bytes(sparse=True),
+    )
+    await storage.write_bytes(
+        agent_storage_key(request.agent_id, pdf_path),
+        _pdf_bytes(),
+    )
+
+    result = await reconcile_runtime_deliverable_artifacts(
+        _Session(
+            [
+                _execution(request, tool_name="convert_html_to_pptx", artifact_type="pptx"),
+                _execution(request, tool_name="convert_html_to_pdf", artifact_type="pdf"),
+            ],
+            [],
+        ),
+        request=request,
+        run_id=request.agent_run_id,
+        storage=storage,
+    )
+
+    assert result.complete is False
+    assert result.invalid_types == ("pptx", "pdf")
+    assert result.failure_codes == (
+        ("pptx", "presentation_picture_coverage_below_minimum"),
+        ("pdf", "presentation_picture_coverage_below_minimum"),
+    )
+    assert result.artifacts == ()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_accepts_image_led_presentation_with_meaningful_coverage(
+    tmp_path,
+) -> None:
+    request = _request()
+    request.goal = "制作一份图文并茂的新品发布方案"
+    storage = LocalStorageBackend(str(tmp_path))
+    pptx_path = f"workspace/deliverables/{request.id}/result.pptx"
+    pdf_path = f"workspace/deliverables/{request.id}/result.pdf"
+    await storage.write_bytes(
+        agent_storage_key(request.agent_id, pptx_path),
+        _picture_pptx_bytes(sparse=False),
+    )
+    await storage.write_bytes(
+        agent_storage_key(request.agent_id, pdf_path),
+        _pdf_bytes(),
+    )
+
+    result = await reconcile_runtime_deliverable_artifacts(
+        _Session(
+            [
+                _execution(request, tool_name="convert_html_to_pptx", artifact_type="pptx"),
+                _execution(request, tool_name="convert_html_to_pdf", artifact_type="pdf"),
+            ],
+            [],
+        ),
+        request=request,
+        run_id=request.agent_run_id,
+        storage=storage,
+    )
+
+    assert result.complete is True
+    assert result.invalid_types == ()
+    pptx_artifact = next(item for item in result.artifacts if item.artifact_type == "pptx")
+    assert pptx_artifact.evaluation["facts"]["picture_coverage_ratio_mean"] == 1
+    assert pptx_artifact.evaluation["facts"]["picture_coverage_gate"] == 1
 
 
 @pytest.mark.asyncio

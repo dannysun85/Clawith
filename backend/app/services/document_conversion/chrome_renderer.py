@@ -254,6 +254,11 @@ paddingLeft: cs.paddingLeft,
 paddingRight: cs.paddingRight,
 paddingTop: cs.paddingTop,
 paddingBottom: cs.paddingBottom,
+height: cs.height,
+maxHeight: cs.maxHeight,
+overflow: cs.overflow,
+overflowX: cs.overflowX,
+overflowY: cs.overflowY,
 webkitTextFillColor: cs.webkitTextFillColor,
 backgroundClip: cs.backgroundClip,
 webkitBackgroundClip: cs.webkitBackgroundClip,
@@ -287,9 +292,15 @@ height: rootRectRaw.height || viewport.height,
       const text = directText(el);
       const hasBlockChildren = children.some(child => !isInlineTag(child.tagName.toLowerCase()));
 
-      // SVG is preserved by the hybrid visual layer. Mapping its internal
-      // <text> nodes again would duplicate labels over the screenshot.
-      if (tag === 'svg') return;
+      // Keep SVG/canvas as one bounded visual item. Their internals are not
+      // safely editable PPT primitives, but the hybrid renderer can capture
+      // only this region instead of rasterizing the whole slide.
+      if (tag === 'svg' || tag === 'canvas') {
+        const visualItem = itemFor(el, rootRect, 'shape');
+        visualItem.requiresScreenshot = true;
+        items.push(visualItem);
+        return;
+      }
 
       if (el !== root && hasPaint(cs) && !isTextClipBackground(cs)) {
 items.push(itemFor(el, rootRect, 'shape'));
@@ -565,9 +576,31 @@ roots = [body];
                             or str(style.get("filter") or "none") != "none"
                             or str(style.get("backdropFilter") or "none") != "none"
                         )
-                        if not has_complex_paint or not item.get("itemId"):
+                        if (
+                            not has_complex_paint
+                            and not item.get("requiresScreenshot")
+                        ) or not item.get("itemId"):
                             continue
                         item_id = str(item["itemId"])
+                        preserve_visual_children = bool(
+                            item.get("requiresScreenshot")
+                            and item.get("tag") in {"svg", "canvas"}
+                        )
+                        child_visibility_rule = (
+                            (
+                                f"[data-clawith-slide-root=\"{slide_idx}\"] "
+                                f"[data-clawith-item-id=\"{item_id}\"] * {{ "
+                                "visibility: visible !important; }"
+                            )
+                            if preserve_visual_children
+                            else (
+                                f"[data-clawith-slide-root=\"{slide_idx}\"] "
+                                f"[data-clawith-item-id=\"{item_id}\"] * {{ "
+                                "visibility: hidden !important; color: transparent !important; "
+                                "-webkit-text-fill-color: transparent !important; "
+                                "text-shadow: none !important; }"
+                            )
+                        )
                         clip_w = max(1.0, float(item.get("w") or 1))
                         clip_h = max(1.0, float(item.get("h") or 1))
                         hide_expr = (
@@ -581,7 +614,7 @@ roots = [body];
                             f"[data-clawith-slide-root=\"{slide_idx}\"] [data-clawith-item-id=\"{item_id}\"] {{ visibility: visible !important; color: transparent !important; -webkit-text-fill-color: transparent !important; text-shadow: none !important; }} "
                             f"[data-clawith-slide-root=\"{slide_idx}\"] [data-clawith-item-id=\"{item_id}\"]::before, "
                             f"[data-clawith-slide-root=\"{slide_idx}\"] [data-clawith-item-id=\"{item_id}\"]::after {{ color: transparent !important; -webkit-text-fill-color: transparent !important; text-shadow: none !important; }} "
-                            f"[data-clawith-slide-root=\"{slide_idx}\"] [data-clawith-item-id=\"{item_id}\"] * {{ visibility: hidden !important; color: transparent !important; -webkit-text-fill-color: transparent !important; text-shadow: none !important; }}';"
+                            f"{child_visibility_rule}';"
                             "document.head.appendChild(style);"
                             "})()"
                         )

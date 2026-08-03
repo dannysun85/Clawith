@@ -8,6 +8,7 @@ import {
     deliverableRouteTier,
     latestPendingDeliverable,
     latestTrackedDeliverables,
+    nextDeliverableComposerText,
     requestCanLaunchFromComposer,
 } from './deliverables';
 
@@ -92,6 +93,22 @@ describe('deliverable composer selection', () => {
         expect(deliverableLaunchMessage(request(), true)).toContain('制作融资汇报');
         expect(deliverableLaunchMessage(request(), false)).toBe(
             'Start from the confirmed work brief: 制作融资汇报',
+        );
+    });
+
+    it('replaces stale generated copy when a newer brief is saved', () => {
+        const previous = request({ id: 'poster-1', work_type: 'poster', workflow_id: 'builtin.poster.v1', goal: '制作一张商品海报' });
+        const next = request({ id: 'ppt-1', goal: '制作一份八页商业提案' });
+        const previousText = deliverableLaunchMessage(previous, true);
+
+        expect(nextDeliverableComposerText('', next, previous, true)).toBe(
+            deliverableLaunchMessage(next, true),
+        );
+        expect(nextDeliverableComposerText(previousText, next, previous, true)).toBe(
+            deliverableLaunchMessage(next, true),
+        );
+        expect(nextDeliverableComposerText('我已经手动补充的要求', next, previous, true)).toBe(
+            '我已经手动补充的要求',
         );
     });
 
