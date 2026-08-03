@@ -31,7 +31,12 @@ SUPPORTED_REFERENCE_FORMATS = {
 _FONT_CANDIDATES = (
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSerifCJK-Bold.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
     "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
     "/System/Library/Fonts/PingFang.ttc",
     "/System/Library/Fonts/Hiragino Sans GB.ttc",
     "/System/Library/Fonts/STHeiti Medium.ttc",
@@ -679,6 +684,79 @@ def _poster_block_layout(
     )
 
 
+def _composite_glass_cta(canvas, rect: tuple[int, int, int, int], radius: int) -> None:
+    """Composite a restrained rose-to-violet glass button with depth and edge light."""
+
+    from PIL import Image, ImageDraw, ImageFilter
+
+    left, top, right, bottom = rect
+    button_width = max(1, right - left)
+    button_height = max(1, bottom - top)
+
+    shadow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    shadow_draw = ImageDraw.Draw(shadow, "RGBA")
+    shadow_offset = max(2, button_height // 12)
+    shadow_draw.rounded_rectangle(
+        (left, top + shadow_offset, right, bottom + shadow_offset),
+        radius=radius,
+        fill=(50, 31, 108, 115),
+    )
+    canvas.alpha_composite(
+        shadow.filter(ImageFilter.GaussianBlur(max(4, button_height // 7)))
+    )
+
+    glow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    glow_draw = ImageDraw.Draw(glow, "RGBA")
+    glow_draw.rounded_rectangle(
+        rect,
+        radius=radius,
+        fill=(217, 104, 255, 155),
+    )
+    canvas.alpha_composite(
+        glow.filter(ImageFilter.GaussianBlur(max(5, button_height // 5)))
+    )
+
+    mask = Image.new("L", (button_width, button_height), 0)
+    ImageDraw.Draw(mask).rounded_rectangle(
+        (0, 0, button_width - 1, button_height - 1),
+        radius=radius,
+        fill=225,
+    )
+    gradient = Image.new("RGBA", (button_width, button_height), (0, 0, 0, 0))
+    gradient_draw = ImageDraw.Draw(gradient, "RGBA")
+    start = (232, 111, 200)
+    end = (115, 124, 246)
+    denominator = max(button_width - 1, 1)
+    for column in range(button_width):
+        mix = column / denominator
+        color = tuple(
+            round(start[channel] * (1 - mix) + end[channel] * mix)
+            for channel in range(3)
+        )
+        gradient_draw.line(
+            (column, 0, column, button_height - 1),
+            fill=(*color, 238),
+        )
+    gradient.putalpha(mask)
+    canvas.alpha_composite(gradient, (left, top))
+
+    edge = ImageDraw.Draw(canvas, "RGBA")
+    inset = max(2, button_height // 24)
+    edge.rounded_rectangle(
+        (left + inset, top + inset, right - inset, bottom - inset),
+        radius=max(1, radius - inset),
+        outline=(255, 239, 255, 225),
+        width=max(2, button_height // 30),
+    )
+    edge.arc(
+        (left + inset * 2, top + inset * 2, right - inset * 2, bottom - inset * 2),
+        190,
+        344,
+        fill=(255, 255, 255, 135),
+        width=max(1, button_height // 42),
+    )
+
+
 def _render_poster_blocks(canvas, blocks: tuple[dict[str, str], ...]) -> OverlayReceipt:
     """Render a quiet, role-aware poster hierarchy without a generic black text box."""
 
@@ -716,7 +794,7 @@ def _render_poster_blocks(canvas, blocks: tuple[dict[str, str], ...]) -> Overlay
         fill = {
             "title": (255, 255, 255, 255),
             "subtitle": (252, 250, 255, 245),
-            "tagline": (225, 216, 255, 235),
+            "tagline": (242, 235, 255, 245),
             "body": (242, 238, 255, 240),
         }[block["role"]]
         line_y = cursor_y
@@ -724,26 +802,55 @@ def _render_poster_blocks(canvas, blocks: tuple[dict[str, str], ...]) -> Overlay
             if line:
                 x = (width - line_width) // 2 - box[0]
                 if block["role"] == "title":
-                    glow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-                    glow_draw = ImageDraw.Draw(glow, "RGBA")
-                    glow_draw.text(
+                    outer_glow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+                    outer_glow_draw = ImageDraw.Draw(outer_glow, "RGBA")
+                    outer_glow_draw.text(
                         (x, line_y - box[1]),
                         line,
                         font=font,
-                        fill=(210, 173, 255, 210),
-                        stroke_width=max(2, font_size // 18),
-                        stroke_fill=(160, 118, 255, 170),
+                        fill=(219, 179, 255, 190),
+                        stroke_width=max(2, font_size // 20),
+                        stroke_fill=(166, 120, 255, 160),
                     )
                     canvas.alpha_composite(
-                        glow.filter(ImageFilter.GaussianBlur(max(2, font_size // 12)))
+                        outer_glow.filter(
+                            ImageFilter.GaussianBlur(max(5, font_size // 8))
+                        )
                     )
+                    inner_glow = outer_glow.filter(
+                        ImageFilter.GaussianBlur(max(2, font_size // 30))
+                    )
+                    canvas.alpha_composite(inner_glow)
+                else:
+                    shadow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+                    shadow_draw = ImageDraw.Draw(shadow, "RGBA")
+                    shadow_draw.text(
+                        (x, line_y - box[1] + max(1, font_size // 24)),
+                        line,
+                        font=font,
+                        fill=(58, 42, 112, 145),
+                    )
+                    canvas.alpha_composite(
+                        shadow.filter(
+                            ImageFilter.GaussianBlur(max(2, font_size // 18))
+                        )
+                    )
+                draw = ImageDraw.Draw(canvas, "RGBA")
                 draw.text(
                     (x, line_y - box[1]),
                     line,
                     font=font,
                     fill=fill,
-                    stroke_width=max(1, font_size // 48) if block["role"] == "title" else 0,
-                    stroke_fill=(255, 220, 255, 210),
+                    stroke_width=(
+                        max(2, font_size // 25)
+                        if block["role"] == "title"
+                        else max(1, font_size // 55)
+                    ),
+                    stroke_fill=(
+                        (255, 226, 255, 235)
+                        if block["role"] == "title"
+                        else (83, 59, 135, 115)
+                    ),
                 )
             line_y += line_height + spacing
             total_lines += 1
@@ -769,14 +876,8 @@ def _render_poster_blocks(canvas, blocks: tuple[dict[str, str], ...]) -> Overlay
         y = min(cta_y, height - button_height - max(18, int(height * 0.08)))
         rect = (x, y, x + button_width, y + button_height)
         radius = button_height // 2
-        draw.rounded_rectangle(rect, radius=radius, fill=(176, 103, 235, 235))
-        inset = max(2, int(font.size * 0.08))
-        draw.rounded_rectangle(
-            (x + inset, y + inset, x + button_width - inset, y + button_height - inset),
-            radius=max(1, radius - inset),
-            outline=(255, 221, 255, 230),
-            width=max(1, inset),
-        )
+        _composite_glass_cta(canvas, rect, radius)
+        draw = ImageDraw.Draw(canvas, "RGBA")
         line_y = y + pad_y
         for line, box, line_width, line_height in zip(lines, boxes, widths, heights, strict=True):
             draw.text(
@@ -784,6 +885,8 @@ def _render_poster_blocks(canvas, blocks: tuple[dict[str, str], ...]) -> Overlay
                 line,
                 font=font,
                 fill=(255, 255, 255, 255),
+                stroke_width=max(1, int(font.size) // 45),
+                stroke_fill=(91, 57, 145, 125),
             )
             line_y += line_height + spacing
             total_lines += 1
@@ -795,7 +898,7 @@ def _render_poster_blocks(canvas, blocks: tuple[dict[str, str], ...]) -> Overlay
         font_family=selection.family,
         font_face_index=selection.face_index,
         line_count=total_lines,
-        layout_version="poster-v1",
+        layout_version="poster-v2",
         block_count=len(blocks),
         overlay_blocks_sha256=overlay_blocks_sha256(blocks),
     )

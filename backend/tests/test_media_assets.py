@@ -290,7 +290,7 @@ def test_role_aware_poster_blocks_render_without_legacy_black_panel():
     )
 
     assert validate_generated_image(result) == (720, 1280)
-    assert receipt.layout_version == "poster-v1"
+    assert receipt.layout_version == "poster-v2"
     assert receipt.block_count == 4
     assert receipt.overlay_blocks_sha256 == blocks_digest
     assert receipt.output_bytes == len(result)
@@ -298,6 +298,19 @@ def test_role_aware_poster_blocks_render_without_legacy_black_panel():
         # The legacy renderer put an opaque black panel behind all copy. The
         # structured poster renderer keeps the supplied background visible.
         assert image.convert("RGB").getpixel((360, 640)) != (0, 0, 0)
+
+
+def test_glass_cta_uses_rose_to_violet_gradient_instead_of_flat_fill():
+    canvas = Image.new("RGBA", (320, 120), (0, 0, 0, 0))
+
+    media_assets._composite_glass_cta(canvas, (20, 20, 300, 100), 40)
+
+    left_red, _left_green, left_blue, left_alpha = canvas.getpixel((70, 60))
+    right_red, _right_green, right_blue, right_alpha = canvas.getpixel((250, 60))
+    assert left_red > right_red
+    assert right_blue > left_blue
+    assert left_alpha > 200
+    assert right_alpha > 200
 
 
 def test_bounded_encoder_downscales_only_when_encoded_result_exceeds_limit():

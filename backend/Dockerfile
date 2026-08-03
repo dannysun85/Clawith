@@ -50,8 +50,8 @@ RUN if ! python -c 'import re, sys; host = sys.argv[1]; label_pattern = re.compi
         fi; \
     fi && \
     apt-get update && \
-    apt-get install -y --no-install-recommends libpq5 curl shadowsocks-libev gosu bubblewrap libcairo2 libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 shared-mime-info pango1.0-tools fonts-wqy-microhei fonts-wqy-zenhei fonts-noto-cjk chromium && \
-    fc-cache -fv && \
+    apt-get install -y --no-install-recommends libpq5 curl shadowsocks-libev gosu bubblewrap libcairo2 libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 shared-mime-info pango1.0-tools fontconfig fonts-wqy-microhei fonts-wqy-zenhei fonts-noto-cjk fonts-noto-cjk-extra fonts-noto-core fonts-noto-extra fonts-noto-color-emoji fonts-noto-mono fonts-dejavu-core fonts-dejavu-extra fonts-liberation2 fonts-freefont-ttf chromium && \
+    fc-cache -f && \
     rm -rf /var/lib/apt/lists/*
 
 # Keep the large browser/font runtime layer cacheable. ffmpeg changes independently
