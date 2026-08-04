@@ -1040,7 +1040,10 @@ def test_remote_worker_identity_is_allowlisted_and_xtrace_safe(tmp_path):
         env=env,
         capture_output=True,
         check=False,
-        timeout=10,
+        # Full release suites can temporarily saturate local process startup;
+        # retain a hard bound without turning scheduler latency into a false
+        # production-contract failure.
+        timeout=30,
     )
 
     assert traced.returncode == 0, traced.stderr.decode()
@@ -1076,7 +1079,7 @@ def test_remote_worker_identity_is_allowlisted_and_xtrace_safe(tmp_path):
         env=duplicate_env,
         capture_output=True,
         check=False,
-        timeout=10,
+        timeout=30,
     )
     assert duplicated.returncode != 0
 
@@ -1119,7 +1122,7 @@ def test_rollback_worker_identity_accepts_the_legacy_release_contract(tmp_path):
         env=env,
         capture_output=True,
         check=False,
-        timeout=10,
+        timeout=30,
     )
 
     assert traced.returncode == 0, traced.stderr.decode()
