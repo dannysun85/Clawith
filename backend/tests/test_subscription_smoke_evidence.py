@@ -70,6 +70,7 @@ def _api_evidence(commit: str, release_id: str, nonce: str) -> dict:
             "client_credit_transactions_ok",
             "client_orders_ok",
             "client_credit_packs_ok",
+            "work_executor_preflight_ok",
             "platform_admin_login_ok",
             "saas_ledger_reconciliation_ok",
             "saas_payment_reconciliation_ok",
@@ -81,6 +82,10 @@ def _api_evidence(commit: str, release_id: str, nonce: str) -> dict:
             "balance": 100,
             "available_balance": 90,
             "reserved": 10,
+        },
+        "work_executor_preflight": {
+            "capability_status": "available",
+            "reason_count": 0,
         },
         "saas_ledger_reconciliation": {
             "checked_tenants": 4,
@@ -249,6 +254,34 @@ def test_api_reconciliation_gate_fails_closed_without_leaking_issue_rows():
         checked_field="checked_orders",
         stage="saas_payment_reconciliation",
     ) == {"checked_orders": 0, "issue_count": 0}
+
+
+def test_work_executor_preflight_gate_requires_available_without_leaking_agent_ids():
+    runner = _load_api_runner()
+    assert runner.summarize_work_executor_preflight(
+        {
+            "capability_status": "available",
+            "reasons": [],
+            "confirmation_fingerprint": "a" * 64,
+            "work_statement": {"executor": {"agent_id": "private-agent-id"}},
+        }
+    ) == {"capability_status": "available", "reason_count": 0}
+
+    with pytest.raises(runner.SmokeFailure) as exc_info:
+        runner.summarize_work_executor_preflight(
+            {
+                "capability_status": "unavailable",
+                "reasons": ["text_route_unavailable:private-agent-id"],
+                "confirmation_fingerprint": "b" * 64,
+            }
+        )
+
+    assert exc_info.value.detail == {
+        "code": "personal_assistant_route_unavailable",
+        "capability_status": "unavailable",
+        "reason_count": 1,
+    }
+    assert "private-agent-id" not in repr(exc_info.value.detail)
 
 
 def test_login_sends_an_explicit_tenant_id(monkeypatch):

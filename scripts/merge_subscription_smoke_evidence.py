@@ -21,6 +21,7 @@ API_CHECKS = {
     "client_credit_transactions_ok",
     "client_orders_ok",
     "client_credit_packs_ok",
+    "work_executor_preflight_ok",
     "platform_admin_login_ok",
     "saas_ledger_reconciliation_ok",
     "saas_payment_reconciliation_ok",
@@ -128,6 +129,13 @@ def main() -> int:
     if not UI_CHECKS.issubset(ui_checks):
         raise ValueError("UI evidence is missing required checks")
 
+    work_executor_preflight = api.get("work_executor_preflight")
+    if work_executor_preflight != {
+        "capability_status": "available",
+        "reason_count": 0,
+    }:
+        raise ValueError("Work executor preflight evidence is unavailable")
+
     api_summary = api.get("subscription_summary")
     ui_summary = ui.get("subscription_summary")
     if not isinstance(api_summary, dict) or not isinstance(ui_summary, dict):
@@ -160,6 +168,7 @@ def main() -> int:
         },
         "checks": sorted(api_checks | ui_checks),
         "subscription_summary": api_summary,
+        "work_executor_preflight": work_executor_preflight,
         "ui": {
             "final_path": ui.get("final_path"),
             "browser_target": ui.get("browser_target"),

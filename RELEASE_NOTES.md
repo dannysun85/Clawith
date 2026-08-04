@@ -1,3 +1,25 @@
+# v1.11.19 — Legacy Personal Assistant Work-Route Readiness
+
+## Runtime route compatibility
+
+- Resolve tenant-bound historical personal-assistant rows whose
+  `preferred_tier`, `primary_model_id`, and `fallback_model_id` are all empty
+  through the entitlement-aware shared model resolver. Legacy Agents that
+  already have a concrete model keep their immutable snapshot behavior.
+- Keep Work preflight and accepted Agent Runs on the same route authority so a
+  tenant assistant cannot be rejected by a stricter, obsolete intake branch.
+
+## Release regression gate
+
+- Extend the isolated candidate smoke with a read-only
+  `/api/work/tasks/preflight` call using the real smoke tenant's personal
+  assistant. Candidate cutover now fails unless the response is explicitly
+  `available`, has no route reasons, and returns a valid confirmation
+  fingerprint. The check creates no Task, invokes no model, and consumes no
+  Credits.
+- Persist only privacy-safe readiness evidence (`available`, zero reasons);
+  Agent identity and route details remain outside release artifacts.
+
 # v1.11.18 — Production Promo Flow Reliability and Poster Quality
 
 ## Managed media routing

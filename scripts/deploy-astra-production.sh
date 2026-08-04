@@ -1568,6 +1568,7 @@ if kind in {"smoke", "smoke-v2"}:
             "client_credit_transactions_ok",
             "client_orders_ok",
             "client_credit_packs_ok",
+            "work_executor_preflight_ok",
             "platform_admin_login_ok",
             "saas_ledger_reconciliation_ok",
             "saas_payment_reconciliation_ok",
@@ -1616,6 +1617,11 @@ if kind in {"smoke", "smoke-v2"}:
             value = summary.get(field)
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise SystemExit(1)
+        if payload.get("work_executor_preflight") != {
+            "capability_status": "available",
+            "reason_count": 0,
+        }:
+            raise SystemExit(1)
         for key, checked_field in (
             ("saas_ledger_reconciliation", "checked_tenants"),
             ("saas_payment_reconciliation", "checked_orders"),

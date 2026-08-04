@@ -86,8 +86,9 @@ async def _resolve_background_runtime_route(
     """Resolve the SaaS route once, then pin its concrete model on the Run.
 
     ``model_id`` is an immutable execution snapshot, not model-object
-    authorization.  Legacy agents without a SaaS tier retain their concrete
-    primary model until they are migrated to the unified route catalog.
+    authorization. Tenant-bound historical Agents without a stored SaaS tier
+    or concrete model are normalized through current entitlements; legacy
+    Agents with a concrete route retain their primary model.
     """
     try:
         return await resolve_runtime_model_route(agent)

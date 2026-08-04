@@ -7,8 +7,12 @@ import uuid
 import pytest
 
 from app.models.agent import Agent
-from app.services.agent_runtime.model_route import resolve_runtime_model_route
+from app.services.agent_runtime.model_route import (
+    RuntimeModelRouteError,
+    resolve_runtime_model_route,
+)
 from app.services.llm.caller import RouteMeta
+from app.services.quota_guard import QuotaExceeded
 
 
 def _agent() -> Agent:
@@ -26,6 +30,7 @@ def _agent() -> Agent:
 @pytest.mark.asyncio
 async def test_legacy_route_pins_primary_and_distinct_fallback() -> None:
     agent = _agent()
+    agent.tenant_id = None
     agent.primary_model_id = uuid.uuid4()
     agent.fallback_model_id = uuid.uuid4()
 
@@ -35,6 +40,54 @@ async def test_legacy_route_pins_primary_and_distinct_fallback() -> None:
     assert route.fallback_model_id == agent.fallback_model_id
     assert route.saas_tier == ""
     assert route.modality == "text"
+
+
+@pytest.mark.asyncio
+async def test_tenant_legacy_row_without_stored_tier_uses_entitlement_route() -> None:
+    agent = _agent()
+    agent.preferred_tier = None
+    agent.primary_model_id = None
+    agent.fallback_model_id = None
+    primary = SimpleNamespace(id=uuid.uuid4())
+    resolver = AsyncMock(
+        return_value=(
+            primary,
+            None,
+            RouteMeta(saas_tier="lite", modality="text"),
+        )
+    )
+
+    with patch(
+        "app.services.llm.caller.resolve_agent_model",
+        new=resolver,
+    ):
+        route = await resolve_runtime_model_route(agent)
+
+    resolver.assert_awaited_once_with(agent)
+    assert route.model_id == primary.id
+    assert route.fallback_model_id is None
+    assert route.saas_tier == "lite"
+    assert route.modality == "text"
+
+
+@pytest.mark.asyncio
+async def test_tenant_route_entitlement_failure_is_a_runtime_route_error() -> None:
+    agent = _agent()
+    agent.preferred_tier = None
+
+    with (
+        patch(
+            "app.services.llm.caller.resolve_agent_model",
+            new=AsyncMock(
+                side_effect=QuotaExceeded(
+                    "No model route configured for lite/text.",
+                    quota_type="no_route",
+                )
+            ),
+        ),
+        pytest.raises(RuntimeModelRouteError, match="no available model route"),
+    ):
+        await resolve_runtime_model_route(agent)
 
 
 @pytest.mark.asyncio

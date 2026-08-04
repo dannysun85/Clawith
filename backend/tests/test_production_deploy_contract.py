@@ -658,6 +658,7 @@ def test_v2_candidate_evidence_binds_ui_release_runner_and_candidate_slot(tmp_pa
         "client_credit_transactions_ok",
         "client_orders_ok",
         "client_credit_packs_ok",
+        "work_executor_preflight_ok",
         "platform_admin_login_ok",
         "saas_ledger_reconciliation_ok",
         "saas_payment_reconciliation_ok",
@@ -693,6 +694,10 @@ def test_v2_candidate_evidence_binds_ui_release_runner_and_candidate_slot(tmp_pa
             "balance": 100,
             "available_balance": 90,
             "reserved": 10,
+        },
+        "work_executor_preflight": {
+            "capability_status": "available",
+            "reason_count": 0,
         },
         "saas_ledger_reconciliation": {
             "checked_tenants": 2,
@@ -743,6 +748,13 @@ candidate_business_evidence_valid {release_id} 3009
     invalid_payloads = [
         {**payload, "frontend_url": "http://127.0.0.1:3008"},
         {**payload, "checks": required_checks[:-1]},
+        {
+            **payload,
+            "work_executor_preflight": {
+                "capability_status": "unavailable",
+                "reason_count": 1,
+            },
+        },
         {
             **payload,
             "release_identity": {**payload["release_identity"], "release_id": "other"},

@@ -25,20 +25,33 @@ class RuntimeModelRoute:
 async def resolve_runtime_model_route(agent: Agent) -> RuntimeModelRoute:
     """Resolve one Agent route without turning model identity into authorization.
 
-    SaaS-tier Agents are resolved through the shared route catalog. Legacy
-    Agents retain their configured concrete primary/fallback pair. The result
-    is copied into the Run input so later admin edits cannot mutate an already
-    accepted execution.
+    Tenant-bound historical Agents with neither a stored ``preferred_tier``
+    nor a concrete model pair are resolved through the shared,
+    entitlement-aware resolver. Legacy Agents that already have a concrete
+    model retain that immutable primary/fallback pair. The result is copied
+    into the Run input so later admin edits cannot mutate an already accepted
+    execution.
     """
 
-    if agent.preferred_tier:
+    needs_entitlement_default = (
+        agent.tenant_id is not None
+        and agent.primary_model_id is None
+        and agent.fallback_model_id is None
+    )
+    if agent.preferred_tier or needs_entitlement_default:
         from app.services.llm.caller import resolve_agent_model
+        from app.services.quota_guard import QuotaExceeded
 
-        primary, fallback, route_meta = await resolve_agent_model(agent)
+        try:
+            primary, fallback, route_meta = await resolve_agent_model(agent)
+        except QuotaExceeded as exc:
+            raise RuntimeModelRouteError(
+                "Agent has no available model route"
+            ) from exc
         if primary is None and fallback is not None:
             primary, fallback = fallback, None
         if primary is None or getattr(primary, "id", None) is None:
-            raise RuntimeModelRouteError("Agent has no available SaaS model route")
+            raise RuntimeModelRouteError("Agent has no available model route")
         fallback_id = getattr(fallback, "id", None)
         return RuntimeModelRoute(
             model_id=primary.id,
@@ -48,7 +61,9 @@ async def resolve_runtime_model_route(agent: Agent) -> RuntimeModelRoute:
                 else None
             ),
             saas_tier=(
-                route_meta.saas_tier if route_meta is not None else agent.preferred_tier
+                route_meta.saas_tier
+                if route_meta is not None
+                else (agent.preferred_tier or "")
             ),
             modality=(
                 route_meta.modality

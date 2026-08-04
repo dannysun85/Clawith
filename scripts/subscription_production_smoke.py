@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -130,6 +131,39 @@ def summarize_reconciliation(
         },
     )
     return {checked_field: checked, "issue_count": 0}
+
+
+def summarize_work_executor_preflight(payload: Any) -> dict[str, Any]:
+    """Require the real tenant's personal assistant to pass Work intake.
+
+    The evidence intentionally excludes Agent IDs, names, and route details.
+    This is a read-only preflight: it neither creates a Task nor calls a model.
+    """
+
+    require(
+        isinstance(payload, dict),
+        "work_executor_preflight",
+        {"code": "invalid_work_preflight_response"},
+    )
+    capability_status = payload.get("capability_status")
+    reasons = payload.get("reasons")
+    fingerprint = payload.get("confirmation_fingerprint")
+    require(
+        capability_status == "available" and reasons == [],
+        "work_executor_preflight",
+        {
+            "code": "personal_assistant_route_unavailable",
+            "capability_status": capability_status,
+            "reason_count": len(reasons) if isinstance(reasons, list) else None,
+        },
+    )
+    require(
+        isinstance(fingerprint, str)
+        and re.fullmatch(r"[0-9a-f]{64}", fingerprint) is not None,
+        "work_executor_preflight",
+        {"code": "invalid_confirmation_fingerprint"},
+    )
+    return {"capability_status": "available", "reason_count": 0}
 
 
 def login(
@@ -337,6 +371,27 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 "seats_used": body.get("seats_used"),
                 "seats_total": body.get("seats_total"),
             }
+
+    status, body = call_api(
+        "POST",
+        api_base,
+        "/work/tasks/preflight",
+        {
+            "title": "Release work-route readiness preflight",
+            "intent": "Verify the tenant personal assistant execution route without creating a task.",
+            "work_type": "general",
+            "priority": "low",
+            "executor_kind": "personal_assistant",
+        },
+        token=tenant_token,
+    )
+    require(
+        status == 200,
+        "work_executor_preflight",
+        {"code": "unexpected_http_status", "status": status},
+    )
+    summary["work_executor_preflight"] = summarize_work_executor_preflight(body)
+    summary["checks"].append("work_executor_preflight_ok")
 
     admin_login = login(
         api_base,
