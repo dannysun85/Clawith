@@ -92,6 +92,7 @@ from app.services.deliverable_workflows import (
     validate_workflow_spec,
 )
 from app.services.storage import get_storage_backend, guess_content_type
+from app.services.work_deliverable_contract import work_task_deliverable_contract
 
 
 router = APIRouter(prefix="/api/deliverables", tags=["deliverables"])
@@ -647,6 +648,37 @@ async def create_deliverable_request(
         ).scalar_one_or_none()
         if linked_task is None:
             raise HTTPException(status_code=404, detail="Task not found")
+        contract = work_task_deliverable_contract(linked_task)
+        mismatches: list[str] = []
+        if linked_task.status != "done":
+            mismatches.append("task_status")
+        if contract is None:
+            mismatches.append("task_contract")
+        else:
+            if data.work_type != contract.work_type:
+                mismatches.append("work_type")
+            if data.goal.strip() != contract.goal:
+                mismatches.append("goal")
+            mismatches.extend(
+                key
+                for key, value in contract.spec.items()
+                if normalized_spec.get(key) != value
+            )
+        if data.inputs:
+            # Work tasks do not yet persist task-owned source files. Refuse to
+            # borrow unrelated files from the current chat session.
+            mismatches.append("inputs")
+        if mismatches:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "task_deliverable_contract_mismatch",
+                    "message": (
+                        "Formal delivery must preserve the completed Work task contract: "
+                        + ", ".join(sorted(set(mismatches)))
+                    ),
+                },
+            )
     existing_result = await db.execute(
         select(DeliverableRequest).where(
             DeliverableRequest.tenant_id == agent.tenant_id,

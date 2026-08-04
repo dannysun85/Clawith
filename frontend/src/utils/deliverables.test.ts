@@ -80,14 +80,89 @@ describe('deliverable composer selection', () => {
             intent: 'fallback goal',
             work_statement: {
                 work_type: 'image',
-                objective: '竖版 9:16 量化交易商业海报，保留完整标题和 CTA',
+                objective: [
+                    '竖版 9:16 量化交易商业海报，保留完整标题和 CTA',
+                    '精确文案（必须逐字一致）：',
+                    '主标题：量化交易平台',
+                    '副标题：智能策略・实时信号・数据驱动决策',
+                    '标语：从复杂市场中，捕捉更清晰的交易方向',
+                    'CTA：立即体验',
+                ].join('\n'),
             },
         });
 
         expect(workTaskDeliverableHandoff(item)).toEqual({
             taskId: 'task-1',
             workType: 'poster',
-            goal: '竖版 9:16 量化交易商业海报，保留完整标题和 CTA',
+            goal: [
+                '竖版 9:16 量化交易商业海报，保留完整标题和 CTA',
+                '精确文案（必须逐字一致）：',
+                '主标题：量化交易平台',
+                '副标题：智能策略・实时信号・数据驱动决策',
+                '标语：从复杂市场中，捕捉更清晰的交易方向',
+                'CTA：立即体验',
+            ].join('\n'),
+            specOverrides: {
+                aspect_ratio: '9:16',
+                exact_copy: [
+                    '量化交易平台',
+                    '智能策略・实时信号・数据驱动决策',
+                    '从复杂市场中，捕捉更清晰的交易方向',
+                    '立即体验',
+                ].join('\n'),
+            },
+        });
+    });
+
+    it('does not guess a structured ratio or copy from ambiguous prose', () => {
+        const item = workItem({
+            work_statement: {
+                work_type: 'image',
+                objective: '同时准备 9:16 与 1:1 两个方向，标题和 CTA 后续再定',
+            },
+        });
+
+        expect(workTaskDeliverableHandoff(item)?.specOverrides).toEqual({});
+    });
+
+    it('prefers the server-owned formal delivery spec over prose fallback', () => {
+        const item = workItem({
+            work_statement: {
+                work_type: 'image',
+                objective: '同时准备 9:16 与 1:1 两个方向，文案以后再定',
+            },
+            formal_delivery_spec: {
+                aspect_ratio: '9:16',
+                exact_copy: '量化交易平台\n立即体验',
+            },
+        });
+
+        expect(workTaskDeliverableHandoff(item)?.specOverrides).toEqual({
+            aspect_ratio: '9:16',
+            exact_copy: '量化交易平台\n立即体验',
+        });
+    });
+
+    it('extracts explicitly quoted poster copy from the original prose format', () => {
+        const item = workItem({
+            work_statement: {
+                work_type: 'image',
+                objective: [
+                    '竖版 9:16 商业宣传海报，画面中部居中放置发光渐变立体白色大标题【量化交易平台】，',
+                    '标题下方小字副标题「智能策略・实时信号・数据驱动决策」，再下方一行浅紫色小字标语「从复杂市场中，捕捉更清晰的交易方向」；',
+                    '画面右下角有渐变粉紫发光圆角按钮，按钮内白色文字 “立即体验”。',
+                ].join(''),
+            },
+        });
+
+        expect(workTaskDeliverableHandoff(item)?.specOverrides).toEqual({
+            aspect_ratio: '9:16',
+            exact_copy: [
+                '量化交易平台',
+                '智能策略・实时信号・数据驱动决策',
+                '从复杂市场中，捕捉更清晰的交易方向',
+                '立即体验',
+            ].join('\n'),
         });
     });
 

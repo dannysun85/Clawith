@@ -71,6 +71,15 @@ class _CreateSession(_Session):
         return _NestedTransaction()
 
 
+class _SequencedCreateSession(_CreateSession):
+    def __init__(self, *execute_values: object | None) -> None:
+        super().__init__()
+        self.execute_values = list(execute_values)
+
+    async def execute(self, _statement):
+        return _Result(self.execute_values.pop(0))
+
+
 class _Storage:
     def __init__(self, data: bytes) -> None:
         self.data = data
@@ -198,6 +207,164 @@ async def test_create_brief_does_not_require_a_provider_route(monkeypatch) -> No
     assert db.flush_count == 3
     assert db.added == [request]
     preflight.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("spec", "inputs", "expected_mismatch"),
+    [
+        (
+            {"aspect_ratio": "3:4", "exact_copy": "量化交易平台\n副标题\n标语\n立即体验"},
+            [],
+            "aspect_ratio",
+        ),
+        (
+            {
+                "aspect_ratio": "9:16",
+                "exact_copy": "量化交易平台\n副标题\n标语\n立即体验",
+            },
+            [{"type": "workspace_file", "path": "workspace/audio/unrelated.mp3"}],
+            "inputs",
+        ),
+    ],
+)
+async def test_linked_work_task_rejects_drifted_formal_delivery_contract(
+    monkeypatch,
+    spec,
+    inputs,
+    expected_mismatch,
+) -> None:
+    tenant_id = uuid.uuid4()
+    user = SimpleNamespace(id=uuid.uuid4(), tenant_id=tenant_id)
+    agent_id = uuid.uuid4()
+    agent = SimpleNamespace(id=agent_id, tenant_id=tenant_id)
+    objective = "\n".join(
+        [
+            "竖版 9:16 商业宣传海报",
+            "主标题：量化交易平台",
+            "副标题：副标题",
+            "标语：标语",
+            "CTA：立即体验",
+        ]
+    )
+    task = SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        created_by=user.id,
+        agent_id=agent_id,
+        status="done",
+        work_type="image",
+        intent=objective,
+        work_statement={
+            "delivery_mode": "task_only",
+            "work_type": "image",
+            "objective": objective,
+        },
+    )
+    workflow = SimpleNamespace(
+        workflow_id="builtin.poster.v1",
+        workflow_version="1.0.0",
+        approval_policy=["composition", "final"],
+        output_contract=["png"],
+    )
+    data = DeliverableRequestCreate(
+        client_request_id=uuid.uuid4(),
+        agent_id=agent_id,
+        session_id=uuid.uuid4(),
+        task_id=task.id,
+        work_type="poster",
+        workflow_id=workflow.workflow_id,
+        workflow_version=workflow.workflow_version,
+        goal=objective,
+        inputs=inputs,
+        spec=spec,
+        tier="ultra",
+    )
+
+    monkeypatch.setattr(deliverables, "check_agent_access", AsyncMock(return_value=(agent, None)))
+    monkeypatch.setattr(deliverables, "_require_direct_session", AsyncMock())
+    monkeypatch.setattr(deliverables, "require_workflow", lambda *_args: workflow)
+    monkeypatch.setattr(deliverables, "validate_workflow_spec", lambda _workflow, value: dict(value))
+
+    with pytest.raises(HTTPException) as error:
+        await deliverables.create_deliverable_request(
+            data,
+            user,  # type: ignore[arg-type]
+            _Session(task),  # type: ignore[arg-type]
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.detail["code"] == "task_deliverable_contract_mismatch"
+    assert expected_mismatch in error.value.detail["message"]
+
+
+@pytest.mark.asyncio
+async def test_linked_work_task_accepts_the_exact_formal_delivery_contract(monkeypatch) -> None:
+    tenant_id = uuid.uuid4()
+    user = SimpleNamespace(id=uuid.uuid4(), tenant_id=tenant_id)
+    agent_id = uuid.uuid4()
+    agent = SimpleNamespace(id=agent_id, tenant_id=tenant_id)
+    exact_copy = "量化交易平台\n副标题\n标语\n立即体验"
+    objective = "\n".join(
+        [
+            "竖版 9:16 商业宣传海报",
+            "主标题：量化交易平台",
+            "副标题：副标题",
+            "标语：标语",
+            "CTA：立即体验",
+        ]
+    )
+    task = SimpleNamespace(
+        id=uuid.uuid4(),
+        status="done",
+        work_type="image",
+        intent=objective,
+        work_statement={
+            "delivery_mode": "task_only",
+            "work_type": "image",
+            "objective": objective,
+        },
+    )
+    workflow = SimpleNamespace(
+        workflow_id="builtin.poster.v1",
+        workflow_version="1.0.0",
+        approval_policy=["composition", "final"],
+        output_contract=["png"],
+    )
+    data = DeliverableRequestCreate(
+        client_request_id=uuid.uuid4(),
+        agent_id=agent_id,
+        session_id=uuid.uuid4(),
+        task_id=task.id,
+        work_type="poster",
+        workflow_id=workflow.workflow_id,
+        workflow_version=workflow.workflow_version,
+        goal=objective,
+        spec={"aspect_ratio": "9:16", "exact_copy": exact_copy},
+        tier="ultra",
+    )
+    db = _SequencedCreateSession(task, None)
+
+    monkeypatch.setattr(deliverables, "check_agent_access", AsyncMock(return_value=(agent, None)))
+    monkeypatch.setattr(deliverables, "_require_direct_session", AsyncMock())
+    monkeypatch.setattr(deliverables, "require_workflow", lambda *_args: workflow)
+    monkeypatch.setattr(deliverables, "validate_workflow_spec", lambda _workflow, value: dict(value))
+    shadow = SimpleNamespace(id=uuid.uuid4())
+    monkeypatch.setattr(deliverables, "add_initial_execution_shadow", lambda *_args: shadow)
+    monkeypatch.setattr(deliverables, "_request_out", AsyncMock(side_effect=lambda _db, request: request))
+
+    request = await deliverables.create_deliverable_request(
+        data,
+        user,  # type: ignore[arg-type]
+        db,  # type: ignore[arg-type]
+    )
+
+    assert request.task_id == task.id
+    assert request.work_type == "poster"
+    assert request.goal == objective
+    assert request.inputs == []
+    assert request.spec == {"aspect_ratio": "9:16", "exact_copy": exact_copy}
+    assert request.current_execution_id == shadow.id
 
 
 @pytest.mark.asyncio

@@ -1,3 +1,39 @@
+# v1.11.21 — Work-to-Deliverable Structured Contract Integrity
+
+## Structured handoff
+
+- Compile the formal Deliverable type, exact confirmed goal, explicit aspect
+  ratio, and explicitly labelled or quoted poster copy from the completed Work
+  task on the server. The single-task projection exposes those values as the
+  authoritative handoff spec instead of leaving the browser to reconstruct a
+  commercial Brief from workflow defaults.
+- Restore explicit `9:16` poster requirements and exact title, subtitle,
+  tagline, and CTA copy into the Deliverable drawer. Optional fields open when
+  a restored task value targets them, so the user can inspect the copy before
+  saving the formal request.
+- Keep a deterministic browser-side extractor only as a rolling-release
+  compatibility path; the server projection wins whenever it is available.
+
+## Fail-closed persistence boundary
+
+- Reject a linked Deliverable request unless the source Work task is complete
+  and its type, full goal, and every explicit server-owned spec value match.
+  A stale `3:4` default can no longer replace an explicit `9:16` task contract.
+- Refuse chat-session attachments on a linked Work handoff while Work tasks do
+  not persist task-owned source-file references. This prevents an unrelated
+  voice-over or prior-session file from contaminating a poster Brief.
+- Cover labelled copy, the customer's original inline quoted-copy prompt
+  format, ambiguous-ratio refusal, server-projection precedence, wrong-ratio
+  rejection, and inherited-attachment rejection.
+
+## Validation
+
+- Complete backend suite: `4319 passed`; frontend Node contracts: `110 passed`;
+  Vitest: `184 passed`; browser-smoke contracts: `2 passed`; TypeScript/Vite
+  production build: `7088` modules.
+- Ruff changed-file and release diff gates, `git diff --check`, and the full
+  PostgreSQL upgrade/downgrade/re-upgrade smoke pass.
+
 # v1.11.20 — Creative Brief Boundary and Formal Delivery Handoff
 
 ## Brief execution safety

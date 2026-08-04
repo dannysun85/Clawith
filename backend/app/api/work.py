@@ -62,6 +62,7 @@ from app.services.work_projection import (
     project_execution_status,
     project_user_stage,
 )
+from app.services.work_deliverable_contract import work_task_deliverable_contract
 
 
 router = APIRouter(prefix="/api/work", tags=["work"])
@@ -578,6 +579,7 @@ async def _work_items(
         request = deliverable_by_task.get(task.id)
         latest_log = latest_log_by_task.get(task.id)
         artifact_status, review_status, delivery_status = deliverable_facts(request)
+        formal_delivery_contract = work_task_deliverable_contract(task)
         items.append(
             WorkItemOut(
                 id=task.id,
@@ -588,6 +590,11 @@ async def _work_items(
                 executor_kind=task.executor_kind,
                 executor_snapshot=dict(task.executor_snapshot or {}),
                 work_statement=dict(task.work_statement or {}),
+                formal_delivery_spec=(
+                    dict(formal_delivery_contract.spec)
+                    if formal_delivery_contract is not None
+                    else {}
+                ),
                 confirmed_at=task.confirmed_at,
                 agent_id=agent.id,
                 agent_name=agent.name,
@@ -663,6 +670,7 @@ async def _work_items(
                 executor_kind="agent_employee",
                 executor_snapshot={"agent_id": str(agent.id), "agent_name": agent.name},
                 work_statement={},
+                formal_delivery_spec={},
                 confirmed_at=None,
                 agent_id=agent.id,
                 agent_name=agent.name,

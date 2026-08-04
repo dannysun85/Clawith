@@ -13,6 +13,7 @@ from app.api.work import (
 from app.core.permissions import is_agent_executable
 from app.schemas.work import WorkTaskCreate, WorkTaskPreflight
 from app.services.work_projection import project_execution_status, project_user_stage
+from app.services.work_deliverable_contract import work_task_deliverable_contract
 
 
 def test_task_done_is_completed_work_not_formal_delivery() -> None:
@@ -49,6 +50,95 @@ def test_work_contract_exposes_task_only_and_formal_delivery_modes() -> None:
     from app.schemas.work import WorkItemOut
 
     assert WorkItemOut.model_fields["delivery_mode"].annotation is not None
+    assert WorkItemOut.model_fields["formal_delivery_spec"].annotation is not None
+
+
+def test_work_task_contract_preserves_explicit_poster_ratio_and_copy() -> None:
+    objective = "\n".join(
+        [
+            "竖版 9:16 商业宣传海报",
+            "主标题：量化交易平台",
+            "副标题：智能策略・实时信号・数据驱动决策",
+            "标语：从复杂市场中，捕捉更清晰的交易方向",
+            "CTA：立即体验",
+        ]
+    )
+    task = SimpleNamespace(
+        work_type="image",
+        intent="fallback",
+        work_statement={
+            "delivery_mode": "task_only",
+            "work_type": "image",
+            "objective": objective,
+        },
+    )
+
+    contract = work_task_deliverable_contract(task)
+
+    assert contract is not None
+    assert contract.work_type == "poster"
+    assert contract.goal == objective
+    assert contract.spec == {
+        "aspect_ratio": "9:16",
+        "exact_copy": "\n".join(
+            [
+                "量化交易平台",
+                "智能策略・实时信号・数据驱动决策",
+                "从复杂市场中，捕捉更清晰的交易方向",
+                "立即体验",
+            ]
+        ),
+    }
+
+
+def test_work_task_contract_refuses_to_guess_ambiguous_ratio() -> None:
+    task = SimpleNamespace(
+        work_type="image",
+        intent="fallback",
+        work_statement={
+            "delivery_mode": "task_only",
+            "work_type": "image",
+            "objective": "同时准备 9:16 和 1:1 两个版本",
+        },
+    )
+
+    contract = work_task_deliverable_contract(task)
+
+    assert contract is not None
+    assert contract.spec == {}
+
+
+def test_work_task_contract_extracts_explicit_copy_from_original_poster_prose() -> None:
+    objective = (
+        "竖版 9:16 商业宣传海报，画面中部居中放置发光渐变立体白色大标题"
+        "【量化交易平台】，标题下方小字副标题「智能策略・实时信号・数据驱动决策」，"
+        "再下方一行浅紫色小字标语「从复杂市场中，捕捉更清晰的交易方向」；"
+        "画面右下角有渐变粉紫发光圆角按钮，按钮内白色文字 “立即体验”。"
+    )
+    task = SimpleNamespace(
+        work_type="image",
+        intent=objective,
+        work_statement={
+            "delivery_mode": "task_only",
+            "work_type": "image",
+            "objective": objective,
+        },
+    )
+
+    contract = work_task_deliverable_contract(task)
+
+    assert contract is not None
+    assert contract.spec == {
+        "aspect_ratio": "9:16",
+        "exact_copy": "\n".join(
+            [
+                "量化交易平台",
+                "智能策略・实时信号・数据驱动决策",
+                "从复杂市场中，捕捉更清晰的交易方向",
+                "立即体验",
+            ]
+        ),
+    }
 
 
 def test_quality_review_and_approval_remain_distinct_stages() -> None:

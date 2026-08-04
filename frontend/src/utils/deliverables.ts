@@ -21,7 +21,89 @@ export type WorkTaskDeliverableHandoff = {
     taskId: string;
     workType: DeliverableWorkType;
     goal: string;
+    specOverrides: Record<string, string | number>;
 };
+
+const DELIVERABLE_ASPECT_RATIOS = new Set(['1:1', '3:4', '9:16', '16:9']);
+const POSTER_COPY_LABELS = ['主标题', '副标题', '标语', 'CTA'] as const;
+const POSTER_COPY_WRAPPERS: Record<string, string> = {
+    '【': '】',
+    '「': '」',
+    '“': '”',
+    '"': '"',
+};
+const INLINE_POSTER_COPY_PATTERNS: Array<[
+    (typeof POSTER_COPY_LABELS)[number],
+    RegExp,
+]> = [
+    ['主标题', /(?:主标题|大标题)[^，；。\n]{0,48}?(?:【([^】\n]+)】|「([^」\n]+)」|“([^”\n]+)”|"([^"\n]+)")/gi],
+    ['副标题', /副标题[^，；。\n]{0,48}?(?:【([^】\n]+)】|「([^」\n]+)」|“([^”\n]+)”|"([^"\n]+)")/gi],
+    ['标语', /(?:标语|口号)[^，；。\n]{0,48}?(?:【([^】\n]+)】|「([^」\n]+)」|“([^”\n]+)”|"([^"\n]+)")/gi],
+    ['CTA', /(?:CTA|按钮(?:内)?(?:白色)?文字)[^，；。\n]{0,48}?(?:【([^】\n]+)】|「([^」\n]+)」|“([^”\n]+)”|"([^"\n]+)")/gi],
+];
+
+function explicitAspectRatio(goal: string): string | undefined {
+    const matches = [...goal.matchAll(/(?:^|[^0-9])((?:1|3|9|16)\s*[:：]\s*(?:1|4|9|16))(?![0-9])/g)]
+        .map((match) => match[1].replace(/\s+/g, '').replace('：', ':'))
+        .filter((value) => DELIVERABLE_ASPECT_RATIOS.has(value));
+    const unique = [...new Set(matches)];
+    return unique.length === 1 ? unique[0] : undefined;
+}
+
+function explicitPosterCopy(goal: string): string | undefined {
+    const values = new Map<(typeof POSTER_COPY_LABELS)[number], string>();
+
+    const record = (
+        label: (typeof POSTER_COPY_LABELS)[number],
+        rawValue: string,
+    ): boolean => {
+        let value = rawValue.trim();
+        if (value.length >= 2 && POSTER_COPY_WRAPPERS[value[0]] === value[value.length - 1]) {
+            value = value.slice(1, -1).trim();
+        }
+        const previous = values.get(label);
+        if (!value || (previous && previous !== value)) return false;
+        values.set(label, value);
+        return true;
+    };
+
+    for (const line of goal.split(/\r?\n/)) {
+        const match = line.trim().match(/^(?:[-*•]\s*)?(主标题|副标题|标语|CTA)\s*[:：]\s*(.+?)\s*$/i);
+        if (!match) continue;
+        const label = match[1].toUpperCase() === 'CTA'
+            ? 'CTA'
+            : match[1] as (typeof POSTER_COPY_LABELS)[number];
+        if (!record(label, match[2])) return undefined;
+    }
+    for (const [label, pattern] of INLINE_POSTER_COPY_PATTERNS) {
+        for (const match of goal.matchAll(pattern)) {
+            const value = match.slice(1).find((candidate) => candidate !== undefined) || '';
+            if (!record(label, value)) return undefined;
+        }
+    }
+    const ordered = POSTER_COPY_LABELS
+        .map((label) => values.get(label))
+        .filter((value): value is string => Boolean(value));
+    if (!values.has('主标题') || ordered.length < 3) return undefined;
+    if (values.has('CTA') && ordered.length < 4) return undefined;
+    return ordered.join('\n');
+}
+
+function workTaskSpecOverrides(
+    workType: DeliverableWorkType,
+    goal: string,
+): Record<string, string | number> {
+    const overrides: Record<string, string | number> = {};
+    if (workType === 'poster' || workType === 'video') {
+        const aspectRatio = explicitAspectRatio(goal);
+        if (aspectRatio) overrides.aspect_ratio = aspectRatio;
+    }
+    if (workType === 'poster') {
+        const exactCopy = explicitPosterCopy(goal);
+        if (exactCopy) overrides.exact_copy = exactCopy;
+    }
+    return overrides;
+}
 
 export function workTaskDeliverableHandoff(
     item: WorkItem | null | undefined,
@@ -52,6 +134,9 @@ export function workTaskDeliverableHandoff(
         taskId: item.task_id,
         workType,
         goal,
+        specOverrides: item.formal_delivery_spec && Object.keys(item.formal_delivery_spec).length > 0
+            ? item.formal_delivery_spec
+            : workTaskSpecOverrides(workType, goal),
     };
 }
 

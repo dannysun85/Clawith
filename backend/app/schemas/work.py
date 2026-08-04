@@ -92,6 +92,7 @@ class WorkItemOut(BaseModel):
     executor_kind: str
     executor_snapshot: dict = Field(default_factory=dict)
     work_statement: dict[str, Any] = Field(default_factory=dict)
+    formal_delivery_spec: dict[str, Any] = Field(default_factory=dict)
     confirmed_at: datetime | None = None
     agent_id: uuid.UUID
     agent_name: str

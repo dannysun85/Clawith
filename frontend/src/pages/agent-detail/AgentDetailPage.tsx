@@ -8412,9 +8412,12 @@ export default function AgentDetailPage() {
                                                             taskId={requestedDeliverableHandoff?.taskId}
                                                             initialWorkType={requestedDeliverableHandoff?.workType}
                                                             initialGoal={requestedDeliverableHandoff?.goal}
+                                                            initialSpecOverrides={requestedDeliverableHandoff?.specOverrides}
                                                             autoOpenKey={requestedDeliverableHandoff?.taskId}
                                                             tier={effectiveChatTier || 'lite'}
-                                                            attachments={attachedFiles.map((file) => ({ name: file.name, path: file.path }))}
+                                                            attachments={requestedDeliverableHandoff
+                                                                ? []
+                                                                : attachedFiles.map((file) => ({ name: file.name, path: file.path }))}
                                                             disabled={chatInputDisabled || !wsConnected || !effectiveChatTier || isWaiting || isStreaming || (agent as any)?.agent_type === 'openclaw'}
                                                             onCreated={(request, launchable) => {
                                                                 dismissedDeliverableRequestIdsRef.current.delete(request.id);

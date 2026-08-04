@@ -44,6 +44,7 @@ interface DeliverableLauncherProps {
     taskId?: string;
     initialWorkType?: DeliverableWorkType;
     initialGoal?: string;
+    initialSpecOverrides?: Record<string, string | number>;
     autoOpenKey?: string;
     tier: SaasTier;
     attachments: DeliverableAttachmentInput[];
@@ -135,6 +136,7 @@ export function DeliverableLauncher({
     taskId,
     initialWorkType,
     initialGoal,
+    initialSpecOverrides,
     autoOpenKey,
     tier,
     attachments,
@@ -225,16 +227,26 @@ export function DeliverableLauncher({
             return;
         }
         handledAutoOpenKeyRef.current = autoOpenKey;
+        const mergedSpec = {
+            ...initialSpec(workflow),
+            ...(initialSpecOverrides || {}),
+        };
+        const optionalFieldKeys = new Set(
+            workflow.fields.filter((field) => !field.required).map((field) => field.key),
+        );
         setSelectedType(workflow.work_type);
-        setSpec(initialSpec(workflow));
+        setSpec(mergedSpec);
         setGoal(initialGoal.trim());
         setError('');
-        setShowAdvanced(false);
+        setShowAdvanced(
+            Object.keys(initialSpecOverrides || {}).some((key) => optionalFieldKeys.has(key)),
+        );
         setClientRequestId(crypto.randomUUID());
         setOpen(true);
     }, [
         autoOpenKey,
         initialGoal,
+        initialSpecOverrides,
         initialWorkType,
         isZh,
         sessionId,

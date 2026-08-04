@@ -334,6 +334,7 @@ export type WorkItem = {
     executor_kind: string;
     executor_snapshot: Record<string, any>;
     work_statement: Record<string, any>;
+    formal_delivery_spec?: Record<string, string | number>;
     confirmed_at?: string | null;
     agent_id: string;
     agent_name: string;
