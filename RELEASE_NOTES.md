@@ -1,3 +1,26 @@
+# v1.11.22 — Task-Bound Launch Input Isolation
+
+## Final launch boundary
+
+- Isolate a task-bound formal Deliverable from every file or upload that was
+  already present in the current chat composer. The visible attachment pills,
+  upload drafts, outgoing display metadata, model content, and storage-file
+  references now all use the same task-owned isolation decision.
+- Stop the workspace preview from auto-attaching its selected file while a
+  task-bound formal request is pending. Ordinary chat and manually created
+  Deliverable requests retain their existing attachment behavior.
+- Enforce the same rule on the server: a linked Work task starts only from the
+  immutable server-owned Deliverable prompt. Stale composer text and attachment
+  markers sent by an older or modified client are excluded from Runtime input.
+
+## Validation
+
+- Complete backend suite: `4320 passed`; frontend Node contracts: `110 passed`;
+  Vitest: `185 passed`; browser-smoke contracts: `2 passed`; TypeScript/Vite
+  production build: `7088` modules.
+- Ruff changed-file and release diff gates, `git diff --check`, and the full
+  PostgreSQL upgrade/downgrade/re-upgrade smoke pass.
+
 # v1.11.21 — Work-to-Deliverable Structured Contract Integrity
 
 ## Structured handoff

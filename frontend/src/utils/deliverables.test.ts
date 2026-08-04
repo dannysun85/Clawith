@@ -5,6 +5,7 @@ import {
     deliverableApprovalBlocked,
     deliverableApprovalStatusMessage,
     deliverableLaunchMessage,
+    deliverableLaunchUsesIsolatedInputs,
     deliverableRouteTier,
     latestPendingDeliverable,
     latestTrackedDeliverables,
@@ -244,6 +245,16 @@ describe('deliverable composer selection', () => {
         expect(deliverableRouteTier(request({ tier: 'ultra' }), 'lite')).toBe('ultra');
         expect(deliverableRouteTier(request({ status: 'running', tier: 'ultra' }), 'lite')).toBe('lite');
         expect(deliverableRouteTier(null, 'pro')).toBe('pro');
+    });
+
+    it('isolates a task-bound launch from unrelated chat attachments', () => {
+        expect(deliverableLaunchUsesIsolatedInputs(request({
+            task_id: 'task-1',
+            work_type: 'poster',
+            workflow_id: 'builtin.poster.v1',
+        }))).toBe(true);
+        expect(deliverableLaunchUsesIsolatedInputs(request({ task_id: null }))).toBe(false);
+        expect(deliverableLaunchUsesIsolatedInputs(null)).toBe(false);
     });
 
     it('keeps legacy output review approvable when readiness is absent', () => {

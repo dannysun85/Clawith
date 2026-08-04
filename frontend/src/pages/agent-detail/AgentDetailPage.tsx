@@ -50,6 +50,7 @@ import {
 } from '../../utils/toolDisplay';
 import {
     deliverableLaunchMessage,
+    deliverableLaunchUsesIsolatedInputs,
     deliverableRouteTier,
     latestPendingDeliverable,
     latestTrackedDeliverables,
@@ -3407,6 +3408,10 @@ export default function AgentDetailPage() {
         request: DeliverableRequest;
         launchable: boolean;
     } | null>(null);
+    const isolateTaskBoundDeliverableInputs = Boolean(
+        pendingDeliverable?.launchable
+        && deliverableLaunchUsesIsolatedInputs(pendingDeliverable.request),
+    );
     const inflightDeliverableRef = useRef<{
         request: DeliverableRequest;
         launchable: boolean;
@@ -4547,7 +4552,10 @@ export default function AgentDetailPage() {
     }, []);
 
     useEffect(() => {
-        const shouldAutoReference = livePanelVisible && sidePanelTab === 'workspace' && !!workspaceActivePath;
+        const shouldAutoReference = !isolateTaskBoundDeliverableInputs
+            && livePanelVisible
+            && sidePanelTab === 'workspace'
+            && !!workspaceActivePath;
         if (!shouldAutoReference) {
             dismissedWorkspaceRefPath.current = null;
             setAttachedFiles((prev) => prev.filter((file) => file.source !== 'workspace_auto'));
@@ -4562,7 +4570,15 @@ export default function AgentDetailPage() {
                 { name: workspaceFileName(path), text: '', path, source: 'workspace_auto' },
             ];
         });
-    }, [livePanelVisible, sidePanelTab, workspaceActivePath]);
+    }, [isolateTaskBoundDeliverableInputs, livePanelVisible, sidePanelTab, workspaceActivePath]);
+
+    useEffect(() => {
+        if (!isolateTaskBoundDeliverableInputs) return;
+        [...chatUploadAbortRef.current.values()].forEach((cancel) => cancel());
+        chatUploadAbortRef.current.clear();
+        setChatUploadDrafts([]);
+        setAttachedFiles([]);
+    }, [isolateTaskBoundDeliverableInputs]);
 
     useEffect(() => {
         return () => {
@@ -5133,14 +5149,15 @@ export default function AgentDetailPage() {
             toast.warning(t('agent.chat.waitingReplyPending', 'Your previous reply is still being processed.'));
             return;
         }
-        if (!chatInput.trim() && attachedFiles.length === 0) return;
+        const outboundAttachedFiles = isolateTaskBoundDeliverableInputs ? [] : attachedFiles;
+        if (!chatInput.trim() && outboundAttachedFiles.length === 0) return;
 
         let userMsg = chatInput.trim();
         let contentForLLM = userMsg;
         let displayFiles = '';
-        const hasImageAttachment = attachedFiles.some((file) => !!file.imageUrl);
-        const hasVideoAttachment = attachedFiles.some((file) => !!file.videoUrl);
-        const inlineMediaBytes = attachedFiles.reduce(
+        const hasImageAttachment = outboundAttachedFiles.some((file) => !!file.imageUrl);
+        const hasVideoAttachment = outboundAttachedFiles.some((file) => !!file.videoUrl);
+        const inlineMediaBytes = outboundAttachedFiles.reduce(
             (total, file) => total + (file.imageUrl || file.videoUrl ? file.sizeBytes || 0 : 0),
             0,
         );
@@ -5161,11 +5178,11 @@ export default function AgentDetailPage() {
         const supportsVideoInput = ['video', 'multimodal'].includes(outboundChatModality);
         const supportsNativeMediaInput = supportsImageInput || supportsVideoInput;
 
-        if (attachedFiles.length > 0) {
+        if (outboundAttachedFiles.length > 0) {
             let filesPrompt = '';
             let filesDisplay = '';
 
-            attachedFiles.forEach(file => {
+            outboundAttachedFiles.forEach(file => {
                 filesDisplay += `[Attachment: ${file.name}] `;
                 const wsPath = file.path || '';
                 const codePath = wsPath.replace(/^workspace\//, '');
@@ -5204,7 +5221,7 @@ export default function AgentDetailPage() {
                 }
             });
 
-            if (supportsNativeMediaInput && attachedFiles.some(f => f.imageUrl || f.videoUrl)) {
+            if (supportsNativeMediaInput && outboundAttachedFiles.some(f => f.imageUrl || f.videoUrl)) {
                 contentForLLM = userMsg ? `${filesPrompt}\n${userMsg}` : `${filesPrompt}\n${t('common.file.analyzeFiles', '请分析这些文件')}`;
             } else {
                 contentForLLM = userMsg ? `${filesPrompt}\nQuestion: ${userMsg}` : `Please analyze these files:\n\n${filesPrompt}`;
@@ -5218,21 +5235,21 @@ export default function AgentDetailPage() {
             runtimeKey: activeRuntimeKey,
             contentForLLM,
             userMsg,
-            displayFileName: attachedFiles.map(f => f.name).join(', '),
-            storageFileNames: attachedFiles
+            displayFileName: outboundAttachedFiles.map(f => f.name).join(', '),
+            storageFileNames: outboundAttachedFiles
                 .map(f => attachmentStorageBasename(f.path, f.name))
                 .filter(Boolean),
-            storageFileName: attachedFiles.length === 1
-                ? attachmentStorageBasename(attachedFiles[0].path, attachedFiles[0].name)
+            storageFileName: outboundAttachedFiles.length === 1
+                ? attachmentStorageBasename(outboundAttachedFiles[0].path, outboundAttachedFiles[0].name)
                 : undefined,
-            storageFilePath: attachedFiles.length === 1
+            storageFilePath: outboundAttachedFiles.length === 1
                 ? (
-                    attachedFiles[0].source === 'workspace_auto' && attachedFiles[0].path
-                        ? attachedFiles[0].path
-                        : `workspace/uploads/${attachmentStorageBasename(attachedFiles[0].path, attachedFiles[0].name)}`
+                    outboundAttachedFiles[0].source === 'workspace_auto' && outboundAttachedFiles[0].path
+                        ? outboundAttachedFiles[0].path
+                        : `workspace/uploads/${attachmentStorageBasename(outboundAttachedFiles[0].path, outboundAttachedFiles[0].name)}`
                 )
                 : undefined,
-            imageUrl: attachedFiles.length === 1 ? attachedFiles[0].imageUrl : undefined,
+            imageUrl: outboundAttachedFiles.length === 1 ? outboundAttachedFiles[0].imageUrl : undefined,
             tier: deliverableRouteTier(
                 pendingDeliverable?.launchable ? pendingDeliverable.request : null,
                 effectiveChatTier,
@@ -5253,7 +5270,11 @@ export default function AgentDetailPage() {
             chatInputRef.current.style.height = 'auto';
         }
         dismissedWorkspaceRefPath.current = null;
-        setAttachedFiles((prev) => prev.filter((file) => file.source === 'workspace_auto'));
+        setAttachedFiles((prev) => (
+            isolateTaskBoundDeliverableInputs
+                ? []
+                : prev.filter((file) => file.source === 'workspace_auto')
+        ));
         if (pendingDeliverable?.launchable) {
             inflightDeliverableRef.current = {
                 ...pendingDeliverable,
@@ -8291,7 +8312,8 @@ export default function AgentDetailPage() {
                                                             }}
                                                         />
                                                     )}
-                                                    {(chatUploadDrafts.length > 0 || attachedFiles.length > 0) && (
+                                                    {!isolateTaskBoundDeliverableInputs
+                                                        && (chatUploadDrafts.length > 0 || attachedFiles.length > 0) && (
                                                         <div className="chat-composer-attachments">
                                                             {chatUploadDrafts.map((draft) => (
                                                                 <div key={draft.id} className="chat-file-pill">

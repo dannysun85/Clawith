@@ -225,7 +225,10 @@ async def test_chat_message_and_start_command_share_the_caller_session() -> None
 
 
 @pytest.mark.asyncio
-async def test_deliverable_request_is_server_augmented_and_linked_to_one_run() -> None:
+@pytest.mark.parametrize("task_bound", [False, True])
+async def test_deliverable_request_is_server_augmented_and_linked_to_one_run(
+    task_bound: bool,
+) -> None:
     agent, user, session, model = _records()
     db = _Session()
     message_id = uuid.uuid4()
@@ -234,6 +237,7 @@ async def test_deliverable_request_is_server_augmented_and_linked_to_one_run() -
     handle = _handle(agent.tenant_id)
     request = SimpleNamespace(
         id=request_id,
+        task_id=uuid.uuid4() if task_bound else None,
         goal="Create the approved presentation",
         work_type="presentation",
         workflow_version="1.0.0",
@@ -288,9 +292,13 @@ async def test_deliverable_request_is_server_augmented_and_linked_to_one_run() -
     )
     command = start_run.await_args.args[0]
     assert command.goal == request.goal
-    assert command.payload["input_content"] == (
-        'SERVER_OWNED_DELIVERABLE_CONTRACT\n\nUSER_MESSAGE="Please start from the saved brief"'
-    )
+    if task_bound:
+        assert command.payload["input_content"] == "SERVER_OWNED_DELIVERABLE_CONTRACT"
+    else:
+        assert command.payload["input_content"] == (
+            'SERVER_OWNED_DELIVERABLE_CONTRACT\n\n'
+            'USER_MESSAGE="Please start from the saved brief"'
+        )
     assert command.payload["deliverable_request_id"] == str(request_id)
     assert command.payload["work_type"] == "presentation"
     assert command.payload["workflow_version"] == "1.0.0"

@@ -654,10 +654,16 @@ async def enqueue_chat_runtime(
                 "deliverable_tier_mismatch",
                 "Deliverable requests must run with the tier saved in their work brief",
             )
-        runtime_content = (
-            f"{prepared_deliverable.prompt}\n\n"
-            f"USER_MESSAGE={json.dumps(content, ensure_ascii=False)}"
-        )
+        if prepared_deliverable.request.task_id is not None:
+            # A task-bound Deliverable is the immutable continuation of the
+            # server-owned Work contract. Do not let stale composer text or a
+            # prior chat attachment re-enter the Runtime at launch time.
+            runtime_content = prepared_deliverable.prompt
+        else:
+            runtime_content = (
+                f"{prepared_deliverable.prompt}\n\n"
+                f"USER_MESSAGE={json.dumps(content, ensure_ascii=False)}"
+            )
 
     adapter = RuntimeCommandIntake(db, settings=runtime_settings)
     if resume_run_id is not None:

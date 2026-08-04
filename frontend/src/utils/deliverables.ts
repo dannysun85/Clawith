@@ -155,6 +155,17 @@ export function deliverableRouteTier(
     return request && requestCanLaunchFromComposer(request) ? request.tier : fallback;
 }
 
+/**
+ * A completed Work task is an immutable, server-owned handoff. Until Work
+ * persists task-owned file references, the launch message must not borrow
+ * files that happen to be attached to the current chat composer.
+ */
+export function deliverableLaunchUsesIsolatedInputs(
+    request: DeliverableRequest | null | undefined,
+): boolean {
+    return Boolean(request?.task_id);
+}
+
 export function latestPendingDeliverable(
     requests: DeliverableRequest[],
     dismissedRequestIds: ReadonlySet<string>,
