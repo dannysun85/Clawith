@@ -29,8 +29,19 @@ type MediaRoute = {
     tier: 'lite' | 'pro' | 'ultra';
     provider: string;
     routing_mode: 'automatic_failover';
+    route_semantics?: 'account_pool_readiness_only';
     provider_order: string[];
     available_providers: string[];
+    execution_strategies?: Array<{
+        strategy: 'commercial_quality' | 'creative_exploration' | 'default';
+        provider_order: string[];
+        available_providers: string[];
+        preferred_provider: string;
+        alternate_provider: string;
+        preferred_ready: boolean;
+        executable_without_alternate_confirmation: boolean;
+        alternate_confirmation_required: boolean;
+    }>;
     primary_provider: string;
     degraded_providers: string[];
     capability_status: 'available' | 'degraded' | 'unavailable';
@@ -452,8 +463,8 @@ function MediaRoutesTab() {
             <div className="card" style={{ marginBottom: 16, padding: 16 }}>
                 <div style={{ fontSize: 14, fontWeight: 650, marginBottom: 6 }}>媒体生成路由（平台统一配置）</div>
                 <div style={{ color: 'var(--text-secondary)', fontSize: 12, lineHeight: 1.7 }}>
-                    文本模型和媒体生成模型是两条独立链路。图片、语音和视频按“火山 Agent Plan → MiniMax”检查可用线路，并且只在供应商尚未接受任务时切换；音乐目前使用 MiniMax。
-                    页面严格区分“已配置账号”“账号只读鉴权通过”“真实生成成功”和“人工质量通过”。图片和视频仅剩 MiniMax 时仍属于非等价降级；即使有生成成功 receipt，也不能据此显示为商用质量已通过。下表中的模型与质量参数仅控制 MiniMax 应急路径。
+                    文本模型和媒体生成模型是两条独立链路。正式图片按 commercial_quality（火山优先）执行，创意探索按 creative_exploration（MiniMax 优先）执行；语音和视频按“火山 Agent Plan → MiniMax”检查可用线路，并且只在供应商尚未接受任务时切换，音乐目前使用 MiniMax。
+                    页面严格区分“已配置账号”“账号只读鉴权通过”“真实生成成功”和“人工质量通过”。视频仅剩 MiniMax 时属于非等价降级；即使有生成成功 receipt，也不能据此显示为商用质量已通过。下表中的模型与质量参数仅控制 MiniMax 路径。
                 </div>
             </div>
             {error && (
@@ -522,13 +533,18 @@ function MediaRouteRow({ route }: { route: MediaRoute }) {
         const value = receipt?.[field];
         return typeof value === 'string' && value ? new Date(value).toLocaleString() : null;
     };
+    const strategyLabel = (strategy: string) => strategy === 'commercial_quality'
+        ? '商用品质'
+        : strategy === 'creative_exploration'
+            ? '创意探索'
+            : '默认策略';
 
     return (
         <>
             <td style={{ minWidth: 180 }}>
                 <strong>{MEDIA_LABELS[route.modality]}</strong>
                 <div style={{ color: 'var(--text-secondary)', fontSize: 11, marginTop: 4 }}>
-                    自动路由：{route.provider_order.map(providerLabel).join(' → ')}
+                    账号池策略基线：{route.provider_order.map(providerLabel).join(' → ')}
                 </div>
                 <div style={{ color: 'var(--text-tertiary)', fontSize: 10, marginTop: 2 }}>
                     当前可用：{route.available_providers.length > 0
@@ -536,10 +552,22 @@ function MediaRouteRow({ route }: { route: MediaRoute }) {
                         : '无'}
                 </div>
                 <div style={{ color: statusColor, fontSize: 11, fontWeight: 650, marginTop: 4 }}>
-                    {statusLabel} · 主线路 {providerLabel(route.primary_provider)}
+                    {statusLabel} · 兼容策略基线 {route.primary_provider ? providerLabel(route.primary_provider) : '无'}
                 </div>
                 <div role="status" style={{ color: 'var(--text-secondary)', fontSize: 10, lineHeight: 1.5, marginTop: 3 }}>
-                    {readinessLabel}。{route.recommended_action}
+                    {readinessLabel}。此处仅表示账号 readiness，不代表任务实际执行；实际 provider/model 只以任务 receipt 为准。{route.recommended_action}
+                </div>
+                <div style={{ marginTop: 5, display: 'grid', gap: 3 }}>
+                    {(route.execution_strategies ?? []).map((strategy) => (
+                        <div key={strategy.strategy} style={{ color: 'var(--text-secondary)', fontSize: 10 }}>
+                            {strategyLabel(strategy.strategy)}：{strategy.provider_order.map(providerLabel).join(' → ')}；
+                            {strategy.preferred_ready
+                                ? `首选 ${providerLabel(strategy.preferred_provider)} 可执行`
+                                : strategy.alternate_provider
+                                    ? `首选不可用，改用 ${providerLabel(strategy.alternate_provider)} 需确认`
+                                    : '当前不可执行'}
+                        </div>
+                    ))}
                 </div>
                 <div style={{ marginTop: 5, display: 'grid', gap: 3 }}>
                     {route.provider_readiness.map((item) => {

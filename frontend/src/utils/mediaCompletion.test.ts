@@ -70,6 +70,17 @@ describe('media completion helpers', () => {
         ])).toBe('workspace/deliverables/campaign/final.mp4');
     });
 
+    it('recovers an asynchronously reconciled image artifact', () => {
+        expect(latestCompletedWorkspaceMediaPath([
+            {
+                role: 'tool_call',
+                toolName: 'check_image_generation',
+                toolStatus: 'done',
+                toolResult: '✅ Image delivered: workspace/images/poster.png',
+            },
+        ])).toBe('workspace/images/poster.png');
+    });
+
     it('ignores unfinished, non-media, and unsafe durable tool rows', () => {
         expect(latestCompletedWorkspaceMediaPath([
             {

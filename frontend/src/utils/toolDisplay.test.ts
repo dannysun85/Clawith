@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 
 import {
     customerSafeAssistantText,
+    customerSafeAnalysisText,
+    customerSafeThinkingText,
     customerSafeToolArgs,
     customerSafeToolResult,
     toolDisplayName,
@@ -10,6 +12,7 @@ import {
 describe('toolDisplayName', () => {
     it.each([
         ['generate_image_minimax', 'Generate Image'],
+        ['check_image_generation', 'Check Image'],
         ['generate_speech_minimax', 'Generate Speech'],
         ['generate_music_minimax', 'Generate Music'],
         ['generate_video_minimax', 'Generate Video'],
@@ -18,6 +21,27 @@ describe('toolDisplayName', () => {
     ])('hides the legacy provider suffix for %s', (toolName, expected) => {
         expect(toolDisplayName(toolName)).toBe(expected);
         expect(toolDisplayName(toolName)).not.toMatch(/minimax/i);
+    });
+
+    it('never exposes raw internal reasoning to tenant users', () => {
+        const privateReasoning = [
+            'SYSTEM PROMPT: hidden operator policy',
+            'Authorization: Bearer private-token',
+            'provider=volcengine_agent_plan model=internal-model',
+        ].join('\n');
+
+        const projected = customerSafeThinkingText(privateReasoning);
+
+        expect(projected).toBe('Internal reasoning is private. Tool execution records remain available.');
+        expect(projected).not.toMatch(/system prompt|private-token|volcengine|internal-model/i);
+        expect(customerSafeThinkingText('')).toBe('');
+    });
+
+    it('keeps customer-facing assistant progress distinct from private reasoning', () => {
+        const progress = '正在整理版式并生成最终海报，请稍候。';
+
+        expect(customerSafeAnalysisText('assistant_progress', progress)).toBe(progress);
+        expect(customerSafeAnalysisText('thinking', progress, '私密推理')).toBe('私密推理');
     });
 
     it('keeps the existing readable formatting for other tool identifiers', () => {

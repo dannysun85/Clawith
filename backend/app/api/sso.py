@@ -109,6 +109,23 @@ def _clear_sso_initiator_cookie(
         samesite="lax",
     )
 
+
+async def _require_tenant_sso_available(
+    db: AsyncSession,
+    tenant_id: uuid.UUID,
+):
+    """Enforce the same global + tenant SSO decision at every entry point."""
+
+    from app.models.tenant import Tenant
+    from app.services.platform_service import platform_service
+
+    if not await platform_service.is_sso_custom_domain_redirect_enabled(db):
+        raise HTTPException(status_code=403, detail="Organization SSO is unavailable")
+    tenant = await db.get(Tenant, tenant_id)
+    if not tenant or not tenant.is_active or not tenant.sso_enabled:
+        raise HTTPException(status_code=403, detail="Organization SSO is unavailable")
+    return tenant
+
 @router.post("/sso/session")
 async def create_sso_session(
     request: Request,
@@ -118,13 +135,9 @@ async def create_sso_session(
 ):
     """Create a short-lived same-browser SSO relay session."""
     response.headers["Cache-Control"] = "no-store"
-    await _enforce_sso_session_creation_rate_limit(request, tenant_id)
     if tenant_id is not None:
-        from app.models.tenant import Tenant
-
-        tenant = await db.get(Tenant, tenant_id)
-        if not tenant or not tenant.is_active or not tenant.sso_enabled:
-            raise HTTPException(status_code=403, detail="Organization SSO is unavailable")
+        await _require_tenant_sso_available(db, tenant_id)
+    await _enforce_sso_session_creation_rate_limit(request, tenant_id)
     initiator_nonce = secrets.token_urlsafe(32)
     session = SSOScanSession(
         id=uuid.uuid4(),
@@ -153,11 +166,7 @@ async def list_sso_providers(
     db: AsyncSession = Depends(get_db),
 ):
     """Return public provider metadata without allocating a relay session."""
-    from app.models.tenant import Tenant
-
-    tenant = await db.get(Tenant, tenant_id)
-    if not tenant or not tenant.is_active or not tenant.sso_enabled:
-        raise HTTPException(status_code=403, detail="Organization SSO is unavailable")
+    await _require_tenant_sso_available(db, tenant_id)
 
     result = await db.execute(
         select(
@@ -308,7 +317,9 @@ async def get_sso_config(sid: uuid.UUID, request: Request, db: AsyncSession = De
         IdentityProvider.is_active.is_(True),
         IdentityProvider.sso_login_enabled.is_(True),
     )
+    tenant_obj = None
     if session.tenant_id:
+        tenant_obj = await _require_tenant_sso_available(db, session.tenant_id)
         query = query.where(IdentityProvider.tenant_id == session.tenant_id)
     else:
         # Fallback to global/unscoped if session has no tenant_id
@@ -321,12 +332,12 @@ async def get_sso_config(sid: uuid.UUID, request: Request, db: AsyncSession = De
     # Determine the base URL for OAuth callbacks using centralized platform service:
     from app.services.platform_service import platform_service
     if session.tenant_id:
-        from app.models.tenant import Tenant
-        tenant_result = await db.execute(select(Tenant).where(Tenant.id == session.tenant_id))
-        tenant_obj = tenant_result.scalar_one_or_none()
-        if not tenant_obj or not tenant_obj.is_active or not tenant_obj.sso_enabled:
-            raise HTTPException(status_code=403, detail="Organization SSO is unavailable")
-        public_base = await platform_service.get_tenant_sso_base_url(db, tenant_obj, request)
+        public_base = await platform_service.get_tenant_sso_base_url(
+            db,
+            tenant_obj,
+            request,
+            sso_redirect_enabled=True,
+        )
     else:
         public_base = await platform_service.get_public_base_url(db, request)
     

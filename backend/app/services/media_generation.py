@@ -145,11 +145,23 @@ _PUBLIC_MEDIA_CONTRACT_KEYS = frozenset(
         "font_sha256",
         "font_family",
         "font_face_index",
+        "font_roles",
         "line_count",
         "background_sanitized",
         "layout_version",
         "block_count",
         "overlay_blocks_sha256",
+        "deliverable_request_id",
+        "expected_overlay_blocks_sha256",
+        "execution_strategy",
+        "allow_degraded_fallback",
+        "layout_bounds_verified",
+        "content_left",
+        "content_top",
+        "content_right",
+        "content_bottom",
+        "safe_margin_x",
+        "safe_margin_y",
         "source_width",
         "source_height",
         "output_width",
@@ -1867,16 +1879,20 @@ async def find_media_generation_task_by_id(
     *,
     agent_id: uuid.UUID,
     record_id: uuid.UUID,
+    modality: str = "video",
 ) -> MediaGenerationTask | None:
     """Load one durable media task without trusting editable workspace metadata."""
 
+    normalized_modality = str(modality or "").strip().lower()
+    if normalized_modality not in {*_SYNC_MEDIA_MODALITIES, "video"}:
+        return None
     async with async_session() as db:
         result = await db.execute(
             select(MediaGenerationTask).where(
                 MediaGenerationTask.id == record_id,
                 MediaGenerationTask.agent_id == agent_id,
                 MediaGenerationTask.provider.in_(_MEDIA_RECOVERY_PROVIDERS),
-                MediaGenerationTask.modality == "video",
+                MediaGenerationTask.modality == normalized_modality,
             )
         )
         return result.scalar_one_or_none()
@@ -2712,7 +2728,37 @@ async def reconcile_minimax_sync_media_task(
                 height,
                 expected_aspect_ratio=metadata.get("aspect_ratio"),
             )
-            status_data["_astra_media_contract"] = receipt.as_dict()
+            deliverable_request_id = str(
+                metadata.get("deliverable_request_id") or ""
+            ).strip()
+            expected_deliverable_digest = str(
+                metadata.get("expected_overlay_blocks_sha256") or ""
+            ).strip()
+            if expected_deliverable_digest and (
+                not receipt.overlay_blocks_sha256
+                or not hmac.compare_digest(
+                    expected_deliverable_digest,
+                    receipt.overlay_blocks_sha256,
+                )
+            ):
+                raise MediaContractError(
+                    "Composed poster copy does not match the persisted deliverable contract"
+                )
+            receipt_contract = receipt.as_dict()
+            if deliverable_request_id:
+                receipt_contract["deliverable_request_id"] = deliverable_request_id
+            if expected_deliverable_digest:
+                receipt_contract["expected_overlay_blocks_sha256"] = (
+                    expected_deliverable_digest
+                )
+            if deliverable_request_id:
+                receipt_contract["execution_strategy"] = str(
+                    metadata.get("execution_strategy") or ""
+                )
+                receipt_contract["allow_degraded_fallback"] = (
+                    metadata.get("allow_degraded_fallback") is True
+                )
+            status_data["_astra_media_contract"] = receipt_contract
         else:
             audio_format = str(metadata.get("output_extension") or "").lstrip(".")
             audio_info = await validate_generated_audio(
@@ -4246,7 +4292,18 @@ async def reconcile_pending_media_generation_tasks() -> int:
                     else:
                         await reconcile_minimax_video_task(task_id)
                 elif task.modality in _SYNC_MEDIA_MODALITIES:
-                    await reconcile_minimax_sync_media_task(task_id)
+                    runtime_managed = bool(
+                        (getattr(task, "request_metadata", None) or {}).get(
+                            "runtime_managed_completion"
+                        )
+                    )
+                    if runtime_managed:
+                        await reconcile_minimax_sync_media_task(
+                            task_id,
+                            deliver_completion=False,
+                        )
+                    else:
+                        await reconcile_minimax_sync_media_task(task_id)
                 else:
                     await _record_media_failure_issue(
                         task,

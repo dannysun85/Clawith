@@ -79,6 +79,7 @@ from app.services.agent_runtime.tool_result_store import (
 from app.services.autonomy_service import autonomy_service
 from app.services.agent_tools import (
     agentbay_run_scope_id,
+    deliverable_request_scope_id,
     enforce_builtin_tool_autonomy_outcome,
     execute_builtin_tool_outcome,
     get_runtime_agent_tools_for_llm,
@@ -104,7 +105,7 @@ _HEARTBEAT_PLAZA_LIMITS = {
 _MEDIA_GENERATION_TOOL_MODALITIES = {
     name: modality
     for name, modality in MEDIA_ARTIFACT_TOOL_MODALITIES.items()
-    if name != "check_video_minimax"
+    if name not in {"check_image_generation", "check_video_minimax"}
 }
 _CHINESE_OUTPUT_NUMBERS = {
     "一": 1,
@@ -2308,9 +2309,22 @@ class RuntimeToolStepService:
                     else:
                         agentbay_run_token = None
                         minimax_tier_token = None
+                        deliverable_request_token = None
                         if tool_name.startswith("agentbay_"):
                             agentbay_run_token = agentbay_run_scope_id.set(
                                 context.run_id
+                            )
+                        if tool_name in MEDIA_ARTIFACT_TOOL_MODALITIES:
+                            deliverable_request_token = (
+                                deliverable_request_scope_id.set(
+                                    str(
+                                        state["snapshots"].initial_input.get(
+                                            "deliverable_request_id",
+                                            "",
+                                        )
+                                        or ""
+                                    ).strip()
+                                )
                             )
                         if tool_name in {
                             "generate_image_minimax",
@@ -2337,6 +2351,10 @@ class RuntimeToolStepService:
                                 context.session_id or "",
                             )
                         finally:
+                            if deliverable_request_token is not None:
+                                deliverable_request_scope_id.reset(
+                                    deliverable_request_token
+                                )
                             if minimax_tier_token is not None:
                                 minimax_saas_tier.reset(minimax_tier_token)
                             if agentbay_run_token is not None:

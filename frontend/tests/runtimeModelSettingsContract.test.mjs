@@ -82,17 +82,20 @@ test('degraded media controls expose a visible business-level warning without pr
   assert.doesNotMatch(agentDetail, /available_providers.*media-capability-launcher/);
 });
 
-test('media admin separates managed routing from non-equivalent emergency quality', () => {
+test('media admin exposes strategy routing, provider receipts, and non-equivalent quality evidence', () => {
   assert.match(saasAdminSource, /routing_mode: 'automatic_failover'/);
   assert.match(saasAdminSource, /provider_order: string\[\]/);
   assert.match(saasAdminSource, /available_providers: string\[\]/);
   assert.match(saasAdminSource, /capability_status: 'available' \| 'degraded' \| 'unavailable'/);
-  assert.match(saasAdminSource, /图片、语音和视频按“火山 Agent Plan → MiniMax”/);
+  assert.match(saasAdminSource, /正式图片按 commercial_quality（火山优先）执行/);
+  assert.match(saasAdminSource, /创意探索按 creative_exploration（MiniMax 优先）执行/);
+  assert.match(saasAdminSource, /只在供应商尚未接受任务时切换/);
   assert.match(saasAdminSource, /音乐目前使用 MiniMax/);
-  assert.match(saasAdminSource, /MiniMax 应急路径/);
-  assert.match(saasAdminSource, /仅剩 MiniMax 时仍属于非等价降级/);
+  assert.match(saasAdminSource, /实际 provider\/model 只以任务 receipt 为准/);
+  assert.match(saasAdminSource, /视频仅剩 MiniMax 时属于非等价降级/);
+  assert.match(saasAdminSource, /首选不可用，改用 \$\{providerLabel\(strategy\.alternate_provider\)\} 需确认/);
   assert.match(saasAdminSource, /账号线路可路由/);
   assert.match(saasAdminSource, /仅降级线路可路由/);
   assert.match(saasAdminSource, /真实生成成功，质量未评审/);
-  assert.match(saasAdminSource, /商用质量已通过/);
+  assert.match(saasAdminSource, /quality_evidence_status: 'not_reviewed'/);
 });

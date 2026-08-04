@@ -40,6 +40,7 @@ const HISTORY_MEDIA_TOOLS = new Set([
     'generate_image_google',
     'generate_image_custom',
     'generate_image_minimax',
+    'check_image_generation',
     'generate_speech_minimax',
     'generate_music_minimax',
     'generate_video_minimax',

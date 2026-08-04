@@ -474,6 +474,7 @@
       "askAboutFile": "Ask about {{name}}...",
       "thinking": "Thinking...",
       "thinkingLabel": "Thinking",
+      "privateReasoning": "Internal reasoning is private; tool execution records remain available.",
       "thoughtLabel": "Thought",
       "collapseSessions": "Collapse sessions",
       "showSessions": "Show chat sessions",

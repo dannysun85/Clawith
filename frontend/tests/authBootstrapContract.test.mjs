@@ -7,8 +7,12 @@ const source = readFileSync(
   'utf8',
 );
 
-test('auth bootstrap refreshes the same-origin browser session when a user is already hydrated', () => {
-  assert.match(source, /establishBrowserSession\(effectiveToken\)/);
-  assert.match(source, /const existingUser = useAuthStore\.getState\(\)\.user/);
-  assert.match(source, /if \(existingUser\)[\s\S]*?establishBrowserSession\(effectiveToken\)/);
+test('auth bootstrap validates a candidate before atomically committing browser identity', () => {
+  assert.match(source, /let pendingCrossOriginSession:/);
+  assert.match(source, /consumeTenantSwitchSessionFromUrl/);
+  assert.match(source, /validateCrossOriginTenantSwitch\(\{/);
+  assert.match(source, /resolveCurrentOriginTenant: \(\) => tenantApi\.resolveByDomain\(window\.location\.host\)/);
+  assert.match(source, /await setAuth\(authenticatedUser, effectiveToken\)/);
+  assert.doesNotMatch(source, /localStorage\.setItem\('token', urlToken\)/);
+  assert.match(source, /priorToken !== effectiveToken/);
 });

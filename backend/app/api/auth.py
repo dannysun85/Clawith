@@ -6,6 +6,7 @@ import secrets
 import uuid
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlencode
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response, status
 from loguru import logger
@@ -1360,7 +1361,11 @@ async def switch_tenant(
 
     sso_redirect_enabled = await system_setting_dao.is_sso_custom_domain_redirect_enabled()
 
-    if not sso_redirect_enabled:
+    if (
+        not sso_redirect_enabled
+        or not bool(getattr(tenant, "sso_enabled", False))
+        or not str(getattr(tenant, "sso_domain", "") or "").strip()
+    ):
         redirect_url = None
     else:
         async with tenant_dao.session() as session:
@@ -1368,12 +1373,22 @@ async def switch_tenant(
                 session, tenant, request, sso_redirect_enabled=sso_redirect_enabled
             )
 
-    # URL fragments are not sent to reverse proxies or access logs.
+    # URL fragments are not sent to reverse proxies or access logs. Bind the
+    # candidate JWT to its intended tenant so the destination browser can
+    # validate token tenant + declared tenant + current origin before commit.
     if redirect_url:
         separator = "&" if "#" in redirect_url else "#"
-        redirect_url = f"{redirect_url}{separator}session_token={token}"
+        redirect_url = f"{redirect_url}{separator}{urlencode({
+            'session_token': token,
+            'target_tenant_id': str(tenant.id),
+        })}"
 
-    return TenantSwitchResponse(access_token=token, redirect_url=redirect_url, message="Switching organization...")
+    return TenantSwitchResponse(
+        access_token=token,
+        target_tenant_id=tenant.id,
+        redirect_url=redirect_url,
+        message="Switching organization...",
+    )
 
 
 @router.put("/me/password")

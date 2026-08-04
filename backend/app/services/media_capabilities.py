@@ -86,10 +86,11 @@ def media_route_capability_status(
 ) -> tuple[str, str | None, str]:
     """Classify a provider pool without treating known quality loss as equivalent.
 
-    Image and video use Agent Plan as their commercial-quality primary route.
-    MiniMax remains an implemented emergency route, but when it is the only
-    available provider the product contract is ``degraded`` and requires an
-    explicit business-level quality decision before a formal delivery starts.
+    Images support two explicit server-owned execution strategies, so either
+    verified image provider is a real callable route rather than a globally
+    degraded vendor. A formal request still snapshots its selected strategy
+    and alternate-route confirmation. Video capabilities remain contract-
+    sensitive because aspect ratio and audio support are not interchangeable.
     Speech may fail over between the two managed providers, while music is a
     MiniMax-only capability by design.
     """
@@ -107,7 +108,7 @@ def media_route_capability_status(
             "保留工作说明并等待可用的生成线路，未提交供应商任务。",
         )
     if (
-        normalized_modality in {"image", "video"}
+        normalized_modality == "video"
         and VOLCENGINE_AGENT_PLAN_PROVIDER not in providers
         and "minimax" in providers
     ):

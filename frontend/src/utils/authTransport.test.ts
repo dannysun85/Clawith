@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
     buildWorkspaceDownloadUrl,
     consumeSessionTokenFromUrl,
+    consumeTenantSwitchSessionFromUrl,
     establishBrowserSession,
     normalizeTenantRedirectUrl,
     resolveBootstrapToken,
@@ -29,9 +30,12 @@ describe('credential-safe browser transports', () => {
     });
 
     it('consumes cross-domain session fragments and removes them', () => {
-        const url = new URL('https://tenant.example/?view=home#session_token=header.payload.signature');
+        const url = new URL('https://tenant.example/?view=home#session_token=header.payload.signature&target_tenant_id=tenant-id');
 
-        expect(consumeSessionTokenFromUrl(url, ['/reset-password', '/verify-email'])).toBe('header.payload.signature');
+        expect(consumeTenantSwitchSessionFromUrl(url, ['/reset-password', '/verify-email'])).toEqual({
+            token: 'header.payload.signature',
+            targetTenantId: 'tenant-id',
+        });
         expect(url.href).toBe('https://tenant.example/?view=home');
     });
 
@@ -44,20 +48,48 @@ describe('credential-safe browser transports', () => {
 
     it('preserves the fragment credential during cross-origin tenant switching', () => {
         const redirect = normalizeTenantRedirectUrl(
-            'https://tenant.example/base#session_token=target.jwt.token',
+            'https://tenant.example/base#session_token=target.jwt.token&target_tenant_id=tenant-id',
             'https://platform.example/current',
+            'tenant-id',
         );
 
-        expect(redirect).toBe('https://tenant.example/#session_token=target.jwt.token');
+        expect(redirect).toBe('https://tenant.example/#session_token=target.jwt.token&target_tenant_id=tenant-id');
     });
 
     it('keeps loopback tenant switching on the active frontend origin', () => {
         const redirect = normalizeTenantRedirectUrl(
             'http://localhost:8008/#session_token=target.jwt.token',
             'http://127.0.0.1:3008/admin/platform-settings',
+            'tenant-id',
         );
 
-        expect(redirect).toBe('http://127.0.0.1:3008/#session_token=target.jwt.token');
+        expect(redirect).toBe('http://127.0.0.1:3008/#session_token=target.jwt.token&target_tenant_id=tenant-id');
+    });
+
+    it('rejects a redirect whose declared tenant differs from the requested tenant', () => {
+        expect(() => normalizeTenantRedirectUrl(
+            'https://tenant.example/#session_token=target.jwt.token&target_tenant_id=other-tenant',
+            'https://platform.example/current',
+            'requested-tenant',
+        )).toThrow('does not match');
+    });
+
+    it.each([
+        'javascript:alert(document.domain)',
+        'data:text/html,unsafe',
+        'file:///tmp/unsafe',
+    ])('rejects a non-http tenant redirect: %s', (redirectUrl) => {
+        expect(() => normalizeTenantRedirectUrl(
+            redirectUrl,
+            'https://platform.example/current',
+        )).toThrow('http or https');
+    });
+
+    it('rejects tenant redirect URL credentials', () => {
+        expect(() => normalizeTenantRedirectUrl(
+            'https://user:secret@tenant.example/',
+            'https://platform.example/current',
+        )).toThrow('must not contain URL credentials');
     });
 
     it('keeps the tenant-scoped token during a StrictMode auth bootstrap replay', () => {

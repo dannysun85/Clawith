@@ -17,6 +17,7 @@ from app.services.media_capabilities import (
 )
 from app.services.media_provider_routing import (
     media_provider_order_for_modality,
+    media_provider_order_for_image_strategy,
     media_provider_order_for_voice_id,
     validate_media_route_policy,
 )
@@ -134,6 +135,13 @@ def test_media_provider_order_matches_implemented_runtime_modalities():
     assert media_provider_order_for_modality("video") == automatic
     assert media_provider_order_for_modality("music") == ("minimax",)
     assert media_provider_order_for_modality("unknown") == ()
+    assert media_provider_order_for_image_strategy("commercial_quality") == automatic
+    assert media_provider_order_for_image_strategy("creative_exploration") == (
+        "minimax",
+        "volcengine_agent_plan",
+    )
+    with pytest.raises(ValueError, match="execution_strategy"):
+        media_provider_order_for_image_strategy("pick_a_vendor")
 
 
 def test_media_route_policy_matches_reviewed_provider_and_model_contract():
@@ -160,10 +168,10 @@ def test_media_capability_display_order_matches_runtime_route_order():
     ]
 
 
-def test_media_route_status_never_treats_minimax_only_visuals_as_equivalent():
+def test_media_route_status_treats_each_image_strategy_as_callable():
     assert media_route_capability_status("image", {"minimax"})[:2] == (
-        "degraded",
-        "commercial_primary_unavailable",
+        "available",
+        None,
     )
     assert media_route_capability_status("video", {"minimax"})[:2] == (
         "degraded",

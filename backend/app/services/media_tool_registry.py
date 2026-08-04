@@ -9,6 +9,7 @@ MEDIA_ARTIFACT_TOOL_MODALITIES: dict[str, str] = {
     "generate_image_google": "image",
     "generate_image_custom": "image",
     "generate_image_minimax": "image",
+    "check_image_generation": "image",
     "generate_speech_minimax": "audio",
     "generate_music_minimax": "music",
     "generate_video_minimax": "video",

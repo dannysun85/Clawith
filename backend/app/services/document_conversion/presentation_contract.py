@@ -37,6 +37,17 @@ _EDITABLE_VISUAL_KINDS = frozenset(
     }
 )
 _VISUAL_KINDS = _IMAGE_VISUAL_KINDS | _EDITABLE_VISUAL_KINDS
+_CSS_URL_PATTERN = re.compile(
+    r"url\(\s*(?:\"([^\"]*)\"|'([^']*)'|([^)]*?))\s*\)",
+    re.IGNORECASE,
+)
+_CSS_COMMENT_PATTERN = re.compile(r"/\*.*?\*/", re.DOTALL)
+_CSS_IMAGE_DECLARATION_PATTERN = re.compile(
+    r"(?:^|[;{])\s*"
+    r"(?:background(?:-image)?|border-image(?:-source)?|content|"
+    r"list-style-image|mask(?:-image)?)\s*:\s*([^;}]+)",
+    re.IGNORECASE,
+)
 
 
 class PresentationVisualQualityError(ValueError):
@@ -73,17 +84,40 @@ def local_image_sources(html: str) -> list[str]:
 
     soup = BeautifulSoup(html, "html.parser")
     sources: list[str] = []
-    for image in soup.find_all("img"):
-        image_src = str(image.get("src") or "").strip()
+    seen: set[str] = set()
+
+    def append_local_source(value: Any, *, preserve_empty: bool = False) -> None:
+        image_src = str(value or "").strip()
         if not image_src:
-            sources.append("")
-            continue
+            if preserve_empty and "" not in seen:
+                sources.append("")
+                seen.add("")
+            return
+        if image_src.startswith("#"):
+            return
         parsed = urlparse(image_src)
         if parsed.scheme in {"data", "http", "https"} or parsed.netloc:
-            continue
+            return
         if parsed.scheme and parsed.scheme != "file":
-            continue
-        sources.append(image_src)
+            return
+        if image_src not in seen:
+            sources.append(image_src)
+            seen.add(image_src)
+
+    for image in soup.find_all("img"):
+        append_local_source(image.get("src"), preserve_empty=True)
+
+    css_sources = [style.get_text("\n") for style in soup.find_all("style")]
+    css_sources.extend(
+        str(element.get("style") or "") for element in soup.find_all(style=True)
+    )
+    for css in css_sources:
+        without_comments = _CSS_COMMENT_PATTERN.sub("", css)
+        for declaration in _CSS_IMAGE_DECLARATION_PATTERN.finditer(without_comments):
+            for match in _CSS_URL_PATTERN.finditer(declaration.group(1)):
+                append_local_source(
+                    next(group for group in match.groups() if group is not None)
+                )
     return sources
 
 

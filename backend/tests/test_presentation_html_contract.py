@@ -6,6 +6,7 @@ import pytest
 from app.services.document_conversion import html_to_pdf, pptx_renderer
 from app.services.document_conversion.presentation_contract import (
     PresentationVisualQualityError,
+    local_image_sources,
     validate_browser_slide_text_bounds,
     validate_browser_slide_visual_quality,
     validate_presentation_html_contract,
@@ -340,6 +341,55 @@ def test_presentation_html_contract_accepts_complete_source_and_local_image(
     )
 
     validate_presentation_html_contract(source, expected_page_count=2)
+
+
+def test_local_image_sources_include_css_backgrounds_and_dedupe_in_order() -> None:
+    html = """
+    <style>
+      .hero { background-image: url('../assets/hero.png'); }
+      .remote { background-image: url("https://example.com/remote.png"); }
+      .mask { mask-image: url(#shape); }
+    </style>
+    <img src="../assets/hero.png">
+    <div style="background: url(./inline image.jpg) center/cover"></div>
+    <div style="background-image: url(data:image/png;base64,AAAA)"></div>
+    """
+
+    assert local_image_sources(html) == [
+        "../assets/hero.png",
+        "./inline image.jpg",
+    ]
+
+
+def test_local_image_sources_ignore_comments_fonts_and_cursor_resources() -> None:
+    html = """
+    <style>
+      /* .stale { background: url('commented-out.png'); } */
+      @font-face { font-family: Local; src: url('./font.woff2') format('woff2'); }
+      .interactive { cursor: url('./cursor.cur'), auto; }
+      .hero { background: url('./hero.png') center/cover; }
+    </style>
+    """
+
+    assert local_image_sources(html) == ["./hero.png"]
+
+
+def test_presentation_html_contract_rejects_missing_css_background(
+    tmp_path: Path,
+) -> None:
+    source = _write(
+        tmp_path / "slides.html",
+        """
+        <html><head><style>
+          .slide { width:1280px; height:720px; background:url('missing-bg.png') center/cover; }
+        </style></head><body>
+          <section class="slide" data-slide="1"></section>
+        </body></html>
+        """,
+    )
+
+    with pytest.raises(ValueError, match="missing local image files: missing-bg.png"):
+        validate_presentation_html_contract(source, expected_page_count=1)
 
 
 @pytest.mark.parametrize(

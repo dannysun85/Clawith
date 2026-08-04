@@ -15,8 +15,9 @@ Seedream Skill v3.0.0.
 - This Skill is an instruction package. It does not grant a provider account,
   a Tool, a model entitlement, or permission to spend Credits.
 - Use only the managed `generate_image_minimax` Tool. Despite its legacy name,
-  Astra routes this Tool through the healthy platform media pool and currently
-  prefers the Agent Plan image route before MiniMax.
+  the identifier is protocol compatibility rather than provider evidence.
+  Astra routes formal delivery with `execution_strategy=commercial_quality`
+  and exploratory ideation with `execution_strategy=creative_exploration`.
 - Never request, repeat, save, or pass an API key in chat or Tool arguments.
   Astra resolves the encrypted platform credential server-side.
 - Never execute the upstream JavaScript directly. Its desktop paths,
@@ -75,6 +76,9 @@ upstream sequential mode was used.
   pixel-faithful. Do not combine it with `reference_image`.
 - Put exact visible wording in `overlay_text`, not in the generation prompt.
   Preserve the user's Unicode characters and line breaks exactly.
+- For hierarchical poster copy use ordered `overlay_blocks`; the returned PNG
+  is already the final deterministic composition. Never place it behind the
+  same HTML/PDF/PPTX text a second time, and do not create unrequested formats.
 - When `brand_asset` or `overlay_text` is used, ask the model for only the clean
   background and leave deliberate negative space. Astra will composite the
   protected layer and copy deterministically.

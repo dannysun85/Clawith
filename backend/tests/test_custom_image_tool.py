@@ -29,6 +29,7 @@ from app.services.agent_tools import (
     _generate_video_minimax,
     _get_agent_tenant_id,
     _get_minimax_tenant_uuid,
+    _validate_formal_poster_copy_contract,
     _json_path_get,
     _is_minimax_deterministic_rejection,
     _minimax_image_acceptance_evidence_key,
@@ -295,9 +296,89 @@ async def test_formal_image_does_not_enter_unconfirmed_degraded_route(tmp_path):
     assert isinstance(result, ToolExecutionOutcome)
     assert result.status == "failed"
     assert result.error_code == "media_image_degraded_confirmation_required"
+    assert result.metadata["route_error_code"] == (
+        "media_image_alternate_route_confirmation_required"
+    )
     assert "no Credits were consumed" in result.result_summary
     assert prepare.await_count == 1
     assert prepare.await_args.args == ("volcengine_agent_plan",)
+
+
+@pytest.mark.asyncio
+async def test_image_rejects_unknown_execution_strategy_before_configuration(
+    tmp_path,
+):
+    get_config = AsyncMock()
+    with patch("app.services.agent_tools._get_tool_config", get_config):
+        result = await _generate_image(
+            uuid.uuid4(),
+            tmp_path,
+            {
+                "prompt": "commercial poster",
+                "execution_strategy": "pick_minimax_directly",
+            },
+            "minimax",
+            typed=True,
+        )
+
+    assert isinstance(result, ToolExecutionOutcome)
+    assert result.status == "failed"
+    assert result.error_code == "invalid_tool_arguments"
+    assert "pick_minimax_directly" not in result.result_summary
+    get_config.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_creative_exploration_uses_minimax_as_primary_route(tmp_path):
+    prepare = AsyncMock(side_effect=NoCredentialAvailable("minimax", "image"))
+    with (
+        patch("app.services.agent_tools._get_tool_config", AsyncMock(return_value={})),
+        patch(
+            "app.services.agent_tools._resolve_minimax_tool_tier",
+            AsyncMock(return_value="pro"),
+        ),
+        patch(
+            "app.services.minimax_media_profiles.load_platform_minimax_media_profile",
+            AsyncMock(return_value=resolve_minimax_media_profile("image", "pro")),
+        ),
+        patch(
+            "app.services.agent_tools._check_minimax_tool_allowed",
+            AsyncMock(return_value=None),
+        ),
+        patch(
+            "app.services.agent_tools._get_minimax_tenant_uuid",
+            AsyncMock(return_value=uuid.uuid4()),
+        ),
+        patch("app.services.agent_tools._check_minimax_credit_amount", AsyncMock()),
+        patch(
+            "app.services.media_provider_routing.prepare_media_provider",
+            prepare,
+        ),
+        patch(
+            "app.services.agent_tools._record_minimax_tool_product_issue",
+            AsyncMock(),
+        ),
+    ):
+        result = await _generate_image(
+            uuid.uuid4(),
+            tmp_path,
+            {
+                "prompt": "exploratory product concept",
+                "execution_strategy": "creative_exploration",
+                "allow_degraded_fallback": False,
+            },
+            "minimax",
+            typed=True,
+        )
+
+    assert isinstance(result, ToolExecutionOutcome)
+    assert result.status == "failed"
+    assert result.error_code == "media_image_degraded_confirmation_required"
+    assert result.metadata["route_error_code"] == (
+        "media_image_alternate_route_confirmation_required"
+    )
+    assert prepare.await_count == 1
+    assert prepare.await_args.args == ("minimax",)
 
 
 @pytest.mark.asyncio
@@ -755,6 +836,196 @@ async def test_minimax_image_stops_before_provider_when_billing_context_is_unava
 
 
 @pytest.mark.asyncio
+async def test_formal_poster_copy_mismatch_stops_before_credit_and_provider(tmp_path):
+    from app.services.media_assets import MediaContractError
+
+    credit_check = AsyncMock()
+    prepare_provider = AsyncMock()
+    request_id = uuid.uuid4()
+    with (
+        patch("app.services.agent_tools._get_tool_config", AsyncMock(return_value={})),
+        patch("app.services.agent_tools._resolve_minimax_tool_tier", AsyncMock(return_value="pro")),
+        patch(
+            "app.services.minimax_media_profiles.load_platform_minimax_media_profile",
+            AsyncMock(return_value=resolve_minimax_media_profile("image", "pro")),
+        ),
+        patch("app.services.agent_tools._check_minimax_tool_allowed", AsyncMock(return_value=None)),
+        patch("app.services.agent_tools._get_minimax_tenant_uuid", AsyncMock(return_value=uuid.uuid4())),
+        patch(
+            "app.services.agent_tools._validate_formal_poster_copy_contract",
+            AsyncMock(side_effect=MediaContractError("persisted copy mismatch")),
+        ),
+        patch("app.services.agent_tools._check_minimax_credit_amount", credit_check),
+        patch("app.services.media_provider_routing.prepare_media_provider", prepare_provider),
+    ):
+        result = await _generate_image(
+            uuid.uuid4(),
+            tmp_path,
+            {
+                "prompt": "commercial poster",
+                "save_path": f"workspace/deliverables/{request_id}/final.png",
+                "overlay_blocks": [{"role": "title", "text": "wrong copy"}],
+            },
+            "minimax",
+            session_id=str(uuid.uuid4()),
+            typed=True,
+        )
+
+    assert isinstance(result, ToolExecutionOutcome)
+    assert result.status == "failed"
+    assert result.error_code == "deliverable_poster_copy_contract_mismatch"
+    credit_check.assert_not_awaited()
+    prepare_provider.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_formal_poster_scope_not_filename_controls_pre_spend_copy_validation():
+    from app.services.media_assets import MediaContractError
+    from app.services.poster_contract import poster_exact_copy_contract
+
+    tenant_id = uuid.uuid4()
+    agent_id = uuid.uuid4()
+    session_id = uuid.uuid4()
+    request_id = uuid.uuid4()
+    spec = {"exact_copy": "量化交易平台\n智能策略・实时信号\n立即体验"}
+    blocks, _ = poster_exact_copy_contract(spec)
+    assert [block["role"] for block in blocks] == ["title", "subtitle", "cta"]
+    request = SimpleNamespace(
+        id=request_id,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        session_id=session_id,
+        work_type="poster",
+        spec=spec,
+    )
+
+    class _Result:
+        def scalar_one_or_none(self):
+            return request
+
+    class _Session:
+        async def execute(self, _statement):
+            return _Result()
+
+    class _SessionContext:
+        async def __aenter__(self):
+            return _Session()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            del exc_type, exc, tb
+
+    with patch(
+        "app.services.agent_tools.async_session",
+        return_value=_SessionContext(),
+    ):
+        with pytest.raises(MediaContractError, match="trusted Runtime scope"):
+            await _validate_formal_poster_copy_contract(
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                session_id=str(session_id),
+                save_path=f"workspace/deliverables/{request_id}/final.png",
+                overlay_text="",
+                overlay_blocks=blocks,
+                execution_strategy="commercial_quality",
+                allow_degraded_fallback=False,
+                formal_request_id=None,
+            )
+        contract = await _validate_formal_poster_copy_contract(
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+            session_id=str(session_id),
+            save_path=(
+                f"workspace/deliverables/{request_id}/nested/FINAL.PNG"
+            ),
+            overlay_text="",
+            overlay_blocks=blocks,
+            execution_strategy="commercial_quality",
+            allow_degraded_fallback=False,
+            formal_request_id=str(request_id),
+        )
+        assert contract is not None
+        assert contract.request_id == request_id
+
+        with pytest.raises(MediaContractError, match="request directory"):
+            await _validate_formal_poster_copy_contract(
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                session_id=str(session_id),
+                save_path="workspace/images/unscoped.png",
+                overlay_text="",
+                overlay_blocks=blocks,
+                execution_strategy="commercial_quality",
+                allow_degraded_fallback=False,
+                formal_request_id=str(request_id),
+            )
+
+        with pytest.raises(MediaContractError, match="exact-copy contract"):
+            await _validate_formal_poster_copy_contract(
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                session_id=str(session_id),
+                save_path=f"workspace/deliverables/{request_id}/final.png",
+                overlay_text="",
+                overlay_blocks=({"role": "title", "text": "wrong"},),
+                execution_strategy="commercial_quality",
+                allow_degraded_fallback=False,
+                formal_request_id=str(request_id),
+            )
+
+        with pytest.raises(MediaContractError, match="execution strategy"):
+            await _validate_formal_poster_copy_contract(
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                session_id=str(session_id),
+                save_path=f"workspace/deliverables/{request_id}/final.png",
+                overlay_text="",
+                overlay_blocks=blocks,
+                execution_strategy="creative_exploration",
+                allow_degraded_fallback=False,
+                formal_request_id=str(request_id),
+            )
+
+        with pytest.raises(MediaContractError, match="fallback authorization"):
+            await _validate_formal_poster_copy_contract(
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                session_id=str(session_id),
+                save_path=f"workspace/deliverables/{request_id}/final.png",
+                overlay_text="",
+                overlay_blocks=blocks,
+                execution_strategy="commercial_quality",
+                allow_degraded_fallback=True,
+                formal_request_id=str(request_id),
+            )
+
+
+@pytest.mark.asyncio
+async def test_generic_image_provider_cannot_bypass_formal_managed_route(tmp_path):
+    request_token = agent_tools.deliverable_request_scope_id.set(str(uuid.uuid4()))
+    config_lookup = AsyncMock(side_effect=AssertionError("config lookup must not run"))
+    try:
+        with patch(
+            "app.services.agent_tools._get_tool_config",
+            config_lookup,
+        ):
+            outcome = await agent_tools._generate_image_outcome(
+                uuid.uuid4(),
+                tmp_path,
+                {
+                    "prompt": "formal campaign",
+                    "save_path": "workspace/images/formal.png",
+                },
+                "openai",
+            )
+    finally:
+        agent_tools.deliverable_request_scope_id.reset(request_token)
+
+    assert outcome.status == "failed"
+    assert outcome.error_code == "deliverable_managed_image_route_required"
+    config_lookup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_minimax_image_acceptance_evidence_is_private_and_encrypted():
     agent_id = uuid.uuid4()
     recovery_id = uuid.uuid4()
@@ -1180,6 +1451,7 @@ async def test_generate_image_minimax_records_success(tmp_path):
             tmp_path,
             {
                 "prompt": "星空海报，主标题量化交易平台，按钮立即体验",
+                "execution_strategy": " Commercial_Quality ",
                 "overlay_blocks": overlay_blocks,
                 "save_path": "workspace/images/cat.png",
             },
@@ -1201,6 +1473,7 @@ async def test_generate_image_minimax_records_success(tmp_path):
     assert creation["credit_cost"] == 4
     assert creation["request_metadata"]["overlay_blocks"] == overlay_blocks
     assert creation["request_metadata"]["overlay_blocks_sha256"]
+    assert creation["request_metadata"]["execution_strategy"] == "commercial_quality"
     assert creation["output_path"].startswith("workspace/images/cat_")
     assert creation["output_path"].endswith(".png")
     record_id = creation["record_id"]

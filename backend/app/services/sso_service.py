@@ -167,33 +167,27 @@ class SSOService:
         if not email or "@" not in email:
             return None
 
-        domain = email.split("@")[1].lower()
+        domain = email.rsplit("@", 1)[1].lower()
 
         # Check domain hints first
         if domain in self.DOMAIN_TENANT_HINTS:
             return self.DOMAIN_TENANT_HINTS[domain]
 
-        # Try to find tenant by custom domain
-        result = await db.execute(
-            select(Tenant).where(Tenant.sso_domain.ilike(f"%{domain}%"))
-        )
-        tenant = result.scalar_one_or_none()
+        candidates = platform_service.sso_origin_candidates_for_email_domain(domain)
+        if not candidates:
+            return None
 
-        if tenant:
-            return str(tenant.id)
-
-        # Try to find tenant by matching tenant name
+        # Compatibility association is exact and ambiguity fails closed.  A
+        # partial origin or tenant-name match could silently place a verified
+        # external identity into the wrong company.
         result = await db.execute(
             select(Tenant).where(
-                Tenant.name.ilike(f"%{domain.split('.')[0]}%")
+                func.lower(Tenant.sso_domain).in_(candidates),
+                Tenant.is_active.is_(True),
             )
         )
-        tenant = result.scalar_one_or_none()
-
-        if tenant:
-            return str(tenant.id)
-
-        return None
+        tenants = list(result.scalars().all())
+        return str(tenants[0].id) if len(tenants) == 1 else None
 
     async def resolve_user_identity(
         self,

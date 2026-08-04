@@ -7,6 +7,13 @@ from pptx import Presentation
 from app.services.document_conversion import pptx_renderer
 
 
+def test_slide_size_preserves_portrait_source_aspect_ratio() -> None:
+    width, height = pptx_renderer._slide_size_inches(1080, 1920)
+
+    assert width == pytest.approx(7.5)
+    assert height == pytest.approx(13.333333)
+
+
 @pytest.mark.asyncio
 async def test_default_visual_conversion_preserves_browser_slide_and_cleans_temp_file(monkeypatch, tmp_path):
     src_file = tmp_path / "source.html"
@@ -42,6 +49,60 @@ async def test_default_visual_conversion_preserves_browser_slide_and_cleans_temp
     assert len(presentation.slides[0].shapes) == 1
     assert presentation.slides[0].shapes[0].shape_type == 13  # MSO_SHAPE_TYPE.PICTURE
     assert not screenshot.exists()
+
+
+@pytest.mark.asyncio
+async def test_portrait_visual_conversion_uses_portrait_pptx_canvas(
+    monkeypatch,
+    tmp_path,
+):
+    src_file = tmp_path / "poster.html"
+    tgt_file = tmp_path / "poster.pptx"
+    screenshot = tmp_path / "poster.png"
+    src_file.write_text(
+        '<html><body><section class="slide"></section></body></html>',
+        encoding="utf-8",
+    )
+    Image.new("RGB", (1080, 1920), color=(45, 35, 95)).save(screenshot)
+
+    async def fake_collect_browser_layout(
+        _src,
+        width,
+        height,
+        render_mode,
+        render_scale,
+    ):
+        assert (width, height, render_mode, render_scale) == (
+            1080,
+            1920,
+            "visual",
+            2.0,
+        )
+        return {
+            "slides": [{"width": 1080, "height": 1920}],
+            "screenshots": [str(screenshot)],
+        }
+
+    monkeypatch.setattr(
+        pptx_renderer,
+        "collect_browser_layout",
+        fake_collect_browser_layout,
+    )
+
+    await pptx_renderer.render_html_to_pptx(
+        src_file,
+        tgt_file,
+        "workspace/poster.pptx",
+        tmp_path,
+        {"design_width": 1080, "design_height": 1920},
+    )
+
+    presentation = Presentation(tgt_file)
+    assert presentation.slide_width / 914400 == pytest.approx(7.5, abs=1e-5)
+    assert presentation.slide_height / 914400 == pytest.approx(13.333333, abs=1e-5)
+    picture = presentation.slides[0].shapes[0]
+    assert picture.width == presentation.slide_width
+    assert abs(picture.height - presentation.slide_height) <= 1
 
 
 @pytest.mark.asyncio

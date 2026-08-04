@@ -50,7 +50,13 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
             || url.startsWith('/auth/resend-verification')
             || url.startsWith('/auth/forgot-password')
             || url.startsWith('/auth/reset-password');
-        if (res.status === 401 && !isAuthEndpoint) {
+        const explicitAuthorization = new Headers(options.headers).get('Authorization');
+        const storedAuthorization = token ? `Bearer ${token}` : null;
+        const isCandidateTokenRequest = Boolean(
+            explicitAuthorization
+            && explicitAuthorization !== storedAuthorization,
+        );
+        if (res.status === 401 && !isAuthEndpoint && !isCandidateTokenRequest) {
             clearAuthStorage();
             window.location.href = '/login';
             throw apiError;
@@ -174,7 +180,12 @@ export const authApi = {
     emailHint: (username: string) =>
         request<{ hint: string }>(`/auth/email-hint?username=${encodeURIComponent(username)}`),
 
-    me: () => request<User>('/auth/me'),
+    me: (accessToken?: string) => request<User>(
+        '/auth/me',
+        accessToken
+            ? { headers: { Authorization: `Bearer ${accessToken}` } }
+            : undefined,
+    ),
 
     updateMe: (data: Partial<User> & { current_password?: string }) =>
         request<User>('/auth/me', { method: 'PATCH', body: JSON.stringify(data) }),
@@ -189,7 +200,7 @@ export const authApi = {
         request<any[]>('/auth/my-tenants'),
 
     switchTenant: (tenantId: string) =>
-        request<{ access_token: string; redirect_url?: string; message?: string }>('/auth/switch-tenant', { method: 'POST', body: JSON.stringify({ tenant_id: tenantId }) }),
+        request<{ access_token: string; target_tenant_id: string; redirect_url?: string; message?: string }>('/auth/switch-tenant', { method: 'POST', body: JSON.stringify({ tenant_id: tenantId }) }),
 };
 
 // ─── Tenants ──────────────────────────────────────────

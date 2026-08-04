@@ -9,10 +9,31 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.system_settings import SystemSetting
+from app.services.system_setting_security import strict_system_setting_enabled
 
 
 class PlatformService:
     """Service to handle platform-wide settings and URL resolution."""
+
+    _EMAIL_DOMAIN_RE = re.compile(
+        r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+        r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+    )
+
+    @classmethod
+    def sso_origin_candidates_for_email_domain(cls, value: str) -> tuple[str, ...]:
+        """Return exact legacy/origin values eligible for email-domain matching.
+
+        SSO origins and email domains are different concepts.  Compatibility
+        matching is therefore deliberately narrow: an email domain may match
+        only the exact origin hostname, never a substring, tenant name, path,
+        credential, sibling subdomain, or lookalike hostname.
+        """
+
+        domain = str(value or "").strip().lower().rstrip(".")
+        if not cls._EMAIL_DOMAIN_RE.fullmatch(domain):
+            return ()
+        return (domain, f"https://{domain}", f"http://{domain}")
 
     @staticmethod
     def normalize_public_base_url(value: str, *, source: str = "PUBLIC_BASE_URL") -> str:
@@ -24,6 +45,21 @@ class PlatformService:
         if parsed.username or parsed.password:
             raise ValueError(f"{source} must not include URL credentials")
         return normalized
+
+    @classmethod
+    def normalize_tenant_sso_domain(cls, value: str) -> str:
+        """Validate a tenant redirect as an origin, never an executable URL."""
+
+        normalized = cls.normalize_public_base_url(
+            value,
+            source="sso_domain",
+        )
+        parsed = urlsplit(normalized)
+        if parsed.query or parsed.fragment:
+            raise ValueError("sso_domain must not include a query or fragment")
+        if parsed.path not in {"", "/"}:
+            raise ValueError("sso_domain must be an origin without a path")
+        return f"{parsed.scheme}://{parsed.netloc}"
 
     def is_ip_address(self, host: str) -> bool:
         """Check if a host is an IP address (IPv4)."""
@@ -69,58 +105,58 @@ class PlatformService:
 
     async def get_tenant_sso_base_url(
         self,
-        db: AsyncSession,
+        db: AsyncSession | None,
         tenant,
         request: Request | None = None,
         *,
-        sso_redirect_enabled: bool = True,
+        sso_redirect_enabled: bool | None = None,
     ) -> str:
-        """Generate the SSO base URL for a tenant based on IP/Domain logic.
+        """Return an explicitly configured tenant SSO origin, or the public origin.
 
-        ``sso_redirect_enabled`` should be pre-resolved by the caller via
-        ``system_setting_dao.is_sso_custom_domain_redirect_enabled()`` so this
-        method never issues an extra DB round-trip for the setting.
+        Callers may pass a previously resolved global flag.  Omitted state is
+        resolved from the same transaction and fails closed when the setting is
+        absent or malformed, so secondary OAuth/SSO entry points cannot bypass
+        the platform switch.
         """
-        if sso_redirect_enabled and tenant.sso_domain:
-            return tenant.sso_domain.rstrip("/")
+        if sso_redirect_enabled is None:
+            sso_redirect_enabled = await self.is_sso_custom_domain_redirect_enabled(db)
 
-        if not sso_redirect_enabled:
-            return await self.get_public_base_url(db, request)
+        if (
+            sso_redirect_enabled
+            and bool(getattr(tenant, "sso_enabled", False))
+            and str(getattr(tenant, "sso_domain", "") or "").strip()
+        ):
+            try:
+                return self.normalize_tenant_sso_domain(str(tenant.sso_domain))
+            except ValueError:
+                # Legacy rows may predate URL validation.  They must never be
+                # projected into a browser redirect.
+                pass
 
-        base_url = await self.get_public_base_url(db, request)
+        # Never invent a tenant subdomain. Redirects are valid only when both
+        # the platform flag and the tenant's explicitly configured SSO domain
+        # are enabled. DNS, TLS and reverse-proxy provisioning are external
+        # facts that cannot be inferred from a tenant slug.
+        return await self.get_public_base_url(db, request)
 
-        # Parse protocol and host
-        # Example: http://1.2.3.4:8000 or http://astra.ai
-        parts = base_url.split("://")
-        if len(parts) < 2:
-            return base_url
+    async def is_sso_custom_domain_redirect_enabled(
+        self,
+        db: AsyncSession | None,
+    ) -> bool:
+        """Return the one fail-closed platform SSO redirect decision."""
 
-        protocol = parts[0]
-        host_port = parts[1]
-
-        # Split host and port
-        host_parts = host_port.split(":")
-        host = host_parts[0]
-        port = f":{host_parts[1]}" if len(host_parts) > 1 else ""
-
-        if self.is_ip_address(host):
-            # IP: No subdomain, just base URL
-            return base_url
-        else:
-            # Domain: {tenant_slug}.{domain}
-            # Special case for localhost: keep it as is or handle it
-            if host == "localhost":
-                return f"{protocol}://{host}{port}"
-
-            # Generic logic: if host has a subdomain (e.g. try.astra.ai),
-            # we strip the first component to form a base for tenant subdomains.
-            h_parts = host.split(".")
-            if len(h_parts) > 2:
-                target_host = ".".join(h_parts[1:])
-            else:
-                target_host = host
-
-            return f"{protocol}://{tenant.slug}.{target_host}{port}"
+        if db is None:
+            return False
+        result = await db.execute(
+            select(SystemSetting).where(
+                SystemSetting.key == "sso_custom_domain_redirect_enabled"
+            )
+        )
+        setting = result.scalar_one_or_none()
+        return strict_system_setting_enabled(
+            getattr(setting, "value", None),
+            default=False,
+        )
 
 
 # Global instance

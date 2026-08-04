@@ -566,6 +566,30 @@ async def test_prepare_launch_rechecks_capability_without_mutating_blocked_reque
     assert request.version == 1
 
 
+@pytest.mark.asyncio
+async def test_prepare_launch_compiles_prompt_before_mutating_request(monkeypatch) -> None:
+    request = _request()
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.build_deliverable_prompt",
+        lambda _request: (_ for _ in ()).throw(RuntimeError("prompt invalid")),
+    )
+
+    with pytest.raises(RuntimeError, match="prompt invalid"):
+        await prepare_deliverable_launch(
+            _Session(request),  # type: ignore[arg-type]
+            request_id=request.id,
+            tenant_id=request.tenant_id,
+            user_id=request.created_by_user_id,
+            agent_id=request.agent_id,
+            session_id=request.session_id,
+            message_id=uuid.uuid4(),
+        )
+
+    assert request.status == "ready"
+    assert request.launch_message_id is None
+    assert request.version == 1
+
+
 def test_poster_workflow_compiles_one_image_delivery_contract() -> None:
     request = _request(
         work_type="poster",
@@ -613,7 +637,12 @@ async def test_poster_preflight_is_available_and_launchable(monkeypatch) -> None
         "app.services.deliverable_workflows.get_agent_media_capabilities",
         AsyncMock(
             return_value=[
-                {"modality": "image", "available": True, "reason": None},
+                {
+                    "modality": "image",
+                    "available": True,
+                    "reason": None,
+                    "available_providers": ["volcengine_agent_plan", "minimax"],
+                },
             ]
         ),
     )
@@ -641,6 +670,58 @@ async def test_poster_preflight_is_available_and_launchable(monkeypatch) -> None
         "billing_unit": "one_final_image",
     }
     assert result["creates_reservation"] is False
+
+
+@pytest.mark.asyncio
+async def test_formal_poster_preflight_requires_confirmation_for_minimax_only_pool(
+    monkeypatch,
+) -> None:
+    workflow = require_workflow("poster")
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.resolve_route",
+        AsyncMock(return_value=SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.get_tenant_entitlements",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.get_agent_media_capabilities",
+        AsyncMock(
+            return_value=[
+                {
+                    "modality": "image",
+                    "available": True,
+                    "reason": None,
+                    "capability_status": "available",
+                    "available_providers": ["minimax"],
+                },
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows._agent_tool_available",
+        AsyncMock(return_value=True),
+    )
+
+    result = await preflight_workflow(
+        SimpleNamespace(),  # type: ignore[arg-type]
+        tenant_id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        workflow=workflow,
+        tier="pro",
+        spec={
+            "channel": "social",
+            "aspect_ratio": "3:4",
+            "style": "commercial",
+            "fallback_policy": "primary_only",
+        },
+    )
+
+    assert result["available"] is True
+    assert result["launchable"] is False
+    assert result["capability_status"] == "degraded"
+    assert result["reasons"] == ["degraded_route_requires_confirmation"]
 
 
 @pytest.mark.asyncio
@@ -836,6 +917,96 @@ def test_explicit_degraded_policy_is_compiled_into_formal_tool_contract() -> Non
     )
 
     assert "allow_degraded_fallback=true" in build_deliverable_prompt(request)
+    assert "execution_strategy='commercial_quality'" in build_deliverable_prompt(request)
+    assert "never overlay the same copy again" in build_deliverable_prompt(request)
+
+
+def test_formal_poster_prompt_compiles_persisted_exact_copy_blocks() -> None:
+    from app.services.poster_contract import poster_exact_copy_contract
+
+    request = _request(
+        work_type="poster",
+        workflow_id="builtin.poster.v1",
+        spec={
+            "channel": "social",
+            "aspect_ratio": "9:16",
+            "style": "commercial",
+            "exact_copy": "量化交易平台\n智能策略・实时信号\n从复杂市场中捕捉方向\n立即体验",
+        },
+        output_contract=["png"],
+    )
+    blocks, digest = poster_exact_copy_contract(request.spec)
+    prompt = build_deliverable_prompt(request)
+
+    assert [block["role"] for block in blocks] == [
+        "title",
+        "subtitle",
+        "tagline",
+        "cta",
+    ]
+    assert all(block["text"] in prompt for block in blocks)
+    assert digest in prompt
+    assert "server will reject any mismatch before a paid provider request" in prompt
+    assert '"execution_strategy": "commercial_quality"' in prompt
+    assert '"allow_degraded_fallback": false' in prompt
+
+
+@pytest.mark.asyncio
+async def test_video_preflight_requires_the_first_frame_image_route(monkeypatch) -> None:
+    workflow = require_workflow("video")
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.resolve_route",
+        AsyncMock(return_value=SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.get_tenant_entitlements",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.get_agent_media_capabilities",
+        AsyncMock(
+            return_value=[
+                {
+                    "modality": "video",
+                    "available": True,
+                    "capability_status": "available",
+                },
+                {
+                    "modality": "image",
+                    "available": False,
+                    "reason": "image_pool_unavailable",
+                },
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows._agent_tool_available",
+        AsyncMock(return_value=True),
+    )
+
+    result = await preflight_workflow(
+        SimpleNamespace(),  # type: ignore[arg-type]
+        tenant_id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        workflow=workflow,
+        tier="pro",
+        spec={
+            "channel": "social",
+            "aspect_ratio": "9:16",
+            "duration": "6",
+            "audience": "都市白领",
+            "language": "zh-CN",
+            "audio_mode": "silent",
+            "story": "真人使用产品",
+            "fallback_policy": "primary_only",
+        },
+    )
+
+    assert result["launchable"] is False
+    assert result["available"] is False
+    assert result["reasons"] == [
+        "video_first_frame_image_capability_unavailable"
+    ]
 
 
 @pytest.mark.asyncio

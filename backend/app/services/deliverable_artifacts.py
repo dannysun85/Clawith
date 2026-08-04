@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import hmac
 from io import BytesIO
 from pathlib import Path
 import re
@@ -31,6 +32,7 @@ from app.services.presentation_visual_policy import (
     MINIMUM_PICTURE_COVERAGE_RATIO,
     presentation_brief_is_image_led,
 )
+from app.services.poster_contract import poster_exact_copy_contract
 from app.services.storage import agent_storage_key, get_storage_backend, normalize_storage_key
 from app.services.storage_runtime.base import StorageBackend, WriteCondition
 
@@ -504,6 +506,110 @@ def _artifact_refs(execution: AgentToolExecution) -> tuple[str, ...]:
     return tuple(ref for ref in refs if isinstance(ref, str) and ref)
 
 
+def _poster_copy_receipt_facts(
+    request: DeliverableRequest,
+    execution: AgentToolExecution,
+    *,
+    expected_digest: str | None,
+) -> dict[str, Any] | None:
+    """Verify the server-issued formal-poster receipt carried by Runtime."""
+
+    if not expected_digest:
+        return {}
+    metadata = (
+        execution.result_metadata
+        if isinstance(execution.result_metadata, Mapping)
+        else {}
+    )
+    request_id = str(metadata.get("deliverable_request_id") or "")
+    receipt_digest = str(metadata.get("expected_overlay_blocks_sha256") or "")
+    if request_id != str(request.id) or not hmac.compare_digest(
+        receipt_digest,
+        expected_digest,
+    ):
+        return None
+    from app.services.poster_contract import poster_execution_policy
+
+    expected_policy = poster_execution_policy(request.spec)
+    if (
+        str(metadata.get("execution_strategy") or "")
+        != expected_policy.execution_strategy
+        or metadata.get("allow_degraded_fallback")
+        is not expected_policy.allow_degraded_fallback
+        or str(metadata.get("layout_version") or "") != "poster-v3"
+        or metadata.get("layout_bounds_verified") is not True
+    ):
+        return None
+    integer_fields = (
+        "content_left",
+        "content_top",
+        "content_right",
+        "content_bottom",
+        "safe_margin_x",
+        "safe_margin_y",
+        "source_width",
+        "source_height",
+    )
+    if any(
+        not isinstance(metadata.get(field), int)
+        or isinstance(metadata.get(field), bool)
+        for field in integer_fields
+    ):
+        return None
+    left = int(metadata["content_left"])
+    top = int(metadata["content_top"])
+    right = int(metadata["content_right"])
+    bottom = int(metadata["content_bottom"])
+    margin_x = int(metadata["safe_margin_x"])
+    margin_y = int(metadata["safe_margin_y"])
+    source_width = int(metadata["source_width"])
+    source_height = int(metadata["source_height"])
+    if (
+        margin_x < 0
+        or margin_y < 0
+        or source_width <= 0
+        or source_height <= 0
+        or left < margin_x
+        or top < margin_y
+        or right > source_width - margin_x
+        or bottom > source_height - margin_y
+        or left >= right
+        or top >= bottom
+    ):
+        return None
+    return {
+        "deliverable_request_id": request_id,
+        "expected_overlay_blocks_sha256": expected_digest,
+        "execution_strategy": expected_policy.execution_strategy,
+        "allow_degraded_fallback": expected_policy.allow_degraded_fallback,
+        "layout_version": "poster-v3",
+        "layout_bounds_verified": True,
+        **{field: metadata[field] for field in integer_fields},
+    }
+
+
+def _poster_artifact_facts_match(
+    request: DeliverableRequest,
+    facts: object,
+    *,
+    expected_digest: str,
+) -> bool:
+    """Revalidate persisted candidate facts without trusting old gate output."""
+
+    if not isinstance(facts, Mapping):
+        return False
+    synthetic_execution = type(
+        "PosterReceiptExecution",
+        (),
+        {"result_metadata": facts},
+    )()
+    return _poster_copy_receipt_facts(
+        request,
+        synthetic_execution,
+        expected_digest=expected_digest,
+    ) is not None
+
+
 def _execution_targets_request_artifact(
     execution: AgentToolExecution,
     *,
@@ -584,7 +690,13 @@ async def reconcile_runtime_deliverable_artifacts(
     existing = tuple(existing_result.scalars().all())
     storage_backend = storage or get_storage_backend()
 
+    _poster_blocks, poster_expected_digest = (
+        poster_exact_copy_contract(request.spec)
+        if request.work_type == "poster"
+        else ((), None)
+    )
     verified_by_type: dict[str, _VerifiedArtifact] = {}
+    poster_receipt_facts: dict[str, dict[str, str]] = {}
     observed_errors: dict[str, set[str]] = {artifact_type: set() for artifact_type in required_types}
     attempted_types: set[str] = set()
     failed_types: set[str] = set()
@@ -650,6 +762,21 @@ async def reconcile_runtime_deliverable_artifacts(
                     )
                     if workspace_path is None:
                         continue
+                    if artifact_type == "png" and request.work_type == "poster":
+                        receipt_facts = _poster_copy_receipt_facts(
+                            request,
+                            execution,
+                            expected_digest=poster_expected_digest,
+                        )
+                        if receipt_facts is None:
+                            observed_errors[artifact_type].add("invalid")
+                            failure_codes.setdefault(
+                                artifact_type,
+                                "deliverable_poster_copy_receipt_mismatch",
+                            )
+                            continue
+                    else:
+                        receipt_facts = {}
                     verified, error = await _verify_storage_artifact(
                         storage_backend,
                         agent_id=request.agent_id,
@@ -659,6 +786,8 @@ async def reconcile_runtime_deliverable_artifacts(
                     )
                     if verified is not None:
                         verified_by_type[artifact_type] = verified
+                        if receipt_facts:
+                            poster_receipt_facts[artifact_type] = receipt_facts
                         break
                     if error is not None:
                         observed_errors[artifact_type].add(error)
@@ -682,6 +811,20 @@ async def reconcile_runtime_deliverable_artifacts(
         latest = latest_by_key.get(artifact_type)
         if latest is None or latest.status != "candidate":
             continue
+        if artifact_type == "png" and poster_expected_digest:
+            evaluation = latest.evaluation if isinstance(latest.evaluation, Mapping) else {}
+            facts = evaluation.get("facts") if isinstance(evaluation, Mapping) else {}
+            if not _poster_artifact_facts_match(
+                request,
+                facts,
+                expected_digest=poster_expected_digest,
+            ):
+                observed_errors[artifact_type].add("invalid")
+                failure_codes.setdefault(
+                    artifact_type,
+                    "deliverable_poster_copy_receipt_mismatch",
+                )
+                continue
         verified, error = await _verify_storage_artifact(
             storage_backend,
             agent_id=request.agent_id,
@@ -704,7 +847,7 @@ async def reconcile_runtime_deliverable_artifacts(
         else:
             observed_errors[artifact_type].add("invalid")
 
-    contract_facts: dict[str, dict[str, Any]] = {}
+    contract_facts: dict[str, dict[str, Any]] = dict(poster_receipt_facts)
     if request.work_type == "presentation":
         contract_facts, contract_invalid_types = _presentation_contract_facts(
             request,
@@ -882,6 +1025,26 @@ async def approve_deliverable_artifacts(
 
     storage_backend = storage or get_storage_backend()
     selected = tuple(latest_candidates[item] for item in required_types)
+    if request.work_type == "poster":
+        _poster_blocks, poster_expected_digest = poster_exact_copy_contract(request.spec)
+        if poster_expected_digest:
+            poster_artifact = latest_candidates.get("png")
+            evaluation = (
+                poster_artifact.evaluation
+                if poster_artifact is not None
+                and isinstance(poster_artifact.evaluation, Mapping)
+                else {}
+            )
+            facts = evaluation.get("facts") if isinstance(evaluation, Mapping) else {}
+            if not _poster_artifact_facts_match(
+                request,
+                facts,
+                expected_digest=poster_expected_digest,
+            ):
+                raise DeliverableArtifactError(
+                    "deliverable_poster_copy_receipt_mismatch",
+                    "Poster artifact has no receipt for the persisted exact-copy contract",
+                )
     if require_creative_quality_gate is None:
         settings = get_settings()
         quality_gate_required = creative_quality_gate_required_for_request(

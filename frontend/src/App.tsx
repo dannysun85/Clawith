@@ -2,15 +2,24 @@ import { Routes, Route, Navigate } from 'react-router';
 import { useAuthStore } from './stores';
 import { Suspense, lazy, useEffect, useLayoutEffect, useState, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
-import { authApi } from './services/api';
+import { authApi, tenantApi } from './services/api';
 import { canAccessSaasAdmin } from './utils/saasAdmin';
 import {
-    consumeSessionTokenFromUrl,
-    establishBrowserSession,
+    consumeTenantSwitchSessionFromUrl,
     resolveBootstrapToken,
 } from './utils/authTransport';
+import { validateCrossOriginTenantSwitch } from './utils/tenantSwitch';
 import { useQueryClient } from '@tanstack/react-query';
 import { authQueryScopeKey, tenantWorkspaceRedirect } from './utils/workspaceAccess';
+
+// React StrictMode remounts the auth bootstrap in development.  Keep a
+// consumed cross-origin candidate in memory until one non-cancelled pass has
+// validated and committed it; never place an unvalidated JWT in identity
+// storage merely to survive that replay.
+let pendingCrossOriginSession: {
+    token: string;
+    targetTenantId: string | null;
+} | null = null;
 
 const Login = lazy(() => import('./pages/Login'));
 const ForgotPassword = lazy(() => import('./pages/ForgotPassword'));
@@ -270,20 +279,17 @@ export default function App() {
             // Legacy query links are consumed once for backward compatibility.
             const pathsWithOwnToken = ['/reset-password', '/verify-email'];
             const currentUrl = new URL(window.location.href);
-            const urlToken = consumeSessionTokenFromUrl(currentUrl, pathsWithOwnToken);
+            const urlSession = consumeTenantSwitchSessionFromUrl(currentUrl, pathsWithOwnToken);
+            if (urlSession) pendingCrossOriginSession = urlSession;
+            const pendingCrossOriginToken = pendingCrossOriginSession?.token || null;
+            const storedToken = localStorage.getItem('token');
             const effectiveToken = resolveBootstrapToken(
-                urlToken,
-                localStorage.getItem('token'),
+                pendingCrossOriginToken,
+                storedToken,
                 token,
             );
 
-            if (urlToken) {
-                // /auth/me reads its bearer credential from localStorage. The
-                // authenticated tree remains behind loading until setAuth has
-                // also confirmed the HttpOnly browser session.
-                localStorage.setItem('token', urlToken);
-                useAuthStore.setState({ token: urlToken, user: null });
-
+            if (urlSession) {
                 // Remove the one-time transport fragment/query before auth calls.
                 const cleanUrl = currentUrl.pathname + currentUrl.search + currentUrl.hash;
                 window.history.replaceState({}, '', cleanUrl);
@@ -291,24 +297,51 @@ export default function App() {
 
             if (effectiveToken) {
                 try {
-                    const existingUser = useAuthStore.getState().user;
-                    if (existingUser) {
-                        // A user can survive a tenant/origin switch in the SPA
-                        // while the host-only HttpOnly cookie does not. Refresh
-                        // it even when the in-memory user is already populated;
-                        // otherwise native media URLs can receive a 401 while
-                        // fetch-based API calls still succeed with the bearer
-                        // token from localStorage.
-                        await establishBrowserSession(effectiveToken);
-                    } else {
-                        const authenticatedUser = await authApi.me();
-                        if (!cancelled) {
-                            await setAuth(authenticatedUser, effectiveToken);
+                    // Candidate validation uses an explicit Authorization
+                    // header.  request() recognizes it as non-current and
+                    // therefore cannot clear the existing origin identity on
+                    // a 401. setAuth commits only after browser-session setup.
+                    const isCrossOriginCandidate = effectiveToken === pendingCrossOriginToken;
+                    const authenticatedUser = isCrossOriginCandidate
+                        ? await validateCrossOriginTenantSwitch({
+                            tenantId: pendingCrossOriginSession?.targetTenantId,
+                            accessToken: effectiveToken,
+                            validateToken: authApi.me,
+                            resolvedTenantId: (candidateUser) => candidateUser.tenant_id,
+                            resolveCurrentOriginTenant: () => tenantApi.resolveByDomain(window.location.host),
+                        })
+                        : await authApi.me(effectiveToken);
+                    if (!cancelled) {
+                        await setAuth(authenticatedUser, effectiveToken);
+                        if (authenticatedUser.tenant_id) {
+                            localStorage.setItem('current_tenant_id', authenticatedUser.tenant_id);
+                        }
+                        if (isCrossOriginCandidate) {
+                            pendingCrossOriginSession = null;
                         }
                     }
                 } catch {
                     if (!cancelled) {
-                        useAuthStore.getState().logout();
+                        const rejectedCrossOriginCandidate =
+                            effectiveToken === pendingCrossOriginToken;
+                        if (rejectedCrossOriginCandidate) {
+                            pendingCrossOriginSession = null;
+                        }
+                        const priorToken = storedToken || token;
+                        if (
+                            rejectedCrossOriginCandidate
+                            && priorToken
+                            && priorToken !== effectiveToken
+                        ) {
+                            try {
+                                const priorUser = await authApi.me(priorToken);
+                                if (!cancelled) await setAuth(priorUser, priorToken);
+                            } catch {
+                                if (!cancelled) useAuthStore.getState().logout();
+                            }
+                        } else {
+                            useAuthStore.getState().logout();
+                        }
                     }
                 }
             }

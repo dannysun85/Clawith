@@ -24,6 +24,7 @@ from app.models.system_settings import SystemSetting
 from app.models.tenant import Tenant
 from app.models.user import User, Identity
 from app.services.subscription_lifecycle import ensure_free_subscription_for_tenant
+from app.services.system_setting_security import strict_system_setting_enabled
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -64,7 +65,7 @@ class CompanyCreateResponse(BaseModel):
 class PlatformSettingsOut(BaseModel):
     allow_self_create_company: bool = True
     invitation_code_enabled: bool = True
-    sso_custom_domain_redirect_enabled: bool = True
+    sso_custom_domain_redirect_enabled: bool = False
 
 
 class PlatformSettingsUpdate(BaseModel):
@@ -1013,11 +1014,21 @@ async def get_platform_settings(
     for key, default in [
         ("allow_self_create_company", True),
         ("invitation_code_enabled", True),
-        ("sso_custom_domain_redirect_enabled", True),
+        ("sso_custom_domain_redirect_enabled", False),
     ]:
         r = await db.execute(select(SystemSetting).where(SystemSetting.key == key))
         s = r.scalar_one_or_none()
-        settings[key] = s.value.get("enabled", default) if s else default
+        if key == "sso_custom_domain_redirect_enabled":
+            settings[key] = strict_system_setting_enabled(
+                getattr(s, "value", None),
+                default=False,
+            )
+        else:
+            settings[key] = (
+                s.value.get("enabled", default)
+                if s and isinstance(s.value, dict)
+                else default
+            )
 
     return PlatformSettingsOut(**settings)
 

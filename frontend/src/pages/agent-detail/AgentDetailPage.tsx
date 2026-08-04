@@ -41,6 +41,8 @@ import { canAccessSaasAdmin } from '../../utils/saasAdmin';
 import { displaySessionTitle } from '../../utils/sessionDisplay';
 import {
     customerSafeAssistantText,
+    customerSafeAnalysisText,
+    customerSafeThinkingText,
     customerSafeToolArgs,
     customerSafeToolResult,
     isManagedMediaTool,
@@ -1132,6 +1134,7 @@ if (typeof document !== 'undefined' && !document.getElementById(_PULSE_STYLE_ID)
  */
 type AnalysisItem =
     | { type: 'thinking'; content: string }
+    | { type: 'assistant_progress'; content: string }
     | { type: 'tool'; name: string; args: any; status: 'running' | 'done'; result?: string };
 
 type AnalysisToolMeta = {
@@ -1327,8 +1330,12 @@ function AnalysisCard({
                         {items.map((item, idx) => {
                             const isLast = idx === items.length - 1;
                             if (item.type === 'tool' && (item as any).name === 'propose_experience_draft') return null;
-                            if (item.type === 'thinking') {
-                                const safeThinkingContent = customerSafeAssistantText(item.content);
+                            if (item.type === 'thinking' || item.type === 'assistant_progress') {
+                                const safeThinkingContent = customerSafeAnalysisText(
+                                    item.type,
+                                    item.content,
+                                    t('agent.chat.privateReasoning'),
+                                );
                                 const itemPreview = safeThinkingContent.length > 360
                                     ? safeThinkingContent.slice(0, 360).trimEnd() + '...'
                                     : safeThinkingContent;
@@ -7855,7 +7862,7 @@ export default function AgentDetailPage() {
                                                         if (m.role === 'assistant' && !m.content?.trim()) {
                                                             if (m.thinking) {
                                                                 return (
-                                                                    <ThoughtDisclosure key={i} content={customerSafeAssistantText(m.thinking)} t={t} />
+                                                                    <ThoughtDisclosure key={i} content={customerSafeThinkingText(m.thinking, t('agent.chat.privateReasoning'))} t={t} />
                                                                 );
                                                             }
                                                             return null;
@@ -7863,7 +7870,7 @@ export default function AgentDetailPage() {
                                                         return (
                                                             <React.Fragment key={i}>
                                                                 {m.role === 'assistant' && m.thinking && (
-                                                                    <ThoughtDisclosure content={customerSafeAssistantText(m.thinking)} t={t} />
+                                                                    <ThoughtDisclosure content={customerSafeThinkingText(m.thinking, t('agent.chat.privateReasoning'))} t={t} />
                                                                 )}
                                                                 <ChatMessageItem
                                                                     msg={{ ...m, thinking: undefined }}
@@ -8019,10 +8026,10 @@ export default function AgentDetailPage() {
                                                                 if (thinkingText) {
                                                                     currentGroup.push({ type: 'thinking', content: thinkingText });
                                                                 }
-                                                                // Add mid-flow content as a thinking block too
-                                                                // (displayed with slightly different style to distinguish)
+                                                                // Mid-flow assistant content is customer-visible progress,
+                                                                // not provider reasoning. Keep the privacy boundary explicit.
                                                                 if (contentText) {
-                                                                    currentGroup.push({ type: 'thinking', content: contentText });
+                                                                    currentGroup.push({ type: 'assistant_progress', content: contentText });
                                                                 }
                                                             }
                                                         } else {
@@ -8081,7 +8088,7 @@ export default function AgentDetailPage() {
                                                             return (
                                                                 <React.Fragment key={i}>
                                                                     <ThoughtDisclosure
-                                                                        content={customerSafeAssistantText(msg.thinking)}
+                                                                        content={customerSafeThinkingText(msg.thinking, t('agent.chat.privateReasoning'))}
                                                                         t={t}
                                                                         streaming={!!((msg as any)._streaming && !contentText)}
                                                                     />

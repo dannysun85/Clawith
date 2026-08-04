@@ -218,6 +218,41 @@ async def test_presentation_conversion_materializes_cross_directory_images(
 
 
 @pytest.mark.asyncio
+async def test_presentation_conversion_materializes_css_background_images(
+    monkeypatch,
+):
+    agent_id = uuid.uuid4()
+    source_path = "workspace/deliverables/request-new/slides.html"
+    image_path = "workspace/deliverables/request-old/hero.jpg"
+    storage = MemoryStorageBackend(
+        {
+            f"{agent_id}/{source_path}": (
+                b"<html><head><style>.hero{background-image:"
+                b"url('../request-old/hero.jpg')}</style></head>"
+                b"<body><section class='hero'></section></body></html>"
+            ),
+            f"{agent_id}/{image_path}": b"image",
+        }
+    )
+    monkeypatch.setattr(agent_tools, "get_storage_backend", lambda: storage)
+
+    paths = await agent_tools._document_conversion_materialization_paths(
+        agent_id,
+        None,
+        {
+            "source_path": source_path,
+            "target_path": "workspace/deliverables/request-new/slides.pptx",
+        },
+    )
+
+    assert paths == [
+        source_path,
+        "workspace/deliverables/request-new/slides.pptx",
+        image_path,
+    ]
+
+
+@pytest.mark.asyncio
 async def test_presentation_materialization_accepts_provider_image_above_default_limit(
     monkeypatch,
 ):

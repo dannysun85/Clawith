@@ -26,8 +26,12 @@ Never use the static product-layer workaround for outcome 2 and describe it as a
 ## Choose the delivery contract
 
 The Agent chooses the user outcome and calls the product-level media Tool. It must not choose a Provider, expose an
-API key, invoke a downloaded vendor script, or promise a specific model. Astra resolves the tenant's eligible
-Agent Plan/MiniMax account, compatible model, health, quota and failover path at the server boundary. A provider may
+API key, invoke a downloaded vendor script, or promise a specific model. The legacy Tool identifier
+`generate_image_minimax` is protocol compatibility only and is never evidence that MiniMax handled a request.
+Astra resolves the tenant's eligible account, compatible model, health, quota and execution path at the server boundary.
+Use `execution_strategy=commercial_quality` for formal customer delivery and
+`execution_strategy=creative_exploration` only for ideation or intentionally broader visual exploration. These values
+describe the work contract; they do not select or reveal a vendor. A provider may
 only be retried or changed before acceptance, or after an explicit reviewed rejection; ambiguous timeouts enter
 reconciliation so the same paid work is not submitted twice.
 
@@ -37,7 +41,8 @@ Use brand-safe delivery when the user supplies exact Chinese/English copy or req
 or brand asset to remain unchanged.
 
 1. Preserve user-supplied copy exactly. Do not translate, rewrite, summarize, correct, or place it inside `prompt`.
-2. Put the exact visible copy in `overlay_text` and describe only the text-free visual background in `prompt`.
+2. Put one exact text element in `overlay_text`, or multi-level poster copy in ordered `overlay_blocks`, and describe
+   only the text-free visual background in `prompt`.
 3. Put an uploaded product/logo path in `brand_asset`. Do not combine `brand_asset` with `reference_image`,
    `first_frame_image`, or `last_frame_image`.
 4. Prefer a transparent PNG for `brand_asset`. JPG/WebP are accepted but their original rectangular background is
@@ -53,6 +58,9 @@ or brand asset to remain unchanged.
 8. Only report success after the tool returns a real saved workspace path and a brand-safe receipt. The receipt must
    record `background_sanitized=true` whenever the background transform ran; this flag is an execution receipt, not
    proof that every unintended glyph is unreadable.
+9. `overlay_text` and `overlay_blocks` return a final composed image. Never use that image as an HTML background and
+   overlay the same wording again. Create PDF, PPTX, HTML, or other formats only when the user or server-owned
+   `output_contract` explicitly requests them; do not expand a PNG poster task into extra deliverables.
 
 ### Product-in-motion delivery
 
@@ -114,6 +122,8 @@ safety. Do not call `read_file` or `read_document` on the resulting MP4; those t
 - User asked you to write copy: create the final copy first, then pass that final text unchanged to `overlay_text`.
 - If the exact copy is too long for the canvas, shorten it only with user approval; never rely on silent truncation.
 - Never ask an image/video model to draw words when `overlay_text` is available.
+- Never infer or announce provider/model from a compatibility Tool name. Only a server-owned admin/audit receipt may
+  identify the actual provider and model; customer-facing delivery remains provider-neutral.
 
 ## Product limits
 

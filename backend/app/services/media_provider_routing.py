@@ -26,6 +26,35 @@ DEFAULT_MEDIA_PROVIDER_ORDER = (
     VOLCENGINE_AGENT_PLAN_PROVIDER,
     MINIMAX_PROVIDER,
 )
+IMAGE_EXECUTION_STRATEGIES = frozenset(
+    {"commercial_quality", "creative_exploration"}
+)
+
+
+def normalize_image_execution_strategy(value: object) -> str:
+    """Resolve the provider-neutral image outcome policy.
+
+    The strategy describes the customer's work contract, not a vendor choice.
+    ``commercial_quality`` keeps the strongest verified commercial route first;
+    ``creative_exploration`` prioritizes visual variation. The durable task
+    receipt remains the only authority for the provider/model actually used.
+    """
+
+    normalized = str(value or "commercial_quality").strip().lower()
+    if normalized not in IMAGE_EXECUTION_STRATEGIES:
+        raise ValueError(
+            "execution_strategy must be commercial_quality or creative_exploration"
+        )
+    return normalized
+
+
+def media_provider_order_for_image_strategy(value: object) -> tuple[str, ...]:
+    """Return the server-owned provider order for an image work contract."""
+
+    strategy = normalize_image_execution_strategy(value)
+    if strategy == "creative_exploration":
+        return (MINIMAX_PROVIDER, VOLCENGINE_AGENT_PLAN_PROVIDER)
+    return DEFAULT_MEDIA_PROVIDER_ORDER
 
 
 def media_provider_order_for_modality(modality: str) -> tuple[str, ...]:
@@ -77,6 +106,23 @@ def validate_media_route_policy() -> tuple[str, ...]:
         if actual != expected:
             errors.append(
                 f"{modality}: provider order {actual!r} does not match {expected!r}"
+            )
+
+    expected_image_strategies = {
+        "commercial_quality": (
+            VOLCENGINE_AGENT_PLAN_PROVIDER,
+            MINIMAX_PROVIDER,
+        ),
+        "creative_exploration": (
+            MINIMAX_PROVIDER,
+            VOLCENGINE_AGENT_PLAN_PROVIDER,
+        ),
+    }
+    for strategy, expected in expected_image_strategies.items():
+        actual = media_provider_order_for_image_strategy(strategy)
+        if actual != expected:
+            errors.append(
+                f"image strategy {strategy}: provider order {actual!r} does not match {expected!r}"
             )
 
     expected_video_models = {
@@ -261,11 +307,14 @@ async def prepare_media_provider(
 
 __all__ = [
     "DEFAULT_MEDIA_PROVIDER_ORDER",
+    "IMAGE_EXECUTION_STRATEGIES",
     "MINIMAX_PROVIDER",
     "PreparedMediaProvider",
     "media_provider_order_for_voice_id",
+    "media_provider_order_for_image_strategy",
     "media_provider_order_for_modality",
     "minimax_video_requires_first_frame",
+    "normalize_image_execution_strategy",
     "prepare_media_provider",
     "validate_media_route_policy",
 ]

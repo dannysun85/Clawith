@@ -3915,6 +3915,13 @@ for _seed in _BUILTIN_TOOL_SOURCE:
     for _field in _brand_safe_fields:
         if _field in _legacy_properties:
             _properties[_field] = deepcopy(_legacy_properties[_field])
+    # Only the provider-neutral managed image entrypoint owns route strategy.
+    # Direct provider tools must not advertise a policy that their runtimes do
+    # not interpret.
+    if _name == "generate_image_minimax" and "execution_strategy" in _legacy_properties:
+        _properties["execution_strategy"] = deepcopy(
+            _legacy_properties["execution_strategy"]
+        )
 
 # Keep product-wide image, speech, and video capabilities ambient even when an
 # upstream seed changes its default. Legacy Plaza and the remaining reviewed

@@ -302,6 +302,16 @@ async def test_media_routes_expose_complete_matrix_without_credentials():
         "volcengine_agent_plan",
         "minimax",
     ]
+    assert by_modality["image"].route_semantics == "account_pool_readiness_only"
+    assert [item.strategy for item in by_modality["image"].execution_strategies] == [
+        "commercial_quality",
+        "creative_exploration",
+    ]
+    commercial, creative = by_modality["image"].execution_strategies
+    assert commercial.provider_order == ["volcengine_agent_plan", "minimax"]
+    assert creative.provider_order == ["minimax", "volcengine_agent_plan"]
+    assert commercial.executable_without_alternate_confirmation is True
+    assert creative.executable_without_alternate_confirmation is True
     assert by_modality["audio"].provider_order == [
         "volcengine_agent_plan",
         "minimax",
@@ -335,7 +345,13 @@ async def test_media_routes_expose_complete_matrix_without_credentials():
         not item.generation_observed
         for item in by_modality["video"].provider_readiness
     )
-    assert all(route.fallback_provider == "minimax" for route in routes)
+    assert by_modality["image"].primary_provider == "volcengine_agent_plan"
+    assert by_modality["image"].fallback_provider == "minimax"
+    assert by_modality["audio"].primary_provider == "volcengine_agent_plan"
+    assert by_modality["audio"].fallback_provider == "minimax"
+    assert by_modality["music"].primary_provider == "minimax"
+    assert by_modality["music"].fallback_provider == "minimax"
+    assert by_modality["video"].fallback_provider == "minimax"
     serialized = " ".join(str(route.model_dump()) for route in routes)
     assert "must-not-leak" not in serialized
     assert "agent-plan-key-must-not-leak" not in serialized
@@ -386,6 +402,17 @@ async def test_media_routes_report_generation_evidence_without_claiming_quality(
     )
     assert image.readiness_status == "generation_observed"
     assert image.quality_evidence_status == "not_reviewed"
+    assert image.provider_order == ["volcengine_agent_plan", "minimax"]
+    assert image.available_providers == ["minimax"]
+    assert image.primary_provider == "volcengine_agent_plan"
+    commercial, creative = image.execution_strategies
+    assert commercial.preferred_ready is False
+    assert commercial.executable_without_alternate_confirmation is False
+    assert commercial.alternate_provider == "minimax"
+    assert commercial.alternate_confirmation_required is True
+    assert creative.preferred_ready is True
+    assert creative.executable_without_alternate_confirmation is True
+    assert image.fallback_provider == "minimax"
     assert minimax.account_verified is True
     assert minimax.generation_observed is True
     assert minimax.generation_receipt is not None

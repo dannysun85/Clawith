@@ -47,6 +47,7 @@ import { useAppStore } from '../stores';
 import TalentMarketModal from '../components/TalentMarketModal';
 import { AstraWordmark } from '../components/atlas';
 import { normalizeTenantRedirectUrl } from '../utils/authTransport';
+import { commitSameOriginTenantSwitch, validateTenantSwitchCandidate } from '../utils/tenantSwitch';
 import { partitionAgentRoles } from '../utils/productRoles';
 
 const MOBILE_NAV_MEDIA_QUERY = '(max-width: 768px)';
@@ -566,17 +567,34 @@ export default function Layout() {
                 throw new Error(String(err.detail || `HTTP ${res.status}`));
             }
             const data = await res.json();
+            if (data.target_tenant_id !== tenantId) {
+                throw new Error('Tenant switch response does not match the requested company');
+            }
             if (data.redirect_url) {
+                await validateTenantSwitchCandidate({
+                    tenantId,
+                    accessToken: data.access_token,
+                    validateToken: authApi.me,
+                    resolvedTenantId: (candidateUser) => candidateUser.tenant_id,
+                });
                 // Preserve the server-issued #session_token for the target
                 // origin. App consumes it before rendering authenticated UI.
                 window.location.href = normalizeTenantRedirectUrl(
                     data.redirect_url,
                     window.location.href,
+                    tenantId,
                 );
             } else if (data.access_token) {
-                localStorage.setItem('token', data.access_token);
-                const me = await authApi.me();
-                await setAuth(me, data.access_token);
+                await commitSameOriginTenantSwitch({
+                    tenantId,
+                    accessToken: data.access_token,
+                    validateToken: authApi.me,
+                    establishAuth: setAuth,
+                    persistTenantId: (value) => localStorage.setItem('current_tenant_id', value),
+                    clearTenantId: () => localStorage.removeItem('current_tenant_id'),
+                    currentTenantId: () => localStorage.getItem('current_tenant_id'),
+                    resolvedTenantId: (candidateUser) => candidateUser.tenant_id,
+                });
                 window.location.href = '/';
             }
         } catch (error) {
@@ -610,17 +628,17 @@ export default function Layout() {
         setTenantFormLoading(true);
         try {
             const result = await tenantApi.join(joinInviteCode);
-            if (result.access_token) {
-                // Multi-tenant: backend created a new User record, switch context.
-                localStorage.setItem('token', result.access_token);
-                const me = await authApi.me();
-                await setAuth(me, result.access_token);
-            } else {
-                // Registration flow: same user updated, refresh store
-                const me = await authApi.me();
-                const token = localStorage.getItem('token');
-                if (token) await setAuth(me, token);
-            }
+            const candidateToken = result.access_token || localStorage.getItem('token');
+            await commitSameOriginTenantSwitch({
+                tenantId: result.tenant.id,
+                accessToken: candidateToken,
+                validateToken: authApi.me,
+                establishAuth: setAuth,
+                persistTenantId: (value) => localStorage.setItem('current_tenant_id', value),
+                clearTenantId: () => localStorage.removeItem('current_tenant_id'),
+                currentTenantId: () => localStorage.getItem('current_tenant_id'),
+                resolvedTenantId: (candidateUser) => candidateUser.tenant_id,
+            });
             setShowTenantMenu(false);
             setShowTenantSetupModal(false);
             window.location.href = '/onboarding?mode=join';
@@ -638,17 +656,17 @@ export default function Layout() {
         setTenantFormLoading(true);
         try {
             const result = await tenantApi.selfCreate({ name: createCompanyName });
-            if (result.access_token) {
-                // Multi-tenant: backend created a new User record, switch context.
-                localStorage.setItem('token', result.access_token);
-                const me = await authApi.me();
-                await setAuth(me, result.access_token);
-            } else {
-                // Registration flow: same user updated, refresh store
-                const me = await authApi.me();
-                const token = localStorage.getItem('token');
-                if (token) await setAuth(me, token);
-            }
+            const candidateToken = result.access_token || localStorage.getItem('token');
+            await commitSameOriginTenantSwitch({
+                tenantId: result.tenant.id,
+                accessToken: candidateToken,
+                validateToken: authApi.me,
+                establishAuth: setAuth,
+                persistTenantId: (value) => localStorage.setItem('current_tenant_id', value),
+                clearTenantId: () => localStorage.removeItem('current_tenant_id'),
+                currentTenantId: () => localStorage.getItem('current_tenant_id'),
+                resolvedTenantId: (candidateUser) => candidateUser.tenant_id,
+            });
             setShowTenantMenu(false);
             setShowTenantSetupModal(false);
             window.location.href = '/onboarding?mode=create';

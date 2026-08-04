@@ -9,6 +9,7 @@ import PlatformDashboard from './PlatformDashboard';
 import LinearCopyButton from '../components/LinearCopyButton';
 import { useDialog } from '../components/Dialog/DialogProvider';
 import { normalizeTenantRedirectUrl } from '../utils/authTransport';
+import { commitSameOriginTenantSwitch, validateTenantSwitchCandidate } from '../utils/tenantSwitch';
 // Format large token numbers with K/M/B suffixes
 function formatTokens(n: number | null | undefined): string {
     if (n == null) return '-';
@@ -64,17 +65,33 @@ function PlatformTenantSwitcher() {
         setError('');
         try {
             const result = await authApi.switchTenant(tenantId);
-            localStorage.setItem('current_tenant_id', tenantId);
+            if (result.target_tenant_id !== tenantId) {
+                throw new Error('Tenant switch response does not match the requested company');
+            }
             if (result.redirect_url) {
+                await validateTenantSwitchCandidate({
+                    tenantId,
+                    accessToken: result.access_token,
+                    validateToken: authApi.me,
+                    resolvedTenantId: (user) => user.tenant_id,
+                });
                 window.location.href = normalizeTenantRedirectUrl(
                     result.redirect_url,
                     window.location.href,
+                    tenantId,
                 );
                 return;
             }
-            if (!result.access_token) throw new Error('No tenant access token returned');
-            const user = await authApi.me();
-            await setAuth(user, result.access_token);
+            await commitSameOriginTenantSwitch({
+                tenantId,
+                accessToken: result.access_token,
+                validateToken: authApi.me,
+                establishAuth: setAuth,
+                persistTenantId: (value) => localStorage.setItem('current_tenant_id', value),
+                clearTenantId: () => localStorage.removeItem('current_tenant_id'),
+                currentTenantId: () => localStorage.getItem('current_tenant_id'),
+                resolvedTenantId: (user) => user.tenant_id,
+            });
             navigate('/work', { replace: true });
         } catch (err: any) {
             setError(err?.message || '公司切换失败');

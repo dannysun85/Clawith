@@ -37,13 +37,24 @@ export function clearBrowserSession(): void {
     });
 }
 
-export function consumeSessionTokenFromUrl(url: URL, pathsWithOwnToken: string[]): string | null {
+export type TenantSwitchSession = {
+    token: string;
+    targetTenantId: string | null;
+};
+
+export function consumeTenantSwitchSessionFromUrl(
+    url: URL,
+    pathsWithOwnToken: string[],
+): TenantSwitchSession | null {
     if (pathsWithOwnToken.includes(url.pathname)) return null;
 
     const fragment = new URLSearchParams(url.hash.replace(/^#/, ''));
     let token = fragment.get('session_token');
+    let targetTenantId: string | null = null;
     if (token) {
+        targetTenantId = fragment.get('target_tenant_id');
         fragment.delete('session_token');
+        fragment.delete('target_tenant_id');
         const remaining = fragment.toString();
         url.hash = remaining ? `#${remaining}` : '';
     }
@@ -53,7 +64,11 @@ export function consumeSessionTokenFromUrl(url: URL, pathsWithOwnToken: string[]
         token = url.searchParams.get('token');
         if (token) url.searchParams.delete('token');
     }
-    return token;
+    return token ? { token, targetTenantId } : null;
+}
+
+export function consumeSessionTokenFromUrl(url: URL, pathsWithOwnToken: string[]): string | null {
+    return consumeTenantSwitchSessionFromUrl(url, pathsWithOwnToken)?.token || null;
 }
 
 export function resolveBootstrapToken(
@@ -67,9 +82,32 @@ export function resolveBootstrapToken(
     return urlToken || storedToken || capturedToken;
 }
 
-export function normalizeTenantRedirectUrl(redirectUrl: string, currentHref: string): string {
+export function normalizeTenantRedirectUrl(
+    redirectUrl: string,
+    currentHref: string,
+    expectedTargetTenantId?: string,
+): string {
     const currentUrl = new URL(currentHref);
     const targetUrl = new URL(redirectUrl, currentUrl.origin);
+    if (targetUrl.protocol !== 'http:' && targetUrl.protocol !== 'https:') {
+        throw new Error('Tenant redirect must use http or https');
+    }
+    if (targetUrl.username || targetUrl.password) {
+        throw new Error('Tenant redirect must not contain URL credentials');
+    }
+    const fragment = new URLSearchParams(targetUrl.hash.replace(/^#/, ''));
+    const declaredTargetTenantId = fragment.get('target_tenant_id');
+    if (
+        expectedTargetTenantId
+        && declaredTargetTenantId
+        && declaredTargetTenantId !== expectedTargetTenantId
+    ) {
+        throw new Error('Tenant redirect does not match the requested company');
+    }
+    if (expectedTargetTenantId) {
+        fragment.set('target_tenant_id', expectedTargetTenantId);
+        targetUrl.hash = fragment.toString();
+    }
     const loopbackHosts = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
     const isSameBrowserHost =
         targetUrl.hostname === currentUrl.hostname ||

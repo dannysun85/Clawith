@@ -1,6 +1,6 @@
 from typing import Any, Sequence
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.dao.base import BaseDAO
 from app.models.tenant import Tenant
@@ -29,15 +29,21 @@ class TenantDAO(BaseDAO[Tenant]):
             return result.scalars().all()
 
     async def get_by_sso_domain(self, domain: str) -> Tenant | None:
-        """Find an active tenant matching the given SSO email domain."""
+        """Find one active tenant whose exact SSO origin host is the email domain."""
+        from app.services.platform_service import platform_service
+
+        candidates = platform_service.sso_origin_candidates_for_email_domain(domain)
+        if not candidates:
+            return None
         async with self.session() as db:
             result = await db.execute(
                 select(Tenant).where(
-                    Tenant.sso_domain == domain.lower(),
+                    func.lower(Tenant.sso_domain).in_(candidates),
                     Tenant.is_active.is_(True),
                 )
             )
-            return result.scalar_one_or_none()
+            tenants = list(result.scalars().all())
+            return tenants[0] if len(tenants) == 1 else None
 
 
 tenant_dao = TenantDAO()

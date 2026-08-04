@@ -50,7 +50,7 @@ RUN if ! python -c 'import re, sys; host = sys.argv[1]; label_pattern = re.compi
         fi; \
     fi && \
     apt-get update && \
-    apt-get install -y --no-install-recommends libpq5 curl shadowsocks-libev gosu bubblewrap libcairo2 libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 shared-mime-info pango1.0-tools fontconfig fonts-wqy-microhei fonts-wqy-zenhei fonts-noto-cjk chromium && \
+    apt-get install -y --no-install-recommends libpq5 curl shadowsocks-libev gosu bubblewrap libcairo2 libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 shared-mime-info pango1.0-tools fontconfig fonts-wqy-microhei fonts-wqy-zenhei fonts-noto-cjk fonts-noto-cjk-extra chromium && \
     fc-cache -f && \
     rm -rf /var/lib/apt/lists/*
 

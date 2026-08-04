@@ -17,6 +17,7 @@ from app.services.agent_runtime.contracts import (
     RuntimeEventCursor,
 )
 from app.services.agent_runtime.event_stream import DatabaseRuntimeEventStream
+from app.services.customer_projection import project_private_reasoning
 
 
 ChatStreamStatus = Literal["completed", "failed", "cancelled", "waiting_user"]
@@ -141,7 +142,13 @@ async def stream_web_chat_run(
         if event.event_type == "status_changed" and activity_type == "thinking":
             content = _text(payload.get("content"))
             if content is not None:
-                await send_packet({"type": "thinking", "content": content, **packet_position})
+                await send_packet(
+                    {
+                        "type": "thinking",
+                        "content": project_private_reasoning(content),
+                        **packet_position,
+                    }
+                )
             continue
         if event.event_type == "status_changed" and activity_type == "assistant_progress":
             content = _text(payload.get("content"))
@@ -161,7 +168,9 @@ async def stream_web_chat_run(
                         "args": payload.get("args") if isinstance(payload.get("args"), dict) else {},
                         "status": tool_status,
                         "result": str(payload.get("result") or ""),
-                        "reasoning_content": str(payload.get("reasoning_content") or ""),
+                        "reasoning_content": project_private_reasoning(
+                            payload.get("reasoning_content")
+                        ),
                         "execution_status": payload.get("execution_status"),
                         "error_code": payload.get("error_code"),
                         "workspace_path": payload.get("workspace_path"),

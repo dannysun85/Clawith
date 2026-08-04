@@ -20,6 +20,7 @@ from app.services.media_assets import (
     compose_video_audio_tracks,
     image_asset_from_bytes,
     image_reference_for_provider,
+    preflight_poster_layout,
     trim_generated_audio,
     validate_generated_audio,
     validate_generated_image,
@@ -354,14 +355,45 @@ def test_role_aware_poster_blocks_render_without_legacy_black_panel():
     )
 
     assert validate_generated_image(result) == (720, 1280)
-    assert receipt.layout_version == "poster-v2"
+    assert receipt.layout_version == "poster-v3"
     assert receipt.block_count == 4
     assert receipt.overlay_blocks_sha256 == blocks_digest
+    assert receipt.font_family is not None
+    assert receipt.font_roles is not None
+    assert set(receipt.font_roles) == {"title", "subtitle", "tagline", "cta"}
+    for role_receipt in receipt.font_roles.values():
+        assert set(role_receipt) == {"family", "face_index", "sha256"}
+        assert len(str(role_receipt["sha256"])) == 64
+    assert receipt.font_family == receipt.font_roles["title"]["family"]
+    assert receipt.font_sha256 == receipt.font_roles["title"]["sha256"]
+    assert receipt.font_face_index == receipt.font_roles["title"]["face_index"]
     assert receipt.output_bytes == len(result)
+    assert receipt.layout_bounds_verified is True
+    assert receipt.safe_margin_x is not None
+    assert receipt.safe_margin_y is not None
+    assert receipt.content_left is not None
+    assert receipt.content_right is not None
+    assert receipt.content_left >= receipt.safe_margin_x
+    assert receipt.content_right <= receipt.source_width - receipt.safe_margin_x
+    assert receipt.content_top >= receipt.safe_margin_y
+    assert receipt.content_bottom <= receipt.source_height - receipt.safe_margin_y
     with Image.open(BytesIO(result)) as image:
         # The legacy renderer put an opaque black panel behind all copy. The
         # structured poster renderer keeps the supplied background visible.
         assert image.convert("RGB").getpixel((360, 640)) != (0, 0, 0)
+
+
+def test_poster_preflight_rejects_copy_that_cannot_fit_the_safe_area():
+    blocks = [
+        {
+            "role": "body",
+            "text": "一\n二\n三\n四\n五\n六\n七\n八\n九\n十",
+        }
+        for _ in range(6)
+    ]
+
+    with pytest.raises(MediaContractError, match="poster safe area"):
+        preflight_poster_layout(blocks, aspect_ratio="16:9")
 
 
 def test_glass_cta_uses_rose_to_violet_gradient_instead_of_flat_fill():

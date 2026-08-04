@@ -14,6 +14,25 @@ from app.services.document_conversion.presentation_contract import (
 )
 
 
+_PRESENTATION_LONG_EDGE_INCHES = 13.333333
+
+
+def _slide_size_inches(design_w_px: int, design_h_px: int) -> tuple[float, float]:
+    """Map the source aspect ratio onto a bounded PowerPoint canvas."""
+
+    if design_w_px <= 0 or design_h_px <= 0:
+        raise ValueError("design_width and design_height must be positive")
+    if design_w_px >= design_h_px:
+        return (
+            _PRESENTATION_LONG_EDGE_INCHES,
+            _PRESENTATION_LONG_EDGE_INCHES * design_h_px / design_w_px,
+        )
+    return (
+        _PRESENTATION_LONG_EDGE_INCHES * design_w_px / design_h_px,
+        _PRESENTATION_LONG_EDGE_INCHES,
+    )
+
+
 async def render_html_to_pptx(src_file: Path, tgt_file: Path, target_path: str, ws: Path, arguments: dict[str, Any]) -> str:
     temporary_render_files: set[Path] = set()
     try:
@@ -61,8 +80,12 @@ async def render_html_to_pptx(src_file: Path, tgt_file: Path, target_path: str, 
             render_scale = 2.0
         render_scale = max(1.0, min(4.0, render_scale))
         prs = Presentation()
-        prs.slide_width = Inches(13.333)
-        prs.slide_height = Inches(7.5)
+        slide_width_inches, slide_height_inches = _slide_size_inches(
+            design_w_px,
+            design_h_px,
+        )
+        prs.slide_width = Inches(slide_width_inches)
+        prs.slide_height = Inches(slide_height_inches)
         blank_layout = prs.slide_layouts[6]
 
         named_colors = {

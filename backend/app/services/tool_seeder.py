@@ -33,6 +33,7 @@ SYNC_IS_DEFAULT_TOOL_NAMES = {
     "jina_read",
     "update_objective",
     "generate_image_minimax",
+    "check_image_generation",
     "generate_speech_minimax",
     "generate_music_minimax",
     "compose_video_audio",
@@ -1367,7 +1368,7 @@ BUILTIN_TOOLS = [
     {
         "name": "generate_image_minimax",
         "display_name": "Generate Image",
-        "description": "Generate an image through Astra's managed media route. Model quality is selected from the active Lite, Pro, or Ultra product tier. Provider failover is safe only before a request is accepted, and a formal delivery must pass allow_degraded_fallback=false unless the user explicitly accepted emergency quality. Generate exactly the number of outputs requested. When one request requires both an uploaded product/reference and exact visible copy, pass brand_asset or reference_image together with overlay_text (one text block) or overlay_blocks (multi-level poster copy) in the same single call; never split them into separate variants unless the user explicitly asks for multiple outputs.",
+        "description": "Generate an image through Astra's managed media route. Model quality is selected from the active Lite, Pro, or Ultra product tier. The provider-neutral execution_strategy selects a commercial-quality or creative-exploration policy; the compatibility Tool name never identifies the actual provider. Route changes are safe only before a request is accepted. Generate exactly the number of outputs requested. When one request requires both an uploaded product/reference and exact visible copy, pass brand_asset or reference_image together with overlay_text (one text block) or overlay_blocks (multi-level poster copy) in the same single call; never split them into separate variants unless the user explicitly asks for multiple outputs.",
         "category": "media",
         "icon": "🎨",
         "is_default": True,
@@ -1378,6 +1379,11 @@ BUILTIN_TOOLS = [
                 "aspect_ratio": {
                     "type": "string",
                     "description": "Aspect ratio: '1:1', '16:9', '4:3', '3:4', '9:16', '2:3', '3:2'. Default: '1:1'.",
+                },
+                "execution_strategy": {
+                    "type": "string",
+                    "enum": ["commercial_quality", "creative_exploration"],
+                    "description": "Provider-neutral work policy. Use commercial_quality for formal customer delivery and creative_exploration for ideation or intentionally broader visual variation. This does not select or reveal a provider. Default: commercial_quality.",
                 },
                 "reference_image": {
                     "type": "string",
@@ -1416,7 +1422,7 @@ BUILTIN_TOOLS = [
                 "brand_asset": {"type": "string", "description": "Canonical workspace image path or data URL composited unchanged as a product/logo layer. For a chat upload use workspace/uploads/<filename>. When exact copy is also requested, include overlay_text or overlay_blocks in this same call. Do not combine with reference_image."},
                 "brand_position": {"type": "string", "enum": ["top_left", "top_right", "center", "bottom_left", "bottom_right"]},
                 "brand_scale": {"type": "number", "description": "Canvas width fraction from 0.1 to 0.8. Default: 0.42."},
-                "allow_degraded_fallback": {"type": "boolean", "description": "Whether a known non-equivalent emergency provider may be used when the commercial primary route is unavailable. Formal delivery contracts default to false and may set true only after explicit user confirmation. Legacy quick-generation calls default to true."},
+                "allow_degraded_fallback": {"type": "boolean", "description": "Whether the alternate route for the selected execution strategy may be used before any provider accepts the request. Formal delivery contracts default to false and may set true only after explicit user confirmation. Legacy quick-generation calls default to true."},
                 "save_path": {"type": "string", "description": "Save path in workspace. Default: auto."},
             },
             "required": ["prompt"],
@@ -1427,6 +1433,27 @@ BUILTIN_TOOLS = [
         "config_schema": {
             "fields": []
         },
+    },
+    {
+        "name": "check_image_generation",
+        "display_name": "Check Image",
+        "description": "Reconcile an already accepted managed image task and expose the durable artifact when local delivery finishes. This tool never submits a second provider request and uses only the server-owned task identity.",
+        "category": "media",
+        "icon": "🖼️",
+        "is_default": True,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "task_record_id": {
+                    "type": "string",
+                    "description": "Server-owned durable image task UUID returned internally by Runtime polling.",
+                },
+            },
+            "required": ["task_record_id"],
+            "additionalProperties": False,
+        },
+        "config": {},
+        "config_schema": {},
     },
     {
         "name": "generate_speech_minimax",

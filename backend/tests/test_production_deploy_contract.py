@@ -1711,10 +1711,10 @@ def test_backend_production_image_installs_bounded_cjk_fonts_and_refreshes_cache
         "fonts-wqy-microhei",
         "fonts-wqy-zenhei",
         "fonts-noto-cjk",
+        "fonts-noto-cjk-extra",
     ):
         assert package in dockerfile
     for oversized_or_unused_package in (
-        "fonts-noto-cjk-extra",
         "fonts-noto-extra",
         "fonts-noto-color-emoji",
         "fonts-freefont-ttf",

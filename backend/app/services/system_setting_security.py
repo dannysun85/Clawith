@@ -19,6 +19,21 @@ SYSTEM_SETTING_SECRET_FIELDS: dict[str, frozenset[str]] = {
 }
 
 
+def strict_system_setting_enabled(value: Any, *, default: bool = False) -> bool:
+    """Read an ``enabled`` flag without JSON truthiness coercion.
+
+    Cross-origin and authentication switches must never treat values such as
+    ``"false"``, ``1`` or a malformed/non-object JSON row as enabled. Only a
+    real JSON boolean is accepted; every other shape fails to the caller's
+    explicit default.
+    """
+
+    if not isinstance(value, dict):
+        return default
+    enabled = value.get("enabled")
+    return enabled if isinstance(enabled, bool) else default
+
+
 def is_sensitive_system_setting(key: str) -> bool:
     return key in SYSTEM_SETTING_SECRET_FIELDS or key.startswith(
         "legacy_tool_config_quarantine:"
@@ -153,4 +168,5 @@ __all__ = [
     "is_sensitive_system_setting",
     "mask_system_setting_value",
     "migrate_sensitive_system_settings",
+    "strict_system_setting_enabled",
 ]

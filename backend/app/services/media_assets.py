@@ -41,6 +41,37 @@ _FONT_CANDIDATES = (
     "/System/Library/Fonts/Hiragino Sans GB.ttc",
     "/System/Library/Fonts/STHeiti Medium.ttc",
 )
+_POSTER_FONT_CANDIDATES_BY_ROLE = {
+    "title": (
+        "/usr/share/fonts/opentype/noto/NotoSerifCJK-Black.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSerifCJK-Bold.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSerifCJK-SemiBold.ttc",
+        "/System/Library/Fonts/Supplemental/Songti.ttc",
+    ),
+    "subtitle": (
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-SemiBold.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    ),
+    "tagline": (
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Light.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-DemiLight.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
+    ),
+    "body": (
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-DemiLight.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
+    ),
+    "cta": (
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Black.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+    ),
+}
 _TEXT_POSITIONS = {"top", "center", "bottom"}
 _OVERLAY_BLOCK_ROLES = {"title", "subtitle", "tagline", "body", "cta"}
 _BRAND_POSITIONS = {
@@ -81,6 +112,7 @@ class OverlayReceipt:
     font_sha256: str | None = None
     font_family: str | None = None
     font_face_index: int | None = None
+    font_roles: dict[str, dict[str, str | int]] | None = None
     line_count: int = 0
     background_sanitized: bool = False
     layout_version: str | None = None
@@ -92,6 +124,13 @@ class OverlayReceipt:
     output_height: int | None = None
     output_bytes: int | None = None
     size_adjusted: bool = False
+    layout_bounds_verified: bool = False
+    content_left: int | None = None
+    content_top: int | None = None
+    content_right: int | None = None
+    content_bottom: int | None = None
+    safe_margin_x: int | None = None
+    safe_margin_y: int | None = None
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -439,7 +478,11 @@ def validate_overlay_blocks(value: object) -> str | None:
     blocks = normalize_overlay_blocks(value)
     if not blocks:
         return None
-    _font_for_text("\n".join(block["text"] for block in blocks))
+    texts_by_role: dict[str, list[str]] = {}
+    for block in blocks:
+        texts_by_role.setdefault(block["role"], []).append(block["text"])
+    for role, texts in texts_by_role.items():
+        _font_for_poster_role("\n".join(texts), role)
     return overlay_blocks_sha256(blocks)
 
 
@@ -476,14 +519,18 @@ def _file_sha256(path: str) -> str:
     return digest.hexdigest()
 
 
-def _font_for_text(text: str) -> FontSelection:
+def _font_for_text(
+    text: str,
+    *,
+    candidates: tuple[str, ...] | None = None,
+) -> FontSelection:
     required = {
         ord(character)
         for character in text
         if not character.isspace() and not unicodedata.category(character).startswith("C")
     }
     missing_by_font: list[str] = []
-    for candidate in _FONT_CANDIDATES:
+    for candidate in candidates or _FONT_CANDIDATES:
         if not Path(candidate).is_file():
             continue
         faces = _font_faces(candidate)
@@ -525,6 +572,16 @@ def _font_for_text(text: str) -> FontSelection:
             missing_by_font.append(f"{family}:{len(missing)}")
     detail = ", ".join(missing_by_font[:4]) or "no CJK font installed"
     raise MediaContractError(f"No installed brand-safe font covers every requested character ({detail})")
+
+
+def _font_for_poster_role(text: str, role: str) -> FontSelection:
+    """Choose a deterministic role-specific face while retaining full-glyph fallback."""
+
+    preferred = _POSTER_FONT_CANDIDATES_BY_ROLE[role]
+    candidates = preferred + tuple(
+        candidate for candidate in _FONT_CANDIDATES if candidate not in preferred
+    )
+    return _font_for_text(text, candidates=candidates)
 
 
 def _font_path() -> str:
@@ -784,15 +841,45 @@ def _composite_glass_cta(canvas, rect: tuple[int, int, int, int], radius: int) -
     )
 
 
-def _render_poster_blocks(canvas, blocks: tuple[dict[str, str], ...]) -> OverlayReceipt:
-    """Render a quiet, role-aware poster hierarchy without a generic black text box."""
+def _render_poster_blocks(
+    canvas,
+    blocks: tuple[dict[str, str], ...],
+    *,
+    dry_run: bool = False,
+) -> OverlayReceipt:
+    """Render and receipt one role-aware hierarchy inside a verified safe area."""
 
     from PIL import Image, ImageDraw, ImageFilter
 
     all_text = "\n".join(block["text"] for block in blocks)
-    selection = _font_for_text(all_text)
+    texts_by_role: dict[str, list[str]] = {}
+    for block in blocks:
+        texts_by_role.setdefault(block["role"], []).append(block["text"])
+    selections = {
+        role: _font_for_poster_role("\n".join(texts), role)
+        for role, texts in texts_by_role.items()
+    }
     width, height = canvas.size
     draw = ImageDraw.Draw(canvas, "RGBA")
+    safe_margin_x = max(18, int(width * 0.06))
+    safe_margin_y = max(18, int(height * 0.06))
+    content_rects: list[tuple[int, int, int, int]] = []
+
+    def record_content_bounds(rect: tuple[int, int, int, int]) -> None:
+        left, top, right, bottom = rect
+        if (
+            left < safe_margin_x
+            or top < safe_margin_y
+            or right > width - safe_margin_x
+            or bottom > height - safe_margin_y
+            or left >= right
+            or top >= bottom
+        ):
+            raise MediaContractError(
+                "overlay_blocks layout cannot fit inside the poster safe area"
+            )
+        content_rects.append(rect)
+
     non_cta = [block for block in blocks if block["role"] != "cta"]
     ctas = [block for block in blocks if block["role"] == "cta"]
     layouts = [
@@ -801,7 +888,7 @@ def _render_poster_blocks(canvas, blocks: tuple[dict[str, str], ...]) -> Overlay
             _poster_block_layout(
                 draw,
                 block["text"],
-                selection,
+                selections[block["role"]],
                 block["role"],
                 width,
                 height,
@@ -810,9 +897,19 @@ def _render_poster_blocks(canvas, blocks: tuple[dict[str, str], ...]) -> Overlay
         for block in non_cta
     ]
     block_gap = max(10, int(height * 0.014))
-    layout_heights = [sum(layout[4]) + layout[5] * max(len(layout[1]) - 1, 0) for _block, layout in layouts]
+    layout_heights = [
+        sum(layout[4]) + layout[5] * max(len(layout[1]) - 1, 0)
+        for _block, layout in layouts
+    ]
     group_height = sum(layout_heights) + block_gap * max(len(layouts) - 1, 0)
     cursor_y = max(int(height * 0.31), (height - group_height) // 2)
+    if layouts and (
+        cursor_y < safe_margin_y
+        or cursor_y + group_height > height - safe_margin_y
+    ):
+        raise MediaContractError(
+            "overlay_blocks layout cannot fit inside the poster safe area"
+        )
     total_lines = 0
 
     for (block, layout), block_height in zip(layouts, layout_heights, strict=True):
@@ -825,10 +922,24 @@ def _render_poster_blocks(canvas, blocks: tuple[dict[str, str], ...]) -> Overlay
             "body": (242, 238, 255, 240),
         }[block["role"]]
         line_y = cursor_y
-        for line, box, line_width, line_height in zip(lines, boxes, widths, heights, strict=True):
+        for line, box, line_width, line_height in zip(
+            lines,
+            boxes,
+            widths,
+            heights,
+            strict=True,
+        ):
             if line:
                 x = (width - line_width) // 2 - box[0]
-                if block["role"] == "title":
+                record_content_bounds(
+                    (
+                        x + box[0],
+                        line_y,
+                        x + box[0] + line_width,
+                        line_y + line_height,
+                    )
+                )
+                if not dry_run and block["role"] == "title":
                     outer_glow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
                     outer_glow_draw = ImageDraw.Draw(outer_glow, "RGBA")
                     outer_glow_draw.text(
@@ -844,11 +955,12 @@ def _render_poster_blocks(canvas, blocks: tuple[dict[str, str], ...]) -> Overlay
                             ImageFilter.GaussianBlur(max(5, font_size // 8))
                         )
                     )
-                    inner_glow = outer_glow.filter(
-                        ImageFilter.GaussianBlur(max(2, font_size // 30))
+                    canvas.alpha_composite(
+                        outer_glow.filter(
+                            ImageFilter.GaussianBlur(max(2, font_size // 30))
+                        )
                     )
-                    canvas.alpha_composite(inner_glow)
-                else:
+                elif not dry_run:
                     shadow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
                     shadow_draw = ImageDraw.Draw(shadow, "RGBA")
                     shadow_draw.text(
@@ -862,23 +974,24 @@ def _render_poster_blocks(canvas, blocks: tuple[dict[str, str], ...]) -> Overlay
                             ImageFilter.GaussianBlur(max(2, font_size // 18))
                         )
                     )
-                draw = ImageDraw.Draw(canvas, "RGBA")
-                draw.text(
-                    (x, line_y - box[1]),
-                    line,
-                    font=font,
-                    fill=fill,
-                    stroke_width=(
-                        max(2, font_size // 25)
-                        if block["role"] == "title"
-                        else max(1, font_size // 55)
-                    ),
-                    stroke_fill=(
-                        (255, 226, 255, 235)
-                        if block["role"] == "title"
-                        else (83, 59, 135, 115)
-                    ),
-                )
+                if not dry_run:
+                    draw = ImageDraw.Draw(canvas, "RGBA")
+                    draw.text(
+                        (x, line_y - box[1]),
+                        line,
+                        font=font,
+                        fill=fill,
+                        stroke_width=(
+                            max(2, font_size // 25)
+                            if block["role"] == "title"
+                            else max(1, font_size // 55)
+                        ),
+                        stroke_fill=(
+                            (255, 226, 255, 235)
+                            if block["role"] == "title"
+                            else (83, 59, 135, 115)
+                        ),
+                    )
             line_y += line_height + spacing
             total_lines += 1
         cursor_y += block_height + block_gap
@@ -888,7 +1001,7 @@ def _render_poster_blocks(canvas, blocks: tuple[dict[str, str], ...]) -> Overlay
         font, lines, boxes, widths, heights, spacing = _poster_block_layout(
             draw,
             block["text"],
-            selection,
+            selections["cta"],
             "cta",
             width,
             height,
@@ -899,36 +1012,90 @@ def _render_poster_blocks(canvas, blocks: tuple[dict[str, str], ...]) -> Overlay
         pad_y = max(12, int(font.size * 0.42))
         button_width = text_width + pad_x * 2
         button_height = text_height + pad_y * 2
-        x = width - button_width - max(18, int(width * 0.08))
-        y = min(cta_y, height - button_height - max(18, int(height * 0.08)))
+        x = width - button_width - max(safe_margin_x, int(width * 0.08))
+        y = cta_y
         rect = (x, y, x + button_width, y + button_height)
-        radius = button_height // 2
-        _composite_glass_cta(canvas, rect, radius)
+        record_content_bounds(rect)
+        if not dry_run:
+            _composite_glass_cta(canvas, rect, button_height // 2)
         draw = ImageDraw.Draw(canvas, "RGBA")
         line_y = y + pad_y
-        for line, box, line_width, line_height in zip(lines, boxes, widths, heights, strict=True):
-            draw.text(
-                (x + (button_width - line_width) // 2 - box[0], line_y - box[1]),
-                line,
-                font=font,
-                fill=(255, 255, 255, 255),
-                stroke_width=max(1, int(font.size) // 45),
-                stroke_fill=(91, 57, 145, 125),
-            )
+        for line, box, line_width, line_height in zip(
+            lines,
+            boxes,
+            widths,
+            heights,
+            strict=True,
+        ):
+            if not dry_run:
+                draw.text(
+                    (x + (button_width - line_width) // 2 - box[0], line_y - box[1]),
+                    line,
+                    font=font,
+                    fill=(255, 255, 255, 255),
+                    stroke_width=max(1, int(font.size) // 45),
+                    stroke_fill=(91, 57, 145, 125),
+                )
             line_y += line_height + spacing
             total_lines += 1
         cta_y = y + button_height + block_gap
 
+    if not content_rects:
+        raise MediaContractError("overlay_blocks produced no visible poster content")
+    font_roles = {
+        role: {
+            "family": selection.family,
+            "face_index": selection.face_index,
+            "sha256": selection.sha256,
+        }
+        for role, selection in sorted(selections.items())
+    }
+    primary_role = "title" if "title" in selections else sorted(selections)[0]
+    primary_selection = selections[primary_role]
     return OverlayReceipt(
         rendered_text_sha256=hashlib.sha256(all_text.encode("utf-8")).hexdigest(),
-        font_sha256=selection.sha256,
-        font_family=selection.family,
-        font_face_index=selection.face_index,
+        font_sha256=primary_selection.sha256,
+        font_family=primary_selection.family,
+        font_face_index=primary_selection.face_index,
+        font_roles=font_roles,
         line_count=total_lines,
-        layout_version="poster-v2",
+        layout_version="poster-v3",
         block_count=len(blocks),
         overlay_blocks_sha256=overlay_blocks_sha256(blocks),
+        layout_bounds_verified=True,
+        content_left=min(rect[0] for rect in content_rects),
+        content_top=min(rect[1] for rect in content_rects),
+        content_right=max(rect[2] for rect in content_rects),
+        content_bottom=max(rect[3] for rect in content_rects),
+        safe_margin_x=safe_margin_x,
+        safe_margin_y=safe_margin_y,
     )
+
+
+def preflight_poster_layout(
+    blocks: object,
+    *,
+    aspect_ratio: str,
+) -> OverlayReceipt:
+    """Run the exact production font/wrap/bounds plan without provider spend."""
+
+    from PIL import Image
+
+    normalized_blocks = normalize_overlay_blocks(blocks)
+    if not normalized_blocks:
+        return OverlayReceipt()
+    dimensions = {
+        "1:1": (1080, 1080),
+        "3:4": (1080, 1440),
+        "9:16": (1080, 1920),
+        "16:9": (1920, 1080),
+    }.get(str(aspect_ratio or "").strip())
+    if dimensions is None:
+        raise MediaContractError(
+            "Poster aspect ratio has no deterministic layout canvas"
+        )
+    canvas = Image.new("RGBA", dimensions, (0, 0, 0, 0))
+    return _render_poster_blocks(canvas, normalized_blocks, dry_run=True)
 
 
 def _compose_overlay_canvas(
@@ -970,6 +1137,7 @@ def _compose_overlay_canvas(
             font_sha256=text_receipt.font_sha256,
             font_family=text_receipt.font_family,
             font_face_index=text_receipt.font_face_index,
+            font_roles=text_receipt.font_roles,
             line_count=text_receipt.line_count,
         )
     return canvas, receipt

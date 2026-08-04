@@ -1344,10 +1344,6 @@ async def update_system_setting(
         db.add(setting)
     await db.commit()
 
-    # When public_base_url changes, regenerate sso_domain for all SSO-enabled tenants
-    if key == "platform" and secured_value.get("public_base_url"):
-        await _regenerate_all_sso_domains(db)
-
     await db.refresh(setting)
     return {
         "key": setting.key,
@@ -1377,11 +1373,12 @@ async def _sync_tenant_sso_state(
     """Recompute tenant.sso_enabled based on channel-level sso_login_enabled flags.
 
     When any identity provider has sso_login_enabled=True, the tenant's
-    sso_enabled is set to True and sso_domain is auto-assigned if empty.
+    sso_enabled is set to True.  sso_domain remains an explicit administrator
+    configuration; DNS and TLS provisioning cannot be inferred from a slug or
+    the platform public URL.
     When all providers have sso_login_enabled=False, sso_enabled becomes False
     but sso_domain is preserved for potential re-enablement.
 
-    Raises HTTPException(400) if IP mode and another tenant already owns the sso_domain.
     """
     from app.models.tenant import Tenant
     count_result = await db.execute(
@@ -1401,24 +1398,6 @@ async def _sync_tenant_sso_state(
         return
 
     tenant.sso_enabled = active_sso_count > 0
-
-    # Auto-assign subdomain on first SSO enablement based on Platform rules
-    if tenant.sso_enabled and not tenant.sso_domain:
-        sso_base = await platform_service.get_tenant_sso_base_url(db, tenant)
-        host = sso_base.split("://")[-1].split(":")[0].split("/")[0]
-        is_ip = platform_service.is_ip_address(host)
-
-        if is_ip:
-            # IP mode: first clear ALL other tenants' sso_domain, then set for this tenant
-            # (unique constraint - only one tenant can hold the IP domain)
-            await db.execute(
-                update(Tenant)
-                .where(Tenant.id != tenant_id)
-                .values(sso_domain=None, sso_enabled=False)
-            )
-            logger.info(f"[SSO] IP mode: cleared sso_domain for all other tenants, setting for tenant_id={tenant_id}")
-
-        tenant.sso_domain = sso_base
 
     if commit:
         await db.commit()
@@ -1472,39 +1451,12 @@ async def _count_provider_users_without_local_recovery(
 
 
 async def _regenerate_all_sso_domains(db: AsyncSession):
-    """Regenerate sso_domain for ALL tenants when public_base_url changes.
+    """Compatibility no-op: explicit tenant SSO domains are never synthesized.
 
-    - Domain mode: every tenant gets {slug}.{domain}, regardless of SSO status.
-    - IP mode: only ONE tenant can hold the IP domain (unique constraint).
-      The first SSO-enabled tenant keeps it; all others get sso_domain=None.
-      If no SSO-enabled tenant exists, the first tenant in the list gets it.
+    Retained for older internal imports while rolling releases converge.  A
+    platform URL change must not rewrite tenant-owned DNS/TLS configuration.
     """
-    base_url = await platform_service.get_public_base_url(db)
-    host = base_url.split("://")[-1].split(":")[0].split("/")[0]
-    is_ip = platform_service.is_ip_address(host)
-
-    # Fetch all tenants; put SSO-enabled ones first so they win the IP slot
-    all_tenants_result = await db.execute(
-        select(Tenant).order_by(Tenant.sso_enabled.desc(), Tenant.created_at.asc())
-    )
-    tenants = all_tenants_result.scalars().all()
-
-    for i, tenant in enumerate(tenants):
-        if is_ip:
-            # IP mode: only one tenant can have SSO domain
-            if i == 0:
-                sso_base = await platform_service.get_tenant_sso_base_url(db, tenant)
-                tenant.sso_domain = sso_base
-            else:
-                tenant.sso_domain = None
-        else:
-            # Domain mode: each tenant gets their own subdomain
-            sso_base = await platform_service.get_tenant_sso_base_url(db, tenant)
-            tenant.sso_domain = sso_base
-        logger.info(f"[SSO regen] tenant={tenant.slug} sso_domain={tenant.sso_domain}")
-
-    if tenants:
-        await db.commit()
+    _ = db
 
 
 # ─── Identity Providers ─────────────────────────────────

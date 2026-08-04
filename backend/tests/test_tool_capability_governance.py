@@ -78,6 +78,7 @@ def test_image_speech_and_video_are_global_defaults_with_agent_opt_out() -> None
 
     assert GLOBAL_DEFAULT_MEDIA_TOOL_NAMES == {
         "generate_image_minimax",
+        "check_image_generation",
         "generate_speech_minimax",
         "compose_video_audio",
         "generate_video_minimax",
@@ -213,6 +214,7 @@ def test_external_writes_and_capability_mutations_use_durable_l3_gates() -> None
 def test_platform_pool_media_credentials_are_removed_from_tool_overrides() -> None:
     assert CENTRAL_CREDENTIAL_POOL_TOOL_NAMES == {
         "generate_image_minimax",
+        "check_image_generation",
         "generate_speech_minimax",
         "generate_music_minimax",
         "generate_video_minimax",

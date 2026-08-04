@@ -88,6 +88,11 @@ class _ProviderRows:
         return [("google_workspace", "Google Workspace")]
 
 
+class _SettingResult:
+    def scalar_one_or_none(self):
+        return SimpleNamespace(value={"enabled": True})
+
+
 class _ProviderMetadataDB:
     def __init__(self):
         self.tenant = SimpleNamespace(is_active=True, sso_enabled=True)
@@ -98,6 +103,8 @@ class _ProviderMetadataDB:
 
     async def execute(self, _statement):
         self.executions += 1
+        if self.executions == 1:
+            return _SettingResult()
         return _ProviderRows()
 
 
@@ -297,7 +304,7 @@ async def test_provider_metadata_listing_does_not_allocate_relay_session():
     assert providers == [
         {"provider_type": "google_workspace", "name": "Google Workspace"},
     ]
-    assert db.executions == 1
+    assert db.executions == 2
 
 
 def test_callback_browser_binding_rejects_missing_wrong_or_other_session_cookie():

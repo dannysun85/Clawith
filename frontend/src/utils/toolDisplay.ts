@@ -1,5 +1,6 @@
 const MANAGED_MEDIA_TOOL_TITLES: Readonly<Record<string, string>> = {
     generate_image_minimax: 'Generate Image',
+    check_image_generation: 'Check Image',
     generate_speech_minimax: 'Generate Speech',
     generate_music_minimax: 'Generate Music',
     generate_video_minimax: 'Generate Video',
@@ -127,4 +128,31 @@ export function customerSafeToolResult(name: string, result: unknown): string {
 export function customerSafeAssistantText(value: unknown): string {
     const normalized = replaceManagedMediaIdentifiers(typeof value === 'string' ? value : '');
     return looksLikeMediaReceipt(normalized) ? removeManagedRoutingLines(normalized) : normalized;
+}
+
+/**
+ * Never project raw model reasoning into a tenant-facing conversation.
+ *
+ * The durable runtime may retain reasoning for provider continuity and audit,
+ * but that payload can contain system instructions, credentials, hidden route
+ * choices, or speculative intermediate text. Tool receipts remain visible as
+ * the customer-verifiable execution trace.
+ */
+export function customerSafeThinkingText(
+    value: unknown,
+    replacement = 'Internal reasoning is private. Tool execution records remain available.',
+): string {
+    return typeof value === 'string' && value.trim()
+        ? replacement
+        : '';
+}
+
+export function customerSafeAnalysisText(
+    kind: 'thinking' | 'assistant_progress',
+    value: unknown,
+    privateReasoningReplacement?: string,
+): string {
+    return kind === 'thinking'
+        ? customerSafeThinkingText(value, privateReasoningReplacement)
+        : customerSafeAssistantText(value);
 }

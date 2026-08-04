@@ -43,6 +43,9 @@ _RETRY_POLICIES = frozenset({"safe", "conditional", "never"})
 _USER_RECONCILABLE_CONDITIONAL_WRITE_TOOLS = frozenset(
     {
         "write_file",
+        "edit_file",
+        "move_file",
+        "delete_file",
         "convert_csv_to_xlsx",
         "convert_html_to_pdf",
         "convert_html_to_pptx",
@@ -133,6 +136,10 @@ _RESULT_METADATA_KEYS = frozenset(
         "runtime_retry_pending",
         "runtime_retry_exhausted",
         "runtime_halt_run",
+        "task_record_id",
+        "deliverable_request_id",
+        "expected_overlay_blocks_sha256",
+        "route_error_code",
         "last_error_code",
         "runtime_async_pending",
         "async_operation",

@@ -635,6 +635,12 @@ minimax_saas_tier: ContextVar[str] = ContextVar(
     "minimax_saas_tier",
     default="",
 )
+# Formal deliverable identity is frozen in the server-owned Runtime snapshot.
+# It must never be inferred from a model-selected output filename.
+deliverable_request_scope_id: ContextVar[str] = ContextVar(
+    "deliverable_request_scope_id",
+    default="",
+)
 
 
 def _agentbay_scope_ids(arguments: Mapping[str, Any]) -> tuple[str, str]:
@@ -803,6 +809,7 @@ RUNTIME_TYPED_APPLICATION_TOOL_NAMES = frozenset(
         "read_webpage",
         "upload_image",
         *_IMAGE_GENERATION_TOOL_NAMES,
+        "check_image_generation",
         "generate_speech_minimax",
         "generate_music_minimax",
         "compose_video_audio",
@@ -2460,11 +2467,17 @@ def _typed_unknown(
     )
 
 
-def _typed_pending(summary: str, *, metadata: dict) -> ToolExecutionOutcome:
+def _typed_pending(
+    summary: str,
+    *,
+    metadata: dict,
+    error_code: str | None = None,
+) -> ToolExecutionOutcome:
     return ToolExecutionOutcome(
         status="pending",
         result_summary=summary,
         result_ref=None,
+        error_code=error_code,
         metadata=metadata,
     )
 
@@ -2521,7 +2534,11 @@ def _minimax_tool_result(
         **dict(runtime_metadata or {}),
     }
     if status == "pending":
-        return _typed_pending(summary, metadata=metadata)
+        return _typed_pending(
+            summary,
+            metadata=metadata,
+            error_code=error_code,
+        )
     if status == "succeeded":
         artifact_refs: tuple[str, ...] = ()
         result_ref = None
@@ -2548,15 +2565,17 @@ def _minimax_tool_result(
     )
 
 
-def _minimax_video_async_metadata(
+def _managed_media_async_metadata(
     *,
     record_id: uuid.UUID,
-    task_meta_path: str | None,
+    modality: str,
+    poll_tool: str,
     state: str,
     pending: bool,
     provider: str = "minimax",
+    task_meta_path: str | None = None,
 ) -> dict[str, object]:
-    """Describe one durable MiniMax video operation to Runtime polling.
+    """Describe one durable managed-media operation to Runtime polling.
 
     The media daemon owns provider reconciliation while Runtime owns the Agent
     turn.  Both converge on the same durable task ID; Runtime polls by that ID
@@ -2567,7 +2586,11 @@ def _minimax_video_async_metadata(
     operation_id = str(record_id)
     operation_key = hashlib.sha256(
         json.dumps(
-            {"provider": provider, "modality": "video", "task_id": operation_id},
+            {
+                "provider": provider,
+                "modality": modality,
+                "task_id": operation_id,
+            },
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
@@ -2588,12 +2611,52 @@ def _minimax_video_async_metadata(
             "operation_id": operation_id,
             "state": state,
             "poll": {
-                "tool": "check_video_minimax",
+                "tool": poll_tool,
                 "arguments": poll_arguments,
                 "interval_ms": interval_ms,
             },
         },
     }
+
+
+def _minimax_video_async_metadata(
+    *,
+    record_id: uuid.UUID,
+    task_meta_path: str | None,
+    state: str,
+    pending: bool,
+    provider: str = "minimax",
+) -> dict[str, object]:
+    """Compatibility wrapper for the existing managed-video poll contract."""
+
+    return _managed_media_async_metadata(
+        record_id=record_id,
+        modality="video",
+        poll_tool="check_video_minimax",
+        task_meta_path=task_meta_path,
+        state=state,
+        pending=pending,
+        provider=provider,
+    )
+
+
+def _managed_image_async_metadata(
+    *,
+    record_id: uuid.UUID,
+    state: str,
+    pending: bool,
+    provider: str = "minimax",
+) -> dict[str, object]:
+    """Anchor accepted synchronous images to Runtime's durable poller."""
+
+    return _managed_media_async_metadata(
+        record_id=record_id,
+        modality="image",
+        poll_tool="check_image_generation",
+        state=state,
+        pending=pending,
+        provider=provider,
+    )
 
 
 def _propose_experience_draft_outcome(
@@ -3449,6 +3512,12 @@ async def execute_builtin_tool_outcome(
                 arguments.get("brand_asset"),
             ),
             sync_back=False,
+        )
+    if tool_name == "check_image_generation":
+        return await _check_image_generation(
+            agent_id,
+            arguments,
+            typed=True,
         )
     if tool_name in _IMAGE_GENERATION_TOOL_NAMES:
         return await _run_with_temp_workspace_outcome(
@@ -4315,6 +4384,11 @@ async def _execute_tool_impl(
                     session_id=session_id,
                 ),
                 sync_back=False,
+            )
+        elif tool_name == "check_image_generation":
+            result = await _check_image_generation(
+                agent_id,
+                arguments,
             )
         elif tool_name == "generate_music_minimax":
             result = await _run_with_temp_workspace(
@@ -7895,9 +7969,11 @@ def _read_document_sync(
 
         elif ext == ".pptx":
             from pptx import Presentation
+            from pptx.enum.shapes import MSO_SHAPE_TYPE
 
             prs = Presentation(str(file_path))
             slides = []
+            image_only_slide_count = 0
             start_index = max(page_start - 1, 0)
             end_index = min(len(prs.slides), start_index + max_pages)
             for i in range(start_index, end_index):
@@ -7908,7 +7984,26 @@ def _read_document_sync(
                         texts.append(shape.text)
                 if texts:
                     slides.append(f"--- Slide {i + 1} ---\n" + "\n".join(texts))
-            content = "\n\n".join(slides) if slides else "(PPT is empty)"
+                elif any(
+                    shape.shape_type == MSO_SHAPE_TYPE.PICTURE
+                    for shape in slide.shapes
+                ):
+                    image_only_slide_count += 1
+            if slides:
+                content = "\n\n".join(slides)
+                if image_only_slide_count:
+                    content += (
+                        "\n\n"
+                        f"(PPT also contains {image_only_slide_count} image-only "
+                        "slide(s); use visual rendering/preview to verify them.)"
+                    )
+            elif image_only_slide_count:
+                content = (
+                    f"(PPT contains {image_only_slide_count} image-only slide(s); "
+                    "no extractable text. Use visual rendering/preview to verify it.)"
+                )
+            else:
+                content = "(PPT is empty)"
 
         elif ext in (".txt", ".md", ".json", ".csv", ".log"):
             content = file_path.read_text(encoding="utf-8", errors="replace")
@@ -12681,6 +12776,16 @@ async def _generate_image_outcome(
         )
     prompt = prompt_value.strip()
 
+    # Formal Runtime work is owned by the provider-neutral managed image route.
+    # Generic/BYOK tools cannot carry the persisted poster policy, Credits
+    # settlement, fallback ownership, or durable receipt, so stop before even
+    # loading provider configuration.
+    if deliverable_request_scope_id.get().strip():
+        return _typed_failure(
+            "Formal deliverable images must use the managed image route.",
+            "deliverable_managed_image_route_required",
+        )
+
     # Astra's brand-safe contract must be decided before configuration lookup
     # or any paid provider request.  The official v1.11 typed settlement path
     # remains authoritative; these fields only prepare deterministic local
@@ -12761,6 +12866,15 @@ async def _generate_image_outcome(
         slug = "".join(character for character in slug if character.isalnum() or character == "_")[:40] or "generated"
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         save_path = f"workspace/images/{slug}_{timestamp}.png"
+    normalized_save_path = save_path.replace("\\", "/")
+    if tuple(part for part in normalized_save_path.split("/") if part)[:2] == (
+        "workspace",
+        "deliverables",
+    ):
+        return _typed_failure(
+            "Formal deliverable output requires trusted Runtime scope and the managed image route.",
+            "deliverable_managed_image_route_required",
+        )
     try:
         full_save_path = _image_workspace_target(ws, save_path)
     except ValueError:
@@ -28006,12 +28120,17 @@ async def _generate_image_minimax_durable(
     provider: str = "minimax",
     provider_size: str | None = None,
     allow_safe_fallback: bool = False,
+    execution_strategy: str = "commercial_quality",
+    allow_degraded_fallback: bool = False,
+    deliverable_request_id: uuid.UUID | None = None,
+    expected_overlay_blocks_sha256: str | None = None,
 ) -> ToolExecutionOutcome | str:
     """Run one provider image attempt through the durable media state machine."""
 
     from app.services.media_assets import MediaContractError, image_reference_for_provider
     from app.services.media_generation import (
         create_minimax_sync_media_task_record,
+        find_media_generation_task_by_id,
         mark_media_generation_submission_ambiguous,
         mark_media_generation_submission_failed,
         mark_minimax_sync_provider_accepted,
@@ -28119,6 +28238,13 @@ async def _generate_image_minimax_durable(
                 "brand_position": brand_position,
                 "brand_scale": brand_scale,
                 "aspect_ratio": aspect_ratio,
+                "execution_strategy": execution_strategy,
+                "allow_degraded_fallback": allow_degraded_fallback,
+                "runtime_managed_completion": bool(typed),
+                "deliverable_request_id": (
+                    str(deliverable_request_id) if deliverable_request_id else None
+                ),
+                "expected_overlay_blocks_sha256": expected_overlay_blocks_sha256,
                 "provider_size": agent_plan_size or provider_size,
                 "sanitize_generated_background": sanitize_generated_background,
                 **brand_metadata,
@@ -28223,6 +28349,26 @@ async def _generate_image_minimax_durable(
         )
         if outcome.status == "succeeded":
             summary = f"✅ Image generated and durably delivered: {save_path}"
+            try:
+                completed_task = await find_media_generation_task_by_id(
+                    agent_id=agent_id,
+                    record_id=record_id,
+                    modality="image",
+                )
+            except Exception:
+                # Delivery already succeeded. Receipt projection is read-only
+                # and must not demote a settled task into pending; formal
+                # artifact acceptance will still fail closed if facts are absent.
+                logger.exception(
+                    "[GenerateImage] completed task receipt projection failed record_id={}",
+                    record_id,
+                )
+                completed_task = None
+            receipt_metadata = (
+                _image_runtime_receipt_metadata(completed_task)
+                if completed_task is not None
+                else {}
+            )
             return _minimax_tool_result(
                 summary,
                 typed=typed,
@@ -28234,6 +28380,15 @@ async def _generate_image_minimax_durable(
                 model=model,
                 tier=tier,
                 provider=provider,
+                runtime_metadata={
+                    **_managed_image_async_metadata(
+                        record_id=record_id,
+                        state="succeeded",
+                        pending=False,
+                        provider=provider,
+                    ),
+                    **receipt_metadata,
+                },
             )
         if outcome.status == "compensated":
             summary = (
@@ -28276,7 +28431,7 @@ async def _generate_image_minimax_durable(
         return _minimax_tool_result(
             summary,
             typed=typed,
-            status="unknown",
+            status="pending",
             error_code="media_image_delivery_pending",
             agent_id=agent_id,
             modality="image",
@@ -28284,6 +28439,12 @@ async def _generate_image_minimax_durable(
             model=model,
             tier=tier,
             provider=provider,
+            runtime_metadata=_managed_image_async_metadata(
+                record_id=record_id,
+                state=str(outcome.status or "processing"),
+                pending=True,
+                provider=provider,
+            ),
         )
     except asyncio.CancelledError as exc:
         await _complete_media_cancellation_transition(
@@ -28367,7 +28528,7 @@ async def _generate_image_minimax_durable(
             return _minimax_tool_result(
                 summary,
                 typed=typed,
-                status="unknown",
+                status="pending",
                 error_code="media_image_recovery_pending",
                 agent_id=agent_id,
                 modality="image",
@@ -28375,6 +28536,12 @@ async def _generate_image_minimax_durable(
                 model=model,
                 tier=tier,
                 provider=provider,
+                runtime_metadata=_managed_image_async_metadata(
+                    record_id=record_id,
+                    state="asset_recovery_pending",
+                    pending=True,
+                    provider=provider,
+                ),
             )
         if provider_response_accepted:
             summary = (
@@ -28384,7 +28551,7 @@ async def _generate_image_minimax_durable(
             return _minimax_tool_result(
                 summary,
                 typed=typed,
-                status="unknown",
+                status="pending",
                 error_code="media_image_acceptance_repair_pending",
                 agent_id=agent_id,
                 modality="image",
@@ -28392,6 +28559,12 @@ async def _generate_image_minimax_durable(
                 model=model,
                 tier=tier,
                 provider=provider,
+                runtime_metadata=_managed_image_async_metadata(
+                    record_id=record_id,
+                    state="acceptance_repair_pending",
+                    pending=True,
+                    provider=provider,
+                ),
             )
         if provider_request_started and not deterministic_rejection:
             summary = (
@@ -28544,6 +28717,117 @@ async def _get_minimax_tenant_uuid(agent_id: uuid.UUID) -> uuid.UUID:
         return uuid.UUID(str(tenant_id))
     except (TypeError, ValueError) as exc:
         raise MinimaxBillingContextError("Media billing context is invalid. No provider request was made.") from exc
+
+
+@dataclass(frozen=True)
+class _FormalPosterCopyContract:
+    request_id: uuid.UUID
+    blocks: tuple[dict[str, str], ...]
+    blocks_sha256: str | None
+    execution_strategy: str
+    allow_degraded_fallback: bool
+
+
+async def _validate_formal_poster_copy_contract(
+    *,
+    tenant_id: uuid.UUID,
+    agent_id: uuid.UUID,
+    session_id: str,
+    save_path: str,
+    overlay_text: str,
+    overlay_blocks: tuple[dict[str, str], ...],
+    execution_strategy: str,
+    allow_degraded_fallback: bool,
+    formal_request_id: str | uuid.UUID | None = None,
+) -> _FormalPosterCopyContract | None:
+    """Bind formal poster copy to the persisted request before provider spend."""
+
+    normalized_path = str(save_path or "").strip().replace("\\", "/")
+    path_parts = tuple(part for part in normalized_path.split("/") if part)
+    scoped_request_id = str(
+        formal_request_id or deliverable_request_scope_id.get() or ""
+    ).strip()
+    if not scoped_request_id:
+        # The deliverables namespace is server-owned.  A model may choose a
+        # normal workspace image path, but it must never manufacture a formal
+        # request identity in the filename and thereby bypass the persisted
+        # exact-copy contract.  Reject before Credits or provider submission.
+        if path_parts[:2] == ("workspace", "deliverables"):
+            from app.services.media_assets import MediaContractError
+
+            raise MediaContractError(
+                "Formal deliverable output namespace requires trusted Runtime scope"
+            )
+        return None
+    from app.services.media_assets import MediaContractError
+
+    try:
+        request_id = uuid.UUID(scoped_request_id)
+        parsed_session_id = uuid.UUID(str(session_id))
+    except (TypeError, ValueError) as exc:
+        raise MediaContractError(
+            "Formal deliverable Runtime scope has no valid request/session identity"
+        ) from exc
+
+    from app.models.deliverable import DeliverableRequest
+    from app.services.poster_contract import (
+        poster_exact_copy_contract,
+        poster_execution_policy,
+    )
+
+    async with async_session() as db:
+        result = await db.execute(
+            select(DeliverableRequest).where(
+                DeliverableRequest.id == request_id,
+                DeliverableRequest.tenant_id == tenant_id,
+                DeliverableRequest.agent_id == agent_id,
+                DeliverableRequest.session_id == parsed_session_id,
+            )
+        )
+        request = result.scalar_one_or_none()
+    if request is None:
+        raise MediaContractError(
+            "Formal deliverable image path is not owned by this tenant, Agent, and session"
+        )
+    if request.work_type != "poster":
+        return None
+
+    expected_prefix = ("workspace", "deliverables", str(request.id))
+    if (
+        path_parts[:3] != expected_prefix
+        or len(path_parts) < 4
+        or any(part in {".", ".."} for part in path_parts)
+        or not path_parts[-1].lower().endswith((".png", ".jpg", ".jpeg"))
+    ):
+        raise MediaContractError(
+            "Formal poster output must stay under its persisted deliverable request directory"
+        )
+
+    expected_blocks, expected_digest = poster_exact_copy_contract(request.spec)
+    if overlay_text:
+        raise MediaContractError(
+            "Formal poster exact copy must use the persisted overlay_blocks contract"
+        )
+    if overlay_blocks != expected_blocks:
+        raise MediaContractError(
+            "Formal poster overlay_blocks do not match the persisted exact-copy contract"
+        )
+    expected_policy = poster_execution_policy(request.spec)
+    if execution_strategy != expected_policy.execution_strategy:
+        raise MediaContractError(
+            "Formal poster execution strategy does not match the persisted policy"
+        )
+    if allow_degraded_fallback is not expected_policy.allow_degraded_fallback:
+        raise MediaContractError(
+            "Formal poster fallback authorization does not match the persisted policy"
+        )
+    return _FormalPosterCopyContract(
+        request_id=request.id,
+        blocks=expected_blocks,
+        blocks_sha256=expected_digest,
+        execution_strategy=expected_policy.execution_strategy,
+        allow_degraded_fallback=expected_policy.allow_degraded_fallback,
+    )
 
 
 async def _check_minimax_credit_amount(tenant_id: uuid.UUID, credits: int) -> None:
@@ -31276,6 +31560,291 @@ async def _generate_video_minimax(
     )
 
 
+def _image_runtime_receipt_metadata(task: object) -> dict[str, object]:
+    """Project the formal-poster identity from one durable image task."""
+
+    request_metadata = getattr(task, "request_metadata", None)
+    request_metadata = (
+        dict(request_metadata) if isinstance(request_metadata, Mapping) else {}
+    )
+    last_response = getattr(task, "last_response", None)
+    last_response = dict(last_response) if isinstance(last_response, Mapping) else {}
+    media_contract = last_response.get("_astra_media_contract")
+    media_contract = (
+        dict(media_contract) if isinstance(media_contract, Mapping) else {}
+    )
+    request_id = str(
+        media_contract.get("deliverable_request_id")
+        or request_metadata.get("deliverable_request_id")
+        or ""
+    ).strip()
+    expected_digest = str(
+        media_contract.get("expected_overlay_blocks_sha256")
+        or request_metadata.get("expected_overlay_blocks_sha256")
+        or ""
+    ).strip()
+    receipt: dict[str, object] = {}
+    if request_id:
+        receipt["deliverable_request_id"] = request_id
+    if expected_digest:
+        receipt["expected_overlay_blocks_sha256"] = expected_digest
+    for field in (
+        "execution_strategy",
+        "allow_degraded_fallback",
+        "layout_version",
+        "layout_bounds_verified",
+        "content_left",
+        "content_top",
+        "content_right",
+        "content_bottom",
+        "safe_margin_x",
+        "safe_margin_y",
+        "source_width",
+        "source_height",
+        "output_width",
+        "output_height",
+    ):
+        if field in media_contract:
+            receipt[field] = media_contract[field]
+        elif field in request_metadata:
+            receipt[field] = request_metadata[field]
+    return receipt
+
+
+async def _check_image_generation(
+    agent_id: uuid.UUID,
+    arguments: dict,
+    *,
+    typed: bool = False,
+) -> ToolExecutionOutcome | str:
+    """Reconcile one accepted image without re-submitting a provider request."""
+
+    task_record_id = str(arguments.get("task_record_id") or "").strip()
+    if not task_record_id:
+        return _minimax_tool_result(
+            "❌ Image status checking requires task_record_id.",
+            typed=typed,
+            status="failed",
+            error_code="invalid_tool_arguments",
+            agent_id=agent_id,
+            modality="image_check",
+        )
+    try:
+        record_id = uuid.UUID(task_record_id)
+    except ValueError:
+        return _minimax_tool_result(
+            "❌ Invalid image task_record_id.",
+            typed=typed,
+            status="failed",
+            error_code="invalid_tool_arguments",
+            agent_id=agent_id,
+            modality="image_check",
+        )
+
+    durable_task = None
+    try:
+        from app.services.media_generation import (
+            find_media_generation_task_by_id,
+            reconcile_minimax_sync_media_task,
+        )
+
+        durable_task = await find_media_generation_task_by_id(
+            agent_id=agent_id,
+            record_id=record_id,
+            modality="image",
+        )
+        if durable_task is None:
+            return _minimax_tool_result(
+                "❌ Image task is unavailable in this Agent workspace.",
+                typed=typed,
+                status="failed",
+                error_code="managed_image_task_unavailable",
+                agent_id=agent_id,
+                modality="image_check",
+                record_id=record_id,
+            )
+
+        outcome = await reconcile_minimax_sync_media_task(
+            durable_task.id,
+            deliver_completion=False,
+        )
+        refreshed_task = await find_media_generation_task_by_id(
+            agent_id=agent_id,
+            record_id=record_id,
+            modality="image",
+        )
+        if refreshed_task is not None:
+            durable_task = refreshed_task
+        provider = str(getattr(durable_task, "provider", None) or "minimax")
+        model = str(getattr(durable_task, "model", None) or "") or None
+        request_metadata = getattr(durable_task, "request_metadata", None)
+        request_metadata = (
+            dict(request_metadata)
+            if isinstance(request_metadata, Mapping)
+            else {}
+        )
+        tier = str(request_metadata.get("tier") or "") or None
+        receipt_metadata = _image_runtime_receipt_metadata(durable_task)
+
+        if outcome.status == "succeeded":
+            output_path = outcome.output_path or str(
+                getattr(durable_task, "output_path", "") or ""
+            )
+            return _minimax_tool_result(
+                f"✅ Image is ready and durably delivered: {output_path}",
+                typed=typed,
+                status="succeeded",
+                agent_id=agent_id,
+                modality="image_check",
+                record_id=durable_task.id,
+                output_path=output_path,
+                model=model,
+                tier=tier,
+                provider=provider,
+                runtime_metadata={
+                    **_managed_image_async_metadata(
+                        record_id=durable_task.id,
+                        state="succeeded",
+                        pending=False,
+                        provider=provider,
+                    ),
+                    **receipt_metadata,
+                },
+            )
+        if outcome.status == "compensated":
+            return _minimax_tool_result(
+                "❌ The accepted image could not be recovered. Credits were refunded.",
+                typed=typed,
+                status="failed",
+                error_code="media_image_compensated",
+                agent_id=agent_id,
+                modality="image_check",
+                record_id=durable_task.id,
+                model=model,
+                tier=tier,
+                provider=provider,
+                runtime_metadata=_managed_image_async_metadata(
+                    record_id=durable_task.id,
+                    state="compensated",
+                    pending=False,
+                    provider=provider,
+                ),
+            )
+        if outcome.status == "asset_delivery_failed":
+            return _minimax_tool_result(
+                "❌ The provider completed the image, but the local artifact delivery contract failed. Do not submit again.",
+                typed=typed,
+                status="failed",
+                error_code="media_image_asset_delivery_failed",
+                agent_id=agent_id,
+                modality="image_check",
+                record_id=durable_task.id,
+                model=model,
+                tier=tier,
+                provider=provider,
+                runtime_metadata=_managed_image_async_metadata(
+                    record_id=durable_task.id,
+                    state="asset_delivery_failed",
+                    pending=False,
+                    provider=provider,
+                ),
+            )
+        if outcome.status == "failed":
+            return _minimax_tool_result(
+                _safe_media_failure_message(
+                    "Image delivery",
+                    "platform media",
+                    outcome.error,
+                ),
+                typed=typed,
+                status="failed",
+                error_code="managed_image_delivery_failed",
+                agent_id=agent_id,
+                modality="image_check",
+                record_id=durable_task.id,
+                model=model,
+                tier=tier,
+                provider=provider,
+                runtime_metadata=_managed_image_async_metadata(
+                    record_id=durable_task.id,
+                    state="failed",
+                    pending=False,
+                    provider=provider,
+                ),
+            )
+
+        return _minimax_tool_result(
+            "⏳ Image delivery is still being finalized. The system will continue checking automatically.",
+            typed=typed,
+            status="pending",
+            agent_id=agent_id,
+            modality="image_check",
+            record_id=durable_task.id,
+            model=model,
+            tier=tier,
+            provider=provider,
+            runtime_metadata={
+                **_managed_image_async_metadata(
+                    record_id=durable_task.id,
+                    state=str(outcome.status or "processing"),
+                    pending=True,
+                    provider=provider,
+                ),
+                **receipt_metadata,
+            },
+        )
+    except Exception as exc:
+        await _record_minimax_tool_product_issue(
+            agent_id,
+            "image",
+            error=exc,
+            model=(
+                str(getattr(durable_task, "model", None) or "") or None
+                if durable_task is not None
+                else None
+            ),
+            tier=None,
+            recovery_path=f"media-task:{record_id}",
+            provider=str(
+                getattr(durable_task, "provider", None) or "minimax"
+            ),
+        )
+        _log_minimax_operation_failure("ManagedImageCheck", exc)
+        if durable_task is not None:
+            provider = str(getattr(durable_task, "provider", None) or "minimax")
+            return _minimax_tool_result(
+                "⏳ Image delivery reconciliation was temporarily unavailable. The durable worker and Runtime will check again automatically.",
+                typed=typed,
+                status="pending",
+                agent_id=agent_id,
+                modality="image_check",
+                record_id=durable_task.id,
+                model=str(getattr(durable_task, "model", None) or "") or None,
+                tier=None,
+                provider=provider,
+                runtime_metadata=_managed_image_async_metadata(
+                    record_id=durable_task.id,
+                    state="check_error",
+                    pending=True,
+                    provider=provider,
+                ),
+            )
+        return _minimax_tool_result(
+            _safe_media_failure_message(
+                "Image status check",
+                "platform media",
+                exc,
+            ),
+            typed=typed,
+            status="failed",
+            error_code="managed_image_check_failed",
+            agent_id=agent_id,
+            modality="image_check",
+            record_id=record_id,
+            retryable=True,
+        )
+
+
 async def _check_video_minimax(
     agent_id: uuid.UUID,
     ws: Path,
@@ -32301,6 +32870,21 @@ async def _generate_image(
             agent_id=agent_id,
             modality="image",
         )
+    from app.services.media_provider_routing import normalize_image_execution_strategy
+
+    try:
+        execution_strategy = normalize_image_execution_strategy(
+            arguments.get("execution_strategy")
+        )
+    except ValueError as exc:
+        return _minimax_tool_result(
+            f"❌ Image execution strategy is invalid: {exc}",
+            typed=typed,
+            status="failed",
+            error_code="invalid_tool_arguments",
+            agent_id=agent_id,
+            modality="image",
+        )
     allow_degraded_fallback = _allow_degraded_media_fallback(arguments)
 
     size = arguments.get("size", "1024x1024")
@@ -32446,6 +33030,7 @@ async def _generate_image(
     base_url = config.get("base_url", "")
     minimax_tier: str | None = None
     minimax_tenant_id: uuid.UUID | None = None
+    formal_poster_contract: _FormalPosterCopyContract | None = None
     minimax_credit_cost = 0
     image_bytes = b""
 
@@ -32486,7 +33071,29 @@ async def _generate_image(
         minimax_credit_cost = minimax_image_credits(model or "image-01", images=1)
         try:
             minimax_tenant_id = await _get_minimax_tenant_uuid(agent_id)
+            formal_poster_contract = await _validate_formal_poster_copy_contract(
+                tenant_id=minimax_tenant_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                save_path=save_path,
+                overlay_text=overlay_text,
+                overlay_blocks=overlay_blocks,
+                execution_strategy=execution_strategy,
+                allow_degraded_fallback=allow_degraded_fallback,
+                formal_request_id=deliverable_request_scope_id.get(),
+            )
             await _check_minimax_credit_amount(minimax_tenant_id, minimax_credit_cost)
+        except MediaContractError as exc:
+            return _minimax_tool_result(
+                f"❌ Formal poster copy contract is invalid: {exc}",
+                typed=typed,
+                status="failed",
+                error_code="deliverable_poster_copy_contract_mismatch",
+                agent_id=agent_id,
+                modality="image",
+                model=model,
+                tier=minimax_tier,
+            )
         except MinimaxBillingContextError as exc:
             return _minimax_tool_result(
                 f"❌ {exc}",
@@ -32523,16 +33130,17 @@ async def _generate_image(
         assert minimax_tenant_id is not None
         from app.services.llm.load_balancer import NoCredentialAvailable
         from app.services.media_provider_routing import (
-            DEFAULT_MEDIA_PROVIDER_ORDER,
+            media_provider_order_for_image_strategy,
             prepare_media_provider,
         )
 
+        provider_order = media_provider_order_for_image_strategy(execution_strategy)
         provider_errors: list[str] = []
         degraded_fallback_blocked = False
-        for index, candidate in enumerate(DEFAULT_MEDIA_PROVIDER_ORDER):
-            if candidate == "minimax" and not allow_degraded_fallback:
+        for index, candidate in enumerate(provider_order):
+            if index > 0 and not allow_degraded_fallback:
                 degraded_fallback_blocked = True
-                provider_errors.append("minimax:degraded_confirmation_required")
+                provider_errors.append(f"{candidate}:alternative_route_confirmation_required")
                 break
             try:
                 prepared = await prepare_media_provider(
@@ -32582,9 +33190,21 @@ async def _generate_image(
                     typed=typed,
                     provider=prepared.provider,
                     provider_size=prepared.size,
+                    execution_strategy=execution_strategy,
+                    allow_degraded_fallback=allow_degraded_fallback,
                     allow_safe_fallback=(
                         allow_degraded_fallback
-                        and index < len(DEFAULT_MEDIA_PROVIDER_ORDER) - 1
+                        and index < len(provider_order) - 1
+                    ),
+                    deliverable_request_id=(
+                        formal_poster_contract.request_id
+                        if formal_poster_contract
+                        else None
+                    ),
+                    expected_overlay_blocks_sha256=(
+                        formal_poster_contract.blocks_sha256
+                        if formal_poster_contract
+                        else None
                     ),
                 )
             except MediaProviderSafeFallback as exc:
@@ -32597,7 +33217,7 @@ async def _generate_image(
         )
         return _minimax_tool_result(
             (
-                "⚠️ Formal image quality is temporarily unavailable. The emergency-quality route was not "
+                "⚠️ The selected image execution strategy is temporarily unavailable. The alternate route was not "
                 "authorized, so no provider task was submitted and no Credits were consumed."
                 if degraded_fallback_blocked
                 else "❌ Image generation is temporarily unavailable. No provider accepted the request and no Credits were consumed."
@@ -32609,6 +33229,13 @@ async def _generate_image(
                 if degraded_fallback_blocked
                 else "media_image_provider_unavailable"
             ),
+            runtime_metadata={
+                "route_error_code": (
+                    "media_image_alternate_route_confirmation_required"
+                    if degraded_fallback_blocked
+                    else "media_image_provider_unavailable"
+                )
+            },
             agent_id=agent_id,
             modality="image",
             model=model,

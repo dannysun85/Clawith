@@ -91,6 +91,7 @@ from app.services.media_capabilities import (
 )
 from app.services.media_provider_routing import (
     MINIMAX_PROVIDER,
+    media_provider_order_for_image_strategy,
     media_provider_order_for_modality,
 )
 from app.services.modalities import canonicalize_modality, model_supports_modality
@@ -483,8 +484,15 @@ def _media_route_out(
         if modality in provider_state.verified_modalities.get(provider, set())
     ]
     capability_status, reason_code, recommended_action = (
-        media_route_capability_status(modality, available_providers)
+        media_route_capability_status(
+            modality,
+            available_providers,
+            provider_plan_tiers=provider_state.provider_plan_tiers,
+        )
     )
+    # Preserve the legacy route-baseline fields during rolling deployment.
+    # Strategy-specific availability lives in execution_strategies; actual
+    # provider/model remains authoritative only in task receipts.
     primary_provider = (
         MINIMAX_PROVIDER
         if modality == "music"
@@ -492,11 +500,49 @@ def _media_route_out(
         if provider_order
         else ""
     )
+    fallback_provider = MINIMAX_PROVIDER
     degraded_providers = (
         [MINIMAX_PROVIDER]
         if modality in {"image", "video"}
         else []
     )
+    strategy_orders = (
+        (
+            ("commercial_quality", media_provider_order_for_image_strategy("commercial_quality")),
+            ("creative_exploration", media_provider_order_for_image_strategy("creative_exploration")),
+        )
+        if modality == "image"
+        else (("default", provider_order),)
+    )
+    execution_strategies = []
+    for strategy, strategy_order in strategy_orders:
+        strategy_available = [
+            provider for provider in strategy_order if provider in available_providers
+        ]
+        preferred_provider = strategy_order[0] if strategy_order else ""
+        preferred_ready = bool(
+            preferred_provider and preferred_provider in strategy_available
+        )
+        alternate_provider = next(
+            (
+                provider
+                for provider in strategy_order[1:]
+                if provider in strategy_available
+            ),
+            "",
+        )
+        execution_strategies.append(
+            {
+                "strategy": strategy,
+                "provider_order": list(strategy_order),
+                "available_providers": strategy_available,
+                "preferred_provider": preferred_provider,
+                "alternate_provider": alternate_provider,
+                "preferred_ready": preferred_ready,
+                "executable_without_alternate_confirmation": preferred_ready,
+                "alternate_confirmation_required": bool(alternate_provider),
+            }
+        )
     pool_available = bool(available_providers)
     tool_enabled = bool(tool and tool.enabled)
     provider_readiness = []
@@ -547,8 +593,10 @@ def _media_route_out(
         tier=tier,
         provider="automatic",
         routing_mode="automatic_failover",
+        route_semantics="account_pool_readiness_only",
         provider_order=list(provider_order),
         available_providers=available_providers,
+        execution_strategies=execution_strategies,
         primary_provider=primary_provider,
         degraded_providers=degraded_providers,
         capability_status=capability_status,
@@ -558,7 +606,7 @@ def _media_route_out(
         readiness_status=readiness_status,
         quality_evidence_status="not_reviewed",
         provider_readiness=provider_readiness,
-        fallback_provider=MINIMAX_PROVIDER,
+        fallback_provider=fallback_provider,
         tool_name=MINIMAX_MEDIA_TOOL_NAMES[modality],
         model=profile.model,
         settings=settings,

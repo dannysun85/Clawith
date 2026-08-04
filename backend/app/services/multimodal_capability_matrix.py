@@ -75,13 +75,13 @@ CAPABILITY_MATRIX: tuple[CapabilitySpec, ...] = (
         label="图片/海报",
         route_policy="Volcengine Agent Plan image -> MiniMax fallback",
         entrypoint_skills=("brand-safe-media",),
-        entrypoint_tools=("generate_image_minimax",),
-        expected_default_tools=("generate_image_minimax",),
+        entrypoint_tools=("generate_image_minimax", "check_image_generation"),
+        expected_default_tools=("generate_image_minimax", "check_image_generation"),
         specialist_requirements=(
             SpecialistRequirement(
                 "douyin-operator",
                 skills=("brand-safe-media", "volcengine-seedream-commercial"),
-                tools=("generate_image_minimax",),
+                tools=("generate_image_minimax", "check_image_generation"),
             ),
         ),
     ),

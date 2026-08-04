@@ -46,6 +46,7 @@ from app.services.agent_plan_selection import (
     resolve_agent_plan_selection,
 )
 from app.services.entitlements import get_tenant_entitlements
+from app.services.customer_projection import project_private_reasoning
 
 router = APIRouter(prefix="/api/agents", tags=["chat-sessions"])
 
@@ -1140,10 +1141,12 @@ async def get_session_messages(
                 entry["toolArgs"] = data.get("args") or data.get("arguments")
                 entry["toolStatus"] = data.get("status", "done")
                 entry["toolResult"] = data.get("result", "")
-                entry["toolThinking"] = data.get("reasoning_content", "")
+                entry["toolThinking"] = project_private_reasoning(
+                    data.get("reasoning_content")
+                )
                 entry["toolCallId"] = data.get("tool_call_id") or ""
         if getattr(message, "thinking", None):
-            entry["thinking"] = message.thinking
+            entry["thinking"] = project_private_reasoning(message.thinking)
         if sender_name:
             entry["sender_name"] = sender_name
         if message.participant_id:

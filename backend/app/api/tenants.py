@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 from PIL import Image
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func as sqla_func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -28,6 +28,7 @@ from app.models.tenant import Tenant
 from app.models.user import User
 from app.services.storage import ensure_local_path, get_storage_backend, normalize_storage_key
 from app.services.subscription_lifecycle import ensure_free_subscription_for_tenant
+from app.services.platform_service import platform_service
 
 router = APIRouter(prefix="/tenants", tags=["tenants"])
 
@@ -65,6 +66,13 @@ class TenantUpdate(BaseModel):
     sso_enabled: bool | None = None
     sso_domain: str | None = None
     a2a_async_enabled: bool | None = None
+
+    @field_validator("sso_domain")
+    @classmethod
+    def validate_sso_domain(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return platform_service.normalize_tenant_sso_domain(value)
 
 
 def _validated_tenant_name(name: str) -> str:
@@ -480,11 +488,31 @@ async def resolve_tenant_by_domain(
     sso_domain is stored as a full URL (e.g. "https://acme.astra.ai" or "http://1.2.3.4:3009").
     The incoming `domain` parameter is the host (without protocol).
 
-    Lookup precedence:
-    1. Exact match on tenant.sso_domain ending with the host (strips protocol)
-    2. Extract slug from "{slug}.astra.ai" and match tenant.slug
+    Only an explicitly configured tenant.sso_domain may match.  Synthetic
+    ``{slug}.astra.ai`` hostnames are never inferred from a database slug.
     """
-    normalized_domain = domain.strip().lower().rstrip(".")
+    raw_domain = str(domain or "").strip()
+    parsed_domain = urlsplit(f"//{raw_domain}")
+    if (
+        not raw_domain
+        or parsed_domain.username
+        or parsed_domain.password
+        or parsed_domain.path
+        or parsed_domain.query
+        or parsed_domain.fragment
+        or not parsed_domain.hostname
+    ):
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    try:
+        parsed_port = parsed_domain.port
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Tenant not found") from exc
+    normalized_hostname = parsed_domain.hostname.lower().rstrip(".")
+    normalized_domain = (
+        f"[{normalized_hostname}]" if ":" in normalized_hostname else normalized_hostname
+    )
+    if parsed_port is not None:
+        normalized_domain = f"{normalized_domain}:{parsed_port}"
     public_base_url = str(get_settings().PUBLIC_BASE_URL or "").strip()
     parsed_public_url = urlsplit(
         public_base_url if "://" in public_base_url else f"//{public_base_url}"
@@ -496,49 +524,26 @@ async def resolve_tenant_by_domain(
         # network error while retaining 404 for unknown tenant-specific hosts.
         return None
 
-    domain = normalized_domain
-    tenant = None
-
-    from app.models.system_settings import SystemSetting
-    setting_result = await db.execute(
-        select(SystemSetting).where(SystemSetting.key == "sso_custom_domain_redirect_enabled")
-    )
-    setting_s = setting_result.scalar_one_or_none()
-    sso_redirect_enabled = setting_s.value.get("enabled", True) if setting_s else True
-
-    if sso_redirect_enabled:
-        # 1. Match by stripping protocol from stored sso_domain
-        # sso_domain = "https://acme.astra.ai" → compare against "acme.astra.ai"
-        for proto in ("https://", "http://"):
-            result = await db.execute(
-                select(Tenant).where(Tenant.sso_domain == f"{proto}{domain}")
-            )
-            tenant = result.scalar_one_or_none()
-            if tenant:
-                break
-
-        # 2. Try without port (e.g. domain = "1.2.3.4:3009" → try "1.2.3.4")
-        if not tenant and ":" in domain:
-            domain_no_port = domain.split(":")[0]
-            for proto in ("https://", "http://"):
-                result = await db.execute(
-                    select(Tenant).where(Tenant.sso_domain.like(f"{proto}{domain_no_port}%"))
-                )
-                tenant = result.scalar_one_or_none()
-                if tenant:
-                    break
-
-    # 3. Fallback: extract slug from subdomain pattern
-    if not tenant:
-        import re
-        m = re.match(r"^([a-z0-9][a-z0-9\-]*[a-z0-9])\.astra\.ai$", domain.lower())
-        if m:
-            slug = m.group(1)
-            result = await db.execute(select(Tenant).where(Tenant.slug == slug))
-            tenant = result.scalar_one_or_none()
-
-    if not tenant or not tenant.is_active or not tenant.sso_enabled:
+    if not await platform_service.is_sso_custom_domain_redirect_enabled(db):
         raise HTTPException(status_code=404, detail="Tenant not found or not active or SSO not enabled")
+
+    exact_origins = (
+        f"https://{normalized_domain}",
+        f"http://{normalized_domain}",
+    )
+    tenant_result = await db.execute(
+        select(Tenant).where(
+            sqla_func.lower(Tenant.sso_domain).in_(exact_origins),
+            Tenant.is_active.is_(True),
+            Tenant.sso_enabled.is_(True),
+        )
+    )
+    matching_tenants = tenant_result.scalars().all()
+    if len(matching_tenants) != 1:
+        # Duplicate origins are configuration corruption. Never select an
+        # arbitrary tenant when browser identity is at stake.
+        raise HTTPException(status_code=404, detail="Tenant not found or not active or SSO not enabled")
+    tenant = matching_tenants[0]
 
     return {
         "id": tenant.id,

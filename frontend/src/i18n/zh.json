@@ -453,6 +453,7 @@
             "askAboutFile": "关于 {{name}} 的问题...",
             "thinking": "思考中...",
             "thinkingLabel": "思考中",
+            "privateReasoning": "内部推理不会向客户展示；工具执行记录仍可核验。",
             "thoughtLabel": "已思考",
             "collapseSessions": "折叠会话列表",
             "showSessions": "显示聊天会话",

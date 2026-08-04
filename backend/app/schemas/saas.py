@@ -125,15 +125,30 @@ class MediaProviderReadinessOut(BaseModel):
     generation_receipt: dict[str, object] | None = None
 
 
+class MediaExecutionStrategyRouteOut(BaseModel):
+    """Account-pool readiness for one provider-neutral execution strategy."""
+
+    strategy: str
+    provider_order: list[str]
+    available_providers: list[str]
+    preferred_provider: str
+    alternate_provider: str
+    preferred_ready: bool
+    executable_without_alternate_confirmation: bool
+    alternate_confirmation_required: bool
+
+
 class MediaRouteOut(BaseModel):
-    """Effective platform media route plus MiniMax fallback profile."""
+    """Platform account readiness; actual execution lives only in task receipts."""
 
     modality: str
     tier: str
     provider: str
     routing_mode: str
+    route_semantics: str
     provider_order: list[str]
     available_providers: list[str]
+    execution_strategies: list[MediaExecutionStrategyRouteOut]
     primary_provider: str
     degraded_providers: list[str]
     capability_status: str

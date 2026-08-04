@@ -267,6 +267,56 @@ def test_document_reader_extracts_pptx_slides_without_slicing(
     assert "--- Slide 2 ---\nSecond slide" in result.content
 
 
+def test_document_reader_identifies_image_only_pptx(tmp_path: Path) -> None:
+    from PIL import Image
+    from pptx import Presentation
+    from pptx.util import Inches
+
+    image_path = tmp_path / "poster.png"
+    Image.new("RGB", (320, 480), color=(45, 35, 95)).save(image_path)
+    presentation = Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+    slide.shapes.add_picture(str(image_path), Inches(0), Inches(0))
+    presentation.save(tmp_path / "image-only.pptx")
+
+    result = agent_tools._read_document_sync(tmp_path, "image-only.pptx")
+
+    assert result.ok is True
+    assert result.content == (
+        "(PPT contains 1 image-only slide(s); no extractable text. "
+        "Use visual rendering/preview to verify it.)"
+    )
+
+
+def test_document_reader_reports_image_only_pages_in_mixed_pptx(
+    tmp_path: Path,
+) -> None:
+    from PIL import Image
+    from pptx import Presentation
+    from pptx.util import Inches
+
+    image_path = tmp_path / "poster.png"
+    Image.new("RGB", (320, 480), color=(45, 35, 95)).save(image_path)
+    presentation = Presentation()
+    text_slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+    text_box = text_slide.shapes.add_textbox(
+        Inches(1),
+        Inches(1),
+        Inches(5),
+        Inches(1),
+    )
+    text_box.text = "Executive summary"
+    image_slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+    image_slide.shapes.add_picture(str(image_path), Inches(0), Inches(0))
+    presentation.save(tmp_path / "mixed.pptx")
+
+    result = agent_tools._read_document_sync(tmp_path, "mixed.pptx")
+
+    assert result.ok is True
+    assert "--- Slide 1 ---\nExecutive summary" in result.content
+    assert "also contains 1 image-only slide(s)" in result.content
+
+
 @pytest.mark.asyncio
 async def test_document_process_boundary_preserves_structured_result(
     tmp_path: Path,

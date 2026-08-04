@@ -27,6 +27,7 @@ from app.services.deliverable_executions import (
 )
 from app.services.entitlements import get_tenant_entitlements
 from app.services.media_capabilities import get_agent_media_capabilities
+from app.services.media_provider_routing import media_provider_order_for_image_strategy
 from app.services.minimax_media_profiles import resolve_minimax_media_profile
 from app.services.model_router import resolve_route
 from app.services.provider_pricing import minimax_image_credits, minimax_video_credits
@@ -503,6 +504,17 @@ def _presentation_visual_policy(
 def build_deliverable_prompt(request: DeliverableRequest) -> str:
     """Build server-owned execution context; provider/model choice is intentionally absent."""
 
+    from app.services.poster_contract import (
+        poster_exact_copy_contract,
+        poster_execution_policy,
+    )
+
+    poster_copy_blocks, poster_copy_sha256 = (
+        poster_exact_copy_contract(request.spec)
+        if request.work_type == "poster"
+        else ((), None)
+    )
+
     contract = {
         "request_id": str(request.id),
         "work_type": request.work_type,
@@ -514,9 +526,23 @@ def build_deliverable_prompt(request: DeliverableRequest) -> str:
         "tier": request.tier,
         "approval_policy": request.approval_policy,
         "output_contract": request.output_contract,
+        "exact_copy_blocks": list(poster_copy_blocks),
+        "exact_copy_blocks_sha256": poster_copy_sha256,
     }
+    poster_policy = (
+        poster_execution_policy(request.spec)
+        if request.work_type == "poster"
+        else None
+    )
+    if poster_policy is not None:
+        contract["execution_policy"] = {
+            "execution_strategy": poster_policy.execution_strategy,
+            "allow_degraded_fallback": poster_policy.allow_degraded_fallback,
+        }
     allow_degraded_fallback = (
-        str((request.spec or {}).get("fallback_policy") or "primary_only")
+        poster_policy.allow_degraded_fallback
+        if poster_policy is not None
+        else str((request.spec or {}).get("fallback_policy") or "primary_only")
         == "allow_degraded"
     )
     allow_degraded_literal = str(allow_degraded_fallback).lower()
@@ -528,11 +554,17 @@ def build_deliverable_prompt(request: DeliverableRequest) -> str:
             f"{request.id}/. Create one polished commercial image with generate_image_minimax exactly once, "
             "using save_path='workspace/deliverables/"
             f"{request.id}/final.png', aspect_ratio=spec.aspect_ratio, and "
+            "execution_strategy='commercial_quality', and "
             f"allow_degraded_fallback={allow_degraded_literal}. The composition must match the "
-            "requested channel and style, use a clear visual hierarchy, and contain no generated words, "
+            "requested channel and style, use a clear visual hierarchy, reserve clean negative space for the "
+            "requested copy, and contain no generated words, "
             "captions, logos, watermarks, signatures, UI chrome, or placeholder text. If exact_copy is "
-            "non-empty, reserve clean negative space for that copy and report that deterministic typography "
-            "still needs composition; never ask the image model to spell exact copy. Call the generation "
+            "non-empty, pass DELIVERABLE_REQUEST.exact_copy_blocks unchanged as overlay_blocks in that same call; "
+            "the server will reject any mismatch before a paid provider request. The returned "
+            "PNG uses deterministic text composition, so never ask the image model to spell exact copy. The "
+            "returned "
+            "PNG is already the final deterministic composition, so never overlay the same copy again in HTML, "
+            "PDF, PPTX, or another image. Create only formats explicitly listed in output_contract. Call the generation "
             "Tool exactly once because it owns provider fallback and durable recovery. If no provider accepts "
             "the request, stop without retrying or claiming delivery. Do not read the binary image. The final "
             "response must report the exact versioned PNG workspace path returned by the Tool, and never claim "
@@ -903,6 +935,24 @@ async def preflight_workflow(
     capability_status = "available"
     next_action = "确认工作说明后，由平台按正式质量合同选择执行线路。"
 
+    if workflow.work_type == "poster":
+        from app.services.media_assets import MediaContractError, preflight_poster_layout
+        from app.services.poster_contract import poster_exact_copy_contract
+
+        try:
+            poster_blocks, _poster_digest = poster_exact_copy_contract(normalized_spec)
+        except MediaContractError:
+            poster_blocks = ()
+            reasons.append("poster_exact_copy_contract_invalid")
+        if poster_blocks:
+            try:
+                preflight_poster_layout(
+                    poster_blocks,
+                    aspect_ratio=str(normalized_spec.get("aspect_ratio") or ""),
+                )
+            except MediaContractError:
+                reasons.append("poster_layout_unfit")
+
     try:
         await resolve_route(tenant_id, normalized_tier, "text")
     except QuotaExceeded as exc:
@@ -930,6 +980,7 @@ async def preflight_workflow(
         if workflow.required_capability in {"image", "video"}
         else None
     )
+    media: list[dict[str, Any]] = []
     if media_modality is not None:
         entitlements = await get_tenant_entitlements(tenant_id)
         media = await get_agent_media_capabilities(
@@ -949,6 +1000,29 @@ async def preflight_workflow(
         else:
             capability_status = str(row.get("capability_status") or "available")
             next_action = str(row.get("next_action") or next_action)
+            if media_modality == "image" and "available_providers" in row:
+                strategy_order = media_provider_order_for_image_strategy(
+                    "commercial_quality"
+                )
+                available_providers = {
+                    str(provider or "").strip().lower()
+                    for provider in row.get("available_providers", [])
+                    if str(provider or "").strip()
+                }
+                preferred_ready = bool(
+                    strategy_order
+                    and strategy_order[0] in available_providers
+                )
+                strategy_ready = any(
+                    provider in available_providers
+                    for provider in strategy_order
+                )
+                if strategy_ready and not preferred_ready:
+                    capability_status = "degraded"
+                    next_action = (
+                        "正式工作流固定使用商用品质策略；当前只有备选图片线路，"
+                        "保持正式质量优先可等待首选线路，或明确允许备选线路。"
+                    )
             if (
                 capability_status == "degraded"
                 and normalized_spec.get("fallback_policy") != "allow_degraded"
@@ -974,12 +1048,49 @@ async def preflight_workflow(
         ):
             reasons.append("video_post_production_tool_unavailable")
 
+        if workflow.work_type == "video":
+            first_frame_row = next(
+                (item for item in media if item["modality"] == "image"),
+                None,
+            )
+            if first_frame_row is None or not first_frame_row.get("available"):
+                reasons.append("video_first_frame_image_capability_unavailable")
+                capability_status = "unavailable"
+            else:
+                strategy_order = media_provider_order_for_image_strategy(
+                    "commercial_quality"
+                )
+                available_providers = {
+                    str(provider or "").strip().lower()
+                    for provider in first_frame_row.get("available_providers", [])
+                    if str(provider or "").strip()
+                }
+                if not any(
+                    provider in available_providers for provider in strategy_order
+                ):
+                    reasons.append("video_first_frame_image_capability_unavailable")
+                    capability_status = "unavailable"
+                elif (
+                    strategy_order[0] not in available_providers
+                    and normalized_spec.get("fallback_policy") != "allow_degraded"
+                ):
+                    reasons.append("degraded_route_requires_confirmation")
+                    if capability_status == "available":
+                        capability_status = "degraded"
+            if not await _agent_tool_available(
+                db,
+                agent_id=agent_id,
+                tool_name="generate_image_minimax",
+            ):
+                reasons.append("video_first_frame_image_tool_unavailable")
+
     if workflow.launch_policy == "dry_run":
         reasons.append("workflow_execution_not_enabled")
     soft_reasons = {
         "workflow_execution_not_enabled",
         "degraded_route_requires_confirmation",
     }
+    reasons = list(dict.fromkeys(reasons))
     hard_reasons = [reason for reason in reasons if reason not in soft_reasons]
     return {
         "available": not hard_reasons,
@@ -1044,6 +1155,10 @@ async def prepare_deliverable_launch(
             "deliverable_invalid_status",
             f"Deliverable request cannot be launched from status {request.status}",
         )
+    # Prompt compilation performs exact-copy/font/layout validation. It must
+    # complete before status or launch ownership is mutated so a malformed
+    # persisted request cannot be left falsely marked as running.
+    prompt = build_deliverable_prompt(request)
     if request.launch_message_id is None:
         preflight = await preflight_workflow(
             db,
@@ -1078,7 +1193,7 @@ async def prepare_deliverable_launch(
         )
     return PreparedDeliverableLaunch(
         request=request,
-        prompt=build_deliverable_prompt(request),
+        prompt=prompt,
         execution=execution,
     )
 

@@ -127,6 +127,7 @@ def _execution(
     tool_name: str,
     artifact_type: str,
     path: str | None = None,
+    result_metadata: dict | None = None,
 ) -> AgentToolExecution:
     workspace_path = path or f"workspace/deliverables/{request.id}/result.{artifact_type}"
     return AgentToolExecution(
@@ -143,6 +144,7 @@ def _execution(
         status="succeeded",
         result_metadata={
             "artifact_refs": [f"workspace://{request.agent_id}/{workspace_path}"],
+            **(result_metadata or {}),
         },
     )
 
@@ -276,6 +278,94 @@ async def test_reconcile_accepts_request_scoped_generated_png(tmp_path) -> None:
     assert artifact.mime_type == "image/png"
     assert artifact.evaluation["verified"] is True
     assert artifact.evaluation["verification_level"] == "contract"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_rejects_poster_without_persisted_copy_receipt(tmp_path) -> None:
+    request = _poster_request()
+    request.spec["exact_copy"] = "量化交易平台\n立即体验"
+    storage = LocalStorageBackend(str(tmp_path))
+    png_path = f"workspace/deliverables/{request.id}/final.png"
+    await storage.write_bytes(agent_storage_key(request.agent_id, png_path), _png_bytes())
+    db = _Session(
+        [_execution(request, tool_name="generate_image_minimax", artifact_type="png", path=png_path)],
+        [],
+    )
+
+    result = await reconcile_runtime_deliverable_artifacts(
+        db,  # type: ignore[arg-type]
+        request=request,
+        run_id=request.agent_run_id,
+        storage=storage,
+    )
+
+    assert result.complete is False
+    assert result.invalid_types == ("png",)
+    assert dict(result.failure_codes)["png"] == "deliverable_poster_copy_receipt_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_accepts_poster_with_matching_persisted_copy_receipt(tmp_path) -> None:
+    from app.services.poster_contract import poster_exact_copy_contract
+
+    request = _poster_request()
+    request.spec["exact_copy"] = "量化交易平台\n立即体验"
+    _blocks, digest = poster_exact_copy_contract(request.spec)
+    storage = LocalStorageBackend(str(tmp_path))
+    png_path = f"workspace/deliverables/{request.id}/final.png"
+    await storage.write_bytes(agent_storage_key(request.agent_id, png_path), _png_bytes())
+    db = _Session(
+        [
+            _execution(
+                request,
+                tool_name="generate_image_minimax",
+                artifact_type="png",
+                path=png_path,
+                result_metadata={
+                    "deliverable_request_id": str(request.id),
+                    "expected_overlay_blocks_sha256": digest,
+                    "execution_strategy": "commercial_quality",
+                    "allow_degraded_fallback": False,
+                    "layout_version": "poster-v3",
+                    "layout_bounds_verified": True,
+                    "content_left": 200,
+                    "content_top": 180,
+                    "content_right": 1400,
+                    "content_bottom": 720,
+                    "safe_margin_x": 96,
+                    "safe_margin_y": 54,
+                    "source_width": 1600,
+                    "source_height": 900,
+                },
+            )
+        ],
+        [],
+    )
+
+    result = await reconcile_runtime_deliverable_artifacts(
+        db,  # type: ignore[arg-type]
+        request=request,
+        run_id=request.agent_run_id,
+        storage=storage,
+    )
+
+    assert result.complete is True
+    assert result.artifacts[0].evaluation["facts"] == {
+        "deliverable_request_id": str(request.id),
+        "expected_overlay_blocks_sha256": digest,
+        "execution_strategy": "commercial_quality",
+        "allow_degraded_fallback": False,
+        "layout_version": "poster-v3",
+        "layout_bounds_verified": True,
+        "content_left": 200,
+        "content_top": 180,
+        "content_right": 1400,
+        "content_bottom": 720,
+        "safe_margin_x": 96,
+        "safe_margin_y": 54,
+        "source_width": 1600,
+        "source_height": 900,
+    }
 
 
 @pytest.mark.asyncio

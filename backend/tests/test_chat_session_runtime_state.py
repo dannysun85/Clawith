@@ -183,7 +183,20 @@ async def test_runtime_state_returns_exact_waiting_lane_holder() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tool_name", ["write_file", "convert_html_to_pdf"])
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "write_file",
+        "edit_file",
+        "move_file",
+        "delete_file",
+        "convert_csv_to_xlsx",
+        "convert_html_to_pdf",
+        "convert_html_to_pptx",
+        "convert_markdown_to_docx",
+        "convert_markdown_to_pdf",
+    ],
+)
 async def test_runtime_state_exposes_unknown_write_and_blocks_plain_resume(
     tool_name: str,
 ) -> None:

@@ -95,21 +95,28 @@ async def test_video_check_settles_same_runtime_operation_without_metadata_file(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("runtime_managed", "deliver_completion"),
-    [(True, False), (False, True)],
+    ("modality", "runtime_managed", "deliver_completion"),
+    [
+        ("video", True, False),
+        ("video", False, True),
+        ("image", True, False),
+        ("image", False, True),
+    ],
 )
 async def test_media_daemon_does_not_duplicate_runtime_completion_delivery(
     monkeypatch,
+    modality,
     runtime_managed,
     deliver_completion,
 ) -> None:
     task_id = uuid.uuid4()
     task = SimpleNamespace(
         id=task_id,
-        modality="video",
+        modality=modality,
         request_metadata={"runtime_managed_completion": runtime_managed},
     )
-    reconcile = AsyncMock()
+    video_reconcile = AsyncMock()
+    sync_reconcile = AsyncMock()
     monkeypatch.setattr(
         media_generation,
         "_claim_due_task_ids",
@@ -123,7 +130,12 @@ async def test_media_daemon_does_not_duplicate_runtime_completion_delivery(
     monkeypatch.setattr(
         media_generation,
         "reconcile_minimax_video_task",
-        reconcile,
+        video_reconcile,
+    )
+    monkeypatch.setattr(
+        media_generation,
+        "reconcile_minimax_sync_media_task",
+        sync_reconcile,
     )
     monkeypatch.setattr(
         media_generation,
@@ -132,6 +144,7 @@ async def test_media_daemon_does_not_duplicate_runtime_completion_delivery(
     )
 
     assert await media_generation.reconcile_pending_media_generation_tasks() == 1
+    reconcile = video_reconcile if modality == "video" else sync_reconcile
     if deliver_completion:
         reconcile.assert_awaited_once_with(task_id)
     else:

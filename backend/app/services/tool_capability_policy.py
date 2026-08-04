@@ -12,6 +12,7 @@ from app.services.code_execution_policy import CODE_EXECUTION_TOOL_NAMES
 GLOBAL_DEFAULT_MEDIA_TOOL_NAMES = frozenset(
     {
         "generate_image_minimax",
+        "check_image_generation",
         "generate_speech_minimax",
         "compose_video_audio",
         "generate_video_minimax",

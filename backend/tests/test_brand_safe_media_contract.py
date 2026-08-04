@@ -47,6 +47,19 @@ def test_every_image_provider_exposes_the_same_brand_safe_contract():
         assert "creative" in reference_help
         assert "may redraw" in reference_help
         assert "public URL" not in reference_help
+        assert properties["execution_strategy"]["enum"] == [
+            "commercial_quality",
+            "creative_exploration",
+        ]
+    for name in IMAGE_TOOL_NAMES - {"generate_image_minimax"}:
+        assert (
+            "execution_strategy"
+            not in _runtime_tool(name)["function"]["parameters"]["properties"]
+        )
+        assert (
+            "execution_strategy"
+            not in _seeded_tool(name)["parameters_schema"]["properties"]
+        )
 
 
 def test_media_artifact_registry_covers_every_seeded_media_producer():
@@ -56,7 +69,8 @@ def test_media_artifact_registry_covers_every_seeded_media_producer():
         if item.get("category") == "media"
         and (
             str(item.get("name") or "").startswith("generate_")
-            or item.get("name") == "check_video_minimax"
+            or item.get("name")
+            in {"check_image_generation", "check_video_minimax"}
         )
     }
 
@@ -93,12 +107,16 @@ def test_brand_safe_media_skill_is_role_scoped_with_explicit_media_grants():
     assert skill_path.is_file()
     content = skill_path.read_text(encoding="utf-8")
     assert "Do not make the user complete a production form" in content
-    assert "Put the exact visible copy in `overlay_text`" in content
+    assert "Put one exact text element in `overlay_text`" in content
+    assert "multi-level poster copy in ordered `overlay_blocks`" in content
     assert "Never use the static product-layer workaround for outcome 2" in content
     assert "Do not blur or soften the scene by default" in content
     assert "If the selected provider cannot accept the reference frame, stop" in content
     assert "background_sanitized=true" in content
     assert "Skills guide the workflow; the native media tools enforce" in content
+    assert "protocol compatibility only" in content
+    assert "Never use that image as an HTML background" in content
+    assert "Create PDF, PPTX, HTML, or other formats only" in content
 
     templates_root = Path(__file__).parents[1] / "agent_templates"
     for folder in (

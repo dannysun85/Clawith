@@ -245,6 +245,12 @@ async def test_runtime_observation_events_restore_thinking_and_tool_packets() ->
         "done",
     ]
     assert packets[1]["call_id"] == packets[2]["call_id"] == "call-1"
+    assert packets[0]["content"] == (
+        "Internal reasoning is private. Tool execution records remain available."
+    )
+    assert packets[1]["reasoning_content"] == packets[0]["content"]
+    assert packets[2]["reasoning_content"] == packets[0]["content"]
+    assert "I should inspect the file." not in str(packets)
     assert packets[1]["status"] == "running"
     assert packets[2]["status"] == "done"
     assert packets[2]["result"] == "contents"

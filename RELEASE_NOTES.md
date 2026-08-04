@@ -1,4 +1,4 @@
-# Unreleased — Large Agent Plan and Product-role Accuracy
+# v1.11.18 — Production Promo Flow Reliability and Poster Quality
 
 ## Managed media routing
 
@@ -17,6 +17,57 @@
   and failover boundaries. Managed voice-over follows the official
   `doubao-seed-tts-2.0` API contract; ASR is not exposed as a completed product
   capability.
+- Replace the image route's implicit vendor fallback with two provider-neutral
+  execution strategies. `commercial_quality` evaluates Agent Plan before
+  MiniMax; `creative_exploration` evaluates MiniMax before Agent Plan. The
+  durable media-task receipt remains the only authority for the actual
+  Provider/model, and a Provider may change only before acceptance.
+- Keep `generate_image_minimax` as a protocol-compatibility identifier instead
+  of presenting it as evidence that MiniMax executed the request.
+- Represent an accepted synchronous image as a durable Runtime `pending`
+  operation and poll it through `check_image_generation`. Preserve the three
+  legacy image-pending codes during rolling frontend/backend releases, while
+  preventing the old unknown-outcome confirmation card and duplicate daemon
+  completion messages.
+
+## Poster typography and artifact conversion
+
+- Upgrade exact-copy poster composition to `poster-v3`. Title, subtitle,
+  tagline/body, and CTA now select separate deterministic CJK font families or
+  weights, and the receipt binds the complete role-to-font selection. The
+  production image installs the additional bounded Noto CJK weight package.
+- Require formal poster generation to pass all ordered `overlay_blocks` in the
+  one paid image call. The returned PNG is final: workflows must not place it
+  behind the same HTML copy or create PDF/PPTX formats that were not requested.
+- Compile formal poster copy on the server, bind its digest to the persisted
+  DeliverableRequest, and validate the trusted Runtime request scope before
+  Credits reservation or Provider dispatch. Model-selected filenames cannot
+  manufacture or bypass a formal deliverable identity.
+- Discover local images in CSS `url(...)` declarations as well as `<img src>`
+  before HTML conversion, preventing a valid background from becoming a blank
+  PDF/PPTX page inside the bounded conversion workspace.
+- Preserve the source aspect ratio in PPTX canvases, including 9:16 portrait
+  posters. `read_document` now identifies image-only slides and asks for visual
+  preview instead of incorrectly reporting that the PPT is empty.
+
+## Tenant, Runtime, and customer-safe presentation
+
+- Fail closed when the global custom-domain redirect setting is absent. Tenant
+  switching uses only an explicitly enabled tenant SSO domain; it no longer
+  synthesizes an unresolved `{tenant.slug}.reeftotem.ai` host.
+- Accept only normalized `http(s)` tenant SSO origins without credentials,
+  query, or fragment data. Email-domain discovery uses exact origin candidates,
+  rejects ambiguous matches, and no longer performs tenant-name or substring
+  matching.
+- Validate a tenant-switch token with that token itself before replacing the
+  current browser identity, avoiding stale-platform-token lookups and transient
+  local-storage identity changes.
+- Allow `edit_file`, `move_file`, and `delete_file` to enter the existing
+  explicit user reconciliation path so a legacy unknown write no longer holds
+  a new session forever without a recovery action.
+- Replace raw model `thinking`/`reasoning_content` in customer chat with a
+  localized private-reasoning marker. Audit and server-side execution evidence
+  remain available to authorized operators.
 
 ## Product roles
 
@@ -26,12 +77,15 @@
 
 ## Validation
 
-- Complete backend suite: `4240 passed`; frontend Node contracts: `109 passed`;
-  Vitest: `162 passed`; TypeScript/Vite production build: `7087` modules.
-- Ruff and `git diff --check` pass. Local authenticated browser validation
-  confirms the assistant/employee labels, Large media routes, Agent-message
-  delivery cards, preview, and download surfaces. Regression reruns did not
-  repeat the already completed paid Provider samples.
+- Complete backend suite: `4307 passed`; frontend Node contracts: `110 passed`;
+  Vitest: `179 passed`; browser-smoke contracts: `2 passed`; TypeScript/Vite
+  production build: `7088` modules.
+- Targeted regression covers both image strategies, exact-copy poster font
+  receipts, CSS-backed assets, portrait PPTX geometry, image-only document
+  detection, durable image polling and rolling pending-code compatibility,
+  tenant switching and exact SSO association, old-write reconciliation, and
+  customer-safe reasoning projection. Ruff, capability validators, and
+  `git diff --check` pass.
 
 # v1.11.17 — Chinese Poster Punctuation Classification
 

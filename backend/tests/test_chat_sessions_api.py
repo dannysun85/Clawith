@@ -838,7 +838,10 @@ async def test_runtime_tool_history_returns_stable_call_identity(monkeypatch):
     assert messages[0]["toolCallId"] == "call-1"
     assert messages[0]["toolStatus"] == "done"
     assert messages[0]["toolResult"] == "contents"
-    assert messages[0]["toolThinking"] == "Inspect the file"
+    assert messages[0]["toolThinking"] == (
+        "Internal reasoning is private. Tool execution records remain available."
+    )
+    assert "Inspect the file" not in json.dumps(messages)
 
 
 @pytest.mark.asyncio

@@ -150,6 +150,7 @@ class TenantSwitchRequest(BaseModel):
 
 class TenantSwitchResponse(BaseModel):
     access_token: str
+    target_tenant_id: uuid.UUID
     token_type: str = "bearer"
     redirect_url: str | None = None
     message: str | None = None

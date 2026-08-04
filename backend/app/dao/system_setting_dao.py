@@ -40,8 +40,13 @@ class SystemSettingDAO(BaseDAO[SystemSetting]):
 
     async def is_sso_custom_domain_redirect_enabled(self) -> bool:
         """Return whether cross-domain SSO redirect is globally enabled."""
-        value = await self.get_value("sso_custom_domain_redirect_enabled", {})
-        return bool(value.get("enabled", True))
+        from app.services.system_setting_security import strict_system_setting_enabled
+
+        value = await self.get_value(
+            "sso_custom_domain_redirect_enabled",
+            {"enabled": False},
+        )
+        return strict_system_setting_enabled(value, default=False)
 
 
 system_setting_dao = SystemSettingDAO()
