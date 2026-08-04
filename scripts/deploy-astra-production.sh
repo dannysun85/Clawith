@@ -5262,6 +5262,18 @@ fi
 write_cutover_state complete "$CANDIDATE_SLOT" "$RELEASE_ID"
 
 cleanup_browser_smoke_runtime
+echo "[remote] applying bounded Astra artifact retention"
+if ! python3 "$RELEASE/scripts/cleanup_astra_production_artifacts.py" \
+    --app-root "$APP_ROOT" \
+    --keep-recent 7 \
+    --keep-daily-days 14 \
+    --prune-docker \
+    --apply \
+    --lock-held \
+    --summary-only \
+    --report "$BACKUP/artifact-retention.json"; then
+    echo "[remote] warning: artifact retention was incomplete; release remains active" >&2
+fi
 trap - ERR HUP INT TERM
 sudo find /var/log/nginx -maxdepth 1 -type f -name 'access.log.*' -exec chmod 600 {} + >/dev/null 2>&1 || true
 rm -f "$PACKAGE" "$SMOKE_ENV_FILE"

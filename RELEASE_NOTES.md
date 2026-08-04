@@ -1,3 +1,31 @@
+# v1.11.23 — Bounded Production Artifact Retention
+
+## Release storage lifecycle
+
+- Add a fail-closed production cleanup planner that preserves the authoritative
+  active release, both blue/green slot journals, any cutover or pending-drain
+  release, the seven newest release/backup sets, and one daily recovery anchor
+  for the latest fourteen days.
+- Retire only direct children with the immutable Clawith release-ID format.
+  Symlinked, malformed, missing, multiline, changed, or out-of-root metadata
+  refuses cleanup before deletion. Applied cleanup additionally requires an
+  explicit deploy-lock confirmation and rechecks release authority immediately
+  before mutation.
+- Limit Docker retirement to old `astra-backend` and `astra-browser-smoke`
+  release tags. Shared-host QuantAgent images, volumes, containers, build cache,
+  uploads, release evidence, and unrecognized files remain outside the policy.
+- Run retention only after a completed blue/green cutover. Cleanup failure is
+  recorded as an operational warning and cannot roll back an otherwise healthy
+  release; a durable JSON report records the exact plan, removals, failures, and
+  disk snapshots.
+
+## Validation
+
+- Cover active/standby protection, recent and daily retention, exact namespace
+  filtering, symlink refusal, apply-lock confirmation, and post-cutover ordering.
+- Require the complete backend/frontend suites, production build, bounded browser
+  contracts, Ruff/diff gates, and PostgreSQL upgrade/downgrade/re-upgrade smoke.
+
 # v1.11.22 — Task-Bound Launch Input Isolation
 
 ## Final launch boundary
