@@ -7,14 +7,13 @@ import uuid
 
 from app.services.llm import load_balancer
 from app.services.llm import utils as llm_utils
-from app.services.llm.load_balancer import NoCredentialAvailable
+from app.services.llm.load_balancer import CredentialUnavailableReason, NoCredentialAvailable
 from app.services.llm.load_balancer import credential_quota_is_blocked
 from app.services.volcengine_agent_plan import (
     PROVIDER as VOLCENGINE_AGENT_PLAN_PROVIDER,
     RETIRING_VIDEO_MODELS,
     TTS_MODEL,
     VIDEO_MODEL,
-    VIDEO_MODEL_MINI,
     VIDEO_MODELS_BY_PLAN_TIER,
     normalize_base_url as normalize_volcengine_agent_plan_base_url,
     plan_tier_supports_modality,
@@ -81,7 +80,6 @@ def validate_media_route_policy() -> tuple[str, ...]:
             )
 
     expected_video_models = {
-        "medium": VIDEO_MODEL_MINI,
         "large": VIDEO_MODEL,
         "max": VIDEO_MODEL,
     }
@@ -95,10 +93,9 @@ def validate_media_route_policy() -> tuple[str, ...]:
         if not plan_tier_supports_modality(plan_tier, "video"):
             errors.append(f"{plan_tier}: video entitlement is unexpectedly disabled")
 
-    if plan_tier_supports_modality("small", "video"):
-        errors.append("small: video entitlement must remain disabled")
-    if VIDEO_MODEL_MINI in RETIRING_VIDEO_MODELS:
-        errors.append("current Medium video model is incorrectly marked retiring")
+    for ineligible_tier in ("small", "medium"):
+        if plan_tier_supports_modality(ineligible_tier, "video"):
+            errors.append(f"{ineligible_tier}: video entitlement must remain disabled")
     if any(model in RETIRING_VIDEO_MODELS for model in expected_video_models.values()):
         errors.append("a new-tier video model is incorrectly marked retiring")
     if VIDEO_MODEL in RETIRING_VIDEO_MODELS:
@@ -219,6 +216,7 @@ async def prepare_media_provider(
             raise NoCredentialAvailable(
                 normalized_provider,
                 modality,
+                reason_code=CredentialUnavailableReason.CAPABILITY_MISMATCH,
                 reason="credential plan tier does not support this modality",
             )
         normalized_modality = str(modality or "").strip().lower()

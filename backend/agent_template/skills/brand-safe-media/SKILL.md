@@ -46,7 +46,11 @@ or brand asset to remain unchanged.
    product layer is static; disclose that limitation and do not use it for a request that expects product motion.
 6. Do not blur or soften the scene by default. Background sanitization is a fallback for provider-created pseudo-text,
    not a general quality enhancement. Prefer a clean text-free prompt and deterministic overlay copy first.
-7. Only report success after the tool returns a real saved workspace path and a brand-safe receipt. The receipt must
+7. Treat screens, temperature displays, watch faces, labels, signs, and packaging panels as copy surfaces. When their
+   exact content is not supplied, require an unlit/blank surface during generation and add approved content later with
+   deterministic composition. Never combine a request for a visible display with "no letters or numbers" and then
+   accept provider-created pseudo-glyphs as product detail.
+8. Only report success after the tool returns a real saved workspace path and a brand-safe receipt. The receipt must
    record `background_sanitized=true` whenever the background transform ran; this flag is an execution receipt, not
    proof that every unintended glyph is unreadable.
 
@@ -63,6 +67,9 @@ When the user provides a product photo and asks for a moving advertisement:
    fall back to text-to-video or regenerate a look-alike product.
 5. Validate the returned artifact visually before presenting it: product identity, label readability, copy, duration,
    aspect ratio, and absence of corrupted frames.
+6. When the brief prohibits third-party brands, use a controlled set with sparse unbranded props. Avoid retail shelves,
+   stocked refrigerators, streets of storefront signs, app screens, or other logo-dense backgrounds unless every
+   visible asset is supplied and cleared; a clean prompt does not make uncontrolled packaging brand-safe.
 
 ### Creative delivery
 

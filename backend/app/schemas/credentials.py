@@ -119,7 +119,7 @@ class CredentialCreateIn(BaseModel):
                 )
             if "video" in supported and self.plan_tier not in VIDEO_CAPABLE_PLAN_TIERS:
                 raise ValueError(
-                    "Agent Plan video requires Medium, Large, or Max and a current "
+                    "Agent Plan video requires Large or Max and a current "
                     "operator-reviewed model policy"
                 )
         elif self.plan_tier is not None:

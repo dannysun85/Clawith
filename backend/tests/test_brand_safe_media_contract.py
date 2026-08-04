@@ -160,7 +160,7 @@ def test_douyin_operator_receives_managed_volcengine_commercial_skills():
         / "SKILL.md"
     ).read_text(encoding="utf-8")
     assert "Seedance 1.5 Pro legacy-task compatibility" in seedance_content
-    assert "maps an eligible Medium plan to Seedance 2.0 Mini" in seedance_content
+    assert "Large / Max plans to Seedance 2.0" in seedance_content
     assert "`require_audio=false` is the default product contract" in seedance_content
 
 

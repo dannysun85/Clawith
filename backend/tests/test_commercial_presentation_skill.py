@@ -34,6 +34,8 @@ def test_commercial_presentation_skill_is_managed_and_role_scoped() -> None:
     assert "Never choose or reveal a media" in content
     assert "Never present an outline, HTML file" in content
     assert "Do not invent an" in content
+    assert "at or above the 16px hard floor" in content
+    assert 'data-clawith-text-role="metadata"' in content
     assert "Treat a successful conversion as a candidate" in content
 
 

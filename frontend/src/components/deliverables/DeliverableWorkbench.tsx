@@ -318,6 +318,13 @@ export function DeliverableLauncher({
                 workflow_id: selectedWorkflow.workflow_id,
                 workflow_version: selectedWorkflow.workflow_version,
                 goal: goal.trim(),
+                inputs: attachments
+                    .filter((attachment): attachment is DeliverableAttachmentInput & { path: string } => Boolean(attachment.path))
+                    .map((attachment) => ({
+                        type: 'workspace_file' as const,
+                        path: attachment.path,
+                        name: attachment.name,
+                    })),
                 spec,
                 tier,
             });

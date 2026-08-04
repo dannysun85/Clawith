@@ -54,16 +54,17 @@ identity or product consistency.
 ## Current reviewed model policy
 
 Agents never choose a model name. The server-side policy reviewed on
-2026-07-24 maps an eligible Medium plan to Seedance 2.0 Mini and Large / Max
-to Seedance 2.0. Small has no Agent Plan video entitlement. If that policy or
-the verified credential capability does not admit the request, Astra uses the
-provider-neutral pre-submission fallback instead of asking the Agent to change
-its prompt.
+2026-08-04 maps eligible Large / Max plans to Seedance 2.0. The official
+package overview marks both Small and Medium as lightweight tiers without new
+video generation. If that policy or the verified credential capability does
+not admit the request, Astra uses the provider-neutral pre-submission fallback
+instead of asking the Agent to change its prompt.
 
-Seedance 2.0 Mini is the current Medium migration target. Keep new requests
-inside its server-enforced envelope: up to 15 seconds, `480p` or `720p`, and a
-supported fixed aspect ratio. Do not copy model IDs into the prompt or assume
-that a future plan name guarantees the same model.
+Seedance 2.0 Fast and Mini remain supported models for an eligible Large / Max
+account, but they are not inferred from a lower package tier. A later
+administrator-owned speed/cost policy may select them explicitly. Do not copy
+model IDs into the prompt or assume that a future plan name guarantees the
+same model.
 
 ## Seedance 1.5 Pro legacy-task compatibility
 
@@ -121,6 +122,14 @@ screen/display state, lighting direction, and location. Use one camera move per
 short clip. Avoid scene jumps, impossible object transformations, floating
 hands, extra fingers, lip movement without speech, baked-in captions, logos,
 watermarks, and pseudo-text.
+
+If the brief prohibits third-party brands, stage the action in a controlled set
+with sparse unbranded props. Do not place the actor in front of stocked retail
+shelves, beverage refrigerators, storefront signage, or unrelated device UIs;
+those backgrounds routinely introduce recognizable packaging and logos even
+when the prompt says "no logo". Keep any product display blank/unlit during
+generation unless its exact approved state is provided for deterministic
+composition.
 
 ## Audio and copy decisions
 

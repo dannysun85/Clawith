@@ -12,11 +12,12 @@
 
 ## Current official package matrix
 
-- Small: no video generation.
-- Astra's reviewed new-task policy (2026-07-24): Medium routes to
-  `doubao-seedance-2.0-mini`; Large / Max route to the standard
-  `doubao-seedance-2.0` model. The exact account entitlement still requires a
-  provider receipt.
+- Small / Medium: lightweight packages without new video generation.
+- Astra's reviewed new-task policy (2026-08-04): Large / Max route to the
+  standard `doubao-seedance-2.0` model. Fast / Mini remain optional models
+  inside those eligible packages and require an administrator-owned
+  speed/cost policy rather than package-name inference. The exact account
+  acceptance still requires a provider receipt.
 - `doubao-seedance-1.5-pro` is retained only for reconciling an already accepted
   legacy task and must not be selected for a new task.
 

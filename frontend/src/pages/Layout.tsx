@@ -785,7 +785,11 @@ export default function Layout() {
         queryFn: () => onboardingApi.status(),
         enabled: hasTenantContext,
     });
-    const { personalAssistant, employees: employeeAgents } = useMemo(
+    const {
+        personalAssistant,
+        legacyPersonalAssistants,
+        employees: employeeAgents,
+    } = useMemo(
         () => partitionAgentRoles(
             agents as any[],
             onboardingStatus?.personal_assistant_agent_id,
@@ -1047,8 +1051,8 @@ export default function Layout() {
     const visiblePersonalAssistant = personalAssistant && matchesAgentSearch(personalAssistant)
         ? personalAssistant
         : null;
-    const sortedAgents = [...employeeAgents].filter((a: any) => {
-        return matchesAgentSearch(a);
+    const sortVisibleAgents = (items: any[]) => [...items].filter((agent: any) => {
+        return matchesAgentSearch(agent);
     }).sort((a: any, b: any) => {
         const ap = pinnedAgents.has(a.id) ? 1 : 0;
         const bp = pinnedAgents.has(b.id) ? 1 : 0;
@@ -1057,6 +1061,8 @@ export default function Layout() {
         const bTime = b.created_at ? new Date(b.created_at).getTime() : 0;
         return bTime - aTime;
     });
+    const visibleLegacyPersonalAssistants = sortVisibleAgents(legacyPersonalAssistants as any[]);
+    const sortedAgents = sortVisibleAgents(employeeAgents as any[]);
 
     const agentSearchBox = (force = false) => (force || agents.length >= 5) && (
         <div className="sidebar-agent-search">
@@ -1138,6 +1144,23 @@ export default function Layout() {
                     {isChinese ? '尚未创建私人助理' : 'No private assistant yet'}
                 </div>
             )}
+            {visibleLegacyPersonalAssistants.length > 0 && (
+                <>
+                    <div
+                        className="sidebar-agent-header"
+                        title={isChinese
+                            ? '旧版本保留的私人助理，可继续查看历史内容，但不属于当前“我的助理”或长期 Agent 员工。'
+                            : 'Assistants retained from earlier versions. They keep their history but are neither your current assistant nor long-term Agent employees.'}
+                    >
+                        <span>
+                            {isChinese
+                                ? `历史助理（${visibleLegacyPersonalAssistants.length}）`
+                                : `Previous assistants (${visibleLegacyPersonalAssistants.length})`}
+                        </span>
+                    </div>
+                    {visibleLegacyPersonalAssistants.map(agent => renderAgent(agent, { drawer }))}
+                </>
+            )}
             <div className="sidebar-agent-header">
                 <span>{isChinese ? 'Agent 员工' : 'Agent employees'}</span>
                 <button
@@ -1158,7 +1181,11 @@ export default function Layout() {
                     {isChinese ? '还没有长期 Agent 员工' : 'No long-term Agent employees yet'}
                 </div>
             )}
-            {agents.length > 0 && !visiblePersonalAssistant && sortedAgents.length === 0 && q && (
+            {agents.length > 0
+                && !visiblePersonalAssistant
+                && visibleLegacyPersonalAssistants.length === 0
+                && sortedAgents.length === 0
+                && q && (
                 <div className="sidebar-agent-empty">
                     {isChinese ? '无匹配结果' : 'No matches'}
                 </div>

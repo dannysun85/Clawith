@@ -23,6 +23,9 @@ _UNRESOLVED_PLACEHOLDER_PATTERNS = (
     re.compile(r"(?:待替换|待补充|请填写|占位符)\s*(?:品牌|公司|客户|名称|标题|Logo)?"),
 )
 _RATING_GLYPHS = frozenset({"★", "☆", "⭐"})
+_MINIMUM_BODY_FONT_SIZE_PX = 16.0
+_MINIMUM_METADATA_FONT_SIZE_PX = 10.0
+_METADATA_TEXT_ROLE = "metadata"
 _ADAPTIVE_VISUAL_PLAN_VERSION = "adaptive-v1"
 _IMAGE_VISUAL_KINDS = frozenset({"generated_image", "supplied_image"})
 _EDITABLE_VISUAL_KINDS = frozenset(
@@ -122,6 +125,20 @@ def _compact_visible_title(value: str) -> str:
     """Ignore markup-induced whitespace while preserving visible characters."""
 
     return re.sub(r"\s+", "", value)
+
+
+def _css_pixel_value(value: Any) -> float | None:
+    """Return a finite computed CSS pixel value without guessing other units."""
+
+    match = re.fullmatch(
+        r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))px\s*",
+        str(value or ""),
+        re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    parsed = float(match.group(1))
+    return parsed if math.isfinite(parsed) else None
 
 
 def _visual_node_has_substance(node: Any) -> bool:
@@ -269,6 +286,52 @@ def validate_browser_slide_visual_quality(
             y = float(item.get("y") or 0)
             item_width = float(item.get("w") or 0)
             item_height = float(item.get("h") or 0)
+            style = item.get("style") or {}
+            font_size_px = _css_pixel_value(style.get("fontSize"))
+            text_role = str(item.get("textRole") or "").strip().lower()
+            is_edge_metadata = (
+                text_role == _METADATA_TEXT_ROLE
+                and len(text) <= 40
+                and height > 0
+                and (
+                    y <= max(80.0, height * 0.13)
+                    or y + item_height >= height - max(64.0, height * 0.10)
+                )
+            )
+            if text_role == _METADATA_TEXT_ROLE and not is_edge_metadata:
+                failures.append(
+                    {
+                        "code": "invalid_metadata_text_role",
+                        "slide": slide_index,
+                        "item": item_index,
+                        "excerpt": text[:80],
+                        "message": (
+                            f"slide {slide_index} metadata text role is only allowed "
+                            f"for short edge labels: {text[:60]}"
+                        ),
+                    }
+                )
+            if font_size_px is not None:
+                minimum_font_size_px = (
+                    _MINIMUM_METADATA_FONT_SIZE_PX
+                    if is_edge_metadata
+                    else _MINIMUM_BODY_FONT_SIZE_PX
+                )
+                if font_size_px + 0.01 < minimum_font_size_px:
+                    failures.append(
+                        {
+                            "code": "text_too_small",
+                            "slide": slide_index,
+                            "item": item_index,
+                            "excerpt": text[:80],
+                            "font_size_px": round(font_size_px, 3),
+                            "minimum_font_size_px": minimum_font_size_px,
+                            "message": (
+                                f"slide {slide_index} text is {font_size_px:g}px; "
+                                f"minimum is {minimum_font_size_px:g}px: {text[:60]}"
+                            ),
+                        }
+                    )
             if (
                 width > 0
                 and height > 0
@@ -293,7 +356,6 @@ def validate_browser_slide_visual_quality(
             scroll_height = float(item.get("scrollHeight") or 0)
             client_width = float(item.get("clientWidth") or item_width)
             client_height = float(item.get("clientHeight") or item_height)
-            style = item.get("style")
             overflow_values = {
                 str((style or {}).get(name) or "").strip().lower()
                 for name in ("overflow", "overflowX", "overflowY")
@@ -407,6 +469,7 @@ def validate_browser_slide_visual_quality(
         "checks": (
             "render_evidence",
             "canvas_bounds",
+            "minimum_readable_font_size",
             "text_container_overflow",
             "title_orphan_line",
             "text_overlap",

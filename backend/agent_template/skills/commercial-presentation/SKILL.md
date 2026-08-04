@@ -91,6 +91,14 @@ Build one `presentation.html` source at 1280x720 per slide. Keep each visible
 element inside the page; reduce copy, padding, gaps, or visual height rather than
 hiding overflow.
 
+Treat projected readability as a delivery contract, not a visual preference.
+Target at least 22px for ordinary body copy and keep every title, body, table,
+caption, footnote, and decision label at or above the 16px hard floor. Only a
+short folio or eyebrow placed at the top or bottom edge may use 10–15px, and it
+must declare `data-clawith-text-role="metadata"`. Never mark body copy, evidence,
+tables, or footnotes as metadata to bypass the floor. Split the slide or reduce
+copy instead of shrinking text.
+
 Before conversion, verify:
 
 - page count and ordered slide identifiers match the formal brief;

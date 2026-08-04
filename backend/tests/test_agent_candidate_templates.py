@@ -62,4 +62,8 @@ def test_template_seeder_includes_92_candidates_without_replacing_existing_roles
     assert sum(
         template.get("lifecycle_status", "enabled") == "enabled"
         for template in templates
-    ) == 33
+    ) == 32
+    assert sum(
+        template.get("lifecycle_status", "enabled") == "not_recruitable"
+        for template in templates
+    ) == 1

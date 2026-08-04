@@ -7,7 +7,7 @@
 - 当前已授权本地火山 Agent Plan 配置、受成本护栏约束的真实 Provider 调用、本地业务流和豆包同题
   Benchmark；仍不授权修改生产配置、生产灰度或发布。
 - 当前完成分层：
-  - `provider_verified`：Agent Plan 文字、图片、语音；MiniMax 图片、视频、语音；
+  - `provider_verified`：Agent Plan 文字、图片、标准 Seedance 2.0 视频、语音；MiniMax 图片、视频、语音；
   - `business_flow_proven`：Agent Plan 文字规划 + Tool Call + Agent Plan 语音持久化交付，
     MiniMax 视频 + 旁白确定性合成，以及正式图片、视频、PPT 的 brief → Runtime →
     Provider route/failover → Artifact candidate 浏览器成功流；三类候选均尚未完成真实多人质量评审
@@ -18,18 +18,19 @@
     流式脱敏、Artifact 结构观察、清单/文件名去标识、先封存评分后解盲和 fail-closed 统一评分已本地
     落地；19 条生产候选已完成第一轮显式隐私/信息充分性审核（8 条批准、11 条需补充），但尚未完成
     滚动真实客户样本的正式多人盲评；
-  - `blocked_by_provider_entitlement`：当前 Agent Plan Key 的行为级套餐为 Small；1.5 Pro 与
-    Seedance 2.0/fast/mini（公开名及官方 Skill 版本化 ID）均在提交前返回 `UnsupportedModel`；
-  - `tool_ready`：Medium 新任务到 Seedance 2.0 Mini、Large/Max 到标准 Seedance 2.0 的路由、
+  - `video_provider_verified`：2026-08-04 登录火山控制台确认当前 Agent Plan 已升级为 Large；本地凭证
+    元数据已同步为 `large + text/image/audio/video`，标准 `doubao-seedance-2.0` 已取得真实 acceptance
+    receipt 和可解码的 1080×1920 H.264/AAC Artifact；这仍不等于人工商用质量或生产验证；
+  - `tool_ready`：Small/Medium 提交前拒绝、Large/Max 到标准 Seedance 2.0 的路由、
     官方版本化 ID、15 秒/分辨率/比例/首尾帧和显式音频意图已在本地 adapter 与测试中落地；
   - `skill_ready`：图片 `volcengine-seedream-commercial`、视频
     `volcengine-seedance-commercial`、语音 `commercial-voiceover` 与 provider-neutral PPT
     `commercial-presentation` 已注册并按角色授权；本地 `Douyin Operations Manager`
     workspace 通过受管 seeder 同步这些 Skill；
-  - `production_release_verified`：v1.11.9 已发布并核验 release identity、容器健康和生产 smoke；
+  - `production_release_verified`：v1.11.17 / `1286865f` 是已核验的生产基线；当前工作树不是发布证据；
   - `production_agent_plan_media_verified`：否，生产图片/视频媒体池仍只核验到 MiniMax，
     未获得本轮生产配置变更授权。
-- 底座边界：当前 Astra v1.11.9 已吸收上游 Clawith v1.11.3；后续上游升级仍必须按
+- 底座边界：当前 Astra v1.11.17 已吸收上游 Clawith v1.11.3；后续上游升级仍必须按
   `.agents/reference/clawith-v1.11.3-upgrade.md` 的语义合并方式执行，禁止覆盖自有 Deliverable、
   Credits、Approval、Provider 路由和质量门禁。
 - 本文是图片、视频、PPT 实施阶段的强制工作流；同时遵守：

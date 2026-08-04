@@ -33,18 +33,22 @@ from app.services.media_provider_routing import (  # noqa: E402
 from app.services.llm.load_balancer import NoCredentialAvailable  # noqa: E402
 from app.services.volcengine_agent_plan import (  # noqa: E402
     IMAGE_MODEL as VOLCENGINE_IMAGE_MODEL,
+    TTS_DEFAULT_SPEAKER as VOLCENGINE_TTS_DEFAULT_SPEAKER,
+    TTS_MODEL as VOLCENGINE_TTS_MODEL,
     VIDEO_MODEL as VOLCENGINE_VIDEO_MODEL,
     VolcengineAgentPlanError,
     VolcengineAgentPlanRejected,
     create_video_task as create_volcengine_video_task,
     download_video as download_volcengine_video,
     generate_image as generate_volcengine_image,
+    generate_speech as generate_volcengine_speech,
     image_size_for_aspect_ratio,
     normalized_video_status as normalized_volcengine_video_status,
     query_video_task as query_volcengine_video_task,
     video_url_from_response as volcengine_video_url_from_response,
 )
 from app.services.media_assets import (  # noqa: E402
+    validate_generated_audio,
     validate_generated_image,
     validate_generated_video,
     validate_image_delivery_contract,
@@ -162,7 +166,7 @@ def benchmark_generation_limit(plan_path: Path, modality: str) -> int | None:
     """
 
     normalized_modality = str(modality or "").strip().lower()
-    if normalized_modality not in {"image", "video"}:
+    if normalized_modality not in {"image", "video", "audio"}:
         return None
     payload = json.loads(plan_path.read_text(encoding="utf-8"))
     guardrail = payload.get("cost_guardrail")
@@ -261,7 +265,7 @@ def enforce_direct_provider_benchmark_contract(
     """Validate the direct-media boundary before selecting a Provider."""
 
     modality = str(case.get("modality") or "").strip().lower()
-    if modality not in {"image", "video"}:
+    if modality not in {"image", "video", "audio"}:
         raise BenchmarkContractError("presentation_requires_artifact_pair")
     require_paid_provider_call_authorization(paid_call_confirmed)
 
@@ -335,6 +339,7 @@ async def validate_benchmark_artifact(
             info,
             expected_duration_seconds=case.get("duration_seconds"),
             expected_aspect_ratio=case.get("aspect_ratio"),
+            require_audio=bool(case.get("require_audio", False)),
         )
         return {
             "kind": "video",
@@ -351,6 +356,23 @@ async def validate_benchmark_artifact(
                 and info.audio_codec_name in {None, "aac", "mp3"}
                 and info.fast_start
             ),
+        }
+    if modality == "audio":
+        audio_format = str(case.get("format") or "mp3").strip().lower()
+        info = await validate_generated_audio(
+            artifact_bytes,
+            audio_format=audio_format,
+            sample_rate=case.get("sample_rate"),
+            label="Benchmark provider audio",
+        )
+        return {
+            "kind": "audio",
+            "duration_seconds": round(info.duration_seconds, 3),
+            "codec_name": info.codec_name,
+            "sample_rate": info.sample_rate,
+            "channels": info.channels,
+            "container_format": info.container_format,
+            "requested_format": audio_format,
         }
     raise BenchmarkContractError("unsupported_benchmark_artifact_modality")
 
@@ -552,6 +574,7 @@ async def generate_video(
 
     if provider == "volcengine_agent_plan":
         requested_model = volcengine_video_model or prepared.model
+        require_audio = bool(case.get("require_audio", False))
         task_id = await create_volcengine_video_task(
             api_key=prepared.api_key,
             base_url=prepared.base_url,
@@ -561,6 +584,7 @@ async def generate_video(
             resolution=prepared.resolution or "720p",
             ratio=case["aspect_ratio"],
             first_frame_image=first_frame_image,
+            generate_audio=require_audio,
         )
         status_payload: dict[str, Any] = {}
         while time.monotonic() - started < timeout_seconds:
@@ -639,8 +663,87 @@ async def generate_video(
         "provider_plan_tier": prepared.plan_tier,
         "provider_task_id_sha256": sha256_text(task_id),
         "requested_duration_seconds": duration,
+        "requested_generate_audio": bool(case.get("require_audio", False)),
         "requested_resolution": prepared.resolution if provider == "volcengine_agent_plan" else "768P",
         "status": status,
+    }
+
+
+async def generate_audio(
+    *,
+    provider: str,
+    saas_tier: str,
+    case: dict[str, Any],
+) -> tuple[bytes, dict[str, Any]]:
+    """Generate one bounded speech sample through the selected Provider."""
+
+    text = str(case.get("text") or "").strip()
+    if not text:
+        raise BenchmarkContractError("audio_text_required")
+    audio_format = str(case.get("format") or "mp3").strip().lower()
+    if audio_format not in {"mp3", "wav", "flac"}:
+        raise BenchmarkContractError("unsupported_audio_format")
+    requested_sample_rate = int(case.get("sample_rate") or 24000)
+    if requested_sample_rate <= 0:
+        raise BenchmarkContractError("invalid_audio_sample_rate")
+
+    minimax_model = "speech-2.8-turbo"
+    prepared = await prepare_media_provider(
+        provider,
+        modality="audio",
+        saas_tier=saas_tier,
+        minimax_model=minimax_model,
+    )
+    accepted_audio_sha256: str | None = None
+
+    async def record_acceptance(audio: bytes | None) -> None:
+        nonlocal accepted_audio_sha256
+        accepted_audio_sha256 = sha256_bytes(audio) if audio else None
+
+    if provider == "volcengine_agent_plan":
+        speaker = str(
+            case.get("speaker") or VOLCENGINE_TTS_DEFAULT_SPEAKER
+        ).strip()
+        audio_bytes = await generate_volcengine_speech(
+            api_key=prepared.api_key,
+            text=text,
+            speaker=speaker,
+            audio_format=audio_format,
+            sample_rate=requested_sample_rate,
+            on_provider_accepted=record_acceptance,
+        )
+        voice_id = speaker
+    else:
+        from app.services.agent_tools import (
+            _minimax_default_voice_id,
+            _minimax_tts_http,
+        )
+
+        voice_id = str(case.get("voice_id") or "").strip() or _minimax_default_voice_id(text)
+        audio_bytes = await _minimax_tts_http(
+            api_key=prepared.api_key,
+            base_url=prepared.base_url,
+            model=prepared.model,
+            text=text,
+            voice_id=voice_id,
+            audio_format=audio_format,
+            speed=float(case.get("speed") or 1.0),
+            volume=float(case.get("volume") or 1.0),
+            pitch=int(case.get("pitch") or 0),
+            sample_rate=requested_sample_rate,
+            bitrate=int(case.get("bitrate") or 128000),
+            language_boost=str(case.get("language_boost") or "auto"),
+            on_provider_accepted=record_acceptance,
+        )
+
+    return audio_bytes, {
+        "credential_id": str(prepared.credential_id),
+        "model": prepared.model,
+        "provider_acceptance_audio_sha256": accepted_audio_sha256,
+        "provider_plan_tier": prepared.plan_tier,
+        "requested_format": audio_format,
+        "requested_sample_rate": requested_sample_rate,
+        "voice_id": voice_id,
     }
 
 
@@ -689,6 +792,13 @@ async def main() -> None:
                 first_frame_image_path=args.first_frame_image,
             )
             extension = "mp4"
+        elif case["modality"] == "audio":
+            artifact_bytes, provider_receipt = await generate_audio(
+                provider=args.provider,
+                saas_tier=args.saas_tier,
+                case=case,
+            )
+            extension = str(case.get("format") or "mp3").strip().lower()
         try:
             artifact_contract = await validate_benchmark_artifact(
                 case,
@@ -708,11 +818,11 @@ async def main() -> None:
             args.provider == "volcengine_agent_plan"
             and isinstance(error, VolcengineAgentPlanError)
         ):
-            requested_model = (
-                VOLCENGINE_IMAGE_MODEL
-                if case["modality"] == "image"
-                else args.volcengine_video_model or VOLCENGINE_VIDEO_MODEL
-            )
+            requested_model = {
+                "image": VOLCENGINE_IMAGE_MODEL,
+                "audio": VOLCENGINE_TTS_MODEL,
+                "video": args.volcengine_video_model or VOLCENGINE_VIDEO_MODEL,
+            }.get(str(case.get("modality") or ""))
         receipt = {
             "artifact_path": None,
             "artifact_sha256": None,

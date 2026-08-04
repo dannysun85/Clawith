@@ -30,7 +30,6 @@ from app.services.volcengine_agent_plan import (
     TTS_MODEL,
     VIDEO_MODEL,
     VIDEO_MODEL_15_PRO,
-    VIDEO_MODEL_MINI,
     VIDEO_MODEL_ALIASES,
     VolcengineAgentPlanError,
     VolcengineAgentPlanRejected,
@@ -73,20 +72,18 @@ def test_agent_plan_tier_and_product_quality_profiles_are_explicit():
     assert plan_tier_supports_modality("small", "text") is True
     assert plan_tier_supports_modality("small", "image") is True
     assert plan_tier_supports_modality("small", "audio") is True
-    assert plan_tier_supports_modality("medium", "video") is True
+    assert plan_tier_supports_modality("medium", "video") is False
     assert plan_tier_supports_modality("large", "video") is True
     assert plan_tier_supports_modality("max", "video") is True
 
     assert resolve_visual_profile("image", "lite").model == IMAGE_MODEL
     assert resolve_visual_profile("image", "ultra").size == "4K"
     assert resolve_visual_profile("video", "pro").model == VIDEO_MODEL
-    assert (
-        resolve_visual_profile("video", "pro", plan_tier="medium").model
-        == VIDEO_MODEL_MINI
-    )
     assert resolve_video_model("large") == VIDEO_MODEL
-    with pytest.raises(ValueError, match="requires Medium"):
+    with pytest.raises(ValueError, match="requires Large or Max"):
         resolve_video_model("small")
+    with pytest.raises(ValueError, match="requires Large or Max"):
+        resolve_visual_profile("video", "pro", plan_tier="medium")
     assert resolve_visual_profile("video", "ultra").resolution == "1080p"
     assert resolve_text_model("lite") == TEXT_MODELS_BY_SAAS_TIER["lite"]
     assert resolve_text_model("pro") == "doubao-seed-2.1-turbo"
@@ -94,7 +91,7 @@ def test_agent_plan_tier_and_product_quality_profiles_are_explicit():
 
 
 @pytest.mark.asyncio
-async def test_medium_agent_plan_routes_video_to_current_non_retiring_model(monkeypatch):
+async def test_medium_agent_plan_fails_before_provider_request(monkeypatch):
     credential = SimpleNamespace(
         id=uuid.uuid4(),
         provider="volcengine_agent_plan",
@@ -109,16 +106,15 @@ async def test_medium_agent_plan_routes_video_to_current_non_retiring_model(monk
         "get_credential_api_key",
         lambda _credential: "secret-plan-key",
     )
+    with pytest.raises(NoCredentialAvailable) as exc_info:
+        await prepare_media_provider(
+            "volcengine_agent_plan",
+            modality="video",
+            saas_tier="pro",
+            minimax_model="MiniMax-Hailuo-02",
+        )
 
-    prepared = await prepare_media_provider(
-        "volcengine_agent_plan",
-        modality="video",
-        saas_tier="pro",
-        minimax_model="MiniMax-Hailuo-02",
-    )
-
-    assert prepared.model == VIDEO_MODEL_MINI
-    assert prepared.resolution == "720p"
+    assert exc_info.value.reason_code.value == "capability_mismatch"
     pick_credential.assert_awaited_once_with(
         "volcengine_agent_plan",
         modality="video",
@@ -528,14 +524,14 @@ def test_agent_plan_credential_schema_prevents_payg_and_unsupported_video_tiers(
     assert value.base_url == DEFAULT_BASE_URL
     assert value.plan_tier == "large"
 
-    medium = CredentialCreateIn(
-        provider="volcengine_agent_plan",
-        label="Agent Plan Medium",
-        api_key="plan-key",
-        plan_tier="medium",
-        capabilities=["image", "video"],
-    )
-    assert medium.plan_tier == "medium"
+    with pytest.raises(ValidationError, match="requires Large or Max"):
+        CredentialCreateIn(
+            provider="volcengine_agent_plan",
+            label="Agent Plan Medium",
+            api_key="plan-key",
+            plan_tier="medium",
+            capabilities=["image", "video"],
+        )
     with pytest.raises(ValidationError, match="explicit text/image/audio/video"):
         CredentialCreateIn(
             provider="volcengine_agent_plan",

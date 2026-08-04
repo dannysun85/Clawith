@@ -2,8 +2,9 @@
 
 ## 0. 计划基线
 
-- 日期：2026-08-02
-- 当前实现状态：工作树 HEAD `1a81291a`，含未提交变更；尚未形成新的 immutable candidate SHA
+- 日期：2026-08-03
+- 已部署基线：`v1.11.17` / `1286865f08a9b09ab4f3bccfd2875f08fd990b15`
+- 当前实现状态：`main` 位于已部署基线，含未提交的下一切片角色分类；尚未形成新的 immutable candidate SHA
 - 分支：`main`（仅本地，未推送、未发布）
 - 事实来源：`docs/product-line/01-09`、当前代码、测试、迁移与既有本地浏览器证据
 - 总目标：把“私人助手是默认任务入口、Agent 是长期执行员工、Deliverable 是正式产物、Workspace 是工作现场”落实为可恢复、可审计、可验收的完整产品链路。
@@ -65,22 +66,34 @@
 |---|---|---|
 | E1 真实 Provider 验证 | 明确费用上限、目标账号与测试模型 | route snapshot、Provider receipt、Artifact、Credits 结算一致 |
 | E2 豆包动态 Benchmark | 明确样本与费用授权 | 相同开放输入和交付合同、盲评、失败分类、可复现优化结论 |
-| E3 套餐与商业政策 | 产品/财务确认私人助手数量、价格、超限和 Medium+ 权益 | UI、Entitlement、账单和对外说明一致 |
+| E3 套餐与商业政策 | 产品/财务确认私人助手数量、价格、超限和 Large/Max 视频权益 | UI、Entitlement、账单和对外说明一致 |
 | E4 发布与生产验收 | 推送/发布/生产配置/迁移授权 | release identity 一致、监控健康、生产浏览器业务流通过 |
 
 没有 E1/E2 时可以完成 provider-free 流程和质量门禁，但不得写成“图片、视频、PPT 已达商用”；
 没有 E4 时只能标记本地候选，不得写成已发布或生产验证。
 
-## 5. 当前实施状态（2026-08-02 本地证据）
+## 5. 当前实施状态（更新至 2026-08-04 本地证据）
 
 | 目标 | 当前状态 | 已取得证据 | 尚未包含 |
 |---|---|---|---|
-| R1 身份、Onboarding 与角色合同 | `candidate_admin_browser_verified + tests_pass` | 新迁移只修复 onboarding 明确关联但权限不一致的私人助手，并精确保存/恢复旧 Agent policy 与 permission UUID；普通成员、`agent_admin`、公司管理员正负入口已实跑；实现候选上“我的助理”和“Agent 员工”分区、管理员正向入口及 release identity 已复验 | 全新 tenant、普通成员/`agent_admin` 在最终候选上的再次登录、生产身份提供方与生产多租户验收 |
+| R1 身份、Onboarding 与角色合同 | `local_browser_verified_normal_state + production_problem_verified` | `v1.11.17` 已上线原有“我的助理/Agent 员工”边界；当前本地切片新增 viewer-specific `product_role`、历史助理独立分组和不可招聘 Private Assistant 模板，保留旧 ID/会话/Workspace/深链；全量自动化、租户 API 和当前本地数据的真实浏览器验收已通过 | 本地缺少历史助理 fixture，仍需验证历史分组视觉；全新 tenant、普通成员/`agent_admin` 在最终候选上的再次登录；历史助理显式归档/转员工流程 |
 | R2 任务恢复与 Group 协作 | `local_verified` | Work 草稿跨页面恢复且清理成功；Group 页面保留成员/Agent、会话与 `@` 唤醒入口；Group handoff/planning/task completion 合同进入全量测试 | Docker 不可用，本机未新起真实 Agent 容器执行一轮 Group 任务 |
 | R3 产物、审批、OKR 与 Experience | `local_verified` | Work、Agent 对话、交付抽屉、OKR、团队经验库页面边界成立；旧产物 review/approval/evidence supersede 合同与来源回跳进入全量测试 | 生产通知、真实人工评审队列 |
-| R4 Provider readiness 治理 | `code_and_local_ui_verified` | SaaS 页面严格区分已配置、账号验证、生成验证、人工质量；生成 receipt 绑定当前已验证的同一 Provider，错绑或鉴权前旧任务不会污染 readiness；文本路由显示 MiniMax-M3 优先，图片/视频/语音显示火山 Agent Plan 主线路，音乐仅 MiniMax；普通 Agent 页面不暴露 Key/Provider；2026-08-02 对本地数据库做了脱敏只读检查：2 个已启用且 `healthy`、具有当前验证回执的账号池凭证，MiniMax 覆盖 `audio/image/music/video`，火山 Agent Plan `Small` 覆盖 `audio/image`，未覆盖视频 | 当前运行数据未建立新的付费生成 receipt；未做任何新增付费生成或外部连接验证 |
-| R5 创意交付闭环 | `local_artifact_verified` | PPT/图片/视频在 Agent 消息中展示，详情在右侧抽屉；历史执行影子按已验证 Artifact 投影；PPT 可按页、视频可按镜头创建新修订且不覆盖旧版；真实存量文件 hash/size 与数据库一致 | 真实 Provider 新生成、豆包盲评、商用质量结论 |
+| R4 Provider readiness 治理 | `local_provider_verified` | SaaS 页面严格区分已配置、账号验证、生成验证、人工质量；文本路由显示 MiniMax-M3 优先，图片/视频/语音显示火山 Agent Plan 主线路，音乐仅 MiniMax；2026-08-04 控制台确认 Large，本地同步为 `text/image/audio/video`，并为 Seedream、标准 Seedance 2.0、Seed TTS 取得 hash 绑定真实 Artifact | 最后一次真实验证回执的产品化持久展示；生产配置与真实调用验证；独立人工质量评审 |
+| R5 创意交付闭环 | `local_real_artifact_and_flow_verified` | 火山图片、1080×1920 有声 Seedance 2.0 视频、语音和 6 页 PPTX/PDF 已真实生成；交付卡位于 Agent 消息区，详情在右侧抽屉，PDF 可预览、PPTX 可下载；同题类豆包样本已做实操缺陷对照 | 三人独立盲评、滚动真实客户样本、商用质量结论与生产验收 |
 | R6 非付费浏览器与候选冻结 | `local_business_flow_verified_with_evidence_gap` | 上一候选 `cc6affe7` 的管理员 release identity 和复审证据可追溯；当前工作树已完成本地真实产物展示、媒体路由防错、平台管理员到公司工作区切换和回归测试，但含未提交变更 | 新候选的前端/迁移/浏览器收口、immutable SHA 绑定；普通成员/`agent_admin` 需在新候选上复验 |
+
+### 2026-08-03 角色边界切片新鲜证据
+
+- 生产 `v1.11.17` / `1286865f08a9b09ab4f3bccfd2875f08fd990b15` 只读页面仍显示当前“我的助理 · 小丽”和员工区内的旧“私人助理”，证明问题来自真实历史对象，不是凭空设计。
+- 当前未提交工作树以 onboarding 关系识别当前 assistant，以内置 `private-assistant` 模板身份识别历史 assistant；前端不读取名称或可编辑 `role_description` 判断产品角色。历史对象只改变分组和员工计数，原 ID、会话、Workspace、权限与深链保持不变。
+- 本地租户 API 返回 19 个可见 Agent：1 个 `personal_assistant`、18 个 `agent_employee`、0 个未标注角色；当前本地数据没有历史助理 fixture。员工市场返回 0 个 `private-assistant` 可招聘模板，证明未来重复创建入口已关闭。
+- 新鲜门禁为后端 `4240 passed, 13 warnings`，前端 Node `109 passed`、Vitest `31 files / 162 passed`，生产构建 `7087 modules` 成功；Ruff、`git diff --check`、Agent 能力合同与六模态能力矩阵均通过。能力矩阵本身仍是 provider-free 注册检查；独立的 hash 绑定回执记录了本轮受控火山图片、视频和语音真实调用，二者不能互相替代。
+- 本地源码运行时 `/api/health=200`，`/api/version` 为 `1.11.17`、基础 commit `1286865f`、release id `local-dirty-product-roles-20260803`，Alembic 为 `backfill_private_assistant_tpl (head)`。该 release id 明确表示未提交工作树，不是 immutable candidate。
+- 使用 `admin@reeftotem.ai` 通过真实本地登录页进入平台控制台，并由可见的公司选择器切换到目标公司；没有读取或输出浏览器令牌。
+- 本地真实浏览器已验证：侧栏仅在“我的助理”下显示当前“私人助理”；任务工作台切换到“指定 Agent 员工”后出现 18 个候选且不含私人助理；公司概览显示“共 18 名数字员工”；人才市场正常打开，热门推荐显示 15 个“聘用”入口且全文不含 `Private Assistant`/“私人助理”；当前助理 `/agents/719c8437-043d-410a-94bd-7b56dcfb952b/chat` 深链、会话和 Workspace 继续可达。页面没有来自 `http://127.0.0.1:3008` 的 console warning/error。
+- 当前本地租户没有历史助理 fixture，所以“历史助理（N）”的实际视觉分组仍未在本地浏览器中出现；该分支已有自动化合同覆盖，生产只读证据则确认真实旧对象确实存在。当前状态可以写成 `local_browser_verified_normal_state + production_problem_verified`，但仍不得写成历史数据迁移已完整验收、immutable candidate、已发布或生产已修复。
+- 本次浏览器验收只进行了登录、公司切换、页面读取和招聘市场查看；没有聘用 Agent、发送消息、创建任务或触发任何付费 Provider 调用。
 
 本地文件证据：
 
@@ -92,7 +105,7 @@
 本轮新鲜门禁为：后端 `4192 passed, 13 warnings`；creative v1 合同 `94 passed`；前端 Node 合同 `107 passed`、
 Vitest `31 files / 158 passed`，生产构建 `7087 modules` 成功；Agent 能力合同为 `30` 个模板、`17` 个 Skill、
 `140` 个 Tool；Ruff 与 `git diff --check` 均通过。真实公司租户浏览器会话再次确认 `/work`、`/groups`、
-`/account` 与 `/enterprise#skills` 的入口、Group @ 唤醒、账号掩码和媒体能力治理；当前 Small Agent Plan 缺少火山视频主线路，
+`/account` 与 `/enterprise#skills` 的入口、Group @ 唤醒、账号掩码和媒体能力治理；该次 2026-08-02 历史快照中的 Small Agent Plan 缺少火山视频主线路，
 但聊天中的快速视频快捷入口会在存在 MiniMax fallback 时可用，正式交付仍需显式允许降级。无新增付费 Provider 调用。Benchmark 审计已生成图片/视频/PPT 的候选哈希、观察事实和
 reviewer 模板，状态仍为 `awaiting_human_review`，不能写成商业就绪。上一候选的数据库 smoke、独立复审、
 重启与管理员 identity 仍可追溯，但当前工作树有未提交变更，不能写成“当前候选多角色浏览器全部通过”。
@@ -116,8 +129,8 @@ reviewer 模板，状态仍为 `awaiting_human_review`，不能写成商业就�
 
 本轮又把 reviewed provider/model route policy 纳入同一组无 Provider 校验：
 `validate_media_route_policy()` 固定核对图片、视频、语音的运行时顺序为
-`volcengine_agent_plan -> minimax`、音乐为 `minimax-only`，并核对 Medium 使用
-`doubao-seedance-2.0-mini`、Large/Max 使用 `doubao-seedance-2.0`，Small 不得宣称视频可用，
+`volcengine_agent_plan -> minimax`、音乐为 `minimax-only`，并核对 Small/Medium 不接收新视频任务、
+Large/Max 使用 `doubao-seedance-2.0`，Fast/Mini 只允许在合资格套餐内由管理员策略显式选择，
 且退休的 `doubao-seedance-1.5-pro` 不得进入新套餐映射。该校验只验证代码策略没有漂移，不探测密钥、套餐额度或
 Provider 生成；本轮定向测试 `49 passed`，能力矩阵与 Agent 能力脚本均返回 `ready/valid`。
 
@@ -127,13 +140,13 @@ Provider 生成；本轮定向测试 `49 passed`，能力矩阵与 Agent 能力�
 `60 passed`，`ruff` 与 `git diff --check` 均通过；这仍属于 provider-free 合同验证，不等于真实视频生成成功。
 
 本轮同时执行了一次本地 Provider readiness 的脱敏只读检查（未打印密钥、未修改数据库、未调用外部 Provider）。
-数据库状态为：当前启用账号池有 3 条记录，其中 2 条为已验证且健康（MiniMax 1 条、火山 Agent Plan 1 条），另有 1 条
+数据库状态为：当时启用账号池有 3 条记录，其中 2 条为已验证且健康（MiniMax 1 条、火山 Agent Plan 1 条），另有 1 条
 MiniMax `video` 专用记录仍为 `unverified`，不会进入运行时 verified pool；健康 MiniMax 的已验证媒体能力为
 `audio/image/music/video`，火山 Agent Plan `Small` 的已验证媒体能力为 `audio/image`。因此当前本地运行时可以
-证明账号验证和能力边界，但不能把火山 Small 账号宣称为视频可用，也不能把账号验证 receipt 当成真实生成或
+证明当时的账号验证和能力边界，也不能把账号验证 receipt 当成真实生成或
 商业质量证据；按这组已验证能力计算出的路由状态为：图片 `available`（火山 + MiniMax）、视频 `degraded`
 （仅 MiniMax，应急路线）、语音 `available`（火山 + MiniMax）、音乐 `available`（MiniMax-only）。视频主线路
-仍需具备相应套餐/模型资格的火山账号后，再按 E1 做付费生成验证。
+在当时仍需具备相应套餐/模型资格的火山账号后，再按 E1 做付费生成验证；2026-08-04 的 Large 升级证据已在上表和后续复验条目覆盖该资格缺口。
 
 随后又对当前本地数据库做了第二次只读注册核验：共 `32` 个 Agent，`compose_video_audio` 已注册、默认启用，
 分配到 `29` 个 Agent 且全部启用；`brand-safe-media` 已注册并同步到 `40` 个模板，同时包含旁白广告流程和
@@ -298,14 +311,15 @@ npm run build
 - 追加预检确认：本机真实账号池包含火山 Agent Plan `small`（`text/image/audio`）与 MiniMax（`text/multimodal/image/audio/video/music`）；火山视频路线在 Provider 外发前以 `capability_mismatch` 拒绝，MiniMax 视频 fallback 可选。尝试启动一份受成本护栏约束的火山图片 Benchmark 时被外部执行审批拒绝，未发出请求、未产生费用；后续必须由用户明确授权“本轮 1 次火山图片 + 1 次 MiniMax 视频真实生成”后才能进入 E1/E2。
 - 本地凭证池只读复核（2026-08-02）：火山 Agent Plan 账号状态为 `healthy`、`plan_tier=small`、能力为 `text/image/audio`；MiniMax Token Plan 状态为 `healthy`、能力覆盖 `text/multimodal/image/audio/video/music`。这只是本地凭证健康/资格快照，不等同于本轮 Provider 生成 receipt，也不改变 `provider_health_verified=false` 的 Benchmark 门禁。
 - 本地角色入口短路径浏览器复验（2026-08-02）：`member` 登录后 `/work` 可用，访问 `/enterprise` 正确回到 `/work`，`/account/subscription` 可用；`org_admin` 登录后 `/enterprise` 与 `/invitations` 可用，访问 `/account` 正确回到 `/work`，`/account/subscription` 可用。两种身份均无页面异常或 5xx；临时身份和租户已清理。该证据补齐角色路由，不代表新租户注册、Agent 招聘、Group 协作或真实媒体 Provider 已验收。
-- E1 成本/资格预检（2026-08-02）：以 `video_smart_thermos` 调用 `creative_provider_benchmark.py` 的火山视频路径并显式指定 `doubao-seedance-2.0-mini`，本地凭证在 Provider I/O 前因 `capability_mismatch` fail closed，退出码 `2`，回执 `provider_accepted=false`、`artifact_path=null`。这证明 Small 账号不会被误发视频请求，也没有产生费用；它不是视频生成失败，也不能替代 Medium/Large/Max 账号的真实验证。
+- E1 成本/资格预检（2026-08-02）：以 `video_smart_thermos` 调用 `creative_provider_benchmark.py` 的火山视频路径并显式指定 `doubao-seedance-2.0-mini`，本地凭证在 Provider I/O 前因 `capability_mismatch` fail closed，退出码 `2`，回执 `provider_accepted=false`、`artifact_path=null`。这证明当时 Small 账号不会被误发视频请求，也没有产生费用；它不是视频生成失败。2026-08-04 控制台确认账号升级为 Large，本地元数据同步为 `large + text/image/audio/video`，标准 `doubao-seedance-2.0` 随后真实生成 1080×1920 H.264/AAC Artifact 并取得 hash 绑定回执；该单样本仍不能替代商用质量或生产验证。
 - 新增 `backend/scripts/record_external_creative_benchmark.py` 及对应测试，用于把豆包等外部产品已生成的图片/PPT 文件以只读方式复制到隔离评测目录，并绑定 benchmark plan/case hash、源文件/副本 hash 和结构观察。该入口仅记录 `external_artifact_imported`，`generation_performed=false`、`acceptance_observed=false`，不调用 Provider、不扣 Credits、不把外部文件标记为商用完成；图片、视频、PPTX/PDF 的导入、缺失配对、重复导入和非 allowlist Provider 已通过 5 条定向测试。
 - 又用此前已保存的豆包同题样本做了一次 CLI 导入实证（不联网、不调用 Provider）：`image_smart_thermos`、`video_smart_thermos`、`ppt_smart_thermos` 均绑定同一 `benchmark_plan_sha256=e636e3f82c450794d2bfe21e9052da72811fe93b9ff68c42e17cad12fe572b86`，分别通过图片解码/画幅、视频解码/音频/时长画幅、PPTX/PDF/页数画幅/可编辑性/图片覆盖率结构观察；三份回执均为 `evidence_level=external_artifact_imported`、`generation_performed=false`、`acceptance_observed=false`。导入结果仅证明文件可观察，图片/视频水印与事实、PPT 来源/溢出等语义门禁仍是未知，不能升级为商用质量或 Provider 已验证。
 - 2026-08-02 又对上述三个豆包外部回执分别执行 `verify_creative_benchmark_provenance.py`：图片、视频、PPT 三份回执均返回 `status=valid`、`artifact_verified=true`、`issues=[]`，仍保持 `evidence_level=external_artifact_imported`；该复核没有联网、没有调用 Provider、没有产生费用，也不改变三类正式评审为 `0` 的结论。
 - 新增 `backend/scripts/verify_creative_benchmark_provenance.py` 及 7 条测试，统一校验单文件 Provider 回执和多文件外部导入回执的 plan/case/brief hash、模态对应的 Artifact 类型、Artifact 内容 hash、重复 Provider-case 组合、旧回执缺失 provenance，以及可选的每个 case Provider parity 门禁。对上述 3 份豆包导入回执的审计结果为 `status=valid`、`artifact_verified=true`；对历史 MiniMax 回执的复核明确返回 `invalid`（缺少当前 plan/case hash），因此旧样本不能直接作为新候选证据复用。当前迁移后的图片样本使用 `minimax + volcengine_agent_plan` 要求执行 parity 校验并通过。
 - 新增 `backend/scripts/migrate_historical_benchmark_receipt.py` 及 3 条测试。它只在历史回执的 benchmark/case、canonical brief hash 和 Artifact hash 全部匹配时生成新的 `historical_receipt_provenance_bound` 副本，记录原始回执 hash，内部 `credential_id` 只保留 SHA-256，拒绝覆盖源文件或已有输出。当前已对历史 MiniMax 图片、火山图片和 MiniMax 视频样本生成迁移副本，三份回执通过 provenance verifier；这提升了可追溯性，但不把历史样本升级为新的 Provider 生成或商业质量结论。
 - 当前工作树的本地浏览器矩阵又完成一次无私有内容输出的复验：使用 `admin@reeftotem.ai` 登录并切换到目标公司后，`/work`、`/dashboard`、`/plaza`、`/groups`、`/enterprise`、`/okr`、`/account/subscription`、`/account` 和指定 Agent Chat 均可达，`Groups` 按设计进入已有会话，所有页面无 `5xx`。Agent Chat 的固定媒体入口显示图片、语音、音乐、视频四个 `available` 控件；点击图片/视频只把受控请求插入 composer，未发送消息、未产生生成/运行请求。该证据补强本地入口与“先插入需求、再由用户发送”的交互，不等同于真实 Provider 生成或商用质量。
-- 同一租户下读取指定 Agent 的 `/media-capabilities?tier=pro` 得到 `200`：图片和语音的 `capability_status=available`、Provider 顺序为 `volcengine_agent_plan -> minimax`；音乐为 `available` 且仅 `minimax`；视频入口允许插入需求但 `capability_status=degraded`、`available_providers=["minimax"]`、`route_reason=commercial_primary_unavailable`，服务端明确说明火山 `plan=small` 不包含视频资格。该结果证明 UI 的可插入与正式质量可用是两层状态，仍未触发 Provider。
+- 2026-08-04 升级后复验：同一租户的 SaaS 媒体路由中图片、语音、视频 Lite/Pro/Ultra 均显示 `volcengine_agent_plan -> minimax`，主线路为火山，凭证为 `plan=large`；音乐仍为 MiniMax-only。页面同时明确显示“账号已验证，生成未验证”，因此该结果证明资格与路由已对齐，不代表真实生成或商用质量通过。
+- 同一浏览器会话又验证 Agent 详情身份：当前 `私人助理` 显示唯一 `agent-product-role=我的助理`，`抖音运营经理` 显示 `agent-product-role=Agent 员工`；详情 API 不再丢失列表 API 已判定的 viewer-specific 产品角色。
 - 选取本地已有的 `succeeded` PPT 交付（2 个 Artifact）做只读浏览器投影复验：交付卡片位于 Agent 聊天消息区；点击“查看交付详情”后出现唯一的右侧 `deliverable-detail-drawer`，其中存在 PPT 预览 iframe 与 2 个 Artifact 下载链接；composer 中不存在“文件已生成，等待质量检查”面板。该证据确认 `Agent message -> Workspace detail drawer -> Artifact preview/download` 边界已落地，不代表该历史文件的 Provider/商业质量门禁已重新通过。
 - 同一抽屉中的两个下载响应也通过本地会话复核：PDF 返回 `200`、`application/pdf`、`1542627` bytes；PPTX 返回 `200`、`application/vnd.openxmlformats-officedocument.presentationml.presentation`、`3875751` bytes。只验证传输与 MIME，不读取或评价文件内容。
 - 普通成员媒体能力接口现已按产品边界脱敏：`/api/agents/{agent_id}/media-capabilities` 对非平台管理员只返回业务能力、可用性和质量状态，`tool_name` 统一为 `media_generation`，不返回 Provider、套餐、`route_reason` 或内部线路细节；平台管理员仍保留完整诊断。新增接口回归覆盖成员与平台管理员两种视图，本轮相关后端测试 `43 passed`，前端测试与生产构建也已通过。
@@ -314,4 +328,4 @@ npm run build
 - 降级能力按钮新增警示色和 `data-capability-state="degraded"`，不依赖悬停才能发现状态；按钮仍只显示业务能力名称，不显示 Provider/套餐信息。
 - 本轮又在本机权限上下文执行 `./restart.sh --source`：PostgreSQL、Backend、Frontend 和 Vite API proxy 均启动成功，`/api/health` 返回 `status=ok、version=1.11.14`，`/api/version` 返回 commit `1a81291a`、空 `release_id`。这只证明本地运行时可启动，不代表远程部署或真实 Provider 生成。
 - Benchmark CLI 新增逐次授权门禁：在隔离目录执行火山视频 case 且不传 `--confirm-paid-provider-call` 时，回执为 `explicit_paid_provider_call_authorization_required`，`provider_accepted=false`、`artifact_path=null`、`credential_id=null`；直接把 PPT case 交给该 CLI 则以 `presentation_requires_artifact_pair` fail closed。两种预检都没有选择凭据、没有发出 Provider 请求，也没有消耗额度。相关定向测试此前为 `24 passed`；本次补入普通成员媒体能力脱敏回归后，复跑 `creative_provider_benchmark.py`、`record_external_creative_benchmark.py` 与 `agent_media_capabilities_api.py` 共 `26 passed`，Ruff 与差异检查均通过。
-- 目标续跑的新鲜本地证据：`validate_multimodal_capability_matrix.py --json` 返回 `status=ready`、`errors=[]`、`route_policy_verified=true`，并明确保留 `provider_health_verified=false`；`audit_creative_benchmark_run.py` 的运行指纹仍为 `582d3f4b43bbf1b93e2e6274b029f20b6d32045c2a505b284ffc73f9c76059d6`，三种模态均为 `awaiting_human_review`，正式评审与商用结果均为 `0`。这轮仍未调用 Provider、未消耗 Credits、未修改远程环境。
+- 2026-08-02 目标续跑证据：`validate_multimodal_capability_matrix.py --json` 返回 `status=ready`、`errors=[]`、`route_policy_verified=true`，并明确保留 `provider_health_verified=false`；`audit_creative_benchmark_run.py` 的运行指纹仍为 `582d3f4b43bbf1b93e2e6274b029f20b6d32045c2a505b284ffc73f9c76059d6`，三种模态均为 `awaiting_human_review`，正式评审与商用结果均为 `0`。该次历史续跑未调用 Provider、未消耗 Credits、未修改远程环境；2026-08-04 的受控真实样本是后续独立证据。

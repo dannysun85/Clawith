@@ -58,6 +58,16 @@ def test_first_imported_role_set_is_present_and_legacy_project_manager_is_replac
     assert "complex-task-executor" in by_name["Project Manager"]["default_skills"]
 
 
+def test_private_assistant_is_a_product_managed_companion_not_a_recruitable_role() -> None:
+    manifest = load_agent_template_manifest(_TEMPLATE_ROOT / "private-assistant")
+
+    assert manifest.role_key == "private-assistant"
+    assert manifest.lifecycle_status == "not_recruitable"
+    assert manifest.activation_gate == (
+        "Product-managed companion only; provision through company onboarding."
+    )
+
+
 def test_all_19_upgrade_roles_have_pinned_executable_v2_contracts() -> None:
     manifests = {
         manifest.role_key: manifest

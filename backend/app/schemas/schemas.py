@@ -325,6 +325,14 @@ class AgentOut(BaseModel):
     expires_at: datetime | None = None
     is_expired: bool = False
     is_system: bool = False
+    # Viewer-specific roster role. Agent list responses derive this from
+    # onboarding and reviewed template identity; clients must not infer it
+    # from names. Other Agent responses may leave it unset.
+    product_role: Literal[
+        "personal_assistant",
+        "legacy_personal_assistant",
+        "agent_employee",
+    ] | None = None
     access_mode: str = "company"
     company_access_level: str = "use"
     llm_calls_today: int = 0

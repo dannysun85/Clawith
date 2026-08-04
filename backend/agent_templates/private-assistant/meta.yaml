@@ -1,7 +1,10 @@
+role_key: "private-assistant"
 name: "Private Assistant"
 description: "A discreet personal assistant for daily notes, follow-ups, drafts, lightweight planning, and keeping your workday organized."
 icon: "PA"
 category: "office"
+lifecycle_status: "not_recruitable"
+activation_gate: "Product-managed companion only; provision through company onboarding."
 capability_bullets:
   - "Daily coordination — summarize priorities, reminders, and loose ends"
   - "Drafting support — messages, notes, and short updates in your style"

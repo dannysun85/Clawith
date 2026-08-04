@@ -17,6 +17,7 @@ from scripts.creative_provider_benchmark import (
     enforce_benchmark_cost_guardrail,
     existing_successful_generation_count,
     failure_receipt_stem,
+    generate_audio,
     generate_video,
     load_case,
     output_stem,
@@ -128,6 +129,10 @@ def test_direct_provider_contract_keeps_presentation_on_artifact_path():
         {"modality": "video"},
         paid_call_confirmed=True,
     )
+    enforce_direct_provider_benchmark_contract(
+        {"modality": "audio"},
+        paid_call_confirmed=True,
+    )
 
 
 def test_benchmark_artifact_failure_preserves_provider_acceptance():
@@ -162,6 +167,116 @@ async def test_benchmark_validates_image_dimensions_and_records_contract():
         "height": 600,
         "aspect_ratio": "3:2",
     }
+
+
+@pytest.mark.asyncio
+async def test_benchmark_video_contract_requires_audio_when_requested(monkeypatch):
+    class FakeInfo:
+        width = 720
+        height = 1280
+        duration_seconds = 6.0
+        codec_name = "h264"
+        pixel_format = "yuv420p"
+        audio_codec_name = None
+        fast_start = True
+
+    async def fake_validate(*_args, **_kwargs):
+        return FakeInfo()
+
+    monkeypatch.setattr(
+        "scripts.creative_provider_benchmark.validate_generated_video",
+        fake_validate,
+    )
+
+    with pytest.raises(Exception, match="audio stream is required but missing"):
+        await validate_benchmark_artifact(
+            {
+                "modality": "video",
+                "aspect_ratio": "9:16",
+                "duration_seconds": 6,
+                "require_audio": True,
+            },
+            b"provider-video",
+        )
+
+
+@pytest.mark.asyncio
+async def test_benchmark_validates_audio_and_records_contract(monkeypatch):
+    class FakeInfo:
+        duration_seconds = 2.75
+        codec_name = "mp3"
+        sample_rate = 24000
+        channels = 1
+        container_format = "mp3"
+
+    async def fake_validate(*_args, **_kwargs):
+        return FakeInfo()
+
+    monkeypatch.setattr(
+        "scripts.creative_provider_benchmark.validate_generated_audio",
+        fake_validate,
+    )
+
+    contract = await validate_benchmark_artifact(
+        {"modality": "audio", "format": "mp3", "sample_rate": 24000},
+        b"provider-audio",
+    )
+
+    assert contract == {
+        "kind": "audio",
+        "duration_seconds": 2.75,
+        "codec_name": "mp3",
+        "sample_rate": 24000,
+        "channels": 1,
+        "container_format": "mp3",
+        "requested_format": "mp3",
+    }
+
+
+@pytest.mark.asyncio
+async def test_generate_audio_uses_agent_plan_tts_contract(monkeypatch):
+    class Prepared:
+        credential_id = "credential-id"
+        api_key = "secret"
+        base_url = "https://unused.example"
+        model = "doubao-seed-tts-2.0"
+        plan_tier = "large"
+
+    async def fake_prepare(*_args, **kwargs):
+        assert kwargs["modality"] == "audio"
+        return Prepared()
+
+    async def fake_generate(**kwargs):
+        assert kwargs["text"] == "忙里，也有一口温度。"
+        assert kwargs["audio_format"] == "mp3"
+        assert kwargs["sample_rate"] == 24000
+        await kwargs["on_provider_accepted"](b"audio")
+        return b"audio"
+
+    monkeypatch.setattr(
+        "scripts.creative_provider_benchmark.prepare_media_provider",
+        fake_prepare,
+    )
+    monkeypatch.setattr(
+        "scripts.creative_provider_benchmark.generate_volcengine_speech",
+        fake_generate,
+    )
+
+    artifact, receipt = await generate_audio(
+        provider="volcengine_agent_plan",
+        saas_tier="ultra",
+        case={
+            "modality": "audio",
+            "text": "忙里，也有一口温度。",
+            "format": "mp3",
+            "sample_rate": 24000,
+        },
+    )
+
+    assert artifact == b"audio"
+    assert receipt["model"] == "doubao-seed-tts-2.0"
+    assert receipt["provider_plan_tier"] == "large"
+    assert receipt["provider_acceptance_audio_sha256"]
 
 
 def test_presentation_benchmark_contract_is_not_treated_as_video():
@@ -212,12 +327,14 @@ def test_benchmark_cost_guardrail_reads_plan_owned_limits(tmp_path):
     plan_path = tmp_path / "plan.json"
     plan_path.write_text(
         '{"cost_guardrail":{"image_generations_per_provider":1,'
-        '"video_generations_per_provider":1,"automatic_quality_retries":0}}',
+        '"video_generations_per_provider":1,'
+        '"audio_generations_per_provider":1,"automatic_quality_retries":0}}',
         encoding="utf-8",
     )
 
     assert benchmark_generation_limit(plan_path, "image") == 1
     assert benchmark_generation_limit(plan_path, "video") == 1
+    assert benchmark_generation_limit(plan_path, "audio") == 1
     assert benchmark_generation_limit(plan_path, "presentation") is None
 
 

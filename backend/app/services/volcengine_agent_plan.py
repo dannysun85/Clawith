@@ -27,18 +27,18 @@ IMAGE_MODEL = "doubao-seedream-5.0-lite"
 VIDEO_MODEL = "doubao-seedance-2.0"
 VIDEO_MODEL_15_PRO = "doubao-seedance-1.5-pro"
 VIDEO_MODEL_MINI = "doubao-seedance-2.0-mini"
-VIDEO_CAPABLE_PLAN_TIERS = frozenset({"medium", "large", "max"})
+VIDEO_CAPABLE_PLAN_TIERS = frozenset({"large", "max"})
 # Single source of truth for the operator-reviewed Agent Plan video policy.
-# Reviewed against the official 2026-06-07 Medium adjustment and 2026-07-24
-# model retirement notices.  Medium no longer includes Seedance 2.0 / Fast,
-# and Seedance 1.5 Pro is being retired in favour of Seedance 2.0 Mini.
-VIDEO_PLAN_POLICY_REVIEWED_AT = "2026-07-24"
+# Reviewed against the official package overview updated on 2026-08-03 and
+# visual-model guide updated on 2026-07-29.  Small and Medium are lightweight
+# tiers without new video generation; Large and Max admit the Seedance 2.0
+# family.  Seedance 1.5 Pro remains readable only for accepted legacy tasks.
+VIDEO_PLAN_POLICY_REVIEWED_AT = "2026-08-04"
 VIDEO_PLAN_POLICY_SOURCES = (
-    "https://docs.volcengine.com/docs/82379/2525064?lang=zh",
-    "https://docs.volcengine.com/docs/82379/2578673?lang=zh",
+    "https://docs.volcengine.com/docs/82379/2366394?lang=zh",
+    "https://docs.volcengine.com/docs/82379/2375486?lang=zh",
 )
 VIDEO_MODELS_BY_PLAN_TIER = {
-    "medium": VIDEO_MODEL_MINI,
     "large": VIDEO_MODEL,
     "max": VIDEO_MODEL,
 }
@@ -242,7 +242,7 @@ def resolve_video_model(plan_tier: str | None) -> str:
     model = VIDEO_MODELS_BY_PLAN_TIER.get(normalized_plan)
     if model is None:
         raise ValueError(
-            "Agent Plan video requires Medium, Large, or Max and a current "
+            "Agent Plan video requires Large or Max and a current "
             "operator-reviewed model policy"
         )
     return model

@@ -45,6 +45,18 @@ const requiredText = (value: unknown): string | null => {
     return normalized || null;
 };
 
+export const chatSessionMatchesAgent = (
+    session: unknown,
+    agentId: unknown,
+): boolean => {
+    const body = record(session);
+    const sessionAgentId = requiredText(body?.agent_id);
+    const expectedAgentId = requiredText(agentId);
+    return sessionAgentId !== null
+        && expectedAgentId !== null
+        && sessionAgentId === expectedAgentId;
+};
+
 const optionalText = (value: unknown): string | null =>
     value == null ? null : requiredText(value);
 

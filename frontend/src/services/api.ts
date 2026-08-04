@@ -850,6 +850,7 @@ export const deliverableApi = {
         workflow_id: string;
         workflow_version: string;
         goal?: string;
+        inputs?: Array<{ type: 'workspace_file'; path: string; name?: string }>;
         spec: Record<string, string | number>;
         tier: 'lite' | 'pro' | 'ultra';
     }) => request<DeliverablePreflight>('/deliverables/preflight', {

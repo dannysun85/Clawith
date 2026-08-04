@@ -18,6 +18,10 @@ or a text draft that does not require an audio artifact.
   model entitlement, Credits, tenant access, or approval authority.
 - Use the provider-neutral `generate_speech_minimax` Tool name exposed by the
   current runtime. Astra selects an eligible Provider before submission.
+- The managed Agent Plan route uses `doubao-seed-tts-2.0` through the official
+  subscription endpoint. See
+  `references/official-agent-plan-speech-contract.md` for the reviewed
+  protocol boundary; the Agent still never selects this model directly.
 - Never choose, reveal, or promise a Provider. Never retry manually after a
   Provider has accepted a request or acceptance is ambiguous.
 - If the Tool is unavailable, preserve the exact script, pronunciation notes,

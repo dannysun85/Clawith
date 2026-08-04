@@ -138,6 +138,7 @@ import {
     runtimeCompletionNeedsMessageRefresh,
     sessionActiveRunFromResponse,
     sessionRuntimeStateResponseIsValid,
+    chatSessionMatchesAgent,
     type SessionActiveRun,
     type ToolReconciliation,
     waitingSessionActiveRunHint,
@@ -4477,6 +4478,13 @@ export default function AgentDetailPage() {
             syncActiveSocketState(null, id);
             return;
         }
+        // React may render the previous Agent's selected Session once while an
+        // Agent route transition is committing. Never bind that stale Session
+        // to the new Agent's runtime-state or websocket endpoints.
+        if (!chatSessionMatchesAgent(activeSession, id)) {
+            syncActiveSocketState(null, id);
+            return;
+        }
         activeSessionIdRef.current = String(activeSession.id);
         if (!isWritableSession(activeSession)) {
             syncActiveSocketState(activeSession, id);
@@ -5554,7 +5562,11 @@ export default function AgentDetailPage() {
     const { data: sessionDeliverableRequests = [] } = useQuery({
         queryKey: ['deliverable-requests', id, activeSession?.id],
         queryFn: () => deliverableApi.list(id!, String(activeSession!.id)),
-        enabled: !!id && !!activeSession?.id && activeTab === 'chat' && (agent as any)?.agent_type !== 'openclaw',
+        enabled: !!id
+            && !!activeSession?.id
+            && chatSessionMatchesAgent(activeSession, id)
+            && activeTab === 'chat'
+            && (agent as any)?.agent_type !== 'openclaw',
         refetchInterval: (query) => (
             query.state.data?.some((request) => request.status === 'running') ? 3000 : false
         ),
@@ -5713,6 +5725,13 @@ export default function AgentDetailPage() {
     };
     const statusKey = computeStatusKey();
     const canManage = (agent as any).access_level === 'manage';
+    const isAgentDetailChinese = i18n.language?.startsWith('zh');
+    const agentProductRole = agent.product_role || 'agent_employee';
+    const agentProductRoleLabel = agentProductRole === 'personal_assistant'
+        ? (isAgentDetailChinese ? '我的助理' : 'My assistant')
+        : agentProductRole === 'legacy_personal_assistant'
+            ? (isAgentDetailChinese ? '历史助理' : 'Previous assistant')
+            : (isAgentDetailChinese ? 'Agent 员工' : 'Agent employee');
     const agentNameText = String((agent as any)?.name || '').toLowerCase();
     const agentRoleText = String((agent as any)?.role_description || '').toLowerCase();
     const isDouyinAgent = agentNameText.includes('douyin')
@@ -6408,7 +6427,7 @@ export default function AgentDetailPage() {
                         >
                             <div className="agent-detail-identity-trigger">
                                 <div className="agent-detail-avatar">{(Array.from(agent.name || 'A')[0] as string || 'A').toUpperCase()}</div>
-                                <div style={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
+                                <div style={{ flex: 1, minWidth: 0, overflow: 'hidden', display: 'flex', alignItems: 'center', gap: 8 }}>
                                     {canManage && editingName ? (
                                         <input
                                             className="page-title"
@@ -6446,6 +6465,12 @@ export default function AgentDetailPage() {
                                             {agent.name}
                                         </h1>
                                     )}
+                                    <span
+                                        className="badge badge-info"
+                                        data-testid="agent-product-role"
+                                    >
+                                        {agentProductRoleLabel}
+                                    </span>
                                 </div>
                                 <button
                                     className={`agent-info-chevron${infoCardOpen ? ' agent-info-chevron--open' : ''}`}

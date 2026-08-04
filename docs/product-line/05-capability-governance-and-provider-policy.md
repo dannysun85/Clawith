@@ -31,8 +31,9 @@ Skill、Tool、Provider、模型、套餐和故障切换不得出现在普通用
 - `media_provider_order_for_modality()` 当前对 `image/audio/video` 返回 `volcengine_agent_plan → minimax`，对 `music` 只返回 `minimax`。
 - 语音在未指定 `voice_id` 时允许火山优先、MiniMax 回退；显式 Provider voice ID 会固定到对应 Provider，避免换声线。
 - 现有 Tool 内部名仍包含 `*_minimax`，但图片、语音和视频已是平台托管的 provider-neutral route；名称是兼容债务，不是用户承诺。
-- Agent Plan 代码支持 Small/Medium/Large/Max；Small 不具备视频，当前经过运营复核的策略将 Medium 路由到 Seedance 2.0 Mini，Large/Max 路由到标准 Seedance 2.0。Seedance 1.5 Pro 仅保留已接受旧任务的兼容解析，不再用于新任务。
-- 先前行为级验证表明当前 Agent Plan Key 是 Small：文字、Seedream、TTS 可用，火山视频不可用。该事实不能被写成“火山视频已在当前账号可用”。
+- Agent Plan 代码支持 Small/Medium/Large/Max；2026-08-03 官方套餐概览明确 Small/Medium 均不包含新视频生成，当前策略只把 Large/Max 路由到标准 Seedance 2.0。Fast/Mini 仅能由后续管理员速度/成本策略在合资格套餐内显式选择。Seedance 1.5 Pro 仅保留已接受旧任务的兼容解析，不再用于新任务。
+- 2026-08-04 登录火山控制台确认当前 Agent Plan 已升级为 Large；此前 Small 行为级验证是历史证据。套餐资格、本地凭证元数据、真实 Provider acceptance、人工质量和生产验证仍是五个独立门禁。
+- 同日已把本地凭证元数据同步为 Large 和 `text/image/audio/video`，只读鉴权探测为 HTTP 200；媒体路由恢复火山主线路。受成本护栏约束的本地实测随后取得 Seedream 图片、标准 Seedance 2.0 视频和 Seed TTS 音频 Artifact，因此本地三类路线为 `provider_verified`；独立人工质量与生产门禁仍未通过。
 
 ### 2.2 文字
 
@@ -46,7 +47,7 @@ Skill、Tool、Provider、模型、套餐和故障切换不得出现在普通用
 |---|---|---|---|
 | 文字推理与写作 | `MiniMax-M3` | 火山文字模型，仅在合同、工具调用和上下文能力兼容时 | 可以自动切换，但 Run 必须记录 route snapshot；不能在已有有效输出/副作用后普通 failover |
 | 图片/海报生成 | 火山 Seedream | MiniMax 仅作为明确的 degraded/应急路线 | 已知质量差异不得伪装成等价；正式商业交付可选择等待火山恢复 |
-| 视频生成 | 火山 Seedance | MiniMax 仅作为经场景验收的 degraded/快速路线 | 当前 Small 无火山视频；正式商业视频不得假装已可用，升级 Medium+ 并通过真实验证后开放 |
+| 视频生成 | 火山 Seedance | MiniMax 仅作为经场景验收的 degraded/快速路线 | 当前账号已为 Large；同步本地凭证后仍需真实生成 receipt 与质量验收才可开放正式商业视频 |
 | 语音/TTS | 火山 TTS | MiniMax TTS | 默认声线可自动切；显式声线/品牌音色需要保持身份或重新确认 |
 | 音乐 | MiniMax | 无 | 不伪造备用 Provider；不可用时保留 brief 并明确等待/失败 |
 | PPT | Provider-neutral workflow | 文字规划走 M3，视觉走图片策略，必要配音/视频走各自策略，PPTX/PDF 由确定性工具生成 | Provider Skill 不是 PPT 质量替代品；版式、结构、可编辑性和 QA 独立治理 |
@@ -91,7 +92,7 @@ Skill、Tool、Provider、模型、套餐和故障切换不得出现在普通用
 - 区分人物广告、产品展示、口播、剧情和信息流等任务；
 - 每个镜头独立生成与重做；
 - 后期剪辑、字幕、配音、音乐、音量、封装和 QA 独立于生成模型；
-- 对 Small/Medium/Large/Max 与具体 Seedance 模型做服务端能力校验；
+- 对 Small/Medium（无新视频）和 Large/Max（Seedance 2.0）与具体模型做服务端能力校验；
 - 供应商任务已接受但响应未知时进入对账，禁止重复扣费。
 
 ### PPT Skill
@@ -141,7 +142,7 @@ Agent 只有同时满足以下条件才可执行：
 4. Runtime 对正式图片/视频执行同一降级门禁，并返回可操作的 reason code；旧快速生成在未声明正式合同的兼容路径上保持原行为，避免破坏旧流程。
    当前 Agent 聊天工具栏也允许该快速路径插入视频需求，由平台自动选择可用线路；按钮不展示 Provider，正式交付入口仍要求显式质量确认。
 5. 运营控制面已经持久化账号鉴权与成功生成 receipt，并将生成任务绑定到当前已验证的同一 Provider、账号和时间窗口；错绑 Provider 或重新鉴权前的旧任务不会污染 readiness。该 receipt 只证明真实生成被观察到，不等于人工质量评审或商用就绪。
-6. 当前 Small 账号继续只把已验证的 Seedream/TTS 能力贡献给火山池。升级 Medium+ 后仍需经授权的受控视频调用与质量评审，才能开放火山正式视频。
+6. 当前账号控制台已确认升级为 Large；本地凭证同步后可把 Seedance 2.0 贡献给火山池，但仍需经授权的受控视频调用与质量评审，才能开放火山正式商业视频。
 7. 真实 Provider、豆包盲评、发布和生产配置一致性都属于后续授权门禁，本地测试通过不能替代这些证据。
 
 ## 9. 完成标准

@@ -48,8 +48,8 @@
 | GRP-02 | Group 交接审批 | Agent 产出 → 人类 review/approval → 交付 | 责任主体、检查人和批准人可追溯 | timeline、review、approval receipt |
 | IMG-01 | 正式图片交付 | 工作说明 → 火山 Seedream → Artifact → 检查 → 批准 | 正确画幅/尺寸；Logo/文字合同；Provider/Credits/Artifact 一致 | 原图、hash、route snapshot、质量报告 |
 | IMG-02 | 图片故障/降级 | 阻断火山 → 检查 MiniMax 路线 | 正式合同不得静默降级；可等待或明确确认 degraded | preflight 文案、未重复扣费 |
-| VID-01 | 当前 Small 视频 | 正式人物广告视频 → 预检 | 火山视频显示 unavailable；不等待不存在的 Seedance；不假成功 | capability reason、无 Provider submit |
-| VID-02 | 升级后火山视频 | Medium+ Key → 脚本/分镜 → Seedance → 后期 → 交付 | 套餐模型正确；人物/品牌/音画合同；局部镜头可重做 | provider task、MP4 probe、质量与审批证据 |
+| VID-01 | Small/Medium 视频 | 正式人物广告视频 → 预检 | 火山视频显示 unavailable；不等待不存在的 Seedance；不假成功 | capability reason、无 Provider submit |
+| VID-02 | 当前 Large 火山视频 | Large Key → 脚本/分镜 → Seedance 2.0 → 后期 → 交付 | 套餐模型正确；人物/品牌/音画合同；局部镜头可重做 | provider task、MP4 probe、质量与审批证据 |
 | PPT-01 | 正式 PPT | 来源 → 大纲确认 → 逐页生成 → 预览 → 下载 PPTX/PDF | 有多版式与所需图片；可编辑；无溢出；PPTX/PDF 一致 | PPTX、PDF、页面渲染、结构检查 |
 | PPT-02 | PPT 局部修改 | 指定一页改文案/图片/图表 | 只创建目标页相关 revision，不全量重做 | revision lineage、前后对比 |
 | REV-01 | 三人质量检查 | 创建者分配三名 reviewer → 分别提交 | 创建者不能算独立 reviewer；身份唯一；提交不可改 | assignment/identity/receipt |
@@ -91,7 +91,7 @@
 ### 视频
 
 - 至少覆盖真人广告、产品展示、口播/旁白和短剧情；每类使用开放输入而非固定 prompt。
-- 当前 Small 只验证正确 unavailable；只有 Medium+ 受控真实调用通过后才验证商业质量。
+- Small/Medium 只验证正确 unavailable；当前 Large 必须在受控真实调用通过后才进入商业质量判断。
 
 ### PPT
 

@@ -49,6 +49,7 @@ class DeliverablePreflightIn(BaseModel):
     workflow_id: str = Field(min_length=1, max_length=120)
     workflow_version: str = Field(min_length=1, max_length=32)
     goal: str = Field(default="", max_length=4000)
+    inputs: list[DeliverableInput] = Field(default_factory=list, max_length=20)
     spec: dict[str, Any] = Field(default_factory=dict)
     tier: Literal["lite", "pro", "ultra"]
 

@@ -1,14 +1,14 @@
 # 导航与页面归属事实基线
 
-- 状态：`implementation-candidate`
-- 日期：2026-08-01
+- 状态：`next-slice-worktree-implemented`
+- 日期：2026-08-03
 - 目的：给每个一级入口一个唯一职责，清除“功能都有，但用户不知道从哪里开始”的问题
 
 ## 1. 当前路由事实
 
 `frontend/src/App.tsx` 已注册 `/work`，有租户上下文的根路径默认进入 `/work`；`/dashboard`、`/plaza`、`/agents/*`、`/groups/*`、`/quality-reviews/*`、`/enterprise`、`/okr`、`/account/subscription` 等旧路由继续保留。
 
-`Layout.tsx` 当前按三层呈现：`工作`（工作台、协作群组）、`协作角色`（我的助理、Agent 员工）和 `组织`（公司概览、OKR、发现中心、管理员可见企业设置）。账户菜单承载账户设置、套餐与用量、平台运营和 SaaS 能力治理；后两项只对对应平台角色显示。
+`Layout.tsx` 当前按三层呈现：`工作`（工作台、协作群组）、`协作角色`（我的助理、按需出现的历史助理、Agent 员工）和 `组织`（公司概览、OKR、发现中心、管理员可见企业设置）。`历史助理` 是兼容旧数据的迁移分组，不是可创建的新角色。账户菜单承载账户设置、套餐与用量、平台运营和 SaaS 能力治理；后两项只对对应平台角色显示。
 
 ## 2. 页面逐项审查
 
@@ -19,7 +19,7 @@
 | OKR | 目标、KR、看板、日报和管理员设置链接；进度可引用已完成工作证据 | 不能从 Agent 自述自动完成 KR | 目标与结果证据 | 保留一级组织入口；仅接受完成 Task 或带批准 Artifact 的成功 Deliverable |
 | Plaza | 团队/我的 Experience；发现中心可进入员工市场 | 经验与招聘共享入口但不共享生命周期 | 发现中心：经验库 + 员工市场 | 保留 `/plaza` 和 Talent Market；不混合 Experience 与 Agent 模板数据模型 |
 | Groups | 群组树、会话、消息、成员、Workspace；可接收工作台 Group Task | 不应被当成组织架构或无责任人的黑盒编排 | 可见多人协作 | 保留；每项工作固定 Task、owner Agent、session、参与者与 correlation |
-| Agents | 分离后的我的助理、Agent 员工列表及 chat/directory/settings | Agent 详情仍承载较多专业设置 | 长期角色与执行现场 | 私人关系和长期员工已分组；旧 Agent 深链、权限与设置保持 |
+| Agents | 分离后的我的助理、历史助理、Agent 员工列表及 chat/directory/settings | Agent 详情仍承载较多专业设置 | 长期角色与执行现场 | 当前 companion、迁移历史和长期员工分别展示；旧 Agent 深链、权限与设置保持 |
 | Enterprise | info/users/invites/org/tools/skills/approvals/audit/okr/subscription 等 | 租户治理与平台路由曾混在一起；页面过宽 | 公司治理控制面 | 保留管理员入口；Provider/model 永远跳 SaaS Admin |
 | Subscription | `/account/subscription` 用量/流水/订单；Enterprise 有购买/计划 | 两处都叫套餐 | 成员可见“套餐与用量” + 管理员“购买与配置” | 共享数据源；前者读用量与账单，后者管理订阅；互相深链 |
 | Deliverable | chat 中发起、结果卡、右侧详情、独立 reviewer 路由，并由工作台跨员工聚合 | 必须保持结果属于产出者，不能再次挤入 composer | 正式产物生命周期 | 不做孤立文件库；Agent/Group 时间线报告，右侧详情检查与交付 |
@@ -36,6 +36,7 @@
 
 协作角色
   我的助理 · <自定义名称>
+  历史助理（仅旧数据存在时显示）
   Agent 员工
 
 组织
@@ -104,6 +105,7 @@ SaaS 能力治理
 ### 数字员工与我的助理
 
 - `我的助理` 是固定关系入口；`数字员工` 是长期角色花名册。
+- `历史助理` 只承接旧版本内容回访，不计入员工花名册，也不能从员工市场新增。
 - Agent chat 是执行和沟通现场；Settings 仅对有管理权的人显示。
 
 ### 企业设置、套餐、SaaS 管理
@@ -127,6 +129,7 @@ SaaS 能力治理
 - 保留 `/agents/:id/chat|directory|settings`、`/groups/*`、`/quality-reviews/:id`、`/okr`、`/plaza`、`/enterprise`、`/account/subscription`。
 - 旧链接永不因导航改名失效；新页面只产生到旧权威页面的深链。
 - Onboarding 已变更落点到 `/work`，没有改变已有助手 Agent ID。
+- 历史助理沿用原 `/agents/:id/*` 深链；分类只改变展示和员工统计，不迁移会话或 Workspace。
 - 狭窄屏幕上工作台、审批和 Deliverable 详情必须可用；复杂管理员页面仍可声明 desktop-first。
 
 ## 7. 当前剩余的定位与验证问题
@@ -137,6 +140,7 @@ SaaS 能力治理
 4. Workspace、聊天附件和 Deliverable 已有文案与深链边界，但图片、视频、PPT 的真实右侧预览和正式交付仍需逐类核验。
 5. 普通成员与 `agent_admin` 已无法进入企业设置、邀请、账户运营或 SaaS 管理入口；仍需在候选 SHA 上补跨租户 API IDOR 专项，并持续保证错误和日志不泄露 Provider Key。
 6. OKR 证据链已实现，但需要验证审批 Artifact 更新、证据快照和旧进度路径不会互相覆盖。
+7. 历史助理当前只提供无损回访入口；后续归档或转员工必须作为独立、可撤销并显示席位影响的产品流程设计。
 
 ## 8. 完成标准
 

@@ -1,7 +1,7 @@
 # 产品角色体系事实基线
 
-- 状态：`implementation-candidate`
-- 日期：2026-08-01
+- 状态：`next-slice-worktree-implemented`
+- 日期：2026-08-03
 - 范围：下一产品线角色、责任、权限边界与迁移约束
 - 非完成声明：本文同时记录已进入本地工作树的实现与仍受外部门禁约束的事项；不代表已发布、生产验证或商用质量达标
 
@@ -9,11 +9,12 @@
 
 1. 人类成员角色由 `backend/app/models/user.py` 定义为 `platform_admin`、`org_admin`、`agent_admin`、`member`。`Identity` 表达跨租户自然人，`User` 表达该自然人在一个租户内的成员身份。
 2. 私人助手没有独立 Agent 类型。它由 `backend/app/api/onboarding.py` 以普通 `Agent` 创建，通过 `role_description="Private Assistant"`、`access_mode="private"` 和当前用户的 `manage` 权限表达，并由 `UserTenantOnboarding.personal_assistant_agent_id` 建立 `(tenant, user)` 关联。
-3. 注册页已把私人助手称为“私人协调者”，完成或恢复 Onboarding 后进入 `/work`；`Layout.tsx` 通过 `personal_assistant_agent_id` 把“我的助理”和长期 `Agent 员工` 分组展示。
+3. 注册页已把私人助手称为“私人协调者”，完成或恢复 Onboarding 后进入 `/work`；`Layout.tsx` 通过 `personal_assistant_agent_id` 把“我的助理”和长期 `Agent 员工` 分组展示。当前本地切片由 Agent 列表 API 下发 viewer-specific `product_role`，把旧版本遗留、仍绑定内置私人助手模板但不再是当前 companion 的对象单列为“历史助理”。
 4. 长期 Agent 员工由 `Agent`、`AgentTemplate`、`AgentPermission`、Skill、Tool、Trigger、Channel、Workspace 等对象共同表达。Skill 只提供做事方法，Tool 才是可执行能力。
 5. 临时专家没有被实现成新的长期 Agent 类型；工作台用 `Task.executor_kind="temporary_expert"` 和 `executor_snapshot` 固定本次角色，并由一个真实、租户可用的 Agent 承担 Runtime 执行，因此不会污染员工花名册。
 6. Group 是租户内长期协作空间，成员是 `Participant`，群成员角色只有 `manager` 和 `member`；工作台可选择一个 Group session 和有序 Agent 参与者，创建带 `work-task:{task_id}` correlation 的真实 Group 运行，但 Group 本身仍不是人类组织架构或新的 Agent。
 7. 私人助手使用每个 `(tenant, user)` 的 companion slot：Onboarding 创建不执行普通员工 `max_agents` 检查，员工配额统计也按 onboarding 关联 ID 排除私人助手；具体免费政策和超限价格仍是外部产品/财务决策。
+8. 内置 `Private Assistant` 模板当前本地切片标记为 `not_recruitable`，只能由 Onboarding 产品流程创建；员工市场和普通 Agent 创建接口不能再用它产生第二个 companion。
 
 ## 2. 已确认的目标角色
 
@@ -83,12 +84,14 @@
 3. **权限角色与产品称谓仍需持续解释**：浏览器已证明 `agent_admin` 只能编辑显式授予 `manage` 的 Agent，并且不能进入企业/邀请/SaaS 管理入口；自动化合同进一步覆盖该对象的审批查看/处理和 OpenClaw API Key 管理。界面文案仍要维持这一边界，不能让它看起来等同公司管理员。
 4. **Group 的工作边界需要业务验证**：真实多 Agent Group 运行已接入，但其顺序、失败聚合、交接和审批体验仍需浏览器矩阵验证，不能宣传为万能自动团队。
 5. **私人助手商业政策未批准**：技术上已独立于员工席位，但“是否免费、套餐含几个 companion slot、超限如何收费”仍不能由代码自行决定。
+6. **历史助理需要显式处置流程**：当前切片只做无损分类和兼容展示，不自动删除、合并、转员工或迁移会话。后续需提供仅限 owner/授权管理员的“保留归档”或“转为员工”流程，并逐项解释权限、席位和 Workspace 影响。
 
 ## 7. 无破坏迁移规则
 
 - 保留所有现有 Agent ID、会话、Workspace、权限和深链；只新增角色标签和入口分组。
 - 通过 `UserTenantOnboarding.personal_assistant_agent_id` 识别现有私人助手，不按名称猜测。
-- 迁移前检测一名用户是否有多个候选私人助手；冲突进入管理员修复队列，不自动合并内容。
+- 通过服务端 `product_role` 和内置模板稳定身份识别历史助理；前端不得按名称或可编辑 `role_description` 猜测。
+- 多个候选私人助手先进入独立“历史助理”分组；不自动合并内容，也不计入长期员工花名册。任何归档、转员工或删除动作必须是后续显式、可审计操作。
 - 临时专家第一阶段作为 Task/Run 的执行策略和快照实现，不先新增可见员工记录。
 - 现有 `agent_admin` 权限不扩大；新增界面必须基于服务端 `manage` 关系判定。
 - 私人助手的员工席位豁免已在服务端实现；具体商业价格、套餐数量和账单展示仍需产品/财务批准后才可对外承诺。
@@ -98,4 +101,5 @@
 - 注册、导航、Agent 列表、Group 成员和企业管理对上述角色使用一致术语。
 - 普通成员无需理解 Skill、Tool、Provider 或模型即可完成首次任务。
 - 私人助手与数字员工在界面、权限、配额、发现和协作行为上均可区分。
+- 历史助理继续保留原 Agent ID、会话、Workspace 和深链，同时不再冒充当前私人助手或长期 Agent 员工。
 - 一次性任务无需创建长期员工，并且其执行者、授权、Run 和 Artifact 仍可审计。

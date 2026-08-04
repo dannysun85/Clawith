@@ -8,6 +8,7 @@ const onboarding = readFileSync(new URL('../src/pages/Onboarding.tsx', import.me
 const work = readFileSync(new URL('../src/pages/Work.tsx', import.meta.url), 'utf8');
 const plaza = readFileSync(new URL('../src/pages/Plaza.tsx', import.meta.url), 'utf8');
 const editor = readFileSync(new URL('../src/components/ExperienceDraftEditor.tsx', import.meta.url), 'utf8');
+const agentDetail = readFileSync(new URL('../src/pages/agent-detail/AgentDetailPage.tsx', import.meta.url), 'utf8');
 
 test('the task workbench is the default entry while legacy routes remain available', () => {
   assert.match(app, /<Navigate to="\/work" replace/);
@@ -25,7 +26,15 @@ test('navigation names communicate distinct product responsibilities', () => {
   assert.match(layout, /'发现中心'/);
   assert.match(layout, /'协作群组'/);
   assert.match(layout, /'我的助理'/);
+  assert.match(layout, /历史助理/);
   assert.match(layout, /'Agent 员工'/);
+});
+
+test('agent detail preserves the server-owned product role instead of guessing from names', () => {
+  assert.match(agentDetail, /agent\.product_role \|\| 'agent_employee'/);
+  assert.match(agentDetail, /data-testid="agent-product-role"/);
+  assert.match(agentDetail, /'legacy_personal_assistant'/);
+  assert.doesNotMatch(agentDetail, /role_description.*legacy_personal_assistant/);
 });
 
 test('company administration routes stay behind the company-admin boundary', () => {

@@ -231,6 +231,8 @@ def test_execution_prompt_contains_contract_but_never_provider_selection() -> No
     assert '"tier": "pro"' in prompt
     assert "render_mode='hybrid_editable'" in prompt
     assert "every visible text node must remain fully inside its 1280x720 slide" in prompt
+    assert "Use at least 16px computed font size" in prompt
+    assert "data-clawith-text-role='metadata'" in prompt
     assert "one unique placeholder" in prompt
     assert "under 3500 characters" in prompt
     assert "exactly one placeholder per edit_file call" in prompt
@@ -290,6 +292,91 @@ def test_image_led_commercial_presentation_compiles_required_media_contract() ->
     assert "pass its exact versioned output_path as reference_image" in prompt
     assert "Do not use emoji as a substitute" in prompt
     assert "stop without converting or claiming a commercial-quality deck" in prompt
+
+
+def test_supplied_presentation_images_satisfy_media_roles_without_paid_generation() -> None:
+    request = _request(
+        goal=(
+            "制作一份高端智能保温杯新品发布提案，图文并茂，"
+            "包含人物广告创意与三镜头故事板。"
+        ),
+        inputs=[
+            {
+                "type": "workspace_file",
+                "path": "workspace/deliverables/old/assets/product.png",
+            },
+            {
+                "type": "workspace_file",
+                "path": "workspace/uploads/lifestyle.webp",
+            },
+            {
+                "type": "workspace_file",
+                "path": "workspace/uploads/storyboard.jpg",
+            },
+        ],
+        spec={
+            "audience": "品牌与增长决策者",
+            "page_count": 8,
+            "language": "zh-CN",
+            "style": "高端商业风",
+        },
+    )
+
+    prompt = build_deliverable_prompt(request)
+
+    assert '"generation_required_roles": []' in prompt
+    assert '"role": "product_hero"' in prompt
+    assert '"asset_ref": "../old/assets/product.png"' in prompt
+    assert '"asset_ref": "../../uploads/lifestyle.webp"' in prompt
+    assert '"minimum_distinct_images": 3' in prompt
+    assert "All required media roles are satisfied by supplied assets" in prompt
+    assert "Do not call generate_image_minimax for this presentation" in prompt
+    assert "generate_image_minimax exactly once" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_supplied_presentation_images_skip_unneeded_provider_preflight(
+    monkeypatch,
+) -> None:
+    workflow = require_workflow("presentation")
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.resolve_route",
+        AsyncMock(return_value=SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows._presentation_tool_available",
+        AsyncMock(return_value=True),
+    )
+    media_capabilities = AsyncMock()
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.get_agent_media_capabilities",
+        media_capabilities,
+    )
+
+    result = await preflight_workflow(
+        SimpleNamespace(),  # type: ignore[arg-type]
+        tenant_id=uuid.uuid4(),
+        agent_id=uuid.uuid4(),
+        workflow=workflow,
+        tier="pro",
+        goal="制作一份图文并茂的新品发布 PPT",
+        inputs=[
+            {"type": "workspace_file", "path": "workspace/uploads/one.png"},
+            {"type": "workspace_file", "path": "workspace/uploads/two.jpg"},
+            {"type": "workspace_file", "path": "workspace/uploads/three.webp"},
+        ],
+        spec={
+            "audience": "客户",
+            "page_count": 8,
+            "language": "zh-CN",
+            "style": "商业风",
+        },
+    )
+
+    assert result["available"] is True
+    assert result["launchable"] is True
+    assert result["reasons"] == []
+    media_capabilities.assert_not_awaited()
 
 
 def test_customer_launch_brief_is_image_led_without_literal_image_word() -> None:

@@ -191,8 +191,8 @@ Astra 适配必须替换为：
   公开名映射为版本化 Provider ID。Astra 已把该映射收进 server-owned adapter，不向 Agent 暴露，
   也不再把低套餐返回的 `UnsupportedModel` 错判为“版本化 ID 无效”；
 - 当前 adapter 支持 `doubao-seedance-1.5-pro`、`doubao-seedance-2.0`、
-  `doubao-seedance-2.0-fast` 和 `doubao-seedance-2.0-mini`。按照 2026-07-24 的运营复核策略，
-  Medium 显式路由到 `2.0-mini`，Large/Max 的商用质量默认使用标准 `2.0`，fast 仅在速度/成本策略明确时使用；
+  `doubao-seedance-2.0-fast` 和 `doubao-seedance-2.0-mini`。按照 2026-08-03 更新的官方套餐矩阵，
+  Small/Medium 不接收新视频任务；Large/Max 的商用质量默认使用标准 `2.0`，Fast/Mini 仅在速度/成本策略明确时使用；
 - `doubao-seedance-1.5-pro` 已进入退役兼容期，只允许已被 Provider 接受且已固定模型的旧任务继续对账，
   不是新任务或长期商用依赖；
 - 2.0 系列的实际可用性仍必须以账号套餐和 Provider receipt 为准；本地 `plan_tier` 是管理员声明，不能替代
@@ -214,7 +214,7 @@ Astra 适配必须替换为：
 | Seedance 文生、首帧、首尾帧、生成音频 | 1.5/2.0 均支持 | 支持 | 当前正式协议 |
 | Seedance 1.5 Pro | 4–12 秒；480/720/1080p；固定六种比例；支持 draft/flex；不支持联网、多图/视频/音频参考、编辑/延长 | 仅已接受旧任务的兼容对账；Agent Tool 不为新任务暴露该模型 | 兼容接入，不作为新任务路由 |
 | Seedance 2.0 标准 | 最长 15 秒；最高 4K；支持多模态参考、联网、编辑/延长；不支持 draft/flex | Large/Max 默认模型；当前 Tool 只开放与 1.5 共同的稳定子集 | 后续按可恢复执行单元逐项扩展 |
-| Seedance 2.0 Fast/Mini | 最长 15 秒、最高 720p；高级参考能力与 2.0 对齐 | Medium 默认使用 Mini；Fast 仅按管理员速度/成本策略路由 | 仍需目标账号真实权益和生成 receipt |
+| Seedance 2.0 Fast/Mini | 最长 15 秒、最高 720p；高级参考能力与 2.0 对齐 | 仅在 Large/Max 内按管理员速度/成本策略显式路由；不能从 Medium 套餐推断 | 仍需目标账号真实生成 receipt |
 
 图片和视频 Skill 都必须定制，但定制位置不同：
 
@@ -249,10 +249,26 @@ Astra 适配必须替换为：
 - 公开名和官方 Skill 版本化 ID 均已做最小 4 秒、480p 提交前探测：
   `doubao-seedance-1.5-pro`、`doubao-seedance-2.0`、`doubao-seedance-2.0-fast`、
   `doubao-seedance-2.0-mini` 全部返回 `UnsupportedModel`，没有创建 Provider task、没有生成费用；
-- 当前运营复核策略显示：Small 无视频，Medium 的新任务目标为 Seedance 2.0 Mini，Large/Max 默认标准
+- 当时运营复核策略把 Medium 视为 Seedance 2.0 Mini 迁移目标、Large/Max 默认标准
   Seedance 2.0；1.5 Pro 仅保留旧任务兼容。当前 Key 的文字、Seedream、TTS 成功且所有视频模型拒绝，
   与 Small 权益完全一致，因此本地按 provider behavior 将账号纠正为 `plan_tier=small`、
   `capabilities=text/image/audio`，不再保留虚假的视频 capability 或无意义 model circuit；
+
+### 当前账号与官方套餐复核（2026-08-04）
+
+- 登录火山控制台的 Agent Plan 套餐页确认当前账号为 **Large**，有效期至 2026-09-05；这证明套餐资格，
+  但不替代一次真实 Seedance 任务的 Provider acceptance receipt。
+- 本地 SaaS 凭证元数据已同步为 `plan_tier=large` 与
+  `capabilities=text/image/audio/video`；只读账号鉴权返回 HTTP 200，图片、语音和视频都恢复为
+  `volcengine_agent_plan -> minimax`。随后受成本护栏约束的本地实测已为 Seedream、标准 Seedance 2.0
+  和 Seed TTS 取得 hash 绑定 Artifact；这只把三类本地路线提升为 `provider_verified`，不代表商用或生产通过。
+- 2026-08-03 更新的官方套餐概览明确把 Small/Medium 定义为轻量套餐且不包含新视频生成；
+  Seedance 2.0、Fast、Mini 均为 Large/Max 权益。Astra 因此不再执行 Medium → Mini 路由。
+- 官方 Skill 源仍只有 `byted-ark-seedream-skill` v3.0.0 与
+  `byted-ark-seedance-skill` v4.0.0，锁定哈希与仓库已审计版本一致；本轮保留 Astra 的租户、
+  Credits、Artifact、审批和故障切换适配层，而不是覆盖安装上游脚本。
+- 语音生成继续使用已接入的 `doubao-seed-tts-2.0`；官方同时提供
+  `doubao-seed-asr-2.0`，但当前产品没有语音转文字 Tool/Artifact 合同，不能把 ASR 标记为已接入。
 - 2026-07-26 17:31 从正式“制作交付物 → 短视频”入口创建了 6 秒、9:16、真人使用产品、
   中文旁白的 ULTRA 请求 `6e50d404-a0f5-48f8-a4ef-a0a20eab32ca`。Runtime 正确创建了
   request-scoped storyboard，并由 provider-neutral Tool 依次检查火山和 MiniMax；火山三个
@@ -263,18 +279,20 @@ Astra 适配必须替换为：
   `last_error_code=deliverable_artifact_missing`，不再出现批准入口；
 - 视频执行 prompt 现在只允许调用一次 provider-neutral 生成 Tool，由 Tool 自己完成 Provider fallback；
   Provider 均不接受时禁止 Agent 自行连点重试、创建 Trigger 或把 storyboard 当成交付结果；
-- 本地管理员原填写的 `plan=large` 与上述真实权益冲突，已纠正。Plan Key 本身的只读任务接口不返回
-  套餐名称；若要获得“订单级 SKU/有效期”而不是行为级判断，仍需登录控制台或使用需要火山 AK/SK
-  签名的 `GetPersonalPlan` 管理 API。再次点击通用鉴权验证不能扩大模型权益；
+- 2026-07-26 当时仅凭 Provider 行为把管理员声明的 `plan=large` 暂时收敛为 Small，是没有控制台订单证据时的
+  fail-closed 历史处理；2026-08-04 控制台已确认新订单为 Large，因此本地已重新同步为 Large。Plan Key 本身的
+  只读任务接口仍不返回套餐名称；若要获得“订单级 SKU/有效期”，必须登录控制台或使用需要火山 AK/SK
+  签名的 `GetPersonalPlan` 管理 API。再次点击通用鉴权验证不能自行扩大模型权益；
 - 同题 MiniMax `MiniMax-Hailuo-2.3` 文字生成视频返回 10.125 秒、1366×768、无音轨，
   未满足 9:16 + 音频的广告硬门槛。这证明“有 fallback”不等于“fallback 能满足同一交付合同”。
 
 配置一致性边界：
 
-- 新建 Agent Plan 凭证默认声明 `text/image/audio`；Medium、Large、Max 可声明 `video`，Medium 新任务
-  路由到 `2.0-mini`，且声明值仍必须经过 Provider 实证；
+- 新建 Agent Plan 凭证默认声明 `text/image/audio`；只有 Large/Max 可声明 `video`，且声明值仍必须经过
+  Provider 实证；
 - 迁移只创建 provider model 和 SaaS route，不擅自扩大管理员已有凭证的 capabilities；
-- 本地凭证已按真实 Provider 行为收敛为 `small + text/image/audio`；
+- 2026-08-04 本地凭证已按控制台确认的套餐同步为 `large + text/image/audio/video`；图片、视频和语音均已通过
+  只读鉴权、浏览器路由和一次受控真实生成；质量状态仍保持待独立人工评审；
 - 生产仍需在发布变更窗口内显式配置/核验凭证 capability、套餐、额度和真实调用，当前不得标记
   `production_verified`。
 
@@ -289,8 +307,8 @@ Astra 适配必须替换为：
 - `Douyin Operations Manager` 模板已获得这两个 Skill，同时保留原有
   `brand-safe-media` 和显式媒体 Tool grant；Skill 不授予 Tool；
 - 当前“抖音运营经理”工作区已真实同步两个 Skill 的 `SKILL.md` 与 provenance reference；
-- 当前 Small 账号下 Seedream Skill 可执行；Seedance Skill 会先服从运行时 capability，火山视频不入选，
-  MiniMax 只有在健康可用且在 Provider 接受前才可自动兜底。
+- 当前 Large 账号下 Seedream Skill 与 Seedance Skill 都已进入火山优先路由；MiniMax 仍只在健康可用且火山尚未
+  接受任务时自动兜底。当前配置尚无新生成 receipt，不能把路由可选写成商用质量已通过。
 - 2026-07-26 18:45 已通过真实 Agent 会话执行 `volcengine-seedream-commercial`：
   `volcengine_agent_plan / doubao-seedream-5.0-lite` 成功交付
   `workspace/images/agent_plan_skill_real_person_ad_bd78482be7cb.png`。样张为 9:16 真人持杯场景，
@@ -614,9 +632,9 @@ PPT Provider 对比。拒绝凭空补齐 brief 是评测正确性，不是 PPT �
   identity、视频时长/比例/音轨合同、PPTX/PDF 结构与页数均通过；图片 1 帧 6 个 OCR 变体、
   视频 6 帧 36 个 OCR 变体未命中本轮禁止平台词。该结果只证明自动门禁未发现问题，事实安全、
   水印视觉判断、溢出细节和来源追溯仍需独立人工评审。
-- 本地 SaaS“媒体路由”现按真实运行时展示：图片、语音为
-  `volcengine_agent_plan -> minimax` 且两条路径就绪；当前 Small Agent Plan 不具备视频权益，
-  所以视频仍显示相同自动顺序但实际可用 Provider 只有 MiniMax；音乐明确为 MiniMax-only。
+- 本地 SaaS“媒体路由”现按真实运行时展示：图片、语音、视频均为
+  `volcengine_agent_plan -> minimax` 且两条账号验证路径就绪；当前 Large Agent Plan 为三类主线路，
+  音乐明确为 MiniMax-only。三类火山线路已有本地 hash 绑定真实样本，但不能据此放行商用质量或生产状态。
   可编辑模型与质量参数只属于 MiniMax 兜底配置，不再伪装成整条统一路由。
 
 因此当前准确状态是：
@@ -688,3 +706,18 @@ PPT Provider 对比。拒绝凭空补齐 brief 是评测正确性，不是 PPT �
 - tenant、授权和审计正确。
 
 后续新增模型、Provider、Skill、Tool 或 Agent 员工，一律执行 `.agents/workflows/add-product-capability.md`，不得绕过产品合同、真实样本、权限、Credits、降级、业务流和生产验证。
+
+### 2026-08-04 Large / Seedance 2.0 真实运行增量
+
+- 当前本地 Agent Plan 账号已由行为级验证确认为 `large + text/image/audio/video`；标准
+  `doubao-seedance-2.0` 已真实生成 `1080×1920`、H.264/AAC 的竖版人物广告视频。不能再沿用历史
+  Small/Medium 无视频结论，也不能只凭套餐名推断生成成功。
+- 同一轮已取得 Seedream 图片、Seedance 2.0 视频和 `doubao-seed-tts-2.0` 音频 Artifact；正式 PPT
+  工作流复用了这些已提供素材并产出 6 页 PPTX/PDF。详细 hash、规格和豆包对照记录见
+  `docs/product-line/09-multimodal-benchmark-current-status.md` 第 6 节。
+- 真实样本暴露的首要硬伤不是“模型不能生成”，而是产品显示面伪字符、无品牌场景中的第三方包装风险、
+  PPT 小字号和生成事实失控。`brand-safe-media`、`volcengine-seedance-commercial` 和演示文稿 HTML 合同
+  已按这些缺陷加入动态门禁。
+- 当前只可标记本地 `provider_verified=true` 和 `local_browser_flow_verified=true`；没有三名独立人员的
+  完整感知评审、没有生产配置/发布/浏览器证据，因此继续保持
+  `commercially_usable_proven=false`、`production_verified=false`。

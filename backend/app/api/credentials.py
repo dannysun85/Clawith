@@ -83,7 +83,7 @@ def _validate_provider_account_contract(
         raise HTTPException(
             status_code=422,
             detail=(
-                "Agent Plan video requires Medium, Large, or Max and a current "
+                "Agent Plan video requires Large or Max and a current "
                 "operator-reviewed model policy"
             ),
         )

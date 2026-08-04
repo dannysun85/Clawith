@@ -159,6 +159,86 @@ def test_browser_visual_quality_accepts_measured_non_overlapping_layout():
     assert receipt["slide_count"] == 1
 
 
+def test_browser_visual_quality_rejects_unreadably_small_body_copy():
+    layout = {
+        "slides": [
+            {
+                "width": 1280,
+                "height": 720,
+                "items": [
+                    {
+                        "kind": "text",
+                        "tag": "p",
+                        "text": "渠道策略与投放节奏需要在会议屏幕上直接读清",
+                        "x": 80,
+                        "y": 220,
+                        "w": 520,
+                        "h": 44,
+                        "clientWidth": 520,
+                        "clientHeight": 44,
+                        "scrollWidth": 520,
+                        "scrollHeight": 44,
+                        "style": {
+                            "fontSize": "12px",
+                            "overflow": "visible",
+                        },
+                        "lines": [{"text": "渠道策略与投放节奏需要在会议屏幕上直接读清"}],
+                    }
+                ],
+            }
+        ]
+    }
+
+    with pytest.raises(PresentationVisualQualityError) as error:
+        validate_browser_slide_visual_quality(layout)
+
+    failure = next(
+        item for item in error.value.receipt["failures"]
+        if item["code"] == "text_too_small"
+    )
+    assert failure["font_size_px"] == 12
+    assert failure["minimum_font_size_px"] == 16
+
+
+def test_browser_visual_quality_allows_only_short_edge_metadata_to_be_smaller():
+    metadata_item = {
+        "kind": "text",
+        "tag": "small",
+        "text": "03 / 06",
+        "textRole": "metadata",
+        "x": 1160,
+        "y": 680,
+        "w": 70,
+        "h": 18,
+        "clientWidth": 70,
+        "clientHeight": 18,
+        "scrollWidth": 70,
+        "scrollHeight": 18,
+        "style": {"fontSize": "10px", "overflow": "visible"},
+        "lines": [{"text": "03 / 06"}],
+    }
+    layout = {
+        "slides": [
+            {
+                "width": 1280,
+                "height": 720,
+                "items": [metadata_item],
+            }
+        ]
+    }
+
+    receipt = validate_browser_slide_visual_quality(layout)
+    assert receipt["status"] == "passed"
+
+    metadata_item["text"] = "这是一段被错误标记为元数据的正文内容，不能靠角色标记绕过正文可读性门槛"
+    metadata_item["lines"] = [{"text": metadata_item["text"]}]
+    metadata_item["y"] = 260
+    with pytest.raises(PresentationVisualQualityError) as error:
+        validate_browser_slide_visual_quality(layout)
+    codes = {item["code"] for item in error.value.receipt["failures"]}
+    assert {"invalid_metadata_text_role", "text_too_small"} <= codes
+
+
 def test_browser_visual_quality_ignores_scroll_height_for_visible_auto_sized_text():
     layout = {
         "slides": [

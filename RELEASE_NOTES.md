@@ -1,3 +1,38 @@
+# Unreleased — Large Agent Plan and Product-role Accuracy
+
+## Managed media routing
+
+- Align the reviewed Agent Plan matrix with the official package overview
+  updated on 2026-08-04: Small / Medium reject new video work, while Large /
+  Max route new commercial video to standard Seedance 2.0. Fast / Mini remain
+  administrator-owned speed/cost choices inside eligible packages.
+- Synchronize the verified local account metadata to Large with
+  `text/image/audio/video`; image, speech, and video now show Volcengine first
+  and MiniMax fallback. Bounded local runs produced hash-bound Seedream,
+  Seedance 2.0, and Seed TTS artifacts, so those three local routes are
+  provider-verified; music remains MiniMax-only. Independent human quality
+  approval and production verification remain open.
+- Keep the reviewed official Seedream v3.0.0 and Seedance v4.0.0 Skill
+  contracts inside Astra's tenant, Credits, durable task, Artifact, approval,
+  and failover boundaries. Managed voice-over follows the official
+  `doubao-seed-tts-2.0` API contract; ASR is not exposed as a completed product
+  capability.
+
+## Product roles
+
+- Preserve the server-owned viewer-specific `product_role` on both Agent list
+  and detail responses. Current assistants, previous assistants, and Agent
+  employees no longer collapse into the same detail-page identity.
+
+## Validation
+
+- Complete backend suite: `4240 passed`; frontend Node contracts: `109 passed`;
+  Vitest: `162 passed`; TypeScript/Vite production build: `7087` modules.
+- Ruff and `git diff --check` pass. Local authenticated browser validation
+  confirms the assistant/employee labels, Large media routes, Agent-message
+  delivery cards, preview, and download surfaces. Regression reruns did not
+  repeat the already completed paid Provider samples.
+
 # v1.11.17 — Chinese Poster Punctuation Classification
 
 ## Poster Typography
@@ -173,10 +208,10 @@
   same provider order, but a Small Agent Plan account is correctly excluded
   from the video route, leaving MiniMax as the current executable provider.
   Music remains MiniMax-only.
-- The dated Agent Plan video policy follows the current official retirement
-  notices: Medium routes new work to Seedance 2.0 Mini, Large / Max route to
-  Seedance 2.0, and Seedance 1.5 Pro remains compatibility-only for already
-  accepted legacy work until its announced service shutdown.
+- The dated Agent Plan video policy follows the then-current official
+  retirement notices: Medium routes new work to Seedance 2.0 Mini, Large / Max
+  route to Seedance 2.0, and Seedance 1.5 Pro remains compatibility-only for
+  already accepted legacy work until its announced service shutdown.
 - Platform credentials can be synchronized through a bounded stdin-only
   operator command. The target environment encrypts the API key with its own
   `SECRET_KEY`, verifies account authentication before reporting readiness,

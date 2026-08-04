@@ -6,8 +6,9 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
+import posixpath
 from datetime import UTC, datetime
-from typing import Any, Literal, Mapping
+from typing import Any, Literal, Mapping, Sequence
 import uuid
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -416,6 +417,54 @@ def _presentation_media_roles(request: DeliverableRequest) -> tuple[str, ...]:
     )
 
 
+_PRESENTATION_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
+
+
+def presentation_supplied_image_paths(
+    inputs: Sequence[Mapping[str, Any] | object] | None,
+) -> tuple[str, ...]:
+    """Return distinct, safe image attachments in the user's declared order."""
+
+    paths: list[str] = []
+    seen: set[str] = set()
+    for item in inputs or ():
+        value = item.get("path") if isinstance(item, Mapping) else getattr(item, "path", None)
+        path = str(value or "").strip().replace("\\", "/")
+        normalized = path.casefold()
+        if (
+            not path.startswith("workspace/")
+            or ".." in path.split("/")
+            or not normalized.endswith(_PRESENTATION_IMAGE_SUFFIXES)
+            or normalized in seen
+        ):
+            continue
+        seen.add(normalized)
+        paths.append(path)
+    return tuple(paths)
+
+
+def _presentation_media_plan(
+    request: DeliverableRequest,
+) -> tuple[tuple[str, ...], tuple[dict[str, str], ...], tuple[str, ...]]:
+    """Bind supplied imagery first and generate only genuinely missing roles."""
+
+    roles = _presentation_media_roles(request)
+    supplied_paths = presentation_supplied_image_paths(request.inputs)
+    bindings = tuple(
+        {
+            "role": role,
+            "workspace_path": path,
+            "asset_ref": posixpath.relpath(
+                path,
+                start=f"workspace/deliverables/{request.id}",
+            ),
+        }
+        for role, path in zip(roles, supplied_paths, strict=False)
+    )
+    generated_roles = roles[len(bindings) :]
+    return roles, bindings, generated_roles
+
+
 def _presentation_visual_policy(
     request: DeliverableRequest,
     media_roles: tuple[str, ...],
@@ -529,7 +578,11 @@ def build_deliverable_prompt(request: DeliverableRequest) -> str:
             "storyboard, prompt, visual-only intermediate, or voiceover-only file is not the final deliverable.\n"
             f"DELIVERABLE_REQUEST={json.dumps(contract, ensure_ascii=False, sort_keys=True)}"
         )
-    presentation_media_roles = _presentation_media_roles(request)
+    (
+        presentation_media_roles,
+        presentation_supplied_assets,
+        presentation_generation_roles,
+    ) = _presentation_media_plan(request)
     presentation_visual_policy = _presentation_visual_policy(
         request,
         presentation_media_roles,
@@ -538,6 +591,8 @@ def build_deliverable_prompt(request: DeliverableRequest) -> str:
         "required": bool(presentation_media_roles),
         "asset_roles": list(presentation_media_roles),
         "minimum_distinct_images": len(presentation_media_roles),
+        "supplied_assets": list(presentation_supplied_assets),
+        "generation_required_roles": list(presentation_generation_roles),
     }
     media_instructions = (
         "PRESENTATION_MEDIA_CONTRACT="
@@ -545,7 +600,7 @@ def build_deliverable_prompt(request: DeliverableRequest) -> str:
     )
     if presentation_media_roles:
         role_instructions: list[str] = []
-        for role in presentation_media_roles:
+        for role in presentation_generation_roles:
             if role == "product_hero":
                 role_instructions.append(
                     "For product_hero, call generate_image_minimax exactly once with a polished "
@@ -598,18 +653,35 @@ def build_deliverable_prompt(request: DeliverableRequest) -> str:
                     f"save_path='workspace/deliverables/{request.id}/assets/{role}.png', and "
                     f"allow_degraded_fallback={allow_degraded_literal}."
                 )
+        supplied_instructions = ""
+        if presentation_supplied_assets:
+            supplied_instructions = (
+                "PRESENTATION_MEDIA_CONTRACT.supplied_assets is authoritative. Use every mapped "
+                "workspace image without regenerating, redrawing, moving, or replacing it. For each "
+                "mapped role, use its exact asset_ref in both presentation.html and "
+                "slide_spec.asset_ref, and include its workspace_path in source_refs. The relative "
+                "asset_ref may contain '..'; the converter resolves and materializes it safely. "
+            )
+        generation_instructions = " ".join(role_instructions)
+        if not presentation_generation_roles:
+            generation_instructions = (
+                "All required media roles are satisfied by supplied assets. Do not call "
+                "generate_image_minimax for this presentation."
+            )
         media_instructions = (
-            "The server-owned PRESENTATION_MEDIA_CONTRACT below requires real generated imagery. "
+            "The server-owned PRESENTATION_MEDIA_CONTRACT below requires real imagery. "
             "Complete every required asset role before writing presentation.html. "
-            + " ".join(role_instructions)
-            + " Use the exact versioned workspace output_path returned by each successful Tool "
-            "call to derive slide_spec.asset_ref and reference it from presentation.html with the "
-            "same path relative to presentation.html (for example assets/<versioned-file>.png). "
+            + supplied_instructions
+            + generation_instructions
+            + " For generated roles only, use the exact versioned workspace output_path returned "
+            "by each successful Tool call to derive slide_spec.asset_ref and reference it from "
+            "presentation.html with the same path relative to presentation.html (for example "
+            "assets/<versioned-file>.png). "
             "Keep slide_spec.visual_asset as a human-readable description. Embed every "
             "required image in at least one visible <img> or CSS background-image region and crop "
             "it intentionally; decorative CSS silhouettes, gradients, icons, and emoji do not "
             "satisfy this media contract. Do not use emoji as a substitute for photography or "
-            "illustration. Each generation Tool call owns provider fallback, so call it only once "
+            "illustration. Each required generation Tool call owns provider fallback, so call it only once "
             "per role and never manually retry. If any required image Tool call fails or is "
             "unavailable, stop without converting or claiming a commercial-quality deck; report "
             "the missing asset role and request supplied imagery instead. "
@@ -661,8 +733,12 @@ def build_deliverable_prompt(request: DeliverableRequest) -> str:
         "generated images as appropriate, while keeping all important text editable. "
         "Treat visual fit as a hard contract: every visible text node must remain fully inside its "
         "1280x720 slide with at least 24px bottom safety. Never rely on overflow:hidden to hide dense "
-        "content. Reduce card padding, gaps, image height, or copy density before conversion when a "
-        "slide approaches the canvas edge. "
+        "content. Use at least 16px computed font size for every title, body, table, caption, footnote, "
+        "and decision label. Only short folios or eyebrow labels placed at the top/bottom slide edge may "
+        "use 10-15px, and those elements must declare data-clawith-text-role='metadata'; never use that "
+        "role for body copy, tables, evidence, or footnotes. Split a slide or reduce copy density instead "
+        "of shrinking readable content. Reduce card padding, gaps, image height, or copy density before "
+        "conversion when a slide approaches the canvas edge. "
         "Do not invent star ratings, scores, percentages, ROI claims, price support, market rankings, "
         "performance thresholds, or other quantified judgments unless they are present in the brief or "
         "a supplied source. When data is absent, label the statement as a hypothesis to validate and use "
@@ -673,10 +749,13 @@ def build_deliverable_prompt(request: DeliverableRequest) -> str:
         "except the last. Do not invent a brand, organization, team, author, "
         "or internal-use label that is absent from the brief. When the brief calls for commercial "
         "product or people imagery, use supplied or generated image assets rather than empty frames "
-        "or diagram placeholders. For several images of the same product, create one canonical hero "
-        "asset first and pass its exact workspace path as reference_image for every later scene. If "
-        "the available generator cannot preserve the product identity, reuse and crop the canonical "
-        "asset instead of independently inventing a different product. Convert that single HTML "
+        "or diagram placeholders. Treat a supplied product_hero as the canonical identity reference; "
+        "never generate a replacement for an already mapped supplied role. When no canonical "
+        "product_hero is supplied, generate one canonical hero asset first, before other missing "
+        "roles, and pass its exact workspace path as "
+        "reference_image for later generated scenes. If the available generator cannot preserve the "
+        "product identity, reuse and crop the canonical asset instead of independently inventing a "
+        "different product. Convert that single HTML "
         "source to PPTX using convert_html_to_pptx "
         "with design_width=1280, design_height=720, render_mode='hybrid_editable', render_scale=2, "
         "expected_page_count=spec.page_count, outline_path='workspace/deliverables/"
@@ -814,6 +893,7 @@ async def preflight_workflow(
     tier: str,
     spec: dict[str, Any],
     goal: str = "",
+    inputs: Sequence[Mapping[str, Any] | object] | None = None,
 ) -> dict[str, Any]:
     normalized_tier = str(tier or "lite").strip().lower()
     if normalized_tier not in SAAS_TIERS:
@@ -832,13 +912,16 @@ async def preflight_workflow(
     if workflow.required_capability == "presentation":
         if not await _presentation_tool_available(db, agent_id):
             reasons.append("presentation_tool_unavailable")
-        presentation_image_required = bool(
-            presentation_media_roles_for_brief(
-                goal,
-                normalized_spec,
-                tier=normalized_tier,
-            )
+        presentation_roles = presentation_media_roles_for_brief(
+            goal,
+            normalized_spec,
+            tier=normalized_tier,
         )
+        supplied_image_count = min(
+            len(presentation_roles),
+            len(presentation_supplied_image_paths(inputs)),
+        )
+        presentation_image_required = bool(presentation_roles[supplied_image_count:])
 
     media_modality = (
         "image"
@@ -970,6 +1053,7 @@ async def prepare_deliverable_launch(
             tier=request.tier,
             spec=request.spec,
             goal=request.goal,
+            inputs=request.inputs,
         )
         execution = None
         if request.current_execution_id is not None:

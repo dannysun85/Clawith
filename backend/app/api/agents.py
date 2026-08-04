@@ -54,6 +54,7 @@ from app.services.agent_capability_readiness import (
     agent_runtime_capability_readiness,
     template_capability_contract,
 )
+from app.services.product_roles import resolve_agent_product_roles
 
 router = APIRouter(prefix="/agents", tags=["agents"])
 settings = get_settings()
@@ -254,9 +255,15 @@ async def _build_unread_count_by_agent(
     return {str(row[0]): int(row[1] or 0) for row in result.all()}
 
 
-def _serialize_agent_out(agent: Agent, unread_count: int = 0) -> AgentOut:
+def _serialize_agent_out(
+    agent: Agent,
+    unread_count: int = 0,
+    *,
+    product_role: str | None = None,
+) -> AgentOut:
     payload = AgentOut.model_validate(agent).model_dump()
     payload["unread_count"] = unread_count
+    payload["product_role"] = product_role
     model = AgentOut.model_validate(payload)
     _apply_release_capabilities(model)
     return model
@@ -343,12 +350,15 @@ async def _agent_to_out(
     db: AsyncSession,
     agent: Agent,
     viewer_id: uuid.UUID,
+    *,
+    product_role: str | None = None,
 ) -> AgentOut:
-    """Serialize one agent with ``onboarded_for_me`` for the given viewer."""
+    """Serialize one agent with viewer-specific onboarding and product role."""
     from app.services.onboarding import is_onboarded
 
     model = AgentOut.model_validate(agent)
     model.onboarded_for_me = await is_onboarded(db, agent.id, viewer_id)
+    model.product_role = product_role
     _apply_release_capabilities(model)
     return model
 
@@ -472,9 +482,19 @@ async def list_agents(
     from app.services.onboarding import onboarded_agent_ids
 
     onboarded = await onboarded_agent_ids(db, current_user.id, [a.id for a in agents])
+    product_roles = await resolve_agent_product_roles(
+        db,
+        viewer_id=current_user.id,
+        tenant_id=requested_tenant_id,
+        agents=agents,
+    )
     out: list[AgentOut] = []
     for a in agents:
-        model = _serialize_agent_out(a, unread_by_agent.get(str(a.id), 0))
+        model = _serialize_agent_out(
+            a,
+            unread_by_agent.get(str(a.id), 0),
+            product_role=product_roles.get(a.id, "agent_employee"),
+        )
         model.onboarded_for_me = a.id in onboarded
         out.append(model)
     return out
@@ -924,7 +944,18 @@ async def get_agent(
     # Lazy reset token counters
     if await _lazy_reset_token_counters(agent, db):
         await db.commit()
-    out_model = await _agent_to_out(db, agent, current_user.id)
+    product_roles = await resolve_agent_product_roles(
+        db,
+        viewer_id=current_user.id,
+        tenant_id=agent.tenant_id,
+        agents=[agent],
+    )
+    out_model = await _agent_to_out(
+        db,
+        agent,
+        current_user.id,
+        product_role=product_roles.get(agent.id, "agent_employee"),
+    )
     out = out_model.model_dump()
     out["access_level"] = access_level
     if access_level == "manage":

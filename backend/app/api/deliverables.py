@@ -584,6 +584,7 @@ async def preflight_deliverable(
             tier=data.tier,
             spec=data.spec,
             goal=data.goal,
+            inputs=data.inputs,
         )
     except DeliverableWorkflowError as exc:
         raise _workflow_error(exc) from exc

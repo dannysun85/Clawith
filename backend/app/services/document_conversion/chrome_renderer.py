@@ -235,6 +235,7 @@ async def collect_browser_layout(
       scrollWidth: el.scrollWidth,
       scrollHeight: el.scrollHeight,
       allowOverlap: el.getAttribute('data-allow-overlap') === 'true',
+      textRole: el.getAttribute('data-clawith-text-role') || '',
       lines: kind === 'text' ? textLineBoxes(el, rootRect) : [],
       style: {
 color: cs.color,

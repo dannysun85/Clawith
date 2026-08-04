@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  chatSessionMatchesAgent,
   failClosedSessionActiveRun,
   runtimeCompletionNeedsMessageRefresh,
   sessionActiveRunFromResponse,
@@ -10,6 +11,18 @@ import {
   terminalAssistantMessageAlreadyPresent,
   waitingSessionActiveRunHint,
 } from '../src/pages/agent-detail/sessionRuntimeState.ts';
+
+test('route transitions never attach a stale session to the next agent', () => {
+  assert.equal(
+    chatSessionMatchesAgent({ id: 'session-1', agent_id: 'agent-1' }, 'agent-1'),
+    true,
+  );
+  assert.equal(
+    chatSessionMatchesAgent({ id: 'session-1', agent_id: 'agent-1' }, 'agent-2'),
+    false,
+  );
+  assert.equal(chatSessionMatchesAgent({ id: 'session-1' }, 'agent-1'), false);
+});
 
 const waitingRun = {
   runId: 'run-1',
