@@ -763,6 +763,17 @@ async def _work_item_for_task(
     return item
 
 
+@router.get("/tasks/{task_id}", response_model=WorkItemOut)
+async def get_work_task(
+    task_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Restore one tenant- and creator-scoped Work contract for formal handoff."""
+
+    return await _work_item_for_task(db, user=current_user, task_id=task_id)
+
+
 @router.post(
     "/tasks",
     response_model=WorkTaskCreateOut,

@@ -334,6 +334,7 @@ async def test_public_message_and_single_mention_start_share_one_session() -> No
             message_id=message_id,
             correlation_id=f"work-task:{work_task_id}",
             work_task_id=work_task_id,
+            application_tools_enabled=False,
             settings_override=_settings(),
             clock=NOW,
         )
@@ -361,6 +362,7 @@ async def test_public_message_and_single_mention_start_share_one_session() -> No
     assert command.source_type == "chat"
     assert command.correlation_id == f"work-task:{work_task_id}"
     assert command.payload["work_task_id"] == str(work_task_id)
+    assert command.payload["application_tools_enabled"] is False
     assert command.run_kind == "foreground"
     assert command.model_id == mention.model.id
     assert command.session_id == scope.session.id
@@ -436,6 +438,7 @@ async def test_multi_agent_message_creates_one_planning_root_in_the_same_transac
             mention_participant_ids=[target.id, other_target_id],
             correlation_id=f"work-task:{work_task_id}",
             work_task_id=work_task_id,
+            application_tools_enabled=False,
             settings_override=_settings(),
             clock=NOW,
         )
@@ -448,6 +451,7 @@ async def test_multi_agent_message_creates_one_planning_root_in_the_same_transac
     assert command.run_kind == "orchestration"
     assert command.correlation_id == f"work-task:{work_task_id}"
     assert command.payload["work_task_id"] == str(work_task_id)
+    assert command.payload["application_tools_enabled"] is False
     assert command.system_role == "group_planning"
     assert command.agent_id is None
     assert command.source_execution_id == f"group_mention:{intake.message.id}:plan"

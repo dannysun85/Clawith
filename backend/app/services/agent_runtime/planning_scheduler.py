@@ -300,6 +300,7 @@ def _entry_command(
     plan: Mapping[str, object],
     entry: Mapping[str, object],
     target: ResolvedGroupMention,
+    application_tools_enabled: bool = True,
 ) -> StartRunCommand:
     if message.created_at is None or target.agent is None or target.model is None:
         raise PlanningSchedulingError(
@@ -360,6 +361,7 @@ def _entry_command(
                 "created_at": message.created_at.isoformat(),
             },
             "source_channel": scope.session.source_channel,
+            "application_tools_enabled": application_tools_enabled,
         },
         origin_user_id=root.origin_user_id,
         origin_agent_id=root.origin_agent_id,
@@ -486,6 +488,15 @@ class PlanningCheckpointScheduler:
                     session_id=session_id,
                 )
                 candidate_participants = _candidate_participants(initial_input)
+                application_tools_enabled = initial_input.get(
+                    "application_tools_enabled",
+                    True,
+                )
+                if not isinstance(application_tools_enabled, bool):
+                    raise PlanningSchedulingError(
+                        "invalid_planning_checkpoint",
+                        "application_tools_enabled must be a boolean",
+                    )
 
                 message_result = await db.execute(
                     select(ChatMessage).where(
@@ -547,6 +558,7 @@ class PlanningCheckpointScheduler:
                             plan=plan,
                             entry=entry,
                             target=target,
+                            application_tools_enabled=application_tools_enabled,
                         )
                     )
                 root.delivery_status = "not_required"

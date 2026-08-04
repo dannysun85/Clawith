@@ -103,6 +103,47 @@ async def test_todo_registration_updates_task_in_same_caller_session() -> None:
     assert command.payload["model_modality"] == "text"
     assert command.delivery_status == "not_required"
     assert command.payload["task_id"] == str(task.id)
+    assert command.payload["work_task_id"] == str(task.id)
+    assert command.payload["application_tools_enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_confirmed_creative_workbench_task_is_a_tool_free_brief_run() -> None:
+    task, agent = _records()
+    task.origin_type = "workbench"
+    task.work_type = "image"
+    task.confirmation_fingerprint = "b" * 64
+    task.confirmed_at = datetime(2026, 8, 4, tzinfo=UTC)
+    task.work_statement = {
+        "work_type": "image",
+        "expected_output": "confirmed_image_brief",
+        "delivery_mode": "task_only",
+    }
+    session = _Session()
+    handle = RunHandle(
+        tenant_id=agent.tenant_id,
+        run_id=uuid.uuid4(),
+        thread_id=str(uuid.uuid4()),
+        command_id=uuid.uuid4(),
+        runtime_type="langgraph",
+        created=True,
+    )
+
+    with patch(
+        "app.services.task_executor.RuntimeCommandIntake.start_run",
+        new=AsyncMock(return_value=handle),
+    ) as start_run:
+        await enqueue_task_runtime(
+            session,  # type: ignore[arg-type]
+            task=task,
+            agent=agent,
+            settings_override=_settings(enabled=True),
+        )
+
+    command = start_run.await_args.args[0]
+    assert command.payload["application_tools_enabled"] is False
+    assert "仅负责整理并返回可确认的 Brief" in command.goal
+    assert "正式制作必须由用户进入独立 Deliverable" in command.goal
 
 
 @pytest.mark.asyncio
@@ -225,6 +266,7 @@ async def test_confirmed_group_task_enters_native_group_runtime_with_stable_iden
     assert kwargs["message_id"] == uuid.uuid5(task.id, "group-work-task-message")
     assert kwargs["correlation_id"] == f"work-task:{task.id}"
     assert kwargs["work_task_id"] == task.id
+    assert kwargs["application_tools_enabled"] is True
 
 
 @pytest.mark.asyncio

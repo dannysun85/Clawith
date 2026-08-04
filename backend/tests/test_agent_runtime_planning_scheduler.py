@@ -277,6 +277,7 @@ def _records():
                 "group_id": str(group.id),
                 "session_id": str(session.id),
                 "sender_participant_id": str(sender.id),
+                "application_tools_enabled": False,
                 "mention_targets": mentions,
                 "candidate_agents": [
                     {
@@ -363,6 +364,7 @@ async def test_completed_plan_creates_only_entry_children_with_one_immutable_pla
     assert all(command.scheduling_position_id == message.id for command in commands)
     assert all(command.payload["mode"] == plan["mode"] for command in commands)
     assert all(command.payload["plan_prompt"] == plan["plan_prompt"] for command in commands)
+    assert all(command.payload["application_tools_enabled"] is False for command in commands)
     assert all(
         command.payload["context_cutoff"] == {"message_id": str(message.id), "created_at": NOW.isoformat()}
         for command in commands

@@ -1,10 +1,59 @@
-import type { DeliverableRequest } from '../services/api';
+import type {
+    DeliverableRequest,
+    DeliverableWorkType,
+    WorkItem,
+} from '../services/api';
 
 const COMPOSER_LAUNCHABLE_WORKFLOWS = new Set([
     'builtin.poster.v1@1.0.0',
     'builtin.presentation.v1@1.0.0',
     'builtin.video.v1@1.0.0',
 ]);
+
+const WORK_TASK_TO_DELIVERABLE_TYPE: Partial<Record<string, DeliverableWorkType>> = {
+    image: 'poster',
+    video: 'video',
+    presentation: 'presentation',
+    document: 'report',
+};
+
+export type WorkTaskDeliverableHandoff = {
+    taskId: string;
+    workType: DeliverableWorkType;
+    goal: string;
+};
+
+export function workTaskDeliverableHandoff(
+    item: WorkItem | null | undefined,
+): WorkTaskDeliverableHandoff | null {
+    if (
+        !item
+        || item.kind !== 'task'
+        || item.delivery_mode !== 'task_only'
+        || item.user_stage !== 'completed'
+        || item.deliverable_id
+        || !item.task_id
+    ) {
+        return null;
+    }
+    const statementWorkType = item.work_statement?.work_type;
+    const sourceWorkType = typeof statementWorkType === 'string'
+        ? statementWorkType
+        : item.work_type;
+    const workType = sourceWorkType
+        ? WORK_TASK_TO_DELIVERABLE_TYPE[sourceWorkType]
+        : undefined;
+    const statementObjective = item.work_statement?.objective;
+    const goal = typeof statementObjective === 'string' && statementObjective.trim()
+        ? statementObjective.trim()
+        : item.intent.trim();
+    if (!workType || goal.length < 3) return null;
+    return {
+        taskId: item.task_id,
+        workType,
+        goal,
+    };
+}
 
 export function requestCanLaunchFromComposer(request: DeliverableRequest): boolean {
     return request.status === 'ready'

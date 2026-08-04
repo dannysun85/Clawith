@@ -42,6 +42,9 @@ interface DeliverableLauncherProps {
     agentId: string;
     sessionId?: string;
     taskId?: string;
+    initialWorkType?: DeliverableWorkType;
+    initialGoal?: string;
+    autoOpenKey?: string;
     tier: SaasTier;
     attachments: DeliverableAttachmentInput[];
     disabled?: boolean;
@@ -130,6 +133,9 @@ export function DeliverableLauncher({
     agentId,
     sessionId,
     taskId,
+    initialWorkType,
+    initialGoal,
+    autoOpenKey,
     tier,
     attachments,
     disabled = false,
@@ -140,6 +146,7 @@ export function DeliverableLauncher({
     const toast = useToast();
     const triggerRef = useRef<HTMLButtonElement>(null);
     const drawerRef = useRef<HTMLElement>(null);
+    const handledAutoOpenKeyRef = useRef('');
     const [open, setOpen] = useState(false);
     const [workflows, setWorkflows] = useState<DeliverableWorkflow[]>([]);
     const [loadingWorkflows, setLoadingWorkflows] = useState(false);
@@ -194,6 +201,46 @@ export function DeliverableLauncher({
             });
         return () => { active = false; };
     }, [agentId, isZh, tier, toast]);
+
+    useEffect(() => {
+        if (
+            !autoOpenKey
+            || handledAutoOpenKeyRef.current === autoOpenKey
+            || !sessionId
+            || !initialWorkType
+            || !initialGoal?.trim()
+            || !workflowsLoaded
+            || workflows.length === 0
+        ) {
+            return;
+        }
+        const workflow = workflows.find((item) => item.work_type === initialWorkType);
+        if (!workflow) {
+            setError(
+                isZh
+                    ? '当前数字员工没有与该任务匹配的正式交付工作流'
+                    : 'This Agent has no formal delivery workflow matching the task',
+            );
+            setOpen(true);
+            return;
+        }
+        handledAutoOpenKeyRef.current = autoOpenKey;
+        setSelectedType(workflow.work_type);
+        setSpec(initialSpec(workflow));
+        setGoal(initialGoal.trim());
+        setError('');
+        setShowAdvanced(false);
+        setClientRequestId(crypto.randomUUID());
+        setOpen(true);
+    }, [
+        autoOpenKey,
+        initialGoal,
+        initialWorkType,
+        isZh,
+        sessionId,
+        workflows,
+        workflowsLoaded,
+    ]);
 
     const closeDrawer = useCallback(() => {
         if (saving) return;

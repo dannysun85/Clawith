@@ -417,6 +417,26 @@ async def test_private_run_rejects_group_at() -> None:
 
 
 @pytest.mark.asyncio
+async def test_disabled_application_tools_reject_stale_tool_call_before_execution() -> None:
+    tenant_id = uuid.uuid4()
+    agent = _agent(tenant_id)
+    call = _call("call-disabled", "write_file", {"path": "brief.md"})
+    state = _state(tenant_id, agent, (call,))
+    state["snapshots"].initial_input["application_tools_enabled"] = False
+
+    result = await _service(
+        agent,
+        _CancelSource(None),
+        _unexpected_executor,
+    ).execute_pending(state, _context(state), (call,))
+
+    assert result.error == {
+        "code": "tool_not_enabled",
+        "message": "tool 'write_file' is not enabled for this Agent",
+    }
+
+
+@pytest.mark.asyncio
 async def test_success_is_reserved_before_execution_and_settled_afterwards(
     monkeypatch,
 ) -> None:

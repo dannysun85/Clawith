@@ -432,6 +432,8 @@ export type WorkIndex = {
 export const workApi = {
     list: (limit = 50) => request<WorkIndex>(`/work?limit=${limit}`),
 
+    getTask: (taskId: string) => request<WorkItem>(`/work/tasks/${taskId}`),
+
     preflightTask: (data: WorkTaskDraft) => request<WorkTaskPreflight>('/work/tasks/preflight', {
         method: 'POST',
         body: JSON.stringify(data),

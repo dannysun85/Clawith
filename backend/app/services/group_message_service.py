@@ -479,6 +479,7 @@ def _single_mention_command(
     target: ResolvedGroupMention,
     correlation_id: str | None = None,
     work_task_id: uuid.UUID | None = None,
+    application_tools_enabled: bool = True,
 ) -> StartRunCommand:
     if target.agent is None or target.model is None or message.created_at is None:
         raise GroupMessageServiceError(
@@ -529,6 +530,7 @@ def _single_mention_command(
             "saas_tier": target.saas_tier,
             "model_modality": target.model_modality,
             "work_task_id": str(work_task_id) if work_task_id is not None else None,
+            "application_tools_enabled": application_tools_enabled,
         },
         origin_user_id=origin_user_id,
         origin_agent_id=origin_agent_id,
@@ -547,6 +549,7 @@ def _planning_command(
     model: LLMModel,
     correlation_id: str | None = None,
     work_task_id: uuid.UUID | None = None,
+    application_tools_enabled: bool = True,
 ) -> StartRunCommand:
     if message.created_at is None:
         raise GroupMessageServiceError(
@@ -595,6 +598,7 @@ def _planning_command(
             ],
             "source_channel": scope.session.source_channel,
             "work_task_id": str(work_task_id) if work_task_id is not None else None,
+            "application_tools_enabled": application_tools_enabled,
         },
         origin_user_id=scope.user_id,
         origin_agent_id=scope.agent_id,
@@ -653,6 +657,7 @@ async def enqueue_group_message(
     message_id: uuid.UUID | None = None,
     correlation_id: str | None = None,
     work_task_id: uuid.UUID | None = None,
+    application_tools_enabled: bool = True,
     settings_override: Settings | None = None,
     clock: datetime | None = None,
 ) -> GroupMessageIntake:
@@ -712,6 +717,7 @@ async def enqueue_group_message(
                     model=planning_model,
                     correlation_id=correlation_id,
                     work_task_id=work_task_id,
+                    application_tools_enabled=application_tools_enabled,
                 )
             )
         except (
@@ -768,6 +774,7 @@ async def enqueue_group_message(
                 target=agent_mentions[0],
                 correlation_id=correlation_id,
                 work_task_id=work_task_id,
+                application_tools_enabled=application_tools_enabled,
             )
         )
     except (RuntimeAdapterError, RuntimePersistenceError) as exc:

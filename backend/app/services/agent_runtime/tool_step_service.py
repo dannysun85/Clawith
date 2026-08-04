@@ -443,6 +443,16 @@ def _allowed_tool_names(tools: Sequence[Mapping[str, object]]) -> frozenset[str]
     return frozenset(name for name in (_tool_name(tool) for tool in tools) if name)
 
 
+def _application_tools_enabled(state: RuntimeGraphState) -> bool:
+    value = state["snapshots"].initial_input.get("application_tools_enabled", True)
+    if not isinstance(value, bool):
+        raise ToolExecutionError(
+            "invalid_runtime_input",
+            "application_tools_enabled must be a boolean",
+        )
+    return value
+
+
 def _call_fields(call: JsonObject) -> tuple[str, str, dict]:
     call_id = call.get("id")
     function = call.get("function")
@@ -1611,13 +1621,18 @@ class RuntimeToolStepService:
                 if isinstance(assistant_message, Mapping)
                 else ""
             )
-            allowed_names = _allowed_tool_names(
-                with_group_runtime_tools(
-                    await self._tool_provider(agent.id),
-                    state,
+            application_tools_enabled = _application_tools_enabled(state)
+            allowed_names = (
+                _allowed_tool_names(
+                    with_group_runtime_tools(
+                        await self._tool_provider(agent.id),
+                        state,
+                    )
                 )
+                if application_tools_enabled
+                else frozenset()
             )
-            if _is_group_agent_run(state):
+            if application_tools_enabled and _is_group_agent_run(state):
                 # Historical checkpoints may still contain hidden legacy calls.
                 # Keep them executable without exposing the names to new model turns.
                 allowed_names = allowed_names | GROUP_SCOPED_WORKSPACE_TOOL_NAMES

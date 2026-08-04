@@ -8,6 +8,7 @@ from app.api.work import (
     _build_work_statement,
     _confirmation_fingerprint,
     _fingerprint,
+    get_work_task,
 )
 from app.core.permissions import is_agent_executable
 from app.schemas.work import WorkTaskCreate, WorkTaskPreflight
@@ -183,3 +184,26 @@ def test_stopped_or_deleting_agent_is_not_available_for_execution() -> None:
     assert not is_agent_executable(
         SimpleNamespace(status="idle", **(base | {"deletion_requested_at": object()}))
     )
+
+
+@pytest.mark.asyncio
+async def test_single_work_task_endpoint_restores_scoped_projection(monkeypatch) -> None:
+    task_id = uuid.uuid4()
+    user = SimpleNamespace(id=uuid.uuid4(), tenant_id=uuid.uuid4())
+    expected = SimpleNamespace(task_id=task_id)
+
+    async def project(db, *, user: object, task_id: uuid.UUID):
+        assert db == "db"
+        assert user is not None
+        assert task_id == expected.task_id
+        return expected
+
+    monkeypatch.setattr("app.api.work._work_item_for_task", project)
+
+    result = await get_work_task(
+        task_id=task_id,
+        current_user=user,  # type: ignore[arg-type]
+        db="db",  # type: ignore[arg-type]
+    )
+
+    assert result is expected

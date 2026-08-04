@@ -10,7 +10,9 @@ import {
     latestTrackedDeliverables,
     nextDeliverableComposerText,
     requestCanLaunchFromComposer,
+    workTaskDeliverableHandoff,
 } from './deliverables';
+import type { WorkItem } from '../services/api';
 
 
 function request(overrides: Partial<DeliverableRequest> = {}): DeliverableRequest {
@@ -44,7 +46,58 @@ function request(overrides: Partial<DeliverableRequest> = {}): DeliverableReques
     };
 }
 
+function workItem(overrides: Partial<WorkItem> = {}): WorkItem {
+    return {
+        id: 'task-1',
+        kind: 'task',
+        title: '制作商业海报 Brief',
+        intent: '制作商业海报',
+        origin_type: 'workbench',
+        executor_kind: 'personal_assistant',
+        executor_snapshot: {},
+        work_statement: { work_type: 'image' },
+        agent_id: 'agent-1',
+        agent_name: '小丽',
+        task_id: 'task-1',
+        task_status: 'done',
+        execution_status: 'completed',
+        deliverable_id: null,
+        work_type: 'image',
+        delivery_status: 'not_requested',
+        delivery_mode: 'task_only',
+        user_stage: 'completed',
+        artifacts: [],
+        deep_link: '/agents/agent-1/chat?task_id=task-1',
+        created_at: '2026-08-04T00:00:00Z',
+        updated_at: '2026-08-04T00:00:00Z',
+        ...overrides,
+    };
+}
+
 describe('deliverable composer selection', () => {
+    it('restores a completed image Brief as a poster handoff with exact objective', () => {
+        const item = workItem({
+            intent: 'fallback goal',
+            work_statement: {
+                work_type: 'image',
+                objective: '竖版 9:16 量化交易商业海报，保留完整标题和 CTA',
+            },
+        });
+
+        expect(workTaskDeliverableHandoff(item)).toEqual({
+            taskId: 'task-1',
+            workType: 'poster',
+            goal: '竖版 9:16 量化交易商业海报，保留完整标题和 CTA',
+        });
+    });
+
+    it('does not open formal delivery for unfinished or already-linked work', () => {
+        const base = workItem();
+
+        expect(workTaskDeliverableHandoff({ ...base, user_stage: 'execution' })).toBeNull();
+        expect(workTaskDeliverableHandoff({ ...base, deliverable_id: 'delivery-1' })).toBeNull();
+    });
+
     it('fails closed for dry-run and unknown workflow versions', () => {
         expect(requestCanLaunchFromComposer(request())).toBe(true);
         expect(requestCanLaunchFromComposer(request({

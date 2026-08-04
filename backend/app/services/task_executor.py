@@ -24,6 +24,7 @@ from app.services.group_message_service import (
 
 settings = get_settings()
 AUTOMATIC_TASK_EXECUTION_ENABLED = settings.USER_TASK_EXECUTION_ENABLED
+_BRIEF_ONLY_WORK_TYPES = frozenset({"image", "video", "presentation", "document"})
 
 
 class TaskRuntimeIntakeError(RuntimeError):
@@ -52,6 +53,12 @@ def _task_goal(task: Task) -> str:
             normalized_criteria = [str(item).strip() for item in criteria if str(item).strip()]
             if normalized_criteria:
                 goal += "\n完成标准:\n- " + "\n- ".join(normalized_criteria)
+    if _application_tools_enabled_for_task(task) is False:
+        goal += (
+            "\n\n本 Run 仅负责整理并返回可确认的 Brief。"
+            "应用工具已由运行时关闭；不得生成、上传或声称已经交付正式产物。"
+            "正式制作必须由用户进入独立 Deliverable 预检与确认流程。"
+        )
     if task.executor_kind == "temporary_expert":
         expert_role = str((task.executor_snapshot or {}).get("expert_role") or "").strip()
         if expert_role:
@@ -64,6 +71,15 @@ def _task_goal(task: Task) -> str:
             goal += f"\n督办对象: {task.supervision_target_name}"
         return goal + "\n\n请执行此督办任务：联系督办对象，了解进展，并汇报结果。"
     return goal + "\n\n请认真完成此任务，给出详细的执行结果。"
+
+
+def _application_tools_enabled_for_task(task: Task) -> bool:
+    """Keep a confirmed creative Brief separate from paid formal delivery."""
+
+    return not (
+        task.origin_type == "workbench"
+        and task.work_type in _BRIEF_ONLY_WORK_TYPES
+    )
 
 
 async def enqueue_task_runtime(
@@ -136,6 +152,7 @@ async def enqueue_task_runtime(
             idempotency_key=f"start:{source_execution_id}",
             payload={
                 "task_id": str(task.id),
+                "work_task_id": str(task.id),
                 "task_type": task.type,
                 "title": task.title,
                 "description": task.description,
@@ -145,6 +162,7 @@ async def enqueue_task_runtime(
                 "work_statement": dict(task.work_statement or {}),
                 "confirmation_fingerprint": task.confirmation_fingerprint,
                 "confirmed_at": task.confirmed_at.isoformat() if task.confirmed_at else None,
+                "application_tools_enabled": _application_tools_enabled_for_task(task),
                 "saas_tier": route.saas_tier,
                 "model_modality": route.modality,
                 "fallback_model_id": (
@@ -237,6 +255,7 @@ async def enqueue_group_task_runtime(
             message_id=uuid.uuid5(task.id, "group-work-task-message"),
             correlation_id=f"work-task:{task.id}",
             work_task_id=task.id,
+            application_tools_enabled=_application_tools_enabled_for_task(task),
             settings_override=settings_override,
         )
     except GroupMessageServiceError as exc:

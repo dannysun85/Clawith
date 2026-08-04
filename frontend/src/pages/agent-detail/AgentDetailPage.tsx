@@ -20,7 +20,7 @@ import {
     DeliverableReviewCard,
 } from '../../components/deliverables/DeliverableWorkbench';
 import type { WorkspaceActivity, WorkspaceLiveDraft } from '../../components/WorkspaceOperationPanel';
-import { activityApi, agentApi, channelApi, deliverableApi, experienceApi, fileApi, focusApi, scheduleApi, skillApi, taskApi, triggerApi, uploadFileWithProgress, type DeliverableRequest } from '../../services/api';
+import { activityApi, agentApi, channelApi, deliverableApi, experienceApi, fileApi, focusApi, scheduleApi, skillApi, taskApi, triggerApi, uploadFileWithProgress, workApi, type DeliverableRequest } from '../../services/api';
 import { websocketAuthProtocols } from '../../utils/authTransport';
 import { reportClientIssue, shouldReportWebSocketClose } from '../../services/productionIssueReporter';
 import type { FocusApiItem } from '../../services/api';
@@ -55,6 +55,7 @@ import {
     latestTrackedDeliverables,
     nextDeliverableComposerText,
     requestCanLaunchFromComposer,
+    workTaskDeliverableHandoff,
 } from '../../utils/deliverables';
 import {
     appendUniqueById,
@@ -2373,6 +2374,16 @@ export default function AgentDetailPage() {
         queryFn: () => agentApi.get(id!),
         enabled: !!id,
     });
+    const { data: requestedWorkTask } = useQuery({
+        queryKey: ['work-task', requestedTaskId],
+        queryFn: () => workApi.getTask(requestedTaskId),
+        enabled: Boolean(id && requestedTaskId),
+        retry: false,
+    });
+    const requestedDeliverableHandoff = useMemo(() => {
+        if (!requestedWorkTask || requestedWorkTask.agent_id !== id) return null;
+        return workTaskDeliverableHandoff(requestedWorkTask);
+    }, [id, requestedWorkTask]);
 
     // Chat-side tier picker. A user's explicit Lite/Pro/Ultra choice follows
     // them across Agents; each touched session snapshots the effective route.
@@ -8398,7 +8409,10 @@ export default function AgentDetailPage() {
                                                         <DeliverableLauncher
                                                             agentId={id!}
                                                             sessionId={activeSession?.id ? String(activeSession.id) : undefined}
-                                                            taskId={requestedTaskId || undefined}
+                                                            taskId={requestedDeliverableHandoff?.taskId}
+                                                            initialWorkType={requestedDeliverableHandoff?.workType}
+                                                            initialGoal={requestedDeliverableHandoff?.goal}
+                                                            autoOpenKey={requestedDeliverableHandoff?.taskId}
                                                             tier={effectiveChatTier || 'lite'}
                                                             attachments={attachedFiles.map((file) => ({ name: file.name, path: file.path }))}
                                                             disabled={chatInputDisabled || !wsConnected || !effectiveChatTier || isWaiting || isStreaming || (agent as any)?.agent_type === 'openclaw'}

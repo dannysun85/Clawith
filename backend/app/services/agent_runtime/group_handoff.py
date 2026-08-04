@@ -144,6 +144,7 @@ class GroupAgentHandoffIntent:
     origin_user_id: uuid.UUID | None
     mode: str | None
     plan_prompt: str | None
+    application_tools_enabled: bool = True
 
     def payload(self) -> JsonObject:
         return {
@@ -169,6 +170,7 @@ class GroupAgentHandoffIntent:
             ),
             "mode": self.mode,
             "plan_prompt": self.plan_prompt,
+            "application_tools_enabled": self.application_tools_enabled,
         }
 
     @classmethod
@@ -240,6 +242,13 @@ class GroupAgentHandoffIntent:
                 "Group handoff intent requires a canonical stable idempotency key",
                 repairable=False,
             )
+        application_tools_enabled = value.get("application_tools_enabled", True)
+        if not isinstance(application_tools_enabled, bool):
+            raise GroupAgentHandoffError(
+                "group_handoff_intent_invalid",
+                "application_tools_enabled must be a boolean",
+                repairable=False,
+            )
         return cls(
             source_run_id=_uuid(value.get("source_run_id"), field="source_run_id"),
             source_agent_id=_uuid(
@@ -276,6 +285,7 @@ class GroupAgentHandoffIntent:
                 value.get("plan_prompt"),
                 field="plan_prompt",
             ),
+            application_tools_enabled=application_tools_enabled,
         )
 
 
@@ -684,6 +694,16 @@ async def preflight_group_agent_handoff(
         f"delivery-message:{idempotency_key}",
     )
     mode, plan_prompt = _planning_values(state)
+    application_tools_enabled = state["snapshots"].initial_input.get(
+        "application_tools_enabled",
+        True,
+    )
+    if not isinstance(application_tools_enabled, bool):
+        raise GroupAgentHandoffError(
+            "group_handoff_source_invalid",
+            "application_tools_enabled must be a boolean",
+            repairable=False,
+        )
     return GroupAgentHandoffIntent(
         source_run_id=run_id,
         source_agent_id=source_agent_id,
@@ -699,6 +719,7 @@ async def preflight_group_agent_handoff(
         origin_user_id=source_run.origin_user_id,
         mode=mode,
         plan_prompt=plan_prompt,
+        application_tools_enabled=application_tools_enabled,
     )
 
 
@@ -755,6 +776,7 @@ def _handoff_child_command(
         payload["mode"] = intent.mode
     if intent.plan_prompt is not None:
         payload["plan_prompt"] = intent.plan_prompt
+    payload["application_tools_enabled"] = intent.application_tools_enabled
     return StartRunCommand(
         tenant_id=source_run.tenant_id,
         agent_id=target.agent.id,

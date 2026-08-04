@@ -193,6 +193,7 @@ def _records():
                 "target_participant_id": str(source_participant.id),
                 "mode": "enforced",
                 "plan_prompt": "Reviewer hands the result to the final approver.",
+                "application_tools_enabled": False,
                 "group_context": {
                     "agent": {
                         "agent_id": str(source_agent_id),
@@ -643,6 +644,7 @@ async def test_atomic_apply_creates_public_message_and_one_new_child_per_target(
     assert all("write its display name without @" in command.goal for command in commands)
     assert all(f"Source message:\n{message.content}" in command.goal for command in commands)
     assert all(command.payload["mode"] == "enforced" for command in commands)
+    assert all(command.payload["application_tools_enabled"] is False for command in commands)
     assert all(
         command.payload["plan_prompt"]
         == "Reviewer hands the result to the final approver."

@@ -1,3 +1,34 @@
+# v1.11.20 — Creative Brief Boundary and Formal Delivery Handoff
+
+## Brief execution safety
+
+- Make creative Work tasks (`image`, `video`, `presentation`, and `document`)
+  text-only Brief Runs. Runtime intake now freezes
+  `application_tools_enabled=false` and tells the Agent that formal production
+  requires the independent Deliverable preflight and user confirmation path.
+- Enforce the same flag again in the durable tool step, so a stale checkpoint or
+  non-compliant model proposal cannot execute an application tool after the
+  Brief boundary is confirmed.
+- Propagate the immutable tool boundary through Group planning entries and
+  public Agent handoffs instead of protecting only the personal-assistant path.
+
+## Formal delivery continuation
+
+- Add a tenant- and creator-scoped single Work-task projection endpoint for
+  restoring the confirmed task contract after navigation.
+- Make `Continue to formal delivery` load that task, verify the destination
+  Agent, map the Work type to the matching Deliverable workflow, open the
+  drawer automatically, and restore the exact confirmed objective.
+- Bind a Deliverable to the Work task only after the completed task projection
+  is valid; unfinished or already-linked work cannot silently prefill a new
+  formal request.
+
+## Regression coverage
+
+- Cover personal and Group Brief intake, planning and handoff inheritance,
+  stale tool-call rejection, scoped task restoration, and frontend handoff
+  mapping.
+
 # v1.11.19 — Legacy Personal Assistant Work-Route Readiness
 
 ## Runtime route compatibility
