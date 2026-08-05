@@ -1,3 +1,20 @@
+# v1.11.29 — Native-only Presentation Contract Repair
+
+## Contract classification
+
+- Treat `严禁调用图片生成` and whitespace-preserving phrases such as
+  `只使用 PPT 原生文字、形状、图表与线条` as authoritative native-only
+  presentation intent.
+- Keep image-led commercial decks on the existing real-media quality contract,
+  while native-only decks compile to zero required images and retain editable
+  diagram, chart, table, and typography validation.
+
+## Production regression
+
+- Cover the exact Chinese wording submitted by the production Deliverable form,
+  preventing positive words such as `图片生成` from incorrectly creating a
+  paid image contract when the user is explicitly prohibiting that action.
+
 # v1.11.28 — Server-owned Video Failover
 
 ## Quick-generation continuity

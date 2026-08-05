@@ -85,10 +85,12 @@ _NATIVE_ONLY_BRIEF_MARKERS = (
     "不要调用任何图片",
     "不调用图片",
     "禁止调用图片",
+    "严禁调用图片",
     "不得调用图片",
     "不要用图片",
     "不使用图片生成",
     "禁止使用图片生成",
+    "严禁使用图片生成",
     "无需图片",
     "不需要图片",
     "只做原生矢量",
@@ -98,6 +100,20 @@ _NATIVE_ONLY_BRIEF_MARKERS = (
     "ppt native shapes only",
     "only native vector shapes",
 )
+
+
+def _brief_contains_marker(brief: str, marker: str) -> bool:
+    """Match intent markers without making Chinese spacing significant.
+
+    The deliverable form preserves user-authored spacing, so briefs such as
+    ``只使用 PPT 原生文字`` must match the same native-only contract as
+    ``只使用PPT原生文字``.  English markers still use their ordinary form.
+    """
+
+    if marker in brief:
+        return True
+    compact_marker = "".join(marker.split())
+    return bool(compact_marker) and compact_marker in "".join(brief.split())
 
 # A deck may still contain editable narrative slides.  The threshold is the
 # mean picture coverage across the whole deck, so the existing minimum image
@@ -120,7 +136,7 @@ def presentation_brief_is_image_led(
     # images only to prohibit them (for example, "不要调用任何图片生成工具").
     # Keyword matching must not turn that explicit constraint into a paid
     # image-generation contract.
-    if any(marker in brief for marker in _NATIVE_ONLY_BRIEF_MARKERS):
+    if any(_brief_contains_marker(brief, marker) for marker in _NATIVE_ONLY_BRIEF_MARKERS):
         return False
     if any(keyword in brief for keyword in IMAGE_LED_BRIEF_KEYWORDS):
         return True

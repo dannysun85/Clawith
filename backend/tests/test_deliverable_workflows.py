@@ -437,6 +437,8 @@ def test_explicit_native_only_presentation_does_not_require_images() -> None:
         "无需图片，只用原生 shape",
         "不需要图片",
         "不调用图片、视频或语音生成工具",
+        "严禁调用图片生成、视频生成或语音生成工具",
+        "只使用 PPT 原生文字、形状、图表与线条",
         "Only native vector shapes, without images",
     ),
 )
