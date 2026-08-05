@@ -274,3 +274,91 @@ async def test_hybrid_editable_materializes_measured_image_instead_of_full_slide
     assert pictures[0].width < presentation.slide_width * 0.6
     assert pictures[0].height < presentation.slide_height * 0.6
     assert not content_screenshot.exists()
+
+
+@pytest.mark.asyncio
+async def test_hybrid_editable_prefers_text_free_visual_capture_for_collapsed_canvas(
+    monkeypatch,
+    tmp_path,
+):
+    src_file = tmp_path / "source.html"
+    tgt_file = tmp_path / "result.pptx"
+    content_screenshot = tmp_path / "content-without-text.png"
+    src_file.write_text(
+        '<html><body><section class="slide"><div data-visual></div><h1>可编辑标题</h1></section></body></html>',
+        encoding="utf-8",
+    )
+    Image.new("RGB", (1280, 720), color=(24, 36, 52)).save(content_screenshot)
+
+    async def fake_collect_browser_layout(
+        _src,
+        width,
+        height,
+        render_mode,
+        render_scale,
+    ):
+        return {
+            "slides": [
+                {
+                    "width": 1280,
+                    "height": 720,
+                    "backgroundColor": "#ffffff",
+                    "preferWholeSlideVisualCapture": True,
+                    "items": [
+                        {
+                            "kind": "shape",
+                            "x": 40,
+                            "y": 40,
+                            "w": 600,
+                            "h": 120,
+                            "style": {"backgroundColor": "rgb(139, 92, 246)"},
+                        },
+                        {
+                            "kind": "text",
+                            "tag": "h1",
+                            "text": "可编辑标题",
+                            "x": 80,
+                            "y": 60,
+                            "w": 500,
+                            "h": 80,
+                            "style": {
+                                "color": "rgb(255, 255, 255)",
+                                "fontSize": "48px",
+                            },
+                        },
+                    ],
+                }
+            ],
+            "contentScreenshots": [str(content_screenshot)],
+        }
+
+    monkeypatch.setattr(
+        pptx_renderer,
+        "collect_browser_layout",
+        fake_collect_browser_layout,
+    )
+
+    result = await pptx_renderer.render_html_to_pptx(
+        src_file,
+        tgt_file,
+        "workspace/result.pptx",
+        tmp_path,
+        {"render_mode": "hybrid_editable"},
+    )
+
+    assert result.startswith("✅ Successfully converted HTML to editable PPTX")
+    presentation = Presentation(tgt_file)
+    assert len(presentation.slides) == 1
+    pictures = [
+        shape
+        for shape in presentation.slides[0].shapes
+        if shape.shape_type == 13
+    ]
+    assert len(pictures) == 1
+    text_shapes = [
+        shape
+        for shape in presentation.slides[0].shapes
+        if shape.has_text_frame and shape.text.strip()
+    ]
+    assert [shape.text for shape in text_shapes] == ["可编辑标题"]
+    assert not content_screenshot.exists()

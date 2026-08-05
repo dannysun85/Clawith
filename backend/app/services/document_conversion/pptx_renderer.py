@@ -507,17 +507,21 @@ async def render_html_to_pptx(src_file: Path, tgt_file: Path, target_path: str, 
                     for item in (slide_data.get("items") or [])
                     if item.get("kind") in {"image", "shape"}
                 ]
+                use_content_visual = bool(
+                    content_screenshot
+                    and Path(content_screenshot).exists()
+                    and (
+                        not visual_items
+                        or slide_data.get("preferWholeSlideVisualCapture")
+                    )
+                )
                 bg_screenshots = layout.get("backgroundScreenshots") or []
                 bg_screenshot = bg_screenshots[len(prs.slides) - 1] if len(bg_screenshots) >= len(prs.slides) else None
-                # Keep a whole-slide content screenshot only when there is no
-                # measured visual layer to materialize. If image/shape items
-                # exist, using this screenshot would hide the real assets in
-                # an effectively non-editable slide image.
-                if (
-                    content_screenshot
-                    and not visual_items
-                    and Path(content_screenshot).exists()
-                ):
+                # A zero-size visual-canvas wrapper cannot be faithfully
+                # reconstructed from individual PowerPoint primitives. Use a
+                # text-free page capture for the visual layer and keep every
+                # measured text item editable on top of it.
+                if use_content_visual:
                     slide.shapes.add_picture(
                         content_screenshot,
                         Inches(offset_x),
@@ -570,6 +574,8 @@ async def render_html_to_pptx(src_file: Path, tgt_file: Path, target_path: str, 
                         "_backdrop-color": slide_bg_value,
                     }
                     kind = item.get("kind")
+                    if use_content_visual and kind in {"shape", "image"}:
+                        continue
                     if kind == "shape":
                         shape_screenshots = layout.get("shapeScreenshots") or {}
                         shape_screenshot = shape_screenshots.get(str(item.get("itemId") or ""))

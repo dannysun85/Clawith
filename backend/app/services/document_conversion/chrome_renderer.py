@@ -43,6 +43,47 @@ def is_translucent_css_color(value: str | None) -> bool:
         return False
 
 
+def build_hybrid_text_capture_css(
+    text_item_ids: list[str],
+    *,
+    text_clip_item_ids: list[str] | None = None,
+) -> str:
+    """Hide editable text, including styled inline descendants, in visual captures."""
+    selectors: list[str] = []
+    for item_id in text_item_ids:
+        selector = f'[data-clawith-item-id="{item_id}"]'
+        selectors.extend(
+            (
+                selector,
+                f"{selector} *",
+                f"{selector}::before",
+                f"{selector}::after",
+                f"{selector} *::before",
+                f"{selector} *::after",
+            )
+        )
+    if not selectors:
+        return ""
+    css = (
+        ",".join(selectors)
+        + " { color: transparent !important; "
+        "-webkit-text-fill-color: transparent !important; "
+        "text-shadow: none !important; }"
+    )
+    clip_selectors = [
+        f'[data-clawith-item-id="{item_id}"]'
+        for item_id in (text_clip_item_ids or [])
+    ]
+    if clip_selectors:
+        css += (
+            " "
+            + ",".join(clip_selectors)
+            + " { background-image: none !important; "
+            "background-color: transparent !important; }"
+        )
+    return css
+
+
 async def collect_browser_layout(
     src_file: Path,
     design_w_px: int,
@@ -135,7 +176,10 @@ async def collect_browser_layout(
   }
 
   function childElements(el) {
-    return Array.from(el.children || []).filter(isVisible);
+    return Array.from(el.children || []).filter(child => {
+      if (isVisible(child)) return true;
+      return Array.from(child.querySelectorAll('*')).some(isVisible);
+    });
   }
 
   function directText(el) {
@@ -171,12 +215,21 @@ async def collect_browser_layout(
     return clip.includes('text') || fill === 'transparent' || fill === 'rgba(0, 0, 0, 0)';
   }
 
-  function textLineBoxes(el, rootRect) {
+  function textLineBoxes(el, rootRect, directOnly = false) {
     const groups = [];
-    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
-    let node;
+    const nodes = [];
+    if (directOnly) {
+      Array.from(el.childNodes || [])
+        .filter(node => node.nodeType === Node.TEXT_NODE)
+        .forEach(node => nodes.push(node));
+    } else {
+      const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+      let node;
+      while ((node = walker.nextNode())) nodes.push(node);
+    }
     let measuredCharacters = 0;
-    while ((node = walker.nextNode()) && measuredCharacters < 1200) {
+    for (const node of nodes) {
+      if (measuredCharacters >= 1200) break;
       const value = node.textContent || '';
       for (let index = 0; index < value.length && measuredCharacters < 1200; index += 1) {
         const character = value[index];
@@ -215,7 +268,7 @@ async def collect_browser_layout(
       }));
   }
 
-  function itemFor(el, rootRect, kind, text) {
+  function itemFor(el, rootRect, kind, text, directOnly = false) {
     const cs = getComputedStyle(el);
     const r = el.getBoundingClientRect();
     const itemId = `item-${Math.random().toString(36).slice(2)}-${Date.now()}`;
@@ -236,7 +289,7 @@ async def collect_browser_layout(
       scrollHeight: el.scrollHeight,
       allowOverlap: el.getAttribute('data-allow-overlap') === 'true',
       textRole: el.getAttribute('data-clawith-text-role') || '',
-      lines: kind === 'text' ? textLineBoxes(el, rootRect) : [],
+      lines: kind === 'text' ? textLineBoxes(el, rootRect, directOnly) : [],
       style: {
 color: cs.color,
 backgroundColor: cs.backgroundColor,
@@ -272,6 +325,21 @@ backdropFilter: cs.backdropFilter || cs.webkitBackdropFilter,
     };
   }
 
+  function fitTextItemToLines(item) {
+    const lines = (item.lines || []).filter(line => line.text && line.w > 0 && line.h > 0);
+    if (!lines.length) return item;
+    const originalRight = item.x + item.w;
+    const left = Math.min(...lines.map(line => line.x));
+    const top = Math.min(...lines.map(line => line.y));
+    const right = Math.max(originalRight, ...lines.map(line => line.x + line.w));
+    const bottom = Math.max(...lines.map(line => line.y + line.h));
+    item.x = left;
+    item.y = top;
+    item.w = Math.max(1, right - left);
+    item.h = Math.max(1, bottom - top);
+    return item;
+  }
+
   function collectRoot(root) {
     const rootRectRaw = root === document.body
       ? { left: 0, top: 0, width: viewport.width, height: viewport.height }
@@ -284,14 +352,29 @@ height: rootRectRaw.height || viewport.height,
     };
     const items = [];
     const rootStyle = getComputedStyle(root);
+    let preferWholeSlideVisualCapture = false;
 
     function walk(el) {
-      if (!isVisible(el)) return;
+      if (!isVisible(el)) {
+        const visibleDescendants = childElements(el);
+        if (visibleDescendants.length) {
+          // Presentation generators commonly wrap an absolute-positioned
+          // visual canvas in a zero-size data-visual element. Preserve that
+          // canvas as a single high-fidelity layer while extracting its text.
+          preferWholeSlideVisualCapture = true;
+        }
+        visibleDescendants.forEach(walk);
+        return;
+      }
       const cs = getComputedStyle(el);
       const children = childElements(el);
       const tag = el.tagName.toLowerCase();
       const text = directText(el);
       const hasBlockChildren = children.some(child => !isInlineTag(child.tagName.toLowerCase()));
+      const hasSeparatedInlineChildren = !hasBlockChildren && children.some(child => {
+        const childStyle = getComputedStyle(child);
+        return hasPaint(childStyle) || isTextClipBackground(childStyle);
+      });
 
       // Keep SVG/canvas as one bounded visual item. Their internals are not
       // safely editable PPT primitives, but the hybrid renderer can capture
@@ -315,10 +398,17 @@ const content = fullText(el);
 if (content) items.push(itemFor(el, rootRect, 'text', content));
 return;
       }
-      if (children.length && !hasBlockChildren) {
+      if (children.length && !hasBlockChildren && !hasSeparatedInlineChildren) {
 const content = fullText(el);
 if (content) items.push(itemFor(el, rootRect, 'text', content));
 return;
+      }
+      if (children.length && !hasBlockChildren && hasSeparatedInlineChildren) {
+        if (text) {
+          items.push(fitTextItemToLines(itemFor(el, rootRect, 'text', text, true)));
+        }
+        children.forEach(walk);
+        return;
       }
       if (text || ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'li', 'span', 'strong', 'em', 'button', 'a'].includes(tag)) {
 const content = text || (children.length ? '' : (el.innerText || '').replace(/\s+/g, ' ').trim());
@@ -334,6 +424,7 @@ if (content) items.push(itemFor(el, rootRect, 'text', content));
       width: rootRect.width,
       height: rootRect.height,
       backgroundColor: cssPaint(rootStyle) || pageBg,
+      preferWholeSlideVisualCapture,
       items,
     };
   }
@@ -514,9 +605,32 @@ roots = [body];
                             for item in slide_data.get("items") or []
                             if item.get("kind") == "text" and item.get("itemId")
                         ]
-                        selectors = ",".join(
-                            f'[data-clawith-item-id="{item_id}"]'
-                            for item_id in text_item_ids
+                        text_clip_item_ids = [
+                            str(item.get("itemId"))
+                            for item in slide_data.get("items") or []
+                            if item.get("kind") == "text"
+                            and item.get("itemId")
+                            and (
+                                "text"
+                                in str(
+                                    (item.get("style") or {}).get("backgroundClip")
+                                    or (item.get("style") or {}).get(
+                                        "webkitBackgroundClip"
+                                    )
+                                    or ""
+                                ).lower()
+                                or str(
+                                    (item.get("style") or {}).get(
+                                        "webkitTextFillColor"
+                                    )
+                                    or ""
+                                ).lower()
+                                in {"transparent", "rgba(0, 0, 0, 0)"}
+                            )
+                        ]
+                        text_capture_css = build_hybrid_text_capture_css(
+                            text_item_ids,
+                            text_clip_item_ids=text_clip_item_ids,
                         )
                         hide_text_expr = (
                             "(() => {"
@@ -524,7 +638,7 @@ roots = [body];
                             "document.getElementById(id)?.remove();"
                             "const style=document.createElement('style');"
                             "style.id=id;"
-                            f"style.textContent={json.dumps(selectors + ' { color: transparent !important; -webkit-text-fill-color: transparent !important; text-shadow: none !important; }')};"
+                            f"style.textContent={json.dumps(text_capture_css)};"
                             "document.head.appendChild(style);"
                             "})()"
                         )

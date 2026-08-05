@@ -1,3 +1,29 @@
+# v1.11.30 — Editable Presentation Visual Fidelity
+
+## Hybrid presentation rendering
+
+- Detect zero-size visual-canvas wrappers whose absolutely positioned
+  descendants would otherwise be omitted from browser layout extraction.
+- Preserve complex gradients, translucent cards, filters, and diagrams as one
+  text-free high-fidelity visual layer while keeping measured headings, body
+  copy, labels, and metadata as independently editable PowerPoint text.
+- Split painted and gradient-clipped inline labels before capture, remove their
+  glyph paint from the visual layer, and fit direct text beside decorative
+  inline shapes to its actual browser line bounds. This removes duplicated
+  cover copy and prevents brand marks from overlapping adjacent text.
+- Keep ordinary measured image slides on the existing per-asset path; the
+  whole-slide visual layer is selected only for collapsed visual canvases or
+  slides without a measurable visual item.
+
+## Validation
+
+- Add browser-backed regressions for zero-size visual wrappers, painted labels,
+  gradient-clipped text, and inline brand marks, plus renderer coverage for the
+  high-fidelity visual-layer preference.
+- Re-convert and render the six-page production OPC proposal with one visual
+  layer per slide and editable text overlays; all pages pass overflow checks
+  without the previous cover-title duplication.
+
 # v1.11.29 — Native-only Presentation Contract Repair
 
 ## Contract classification
