@@ -74,7 +74,6 @@ def poster_exact_copy_blocks(spec: object) -> tuple[dict[str, str], ...]:
                 "role": (
                     "cta"
                     if index >= 2
-                    and index == len(visible_lines) - 1
                     and _CTA_COPY_RE.search(line)
                     else _DEFAULT_POSTER_COPY_ROLES[index]
                     if index < len(_DEFAULT_POSTER_COPY_ROLES)

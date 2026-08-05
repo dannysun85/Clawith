@@ -436,6 +436,7 @@ def test_explicit_native_only_presentation_does_not_require_images() -> None:
         "不要用图片，只做原生矢量",
         "无需图片，只用原生 shape",
         "不需要图片",
+        "不调用图片、视频或语音生成工具",
         "Only native vector shapes, without images",
     ),
 )
@@ -1020,6 +1021,31 @@ def test_formal_poster_prompt_compiles_persisted_exact_copy_blocks() -> None:
     assert "server will reject any mismatch before a paid provider request" in prompt
     assert '"execution_strategy": "commercial_quality"' in prompt
     assert '"allow_degraded_fallback": false' in prompt
+    assert "do not simplify a detailed brief into a flat gradient" in prompt
+
+
+def test_formal_poster_detects_cta_before_company_footer() -> None:
+    from app.services.poster_contract import poster_exact_copy_contract
+
+    blocks, _digest = poster_exact_copy_contract(
+        {
+            "exact_copy": (
+                "把 AI 公司真正运行起来\n"
+                "数字员工 · 任务协作 · 成果审核\n"
+                "从需求到商业成果，完整闭环\n"
+                "立即体验 ReefTotem OPC\n"
+                "深圳前海瑞孚图腾科技有限公司"
+            )
+        }
+    )
+
+    assert [block["role"] for block in blocks] == [
+        "title",
+        "subtitle",
+        "tagline",
+        "cta",
+        "body",
+    ]
 
 
 @pytest.mark.asyncio

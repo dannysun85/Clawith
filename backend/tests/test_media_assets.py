@@ -414,6 +414,13 @@ def test_role_aware_poster_blocks_render_without_legacy_black_panel():
         assert image.convert("RGB").getpixel((360, 640)) != (0, 0, 0)
 
 
+def test_commercial_poster_title_prefers_black_sans_over_serif() -> None:
+    candidates = media_assets._POSTER_FONT_CANDIDATES_BY_ROLE["title"]
+
+    assert "NotoSansCJK-Black" in candidates[0]
+    assert next(path for path in candidates if "NotoSerif" in path) != candidates[0]
+
+
 def test_poster_preflight_rejects_copy_that_cannot_fit_the_safe_area():
     blocks = [
         {
@@ -440,6 +447,23 @@ def test_commercial_poster_title_avoids_single_character_widow():
 
     assert receipt.block_count == 5
     assert receipt.line_count == 5
+
+
+def test_poster_copy_after_cta_is_rendered_as_a_footer():
+    blocks = [
+        {"role": "title", "text": "把 AI 公司真正运行起来"},
+        {"role": "subtitle", "text": "数字员工 · 任务协作 · 成果审核"},
+        {"role": "tagline", "text": "从需求到商业成果，完整闭环"},
+        {"role": "cta", "text": "立即体验 ReefTotem OPC"},
+        {"role": "body", "text": "深圳前海瑞孚图腾科技有限公司"},
+    ]
+
+    receipt = preflight_poster_layout(blocks, aspect_ratio="9:16")
+
+    assert receipt.block_count == 5
+    assert receipt.line_count == 5
+    assert receipt.content_bottom is not None
+    assert receipt.content_bottom >= int(1920 * 0.88)
 
 
 def test_glass_cta_uses_rose_to_violet_gradient_instead_of_flat_fill():

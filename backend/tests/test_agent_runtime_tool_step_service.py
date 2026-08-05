@@ -3954,6 +3954,59 @@ def test_formal_deliverable_uses_persisted_media_contract_instead_of_goal_parser
     )
 
 
+def test_native_presentation_contract_blocks_image_before_provider() -> None:
+    goal = (
+        'PRESENTATION_MEDIA_CONTRACT={"required": false, '
+        '"generation_required_roles": [], "supplied_assets": []} '
+        "Create the deck with native shapes."
+    )
+
+    blocked = tool_step_service._media_contract_block(
+        goal,
+        "generate_image_minimax",
+        {"prompt": "unrequested hero"},
+        formal_request_scoped=True,
+    )
+
+    assert blocked is not None
+    assert blocked[0] == "presentation_media_contract_blocked"
+    assert "No media provider request was made" in blocked[1]
+
+
+def test_native_presentation_contract_blocks_audio_before_provider() -> None:
+    goal = (
+        'PRESENTATION_MEDIA_CONTRACT={"required": false, '
+        '"generation_required_roles": []}'
+    )
+
+    blocked = tool_step_service._media_contract_block(
+        goal,
+        "generate_speech_minimax",
+        {"text": "unrequested narration"},
+        formal_request_scoped=True,
+    )
+
+    assert blocked is not None
+    assert blocked[0] == "presentation_media_contract_blocked"
+
+
+def test_image_led_presentation_contract_allows_required_generation() -> None:
+    goal = (
+        'PRESENTATION_MEDIA_CONTRACT={"required": true, '
+        '"generation_required_roles": ["product_hero"]}'
+    )
+
+    assert (
+        tool_step_service._media_contract_block(
+            goal,
+            "generate_image_minimax",
+            {"prompt": "authorized hero"},
+            formal_request_scoped=True,
+        )
+        is None
+    )
+
+
 def test_media_contract_requires_structured_blocks_for_multi_copy_poster() -> None:
     blocked = tool_step_service._media_contract_block(
         _QUANT_POSTER_GOAL,

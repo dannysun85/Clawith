@@ -107,6 +107,7 @@ _MEDIA_GENERATION_TOOL_MODALITIES = {
     for name, modality in MEDIA_ARTIFACT_TOOL_MODALITIES.items()
     if name not in {"check_image_generation", "check_video_minimax"}
 }
+_PRESENTATION_MEDIA_CONTRACT_MARKER = "PRESENTATION_MEDIA_CONTRACT="
 _CHINESE_OUTPUT_NUMBERS = {
     "一": 1,
     "壹": 1,
@@ -289,6 +290,28 @@ def _explicit_media_output_limit(goal: str, modality: str) -> int | None:
     return None
 
 
+def _presentation_media_contract(goal: str) -> dict[str, object] | None:
+    """Read the server-owned presentation media policy embedded in a formal goal."""
+
+    decoder = json.JSONDecoder()
+    search_from = 0
+    while True:
+        marker_index = goal.find(_PRESENTATION_MEDIA_CONTRACT_MARKER, search_from)
+        if marker_index < 0:
+            return None
+        raw_contract = goal[
+            marker_index + len(_PRESENTATION_MEDIA_CONTRACT_MARKER) :
+        ].lstrip()
+        try:
+            value, _end = decoder.raw_decode(raw_contract)
+        except json.JSONDecodeError:
+            search_from = marker_index + len(_PRESENTATION_MEDIA_CONTRACT_MARKER)
+            continue
+        if isinstance(value, dict) and isinstance(value.get("required"), bool):
+            return value
+        search_from = marker_index + len(_PRESENTATION_MEDIA_CONTRACT_MARKER)
+
+
 def _media_contract_block(
     goal: str,
     tool_name: str,
@@ -297,6 +320,27 @@ def _media_contract_block(
     formal_request_scoped: bool = False,
 ) -> tuple[str, str] | None:
     modality = _MEDIA_GENERATION_TOOL_MODALITIES.get(tool_name)
+    if modality is None:
+        return None
+    presentation_contract = _presentation_media_contract(goal)
+    if formal_request_scoped and presentation_contract is not None:
+        generation_roles = presentation_contract.get("generation_required_roles")
+        image_generation_allowed = (
+            modality == "image"
+            and isinstance(generation_roles, list)
+            and any(str(role or "").strip() for role in generation_roles)
+        )
+        if image_generation_allowed:
+            return None
+        return (
+            "presentation_media_contract_blocked",
+            (
+                "[BLOCKED] The server-owned presentation media contract does not "
+                f"authorize {modality} generation for this deliverable. No media "
+                "provider request was made. Continue with the supplied assets or "
+                "native editable presentation elements required by the contract."
+            ),
+        )
     if modality not in {"image", "video"}:
         return None
     # Persisted Deliverable Requests already carry a server-owned exact-copy,

@@ -1,3 +1,29 @@
+# v1.11.26 — Commercial Poster and Presentation Guardrails
+
+## Poster composition
+
+- Detect CTA copy wherever it appears after the main hierarchy, including when
+  a company attribution follows it, so the CTA receives the commercial glass
+  button treatment instead of becoming plain body text.
+- Reduce oversized poster typography, place post-CTA attribution in a restrained
+  bottom footer, prefer modern CJK Black/Bold sans-serif title faces over the
+  previous serif-first choice, and require formal poster prompts to preserve the
+  detailed art direction instead of collapsing it into a flat template.
+
+## Presentation provider safety
+
+- Recognize additional natural Chinese prohibitions such as
+  `不调用图片、视频或语音生成工具` as native-only presentation intent.
+- Enforce the persisted `PRESENTATION_MEDIA_CONTRACT` again immediately before
+  every formal media Tool call. Native-only decks now fail closed before any
+  image, video, speech, or music provider request; image-led decks permit only
+  explicitly required image roles.
+
+## Validation
+
+- Add regression coverage for CTA-before-footer composition, bottom attribution,
+  native-only phrasing, and the formal presentation runtime media guard.
+
 # v1.11.25 — Commercial Media Contract Hardening
 
 ## Poster, presentation, and session isolation

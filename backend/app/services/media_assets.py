@@ -43,9 +43,12 @@ _FONT_CANDIDATES = (
 )
 _POSTER_FONT_CANDIDATES_BY_ROLE = {
     "title": (
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Black.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc",
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
         "/usr/share/fonts/opentype/noto/NotoSerifCJK-Black.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSerifCJK-Bold.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSerifCJK-SemiBold.ttc",
         "/System/Library/Fonts/Supplemental/Songti.ttc",
     ),
     "subtitle": (
@@ -797,11 +800,11 @@ def _poster_block_layout(
 
     short_edge = min(width, height)
     role_scale = {
-        "title": 0.082,
-        "subtitle": 0.038,
-        "tagline": 0.029,
-        "body": 0.032,
-        "cta": 0.036,
+        "title": 0.068,
+        "subtitle": 0.034,
+        "tagline": 0.027,
+        "body": 0.024,
+        "cta": 0.032,
     }[role]
     max_width_ratio = 0.82 if role != "cta" else 0.42
     max_width = max(1, int(width * max_width_ratio))
@@ -987,7 +990,24 @@ def _render_poster_blocks(
             )
         content_rects.append(rect)
 
-    non_cta = [block for block in blocks if block["role"] != "cta"]
+    first_cta_index = next(
+        (index for index, block in enumerate(blocks) if block["role"] == "cta"),
+        len(blocks),
+    )
+    # Copy following a CTA is conventionally legal/brand attribution. Keep it
+    # out of the primary hierarchy and render it as a restrained footer rather
+    # than turning the company name into another headline-sized body row.
+    footer_blocks = [
+        block
+        for index, block in enumerate(blocks)
+        if index > first_cta_index and block["role"] == "body"
+    ]
+    footer_ids = {id(block) for block in footer_blocks}
+    non_cta = [
+        block
+        for block in blocks
+        if block["role"] != "cta" and id(block) not in footer_ids
+    ]
     ctas = [block for block in blocks if block["role"] == "cta"]
     layouts = [
         (
@@ -1146,6 +1166,52 @@ def _render_poster_blocks(
             line_y += line_height + spacing
             total_lines += 1
         cta_y = y + button_height + block_gap
+
+    footer_y = max(cta_y + block_gap, int(height * 0.88))
+    for block in footer_blocks:
+        font, lines, boxes, widths, heights, spacing = _poster_block_layout(
+            draw,
+            block["text"],
+            selections["body"],
+            "body",
+            width,
+            height,
+        )
+        footer_height = sum(heights) + spacing * max(len(lines) - 1, 0)
+        if footer_y + footer_height > height - safe_margin_y:
+            raise MediaContractError(
+                "overlay_blocks footer cannot fit inside the poster safe area"
+            )
+        line_y = footer_y
+        for line, box, line_width, line_height in zip(
+            lines,
+            boxes,
+            widths,
+            heights,
+            strict=True,
+        ):
+            if line:
+                x = (width - line_width) // 2 - box[0]
+                record_content_bounds(
+                    (
+                        x + box[0],
+                        line_y,
+                        x + box[0] + line_width,
+                        line_y + line_height,
+                    )
+                )
+                if not dry_run:
+                    draw.text(
+                        (x, line_y - box[1]),
+                        line,
+                        font=font,
+                        fill=(232, 229, 247, 205),
+                        stroke_width=max(1, int(font.size) // 60),
+                        stroke_fill=(50, 39, 91, 105),
+                    )
+            line_y += line_height + spacing
+            total_lines += 1
+        footer_y += footer_height + block_gap
 
     if not content_rects:
         raise MediaContractError("overlay_blocks produced no visible poster content")
