@@ -33,6 +33,13 @@ test('agent message owns the compact result summary and the full workflow stays 
   assert.doesNotMatch(workbench, /artifact\.status/);
 });
 
+test('failed delivery with a downloadable artifact is labeled as partial, not complete', () => {
+  assert.match(workbench, /const hasPartialArtifacts = artifacts\.length > 0 && request\.status === 'failed';/);
+  assert.match(workbench, /'部分文件已生成'/);
+  assert.match(workbench, /'仍有交付项未完成，请查看详情'/);
+  assert.match(workbench, /<small>\{compactDescription\}<\/small>/);
+});
+
 test('completed deliverable is rendered in the chat timeline, never inside the composer', () => {
   const resultCard = agentDetailPage.indexOf('{trackedDeliverables.map((request) => (');
   const composer = agentDetailPage.indexOf('<div ref={chatInputAreaRef} className="chat-input-area"');

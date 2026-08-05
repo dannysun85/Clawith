@@ -1,3 +1,20 @@
+# v1.11.31 — Partial Deliverable Status Clarity
+
+## Customer-facing delivery status
+
+- Label a failed formal delivery that still has downloadable artifacts as
+  `部分文件已生成`, instead of displaying a completed artifact title beside the
+  generic `生成遇到问题` failure heading.
+- Tell the user that remaining deliverable items are incomplete and route them
+  to the detailed status, while preserving download access to the valid partial
+  artifact.
+
+## Validation
+
+- Add a frontend contract regression for failed requests with partial artifacts.
+- Verify the production OPC proposal remains downloadable while its missing PDF
+  and failed workflow units remain truthfully visible in the details drawer.
+
 # v1.11.30 — Editable Presentation Visual Fidelity
 
 ## Hybrid presentation rendering

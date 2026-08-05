@@ -835,15 +835,23 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
             step: 0,
         };
     })();
-    const compactTitle = artifacts.length > 0
-        ? {
-            presentation: isZh ? 'PPT 已生成' : 'Presentation ready',
-            poster: isZh ? '图片已生成' : 'Image ready',
-            video: isZh ? '视频已生成' : 'Video ready',
-            report: isZh ? '报告已生成' : 'Report ready',
-            spreadsheet: isZh ? '表格已生成' : 'Spreadsheet ready',
-        }[request.work_type]
-        : presentation.title;
+    const hasPartialArtifacts = artifacts.length > 0 && request.status === 'failed';
+    const compactTitle = hasPartialArtifacts
+        ? (isZh ? '部分文件已生成' : 'Some files are ready')
+        : artifacts.length > 0
+            ? {
+                presentation: isZh ? 'PPT 已生成' : 'Presentation ready',
+                poster: isZh ? '图片已生成' : 'Image ready',
+                video: isZh ? '视频已生成' : 'Video ready',
+                report: isZh ? '报告已生成' : 'Report ready',
+                spreadsheet: isZh ? '表格已生成' : 'Spreadsheet ready',
+            }[request.work_type]
+            : presentation.title;
+    const compactDescription = hasPartialArtifacts
+        ? (isZh ? '仍有交付项未完成，请查看详情' : 'Some deliverables still need attention; view details')
+        : compactTitle === presentation.title
+            ? presentation.description
+            : presentation.title;
 
     const closeDetails = useCallback(() => {
         setDetailsOpen(false);
@@ -1415,7 +1423,7 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
                 </span>
                 <div className="deliverable-summary-card__body">
                     <strong>{compactTitle}</strong>
-                    <small>{compactTitle === presentation.title ? presentation.description : presentation.title}</small>
+                    <small>{compactDescription}</small>
                 </div>
                 <div className="deliverable-summary-card__actions">
                     {artifacts.slice(0, 2).map((artifact) => (
