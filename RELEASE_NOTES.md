@@ -1,3 +1,32 @@
+# v1.11.32 — Registration Reliability and Readiness
+
+## Numeric email registration
+
+- Derive a safe internal username when an email local-part is numeric or
+  otherwise resembles a phone number, while the customer continues to register
+  with email, password, and registration code only.
+- Add a stable email-derived suffix for contact-shaped local-parts so common
+  cross-domain addresses do not collide in the global login namespace.
+- Keep generated usernames and display names within their persisted limits.
+
+## Registration readiness and error clarity
+
+- Expose whether password registration is currently available under the same
+  fail-closed SMTP policy enforced by the registration endpoint.
+- Disable self-service registration with an actionable localized explanation
+  when system email is unavailable, instead of accepting a form that can only
+  fail after submission.
+- Render safe structured validation details in the frontend instead of the
+  generic `Request validation failed` message.
+
+## Validation
+
+- Add regression coverage for numeric email local-parts, cross-domain
+  collision avoidance, persisted length limits, registration readiness, and
+  structured validation messages.
+- Pass the complete backend test suite, complete frontend test suite, Ruff on
+  the changed Python files, and the production frontend build.
+
 # v1.11.31 — Partial Deliverable Status Clarity
 
 ## Customer-facing delivery status
