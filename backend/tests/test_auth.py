@@ -1197,25 +1197,65 @@ async def test_login_unverified_email_fails_closed_when_policy_is_unavailable():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("email_config", "local_opt_in", "expected"),
+    [
+        (SimpleNamespace(smtp_host="smtp.example.com"), False, True),
+        (None, True, True),
+        (None, False, False),
+    ],
+)
+async def test_password_registration_availability_mirrors_fail_closed_policy(
+    monkeypatch,
+    email_config,
+    local_opt_in,
+    expected,
+):
+    monkeypatch.setattr(
+        auth_api,
+        "_resolve_auth_email_config",
+        AsyncMock(return_value=email_config),
+    )
+    monkeypatch.setattr(
+        "app.config.unverified_local_signup_allowed",
+        lambda: local_opt_in,
+    )
+
+    assert await auth_api._password_registration_available() is expected
+
+
+@pytest.mark.asyncio
 async def test_registration_config_allows_bootstrap_without_code(monkeypatch):
     is_empty = AsyncMock(return_value=True)
     monkeypatch.setattr(auth_api.identity_dao, "is_empty", is_empty)
+    availability = AsyncMock(return_value=True)
+    monkeypatch.setattr(auth_api, "_password_registration_available", availability)
 
     result = await auth_api.get_registration_config()
 
-    assert result == {"invitation_code_required": False}
+    assert result == {
+        "invitation_code_required": False,
+        "password_registration_available": True,
+    }
     is_empty.assert_awaited_once_with()
+    availability.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
 async def test_registration_config_requires_code_after_bootstrap(monkeypatch):
     is_empty = AsyncMock(return_value=False)
     monkeypatch.setattr(auth_api.identity_dao, "is_empty", is_empty)
+    availability = AsyncMock(return_value=False)
+    monkeypatch.setattr(auth_api, "_password_registration_available", availability)
 
     result = await auth_api.get_registration_config()
 
-    assert result == {"invitation_code_required": True}
+    assert result == {
+        "invitation_code_required": True,
+        "password_registration_available": False,
+    }
     is_empty.assert_awaited_once_with()
+    availability.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio

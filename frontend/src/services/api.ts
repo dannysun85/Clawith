@@ -163,7 +163,10 @@ export function uploadFileWithProgress(
 // ─── Auth ─────────────────────────────────────────────
 export const authApi = {
     registrationConfig: () =>
-        request<{ invitation_code_required: boolean }>('/auth/registration-config'),
+        request<{
+            invitation_code_required: boolean;
+            password_registration_available?: boolean;
+        }>('/auth/registration-config'),
 
     register: (data: { username?: string; email: string; password: string; display_name: string; invitation_code?: string; provider?: string; provider_code?: string }) =>
         request<{ user_id: string; email: string; access_token: string; message: string; user?: any; needs_company_setup: boolean }>('/auth/register', { method: 'POST', body: JSON.stringify(data) }),

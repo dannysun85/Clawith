@@ -119,6 +119,14 @@ async def _resolve_password_registration_email_config():
     )
 
 
+async def _password_registration_available() -> bool:
+    """Mirror the password-registration fail-closed policy for public UI readiness."""
+    from app.config import unverified_local_signup_allowed
+
+    email_config = await _resolve_auth_email_config()
+    return bool(email_config or unverified_local_signup_allowed())
+
+
 def serialize_user(user: User | None) -> UserOut | None:
     if user is None:
         return None
@@ -311,7 +319,10 @@ async def get_registration_config():
     # by register_init. Expose the same rule to the UI so a fresh deployment is
     # not deadlocked waiting for a code that no administrator exists to create.
     is_first_user = await identity_dao.is_empty()
-    return {"invitation_code_required": not is_first_user}
+    return {
+        "invitation_code_required": not is_first_user,
+        "password_registration_available": await _password_registration_available(),
+    }
 
 
 @router.get("/check-duplicate")

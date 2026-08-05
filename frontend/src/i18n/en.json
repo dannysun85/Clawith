@@ -131,6 +131,7 @@
     "notInOrganization": "This account does not belong to this organization.",
     "serverStarting": "Service is starting up or experiencing issues. Please try again in a few seconds.",
     "serverUnreachable": "Unable to reach server. Please check if the service is running and try again.",
+    "registrationUnavailable": "Self-service registration is temporarily unavailable because system email is not configured. Contact the platform administrator to have your account provisioned.",
     "checkEmailVerification": "Registration successful! Please check your email and click the verification link to verify your account.",
     "loginWithSSO": "Enterprise SSO Login",
     "ssoNotice": "Enterprise SSO is enabled for this domain.",

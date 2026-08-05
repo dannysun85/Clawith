@@ -14,6 +14,7 @@ import {
     IconCheck,
 } from '@tabler/icons-react';
 import { AtlasFrame, OriginPlate } from '../components/atlas';
+import { deriveRegistrationIdentity } from '../utils/registrationIdentity';
 
 export default function Login() {
     const { t, i18n } = useTranslation();
@@ -41,6 +42,7 @@ export default function Login() {
     const [verificationCode, setVerificationCode] = useState('');
     const [verificationEntryMode, setVerificationEntryMode] = useState<'create' | 'join' | 'home'>('home');
     const [registrationCodeRequired, setRegistrationCodeRequired] = useState(true);
+    const [passwordRegistrationAvailable, setPasswordRegistrationAvailable] = useState<boolean | null>(null);
     const [registrationCode, setRegistrationCode] = useState(invitationCode);
 
     const [form, setForm] = useState({
@@ -53,8 +55,14 @@ export default function Login() {
         document.documentElement.setAttribute('data-theme', localStorage.getItem('theme') || 'light');
 
         authApi.registrationConfig()
-            .then(config => setRegistrationCodeRequired(!!config.invitation_code_required))
-            .catch(() => setRegistrationCodeRequired(true));
+            .then(config => {
+                setRegistrationCodeRequired(!!config.invitation_code_required);
+                setPasswordRegistrationAvailable(config.password_registration_available ?? true);
+            })
+            .catch(() => {
+                setRegistrationCodeRequired(true);
+                setPasswordRegistrationAvailable(false);
+            });
 
         // Resolve tenant by domain (for SSO detection only, not for login form)
         const domain = window.location.host;
@@ -209,17 +217,23 @@ export default function Login() {
 
         try {
             if (isRegister) {
+                if (passwordRegistrationAvailable === false) {
+                    setError(t('auth.registrationUnavailable'));
+                    setLoading(false);
+                    return;
+                }
                 const code = registrationCode.trim();
                 if (registrationCodeRequired && !code) {
                     setError(isZh ? '请输入注册码' : 'Registration code is required.');
                     setLoading(false);
                     return;
                 }
+                const registrationIdentity = deriveRegistrationIdentity(form.login_identifier);
                 const regRes = await authApi.register({
-                    username: form.login_identifier.split('@')[0],
+                    username: registrationIdentity.username,
                     email: form.login_identifier,
                     password: form.password,
-                    display_name: form.login_identifier.split('@')[0],
+                    display_name: registrationIdentity.displayName,
                     ...(code ? { invitation_code: code } : {})
                 });
                 // Save authentication state for company selection (user not active yet)
@@ -326,6 +340,8 @@ export default function Login() {
                     setError(t('auth.serverStarting'));
                 } else if (msg.includes('Email already registered') || msg.includes('该邮箱已注册')) {
                     setError(t('auth.emailAlreadyRegistered', '该邮箱已注册，请直接登录'));
+                } else if (msg.includes('Password registration is temporarily unavailable')) {
+                    setError(t('auth.registrationUnavailable'));
                 } else {
                     setError(msg);
                 }
@@ -473,6 +489,13 @@ export default function Login() {
                             border: '1px solid rgba(34, 197, 94, 0.2)',
                         }}>
                             <IconCheck size={16} stroke={1.8} /> {successMessage}
+                        </div>
+                    )}
+
+                    {isRegister && passwordRegistrationAvailable === false && !showVerification && (
+                        <div className="login-error">
+                            <IconAlertTriangle size={16} stroke={1.8} />
+                            {t('auth.registrationUnavailable')}
                         </div>
                     )}
 
@@ -717,7 +740,11 @@ export default function Login() {
                                 </div>
                             )}
 
-                            <button className="login-submit" type="submit" disabled={loading}>
+                            <button
+                                className="login-submit"
+                                type="submit"
+                                disabled={loading || (isRegister && passwordRegistrationAvailable === false)}
+                            >
                                 {loading ? (
                                     <span className="login-spinner" />
                                 ) : (

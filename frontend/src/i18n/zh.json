@@ -137,6 +137,7 @@
         "notInOrganization": "该账号不属于当前组织。",
         "serverStarting": "服务正在启动或遇到问题，请稍后重试。",
         "serverUnreachable": "无法连接服务器，请检查服务是否正在运行。",
+        "registrationUnavailable": "当前暂不能自助注册：系统邮件服务尚未配置。请联系平台管理员为你开通账号。",
         "checkEmailVerification": "注册成功！请检查邮箱并点击验证链接完成邮箱验证。",
         "loginWithSSO": "使用企业 SSO 登录",
         "ssoNotice": "此域名已启用企业单点登录 (SSO)。",
