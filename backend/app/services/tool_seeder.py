@@ -1573,7 +1573,7 @@ BUILTIN_TOOLS = [
     {
         "name": "generate_video_minimax",
         "display_name": "Generate Video",
-        "description": "Create a managed text-to-video or image-to-video task with the active Lite, Pro, or Ultra quality profile. Astra selects a healthy provider before submission and keeps an accepted task on that provider for idempotent polling and delivery. A formal delivery must pass allow_degraded_fallback=false unless the user explicitly accepted emergency quality. The completed file is rejected if its actual duration or aspect ratio differs from the request, or if require_audio=true and no audio stream exists.",
+        "description": "Create a managed text-to-video or image-to-video task with the active Lite, Pro, or Ultra quality profile. Astra selects a healthy provider before submission and keeps an accepted task on that provider for idempotent polling and delivery. Quick generation always uses the server-owned safe provider failover policy; the model cannot disable it. A formal delivery must pass allow_degraded_fallback=false unless the user explicitly accepted emergency quality. The completed file is rejected if its actual duration or aspect ratio differs from the request, or if require_audio=true and no audio stream exists.",
         "category": "media",
         "icon": "🎬",
         "is_default": True,
@@ -1600,7 +1600,7 @@ BUILTIN_TOOLS = [
                 "brand_asset": {"type": "string", "description": "Workspace image path frozen and composited over every frame as the protected product/logo layer. Do not combine with frame references."},
                 "brand_position": {"type": "string", "enum": ["top_left", "top_right", "center", "bottom_left", "bottom_right"]},
                 "brand_scale": {"type": "number", "description": "Video width fraction from 0.1 to 0.8. Default: 0.42."},
-                "allow_degraded_fallback": {"type": "boolean", "description": "Whether a known non-equivalent emergency provider may be used when the commercial primary route is unavailable. Formal delivery contracts default to false and may set true only after explicit user confirmation. Legacy quick-generation calls default to true."},
+                "allow_degraded_fallback": {"type": "boolean", "description": "Formal-delivery approval for a known non-equivalent emergency route. Formal delivery contracts default to false and may set true only after explicit user confirmation. Quick-generation calls always use Astra's server-owned safe provider failover policy, regardless of a model-supplied value."},
                 "wait_for_completion": {"type": "boolean", "description": "Poll and download if completed before timeout. Default: false."},
                 "poll_timeout_seconds": {"type": "integer", "description": "Maximum wait time when wait_for_completion=true. Default: 180."},
                 "save_path": {"type": "string", "description": "Save path for the completed video. Default: auto."},

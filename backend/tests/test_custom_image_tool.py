@@ -151,38 +151,42 @@ async def test_formal_video_does_not_enter_unconfirmed_degraded_route(tmp_path):
     prepare = AsyncMock(
         side_effect=NoCredentialAvailable("volcengine_agent_plan", "video")
     )
-    with (
-        patch("app.services.agent_tools._get_tool_config", AsyncMock(return_value={})),
-        patch(
-            "app.services.agent_tools._resolve_minimax_tool_tier",
-            AsyncMock(return_value="pro"),
-        ),
-        patch(
-            "app.services.minimax_media_profiles.load_platform_minimax_media_profile",
-            AsyncMock(return_value=resolve_minimax_media_profile("video", "pro")),
-        ),
-        patch(
-            "app.services.agent_tools._get_minimax_tenant_uuid",
-            AsyncMock(return_value=uuid.uuid4()),
-        ),
-        patch(
-            "app.services.media_provider_routing.prepare_media_provider",
-            prepare,
-        ),
-        patch(
-            "app.services.agent_tools._record_minimax_tool_product_issue",
-            AsyncMock(),
-        ),
-    ):
-        result = await _generate_video_minimax(
-            uuid.uuid4(),
-            tmp_path,
-            {
-                "prompt": "formal people-led commercial",
-                "allow_degraded_fallback": False,
-            },
-            typed=True,
-        )
+    token = agent_tools.deliverable_request_scope_id.set(str(uuid.uuid4()))
+    try:
+        with (
+            patch("app.services.agent_tools._get_tool_config", AsyncMock(return_value={})),
+            patch(
+                "app.services.agent_tools._resolve_minimax_tool_tier",
+                AsyncMock(return_value="pro"),
+            ),
+            patch(
+                "app.services.minimax_media_profiles.load_platform_minimax_media_profile",
+                AsyncMock(return_value=resolve_minimax_media_profile("video", "pro")),
+            ),
+            patch(
+                "app.services.agent_tools._get_minimax_tenant_uuid",
+                AsyncMock(return_value=uuid.uuid4()),
+            ),
+            patch(
+                "app.services.media_provider_routing.prepare_media_provider",
+                prepare,
+            ),
+            patch(
+                "app.services.agent_tools._record_minimax_tool_product_issue",
+                AsyncMock(),
+            ),
+        ):
+            result = await _generate_video_minimax(
+                uuid.uuid4(),
+                tmp_path,
+                {
+                    "prompt": "formal people-led commercial",
+                    "allow_degraded_fallback": False,
+                },
+                typed=True,
+            )
+    finally:
+        agent_tools.deliverable_request_scope_id.reset(token)
 
     assert isinstance(result, ToolExecutionOutcome)
     assert result.status == "failed"
@@ -190,6 +194,106 @@ async def test_formal_video_does_not_enter_unconfirmed_degraded_route(tmp_path):
     assert "no Credits were consumed" in result.result_summary
     assert prepare.await_count == 1
     assert prepare.await_args.args == ("volcengine_agent_plan",)
+
+
+@pytest.mark.asyncio
+async def test_formal_video_reports_reviewed_rejection_instead_of_ambiguous_submission(
+    tmp_path,
+):
+    from app.services.volcengine_agent_plan import VolcengineAgentPlanRejected
+
+    agent_id = uuid.uuid4()
+    tenant_id = uuid.uuid4()
+    credential_id = uuid.uuid4()
+    reservation_id = uuid.uuid4()
+    rejection = VolcengineAgentPlanRejected(
+        "Volcengine Agent Plan error (QuotaExceeded): quota exhausted",
+        provider_code="QuotaExceeded",
+        http_status=429,
+    )
+    credential = SimpleNamespace(
+        id=credential_id,
+        provider="volcengine_agent_plan",
+        model="doubao-seedance-2.0",
+        resolution="720p",
+        api_key="sk-test",
+        base_url="https://ark.test",
+    )
+
+    async def reject_provider_request(**kwargs):
+        kwargs["on_provider_request_started"]()
+        raise rejection
+
+    token = agent_tools.deliverable_request_scope_id.set(str(uuid.uuid4()))
+    try:
+        with (
+            patch("app.services.agent_tools._get_tool_config", AsyncMock(return_value={})),
+            patch(
+                "app.services.agent_tools._resolve_minimax_tool_tier",
+                AsyncMock(return_value="pro"),
+            ),
+            patch(
+                "app.services.minimax_media_profiles.load_platform_minimax_media_profile",
+                AsyncMock(return_value=resolve_minimax_media_profile("video", "pro")),
+            ),
+            patch(
+                "app.services.agent_tools._get_minimax_tenant_uuid",
+                AsyncMock(return_value=tenant_id),
+            ),
+            patch(
+                "app.services.media_provider_routing.prepare_media_provider",
+                AsyncMock(return_value=credential),
+            ),
+            patch("app.services.agent_tools._check_minimax_credit_amount", AsyncMock()),
+            patch(
+                "app.services.media_generation.validate_media_origin_session",
+                AsyncMock(),
+            ),
+            patch(
+                "app.services.media_generation.create_minimax_video_task_record",
+                AsyncMock(return_value=SimpleNamespace(reservation_id=reservation_id)),
+            ) as create_task,
+            patch(
+                "app.services.volcengine_agent_plan.create_video_task",
+                AsyncMock(side_effect=reject_provider_request),
+            ),
+            patch(
+                "app.services.media_generation.mark_media_generation_submission_failed",
+                AsyncMock(return_value=True),
+            ) as failed,
+            patch(
+                "app.services.media_generation.mark_media_generation_submission_ambiguous",
+                AsyncMock(),
+            ) as ambiguous,
+            patch(
+                "app.services.agent_tools._mark_media_provider_credential_failure",
+                AsyncMock(),
+            ),
+            patch(
+                "app.services.agent_tools._record_minimax_tool_product_issue",
+                AsyncMock(),
+            ),
+        ):
+            result = await _generate_video_minimax(
+                agent_id,
+                tmp_path,
+                {
+                    "prompt": "formal commercial",
+                    "allow_degraded_fallback": False,
+                },
+                typed=True,
+            )
+    finally:
+        agent_tools.deliverable_request_scope_id.reset(token)
+
+    record_id = create_task.await_args.kwargs["record_id"]
+    failed.assert_awaited_once_with(record_id, rejection)
+    ambiguous.assert_not_awaited()
+    assert isinstance(result, ToolExecutionOutcome)
+    assert result.status == "failed"
+    assert result.error_code == "media_video_degraded_confirmation_required"
+    assert "no video Credits were consumed" in result.result_summary
+    assert "outcome is uncertain" not in result.result_summary
 
 
 @pytest.mark.asyncio
@@ -297,7 +401,9 @@ async def test_video_stops_run_after_all_provider_routes_are_unavailable(tmp_pat
             tmp_path,
             {
                 "prompt": "commercial product motion",
-                "allow_degraded_fallback": True,
+                # Quick generation is server-managed. A model-supplied false
+                # value must not disable the safe Volcano -> MiniMax route.
+                "allow_degraded_fallback": False,
             },
             typed=True,
         )

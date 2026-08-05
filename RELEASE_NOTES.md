@@ -1,3 +1,27 @@
+# v1.11.28 — Server-owned Video Failover
+
+## Quick-generation continuity
+
+- Enforce the safe Volcano-to-MiniMax provider route for quick video
+  generation at the server boundary. A model-supplied
+  `allow_degraded_fallback=false` value can no longer silently disable the
+  operator-approved emergency path.
+- Keep formal Deliverable Requests on their persisted quality contract: an
+  alternate non-equivalent route still requires explicit approval before use.
+
+## Submission-state accuracy
+
+- Report a reviewed provider rejection as a released, non-active request rather
+  than an ambiguous submission. Credits remain held only when acceptance is
+  genuinely unknown, preventing misleading operator alerts after a confirmed
+  `QuotaExceeded` rejection.
+
+## Validation
+
+- Add regressions proving that quick generation checks both provider routes even
+  when the model tries to opt out, while formal workflows preserve their
+  approval boundary and never label a reviewed rejection as uncertain.
+
 # v1.11.27 — Resolution-aware Video Quota Routing
 
 ## Agent Plan video stability

@@ -30607,7 +30607,16 @@ async def _generate_video_minimax(
             agent_id=agent_id,
             modality="video",
         )
-    allow_degraded_fallback = _allow_degraded_media_fallback(arguments)
+    # A chat shortcut is a platform-managed route: the model must not be able
+    # to disable a safe provider failover by inventing an argument value.  A
+    # formal deliverable has an explicit, persisted quality contract and may
+    # still require confirmation before entering a non-equivalent route.
+    formal_request_scoped = bool(deliverable_request_scope_id.get().strip())
+    allow_degraded_fallback = (
+        _allow_degraded_media_fallback(arguments)
+        if formal_request_scoped
+        else True
+    )
 
     config = await _get_tool_config(agent_id, "generate_video_minimax") or {}
     tier = await _resolve_minimax_tool_tier(agent_id, config, saas_tier)
@@ -30920,7 +30929,6 @@ async def _generate_video_minimax(
                 },
             )
 
-    formal_request_scoped = bool(deliverable_request_scope_id.get().strip())
     requested_resolution = (
         profile.resolution
         if formal_request_scoped
@@ -31485,7 +31493,31 @@ async def _generate_video_minimax(
                 typed=typed,
                 _provider_index=selected_provider_index + 1,
             )
-        if record_id and provider_request_started and not provider_task_id:
+        if (
+            provider_rejected
+            and not allow_degraded_fallback
+            and selected_provider_index + 1 < len(DEFAULT_MEDIA_PROVIDER_ORDER)
+        ):
+            return _minimax_tool_result(
+                "⚠️ The primary video route explicitly rejected the request before acceptance. "
+                "The alternate quality route was not authorized, so no provider task remains active "
+                "and no video Credits were consumed.",
+                typed=typed,
+                status="failed",
+                error_code="media_video_degraded_confirmation_required",
+                agent_id=agent_id,
+                modality="video",
+                record_id=record_id,
+                model=model,
+                tier=tier,
+                provider="platform_media",
+            )
+        if (
+            record_id
+            and provider_request_started
+            and not provider_task_id
+            and not provider_rejected
+        ):
             return _minimax_tool_result(
                 "⚠️ Video submission outcome is uncertain. The system retained "
                 "the Credits hold and opened an operator alert to prevent duplicate generation. "
