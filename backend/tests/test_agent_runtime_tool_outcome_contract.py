@@ -318,6 +318,51 @@ def test_outcome_normalizer_preserves_bounded_email_provider_receipt() -> None:
     assert "provider_response" not in normalized.metadata
 
 
+def test_outcome_normalizer_preserves_formal_poster_receipt() -> None:
+    receipt = {
+        "provider": "volcengine_agent_plan",
+        "modality": "image_check",
+        "model": "doubao-seedream-5.0-lite",
+        "saas_tier": "ultra",
+        "task_record_id": str(uuid.uuid4()),
+        "deliverable_request_id": str(uuid.uuid4()),
+        "expected_overlay_blocks_sha256": "a" * 64,
+        "execution_strategy": "commercial_quality",
+        "allow_degraded_fallback": False,
+        "layout_version": "poster-v3",
+        "layout_bounds_verified": True,
+        "content_left": 241,
+        "content_top": 1615,
+        "content_right": 2120,
+        "content_bottom": 2750,
+        "safe_margin_x": 138,
+        "safe_margin_y": 245,
+        "source_width": 2304,
+        "source_height": 4096,
+        "output_width": 2304,
+        "output_height": 4096,
+        "provider_payload": "must-not-persist",
+    }
+
+    normalized, archived_body = normalize_tool_outcome(
+        ToolExecutionOutcome(
+            status="succeeded",
+            result_summary="Poster generated and durably delivered.",
+            result_ref="workspace://agent/workspace/deliverables/poster.png",
+            metadata=receipt,
+        ),
+        effect="external_write",
+        retry_policy="never",
+        inline_max_bytes=1024,
+    )
+
+    assert archived_body is None
+    for key, value in receipt.items():
+        if key != "provider_payload":
+            assert normalized.metadata[key] == value
+    assert "provider_payload" not in normalized.metadata
+
+
 def test_outcome_normalizer_preserves_bounded_okr_transaction_receipt() -> None:
     normalized, archived_body = normalize_tool_outcome(
         ToolExecutionOutcome(

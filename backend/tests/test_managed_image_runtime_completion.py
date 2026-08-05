@@ -30,12 +30,28 @@ def _durable_image_task(agent_id: uuid.UUID) -> SimpleNamespace:
             "tier": "ultra",
             "deliverable_request_id": str(request_id),
             "expected_overlay_blocks_sha256": digest,
+            "execution_strategy": "commercial_quality",
+            "allow_degraded_fallback": False,
         },
         last_response={
             "status": "Success",
             "_astra_media_contract": {
                 "deliverable_request_id": str(request_id),
                 "expected_overlay_blocks_sha256": digest,
+                "execution_strategy": "commercial_quality",
+                "allow_degraded_fallback": False,
+                "layout_version": "poster-v3",
+                "layout_bounds_verified": True,
+                "content_left": 241,
+                "content_top": 1615,
+                "content_right": 2120,
+                "content_bottom": 2750,
+                "safe_margin_x": 138,
+                "safe_margin_y": 245,
+                "source_width": 2304,
+                "source_height": 4096,
+                "output_width": 2304,
+                "output_height": 4096,
             },
         },
     )
@@ -227,3 +243,17 @@ async def test_image_check_settles_the_same_runtime_operation(
         assert result.metadata["expected_overlay_blocks_sha256"] == (
             task.request_metadata["expected_overlay_blocks_sha256"]
         )
+        assert result.metadata["execution_strategy"] == "commercial_quality"
+        assert result.metadata["allow_degraded_fallback"] is False
+        assert result.metadata["layout_version"] == "poster-v3"
+        assert result.metadata["layout_bounds_verified"] is True
+        assert result.metadata["content_left"] == 241
+        assert result.metadata["content_top"] == 1615
+        assert result.metadata["content_right"] == 2120
+        assert result.metadata["content_bottom"] == 2750
+        assert result.metadata["safe_margin_x"] == 138
+        assert result.metadata["safe_margin_y"] == 245
+        assert result.metadata["source_width"] == 2304
+        assert result.metadata["source_height"] == 4096
+        assert result.metadata["output_width"] == 2304
+        assert result.metadata["output_height"] == 4096

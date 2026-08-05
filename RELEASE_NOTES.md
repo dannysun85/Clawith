@@ -1,3 +1,26 @@
+# v1.11.24 — Formal Poster Receipt Integrity
+
+## Production deliverable verification
+
+- Preserve the server-issued `poster-v3` execution policy, exact-copy digest,
+  layout-boundary receipt, safe margins, and source/output dimensions when a
+  managed image poll settles the original Runtime tool execution.
+- Keep provider, modality, model, and SaaS tier in the bounded non-secret
+  execution receipt. Unknown provider payload fields remain excluded.
+- Allow formal poster verification to consume the same durable receipt that
+  the media worker produced, preventing a successfully rendered commercial
+  poster from being rejected after delivery as
+  `deliverable_poster_copy_receipt_mismatch`.
+
+## Validation
+
+- Cover bounded receipt normalization together with managed-image completion
+  and formal deliverable artifact verification (`43 passed` targeted;
+  `4328 passed` full backend).
+- Frontend Node contracts (`110 passed`), Vitest (`185 passed`), production
+  build (`7088` modules), bounded browser contracts (`2 passed`), Ruff/diff
+  gates, and PostgreSQL upgrade/downgrade/re-upgrade smoke pass.
+
 # v1.11.23 — Bounded Production Artifact Retention
 
 ## Release storage lifecycle
