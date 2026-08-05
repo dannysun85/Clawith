@@ -387,6 +387,7 @@ def image_reference_for_provider(
     *,
     label: str,
     require_video_dimensions: bool = False,
+    transport_metadata: dict[str, object] | None = None,
 ) -> str | None:
     """Return a validated Base64 data URL for MiniMax."""
     reference = str(value or "").strip()
@@ -409,7 +410,61 @@ def image_reference_for_provider(
             label=label,
             require_video_dimensions=require_video_dimensions,
         )
+    source_asset = asset
+    if require_video_dimensions:
+        asset = _compact_video_reference_asset(asset)
+    if transport_metadata is not None:
+        transport_metadata.clear()
+        transport_metadata.update(
+            {
+                "source_sha256": source_asset.sha256,
+                "source_mime_type": source_asset.mime_type,
+                "source_width": source_asset.width,
+                "source_height": source_asset.height,
+                "source_bytes": len(source_asset.raw),
+                "transport_sha256": asset.sha256,
+                "transport_mime_type": asset.mime_type,
+                "transport_width": asset.width,
+                "transport_height": asset.height,
+                "transport_bytes": len(asset.raw),
+                "compacted": asset.sha256 != source_asset.sha256,
+            }
+        )
     return f"data:{asset.mime_type};base64,{base64.b64encode(asset.raw).decode('ascii')}"
+
+
+def _compact_video_reference_asset(asset: ImageAsset) -> ImageAsset:
+    """Bound I2V request bodies to a browser/video-sized JPEG.
+
+    Ultra image generation can produce a 4K PNG larger than 8 MB. Embedding
+    that file unchanged in a JSON video-submission request expands it again by
+    roughly one third and has caused the provider gateway to reach its request
+    timeout without returning a task identity. Keep small references byte-for-
+    byte compatible, but normalize oversized inputs to at most 1920 px and
+    2 MB before the provider request starts.
+    """
+
+    max_edge = 1920
+    max_bytes = 2 * 1024 * 1024
+    if max(asset.width, asset.height) <= max_edge and len(asset.raw) <= max_bytes:
+        return asset
+
+    from PIL import Image, ImageOps
+
+    with Image.open(BytesIO(asset.raw)) as source:
+        image = ImageOps.exif_transpose(source).convert("RGBA")
+    image.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+    encoded, _output_size = _encode_bounded_image(
+        image,
+        "JPEG",
+        max_bytes=max_bytes,
+    )
+    return image_asset_from_bytes(
+        encoded,
+        label="Compacted video reference",
+        source_path=asset.source_path,
+        require_video_dimensions=True,
+    )
 
 
 def normalize_overlay_text(text: str | None) -> str:
@@ -761,10 +816,62 @@ def _poster_block_layout(
         default_height = max(sample[3] - sample[1], 1)
         heights = [max(box[3] - box[1], default_height) for box in boxes]
         spacing = max(3, font_size // 5)
-        if max(widths, default=0) <= max_width:
+        if (
+            max(widths, default=0) <= max_width
+            and _poster_lines_are_commercially_balanced(
+                text,
+                role=role,
+                lines=lines,
+                widths=widths,
+            )
+        ):
             return font, lines, boxes, widths, heights, spacing
     raise MediaContractError(
         f"overlay_blocks {role} copy cannot fit without truncation"
+    )
+
+
+def _poster_lines_are_commercially_balanced(
+    text: str,
+    *,
+    role: str,
+    lines: list[str],
+    widths: list[int],
+) -> bool:
+    """Reject accidental title widows while preserving explicit line breaks."""
+
+    visible = [
+        (line.strip(), width)
+        for line, width in zip(lines, widths, strict=True)
+        if line.strip()
+    ]
+    if not visible:
+        return False
+    if "\n" in text:
+        return True
+    maximum_lines = {
+        "title": 2,
+        "subtitle": 2,
+        "tagline": 3,
+        "body": 3,
+        "cta": 2,
+    }[role]
+    if len(visible) > maximum_lines:
+        return False
+    if len(visible) == 1:
+        return True
+
+    shortest_text, shortest_width = min(
+        visible,
+        key=lambda item: (item[1], len(item[0])),
+    )
+    longest_width = max(width for _line, width in visible)
+    display_characters = sum(
+        1 for character in shortest_text if not character.isspace()
+    )
+    return (
+        display_characters >= 2
+        and shortest_width >= max(1, int(longest_width * 0.34))
     )
 
 

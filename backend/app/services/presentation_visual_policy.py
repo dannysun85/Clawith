@@ -77,6 +77,22 @@ _CLIENT_PROPOSAL_MARKERS = (
     "client-ready",
     "customer proposal",
 )
+_NATIVE_ONLY_BRIEF_MARKERS = (
+    "只使用ppt原生",
+    "仅使用ppt原生",
+    "只用ppt原生",
+    "必须只使用ppt原生",
+    "不要调用任何图片",
+    "不要用图片",
+    "无需图片",
+    "不需要图片",
+    "只做原生矢量",
+    "仅做原生矢量",
+    "只用原生 shape",
+    "native shapes only",
+    "ppt native shapes only",
+    "only native vector shapes",
+)
 
 # A deck may still contain editable narrative slides.  The threshold is the
 # mean picture coverage across the whole deck, so the existing minimum image
@@ -95,6 +111,12 @@ def presentation_brief_is_image_led(
             json.dumps(dict(spec or {}), ensure_ascii=False, sort_keys=True),
         )
     ).casefold()
+    # Negative intent is authoritative. A native/editable deck often names
+    # images only to prohibit them (for example, "不要调用任何图片生成工具").
+    # Keyword matching must not turn that explicit constraint into a paid
+    # image-generation contract.
+    if any(marker in brief for marker in _NATIVE_ONLY_BRIEF_MARKERS):
+        return False
     if any(keyword in brief for keyword in IMAGE_LED_BRIEF_KEYWORDS):
         return True
 

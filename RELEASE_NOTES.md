@@ -1,3 +1,43 @@
+# v1.11.25 — Commercial Media Contract Hardening
+
+## Poster, presentation, and session isolation
+
+- Reject accidental one-character poster-title widows while preserving explicit
+  author line breaks, and retain the complete bounded font/layout receipt used
+  to verify a deterministic `poster-v3` composition.
+- Treat an explicit native-shape-only presentation brief as negative image
+  intent, so phrases such as "不要调用任何图片生成工具" cannot trigger a paid
+  image-led presentation contract.
+- Let persisted Deliverable Requests use their authoritative server-owned media
+  contract instead of a second conversational heuristic, including formal
+  poster footer copy such as `落款`.
+- Cancel and clear upload drafts, selected attachments, and auto-workspace
+  references whenever the user changes chat sessions.
+
+## Video submission and provider routing
+
+- Compact oversized image-to-video references to a validated portrait/landscape
+  JPEG no larger than 1920 px or 2 MB before a provider request starts, avoiding
+  timeout-sized base64 request bodies with ambiguous billing state.
+- Lock formal Ultra video submissions to the current runtime platform profile
+  in the server-side billing contract; the execution prompt delegates quality
+  selection instead of duplicating a potentially stale profile, and
+  model-supplied lower resolutions cannot silently reduce a paid request.
+- Persist bounded source/transport hashes, dimensions, MIME types, byte counts,
+  and the compaction decision for every first/last frame used by a durable
+  video task, so timeout recovery and billing review can identify the exact
+  submitted reference payload.
+- Preserve safe provider fallback semantics: an explicitly allowed route may
+  move from Volcano to MiniMax only before acceptance or after deterministic
+  rejection, never after an ambiguous provider submission.
+
+## Validation
+
+- Add regressions for commercial poster line balance, 4K first-frame compaction,
+  native-only PPT classification, formal media-contract authority, receipt
+  retention, Ultra resolution locking, and explicit Volcano-to-MiniMax route
+  selection.
+
 # v1.11.24 — Formal Poster Receipt Integrity
 
 ## Production deliverable verification

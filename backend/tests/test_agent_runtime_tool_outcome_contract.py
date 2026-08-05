@@ -341,6 +341,21 @@ def test_outcome_normalizer_preserves_formal_poster_receipt() -> None:
         "source_height": 4096,
         "output_width": 2304,
         "output_height": 4096,
+        "font_roles": {
+            "title": {
+                "font_family": "Noto Sans CJK SC",
+                "font_sha256": "b" * 64,
+                "font_face_index": 0,
+            }
+        },
+        "font_sha256": "b" * 64,
+        "font_family": "Noto Sans CJK SC",
+        "font_face_index": 0,
+        "block_count": 5,
+        "line_count": 5,
+        "overlay_blocks_sha256": "c" * 64,
+        "output_bytes": 8_749_185,
+        "size_adjusted": False,
         "provider_payload": "must-not-persist",
     }
 

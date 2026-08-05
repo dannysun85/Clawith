@@ -30636,18 +30636,22 @@ async def _generate_video_minimax(
         validate_overlay_text,
     )
 
+    first_frame_transport: dict[str, object] = {}
+    last_frame_transport: dict[str, object] = {}
     try:
         first_frame_image = image_reference_for_provider(
             ws,
             arguments.get("first_frame_image"),
             label="First-frame image",
             require_video_dimensions=True,
+            transport_metadata=first_frame_transport,
         )
         last_frame_image = image_reference_for_provider(
             ws,
             arguments.get("last_frame_image"),
             label="Last-frame image",
             require_video_dimensions=True,
+            transport_metadata=last_frame_transport,
         )
         brand_asset = load_brand_asset(
             ws,
@@ -30891,11 +30895,17 @@ async def _generate_video_minimax(
                 },
             )
 
+    formal_request_scoped = bool(deliverable_request_scope_id.get().strip())
+    requested_resolution = (
+        profile.resolution
+        if formal_request_scoped
+        else arguments.get("resolution")
+    )
     duration, resolution = constrain_minimax_video_request(
         tier,
         profile,
         arguments.get("duration"),
-        arguments.get("resolution"),
+        requested_resolution,
     )
     billing_resolution = resolution
     if media_provider == "volcengine_agent_plan":
@@ -30998,6 +31008,8 @@ async def _generate_video_minimax(
             else "text_to_video",
             "has_first_frame": bool(first_frame_image),
             "has_last_frame": bool(last_frame_image),
+            "first_frame_transport": first_frame_transport or None,
+            "last_frame_transport": last_frame_transport or None,
             "prompt_optimizer": bool(prompt_optimizer),
             "overlay_text": overlay_text,
             "overlay_text_sha256": overlay_text_sha256,

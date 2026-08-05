@@ -3060,10 +3060,21 @@ export default function AgentDetailPage() {
         const targetAgentId = id;
         if (!targetAgentId) return;
         const sessionId = String(sess.id);
+        const isSessionChange = activeSessionIdRef.current !== sessionId;
         historyPaginationAbortRef.current?.abort();
         historyPaginationAbortRef.current = null;
         chatPaginationAbortRef.current?.abort();
         chatPaginationAbortRef.current = null;
+        // Composer attachments belong to the session in which the user chose
+        // them. Carrying upload drafts or auto-workspace references into a
+        // different session can silently contaminate a paid media request.
+        if (isSessionChange) {
+            [...chatUploadAbortRef.current.values()].forEach((cancel) => cancel());
+            chatUploadAbortRef.current.clear();
+            setChatUploadDrafts([]);
+            setAttachedFiles([]);
+            dismissedWorkspaceRefPath.current = null;
+        }
         activeSessionIdRef.current = sessionId;
         if (syncLocation) {
             navigate({

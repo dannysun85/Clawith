@@ -3934,6 +3934,26 @@ def test_media_contract_extracts_role_aware_copy_from_quant_poster() -> None:
     )
 
 
+def test_media_contract_extracts_footer_as_body_copy() -> None:
+    goal = "海报底部落款「深圳前海瑞孚图腾科技有限公司」"
+
+    assert tool_step_service._required_exact_overlay_blocks(goal) == [
+        {"role": "body", "text": "深圳前海瑞孚图腾科技有限公司"}
+    ]
+
+
+def test_formal_deliverable_uses_persisted_media_contract_instead_of_goal_parser() -> None:
+    assert (
+        tool_step_service._media_contract_block(
+            _QUANT_POSTER_GOAL,
+            "generate_image_minimax",
+            {"prompt": "server-owned poster background"},
+            formal_request_scoped=True,
+        )
+        is None
+    )
+
+
 def test_media_contract_requires_structured_blocks_for_multi_copy_poster() -> None:
     blocked = tool_step_service._media_contract_block(
         _QUANT_POSTER_GOAL,

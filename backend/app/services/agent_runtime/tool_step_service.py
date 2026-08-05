@@ -130,6 +130,7 @@ _EXACT_COPY_CUES = (
     ("主标题", "title"),
     ("副标题", "subtitle"),
     ("标语", "tagline"),
+    ("落款", "body"),
     ("按钮文案", "cta"),
     ("按钮文字", "cta"),
     ("按钮内文字", "cta"),
@@ -292,9 +293,19 @@ def _media_contract_block(
     goal: str,
     tool_name: str,
     arguments: Mapping[str, object],
+    *,
+    formal_request_scoped: bool = False,
 ) -> tuple[str, str] | None:
     modality = _MEDIA_GENERATION_TOOL_MODALITIES.get(tool_name)
     if modality not in {"image", "video"}:
+        return None
+    # Persisted Deliverable Requests already carry a server-owned exact-copy,
+    # reference, provider-fallback, and artifact contract. Re-parsing the
+    # conversational goal here can contradict that authoritative contract
+    # (especially negative or descriptive text) and create an impossible
+    # pre-provider retry loop. The workflow/tool validators remain the single
+    # gate for formal requests; this heuristic protects ordinary chat calls.
+    if formal_request_scoped:
         return None
 
     exact_blocks = _required_exact_overlay_blocks(goal)
@@ -2220,6 +2231,15 @@ class RuntimeToolStepService:
                         context.goal,
                         tool_name,
                         arguments,
+                        formal_request_scoped=bool(
+                            str(
+                                state["snapshots"].initial_input.get(
+                                    "deliverable_request_id",
+                                    "",
+                                )
+                                or ""
+                            ).strip()
+                        ),
                     )
                     if media_block is not None:
                         error_code, result_summary = media_block

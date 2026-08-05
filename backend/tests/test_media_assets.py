@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 from io import BytesIO
 from pathlib import Path
 import shutil
@@ -126,6 +127,36 @@ def test_workspace_reference_is_validated_and_transported_as_data_url(tmp_path):
 
     assert data_url.startswith("data:image/png;base64,")
     assert base64.b64decode(data_url.split(",", 1)[1]) == source.read_bytes()
+
+
+def test_ultra_first_frame_is_compacted_before_video_submission(tmp_path):
+    source = tmp_path / "workspace" / "ultra-first-frame.png"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(_image_bytes((2304, 4096)))
+
+    transport_metadata: dict[str, object] = {}
+    data_url = image_reference_for_provider(
+        tmp_path,
+        "workspace/ultra-first-frame.png",
+        label="First-frame image",
+        require_video_dimensions=True,
+        transport_metadata=transport_metadata,
+    )
+
+    assert data_url.startswith("data:image/jpeg;base64,")
+    compacted = base64.b64decode(data_url.split(",", 1)[1])
+    assert len(compacted) < 2 * 1024 * 1024
+    with Image.open(BytesIO(compacted)) as image:
+        assert image.size == (1080, 1920)
+    assert transport_metadata["source_width"] == 2304
+    assert transport_metadata["source_height"] == 4096
+    assert transport_metadata["transport_width"] == 1080
+    assert transport_metadata["transport_height"] == 1920
+    assert transport_metadata["transport_bytes"] == len(compacted)
+    assert transport_metadata["transport_sha256"] == hashlib.sha256(
+        compacted
+    ).hexdigest()
+    assert transport_metadata["compacted"] is True
 
 
 def test_workspace_reference_accepts_chat_upload_shorthand(tmp_path):
@@ -394,6 +425,21 @@ def test_poster_preflight_rejects_copy_that_cannot_fit_the_safe_area():
 
     with pytest.raises(MediaContractError, match="poster safe area"):
         preflight_poster_layout(blocks, aspect_ratio="16:9")
+
+
+def test_commercial_poster_title_avoids_single_character_widow():
+    blocks = [
+        {"role": "title", "text": "把 AI 公司真正运行起来"},
+        {"role": "subtitle", "text": "数字员工・任务协作・WorkProduct 审核"},
+        {"role": "tagline", "text": "从任务到成果，企业运营真正闭环"},
+        {"role": "body", "text": "ReefTotem｜深圳前海瑞孚图腾科技有限公司"},
+        {"role": "cta", "text": "立即体验"},
+    ]
+
+    receipt = preflight_poster_layout(blocks, aspect_ratio="9:16")
+
+    assert receipt.block_count == 5
+    assert receipt.line_count == 5
 
 
 def test_glass_cta_uses_rose_to_violet_gradient_instead_of_flat_fill():

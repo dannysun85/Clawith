@@ -594,6 +594,7 @@ def build_deliverable_prompt(request: DeliverableRequest) -> str:
             f"{request.id}/visual.mp4', aspect_ratio=spec.aspect_ratio, duration=spec.duration, "
             "first_frame_image=<exact returned first-frame output_path>, require_audio=false, "
             f"wait_for_completion=true, poll_timeout_seconds=300, and allow_degraded_fallback={allow_degraded_literal}. "
+            "The call must omit the resolution argument because the server locks the current configured formal-tier quality profile. "
             "The first-frame generate_image_minimax call must use the same allow_degraded_fallback value. "
             "Call each generation Tool exactly once "
             "because each Tool owns provider fallback and durable recovery. If no provider accepts the "

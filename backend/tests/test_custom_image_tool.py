@@ -235,6 +235,7 @@ async def test_quick_video_falls_back_to_minimax_when_agent_plan_is_unavailable(
             {
                 "prompt": "quick people-led commercial",
                 "aspect_ratio": "9:16",
+                "allow_degraded_fallback": True,
             },
             typed=True,
         )
@@ -247,6 +248,58 @@ async def test_quick_video_falls_back_to_minimax_when_agent_plan_is_unavailable(
         "volcengine_agent_plan",
         "minimax",
     ]
+
+
+@pytest.mark.asyncio
+async def test_formal_ultra_video_ignores_model_supplied_lower_resolution(tmp_path):
+    credential = SimpleNamespace(
+        id=uuid.uuid4(),
+        provider="volcengine_agent_plan",
+        model="doubao-seedance-2.0",
+        resolution="1080p",
+    )
+    constrain = MagicMock(side_effect=RuntimeError("resolution captured"))
+    token = agent_tools.deliverable_request_scope_id.set(str(uuid.uuid4()))
+    try:
+        with (
+            patch("app.services.agent_tools._get_tool_config", AsyncMock(return_value={})),
+            patch(
+                "app.services.agent_tools._resolve_minimax_tool_tier",
+                AsyncMock(return_value="ultra"),
+            ),
+            patch(
+                "app.services.minimax_media_profiles.load_platform_minimax_media_profile",
+                AsyncMock(return_value=resolve_minimax_media_profile("video", "ultra")),
+            ),
+            patch(
+                "app.services.minimax_media_profiles.constrain_minimax_video_request",
+                constrain,
+            ),
+            patch(
+                "app.services.agent_tools._get_minimax_tenant_uuid",
+                AsyncMock(return_value=uuid.uuid4()),
+            ),
+            patch(
+                "app.services.media_provider_routing.prepare_media_provider",
+                AsyncMock(return_value=credential),
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="resolution captured"):
+                await _generate_video_minimax(
+                    uuid.uuid4(),
+                    tmp_path,
+                    {
+                        "prompt": "formal people-led commercial",
+                        "duration": 6,
+                        "resolution": "768P",
+                        "allow_degraded_fallback": True,
+                    },
+                    typed=True,
+                )
+    finally:
+        agent_tools.deliverable_request_scope_id.reset(token)
+
+    assert constrain.call_args.args[3] == "1080P"
 
 
 @pytest.mark.asyncio
@@ -2769,6 +2822,10 @@ async def test_generate_video_minimax_creates_task_metadata(tmp_path, typed):
     assert metadata["status"] == "submitted"
     assert metadata["generation_mode"] == "image_to_video"
     assert metadata["has_first_frame"] is True
+    assert metadata["first_frame_transport"]["source_width"] == 512
+    assert metadata["first_frame_transport"]["transport_width"] == 512
+    assert metadata["first_frame_transport"]["compacted"] is False
+    assert metadata["last_frame_transport"] is None
     assert "data:image" not in json.dumps(metadata)
     assert metadata["save_path"].endswith(".mp4")
     assert lifecycle_order == ["register", "provider", "evidence", "submitted"]

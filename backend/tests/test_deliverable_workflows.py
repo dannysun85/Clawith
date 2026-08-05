@@ -27,6 +27,9 @@ from app.services.deliverable_workflows import (
     validate_workflow_spec,
     sync_deliverable_lifecycle,
 )
+from app.services.presentation_visual_policy import (
+    presentation_brief_is_image_led,
+)
 
 
 class _ScalarResult:
@@ -403,6 +406,51 @@ def test_customer_launch_brief_is_image_led_without_literal_image_word() -> None
     assert '"minimum_picture_coverage_ratio": 0.35' in prompt
 
 
+def test_explicit_native_only_presentation_does_not_require_images() -> None:
+    request = _request(
+        goal=(
+            "为 ReefTotem 制作 6 页商业宣发 PPT，介绍图片、语音和视频业务流程。"
+            "必须只使用PPT原生矢量形状、渐变、线条、图标和文字排版；"
+            "不要调用任何图片、视频或语音生成工具，不使用外部素材。"
+        ),
+        spec={
+            "audience": "客户决策者",
+            "page_count": 6,
+            "language": "zh-CN",
+            "style": "深色科技商业风",
+        },
+    )
+
+    prompt = build_deliverable_prompt(request)
+
+    assert '"required": false' in prompt
+    assert '"minimum_distinct_images": 0' in prompt
+    assert '"minimum_image_slides": 0' in prompt
+    assert '"minimum_picture_coverage_ratio": 0.0' in prompt
+    assert "Do not call generate_image_minimax for this presentation" not in prompt
+
+
+@pytest.mark.parametrize(
+    "native_only_phrase",
+    (
+        "不要用图片，只做原生矢量",
+        "无需图片，只用原生 shape",
+        "不需要图片",
+        "Only native vector shapes, without images",
+    ),
+)
+def test_common_native_only_phrases_override_positive_image_words(
+    native_only_phrase: str,
+) -> None:
+    assert (
+        presentation_brief_is_image_led(
+            f"制作商业宣发 PPT，介绍图片业务；{native_only_phrase}",
+            {"style": "商业风"},
+        )
+        is False
+    )
+
+
 def test_long_image_led_deck_scales_visual_budget_without_weakening_lite_contract() -> None:
     prompt = build_deliverable_prompt(
         _request(
@@ -453,6 +501,8 @@ def test_video_workflow_compiles_people_led_voiceover_delivery_contract() -> Non
     assert "exact versioned workspace output_path" in prompt
     assert "first_frame_image=<exact returned first-frame output_path>" in prompt
     assert "generate_video_minimax" in prompt
+    assert "duration=spec.duration" in prompt
+    assert "server locks the current configured formal-tier quality profile" in prompt
     assert "allow_degraded_fallback=false" in prompt
     assert "generate_speech_minimax" in prompt
     assert "compose_video_audio" in prompt
@@ -462,6 +512,27 @@ def test_video_workflow_compiles_people_led_voiceover_delivery_contract() -> Non
     assert prompt.index("generate_image_minimax") < prompt.index("generate_video_minimax")
     assert '"provider"' not in prompt
     assert '"model"' not in prompt
+
+
+def test_ultra_video_prompt_delegates_quality_to_runtime_platform_profile() -> None:
+    request = _request(
+        work_type="video",
+        workflow_id="builtin.video.v1",
+        tier="ultra",
+        spec={
+            "channel": "social",
+            "aspect_ratio": "9:16",
+            "duration": "6",
+            "audio_mode": "voiceover",
+        },
+        output_contract=["mp4"],
+    )
+
+    prompt = build_deliverable_prompt(request)
+
+    assert "duration=spec.duration" in prompt
+    assert "omit the resolution argument" in prompt
+    assert "resolution='1080P'" not in prompt
 
 
 def test_video_credit_estimate_includes_one_managed_first_frame() -> None:
