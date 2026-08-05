@@ -20,6 +20,7 @@ from app.services.llm.load_balancer import NoCredentialAvailable
 from app.services.media_provider_routing import (
     DEFAULT_MEDIA_PROVIDER_ORDER,
     prepare_media_provider,
+    volcengine_video_quota_model,
 )
 from app.services.volcengine_agent_plan import (
     DEFAULT_BASE_URL,
@@ -119,7 +120,7 @@ async def test_medium_agent_plan_fails_before_provider_request(monkeypatch):
         "volcengine_agent_plan",
         modality="video",
         quota_modality="video",
-        quota_model=None,
+        quota_model=volcengine_video_quota_model(VIDEO_MODEL, "720p"),
     )
 
 
@@ -154,7 +155,7 @@ async def test_small_agent_plan_never_falls_through_to_a_video_call(monkeypatch)
         "volcengine_agent_plan",
         modality="video",
         quota_modality="video",
-        quota_model=None,
+        quota_model=volcengine_video_quota_model(VIDEO_MODEL, "720p"),
     )
 
 
@@ -652,3 +653,53 @@ async def test_unsupported_video_model_opens_exact_provider_evidence_circuit(
     mark_degraded.assert_not_awaited()
     mark_quota.assert_not_awaited()
     mark_rate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_video_quota_error_is_scoped_to_requested_resolution(monkeypatch):
+    credential_id = uuid.uuid4()
+    mark_modality = AsyncMock()
+    monkeypatch.setattr(
+        load_balancer,
+        "mark_credential_modality_quota_exceeded",
+        mark_modality,
+    )
+    monkeypatch.setattr(
+        load_balancer,
+        "mark_credential_degraded",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        load_balancer,
+        "mark_credential_quota_exceeded",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        load_balancer,
+        "mark_credential_rate_saturated",
+        AsyncMock(),
+    )
+
+    error = VolcengineAgentPlanRejected(
+        "requested video exceeds the remaining AFP allowance",
+        provider_code="QuotaExceeded",
+        http_status=429,
+    )
+    quota_model = volcengine_video_quota_model(VIDEO_MODEL, "1080p")
+    await agent_tools._mark_media_provider_credential_failure(
+        credential_id,
+        error,
+        provider="volcengine_agent_plan",
+        modality="video",
+        model=VIDEO_MODEL,
+        quota_model=quota_model,
+    )
+
+    mark_modality.assert_awaited_once_with(
+        credential_id,
+        "video",
+        model=quota_model,
+        error_code="QuotaExceeded",
+    )
+    assert quota_model.endswith("@1080p")
+    assert volcengine_video_quota_model(VIDEO_MODEL, "480P").endswith("@480p")

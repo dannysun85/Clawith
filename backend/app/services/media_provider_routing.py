@@ -167,6 +167,22 @@ def minimax_video_requires_first_frame(
     )
 
 
+def volcengine_video_quota_model(model: str, resolution: str | None) -> str:
+    """Return the variable-cost Agent Plan video allowance resource.
+
+    Seedance video AFP consumption changes materially with output resolution.
+    Provider evidence that an expensive 1080p request exceeds the remaining
+    allowance therefore must not disable a cheaper 480p or 720p request for
+    the same model.
+    """
+
+    normalized_model = str(model or "").strip()
+    normalized_resolution = str(resolution or "").strip().lower()
+    if not normalized_model or not normalized_resolution:
+        return normalized_model
+    return f"{normalized_model}@{normalized_resolution}"
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedMediaProvider:
     provider: str
@@ -204,14 +220,23 @@ async def prepare_media_provider(
         raise ValueError(f"Unsupported media provider: {provider}")
 
     quota_model = minimax_model
+    preselected_profile = None
     if normalized_provider == VOLCENGINE_AGENT_PLAN_PROVIDER:
         normalized_modality = str(modality or "").strip().lower()
+        preselected_profile = (
+            None
+            if normalized_modality == "audio"
+            else resolve_visual_profile(normalized_modality, saas_tier)
+        )
         quota_model = (
             TTS_MODEL
             if normalized_modality == "audio"
-            else None
+            else volcengine_video_quota_model(
+                preselected_profile.model,
+                preselected_profile.resolution,
+            )
             if normalized_modality == "video"
-            else resolve_visual_profile(normalized_modality, saas_tier).model
+            else preselected_profile.model
         )
 
     # Resolve through the module so existing MiniMax call sites and tests can
@@ -275,10 +300,17 @@ async def prepare_media_provider(
                 plan_tier=plan_tier,
             )
         )
+        quota_profile_model = (
+            volcengine_video_quota_model(profile.model, profile.resolution)
+            if profile and normalized_modality == "video"
+            else profile.model
+            if profile
+            else None
+        )
         if profile and credential_quota_is_blocked(
             credential,
             normalized_modality,
-            profile.model,
+            quota_profile_model,
         ):
             raise NoCredentialAvailable(
                 normalized_provider,
@@ -317,4 +349,5 @@ __all__ = [
     "normalize_image_execution_strategy",
     "prepare_media_provider",
     "validate_media_route_policy",
+    "volcengine_video_quota_model",
 ]

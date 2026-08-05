@@ -29095,6 +29095,7 @@ async def _mark_media_provider_credential_failure(
     provider: str,
     modality: str,
     model: str | None = None,
+    quota_model: str | None = None,
 ) -> None:
     if provider == "minimax":
         await _mark_minimax_tool_credential_failure(
@@ -29131,7 +29132,7 @@ async def _mark_media_provider_credential_failure(
         await mark_credential_modality_quota_exceeded(
             credential_id,
             modality,
-            model=model,
+            model=quota_model or model,
             error_code=code or "QuotaExceeded",
         )
         return
@@ -30810,17 +30811,25 @@ async def _generate_video_minimax(
     from app.services.media_provider_routing import (
         DEFAULT_MEDIA_PROVIDER_ORDER,
         prepare_media_provider,
+        volcengine_video_quota_model,
     )
 
     credential = None
     selected_provider_index = max(int(_provider_index), 0)
     provider_route_errors: list[str] = []
+    provider_route_statuses: list[dict[str, str]] = []
     degraded_fallback_blocked = False
     for candidate_index in range(selected_provider_index, len(DEFAULT_MEDIA_PROVIDER_ORDER)):
         candidate = DEFAULT_MEDIA_PROVIDER_ORDER[candidate_index]
         if candidate == "minimax" and not allow_degraded_fallback:
             degraded_fallback_blocked = True
             provider_route_errors.append("minimax:degraded_confirmation_required")
+            provider_route_statuses.append(
+                {
+                    "provider": "minimax",
+                    "status": "degraded_confirmation_required",
+                }
+            )
             break
         try:
             credential = await prepare_media_provider(
@@ -30832,7 +30841,19 @@ async def _generate_video_minimax(
             selected_provider_index = candidate_index
             break
         except (NoCredentialAvailable, ValueError) as exc:
-            provider_route_errors.append(f"{candidate}:{type(exc).__name__}")
+            reason_code = (
+                exc.reason_code.value
+                if isinstance(exc, NoCredentialAvailable)
+                else "route_configuration_invalid"
+            )
+            provider_route_errors.append(f"{candidate}:{reason_code}")
+            provider_route_statuses.append(
+                {
+                    "provider": candidate,
+                    "status": "unavailable",
+                    "reason_code": reason_code,
+                }
+            )
             await _record_minimax_tool_product_issue(
                 agent_id,
                 "video",
@@ -30853,7 +30874,8 @@ async def _generate_video_minimax(
                 "⚠️ Formal video quality is temporarily unavailable. The emergency-quality route was not "
                 "authorized, so no provider task was submitted and no Credits were consumed."
                 if degraded_fallback_blocked
-                else "❌ Video generation is temporarily unavailable. No provider accepted the request and no Credits were consumed."
+                else "❌ Video generation is temporarily unavailable. No provider accepted the request and no Credits were consumed. "
+                "Do not call this tool again in the current run."
             ),
             typed=typed,
             status="failed",
@@ -30866,6 +30888,9 @@ async def _generate_video_minimax(
             modality="video",
             model=billing_model,
             tier=tier,
+            halt_run=not degraded_fallback_blocked,
+            provider="platform_media",
+            runtime_metadata={"provider_routes": provider_route_statuses},
         )
     media_provider = credential.provider
     model = credential.model
@@ -31341,6 +31366,11 @@ async def _generate_video_minimax(
                 provider=media_provider,
                 modality="video",
                 model=model,
+                quota_model=(
+                    volcengine_video_quota_model(model, resolution)
+                    if media_provider == "volcengine_agent_plan"
+                    else None
+                ),
             )
             logger.warning(f"[MiniMaxVideo] Submitted task queued for automatic recovery: {exc}")
             metadata_notice = (
@@ -31418,6 +31448,11 @@ async def _generate_video_minimax(
             provider=media_provider,
             modality="video",
             model=model,
+            quota_model=(
+                volcengine_video_quota_model(model, resolution)
+                if media_provider == "volcengine_agent_plan"
+                else None
+            ),
         )
         if not incident_recorded:
             await _record_minimax_tool_product_issue(

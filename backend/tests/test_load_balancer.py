@@ -252,6 +252,37 @@ async def test_pick_scopes_non_text_quota_to_the_concrete_model():
 
 
 @pytest.mark.asyncio
+async def test_pick_scopes_variable_cost_video_quota_to_resolution():
+    seedance_1080p_blocked = _cred(
+        priority=10,
+        modality_status={
+            "video:doubao-seedance-2.0@1080p": {"status": "quota_exceeded"},
+        },
+    )
+    fallback = _cred(priority=0)
+
+    sess, _ = _patch_session(execute_result=[seedance_1080p_blocked, fallback])
+    with sess:
+        chosen = await pick_credential(
+            "minimax",
+            "video",
+            quota_modality="video",
+            quota_model="doubao-seedance-2.0@1080p",
+        )
+    assert chosen.id == fallback.id
+
+    sess, _ = _patch_session(execute_result=[seedance_1080p_blocked, fallback])
+    with sess:
+        chosen = await pick_credential(
+            "minimax",
+            "video",
+            quota_modality="video",
+            quota_model="doubao-seedance-2.0@480p",
+        )
+    assert chosen.id == seedance_1080p_blocked.id
+
+
+@pytest.mark.asyncio
 async def test_understanding_route_uses_shared_plan_without_media_generation_circuit():
     credential = _cred(
         capabilities=["text", "image", "video"],

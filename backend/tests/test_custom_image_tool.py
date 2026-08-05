@@ -50,7 +50,10 @@ from app.api import tools as tools_api
 from app.services.quota_guard import QuotaExceeded
 from app.services.minimax_media_profiles import resolve_minimax_media_profile
 from app.services.mcp_security import MCPURLPolicyError
-from app.services.llm.load_balancer import NoCredentialAvailable
+from app.services.llm.load_balancer import (
+    CredentialUnavailableReason,
+    NoCredentialAvailable,
+)
 
 
 def _valid_png_bytes() -> bytes:
@@ -248,6 +251,76 @@ async def test_quick_video_falls_back_to_minimax_when_agent_plan_is_unavailable(
         "volcengine_agent_plan",
         "minimax",
     ]
+
+
+@pytest.mark.asyncio
+async def test_video_stops_run_after_all_provider_routes_are_unavailable(tmp_path):
+    prepare = AsyncMock(
+        side_effect=[
+            NoCredentialAvailable(
+                "volcengine_agent_plan",
+                "video",
+                reason_code=CredentialUnavailableReason.QUOTA_EXHAUSTED,
+            ),
+            NoCredentialAvailable(
+                "minimax",
+                "video",
+                reason_code=CredentialUnavailableReason.QUOTA_EXHAUSTED,
+            ),
+        ]
+    )
+    with (
+        patch("app.services.agent_tools._get_tool_config", AsyncMock(return_value={})),
+        patch(
+            "app.services.agent_tools._resolve_minimax_tool_tier",
+            AsyncMock(return_value="lite"),
+        ),
+        patch(
+            "app.services.minimax_media_profiles.load_platform_minimax_media_profile",
+            AsyncMock(return_value=resolve_minimax_media_profile("video", "lite")),
+        ),
+        patch(
+            "app.services.agent_tools._get_minimax_tenant_uuid",
+            AsyncMock(return_value=uuid.uuid4()),
+        ),
+        patch(
+            "app.services.media_provider_routing.prepare_media_provider",
+            prepare,
+        ),
+        patch(
+            "app.services.agent_tools._record_minimax_tool_product_issue",
+            AsyncMock(),
+        ),
+    ):
+        result = await _generate_video_minimax(
+            uuid.uuid4(),
+            tmp_path,
+            {
+                "prompt": "commercial product motion",
+                "allow_degraded_fallback": True,
+            },
+            typed=True,
+        )
+
+    assert isinstance(result, ToolExecutionOutcome)
+    assert result.status == "failed"
+    assert result.error_code == "media_video_provider_unavailable"
+    assert result.metadata["runtime_halt_run"] is True
+    assert result.metadata["provider"] == "platform_media"
+    assert result.metadata["provider_routes"] == [
+        {
+            "provider": "volcengine_agent_plan",
+            "status": "unavailable",
+            "reason_code": "quota_exhausted",
+        },
+        {
+            "provider": "minimax",
+            "status": "unavailable",
+            "reason_code": "quota_exhausted",
+        },
+    ]
+    assert "Do not call this tool again" in result.result_summary
+    assert prepare.await_count == 2
 
 
 @pytest.mark.asyncio

@@ -1,3 +1,27 @@
+# v1.11.27 — Resolution-aware Video Quota Routing
+
+## Agent Plan video stability
+
+- Scope Volcano Seedance quota evidence to the concrete model and output
+  resolution. A rejected 1080p request no longer disables lower-cost 480p or
+  720p work that can still fit the remaining Agent Plan AFP allowance.
+- Preserve the provider-neutral quality-first route: Volcano remains primary
+  and MiniMax remains the deterministic pre-acceptance fallback; neither route
+  is retried after provider acceptance or an ambiguous submission.
+
+## Runtime retry safety
+
+- Return bounded provider-route reason receipts when every video route is
+  unavailable and halt the current Agent run after that deterministic result.
+  This prevents repeated Tool calls, duplicate user noise, and accidental
+  provider quota consumption inside one conversational turn.
+
+## Validation
+
+- Add regressions for resolution-specific quota circuits, exact Volcano quota
+  failure recording, the existing model-entitlement circuit, provider
+  fallback, and runtime halt behavior.
+
 # v1.11.26 — Commercial Poster and Presentation Guardrails
 
 ## Poster composition
