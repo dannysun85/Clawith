@@ -1,3 +1,36 @@
+# v1.11.33 — Commercial Media Routing and Poster Quality
+
+## Commercial poster composition
+
+- Prefer the Simplified Chinese face inside weighted Noto CJK collections such
+  as `Noto Sans CJK SC Black`, instead of accidentally selecting the Japanese
+  face when the family name includes a weight suffix.
+- Add a formal-poster background contract that preserves one continuous scene,
+  creates copy-safe space through lower local detail, and explicitly rejects
+  hard horizontal bands, flat middle slabs, and split-panel layouts.
+- Restrain title glow, text strokes, CTA bloom, and glass-button outlines while
+  retaining deterministic exact-copy rendering and safe-area receipts.
+
+## Video quota recovery
+
+- Keep the existing safe Volcano-to-MiniMax failover boundary: another provider
+  is eligible only before task acceptance or after deterministic rejection, so
+  ambiguous/accepted work cannot be submitted twice.
+- Add a SaaS-owner-only, exact-resource recovery action for Volcano Agent Plan
+  quota circuits. It requires an operator note based on current provider AFP
+  evidence, rejects credential-like content before any state change, clears
+  only the listed circuits, and writes a durable secret-free audit log.
+- Expose that recovery action in the account-pool UI without treating ordinary
+  authentication verification or a local date rollover as provider quota proof.
+
+## Validation
+
+- Add regressions for weighted Simplified Chinese font selection, seamless
+  commercial-poster prompting, strict evidence validation, exact circuit
+  recovery, secret-like evidence rejection, and audit persistence.
+- Pass targeted backend media/credential tests, frontend contracts and Vitest,
+  Ruff, and the production build before release.
+
 # v1.11.32 — Registration Reliability and Readiness
 
 ## Numeric email registration

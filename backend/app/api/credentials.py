@@ -13,13 +13,17 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.core.secret_detection import contains_secret_like_material
 from app.core.security import encrypt_data, get_saas_admin
 from app.database import get_db
 from app.models.llm import LLMCredential
+from app.models.audit import AuditLog
 from app.schemas.credentials import (
     CredentialCreateIn,
     CredentialHealthOut,
     CredentialOut,
+    CredentialQuotaRecoveryIn,
+    CredentialQuotaRecoveryOut,
     CredentialUpdateIn,
     CredentialVerificationOut,
 )
@@ -245,6 +249,95 @@ async def verify_credential(credential_id: uuid.UUID, db: AsyncSession = Depends
         model_count=result.model_count,
         message=result.message,
         receipt=receipt,
+    )
+
+
+@router.post(
+    "/{credential_id}/quota-recovery",
+    response_model=CredentialQuotaRecoveryOut,
+)
+async def recover_credential_quota(
+    credential_id: uuid.UUID,
+    data: CredentialQuotaRecoveryIn,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_saas_admin),
+):
+    """Close exact Volcano media circuits only after operator-supplied provider evidence."""
+
+    if contains_secret_like_material(data.provider_evidence_note):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Provider evidence contains credential-like text. Remove tokens, API keys, "
+                "Authorization headers, and signed URLs before submitting it."
+            ),
+        )
+
+    cred = await db.get(LLMCredential, credential_id, with_for_update=True)
+    if not cred:
+        raise HTTPException(status_code=404, detail="Credential not found")
+    if cred.provider != VOLCENGINE_AGENT_PLAN_PROVIDER:
+        raise HTTPException(
+            status_code=422,
+            detail="Manual quota recovery is reserved for Volcano Agent Plan; MiniMax recovers from its provider remains evidence.",
+        )
+
+    statuses = dict(getattr(cred, "modality_status", None) or {})
+    invalid_resources: list[str] = []
+    for resource in data.resources:
+        entry = statuses.get(resource)
+        if (
+            not isinstance(entry, dict)
+            or str(entry.get("status") or "").strip().lower() != "quota_exceeded"
+            or str(entry.get("reset_scope") or "").strip().lower() != "provider_evidence"
+        ):
+            invalid_resources.append(resource)
+    if invalid_resources:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Quota recovery requires matching provider-evidence circuits: "
+                + ", ".join(invalid_resources)
+            ),
+        )
+
+    previous = {
+        resource: {
+            "error_code": str(statuses[resource].get("error_code") or ""),
+            "detected_at": statuses[resource].get("detected_at"),
+        }
+        for resource in data.resources
+    }
+    for resource in data.resources:
+        statuses.pop(resource, None)
+    cred.modality_status = statuses
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            agent_id=None,
+            action="credential:quota_recovery_confirmed",
+            details={
+                "credential_id": str(cred.id),
+                "provider": cred.provider,
+                "resources": data.resources,
+                "previous": previous,
+                "provider_evidence_note": data.provider_evidence_note,
+                "confirmed_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+    )
+    await db.commit()
+    remaining = sorted(
+        str(resource)
+        for resource, entry in statuses.items()
+        if isinstance(entry, dict)
+        and str(entry.get("status") or "").strip().lower() == "quota_exceeded"
+    )
+    return CredentialQuotaRecoveryOut(
+        recovered=True,
+        recovered_resources=data.resources,
+        remaining_quota_resources=remaining,
+        message="Quota circuits were reopened from audited provider evidence.",
     )
 
 

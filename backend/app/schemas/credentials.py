@@ -220,6 +220,48 @@ class CredentialVerificationOut(BaseModel):
     receipt: dict[str, object]
 
 
+class CredentialQuotaRecoveryIn(BaseModel):
+    resources: list[str] = Field(min_length=1, max_length=20)
+    provider_evidence_note: str = Field(min_length=20, max_length=500)
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("resources")
+    @classmethod
+    def normalize_resources(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for raw in value:
+            resource = str(raw or "").strip().lower()
+            modality, separator, model = resource.partition(":")
+            if modality not in {"image", "audio", "music", "video"}:
+                raise ValueError("quota recovery resources must use a media modality")
+            if separator and (
+                not model
+                or len(model) > 160
+                or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789._-@" for character in model)
+            ):
+                raise ValueError("quota recovery resource model is invalid")
+            canonical = f"{modality}:{model}" if separator else modality
+            if canonical not in normalized:
+                normalized.append(canonical)
+        return normalized
+
+    @field_validator("provider_evidence_note")
+    @classmethod
+    def normalize_provider_evidence_note(cls, value: str) -> str:
+        normalized = value.strip()
+        if len(normalized) < 20:
+            raise ValueError("provider_evidence_note must contain at least 20 non-whitespace characters")
+        return normalized
+
+
+class CredentialQuotaRecoveryOut(BaseModel):
+    recovered: bool
+    recovered_resources: list[str]
+    remaining_quota_resources: list[str]
+    message: str
+
+
 class CredentialHealthOut(BaseModel):
     id: uuid.UUID
     provider: str

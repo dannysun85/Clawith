@@ -33095,6 +33095,17 @@ async def _generate_image(
         background_prompt = provider_prompt
         for exact_text in reserved_copy:
             background_prompt = background_prompt.replace(exact_text, "")
+        if overlay_blocks and execution_strategy == "commercial_quality":
+            background_prompt = (
+                f"{background_prompt}\n"
+                "Commercial poster composition contract: build one continuous seamless vertical scene, not stacked "
+                "upper, middle, and lower panels. Let atmospheric light, nebula color, particles, and financial "
+                "graphics overlap and taper naturally through the full frame with feathered depth transitions. "
+                "Create the copy-safe area by lowering local detail and contrast, not by inserting a flat color slab. "
+                "Do not create straight horizontal boundaries, hard horizon seams, rectangular color fields, "
+                "split-screen sections, or template-like bands. Keep the main visual energy connected across the "
+                "entire poster while preserving calm readable negative space."
+            )
         provider_prompt = (
             f"{background_prompt}\nCreate only a clean visual background. Do not render words, letters, captions, logos, "
             "watermarks, product packaging, or product replicas. Leave clear negative space for Astra to add "

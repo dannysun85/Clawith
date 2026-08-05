@@ -82,6 +82,12 @@ upstream sequential mode was used.
 - When `brand_asset` or `overlay_text` is used, ask the model for only the clean
   background and leave deliberate negative space. Astra will composite the
   protected layer and copy deterministically.
+- For vertical posters, compose one continuous scene rather than literal
+  top/middle/bottom panels. Carry light, atmosphere, color, particles, and
+  secondary graphics through the frame with feathered transitions. Create
+  copy-safe space by reducing local detail and contrast, never with a flat
+  rectangular slab, hard horizontal seam, split-screen section, or template
+  band.
 - One flat reference cannot prove unseen product sides. Request approved
   multi-view/3D material or disclose the limitation before inventing a new
   angle.

@@ -15,7 +15,11 @@ from app.scripts.import_platform_credential import (
     _audit_details,
     _load_payload,
 )
-from app.schemas.credentials import CredentialCreateIn, CredentialUpdateIn
+from app.schemas.credentials import (
+    CredentialCreateIn,
+    CredentialQuotaRecoveryIn,
+    CredentialUpdateIn,
+)
 from app.services.credential_verification import (
     CredentialVerificationResult,
     build_credential_verification_receipt,
@@ -32,7 +36,7 @@ class _FakeCredentialDb:
     def add(self, value):
         self.added = value
 
-    async def get(self, _model, _credential_id):
+    async def get(self, _model, _credential_id, **_kwargs):
         return self.credential
 
     async def commit(self):
@@ -417,3 +421,165 @@ async def test_failed_probe_keeps_credential_out_of_pool(monkeypatch):
     assert result.provider_status == 401
     assert credential.status == "unverified"
     assert db.commits == 1
+
+
+def test_quota_recovery_schema_requires_specific_resources_and_evidence():
+    with pytest.raises(ValidationError, match="at least 20 characters"):
+        CredentialQuotaRecoveryIn(
+            resources=["video:doubao-seedance-2.0@480p"],
+            provider_evidence_note="too short",
+        )
+    with pytest.raises(ValidationError, match="non-whitespace"):
+        CredentialQuotaRecoveryIn(
+            resources=["video:doubao-seedance-2.0@480p"],
+            provider_evidence_note=" " * 30,
+        )
+    with pytest.raises(ValidationError, match="media modality"):
+        CredentialQuotaRecoveryIn(
+            resources=["text:model"],
+            provider_evidence_note="Console confirms quota has recovered at 00:05 CST.",
+        )
+
+
+@pytest.mark.asyncio
+async def test_volcano_quota_recovery_is_exact_and_audited():
+    credential_id = uuid.uuid4()
+    credential = SimpleNamespace(
+        id=credential_id,
+        provider="volcengine_agent_plan",
+        modality_status={
+            "video:doubao-seedance-2.0": {
+                "status": "quota_exceeded",
+                "error_code": "QuotaExceeded",
+                "detected_at": "2026-08-05T12:00:00+00:00",
+                "reset_scope": "provider_evidence",
+            },
+            "video:doubao-seedance-2.0@480p": {
+                "status": "quota_exceeded",
+                "error_code": "QuotaExceeded",
+                "detected_at": "2026-08-05T12:00:00+00:00",
+                "reset_scope": "provider_evidence",
+            },
+            "image:doubao-seedream-5.0-lite": {
+                "status": "quota_exceeded",
+                "reset_scope": "provider_evidence",
+            },
+        },
+    )
+    db = _FakeCredentialDb(credential)
+    actor = SimpleNamespace(id=uuid.uuid4())
+
+    result = await credentials_api.recover_credential_quota(
+        credential_id,
+        CredentialQuotaRecoveryIn(
+            resources=[
+                "video:doubao-seedance-2.0",
+                "video:doubao-seedance-2.0@480p",
+            ],
+            provider_evidence_note=(
+                "2026-08-06 00:05 CST console confirms positive 5h, weekly, and monthly AFP remaining."
+            ),
+        ),
+        db=db,
+        current_user=actor,
+    )
+
+    assert result.recovered is True
+    assert result.recovered_resources == [
+        "video:doubao-seedance-2.0",
+        "video:doubao-seedance-2.0@480p",
+    ]
+    assert result.remaining_quota_resources == ["image:doubao-seedream-5.0-lite"]
+    assert set(credential.modality_status) == {"image:doubao-seedream-5.0-lite"}
+    assert db.added.action == "credential:quota_recovery_confirmed"
+    assert db.added.user_id == actor.id
+    assert db.added.details["resources"] == result.recovered_resources
+    assert db.commits == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "submitted_secret",
+    [
+        "Authorization: Bearer sk-ABCDEFGHIJKLMNOP1234567890",
+        "Volcano credential ark-ABCDEFGHIJKLMNOP1234567890",
+        "access_key=AKABCDEFGHIJKLMNOP",
+        "https://operator:secret-value@console.example.test/quota",
+        "opaque token aB9dE2fG7hJ4kL8mN3pQ6rS1tV5xY0zC",
+    ],
+)
+async def test_quota_recovery_rejects_secret_like_evidence_without_audit(
+    submitted_secret: str,
+):
+    credential_id = uuid.uuid4()
+    credential = SimpleNamespace(
+        id=credential_id,
+        provider="volcengine_agent_plan",
+        modality_status={
+            "video:doubao-seedance-2.0@480p": {
+                "status": "quota_exceeded",
+                "reset_scope": "provider_evidence",
+            }
+        },
+    )
+    db = _FakeCredentialDb(credential)
+
+    with pytest.raises(credentials_api.HTTPException) as exc_info:
+        await credentials_api.recover_credential_quota(
+            credential_id,
+            CredentialQuotaRecoveryIn(
+                resources=["video:doubao-seedance-2.0@480p"],
+                provider_evidence_note=(
+                    f"Console quota check includes {submitted_secret}; do not persist it."
+                ),
+            ),
+            db=db,
+            current_user=SimpleNamespace(id=uuid.uuid4()),
+        )
+
+    assert exc_info.value.status_code == 422
+    assert submitted_secret not in str(exc_info.value.detail)
+    assert set(credential.modality_status) == {"video:doubao-seedance-2.0@480p"}
+    assert db.added is None
+    assert db.commits == 0
+
+
+@pytest.mark.asyncio
+async def test_quota_recovery_rejects_unproven_or_non_volcano_circuits():
+    actor = SimpleNamespace(id=uuid.uuid4())
+    for credential in (
+        SimpleNamespace(
+            id=uuid.uuid4(),
+            provider="minimax",
+            modality_status={
+                "video:minimax-hailuo-02": {
+                    "status": "quota_exceeded",
+                    "reset_scope": "provider_evidence",
+                }
+            },
+        ),
+        SimpleNamespace(
+            id=uuid.uuid4(),
+            provider="volcengine_agent_plan",
+            modality_status={
+                "video:doubao-seedance-2.0@480p": {
+                    "status": "quota_exceeded",
+                    "reset_scope": "daily",
+                }
+            },
+        ),
+    ):
+        db = _FakeCredentialDb(credential)
+        with pytest.raises(credentials_api.HTTPException):
+            await credentials_api.recover_credential_quota(
+                credential.id,
+                CredentialQuotaRecoveryIn(
+                    resources=[next(iter(credential.modality_status))],
+                    provider_evidence_note=(
+                        "2026-08-06 00:05 CST console confirms available AFP remaining."
+                    ),
+                ),
+                db=db,
+                current_user=actor,
+            )
+        assert db.commits == 0

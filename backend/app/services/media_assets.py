@@ -613,7 +613,8 @@ def _font_for_text(
             faces,
             key=lambda face: (
                 0
-                if face[2].upper().endswith(f" {preferred_region}")
+                if preferred_region
+                in face[2].upper().replace("-", " ").replace("_", " ").split()
                 else 1,
                 face[0],
             ),
@@ -893,10 +894,10 @@ def _composite_glass_cta(canvas, rect: tuple[int, int, int, int], radius: int) -
     shadow_draw.rounded_rectangle(
         (left, top + shadow_offset, right, bottom + shadow_offset),
         radius=radius,
-        fill=(50, 31, 108, 115),
+        fill=(50, 31, 108, 78),
     )
     canvas.alpha_composite(
-        shadow.filter(ImageFilter.GaussianBlur(max(4, button_height // 7)))
+        shadow.filter(ImageFilter.GaussianBlur(max(4, button_height // 6)))
     )
 
     glow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
@@ -904,17 +905,17 @@ def _composite_glass_cta(canvas, rect: tuple[int, int, int, int], radius: int) -
     glow_draw.rounded_rectangle(
         rect,
         radius=radius,
-        fill=(217, 104, 255, 155),
+        fill=(217, 104, 255, 92),
     )
     canvas.alpha_composite(
-        glow.filter(ImageFilter.GaussianBlur(max(5, button_height // 5)))
+        glow.filter(ImageFilter.GaussianBlur(max(5, button_height // 4)))
     )
 
     mask = Image.new("L", (button_width, button_height), 0)
     ImageDraw.Draw(mask).rounded_rectangle(
         (0, 0, button_width - 1, button_height - 1),
         radius=radius,
-        fill=225,
+        fill=218,
     )
     gradient = Image.new("RGBA", (button_width, button_height), (0, 0, 0, 0))
     gradient_draw = ImageDraw.Draw(gradient, "RGBA")
@@ -929,7 +930,7 @@ def _composite_glass_cta(canvas, rect: tuple[int, int, int, int], radius: int) -
         )
         gradient_draw.line(
             (column, 0, column, button_height - 1),
-            fill=(*color, 238),
+            fill=(*color, 226),
         )
     gradient.putalpha(mask)
     canvas.alpha_composite(gradient, (left, top))
@@ -939,15 +940,15 @@ def _composite_glass_cta(canvas, rect: tuple[int, int, int, int], radius: int) -
     edge.rounded_rectangle(
         (left + inset, top + inset, right - inset, bottom - inset),
         radius=max(1, radius - inset),
-        outline=(255, 239, 255, 225),
-        width=max(2, button_height // 30),
+        outline=(255, 239, 255, 188),
+        width=max(1, button_height // 38),
     )
     edge.arc(
         (left + inset * 2, top + inset * 2, right - inset * 2, bottom - inset * 2),
         190,
         344,
-        fill=(255, 255, 255, 135),
-        width=max(1, button_height // 42),
+        fill=(255, 255, 255, 102),
+        width=max(1, button_height // 50),
     )
 
 
@@ -1073,18 +1074,13 @@ def _render_poster_blocks(
                         (x, line_y - box[1]),
                         line,
                         font=font,
-                        fill=(219, 179, 255, 190),
-                        stroke_width=max(2, font_size // 20),
-                        stroke_fill=(166, 120, 255, 160),
+                        fill=(219, 179, 255, 108),
+                        stroke_width=max(1, font_size // 32),
+                        stroke_fill=(166, 120, 255, 86),
                     )
                     canvas.alpha_composite(
                         outer_glow.filter(
-                            ImageFilter.GaussianBlur(max(5, font_size // 8))
-                        )
-                    )
-                    canvas.alpha_composite(
-                        outer_glow.filter(
-                            ImageFilter.GaussianBlur(max(2, font_size // 30))
+                            ImageFilter.GaussianBlur(max(4, font_size // 10))
                         )
                     )
                 elif not dry_run:
@@ -1094,7 +1090,7 @@ def _render_poster_blocks(
                         (x, line_y - box[1] + max(1, font_size // 24)),
                         line,
                         font=font,
-                        fill=(58, 42, 112, 145),
+                        fill=(58, 42, 112, 104),
                     )
                     canvas.alpha_composite(
                         shadow.filter(
@@ -1109,14 +1105,14 @@ def _render_poster_blocks(
                         font=font,
                         fill=fill,
                         stroke_width=(
-                            max(2, font_size // 25)
+                            max(1, font_size // 40)
                             if block["role"] == "title"
-                            else max(1, font_size // 55)
+                            else max(1, font_size // 70)
                         ),
                         stroke_fill=(
-                            (255, 226, 255, 235)
+                            (246, 226, 255, 178)
                             if block["role"] == "title"
-                            else (83, 59, 135, 115)
+                            else (83, 59, 135, 88)
                         ),
                     )
             line_y += line_height + spacing

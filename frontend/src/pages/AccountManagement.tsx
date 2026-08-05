@@ -66,6 +66,13 @@ interface CredentialVerification {
     receipt: Record<string, unknown>;
 }
 
+interface CredentialQuotaRecovery {
+    recovered: boolean;
+    recovered_resources: string[];
+    remaining_quota_resources: string[];
+    message: string;
+}
+
 const STATUS_COLOR: Record<string, string> = {
     unverified: 'var(--warning)',
     healthy: 'var(--success)',
@@ -104,11 +111,28 @@ export default function AccountManagement() {
     const [editingId, setEditingId] = useState<string | null>(null);
     const [formError, setFormError] = useState('');
     const [poolNotice, setPoolNotice] = useState('');
+    const [recoveryTarget, setRecoveryTarget] = useState<{ id: string; label: string; resources: string[] } | null>(null);
+    const [recoveryEvidence, setRecoveryEvidence] = useState('');
     const verifyMut = useMutation({
         mutationFn: (id: string) => fetchJson<CredentialVerification>(`/credentials/${id}/verify`, { method: 'POST' }),
         onSuccess: (result) => {
             invalidatePool();
             setPoolNotice(result.message || (result.ok ? t('account.verifySuccess', '验证成功') : t('account.verifyFailed', '验证失败')));
+        },
+        onError: (error) => setPoolNotice(error instanceof Error ? error.message : String(error)),
+    });
+    const recoveryMut = useMutation({
+        mutationFn: ({ id, resources, providerEvidenceNote }: { id: string; resources: string[]; providerEvidenceNote: string }) => (
+            fetchJson<CredentialQuotaRecovery>(`/credentials/${id}/quota-recovery`, {
+                method: 'POST',
+                body: JSON.stringify({ resources, provider_evidence_note: providerEvidenceNote }),
+            })
+        ),
+        onSuccess: (result) => {
+            invalidatePool();
+            setRecoveryTarget(null);
+            setRecoveryEvidence('');
+            setPoolNotice(`${result.message} ${result.recovered_resources.join(' / ')}`);
         },
         onError: (error) => setPoolNotice(error instanceof Error ? error.message : String(error)),
     });
@@ -244,8 +268,8 @@ export default function AccountManagement() {
                                     base_url: provider === 'volcengine_agent_plan'
                                         ? 'https://ark.cn-beijing.volces.com/api/plan/v3'
                                         : '',
-                                    // Agent Plan does not expose a cheap read-only
-                                    // endpoint that proves the purchased tier. Never
+                                    // The generation Bearer token cannot authorize the
+                                    // HMAC-only GetAFPUsage management endpoint. Never
                                     // predeclare Large or grant video on behalf of the
                                     // operator; the selected value must match the
                                     // current Volcano Engine console.
@@ -350,6 +374,47 @@ export default function AccountManagement() {
                 </div>
             )}
 
+            {recoveryTarget && (
+                <div className="card" style={{ marginBottom: 12, padding: 14 }}>
+                    <div style={{ fontWeight: 600, marginBottom: 6 }}>
+                        恢复火山 Agent Plan 媒体额度 · {recoveryTarget.label}
+                    </div>
+                    <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8 }}>
+                        仅在火山控制台已确认 AFP 可用额度恢复后提交。系统会原样审计证据说明，不会因本地日期变化自动清除供应商熔断。
+                        <br />待恢复资源：{recoveryTarget.resources.join(' / ')}
+                    </div>
+                    <textarea
+                        className="form-input"
+                        rows={3}
+                        value={recoveryEvidence}
+                        onChange={(event) => setRecoveryEvidence(event.target.value)}
+                        placeholder="填写至少 20 个字符：检查时间、5 小时/周/月剩余 AFP，以及控制台确认结果（不要粘贴密钥）"
+                    />
+                    <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 8 }}>
+                        <button
+                            className="btn btn-secondary"
+                            onClick={() => {
+                                setRecoveryTarget(null);
+                                setRecoveryEvidence('');
+                            }}
+                        >
+                            {t('common.cancel')}
+                        </button>
+                        <button
+                            className="btn btn-primary"
+                            disabled={recoveryEvidence.trim().length < 20 || recoveryMut.isPending}
+                            onClick={() => recoveryMut.mutate({
+                                id: recoveryTarget.id,
+                                resources: recoveryTarget.resources,
+                                providerEvidenceNote: recoveryEvidence.trim(),
+                            })}
+                        >
+                            {recoveryMut.isPending ? '提交中…' : '提交证据并恢复路由'}
+                        </button>
+                    </div>
+                </div>
+            )}
+
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                 {creds.map((c) => {
                     const h = healthMap.get(c.id);
@@ -358,6 +423,9 @@ export default function AccountManagement() {
                         sharedPlanBlocked,
                         unsupportedModelLabels,
                     } = summarizeCredentialQuota(c.modality_status);
+                    const recoverableResources = Object.entries(c.modality_status || {})
+                        .filter(([, entry]) => entry.status === 'quota_exceeded' && entry.reset_scope === 'provider_evidence')
+                        .map(([resource]) => resource);
                     return (
                         <div key={c.id} className="card" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                             <div style={{ flex: 1 }}>
@@ -403,6 +471,19 @@ export default function AccountManagement() {
                                 )}
                             </div>
                             <div style={{ display: 'flex', gap: 6 }}>
+                                {c.provider === 'volcengine_agent_plan' && recoverableResources.length > 0 && (
+                                    <button
+                                        className="btn btn-secondary"
+                                        style={{ fontSize: 12 }}
+                                        onClick={() => {
+                                            setPoolNotice('');
+                                            setRecoveryEvidence('');
+                                            setRecoveryTarget({ id: c.id, label: c.label, resources: recoverableResources });
+                                        }}
+                                    >
+                                        AFP 已恢复
+                                    </button>
+                                )}
                                 <button
                                     className="btn btn-secondary"
                                     style={{ fontSize: 12 }}

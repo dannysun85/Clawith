@@ -1714,6 +1714,9 @@ async def test_generate_image_minimax_records_success(tmp_path):
     assert "量化交易平台" not in submitted_prompt
     assert "立即体验" not in submitted_prompt
     assert "Do not render words" in submitted_prompt
+    assert "one continuous seamless vertical scene" in submitted_prompt
+    assert "not by inserting a flat color slab" in submitted_prompt
+    assert "hard horizon seams" in submitted_prompt
     assert store_evidence.await_args.kwargs["recovery_id"] == record_id
     mark_accepted.assert_awaited_once_with(
         record_id,
