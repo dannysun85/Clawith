@@ -64,7 +64,7 @@ class _Session:
 
 def _request(*, work_type: str = "presentation", spec: dict | None = None) -> DeliverableRequest:
     output_contract = {
-        "presentation": ["pptx", "pdf"],
+        "presentation": ["pptx"],
         "poster": ["png"],
         "video": ["mp4"],
     }[work_type]

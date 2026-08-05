@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -121,18 +122,18 @@ def media_route_capability_status(
         ):
             tier_text = "、".join(primary_plan_tiers)
             return (
-                "degraded",
-                "commercial_primary_unavailable",
+                "available",
+                "minimax_daily_allowance_only",
                 (
                     f"火山 Agent Plan 当前为 plan={tier_text}，不包含视频资格；"
-                    "当前仅有 MiniMax 应急视频线路。正式质量优先时请升级到支持视频的火山套餐，"
-                    "或在正式交付中明确确认降级。"
+                    "当前先使用 MiniMax 每账号每日 3 次 Plan 额度。额度耗尽后需等待次日，"
+                    "或配置支持视频的火山套餐。"
                 ),
             )
         return (
-            "degraded",
-            "commercial_primary_unavailable",
-            "正式质量优先时等待主线路恢复；如接受应急质量，再明确确认降级执行。",
+            "available",
+            "minimax_daily_allowance_only",
+            "当前先使用 MiniMax 每账号每日 3 次 Plan 额度；额度耗尽后等待次日或启用火山线路。",
         )
     return (
         "available",
@@ -321,7 +322,19 @@ async def get_platform_media_generation_receipts(
         ):
             continue
         account_receipt = current_credential_verification_receipt(credential) or {}
-        receipts[key] = {
+        metadata = getattr(task, "request_metadata", None)
+        metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
+        last_response = getattr(task, "last_response", None)
+        last_response = (
+            dict(last_response) if isinstance(last_response, Mapping) else {}
+        )
+        provider_usage = metadata.get("provider_usage")
+        if not isinstance(provider_usage, Mapping):
+            provider_usage = last_response.get("usage")
+        provider_usage = (
+            dict(provider_usage) if isinstance(provider_usage, Mapping) else None
+        )
+        receipt = {
             "receipt_ref": f"media-generation:{task.id}",
             "kind": "media_generation_success",
             "evidence_level": "generation_observed",
@@ -334,6 +347,21 @@ async def get_platform_media_generation_receipts(
             "account_verification_ref": account_receipt.get("receipt_ref"),
             "quality_reviewed": False,
         }
+        for metadata_field in (
+            "quoted_credits",
+            "pricing_version",
+            "billing_basis",
+        ):
+            if metadata.get(metadata_field) is not None:
+                receipt[metadata_field] = metadata[metadata_field]
+        if provider_usage is not None:
+            receipt["provider_usage"] = provider_usage
+            total_tokens = provider_usage.get("total_tokens")
+            if isinstance(total_tokens, (int, float)) and not isinstance(
+                total_tokens, bool
+            ):
+                receipt["provider_total_tokens"] = int(total_tokens)
+        receipts[key] = receipt
     return receipts
 
 

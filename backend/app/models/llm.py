@@ -1,9 +1,9 @@
 """LLM model pool configuration."""
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, JSON, String, func, text
+from sqlalchemy import Boolean, CheckConstraint, Date, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, func, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -151,4 +151,65 @@ class LLMCredential(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class MediaProviderDailyAllowanceClaim(Base):
+    """Transactional claim against a provider's modality-specific daily allowance.
+
+    This is intentionally separate from ``LLMCredential.used_today``: that
+    legacy counter spans every modality, whereas MiniMax Plan currently grants
+    a small video-only daily allowance.  Rows are retained as an audit trail;
+    only ``claimed`` and ``accepted`` rows consume the day's allowance.
+    """
+
+    __tablename__ = "media_provider_daily_allowance_claims"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('claimed', 'accepted', 'released')",
+            name="ck_media_provider_daily_allowance_claim_status",
+        ),
+        Index(
+            "ix_media_provider_daily_allowance_active",
+            "credential_id",
+            "modality",
+            "allowance_date",
+            "status",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    credential_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("llm_credentials.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    provider: Mapped[str] = mapped_column(String(50), nullable=False)
+    modality: Mapped[str] = mapped_column(String(20), nullable=False)
+    allowance_date: Mapped[date] = mapped_column(Date, nullable=False)
+    quota_snapshot: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="claimed", server_default=text("'claimed'")
+    )
+    task_record_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("media_generation_tasks.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    provider_task_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    release_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
     )

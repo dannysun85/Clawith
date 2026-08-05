@@ -19,10 +19,10 @@ def _capability_rows() -> list[dict[str, object]]:
             "tool_enabled": True,
             "reason": None,
             "allowed_tiers": ["lite", "pro", "ultra"],
-            "capability_status": "degraded",
+            "capability_status": "available",
             "available_providers": ["minimax"],
-            "route_reason": "commercial_primary_unavailable",
-            "next_action": "火山 Agent Plan 当前为 plan=small，不包含视频资格；当前仅有 MiniMax 应急视频线路。",
+            "route_reason": "minimax_daily_allowance_only",
+            "next_action": "火山 Agent Plan 当前为 plan=small，不包含视频资格；当前先使用 MiniMax 每账号每日 3 次 Plan 额度。",
         },
         {
             "modality": "image",
@@ -78,13 +78,10 @@ async def test_media_capability_endpoint_redacts_provider_diagnostics_for_member
 
     by_modality = {row["modality"]: row for row in result["capabilities"]}
     assert by_modality["video"]["available"] is True
-    assert by_modality["video"]["capability_status"] == "degraded"
+    assert by_modality["video"]["capability_status"] == "available"
     assert by_modality["video"]["available_providers"] == []
     assert by_modality["video"]["route_reason"] is None
-    assert by_modality["video"]["next_action"] == (
-        "当前仅有应急质量线路；正式交付需先确认质量差异，"
-        "也可以先保存工作说明并等待主线路恢复。"
-    )
+    assert by_modality["video"]["next_action"] == "按当前工作合同执行；供应商选择由平台托管。"
     assert "plan=small" not in json.dumps(result, ensure_ascii=False)
     assert "minimax" not in json.dumps(result, ensure_ascii=False)
 
@@ -118,5 +115,5 @@ async def test_media_capability_endpoint_keeps_diagnostics_for_platform_admin():
 
     by_modality = {row["modality"]: row for row in result["capabilities"]}
     assert by_modality["video"]["available_providers"] == ["minimax"]
-    assert by_modality["video"]["route_reason"] == "commercial_primary_unavailable"
+    assert by_modality["video"]["route_reason"] == "minimax_daily_allowance_only"
     assert "plan=small" in by_modality["video"]["next_action"]

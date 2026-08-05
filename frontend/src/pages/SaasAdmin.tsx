@@ -27,6 +27,7 @@ type ModelRoute = {
 type MediaRoute = {
     modality: 'image' | 'audio' | 'music' | 'video';
     tier: 'lite' | 'pro' | 'ultra';
+    route_purpose: 'media_generation';
     provider: string;
     routing_mode: 'automatic_failover';
     route_semantics?: 'account_pool_readiness_only';
@@ -72,6 +73,26 @@ type MediaRoute = {
     billing_mode: 'provider_dynamic';
     estimated_credits?: number | null;
     billing_unit: string;
+    volcengine_profile?: { model: string; resolution: string } | null;
+    minimax_allowance?: {
+        allowance_date: string;
+        timezone: string;
+        quota: number;
+        used: number;
+        remaining: number;
+        eligible_accounts: number;
+        excluded_accounts: number;
+        accounts: Array<{ credential_id: string; label: string; quota: number; used: number; remaining: number }>;
+    } | null;
+    provider_quotes?: Record<string, {
+        model: string;
+        resolution: string;
+        duration_seconds: number;
+        credits: number;
+        billing_basis: string;
+        pricing_version: string;
+    }>;
+    pricing_version?: string | null;
 };
 
 type CreditPack = {
@@ -154,6 +175,8 @@ type ProductionIssue = {
     last_trace_id?: string | null;
     release_version?: string | null;
     last_metadata?: Record<string, string | number | boolean | null> | null;
+    resolution_reason?: string | null;
+    auto_resolved: boolean;
 };
 
 type ProductionIssueSummary = {
@@ -169,8 +192,8 @@ const tabMeta: { key: SaasTab; label: string; icon: ReactNode }[] = [
     { key: 'plans', label: '套餐', icon: <IconStack2 size={15} stroke={1.7} /> },
     { key: 'packs', label: '额度包', icon: <IconWallet size={15} stroke={1.7} /> },
     { key: 'rules', label: '计费规则', icon: <IconReceipt size={15} stroke={1.7} /> },
-    { key: 'model-routes', label: '理解模型', icon: <IconRoute size={15} stroke={1.7} /> },
-    { key: 'media-routes', label: '媒体路由', icon: <IconPhotoVideo size={15} stroke={1.7} /> },
+    { key: 'model-routes', label: '输入理解路由', icon: <IconRoute size={15} stroke={1.7} /> },
+    { key: 'media-routes', label: '媒体生成策略', icon: <IconPhotoVideo size={15} stroke={1.7} /> },
     { key: 'tenants', label: '租户订阅', icon: <IconUsers size={15} stroke={1.7} /> },
     { key: 'registration-codes', label: '注册码', icon: <IconKey size={15} stroke={1.7} /> },
     { key: 'accounts', label: '账号池', icon: <IconDatabase size={15} stroke={1.7} /> },
@@ -463,8 +486,8 @@ function MediaRoutesTab() {
             <div className="card" style={{ marginBottom: 16, padding: 16 }}>
                 <div style={{ fontSize: 14, fontWeight: 650, marginBottom: 6 }}>媒体生成路由（平台统一配置）</div>
                 <div style={{ color: 'var(--text-secondary)', fontSize: 12, lineHeight: 1.7 }}>
-                    文本模型和媒体生成模型是两条独立链路。正式图片按 commercial_quality（火山优先）执行，创意探索按 creative_exploration（MiniMax 优先）执行；语音和视频按“火山 Agent Plan → MiniMax”检查可用线路，并且只在供应商尚未接受任务时切换，音乐目前使用 MiniMax。
-                    页面严格区分“已配置账号”“账号只读鉴权通过”“真实生成成功”和“人工质量通过”。视频仅剩 MiniMax 时属于非等价降级；即使有生成成功 receipt，也不能据此显示为商用质量已通过。下表中的模型与质量参数仅控制 MiniMax 路径。
+                    “输入理解路由”和“媒体生成执行策略”是两条独立链路。视频优先消耗 MiniMax Plan 每账号每日 3 次额度，额度耗尽后自动接续火山 Agent Plan；只有供应商明确拒绝且尚未接受任务时才切换，accepted/unknown 均禁止重复提交。
+                    火山档位固定为 Lite=Seedance 2.0-mini/480P、Pro=2.0-fast/720P、Ultra=标准 2.0/720P；Ultra 只有请求明确指定 1080P 才升级。页面严格区分账号 readiness、真实生成 receipt 与人工商用品质。
                 </div>
             </div>
             {error && (
@@ -475,7 +498,7 @@ function MediaRoutesTab() {
             <DataTable
                 rows={routes}
                 empty={isLoading ? '正在读取生产媒体路由…' : '暂无媒体路由'}
-                renderHeader={() => <><th>能力与路由</th><th>Tier</th><th>MiniMax 应急模型</th><th>应急质量参数</th><th>MiniMax 预计费用</th><th>可用性</th><th>应急配置来源</th><th /></>}
+                renderHeader={() => <><th>媒体生成策略</th><th>Tier</th><th>MiniMax 免费路线</th><th>MiniMax 参数</th><th>Provider 报价</th><th>可用性</th><th>配置来源</th><th /></>}
                 renderRow={(route) => <MediaRouteRow route={route} />}
             />
         </div>
@@ -564,11 +587,22 @@ function MediaRouteRow({ route }: { route: MediaRoute }) {
                             {strategy.preferred_ready
                                 ? `首选 ${providerLabel(strategy.preferred_provider)} 可执行`
                                 : strategy.alternate_provider
-                                    ? `首选不可用，改用 ${providerLabel(strategy.alternate_provider)} 需确认`
+                                    ? `首选不可用，改用 ${providerLabel(strategy.alternate_provider)}${strategy.alternate_confirmation_required ? '需确认' : '自动接续'}`
                                     : '当前不可执行'}
                         </div>
                     ))}
                 </div>
+                {route.modality === 'video' && route.volcengine_profile && (
+                    <div style={{ color: 'var(--text-secondary)', fontSize: 10, marginTop: 5 }}>
+                        火山接续档位：{route.volcengine_profile.model} / {route.volcengine_profile.resolution}
+                    </div>
+                )}
+                {route.modality === 'video' && route.minimax_allowance && (
+                    <div style={{ color: route.minimax_allowance.remaining > 0 ? 'var(--success)' : 'var(--warning)', fontSize: 10, marginTop: 3 }}>
+                        MiniMax 日额度：{route.minimax_allowance.used}/{route.minimax_allowance.quota}，剩余 {route.minimax_allowance.remaining}（{route.minimax_allowance.allowance_date}）
+                        {route.minimax_allowance.excluded_accounts > 0 && `；另有 ${route.minimax_allowance.excluded_accounts} 个账号不满足当前执行条件`}
+                    </div>
+                )}
                 <div style={{ marginTop: 5, display: 'grid', gap: 3 }}>
                     {route.provider_readiness.map((item) => {
                         const accountTime = receiptTime(item.account_receipt, 'checked_at');
@@ -594,7 +628,13 @@ function MediaRouteRow({ route }: { route: MediaRoute }) {
                 <MediaQualityFields modality={route.modality} tier={route.tier} settings={settings} onChange={setSetting} />
             </td>
             <td style={{ whiteSpace: 'nowrap' }}>
-                {route.estimated_credits == null ? '按量' : `${route.estimated_credits} Credits/${route.billing_unit}`}
+                {route.modality === 'video' && route.provider_quotes
+                    ? Object.entries(route.provider_quotes).map(([provider, quote]) => (
+                        <div key={provider} style={{ fontSize: 10, marginBottom: 3 }}>
+                            {providerLabel(provider)}：{quote.credits} Credits/{quote.duration_seconds}s
+                        </div>
+                    ))
+                    : route.estimated_credits == null ? '按量' : `${route.estimated_credits} Credits/${route.billing_unit}`}
             </td>
             <td style={{ minWidth: 130 }}>
                 <label style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
@@ -974,6 +1014,11 @@ function ProductionIssuesTab() {
                             <div style={{ color: 'var(--text-secondary)', fontSize: 11, marginTop: 3 }}>
                                 {issue.operation || '-'} {issue.route || ''}
                             </div>
+                            {issue.resolution_reason && (
+                                <div style={{ color: 'var(--text-tertiary)', fontSize: 10, marginTop: 3 }}>
+                                    {issue.auto_resolved ? '自动解决' : '人工解决'}：{issue.resolution_reason}
+                                </div>
+                            )}
                         </td>
                         <td style={{ color: issue.severity === 'critical' ? 'var(--error)' : 'inherit' }}>{issue.severity}</td>
                         <td>{issue.event_count} 次 / {issue.affected_tenant_count} 家</td>

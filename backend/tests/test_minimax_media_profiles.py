@@ -37,7 +37,7 @@ def test_minimax_media_profiles_are_tier_specific_and_provider_valid():
     assert (ultra_video.model, ultra_video.duration, ultra_video.resolution) == (
         "MiniMax-Hailuo-2.3",
         6,
-        "1080P",
+        "768P",
     )
 
 

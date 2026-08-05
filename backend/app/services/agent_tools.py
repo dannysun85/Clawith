@@ -28160,26 +28160,33 @@ async def _generate_image_minimax_durable(
         )
     aspect_ratio = str(arguments.get("aspect_ratio") or "1:1").strip()
     agent_plan_size: str | None = None
-    if provider == "volcengine_agent_plan":
-        from app.services.volcengine_agent_plan import image_size_for_aspect_ratio
+    delivery_size: str | None = None
+    from app.services.volcengine_agent_plan import image_size_for_aspect_ratio
 
-        try:
+    try:
+        if provider == "volcengine_agent_plan":
             agent_plan_size = image_size_for_aspect_ratio(
                 provider_size or "2K",
                 aspect_ratio,
             )
-        except ValueError as exc:
-            return _minimax_tool_result(
-                f"❌ Image delivery contract is invalid: {exc}",
-                typed=typed,
-                status="failed",
-                error_code="brand_safe_media_contract_invalid",
-                agent_id=agent_id,
-                modality="image",
-                model=model,
-                tier=tier,
-                provider=provider,
+            delivery_size = agent_plan_size
+        else:
+            delivery_size = image_size_for_aspect_ratio(
+                {"lite": "2K", "pro": "3K", "ultra": "4K"}.get(tier, "2K"),
+                aspect_ratio,
             )
+    except ValueError as exc:
+        return _minimax_tool_result(
+            f"❌ Image delivery contract is invalid: {exc}",
+            typed=typed,
+            status="failed",
+            error_code="brand_safe_media_contract_invalid",
+            agent_id=agent_id,
+            modality="image",
+            model=model,
+            tier=tier,
+            provider=provider,
+        )
     # Keep the generated artwork crisp. Whole-frame blur used to be enabled
     # whenever exact copy or a protected asset was composed, which destroyed
     # otherwise usable commercial output. Background sanitization is now an
@@ -28246,6 +28253,10 @@ async def _generate_image_minimax_durable(
                 ),
                 "expected_overlay_blocks_sha256": expected_overlay_blocks_sha256,
                 "provider_size": agent_plan_size or provider_size,
+                # Provider-native image dimensions are not a customer
+                # contract.  Freeze the exact server-owned delivery canvas so
+                # MiniMax and Agent Plan produce the same tier/aspect output.
+                "delivery_size": delivery_size,
                 "sanitize_generated_background": sanitize_generated_background,
                 **brand_metadata,
             },
@@ -28942,13 +28953,21 @@ async def _record_minimax_tool_success(
     tier: str | None,
     modality: str,
     model: str | None = None,
+    credential_daily_weight: int = 1,
 ) -> None:
     """Record successful MiniMax tool usage without failing the user result path."""
     from app.services.llm.load_balancer import record_credential_call
     from app.services.quota_guard import consume_agent_llm_quota
 
     try:
-        await record_credential_call(credential_id, tokens_used=0)
+        if credential_daily_weight == 1:
+            await record_credential_call(credential_id, tokens_used=0)
+        else:
+            await record_credential_call(
+                credential_id,
+                tokens_used=0,
+                weight_daily=credential_daily_weight,
+            )
     except Exception as exc:
         logger.warning(
             "[MiniMaxTool] Credential usage accounting failed error_type={}",
@@ -28998,16 +29017,22 @@ async def _record_media_provider_success(
     tier: str | None,
     modality: str,
     model: str | None = None,
+    daily_allowance_preclaimed: bool = False,
 ) -> None:
     """Record provider-independent media success without changing UX pricing."""
 
     if provider == "minimax":
+        success_kwargs = {
+            "tier": tier,
+            "modality": modality,
+            "model": model,
+        }
+        if daily_allowance_preclaimed:
+            success_kwargs["credential_daily_weight"] = 0
         await _record_minimax_tool_success(
             agent_id,
             credential_id,
-            tier=tier,
-            modality=modality,
-            model=model,
+            **success_kwargs,
         )
         return
     from app.services.llm.load_balancer import record_credential_call
@@ -30849,35 +30874,48 @@ async def _generate_video_minimax(
         )
     from app.services.llm.load_balancer import NoCredentialAvailable
     from app.services.media_provider_routing import (
-        DEFAULT_MEDIA_PROVIDER_ORDER,
+        media_provider_order_for_modality,
+        minimax_video_requires_first_frame,
         prepare_media_provider,
         volcengine_video_quota_model,
     )
 
     credential = None
+    provider_order = media_provider_order_for_modality("video")
     selected_provider_index = max(int(_provider_index), 0)
     provider_route_errors: list[str] = []
     provider_route_statuses: list[dict[str, str]] = []
-    degraded_fallback_blocked = False
-    for candidate_index in range(selected_provider_index, len(DEFAULT_MEDIA_PROVIDER_ORDER)):
-        candidate = DEFAULT_MEDIA_PROVIDER_ORDER[candidate_index]
-        if candidate == "minimax" and not allow_degraded_fallback:
-            degraded_fallback_blocked = True
-            provider_route_errors.append("minimax:degraded_confirmation_required")
-            provider_route_statuses.append(
-                {
-                    "provider": "minimax",
-                    "status": "degraded_confirmation_required",
-                }
-            )
-            break
+    for candidate_index in range(selected_provider_index, len(provider_order)):
+        candidate = provider_order[candidate_index]
         try:
             credential = await prepare_media_provider(
                 candidate,
                 modality="video",
                 saas_tier=tier,
                 minimax_model=billing_model,
+                reserve_daily_video_allowance=(candidate == "minimax"),
             )
+            if candidate == "minimax" and minimax_video_requires_first_frame(
+                video_ratio,
+                first_frame_image,
+            ):
+                from app.services.media_daily_allowance import (
+                    release_daily_allowance_claim,
+                )
+
+                await release_daily_allowance_claim(
+                    getattr(credential, "daily_allowance_claim_id", None),
+                    reason="request_shape_requires_first_frame",
+                )
+                provider_route_statuses.append(
+                    {
+                        "provider": candidate,
+                        "status": "incompatible_request_shape",
+                        "reason_code": "first_frame_required",
+                    }
+                )
+                credential = None
+                continue
             selected_provider_index = candidate_index
             break
         except (NoCredentialAvailable, ValueError) as exc:
@@ -30910,70 +30948,44 @@ async def _generate_video_minimax(
             provider_route_errors,
         )
         return _minimax_tool_result(
-            (
-                "⚠️ Formal video quality is temporarily unavailable. The emergency-quality route was not "
-                "authorized, so no provider task was submitted and no Credits were consumed."
-                if degraded_fallback_blocked
-                else "❌ Video generation is temporarily unavailable. No provider accepted the request and no Credits were consumed. "
-                "Do not call this tool again in the current run."
-            ),
+            "❌ Video generation is temporarily unavailable. No provider accepted the request and no Credits were consumed. "
+            "Do not call this tool again in the current run.",
             typed=typed,
             status="failed",
-            error_code=(
-                "media_video_degraded_confirmation_required"
-                if degraded_fallback_blocked
-                else "media_video_provider_unavailable"
-            ),
+            error_code="media_video_provider_unavailable",
             agent_id=agent_id,
             modality="video",
             model=billing_model,
             tier=tier,
-            halt_run=not degraded_fallback_blocked,
+            halt_run=True,
             provider="platform_media",
             runtime_metadata={"provider_routes": provider_route_statuses},
         )
     media_provider = credential.provider
     model = credential.model
-    if media_provider == "minimax":
-        from app.services.media_provider_routing import (
-            minimax_video_requires_first_frame,
-        )
 
-        if minimax_video_requires_first_frame(
-            video_ratio,
-            first_frame_image,
-        ):
-            return _minimax_tool_result(
-                "❌ The current fallback video route cannot guarantee this aspect ratio from text alone. "
-                "Generate or provide a first-frame image with the requested dimensions, "
-                "then retry as image-to-video. No Credits were consumed.",
-                typed=typed,
-                status="failed",
-                error_code="media_video_requires_first_frame_for_aspect_ratio",
-                agent_id=agent_id,
-                modality="video",
-                model=model,
-                tier=tier,
-                provider=media_provider,
-                runtime_metadata={
-                    "requested_aspect_ratio": video_ratio,
-                },
-            )
-
-    requested_resolution = (
-        profile.resolution
-        if formal_request_scoped
-        else arguments.get("resolution")
-    )
+    requested_resolution = arguments.get("resolution")
     duration, resolution = constrain_minimax_video_request(
         tier,
         profile,
         arguments.get("duration"),
         requested_resolution,
     )
-    billing_resolution = resolution
     if media_provider == "volcengine_agent_plan":
-        resolution = credential.resolution or resolution
+        # Enforce the commercial profile at execution time as well as in the
+        # admin route.  A stale credential/config row must never silently
+        # promote an ordinary Ultra request to the substantially dearer 1080p
+        # SKU.
+        resolution = {
+            "lite": "480p",
+            "pro": "720p",
+            "ultra": "720p",
+        }.get(tier, "480p")
+        if (
+            tier == "ultra"
+            and str(requested_resolution or "").strip().lower() == "1080p"
+        ):
+            resolution = "1080p"
     wait_for_completion = bool(arguments.get("wait_for_completion") or config.get("wait_for_completion") or False)
     poll_timeout_seconds = int(arguments.get("poll_timeout_seconds") or config.get("poll_timeout_seconds") or 180)
     provider_prompt = _brand_safe_video_provider_prompt(
@@ -30995,6 +31007,9 @@ async def _generate_video_minimax(
     output_path = ""
     metadata_persisted = False
     frozen_brand_key: str | None = None
+    daily_allowance_claim_id = getattr(
+        credential, "daily_allowance_claim_id", None
+    )
     try:
         from app.services.media_generation import (
             ProviderTaskIdentityCollision,
@@ -31006,13 +31021,15 @@ async def _generate_video_minimax(
             store_minimax_video_provider_identity_evidence,
             validate_media_origin_session,
         )
-        from app.services.provider_pricing import minimax_video_credits
+        from app.services.provider_pricing import video_generation_quote
 
-        credit_cost = minimax_video_credits(
-            billing_model,
+        video_quote = video_generation_quote(
+            media_provider,
+            model,
             duration=duration,
-            resolution=billing_resolution,
+            resolution=resolution,
         )
+        credit_cost = video_quote.credits
         await validate_media_origin_session(
             origin_session_id=session_id,
             agent_id=agent_id,
@@ -31055,6 +31072,11 @@ async def _generate_video_minimax(
         created_at = datetime.now(timezone.utc).isoformat()
         request_metadata = {
             "credit_cost": credit_cost,
+            "quoted_credits": credit_cost,
+            "pricing_version": video_quote.pricing_version,
+            "billing_basis": video_quote.billing_basis,
+            "actual_provider": media_provider,
+            "provider_usage": None,
             "model": model,
             "tier": tier,
             "prompt": prompt,
@@ -31086,6 +31108,18 @@ async def _generate_video_minimax(
             # terminal Agent message. Legacy callers keep the media daemon's
             # existing completion delivery behavior.
             "runtime_managed_completion": bool(typed),
+            "daily_allowance_claim_id": (
+                str(daily_allowance_claim_id) if daily_allowance_claim_id else None
+            ),
+            "daily_allowance_quota": getattr(
+                credential, "daily_allowance_quota", None
+            ),
+            "daily_allowance_used": getattr(
+                credential, "daily_allowance_used", None
+            ),
+            "daily_allowance_remaining": getattr(
+                credential, "daily_allowance_remaining", None
+            ),
         }
         created_task = await create_minimax_video_task_record(
             record_id=record_id,
@@ -31144,6 +31178,16 @@ async def _generate_video_minimax(
                 last_frame_image=last_frame_image,
                 prompt_optimizer=bool(prompt_optimizer),
                 on_provider_request_started=record_provider_request_started,
+            )
+        if daily_allowance_claim_id:
+            from app.services.media_daily_allowance import (
+                accept_daily_allowance_claim,
+            )
+
+            await accept_daily_allowance_claim(
+                daily_allowance_claim_id,
+                task_record_id=record_id,
+                provider_task_id=provider_task_id,
             )
         try:
             await _finish_durable_media_side_effect(
@@ -31215,6 +31259,7 @@ async def _generate_video_minimax(
             tier=tier,
             modality="video",
             model=model,
+            daily_allowance_preclaimed=bool(daily_allowance_claim_id),
         )
         metadata_persisted = _write_minimax_video_metadata_best_effort(
             full_meta_path,
@@ -31504,13 +31549,12 @@ async def _generate_video_minimax(
         _log_minimax_operation_failure("MiniMaxVideo", exc)
         if (
             not provider_task_id
-            and allow_degraded_fallback
             and _media_failover_is_safe(
                 exc,
                 provider_request_started=provider_request_started,
                 provider_accepted=bool(provider_task_id),
             )
-            and selected_provider_index + 1 < len(DEFAULT_MEDIA_PROVIDER_ORDER)
+            and selected_provider_index + 1 < len(provider_order)
         ):
             return await _generate_video_minimax(
                 agent_id,
@@ -31521,25 +31565,6 @@ async def _generate_video_minimax(
                 session_id=session_id,
                 typed=typed,
                 _provider_index=selected_provider_index + 1,
-            )
-        if (
-            provider_rejected
-            and not allow_degraded_fallback
-            and selected_provider_index + 1 < len(DEFAULT_MEDIA_PROVIDER_ORDER)
-        ):
-            return _minimax_tool_result(
-                "⚠️ The primary video route explicitly rejected the request before acceptance. "
-                "The alternate quality route was not authorized, so no provider task remains active "
-                "and no video Credits were consumed.",
-                typed=typed,
-                status="failed",
-                error_code="media_video_degraded_confirmation_required",
-                agent_id=agent_id,
-                modality="video",
-                record_id=record_id,
-                model=model,
-                tier=tier,
-                provider="platform_media",
             )
         if (
             record_id
@@ -31575,6 +31600,24 @@ async def _generate_video_minimax(
             provider=media_provider,
         )
     finally:
+        if daily_allowance_claim_id and (
+            not provider_request_started or provider_rejected
+        ):
+            try:
+                from app.services.media_daily_allowance import (
+                    release_daily_allowance_claim,
+                )
+
+                await release_daily_allowance_claim(
+                    daily_allowance_claim_id,
+                    reason=(
+                        "provider_rejected_pre_accept"
+                        if provider_rejected
+                        else "request_not_submitted"
+                    ),
+                )
+            except Exception:
+                logger.exception("[MiniMaxVideo] Daily allowance release failed")
         if frozen_brand_key and (not provider_request_started or provider_rejected):
             try:
                 await get_storage_backend().delete(frozen_brand_key)

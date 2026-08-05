@@ -91,7 +91,7 @@ _PROFILES: dict[tuple[str, str], MiniMaxMediaProfile] = {
         "video", "pro", "MiniMax-Hailuo-2.3", duration=6, resolution="768P"
     ),
     ("video", "ultra"): MiniMaxMediaProfile(
-        "video", "ultra", "MiniMax-Hailuo-2.3", duration=6, resolution="1080P"
+        "video", "ultra", "MiniMax-Hailuo-2.3", duration=6, resolution="768P"
     ),
 }
 
@@ -215,7 +215,15 @@ def constrain_minimax_video_request(
         duration = int(requested_duration) if requested_duration not in (None, "") else int(profile.duration or 6)
     except (TypeError, ValueError):
         duration = int(profile.duration or 6)
+    explicitly_requested_1080p = (
+        requested_resolution is not None
+        and str(requested_resolution).strip().upper() == "1080P"
+    )
     resolution = str(requested_resolution or profile.resolution or "768P").upper()
+    if resolution == "1080P" and not (
+        normalized_tier == "ultra" and explicitly_requested_1080p
+    ):
+        resolution = "768P"
     if (duration, resolution) in allowed:
         return duration, resolution
     if normalized_tier == "ultra" and duration == 10:
@@ -223,7 +231,7 @@ def constrain_minimax_video_request(
     safe_default = {
         "lite": (6, "768P"),
         "pro": (6, "768P"),
-        "ultra": (6, "1080P"),
+        "ultra": (6, "768P"),
     }[normalized_tier]
     configured_default = (
         int(profile.duration or safe_default[0]),

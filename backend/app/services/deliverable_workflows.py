@@ -130,7 +130,7 @@ _WORKFLOWS = (
             _fallback_policy_field(),
         ],
         approval_policy=["outline", "final"],
-        output_contract=["pptx", "pdf"],
+        output_contract=["pptx"],
         required_capability="presentation",
         launch_policy="agent_runtime",
     ),
@@ -253,7 +253,11 @@ async def list_agent_launchable_workflows(
             continue
         if (
             workflow.required_capability == "presentation"
-            and not await _presentation_tool_available(db, agent_id)
+            and not await _presentation_tool_available(
+                db,
+                agent_id,
+                workflow.output_contract,
+            )
         ):
             continue
         if (
@@ -723,6 +727,29 @@ def build_deliverable_prompt(request: DeliverableRequest) -> str:
             "the missing asset role and request supplied imagery instead. "
             f"PRESENTATION_MEDIA_CONTRACT={json.dumps(presentation_media_contract, ensure_ascii=False, sort_keys=True)} "
         )
+    presentation_outputs = {
+        str(value or "").strip().lower() for value in request.output_contract
+    }
+    if "pdf" in presentation_outputs:
+        presentation_delivery_instructions = (
+            "Convert the same source to PDF using convert_html_to_pdf with design_width=1280, "
+            "design_height=720, pdf_mode='pages', scale=1, paper_width=13.333333, paper_height=7.5, "
+            "expected_page_count=spec.page_count, outline_path='workspace/deliverables/"
+            f"{request.id}/outline.json', and slide_spec_path='workspace/deliverables/"
+            f"{request.id}/slide_spec.json'. "
+            "The PPTX and PDF must each contain exactly spec.page_count 16:9 pages. Report both exact "
+            "workspace paths and do not claim visual consistency, no-overflow, or page-count success "
+            "unless the registered artifact contract confirms it."
+        )
+    else:
+        presentation_delivery_instructions = (
+            "The customer output contract requires PPTX only. Do not call convert_html_to_pdf, do not "
+            "register or report a customer-facing PDF, and report only the exact PPTX workspace path. "
+            "A PDF render may be created separately by an internal QA workflow, but it is not a customer "
+            "deliverable unless output_contract explicitly lists pdf. The PPTX must contain exactly "
+            "spec.page_count 16:9 slides; do not claim no-overflow, page-count success, or editability "
+            "unless the registered artifact contract confirms it."
+        )
     return (
         "You are executing a persisted Astra Deliverable Request. Treat the following JSON as "
         "the authoritative product brief. Do not choose or reveal a provider/model. Use only enabled "
@@ -797,14 +824,7 @@ def build_deliverable_prompt(request: DeliverableRequest) -> str:
         "expected_page_count=spec.page_count, outline_path='workspace/deliverables/"
         f"{request.id}/outline.json', and slide_spec_path='workspace/deliverables/"
         f"{request.id}/slide_spec.json'. "
-        "Convert the same source to PDF using convert_html_to_pdf with design_width=1280, "
-        "design_height=720, pdf_mode='pages', scale=1, paper_width=13.333333, paper_height=7.5, "
-        "expected_page_count=spec.page_count, outline_path='workspace/deliverables/"
-        f"{request.id}/outline.json', and slide_spec_path='workspace/deliverables/"
-        f"{request.id}/slide_spec.json'. "
-        "The PPTX and PDF must each contain exactly spec.page_count 16:9 pages. Report both exact "
-        "workspace paths and do not claim visual consistency, no-overflow, or page-count success "
-        "unless the registered artifact contract confirms it.\n"
+        f"{presentation_delivery_instructions}\n"
         f"DELIVERABLE_REQUEST={json.dumps(contract, ensure_ascii=False, sort_keys=True)}"
     )
 
@@ -834,19 +854,25 @@ async def _agent_tool_available(
     return tool_enabled_for_agent(tool, assignment)
 
 
-async def _presentation_tool_available(db: AsyncSession, agent_id: uuid.UUID) -> bool:
+async def _presentation_tool_available(
+    db: AsyncSession,
+    agent_id: uuid.UUID,
+    output_contract: Sequence[str] | None = None,
+) -> bool:
+    required_tools = ["convert_html_to_pptx"]
+    normalized_outputs = {
+        str(value or "").strip().lower() for value in (output_contract or ())
+    }
+    if "pdf" in normalized_outputs:
+        required_tools.append("convert_html_to_pdf")
     return all(
         [
             await _agent_tool_available(
                 db,
                 agent_id=agent_id,
-                tool_name="convert_html_to_pptx",
-            ),
-            await _agent_tool_available(
-                db,
-                agent_id=agent_id,
-                tool_name="convert_html_to_pdf",
-            ),
+                tool_name=tool_name,
+            )
+            for tool_name in required_tools
         ]
     )
 
@@ -964,7 +990,11 @@ async def preflight_workflow(
 
     presentation_image_required = False
     if workflow.required_capability == "presentation":
-        if not await _presentation_tool_available(db, agent_id):
+        if not await _presentation_tool_available(
+            db,
+            agent_id,
+            workflow.output_contract,
+        ):
             reasons.append("presentation_tool_unavailable")
         presentation_roles = presentation_media_roles_for_brief(
             goal,

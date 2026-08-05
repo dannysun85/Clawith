@@ -37,7 +37,8 @@ class CreativeArtifactContract(BaseModel):
     audio_required: bool = False
     reference_identity_required: bool = False
     editable_required: bool = True
-    preview_required: bool = True
+    # PDF/render previews are internal QA evidence, not a customer deliverable.
+    preview_required: bool = False
     minimum_picture_coverage_ratio: float | None = Field(
         default=None,
         ge=0,

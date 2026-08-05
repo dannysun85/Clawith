@@ -273,6 +273,10 @@ async def update_production_issue_status(
     issue.status = data.status
     issue.acknowledged_at = now if data.status == "acknowledged" else None
     issue.resolved_at = now if data.status in {"resolved", "ignored"} else None
+    issue.auto_resolved = False
+    issue.resolution_reason = (
+        f"operator_{data.status}" if data.status in {"resolved", "ignored"} else None
+    )
     if data.status == "open":
         if before != "open":
             issue.alert_epoch = int(issue.alert_epoch or 1) + 1

@@ -27,6 +27,9 @@ class DummyResult:
             return self._values[0]
         return self._scalar
 
+    def scalar_one(self):
+        return self._scalar
+
     def scalars(self):
         return self
 
@@ -317,8 +320,8 @@ async def test_media_routes_expose_complete_matrix_without_credentials():
         "minimax",
     ]
     assert by_modality["video"].provider_order == [
-        "volcengine_agent_plan",
         "minimax",
+        "volcengine_agent_plan",
     ]
     assert by_modality["music"].provider_order == ["minimax"]
     assert by_modality["image"].available_providers == [
@@ -334,10 +337,10 @@ async def test_media_routes_expose_complete_matrix_without_credentials():
     assert by_modality["image"].capability_status == "available"
     assert by_modality["audio"].capability_status == "available"
     assert by_modality["music"].capability_status == "available"
-    assert by_modality["video"].capability_status == "degraded"
-    assert by_modality["video"].reason_code == "commercial_primary_unavailable"
-    assert by_modality["video"].primary_provider == "volcengine_agent_plan"
-    assert by_modality["video"].degraded_providers == ["minimax"]
+    assert by_modality["video"].capability_status == "available"
+    assert by_modality["video"].reason_code == "minimax_daily_allowance_only"
+    assert by_modality["video"].primary_provider == "minimax"
+    assert by_modality["video"].degraded_providers == []
     assert by_modality["video"].evaluation_source == "persisted_account_and_generation_receipts"
     assert by_modality["video"].readiness_status == "generation_unverified"
     assert by_modality["video"].quality_evidence_status == "not_reviewed"
@@ -350,8 +353,8 @@ async def test_media_routes_expose_complete_matrix_without_credentials():
     assert by_modality["audio"].primary_provider == "volcengine_agent_plan"
     assert by_modality["audio"].fallback_provider == "minimax"
     assert by_modality["music"].primary_provider == "minimax"
-    assert by_modality["music"].fallback_provider == "minimax"
-    assert by_modality["video"].fallback_provider == "minimax"
+    assert by_modality["music"].fallback_provider == ""
+    assert by_modality["video"].fallback_provider == "volcengine_agent_plan"
     serialized = " ".join(str(route.model_dump()) for route in routes)
     assert "must-not-leak" not in serialized
     assert "agent-plan-key-must-not-leak" not in serialized
@@ -359,6 +362,83 @@ async def test_media_routes_expose_complete_matrix_without_credentials():
     statements = "\n".join(str(statement) for statement in db.statements)
     assert "tools.tenant_id IS NULL" in statements
     assert "llm_credentials.tenant_id IS NULL" in statements
+
+
+def _video_provider_state(*providers: str) -> saas_api.PlatformMediaProviderState:
+    provider_set = set(providers)
+    return saas_api.PlatformMediaProviderState(
+        configured_modalities={
+            "volcengine_agent_plan": {"video"}
+            if "volcengine_agent_plan" in provider_set
+            else set(),
+            "minimax": {"video"} if "minimax" in provider_set else set(),
+        },
+        verified_modalities={
+            "volcengine_agent_plan": {"video"}
+            if "volcengine_agent_plan" in provider_set
+            else set(),
+            "minimax": {"video"} if "minimax" in provider_set else set(),
+        },
+        plan_tiers={},
+        account_receipts={},
+        verified_credentials={},
+    )
+
+
+def _video_allowance(*, used: int, remaining: int) -> dict[str, object]:
+    return {
+        "allowance_date": "2026-08-06",
+        "timezone": "Asia/Shanghai",
+        "quota": 3,
+        "used": used,
+        "remaining": remaining,
+        "eligible_accounts": 1,
+        "excluded_accounts": 0,
+        "accounts": [],
+    }
+
+
+def test_video_route_is_unavailable_when_minimax_is_exhausted_and_fire_is_off():
+    route = saas_api._media_route_out(
+        modality="video",
+        tier="lite",
+        tool=SimpleNamespace(config={}, enabled=True),
+        provider_state=_video_provider_state("minimax"),
+        generation_receipts={},
+        minimax_allowance=_video_allowance(used=3, remaining=0),
+    )
+
+    assert route.available is False
+    assert route.pool_available is False
+    assert route.available_providers == []
+    assert route.capability_status == "unavailable"
+    assert route.reason_code == "minimax_daily_allowance_exhausted"
+
+
+def test_video_route_activates_fire_after_minimax_daily_allowance_is_exhausted():
+    route = saas_api._media_route_out(
+        modality="video",
+        tier="pro",
+        tool=SimpleNamespace(config={}, enabled=True),
+        provider_state=_video_provider_state("minimax", "volcengine_agent_plan"),
+        generation_receipts={},
+        minimax_allowance=_video_allowance(used=3, remaining=0),
+    )
+
+    assert route.available is True
+    assert route.pool_available is True
+    assert route.available_providers == ["volcengine_agent_plan"]
+    assert route.capability_status == "available"
+    assert (
+        route.reason_code
+        == "minimax_daily_allowance_exhausted_volcengine_active"
+    )
+    assert "火山 Agent Plan 接管" in route.recommended_action
+    strategy = route.execution_strategies[0]
+    assert strategy.provider_order == ["minimax", "volcengine_agent_plan"]
+    assert strategy.preferred_ready is False
+    assert strategy.alternate_provider == "volcengine_agent_plan"
+    assert strategy.executable_without_alternate_confirmation is True
 
 
 @pytest.mark.asyncio
@@ -383,6 +463,12 @@ async def test_media_routes_report_generation_evidence_without_claiming_quality(
         output_size=4096,
         completed_at=completed_at,
         model="image-01",
+        request_metadata={
+            "quoted_credits": 4,
+            "pricing_version": "image-provider-v1",
+            "billing_basis": "provider_native",
+        },
+        last_response={"usage": {"total_tokens": 321}},
     )
     db = RecordingDB(
         [
@@ -418,6 +504,9 @@ async def test_media_routes_report_generation_evidence_without_claiming_quality(
     assert minimax.generation_receipt is not None
     assert minimax.generation_receipt["evidence_level"] == "generation_observed"
     assert minimax.generation_receipt["quality_reviewed"] is False
+    assert minimax.generation_receipt["quoted_credits"] == 4
+    assert minimax.generation_receipt["pricing_version"] == "image-provider-v1"
+    assert minimax.generation_receipt["provider_total_tokens"] == 321
     serialized = str(image.model_dump())
     assert "provider-task-recorded" not in serialized
     assert "must-not-leak" not in serialized

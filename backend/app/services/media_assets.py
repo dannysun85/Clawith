@@ -824,7 +824,10 @@ def _poster_block_layout(
 
     short_edge = min(width, height)
     role_scale = {
-        "title": 0.068,
+        # Commercial CJK poster titles need a materially stronger hierarchy
+        # than body copy.  The previous 6.8% scale read like a document
+        # heading on 9:16 artwork, especially next to a detailed AI scene.
+        "title": 0.088,
         "subtitle": 0.034,
         "tagline": 0.027,
         "body": 0.024,
@@ -975,10 +978,39 @@ def _composite_glass_cta(canvas, rect: tuple[int, int, int, int], radius: int) -
     )
 
 
+def _poster_region_is_bright(
+    background,
+    rect: tuple[int, int, int, int],
+) -> bool:
+    """Return whether a copy region needs dark ink for readable hierarchy."""
+
+    if background is None:
+        return False
+    from PIL import ImageStat
+
+    left, top, right, bottom = rect
+    pad_x = max(4, (right - left) // 18)
+    pad_y = max(4, (bottom - top) // 8)
+    sample = background.convert("RGB").crop(
+        (
+            max(0, left - pad_x),
+            max(0, top - pad_y),
+            min(background.width, right + pad_x),
+            min(background.height, bottom + pad_y),
+        )
+    )
+    red, green, blue = ImageStat.Stat(sample).mean[:3]
+    # Rec. 709 perceived luminance.  The threshold intentionally changes only
+    # secondary copy; the display title retains the campaign's white identity.
+    luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+    return luminance >= 158
+
+
 def _render_poster_blocks(
     canvas,
     blocks: tuple[dict[str, str], ...],
     *,
+    background=None,
     dry_run: bool = False,
 ) -> OverlayReceipt:
     """Render and receipt one role-aware hierarchy inside a verified safe area."""
@@ -1066,7 +1098,7 @@ def _render_poster_blocks(
     for (block, layout), block_height in zip(layouts, layout_heights, strict=True):
         font, lines, boxes, widths, heights, spacing = layout
         font_size = int(font.size)
-        fill = {
+        role_fill = {
             "title": (255, 255, 255, 255),
             "subtitle": (252, 250, 255, 245),
             "tagline": (242, 235, 255, 245),
@@ -1082,31 +1114,57 @@ def _render_poster_blocks(
         ):
             if line:
                 x = (width - line_width) // 2 - box[0]
-                record_content_bounds(
-                    (
-                        x + box[0],
-                        line_y,
-                        x + box[0] + line_width,
-                        line_y + line_height,
-                    )
+                line_rect = (
+                    x + box[0],
+                    line_y,
+                    x + box[0] + line_width,
+                    line_y + line_height,
+                )
+                record_content_bounds(line_rect)
+                dark_secondary_copy = (
+                    block["role"] in {"tagline", "body"}
+                    and _poster_region_is_bright(background, line_rect)
+                )
+                fill = (
+                    (67, 57, 126, 242)
+                    if dark_secondary_copy
+                    else role_fill
                 )
                 if not dry_run and block["role"] == "title":
+                    title_shadow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+                    title_shadow_draw = ImageDraw.Draw(title_shadow, "RGBA")
+                    title_shadow_draw.text(
+                        (
+                            x + max(1, font_size // 30),
+                            line_y - box[1] + max(1, font_size // 24),
+                        ),
+                        line,
+                        font=font,
+                        fill=(48, 33, 103, 164),
+                        stroke_width=max(1, font_size // 44),
+                        stroke_fill=(48, 33, 103, 132),
+                    )
+                    canvas.alpha_composite(
+                        title_shadow.filter(
+                            ImageFilter.GaussianBlur(max(3, font_size // 18))
+                        )
+                    )
                     outer_glow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
                     outer_glow_draw = ImageDraw.Draw(outer_glow, "RGBA")
                     outer_glow_draw.text(
                         (x, line_y - box[1]),
                         line,
                         font=font,
-                        fill=(219, 179, 255, 108),
-                        stroke_width=max(1, font_size // 32),
-                        stroke_fill=(166, 120, 255, 86),
+                        fill=(255, 245, 255, 82),
+                        stroke_width=max(1, font_size // 42),
+                        stroke_fill=(222, 181, 255, 72),
                     )
                     canvas.alpha_composite(
                         outer_glow.filter(
-                            ImageFilter.GaussianBlur(max(4, font_size // 10))
+                            ImageFilter.GaussianBlur(max(3, font_size // 16))
                         )
                     )
-                elif not dry_run:
+                elif not dry_run and not dark_secondary_copy:
                     shadow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
                     shadow_draw = ImageDraw.Draw(shadow, "RGBA")
                     shadow_draw.text(
@@ -1133,9 +1191,13 @@ def _render_poster_blocks(
                             else max(1, font_size // 70)
                         ),
                         stroke_fill=(
-                            (246, 226, 255, 178)
+                            (249, 235, 255, 145)
                             if block["role"] == "title"
-                            else (83, 59, 135, 88)
+                            else (
+                                (255, 255, 255, 105)
+                                if dark_secondary_copy
+                                else (83, 59, 135, 88)
+                            )
                         ),
                     )
             line_y += line_height + spacing
@@ -1299,6 +1361,7 @@ def _compose_overlay_canvas(
     brand_asset: ImageAsset | None,
     brand_position: str,
     brand_scale: float,
+    background=None,
 ):
     from PIL import Image
 
@@ -1316,7 +1379,11 @@ def _compose_overlay_canvas(
     if normalized_text and overlay_blocks:
         raise MediaContractError("Use overlay_text or overlay_blocks, not both")
     if overlay_blocks:
-        text_receipt = _render_poster_blocks(canvas, overlay_blocks)
+        text_receipt = _render_poster_blocks(
+            canvas,
+            overlay_blocks,
+            background=background,
+        )
         receipt = replace(
             text_receipt,
             brand_asset_sha256=receipt.brand_asset_sha256,
@@ -1394,6 +1461,7 @@ def apply_image_brand_overlays(
     brand_position: str = "center",
     brand_scale: float = 0.42,
     output_format: str | None = None,
+    output_dimensions: str | tuple[int, int] | None = None,
     sanitize_generated_background: bool = False,
 ) -> tuple[bytes, OverlayReceipt]:
     """Render exact copy and an immutable product/logo layer on one image."""
@@ -1409,6 +1477,48 @@ def apply_image_brand_overlays(
     validate_generated_image(raw)
     with Image.open(BytesIO(raw)) as source:
         image = ImageOps.exif_transpose(source).convert("RGBA")
+    source_width, source_height = image.size
+    if output_dimensions:
+        if isinstance(output_dimensions, str):
+            pieces = output_dimensions.lower().split("x", 1)
+            if len(pieces) != 2 or not all(piece.isdigit() for piece in pieces):
+                raise MediaContractError(
+                    "Image output_dimensions must use WIDTHxHEIGHT"
+                )
+            target_size = (int(pieces[0]), int(pieces[1]))
+        else:
+            try:
+                target_size = (
+                    int(output_dimensions[0]),
+                    int(output_dimensions[1]),
+                )
+            except (IndexError, TypeError, ValueError) as exc:
+                raise MediaContractError(
+                    "Image output_dimensions must contain width and height"
+                ) from exc
+        target_width, target_height = target_size
+        if (
+            target_width <= 0
+            or target_height <= 0
+            or target_width > MAX_IMAGE_EDGE_PIXELS
+            or target_height > MAX_IMAGE_EDGE_PIXELS
+            or target_width * target_height > MAX_IMAGE_PIXELS
+        ):
+            raise MediaContractError("Image output_dimensions exceed the safe limit")
+        source_ratio = source_width / source_height
+        target_ratio = target_width / target_height
+        if abs(source_ratio - target_ratio) / target_ratio > 0.03:
+            raise MediaContractError(
+                "Generated image cannot be normalized to the requested output dimensions "
+                "without changing its aspect ratio"
+            )
+        if image.size != target_size:
+            image = ImageOps.fit(
+                image,
+                target_size,
+                method=Image.Resampling.LANCZOS,
+                centering=(0.5, 0.5),
+            )
     if sanitize_generated_background:
         image = image.filter(
             ImageFilter.GaussianBlur(radius=_brand_safe_background_blur(image.size))
@@ -1421,6 +1531,7 @@ def apply_image_brand_overlays(
         brand_asset=brand_asset,
         brand_position=brand_position,
         brand_scale=brand_scale,
+        background=image,
     )
     image.alpha_composite(overlay)
     if sanitize_generated_background:
@@ -1432,7 +1543,6 @@ def apply_image_brand_overlays(
         # Pillow/libwebp encoder that is absent from some release runtimes.
         raise MediaContractError("WebP output encoding is unavailable; use PNG or JPEG")
     normalized_format = {"JPG": "JPEG", "JPEG": "JPEG"}.get(requested, "PNG")
-    source_width, source_height = image.size
     result, output_size = _encode_bounded_image(image, normalized_format)
     receipt = replace(
         receipt,

@@ -929,6 +929,131 @@ async def test_release_alert_canary_status_cannot_be_changed_through_admin_api()
     assert "release verifier" in exc_info.value.detail.lower()
 
 
+@pytest.mark.asyncio
+async def test_stale_noise_is_auto_resolved_with_auditable_reasons(monkeypatch):
+    now = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
+    old_release = SimpleNamespace(
+        release_version="1.11.33",
+        last_seen_at=now - production_issue_monitor.timedelta(days=2),
+        status="open",
+        resolved_at=None,
+        auto_resolved=False,
+        resolution_reason=None,
+    )
+    transient_socket = SimpleNamespace(
+        release_version="1.11.34",
+        last_seen_at=now - production_issue_monitor.timedelta(hours=2),
+        status="open",
+        resolved_at=None,
+        auto_resolved=False,
+        resolution_reason=None,
+    )
+
+    class Result:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return [old_release, transient_socket]
+
+    class Session:
+        def __init__(self):
+            self.statement = None
+            self.commit = AsyncMock()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def execute(self, statement):
+            self.statement = statement
+            return Result()
+
+    session = Session()
+    monkeypatch.setattr(production_issue_monitor, "async_session", lambda: session)
+    monkeypatch.setattr(
+        production_issue_monitor,
+        "get_settings",
+        lambda: SimpleNamespace(APP_VERSION="1.11.34"),
+    )
+
+    resolved = await production_issue_monitor.auto_resolve_stale_production_issues(
+        now=now
+    )
+
+    assert resolved == 2
+    assert old_release.status == "resolved"
+    assert old_release.auto_resolved is True
+    assert old_release.resolution_reason == "superseded_release_inactive"
+    assert transient_socket.status == "resolved"
+    assert transient_socket.auto_resolved is True
+    assert (
+        transient_socket.resolution_reason
+        == "transient_client_disconnect_inactive"
+    )
+    assert old_release.resolved_at == now
+    session.commit.assert_awaited_once()
+    sql = str(session.statement.compile()).lower()
+    assert "production_issues.source !=" in sql
+    assert "for update" in sql
+
+
+@pytest.mark.asyncio
+async def test_operator_resolution_is_distinct_from_automatic_cleanup():
+    issue_id = uuid.uuid4()
+    issue = SimpleNamespace(
+        id=issue_id,
+        fingerprint="a" * 64,
+        category="api",
+        severity="error",
+        source="client_api",
+        error_code="http_503",
+        summary="Client observed an API operation failure",
+        route="/api/example",
+        operation="GET",
+        event_count=1,
+        first_seen_at=datetime.now(timezone.utc),
+        last_seen_at=datetime.now(timezone.utc),
+        last_trace_id=None,
+        release_version="1.11.34",
+        last_metadata=None,
+        status="open",
+        alert_epoch=1,
+        alerted_at=None,
+        alert_attempts=0,
+        alert_next_attempt_at=None,
+        alert_last_error_code=None,
+        alert_notification_sent_at=None,
+        acknowledged_at=None,
+        resolved_at=None,
+        auto_resolved=True,
+        resolution_reason="transient_client_disconnect_inactive",
+    )
+    db = SimpleNamespace(
+        get=AsyncMock(return_value=issue),
+        add=lambda _value: None,
+        commit=AsyncMock(),
+        refresh=AsyncMock(),
+        execute=AsyncMock(
+            return_value=SimpleNamespace(scalar_one=lambda: 0)
+        ),
+    )
+
+    await production_issues.update_production_issue_status(
+        issue_id,
+        production_issues.ProductionIssueStatusIn(status="resolved"),
+        SimpleNamespace(id=uuid.uuid4()),
+        db,
+    )
+
+    assert issue.status == "resolved"
+    assert issue.auto_resolved is False
+    assert issue.resolution_reason == "operator_resolved"
+    db.commit.assert_awaited_once()
+
+
 def test_monitor_health_turns_unhealthy_after_the_db_loop_deadline(monkeypatch):
     started_at = datetime.now(timezone.utc)
     monkeypatch.setattr(

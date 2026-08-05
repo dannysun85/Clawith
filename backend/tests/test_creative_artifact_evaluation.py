@@ -217,6 +217,30 @@ async def test_presentation_observation_accepts_editable_pptx_and_pdf(
 
 
 @pytest.mark.asyncio
+async def test_default_presentation_contract_accepts_editable_pptx_without_pdf(
+    tmp_path,
+) -> None:
+    pptx_path = tmp_path / "deck.pptx"
+    _write_editable_pptx(pptx_path)
+
+    observation = await observe_creative_artifacts(
+        CreativeArtifactContract(
+            modality="presentation",
+            aspect_ratio="16:9",
+            page_count=2,
+            editable_required=True,
+        ),
+        {"pptx": pptx_path},
+    )
+
+    assert observation.hard_gates["pptx_and_preview_valid"].passed is True
+    assert observation.hard_gates["page_count_and_aspect_match"].passed is True
+    assert observation.hard_gates["editability"].passed is True
+    assert "pdf_missing" not in observation.warnings
+    assert set(observation.files) == {"pptx"}
+
+
+@pytest.mark.asyncio
 async def test_screenshot_only_presentation_fails_editability_contract(
     tmp_path,
 ) -> None:

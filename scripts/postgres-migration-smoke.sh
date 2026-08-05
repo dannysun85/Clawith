@@ -4,10 +4,11 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 db_name="clawith_migration_smoke_${USER//[^a-zA-Z0-9_]/_}_$$"
 fresh_db_name="${db_name}_fresh"
+partial_db_name="${db_name}_partial"
 db_user="${PGUSER:-$USER}"
 db_host="${PGHOST:-127.0.0.1}"
 db_port="${PGPORT:-5432}"
-release_head="${MIGRATION_SMOKE_EXPECTED_HEAD:-backfill_private_assistant_tpl}"
+release_head="${MIGRATION_SMOKE_EXPECTED_HEAD:-media_daily_allowance_claims}"
 
 assert_at_release_head() {
   .venv/bin/alembic current | grep -F "${release_head} (head)"
@@ -84,6 +85,7 @@ SQL
 cleanup() {
   dropdb --if-exists --host "$db_host" --port "$db_port" --username "$db_user" "$db_name"
   dropdb --if-exists --host "$db_host" --port "$db_port" --username "$db_user" "$fresh_db_name"
+  dropdb --if-exists --host "$db_host" --port "$db_port" --username "$db_user" "$partial_db_name"
 }
 trap cleanup EXIT
 
@@ -257,6 +259,7 @@ SQL
 
 createdb --host "$db_host" --port "$db_port" --username "$db_user" "$db_name"
 createdb --host "$db_host" --port "$db_port" --username "$db_user" "$fresh_db_name"
+createdb --host "$db_host" --port "$db_port" --username "$db_user" "$partial_db_name"
 export DATABASE_URL="postgresql+asyncpg://${db_user}@${db_host}:${db_port}/${db_name}"
 
 cd "$repo_root/backend"
@@ -270,6 +273,32 @@ DATABASE_URL="postgresql+asyncpg://${db_user}@${db_host}:${db_port}/${fresh_db_n
   bash -c '.venv/bin/alembic current' | grep -F "${release_head} (head)"
 DATABASE_URL="postgresql+asyncpg://${db_user}@${db_host}:${db_port}/${fresh_db_name}" \
   PYTHONPATH=. .venv/bin/python -m app.scripts.verify_identity_provider_secrets
+
+# A failed historical rollout may leave the allowance table only partially
+# created. The release must fail before serving traffic instead of silently
+# adding indexes to an ORM-incompatible shape.
+DATABASE_URL="postgresql+asyncpg://${db_user}@${db_host}:${db_port}/${partial_db_name}" \
+  .venv/bin/alembic upgrade backfill_private_assistant_tpl
+psql --host "$db_host" --port "$db_port" --username "$db_user" \
+  --dbname "$partial_db_name" --set ON_ERROR_STOP=1 <<'SQL'
+DROP TABLE media_provider_daily_allowance_claims;
+CREATE TABLE media_provider_daily_allowance_claims (
+  id uuid PRIMARY KEY
+);
+SQL
+set +e
+partial_upgrade_output="$({
+  DATABASE_URL="postgresql+asyncpg://${db_user}@${db_host}:${db_port}/${partial_db_name}" \
+    .venv/bin/alembic upgrade head
+} 2>&1)"
+partial_upgrade_status=$?
+set -e
+if [[ "$partial_upgrade_status" -eq 0 ]]; then
+  echo "partial allowance table unexpectedly passed migration" >&2
+  exit 1
+fi
+grep -F "Incompatible pre-existing media_provider_daily_allowance_claims" \
+  <<<"$partial_upgrade_output"
 
 .venv/bin/alembic upgrade add_douyin_collab_publish_fields
 

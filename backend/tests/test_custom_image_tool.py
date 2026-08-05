@@ -118,7 +118,7 @@ def test_quick_media_calls_default_to_platform_managed_fallback():
 
 
 @pytest.mark.asyncio
-async def test_generate_video_blocks_portrait_minimax_t2v_before_credit_check(
+async def test_portrait_t2v_skips_incompatible_minimax_before_credit_check(
     tmp_path,
 ):
     credential = SimpleNamespace(
@@ -145,8 +145,13 @@ async def test_generate_video_blocks_portrait_minimax_t2v_before_credit_check(
         ),
         patch(
             "app.services.media_provider_routing.prepare_media_provider",
-            AsyncMock(return_value=credential),
-        ),
+            AsyncMock(
+                side_effect=[
+                    credential,
+                    NoCredentialAvailable("volcengine_agent_plan", "video"),
+                ]
+            ),
+        ) as prepare,
         patch(
             "app.services.agent_tools._check_minimax_credit_amount",
             AsyncMock(),
@@ -164,17 +169,33 @@ async def test_generate_video_blocks_portrait_minimax_t2v_before_credit_check(
 
     assert isinstance(result, ToolExecutionOutcome)
     assert result.status == "failed"
-    assert result.error_code == (
-        "media_video_requires_first_frame_for_aspect_ratio"
-    )
-    assert "No Credits were consumed" in result.result_summary
+    assert result.error_code == "media_video_provider_unavailable"
+    assert result.metadata["provider_routes"] == [
+        {
+            "provider": "minimax",
+            "status": "incompatible_request_shape",
+            "reason_code": "first_frame_required",
+        },
+        {
+            "provider": "volcengine_agent_plan",
+            "status": "unavailable",
+            "reason_code": "not_configured",
+        },
+    ]
+    assert [call.args[0] for call in prepare.await_args_list] == [
+        "minimax",
+        "volcengine_agent_plan",
+    ]
     credit_check.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_formal_video_does_not_enter_unconfirmed_degraded_route(tmp_path):
+async def test_formal_video_uses_safe_provider_failover_without_confirmation(tmp_path):
     prepare = AsyncMock(
-        side_effect=NoCredentialAvailable("volcengine_agent_plan", "video")
+        side_effect=[
+            NoCredentialAvailable("minimax", "video"),
+            NoCredentialAvailable("volcengine_agent_plan", "video"),
+        ]
     )
     token = agent_tools.deliverable_request_scope_id.set(str(uuid.uuid4()))
     try:
@@ -215,10 +236,13 @@ async def test_formal_video_does_not_enter_unconfirmed_degraded_route(tmp_path):
 
     assert isinstance(result, ToolExecutionOutcome)
     assert result.status == "failed"
-    assert result.error_code == "media_video_degraded_confirmation_required"
+    assert result.error_code == "media_video_provider_unavailable"
     assert "no Credits were consumed" in result.result_summary
-    assert prepare.await_count == 1
-    assert prepare.await_args.args == ("volcengine_agent_plan",)
+    assert prepare.await_count == 2
+    assert [call.args[0] for call in prepare.await_args_list] == [
+        "minimax",
+        "volcengine_agent_plan",
+    ]
 
 
 @pytest.mark.asyncio
@@ -267,8 +291,13 @@ async def test_formal_video_reports_reviewed_rejection_instead_of_ambiguous_subm
             ),
             patch(
                 "app.services.media_provider_routing.prepare_media_provider",
-                AsyncMock(return_value=credential),
-            ),
+                AsyncMock(
+                    side_effect=[
+                        NoCredentialAvailable("minimax", "video"),
+                        credential,
+                    ]
+                ),
+            ) as prepare,
             patch("app.services.agent_tools._check_minimax_credit_amount", AsyncMock()),
             patch(
                 "app.services.media_generation.validate_media_origin_session",
@@ -316,26 +345,36 @@ async def test_formal_video_reports_reviewed_rejection_instead_of_ambiguous_subm
     ambiguous.assert_not_awaited()
     assert isinstance(result, ToolExecutionOutcome)
     assert result.status == "failed"
-    assert result.error_code == "media_video_degraded_confirmation_required"
-    assert "no video Credits were consumed" in result.result_summary
+    assert result.error_code == "media_video_generation_failed"
     assert "outcome is uncertain" not in result.result_summary
+    assert [call.args[0] for call in prepare.await_args_list] == [
+        "minimax",
+        "volcengine_agent_plan",
+    ]
 
 
 @pytest.mark.asyncio
-async def test_quick_video_falls_back_to_minimax_when_agent_plan_is_unavailable(tmp_path):
-    """The chat shortcut must select the next route without submitting twice."""
+async def test_video_falls_back_to_agent_plan_when_minimax_allowance_is_unavailable(
+    tmp_path,
+):
+    """Exhausting the free MiniMax route selects Fire before any submission."""
 
-    minimax_credential = SimpleNamespace(
+    agent_plan_credential = SimpleNamespace(
         id=uuid.uuid4(),
-        provider="minimax",
-        model="MiniMax-Hailuo-2.3",
+        provider="volcengine_agent_plan",
+        model="doubao-seedance-2.0-fast",
+        resolution="720p",
         api_key="sk-test",
-        base_url="https://api.minimax.test",
+        base_url="https://ark.test",
     )
     prepare = AsyncMock(
         side_effect=[
-            NoCredentialAvailable("volcengine_agent_plan", "video"),
-            minimax_credential,
+            NoCredentialAvailable(
+                "minimax",
+                "video",
+                reason_code=CredentialUnavailableReason.QUOTA_EXHAUSTED,
+            ),
+            agent_plan_credential,
         ]
     )
     with (
@@ -356,29 +395,27 @@ async def test_quick_video_falls_back_to_minimax_when_agent_plan_is_unavailable(
             "app.services.media_provider_routing.prepare_media_provider",
             prepare,
         ),
+        patch("app.services.agent_tools._record_minimax_tool_product_issue", AsyncMock()),
         patch(
-            "app.services.agent_tools._record_minimax_tool_product_issue",
-            AsyncMock(),
+            "app.services.minimax_media_profiles.constrain_minimax_video_request",
+            MagicMock(side_effect=RuntimeError("route selected")),
         ),
     ):
-        result = await _generate_video_minimax(
-            uuid.uuid4(),
-            tmp_path,
-            {
-                "prompt": "quick people-led commercial",
-                "aspect_ratio": "9:16",
-                "allow_degraded_fallback": True,
-            },
-            typed=True,
-        )
+        with pytest.raises(RuntimeError, match="route selected"):
+            await _generate_video_minimax(
+                uuid.uuid4(),
+                tmp_path,
+                {
+                    "prompt": "quick people-led commercial",
+                    "aspect_ratio": "9:16",
+                    "allow_degraded_fallback": True,
+                },
+                typed=True,
+            )
 
-    assert isinstance(result, ToolExecutionOutcome)
-    assert result.status == "failed"
-    assert result.error_code == "media_video_requires_first_frame_for_aspect_ratio"
-    assert "No Credits were consumed" in result.result_summary
     assert [call.args[0] for call in prepare.await_args_list] == [
-        "volcengine_agent_plan",
         "minimax",
+        "volcengine_agent_plan",
     ]
 
 
@@ -387,12 +424,12 @@ async def test_video_stops_run_after_all_provider_routes_are_unavailable(tmp_pat
     prepare = AsyncMock(
         side_effect=[
             NoCredentialAvailable(
-                "volcengine_agent_plan",
+                "minimax",
                 "video",
                 reason_code=CredentialUnavailableReason.QUOTA_EXHAUSTED,
             ),
             NoCredentialAvailable(
-                "minimax",
+                "volcengine_agent_plan",
                 "video",
                 reason_code=CredentialUnavailableReason.QUOTA_EXHAUSTED,
             ),
@@ -427,7 +464,7 @@ async def test_video_stops_run_after_all_provider_routes_are_unavailable(tmp_pat
             {
                 "prompt": "commercial product motion",
                 # Quick generation is server-managed. A model-supplied false
-                # value must not disable the safe Volcano -> MiniMax route.
+                # value must not disable the safe MiniMax -> Fire route.
                 "allow_degraded_fallback": False,
             },
             typed=True,
@@ -440,12 +477,12 @@ async def test_video_stops_run_after_all_provider_routes_are_unavailable(tmp_pat
     assert result.metadata["provider"] == "platform_media"
     assert result.metadata["provider_routes"] == [
         {
-            "provider": "volcengine_agent_plan",
+            "provider": "minimax",
             "status": "unavailable",
             "reason_code": "quota_exhausted",
         },
         {
-            "provider": "minimax",
+            "provider": "volcengine_agent_plan",
             "status": "unavailable",
             "reason_code": "quota_exhausted",
         },
@@ -455,7 +492,7 @@ async def test_video_stops_run_after_all_provider_routes_are_unavailable(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_formal_ultra_video_ignores_model_supplied_lower_resolution(tmp_path):
+async def test_formal_ultra_video_does_not_promote_lower_resolution_to_1080(tmp_path):
     credential = SimpleNamespace(
         id=uuid.uuid4(),
         provider="volcengine_agent_plan",
@@ -503,7 +540,7 @@ async def test_formal_ultra_video_ignores_model_supplied_lower_resolution(tmp_pa
     finally:
         agent_tools.deliverable_request_scope_id.reset(token)
 
-    assert constrain.call_args.args[3] == "1080P"
+    assert constrain.call_args.args[3] == "768P"
 
 
 @pytest.mark.asyncio
@@ -1731,6 +1768,7 @@ async def test_generate_image_minimax_records_success(tmp_path):
     assert creation["request_metadata"]["overlay_blocks"] == overlay_blocks
     assert creation["request_metadata"]["overlay_blocks_sha256"]
     assert creation["request_metadata"]["execution_strategy"] == "commercial_quality"
+    assert creation["request_metadata"]["delivery_size"] == "3072x3072"
     assert creation["output_path"].startswith("workspace/images/cat_")
     assert creation["output_path"].endswith(".png")
     record_id = creation["record_id"]
@@ -1877,6 +1915,7 @@ async def test_agent_plan_durable_image_preserves_ratio_in_provider_and_recovery
     metadata = create_task.await_args.kwargs["request_metadata"]
     assert metadata["aspect_ratio"] == "9:16"
     assert metadata["provider_size"] == "1440x2560"
+    assert metadata["delivery_size"] == "1440x2560"
 
 
 @pytest.mark.asyncio

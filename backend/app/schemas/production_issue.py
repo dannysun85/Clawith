@@ -94,6 +94,8 @@ class ProductionIssueOut(BaseModel):
     alert_notification_sent_at: datetime | None = None
     acknowledged_at: datetime | None = None
     resolved_at: datetime | None = None
+    resolution_reason: str | None = None
+    auto_resolved: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 

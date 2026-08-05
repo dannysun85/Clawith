@@ -96,10 +96,17 @@ from app.services.media_provider_routing import (
 )
 from app.services.modalities import canonicalize_modality, model_supports_modality
 from app.services.provider_pricing import (
+    VIDEO_PRICING_VERSION,
     minimax_image_credits,
     minimax_music_credits,
     minimax_tts_credits,
     minimax_video_credits,
+    video_generation_quote,
+)
+from app.services.media_daily_allowance import minimax_video_allowance_summary
+from app.services.volcengine_agent_plan import (
+    PROVIDER as VOLCENGINE_AGENT_PLAN_PROVIDER,
+    resolve_visual_profile,
 )
 
 router = APIRouter(prefix="/saas", tags=["saas"])
@@ -467,6 +474,7 @@ def _media_route_out(
     tool: Tool | None,
     provider_state: PlatformMediaProviderState,
     generation_receipts: dict[tuple[str, str], dict[str, object]],
+    minimax_allowance: dict[str, object] | None = None,
 ) -> MediaRouteOut:
     config = dict(tool.config or {}) if tool else {}
     profile = resolve_minimax_media_profile(modality, tier, config)
@@ -478,10 +486,21 @@ def _media_route_out(
     }
     overridden = bool(minimax_media_override_snapshot(modality, tier, config))
     provider_order = media_provider_order_for_modality(modality)
-    available_providers = [
+    account_ready_providers = [
         provider
         for provider in provider_order
         if modality in provider_state.verified_modalities.get(provider, set())
+    ]
+    minimax_allowance_exhausted = bool(
+        modality == "video"
+        and MINIMAX_PROVIDER in account_ready_providers
+        and minimax_allowance is not None
+        and int(minimax_allowance.get("remaining", 0) or 0) <= 0
+    )
+    available_providers = [
+        provider
+        for provider in account_ready_providers
+        if not (minimax_allowance_exhausted and provider == MINIMAX_PROVIDER)
     ]
     capability_status, reason_code, recommended_action = (
         media_route_capability_status(
@@ -490,6 +509,19 @@ def _media_route_out(
             provider_plan_tiers=provider_state.provider_plan_tiers,
         )
     )
+    if minimax_allowance_exhausted:
+        if VOLCENGINE_AGENT_PLAN_PROVIDER in available_providers:
+            reason_code = "minimax_daily_allowance_exhausted_volcengine_active"
+            recommended_action = (
+                "MiniMax 今日免费额度已用尽，当前按策略由火山 Agent Plan 接管；"
+                "仅在供应商明确拒绝且尚未接受任务时才会切换线路。"
+            )
+        else:
+            reason_code = "minimax_daily_allowance_exhausted"
+            recommended_action = (
+                "MiniMax 今日免费额度已用尽，且火山视频线路当前不可用；"
+                "等待次日额度重置或恢复火山账号后再提交。"
+            )
     # Preserve the legacy route-baseline fields during rolling deployment.
     # Strategy-specific availability lives in execution_strategies; actual
     # provider/model remains authoritative only in task receipts.
@@ -500,10 +532,10 @@ def _media_route_out(
         if provider_order
         else ""
     )
-    fallback_provider = MINIMAX_PROVIDER
+    fallback_provider = str(provider_order[1]) if len(provider_order) > 1 else ""
     degraded_providers = (
         [MINIMAX_PROVIDER]
-        if modality in {"image", "video"}
+        if modality == "image"
         else []
     )
     strategy_orders = (
@@ -539,8 +571,13 @@ def _media_route_out(
                 "preferred_provider": preferred_provider,
                 "alternate_provider": alternate_provider,
                 "preferred_ready": preferred_ready,
-                "executable_without_alternate_confirmation": preferred_ready,
-                "alternate_confirmation_required": bool(alternate_provider),
+                "executable_without_alternate_confirmation": bool(
+                    preferred_ready
+                    or (alternate_provider and modality != "image")
+                ),
+                "alternate_confirmation_required": bool(
+                    alternate_provider and modality == "image"
+                ),
             }
         )
     pool_available = bool(available_providers)
@@ -588,6 +625,39 @@ def _media_route_out(
     if evidence_action:
         recommended_action = f"{recommended_action} {evidence_action}"
     estimated_credits, billing_unit = _media_route_billing(profile)
+    volcengine_profile = None
+    provider_quotes: dict[str, dict[str, object]] = {}
+    if modality == "video":
+        fire_profile = resolve_visual_profile("video", tier)
+        volcengine_profile = {
+            "model": fire_profile.model,
+            "resolution": str(fire_profile.resolution or ""),
+        }
+        for quote_provider, quote_model, quote_resolution in (
+            ("minimax", profile.model, str(profile.resolution or "768P")),
+            (
+                "volcengine_agent_plan",
+                fire_profile.model,
+                str(fire_profile.resolution or "720p"),
+            ),
+        ):
+            try:
+                quote = video_generation_quote(
+                    quote_provider,
+                    quote_model,
+                    duration=int(profile.duration or 6),
+                    resolution=quote_resolution,
+                )
+            except ValueError:
+                continue
+            provider_quotes[quote_provider] = {
+                "model": quote.model,
+                "resolution": quote.resolution,
+                "duration_seconds": quote.duration_seconds,
+                "credits": quote.credits,
+                "billing_basis": quote.billing_basis,
+                "pricing_version": quote.pricing_version,
+            }
     return MediaRouteOut(
         modality=modality,
         tier=tier,
@@ -619,6 +689,10 @@ def _media_route_out(
         billing_mode="provider_dynamic",
         estimated_credits=estimated_credits,
         billing_unit=billing_unit,
+        volcengine_profile=volcengine_profile,
+        minimax_allowance=minimax_allowance if modality == "video" else None,
+        provider_quotes=provider_quotes,
+        pricing_version=VIDEO_PRICING_VERSION if modality == "video" else None,
     )
 
 
@@ -643,6 +717,10 @@ async def list_media_routes(
     generation_receipts = await get_platform_media_generation_receipts(
         db, provider_state
     )
+    minimax_allowance = await minimax_video_allowance_summary(
+        db,
+        credentials=tuple(provider_state.verified_credentials.values()),
+    )
     return [
         _media_route_out(
             modality=modality,
@@ -650,6 +728,7 @@ async def list_media_routes(
             tool=tools.get(tool_name),
             provider_state=provider_state,
             generation_receipts=generation_receipts,
+            minimax_allowance=minimax_allowance,
         )
         for modality, tool_name in MINIMAX_MEDIA_TOOL_NAMES.items()
         for tier in ("lite", "pro", "ultra")
@@ -742,12 +821,17 @@ async def update_media_route(
     generation_receipts = await get_platform_media_generation_receipts(
         db, provider_state
     )
+    minimax_allowance = await minimax_video_allowance_summary(
+        db,
+        credentials=tuple(provider_state.verified_credentials.values()),
+    )
     return _media_route_out(
         modality=canonical,
         tier=normalized_tier,
         tool=tool,
         provider_state=provider_state,
         generation_receipts=generation_receipts,
+        minimax_allowance=minimax_allowance,
     )
 
 

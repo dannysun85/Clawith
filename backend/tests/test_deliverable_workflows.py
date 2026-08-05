@@ -16,6 +16,7 @@ from app.schemas.deliverable import DeliverableInput
 from app.services.deliverable_workflows import (
     DeliverableWorkflowError,
     _credit_estimate,
+    _presentation_tool_available,
     attach_deliverable_run,
     build_deliverable_prompt,
     list_agent_launchable_workflows,
@@ -88,7 +89,7 @@ def _request(**overrides):
         },
         "tier": "pro",
         "approval_policy": ["outline", "final"],
-        "output_contract": ["pptx", "pdf"],
+        "output_contract": ["pptx"],
         "status": "ready",
         "current_stage": "brief_confirmed",
         "version": 1,
@@ -146,7 +147,7 @@ async def test_launcher_lists_only_workflows_executable_by_this_agent(monkeypatc
     )
 
     assert [workflow.work_type for workflow in workflows] == ["presentation", "poster", "video"]
-    available.assert_awaited_once_with(ANY, agent_id)
+    available.assert_awaited_once_with(ANY, agent_id, ["pptx"])
     image_tool_available.assert_awaited_once_with(
         ANY,
         agent_id=agent_id,
@@ -250,9 +251,11 @@ def test_execution_prompt_contains_contract_but_never_provider_selection() -> No
     assert "[data-slide-title]" in prompt
     assert "The outline, slide_spec, and final visible slide titles must agree exactly" in prompt
     assert "expected_page_count=spec.page_count" in prompt
-    assert "paper_width=13.333333" in prompt
-    assert "paper_height=7.5" in prompt
-    assert "exactly spec.page_count 16:9 pages" in prompt
+    assert "The customer output contract requires PPTX only" in prompt
+    assert "Do not call convert_html_to_pdf" in prompt
+    assert "paper_width=13.333333" not in prompt
+    assert "paper_height=7.5" not in prompt
+    assert "spec.page_count 16:9 slides" in prompt
     assert "Do not invent a brand" in prompt
     assert "one canonical hero asset first" in prompt
     assert "reference_image" in prompt
@@ -261,6 +264,41 @@ def test_execution_prompt_contains_contract_but_never_provider_selection() -> No
     assert "label the statement as a hypothesis to validate" in prompt
     assert '"provider"' not in prompt
     assert '"model"' not in prompt
+
+
+def test_explicit_pdf_presentation_contract_requires_and_reports_both_outputs() -> None:
+    prompt = build_deliverable_prompt(_request(output_contract=["pptx", "pdf"]))
+
+    assert "Convert the same source to PDF using convert_html_to_pdf" in prompt
+    assert "paper_width=13.333333" in prompt
+    assert "paper_height=7.5" in prompt
+    assert "The PPTX and PDF must each contain exactly spec.page_count 16:9 pages" in prompt
+    assert "The customer output contract requires PPTX only" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_presentation_tool_contract_requires_pdf_only_when_requested(
+    monkeypatch,
+) -> None:
+    available = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows._agent_tool_available",
+        available,
+    )
+    db = SimpleNamespace()
+    agent_id = uuid.uuid4()
+
+    assert await _presentation_tool_available(db, agent_id, ["pptx"]) is True
+    assert [call.kwargs["tool_name"] for call in available.await_args_list] == [
+        "convert_html_to_pptx"
+    ]
+
+    available.reset_mock()
+    assert await _presentation_tool_available(db, agent_id, ["pptx", "pdf"]) is True
+    assert [call.kwargs["tool_name"] for call in available.await_args_list] == [
+        "convert_html_to_pptx",
+        "convert_html_to_pdf",
+    ]
 
 
 def test_image_led_commercial_presentation_compiles_required_media_contract() -> None:

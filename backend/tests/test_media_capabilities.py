@@ -132,7 +132,10 @@ def test_media_provider_order_matches_implemented_runtime_modalities():
     automatic = ("volcengine_agent_plan", "minimax")
     assert media_provider_order_for_modality("image") == automatic
     assert media_provider_order_for_modality("audio") == automatic
-    assert media_provider_order_for_modality("video") == automatic
+    assert media_provider_order_for_modality("video") == (
+        "minimax",
+        "volcengine_agent_plan",
+    )
     assert media_provider_order_for_modality("music") == ("minimax",)
     assert media_provider_order_for_modality("unknown") == ()
     assert media_provider_order_for_image_strategy("commercial_quality") == automatic
@@ -155,8 +158,8 @@ def test_media_capability_display_order_matches_runtime_route_order():
         "minimax",
     ]
     assert _ordered_available_providers("video", providers) == [
-        "volcengine_agent_plan",
         "minimax",
+        "volcengine_agent_plan",
     ]
     assert _ordered_available_providers("music", providers) == [
         "minimax",
@@ -174,25 +177,25 @@ def test_media_route_status_treats_each_image_strategy_as_callable():
         None,
     )
     assert media_route_capability_status("video", {"minimax"})[:2] == (
-        "degraded",
-        "commercial_primary_unavailable",
+        "available",
+        "minimax_daily_allowance_only",
     )
     assert media_route_capability_status("audio", {"minimax"})[0] == "available"
     assert media_route_capability_status("music", {"minimax"})[0] == "available"
     assert media_route_capability_status("image", set())[0] == "unavailable"
 
 
-def test_video_degraded_status_explains_agent_plan_tier_without_granting_access():
+def test_video_allowance_status_explains_agent_plan_tier_without_granting_access():
     status, reason, next_action = media_route_capability_status(
         "video",
         {"minimax"},
         provider_plan_tiers={"volcengine_agent_plan": {"small"}},
     )
 
-    assert (status, reason) == ("degraded", "commercial_primary_unavailable")
+    assert (status, reason) == ("available", "minimax_daily_allowance_only")
     assert "plan=small" in next_action
     assert "不包含视频资格" in next_action
-    assert "MiniMax 应急视频线路" in next_action
+    assert "MiniMax 每账号每日 3 次" in next_action
 
 
 def test_explicit_voice_identity_never_silently_crosses_provider_namespaces():

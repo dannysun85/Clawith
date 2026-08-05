@@ -56,10 +56,10 @@ Astra 自有 Deliverable、Credits、Approval、Provider 路由和质量门禁�
 
 ### PPT
 
-- 已有 `convert_html_to_pptx`、`convert_html_to_pdf` 和 `builtin.presentation.v1`；正式合同要求同时生成结构有效的 PPTX 和匹配 PDF。
+- 已有 `convert_html_to_pptx`、`convert_html_to_pdf` 和 `builtin.presentation.v1`；标准客户合同只要求结构有效、可编辑的 PPTX。PDF 仅在 `output_contract` 明确列出时作为客户交付物；否则只可作为内部渲染 QA，不得阻塞或污染客户合同。
 - 当前已生成 server-owned `PresentationBrief`、`DeckOutline`、adaptive-v1 `SlideSpec`、
-  主题/版式下限、页数/素材/重复版式/溢出等结构门禁，并同时交付 PPTX/PDF。事实引用、字体替换、
-  PPTX/PDF 像素级一致性、按页局部修订和真实多人视觉评审仍未形成完整商用闭环。
+  主题/版式下限、页数/素材/重复版式/溢出等结构门禁，并按合同交付 PPTX 或 PPTX/PDF。事实引用、字体替换、
+  显式要求 PDF 时的 PPTX/PDF 一致性、按页局部修订和真实多人视觉评审仍未形成完整商用闭环。
 - 图片/视频 Provider 只应提供 PPT 中的装饰或场景视觉，不负责事实正确性、叙事结构、图表数据和可编辑性。
 
 ## 二、谁可以调用
@@ -126,8 +126,8 @@ tenant 内有权使用对应 Agent/Group 的成员都可以提出图片、视频
 4. `SlideSpec`：每页定义 slide type、headline、supporting points、data、source、visual intent、speaker notes。
 5. Theme/Layout Engine：标题、章节、图文、对比、流程、数据、案例、结尾等受控版式；统一网格、字号、留白、颜色、图标和品牌 token。
 6. 结构化内容优先：图表、表格、流程、关键数字使用可编辑 shapes/data；生成图片只用于无事实负担的插画、背景或氛围视觉。
-7. HTML/structured schema 渲染为 PPTX/PDF，默认可编辑；复杂视觉页栅格化必须显式标记并获得确认。
-8. 自动 QA：页数、overflow、最小字号、对齐、对比度、字体替换、图片分辨率与每页素材覆盖、整页栅格化/局部图片对象比例、引用完整性、PPTX 结构和 PPTX/PDF 一致性。
+7. HTML/structured schema 默认渲染为可编辑 PPTX；只有客户合同明确要求 PDF，或内部 QA 单独执行预览时，才额外渲染 PDF。复杂视觉页栅格化必须显式标记并获得确认。
+8. 自动 QA：页数、overflow、最小字号、对齐、对比度、字体替换、图片分辨率与每页素材覆盖、整页栅格化/局部图片对象比例、引用完整性和 PPTX 结构；仅在 PDF 明确属于合同或内部 QA 时检查 PPTX/PDF 一致性。
 9. 人工/视觉 review：叙事、信息密度、视觉节奏、重复版式、数据可读性。
 10. 支持按页自然语言修订并保存 Artifact revision；只重做被修改的页。
 
@@ -307,8 +307,10 @@ Astra 适配必须替换为：
 - `Douyin Operations Manager` 模板已获得这两个 Skill，同时保留原有
   `brand-safe-media` 和显式媒体 Tool grant；Skill 不授予 Tool；
 - 当前“抖音运营经理”工作区已真实同步两个 Skill 的 `SKILL.md` 与 provenance reference；
-- 当前 Large 账号下 Seedream Skill 与 Seedance Skill 都已进入火山优先路由；MiniMax 仍只在健康可用且火山尚未
-  接受任务时自动兜底。当前配置尚无新生成 receipt，不能把路由可选写成商用质量已通过。
+- 当前 Large 账号下 Seedream Skill 继续使用正式图片策略；视频执行策略自 2026-08-06 起改为
+  MiniMax Plan 每账号每日 3 次 allowance 优先，事务占位耗尽后才进入火山 Agent Plan。MiniMax 或火山一旦
+  accepted/unknown 均禁止跨 Provider 重放；只有受审计的明确拒绝且尚未接受才允许执行期切换。配置可选仍
+  不能替代真实生成 receipt 或人工商用品质结论。
 - 2026-07-26 18:45 已通过真实 Agent 会话执行 `volcengine-seedream-commercial`：
   `volcengine_agent_plan / doubao-seedream-5.0-lite` 成功交付
   `workspace/images/agent_plan_skill_real_person_ad_bd78482be7cb.png`。样张为 9:16 真人持杯场景，
@@ -632,10 +634,10 @@ PPT Provider 对比。拒绝凭空补齐 brief 是评测正确性，不是 PPT �
   identity、视频时长/比例/音轨合同、PPTX/PDF 结构与页数均通过；图片 1 帧 6 个 OCR 变体、
   视频 6 帧 36 个 OCR 变体未命中本轮禁止平台词。该结果只证明自动门禁未发现问题，事实安全、
   水印视觉判断、溢出细节和来源追溯仍需独立人工评审。
-- 本地 SaaS“媒体路由”现按真实运行时展示：图片、语音、视频均为
-  `volcengine_agent_plan -> minimax` 且两条账号验证路径就绪；当前 Large Agent Plan 为三类主线路，
-  音乐明确为 MiniMax-only。三类火山线路已有本地 hash 绑定真实样本，但不能据此放行商用质量或生产状态。
-  可编辑模型与质量参数只属于 MiniMax 兜底配置，不再伪装成整条统一路由。
+- 本地 SaaS“媒体生成策略”现按真实运行时分能力展示：图片与语音维持各自策略，视频为
+  `minimax daily allowance -> volcengine_agent_plan`，音乐为 MiniMax-only。视频同时显示 MiniMax 当日
+  事务计数、火山 Lite/Pro/Ultra 档位及版本化 customer Credits quote；账号 readiness、Provider receipt 与
+  人工商用品质仍是三种不同证据，任何一种都不能替代另外两种。
 
 因此当前准确状态是：
 

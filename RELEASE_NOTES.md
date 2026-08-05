@@ -1,3 +1,46 @@
+# v1.11.35 — Cost-Controlled Commercial Media Delivery
+
+## Video allowance, routing, and Credits
+
+- Consume each eligible MiniMax Plan account's three daily video allowances
+  before continuing with Volcengine Agent Plan; reserve allowance slots with a
+  transactional claim so concurrent requests cannot oversubscribe them.
+- Keep provider failover behind the durable acceptance fence: only an explicit
+  pre-accept rejection may continue to the next route, while accepted or
+  unknown submissions are reconciled without replay.
+- Map Lite to Seedance 2.0-mini 480P, Pro to Seedance 2.0-fast 720P, and Ultra
+  to standard Seedance 2.0 720P by default. Ultra 1080P requires an explicit
+  request and receives its own versioned customer Credits quote.
+- Persist actual provider, model, quoted Credits, pricing version, billing
+  basis, provider usage, and allowance state in media receipts; distinguish
+  input-understanding models from generation routes in the SaaS console.
+
+## Commercial poster and presentation contracts
+
+- Normalize every provider image to the exact tier/aspect delivery canvas
+  before deterministic composition, preventing a provider-native 2304x4096
+  file from being presented as a requested 1440x2560 Lite artifact.
+- Strengthen the CJK display-title hierarchy, select role-specific production
+  fonts, and adapt tagline/body ink to bright copy-safe regions while retaining
+  exact-copy hashes, safe-area bounds, font receipts, and the glass CTA.
+- Make editable PPTX the default customer presentation artifact. PDF is
+  generated only when the output contract explicitly requests it or when an
+  internal preview pipeline independently asks for it.
+
+## Operational noise and migration safety
+
+- Auto-resolve stale prior-release issues only with auditable recovery rules,
+  suppress known client disconnect noise, and avoid repeatedly starting
+  unconfigured enterprise channel connectors.
+- Add fail-closed MiniMax daily-allowance storage with compatibility checks for
+  a partially created production table and migration smoke coverage.
+
+## Validation
+
+- Pass the complete backend suite, complete frontend Node/Vitest suites,
+  TypeScript/Vite production build, Ruff, compileall, diff checks, and the
+  PostgreSQL migration matrix before release.
+
 # v1.11.34 — Commercial Video Typography and Chart Safety
 
 ## Video exact-copy composition

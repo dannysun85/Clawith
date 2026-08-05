@@ -28,7 +28,10 @@ const reportFingerprint = (report: ClientIssueReport) => [
 ].join('|');
 
 export function shouldReportWebSocketClose(code: number, intentional: boolean): boolean {
-    return !intentional && ![1000, 1001, 4002, 4003].includes(code);
+    // 1005/1006 are browser-local "no close frame" signals commonly emitted
+    // during sleep, network switching, navigation, or tab teardown. The
+    // socket's onerror path still reports genuine connection failures.
+    return !intentional && ![1000, 1001, 1005, 1006, 4002, 4003].includes(code);
 }
 
 function isDuplicateReport(report: ClientIssueReport, now = Date.now()): boolean {

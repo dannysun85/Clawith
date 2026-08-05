@@ -386,6 +386,7 @@ async def pick_credential(
     *,
     quota_modality: str | None = None,
     quota_model: str | None = None,
+    exclude_credential_ids: set[uuid.UUID] | None = None,
 ) -> LLMCredential:
     """Pick a credential from the pool for (provider, modality).
 
@@ -404,6 +405,8 @@ async def pick_credential(
             retaining image/video as the capability modality.
         quota_model: Optional concrete non-text provider model. A depleted media
             model then does not poison other models in the same modality.
+        exclude_credential_ids: Credentials already rejected by an outer,
+            modality-specific transactional allowance claim.
     """
     redis = await _get_redis_or_none()
     effective_quota_modality = quota_modality if quota_modality is not None else modality
@@ -422,6 +425,9 @@ async def pick_credential(
                 LLMCredential.used_today < LLMCredential.daily_quota,
             ),
         ]
+        excluded = set(exclude_credential_ids or ())
+        if excluded:
+            conditions.append(LLMCredential.id.notin_(excluded))
         if modality:
             capability_values = modality_match_values(modality)
             capability_conditions = [LLMCredential.capabilities.is_(None)]
@@ -465,11 +471,15 @@ async def pick_credential(
                 )
             )
             pool = list(diagnostic_result.scalars().all())
-            reason_code = _diagnose_base_filter_failure(
-                pool,
-                modality,
-                quota_modality=effective_quota_modality,
-                quota_model=quota_model,
+            reason_code = (
+                CredentialUnavailableReason.QUOTA_EXHAUSTED
+                if excluded and pool
+                else _diagnose_base_filter_failure(
+                    pool,
+                    modality,
+                    quota_modality=effective_quota_modality,
+                    quota_model=quota_model,
+                )
             )
             logger.warning(
                 "[load_balancer] no credential provider={} modality={} quota_resource={} reason_code={}",

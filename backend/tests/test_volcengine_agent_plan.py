@@ -30,6 +30,7 @@ from app.services.volcengine_agent_plan import (
     TTS_DEFAULT_SPEAKER,
     TTS_MODEL,
     VIDEO_MODEL,
+    VIDEO_MODEL_FAST,
     VIDEO_MODEL_15_PRO,
     VIDEO_MODEL_ALIASES,
     VolcengineAgentPlanError,
@@ -79,13 +80,13 @@ def test_agent_plan_tier_and_product_quality_profiles_are_explicit():
 
     assert resolve_visual_profile("image", "lite").model == IMAGE_MODEL
     assert resolve_visual_profile("image", "ultra").size == "4K"
-    assert resolve_visual_profile("video", "pro").model == VIDEO_MODEL
+    assert resolve_visual_profile("video", "pro").model == VIDEO_MODEL_FAST
     assert resolve_video_model("large") == VIDEO_MODEL
     with pytest.raises(ValueError, match="requires Large or Max"):
         resolve_video_model("small")
     with pytest.raises(ValueError, match="requires Large or Max"):
         resolve_visual_profile("video", "pro", plan_tier="medium")
-    assert resolve_visual_profile("video", "ultra").resolution == "1080p"
+    assert resolve_visual_profile("video", "ultra").resolution == "720p"
     assert resolve_text_model("lite") == TEXT_MODELS_BY_SAAS_TIER["lite"]
     assert resolve_text_model("pro") == "doubao-seed-2.1-turbo"
     assert resolve_text_model("ultra") == "doubao-seed-evolving"
@@ -120,7 +121,7 @@ async def test_medium_agent_plan_fails_before_provider_request(monkeypatch):
         "volcengine_agent_plan",
         modality="video",
         quota_modality="video",
-        quota_model=volcengine_video_quota_model(VIDEO_MODEL, "720p"),
+        quota_model=volcengine_video_quota_model(VIDEO_MODEL_FAST, "720p"),
     )
 
 
@@ -155,7 +156,7 @@ async def test_small_agent_plan_never_falls_through_to_a_video_call(monkeypatch)
         "volcengine_agent_plan",
         modality="video",
         quota_modality="video",
-        quota_model=volcengine_video_quota_model(VIDEO_MODEL, "720p"),
+        quota_model=volcengine_video_quota_model(VIDEO_MODEL_FAST, "720p"),
     )
 
 

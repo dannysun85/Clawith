@@ -317,6 +317,14 @@ async def record_production_issue(
                         (ProductionIssue.status == "resolved", None),
                         else_=ProductionIssue.resolved_at,
                     ),
+                    "resolution_reason": case(
+                        (ProductionIssue.status == "resolved", None),
+                        else_=ProductionIssue.resolution_reason,
+                    ),
+                    "auto_resolved": case(
+                        (ProductionIssue.status == "resolved", False),
+                        else_=ProductionIssue.auto_resolved,
+                    ),
                     "acknowledged_at": case(
                         (ProductionIssue.status == "resolved", None),
                         else_=ProductionIssue.acknowledged_at,
@@ -1219,6 +1227,56 @@ async def purge_old_production_issue_events() -> int:
         return int(result.rowcount or 0)
 
 
+async def auto_resolve_stale_production_issues(
+    *,
+    now: datetime | None = None,
+) -> int:
+    """Resolve bounded, evidence-safe noise without deleting its audit trail."""
+
+    current = now or datetime.now(timezone.utc)
+    current_release = str(get_settings().APP_VERSION or "")[:50]
+    old_release_cutoff = current - timedelta(hours=24)
+    transient_socket_cutoff = current - timedelta(hours=1)
+    async with async_session() as db:
+        result = await db.execute(
+            select(ProductionIssue)
+            .where(
+                ProductionIssue.status == "open",
+                ProductionIssue.source != RELEASE_ALERT_CANARY_SOURCE,
+                or_(
+                    and_(
+                        ProductionIssue.release_version.is_not(None),
+                        ProductionIssue.release_version != current_release,
+                        ProductionIssue.last_seen_at < old_release_cutoff,
+                    ),
+                    and_(
+                        ProductionIssue.category == "websocket",
+                        ProductionIssue.error_code.in_(("close_1005", "close_1006")),
+                        ProductionIssue.last_seen_at < transient_socket_cutoff,
+                    ),
+                ),
+            )
+            .with_for_update(skip_locked=True)
+        )
+        issues = list(result.scalars().all())
+        for issue in issues:
+            old_release = bool(
+                issue.release_version
+                and issue.release_version != current_release
+                and issue.last_seen_at < old_release_cutoff
+            )
+            issue.status = "resolved"
+            issue.resolved_at = current
+            issue.auto_resolved = True
+            issue.resolution_reason = (
+                "superseded_release_inactive"
+                if old_release
+                else "transient_client_disconnect_inactive"
+            )
+        await db.commit()
+        return len(issues)
+
+
 def production_issue_monitor_health(
     *,
     now: datetime | None = None,
@@ -1269,6 +1327,7 @@ async def start_production_issue_monitor_daemon() -> None:
             purge_counter += 1
             if purge_counter >= max(3600 // interval, 1):
                 await purge_old_production_issue_events()
+                await auto_resolve_stale_production_issues()
                 purge_counter = 0
             _monitor_last_db_loop_success_at = datetime.now(timezone.utc)
             _monitor_consecutive_db_failures = 0

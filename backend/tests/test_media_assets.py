@@ -442,6 +442,15 @@ def test_commercial_poster_title_prefers_black_sans_over_serif() -> None:
     assert next(path for path in candidates if "NotoSerif" in path) != candidates[0]
 
 
+def test_commercial_poster_secondary_copy_adapts_to_background_luminance() -> None:
+    bright = Image.new("RGB", (320, 200), (236, 220, 250))
+    dark = Image.new("RGB", (320, 200), (28, 23, 72))
+    copy_region = (40, 60, 280, 110)
+
+    assert media_assets._poster_region_is_bright(bright, copy_region) is True
+    assert media_assets._poster_region_is_bright(dark, copy_region) is False
+
+
 def test_poster_preflight_rejects_copy_that_cannot_fit_the_safe_area():
     blocks = [
         {
@@ -920,6 +929,41 @@ def test_image_normalization_prevents_extension_content_mismatch():
     assert validate_generated_image(result) == (512, 512)
     with Image.open(BytesIO(result)) as image:
         assert image.mode == "RGB"
+
+
+def test_commercial_image_normalizes_provider_dimensions_before_composition():
+    source = _image_bytes((900, 1600))
+
+    result, receipt = apply_image_brand_overlays(
+        source,
+        None,
+        overlay_blocks=(
+            {"role": "title", "text": "量化交易平台"},
+            {"role": "tagline", "text": "从复杂市场中，捕捉更清晰的交易方向"},
+        ),
+        output_dimensions="540x960",
+        output_format=".png",
+    )
+
+    assert validate_generated_image(result) == (540, 960)
+    assert receipt.source_width == 900
+    assert receipt.source_height == 1600
+    assert receipt.output_width == 540
+    assert receipt.output_height == 960
+    assert receipt.size_adjusted is True
+
+
+def test_commercial_image_rejects_dimension_normalization_that_changes_ratio():
+    with pytest.raises(
+        MediaContractError,
+        match="without changing its aspect ratio",
+    ):
+        apply_image_brand_overlays(
+            _image_bytes((900, 1600)),
+            None,
+            output_dimensions="960x540",
+            output_format=".png",
+        )
 
 
 @pytest.mark.parametrize("output_format", [".png"])

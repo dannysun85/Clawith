@@ -89,8 +89,8 @@ describe('production issue reporter', () => {
         expect(shouldReportWebSocketClose(1001, false)).toBe(false);
         expect(shouldReportWebSocketClose(4002, false)).toBe(false);
         expect(shouldReportWebSocketClose(4003, false)).toBe(false);
-        expect(shouldReportWebSocketClose(1005, false)).toBe(true);
-        expect(shouldReportWebSocketClose(1006, false)).toBe(true);
+        expect(shouldReportWebSocketClose(1005, false)).toBe(false);
+        expect(shouldReportWebSocketClose(1006, false)).toBe(false);
     });
 
     it('suppresses page-teardown failures but resumes reporting after bfcache restore', () => {

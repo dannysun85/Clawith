@@ -7,11 +7,24 @@ for successful non-free calls.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from decimal import Decimal, ROUND_CEILING
 
 from app.services.token_tracker import TokenUsage
 
 MINIMAX_CREDITS_PER_USD = Decimal("1000")
+VIDEO_PRICING_VERSION = "video-provider-v2-2026-08-06"
+
+
+@dataclass(frozen=True, slots=True)
+class VideoGenerationQuote:
+    provider: str
+    model: str
+    resolution: str
+    duration_seconds: int
+    credits: int
+    pricing_version: str
+    billing_basis: str
 
 
 def _credits_from_usd(amount_usd: Decimal | str | float | int) -> int:
@@ -113,6 +126,76 @@ def minimax_video_credits(model: str | None, duration: int, resolution: str) -> 
             f"duration={duration}, resolution={resolution}"
         )
     return _credits_from_usd(prices[key])
+
+
+def video_generation_quote(
+    provider: str,
+    model: str,
+    *,
+    duration: int,
+    resolution: str,
+) -> VideoGenerationQuote:
+    """Return the versioned customer quote for a concrete video route.
+
+    MiniMax retains provider-native PAYG-equivalent pricing even when a plan
+    allowance lowers the platform's marginal cost. Agent Plan is subscription
+    AFP/token funded and does not expose a stable per-task cash receipt, so its
+    customer tariff is a server-owned, cost-controlled SKU matrix. This keeps
+    a 1080p request from being charged as a 480p MiniMax task while preserving
+    historical reservations under their original pricing version.
+    """
+
+    normalized_provider = str(provider or "").strip().lower()
+    normalized_model = str(model or "").strip()
+    normalized_resolution = str(resolution or "").strip().lower()
+    normalized_duration = max(int(duration or 0), 1)
+    if normalized_provider == "minimax":
+        credits = minimax_video_credits(
+            normalized_model,
+            normalized_duration,
+            normalized_resolution.upper(),
+        )
+        basis = "minimax_provider_native"
+    elif normalized_provider == "volcengine_agent_plan":
+        model_key = normalized_model.lower()
+        family = (
+            "mini"
+            if model_key.endswith("-mini")
+            else "fast"
+            if model_key.endswith("-fast")
+            else "standard"
+        )
+        six_second_prices = {
+            ("mini", "480p"): 420,
+            ("mini", "720p"): 560,
+            ("fast", "480p"): 480,
+            ("fast", "720p"): 680,
+            ("standard", "480p"): 560,
+            ("standard", "720p"): 880,
+            ("standard", "1080p"): 1480,
+            ("standard", "4k"): 2960,
+        }
+        try:
+            base = six_second_prices[(family, normalized_resolution)]
+        except KeyError as exc:
+            raise ValueError(
+                "Unsupported Volcengine Agent Plan video billing combination: "
+                f"model={normalized_model}, duration={normalized_duration}, "
+                f"resolution={resolution}"
+            ) from exc
+        credits = max(1, (base * normalized_duration + 5) // 6)
+        basis = "volcengine_agent_plan_budget_tariff"
+    else:
+        raise ValueError(f"Unsupported video pricing provider: {provider}")
+    return VideoGenerationQuote(
+        provider=normalized_provider,
+        model=normalized_model,
+        resolution=normalized_resolution,
+        duration_seconds=normalized_duration,
+        credits=credits,
+        pricing_version=VIDEO_PRICING_VERSION,
+        billing_basis=basis,
+    )
 
 
 def provider_text_credits(

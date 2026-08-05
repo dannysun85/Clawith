@@ -9,6 +9,11 @@ from app.services.llm import load_balancer
 from app.services.llm import utils as llm_utils
 from app.services.llm.load_balancer import CredentialUnavailableReason, NoCredentialAvailable
 from app.services.llm.load_balancer import credential_quota_is_blocked
+from app.models.llm import LLMCredential
+from app.services.media_daily_allowance import (
+    DailyMediaAllowanceExhausted,
+    claim_minimax_video_allowance,
+)
 from app.services.volcengine_agent_plan import (
     PROVIDER as VOLCENGINE_AGENT_PLAN_PROVIDER,
     RETIRING_VIDEO_MODELS,
@@ -25,6 +30,10 @@ MINIMAX_PROVIDER = "minimax"
 DEFAULT_MEDIA_PROVIDER_ORDER = (
     VOLCENGINE_AGENT_PLAN_PROVIDER,
     MINIMAX_PROVIDER,
+)
+VIDEO_MEDIA_PROVIDER_ORDER = (
+    MINIMAX_PROVIDER,
+    VOLCENGINE_AGENT_PLAN_PROVIDER,
 )
 IMAGE_EXECUTION_STRATEGIES = frozenset(
     {"commercial_quality", "creative_exploration"}
@@ -63,7 +72,9 @@ def media_provider_order_for_modality(modality: str) -> tuple[str, ...]:
     normalized = str(modality or "").strip().lower()
     if normalized == "music":
         return (MINIMAX_PROVIDER,)
-    if normalized in {"image", "audio", "video"}:
+    if normalized == "video":
+        return VIDEO_MEDIA_PROVIDER_ORDER
+    if normalized in {"image", "audio"}:
         return DEFAULT_MEDIA_PROVIDER_ORDER
     return ()
 
@@ -98,7 +109,7 @@ def validate_media_route_policy() -> tuple[str, ...]:
     expected_order = {
         "image": (VOLCENGINE_AGENT_PLAN_PROVIDER, MINIMAX_PROVIDER),
         "audio": (VOLCENGINE_AGENT_PLAN_PROVIDER, MINIMAX_PROVIDER),
-        "video": (VOLCENGINE_AGENT_PLAN_PROVIDER, MINIMAX_PROVIDER),
+        "video": (MINIMAX_PROVIDER, VOLCENGINE_AGENT_PLAN_PROVIDER),
         "music": (MINIMAX_PROVIDER,),
     }
     for modality, expected in expected_order.items():
@@ -193,6 +204,10 @@ class PreparedMediaProvider:
     plan_tier: str | None = None
     size: str | None = None
     resolution: str | None = None
+    daily_allowance_claim_id: uuid.UUID | None = None
+    daily_allowance_quota: int | None = None
+    daily_allowance_used: int | None = None
+    daily_allowance_remaining: int | None = None
 
     @property
     def id(self) -> uuid.UUID:
@@ -214,6 +229,7 @@ async def prepare_media_provider(
     modality: str,
     saas_tier: str,
     minimax_model: str,
+    reserve_daily_video_allowance: bool = False,
 ) -> PreparedMediaProvider:
     normalized_provider = str(provider or "").strip().lower()
     if normalized_provider not in DEFAULT_MEDIA_PROVIDER_ORDER:
@@ -243,41 +259,58 @@ async def prepare_media_provider(
     # continue to patch the canonical load-balancer boundary. Keeping a copied
     # function binding here bypassed those overrides and caused legacy paths to
     # open a real database connection during otherwise isolated executions.
-    credential = await load_balancer.pick_credential(
-        normalized_provider,
-        modality=modality,
-        quota_modality=modality,
-        quota_model=quota_model,
-    )
-    credential_provider = str(getattr(credential, "provider", "") or "").strip().lower()
-    if normalized_provider == VOLCENGINE_AGENT_PLAN_PROVIDER and (
-        credential_provider != VOLCENGINE_AGENT_PLAN_PROVIDER
-    ):
-        # Agent Plan routing must never reinterpret a legacy/generic
-        # credential as a plan account. Besides protecting old fixtures, this
-        # prevents an Ark PAYG key or an incompletely migrated row from being
-        # sent to the subscription gateway.
-        raise NoCredentialAvailable(
+    excluded_credentials: set[uuid.UUID] = set()
+    allowance = None
+    while True:
+        pick_kwargs = {
+            "modality": modality,
+            "quota_modality": modality,
+            "quota_model": quota_model,
+        }
+        if excluded_credentials:
+            pick_kwargs["exclude_credential_ids"] = excluded_credentials
+        credential = await load_balancer.pick_credential(
             normalized_provider,
-            modality,
-            reason="credential is not an explicit Agent Plan account",
+            **pick_kwargs,
         )
-    if credential_provider and credential_provider != normalized_provider:
-        raise NoCredentialAvailable(
-            normalized_provider,
-            modality,
-            reason="credential provider does not match the selected route",
-        )
-    # Use the canonical module boundary for the same reason as
-    # ``pick_credential`` above: credential decryption is patched and audited
-    # centrally by existing callers.
-    api_key = llm_utils.get_credential_api_key(credential)
-    if not api_key:
-        raise NoCredentialAvailable(
-            normalized_provider,
-            modality,
-            reason="credential has no usable API key",
-        )
+        credential_provider = str(
+            getattr(credential, "provider", "") or ""
+        ).strip().lower()
+        if normalized_provider == VOLCENGINE_AGENT_PLAN_PROVIDER and (
+            credential_provider != VOLCENGINE_AGENT_PLAN_PROVIDER
+        ):
+            raise NoCredentialAvailable(
+                normalized_provider,
+                modality,
+                reason="credential is not an explicit Agent Plan account",
+            )
+        if credential_provider and credential_provider != normalized_provider:
+            raise NoCredentialAvailable(
+                normalized_provider,
+                modality,
+                reason="credential provider does not match the selected route",
+            )
+        api_key = llm_utils.get_credential_api_key(credential)
+        if not api_key:
+            raise NoCredentialAvailable(
+                normalized_provider,
+                modality,
+                reason="credential has no usable API key",
+            )
+        if not (
+            reserve_daily_video_allowance
+            and normalized_provider == MINIMAX_PROVIDER
+            and credential_provider == MINIMAX_PROVIDER
+            and isinstance(credential, LLMCredential)
+            and str(modality).strip().lower() == "video"
+        ):
+            break
+        try:
+            allowance = await claim_minimax_video_allowance(credential.id)
+            break
+        except DailyMediaAllowanceExhausted:
+            excluded_credentials.add(credential.id)
+            continue
 
     if normalized_provider == VOLCENGINE_AGENT_PLAN_PROVIDER:
         plan_tier = getattr(credential, "plan_tier", None)
@@ -334,6 +367,10 @@ async def prepare_media_provider(
         api_key=api_key,
         base_url=_minimax_base_url(credential.base_url),
         model=minimax_model,
+        daily_allowance_claim_id=allowance.claim_id if allowance else None,
+        daily_allowance_quota=allowance.quota if allowance else None,
+        daily_allowance_used=allowance.used if allowance else None,
+        daily_allowance_remaining=allowance.remaining if allowance else None,
     )
 
 
@@ -342,6 +379,7 @@ __all__ = [
     "IMAGE_EXECUTION_STRATEGIES",
     "MINIMAX_PROVIDER",
     "PreparedMediaProvider",
+    "VIDEO_MEDIA_PROVIDER_ORDER",
     "media_provider_order_for_voice_id",
     "media_provider_order_for_image_strategy",
     "media_provider_order_for_modality",

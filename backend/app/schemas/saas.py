@@ -31,6 +31,7 @@ class ModelRouteOut(BaseModel):
     enabled: bool
     created_at: datetime
     updated_at: datetime
+    route_purpose: str = "input_understanding"
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -143,6 +144,7 @@ class MediaRouteOut(BaseModel):
 
     modality: str
     tier: str
+    route_purpose: str = "media_generation"
     provider: str
     routing_mode: str
     route_semantics: str
@@ -171,6 +173,10 @@ class MediaRouteOut(BaseModel):
     billing_mode: str
     estimated_credits: int | None = None
     billing_unit: str
+    volcengine_profile: dict[str, str] | None = None
+    minimax_allowance: dict[str, object] | None = None
+    provider_quotes: dict[str, dict[str, object]] = Field(default_factory=dict)
+    pricing_version: str | None = None
 
 
 class MediaRouteUpdateIn(BaseModel):

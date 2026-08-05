@@ -44,7 +44,7 @@
 
 1. 图片/海报：可确认 brief、可生成多个候选、可做品牌安全合成、可验收、可局部修改。
 2. 视频：可确认脚本/分镜、逐镜头持久生成、可恢复、可局部重做、可合成并交付。
-3. PPT：有来源、有故事线、有版式系统、可编辑性合同明确、PPTX/PDF 一致、可按页修改。
+3. PPT：有来源、有故事线、有版式系统、可编辑性合同明确、默认交付 PPTX、显式要求 PDF 时保证 PPTX/PDF 一致、可按页修改。
 
 只有同时满足以下条件，某项能力才可称为客户可用：
 
@@ -101,9 +101,8 @@
 
 - 校验 workflow spec；
 - 校验文本路由；
-- PPT 校验两个转换 Tool；
-- 图片/视频校验 entitlement、Agent Tool 和 provider-neutral 平台凭据池；当前运行时按
-  Agent Plan → MiniMax 的安全顺序选择，并只在 Provider 接受前切换；
+- PPT 按 `output_contract` 校验转换 Tool：默认只要求 `convert_html_to_pptx`，显式要求 PDF 时才额外要求 `convert_html_to_pdf`；
+- 图片/视频校验 entitlement、Agent Tool 和 provider-neutral 平台凭据池；视频当前运行时优先使用 MiniMax 每日 Plan allowance，耗尽后使用火山 Agent Plan，并只在 Provider 明确拒绝且尚未接受任务时切换；
 - 返回 Credits 估算；
 - `dry_run` 返回不可启动。
 
@@ -178,7 +177,7 @@ Provider 完成后先把确切债务写为 `settlement_ready`，再释放结果�
 ### 2.7 Artifact 与审批
 
 当前 Artifact 只接受本次 request 目录下、来自成功 Agent Tool execution 的输出：
-PPT 接受 PPTX/PDF，视频优先接受 `compose_video_audio` 的 MP4，silent 合同才允许
+PPT 严格按 `output_contract` 接受 PPTX 或 PPTX/PDF，视频优先接受 `compose_video_audio` 的 MP4，silent 合同才允许
 `generate_video_minimax` 的 MP4。系统验证文件签名、大小、路径、hash；视频额外验证时长、
 分辨率、画幅、H.264/yuv420p 浏览器兼容、fast-start 和声音合同，并保存不可变快照。
 Artifact revision 已支持 candidate/approved/rejected/superseded 和 parent revision
@@ -660,24 +659,24 @@ Request 映射为 `ready/capability_blocked`，不得产生“最终图片”Art
 8. `slide_render`：每页独立 Unit。
 9. `deck_assemble`
 10. `pptx_render`：显式 render mode。
-11. `pdf_render`
+11. `pdf_render`：仅在客户 `output_contract` 包含 PDF 或独立内部 QA 需要预览时执行。
 12. `structural_qa`
 13. `semantic_qa`
 14. `visual_qa`
-15. `pptx_pdf_parity`
+15. `pptx_pdf_parity`：仅在 PDF 已按合同或内部 QA 生成时执行。
 16. `output_review`
 17. `archive`
 
 ### 8.4 必须检查
 
-- PPTX/PDF 均可打开；
+- PPTX 必须可打开；PDF 仅在合同明确要求或内部 QA 生成时检查；
 - 页数、标题、语言和顺序；
 - 文本 overflow、元素越界、遮挡、空白页；
 - 最小字号、对齐、留白、对比度；
 - 字体可用和替换；
 - 图片分辨率和版权/来源；
 - 数据、事实、引文和图表来源；
-- PPTX/PDF 视觉一致；
+- 显式要求 PDF 或内部 QA 生成 PDF 时，检查 PPTX/PDF 视觉一致；
 - editable/rasterized 合同；
 - 逐页信息密度和重复版式；
 - Artifact hash、size、snapshot。
@@ -691,7 +690,7 @@ Request 映射为 `ready/capability_blocked`，不得产生“最终图片”Art
   本次修订必须保留失败回执并请求用户授权扩大范围；不得为了通过质量门禁擅自修改范围外
   的文案、字号、布局、素材或事实；
 - 重新计算 dependency hash；
-- 只 supersede 受影响页及 deck assembly/PPTX/PDF；
+- 只 supersede 受影响页及 deck assembly/PPTX；PDF 在合同明确要求或内部 QA 存在时一并 supersede；
 - 来源、主题未变时复用其他页；
 - 每页 Artifact/preview 和整 deck Artifact 都有 revision lineage；
 - final approve 前重新跑整 deck parity 和引用完整性。
@@ -930,7 +929,7 @@ Request 映射为 `ready/capability_blocked`，不得产生“最终图片”Art
 - revision number 并发；
 - parent lineage；
 - candidate→approved/rejected/superseded；
-- PPTX/PDF/PNG/MP4 结构；
+- 按 `output_contract` 检查 PPTX、可选 PDF、PNG、MP4 结构；
 - 页面/镜头/候选与整包 Artifact 对账；
 - 下载 inline/attachment 和 MIME。
 
@@ -1080,7 +1079,7 @@ provider-free 本地底座：
 ### 14.3 PPT
 
 - 每个评测周期至少 10 个已授权匿名化真实 brief，并加入中文/英文、8–15 页动态开放场景；
-- PPTX/PDF 打开、页数、标题、语言和明确要求 100%；
+- PPTX 打开、页数、标题、语言和明确要求 100%；PDF 仅在合同明确要求时纳入客户交付门禁；
 - 无 overflow、越界、严重遮挡、空白页和缺失字体；
 - 重要事实和数字可追溯；
 - 至少 80% 页面无需人工结构性排版修复；

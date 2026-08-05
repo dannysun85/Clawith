@@ -23,12 +23,16 @@ def test_revision_ids_fit_the_default_alembic_version_column() -> None:
 
 
 def test_release_migration_graph_has_one_expected_head() -> None:
-    assert _script_directory().get_heads() == ["backfill_private_assistant_tpl"]
+    assert _script_directory().get_heads() == ["media_daily_allowance_claims"]
 
 
 def test_release_head_preserves_both_upgrade_lineages() -> None:
     script = _script_directory()
-    release_head = script.get_revision("recon_agent_tpl_lifecycle")
+    release_head = script.get_revision("media_daily_allowance_claims")
+    assistant_template_revision = script.get_revision(
+        "backfill_private_assistant_tpl"
+    )
+    reconciliation_revision = script.get_revision("recon_agent_tpl_lifecycle")
     lifecycle_revision = script.get_revision("agent_template_lifecycle")
     media_retention_revision = script.get_revision("media_task_agent_retention")
     assistant_access_revision = script.get_revision("private_assistant_access")
@@ -54,7 +58,15 @@ def test_release_head_preserves_both_upgrade_lineages() -> None:
     task_status_revision = script.get_revision("align_task_failed_status")
     merge_revision = script.get_revision("merge_v111_astra_heads")
 
-    assert release_head._normalized_down_revisions == ("agent_template_lifecycle",)
+    assert release_head._normalized_down_revisions == (
+        "backfill_private_assistant_tpl",
+    )
+    assert assistant_template_revision._normalized_down_revisions == (
+        "recon_agent_tpl_lifecycle",
+    )
+    assert reconciliation_revision._normalized_down_revisions == (
+        "agent_template_lifecycle",
+    )
     assert lifecycle_revision._normalized_down_revisions == ("media_task_agent_retention",)
     assert media_retention_revision._normalized_down_revisions == (
         "private_assistant_access",
@@ -105,9 +117,23 @@ def test_postgres_migration_smoke_targets_the_release_head() -> None:
         encoding="utf-8"
     )
 
-    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-backfill_private_assistant_tpl' in smoke
+    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-media_daily_allowance_claims' in smoke
     assert "restore_runtime_chat_foreign_key" in smoke
     assert "DROP CONSTRAINT IF EXISTS fk_agent_runs_tenant_session_chat_sessions" in smoke
+    assert "partial allowance table unexpectedly passed migration" in smoke
+    assert "Incompatible pre-existing media_provider_daily_allowance_claims" in smoke
+
+
+def test_daily_allowance_migration_fails_closed_on_partial_existing_table() -> None:
+    migration = (
+        BACKEND_ROOT
+        / "alembic/versions/202608061015_add_media_daily_allowance_claims.py"
+    ).read_text(encoding="utf-8")
+
+    assert "_assert_allowance_table_compatible" in migration
+    assert "missing columns:" in migration
+    assert "missing status check constraint" in migration
+    assert "missing foreign key" in migration
 
 
 def test_agent_plan_text_route_migration_preserves_credential_ownership_and_fallback() -> None:

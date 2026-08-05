@@ -27,6 +27,7 @@ IMAGE_MODEL = "doubao-seedream-5.0-lite"
 VIDEO_MODEL = "doubao-seedance-2.0"
 VIDEO_MODEL_15_PRO = "doubao-seedance-1.5-pro"
 VIDEO_MODEL_MINI = "doubao-seedance-2.0-mini"
+VIDEO_MODEL_FAST = "doubao-seedance-2.0-fast"
 VIDEO_CAPABLE_PLAN_TIERS = frozenset({"large", "max"})
 # Single source of truth for the operator-reviewed Agent Plan video policy.
 # Reviewed against the official package overview updated on 2026-08-03 and
@@ -41,6 +42,11 @@ VIDEO_PLAN_POLICY_SOURCES = (
 VIDEO_MODELS_BY_PLAN_TIER = {
     "large": VIDEO_MODEL,
     "max": VIDEO_MODEL,
+}
+VIDEO_MODELS_BY_SAAS_TIER = {
+    "lite": VIDEO_MODEL_MINI,
+    "pro": VIDEO_MODEL_FAST,
+    "ultra": VIDEO_MODEL,
 }
 TEXT_MODELS_BY_SAAS_TIER = {
     "lite": "doubao-seed-2.0-mini",
@@ -57,7 +63,7 @@ SUPPORTED_VIDEO_MODELS = frozenset(
     {
         VIDEO_MODEL_15_PRO,
         "doubao-seedance-2.0",
-        "doubao-seedance-2.0-fast",
+        VIDEO_MODEL_FAST,
         "doubao-seedance-2.0-mini",
     }
 )
@@ -65,7 +71,7 @@ RETIRING_VIDEO_MODELS = frozenset({"doubao-seedance-1.5-pro"})
 VIDEO_MODEL_ALIASES = {
     VIDEO_MODEL_15_PRO: "doubao-seedance-1-5-pro-251215",
     "doubao-seedance-2.0": "doubao-seedance-2-0-260128",
-    "doubao-seedance-2.0-fast": "doubao-seedance-2-0-fast-260128",
+    VIDEO_MODEL_FAST: "doubao-seedance-2-0-fast-260128",
     VIDEO_MODEL_MINI: "doubao-seedance-2-0-mini-260615",
 }
 # Keep the previously shipped provider ID readable for already persisted tasks
@@ -172,7 +178,7 @@ VIDEO_MODEL_CAPABILITIES = {
         supports_draft=False,
         supports_flex_tier=False,
     ),
-    "doubao-seedance-2.0-fast": SeedanceModelCapabilities(
+    VIDEO_MODEL_FAST: SeedanceModelCapabilities(
         max_duration_seconds=15,
         supported_resolutions=frozenset({"480p", "720p"}),
         supported_ratios=_SEEDANCE_FIXED_RATIOS,
@@ -248,6 +254,13 @@ def resolve_video_model(plan_tier: str | None) -> str:
     return model
 
 
+def resolve_video_model_for_saas_tier(saas_tier: str) -> str:
+    """Return the cost-controlled Seedance family for a product tier."""
+
+    normalized = str(saas_tier or "lite").strip().lower()
+    return VIDEO_MODELS_BY_SAAS_TIER.get(normalized, VIDEO_MODELS_BY_SAAS_TIER["lite"])
+
+
 def resolve_visual_profile(
     modality: str,
     saas_tier: str,
@@ -262,11 +275,15 @@ def resolve_visual_profile(
         size = {"lite": "2K", "pro": "3K", "ultra": "4K"}[normalized_tier]
         return VolcengineVisualProfile("image", normalized_tier, IMAGE_MODEL, size=size)
     if normalized_modality == "video":
-        resolution = {"lite": "480p", "pro": "720p", "ultra": "1080p"}[normalized_tier]
+        if plan_tier is not None:
+            # Validation is account entitlement only; model strength follows
+            # the customer's product tier below.
+            resolve_video_model(plan_tier)
+        resolution = {"lite": "480p", "pro": "720p", "ultra": "720p"}[normalized_tier]
         return VolcengineVisualProfile(
             "video",
             normalized_tier,
-            resolve_video_model(plan_tier) if plan_tier is not None else VIDEO_MODEL,
+            resolve_video_model_for_saas_tier(normalized_tier),
             resolution=resolution,
         )
     raise ValueError(f"Unsupported Volcengine Agent Plan modality: {modality}")
@@ -835,11 +852,13 @@ __all__ = [
     "VIDEO_CAPABLE_PLAN_TIERS",
     "VIDEO_MODEL",
     "VIDEO_MODEL_15_PRO",
+    "VIDEO_MODEL_FAST",
     "VIDEO_MODEL_MINI",
     "VIDEO_MODEL_CAPABILITIES",
     "VIDEO_MODEL_ALIASES",
     "VIDEO_MODEL_LEGACY_ALIASES",
     "VIDEO_MODELS_BY_PLAN_TIER",
+    "VIDEO_MODELS_BY_SAAS_TIER",
     "VIDEO_PLAN_POLICY_REVIEWED_AT",
     "VIDEO_PLAN_POLICY_SOURCES",
     "VIDEO_PROVIDER_MODELS",
@@ -867,6 +886,7 @@ __all__ = [
     "query_video_task",
     "resolve_visual_profile",
     "resolve_video_model",
+    "resolve_video_model_for_saas_tier",
     "stable_video_model_name",
     "resolve_text_model",
     "tts_request_payload",

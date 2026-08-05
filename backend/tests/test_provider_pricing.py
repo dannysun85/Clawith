@@ -6,11 +6,13 @@ without touching provider APIs.
 """
 
 from app.services.provider_pricing import (
+    VIDEO_PRICING_VERSION,
     minimax_image_credits,
     minimax_music_credits,
     minimax_text_credits,
     minimax_tts_credits,
     minimax_video_credits,
+    video_generation_quote,
 )
 from app.services.token_tracker import TokenUsage
 
@@ -98,3 +100,59 @@ def test_minimax_video_credits_follow_duration_resolution_and_speed():
     assert minimax_video_credits("MiniMax-Hailuo-2.3", duration=6, resolution="1080P") == 490
     assert minimax_video_credits("MiniMax-Hailuo-2.3", duration=10, resolution="768P") == 560
     assert minimax_video_credits("MiniMax-Hailuo-2.3-fast", duration=6, resolution="768P") == 190
+
+
+def test_agent_plan_video_quotes_keep_tier_profiles_and_1080_cost_visible():
+    lite = video_generation_quote(
+        "volcengine_agent_plan",
+        "doubao-seedance-2.0-mini",
+        duration=6,
+        resolution="480p",
+    )
+    pro = video_generation_quote(
+        "volcengine_agent_plan",
+        "doubao-seedance-2.0-fast",
+        duration=6,
+        resolution="720p",
+    )
+    ultra_720 = video_generation_quote(
+        "volcengine_agent_plan",
+        "doubao-seedance-2.0",
+        duration=6,
+        resolution="720p",
+    )
+    ultra_1080 = video_generation_quote(
+        "volcengine_agent_plan",
+        "doubao-seedance-2.0",
+        duration=6,
+        resolution="1080p",
+    )
+
+    assert (lite.credits, pro.credits, ultra_720.credits) == (420, 680, 880)
+    assert ultra_1080.credits == 1480
+    assert ultra_1080.credits - ultra_720.credits == 600
+    assert ultra_1080.pricing_version == VIDEO_PRICING_VERSION
+    assert ultra_1080.billing_basis == "volcengine_agent_plan_budget_tariff"
+
+
+def test_agent_plan_video_quote_scales_duration_and_rejects_unknown_sku():
+    quote = video_generation_quote(
+        "volcengine_agent_plan",
+        "doubao-seedance-2.0-fast",
+        duration=9,
+        resolution="720p",
+    )
+
+    assert quote.credits == 1020
+
+    try:
+        video_generation_quote(
+            "volcengine_agent_plan",
+            "doubao-seedance-2.0-fast",
+            duration=6,
+            resolution="1080p",
+        )
+    except ValueError as exc:
+        assert "Unsupported Volcengine Agent Plan video billing combination" in str(exc)
+    else:
+        raise AssertionError("fast 1080p must not receive an accidental quote")

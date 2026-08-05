@@ -2718,6 +2718,7 @@ async def reconcile_minimax_sync_media_task(
                 brand_position=str(metadata.get("brand_position") or "center"),
                 brand_scale=float(metadata.get("brand_scale") or 0.42),
                 output_format=str(metadata.get("output_extension") or ".png"),
+                output_dimensions=metadata.get("delivery_size"),
                 sanitize_generated_background=bool(
                     metadata.get("sanitize_generated_background")
                 ),
