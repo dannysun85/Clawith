@@ -1,3 +1,31 @@
+# v1.11.34 — Commercial Video Typography and Chart Safety
+
+## Video exact-copy composition
+
+- Replace the opaque black exact-copy pill with a production display face,
+  restrained violet outline, and tight soft shadow so titles remain legible
+  without covering the generated scene like a debug label.
+- Preserve the single-title layout version, bounds, font identity, and hash in
+  the durable media receipt instead of dropping those fields while combining
+  overlay layers.
+
+## Finance-video prompt safety
+
+- Rewrite `K-line` / `K 线` wording into explicit financial candlestick and
+  price-trend geometry before provider submission whenever Astra will render
+  the exact copy itself.
+- Explicitly prohibit an isolated Latin `K` or other alphabetic glyphs in the
+  model-generated background while retaining the existing no-text/no-logo
+  brand-safe contract.
+
+## Validation
+
+- Add a real H.264 render regression proving that the display title no longer
+  creates a broad dark panel, plus prompt regressions for both branded and
+  unbranded video requests.
+- Pass the complete media-asset and custom-media-tool suites and Ruff on all
+  changed Python files before release.
+
 # v1.11.33 — Commercial Media Routing and Poster Quality
 
 ## Commercial poster composition

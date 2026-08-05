@@ -686,6 +686,57 @@ async def test_real_video_decodes_and_contains_exact_copy_and_protected_product(
 
 
 @pytest.mark.asyncio
+async def test_video_title_uses_display_font_without_legacy_black_panel(tmp_path):
+    source = _real_mp4(tmp_path)
+
+    result, receipt = await apply_video_brand_overlays(
+        source,
+        "量化交易平台",
+        text_position="center",
+    )
+
+    assert receipt.layout_version == "single-text-v2"
+    assert receipt.block_count == 1
+    assert receipt.layout_bounds_verified is True
+    assert receipt.font_family is not None
+    assert "Serif" not in receipt.font_family
+    assert "Song" not in receipt.font_family
+
+    ffmpeg = shutil.which("ffmpeg")
+    assert ffmpeg
+    frame = subprocess.run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            "pipe:0",
+            "-frames:v",
+            "1",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "png",
+            "pipe:1",
+        ],
+        input=result,
+        stdout=subprocess.PIPE,
+        check=True,
+    )
+    with Image.open(BytesIO(frame.stdout)) as image:
+        rendered = image.convert("RGB")
+        center_band = rendered.crop((180, 130, 460, 230))
+        dark_panel_pixels = sum(
+            1
+            for red, green, blue in center_band.get_flattened_data()
+            if red < 24 and green < 58 and blue < 72
+        )
+
+    assert dark_panel_pixels / (center_band.width * center_band.height) < 0.25
+
+
+@pytest.mark.asyncio
 async def test_silent_video_can_be_finished_with_voiceover_and_music(tmp_path):
     source = _real_mp4(tmp_path)
     voice_dir = tmp_path / "voice"

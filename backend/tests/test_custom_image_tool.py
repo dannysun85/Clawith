@@ -27,6 +27,7 @@ from app.services.agent_tools import (
     _generate_music_minimax,
     _generate_speech_minimax,
     _generate_video_minimax,
+    _brand_safe_video_provider_prompt,
     _get_agent_tenant_id,
     _get_minimax_tenant_uuid,
     _validate_formal_poster_copy_contract,
@@ -54,6 +55,30 @@ from app.services.llm.load_balancer import (
     CredentialUnavailableReason,
     NoCredentialAvailable,
 )
+
+
+def test_brand_safe_video_prompt_rewrites_k_line_into_non_glyph_geometry():
+    provider_prompt = _brand_safe_video_provider_prompt(
+        "Slow push-in toward glowing K-line trend curves and K 线 data.",
+        has_exact_overlay=True,
+        has_brand_asset=False,
+    )
+
+    assert "K-line" not in provider_prompt
+    assert "K 线" not in provider_prompt
+    assert "financial candlestick price-trend chart" in provider_prompt
+    assert "金融蜡烛图与价格走势线" in provider_prompt
+    assert "never draw an isolated Latin K glyph" in provider_prompt
+
+
+def test_unbranded_video_prompt_is_not_rewritten():
+    prompt = "Slow push-in toward a K-line chart."
+
+    assert _brand_safe_video_provider_prompt(
+        prompt,
+        has_exact_overlay=False,
+        has_brand_asset=False,
+    ) == prompt
 
 
 def _valid_png_bytes() -> bytes:

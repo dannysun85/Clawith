@@ -30587,6 +30587,37 @@ def _write_minimax_video_metadata_best_effort(
     return True
 
 
+def _brand_safe_video_provider_prompt(
+    prompt: str,
+    *,
+    has_exact_overlay: bool,
+    has_brand_asset: bool,
+) -> str:
+    """Keep finance-chart language from becoming a literal provider glyph."""
+
+    if not has_exact_overlay and not has_brand_asset:
+        return prompt
+    background_prompt = re.sub(
+        r"\bK[\s-]*line(?:s)?\b",
+        "financial candlestick price-trend chart",
+        prompt,
+        flags=re.IGNORECASE,
+    )
+    background_prompt = re.sub(
+        r"K\s*线",
+        "金融蜡烛图与价格走势线",
+        background_prompt,
+        flags=re.IGNORECASE,
+    )
+    return (
+        f"{background_prompt}\nCreate only a clean moving background. Do not render words, letters, captions, "
+        "logos, watermarks, product packaging, or product replicas. Leave clear negative space for Astra to add "
+        "the exact copy and protected brand asset after generation. When the creative brief mentions a financial "
+        "chart, depict only abstract candlesticks and price-trend geometry; never draw an isolated Latin K glyph "
+        "or any alphabetic symbol."
+    )
+
+
 async def _generate_video_minimax(
     agent_id: uuid.UUID,
     ws: Path,
@@ -30945,13 +30976,11 @@ async def _generate_video_minimax(
         resolution = credential.resolution or resolution
     wait_for_completion = bool(arguments.get("wait_for_completion") or config.get("wait_for_completion") or False)
     poll_timeout_seconds = int(arguments.get("poll_timeout_seconds") or config.get("poll_timeout_seconds") or 180)
-    provider_prompt = prompt
-    if overlay_text.strip() or brand_asset:
-        provider_prompt = (
-            f"{prompt}\nCreate only a clean moving background. Do not render words, letters, captions, logos, "
-            "watermarks, product packaging, or product replicas. Leave clear negative space for Astra to add "
-            "the exact copy and protected brand asset after generation."
-        )
+    provider_prompt = _brand_safe_video_provider_prompt(
+        prompt,
+        has_exact_overlay=bool(overlay_text.strip()),
+        has_brand_asset=bool(brand_asset),
+    )
     sanitize_generated_background = False
 
     reservation_id: uuid.UUID | None = None

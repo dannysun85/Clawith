@@ -735,9 +735,12 @@ def _render_brand_asset_layer(canvas, asset: ImageAsset, *, position: str, scale
 
 
 def _render_text_layer(canvas, text: str, *, position: str) -> OverlayReceipt:
-    from PIL import ImageDraw
+    from PIL import Image, ImageDraw, ImageFilter
 
-    selection = _font_for_text(text)
+    # A single exact-copy overlay is normally a title or short campaign line.
+    # Use the production display face instead of the generic body face so video
+    # titles match the role-aware poster typography.
+    selection = _font_for_poster_role(text, "title")
     draw = ImageDraw.Draw(canvas, "RGBA")
     width, height = canvas.size
     font, lines, boxes, widths, heights, spacing, text_width, text_height = _text_layout(
@@ -748,8 +751,6 @@ def _render_text_layer(canvas, text: str, *, position: str) -> OverlayReceipt:
         height,
     )
     font_size = int(getattr(font, "size", 24))
-    pad_x = max(18, font_size // 2)
-    pad_y = max(14, font_size // 3)
     x = (width - text_width) // 2
     normalized_position = position if position in _TEXT_POSITIONS else "bottom"
     y = {
@@ -757,17 +758,30 @@ def _render_text_layer(canvas, text: str, *, position: str) -> OverlayReceipt:
         "center": (height - text_height) // 2,
         "bottom": height - text_height - int(height * 0.09),
     }[normalized_position]
-    rect = (
-        max(0, x - pad_x),
-        max(0, y - pad_y),
-        min(width, x + text_width + pad_x),
-        min(height, y + text_height + pad_y),
-    )
-    draw.rounded_rectangle(
-        rect,
-        radius=max(12, font_size // 3),
-        fill=(0, 0, 0, 165),
-    )
+    # The legacy renderer placed all exact copy on an opaque black pill. That
+    # guarantees contrast, but reads like a debug label on commercial video.
+    # A tight violet shadow plus a restrained outline keeps the copy legible on
+    # changing footage without hiding the generated scene behind a slab.
+    shadow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    shadow_draw = ImageDraw.Draw(shadow, "RGBA")
+    shadow_offset = max(1, font_size // 18)
+    shadow_blur = max(2, font_size // 12)
+    cursor_y = y
+    for line, box, line_width, line_height in zip(lines, boxes, widths, heights, strict=True):
+        if line:
+            line_x = (width - line_width) // 2 - box[0]
+            shadow_draw.text(
+                (line_x + shadow_offset, cursor_y - box[1] + shadow_offset),
+                line,
+                font=font,
+                fill=(38, 24, 82, 210),
+                stroke_width=max(1, font_size // 30),
+                stroke_fill=(38, 24, 82, 178),
+            )
+        cursor_y += line_height + spacing
+    canvas.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(shadow_blur)))
+
+    draw = ImageDraw.Draw(canvas, "RGBA")
     cursor_y = y
     for line, box, line_width, line_height in zip(lines, boxes, widths, heights, strict=True):
         if line:
@@ -776,8 +790,8 @@ def _render_text_layer(canvas, text: str, *, position: str) -> OverlayReceipt:
                 line,
                 font=font,
                 fill=(255, 255, 255, 255),
-                stroke_width=max(1, font_size // 28),
-                stroke_fill=(0, 0, 0, 225),
+                stroke_width=max(1, font_size // 36),
+                stroke_fill=(83, 59, 135, 188),
             )
         cursor_y += line_height + spacing
     return OverlayReceipt(
@@ -786,6 +800,15 @@ def _render_text_layer(canvas, text: str, *, position: str) -> OverlayReceipt:
         font_family=selection.family,
         font_face_index=selection.face_index,
         line_count=len(lines),
+        layout_version="single-text-v2",
+        block_count=1,
+        layout_bounds_verified=True,
+        content_left=x,
+        content_top=y,
+        content_right=x + text_width,
+        content_bottom=y + text_height,
+        safe_margin_x=max(1, int(width * 0.05)),
+        safe_margin_y=max(1, int(height * 0.06)),
     )
 
 
@@ -1300,14 +1323,9 @@ def _compose_overlay_canvas(
         )
     if normalized_text:
         text_receipt = _render_text_layer(canvas, normalized_text, position=text_position)
-        receipt = OverlayReceipt(
-            rendered_text_sha256=text_receipt.rendered_text_sha256,
+        receipt = replace(
+            text_receipt,
             brand_asset_sha256=receipt.brand_asset_sha256,
-            font_sha256=text_receipt.font_sha256,
-            font_family=text_receipt.font_family,
-            font_face_index=text_receipt.font_face_index,
-            font_roles=text_receipt.font_roles,
-            line_count=text_receipt.line_count,
         )
     return canvas, receipt
 
