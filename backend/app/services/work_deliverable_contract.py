@@ -19,10 +19,15 @@ _ASPECT_RATIO_RE = re.compile(
     r"(?<!\d)(1|3|9|16)\s*[:：]\s*(1|4|9|16)(?!\d)"
 )
 _POSTER_COPY_RE = re.compile(
-    r"^(?:[-*•]\s*)?(主标题|副标题|标语|CTA)\s*[:：]\s*(.+?)\s*$",
+    r"^(?:[-*•]\s*)?(主标题|副标题|标语|落款|署名|品牌落款|CTA|按钮)\s*[:：]\s*(.+?)\s*$",
     re.IGNORECASE,
 )
-_POSTER_COPY_LABELS = ("主标题", "副标题", "标语", "CTA")
+_POSTER_COPY_LABELS = ("主标题", "副标题", "标语", "落款", "CTA")
+_POSTER_COPY_LABEL_ALIASES = {
+    "署名": "落款",
+    "品牌落款": "落款",
+    "按钮": "CTA",
+}
 _INLINE_POSTER_COPY_PATTERNS = {
     "主标题": re.compile(
         r"(?:主标题|大标题)[^，；。\n]{0,48}?(?:【([^】\n]+)】|「([^」\n]+)」|“([^”\n]+)”|\"([^\"\n]+)\")",
@@ -36,8 +41,13 @@ _INLINE_POSTER_COPY_PATTERNS = {
         r"(?:标语|口号)[^，；。\n]{0,48}?(?:【([^】\n]+)】|「([^」\n]+)」|“([^”\n]+)”|\"([^\"\n]+)\")",
         re.IGNORECASE,
     ),
+    "落款": re.compile(
+        r"(?:落款|署名|品牌落款)[^，；。\n]{0,48}?(?:【([^】\n]+)】|「([^」\n]+)」|“([^”\n]+)”|\"([^\"\n]+)\")",
+        re.IGNORECASE,
+    ),
     "CTA": re.compile(
-        r"(?:CTA|按钮(?:内)?(?:白色)?文字)[^，；。\n]{0,48}?(?:【([^】\n]+)】|「([^」\n]+)」|“([^”\n]+)”|\"([^\"\n]+)\")",
+        r"(?:(?:CTA|按钮(?:内)?(?:白色)?(?:文字|文案))[^，；。\n]{0,48}?|"
+        r"按钮\s*[:：]?\s*)(?:【([^】\n]+)】|「([^」\n]+)」|“([^”\n]+)”|\"([^\"\n]+)\")",
         re.IGNORECASE,
     ),
 }
@@ -80,7 +90,11 @@ def _explicit_poster_copy(goal: str) -> str | None:
         if match is None:
             continue
         raw_label, raw_value = match.groups()
-        label = "CTA" if raw_label.upper() == "CTA" else raw_label
+        label = (
+            "CTA"
+            if raw_label.upper() == "CTA"
+            else _POSTER_COPY_LABEL_ALIASES.get(raw_label, raw_label)
+        )
         if not record(label, raw_value):
             return None
 

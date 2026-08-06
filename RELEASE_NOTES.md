@@ -1,3 +1,18 @@
+# v1.11.37 — Complete Poster Copy Handoff
+
+## Work to formal-delivery contract
+
+- Preserve explicit poster footer/signature copy and button/CTA copy when a
+  completed Image Brief continues into the immutable formal-delivery flow.
+- Keep the browser-side handoff parser and server-owned contract compiler in
+  lockstep so users can review all copy without triggering a false
+  `task_deliverable_contract_mismatch`.
+
+## Validation
+
+- Add backend and frontend regressions for five-role commercial poster copy:
+  title, subtitle, tagline, footer, and CTA.
+
 # v1.11.36 — Managed Poster Contract Clarity
 
 ## Agent-visible image execution contract

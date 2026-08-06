@@ -141,6 +141,82 @@ def test_work_task_contract_extracts_explicit_copy_from_original_poster_prose() 
     }
 
 
+def test_work_task_contract_preserves_footer_and_button_from_inline_poster_prose() -> None:
+    objective = (
+        "竖版 9:16 商业宣传海报，主标题【把 AI 公司真正运行起来】；"
+        "副标题【数字员工・任务协作・WorkProduct 审核】；"
+        "标语【从任务到成果，企业运营真正闭环】；"
+        "落款【ReefTotem｜深圳前海瑞孚图腾科技有限公司】；按钮【立即体验】。"
+    )
+    task = SimpleNamespace(
+        work_type="image",
+        intent=objective,
+        work_statement={
+            "delivery_mode": "task_only",
+            "work_type": "image",
+            "objective": objective,
+        },
+    )
+
+    contract = work_task_deliverable_contract(task)
+
+    assert contract is not None
+    assert contract.spec == {
+        "aspect_ratio": "9:16",
+        "exact_copy": "\n".join(
+            [
+                "把 AI 公司真正运行起来",
+                "数字员工・任务协作・WorkProduct 审核",
+                "从任务到成果，企业运营真正闭环",
+                "ReefTotem｜深圳前海瑞孚图腾科技有限公司",
+                "立即体验",
+            ]
+        ),
+    }
+
+
+def test_work_task_contract_does_not_treat_button_style_as_cta_copy() -> None:
+    objective = (
+        "竖版 9:16 海报，主标题【A】；副标题【B】；标语【C】；"
+        "按钮样式【渐变粉紫发光圆角】，按钮内白色文字【立即体验】。"
+    )
+    task = SimpleNamespace(
+        work_type="image",
+        intent=objective,
+        work_statement={
+            "delivery_mode": "task_only",
+            "work_type": "image",
+            "objective": objective,
+        },
+    )
+
+    contract = work_task_deliverable_contract(task)
+
+    assert contract is not None
+    assert contract.spec == {
+        "aspect_ratio": "9:16",
+        "exact_copy": "A\nB\nC\n立即体验",
+    }
+
+    style_only = SimpleNamespace(
+        work_type="image",
+        intent="fallback",
+        work_statement={
+            "delivery_mode": "task_only",
+            "work_type": "image",
+            "objective": (
+                "竖版 9:16 海报，主标题【A】；副标题【B】；"
+                "标语【C】；按钮样式【渐变粉紫发光圆角】。"
+            ),
+        },
+    )
+
+    style_only_contract = work_task_deliverable_contract(style_only)
+
+    assert style_only_contract is not None
+    assert style_only_contract.spec["exact_copy"] == "A\nB\nC"
+
+
 def test_quality_review_and_approval_remain_distinct_stages() -> None:
     assert project_user_stage(
         task_status=None,

@@ -167,6 +167,57 @@ describe('deliverable composer selection', () => {
         });
     });
 
+    it('preserves footer and button copy from inline poster prose', () => {
+        const goal = [
+            '竖版 9:16 商业宣传海报，主标题【把 AI 公司真正运行起来】；',
+            '副标题【数字员工・任务协作・WorkProduct 审核】；',
+            '标语【从任务到成果，企业运营真正闭环】；',
+            '落款【ReefTotem｜深圳前海瑞孚图腾科技有限公司】；按钮【立即体验】。',
+        ].join('');
+        const item = workItem({
+            work_statement: { work_type: 'image', objective: goal },
+        });
+
+        expect(workTaskDeliverableHandoff(item)?.specOverrides).toEqual({
+            aspect_ratio: '9:16',
+            exact_copy: [
+                '把 AI 公司真正运行起来',
+                '数字员工・任务协作・WorkProduct 审核',
+                '从任务到成果，企业运营真正闭环',
+                'ReefTotem｜深圳前海瑞孚图腾科技有限公司',
+                '立即体验',
+            ].join('\n'),
+        });
+    });
+
+    it('does not treat button style as CTA copy', () => {
+        const goal = (
+            '竖版 9:16 海报，主标题【A】；副标题【B】；标语【C】；'
+            + '按钮样式【渐变粉紫发光圆角】，按钮内白色文字【立即体验】。'
+        );
+        const item = workItem({
+            work_statement: { work_type: 'image', objective: goal },
+        });
+
+        expect(workTaskDeliverableHandoff(item)?.specOverrides).toEqual({
+            aspect_ratio: '9:16',
+            exact_copy: 'A\nB\nC\n立即体验',
+        });
+
+        const styleOnly = workItem({
+            work_statement: {
+                work_type: 'image',
+                objective: (
+                    '竖版 9:16 海报，主标题【A】；副标题【B】；'
+                    + '标语【C】；按钮样式【渐变粉紫发光圆角】。'
+                ),
+            },
+        });
+
+        expect(workTaskDeliverableHandoff(styleOnly)?.specOverrides.exact_copy)
+            .toBe('A\nB\nC');
+    });
+
     it('does not open formal delivery for unfinished or already-linked work', () => {
         const base = workItem();
 

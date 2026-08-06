@@ -25,7 +25,12 @@ export type WorkTaskDeliverableHandoff = {
 };
 
 const DELIVERABLE_ASPECT_RATIOS = new Set(['1:1', '3:4', '9:16', '16:9']);
-const POSTER_COPY_LABELS = ['主标题', '副标题', '标语', 'CTA'] as const;
+const POSTER_COPY_LABELS = ['主标题', '副标题', '标语', '落款', 'CTA'] as const;
+const POSTER_COPY_LABEL_ALIASES: Record<string, (typeof POSTER_COPY_LABELS)[number]> = {
+    '署名': '落款',
+    '品牌落款': '落款',
+    '按钮': 'CTA',
+};
 const POSTER_COPY_WRAPPERS: Record<string, string> = {
     '【': '】',
     '「': '」',
@@ -39,7 +44,8 @@ const INLINE_POSTER_COPY_PATTERNS: Array<[
     ['主标题', /(?:主标题|大标题)[^，；。\n]{0,48}?(?:【([^】\n]+)】|「([^」\n]+)」|“([^”\n]+)”|"([^"\n]+)")/gi],
     ['副标题', /副标题[^，；。\n]{0,48}?(?:【([^】\n]+)】|「([^」\n]+)」|“([^”\n]+)”|"([^"\n]+)")/gi],
     ['标语', /(?:标语|口号)[^，；。\n]{0,48}?(?:【([^】\n]+)】|「([^」\n]+)」|“([^”\n]+)”|"([^"\n]+)")/gi],
-    ['CTA', /(?:CTA|按钮(?:内)?(?:白色)?文字)[^，；。\n]{0,48}?(?:【([^】\n]+)】|「([^」\n]+)」|“([^”\n]+)”|"([^"\n]+)")/gi],
+    ['落款', /(?:落款|署名|品牌落款)[^，；。\n]{0,48}?(?:【([^】\n]+)】|「([^」\n]+)」|“([^”\n]+)”|"([^"\n]+)")/gi],
+    ['CTA', /(?:(?:CTA|按钮(?:内)?(?:白色)?(?:文字|文案))[^，；。\n]{0,48}?|按钮\s*[:：]?\s*)(?:【([^】\n]+)】|「([^」\n]+)」|“([^”\n]+)”|"([^"\n]+)")/gi],
 ];
 
 function explicitAspectRatio(goal: string): string | undefined {
@@ -68,11 +74,12 @@ function explicitPosterCopy(goal: string): string | undefined {
     };
 
     for (const line of goal.split(/\r?\n/)) {
-        const match = line.trim().match(/^(?:[-*•]\s*)?(主标题|副标题|标语|CTA)\s*[:：]\s*(.+?)\s*$/i);
+        const match = line.trim().match(/^(?:[-*•]\s*)?(主标题|副标题|标语|落款|署名|品牌落款|CTA|按钮)\s*[:：]\s*(.+?)\s*$/i);
         if (!match) continue;
         const label = match[1].toUpperCase() === 'CTA'
             ? 'CTA'
-            : match[1] as (typeof POSTER_COPY_LABELS)[number];
+            : POSTER_COPY_LABEL_ALIASES[match[1]]
+                || match[1] as (typeof POSTER_COPY_LABELS)[number];
         if (!record(label, match[2])) return undefined;
     }
     for (const [label, pattern] of INLINE_POSTER_COPY_PATTERNS) {
