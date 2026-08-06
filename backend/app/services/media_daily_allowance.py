@@ -54,6 +54,27 @@ def minimax_video_allowance_credential_is_eligible(
     remains the concurrency-safe source of truth at submission time.
     """
 
+    if not minimax_video_allowance_credential_is_trackable(credential):
+        return False
+    daily_quota = getattr(credential, "daily_quota", None)
+    if daily_quota is not None and int(getattr(credential, "used_today", 0) or 0) >= int(
+        daily_quota or 0
+    ):
+        return False
+    return not credential_modality_is_blocked(credential, "video")
+
+
+def minimax_video_allowance_credential_is_trackable(
+    credential: LLMCredential,
+) -> bool:
+    """Return whether an account owns a visible MiniMax video allowance.
+
+    A transient modality block, including the provider's daily quota response,
+    must not erase the account from the control-plane denominator.  Operators
+    still need to see ``3/3`` after the third accepted submission even though
+    the runtime correctly stops selecting that credential until reset.
+    """
+
     if (
         str(getattr(credential, "provider", "") or "").strip().lower()
         != "minimax"
@@ -64,17 +85,12 @@ def minimax_video_allowance_credential_is_eligible(
         or current_credential_verification_receipt(credential) is None
     ):
         return False
-    daily_quota = getattr(credential, "daily_quota", None)
-    if daily_quota is not None and int(getattr(credential, "used_today", 0) or 0) >= int(
-        daily_quota or 0
-    ):
-        return False
     capabilities = getattr(credential, "capabilities", None)
     if capabilities is not None:
         declared = set(canonicalize_modalities(capabilities))
         if "video" not in declared and "multimodal" not in declared:
             return False
-    return not credential_modality_is_blocked(credential, "video")
+    return True
 
 
 async def claim_minimax_video_allowance(
@@ -193,7 +209,7 @@ async def minimax_video_allowance_summary(
     now: datetime | None = None,
     credentials: list[LLMCredential] | tuple[LLMCredential, ...] | None = None,
 ) -> dict[str, object]:
-    """Return the executable, non-sensitive MiniMax video allowance pool."""
+    """Return quota inventory plus current execution eligibility."""
 
     allowance_date = current_allowance_date(now)
     if credentials is None:
@@ -212,13 +228,18 @@ async def minimax_video_allowance_summary(
             == "minimax"
             and getattr(credential, "tenant_id", None) is None
         ]
-    eligible_credentials = [
+    tracked_credentials = [
         credential
         for credential in candidate_credentials
-        if minimax_video_allowance_credential_is_eligible(credential)
+        if minimax_video_allowance_credential_is_trackable(credential)
     ]
+    eligible_credential_ids = {
+        credential.id
+        for credential in tracked_credentials
+        if minimax_video_allowance_credential_is_eligible(credential)
+    }
     accounts: list[dict[str, object]] = []
-    for credential in eligible_credentials:
+    for credential in tracked_credentials:
         used_result = await db.execute(
             select(func.count(MediaProviderDailyAllowanceClaim.id)).where(
                 MediaProviderDailyAllowanceClaim.credential_id == credential.id,
@@ -236,16 +257,23 @@ async def minimax_video_allowance_summary(
                 "quota": MINIMAX_VIDEO_DAILY_ALLOWANCE,
                 "used": used,
                 "remaining": max(MINIMAX_VIDEO_DAILY_ALLOWANCE - used, 0),
+                "eligible": credential.id in eligible_credential_ids,
             }
         )
+    eligible_credentials = [
+        credential
+        for credential in tracked_credentials
+        if credential.id in eligible_credential_ids
+    ]
     return {
         "allowance_date": allowance_date.isoformat(),
         "timezone": str(_ALLOWANCE_TIMEZONE),
         "quota": sum(int(item["quota"]) for item in accounts),
         "used": sum(int(item["used"]) for item in accounts),
         "remaining": sum(int(item["remaining"]) for item in accounts),
-        "eligible_accounts": len(accounts),
-        "excluded_accounts": len(candidate_credentials) - len(accounts),
+        "tracked_accounts": len(accounts),
+        "eligible_accounts": len(eligible_credentials),
+        "excluded_accounts": len(candidate_credentials) - len(eligible_credentials),
         "accounts": accounts,
     }
 
@@ -258,6 +286,7 @@ __all__ = [
     "claim_minimax_video_allowance",
     "current_allowance_date",
     "minimax_video_allowance_credential_is_eligible",
+    "minimax_video_allowance_credential_is_trackable",
     "minimax_video_allowance_summary",
     "release_daily_allowance_claim",
 ]

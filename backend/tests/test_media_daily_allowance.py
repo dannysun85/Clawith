@@ -229,20 +229,25 @@ async def test_provider_selection_tries_next_minimax_account_after_allowance_exh
 
 
 @pytest.mark.asyncio
-async def test_allowance_summary_counts_only_current_executable_video_accounts():
+async def test_allowance_summary_keeps_blocked_account_in_quota_denominator():
     eligible = _verified_credential(label="eligible")
     text_only = _verified_credential(label="text-only", capabilities=["text"])
     unverified = _verified_credential(label="unverified")
     unverified.verification_receipt = None
     blocked = _verified_credential(label="blocked")
     blocked.modality_status = {"video": {"status": "quota_exceeded"}}
-    session = _Session([eligible, text_only, unverified, blocked], 1)
+    session = _Session([eligible, text_only, unverified, blocked], 1, 3)
 
     summary = await media_daily_allowance.minimax_video_allowance_summary(session)
 
-    assert summary["quota"] == 3
-    assert summary["used"] == 1
+    assert summary["quota"] == 6
+    assert summary["used"] == 4
     assert summary["remaining"] == 2
+    assert summary["tracked_accounts"] == 2
     assert summary["eligible_accounts"] == 1
     assert summary["excluded_accounts"] == 3
-    assert [item["label"] for item in summary["accounts"]] == ["eligible"]
+    assert [item["label"] for item in summary["accounts"]] == [
+        "eligible",
+        "blocked",
+    ]
+    assert [item["eligible"] for item in summary["accounts"]] == [True, False]

@@ -80,9 +80,10 @@ type MediaRoute = {
         quota: number;
         used: number;
         remaining: number;
+        tracked_accounts: number;
         eligible_accounts: number;
         excluded_accounts: number;
-        accounts: Array<{ credential_id: string; label: string; quota: number; used: number; remaining: number }>;
+        accounts: Array<{ credential_id: string; label: string; quota: number; used: number; remaining: number; eligible: boolean }>;
     } | null;
     provider_quotes?: Record<string, {
         model: string;
@@ -599,8 +600,8 @@ function MediaRouteRow({ route }: { route: MediaRoute }) {
                 )}
                 {route.modality === 'video' && route.minimax_allowance && (
                     <div style={{ color: route.minimax_allowance.remaining > 0 ? 'var(--success)' : 'var(--warning)', fontSize: 10, marginTop: 3 }}>
-                        MiniMax 日额度：{route.minimax_allowance.used}/{route.minimax_allowance.quota}，剩余 {route.minimax_allowance.remaining}（{route.minimax_allowance.allowance_date}）
-                        {route.minimax_allowance.excluded_accounts > 0 && `；另有 ${route.minimax_allowance.excluded_accounts} 个账号不满足当前执行条件`}
+                        MiniMax 日额度：已用 {route.minimax_allowance.used}/{route.minimax_allowance.quota}，剩余 {route.minimax_allowance.remaining}（{route.minimax_allowance.allowance_date}）
+                        {route.minimax_allowance.excluded_accounts > 0 && `；${route.minimax_allowance.excluded_accounts} 个账号当前不可执行`}
                     </div>
                 )}
                 <div style={{ marginTop: 5, display: 'grid', gap: 3 }}>

@@ -1,3 +1,19 @@
+# v1.11.39 — Visible MiniMax Daily Allowance Accounting
+
+## Operator quota truth
+
+- Keep a verified MiniMax Plan account in the daily allowance denominator after
+  its video route becomes temporarily blocked, so the SaaS console reports
+  `已用 3/3，剩余 0` instead of the misleading `0/0`.
+- Continue to exclude the exhausted account from runtime selection and route
+  the next request to the configured Volcengine tier without changing the
+  accepted/unknown replay fence.
+
+## Validation
+
+- Add regressions for the split between tracked quota accounts and accounts
+  that are currently executable.
+
 # v1.11.38 — Terminal Media Incident Accounting
 
 ## Video recovery and production-noise correctness

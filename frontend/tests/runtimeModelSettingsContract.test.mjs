@@ -95,6 +95,7 @@ test('media admin exposes strategy routing, provider receipts, and non-equivalen
   assert.match(saasAdminSource, /Ultra 只有请求明确指定 1080P 才升级/);
   assert.match(saasAdminSource, /实际 provider\/model 只以任务 receipt 为准/);
   assert.match(saasAdminSource, /MiniMax 日额度/);
+  assert.match(saasAdminSource, /MiniMax 日额度：已用/);
   assert.match(saasAdminSource, /火山接续档位/);
   assert.match(saasAdminSource, /首选不可用，改用 \$\{providerLabel\(strategy\.alternate_provider\)\}\$\{strategy\.alternate_confirmation_required \? '需确认' : '自动接续'\}/);
   assert.match(saasAdminSource, /账号线路可路由/);

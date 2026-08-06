@@ -493,8 +493,8 @@ def _media_route_out(
     ]
     minimax_allowance_exhausted = bool(
         modality == "video"
-        and MINIMAX_PROVIDER in account_ready_providers
         and minimax_allowance is not None
+        and int(minimax_allowance.get("quota", 0) or 0) > 0
         and int(minimax_allowance.get("remaining", 0) or 0) <= 0
     )
     available_providers = [
