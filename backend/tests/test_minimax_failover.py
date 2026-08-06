@@ -37,6 +37,14 @@ class TestExtractMinimaxCode:
     def test_returns_none_when_no_code(self):
         assert extract_minimax_code("random error without code") is None
 
+    def test_does_not_treat_video_resolution_as_provider_code(self):
+        assert (
+            extract_minimax_code(
+                "Video delivery contract invalid: aspect ratio is 1080:1440"
+            )
+            is None
+        )
+
 
 # --- classify_error MiniMax codes ---
 

@@ -1236,7 +1236,7 @@ async def test_expired_sync_task_with_foreign_reservation_is_dead_lettered(monke
 
 
 @pytest.mark.asyncio
-async def test_tampered_exact_copy_holds_provider_debt_for_asset_repair(monkeypatch):
+async def test_tampered_exact_copy_holds_provider_debt_without_retry_loop(monkeypatch):
     task = SimpleNamespace(
         id=uuid.uuid4(),
         tenant_id=uuid.uuid4(),
@@ -1266,7 +1266,8 @@ async def test_tampered_exact_copy_holds_provider_debt_for_asset_repair(monkeypa
             return False
 
     async def record_asset_failure(_record_id, error, _status_data, **_kwargs):
-        task.status = "asset_repairing"
+        assert _kwargs["retryable"] is False
+        task.status = "asset_delivery_failed"
         task.last_error = str(error)
         return True, task
 
@@ -1311,8 +1312,8 @@ async def test_tampered_exact_copy_holds_provider_debt_for_asset_repair(monkeypa
         status_data={"status": "Success", "file_id": "file-1"},
     )
 
-    assert outcome.status == "retrying"
-    assert outcome.retryable is True
+    assert outcome.status == "failed"
+    assert outcome.retryable is False
     assert "Frozen video copy hash" in (outcome.error or "")
     asset_failure_mock.assert_awaited_once()
     finalize_failure_mock.assert_not_awaited()
@@ -2333,6 +2334,70 @@ async def test_transient_recovery_errors_are_bounded_and_release_once(monkeypatc
     assert release.await_count == 1
     assert release.await_args.args[1] == task.reservation_id
     record_issue.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_transient_asset_repair_does_not_emit_one_issue_per_retry(monkeypatch):
+    task = SimpleNamespace(
+        id=uuid.uuid4(),
+        status="downloading",
+        reservation_id=uuid.uuid4(),
+        request_metadata={"processing_lease_token": "lease-a"},
+        consecutive_error_count=0,
+        last_response=None,
+        last_error=None,
+        last_checked_at=None,
+        next_poll_at=datetime.now(timezone.utc),
+    )
+    reservation = SimpleNamespace(id=task.reservation_id, amount=280)
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            return task
+
+        async def commit(self):
+            return None
+
+    record_issue = AsyncMock()
+    monkeypatch.setattr(media_generation, "async_session", lambda: Session())
+    monkeypatch.setattr(
+        media_generation,
+        "_lock_owned_media_reservation",
+        AsyncMock(return_value=reservation),
+    )
+    monkeypatch.setattr(
+        media_generation,
+        "mark_credit_reservation_settlement_ready_in_session",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(media_generation, "_record_media_failure_issue", record_issue)
+    monkeypatch.setattr(
+        media_generation,
+        "get_settings",
+        lambda: SimpleNamespace(
+            MEDIA_GENERATION_MAX_CONSECUTIVE_ERRORS=8,
+            MEDIA_GENERATION_POLL_INTERVAL_SECONDS=5,
+        ),
+    )
+
+    recorded, result = await media_generation._record_provider_success_asset_failure(
+        task.id,
+        TimeoutError("temporary object storage timeout"),
+        {"status": "Success"},
+        expected_working_status="downloading",
+        processing_lease_token="lease-a",
+    )
+
+    assert recorded is True
+    assert result.status == "asset_repairing"
+    assert result.consecutive_error_count == 1
+    record_issue.assert_not_awaited()
 
 
 @pytest.mark.asyncio

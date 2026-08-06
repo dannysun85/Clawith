@@ -54,14 +54,21 @@ MINIMAX_RATELIMIT_CODES = {
 }  # rate / connection / Token Plan interactive-traffic limit
 MINIMAX_TRANSIENT_CODES = {"1000", "1001", "1013", "1024", "1033"}  # unknown/timeout/internal/downstream
 
-# Pattern to extract MiniMax code from error strings like "(1004)" or "code=1004"
-_MINIMAX_CODE_RE = re.compile(r"[(\s=](\d{4})")
+# Extract only an explicitly labelled provider status code.  The previous
+# pattern also matched ordinary four-digit product values such as ``1080P``
+# and turned a local delivery-contract failure into a fake provider code.
+_MINIMAX_CODE_RE = re.compile(
+    r"(?:\((\d{4})\)|\b(?:code|status_code|error_code)\s*=\s*(\d{4})\b)",
+    re.IGNORECASE,
+)
 
 
 def extract_minimax_code(error_msg: str) -> str | None:
     """Extract a MiniMax status_code from an error message if present."""
     m = _MINIMAX_CODE_RE.search(error_msg)
-    return m.group(1) if m else None
+    if not m:
+        return None
+    return next((value for value in m.groups() if value), None)
 
 
 def _structured_provider_code(error: Exception) -> str | None:

@@ -1,3 +1,22 @@
+# v1.11.38 — Terminal Media Incident Accounting
+
+## Video recovery and production-noise correctness
+
+- Treat deterministic video delivery-contract failures, including a provider
+  output with the wrong aspect ratio, as immediate manual-reconciliation
+  states after provider success. Credits remain held and the provider task is
+  never replayed.
+- Record retryable local asset-repair incidents only when recovery reaches its
+  terminal operator state, so one failed task no longer produces one dashboard
+  event per polling attempt.
+- Parse MiniMax error codes only from explicit provider-code syntax, preventing
+  values such as `1080P` from becoming misleading production issue codes.
+
+## Validation
+
+- Add regressions for non-retryable video contract failures, retry-event
+  suppression, and resolution text that contains a four-digit number.
+
 # v1.11.37 — Complete Poster Copy Handoff
 
 ## Work to formal-delivery contract

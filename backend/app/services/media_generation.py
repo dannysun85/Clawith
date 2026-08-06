@@ -1850,7 +1850,12 @@ async def _record_provider_success_asset_failure(
             task.next_poll_at = _utcnow() + timedelta(seconds=backoff)
         await db.commit()
 
-    await _record_media_failure_issue(task, task.last_error or "Asset delivery failed")
+    # ``asset_repairing`` is a bounded internal recovery state, not one new
+    # production incident per poll.  Persist a production event only when the
+    # task actually reaches the manual-reconciliation state.  This keeps the
+    # incident count aligned with affected tasks instead of retry attempts.
+    if task.status == "asset_delivery_failed":
+        await _record_media_failure_issue(task, task.last_error or "Asset delivery failed")
     return True, task
 
 
@@ -3318,6 +3323,7 @@ async def reconcile_minimax_video_task(
             status_data,
             expected_working_status="downloading",
             processing_lease_token=processing_lease_token or "",
+            retryable=False,
         )
         if repair_task.status == "succeeded":
             return MediaGenerationOutcome(
