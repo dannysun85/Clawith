@@ -61,6 +61,13 @@ def test_every_image_provider_exposes_the_same_brand_safe_contract():
             not in _seeded_tool(name)["parameters_schema"]["properties"]
         )
 
+    runtime_description = _runtime_tool("generate_image_minimax")["function"][
+        "description"
+    ]
+    assert "provider generates only the text-free visual background" in runtime_description
+    assert "Astra's server deterministically composites" in runtime_description
+    assert "callers neither provide nor need a delivery_size field" in runtime_description
+
 
 def test_media_artifact_registry_covers_every_seeded_media_producer():
     seeded_media_producers = {
@@ -109,6 +116,10 @@ def test_brand_safe_media_skill_is_role_scoped_with_explicit_media_grants():
     assert "Do not make the user complete a production form" in content
     assert "Put one exact text element in `overlay_text`" in content
     assert "multi-level poster copy in ordered `overlay_blocks`" in content
+    assert "managed provider creates that background first" in content
+    assert "same Tool call" in content
+    assert "no caller-controlled `delivery_size` argument" in content
+    assert "`poster-v3` receipt" in content
     assert "Never use the static product-layer workaround for outcome 2" in content
     assert "Do not blur or soften the scene by default" in content
     assert "If the selected provider cannot accept the reference frame, stop" in content

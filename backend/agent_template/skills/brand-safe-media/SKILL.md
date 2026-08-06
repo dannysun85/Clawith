@@ -42,7 +42,11 @@ or brand asset to remain unchanged.
 
 1. Preserve user-supplied copy exactly. Do not translate, rewrite, summarize, correct, or place it inside `prompt`.
 2. Put one exact text element in `overlay_text`, or multi-level poster copy in ordered `overlay_blocks`, and describe
-   only the text-free visual background in `prompt`.
+   only the text-free visual background in `prompt`. The managed provider creates that background first; Astra's
+   server then composes the exact copy with installed fonts, freezes the final canvas from the active tier plus
+   `aspect_ratio`, and returns a `poster-v3` receipt in the same Tool call. This does not submit a second provider
+   generation. There is intentionally no caller-controlled `delivery_size` argument; do not refuse a valid poster
+   because that field is absent or because the image model itself cannot spell the requested copy.
 3. Put an uploaded product/logo path in `brand_asset`. Do not combine `brand_asset` with `reference_image`,
    `first_frame_image`, or `last_frame_image`.
 4. Prefer a transparent PNG for `brand_asset`. JPG/WebP are accepted but their original rectangular background is

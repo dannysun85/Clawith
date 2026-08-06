@@ -102,6 +102,12 @@ def test_managed_image_tool_exposes_role_aware_poster_copy_contract() -> None:
         canonical["generate_image_minimax"],
         persisted["generate_image_minimax"],
     ):
+        description = definition["description"]
+        assert "provider generates only the text-free visual background" in description
+        assert "Astra's server deterministically composites" in description
+        assert "one Tool call and one provider submission" in description
+        assert "callers neither provide nor need a delivery_size field" in description
+        assert "poster-v3 receipt" in description
         blocks = definition["parameters_schema"]["properties"]["overlay_blocks"]
         assert blocks["type"] == "array"
         assert blocks["maxItems"] == 8
@@ -112,6 +118,10 @@ def test_managed_image_tool_exposes_role_aware_poster_copy_contract() -> None:
             "body",
             "cta",
         ]
+        aspect_help = definition["parameters_schema"]["properties"]["aspect_ratio"][
+            "description"
+        ]
+        assert "do not look for or invent a delivery_size argument" in aspect_help
 
 
 def test_core_default_tools_keep_product_policy_fallback() -> None:

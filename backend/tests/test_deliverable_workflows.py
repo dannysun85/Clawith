@@ -713,6 +713,11 @@ def test_poster_workflow_compiles_one_image_delivery_contract() -> None:
     prompt = build_deliverable_prompt(request)
 
     assert "generate_image_minimax exactly once" in prompt
+    assert "managed provider creates only the text-free visual background" in prompt
+    assert "Astra's server composes those exact blocks" in prompt
+    assert "same Tool call and does not submit a second provider generation" in prompt
+    assert "Do not look for a delivery_size argument" in prompt
+    assert "poster-v3 receipt" in prompt
     assert f"workspace/deliverables/{request.id}/final.png" in prompt
     assert "reserve clean negative space" in prompt
     assert "never ask the image model to spell exact copy" in prompt

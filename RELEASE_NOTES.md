@@ -1,3 +1,21 @@
+# v1.11.36 — Managed Poster Contract Clarity
+
+## Agent-visible image execution contract
+
+- State explicitly that the managed image provider creates only the text-free
+  background and Astra performs deterministic exact-copy composition afterward
+  inside the same Tool call and provider submission.
+- Document that the final delivery canvas is frozen server-side from the active
+  product tier and aspect ratio, so Agents must not require or invent a
+  caller-controlled `delivery_size` argument.
+- Require the final commercial poster receipt to identify `poster-v3` copy,
+  bounds, contrast, and real-font composition before delivery is claimed.
+
+## Validation
+
+- Add governance, workflow-prompt, and Skill regressions that keep the seeded,
+  canonical, and runtime-visible Tool contracts aligned.
+
 # v1.11.35 — Cost-Controlled Commercial Media Delivery
 
 ## Video allowance, routing, and Credits

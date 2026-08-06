@@ -1368,7 +1368,7 @@ BUILTIN_TOOLS = [
     {
         "name": "generate_image_minimax",
         "display_name": "Generate Image",
-        "description": "Generate an image through Astra's managed media route. Model quality is selected from the active Lite, Pro, or Ultra product tier. The provider-neutral execution_strategy selects a commercial-quality or creative-exploration policy; the compatibility Tool name never identifies the actual provider. Route changes are safe only before a request is accepted. Generate exactly the number of outputs requested. When one request requires both an uploaded product/reference and exact visible copy, pass brand_asset or reference_image together with overlay_text (one text block) or overlay_blocks (multi-level poster copy) in the same single call; never split them into separate variants unless the user explicitly asks for multiple outputs.",
+        "description": "Generate one final image through Astra's managed media route. Model quality and final delivery dimensions are selected and frozen by the active Lite, Pro, or Ultra tier plus aspect_ratio; callers neither provide nor need a delivery_size field. For exact visible copy, the managed provider generates only the text-free visual background, then Astra's server deterministically composites overlay_text or overlay_blocks with installed real fonts, role-aware layout, bounds/contrast validation, and a poster-v3 receipt. This is one Tool call and one provider submission, not a second generation request. Never refuse a valid poster merely because an image model cannot spell exact copy or because delivery_size is absent from the schema. The provider-neutral execution_strategy selects a commercial-quality or creative-exploration policy; the compatibility Tool name never identifies the actual provider. Route changes are safe only before a request is accepted. Generate exactly the number of outputs requested. When one request requires both an uploaded product/reference and exact visible copy, pass brand_asset or reference_image together with overlay_text (one text block) or overlay_blocks (multi-level poster copy) in the same single call; never split them into separate variants unless the user explicitly asks for multiple outputs.",
         "category": "media",
         "icon": "🎨",
         "is_default": True,
@@ -1378,7 +1378,7 @@ BUILTIN_TOOLS = [
                 "prompt": {"type": "string", "description": "Detailed image description."},
                 "aspect_ratio": {
                     "type": "string",
-                    "description": "Aspect ratio: '1:1', '16:9', '4:3', '3:4', '9:16', '2:3', '3:2'. Default: '1:1'.",
+                    "description": "Aspect ratio: '1:1', '16:9', '4:3', '3:4', '9:16', '2:3', '3:2'. Default: '1:1'. Astra combines this with the active product tier to freeze the exact final delivery dimensions; do not look for or invent a delivery_size argument.",
                 },
                 "execution_strategy": {
                     "type": "string",
@@ -1391,11 +1391,11 @@ BUILTIN_TOOLS = [
                 },
                 "overlay_text": {
                     "type": "string",
-                    "description": "Optional exact Chinese/English copy rendered after generation with a real font. If the user specifies exact copy, pass it here in the same call as the required brand/reference asset.",
+                    "description": "Optional exact Chinese/English copy rendered by Astra's server after the managed provider creates a text-free background. If the user specifies exact copy, pass it here in the same call as the required brand/reference asset.",
                 },
                 "overlay_blocks": {
                     "type": "array",
-                    "description": "Optional ordered commercial-poster copy blocks rendered after generation with real fonts and role-aware hierarchy. Use this instead of overlay_text when the user specifies multiple exact text elements.",
+                    "description": "Optional ordered commercial-poster copy blocks rendered by Astra's server after background generation with installed real fonts, role-aware hierarchy, bounds/contrast validation, and a poster-v3 receipt. Use this instead of overlay_text when the user specifies multiple exact text elements.",
                     "minItems": 1,
                     "maxItems": 8,
                     "items": {
