@@ -9,12 +9,25 @@ import uuid
 from app.services.storage import get_storage_backend, normalize_storage_key
 
 
+_INTERNAL_A2A_TRIGGER_NAMES = {"a2a_wake", "__a2a_wake__"}
+
+
 def _render_active_trigger_lines(triggers) -> list[str]:
     """Render bounded trigger context without routing metadata or credentials."""
     from app.services.trigger_runtime.config import agent_visible_trigger_config
 
-    lines = ["You have the following active triggers:"]
-    for trigger in triggers:
+    visible_triggers = [
+        trigger
+        for trigger in triggers
+        if str(getattr(trigger, "type", "") or "").strip().lower() != "a2a"
+        and str(getattr(trigger, "name", "") or "").strip()
+        not in _INTERNAL_A2A_TRIGGER_NAMES
+    ]
+    if not visible_triggers:
+        return []
+
+    lines = ["You have the following user-configured active triggers:"]
+    for trigger in visible_triggers:
         config = agent_visible_trigger_config(getattr(trigger, "config", None) or {})
         config_str = str(config)[:80]
         reason_str = str(getattr(trigger, "reason", "") or "")[:500]
@@ -250,15 +263,29 @@ async def _load_company_information(db, agent_id: uuid.UUID) -> str:
 
 
 _BASE_PROMPT_BEFORE_CAPABILITIES = """
-# Clawith Environment
+# Astra Environment
 
-Clawith is a collaborative organization where human members and digital
+Astra is a collaborative organization where human members and digital
 employees work together.
 
 You are a persistent member of this organization, not a stateless chatbot.
 Use the context, capabilities, and permissions available to you to complete
-authorized work for users and collaborators. Clawith provides persistent Memory,
+authorized work for users and collaborators. Astra provides persistent Memory,
 Workspace, Focus, Trigger, and Directory mechanisms.
+
+## Product Identity and Current Source
+
+- The current product identity is Astra. Do not present legacy project names as
+  the name of the current product or deployment.
+- Trusted Current Interaction Source metadata, when supplied by the Runtime,
+  identifies how the current Run began. It overrides conflicting implications
+  in Memory, Trigger context, summaries, and earlier chat messages.
+- Memory, active Triggers, summaries, and earlier messages are historical
+  background. Their presence does not mean the current message came from a
+  Trigger, heartbeat, schedule, or another digital employee.
+- Do not claim a deployment topology, model provider, or official public URL
+  solely from historical context. Verify time-sensitive deployment facts using
+  current trusted context or an available tool.
 
 ## Memory
 
@@ -532,7 +559,7 @@ async def build_agent_context(
     identity = [
         "# Identity",
         "",
-        f"You are {agent_name}, a digital employee in Clawith.",
+        f"You are {agent_name}, a digital employee in Astra.",
     ]
     if soul:
         identity.extend(["", "<soul>", soul, "</soul>"])
@@ -593,13 +620,14 @@ async def build_agent_context(
                 "</relationship_context>",
             ]
         )
-    if active_triggers:
+    rendered_triggers = _render_active_trigger_lines(active_triggers)
+    if rendered_triggers:
         dynamic_parts.extend(
             [
                 "",
                 "## Active Triggers",
                 "<trigger_context>",
-                "\n".join(_render_active_trigger_lines(active_triggers)),
+                "\n".join(rendered_triggers),
                 "</trigger_context>",
             ]
         )

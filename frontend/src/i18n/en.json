@@ -304,7 +304,7 @@
       "emptyDesc": "Try syncing the organization directory, or check this agent's visibility settings.",
       "count": "{{count}} targets",
       "digitalEmployee": "Agent",
-      "clawithUser": "Clawith User",
+      "clawithUser": "Astra User",
       "provider": {
         "feishu": "Feishu User",
         "dingtalk": "DingTalk User",
@@ -452,6 +452,8 @@
       "collapseSidebar": "Collapse session list",
       "mySessions": "My Sessions",
       "otherSessions": "Other Sessions",
+      "channelAndOtherSessions": "Channels & Other Sessions",
+      "channelSessions": "Channel sessions ({{count}})",
       "allUsers": "All Users",
       "viewOtherUsersSessions": "View other users' sessions",
       "otherUsersTab": "Other users",

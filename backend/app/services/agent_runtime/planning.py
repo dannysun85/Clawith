@@ -67,7 +67,7 @@ _SIMPLE_CHECK_INS = frozenset(
 )
 _CHECK_IN_PUNCTUATION = re.compile(r"[\s,，.!！?？。:：;；~～、]+")
 
-_SYSTEM_PROMPT = """You are Clawith's internal multi-Agent planning component.
+_SYSTEM_PROMPT = """You are Astra's internal multi-Agent planning component.
 Return exactly one JSON object and no Markdown. Never call tools and never do the work yourself.
 Use only candidate agent_id values supplied by the caller.
 Return exactly this schema and no additional fields:

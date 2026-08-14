@@ -1,16 +1,18 @@
 export function buildOpenClawInstruction(apiKey: string, isChinese: boolean, origin = window.location.origin) {
     if (isChinese) {
-        return `请在 OpenClaw Agent 中创建技能文件 skills/clawith_sync.md，内容如下；然后把「使用 clawith_sync 技能检查 Clawith inbox 并处理待办消息」加入 HEARTBEAT.md：
+        return `请在 OpenClaw Agent 中创建技能文件 skills/clawith_sync.md，内容如下；然后把「使用 clawith_sync 技能检查 Astra inbox 并处理待办消息」加入 HEARTBEAT.md：
 
 ---
 name: clawith_sync
-description: Sync with Clawith platform — check inbox, submit results, and send messages.
+description: Sync with Astra platform — check inbox, submit results, and send messages.
 ---
 
-# Clawith Sync
+# Astra Sync
+
+> 兼容性说明：\`clawith_sync\` 仅是历史协议的技能标识。当前产品和平台身份均为 Astra；不得在用户回复中将自己描述为其他品牌或其他品牌的云部署。
 
 ## 使用场景
-在每次 heartbeat 时检查 Clawith 平台是否有新消息。
+在每次 heartbeat 时检查 Astra 平台是否有新消息。
 你也可以主动给 gateway 通讯录 payload 中返回的精确目标发送消息。
 
 ## 操作说明
@@ -24,7 +26,7 @@ description: Sync with Clawith platform — check inbox, submit results, and sen
 - id：消息 ID，回报结果时使用
 - delivery_attempt：当前投递代次，回报处理结果时必须原样返回
 - content：消息内容
-- sender_user_name：发送消息的 Clawith 用户名
+- sender_user_name：发送消息的 Astra 用户名
 - sender_user_id：发送者 ID
 - conversation_id：消息所属会话
 - history：该会话的历史消息，用于理解上下文
@@ -54,17 +56,21 @@ description: Sync with Clawith platform — check inbox, submit results, and sen
 系统会自动选择合适渠道。发给 Agent 时，回复会出现在下一次 poll 中；发给人类成员时，会通过可用渠道投递，例如飞书。`;
     }
 
-    return `Please create a skill file at skills/clawith_sync.md with the following content, then add "Check Clawith inbox using the clawith_sync skill and process any pending messages" to your HEARTBEAT.md:
+    return `Please create a skill file at skills/clawith_sync.md with the following content, then add "Check Astra inbox using the clawith_sync skill and process any pending messages" to your HEARTBEAT.md:
 
 ---
 name: clawith_sync
-description: Sync with Clawith platform — check inbox, submit results, and send messages.
+description: Sync with Astra platform — check inbox, submit results, and send messages.
 ---
 
-# Clawith Sync
+# Astra Sync
+
+> Compatibility note: \`clawith_sync\` is a legacy protocol skill identifier only.
+> The current product and platform identity is Astra. Never describe yourself to
+> users as another brand or as another brand's cloud deployment.
 
 ## When to use
-Check for new messages from the Clawith platform during every heartbeat cycle.
+Check for new messages from the Astra platform during every heartbeat cycle.
 You can proactively send messages to exact targets returned in the gateway directory payload.
 
 ## Instructions
@@ -78,7 +84,7 @@ The response contains a messages array. Each message includes:
 - id — unique message ID (use this for reporting)
 - delivery_attempt — current delivery generation (return it unchanged when reporting)
 - content — the message text
-- sender_user_name — name of the Clawith user who sent it
+- sender_user_name — name of the Astra user who sent it
 - sender_user_id — unique ID of the sender
 - conversation_id — the conversation this message belongs to
 - history — array of previous messages in this conversation for context

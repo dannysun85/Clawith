@@ -71,6 +71,7 @@ import {
     chatPaginationRequestIdentityIsCurrent,
     chatSessionRequestIdentityIsCurrent,
     chatHistoryIsReady,
+    isExternalChannelSession,
     mergeLoadedHistoryWithLiveMessages,
     resolveChatHistoryCursor,
     resolveRequestedChatSession,
@@ -2922,6 +2923,10 @@ export default function AgentDetailPage() {
     }, [allSessions, currentUser?.id]);
 
     const othersListForPicker = otherUsersSessions;
+    const externalChannelSessions = useMemo(
+        () => otherUsersSessions.filter((session: any) => isExternalChannelSession(session)),
+        [otherUsersSessions],
+    );
 
     useEffect(() => {
         if (!canViewAllAgentChatSessions && chatScope === 'all') setChatScope('mine');
@@ -3829,6 +3834,9 @@ export default function AgentDetailPage() {
         if (requestedSessionId && activeSessionIdRef.current === requestedSessionId) return;
         let cancelled = false;
         const initializeRequestedSession = async () => {
+            const allSessionsPromise = canViewAllAgentChatSessions
+                ? fetchAllSessions(id)
+                : Promise.resolve([]);
             const data = await fetchMySessions(false, id);
             if (cancelled) return;
             if (currentAgentIdRef.current !== id) return;
@@ -3846,7 +3854,7 @@ export default function AgentDetailPage() {
                     return;
                 }
                 if (canViewAllAgentChatSessions) {
-                    const all = await fetchAllSessions(id);
+                    const all = await allSessionsPromise;
                     if (cancelled || currentAgentIdRef.current !== id) return;
                     const requestedAll = resolveRequestedChatSession(
                         requestedSessionId,
@@ -7582,7 +7590,7 @@ export default function AgentDetailPage() {
                                                     <span className="scope-dropdown-label">
                                                         {chatScope === 'mine'
                                                             ? t('agent.chat.mySessions')
-                                                            : t('agent.chat.otherSessions', '其他会话')
+                                                            : t('agent.chat.channelAndOtherSessions', '渠道与其他会话')
                                                         }
                                                     </span>
                                                     <svg className={`scope-dropdown-chevron${scopeDropdownOpen ? ' scope-dropdown-chevron--open' : ''}`} width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="m6 9 6 6 6-6" /></svg>
@@ -7596,7 +7604,7 @@ export default function AgentDetailPage() {
                                                         <div
                                                             className={`scope-dropdown-item${chatScope === 'all' ? ' scope-dropdown-item--active' : ''}`}
                                                             onClick={() => { onAdminTabOthers(); setScopeDropdownOpen(false); }}
-                                                        >{t('agent.chat.otherSessions', '其他会话')}</div>
+                                                        >{t('agent.chat.channelAndOtherSessions', '渠道与其他会话')}</div>
                                                     </div>
                                                 )}
                                             </div>
@@ -7637,6 +7645,31 @@ export default function AgentDetailPage() {
                                     {(!canViewAllAgentChatSessions || chatScope === 'mine') ? (
                                         <>
                                             <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: '4px 0' }}>
+                                                {canViewAllAgentChatSessions && externalChannelSessions.length > 0 && (
+                                                    <button
+                                                        type="button"
+                                                        onClick={onAdminTabOthers}
+                                                        style={{
+                                                            width: 'calc(100% - 16px)',
+                                                            margin: '0 8px 6px',
+                                                            padding: '8px 10px',
+                                                            border: '1px solid var(--border-subtle)',
+                                                            borderRadius: '8px',
+                                                            background: 'var(--bg-secondary)',
+                                                            color: 'var(--text-primary)',
+                                                            cursor: 'pointer',
+                                                            display: 'flex',
+                                                            alignItems: 'center',
+                                                            justifyContent: 'space-between',
+                                                            gap: '8px',
+                                                            fontSize: '11px',
+                                                            textAlign: 'left',
+                                                        }}
+                                                    >
+                                                        <span>{t('agent.chat.channelSessions', { count: externalChannelSessions.length })}</span>
+                                                        <span aria-hidden style={{ color: 'var(--text-tertiary)' }}>→</span>
+                                                    </button>
+                                                )}
                                                 {sessionsLoading ? (
                                                     <div style={{ padding: '20px 12px', fontSize: '12px', color: 'var(--text-tertiary)' }}>{t('common.loading')}</div>
                                                 ) : sessions.length === 0 ? (

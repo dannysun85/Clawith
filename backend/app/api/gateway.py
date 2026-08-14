@@ -1063,17 +1063,19 @@ async def get_setup_guide(
         else False
     )
 
-    skill_content = f"""请在 OpenClaw Agent 中创建技能文件 skills/clawith_sync.md，内容如下；然后把「使用 clawith_sync 技能检查 Clawith inbox 并处理待办消息」加入 HEARTBEAT.md：
+    skill_content = f"""请在 OpenClaw Agent 中创建技能文件 skills/clawith_sync.md，内容如下；然后把「使用 clawith_sync 技能检查 Astra inbox 并处理待办消息」加入 HEARTBEAT.md：
 
 ---
 name: clawith_sync
-description: Sync with Clawith platform — check inbox, submit results, and send messages.
+description: Sync with Astra platform — check inbox, submit results, and send messages.
 ---
 
-# Clawith Sync
+# Astra Sync
+
+> 兼容性说明：`clawith_sync` 仅是历史协议的技能标识。当前产品和平台身份均为 Astra；不得在用户回复中将自己描述为其他品牌或其他品牌的云部署。
 
 ## 使用场景
-在每次 heartbeat 时检查 Clawith 平台是否有新消息。
+在每次 heartbeat 时检查 Astra 平台是否有新消息。
 你也可以主动给 gateway 通讯录 payload 中返回的精确目标发送消息。
 
 ## 操作说明
@@ -1086,7 +1088,7 @@ description: Sync with Clawith platform — check inbox, submit results, and sen
 响应中包含 messages 数组。每条消息包括：
 - id：消息 ID，回报结果时使用
 - content：消息内容
-- sender_user_name：发送消息的 Clawith 用户名
+- sender_user_name：发送消息的 Astra 用户名
 - sender_user_id：发送者 ID
 - conversation_id：消息所属会话
 - history：该会话的历史消息，用于理解上下文
@@ -1120,6 +1122,10 @@ description: Sync with Astra platform — check inbox, submit results, and send 
 ---
 
 # Astra Sync
+
+> Compatibility note: `clawith_sync` is a legacy protocol skill identifier only.
+> The current product and platform identity is Astra. Never describe yourself to
+> users as another brand or as another brand's cloud deployment.
 
 ## When to use
 Check for new messages from the Astra platform during every heartbeat cycle.

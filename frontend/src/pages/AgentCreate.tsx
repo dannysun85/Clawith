@@ -242,64 +242,11 @@ export default function AgentCreate() {
                                 padding: '12px', background: 'var(--bg-secondary)', borderRadius: '6px',
                                 fontSize: '11px', lineHeight: 1.6, overflow: 'auto', maxHeight: '280px',
                                 border: '1px solid var(--border-default)', whiteSpace: 'pre-wrap',
-                            }}>{`Please create a skill file at skills/clawith_sync.md with the following content, then add "Check Astra inbox using the clawith_sync skill and process any pending messages" to your HEARTBEAT.md:
-
----
-name: clawith_sync
-description: Sync with Astra platform — check inbox, submit results, and send messages.
----
-
-# Astra Sync
-
-## When to use
-Check for new messages from the Astra platform during every heartbeat cycle.
-You can also proactively send messages to people and agents in your relationships.
-
-## Instructions
-
-### 1. Check inbox
-Make an HTTP GET request:
-- URL: ${window.location.origin}/api/gateway/poll
-- Header: X-Api-Key: ${createdApiKey}
-
-The response contains a \`messages\` array. Each message includes:
-- \`id\` — unique message ID (use this for reporting)
-- \`delivery_attempt\` — current delivery generation (return this unchanged when reporting)
-- \`content\` — the message text
-- \`sender_user_name\` — name of the Astra user who sent it
-- \`sender_user_id\` — unique ID of the sender
-- \`conversation_id\` — the conversation this message belongs to
-- \`history\` — array of previous messages in this conversation for context
-
-The response also contains a \`relationships\` array describing your colleagues:
-- \`name\` — the person or agent name
-- \`type\` — "human" or "agent"
-- \`role\` — relationship type (e.g. collaborator, supervisor)
-- \`channels\` — available communication channels (e.g. ["feishu"], ["agent"])
-
-**IMPORTANT**: Use the \`history\` array to understand conversation context before replying.
-Different \`sender_user_name\` values mean different people — address them accordingly.
-
-### 2. Report results
-For each completed message, make an HTTP POST request:
-- URL: ${window.location.origin}/api/gateway/report
-- Header: X-Api-Key: ${createdApiKey}
-- Header: Content-Type: application/json
-- Body: {"message_id": "<id from the message>", "delivery_attempt": <delivery_attempt from the message>, "result": "<your response>"}
-
-### 3. Send a message to someone
-To proactively contact a person or agent, make an HTTP POST request:
-- URL: ${window.location.origin}/api/gateway/send-message
-- Header: X-Api-Key: ${createdApiKey}
-- Header: Content-Type: application/json
-- Body: {"target": "<name of person or agent>", "content": "<your message>"}
-
-The system auto-detects the best channel. For agents, the reply appears in your next poll.
-For humans, the message is delivered via their available channel (e.g. Feishu).`}</pre>
+                            }}>{setupInstruction}</pre>
                                     <LinearCopyButton
                                         className="btn btn-ghost"
                                         style={{ position: 'absolute', top: '4px', right: '4px', fontSize: '11px', minWidth: '60px' }}
-                                        textToCopy={`Please create a skill file at skills/clawith_sync.md with the following content, then add "Check Astra inbox using the clawith_sync skill and process any pending messages" to your HEARTBEAT.md:\n\n---\nname: clawith_sync\ndescription: Sync with Astra platform — check inbox, submit results, and send messages.\n---\n\n# Astra Sync\n\n## When to use\nCheck for new messages from the Astra platform during every heartbeat cycle.\nYou can also proactively send messages to people and agents in your relationships.\n\n## Instructions\n\n### 1. Check inbox\nMake an HTTP GET request:\n- URL: ${window.location.origin}/api/gateway/poll\n- Header: X-Api-Key: ${createdApiKey}\n\nThe response contains a \`messages\` array. Each message includes:\n- \`id\` — unique message ID (use this for reporting)\n- \`content\` — the message text\n- \`sender_user_name\` — name of the Astra user who sent it\n- \`sender_user_id\` — unique ID of the sender\n- \`conversation_id\` — the conversation this message belongs to\n- \`history\` — array of previous messages in this conversation for context\n\nThe response also contains a \`relationships\` array describing your colleagues:\n- \`name\` — the person or agent name\n- \`type\` — "human" or "agent"\n- \`role\` — relationship type (e.g. collaborator, supervisor)\n- \`channels\` — available communication channels (e.g. ["feishu"], ["agent"])\n\n**IMPORTANT**: Use the \`history\` array to understand conversation context before replying.\nDifferent \`sender_user_name\` values mean different people — address them accordingly.\n\n### 2. Report results\nFor each completed message, make an HTTP POST request:\n- URL: ${window.location.origin}/api/gateway/report\n- Header: X-Api-Key: ${createdApiKey}\n- Header: Content-Type: application/json\n- Body: {"message_id": "<id from the message>", "result": "<your response>"}\n\n### 3. Send a message to someone\nTo proactively contact a person or agent, make an HTTP POST request:\n- URL: ${window.location.origin}/api/gateway/send-message\n- Header: X-Api-Key: ${createdApiKey}\n- Header: Content-Type: application/json\n- Body: {"target": "<name of person or agent>", "content": "<your message>"}\n\nThe system auto-detects the best channel. For agents, the reply appears in your next poll.\nFor humans, the message is delivered via their available channel (e.g. Feishu).`}
+                                        textToCopy={setupInstruction}
                                         label={t('common.copy', 'Copy')}
                                         copiedLabel="Copied"
                                     />

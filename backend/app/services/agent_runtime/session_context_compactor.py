@@ -37,7 +37,7 @@ from app.services.llm.utils import get_max_tokens
 
 
 _COMPACT_TOOL_NAME = "commit_session_context"
-_SYSTEM_PROMPT = """You compact one Clawith chat session into durable context.
+_SYSTEM_PROMPT = """You compact one Astra chat session into durable context.
 Preserve confirmed requirements and literal constraints exactly. Merge new facts,
 remove only explicitly resolved open items, keep references stable, and produce a
 concise summary usable by a later model. Call commit_session_context exactly once.

@@ -6,6 +6,7 @@ import {
     chatPaginationRequestIdentityIsCurrent,
     chatSessionRequestIdentityIsCurrent,
     chatHistoryIsReady,
+    isExternalChannelSession,
     mergeLoadedHistoryWithLiveMessages,
     resolveChatHistoryCursor,
     resolveRequestedChatSession,
@@ -49,6 +50,14 @@ describe('agent chat lifecycle guards', () => {
         });
         expect(resolveRequestedChatSession('other-1', mine, all, false)).toBeNull();
         expect(resolveRequestedChatSession('missing', mine, all, true)).toBeNull();
+    });
+
+    it('identifies externally sourced channel sessions without mixing web or agent chats', () => {
+        expect(isExternalChannelSession({ source_channel: 'wechat' })).toBe(true);
+        expect(isExternalChannelSession({ source_channel: 'Microsoft_Teams' })).toBe(true);
+        expect(isExternalChannelSession({ source_channel: 'direct' })).toBe(false);
+        expect(isExternalChannelSession({ source_channel: 'agent' })).toBe(false);
+        expect(isExternalChannelSession({})).toBe(false);
     });
 
     it('retries only server-side history failures while attempts remain', () => {

@@ -629,6 +629,60 @@ export const activityApi = {
         request<any[]>(`/agents/${agentId}/activity?limit=${limit}`),
 };
 
+// ─── Workforce Topology ──────────────────────────────
+export type WorkforceTopologyNode = {
+    id: string;
+    name: string;
+    avatar_url?: string | null;
+    role_description: string;
+    status: 'creating' | 'running' | 'idle' | 'stopped' | 'error' | string;
+    last_active_at?: string | null;
+    tokens_used_today: number;
+    cache_read_tokens_today: number;
+    max_tokens_per_day?: number | null;
+    is_expired: boolean;
+    is_system: boolean;
+};
+
+export type WorkforceTopologyRelationshipEdge = {
+    id: string;
+    source_agent_id: string;
+    target_agent_id: string;
+    relation: string;
+    updated_at?: string | null;
+};
+
+export type WorkforceTopologyActivityEdge = {
+    agent_a_id: string;
+    agent_b_id: string;
+    interaction_count: number;
+    last_activity_at: string;
+};
+
+export type WorkforceTopologyActivity = {
+    id: string;
+    agent_id: string;
+    action_type: string;
+    summary: string;
+    created_at: string;
+};
+
+export type WorkforceTopology = {
+    company_id: string;
+    company_name: string;
+    window_hours: number;
+    generated_at: string;
+    nodes: WorkforceTopologyNode[];
+    relationship_edges: WorkforceTopologyRelationshipEdge[];
+    activity_edges: WorkforceTopologyActivityEdge[];
+    recent_activities: WorkforceTopologyActivity[];
+};
+
+export const workforceApi = {
+    topology: (windowHours = 24) =>
+        request<WorkforceTopology>(`/workforce/topology?window_hours=${windowHours}`),
+};
+
 // ─── Deliverable Workbench ───────────────────────────
 export type DeliverableWorkType = 'presentation' | 'poster' | 'video' | 'report' | 'spreadsheet';
 

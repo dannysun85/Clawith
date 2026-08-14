@@ -69,6 +69,77 @@ def test_active_trigger_prompt_omits_internal_routing_and_webhook_secrets():
     assert "private-user-id" not in rendered
 
 
+def test_active_trigger_prompt_hides_platform_internal_triggers():
+    from types import SimpleNamespace
+
+    from app.services.agent_context import _render_active_trigger_lines
+
+    lines = _render_active_trigger_lines(
+        [
+            SimpleNamespace(
+                name="a2a_wake",
+                type="a2a",
+                config={"session_id": "private-session-id"},
+                reason="Internal A2A routing",
+                focus_ref=None,
+            ),
+            SimpleNamespace(
+                name="__a2a_wake__",
+                type="event",
+                config={"event": "a2a"},
+                reason="Internal A2A routing",
+                focus_ref=None,
+            ),
+            SimpleNamespace(
+                name="daily_report",
+                type="cron",
+                config={"cron": "0 9 * * *"},
+                reason="Prepare the user's daily report",
+                focus_ref=None,
+            ),
+            SimpleNamespace(
+                name="__customer_defined__",
+                type="event",
+                config={"event": "customer_defined"},
+                reason="A user-configured trigger may use a reserved-looking name",
+                focus_ref=None,
+            ),
+        ]
+    )
+
+    rendered = "\n".join(lines)
+    assert "daily_report" in rendered
+    assert "__customer_defined__" in rendered
+    assert "a2a_wake" not in rendered
+    assert "__a2a_wake__" not in rendered
+    assert "Internal A2A routing" not in rendered
+
+
+def test_active_trigger_prompt_is_empty_when_only_internal_triggers_exist():
+    from types import SimpleNamespace
+
+    from app.services.agent_context import _render_active_trigger_lines
+
+    assert _render_active_trigger_lines(
+        [
+            SimpleNamespace(
+                name="a2a_wake",
+                type="a2a",
+                config={},
+                reason="Internal A2A routing",
+                focus_ref=None,
+            ),
+            SimpleNamespace(
+                name="__a2a_wake__",
+                type="event",
+                config={},
+                reason="Internal A2A routing",
+                focus_ref=None,
+            )
+        ]
+    ) == []
+
+
 @pytest.mark.asyncio
 async def test_base_prompt_starts_with_name_and_soul_and_never_injects_self_role():
     from app.services.agent_context import build_agent_context
@@ -88,9 +159,12 @@ async def test_base_prompt_starts_with_name_and_soul_and_never_injects_self_role
             allowed_tool_names={"wait"},
         )
 
-    assert static.startswith("# Identity\n\nYou are TestAgent, a digital employee in Clawith.")
+    assert static.startswith("# Identity\n\nYou are TestAgent, a digital employee in Astra.")
     assert "<soul>\nBe precise and preserve evidence.\n</soul>" in static
-    assert static.index("<soul>") < static.index("# Clawith Environment")
+    assert static.index("<soul>") < static.index("# Astra Environment")
+    assert "The current product identity is Astra." in static
+    assert "legacy project names" in static
+    assert "Clawith" not in static
     assert "THIS ROLE MUST NOT ENTER THE MODEL" not in f"{static}\n{dynamic}"
     assert "# Memory" in static
     assert "The release owner is Alice." not in static

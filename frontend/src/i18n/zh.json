@@ -431,6 +431,8 @@
             "collapseSidebar": "收起会话列表",
             "mySessions": "我的会话",
             "otherSessions": "其他会话",
+            "channelAndOtherSessions": "渠道与其他会话",
+            "channelSessions": "渠道会话（{{count}}）",
             "allUsers": "所有用户",
             "viewOtherUsersSessions": "查看其他用户会话",
             "otherUsersTab": "其他用户",

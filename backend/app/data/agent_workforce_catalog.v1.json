@@ -2136,7 +2136,7 @@
       "lifecycle": "not_recruitable",
       "resolution": "runtime_capability",
       "target_role_key": null,
-      "reason": "Agent orchestration belongs to Clawith Task Runtime, not a prompt employee.",
+      "reason": "Agent orchestration belongs to Astra Task Runtime, not a prompt employee.",
       "activation_gate": "not_applicable"
     },
     {

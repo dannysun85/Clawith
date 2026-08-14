@@ -1,7 +1,7 @@
 """Build the 92 reviewed, disabled workforce candidate templates.
 
 The pinned workforce catalog owns role identity and provenance. This module
-adapts those records into concise Clawith v2 contracts without copying the
+adapts those records into concise Astra v2 contracts without copying the
 upstream long-form prompts or granting executable authority.
 """
 
@@ -374,7 +374,7 @@ def _candidate_manifest(record: WorkforceRoleRecord) -> AgentTemplateManifest:
             ],
             "limitations": [
                 f"This role is disabled pending {record.activation_gate}",
-                "Upstream prompt ideas were adapted into Clawith contracts and do not prove runtime capability",
+                "Upstream prompt ideas were adapted into Astra contracts and do not prove runtime capability",
             ],
             "workflows": list(profile.workflows),
             "deliverables": list(profile.deliverables),
@@ -396,7 +396,7 @@ def _candidate_manifest(record: WorkforceRoleRecord) -> AgentTemplateManifest:
                 "paths": [record.source_path],
                 "license": "MIT",
                 "adaptation": (
-                    "Compressed into a disabled Clawith v2 candidate with explicit "
+                    "Compressed into a disabled Astra v2 candidate with explicit "
                     "workflows, deliverables, evaluation, capability, and approval boundaries."
                 ),
             },

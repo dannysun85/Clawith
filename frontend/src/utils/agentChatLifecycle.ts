@@ -30,6 +30,25 @@ export function searchForSelectedChatSession(
 
 export type RequestedChatSessionScope = 'mine' | 'all';
 
+const EXTERNAL_CHAT_SOURCE_CHANNELS = new Set([
+    'feishu',
+    'dingtalk',
+    'wecom',
+    'wechat',
+    'whatsapp',
+    'slack',
+    'discord',
+    'teams',
+    'microsoft_teams',
+]);
+
+export function isExternalChannelSession(
+    session: { source_channel?: unknown },
+): boolean {
+    const sourceChannel = String(session.source_channel ?? '').trim().toLowerCase();
+    return EXTERNAL_CHAT_SOURCE_CHANNELS.has(sourceChannel);
+}
+
 export function resolveRequestedChatSession<T extends { id: unknown }>(
     requestedSessionId: string,
     mineSessions: T[],

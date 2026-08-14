@@ -103,3 +103,20 @@ async def test_gateway_setup_guide_uses_resolved_deployment_url(monkeypatch):
 
     assert "https://astra.customer.example/api/gateway/poll" in result["skill_content"]
     assert "https://try.astra.ai" not in result["skill_content"]
+    assert "Sync with Astra platform" in result["skill_content"]
+    assert "Clawith platform" not in result["skill_content"]
+    assert "Clawith inbox" not in result["skill_content"]
+    assert result["skill_filename"] == "clawith_sync.md"
+
+    result_zh = await gateway_api.get_setup_guide(
+        agent_id=agent_id,
+        request=_request(),
+        x_api_key="secret-agent-key",
+        accept_language="zh-CN",
+        db=db,
+    )
+
+    assert "检查 Astra inbox" in result_zh["skill_content"]
+    assert "Astra 平台" in result_zh["skill_content"]
+    assert "Clawith platform" not in result_zh["skill_content"]
+    assert "Clawith inbox" not in result_zh["skill_content"]

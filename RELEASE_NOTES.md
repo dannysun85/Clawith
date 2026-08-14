@@ -1,3 +1,28 @@
+# v1.11.40 — Astra Channel Identity and Conversation Visibility
+
+## Channel identity
+
+- Bind the current trusted runtime source and channel to the system instruction so
+  a direct WeChat conversation cannot be reclassified by historical trigger,
+  memory, or A2A context.
+- Reinforce Astra as the active product identity across runtime, planning,
+  compaction, gateway setup, and seeded Agent-facing guidance while retaining
+  legacy machine identifiers only where compatibility requires them.
+- Keep internal A2A wake triggers out of the user-configured trigger context
+  without hiding customer-defined trigger names.
+
+## Conversation visibility
+
+- Let authorized Agent managers load server-approved cross-user sessions and
+  surface external-channel conversations separately in the Agent chat UI.
+- Keep the existing backend tenant and Agent-access checks authoritative; the
+  frontend does not grant additional permissions.
+
+## Operations
+
+- No database migration is required.
+- Rollback is the normal immutable-release rollback to v1.11.39.
+
 # v1.11.39 — Visible MiniMax Daily Allowance Accounting
 
 ## Operator quota truth

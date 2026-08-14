@@ -273,7 +273,7 @@ _RUNTIME_WAIT_TOOL_DEFINITION: dict = {
     },
 }
 _GROUP_RUNTIME_INSTRUCTION = """
-Current Run is executing inside a native Clawith group. Follow these platform rules:
+Current Run is executing inside a native Astra group. Follow these platform rules:
 - Answer only from this group, this group session, the injected Agent context, and data returned by enabled tools.
 - Group scope is not a closed Tool allowlist. Normal Agent tools, the Agent's own Workspace, and global A2A remain available whenever they are present in the current Tool Schema.
 - File tools that expose `workspace_scope` can access both workspaces during Group Runs. Use `group` for every path in `group_context.workspace_index` and `agent` only for the Agent's private Workspace. Tools without that parameter retain their original scope. Never infer that a path is absent from one scope because it is missing from the other.
@@ -607,6 +607,7 @@ def _runtime_sections(build: RuntimeContextBuild) -> JsonObject:
     if group_context is not None:
         source_context["group_context"] = group_context
     for key in (
+        "source_channel",
         "trigger_event_data",
         "heartbeat_context",
         "background_mode",
@@ -632,6 +633,38 @@ def _message_content(value: JsonValue) -> str | list:
 def _runtime_instruction(build: RuntimeContextBuild) -> str:
     instruction = build.initial_input.get("runtime_instruction")
     return instruction.strip() if isinstance(instruction, str) else ""
+
+
+def _current_interaction_source_instruction(build: RuntimeContextBuild) -> str:
+    """Render trusted source identity separately from historical context data."""
+    source_type = build.current_run.get("source_type")
+    source_channel = build.initial_input.get("source_channel")
+    facts: list[str] = []
+    if isinstance(source_type, str) and source_type.strip():
+        facts.append(
+            f"- source_type: {json.dumps(source_type.strip(), ensure_ascii=False)}"
+        )
+    if isinstance(source_channel, str) and source_channel.strip():
+        facts.append(
+            f"- source_channel: {json.dumps(source_channel.strip(), ensure_ascii=False)}"
+        )
+    if not facts:
+        return ""
+    return "\n".join(
+        [
+            "# Current Interaction Source",
+            "",
+            *facts,
+            "",
+            (
+                "This is trusted Runtime metadata for the current Run and is "
+                "authoritative when historical Memory, Trigger context, summaries, "
+                "or earlier messages imply a different source. Do not describe a "
+                "direct chat message as a Trigger, heartbeat, schedule, or A2A "
+                "message unless source_type explicitly identifies it that way."
+            ),
+        ]
+    )
 
 
 def _current_run_directive(build: RuntimeContextBuild) -> str:
@@ -673,12 +706,15 @@ def _prompt_messages(
         allow_nan=False,
         sort_keys=True,
     )
+    trusted_sections = [_current_interaction_source_instruction(build)]
     runtime_instruction = _runtime_instruction(build)
-    trusted_runtime_instruction = (
-        f"# Current Runtime Instruction\n\n{runtime_instruction}"
-        if runtime_instruction
-        else None
-    )
+    if runtime_instruction:
+        trusted_sections.append(
+            f"# Current Runtime Instruction\n\n{runtime_instruction}"
+        )
+    trusted_runtime_instruction = "\n\n".join(
+        section for section in trusted_sections if section
+    ) or None
     messages = [
         LLMMessage(
             role="system",

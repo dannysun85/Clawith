@@ -5146,7 +5146,7 @@ async def _read_webpage_outcome(arguments: dict) -> ToolExecutionOutcome:
     include_links = bool(arguments.get("include_links", False))
     max_bytes = 2_000_000
     headers = {
-        "User-Agent": "ClawithBot/1.0 (+https://clawith.ai) Mozilla/5.0",
+        "User-Agent": "AstraBot/1.0 (+https://opc.reeftotem.ai) Mozilla/5.0",
         "Accept": "text/html, text/plain, application/json, application/xml;q=0.9, text/*;q=0.8, */*;q=0.5",
     }
 

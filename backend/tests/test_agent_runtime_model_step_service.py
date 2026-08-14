@@ -310,6 +310,50 @@ def test_prompt_messages_compatibly_parse_legacy_image_checkpoint() -> None:
     ]
 
 
+def test_prompt_messages_make_current_wechat_source_authoritative() -> None:
+    build = _build(
+        session_context_snapshot={
+            "version": 1,
+            "summary": "A prior internal A2A wake handled an unrelated request.",
+        },
+        current_run={
+            "goal": "Answer the current WeChat user",
+            "source_type": "chat",
+        },
+        initial_input={
+            "message_id": "session-message-1",
+            "source_channel": "wechat",
+        },
+        recent_session_messages_snapshot=(
+            {
+                "id": "old-assistant-message",
+                "role": "assistant",
+                "content": "Old deployment description",
+            },
+            {
+                "id": "session-message-1",
+                "role": "user",
+                "content": "Who are you?",
+            },
+        ),
+    )
+
+    messages = _prompt_messages(
+        static_prompt="Astra system prompt",
+        dynamic_prompt="Historical context",
+        build=build,
+    )
+
+    system_dynamic = str(messages[0].dynamic_content)
+    assert "# Current Interaction Source" in system_dynamic
+    assert 'source_type: "chat"' in system_dynamic
+    assert 'source_channel: "wechat"' in system_dynamic
+    assert "authoritative" in system_dynamic
+    assert "Do not describe a direct chat message as a Trigger" in system_dynamic
+    runtime_data = str(_runtime_data_message(messages).content)
+    assert '"source_channel": "wechat"' in runtime_data
+
+
 def test_message_budget_does_not_treat_large_base64_as_text_tokens() -> None:
     padded_png = base64.b64encode(
         base64.b64decode(_TINY_PNG_BASE64) + b"x" * (1024 * 1024)
