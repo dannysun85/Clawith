@@ -8,6 +8,8 @@
 - Reinforce Astra as the active product identity across runtime, planning,
   compaction, gateway setup, and seeded Agent-facing guidance while retaining
   legacy machine identifiers only where compatibility requires them.
+- Publish new immutable release IDs with the `astra-saas` suffix while keeping
+  artifact cleanup compatible with historical release names.
 - Keep internal A2A wake triggers out of the user-configured trigger context
   without hiding customer-defined trigger names.
 

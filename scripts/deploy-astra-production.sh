@@ -303,7 +303,7 @@ docker compose -f deploy/astra-poc/docker-compose.prod.yml config --quiet
 
 STAMP="$(date -u +%Y%m%d-%H%M%S)"
 NONCE="$(python3 -c 'import secrets; print(secrets.token_hex(4))')"
-RELEASE_ID="${STAMP}-${COMMIT:0:12}-${NONCE}-clawith-saas"
+RELEASE_ID="${STAMP}-${COMMIT:0:12}-${NONCE}-astra-saas"
 PACKAGE_DIR="$ROOT_DIR/.tmp/releases"
 PACKAGE_TAR="$PACKAGE_DIR/${RELEASE_ID}.tar"
 PACKAGE="$PACKAGE_DIR/${RELEASE_ID}.tar.gz"

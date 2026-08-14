@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Safely retire stale Clawith production release artifacts.
+"""Safely retire stale Astra production release artifacts.
 
 The command is intentionally dry-run by default. Applied cleanup must run
 while the production deploy lock is held; the deployment workflow supplies
@@ -24,7 +24,7 @@ from typing import Any
 
 
 RELEASE_ID_PATTERN = re.compile(
-    r"^\d{8}-\d{6}-[0-9a-f]{12}-[0-9a-f]{8}-clawith-saas$"
+    r"^\d{8}-\d{6}-[0-9a-f]{12}-[0-9a-f]{8}-(?:astra|clawith)-saas$"
 )
 ACTIVE_STATE_PATTERN = re.compile(
     r"^slot=(?:a|b|legacy) release=(?P<release_id>[A-Za-z0-9._-]+)$"

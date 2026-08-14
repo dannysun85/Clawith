@@ -34,7 +34,7 @@ def _consume(module, tmp_path: Path, *, fault_hook=None):
         artifact=artifact,
         artifact_sha256=artifact_sha256,
         nonce_sha256=nonce_sha256,
-        release_id="20260715-commit-clawith-saas",
+        release_id="20260715-commit-astra-saas",
         release_version="1.10.12",
         release_commit="a" * 40,
         now=datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc),

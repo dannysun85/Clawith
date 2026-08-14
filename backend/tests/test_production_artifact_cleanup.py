@@ -29,7 +29,16 @@ cleanup = _load_cleanup_module()
 
 
 def _release_id(index: int) -> str:
-    return f"202608{index:02d}-120000-{index:012x}-{index:08x}-clawith-saas"
+    return f"202608{index:02d}-120000-{index:012x}-{index:08x}-astra-saas"
+
+
+def test_release_id_pattern_accepts_current_and_legacy_managed_names() -> None:
+    assert cleanup.RELEASE_ID_PATTERN.fullmatch(
+        "20260815-120000-000000000001-00000001-astra-saas"
+    )
+    assert cleanup.RELEASE_ID_PATTERN.fullmatch(
+        "20260806-022030-aba742674a35-dfc49a84-clawith-saas"
+    )
 
 
 def _production_fixture(tmp_path: Path, count: int = 10) -> tuple[Path, list[str]]:
