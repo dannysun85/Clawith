@@ -739,7 +739,6 @@ from app.api.production_issues import admin_router as production_issue_admin_rou
 from app.api.production_issues import client_router as production_issue_client_router  # noqa: E402
 from app.api.deliverables import router as deliverables_router  # noqa: E402
 from app.api.work import router as work_router  # noqa: E402
-from app.api.workforce_topology import router as workforce_topology_router  # noqa: E402
 
 app.include_router(auth_router, prefix=settings.API_PREFIX)
 app.include_router(agent_workforce_router, prefix=settings.API_PREFIX)
@@ -799,7 +798,6 @@ app.include_router(production_issue_client_router, prefix=settings.API_PREFIX)
 app.include_router(production_issue_admin_router, prefix=settings.API_PREFIX)
 app.include_router(deliverables_router)
 app.include_router(work_router)
-app.include_router(workforce_topology_router, prefix=settings.API_PREFIX)
 
 
 @app.get("/api/health", response_model=HealthResponse, tags=["health"])
