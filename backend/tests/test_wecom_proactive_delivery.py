@@ -52,7 +52,6 @@ async def test_wecom_webhook_configuration_rejects_invalid_application_agent_id(
         "check_agent_access",
         AsyncMock(return_value=(agent, None)),
     )
-    monkeypatch.setattr(wecom, "is_agent_creator", lambda _user, _agent: True)
     db = AsyncMock()
     payload = {
         "corp_id": "corp-id",
@@ -88,7 +87,6 @@ async def test_wecom_customer_service_webhook_configuration_allows_empty_agent_i
         "check_agent_access",
         AsyncMock(return_value=(agent, None)),
     )
-    monkeypatch.setattr(wecom, "is_agent_creator", lambda _user, _agent: True)
     monkeypatch.setattr(wecom.asyncio, "create_task", lambda coroutine: coroutine.close())
     monkeypatch.setattr(
         wecom.channel_user_service,

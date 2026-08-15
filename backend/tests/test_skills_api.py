@@ -130,6 +130,7 @@ def platform_admin_user():
         tenant_id=uuid.uuid4(),
         is_active=True,
         department_id=None,
+        identity=SimpleNamespace(is_platform_admin=True),
     )
 
 

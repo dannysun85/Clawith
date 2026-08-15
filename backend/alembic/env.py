@@ -24,6 +24,15 @@ from app.models.participant import Participant  # noqa: F401
 from app.models.group import Group, GroupMember  # noqa: F401
 from app.models.activity_log import AgentActivityLog  # noqa: F401
 from app.models.invitation_code import InvitationCode  # noqa: F401
+from app.models.identity_governance import (  # noqa: F401
+    IdentityCapabilityGrant,
+    OrganizationInvitation,
+    OrganizationJoinLink,
+    PlatformSupportSession,
+    RegistrationGrant,
+    TenantOwnershipTransfer,
+    TenantOwnershipResolution,
+)
 from app.models.org import OrgDepartment, OrgMember, AgentRelationship, AgentAgentRelationship  # noqa: F401
 from app.models.plaza import PlazaPost, PlazaComment, PlazaLike  # noqa: F401
 from app.models.experience import ExperienceEntry  # noqa: F401
@@ -76,6 +85,13 @@ from app.models.deliverable import (  # noqa: F401
 )
 from app.models.notification import Notification  # noqa: F401
 from app.models.agentbay_session import AgentBaySessionLedger  # noqa: F401
+from app.models.outbound_email import OutboundEmailDelivery  # noqa: F401
+from app.models.identity_mfa import IdentityMfaChallenge, IdentityMfaRecoveryCode  # noqa: F401
+from app.models.tenant_deletion import (  # noqa: F401
+    TenantDeletionHold,
+    TenantDeletionJob,
+    TenantDeletionTombstone,
+)
 
 config = context.config
 settings = get_settings()

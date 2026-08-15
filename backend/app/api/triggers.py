@@ -61,9 +61,7 @@ class TriggerUpdate(BaseModel):
 async def list_agent_triggers(agent_id: uuid.UUID, user=Depends(get_current_user)):
     """List all triggers for an agent."""
     async with async_session() as db:
-        _, access_level = await check_agent_access(db, user, agent_id)
-        if access_level != "manage":
-            raise HTTPException(403, "Manage access required")
+        await check_agent_access(db, user, agent_id, required_level="manage")
         result = await db.execute(
             select(AgentTrigger)
             .where(
@@ -104,9 +102,13 @@ async def update_trigger(
 ):
     """Update a trigger (from frontend management UI)."""
     async with async_session() as db:
-        _, access_level = await check_agent_access(db, user, agent_id)
-        if access_level != "manage":
-            raise HTTPException(403, "Manage access required")
+        await check_agent_access(
+            db,
+            user,
+            agent_id,
+            required_level="manage",
+            lock_authority=True,
+        )
         result = await db.execute(
             select(AgentTrigger).where(
                 AgentTrigger.id == trigger_id,
@@ -211,9 +213,13 @@ async def delete_trigger(
 ):
     """Delete a trigger entirely."""
     async with async_session() as db:
-        _, access_level = await check_agent_access(db, user, agent_id)
-        if access_level != "manage":
-            raise HTTPException(403, "Manage access required")
+        await check_agent_access(
+            db,
+            user,
+            agent_id,
+            required_level="manage",
+            lock_authority=True,
+        )
         result = await db.execute(
             select(AgentTrigger).where(
                 AgentTrigger.id == trigger_id,

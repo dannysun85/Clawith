@@ -24,12 +24,21 @@ class EnterpriseSyncService:
     """Synchronize enterprise information to all online Agent containers."""
 
     async def update_enterprise_info(
-        self, db: AsyncSession, info_type: str, content: dict,
-        visible_roles: list[str], updated_by: uuid.UUID
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: uuid.UUID,
+        info_type: str,
+        content: dict,
+        visible_roles: list[str],
+        updated_by: uuid.UUID,
     ) -> EnterpriseInfo:
         """Update enterprise info in database and notify all agents."""
         result = await db.execute(
-            select(EnterpriseInfo).where(EnterpriseInfo.info_type == info_type)
+            select(EnterpriseInfo).where(
+                EnterpriseInfo.tenant_id == tenant_id,
+                EnterpriseInfo.info_type == info_type,
+            )
         )
         info = result.scalar_one_or_none()
 
@@ -40,6 +49,7 @@ class EnterpriseSyncService:
             info.updated_by = updated_by
         else:
             info = EnterpriseInfo(
+                tenant_id=tenant_id,
                 info_type=info_type,
                 content=content,
                 visible_roles=visible_roles,
@@ -51,6 +61,7 @@ class EnterpriseSyncService:
 
         # Publish update event
         await publish_event(ENTERPRISE_INFO_CHANNEL, {
+            "tenant_id": str(tenant_id),
             "info_type": info_type,
             "version": info.version,
             "visible_roles": visible_roles,
@@ -59,12 +70,21 @@ class EnterpriseSyncService:
         logger.info(f"Published enterprise_info update: {info_type} v{info.version}")
         return info
 
-    async def sync_to_agent(self, db: AsyncSession, agent_id: uuid.UUID, agent_role: str = "") -> None:
+    async def sync_to_agent(
+        self,
+        db: AsyncSession,
+        *,
+        agent_id: uuid.UUID,
+        tenant_id: uuid.UUID,
+        agent_role: str = "",
+    ) -> None:
         """Pull enterprise info from DB and write to agent's enterprise_info/ directory.
 
         Filters by visible_roles — if empty, all roles can see it.
         """
-        result = await db.execute(select(EnterpriseInfo))
+        result = await db.execute(
+            select(EnterpriseInfo).where(EnterpriseInfo.tenant_id == tenant_id)
+        )
         all_info = result.scalars().all()
 
         for info in all_info:
@@ -85,10 +105,11 @@ class EnterpriseSyncService:
 
         logger.info(f"Synced enterprise info to agent {agent_id}")
 
-    async def sync_to_all_agents(self, db: AsyncSession) -> int:
+    async def sync_to_all_agents(self, db: AsyncSession, *, tenant_id: uuid.UUID) -> int:
         """Sync enterprise info to all running agents. Returns count."""
         result = await db.execute(
             select(Agent).where(
+                Agent.tenant_id == tenant_id,
                 Agent.status == "running",
                 Agent.deleted_at.is_(None),
             )
@@ -96,7 +117,12 @@ class EnterpriseSyncService:
         agents = result.scalars().all()
 
         for agent in agents:
-            await self.sync_to_agent(db, agent.id, agent.role_description)
+            await self.sync_to_agent(
+                db,
+                agent_id=agent.id,
+                tenant_id=tenant_id,
+                agent_role=agent.role_description,
+            )
 
         logger.info(f"Synced enterprise info to {len(agents)} agents")
         return len(agents)

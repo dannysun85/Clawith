@@ -2,17 +2,16 @@ import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useSearchParams } from 'react-router';
 import { useTranslation } from 'react-i18next';
-import { IconAlertTriangle, IconDatabase, IconKey, IconPhotoVideo, IconReceipt, IconRoute, IconStack2, IconUsers, IconWallet } from '@tabler/icons-react';
+import { IconAlertTriangle, IconDatabase, IconPhotoVideo, IconReceipt, IconRoute, IconStack2, IconUsers, IconWallet } from '@tabler/icons-react';
 import { fetchJson, enterpriseApi } from '../services/api';
 import { MODALITIES } from '../constants/modalities';
 import PlansTab from './enterprise-settings/tabs/PlansTab';
 import AccountManagement from './AccountManagement';
-import { RegistrationCodesTab } from './AdminCompanies';
 
 const SAAS_TIERS = ['lite', 'pro', 'ultra'];
 const LLM_ROUTE_MODALITIES = ['text', 'image', 'video'];
 
-type SaasTab = 'plans' | 'packs' | 'rules' | 'model-routes' | 'media-routes' | 'tenants' | 'registration-codes' | 'accounts' | 'production-issues';
+type SaasTab = 'plans' | 'packs' | 'rules' | 'model-routes' | 'media-routes' | 'tenants' | 'accounts' | 'production-issues';
 
 type ModelRoute = {
     id: string;
@@ -196,7 +195,6 @@ const tabMeta: { key: SaasTab; label: string; icon: ReactNode }[] = [
     { key: 'model-routes', label: '输入理解路由', icon: <IconRoute size={15} stroke={1.7} /> },
     { key: 'media-routes', label: '媒体生成策略', icon: <IconPhotoVideo size={15} stroke={1.7} /> },
     { key: 'tenants', label: '租户订阅', icon: <IconUsers size={15} stroke={1.7} /> },
-    { key: 'registration-codes', label: '注册码', icon: <IconKey size={15} stroke={1.7} /> },
     { key: 'accounts', label: '账号池', icon: <IconDatabase size={15} stroke={1.7} /> },
     { key: 'production-issues', label: '生产问题', icon: <IconAlertTriangle size={15} stroke={1.7} /> },
 ];
@@ -238,7 +236,6 @@ export default function SaasAdmin() {
             {tab === 'model-routes' && <ModelRoutesTab />}
             {tab === 'media-routes' && <MediaRoutesTab />}
             {tab === 'tenants' && <TenantsTab />}
-            {tab === 'registration-codes' && <RegistrationCodesTab />}
             {tab === 'accounts' && <AccountManagement />}
             {tab === 'production-issues' && <ProductionIssuesTab />}
         </div>

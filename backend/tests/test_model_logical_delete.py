@@ -7,7 +7,7 @@ from app.api import enterprise as enterprise_api
 from app.models.agent import Agent
 from app.models.audit import AuditLog
 from app.models.llm import LLMModel
-from app.models.user import User
+from app.models.user import Identity, User
 
 
 class DummyResult:
@@ -50,6 +50,11 @@ class RecordingDB:
 
 
 def make_user(**overrides) -> User:
+    identity = Identity(
+        id=uuid.uuid4(),
+        username=f"platform-{uuid.uuid4().hex}",
+        is_platform_admin=True,
+    )
     values = {
         "id": uuid.uuid4(),
         "username": "admin",
@@ -58,6 +63,8 @@ def make_user(**overrides) -> User:
         "display_name": "Admin",
         "role": "platform_admin",
         "tenant_id": uuid.uuid4(),
+        "identity_id": identity.id,
+        "identity": identity,
         "is_active": True,
     }
     values.update(overrides)

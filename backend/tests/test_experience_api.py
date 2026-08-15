@@ -289,7 +289,7 @@ async def test_member_cannot_read_someone_elses_unpublished_entry(monkeypatch, s
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("role", ["member", "org_admin", "platform_admin"])
+@pytest.mark.parametrize("role", ["member", "org_admin"])
 async def test_creator_and_admins_can_read_unpublished_entries(monkeypatch, role):
     current_user = _user(role=role)
     creator_id = current_user.id if role == "member" else uuid.uuid4()
@@ -302,6 +302,23 @@ async def test_creator_and_admins_can_read_unpublished_entries(monkeypatch, role
 
     assert result is entry
     assert result.can_manage is True
+
+
+@pytest.mark.asyncio
+async def test_legacy_platform_role_cannot_read_company_unpublished_entry(monkeypatch):
+    current_user = _user(role="platform_admin")
+    entry = _entry(
+        current_user.tenant_id,
+        status="retired",
+        created_by=uuid.uuid4(),
+    )
+    db = RecordingDB(DummyResult([entry]))
+    monkeypatch.setattr(experience_api, "async_session", AsyncSessionFactory(db))
+
+    with pytest.raises(HTTPException) as error:
+        await experience_api.get_entry(entry.id, current_user=current_user)
+
+    assert error.value.status_code == 404
 
 
 @pytest.mark.asyncio

@@ -5,6 +5,7 @@ import { fetchJson } from '../services/api';
 import { useAuthStore } from '../stores';
 import { MODALITIES } from '../constants/modalities';
 import { summarizeCredentialQuota } from '../utils/credentialQuotaStatus';
+import { hasEffectiveCapability, isPlatformOperator } from '../utils/productAccess';
 
 interface Credential {
     id: string;
@@ -93,7 +94,7 @@ export default function AccountManagement() {
     const { t } = useTranslation();
     const qc = useQueryClient();
     const user = useAuthStore((s) => s.user);
-    const isPlatformAdmin = user?.role === 'platform_admin' || !!(user as any)?.is_platform_admin;
+    const isPlatformAdmin = isPlatformOperator(user) && hasEffectiveCapability(user, 'platform.providers.manage');
 
     const { data: creds = [] } = useQuery({ queryKey: ['credentials'], queryFn: () => fetchJson<Credential[]>('/credentials') });
     const { data: health = [] } = useQuery({ queryKey: ['credentials-health'], queryFn: () => fetchJson<Health[]>('/credentials/health'), refetchInterval: 30000 });

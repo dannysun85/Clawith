@@ -294,7 +294,9 @@ def is_company_visible_agent(agent: Agent) -> bool:
 
 
 def _is_admin(user: User) -> bool:
-    return user.role in ("platform_admin", "org_admin")
+    # Company governance is a membership authority.  Global platform
+    # operators never receive tenant Agent access through their Identity role.
+    return user.tenant_id is not None and user.role in ("org_owner", "org_admin")
 
 
 async def get_agent_access_level_for_user_id(
@@ -356,7 +358,7 @@ async def get_agent_accessible_user_ids(db: AsyncSession, agent: Agent) -> set[u
             select(User.id).where(
                 User.tenant_id == agent.tenant_id,
                 User.is_active == True,  # noqa: E712
-                User.role.in_(["platform_admin", "org_admin"]),
+                User.role.in_(["org_owner", "org_admin"]),
             )
         )
         ids.update(row[0] for row in admin_result.fetchall())
@@ -522,6 +524,8 @@ async def check_agent_access(
     agent_id: uuid.UUID,
     *,
     include_deleted: bool = False,
+    required_level: str = "use",
+    lock_authority: bool = False,
 ) -> Tuple[Agent, str]:
     """Check if a user has access to a specific agent.
 
@@ -532,9 +536,17 @@ async def check_agent_access(
     2. Company admin + non-private agent -> manage
     3. User has explicit permission (company/user scope) -> from permission record
     """
+    if required_level not in {"use", "manage"}:
+        raise ValueError("required_level must be 'use' or 'manage'")
+
+    # Management writes use the Agent row as their authorization fence. ACL
+    # replacement takes the same lock, so either the write linearizes before a
+    # revoke or it observes the new permission state and fails closed.
     query = select(Agent).where(Agent.id == agent_id)
     if not include_deleted:
         query = query.where(Agent.deleted_at.is_(None))
+    if lock_authority:
+        query = query.execution_options(populate_existing=True).with_for_update()
     result = await db.execute(query)
     agent = result.scalar_one_or_none()
     if not agent:
@@ -551,6 +563,11 @@ async def check_agent_access(
     if await can_manage_agent(db, user, agent, include_deleted=include_deleted):
         return agent, "manage"
     if await can_use_agent(db, user, agent):
+        if required_level == "manage":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Manage access is required for this Agent",
+            )
         return agent, "use"
 
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No access to this agent")

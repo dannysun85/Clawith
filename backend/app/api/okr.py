@@ -42,6 +42,7 @@ from app.models.okr import (
 )
 from app.models.task import Task
 from app.models.user import User
+from app.services.access_control import is_company_governor
 
 router = APIRouter(prefix="/api/okr", tags=["okr"])
 runtime_settings = get_settings()
@@ -51,7 +52,7 @@ runtime_settings = get_settings()
 
 
 def _is_okr_admin(user) -> bool:
-    return getattr(user, "role", None) in ("org_admin", "platform_admin")
+    return is_company_governor(user)
 
 
 def _dashboard_write_forbidden() -> HTTPException:
@@ -829,9 +830,7 @@ async def get_okr_settings(user=Depends(get_current_user)):
 @router.put("/settings", response_model=OKRSettingsOut)
 async def update_okr_settings(body: OKRSettingsUpdate, user=Depends(get_current_user)):
     """Update OKR configuration. Org admins only."""
-    # Allow org admins and platform admins to modify OKR settings.
-    # user.role is the canonical authority; is_admin is not a real field.
-    if getattr(user, "role", None) not in ("org_admin", "platform_admin"):
+    if not is_company_governor(user):
         raise HTTPException(403, "Only org admins can modify OKR settings")
 
     async with async_session() as db:
@@ -916,9 +915,9 @@ async def sync_okr_relationships(user=Depends(get_current_user)):
     and all company-visible agents in this tenant. Idempotent — safe to call
     multiple times; existing relationships are replaced.
 
-    Org admins and platform admins only.
+    Company governors only.
     """
-    if getattr(user, "role", None) not in ("org_admin", "platform_admin"):
+    if not is_company_governor(user):
         raise HTTPException(403, "Only org admins can sync OKR relationships")
 
 
@@ -1720,7 +1719,7 @@ async def upsert_member_daily_report(
     else:
         target_member_id = user.id
 
-    if getattr(user, "role", None) not in ("org_admin", "platform_admin"):
+    if not is_company_governor(user):
         if target_member_type != "user" or target_member_id != user.id:
             raise HTTPException(403, "You can only submit your own daily report")
 
@@ -1772,7 +1771,7 @@ async def regenerate_company_report(
     user=Depends(get_current_user),
 ):
     """Rebuild a single company report for a target period."""
-    if getattr(user, "role", None) not in ("org_admin", "platform_admin"):
+    if not is_company_governor(user):
         raise HTTPException(403, "Only org admins can regenerate company reports")
 
     from app.services.okr_reporting import (
@@ -2469,7 +2468,7 @@ Contact the {len(members_to_contact)} member(s) below who have NOT set their OKR
 @router.post("/trigger-daily-collection")
 async def trigger_daily_collection(user=Depends(get_current_user)):
     """Admin-triggered daily collection for legacy OKR tracking rows only."""
-    if getattr(user, "role", None) not in ("org_admin", "platform_admin"):
+    if not is_company_governor(user):
         raise HTTPException(403, "Only org admins can trigger daily collection")
     from app.services.okr_daily_collection import trigger_daily_collection_for_tenant
 

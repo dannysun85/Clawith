@@ -894,7 +894,7 @@ def test_org_admin_cannot_hide_custom_media_secret_in_headers():
     )
     with pytest.raises(tools_api.HTTPException) as exc_info:
         tools_api._enforce_media_endpoint_bundle_update(
-            SimpleNamespace(role="org_admin", identity=None),
+            SimpleNamespace(role="org_admin", tenant_id=uuid.uuid4(), identity=None),
             tool,
             incoming_config={
                 "base_url": "https://agent.example/v1",
@@ -921,7 +921,7 @@ def test_agent_media_destination_rotation_requires_fresh_unmasked_secret(api_key
 
     with pytest.raises(tools_api.HTTPException) as exc_info:
         tools_api._enforce_media_endpoint_bundle_update(
-            SimpleNamespace(role="org_admin", identity=None),
+            SimpleNamespace(role="org_admin", tenant_id=uuid.uuid4(), identity=None),
             tool,
             incoming_config=incoming,
             existing_agent_config={
@@ -949,7 +949,7 @@ def test_agent_media_destination_rotation_accepts_fresh_complete_bundle():
     )
 
     tools_api._enforce_media_endpoint_bundle_update(
-        SimpleNamespace(role="org_admin", identity=None),
+        SimpleNamespace(role="org_admin", tenant_id=uuid.uuid4(), identity=None),
         tool,
         incoming_config={
             "api_key": "fresh-secret",

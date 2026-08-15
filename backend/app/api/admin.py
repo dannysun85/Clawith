@@ -8,23 +8,31 @@ import asyncio
 import secrets
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import func as sqla_func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import require_role
+from app.core.security import get_platform_operator
 from app.core.secret_detection import looks_like_secret
 from app.database import get_db
 from app.models.agent import Agent
-from app.models.invitation_code import InvitationCode
+from app.models.audit import AuditLog
+from app.models.identity_governance import RegistrationGrant
 from app.models.system_settings import SystemSetting
 from app.models.tenant import Tenant
 from app.models.user import User, Identity
 from app.services.subscription_lifecycle import ensure_free_subscription_for_tenant
 from app.services.system_setting_security import strict_system_setting_enabled
+from app.services.tenant_purge import (
+    TenantPurgeError,
+    create_tenant_purge_hold,
+    dry_run_tenant_purge,
+    list_tenant_purge_states,
+    release_tenant_purge_hold,
+)
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -49,6 +57,7 @@ class CompanyStats(BaseModel):
 
 class CompanyCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=200)
+    owner_email: EmailStr
 
 
 class AgentBayCleanupReconcileRequest(BaseModel):
@@ -100,11 +109,98 @@ class RegistrationCodeCreateResponse(BaseModel):
     codes: list[str]
 
 
+class TenantPurgeHoldRequest(BaseModel):
+    hold_type: Literal["legal", "operations"]
+    reason_code: str = Field(min_length=3, max_length=100, pattern=r"^[a-z0-9][a-z0-9_.-]+$")
+
+
+class TenantPurgeHoldReleaseRequest(BaseModel):
+    reason_code: str = Field(min_length=3, max_length=100, pattern=r"^[a-z0-9][a-z0-9_.-]+$")
+
+
+def _raise_tenant_purge_http(exc: TenantPurgeError) -> None:
+    raise HTTPException(
+        status_code=exc.status_code,
+        detail={"code": exc.code, "message": exc.message},
+    ) from exc
+
+
+# ─── Expired Tenant Purge Operations ──────────────────
+
+@router.get("/tenant-deletions")
+async def get_tenant_deletions(
+    current_user: User = Depends(get_platform_operator),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return scheduled purge work and non-sensitive completion receipts."""
+    return await list_tenant_purge_states(db)
+
+
+@router.post("/tenant-deletions/{tenant_id}/dry-run")
+async def run_tenant_deletion_dry_run(
+    tenant_id: uuid.UUID,
+    current_user: User = Depends(get_platform_operator),
+    db: AsyncSession = Depends(get_db),
+):
+    """Plan and audit a due tenant purge without deleting any data."""
+    try:
+        return await dry_run_tenant_purge(
+            db,
+            tenant_id,
+            actor_user_id=current_user.id,
+        )
+    except TenantPurgeError as exc:
+        _raise_tenant_purge_http(exc)
+
+
+@router.post("/tenant-deletions/{tenant_id}/holds", status_code=201)
+async def add_tenant_deletion_hold(
+    tenant_id: uuid.UUID,
+    body: TenantPurgeHoldRequest,
+    current_user: User = Depends(get_platform_operator),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create one idempotent legal or operational purge hold."""
+    try:
+        return await create_tenant_purge_hold(
+            db,
+            tenant_id,
+            hold_type=body.hold_type,
+            reason_code=body.reason_code,
+            actor_user_id=current_user.id,
+            actor_identity_id=current_user.identity_id,
+        )
+    except TenantPurgeError as exc:
+        _raise_tenant_purge_http(exc)
+
+
+@router.post("/tenant-deletions/{tenant_id}/holds/{hold_id}/release")
+async def remove_tenant_deletion_hold(
+    tenant_id: uuid.UUID,
+    hold_id: uuid.UUID,
+    body: TenantPurgeHoldReleaseRequest,
+    current_user: User = Depends(get_platform_operator),
+    db: AsyncSession = Depends(get_db),
+):
+    """Release a purge hold while retaining its audit trail."""
+    try:
+        return await release_tenant_purge_hold(
+            db,
+            tenant_id,
+            hold_id,
+            reason_code=body.reason_code,
+            actor_user_id=current_user.id,
+            actor_identity_id=current_user.identity_id,
+        )
+    except TenantPurgeError as exc:
+        _raise_tenant_purge_http(exc)
+
+
 # ─── Company Management ────────────────────────────────
 
 @router.get("/companies", response_model=list[CompanyStats])
 async def list_companies(
-    current_user: User = Depends(require_role("platform_admin")),
+    current_user: User = Depends(get_platform_operator),
     db: AsyncSession = Depends(get_db),
 ):
     """List all companies with stats."""
@@ -177,10 +273,10 @@ async def list_companies(
 @router.post("/companies", response_model=CompanyCreateResponse, status_code=201)
 async def create_company(
     data: CompanyCreateRequest,
-    current_user: User = Depends(require_role("platform_admin")),
+    current_user: User = Depends(get_platform_operator),
     db: AsyncSession = Depends(get_db),
 ):
-    """Create a new company and generate an admin invitation code (max_uses=1)."""
+    """Create an ownerless tenant plus an email-bound owner invitation."""
     import re
 
     company_name = data.name.strip()
@@ -195,7 +291,12 @@ async def create_company(
         slug = "company"
     slug = f"{slug}-{secrets.token_hex(3)}"
 
-    tenant = Tenant(name=company_name, slug=slug, im_provider="web_only")
+    tenant = Tenant(
+        name=company_name,
+        slug=slug,
+        im_provider="web_only",
+        owner_resolution_required=True,
+    )
     db.add(tenant)
     await db.flush()
     await ensure_free_subscription_for_tenant(
@@ -204,16 +305,28 @@ async def create_company(
         granted_by=current_user.id,
     )
 
-    # Generate admin invitation code (single-use)
-    code_str = secrets.token_urlsafe(12)[:16].upper()
-    invite = InvitationCode(
-        code=code_str,
+    from app.services.identity_governance import issue_organization_invitation
+
+    issued = await issue_organization_invitation(
+        db,
         tenant_id=tenant.id,
-        max_uses=1,
-        created_by=current_user.id,
+        target_email=str(data.owner_email),
+        invited_role="org_owner",
+        invited_by_user_id=current_user.id,
     )
-    db.add(invite)
-    await db.flush()
+    code_str = issued.raw_token
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            action="tenant_created",
+            details={
+                "tenant_id": str(tenant.id),
+                "source": "platform_operator",
+                "owner_invitation_id": str(issued.record.id),
+                "owner_email": issued.record.target_email,
+            },
+        )
+    )
 
     return CompanyCreateResponse(
         company=CompanyStats(
@@ -230,7 +343,7 @@ async def create_company(
 @router.put("/companies/{company_id}/toggle")
 async def toggle_company(
     company_id: uuid.UUID,
-    current_user: User = Depends(require_role("platform_admin")),
+    current_user: User = Depends(get_platform_operator),
     db: AsyncSession = Depends(get_db),
 ):
     """Enable or disable a company."""
@@ -266,7 +379,7 @@ async def toggle_company(
 
 @router.get("/agentbay/cleanup-required")
 async def list_agentbay_cleanup_required(
-    current_user: User = Depends(require_role("platform_admin")),
+    current_user: User = Depends(get_platform_operator),
     db: AsyncSession = Depends(get_db),
 ):
     """Release preflight and operator queue for unconfirmed provider cleanup."""
@@ -482,7 +595,7 @@ async def _reconcile_agentbay_provider_collision_group(
 async def reconcile_agentbay_cleanup_required(
     ledger_id: uuid.UUID,
     body: AgentBayCleanupReconcileRequest,
-    current_user: User = Depends(require_role("platform_admin")),
+    current_user: User = Depends(get_platform_operator),
     db: AsyncSession = Depends(get_db),
 ):
     """Close a poison row only after provider deletion is proven explicitly."""
@@ -637,7 +750,7 @@ async def reconcile_agentbay_cleanup_required(
 async def get_platform_timeseries(
     start_date: datetime,
     end_date: datetime,
-    current_user: User = Depends(require_role("platform_admin")),
+    current_user: User = Depends(get_platform_operator),
     db: AsyncSession = Depends(get_db),
 ):
     """Get daily platform metrics within a date range.
@@ -802,7 +915,7 @@ async def get_platform_timeseries(
 
 @router.get("/metrics/leaderboards")
 async def get_platform_leaderboards(
-    current_user: User = Depends(require_role("platform_admin")),
+    current_user: User = Depends(get_platform_operator),
     db: AsyncSession = Depends(get_db),
 ):
     """Get Top 20 token consuming companies and agents."""
@@ -854,7 +967,7 @@ async def get_platform_leaderboards(
 
 @router.get("/metrics/enhanced")
 async def get_enhanced_metrics(
-    current_user: User = Depends(require_role("platform_admin")),
+    current_user: User = Depends(get_platform_operator),
     db: AsyncSession = Depends(get_db),
 ):
     """Enhanced platform metrics: retention, avg tokens/session,
@@ -1005,7 +1118,7 @@ async def get_enhanced_metrics(
 
 @router.get("/platform-settings", response_model=PlatformSettingsOut)
 async def get_platform_settings(
-    current_user: User = Depends(require_role("platform_admin")),
+    current_user: User = Depends(get_platform_operator),
     db: AsyncSession = Depends(get_db),
 ):
     """Get platform-level settings."""
@@ -1036,7 +1149,7 @@ async def get_platform_settings(
 @router.put("/platform-settings", response_model=PlatformSettingsOut)
 async def update_platform_settings(
     data: PlatformSettingsUpdate,
-    current_user: User = Depends(require_role("platform_admin")),
+    current_user: User = Depends(get_platform_operator),
     db: AsyncSession = Depends(get_db),
 ):
     """Update platform-level settings."""
@@ -1056,46 +1169,45 @@ async def update_platform_settings(
 
 # ─── Platform Registration Codes ───────────────────────
 
-async def _generate_unique_registration_code(db: AsyncSession) -> str:
-    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-    for _ in range(20):
-        code = "".join(secrets.choice(alphabet) for _ in range(10))
-        existing = await db.execute(select(InvitationCode.id).where(InvitationCode.code == code))
-        if existing.scalar_one_or_none() is None:
-            return code
-    raise HTTPException(status_code=500, detail="Failed to generate unique registration code")
-
-
 @router.get("/registration-codes", response_model=RegistrationCodeListOut)
 async def list_registration_codes(
     page: int = 1,
     page_size: int = 20,
     search: str = "",
-    current_user: User = Depends(require_role("platform_admin")),
+    current_user: User = Depends(get_platform_operator),
     db: AsyncSession = Depends(get_db),
 ):
-    """List platform-level registration codes used by the signup gate."""
+    """Legacy-shaped list backed by separated RegistrationGrant records."""
     page = max(page, 1)
     page_size = min(max(page_size, 1), 100)
-    base_filter = InvitationCode.tenant_id.is_(None)
-    stmt = select(InvitationCode).where(base_filter)
-    count_stmt = select(sqla_func.count()).select_from(InvitationCode).where(base_filter)
+    stmt = select(RegistrationGrant)
+    count_stmt = select(sqla_func.count()).select_from(RegistrationGrant)
 
     if search:
         normalized = search.strip().upper()
-        stmt = stmt.where(InvitationCode.code.ilike(f"%{normalized}%"))
-        count_stmt = count_stmt.where(InvitationCode.code.ilike(f"%{normalized}%"))
+        stmt = stmt.where(RegistrationGrant.token_prefix.ilike(f"%{normalized}%"))
+        count_stmt = count_stmt.where(RegistrationGrant.token_prefix.ilike(f"%{normalized}%"))
 
     total_result = await db.execute(count_stmt)
     total = total_result.scalar() or 0
     result = await db.execute(
-        stmt.order_by(InvitationCode.created_at.desc())
+        stmt.order_by(RegistrationGrant.created_at.desc())
         .offset((page - 1) * page_size)
         .limit(page_size)
     )
 
     return RegistrationCodeListOut(
-        items=[RegistrationCodeOut.model_validate(c, from_attributes=True) for c in result.scalars().all()],
+        items=[
+            RegistrationCodeOut(
+                id=grant.id,
+                code=f"{grant.token_prefix}…",
+                max_uses=grant.max_uses,
+                used_count=grant.used_count,
+                is_active=grant.status == "active",
+                created_at=grant.created_at,
+            )
+            for grant in result.scalars().all()
+        ],
         total=total,
         page=page,
         page_size=page_size,
@@ -1105,22 +1217,21 @@ async def list_registration_codes(
 @router.post("/registration-codes", response_model=RegistrationCodeCreateResponse, status_code=201)
 async def create_registration_codes(
     data: RegistrationCodeCreateRequest,
-    current_user: User = Depends(require_role("platform_admin")),
+    current_user: User = Depends(get_platform_operator),
     db: AsyncSession = Depends(get_db),
 ):
-    """Batch-create platform-level registration codes."""
+    """Batch-create registration grants; raw tokens are returned once."""
+    from app.services.identity_governance import issue_registration_grant
+
     created: list[str] = []
     for _ in range(data.count):
-        code_str = await _generate_unique_registration_code(db)
-        db.add(
-            InvitationCode(
-                code=code_str,
-                tenant_id=None,
-                max_uses=data.max_uses,
-                created_by=current_user.id,
-            )
+        issued = await issue_registration_grant(
+            db,
+            max_uses=data.max_uses,
+            created_by_identity_id=current_user.identity_id,
+            expires_at=None,
         )
-        created.append(code_str)
+        created.append(issued.raw_token)
 
     await db.flush()
     return RegistrationCodeCreateResponse(created=len(created), codes=created)
@@ -1128,30 +1239,28 @@ async def create_registration_codes(
 
 @router.get("/registration-codes/export")
 async def export_registration_codes_csv(
-    current_user: User = Depends(require_role("platform_admin")),
+    current_user: User = Depends(get_platform_operator),
     db: AsyncSession = Depends(get_db),
 ):
-    """Export platform registration codes as CSV."""
+    """Export non-secret registration grant metadata as CSV."""
     import csv
     import io
     from fastapi.responses import StreamingResponse
 
     result = await db.execute(
-        select(InvitationCode)
-        .where(InvitationCode.tenant_id.is_(None))
-        .order_by(InvitationCode.created_at.asc())
+        select(RegistrationGrant).order_by(RegistrationGrant.created_at.asc())
     )
     codes = result.scalars().all()
 
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["Code", "Max Uses", "Used Count", "Active", "Created At"])
+    writer.writerow(["Token Prefix", "Max Uses", "Used Count", "Status", "Created At"])
     for code in codes:
         writer.writerow([
-            code.code,
+            code.token_prefix,
             code.max_uses,
             code.used_count,
-            "Yes" if code.is_active else "No",
+            code.status,
             code.created_at.strftime("%Y-%m-%d %H:%M:%S") if code.created_at else "",
         ])
 
@@ -1166,19 +1275,17 @@ async def export_registration_codes_csv(
 @router.delete("/registration-codes/{code_id}")
 async def deactivate_registration_code(
     code_id: uuid.UUID,
-    current_user: User = Depends(require_role("platform_admin")),
+    current_user: User = Depends(get_platform_operator),
     db: AsyncSession = Depends(get_db),
 ):
-    """Deactivate a platform registration code."""
+    """Revoke a RegistrationGrant without affecting organization invitations."""
     result = await db.execute(
-        select(InvitationCode).where(
-            InvitationCode.id == code_id,
-            InvitationCode.tenant_id.is_(None),
-        )
+        select(RegistrationGrant).where(RegistrationGrant.id == code_id).with_for_update()
     )
     code = result.scalar_one_or_none()
     if not code:
         raise HTTPException(status_code=404, detail="Registration code not found")
-    code.is_active = False
+    if code.status == "active":
+        code.status = "revoked"
     await db.flush()
     return {"status": "deactivated"}

@@ -4,17 +4,19 @@ import hashlib
 import hmac
 import secrets
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response, status
 from loguru import logger
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 from app.core.security import (
     _request_is_secure,
+    access_context_mfa_verified,
     clear_browser_session_cookie,
     create_access_token,
     get_authenticated_user,
@@ -44,8 +46,8 @@ from app.core.identity_canonicalization import (
     username_looks_like_contact,
 )
 from app.dao import identity_dao, system_setting_dao, tenant_dao, user_dao
-from app.database import transaction
-from app.models.user import User
+from app.database import async_session, transaction
+from app.models.user import Identity, User
 from app.schemas.schemas import (
     ForgotPasswordRequest,
     IdentityBindRequest,
@@ -69,7 +71,6 @@ from app.schemas.schemas import (
     SelfUserUpdate,
     VerifyEmailRequest,
 )
-from app.services.subscription_lifecycle import ensure_free_subscription_for_tenant
 from app.services.external_identity_policy import (
     external_user_can_authenticate,
     require_stable_external_subject,
@@ -81,6 +82,11 @@ from app.services.identity_login_namespace import (
 )
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+# Keep a stable reference so focused tests that replace the public serializer
+# schema do not accidentally open a real database session. Production always
+# returns this concrete schema before resolving live access.
+_ACCESS_AWARE_USER_OUT_TYPE = UserOut
 
 
 async def _acquire_registration_bootstrap_lock(db: AsyncSession) -> None:
@@ -139,6 +145,37 @@ def serialize_user(user: User | None) -> UserOut | None:
     return data
 
 
+async def serialize_user_with_access(user: User | None) -> UserOut | None:
+    """Serialize a user with one live, server-authoritative access snapshot.
+
+    ``serialize_user`` remains the narrow legacy serializer so older unit
+    tests and internal callers can replace it without opening a database
+    session.  Production response paths call this async wrapper.
+    """
+
+    data = serialize_user(user)
+    if user is None or data is None:
+        return None
+    # Several focused policy tests intentionally replace the legacy serializer
+    # with a plain object/dict.  Do not turn those isolated tests into database
+    # integration tests.
+    if not isinstance(data, _ACCESS_AWARE_USER_OUT_TYPE):
+        return data
+
+    from app.services.access_control import resolve_effective_access
+
+    async with async_session() as session:
+        access = await resolve_effective_access(session, user)
+    data.membership_id = access.membership_id
+    data.membership_role = access.membership_role
+    data.global_roles = list(access.global_roles)
+    data.effective_capabilities = list(access.effective_capabilities)
+    data.available_surfaces = list(access.available_surfaces)
+    data.pending_invitation_count = access.pending_invitation_count
+    data.current_support_session = access.current_support_session
+    return data
+
+
 async def _reauthenticate_sensitive_identity_action(
     request: Request,
     current_user: User,
@@ -181,36 +218,69 @@ def _normalize_invitation_code(code: str | None) -> str:
     return (code or "").strip().upper()
 
 
+@dataclass(slots=True)
+class SignupAccess:
+    """Validated registration gate without implicitly joining a tenant."""
+
+    kind: str
+    record: object
+    tenant_id: uuid.UUID | None = None
+    membership_role: str = "member"
+
+
 async def _get_valid_signup_code(
     db: AsyncSession,
     invitation_code: str | None,
     *,
-    allow_exhausted: bool = False,
+    identity_email: str | None = None,
+    requested_tenant_id: uuid.UUID | None = None,
 ):
-    """Return a valid active code for signup gating.
+    """Validate either a platform grant or a pending organization credential.
 
-    Platform registration codes have ``tenant_id IS NULL`` and are consumed by
-    registration. Tenant invitation codes have ``tenant_id IS NOT NULL`` and are
-    allowed to satisfy the signup gate, but remain consumed by /tenants/join.
+    Registration grants are consumed after account creation. Organization
+    credentials remain pending until the authenticated user explicitly accepts
+    them through ``/tenants/join``.
     """
-    from app.models.invitation_code import InvitationCode
+    from app.services.identity_governance import (
+        GovernanceCredentialError,
+        resolve_organization_credential,
+        resolve_registration_grant,
+    )
 
     code = _normalize_invitation_code(invitation_code)
     if not code:
         raise HTTPException(status_code=400, detail="Registration code is required")
 
-    result = await db.execute(
-        select(InvitationCode).where(
-            InvitationCode.code == code,
-            InvitationCode.is_active == True,  # noqa: E712
-        ).with_for_update()
+    try:
+        grant = await resolve_registration_grant(db, code, for_update=True)
+        if grant:
+            if requested_tenant_id is not None:
+                raise HTTPException(
+                    status_code=403,
+                    detail="A platform registration grant is not an organization invitation.",
+                )
+            return SignupAccess(kind="registration_grant", record=grant)
+
+        organization_access = await resolve_organization_credential(
+            db,
+            code,
+            identity_email=identity_email,
+            target_tenant_id=requested_tenant_id,
+            for_update=True,
+        )
+    except GovernanceCredentialError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
+    if not organization_access:
+        raise HTTPException(status_code=400, detail="Invalid registration grant or organization invitation")
+    return SignupAccess(
+        kind=organization_access.kind,
+        record=organization_access,
+        tenant_id=organization_access.tenant_id,
+        membership_role=organization_access.role,
     )
-    code_obj = result.scalar_one_or_none()
-    if not code_obj:
-        raise HTTPException(status_code=400, detail="Invalid registration code")
-    if not allow_exhausted and code_obj.used_count >= code_obj.max_uses:
-        raise HTTPException(status_code=400, detail="Registration code has reached its usage limit")
-    return code_obj
 
 
 async def _prepare_signup_code_if_required(
@@ -218,17 +288,26 @@ async def _prepare_signup_code_if_required(
     invitation_code: str | None,
     *,
     is_first_user: bool,
+    identity_email: str | None = None,
+    requested_tenant_id: uuid.UUID | None = None,
 ):
     """Validate signup code for all non-bootstrap signups."""
     if is_first_user:
         return None
-    return await _get_valid_signup_code(db, invitation_code)
+    return await _get_valid_signup_code(
+        db,
+        invitation_code,
+        identity_email=identity_email,
+        requested_tenant_id=requested_tenant_id,
+    )
 
 
 def _consume_signup_code_if_needed(code_obj) -> None:
-    """Consume the code only after a new account/user record was created."""
-    if code_obj is not None:
-        code_obj.used_count += 1
+    """Consume only a platform registration grant after account creation."""
+    if code_obj is not None and code_obj.kind == "registration_grant":
+        from app.services.identity_governance import consume_registration_grant
+
+        consume_registration_grant(code_obj.record)
 
 
 async def _resolve_signup_tenant(
@@ -237,7 +316,7 @@ async def _resolve_signup_tenant(
     *,
     requested_tenant_id: uuid.UUID | None = None,
 ):
-    """Resolve and lock a tenant invitation for one atomic registration."""
+    """Return pending organization context without creating a membership."""
     if code_obj is None or code_obj.tenant_id is None:
         if requested_tenant_id is not None:
             raise HTTPException(
@@ -246,28 +325,40 @@ async def _resolve_signup_tenant(
             )
         return None, "member"
 
-    from app.models.tenant import Tenant
-
     if requested_tenant_id is not None and requested_tenant_id != code_obj.tenant_id:
         raise HTTPException(
             status_code=403,
             detail="The registration code does not belong to the required organization.",
         )
-    tenant_result = await db.execute(
-        select(Tenant).where(Tenant.id == code_obj.tenant_id).with_for_update()
-    )
-    tenant = tenant_result.scalar_one_or_none()
-    if not tenant or not tenant.is_active:
-        raise HTTPException(status_code=400, detail="Company not found or is disabled")
-    admin_result = await db.execute(
-        select(func.count()).select_from(User).where(
-            User.tenant_id == tenant.id,
-            User.role.in_(["org_admin", "platform_admin"]),
-            User.is_active.is_(True),
+    # Explicit acceptance is F04/F05. Registration never consumes or applies
+    # the organization role and therefore cannot auto-promote the first user.
+    return None, "member"
+
+
+async def _grant_company_creation_from_registration_policy(
+    db: AsyncSession,
+    *,
+    identity,
+    is_first_user: bool,
+) -> None:
+    """Materialize the account-level ``company.create`` policy at signup."""
+    from app.models.system_settings import SystemSetting
+    from app.services.identity_governance import COMPANY_CREATE_CAPABILITY, grant_identity_capability
+
+    should_grant = is_first_user
+    if not should_grant:
+        result = await db.execute(
+            select(SystemSetting).where(SystemSetting.key == "allow_self_create_company")
         )
-    )
-    role = "member" if admin_result.scalar() > 0 else "org_admin"
-    return tenant, role
+        setting = result.scalar_one_or_none()
+        should_grant = setting.value.get("enabled", True) if setting else True
+    if should_grant:
+        await grant_identity_capability(
+            db,
+            identity_id=identity.id,
+            capability=COMPANY_CREATE_CAPABILITY,
+            granted_by_identity_id=None,
+        )
 
 
 async def _require_password_registration_ownership(identity, email: str, password: str) -> None:
@@ -368,16 +459,11 @@ async def check_duplicate(
 async def _send_verification_email_task(
     user: User,
     background_tasks: BackgroundTasks,
-    settings: Any,
+    request: Request | None = None,
 ) -> None:
-    """Helper to create verification token and add email task to background tasks."""
-    from app.services.system_email_service import resolve_email_config_async
+    """Create a token and persist an auditable email delivery request."""
     from app.services.email_verification_service import email_verification_service
-
-    email_config = await resolve_email_config_async()
-    if not email_config:
-        logger.debug("No email config found (env or DB), skipping verification email")
-        return
+    from app.services.outbound_email_service import dispatch_outbound_email, persist_template_email
 
     try:
         identity = await identity_dao.get(user.identity_id)
@@ -390,17 +476,31 @@ async def _send_verification_email_task(
             identity.id, identity.email
         )
         expiry_minutes = int((expires_at - datetime.now(timezone.utc)).total_seconds() // 60)
+        from app.services.platform_service import platform_service
 
-        background_tasks.add_task(
-            email_verification_service.send_verification_email,
-            identity.email,
-            user.display_name or identity.username or "User",
+        async with async_session() as url_db:
+            base_url = await platform_service.get_public_base_url(url_db, request=request)
+        verification_url = await email_verification_service.build_email_verification_url(
+            base_url,
             raw_code,
-            expiry_minutes,
         )
+        delivery = await persist_template_email(
+            purpose="email_verification",
+            to=identity.email,
+            scenario_key="email_verification",
+            variables={
+                "display_name": user.display_name or identity.username or "User",
+                "verification_url": verification_url,
+                "verification_code": raw_code,
+                "expiry_minutes": str(expiry_minutes),
+            },
+            identity_id=identity.id,
+        )
+        if delivery.status in {"queued", "retry_wait"}:
+            background_tasks.add_task(dispatch_outbound_email, delivery.id)
     except Exception as exc:
         logger.warning(
-            "Failed to create verification email user={} error_type={}",
+            "Failed to persist verification email user={} error_type={}",
             user.id,
             type(exc).__name__,
         )
@@ -411,6 +511,7 @@ async def register(
     data: UserRegister,
     background_tasks: BackgroundTasks,
     request: Request,
+    response: Response,
 ):
     """Legacy registration endpoint - kept for backward compatibility.
 
@@ -421,10 +522,6 @@ async def register(
     Public social OAuth is sign-in-only in this release. Organization-managed
     SSO account creation remains available through the tenant SSO callbacks.
     """
-    from app.config import get_settings
-
-    settings = get_settings()
-
     # The legacy payload advertised a social-signup branch that cannot safely
     # complete the provider redirect binding (Google requires the exact
     # redirect_uri and browser-bound state). Fail explicitly before provider,
@@ -438,13 +535,23 @@ async def register(
             ),
         )
 
-    # Regular username/password registration - delegate to new flow
-    await enforce_auth_rate_limit(
+    # Keep old clients functional while making the canonical path and removal
+    # window machine-readable.  Rate limiting and all mutation live solely in
+    # register_init, so compatibility cannot drift into a second signup flow.
+    response.headers["Deprecation"] = "true"
+    response.headers["Sunset"] = "Mon, 16 Nov 2026 00:00:00 GMT"
+    response.headers["Link"] = '</api/auth/register/init>; rel="successor-version"'
+    return await register_init(
+        RegisterInitRequest(
+            username=data.username,
+            email=data.email,
+            password=data.password,
+            display_name=data.display_name,
+            invitation_code=data.invitation_code,
+        ),
+        background_tasks,
         request,
-        identity=str(data.email),
-        policy=password_registration_rate_limit_policy(),
     )
-    return await _handle_normal_register(data, background_tasks, settings)
 
 
 @router.post("/register/init", response_model=RegisterInitResponse, status_code=status.HTTP_201_CREATED)
@@ -457,10 +564,8 @@ async def register_init(
 
     Creates/finds a global Identity and a tenant-scoped User.
     """
-    from app.config import get_settings
     from app.services.registration_service import registration_service
 
-    settings = get_settings()
     logger.info("[REGISTER_INIT] Starting registration")
     email = canonicalize_email(data.email)
     username = normalize_safe_username(data.username)
@@ -511,6 +616,8 @@ async def register_init(
             session,
             data.invitation_code,
             is_first_user=is_first_user,
+            identity_email=email,
+            requested_tenant_id=data.target_tenant_id,
         )
         namespace_owner = await identity_dao.get_by_email(email)
         await validate_identity_login_namespace(
@@ -521,13 +628,14 @@ async def register_init(
 
         tenant_uuid = None
         membership_role = "member"
+        pending_tenant_id = data.target_tenant_id
         if not is_first_user:
-            invited_tenant, membership_role = await _resolve_signup_tenant(
+            _invited_tenant, membership_role = await _resolve_signup_tenant(
                 session,
                 signup_code,
                 requested_tenant_id=data.target_tenant_id,
             )
-            tenant_uuid = invited_tenant.id if invited_tenant else None
+            pending_tenant_id = signup_code.tenant_id if signup_code else pending_tenant_id
 
         # Find or Create Identity inside transaction (handles concurrent creation safely)
         identity = await registration_service.find_or_create_identity(
@@ -543,20 +651,11 @@ async def register_init(
             email,
             data.password,
         )
-
-        # For first user: auto-create/get default tenant
-        if is_first_user:
-            tenant = await tenant_dao.get_by_slug("default")
-            if not tenant:
-                tenant = await tenant_dao.create(
-                    obj_in={
-                        "name": "Default",
-                        "slug": "default",
-                        "im_provider": "web_only",
-                    }
-                )
-            tenant_uuid = tenant.id
-            await ensure_free_subscription_for_tenant(session, tenant.id)
+        await _grant_company_creation_from_registration_policy(
+            session,
+            identity=identity,
+            is_first_user=is_first_user,
+        )
 
         # Create User (tenant-scoped)
         created_user = False
@@ -569,7 +668,7 @@ async def register_init(
             user = await registration_service.create_user_with_identity(
                 identity=identity,
                 display_name=data.display_name or data.username,
-                role="platform_admin" if is_first_user else membership_role,
+                role=membership_role,
                 tenant_id=tenant_uuid,
                 email_config=email_config,
             )
@@ -589,18 +688,18 @@ async def register_init(
 
     # 6. Send verification email if not verified (outside transaction)
     if not identity.email_verified:
-        await _send_verification_email_task(user, background_tasks, settings)
+        await _send_verification_email_task(user, background_tasks, request=request)
 
     return RegisterInitResponse(
         user_id=user.id,
         email=identity.email,
         access_token=token,
-        user=serialize_user(user),
+        user=await serialize_user_with_access(user),
         message="Registration initiated. Please verify your email."
         if not identity.email_verified
         else "Registration successful.",
         needs_company_setup=user.tenant_id is None,
-        target_tenant_id=user.tenant_id or data.target_tenant_id,
+        target_tenant_id=user.tenant_id or pending_tenant_id,
     )
 
 
@@ -625,127 +724,104 @@ async def register_sso(
     )
 
 
-async def _handle_normal_register(data: UserRegister, background_tasks: BackgroundTasks, settings):
-    """Legacy normal registration handler."""
-    logger.info("[REGISTER_LEGACY] Starting registration")
+async def _issue_password_login_mfa_challenge(
+    *,
+    identity: Identity,
+    user: User,
+) -> dict[str, Any] | None:
+    """Fence privileged/enrolled password login behind a persisted MFA ceremony."""
 
-    from app.services.registration_service import registration_service
-    email = canonicalize_email(data.email)
-    username = normalize_safe_username(data.username)
-    if email is None:
-        raise HTTPException(status_code=400, detail="A valid email is required")
+    from app.models.audit import AuditLog
+    from app.services.mfa_service import (
+        MFA_CHALLENGE_MINUTES,
+        create_mfa_challenge,
+        identity_requires_mfa,
+    )
 
-    # 1. Resolve policy before hashing or touching persistent state.  A
-    # production instance without email delivery must fail closed.
-    email_config = await _resolve_password_registration_email_config()
+    # Keep the ordinary member login path unchanged and avoid opening another
+    # transaction unless an MFA decision is actually needed.
+    user.identity = identity
+    if not bool(getattr(identity, "mfa_enabled", False)) and not identity_requires_mfa(user):
+        return None
 
-    # 2. Compute hash without a DB connection checked out.
-    password_hash = None
-    if data.password:
-        password_hash = await hash_password_async(data.password)
-
-    # 3. Check if this email is already registered globally outside transaction
-    identity = await identity_dao.get_by_email(email)
-    if identity:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="Email already registered, please login directly."
+    verified_password_hash = identity.password_hash
+    verified_auth_version = identity_auth_version(identity)
+    async with async_session() as session:
+        identity_result = await session.execute(
+            select(Identity).where(Identity.id == identity.id).with_for_update()
         )
-
-    async with transaction() as session:
-        await _acquire_registration_bootstrap_lock(session)
-        is_first_user = await user_dao.is_empty()
-        signup_code = await _prepare_signup_code_if_required(
-            session,
-            data.invitation_code,
-            is_first_user=is_first_user,
+        locked_identity = identity_result.scalar_one_or_none()
+        user_result = await session.execute(
+            select(User).where(User.id == user.id).with_for_update()
         )
-        await validate_identity_login_namespace(
-            username=username,
-            email=email,
-        )
-
-        # Resolve tenant
-        tenant_uuid = None
-        if is_first_user:
-            tenant = await tenant_dao.get_by_slug("default")
-            if not tenant:
-                tenant = await tenant_dao.create(
-                    obj_in={
-                        "name": "Default",
-                        "slug": "default",
-                        "im_provider": "web_only",
-                    }
-                )
-            tenant_uuid = tenant.id
-            await ensure_free_subscription_for_tenant(session, tenant.id)
-            role = "platform_admin"
-        else:
-            tenant, role = await _resolve_signup_tenant(session, signup_code)
-            if tenant:
-                tenant_uuid = tenant.id
-
-        # Resolve or create Identity inside transaction
-        identity = await registration_service.find_or_create_identity(
-            email=email,
-            username=username,
-            password=data.password,
-            is_platform_admin=is_first_user,
-            email_config=email_config,
-            password_hash=password_hash,
-        )
-        await _require_password_registration_ownership(
-            identity,
-            email,
-            data.password,
-        )
-
-        if is_first_user:
-            identity.email_verified = True
-            identity.is_active = True
-            await session.flush()
-
-        # Create Tenant User
-        user = await registration_service.create_user_with_identity(
-            identity=identity,
-            display_name=data.display_name or data.username,
-            role=role,
-            tenant_id=tenant_uuid,
-            registration_source="web",
-            email_config=email_config,
-        )
-        _consume_signup_code_if_needed(signup_code)
-
-    # 5. Seed default agents for first user outside main registration transaction block
-    if is_first_user:
-        try:
-            from app.services.agent_seeder import seed_default_agents
-            await seed_default_agents()
-        except Exception as exc:
-            logger.warning(
-                "Failed to seed default agents error_type={}",
-                type(exc).__name__,
+        locked_user = user_result.scalar_one_or_none()
+        if (
+            locked_identity is None
+            or locked_user is None
+            or not locked_identity.is_active
+            or not locked_user.is_active
+            or locked_user.identity_id != locked_identity.id
+            or locked_user.tenant_id != user.tenant_id
+            or locked_user.role != user.role
+            or not locked_identity.password_login_enabled
+            or not locked_identity.password_hash
+            or not verified_password_hash
+            or not hmac.compare_digest(
+                locked_identity.password_hash,
+                verified_password_hash,
+            )
+            or identity_auth_version(locked_identity) != verified_auth_version
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "login_state_changed",
+                    "message": "Account state changed; sign in again",
+                },
             )
 
-    # 6. Send verification email only when the identity still needs it (outside transaction)
-    if not identity.email_verified:
-        await _send_verification_email_task(user, background_tasks, settings)
+        locked_user.identity = locked_identity
+        if bool(getattr(locked_identity, "mfa_enabled", False)):
+            purpose = "login"
+        elif identity_requires_mfa(locked_user):
+            purpose = "bootstrap"
+        else:
+            # A concurrent policy change removed the gate. Refuse this stale
+            # ceremony instead of issuing a token from an old snapshot.
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "login_state_changed",
+                    "message": "Account state changed; sign in again",
+                },
+            )
 
-    # 7. Generate access token and build response payload outside transaction
-    token = create_access_token(
-        str(user.id), user.role, auth_version=identity_auth_version(identity)
-    )
-    response_data = RegisterInitResponse(
-        user_id=user.id,
-        email=user.email,
-        access_token=token,
-        user=serialize_user(user),
-        message="Registration successful. Please verify your email."
-        if not identity.email_verified
-        else "Registration successful.",
-        needs_company_setup=user.tenant_id is None,
-    )
+        _challenge, challenge_token = await create_mfa_challenge(
+            session,
+            identity_id=locked_identity.id,
+            user_id=locked_user.id,
+            auth_version=identity_auth_version(locked_identity),
+            purpose=purpose,
+        )
+        session.add(
+            AuditLog(
+                tenant_id=locked_user.tenant_id,
+                user_id=locked_user.id,
+                action="mfa_login_challenge_issued",
+                details={
+                    "identity_id": str(locked_identity.id),
+                    "purpose": purpose,
+                },
+            )
+        )
+        await session.commit()
 
-    return response_data
+    return {
+        "requires_mfa": purpose == "login",
+        "requires_mfa_setup": purpose == "bootstrap",
+        "challenge_token": challenge_token,
+        "expires_in_seconds": MFA_CHALLENGE_MINUTES * 60,
+    }
 
 
 @router.post("/login", response_model=Any)
@@ -786,7 +862,7 @@ async def login(data: UserLogin, background_tasks: BackgroundTasks, request: Req
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Your account has been disabled.")
 
     if not identity.email_verified:
-        from app.config import get_settings, unverified_local_signup_allowed
+        from app.config import unverified_local_signup_allowed
         email_config = await _resolve_auth_email_config()
 
         if not email_config:
@@ -817,7 +893,7 @@ async def login(data: UserLogin, background_tasks: BackgroundTasks, request: Req
 
             # Trigger email delivery in background
             if user:
-                await _send_verification_email_task(user, background_tasks, get_settings())
+                await _send_verification_email_task(user, background_tasks, request=request)
 
             # Consistent with identity-first flow: Return 403 Forbidden with verification intent
             raise HTTPException(
@@ -878,6 +954,7 @@ async def login(data: UserLogin, background_tasks: BackgroundTasks, request: Req
                         tenant_name=tenant.name if tenant else "Create or Join Organization",
                         tenant_slug=tenant.slug if tenant else "",
                         logo_url=tenant.logo_url if tenant else None,
+                        membership_role=(u.role if u.tenant_id else None),
                     )
                 )
 
@@ -909,13 +986,20 @@ async def login(data: UserLogin, background_tasks: BackgroundTasks, request: Req
                 detail="Your organization has been disabled.",
             )
 
+    mfa_challenge = await _issue_password_login_mfa_challenge(
+        identity=identity,
+        user=user,
+    )
+    if mfa_challenge is not None:
+        return mfa_challenge
+
     # 6. Generate Token
     token = create_access_token(
         str(user.id), user.role, auth_version=identity_auth_version(identity)
     )
     return TokenResponse(
         access_token=token,
-        user=serialize_user(user),
+        user=await serialize_user_with_access(user),
         identity=IdentityOut.model_validate(identity),
         needs_company_setup=user.tenant_id is None,
     )
@@ -970,21 +1054,11 @@ async def forgot_password(
     request: Request,
 ):
     """Request a password reset link for a global Identity."""
-    from app.services.system_email_service import resolve_email_config_async
-
     await enforce_auth_rate_limit(
         request,
         identity=str(data.email),
         policy=email_action_rate_limit_policy(),
     )
-    email_config = await resolve_email_config_async()
-
-    if not email_config:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Password reset is currently unavailable (no mail server configured).",
-        )
-
     generic_response = {
         "ok": True,
         "message": "If an account with that email exists, a password reset email has been sent.",
@@ -993,7 +1067,7 @@ async def forgot_password(
     identity = None
     try:
         from app.services.password_reset_service import build_password_reset_url, create_password_reset_token
-        from app.services.system_email_service import send_password_reset_email
+        from app.services.outbound_email_service import dispatch_outbound_email, persist_template_email
 
         # Serialize reset issuance with email changes.  The second lookup under
         # the row lock closes the read/issue race on the old address.
@@ -1018,13 +1092,19 @@ async def forgot_password(
 
         reset_url = await build_password_reset_url(raw_token)
         expiry_minutes = int((expires_at - datetime.now(timezone.utc)).total_seconds() // 60)
-        background_tasks.add_task(
-            send_password_reset_email,
-            identity.email,
-            identity.username or "User",
-            reset_url,
-            expiry_minutes,
+        delivery = await persist_template_email(
+            purpose="password_reset",
+            to=identity.email,
+            scenario_key="password_reset",
+            variables={
+                "display_name": identity.username or "User",
+                "reset_url": reset_url,
+                "expiry_minutes": str(expiry_minutes),
+            },
+            identity_id=identity.id,
         )
+        if delivery.status in {"queued", "retry_wait"}:
+            background_tasks.add_task(dispatch_outbound_email, delivery.id)
     except Exception as exc:
         logger.warning(
             "Failed to process password reset email error_type={}",
@@ -1084,7 +1164,7 @@ async def reset_password(data: ResetPasswordRequest):
 @router.get("/me", response_model=UserOut)
 async def get_me(current_user: User = Depends(get_verification_user)):
     """Get current user profile."""
-    return serialize_user(current_user)
+    return await serialize_user_with_access(current_user)
 
 
 @router.post("/browser-session", status_code=status.HTTP_204_NO_CONTENT)
@@ -1292,12 +1372,13 @@ async def update_me(
                 sync_phone=phone_changed,
             )
 
-        result = serialize_user(user)
+        result = await serialize_user_with_access(user)
         if changed_global_fields:
             refreshed_token = create_access_token(
                 str(user.id),
                 user.role,
                 auth_version=identity_auth_version(locked_identity),
+                mfa_verified=access_context_mfa_verified(current_user),
             )
 
     if refreshed_token:
@@ -1326,12 +1407,14 @@ async def get_my_tenants(
     # 3. Get tenant details
     tenants = [tenant for tenant in await tenant_dao.get_by_ids(tenant_ids) if tenant.is_active]
 
+    membership_by_tenant = {str(user.tenant_id): user for user in users if user.tenant_id}
     return [
         TenantChoice(
             tenant_id=t.id,
             tenant_name=t.name,
             tenant_slug=t.slug,
             logo_url=t.logo_url,
+            membership_role=membership_by_tenant[str(t.id)].role,
         )
         for t in tenants
     ]
@@ -1365,6 +1448,7 @@ async def switch_tenant(
         str(target_user.id),
         target_user.role,
         auth_version=identity_auth_version(current_user),
+        mfa_verified=access_context_mfa_verified(current_user),
     )
 
     # 4. Determine redirect URL
@@ -1389,10 +1473,11 @@ async def switch_tenant(
     # validate token tenant + declared tenant + current origin before commit.
     if redirect_url:
         separator = "&" if "#" in redirect_url else "#"
-        redirect_url = f"{redirect_url}{separator}{urlencode({
+        redirect_fragment = urlencode({
             'session_token': token,
             'target_tenant_id': str(tenant.id),
-        })}"
+        })
+        redirect_url = f"{redirect_url}{separator}{redirect_fragment}"
 
     return TenantSwitchResponse(
         access_token=token,
@@ -1466,6 +1551,7 @@ async def change_password(
         str(current_user.id),
         current_user.role,
         auth_version=tx_identity.auth_version,
+        mfa_verified=access_context_mfa_verified(current_user),
     )
     return {"ok": True, "access_token": token}
 
@@ -1800,7 +1886,7 @@ async def oauth_callback(
         )
         return TokenResponse(
             access_token=jwt_token,
-            user=serialize_user(user),
+            user=await serialize_user_with_access(user),
             needs_company_setup=False,
         )
 
@@ -1955,6 +2041,7 @@ async def oauth_callback(
                         tenant_name=tenants_map[tenant_key].name,
                         tenant_slug=tenants_map[tenant_key].slug,
                         logo_url=tenants_map[tenant_key].logo_url,
+                        membership_role=membership.role,
                     )
                     for tenant_key, membership in memberships_by_tenant.items()
                 ]
@@ -2006,7 +2093,7 @@ async def oauth_callback(
     )
     return TokenResponse(
         access_token=jwt_token,
-        user=serialize_user(selected_user),
+        user=await serialize_user_with_access(selected_user),
         needs_company_setup=selected_user.tenant_id is None,
     )
 
@@ -2175,10 +2262,11 @@ async def bind_identity(
         str(fresh_user.id),
         fresh_user.role,
         auth_version=identity_auth_version(identity),
+        mfa_verified=access_context_mfa_verified(current_user),
     )
     response.headers["X-Astra-Access-Token"] = refreshed_token
     set_browser_session_cookie(response, refreshed_token, request)
-    return serialize_user(fresh_user)
+    return await serialize_user_with_access(fresh_user)
 
 
 @router.post("/{provider}/unbind", response_model=UserOut)
@@ -2281,10 +2369,11 @@ async def unbind_identity(
         str(user.id),
         user.role,
         auth_version=identity_auth_version(identity),
+        mfa_verified=access_context_mfa_verified(current_user),
     )
     response.headers["X-Astra-Access-Token"] = refreshed_token
     set_browser_session_cookie(response, refreshed_token, request)
-    return serialize_user(user)
+    return await serialize_user_with_access(user)
 
 
 # ─── Email Verification Endpoints ──────────────────────────────────────
@@ -2345,7 +2434,7 @@ async def verify_email(data: VerifyEmailRequest):
 
     return TokenResponse(
         access_token=token,
-        user=serialize_user(user),
+        user=await serialize_user_with_access(user),
         identity=IdentityOut.model_validate(identity),
         needs_company_setup=user.tenant_id is None,
     )
@@ -2358,7 +2447,6 @@ async def resend_verification(
     request: Request,
 ):
     """Resend email verification link."""
-    from app.config import get_settings
     from app.services.system_email_service import resolve_email_config_async
 
     # Always return success to prevent email enumeration
@@ -2366,7 +2454,6 @@ async def resend_verification(
         "ok": True,
         "message": "If an account with that email exists, a verification email has been sent.",
     }
-    settings = get_settings()
     await enforce_auth_rate_limit(
         request,
         identity=str(data.email),
@@ -2390,6 +2477,6 @@ async def resend_verification(
 
     if user:
         # Queue email task outside transaction
-        await _send_verification_email_task(user, background_tasks, settings)
+        await _send_verification_email_task(user, background_tasks, request=request)
 
     return generic_response

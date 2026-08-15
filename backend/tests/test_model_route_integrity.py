@@ -315,7 +315,11 @@ async def test_enterprise_model_delete_rejects_any_saas_route(monkeypatch):
     db.execute = AsyncMock(return_value=result)
     routes = AsyncMock(return_value=[SimpleNamespace(id=route_id)])
     monkeypatch.setattr(enterprise_api, "_model_routes", routes)
-    actor = SimpleNamespace(role="platform_admin", identity=None)
+    actor = SimpleNamespace(
+        role="platform_admin",
+        tenant_id=None,
+        identity=SimpleNamespace(is_platform_admin=True),
+    )
 
     with pytest.raises(HTTPException, match="every SaaS model route") as exc:
         await enterprise_api.remove_llm_model(

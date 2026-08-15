@@ -21,7 +21,6 @@ from app.services.auth_provider import ExternalUserInfo, GitHubAuthProvider
 from app.services.google_workspace_oauth import (
     GOOGLE_SYNC_BROWSER_NONCE_COOKIE,
     GOOGLE_SYNC_STATE_PREFIX,
-    sign_google_sso_state,
 )
 
 
@@ -355,17 +354,25 @@ async def test_dedicated_oauth_callbacks_do_not_echo_provider_exceptions(
         monkeypatch.setattr(google_api, "get_pending_sso_session", AsyncMock(return_value=scan_session))
         monkeypatch.setattr(google_api, "get_login_identity_provider_by_id", AsyncMock(return_value=provider_record))
         monkeypatch.setattr(google_api, "get_google_redirect_uri", AsyncMock(return_value="https://example.com/google/callback"))
+        monkeypatch.setattr(google_api, "claim_google_sso_authorization_code", AsyncMock(return_value=True))
+        monkeypatch.setattr(google_api, "fail_sso_session", AsyncMock(return_value=True))
         monkeypatch.setattr(google_api, "GoogleWorkspaceAuthProvider", Mock(return_value=failing_provider))
         monkeypatch.setattr(google_api, "logger", fake_logger)
         response = await google_api._handle_google_sso_callback(
             "code",
-            sid,
-            provider_id,
+            {
+                "session_id": sid,
+                "provider_id": provider_id,
+                "tenant_id": tenant_id,
+                "redirect_uri": "https://example.com/google/callback",
+                "code_verifier": "verifier",
+                "oidc_nonce": "nonce",
+            },
             request,
             _DB(),
         )
 
-    assert response.status_code == 400
+    assert response.status_code == (200 if provider == "google_workspace" else 400)
     assert secret not in response.body.decode("utf-8")
     assert secret not in repr(fake_logger.warning.call_args_list)
     assert secret not in repr(fake_logger.error.call_args_list)
@@ -465,12 +472,21 @@ async def test_attacker_relay_cannot_be_authorized_by_victim_browser(
                 db=_DB(),
             )
         else:
-            await google_api._handle_google_sso_callback(
-                "code",
-                sid,
-                provider_id,
-                request,
-                _DB(),
+            monkeypatch.setattr(
+                google_api,
+                "consume_google_sso_state",
+                AsyncMock(
+                    side_effect=HTTPException(
+                        status_code=403,
+                        detail="SSO session belongs to a different browser",
+                    )
+                ),
+            )
+            await google_api.google_workspace_callback(
+                code="code",
+                state="gwsso.opaque-state",
+                request=request,
+                db=_DB(),
             )
 
     assert exc.value.status_code == 403
@@ -496,25 +512,23 @@ def test_sso_provider_callbacks_only_accept_top_level_get():
 
 
 @pytest.mark.asyncio
-async def test_google_sso_callback_does_not_depend_on_redis(monkeypatch):
-    sid = uuid.uuid4()
-    provider_id = uuid.uuid4()
-    expected = object()
-    handler = AsyncMock(return_value=expected)
+async def test_google_sso_callback_requires_server_owned_redis_state(monkeypatch):
+    handler = AsyncMock()
     redis_consume = AsyncMock(side_effect=RuntimeError("redis unavailable"))
     monkeypatch.setattr(google_api, "_handle_google_sso_callback", handler)
-    monkeypatch.setattr(google_api, "consume_google_sync_state", redis_consume)
+    monkeypatch.setattr(google_api, "consume_google_sso_state", redis_consume)
 
-    result = await google_api.google_workspace_callback(
-        code="oauth-code",
-        state=sign_google_sso_state(sid, provider_id),
-        request=_callback_request(sid, "browser-proof"),
-        db=_DB(),
-    )
+    with pytest.raises(HTTPException) as exc:
+        await google_api.google_workspace_callback(
+            code="oauth-code",
+            state="gwsso.opaque-state",
+            request=_callback_request(uuid.uuid4(), "browser-proof"),
+            db=_DB(),
+        )
 
-    assert result is expected
-    handler.assert_awaited_once()
-    redis_consume.assert_not_awaited()
+    assert exc.value.status_code == 503
+    handler.assert_not_awaited()
+    redis_consume.assert_awaited_once()
 
 
 @pytest.mark.asyncio

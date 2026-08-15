@@ -103,3 +103,17 @@
 - 私人助手与数字员工在界面、权限、配额、发现和协作行为上均可区分。
 - 历史助理继续保留原 Agent ID、会话、Workspace 和深链，同时不再冒充当前私人助手或长期 Agent 员工。
 - 一次性任务无需创建长期员工，并且其执行者、授权、Run 和 Artifact 仍可审计。
+
+## 9. 2026-08-15 身份与权限重构上位合同
+
+本文件第 2 节记录的是当前产品称谓，不再表示四类人类角色构成一条权限等级。后续实现以
+[`10-identity-membership-permission-product-plan.md`](./10-identity-membership-permission-product-plan.md) 为上位合同：
+
+1. 公司成员角色收敛为 `org_owner / org_admin / member`；公司创建者是唯一 owner；
+2. `agent_admin` 仅作为兼容期称谓，实际权力必须来自具体 Agent 的 `use/manage` 对象授权；
+3. `platform_admin` 收敛为全局 `platform_operator` 能力，不自动成为任意公司的管理员；
+4. 管理员也是员工，默认进入工作面，通过独立公司管理面执行治理；
+5. 私人助手继续 owner-only，公司 owner/admin 和平台运营者均不得默认读取内容；
+6. 前端显示和服务端授权以 `effective_capabilities / available_surfaces / access_level` 为准，不再以线性角色层级推导。
+
+在兼容迁移完成前，旧枚举值可以继续存在，但不得扩大既有权限或作为新产品流程的唯一判断条件。

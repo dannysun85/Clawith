@@ -10,6 +10,7 @@ import LinearCopyButton from '../components/LinearCopyButton';
 import { useDialog } from '../components/Dialog/DialogProvider';
 import { normalizeTenantRedirectUrl } from '../utils/authTransport';
 import { commitSameOriginTenantSwitch, validateTenantSwitchCandidate } from '../utils/tenantSwitch';
+import { hasProductSurface } from '../utils/productAccess';
 // Format large token numbers with K/M/B suffixes
 function formatTokens(n: number | null | undefined): string {
     if (n == null) return '-';
@@ -132,7 +133,7 @@ export default function AdminCompanies() {
     const user = useAuthStore((s) => s.user);
     const [activeTab, setActiveTab] = useState<'dashboard' | 'platform' | 'registrationCodes' | 'companies'>('dashboard');
 
-    const canAccessPlatformSettings = user?.role === 'platform_admin' || !!(user as any)?.is_platform_admin;
+    const canAccessPlatformSettings = hasProductSurface(user, 'platform_admin');
 
     // Guard: platform admins keep access across tenant contexts.
     if (!canAccessPlatformSettings) {

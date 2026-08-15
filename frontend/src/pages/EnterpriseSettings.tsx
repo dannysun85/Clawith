@@ -288,20 +288,28 @@ function DouyinAccountTab({ onCreateAgent }: { onCreateAgent: () => void }) {
 
 
 
-export default function EnterpriseSettings() {
+type EnterpriseVisibleTabKey = 'info' | 'douyin' | 'subscription' | 'tools' | 'skills' | 'okr' | 'invites' | 'quotas' | 'users' | 'org' | 'approvals' | 'audit';
+
+type EnterpriseSettingsProps = {
+    initialTab?: EnterpriseVisibleTabKey;
+    embedded?: boolean;
+};
+
+export default function EnterpriseSettings({ initialTab, embedded = false }: EnterpriseSettingsProps = {}) {
     const { t, i18n } = useTranslation();
     const isChinese = i18n.language?.startsWith('zh');
     const navigate = useNavigate();
-    const outletContext = useOutletContext<{ openTalentMarket?: (options?: { initialSearchQuery?: string }) => void }>();
+    const outletContext = useOutletContext<{ openTalentMarket?: (options?: { initialSearchQuery?: string }) => void }>() || {};
     const user = useAuthStore((s) => s.user);
     const dialog = useDialog();
     const toast = useToast();
     const qc = useQueryClient();
-    type VisibleTabKey = 'info' | 'douyin' | 'subscription' | 'tools' | 'skills' | 'okr' | 'invites' | 'quotas' | 'users' | 'org' | 'approvals' | 'audit';
+    type VisibleTabKey = EnterpriseVisibleTabKey;
     type TabKey = VisibleTabKey | 'llm' | 'plans';
     const VISIBLE_TABS: VisibleTabKey[] = ['info', 'douyin', 'subscription', 'tools', 'skills', 'okr', 'invites', 'quotas', 'users', 'org', 'approvals', 'audit'];
     const VALID_TABS: TabKey[] = [...VISIBLE_TABS, 'llm', 'plans'];
     const getTabFromHash = (): TabKey => {
+        if (initialTab && VISIBLE_TABS.includes(initialTab)) return initialTab;
         const hash = window.location.hash.replace('#', '') as TabKey;
         return VALID_TABS.includes(hash) ? hash : 'info';
     };
@@ -608,7 +616,7 @@ export default function EnterpriseSettings() {
     return (
         <>
             <div>
-                <div className="page-header">
+                {!embedded && <div className="page-header">
                     <div>
                         <h1 className="page-title">{t('nav.enterprise')}</h1>
                         {stats && (
@@ -619,9 +627,9 @@ export default function EnterpriseSettings() {
                             </div>
                         )}
                     </div>
-                </div>
+                </div>}
 
-                <div className="tabs">
+                {!embedded && <div className="tabs">
                     {VISIBLE_TABS.map(tab => (
                         <div
                             key={tab}
@@ -635,7 +643,7 @@ export default function EnterpriseSettings() {
                             {tab === 'quotas' ? t('enterprise.tabs.quotas', 'Quotas') : tab === 'users' ? t('enterprise.tabs.users', 'Users') : tab === 'invites' ? t('enterprise.tabs.invites', 'Invitations') : tab === 'okr' ? t('nav.okr', 'OKR') : t(`enterprise.tabs.${tab}`)}
                         </div>
                     ))}
-                </div>
+                </div>}
 
                 {activeTab === 'okr' && <OkrTab tenantId={selectedTenantId} t={t} />}
 

@@ -17,7 +17,11 @@ from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
-from app.core.security import get_current_admin, get_current_user, require_role
+from app.core.security import (
+    get_company_governor,
+    get_company_or_platform_admin,
+    get_current_user,
+)
 from app.database import async_session
 from app.models.skill import Skill, SkillFile
 from app.models.user import User
@@ -354,18 +358,26 @@ def _apply_skill_scope(query, current_user: User):
 
 
 def _is_platform_skill_admin(current_user: User) -> bool:
-    identity = getattr(current_user, "identity", None)
-    return current_user.role == "platform_admin" or bool(
-        getattr(identity, "is_platform_admin", False)
-    )
+    from app.services.access_control import is_platform_operator
+
+    # Product-surface selection is represented by the active membership. A
+    # tenantless platform anchor can edit global definitions; the same Identity
+    # inside a company must obey its company membership instead.
+    return current_user.tenant_id is None and is_platform_operator(current_user)
 
 
 def _ensure_skill_write_access(skill: Skill, current_user: User):
     """Reject cross-tenant writes and tenant writes to global definitions."""
     if _is_platform_skill_admin(current_user):
+        if skill.tenant_id is not None:
+            raise HTTPException(403, "Platform operators cannot modify tenant skills")
         return
+    from app.services.access_control import is_company_governor
+
     if not current_user.tenant_id:
         raise HTTPException(403, "Cannot modify skills without a tenant")
+    if not is_company_governor(current_user):
+        raise HTTPException(403, "Company governance access required")
     if skill.tenant_id is None:
         raise HTTPException(403, "Global skills cannot be modified by tenant admins")
     if skill.tenant_id != current_user.tenant_id:
@@ -870,7 +882,7 @@ async def get_skill(skill_id: str, current_user: User = Depends(get_current_user
 
 
 @router.post("/")
-async def create_skill(body: SkillCreateIn, current_user: User = Depends(get_current_admin)):
+async def create_skill(body: SkillCreateIn, current_user: User = Depends(get_company_or_platform_admin)):
     """Create a custom skill."""
     folder_name = _validate_skill_folder(body.folder_name)
     name = body.name.strip()
@@ -943,7 +955,11 @@ class SkillUpdateIn(BaseModel):
 
 
 @router.put("/{skill_id}")
-async def update_skill(skill_id: str, body: SkillUpdateIn, current_user: User = Depends(get_current_admin)):
+async def update_skill(
+    skill_id: str,
+    body: SkillUpdateIn,
+    current_user: User = Depends(get_company_or_platform_admin),
+):
     """Update a skill's metadata and/or files."""
     async with async_session() as db:
         query = select(Skill).where(Skill.id == skill_id).options(selectinload(Skill.files))
@@ -1016,7 +1032,7 @@ async def update_skill(skill_id: str, body: SkillUpdateIn, current_user: User = 
 
 
 @router.delete("/{skill_id}")
-async def delete_skill(skill_id: str, current_user: User = Depends(get_current_admin)):
+async def delete_skill(skill_id: str, current_user: User = Depends(get_company_or_platform_admin)):
     """Delete a skill (not builtin)."""
     async with async_session() as db:
         query = select(Skill).where(Skill.id == skill_id)
@@ -1070,7 +1086,7 @@ def _mask_token(token: str) -> str:
 
 @router.get("/settings/token")
 async def get_skill_token_status(
-    current_user=Depends(require_role("org_admin", "platform_admin")),
+    current_user=Depends(get_company_governor),
 ):
     """Check if GitHub token and ClawHub key are configured for this tenant."""
     tenant_id = str(current_user.tenant_id) if current_user.tenant_id else None
@@ -1088,7 +1104,7 @@ async def get_skill_token_status(
 @router.put("/settings/token")
 async def set_skill_token(
     body: SkillSettingsIn,
-    current_user=Depends(require_role("org_admin", "platform_admin")),
+    current_user=Depends(get_company_governor),
 ):
     """Save GitHub token and/or ClawHub key for this tenant.
 
@@ -1186,7 +1202,10 @@ class BrowseWriteIn(BaseModel):
 
 
 @router.put("/browse/write")
-async def browse_write(body: BrowseWriteIn, current_user: User = Depends(get_current_admin)):
+async def browse_write(
+    body: BrowseWriteIn,
+    current_user: User = Depends(get_company_or_platform_admin),
+):
     """Write a file in a skill folder. Creates the skill if the folder doesn't exist."""
     parts = body.path.strip("/").split("/", 1)
     if len(parts) < 2:
@@ -1271,7 +1290,10 @@ async def browse_write(body: BrowseWriteIn, current_user: User = Depends(get_cur
 
 
 @router.delete("/browse/delete")
-async def browse_delete(path: str, current_user: User = Depends(get_current_admin)):
+async def browse_delete(
+    path: str,
+    current_user: User = Depends(get_company_or_platform_admin),
+):
     """Delete a file or an entire skill folder."""
     parts = path.strip("/").split("/", 1)
     folder = _validate_skill_folder(parts[0])

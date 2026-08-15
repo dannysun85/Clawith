@@ -38,6 +38,7 @@ interface Props {
     agentLimitReached?: boolean;
     agentLimitMessage?: string;
     onAgentLimitReached?: () => void;
+    onAgentCreated?: (agent: { id: string; name: string }, openChat: boolean) => void;
 }
 
 // Curated list for the "Popular" tab — covers one role from each broad need
@@ -79,6 +80,7 @@ export default function TalentMarketModal({
     agentLimitReached = false,
     agentLimitMessage,
     onAgentLimitReached,
+    onAgentCreated,
 }: Props) {
     const { t, i18n } = useTranslation();
     const isChinese = i18n.language.startsWith('zh');
@@ -339,13 +341,21 @@ export default function TalentMarketModal({
                 template={pendingTemplate}
                 open={!!pendingTemplate}
                 onClose={() => setPendingTemplate(null)}
-                onDone={() => { setPendingTemplate(null); onClose(); }}
+                onDone={(agent, openChat) => {
+                    setPendingTemplate(null);
+                    onClose();
+                    onAgentCreated?.(agent, openChat);
+                }}
             />
             <CustomAgentModal
                 open={customModalOpen}
                 initialMode="native"
                 onClose={() => setCustomModalOpen(false)}
-                onDone={() => { setCustomModalOpen(false); onClose(); }}
+                onDone={(agent, openChat) => {
+                    setCustomModalOpen(false);
+                    onClose();
+                    onAgentCreated?.(agent, openChat);
+                }}
             />
         </div>
     );

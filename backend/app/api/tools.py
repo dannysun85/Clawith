@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from sqlalchemy import String, cast, select, delete, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import get_current_admin, get_current_user
+from app.core.security import get_company_or_platform_admin, get_current_user
 from app.core.permissions import can_manage_agent
 from app.database import get_db
 from app.models.tool import Tool, AgentTool
@@ -229,10 +229,11 @@ def _enforce_media_endpoint_bundle_update(
         incoming_config,
         existing_agent_config,
     )
-    if changed_destination_keys and current_user.role not in (
-        "platform_admin",
-        "org_admin",
-    ) and not _is_platform_admin(current_user):
+    from app.services.access_control import is_company_governor
+
+    if changed_destination_keys and not (
+        is_company_governor(current_user) or _is_platform_admin(current_user)
+    ):
         raise HTTPException(
             status_code=403,
             detail=(
@@ -401,9 +402,9 @@ async def _validated_mcp_url_update(
 
 
 def _is_platform_admin(user: User) -> bool:
-    return user.role == "platform_admin" or bool(
-        getattr(getattr(user, "identity", None), "is_platform_admin", False)
-    )
+    from app.services.access_control import is_platform_operator
+
+    return is_platform_operator(user)
 
 
 async def _require_agent_tool_access(
@@ -417,9 +418,14 @@ async def _require_agent_tool_access(
 
     from app.core.permissions import check_agent_access
 
-    agent, access_level = await check_agent_access(db, current_user, agent_id)
+    agent, access_level = await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage" if manage else "use",
+    )
     if manage and access_level != "manage":
-        raise HTTPException(status_code=403, detail="Manage access to this agent is required")
+        raise HTTPException(status_code=403, detail="Manage access required")
     return agent
 
 
@@ -491,23 +497,37 @@ async def _load_assigned_smithery_connection(
 
 
 def _resolve_target_tenant_id(current_user: User, tenant_id: str | None = None) -> uuid.UUID | None:
+    from app.services.access_control import is_company_governor
+
     if tenant_id:
         try:
             target_tenant_id = uuid.UUID(tenant_id)
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid tenant_id format")
-        if target_tenant_id != current_user.tenant_id and not _is_platform_admin(current_user):
+        if target_tenant_id != current_user.tenant_id:
             raise HTTPException(status_code=403, detail="Cross-tenant tool access is not allowed")
-        return target_tenant_id
-    return current_user.tenant_id
+    else:
+        target_tenant_id = current_user.tenant_id
+
+    if target_tenant_id is None:
+        if not _is_platform_admin(current_user):
+            raise HTTPException(status_code=403, detail="Platform operator access required")
+        return None
+    if not is_company_governor(current_user):
+        raise HTTPException(status_code=403, detail="Company governance access required")
+    return target_tenant_id
 
 
 def _authorize_tool_record(current_user: User, tool: Tool, target_tenant_id: uuid.UUID | None) -> None:
-    """Reject cross-tenant/global mutations unless the caller is platform admin."""
+    """Require the authority matching the concrete global/tenant Tool scope."""
 
-    if _is_platform_admin(current_user):
+    from app.services.access_control import is_company_governor
+
+    if target_tenant_id is None:
+        if not _is_platform_admin(current_user) or tool.tenant_id is not None:
+            raise HTTPException(status_code=403, detail="Global Tool access denied")
         return
-    if target_tenant_id is None or target_tenant_id != current_user.tenant_id:
+    if target_tenant_id != current_user.tenant_id or not is_company_governor(current_user):
         raise HTTPException(status_code=403, detail="Tool tenant access denied")
     if tool.source == "builtin":
         return
@@ -635,8 +655,8 @@ class ToolCreate(BaseModel):
     mcp_server_name: str | None = None
     mcp_tool_name: str | None = None
     is_default: bool = False
-    # Optional: platform admins can specify target tenant (e.g. when managing
-    # another company's tools via the Enterprise Settings page).
+    # Optional stable company selector. It must match the active membership;
+    # platform authority never implies cross-company tool access.
     tenant_id: str | None = None
 
 
@@ -666,7 +686,7 @@ class CategoryConfigUpdate(BaseModel):
 @router.get("")
 async def list_tools(
     tenant_id: str | None = None,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_company_or_platform_admin),
     db: AsyncSession = Depends(get_db),
 ):
     """List platform tools scoped by tenant (builtin + tenant-specific)."""
@@ -724,7 +744,7 @@ async def list_tools(
 @router.post("")
 async def create_tool(
     data: ToolCreate,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_company_or_platform_admin),
     db: AsyncSession = Depends(get_db),
 ):
     """Create a new tool (typically MCP).
@@ -803,7 +823,7 @@ class BulkToolUpdateItem(BaseModel):
 @router.put("/bulk")
 async def update_tools_bulk(
     updates: list[BulkToolUpdateItem],
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_company_or_platform_admin),
     db: AsyncSession = Depends(get_db),
 ):
     """Bulk update the enabled status of multiple tools."""
@@ -826,7 +846,7 @@ async def update_tools_bulk(
 async def update_tool(
     tool_id: uuid.UUID,
     data: ToolUpdate,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_company_or_platform_admin),
     db: AsyncSession = Depends(get_db),
 ):
     """Update a tool."""
@@ -932,7 +952,7 @@ async def update_tool(
 @router.delete("/{tool_id:uuid}")
 async def delete_tool(
     tool_id: uuid.UUID,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_company_or_platform_admin),
     db: AsyncSession = Depends(get_db),
 ):
     """Delete a tool (only non-builtin)."""
@@ -1170,7 +1190,7 @@ class MCPTestRequest(BaseModel):
 @router.post("/test-mcp")
 async def test_mcp_connection(
     data: MCPTestRequest,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_company_or_platform_admin),
 ):
     """Test connection to an MCP server and list available tools.
 
@@ -1200,14 +1220,14 @@ class MCPServerUpdate(BaseModel):
     # Stable anchors supplied by the UI. They prevent one same-name server
     # group from updating another group in the same company.
     tool_ids: list[str] | None = None
-    # Target tenant (platform admins may manage another company's tools)
+    # Target company; it must match the active membership.
     tenant_id: str | None = None
 
 
 @router.put("/mcp-server")
 async def update_mcp_server(
     data: MCPServerUpdate,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_company_or_platform_admin),
     db: AsyncSession = Depends(get_db),
 ):
     """Bulk-update the Server URL and API Key for all tools from an MCP server.
@@ -1329,7 +1349,7 @@ async def update_mcp_server(
 @router.get("/agent-installed")
 async def list_agent_installed_tools(
     tenant_id: str | None = None,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_company_or_platform_admin),
     db: AsyncSession = Depends(get_db),
 ):
     """Admin endpoint: list user-installed tools scoped by tenant."""
@@ -1525,9 +1545,9 @@ async def update_agent_tool_config(
     # separate platform privilege. Organization admins may still configure
     # ordinary tools within their tenant.
     if "allow_network" in data.config:
-        if current_user.role not in ("platform_admin", "org_admin") and not _is_platform_admin(
-            current_user
-        ):
+        from app.services.access_control import is_company_governor
+
+        if not (is_company_governor(current_user) or _is_platform_admin(current_user)):
             raise HTTPException(
                 status_code=403,
                 detail="Only platform or organization admins can modify network access",
@@ -1775,7 +1795,12 @@ async def get_category_config(
     """
     from app.models.channel_config import ChannelConfig
 
-    agent = await _require_agent_tool_access(db, current_user, agent_id)
+    agent = await _require_agent_tool_access(
+        db,
+        current_user,
+        agent_id,
+        manage=True,
+    )
 
     # ── 1. Load company-level (global) config from Tool.config ──────────────
     # Find a tool in this category that actually has config data.

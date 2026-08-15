@@ -7,7 +7,7 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.permissions import check_agent_access, is_agent_creator
+from app.core.permissions import check_agent_access
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.channel_config import ChannelConfig
@@ -34,9 +34,13 @@ async def configure_discord_channel(
     Gateway mode fields: bot_token (+ connection_mode='gateway').
     Webhook mode fields: application_id, bot_token, public_key.
     """
-    agent, _ = await check_agent_access(db, current_user, agent_id)
-    if not is_agent_creator(current_user, agent):
-        raise HTTPException(status_code=403, detail="Only creator can configure channel")
+    await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+        lock_authority=True,
+    )
 
     connection_mode = data.get("connection_mode", "webhook").strip()
     bot_token = data.get("bot_token", "").strip()
@@ -100,7 +104,7 @@ async def get_discord_channel(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    await check_agent_access(db, current_user, agent_id)
+    await check_agent_access(db, current_user, agent_id, required_level="manage")
     result = await db.execute(
         select(ChannelConfig).where(
             ChannelConfig.agent_id == agent_id,
@@ -128,9 +132,13 @@ async def delete_discord_channel(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    agent, _ = await check_agent_access(db, current_user, agent_id)
-    if not is_agent_creator(current_user, agent):
-        raise HTTPException(status_code=403, detail="Only creator can remove channel")
+    await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+        lock_authority=True,
+    )
     result = await db.execute(
         select(ChannelConfig).where(
             ChannelConfig.agent_id == agent_id,

@@ -83,6 +83,7 @@ from app.services.deliverable_quality_reviews import (
     reviewer_submission_fingerprint,
     selected_artifact_hashes,
 )
+from app.services.access_control import is_company_governor
 from app.services.deliverable_workflows import (
     DeliverableWorkflowError,
     list_agent_launchable_workflows,
@@ -271,14 +272,18 @@ async def _owned_request(
     request = result.scalar_one_or_none()
     if request is None:
         raise HTTPException(status_code=404, detail="Deliverable request not found")
-    await check_agent_access(db, user, request.agent_id)
+    await check_agent_access(
+        db,
+        user,
+        request.agent_id,
+        lock_authority=lock,
+    )
     return request
 
 
 def _is_company_admin(user: User) -> bool:
-    return user.role in {"platform_admin", "org_admin"} or bool(
-        getattr(getattr(user, "identity", None), "is_platform_admin", False)
-    )
+    """Return tenant governance authority; global platform authority is separate."""
+    return is_company_governor(user)
 
 
 def _quality_review_error(exc: DeliverableQualityReviewError) -> HTTPException:
@@ -299,15 +304,20 @@ async def _manageable_request(
         DeliverableRequest.id == request_id,
         DeliverableRequest.tenant_id == user.tenant_id,
     )
-    if not _is_company_admin(user):
-        query = query.where(DeliverableRequest.created_by_user_id == user.id)
     if lock:
         query = query.with_for_update()
     result = await db.execute(query)
     request = result.scalar_one_or_none()
     if request is None:
         raise HTTPException(status_code=404, detail="Deliverable request not found")
-    await check_agent_access(db, user, request.agent_id)
+    _agent, access_level = await check_agent_access(
+        db,
+        user,
+        request.agent_id,
+        lock_authority=lock,
+    )
+    if request.created_by_user_id != user.id and access_level != "manage":
+        raise HTTPException(status_code=404, detail="Deliverable request not found")
     return request
 
 

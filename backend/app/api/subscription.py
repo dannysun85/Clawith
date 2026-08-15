@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import get_current_admin, get_current_user, get_saas_admin
+from app.core.security import get_company_governor, get_current_user, get_saas_admin
 from app.database import get_db
 from app.models.agent import Agent
 from app.models.subscription import (
@@ -503,7 +503,7 @@ async def get_subscription_summary(
 @router.post("/checkout/subscribe", response_model=PaymentOrderOut, status_code=status.HTTP_201_CREATED)
 async def checkout_subscribe(
     data: CheckoutSubscribeIn,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_company_governor),
     db: AsyncSession = Depends(get_db),
 ):
     """Create a subscription checkout order."""
@@ -553,7 +553,7 @@ async def checkout_subscribe(
 @router.post("/checkout/topup", response_model=PaymentOrderOut, status_code=status.HTTP_201_CREATED)
 async def checkout_topup(
     data: CheckoutTopupIn,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_company_governor),
     db: AsyncSession = Depends(get_db),
 ):
     """Create a credit top-up checkout order."""
@@ -652,7 +652,7 @@ async def get_billing_profile(
 @router.put("/billing/profile", response_model=BillingProfileOut)
 async def update_billing_profile(
     data: BillingProfileIn,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_company_governor),
     db: AsyncSession = Depends(get_db),
 ):
     """Update tenant billing profile (org_admin+)."""

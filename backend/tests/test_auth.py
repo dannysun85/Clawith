@@ -193,23 +193,18 @@ def test_unverified_local_signup_requires_explicit_non_production_opt_in(
 
 
 @pytest.mark.asyncio
-async def test_signup_first_admin_decision_ignores_disabled_memberships():
-    tenant = SimpleNamespace(id=uuid.uuid4(), is_active=True)
-    db = RecordingDB(
-        responses=[
-            DummyResult(scalar_value=tenant),
-            DummyResult(scalar_value=0),
-        ]
-    )
+async def test_signup_organization_invitation_stays_pending_and_never_promotes():
+    tenant_id = uuid.uuid4()
+    db = RecordingDB()
 
     resolved_tenant, role = await auth_api._resolve_signup_tenant(
         db,
-        SimpleNamespace(tenant_id=tenant.id),
+        SimpleNamespace(tenant_id=tenant_id),
     )
 
-    assert resolved_tenant is tenant
-    assert role == "org_admin"
-    assert "users.is_active IS true" in str(db.statements[1])
+    assert resolved_tenant is None
+    assert role == "member"
+    assert db.statements == []
 
 
 @pytest.mark.asyncio
@@ -399,53 +394,43 @@ async def test_register_init_rejects_sso_identity_created_after_preflight(monkey
 
 
 @pytest.mark.asyncio
-async def test_legacy_register_rejects_sso_identity_created_after_preflight(monkeypatch):
-    identity = SimpleNamespace(
-        id=uuid.uuid4(),
-        email="legacy-race@example.com",
-        username="legacy-race",
-        password_hash=None,
-        password_login_enabled=False,
-        email_verified=False,
-        is_platform_admin=False,
+async def test_legacy_register_is_an_exact_deprecated_delegate(monkeypatch):
+    canonical_result = SimpleNamespace(access_token="canonical-token")
+    canonical_register = AsyncMock(return_value=canonical_result)
+    monkeypatch.setattr(auth_api, "register_init", canonical_register)
+    response = Response()
+    request = _request()
+    background_tasks = AsyncMock()
+
+    result = await auth_api.register(
+        SimpleNamespace(
+            email="legacy@example.com",
+            username="legacy-user",
+            password="correct-password",
+            display_name="Legacy User",
+            invitation_code="REGISTER-CODE",
+            provider=None,
+            provider_code=None,
+        ),
+        background_tasks,
+        request,
+        response,
     )
 
-    @asynccontextmanager
-    async def registration_transaction():
-        yield RecordingDB()
-
-    registration_service = SimpleNamespace(
-        get_tenant_for_registration=AsyncMock(return_value=(None, None)),
-        find_or_create_identity=AsyncMock(return_value=identity),
-        create_user_with_identity=AsyncMock(),
-    )
-    token_factory = AsyncMock()
-    monkeypatch.setattr(auth_api, "transaction", registration_transaction)
-    monkeypatch.setattr(auth_api, "hash_password_async", AsyncMock(return_value="attacker-hash"))
-    monkeypatch.setattr(auth_api.user_dao, "is_empty", AsyncMock(return_value=False))
-    monkeypatch.setattr(auth_api.identity_dao, "get_by_email", AsyncMock(return_value=None))
-    monkeypatch.setattr(auth_api, "_prepare_signup_code_if_required", AsyncMock(return_value=None))
-    monkeypatch.setattr(auth_api, "create_access_token", token_factory)
-    data = SimpleNamespace(
-        email=identity.email,
-        username="attacker",
-        password="attacker-password",
-        display_name="Attacker",
-        invitation_code="REGISTER-CODE",
-    )
-
-    with patch(
-        "app.services.system_email_service.resolve_email_config_async",
-        new=AsyncMock(return_value=SimpleNamespace(smtp_host="smtp.example.com")),
-    ), patch(
-        "app.services.registration_service.registration_service",
-        new=registration_service,
-    ), pytest.raises(HTTPException) as exc:
-        await auth_api._handle_normal_register(data, AsyncMock(), SimpleNamespace())
-
-    assert exc.value.status_code == 400
-    registration_service.create_user_with_identity.assert_not_awaited()
-    token_factory.assert_not_awaited()
+    assert result is canonical_result
+    delegated = canonical_register.await_args.args[0]
+    assert delegated.model_dump() == {
+        "username": "legacy-user",
+        "email": "legacy@example.com",
+        "password": "correct-password",
+        "display_name": "Legacy User",
+        "invitation_code": "REGISTER-CODE",
+        "target_tenant_id": None,
+    }
+    assert canonical_register.await_args.args[1:] == (background_tasks, request)
+    assert response.headers["deprecation"] == "true"
+    assert response.headers["sunset"] == "Mon, 16 Nov 2026 00:00:00 GMT"
+    assert response.headers["link"] == '</api/auth/register/init>; rel="successor-version"'
 
 
 @pytest.mark.asyncio
@@ -567,6 +552,7 @@ async def test_retired_public_social_registration_fails_without_side_effects(
                 ),
                 AsyncMock(),
                 _request(),
+                Response(),
             )
         else:
             await auth_api.register_sso(
@@ -1300,6 +1286,15 @@ async def test_signup_code_gate_rejects_invalid_code(monkeypatch):
         AsyncMock(return_value=True),
     )
 
+    monkeypatch.setattr(
+        "app.services.identity_governance.resolve_registration_grant",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "app.services.identity_governance.resolve_organization_credential",
+        AsyncMock(return_value=None),
+    )
+
     with pytest.raises(HTTPException) as exc:
         await auth_api._prepare_signup_code_if_required(
             RecordingDB(responses=[DummyResult()]),
@@ -1318,11 +1313,21 @@ async def test_signup_code_gate_rejects_exhausted_code(monkeypatch):
         "is_invitation_code_enabled",
         AsyncMock(return_value=True),
     )
-    code = SimpleNamespace(code="FULL", tenant_id=None, used_count=3, max_uses=3)
+    from app.services.identity_governance import GovernanceCredentialError
+
+    monkeypatch.setattr(
+        "app.services.identity_governance.resolve_registration_grant",
+        AsyncMock(
+            side_effect=GovernanceCredentialError(
+                "registration_grant_exhausted",
+                "Registration grant has reached its usage limit",
+            )
+        ),
+    )
 
     with pytest.raises(HTTPException) as exc:
         await auth_api._prepare_signup_code_if_required(
-            RecordingDB(responses=[DummyResult(values=[code])]),
+            RecordingDB(),
             "full",
             is_first_user=False,
         )
@@ -1338,16 +1343,21 @@ async def test_signup_code_gate_consumes_valid_code(monkeypatch):
         "is_invitation_code_enabled",
         AsyncMock(return_value=True),
     )
-    code = SimpleNamespace(code="OPEN123", tenant_id=None, used_count=0, max_uses=2)
+    code = SimpleNamespace(status="active", used_count=0, max_uses=2)
+    monkeypatch.setattr(
+        "app.services.identity_governance.resolve_registration_grant",
+        AsyncMock(return_value=code),
+    )
 
     result = await auth_api._prepare_signup_code_if_required(
-        RecordingDB(responses=[DummyResult(values=[code])]),
+        RecordingDB(),
         " open123 ",
         is_first_user=False,
     )
     auth_api._consume_signup_code_if_needed(result)
 
-    assert result is code
+    assert result.record is code
+    assert result.kind == "registration_grant"
     assert code.used_count == 1
 
 

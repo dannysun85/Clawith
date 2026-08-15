@@ -1,28 +1,13 @@
-import { useState, useEffect } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { useNavigate, useOutletContext } from 'react-router';
+import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import {
-    activityApi,
-    agentApi,
     fetchJson,
-    onboardingApi,
     tenantApi,
-    workApi,
-    type WorkItem,
+    workforceApi,
+    type WorkforceTopologyActivity,
+    type WorkforceTopologyNode,
 } from '../services/api';
-import type { Agent } from '../types';
-import { useToast } from '../components/Toast/ToastProvider';
-import {
-    SUBSCRIPTION_UPGRADE_PATH,
-    agentLimitMessage,
-    useAgentCreationLimit,
-} from '../hooks/useAgentCreationLimit';
-import { partitionAgentRoles } from '../utils/productRoles';
-
-type LayoutOutletContext = {
-    openTalentMarket?: () => void;
-};
 
 /* ────── Inline SVG Icons (monochrome) ────── */
 
@@ -57,11 +42,6 @@ const Icons = {
             <path d="M1 8h3l2-5 3 10 2-5h4" />
         </svg>
     ),
-    plus: (
-        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
-            <path d="M8 3v10M3 8h10" />
-        </svg>
-    ),
     bot: (
         <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round">
             <rect x="3" y="5" width="12" height="10" rx="2" />
@@ -83,37 +63,6 @@ const timeAgo = (dateStr: string | undefined, t: any) => {
     const hours = Math.floor(mins / 60);
     if (hours < 24) return t('dashboard.hoursAgo', { count: hours });
     return t('dashboard.daysAgo', { count: Math.floor(hours / 24) });
-};
-
-const priorityColor = (p: string) => {
-    switch (p) {
-        case 'urgent': return 'var(--error)';
-        case 'high': return 'var(--warning)';
-        case 'medium': return 'var(--accent-primary)';
-        default: return 'var(--text-tertiary)';
-    }
-};
-
-const statusLabel = (s: string, t: any) => {
-    switch (s) {
-        case 'running': return t('dashboard.status.running');
-        case 'idle': return t('dashboard.status.idle');
-        case 'stopped': return t('dashboard.status.stopped');
-        case 'error': return t('dashboard.status.error');
-        case 'creating': return t('dashboard.status.creating');
-        case 'disconnected': return t('dashboard.status.disconnected');
-        default: return s;
-    }
-};
-
-const statusColor = (s: string) => {
-    switch (s) {
-        case 'running': return 'var(--status-running)';
-        case 'idle': return 'var(--status-idle)';
-        case 'error': return 'var(--status-error)';
-        case 'stopped': return 'var(--status-stopped)';
-        default: return 'var(--text-tertiary)';
-    }
 };
 
 const formatTokens = (n: number) => {
@@ -260,17 +209,15 @@ function OKRSummaryCard() {
 
 /* ────── Summary Stats Bar ────── */
 
-function StatsBar({ agents, workItems, tokenUsage }: { agents: Agent[]; workItems: WorkItem[]; tokenUsage?: any }) {
+function StatsBar({ agents, windowHours, tokenUsage }: { agents: WorkforceTopologyNode[]; windowHours: number; tokenUsage?: any }) {
     const { t } = useTranslation();
     const totalAgents = agents.length;
     const activeAgents = agents.filter(a => a.status === 'running' || a.status === 'idle').length;
-    const pendingTasks = workItems.filter(item => ['task', 'execution'].includes(item.user_stage)).length;
-    const completedToday = workItems.filter(item => {
-        if (!['completed', 'delivery'].includes(item.user_stage)) return false;
-        const today = new Date();
-        const completed = new Date(item.latest_update_at || item.updated_at);
-        return completed.toDateString() === today.toDateString();
-    }).length;
+    const pendingTasks = agents.reduce((sum, agent) => sum + (agent.work?.active_count ?? 0), 0);
+    const completedRecently = agents.reduce(
+        (sum, agent) => sum + (agent.work?.recently_completed_count ?? 0),
+        0,
+    );
     const totalTokensToday = tokenUsage?.today?.total_tokens ?? agents.reduce((sum, a) => sum + (a.tokens_used_today || 0), 0);
     const cacheReadToday = tokenUsage?.today?.cache_read_tokens ?? agents.reduce((sum, a) => sum + (a.cache_read_tokens_today || 0), 0);
     const cacheHitRate = totalTokensToday > 0 ? Math.round((cacheReadToday / totalTokensToday) * 100) : 0;
@@ -281,7 +228,7 @@ function StatsBar({ agents, workItems, tokenUsage }: { agents: Agent[]; workItem
 
     const stats = [
         { icon: Icons.users, label: t('dashboard.stats.agents'), value: totalAgents, sub: t('dashboard.stats.online', { count: activeAgents }) },
-        { icon: Icons.tasks, label: t('dashboard.stats.activeTasks'), value: pendingTasks, sub: t('dashboard.stats.completedToday', { count: completedToday }) },
+        { icon: Icons.tasks, label: t('dashboard.stats.activeTasks'), value: pendingTasks, sub: t('dashboard.stats.completedRecent', { count: completedRecently, hours: windowHours }) },
         {
             icon: Icons.zap,
             label: t('dashboard.stats.todayTokens'),
@@ -320,152 +267,15 @@ function StatsBar({ agents, workItems, tokenUsage }: { agents: Agent[]; workItem
     );
 }
 
-/* ────── Agent Row ────── */
-
-function AgentRow({ agent, tasks, recentActivity }: {
-    agent: Agent;
-    tasks: WorkItem[];
-    recentActivity: any[];
-}) {
-    const { t } = useTranslation();
-    const navigate = useNavigate();
-    const pendingTasks = tasks.filter(item => ['task', 'execution'].includes(item.user_stage));
-    const latestActivity = recentActivity[0];
-
-    // Token usage bar
-    const maxTokens = agent.max_tokens_per_day || 0;
-    const usedTokens = agent.tokens_used_today || 0;
-    const tokenPct = maxTokens > 0 ? Math.min(100, (usedTokens / maxTokens) * 100) : 0;
-
-    return (
-        <div
-            onClick={() => navigate(`/agents/${agent.id}`)}
-            style={{
-                display: 'grid',
-                gridTemplateColumns: '220px 1fr 150px 100px',
-                alignItems: 'center', gap: '16px',
-                padding: '12px 16px',
-                borderRadius: 'var(--radius-md)',
-                cursor: 'pointer', transition: 'background 120ms ease',
-            }}
-            onMouseEnter={e => { (e.currentTarget as HTMLElement).style.background = 'var(--bg-hover)'; }}
-            onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = 'transparent'; }}
-        >
-            {/* Agent Info */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', minWidth: 0 }}>
-                <div style={{
-                    width: '32px', height: '32px', borderRadius: 'var(--radius-md)',
-                    background: 'var(--bg-tertiary)', border: '1px solid var(--border-subtle)',
-                    display: 'flex', alignItems: 'center', justifyContent: 'center',
-                    color: 'var(--text-tertiary)', flexShrink: 0,
-                }}>
-                    {Icons.bot}
-                </div>
-                <div style={{ minWidth: 0 }}>
-                    <div style={{
-                        fontWeight: 500, fontSize: '13px', display: 'flex',
-                        alignItems: 'center', gap: '8px', color: 'var(--text-primary)',
-                    }}>
-                        {agent.name}
-                        <span style={{
-                            display: 'inline-flex', alignItems: 'center', gap: '4px',
-                            fontSize: '11px', fontWeight: 400,
-                            color: statusColor(agent.status),
-                        }}>
-                            <span style={{
-                                width: '6px', height: '6px', borderRadius: '50%',
-                                background: statusColor(agent.status),
-                                display: 'inline-block',
-                            }} />
-                            {statusLabel(agent.status, t)}
-                        </span>
-                    </div>
-                    <div style={{
-                        fontSize: '12px', color: 'var(--text-tertiary)',
-                        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                    }}>
-                        {agent.role_description || '-'}
-                    </div>
-                </div>
-            </div>
-
-            {/* Latest Activity / Tasks */}
-            <div style={{ minWidth: 0 }}>
-                {latestActivity ? (
-                    <div style={{
-                        fontSize: '12px', color: 'var(--text-secondary)',
-                        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                    }}>
-                        <span style={{ color: 'var(--text-tertiary)', marginRight: '6px' }}>
-                            {timeAgo(latestActivity.created_at, t)}
-                        </span>
-                        {latestActivity.summary}
-                    </div>
-                ) : (
-                    <div style={{ fontSize: '12px', color: 'var(--text-tertiary)' }}>{t('dashboard.noActivity')}</div>
-                )}
-                {pendingTasks.length > 0 && (
-                    <div style={{ display: 'flex', gap: '4px', marginTop: '4px', flexWrap: 'wrap' }}>
-                        {pendingTasks.slice(0, 3).map(t => (
-                            <span key={t.id} style={{
-                                fontSize: '11px', padding: '1px 6px',
-                                borderRadius: 'var(--radius-sm)', background: 'var(--bg-tertiary)',
-                                color: 'var(--text-secondary)', maxWidth: '140px',
-                                overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                                display: 'inline-flex', alignItems: 'center', gap: '3px',
-                            }}>
-                                <span style={{ width: '4px', height: '4px', borderRadius: '50%', background: priorityColor(t.priority || 'medium'), flexShrink: 0 }} />
-                                {t.title}
-                            </span>
-                        ))}
-                        {pendingTasks.length > 3 && (
-                            <span style={{ fontSize: '11px', color: 'var(--text-tertiary)', padding: '1px 4px' }}>
-                                +{pendingTasks.length - 3}
-                            </span>
-                        )}
-                    </div>
-                )}
-            </div>
-
-            {/* Token Usage */}
-            <div>
-                <div style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginBottom: '3px' }}>
-                    {formatTokens(usedTokens)}
-                    {maxTokens > 0 && <span style={{ opacity: 0.6 }}> / {formatTokens(maxTokens)}</span>}
-                </div>
-                {!!agent.cache_read_tokens_today && (
-                    <div style={{ fontSize: '10px', color: 'var(--text-tertiary)', marginBottom: '3px' }}>
-                        Cache {formatTokens(agent.cache_read_tokens_today)} · {usedTokens > 0 ? Math.round((agent.cache_read_tokens_today / usedTokens) * 100) : 0}%
-                    </div>
-                )}
-                {maxTokens > 0 ? (
-                    <div style={{
-                        height: '3px', background: 'var(--bg-tertiary)',
-                        borderRadius: '2px', overflow: 'hidden',
-                    }}>
-                        <div style={{
-                            height: '100%', borderRadius: '2px',
-                            width: `${tokenPct}%`,
-                            background: tokenPct > 80 ? 'var(--error)' : tokenPct > 50 ? 'var(--warning)' : 'var(--text-tertiary)',
-                            transition: 'width 0.3s',
-                        }} />
-                    </div>
-                ) : (
-                    <div style={{ fontSize: '11px', color: 'var(--text-tertiary)', opacity: 0.5 }}>{t('dashboard.noLimit')}</div>
-                )}
-            </div>
-
-            {/* Last Active */}
-            <div style={{ textAlign: 'right', fontSize: '12px', color: 'var(--text-tertiary)' }}>
-                {timeAgo(agent.last_active_at, t)}
-            </div>
-        </div>
-    );
-}
-
 /* ────── Recent Activity Feed ────── */
 
-function ActivityFeed({ activities, agents }: { activities: any[]; agents: Agent[] }) {
+function ActivityFeed({
+    activities,
+    agents,
+}: {
+    activities: WorkforceTopologyActivity[];
+    agents: WorkforceTopologyNode[];
+}) {
     const { t } = useTranslation();
     const agentMap = new Map(agents.map(a => [a.id, a]));
 
@@ -518,77 +328,25 @@ function ActivityFeed({ activities, agents }: { activities: any[]; agents: Agent
 
 export default function Dashboard() {
     const { t, i18n } = useTranslation();
-    const toast = useToast();
     const navigate = useNavigate();
-    const outletContext = useOutletContext<LayoutOutletContext | null>();
-    const openTalentMarket = outletContext?.openTalentMarket;
     const currentTenant = localStorage.getItem('current_tenant_id') || '';
 
-    const { data: agents = [], isLoading } = useQuery({
-        queryKey: ['agents', currentTenant],
-        queryFn: () => agentApi.list(currentTenant || undefined),
+    const {
+        data: topology,
+        isLoading,
+        isError: isTopologyError,
+        refetch: refetchTopology,
+    } = useQuery({
+        queryKey: ['workforce-topology', currentTenant, 24],
+        queryFn: () => workforceApi.topology(24),
         refetchInterval: 15000,
     });
-    const { data: onboardingStatus } = useQuery({
-        queryKey: ['onboarding-status', currentTenant],
-        queryFn: () => onboardingApi.status(),
-    });
-    const { employees: employeeAgents } = partitionAgentRoles(
-        agents,
-        onboardingStatus?.personal_assistant_agent_id,
-    );
-    const agentCreationLimit = useAgentCreationLimit(employeeAgents as any[]);
+    const employeeAgents = topology?.nodes ?? [];
 
     const { data: tokenUsage } = useQuery({
         queryKey: ['tenant-token-usage', currentTenant],
         queryFn: () => tenantApi.tokenUsage(),
         refetchInterval: 15000,
-    });
-
-    const { data: workIndex } = useQuery({
-        queryKey: ['work-index', currentTenant, 'dashboard'],
-        queryFn: () => workApi.list(100),
-        refetchInterval: 15000,
-    });
-    const workItems = workIndex?.items || [];
-
-    // Activities remain Agent-scoped; work state comes from the authoritative Work projection.
-    const [allActivities, setAllActivities] = useState<any[]>([]);
-    const [agentActivities, setAgentActivities] = useState<Record<string, any[]>>({});
-
-
-    useEffect(() => {
-        if (employeeAgents.length === 0) {
-            setAllActivities([]);
-            setAgentActivities({});
-            return;
-        }
-        const fetchData = async () => {
-            try {
-                const actResults = await Promise.allSettled(employeeAgents.map(a => activityApi.list(a.id, 5)));
-                const activities: any[] = [];
-                const perAgent: Record<string, any[]> = {};
-                actResults.forEach((r, i) => {
-                    if (r.status === 'fulfilled') {
-                        perAgent[employeeAgents[i].id] = r.value;
-                        activities.push(...r.value.map((v: any) => ({ ...v, agent_id: employeeAgents[i].id })));
-                    }
-                });
-                activities.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
-                setAllActivities(activities.slice(0, 20));
-                setAgentActivities(perAgent);
-            } catch (e) { console.error('Failed to fetch activities:', e); }
-        };
-        fetchData();
-        const interval = setInterval(fetchData, 30000);
-        return () => clearInterval(interval);
-    }, [employeeAgents.map(a => a.id).join(',')]);
-
-    // Group tasks by agent
-    const tasksByAgent = new Map<string, WorkItem[]>();
-    workItems.forEach(t => {
-        if (!tasksByAgent.has(t.agent_id)) tasksByAgent.set(t.agent_id, []);
-        tasksByAgent.get(t.agent_id)!.push(t);
     });
 
     // Greeting
@@ -610,14 +368,32 @@ export default function Dashboard() {
                         {greeting} · {t('dashboard.totalAgents', { count: employeeAgents.length })}
                     </p>
                 </div>
-                <button className="btn btn-secondary" onClick={() => navigate('/work')}>
-                    {i18n.language.startsWith('zh') ? '进入工作台' : 'Open workbench'}
-                </button>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <button className="btn btn-secondary" onClick={() => navigate('/employees')}>
+                        {i18n.language.startsWith('zh') ? '数字员工' : 'Digital employees'}
+                    </button>
+                    <button className="btn btn-secondary" onClick={() => navigate('/work')}>
+                        {i18n.language.startsWith('zh') ? '进入工作台' : 'Open workbench'}
+                    </button>
+                </div>
             </div>
 
             {isLoading ? (
                 <div style={{ textAlign: 'center', padding: '60px', color: 'var(--text-tertiary)', fontSize: '13px' }}>
                     {t('common.loading')}
+                </div>
+            ) : isTopologyError ? (
+                <div style={{ textAlign: 'center', padding: '72px 24px' }}>
+                    <div style={{ color: 'var(--text-secondary)', marginBottom: '16px', fontSize: '14px' }}>
+                        {t('dashboard.topology.loadFailed')}
+                    </div>
+                    <button
+                        type="button"
+                        className="btn btn-secondary"
+                        onClick={() => refetchTopology()}
+                    >
+                        {t('dashboard.topology.retry')}
+                    </button>
                 </div>
             ) : employeeAgents.length === 0 ? (
                 <div style={{ textAlign: 'center', padding: '80px' }}>
@@ -629,76 +405,22 @@ export default function Dashboard() {
                     </div>
                     <button
                         className="btn btn-primary"
-                        onClick={() => {
-                            if (openTalentMarket) {
-                                openTalentMarket();
-                                return;
-                            }
-                            if (agentCreationLimit.isLimited) {
-                                toast.warning(
-                                    agentLimitMessage(i18n.language.startsWith('zh'), agentCreationLimit.activeCount, agentCreationLimit.maxAgents),
-                                    { duration: 5000 },
-                                );
-                                navigate(SUBSCRIPTION_UPGRADE_PATH);
-                                return;
-                            }
-                            navigate('/agents/new');
-                        }}
+                        onClick={() => navigate('/employees')}
                     >
-                        {Icons.plus} {t('nav.newAgent')}
+                        {i18n.language.startsWith('zh') ? '进入数字员工中心' : 'Open Digital Employee Center'}
                     </button>
                 </div>
             ) : (
                 <>
                     {/* Stats Bar */}
-                    <StatsBar agents={employeeAgents} workItems={workItems} tokenUsage={tokenUsage} />
+                    <StatsBar
+                        agents={employeeAgents}
+                        windowHours={topology!.window_hours}
+                        tokenUsage={tokenUsage}
+                    />
 
                     {/* OKR Summary (P3) — only shown when OKR is enabled */}
                     <OKRSummaryCard />
-
-                    {/* Agent List Card */}
-                    <div style={{
-                        border: '1px solid var(--border-subtle)',
-                        borderRadius: 'var(--radius-lg)',
-                        overflow: 'hidden',
-                        marginBottom: '32px',
-                    }}>
-                        {/* Agent List Header */}
-                        <div style={{
-                            display: 'grid',
-                            gridTemplateColumns: '220px 1fr 150px 100px',
-                            padding: '10px 16px',
-                            fontSize: '11px', color: 'var(--text-tertiary)', fontWeight: 500,
-                            textTransform: 'uppercase' as const, letterSpacing: '0.05em',
-                            borderBottom: '1px solid var(--border-subtle)',
-                        }}>
-                            <span>{t('dashboard.table.agent')}</span>
-                            <span>{t('dashboard.table.latestActivity')}</span>
-                            <span>Token</span>
-                            <span style={{ textAlign: 'right' }}>{t('dashboard.table.active')}</span>
-                        </div>
-
-                        {/* Agent Rows (scrollable) */}
-                        <div style={{ maxHeight: '350px', overflowY: 'auto' }}>
-                            {[...employeeAgents]
-                                .sort((a, b) => {
-                                    const aActive = a.status === 'running' || a.status === 'idle' ? 1 : 0;
-                                    const bActive = b.status === 'running' || b.status === 'idle' ? 1 : 0;
-                                    if (aActive !== bActive) return bActive - aActive;
-                                    const aTime = a.last_active_at ? new Date(a.last_active_at).getTime() : 0;
-                                    const bTime = b.last_active_at ? new Date(b.last_active_at).getTime() : 0;
-                                    return bTime - aTime;
-                                })
-                                .map(agent => (
-                                    <AgentRow
-                                        key={agent.id}
-                                        agent={agent}
-                                        tasks={tasksByAgent.get(agent.id) || []}
-                                        recentActivity={agentActivities[agent.id] || []}
-                                    />
-                                ))}
-                        </div>
-                    </div>
 
                     {/* Recent Activity */}
                     <div style={{
@@ -720,7 +442,10 @@ export default function Dashboard() {
                             <span style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>{t('dashboard.recentCount', { count: 20 })}</span>
                         </div>
                         <div style={{ padding: '4px', maxHeight: '320px', overflowY: 'auto' }}>
-                            <ActivityFeed activities={allActivities} agents={employeeAgents} />
+                            <ActivityFeed
+                                activities={topology?.recent_activities ?? []}
+                                agents={employeeAgents}
+                            />
                         </div>
                     </div>
                 </>

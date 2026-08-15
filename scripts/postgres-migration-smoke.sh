@@ -8,7 +8,7 @@ partial_db_name="${db_name}_partial"
 db_user="${PGUSER:-$USER}"
 db_host="${PGHOST:-127.0.0.1}"
 db_port="${PGPORT:-5432}"
-release_head="${MIGRATION_SMOKE_EXPECTED_HEAD:-media_daily_allowance_claims}"
+release_head="${MIGRATION_SMOKE_EXPECTED_HEAD:-tenant_deletion_purge}"
 
 assert_at_release_head() {
   .venv/bin/alembic current | grep -F "${release_head} (head)"
@@ -77,6 +77,98 @@ BEGIN
       AND confdeltype = 'n'
   ) <> 1 THEN
     RAISE EXCEPTION 'media task repair did not enforce nullable ON DELETE SET NULL retention';
+  END IF;
+  IF (
+    SELECT count(*)
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND (
+        (table_name = 'tenants' AND column_name IN (
+          'company_size',
+          'allow_member_private_agents',
+          'default_approval_policy'
+        ))
+        OR (table_name = 'users' AND column_name IN (
+          'timezone',
+          'work_hours_start',
+          'work_hours_end'
+        ))
+      )
+  ) <> 6 OR EXISTS (
+    SELECT 1 FROM tenants WHERE initialization_completed_at IS NULL
+  ) THEN
+    RAISE EXCEPTION 'onboarding product settings or historical-company compatibility backfill is incomplete';
+  END IF;
+  IF to_regclass('public.outbound_email_deliveries') IS NULL OR NOT EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'organization_invitations'
+      AND column_name = 'delivery_mode'
+      AND is_nullable = 'NO'
+  ) OR NOT EXISTS (
+    SELECT 1
+    FROM pg_indexes
+    WHERE schemaname = 'public'
+      AND tablename = 'outbound_email_deliveries'
+      AND indexname = 'uq_outbound_email_deliveries_idempotency_key'
+      AND indexdef LIKE 'CREATE UNIQUE INDEX%WHERE (idempotency_key IS NOT NULL)'
+  ) THEN
+    RAISE EXCEPTION 'durable outbound email ledger contract is incomplete';
+  END IF;
+  IF to_regclass('public.identity_mfa_recovery_codes') IS NULL
+     OR to_regclass('public.identity_mfa_challenges') IS NULL
+     OR (
+       SELECT count(*)
+       FROM information_schema.columns
+       WHERE table_schema = 'public'
+         AND table_name = 'identities'
+         AND column_name IN (
+           'mfa_secret_envelope',
+           'mfa_enabled',
+           'mfa_confirmed_at',
+           'mfa_last_totp_step'
+         )
+     ) <> 4
+     OR NOT EXISTS (
+       SELECT 1
+       FROM information_schema.columns
+       WHERE table_schema = 'public'
+         AND table_name = 'identities'
+         AND column_name = 'mfa_enabled'
+         AND is_nullable = 'NO'
+         AND column_default = 'false'
+     )
+     OR NOT EXISTS (
+       SELECT 1
+       FROM pg_indexes
+       WHERE schemaname = 'public'
+         AND tablename = 'identity_mfa_recovery_codes'
+         AND indexname = 'uq_identity_mfa_recovery_codes_active_hash'
+         AND indexdef LIKE 'CREATE UNIQUE INDEX%WHERE (used_at IS NULL)'
+     )
+     OR NOT EXISTS (
+       SELECT 1
+       FROM pg_indexes
+       WHERE schemaname = 'public'
+         AND tablename = 'identity_mfa_challenges'
+         AND indexname = 'ix_identity_mfa_challenges_active'
+         AND indexdef LIKE 'CREATE INDEX%WHERE (consumed_at IS NULL)'
+     ) THEN
+    RAISE EXCEPTION 'Identity MFA schema contract is incomplete';
+  END IF;
+  IF to_regclass('public.tenant_deletion_jobs') IS NULL
+     OR to_regclass('public.tenant_deletion_holds') IS NULL
+     OR to_regclass('public.tenant_deletion_tombstones') IS NULL
+     OR NOT EXISTS (
+       SELECT 1
+       FROM pg_indexes
+       WHERE schemaname = 'public'
+         AND tablename = 'tenant_deletion_holds'
+         AND indexname = 'uq_tenant_deletion_holds_active_type'
+         AND indexdef LIKE 'CREATE UNIQUE INDEX%WHERE (released_at IS NULL)'
+     ) THEN
+    RAISE EXCEPTION 'Tenant deletion purge schema contract is incomplete';
   END IF;
 END $$;
 SQL

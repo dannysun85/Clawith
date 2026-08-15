@@ -55,6 +55,10 @@ from app.services.agent_capability_readiness import (
     template_capability_contract,
 )
 from app.services.product_roles import resolve_agent_product_roles
+from app.services.access_control import is_company_governor, is_platform_operator
+from app.services.company_product_policy import default_agent_autonomy_policy
+from app.models.onboarding import UserTenantOnboarding
+from app.services.product_roles import PRIVATE_ASSISTANT_ROLE_KEY, PRIVATE_ASSISTANT_TEMPLATE_NAME
 
 router = APIRouter(prefix="/agents", tags=["agents"])
 settings = get_settings()
@@ -71,11 +75,6 @@ def _resolve_agent_plan_selection(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=str(exc),
         ) from exc
-
-
-def _is_platform_admin(current_user: User) -> bool:
-    identity = getattr(current_user, "identity", None)
-    return current_user.role == "platform_admin" or bool(getattr(identity, "is_platform_admin", False))
 
 
 async def _validate_agent_skill_selection(
@@ -108,10 +107,67 @@ async def _get_active_admin_users(db: AsyncSession, tenant_id: uuid.UUID | None)
         select(User).where(
             User.tenant_id == tenant_id,
             User.is_active == True,  # noqa: E712
-            User.role.in_(["platform_admin", "org_admin"]),
+            User.role.in_(["org_owner", "org_admin"]),
         )
     )
     return result.scalars().all()
+
+
+async def _validate_permission_target_users(
+    db: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    user_ids: set[uuid.UUID],
+) -> None:
+    """Require every Agent grant target to be an active same-company member."""
+
+    if not user_ids:
+        return
+    result = await db.execute(
+        select(User.id).where(
+            User.id.in_(user_ids),
+            User.tenant_id == tenant_id,
+            User.is_active.is_(True),
+        )
+    )
+    valid_ids = set(result.scalars().all())
+    if valid_ids != user_ids:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "agent_permission_target_invalid",
+                "message": "Agent access can only be granted to active members of this company",
+            },
+        )
+
+
+async def _is_product_managed_private_assistant(
+    db: AsyncSession,
+    agent: Agent,
+) -> bool:
+    """Identify current and retained product-managed private assistants."""
+
+    linked_result = await db.execute(
+        select(UserTenantOnboarding.id)
+        .where(UserTenantOnboarding.personal_assistant_agent_id == agent.id)
+        .limit(1)
+    )
+    if linked_result.scalar_one_or_none() is not None:
+        return True
+    if agent.template_id is None:
+        return False
+    template_result = await db.execute(
+        select(AgentTemplate).where(AgentTemplate.id == agent.template_id)
+    )
+    template = template_result.scalar_one_or_none()
+    return bool(
+        template
+        and template.is_builtin
+        and (
+            template.role_key == PRIVATE_ASSISTANT_ROLE_KEY
+            or template.name == PRIVATE_ASSISTANT_TEMPLATE_NAME
+        )
+    )
 
 
 async def _validate_active_agent_model(
@@ -713,18 +769,82 @@ async def create_agent(
     db: AsyncSession = Depends(get_db),
 ):
     """Create a new digital employee (any authenticated user)."""
+    if current_user.tenant_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "company_membership_required",
+                "message": "Join or create a company before creating an Agent",
+            },
+        )
+
     # A TTL of 0 or less means the agent never expires.
     ttl_hours = current_user.quota_agent_ttl_hours
 
-    # Determine target tenant: only platform admins may cross tenant boundaries.
+    # Agent creation is always a company-work-surface action. Global platform
+    # authority never supplies or overrides the target membership.
     target_tenant_id = current_user.tenant_id
-    if data.tenant_id:
-        if data.tenant_id != current_user.tenant_id and not _is_platform_admin(current_user):
+    if data.tenant_id and data.tenant_id != current_user.tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cannot create an agent in another tenant",
+        )
+
+    permission_scope_type = data.permission_scope_type
+    if permission_scope_type == "user":
+        permission_scope_type = "private"
+    if permission_scope_type not in {"company", "private", "custom"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported permission_scope_type",
+        )
+    if permission_scope_type == "company" and not is_company_governor(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "company_agent_creation_requires_admin",
+                "message": "Only a company administrator can create a company-wide digital employee.",
+                "next_action": "Create a private employee or ask a company administrator.",
+            },
+        )
+    if permission_scope_type == "custom" and not is_company_governor(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "custom_agent_creation_requires_admin",
+                "message": "Only a company administrator can create an Agent shared with selected members.",
+                "next_action": "Create a private Agent if company policy allows it, or ask an administrator.",
+            },
+        )
+    if permission_scope_type == "private" and not is_company_governor(current_user):
+        policy_result = await db.execute(
+            select(Tenant.allow_member_private_agents).where(Tenant.id == target_tenant_id)
+        )
+        if not bool(policy_result.scalar_one_or_none()):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="Cannot create an agent in another tenant",
+                detail={
+                    "code": "member_private_agent_creation_disabled",
+                    "message": "This company does not allow members to create private Agents.",
+                    "next_action": "Ask a company administrator to change the onboarding policy or create the Agent for you.",
+                },
             )
-        target_tenant_id = data.tenant_id
+    if permission_scope_type == "private" and data.permission_scope_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "private_agent_is_owner_only",
+                "message": "A private Agent cannot be shared during creation; use custom access instead",
+            },
+        )
+    permission_target_ids = set(data.permission_scope_ids or [])
+    permission_target_ids.discard(current_user.id)
+    if permission_scope_type == "custom":
+        await _validate_permission_target_users(
+            db,
+            tenant_id=target_tenant_id,
+            user_ids=permission_target_ids,
+        )
 
     await _validate_agent_skill_selection(
         db,
@@ -839,6 +959,8 @@ async def create_agent(
         agent.autonomy_policy = data.autonomy_policy
     elif selected_template and selected_template.is_builtin and selected_template.default_autonomy_policy:
         agent.autonomy_policy = dict(selected_template.default_autonomy_policy)
+    elif tenant:
+        agent.autonomy_policy = default_agent_autonomy_policy(tenant.default_approval_policy)
 
     db.add(agent)
     await db.flush()
@@ -856,29 +978,41 @@ async def create_agent(
 
     # Set permissions
     access_level = data.permission_access_level if data.permission_access_level in ("use", "manage") else "use"
-    if data.permission_scope_type not in ("company", "user", "custom"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported permission_scope_type")
-    if data.permission_scope_type == "company":
+    if permission_scope_type == "company":
         agent.access_mode = "company"
         agent.company_access_level = access_level
         db.add(AgentPermission(agent_id=agent.id, scope_type="company", access_level=access_level))
-    elif data.permission_scope_type == "user":
+    elif permission_scope_type == "private":
         agent.access_mode = "private"
-        agent.company_access_level = access_level
-        if data.permission_scope_ids:
-            for scope_id in data.permission_scope_ids:
-                db.add(
-                    AgentPermission(agent_id=agent.id, scope_type="user", scope_id=scope_id, access_level=access_level)
-                )
-        else:
-            # "仅自己" — insert creator as the only permitted user
-            db.add(
-                AgentPermission(agent_id=agent.id, scope_type="user", scope_id=current_user.id, access_level="manage")
+        agent.company_access_level = "manage"
+        db.add(
+            AgentPermission(
+                agent_id=agent.id,
+                scope_type="user",
+                scope_id=current_user.id,
+                access_level="manage",
             )
-    elif data.permission_scope_type == "custom":
+        )
+    elif permission_scope_type == "custom":
         agent.access_mode = "custom"
         agent.company_access_level = access_level
-        db.add(AgentPermission(agent_id=agent.id, scope_type="user", scope_id=current_user.id, access_level="manage"))
+        db.add(
+            AgentPermission(
+                agent_id=agent.id,
+                scope_type="user",
+                scope_id=current_user.id,
+                access_level="manage",
+            )
+        )
+        for scope_id in permission_target_ids:
+            db.add(
+                AgentPermission(
+                    agent_id=agent.id,
+                    scope_type="user",
+                    scope_id=scope_id,
+                    access_level=access_level,
+                )
+            )
 
     await db.flush()
     await ensure_access_granted_platform_relationships(db, agent, created_by_user_id=current_user.id)
@@ -1012,7 +1146,7 @@ async def get_media_capabilities(
         entitlements=entitlements,
         tier=selected_tier,
     )
-    if not _is_platform_admin(current_user):
+    if not is_platform_operator(current_user):
         # Provider, plan tier, and internal failover reasons are platform
         # governance facts.  The Agent composer only needs business-level
         # readiness; returning the raw route diagnostics here would leak
@@ -1044,8 +1178,13 @@ async def get_agent_permissions(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get agent permission scope."""
-    agent, access_level = await check_agent_access(db, current_user, agent_id)
+    """Get Agent permission scope for an effective Agent manager."""
+    agent, access_level = await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+    )
     result = await db.execute(select(AgentPermission).where(AgentPermission.agent_id == agent_id))
     perms = result.scalars().all()
     can_manage = access_level == "manage"
@@ -1108,7 +1247,7 @@ async def get_agent_permissions(
             if not u:
                 continue
             is_creator = agent.creator_id == u.id
-            is_admin = u.role in ("platform_admin", "org_admin")
+            is_admin = u.role in ("org_owner", "org_admin")
             is_required = access_mode == "custom" and (is_creator or is_admin)
             item = {
                 "id": sid,
@@ -1143,10 +1282,19 @@ async def update_agent_permissions(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Update agent permission scope (owner or platform_admin only)."""
-    agent, access_level = await check_agent_access(db, current_user, agent_id)
+    """Replace an Agent ACL under the canonical object-management boundary."""
+    agent, access_level = await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+        lock_authority=True,
+    )
     if access_level != "manage":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only manager can change permissions")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Manage access required",
+        )
 
     scope_type = data.get("scope_type", "company")
     scope_ids = data.get("scope_ids", [])
@@ -1158,15 +1306,50 @@ async def update_agent_permissions(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported scope_type")
     if scope_type == "user":
         scope_type = "private"
+    if not isinstance(scope_ids, list) or not isinstance(user_access, list):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="scope_ids and user_access must be lists",
+        )
+    if await _is_product_managed_private_assistant(db, agent) and scope_type != "private":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "private_assistant_is_owner_only",
+                "message": "A personal assistant cannot be delegated or made company-visible",
+            },
+        )
 
-    # Serialize every ACL replacement with final-delivery authorization fences.
-    # Deleting/reinserting AgentPermission rows alone does not conflict with the
-    # Agent FOR SHARE locks used by A2A delivery and can otherwise cross a revoke.
-    locked_agent_result = await db.execute(select(Agent).where(Agent.id == agent_id).with_for_update())
-    locked_agent = locked_agent_result.scalar_one_or_none()
-    if locked_agent is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
-    agent = locked_agent
+    creator_id = agent.creator_id or current_user.id
+    requested_access: dict[uuid.UUID, str] = {}
+    try:
+        for item in user_access:
+            if not isinstance(item, dict):
+                raise ValueError
+            raw_id = item.get("id") or item.get("user_id")
+            if raw_id is None:
+                continue
+            target_id = uuid.UUID(str(raw_id))
+            target_level = item.get("access_level", "use")
+            requested_access[target_id] = target_level if target_level in {"use", "manage"} else "use"
+        for raw_id in scope_ids:
+            target_id = uuid.UUID(str(raw_id))
+            requested_access.setdefault(target_id, access_level)
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Agent permission targets must contain valid user IDs",
+        ) from exc
+
+    requested_access.pop(creator_id, None)
+    if scope_type == "custom":
+        await _validate_permission_target_users(
+            db,
+            tenant_id=agent.tenant_id,
+            user_ids=set(requested_access),
+        )
+
+    previous_mode = getattr(agent, "access_mode", None) or "company"
 
     # Delete existing permissions
     from sqlalchemy import delete as sql_delete
@@ -1180,53 +1363,37 @@ async def update_agent_permissions(
         db.add(AgentPermission(agent_id=agent_id, scope_type="company", access_level=access_level))
     elif scope_type == "private":
         agent.access_mode = "private"
-        agent.company_access_level = access_level
+        agent.company_access_level = "manage"
         # "Only me" means private to the agent creator, even when an org admin
         # is managing a company-visible agent created by someone else.
         db.add(
             AgentPermission(
                 agent_id=agent_id,
                 scope_type="user",
-                scope_id=agent.creator_id or current_user.id,
+                scope_id=creator_id,
                 access_level="manage",
             )
         )
     elif scope_type == "custom":
         agent.access_mode = "custom"
         agent.company_access_level = access_level
-        seen_user_ids: set[uuid.UUID] = set()
-        creator_id = agent.creator_id or current_user.id
-        required_manager_ids = {creator_id}
-        required_manager_ids.update(admin.id for admin in await _get_active_admin_users(db, agent.tenant_id))
-        for item in user_access:
-            sid = item.get("id") or item.get("user_id")
-            if not sid:
-                continue
-            uid = uuid.UUID(str(sid))
-            if uid in seen_user_ids:
-                continue
-            lvl = item.get("access_level", "use")
-            if lvl not in ("use", "manage"):
-                lvl = "use"
-            if uid in required_manager_ids:
-                lvl = "manage"
-            seen_user_ids.add(uid)
-            db.add(AgentPermission(agent_id=agent_id, scope_type="user", scope_id=uid, access_level=lvl))
-        for sid in scope_ids:
-            uid = uuid.UUID(str(sid))
-            if uid not in seen_user_ids:
-                seen_user_ids.add(uid)
-                db.add(
-                    AgentPermission(
-                        agent_id=agent_id,
-                        scope_type="user",
-                        scope_id=uid,
-                        access_level="manage" if uid in required_manager_ids else access_level,
-                    )
+        db.add(
+            AgentPermission(
+                agent_id=agent_id,
+                scope_type="user",
+                scope_id=creator_id,
+                access_level="manage",
+            )
+        )
+        for target_id, target_level in requested_access.items():
+            db.add(
+                AgentPermission(
+                    agent_id=agent_id,
+                    scope_type="user",
+                    scope_id=target_id,
+                    access_level=target_level,
                 )
-        for uid in required_manager_ids:
-            if uid not in seen_user_ids:
-                db.add(AgentPermission(agent_id=agent_id, scope_type="user", scope_id=uid, access_level="manage"))
+            )
 
     await db.flush()
     relationships_changed = await ensure_access_granted_platform_relationships(
@@ -1239,6 +1406,21 @@ async def update_agent_permissions(
 
         await _regenerate_relationships_file(db, agent_id)
 
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            agent_id=agent.id,
+            action="agent_permissions_updated",
+            details={
+                "resource_id": str(agent.id),
+                "tenant_id": str(agent.tenant_id),
+                "previous_scope_type": previous_mode,
+                "scope_type": scope_type,
+                "grantee_count": len(requested_access),
+            },
+        )
+    )
+
     await db.commit()
     return {"status": "ok"}
 
@@ -1250,15 +1432,13 @@ async def get_agent_permission_candidates(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return org members that can be granted custom access.
-
-    For members without a linked platform account (user_id is None), we call
-    get_platform_user_by_org_member which will find-or-create a User using the
-    member's email/phone, then link it back to the OrgMember row.
-    """
-    agent, access_level = await check_agent_access(db, current_user, agent_id)
-    if access_level != "manage":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only manager can change permissions")
+    """Return active company memberships eligible for an object grant."""
+    agent, _access_level = await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+    )
 
     member_query = select(OrgMember).where(
         OrgMember.tenant_id == agent.tenant_id,
@@ -1282,26 +1462,18 @@ async def get_agent_permission_candidates(
     if linked_user_ids:
         users_result = await db.execute(
             select(User)
-            .where(User.id.in_(linked_user_ids), User.tenant_id == agent.tenant_id)
+            .where(
+                User.id.in_(linked_user_ids),
+                User.tenant_id == agent.tenant_id,
+                User.is_active.is_(True),
+            )
             .options(selectinload(User.identity))
         )
         users_by_id = {u.id: u for u in users_result.scalars().all()}
 
-    from app.services.channel_user_service import get_platform_user_by_org_member
-
     candidates = []
     for m in members:
-        if m.user_id:
-            u = users_by_id.get(m.user_id)
-        else:
-            # No platform account yet — find-or-create one from OrgMember info
-            # and link it back so future lookups hit Case 1.
-            try:
-                u = await get_platform_user_by_org_member(db, m, agent_tenant_id=agent.tenant_id)
-            except Exception:
-                # If user creation fails for any reason, skip this member
-                continue
-
+        u = users_by_id.get(m.user_id) if m.user_id else None
         if u is None:
             continue
 
@@ -1316,8 +1488,6 @@ async def get_agent_permission_candidates(
             }
         )
 
-    await db.commit()
-
     return {
         "users": candidates,
         "agents": [],
@@ -1331,16 +1501,14 @@ async def update_agent(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Update agent settings (creator or admin)."""
-    agent, access_level = await check_agent_access(db, current_user, agent_id)
-
-    is_admin = current_user.role in ("platform_admin", "org_admin")
-
-    if access_level != "manage":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Manage access is required to update agent settings",
-        )
+    """Update Agent settings with a live object-management grant."""
+    agent, _access_level = await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+        lock_authority=True,
+    )
 
     update_data = data.model_dump(exclude_unset=True)
 
@@ -1373,7 +1541,7 @@ async def update_agent(
 
     # expires_at: admin only
     if "expires_at" in update_data:
-        if not is_admin:
+        if not is_company_governor(current_user):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only admin can modify agent expiry time")
         from datetime import datetime, timezone as tz
 
@@ -1472,15 +1640,13 @@ async def delete_agent(
         current_user,
         agent_id,
         include_deleted=True,
+        required_level="manage",
+        lock_authority=True,
     )
-    if not is_agent_creator(current_user, agent) and current_user.role not in (
-        "super_admin",
-        "org_admin",
-        "platform_admin",
-    ):
+    if not is_agent_creator(current_user, agent) and not is_company_governor(current_user):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only creator or admin can delete agent",
+            detail="Only the Agent creator or a company administrator can delete it",
         )
 
     if agent.is_system:
@@ -1566,9 +1732,13 @@ async def start_agent(
     db: AsyncSession = Depends(get_db),
 ):
     """Start an agent's container."""
-    agent, access_level = await check_agent_access(db, current_user, agent_id)
-    if access_level != "manage":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only manager can start agent")
+    agent, _access_level = await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+        lock_authority=True,
+    )
     if agent.deletion_requested_at is not None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -1589,11 +1759,17 @@ async def recover_agent(
     db: AsyncSession = Depends(get_db),
 ):
     """Repair an incomplete workspace and restart an agent after an error."""
-    agent, access_level = await check_agent_access(db, current_user, agent_id)
+    agent, access_level = await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+        lock_authority=True,
+    )
     if access_level != "manage":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only manager can recover agent",
+            detail="Manage access required",
         )
     if agent.deletion_requested_at is not None:
         raise HTTPException(
@@ -1629,9 +1805,13 @@ async def stop_agent(
     db: AsyncSession = Depends(get_db),
 ):
     """Stop an agent's container."""
-    agent, access_level = await check_agent_access(db, current_user, agent_id)
-    if access_level != "manage":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only manager can stop agent")
+    agent, _access_level = await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+        lock_authority=True,
+    )
 
     from app.services.agent_manager import agent_manager
 
@@ -1653,12 +1833,12 @@ async def list_agent_approvals(
     db: AsyncSession = Depends(get_db),
 ):
     """List approval requests for an Agent the user can manage."""
-    _agent, access_level = await check_agent_access(db, current_user, agent_id)
-    if access_level != "manage":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only an Agent manager can view approvals",
-        )
+    _agent, _access_level = await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+    )
 
     from app.models.audit import ApprovalRequest
     from app.services.autonomy_service import approval_to_public_dict
@@ -1688,12 +1868,13 @@ async def resolve_agent_approval(
     db: AsyncSession = Depends(get_db),
 ):
     """Approve or reject a pending approval for a specific agent."""
-    agent, access_level = await check_agent_access(db, current_user, agent_id)
-    if access_level != "manage":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only an Agent manager can resolve approvals",
-        )
+    agent, _access_level = await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+        lock_authority=True,
+    )
 
     from app.services.autonomy_service import autonomy_service
 
@@ -1723,12 +1904,13 @@ async def generate_or_reset_api_key(
     db: AsyncSession = Depends(get_db),
 ):
     """Generate or regenerate API key for an OpenClaw agent."""
-    agent, access_level = await check_agent_access(db, current_user, agent_id)
-    if access_level != "manage":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only an Agent manager can manage API keys",
-        )
+    agent, _access_level = await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+        lock_authority=True,
+    )
     if getattr(agent, "agent_type", "native") != "openclaw":
         raise HTTPException(status_code=400, detail="API keys are only available for OpenClaw agents")
 

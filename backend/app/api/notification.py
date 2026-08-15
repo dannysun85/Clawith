@@ -12,6 +12,7 @@ from app.core.security import get_current_user
 from app.database import get_db
 from app.models.notification import Notification
 from app.models.user import User
+from app.services.access_control import is_company_governor
 
 router = APIRouter(tags=["notifications"])
 
@@ -127,8 +128,8 @@ async def broadcast_notification(
     db: AsyncSession = Depends(get_db),
 ):
     """Send a notification to all users and agents in the current tenant.
-    Requires org_admin or platform_admin role."""
-    if current_user.role not in ("platform_admin", "org_admin"):
+    Requires a current company governance membership."""
+    if not is_company_governor(current_user):
         raise HTTPException(403, "Only org admins can send broadcasts")
     if not current_user.tenant_id:
         raise HTTPException(400, "No tenant associated with your account")

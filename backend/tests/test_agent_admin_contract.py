@@ -85,7 +85,11 @@ def test_agent_creator_and_company_admin_keep_permitted_audit_boundaries():
         agent=own_agent,
         agent_access_level="manage",
     )
-    assert can_audit_agent_chat_sessions(org_admin)
+    assert can_audit_agent_chat_sessions(
+        org_admin,
+        agent=own_agent,
+        agent_access_level="manage",
+    )
 
 
 @pytest.mark.asyncio
@@ -125,11 +129,13 @@ async def test_agent_admin_cannot_update_an_agent_with_use_only_access():
     agent = _agent(actor)
     db = _DB()
 
-    with patch.object(
-        agents_api,
-        "check_agent_access",
-        AsyncMock(return_value=(agent, "use")),
-    ):
+    access = AsyncMock(
+        side_effect=HTTPException(
+            status_code=403,
+            detail="Manage access is required for this Agent",
+        )
+    )
+    with patch.object(agents_api, "check_agent_access", access):
         with pytest.raises(HTTPException) as exc:
             await agents_api.update_agent(
                 agent.id,
@@ -141,6 +147,8 @@ async def test_agent_admin_cannot_update_an_agent_with_use_only_access():
     assert exc.value.status_code == 403
     assert agent.name == "Original"
     db.flush.assert_not_awaited()
+    assert access.await_args.kwargs["required_level"] == "manage"
+    assert access.await_args.kwargs["lock_authority"] is True
 
 
 @pytest.mark.asyncio
@@ -172,11 +180,13 @@ async def test_agent_admin_cannot_list_approvals_with_use_only_access():
     agent = _agent(actor)
     db = _DB()
 
-    with patch.object(
-        agents_api,
-        "check_agent_access",
-        AsyncMock(return_value=(agent, "use")),
-    ):
+    access = AsyncMock(
+        side_effect=HTTPException(
+            status_code=403,
+            detail="Manage access is required for this Agent",
+        )
+    )
+    with patch.object(agents_api, "check_agent_access", access):
         with pytest.raises(HTTPException) as exc:
             await agents_api.list_agent_approvals(
                 agent.id,
@@ -188,6 +198,7 @@ async def test_agent_admin_cannot_list_approvals_with_use_only_access():
 
     assert exc.value.status_code == 403
     db.execute.assert_not_awaited()
+    assert access.await_args.kwargs["required_level"] == "manage"
 
 
 @pytest.mark.asyncio
@@ -196,11 +207,13 @@ async def test_agent_admin_cannot_resolve_approval_with_use_only_access():
     agent = _agent(actor)
     db = _DB()
 
-    with patch.object(
-        agents_api,
-        "check_agent_access",
-        AsyncMock(return_value=(agent, "use")),
-    ):
+    access = AsyncMock(
+        side_effect=HTTPException(
+            status_code=403,
+            detail="Manage access is required for this Agent",
+        )
+    )
+    with patch.object(agents_api, "check_agent_access", access):
         with pytest.raises(HTTPException) as exc:
             await agents_api.resolve_agent_approval(
                 agent.id,
@@ -212,6 +225,8 @@ async def test_agent_admin_cannot_resolve_approval_with_use_only_access():
 
     assert exc.value.status_code == 403
     db.execute.assert_not_awaited()
+    assert access.await_args.kwargs["required_level"] == "manage"
+    assert access.await_args.kwargs["lock_authority"] is True
 
 
 @pytest.mark.asyncio
@@ -244,11 +259,13 @@ async def test_agent_admin_cannot_reset_openclaw_key_with_use_only_access():
     agent.agent_type = "openclaw"
     db = _DB()
 
-    with patch.object(
-        agents_api,
-        "check_agent_access",
-        AsyncMock(return_value=(agent, "use")),
-    ):
+    access = AsyncMock(
+        side_effect=HTTPException(
+            status_code=403,
+            detail="Manage access is required for this Agent",
+        )
+    )
+    with patch.object(agents_api, "check_agent_access", access):
         with pytest.raises(HTTPException) as exc:
             await agents_api.generate_or_reset_api_key(
                 agent.id,
@@ -259,6 +276,8 @@ async def test_agent_admin_cannot_reset_openclaw_key_with_use_only_access():
     assert exc.value.status_code == 403
     assert agent.api_key_hash is None
     db.commit.assert_not_awaited()
+    assert access.await_args.kwargs["required_level"] == "manage"
+    assert access.await_args.kwargs["lock_authority"] is True
 
 
 class _ScalarResult:

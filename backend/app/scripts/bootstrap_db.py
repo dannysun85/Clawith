@@ -20,6 +20,7 @@ import app.models.experience  # noqa: F401
 import app.models.experience_reference  # noqa: F401
 import app.models.gateway_message  # noqa: F401
 import app.models.invitation_code  # noqa: F401
+import app.models.identity_governance  # noqa: F401
 import app.models.llm  # noqa: F401
 import app.models.media_generation  # noqa: F401
 import app.models.notification  # noqa: F401

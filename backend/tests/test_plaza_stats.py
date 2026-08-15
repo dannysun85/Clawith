@@ -52,22 +52,17 @@ class _NoopSession:
 
 
 @pytest.mark.asyncio
-async def test_platform_admin_without_tenant_can_read_plaza_stats(monkeypatch):
-    """A tenantless platform admin must not combine Python bools with SQL filters."""
-    session = _Session()
-    monkeypatch.setattr(plaza_api, "async_session", lambda: session)
-
-    result = await plaza_api.plaza_stats(
-        current_user=SimpleNamespace(tenant_id=None, role="platform_admin")
+async def test_platform_operator_without_membership_cannot_read_plaza_stats():
+    user = SimpleNamespace(
+        tenant_id=None,
+        role="platform_admin",
+        identity=SimpleNamespace(is_platform_admin=True),
     )
 
-    assert result == {
-        "total_posts": 4,
-        "total_comments": 7,
-        "today_posts": 2,
-        "top_contributors": [{"name": "Astra", "type": "agent", "posts": 3}],
-    }
-    assert len(session.statements) == 4
+    with pytest.raises(HTTPException) as captured:
+        await plaza_api.plaza_stats(current_user=user)
+
+    assert captured.value.status_code == 403
 
 
 @pytest.mark.asyncio
@@ -121,15 +116,21 @@ async def test_tenantless_non_admin_plaza_requests_fail_closed(operation):
     assert captured.value.status_code == 403
 
 
-def test_tenantless_platform_admin_write_requires_explicit_tenant():
-    user = SimpleNamespace(tenant_id=None, role="platform_admin")
+def test_tenantless_platform_operator_cannot_select_a_plaza_tenant():
+    user = SimpleNamespace(
+        tenant_id=None,
+        role="platform_admin",
+        identity=SimpleNamespace(is_platform_admin=True),
+    )
 
     with pytest.raises(HTTPException) as captured:
         plaza_api._effective_plaza_tenant_id(user)
 
-    assert captured.value.status_code == 400
+    assert captured.value.status_code == 403
     tenant_id = uuid.uuid4()
-    assert plaza_api._effective_plaza_tenant_id(user, tenant_id) == str(tenant_id)
+    with pytest.raises(HTTPException) as explicit_tenant_denied:
+        plaza_api._effective_plaza_tenant_id(user, tenant_id)
+    assert explicit_tenant_denied.value.status_code == 403
 
 
 @pytest.mark.asyncio

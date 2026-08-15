@@ -116,6 +116,25 @@ function SsoChannelSection({ idpType, existingProvider, tenant, t }: {
 
     return (
         <div style={{ marginTop: '20px', paddingTop: '20px', borderTop: '1px dashed var(--border-subtle)' }}>
+            {existingProvider?.readiness && (
+                <div style={{ marginBottom: '16px', padding: '12px', borderRadius: '8px', background: 'var(--bg-primary)', border: '1px solid var(--border-subtle)', fontSize: '11px', lineHeight: 1.6 }}>
+                    <div style={{ fontWeight: 600, color: 'var(--text-primary)', marginBottom: '4px' }}>
+                        {t('enterprise.identity.readinessTitle', 'Provider readiness')}
+                    </div>
+                    <div style={{ color: 'var(--text-secondary)' }}>
+                        {t('enterprise.identity.operationalStatus', 'Configuration')}: {existingProvider.readiness.operational_status}
+                        {' · '}SSO: {existingProvider.readiness.sso_login}
+                        {' · '}JIT: {existingProvider.readiness.jit_policy}
+                    </div>
+                    {idpType === 'google_workspace' && (
+                        <div style={{ color: 'var(--warning, #b7791f)', marginTop: '4px' }}>
+                            {existingProvider.readiness.provider_verification === 'local_emulator_configured'
+                                ? t('enterprise.identity.localIdpOnly', 'Local IdP emulator configured: suitable for local acceptance only, not real-provider verification.')
+                                : t('enterprise.identity.realIdpPending', 'Real Google Workspace verification is still pending; saved credentials alone are not provider proof.')}
+                        </div>
+                    )}
+                </div>
+            )}
             {/* SSO Toggle */}
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: ssoError ? '8px' : '16px' }}>
                 <div>
@@ -534,6 +553,8 @@ export default function OrgTab({ tenant }: { tenant: any }) {
                 google_workspace: {
                     client_id: '',
                     client_secret: '',
+                    jit_provisioning_enabled: false,
+                    jit_allowed_domains: [],
                 },
             };
             const nameMap: Record<string, string> = { feishu: 'Feishu', wecom: 'WeCom', dingtalk: 'DingTalk', google_workspace: 'Google', oauth2: 'OAuth2' };
@@ -739,6 +760,55 @@ export default function OrgTab({ tenant }: { tenant: any }) {
                                         onChange={e => setForm({ ...form, config: { ...form.config, client_secret: e.target.value } })}
                                     />
                                 </div>
+                                <div className="form-group" style={{ gridColumn: '1 / -1' }}>
+                                    <label style={{ display: 'flex', alignItems: 'flex-start', gap: '8px', cursor: 'pointer' }}>
+                                        <input
+                                            type="checkbox"
+                                            checked={form.config.jit_provisioning_enabled === true}
+                                            onChange={e => setForm({
+                                                ...form,
+                                                config: {
+                                                    ...form.config,
+                                                    jit_provisioning_enabled: e.target.checked,
+                                                },
+                                            })}
+                                            style={{ marginTop: '2px' }}
+                                        />
+                                        <span>
+                                            <span style={{ display: 'block', fontSize: '12px', fontWeight: 600, color: 'var(--text-primary)' }}>
+                                                {t('enterprise.identity.googleJitTitle', 'Allow verified-domain JIT (member only)')}
+                                            </span>
+                                            <span style={{ display: 'block', fontSize: '10px', color: 'var(--text-tertiary)', marginTop: '2px', lineHeight: 1.5 }}>
+                                                {t('enterprise.identity.googleJitHint', 'Only an exact Google-hosted domain claim may create a new ordinary member. This can never create an admin or owner.')}
+                                            </span>
+                                        </span>
+                                    </label>
+                                </div>
+                                {form.config.jit_provisioning_enabled === true && (
+                                    <div className="form-group" style={{ gridColumn: '1 / -1' }}>
+                                        <label className="form-label">{t('enterprise.identity.googleJitDomains', 'Allowed Workspace domains')}</label>
+                                        <input
+                                            className="form-input"
+                                            value={Array.isArray(form.config.jit_allowed_domains)
+                                                ? form.config.jit_allowed_domains.join(', ')
+                                                : form.config.jit_allowed_domains || ''}
+                                            onChange={e => setForm({
+                                                ...form,
+                                                config: {
+                                                    ...form.config,
+                                                    jit_allowed_domains: e.target.value
+                                                        .split(',')
+                                                        .map((value: string) => value.trim())
+                                                        .filter(Boolean),
+                                                },
+                                            })}
+                                            placeholder="example.com, subsidiary.example.com"
+                                        />
+                                        <div style={{ fontSize: '10px', color: 'var(--text-tertiary)', marginTop: '4px' }}>
+                                            {t('enterprise.identity.googleJitDomainsHint', 'Comma-separated bare domains. Email and the signed Google hd claim must both match exactly.')}
+                                        </div>
+                                    </div>
+                                )}
                                 <div className="form-group" style={{ gridColumn: '1 / -1' }}>
                                     <label className="form-label">{t('enterprise.identity.callbackUrl', 'Redirect URL (paste this in your app settings)')}</label>
                                     <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
@@ -979,7 +1049,12 @@ export default function OrgTab({ tenant }: { tenant: any }) {
                                     <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
                                         {existingProvider ? (
                                             <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'flex-end', gap: '8px' }}>
-                                                <span className="badge badge-success" style={{ fontSize: '10px' }}>Active</span>
+                                                <span
+                                                    className={`badge ${existingProvider.readiness?.operational_status === 'configuration_ready' ? 'badge-success' : 'badge-secondary'}`}
+                                                    style={{ fontSize: '10px' }}
+                                                >
+                                                    {existingProvider.readiness?.operational_status || (existingProvider.is_active ? 'configured' : 'disabled')}
+                                                </span>
                                                 {existingProvider.last_synced_at && (
                                                     <span style={{ fontSize: '10px', color: 'var(--text-tertiary)' }}>
                                                         Synced: {new Date(existingProvider.last_synced_at).toLocaleDateString()}

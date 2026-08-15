@@ -43,6 +43,7 @@ from app.services.storage import (
 )
 from app.services.storage_runtime.base import StorageEntry
 from app.services.workspace_paths import WorkspacePathError, resolve_agent_visible_path
+from app.services.access_control import is_company_governor
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -267,13 +268,13 @@ async def _require_agent_file_delete_access(
     current_user: User,
     agent_id: uuid.UUID,
 ) -> None:
-    """Allow destructive workspace file operations only for managers/admins."""
-    _agent, access_level = await check_agent_access(db, current_user, agent_id)
-    if access_level == "manage" or current_user.role in ("platform_admin", "org_admin", "super_admin"):
-        return
-    raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
-        detail="Only agent managers or admins can delete files",
+    """Allow destructive workspace file operations only for Agent managers."""
+    await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+        lock_authority=True,
     )
 
 
@@ -688,7 +689,17 @@ async def write_file(
     db: AsyncSession = Depends(get_db),
 ):
     """Write content to a file (create or overwrite)."""
-    await check_agent_access(db, current_user, agent_id)
+    normalized_path = path.strip("/")
+    required_level = "manage" if (
+        normalized_path == "skills" or normalized_path.startswith("skills/")
+    ) else "use"
+    await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level=required_level,
+        lock_authority=required_level == "manage",
+    )
     _reject_internal_skill_metadata_path(path, mutation=True)
     if is_focus_file_path(path):
         raise HTTPException(
@@ -696,7 +707,7 @@ async def write_file(
             detail="Focus is stored in the system database. Use the Focus API.",
         )
     if path.startswith("enterprise_info"):
-        if current_user.role not in ("platform_admin", "org_admin"):
+        if not is_company_governor(current_user):
             raise HTTPException(status_code=403, detail="Only admins can edit enterprise knowledge base")
         if path.strip("/") == "enterprise_info":
             raise HTTPException(status_code=400, detail="Cannot overwrite enterprise_info root")
@@ -734,7 +745,17 @@ async def lock_file(
     db: AsyncSession = Depends(get_db),
 ):
     """Acquire or refresh a short-lived human editing lock for a file."""
-    await check_agent_access(db, current_user, agent_id)
+    normalized_path = data.path.strip("/")
+    required_level = "manage" if (
+        normalized_path == "skills" or normalized_path.startswith("skills/")
+    ) else "use"
+    await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level=required_level,
+        lock_authority=required_level == "manage",
+    )
     _reject_internal_skill_metadata_path(data.path, mutation=True)
     if is_focus_file_path(data.path):
         raise HTTPException(status_code=status.HTTP_410_GONE, detail="Focus is stored in the system database.")
@@ -757,7 +778,17 @@ async def unlock_file(
     db: AsyncSession = Depends(get_db),
 ):
     """Release the current user's edit lock for a file."""
-    await check_agent_access(db, current_user, agent_id)
+    normalized_path = path.strip("/")
+    required_level = "manage" if (
+        normalized_path == "skills" or normalized_path.startswith("skills/")
+    ) else "use"
+    await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level=required_level,
+        lock_authority=required_level == "manage",
+    )
     _reject_internal_skill_metadata_path(path, mutation=True)
     await release_edit_lock(db, agent_id=agent_id, path=path, user_id=current_user.id)
     if hasattr(db, "commit"):
@@ -773,7 +804,16 @@ async def get_file_revisions(
     db: AsyncSession = Depends(get_db),
 ):
     """List version history for the currently opened Workspace file."""
-    await check_agent_access(db, current_user, agent_id)
+    normalized_path = path.strip("/")
+    required_level = "manage" if (
+        normalized_path == "skills" or normalized_path.startswith("skills/")
+    ) else "use"
+    await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level=required_level,
+    )
     _reject_internal_skill_metadata_path(path)
     if is_focus_file_path(path):
         return []
@@ -815,6 +855,15 @@ async def restore_file_revision(
     revision = result.scalar_one_or_none()
     if not revision:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Revision not found")
+    normalized_path = revision.path.strip("/")
+    if normalized_path == "skills" or normalized_path.startswith("skills/"):
+        await check_agent_access(
+            db,
+            current_user,
+            agent_id,
+            required_level="manage",
+            lock_authority=True,
+        )
     _reject_internal_skill_metadata_path(revision.path, mutation=True)
     if revision.after_content is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot restore an empty/deleted revision")
@@ -853,7 +902,7 @@ async def delete_file(
             status_code=status.HTTP_410_GONE,
             detail="Focus is stored in the system database. Use the Focus API.",
         )
-    if path.startswith("enterprise_info") and current_user.role not in ("platform_admin", "org_admin"):
+    if path.startswith("enterprise_info") and not is_company_governor(current_user):
         raise HTTPException(status_code=403, detail="Only admins can delete enterprise knowledge base files")
     if path.strip("/") == "enterprise_info":
         raise HTTPException(status_code=400, detail="Cannot delete enterprise_info root")
@@ -892,7 +941,13 @@ async def import_skill_to_agent(
     Copies all files from the global skill registry into
     <agent_workspace>/skills/<folder_name>/.
     """
-    agent, _ = await check_agent_access(db, current_user, agent_id)
+    agent, _ = await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+        lock_authority=True,
+    )
 
     from app.models.skill import Skill
     from app.services.skill_scope import scope_skill_query
@@ -952,8 +1007,6 @@ async def upload_file_to_workspace(
     db: AsyncSession = Depends(get_db),
 ):
     """Upload a binary file to agent workspace."""
-    await check_agent_access(db, current_user, agent_id)
-
     normalized_path = (path or "").strip().strip("/")
     if not normalized_path or normalized_path == ".":
         normalized_path = DEFAULT_UPLOAD_DIR
@@ -961,6 +1014,17 @@ async def upload_file_to_workspace(
     # Validate path prefix
     if normalized_path not in {"workspace", "skills"} and not normalized_path.startswith(("workspace/", "skills/")):
         raise HTTPException(status_code=400, detail="右侧根目录视图是 agent 根目录；上传文件时请放到 workspace/ 或 skills/ 目录下")
+
+    required_level = "manage" if (
+        normalized_path == "skills" or normalized_path.startswith("skills/")
+    ) else "use"
+    await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level=required_level,
+        lock_authority=required_level == "manage",
+    )
 
     filename = file.filename or "unnamed"
     # Sanitize filename
@@ -1053,7 +1117,7 @@ async def upload_enterprise_kb_file(
 ):
     """Upload a file to enterprise knowledge base (tenant-scoped)."""
     # Only admin can upload to enterprise KB
-    if current_user.role not in ("platform_admin", "org_admin"):
+    if not is_company_governor(current_user):
         raise HTTPException(status_code=403, detail="Only admins can upload to enterprise knowledge base")
     if not current_user.tenant_id:
         raise HTTPException(status_code=400, detail="No tenant associated")
@@ -1114,7 +1178,7 @@ async def write_enterprise_file(
     current_user: User = Depends(get_current_user),
 ):
     """Write content to an enterprise file (tenant-scoped)."""
-    if current_user.role not in ("platform_admin", "org_admin"):
+    if not is_company_governor(current_user):
         raise HTTPException(status_code=403, detail="Only admins can edit enterprise knowledge base")
     if not current_user.tenant_id:
         raise HTTPException(status_code=400, detail="No tenant associated")
@@ -1130,7 +1194,7 @@ async def delete_enterprise_file(
     current_user: User = Depends(get_current_user),
 ):
     """Delete an enterprise knowledge base file (tenant-scoped)."""
-    if current_user.role not in ("platform_admin", "org_admin"):
+    if not is_company_governor(current_user):
         raise HTTPException(status_code=403, detail="Only admins can delete enterprise knowledge base files")
     if not current_user.tenant_id:
         raise HTTPException(status_code=400, detail="No tenant associated")
@@ -1193,7 +1257,13 @@ async def agent_import_from_clawhub(
     db: AsyncSession = Depends(get_db),
 ):
     """Import a skill from ClawHub directly into this agent's skills/ workspace."""
-    await check_agent_access(db, current_user, agent_id)
+    await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+        lock_authority=True,
+    )
 
     from app.api.skills import (
         _fetch_clawhub_skill_archive, _fetch_clawhub_skill_meta, _get_clawhub_key,
@@ -1250,7 +1320,13 @@ async def agent_import_from_url(
     db: AsyncSession = Depends(get_db),
 ):
     """Import a skill from a GitHub URL directly into this agent's skills/ workspace."""
-    await check_agent_access(db, current_user, agent_id)
+    await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+        lock_authority=True,
+    )
 
     from app.api.skills import _parse_github_url, _fetch_github_directory, _get_github_token
 

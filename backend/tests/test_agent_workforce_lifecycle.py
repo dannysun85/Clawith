@@ -94,7 +94,7 @@ async def test_talent_market_query_is_fail_closed_to_enabled_templates() -> None
 @pytest.mark.asyncio
 async def test_disabled_template_id_cannot_bypass_recruitment_gate() -> None:
     template = _template(lifecycle_status="candidate_disabled")
-    session = _Session([template])
+    session = _Session([True], [template])
     user = SimpleNamespace(
         id=uuid.uuid4(),
         tenant_id=uuid.uuid4(),
@@ -104,8 +104,12 @@ async def test_disabled_template_id_cannot_bypass_recruitment_gate() -> None:
     )
 
     with pytest.raises(HTTPException) as exc_info:
-        await agents_api.create_agent(
-            AgentCreate(name="Blocked hire", template_id=template.id),
+            await agents_api.create_agent(
+                AgentCreate(
+                    name="Blocked hire",
+                    template_id=template.id,
+                    permission_scope_type="private",
+                ),
             BackgroundTasks(),
             current_user=user,
             db=session,
@@ -120,11 +124,14 @@ async def test_disabled_template_id_cannot_bypass_recruitment_gate() -> None:
 
 
 @pytest.mark.asyncio
-async def test_admin_catalog_exposes_decisions_without_enabling_roles() -> None:
+async def test_platform_catalog_exposes_decisions_without_enabling_roles() -> None:
     response = await workforce_api.get_workforce_catalog(
         decision="merge_or_reject",
         pack=None,
-        current_user=SimpleNamespace(role="org_admin"),
+        current_user=SimpleNamespace(
+            role="platform_admin",
+            identity=SimpleNamespace(is_platform_admin=True),
+        ),
     )
 
     assert response["summary"]["total"] == 268

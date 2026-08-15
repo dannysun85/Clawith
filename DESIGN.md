@@ -3,8 +3,8 @@
 ## Source of truth
 
 - Status: Active
-- Last refreshed: 2026-08-03
-- Primary product surfaces: Workbench, personal assistant, Agent direct chat, Group collaboration, deliverable brief drawer, deliverable run timeline, Workspace artifact preview, Enterprise Settings, SaaS Admin.
+- Last refreshed: 2026-08-15
+- Primary product surfaces: Workbench, personal assistant, Digital Employee Center, Agent direct chat, Group collaboration, deliverable brief drawer, deliverable run timeline, Workspace artifact preview, Enterprise Settings, SaaS Admin.
 - Evidence reviewed: `frontend/src/App.tsx`, `frontend/src/index.css`, `frontend/src/styles/atlas.css`, `frontend/src/pages/Layout.tsx`, `frontend/src/pages/Onboarding.tsx`, `frontend/src/pages/agent-detail/AgentDetailPage.tsx`, `frontend/src/components/AgentSidePanel.tsx`, `frontend/src/components/WorkspaceOperationPanel.tsx`, `frontend/src/components/deliverables/DeliverableWorkbench.tsx`, `frontend/src/pages/enterprise-settings/tabs/SkillsTab.tsx`, `backend/app/api/onboarding.py`, `backend/app/api/tasks.py`, `backend/app/models/agent.py`, `backend/app/models/onboarding.py`, `backend/app/models/task.py`, `backend/app/models/group.py`, `backend/app/models/deliverable.py`, `backend/app/models/okr.py`, `backend/app/models/experience.py`, `backend/app/models/subscription.py`, `backend/app/services/product_roles.py`, `backend/app/services/deliverable_workflows.py`, `backend/app/services/tool_capability_policy.py`, `backend/app/services/tool_visibility.py`, `backend/app/services/skill_scope.py`, `backend/agent_templates/private-assistant/`, `backend/agent_template/skills/brand-safe-media/SKILL.md`, `docs/multimodal-product-flow-ledger.md`, `docs/agent-roster/organization-roster-business-prd-v2.md`, `.omx/plans/2026-07-24-image-video-ppt-provider-evaluation-plan.md`, the supplied WorkBuddy entry screenshot, and the previously reviewed feature-entry references.
 - Authority: this file governs product/UI decisions. Runtime, security, billing, and data-model facts remain governed by `SKILL.md`, code, migrations, and tests.
 
@@ -45,7 +45,7 @@ This section records current local implementation facts. Everything labelled `ta
 
 - The live production identity must be read from `/api/version` and matched to the backend, worker, frontend, and immutable release commit; this design file is not release evidence. Production `v1.11.17` at `1286865f08a9b09ab4f3bccfd2875f08fd990b15` is the deployed baseline. The current product-role slice is an uncommitted local worktree change and is neither a candidate nor a release.
 - Onboarding provisions one private Assistant Agent, records it on `UserTenantOnboarding`, calls the role a private coordinator, and enters `/work` after creation or recovery.
-- `Layout.tsx` separates the onboarding-linked `我的助理` from long-term `Agent 员工`; the companion is also excluded from long-term employee quota and Dashboard roster statistics. The current local slice additionally labels template-bound assistants left by older versions as `历史助理`, preserves their IDs/history/deep links, and excludes them from the employee roster without guessing from editable names or role text.
+- `Layout.tsx` separates the onboarding-linked `我的助理` from long-term `数字员工`; the companion is also excluded from long-term employee quota and Dashboard roster statistics. Its user-selected name is secondary identity under the fixed relationship label. Template-bound assistants left by older versions remain reachable through a default-collapsed `历史助理` compatibility control, preserve their IDs/history/deep links, and stay outside the employee roster without guessing from editable names or role text.
 - Agent chat, Agent-scoped tasks, Groups, OKR, Plaza/Experience, Enterprise Settings, subscription/Credits, Workspace artifacts, deliverable requests, quality reviews, and SaaS Admin already exist as separate runtime or management surfaces.
 - The local worktree adds a tenant-scoped Work read model, confirmed work statements, task-scoped experts, real Group task correlation, Experience provenance, OKR work evidence, and page-ownership navigation without replacing Runtime, Deliverable, Workspace, Credits, or Approval authorities.
 - Creative delivery has provider-neutral image/audio/video routing controls, registered presentation/voiceover Skills, durable deliverable state, artifact preview/download, three-reviewer quality state, and creator delivery confirmation. MiniMax-only image/video routes are exposed as non-equivalent degraded capacity and formal Deliverables require explicit acceptance before paid dispatch. Hash-bound local Seedream, Seedance 2.0, and Seed TTS artifacts now prove bounded Provider execution, but independent human quality approval, production configuration parity, and production browser evidence remain incomplete.
@@ -84,7 +84,7 @@ These are product objects, not a proposal to rename every existing database mode
 | User identity and membership | person, tenant membership, role, onboarding state | user plus company administrator | Workbench, My Assistant, Enterprise Settings |
 | Personal-assistant slot | idempotent link from one user in one tenant to one private Agent | current user | `我的助理`, onboarding |
 | Agent | persistent worker identity, role, memory and granted capabilities | creator/authorized manager | digital-employee roster, direct chat |
-| Historical assistant marker | migration-only presentation of an earlier product-managed companion whose content must remain reachable | original owner | separate `历史助理` roster section and existing deep link |
+| Historical assistant marker | migration-only presentation of an earlier product-managed companion whose content must remain reachable | original owner | default-collapsed `历史助理` compatibility control and existing deep link |
 | Task and Run | durable execution intent and runtime progress | selected Agent or Group runtime | Workbench index, chat/session timeline |
 | Deliverable request | structured output contract and stage machine | producing Agent plus requester | chat result card, detail drawer |
 | Artifact and revision | generated file, preview, version and integrity metadata | deliverable request | Workspace and delivery detail |
@@ -171,10 +171,24 @@ No-flow-break guards:
 
 ## Information architecture
 
-- Primary navigation: `工作` contains `工作台` and `协作群组`; `协作角色` separates `我的助理` from `Agent 员工`; `组织` contains `公司概览`, `OKR`, `发现中心`, and role-gated `企业设置`. Account controls hold plan/usage and platform-only operations.
-- Core routes/screens: `/work` is the default post-onboarding task entry; `/dashboard` remains the company overview. Existing Agent chat remains the execution/conversation surface for named employees. `交付物` opens a right-side Brief Drawer; after confirmation, the chat timeline shows a request card and the existing side panel exposes stages and Workspace artifacts.
+- Primary navigation: `工作` contains `工作台` and `协作群组`; `团队` contains one direct `我的助理` relationship and one `数字员工` center entry rather than the complete employee roster; `经营` contains `公司概览`, `目标与复盘`, and `团队知识`; role-gated `管理` contains `企业管理`. Company switching stays above the business navigation, while account, plan/usage, and platform-only operations stay below it.
+- Navigation labels do not change route ownership in this slice: `目标与复盘` retains `/okr`, `团队知识` retains `/plaza`, and `企业管理` retains `/enterprise`. The existing employee-market compatibility flow under `/plaza` remains available until its later product migration into the Digital Employee Center; this navigation implementation does not move or duplicate that flow.
+- Core routes/screens: `/work` is the default post-onboarding task entry; `/employees` owns the complete visible digital-employee roster and collaboration network; `/dashboard` remains the company operating overview. Existing Agent chat remains the execution/conversation surface for named employees. `交付物` opens a right-side Brief Drawer; after confirmation, the chat timeline shows a request card and the existing side panel exposes stages and Workspace artifacts.
 - Content hierarchy: current Agent/team and session first; conversation/run state second; composer and work entry third; structured brief and capability/cost preflight fourth; artifact preview and version actions in the side panel.
 - Work-entry hierarchy: `交付物`, `调研分析`, `自动化`, `团队协作`. Under `交付物`: `PPT`, `海报/图片`, `短视频`, then reports/spreadsheets as later workflows. Modality is an implementation capability, not the user's primary task taxonomy.
+
+## Digital employee center and hiring flow
+
+- The global sidebar is navigation, not the employee database. It shows `我的助理` and one `数字员工` entry with a visible count; it must not render every employee, repeat search/filter controls, or grow with tenant headcount.
+- `/employees` is the single employee-management surface. Its default `协作网络` view explains long-term relationships and recent collaboration; its `员工名册` view lists every employee visible to the current viewer, including employees with no graph edge. Both views read the same viewer-scoped backend projection so counts, permissions, health, and work stages cannot drift.
+- Company Overview may summarize employee health, work and activity and link to `/employees`; it must not duplicate the full topology or the hiring workflow.
+- `添加员工` belongs in the Digital Employee Center page header. The no-employee state may call the same action. It is not a free-floating graph node editor and does not imply that drawing a node or edge creates execution authority.
+- The add action opens one governed flow with two choices: recruit an enabled role from the employee market, or create/connect a custom employee. The template path is the default; custom creation is advanced. Disabled/candidate roles remain non-recruitable even through a direct template ID.
+- Before creation, show responsibility, deliverables, limitations, visibility, seat impact and readiness in user-facing language. Ordinary members may create a private/custom employee for themselves; only company administrators or platform administrators may create a company-wide employee. Company-wide default access is `use`, while the creator retains management authority.
+- Ordinary hiring does not ask for Provider, model, raw Tool/Skill lists or routing modality. The tenant plan and backend select an allowed routing tier. Advanced technical configuration remains in the employee Settings surface after creation and stays permission-gated.
+- A successful `仅创建` action returns to `/employees?view=directory`, highlights the new employee and shows that background setup may still be running. `创建并开始对话` enters the existing `/agents/:id/chat` surface. Both paths invalidate the employee and topology read models; failure preserves the selected role and form state.
+- Employee rows and topology drawers expose `开始对话` to every authorized user and `管理设置` only when the viewer has manage access. Removing, retiring, changing visibility and editing stable relationships remain settings/governance actions, not direct graph manipulation.
+- On mobile, `/employees` defaults to the roster-friendly list while retaining an explicit network switch. The sidebar remains short; the complete directory never expands inside the off-canvas navigation.
 
 ## Workbench and personal-assistant architecture
 
@@ -325,3 +339,13 @@ The local migration now promotes `MiniMax-M3` to the Lite/Pro/Ultra text primary
 - [ ] Product/finance: approve the personal-assistant companion slot as excluded from digital-employee headcount while retaining normal usage/Credits accounting.
 - [ ] Product/admin: define who may publish or retire company work templates and whether approval is required for templates containing paid or external-write steps.
 - [ ] Security/legal: approve any external segmentation/PPT engine and its model-weight licenses before Phase 3 or dependency adoption.
+
+## Identity delivery and account-security surfaces
+
+- The existing `AccountManagement.tsx` is the platform Provider credential pool; it must never be reused or labelled as an employee account-security page.
+- The employee account menu keeps profile and password settings and adds a dedicated security section for MFA status, enrollment, one-time recovery-code display, rotation, and disable confirmation. Privileged users who have not enrolled can still reach this section but cannot reach company/platform administration.
+- Login becomes an explicit two-step surface only when an enabled Identity requires MFA: password first, then TOTP or a single-use recovery code. Challenge errors preserve the email and never expose whether another Identity exists.
+- Company invitation creation is mail-first. The members page shows recipient, role, expiry, and an honest delivery state (`queued`, `smtp_accepted`, retrying, blocked, failed); it does not display a raw token by default.
+- Resend and manual-link fallback are separate actions. Resend rotates the credential and creates a new delivery record. Manual link generation requires reauthentication, displays the link once, warns that it is sensitive, and is fully audited.
+- Customer-facing copy must distinguish “已受理/等待发送” from “SMTP 已接受”; without delivery-provider evidence it must not say “对方已收到”.
+- Destructive company lifecycle controls show the 30-day recovery deadline, legal-hold state, dry-run blockers, and final purge status. Minimal audit tombstones are administrator evidence, not recoverable company content.

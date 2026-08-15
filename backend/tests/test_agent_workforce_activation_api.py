@@ -69,7 +69,11 @@ def _evaluation(*, status="passed"):
 
 
 def _platform_admin():
-    return SimpleNamespace(id=uuid.uuid4(), role="platform_admin", identity=None)
+    return SimpleNamespace(
+        id=uuid.uuid4(),
+        role="platform_admin",
+        identity=SimpleNamespace(is_platform_admin=True),
+    )
 
 
 @pytest.mark.asyncio

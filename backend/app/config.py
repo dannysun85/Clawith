@@ -111,6 +111,14 @@ class Settings(BaseSettings):
     SSO_SESSION_CREATE_GLOBAL_LIMIT_PER_MINUTE: int = 300
     SSO_SESSION_CLEANUP_INTERVAL_SECONDS: int = 60
     SSO_SESSION_RETENTION_MINUTES: int = 60
+    # Local OIDC emulation is an explicit development/test-only acceptance
+    # harness.  It must never turn a tenant-supplied URL into a production
+    # OAuth endpoint override.
+    ALLOW_LOCAL_OIDC_EMULATOR: bool = False
+    # Physical tenant purge is deliberately unavailable in normal application
+    # processes.  G11 exercises it only against an isolated loopback fixture
+    # database whose name and tenant slug also pass independent guards.
+    ALLOW_LOCAL_TENANT_PURGE: bool = False
     # Anonymous auth work is protected in the application so every deployment
     # shape receives the same client + target + global quotas. Global bcrypt
     # limits use short windows to bound bursts into the four-worker pool.
@@ -148,6 +156,9 @@ class Settings(BaseSettings):
     AUTH_OAUTH_EXCHANGE_CLIENT_LIMIT_PER_MINUTE: int = 60
     AUTH_OAUTH_EXCHANGE_PROVIDER_LIMIT_PER_MINUTE: int = 60
     AUTH_OAUTH_EXCHANGE_GLOBAL_LIMIT_PER_MINUTE: int = 120
+    AUTH_MFA_CLIENT_LIMIT_PER_5_MINUTES: int = 30
+    AUTH_MFA_IDENTITY_LIMIT_PER_5_MINUTES: int = 8
+    AUTH_MFA_GLOBAL_LIMIT_PER_MINUTE: int = 180
 
     # File Storage
     STORAGE_BACKEND: str = "local"
@@ -167,6 +178,7 @@ class Settings(BaseSettings):
 
     # Process role
     PROCESS_ROLE: str = "all"
+    OUTBOUND_EMAIL_POLL_SECONDS: int = 10
 
     # Durable Agent Runtime. This is the only supported execution path; the
     # legacy rollout fields remain readable only for explicit test coverage and

@@ -1023,7 +1023,7 @@ _BUILTIN_TOOL_SOURCE = [
                     "label": "Allow Network Access",
                     "type": "checkbox",
                     "default": True,
-                    "read_only_for_roles": ["agent_admin", "member"],
+                    "read_only_for_roles": ["org_owner", "org_admin", "agent_admin", "member"],
                 },
                 {
                     "key": "default_timeout",

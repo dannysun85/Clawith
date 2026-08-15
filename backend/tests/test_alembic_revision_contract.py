@@ -23,12 +23,19 @@ def test_revision_ids_fit_the_default_alembic_version_column() -> None:
 
 
 def test_release_migration_graph_has_one_expected_head() -> None:
-    assert _script_directory().get_heads() == ["media_daily_allowance_claims"]
+    assert _script_directory().get_heads() == ["tenant_deletion_purge"]
 
 
 def test_release_head_preserves_both_upgrade_lineages() -> None:
     script = _script_directory()
-    release_head = script.get_revision("media_daily_allowance_claims")
+    release_head = script.get_revision("tenant_deletion_purge")
+    identity_mfa_revision = script.get_revision("identity_mfa")
+    outbound_email_revision = script.get_revision("outbound_email_delivery")
+    onboarding_revision = script.get_revision("onboarding_product_settings")
+    tenant_access_revision = script.get_revision("harden_tenant_access_control")
+    identity_governance_revision = script.get_revision("identity_membership_governance")
+    owner_role_revision = script.get_revision("add_org_owner_role")
+    media_allowance_revision = script.get_revision("media_daily_allowance_claims")
     assistant_template_revision = script.get_revision(
         "backfill_private_assistant_tpl"
     )
@@ -58,7 +65,18 @@ def test_release_head_preserves_both_upgrade_lineages() -> None:
     task_status_revision = script.get_revision("align_task_failed_status")
     merge_revision = script.get_revision("merge_v111_astra_heads")
 
-    assert release_head._normalized_down_revisions == (
+    assert release_head._normalized_down_revisions == ("identity_mfa",)
+    assert identity_mfa_revision._normalized_down_revisions == ("outbound_email_delivery",)
+    assert outbound_email_revision._normalized_down_revisions == (
+        "onboarding_product_settings",
+    )
+    assert onboarding_revision._normalized_down_revisions == (
+        "harden_tenant_access_control",
+    )
+    assert tenant_access_revision._normalized_down_revisions == ("identity_membership_governance",)
+    assert identity_governance_revision._normalized_down_revisions == ("add_org_owner_role",)
+    assert owner_role_revision._normalized_down_revisions == ("media_daily_allowance_claims",)
+    assert media_allowance_revision._normalized_down_revisions == (
         "backfill_private_assistant_tpl",
     )
     assert assistant_template_revision._normalized_down_revisions == (
@@ -117,11 +135,40 @@ def test_postgres_migration_smoke_targets_the_release_head() -> None:
         encoding="utf-8"
     )
 
-    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-media_daily_allowance_claims' in smoke
+    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-tenant_deletion_purge' in smoke
     assert "restore_runtime_chat_foreign_key" in smoke
     assert "DROP CONSTRAINT IF EXISTS fk_agent_runs_tenant_session_chat_sessions" in smoke
     assert "partial allowance table unexpectedly passed migration" in smoke
     assert "Incompatible pre-existing media_provider_daily_allowance_claims" in smoke
+
+
+def test_tenant_deletion_purge_migration_is_minimal_reentrant_and_reversible() -> None:
+    migration = (
+        BACKEND_ROOT
+        / "alembic/versions/202608161200_add_tenant_deletion_purge.py"
+    ).read_text(encoding="utf-8")
+
+    assert 'down_revision: str | Sequence[str] | None = "identity_mfa"' in migration
+    assert "tenant_deletion_jobs" in migration
+    assert "tenant_deletion_holds" in migration
+    assert "tenant_deletion_tombstones" in migration
+    assert "found partial tables" in migration
+    assert "deletion_scheduled_for IS NOT NULL" in migration
+    assert "op.drop_table" in migration
+
+
+def test_onboarding_product_settings_migration_preserves_existing_company_entry() -> None:
+    migration = (
+        BACKEND_ROOT
+        / "alembic/versions/202608151130_add_onboarding_product_settings.py"
+    ).read_text(encoding="utf-8")
+
+    assert 'down_revision: str | Sequence[str] | None = "harden_tenant_access_control"' in migration
+    assert '"allow_member_private_agents"' in migration
+    assert '"default_approval_policy"' in migration
+    assert '"work_hours_start"' in migration
+    assert "SET initialization_completed_at = COALESCE(created_at, CURRENT_TIMESTAMP)" in migration
+    assert "WHERE initialization_completed_at IS NULL" in migration
 
 
 def test_daily_allowance_migration_fails_closed_on_partial_existing_table() -> None:

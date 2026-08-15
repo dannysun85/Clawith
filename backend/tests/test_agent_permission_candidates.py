@@ -45,21 +45,21 @@ class RecordingDB:
 
 
 @pytest.mark.asyncio
-async def test_get_agent_permission_candidates_resolves_and_lazy_load_safety(monkeypatch):
+async def test_get_agent_permission_candidates_is_read_only_and_skips_unlinked_members(monkeypatch):
     agent_id = uuid.uuid4()
     tenant_id = uuid.uuid4()
     current_user = User(id=uuid.uuid4(), role="member", tenant_id=tenant_id)
     agent = SimpleNamespace(id=agent_id, tenant_id=tenant_id)
 
     # Mock access check
-    async def fake_check_access(_db, _user, _agent_id):
+    async def fake_check_access(_db, _user, _agent_id, **kwargs):
+        assert kwargs["required_level"] == "manage"
         return agent, "manage"
 
     monkeypatch.setattr(agents_api, "check_agent_access", fake_check_access)
 
-    # 1. We have two members:
-    # member_1: already has a linked user_id
-    # member_2: user_id is None, triggers resolve/creation
+    # Only a membership that is already linked to an active platform User can
+    # receive an Agent object grant. A GET must never create that User.
     member_1 = OrgMember(
         id=uuid.uuid4(),
         tenant_id=tenant_id,
@@ -80,18 +80,6 @@ async def test_get_agent_permission_candidates_resolves_and_lazy_load_safety(mon
     identity_1 = Identity(username="member_one", email="member1@example.com")
     user_1 = User(id=member_1.user_id, identity=identity_1, tenant_id=tenant_id)
 
-    identity_2 = Identity(username="member_two", email="member2@example.com")
-    user_2 = User(id=uuid.uuid4(), identity=identity_2, tenant_id=tenant_id)
-
-    # Mock channel user resolve service call
-    async def fake_resolve_or_create(_db, _org_member, agent_tenant_id=None):
-        return user_2
-
-    monkeypatch.setattr(
-        "app.services.channel_user_service.get_platform_user_by_org_member",
-        fake_resolve_or_create,
-    )
-
     # Database responses:
     # 1. members query: returns member_1 and member_2
     # 2. batch load of linked users (only member_1.user_id): returns user_1
@@ -107,10 +95,8 @@ async def test_get_agent_permission_candidates_resolves_and_lazy_load_safety(mon
         db=db,
     )
 
-    assert len(result["users"]) == 2
+    assert len(result["users"]) == 1
     assert result["users"][0]["name"] == "Member One"
     assert result["users"][0]["username"] == "member_one"
-    assert result["users"][1]["name"] == "Member Two"
-    assert result["users"][1]["username"] == "member_two"
-    assert db.committed is True
-
+    assert db.added == []
+    assert db.committed is False

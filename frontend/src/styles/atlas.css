@@ -645,6 +645,74 @@
 
 .atlas-screen-pad { padding: 90px 24px; }
 
+.atlas-policy-plate {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  justify-items: center;
+  width: min(420px, 100%);
+  gap: 18px;
+  padding: 42px;
+  text-align: center;
+  border: 1px solid var(--hairline);
+  background: color-mix(in srgb, var(--paper) 88%, transparent);
+}
+
+.atlas-policy-plate strong {
+  font-family: var(--font-serif);
+  font-size: clamp(28px, 4vw, 46px);
+  font-weight: 400;
+}
+
+.atlas-policy-plate p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.atlas-policy-check,
+.atlas-privacy-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 16px;
+  border: 1px solid var(--hairline);
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.atlas-policy-check input {
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+}
+
+.atlas-policy-check span {
+  display: grid;
+  gap: 3px;
+}
+
+.atlas-policy-check small,
+.atlas-privacy-note {
+  color: var(--muted);
+}
+
+.atlas-dual-input {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.atlas-dual-input label {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
 .atlas-divider {
   height: 1px;
   width: 100%;
@@ -848,6 +916,77 @@
   text-decoration: underline;
   text-decoration-thickness: 0.5px;
   text-underline-offset: 4px;
+}
+
+.atlas-page .login-mfa-setup {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+  background: var(--bg-card);
+}
+
+.atlas-page .login-mfa-setup p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.atlas-page .login-mfa-setup code {
+  overflow-wrap: anywhere;
+  color: var(--ink);
+  font-size: 14px;
+  letter-spacing: .08em;
+}
+
+.atlas-page .login-mfa-setup a,
+.atlas-page .login-secondary-action {
+  width: fit-content;
+  padding: 0;
+  border: 0;
+  color: var(--accent-primary);
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.atlas-page .login-recovery-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.atlas-page .login-recovery-grid code {
+  padding: 9px 10px;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  color: var(--ink);
+  background: var(--bg-card);
+  font-size: 12px;
+  text-align: center;
+}
+
+.atlas-page .login-recovery-confirmation {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.atlas-page .login-recovery-confirmation input {
+  margin-top: 2px;
+}
+
+@media (max-width: 520px) {
+  .atlas-page .login-recovery-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 /* ═══════════════════════════════════════════════════════

@@ -21,7 +21,7 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.permissions import check_agent_access, is_agent_creator
+from app.core.permissions import check_agent_access
 from app.core.security import create_access_token, get_current_user, identity_auth_version
 from app.database import async_session, get_db, transaction
 from app.models.agent import Agent as AgentModel
@@ -171,9 +171,13 @@ async def configure_wecom_channel(
     - WebSocket (AI Bot): bot_id + bot_secret (no callback URL needed)
     - Webhook (legacy): corp_id, secret, token, encoding_aes_key
     """
-    agent, _ = await check_agent_access(db, current_user, agent_id)
-    if not is_agent_creator(current_user, agent):
-        raise HTTPException(status_code=403, detail="Only creator can configure channel")
+    agent, _ = await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+        lock_authority=True,
+    )
 
     requested_mode = str(data.get("connection_mode") or "").strip().lower()
     if requested_mode not in {"", "websocket", "webhook"}:
@@ -362,7 +366,7 @@ async def get_wecom_channel(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    await check_agent_access(db, current_user, agent_id)
+    await check_agent_access(db, current_user, agent_id, required_level="manage")
     result = await db.execute(
         select(ChannelConfig).where(
             ChannelConfig.agent_id == agent_id,
@@ -399,9 +403,13 @@ async def delete_wecom_channel(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    agent, _ = await check_agent_access(db, current_user, agent_id)
-    if not is_agent_creator(current_user, agent):
-        raise HTTPException(status_code=403, detail="Only creator can remove channel")
+    await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+        lock_authority=True,
+    )
     result = await db.execute(
         select(ChannelConfig).where(
             ChannelConfig.agent_id == agent_id,

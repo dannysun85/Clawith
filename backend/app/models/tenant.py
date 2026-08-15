@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String, func
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, Integer, String, func, text
 from sqlalchemy.dialects.postgresql import JSON, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -14,6 +14,15 @@ class Tenant(Base):
     """A company/organization that uses the platform."""
 
     __tablename__ = "tenants"
+    __table_args__ = (
+        Index(
+            "uq_tenants_creator_idempotency_key",
+            "created_by_identity_id",
+            "creation_idempotency_key_hash",
+            unique=True,
+            postgresql_where=text("creation_idempotency_key_hash IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
@@ -26,6 +35,46 @@ class Tenant(Base):
     im_config: Mapped[dict | None] = mapped_column(JSON, default=None)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    # Self-service creation requests are replay-safe per global Identity. The
+    # raw Idempotency-Key is never persisted; only its SHA-256 digest is kept.
+    created_by_identity_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("identities.id", ondelete="SET NULL"), nullable=True
+    )
+    creation_idempotency_key_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # Exactly one tenant membership owns the company. Historical tenants that
+    # cannot be resolved deterministically are quarantined in an explicit
+    # resolution queue instead of silently promoting an arbitrary admin.
+    owner_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=True, unique=True
+    )
+    owner_resolution_required: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
+    initialization_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    initialized_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    # First-company setup is intentionally limited to product policy. Provider,
+    # model, Tool and Skill choices belong to the operator/admin surfaces.
+    company_size: Mapped[str] = mapped_column(
+        String(32), default="unspecified", server_default="unspecified", nullable=False
+    )
+    allow_member_private_agents: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
+    default_approval_policy: Mapped[str] = mapped_column(
+        String(32), default="high_risk", server_default="high_risk", nullable=False
+    )
+
+    # Company deletion is recoverable until ``deletion_scheduled_for``. The
+    # public API never performs an immediate destructive cascade.
+    deletion_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deletion_scheduled_for: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deletion_requested_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
 
     # Default quotas for new users
     default_message_limit: Mapped[int] = mapped_column(Integer, default=50)

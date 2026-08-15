@@ -205,6 +205,7 @@ DEFAULT_EMAIL_TEMPLATES: dict[str, dict[str, str]] = {
         "body": (
             "Hello {{display_name}},\n\n"
             "Welcome to Astra! Please use the following secure token to verify your email address:\n\n"
+            "Verification link: {{verification_url}}\n\n"
             "Verification token: {{verification_code}}\n\n"
             "This token expires in {{expiry_minutes}} minutes. "
             "If you did not create an account, you can ignore this email."
@@ -234,7 +235,7 @@ DEFAULT_EMAIL_TEMPLATES: dict[str, dict[str, str]] = {
 
 # Fixed available variables per scenario (for frontend display)
 EMAIL_TEMPLATE_VARIABLES: dict[str, list[str]] = {
-    "email_verification": ["display_name", "verification_code", "expiry_minutes"],
+    "email_verification": ["display_name", "verification_url", "verification_code", "expiry_minutes"],
     "password_reset": ["display_name", "reset_url", "expiry_minutes"],
     "company_invitation": ["inviter_name", "company_name", "invite_url"],
 }

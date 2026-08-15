@@ -10,7 +10,7 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.permissions import check_agent_access, is_agent_creator
+from app.core.permissions import check_agent_access
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.channel_config import ChannelConfig
@@ -37,9 +37,13 @@ async def configure_slack_channel(
     db: AsyncSession = Depends(get_db),
 ):
     """Configure Slack bot for an agent. Fields: bot_token, signing_secret."""
-    agent, _ = await check_agent_access(db, current_user, agent_id)
-    if not is_agent_creator(current_user, agent):
-        raise HTTPException(status_code=403, detail="Only creator can configure channel")
+    agent, _ = await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+        lock_authority=True,
+    )
 
     result = await db.execute(
         select(ChannelConfig).where(
@@ -89,7 +93,7 @@ async def get_slack_channel(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    await check_agent_access(db, current_user, agent_id)
+    await check_agent_access(db, current_user, agent_id, required_level="manage")
     result = await db.execute(
         select(ChannelConfig).where(
             ChannelConfig.agent_id == agent_id,
@@ -111,7 +115,7 @@ async def get_slack_webhook_url(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    await check_agent_access(db, current_user, agent_id)
+    await check_agent_access(db, current_user, agent_id, required_level="manage")
     from app.services.platform_service import platform_service
     public_base = await platform_service.get_public_base_url(db, request)
     return {"webhook_url": f"{public_base}/api/channel/slack/{agent_id}/webhook"}
@@ -123,9 +127,13 @@ async def delete_slack_channel(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    agent, _ = await check_agent_access(db, current_user, agent_id)
-    if not is_agent_creator(current_user, agent):
-        raise HTTPException(status_code=403, detail="Only creator can remove channel")
+    await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+        lock_authority=True,
+    )
     result = await db.execute(
         select(ChannelConfig).where(
             ChannelConfig.agent_id == agent_id,

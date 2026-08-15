@@ -42,6 +42,15 @@ def _target(*, model_id: uuid.UUID | None = None):
     )
 
 
+def _platform_operator(*, tenant_id: uuid.UUID | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=uuid.uuid4(),
+        role="platform_admin",
+        tenant_id=tenant_id,
+        identity=SimpleNamespace(is_platform_admin=True),
+    )
+
+
 @pytest.mark.asyncio
 async def test_unsaved_draft_test_separates_capabilities_but_does_not_record_them(
     monkeypatch,
@@ -76,9 +85,7 @@ async def test_unsaved_draft_test_separates_capabilities_but_does_not_record_the
             api_key="ollama",
             base_url="http://localhost:11434/v1",
         ),
-        current_user=SimpleNamespace(
-            id=uuid.uuid4(), role="platform_admin", tenant_id=uuid.uuid4()
-        ),
+        current_user=_platform_operator(),
     )
 
     assert result["success"] is True
@@ -115,9 +122,7 @@ async def test_tool_probe_transport_failure_records_unknown_not_unsupported(
             model="qwen-local",
             model_id=str(model_id),
         ),
-        current_user=SimpleNamespace(
-            id=uuid.uuid4(), role="platform_admin", tenant_id=uuid.uuid4()
-        ),
+        current_user=_platform_operator(),
     )
 
     assert result["success"] is False
@@ -153,9 +158,7 @@ async def test_plain_text_probe_is_not_reported_as_agent_compatible_and_is_recor
             model="qwen-local",
             model_id=str(model_id),
         ),
-        current_user=SimpleNamespace(
-            id=uuid.uuid4(), role="platform_admin", tenant_id=uuid.uuid4()
-        ),
+        current_user=_platform_operator(),
     )
 
     assert result["success"] is False
@@ -244,7 +247,7 @@ async def test_updating_model_identity_invalidates_prior_tool_probe(
     updated = await enterprise.update_llm_model(
         model.id,
         update,
-        current_user=SimpleNamespace(tenant_id=tenant_id, role="platform_admin"),
+        current_user=_platform_operator(tenant_id=tenant_id),
         db=db,  # type: ignore[arg-type]
     )
 

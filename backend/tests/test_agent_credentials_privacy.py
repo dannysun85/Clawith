@@ -24,7 +24,7 @@ async def test_use_level_agent_user_can_manage_only_their_private_login(monkeypa
 @pytest.mark.asyncio
 async def test_user_without_agent_access_cannot_manage_private_login(monkeypatch):
     async def deny(_db, _user, _agent_id):
-        return SimpleNamespace(id=_agent_id), "none"
+        raise HTTPException(status_code=403, detail="No access to this agent")
 
     monkeypatch.setattr(credentials_api, "check_agent_access", deny)
 

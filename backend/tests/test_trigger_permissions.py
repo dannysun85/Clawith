@@ -49,7 +49,7 @@ async def test_trigger_endpoints_reject_cross_tenant_access_before_query(monkeyp
     user = SimpleNamespace(id=uuid.uuid4(), tenant_id=uuid.uuid4(), role="member")
     agent_id = uuid.uuid4()
 
-    async def reject_access(_db, _user, _agent_id):
+    async def reject_access(_db, _user, _agent_id, **_kwargs):
         raise HTTPException(status_code=403, detail="No access to this agent")
 
     monkeypatch.setattr(triggers_api, "async_session", FakeSessionFactory(session))
@@ -79,7 +79,9 @@ async def test_trigger_mutations_require_manage_access(monkeypatch, operation):
     user = SimpleNamespace(id=uuid.uuid4(), tenant_id=uuid.uuid4(), role="member")
     agent_id = uuid.uuid4()
 
-    async def grant_use_only(_db, _user, _agent_id):
+    async def grant_use_only(_db, _user, _agent_id, **kwargs):
+        if kwargs.get("required_level") == "manage":
+            raise HTTPException(status_code=403, detail="Manage access required")
         return SimpleNamespace(id=agent_id), "use"
 
     monkeypatch.setattr(triggers_api, "async_session", FakeSessionFactory(session))
@@ -133,7 +135,7 @@ async def test_trigger_update_rejects_internal_routing_fields(monkeypatch):
     )
     session = MutableTriggerSession(trigger)
 
-    async def grant_manage(*_args):
+    async def grant_manage(*_args, **_kwargs):
         return SimpleNamespace(id=agent_id), "manage"
 
     monkeypatch.setattr(triggers_api, "async_session", FakeSessionFactory(session))
@@ -170,7 +172,7 @@ async def test_webhook_update_preserves_redacted_secret(monkeypatch):
     )
     session = MutableTriggerSession(trigger)
 
-    async def grant_manage(*_args):
+    async def grant_manage(*_args, **_kwargs):
         return SimpleNamespace(id=agent_id), "manage"
 
     monkeypatch.setattr(triggers_api, "async_session", FakeSessionFactory(session))
@@ -216,7 +218,7 @@ async def test_trigger_update_drops_unattested_legacy_reserved_state(monkeypatch
     )
     session = MutableTriggerSession(trigger)
 
-    async def grant_manage(*_args):
+    async def grant_manage(*_args, **_kwargs):
         return SimpleNamespace(id=agent_id), "manage"
 
     monkeypatch.setattr(triggers_api, "async_session", FakeSessionFactory(session))
@@ -252,7 +254,7 @@ async def test_legacy_unsigned_webhook_cannot_be_enabled(monkeypatch):
     )
     session = MutableTriggerSession(trigger)
 
-    async def grant_manage(*_args):
+    async def grant_manage(*_args, **_kwargs):
         return SimpleNamespace(id=agent_id), "manage"
 
     monkeypatch.setattr(triggers_api, "async_session", FakeSessionFactory(session))
@@ -297,7 +299,7 @@ async def test_trigger_enable_uses_the_same_runtime_gate(
     )
     session = MutableTriggerSession(trigger)
 
-    async def grant_manage(*_args):
+    async def grant_manage(*_args, **_kwargs):
         return SimpleNamespace(id=agent_id), "manage"
 
     monkeypatch.setattr(triggers_api, "async_session", FakeSessionFactory(session))
@@ -347,7 +349,7 @@ async def test_internal_a2a_trigger_cannot_be_modified(monkeypatch):
     )
     session = MutableTriggerSession(trigger)
 
-    async def grant_manage(*_args):
+    async def grant_manage(*_args, **_kwargs):
         return SimpleNamespace(id=agent_id), "manage"
 
     monkeypatch.setattr(triggers_api, "async_session", FakeSessionFactory(session))
@@ -377,7 +379,7 @@ async def test_system_trigger_cannot_be_deleted(monkeypatch):
     )
     session = MutableTriggerSession(trigger)
 
-    async def grant_manage(*_args):
+    async def grant_manage(*_args, **_kwargs):
         return SimpleNamespace(id=agent_id), "manage"
 
     monkeypatch.setattr(triggers_api, "async_session", FakeSessionFactory(session))
@@ -412,7 +414,7 @@ async def test_system_trigger_only_allows_enable_disable(monkeypatch):
     )
     session = MutableTriggerSession(trigger)
 
-    async def grant_manage(*_args):
+    async def grant_manage(*_args, **_kwargs):
         return SimpleNamespace(id=agent_id), "manage"
 
     monkeypatch.setattr(triggers_api, "async_session", FakeSessionFactory(session))

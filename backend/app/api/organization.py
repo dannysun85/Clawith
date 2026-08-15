@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import get_current_admin, get_current_user
+from app.core.security import get_company_governor
 from app.core.identity_canonicalization import canonicalize_email, canonicalize_phone
 from app.database import get_db
 from app.models.user import User, Identity
@@ -28,10 +28,11 @@ router = APIRouter(prefix="/org", tags=["organization"])
 @router.get("/users", response_model=list[UserOut])
 async def list_users(
     tenant_id: uuid.UUID | None = None,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_company_governor),
     db: AsyncSession = Depends(get_db),
 ):
     """List users, optionally filtered by tenant."""
+    await get_company_governor(current_user)
     query = (
         select(User)
         .options(selectinload(User.identity))
@@ -39,18 +40,8 @@ async def list_users(
     )
 
     target_tenant_id = current_user.tenant_id
-    if current_user.role == "platform_admin":
-        target_tenant_id = tenant_id or current_user.tenant_id
-        if target_tenant_id is None:
-            raise HTTPException(
-                status_code=400,
-                detail="tenant_id is required for a tenantless platform administrator",
-            )
-    elif target_tenant_id is None:
-        raise HTTPException(
-            status_code=403,
-            detail="Organization membership is required",
-        )
+    if tenant_id is not None and tenant_id != target_tenant_id:
+        raise HTTPException(status_code=403, detail="Cannot list users outside your organization")
     query = query.where(User.tenant_id == target_tenant_id)
 
     query = query.order_by(User.display_name)
@@ -62,10 +53,11 @@ async def list_users(
 async def admin_update_user(
     user_id: uuid.UUID,
     data: UserUpdate,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_company_governor),
     db: AsyncSession = Depends(get_db),
 ):
     """Admin update user profile."""
+    await get_company_governor(current_user)
     result = await db.execute(
         select(User)
         .options(selectinload(User.identity))
@@ -75,10 +67,8 @@ async def admin_update_user(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    if current_user.role != "platform_admin" and user.tenant_id != current_user.tenant_id:
+    if user.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=403, detail="Cannot modify users outside your organization")
-    if current_user.role != "platform_admin" and user.role == "platform_admin":
-        raise HTTPException(status_code=403, detail="Platform administrators can only be modified by a platform administrator")
 
     update_data = data.model_dump(exclude_unset=True)
     if "email" in update_data and update_data["email"] is not None:
@@ -114,10 +104,10 @@ async def admin_update_user(
             if update_data[field] != current_values[field]
         }
 
-    if changed_global_fields and current_user.role != "platform_admin":
+    if changed_global_fields:
         raise HTTPException(
             status_code=403,
-            detail="Organization administrators cannot modify global login identity fields",
+            detail="Company administrators cannot modify global login identity fields",
         )
 
     email_changed = "email" in changed_global_fields

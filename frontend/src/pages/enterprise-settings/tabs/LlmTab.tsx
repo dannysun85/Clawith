@@ -8,6 +8,7 @@ import { useAuthStore } from '../../../stores';
 import { MODALITIES } from '../../../constants/modalities';
 import { notifyModelCacheInvalidated } from '../../../services/modelCacheEvents';
 import { fetchJson } from '../utils/fetchJson';
+import { hasEffectiveCapability } from '../../../utils/productAccess';
 
 interface LLMModel {
     id: string;
@@ -127,9 +128,7 @@ export default function LlmTab({ selectedTenantId }: LlmTabProps) {
         queryFn: () => fetchJson<LLMProviderSpec[]>('/enterprise/llm-providers'),
     });
     const providerOptions = providerSpecs.length > 0 ? providerSpecs : FALLBACK_LLM_PROVIDERS;
-    const canManageRuntimeModels = currentUser?.role === 'platform_admin'
-        || currentUser?.role === 'org_admin'
-        || !!currentUser?.is_platform_admin;
+    const canManageRuntimeModels = hasEffectiveCapability(currentUser, 'platform.providers.manage');
     const runtimeModelSettingsUrl = `/enterprise/runtime-model-settings${selectedTenantId ? `?tenant_id=${selectedTenantId}` : ''}`;
     const { data: runtimeModelSettings } = useQuery({
         queryKey: ['runtime-model-settings', selectedTenantId],

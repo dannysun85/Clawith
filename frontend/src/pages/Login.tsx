@@ -2,7 +2,13 @@ import { useState, useEffect } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { useAuthStore } from '../stores';
-import { authApi, tenantApi, fetchJson } from '../services/api';
+import {
+    authApi,
+    tenantApi,
+    fetchJson,
+    type MfaLoginChallenge,
+    type MfaTokenResponse,
+} from '../services/api';
 import {
     createTenantSsoAuthorization,
     loadTenantSsoProviders,
@@ -20,11 +26,20 @@ export default function Login() {
     const { t, i18n } = useTranslation();
     const navigate = useNavigate();
     const [searchParams] = useSearchParams();
-    const invitationCode = searchParams.get('code') || '';
+    const legacyCode = searchParams.get('code') || '';
     const invitedEmail = searchParams.get('email') || '';
+    // New links name the two credentials explicitly. Legacy links with an
+    // email are treated as organization invitations; legacy bare codes remain
+    // registration grants. Neither credential is consumed as the other kind.
+    const organizationInvitationToken = searchParams.get('organization_invitation')
+        || searchParams.get('join_token')
+        || (invitedEmail ? legacyCode : '');
+    const initialRegistrationGrant = searchParams.get('registration_grant')
+        || searchParams.get('registration_code')
+        || (!invitedEmail ? legacyCode : '');
     const setAuth = useAuthStore((s) => s.setAuth);
     // Default to register if there's an invitation code — will be overridden after email check
-    const [isRegister, setIsRegister] = useState(!!invitationCode);
+    const [isRegister, setIsRegister] = useState(!!organizationInvitationToken || !!initialRegistrationGrant);
     const [error, setError] = useState('');
     const [successMessage, setSuccessMessage] = useState('');
     const [loading, setLoading] = useState(false);
@@ -43,7 +58,18 @@ export default function Login() {
     const [verificationEntryMode, setVerificationEntryMode] = useState<'create' | 'join' | 'home'>('home');
     const [registrationCodeRequired, setRegistrationCodeRequired] = useState(true);
     const [passwordRegistrationAvailable, setPasswordRegistrationAvailable] = useState<boolean | null>(null);
-    const [registrationCode, setRegistrationCode] = useState(invitationCode);
+    const [registrationCode, setRegistrationCode] = useState(initialRegistrationGrant);
+    const [mfaFlow, setMfaFlow] = useState<{
+        stage: 'verify' | 'setup' | 'recovery';
+        challengeToken: string;
+        destination: string;
+        secret?: string;
+        provisioningUri?: string;
+        recoveryCodes?: string[];
+        tokenResponse?: MfaTokenResponse;
+    } | null>(null);
+    const [mfaCode, setMfaCode] = useState('');
+    const [mfaCodesSaved, setMfaCodesSaved] = useState(false);
 
     const [form, setForm] = useState({
         login_identifier: invitedEmail,  // Pre-fill invited email if present
@@ -168,18 +194,16 @@ export default function Login() {
                 await setAuth(res.user, res.access_token);
             }
 
-            if (res.needs_company_setup) {
-                navigate('/setup-company', {
+            if (res.needs_company_setup || verificationEntryMode === 'join') {
+                const joinQuery = organizationInvitationToken
+                    ? `?join_token=${encodeURIComponent(organizationInvitationToken)}`
+                    : '';
+                navigate(`/setup-company${joinQuery}`, {
                     state: {
                         fromRegister: true,
                         email: verificationEmail || res.user?.email,
                     },
                 });
-                return;
-            }
-
-            if (verificationEntryMode === 'join') {
-                navigate('/onboarding?mode=join');
                 return;
             }
 
@@ -207,6 +231,97 @@ export default function Login() {
         } finally {
             setLoading(false);
         }
+    };
+
+    const isMfaChallenge = (value: unknown): value is MfaLoginChallenge => {
+        if (!value || typeof value !== 'object') return false;
+        const candidate = value as Partial<MfaLoginChallenge>;
+        return typeof candidate.challenge_token === 'string'
+            && (candidate.requires_mfa === true || candidate.requires_mfa_setup === true);
+    };
+
+    const finishTokenLogin = async (tokenResponse: TokenResponse, destination: string) => {
+        await setAuth(tokenResponse.user, tokenResponse.access_token);
+        setMfaFlow(null);
+        setMfaCode('');
+        setMfaCodesSaved(false);
+        navigate(destination);
+    };
+
+    const beginMfaFlow = async (challenge: MfaLoginChallenge, destination: string) => {
+        setTenantSelection(null);
+        setMfaCode('');
+        setMfaCodesSaved(false);
+        if (challenge.requires_mfa_setup) {
+            const setup = await authApi.startMfaBootstrap(challenge.challenge_token);
+            setMfaFlow({
+                stage: 'setup',
+                challengeToken: setup.challenge_token,
+                destination,
+                secret: setup.secret,
+                provisioningUri: setup.provisioning_uri,
+            });
+            return;
+        }
+        setMfaFlow({
+            stage: 'verify',
+            challengeToken: challenge.challenge_token,
+            destination,
+        });
+    };
+
+    const handleLoginResult = async (result: Awaited<ReturnType<typeof authApi.login>>, destination: string) => {
+        if ('requires_tenant_selection' in result && result.requires_tenant_selection) {
+            setTenantSelection(result.tenants);
+            return;
+        }
+        if (isMfaChallenge(result)) {
+            await beginMfaFlow(result, destination);
+            return;
+        }
+        await finishTokenLogin(result as TokenResponse, destination);
+    };
+
+    const handleMfaSubmit = async (event: React.FormEvent) => {
+        event.preventDefault();
+        if (!mfaFlow || mfaFlow.stage === 'recovery' || !mfaCode.trim()) return;
+        setError('');
+        setLoading(true);
+        try {
+            const tokenResponse = mfaFlow.stage === 'setup'
+                ? await authApi.confirmMfaSetup(mfaFlow.challengeToken, mfaCode.trim())
+                : await authApi.verifyMfaChallenge(mfaFlow.challengeToken, mfaCode.trim());
+            if (tokenResponse.recovery_codes?.length) {
+                setMfaFlow({
+                    ...mfaFlow,
+                    stage: 'recovery',
+                    recoveryCodes: tokenResponse.recovery_codes,
+                    tokenResponse,
+                });
+                setMfaCode('');
+                return;
+            }
+            await finishTokenLogin(tokenResponse, mfaFlow.destination);
+        } catch (nextError: any) {
+            setError(nextError.message || (isZh ? '多因素验证失败，请重试。' : 'Multi-factor verification failed.'));
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    const copyRecoveryCodes = async () => {
+        if (!mfaFlow?.recoveryCodes?.length) return;
+        try {
+            await navigator.clipboard.writeText(mfaFlow.recoveryCodes.join('\n'));
+            setSuccessMessage(isZh ? '恢复码已复制，请保存到安全的位置。' : 'Recovery codes copied. Store them securely.');
+        } catch {
+            setError(isZh ? '无法自动复制，请手动保存恢复码。' : 'Copy failed. Save the recovery codes manually.');
+        }
+    };
+
+    const finishRecoveryStep = async () => {
+        if (!mfaFlow?.tokenResponse || !mfaCodesSaved) return;
+        await finishTokenLogin(mfaFlow.tokenResponse, mfaFlow.destination);
     };
 
     const handleSubmit = async (e: React.FormEvent) => {
@@ -241,8 +356,8 @@ export default function Login() {
                     await setAuth(regRes.user, regRes.access_token);
                 }
                 if (regRes.user?.email_verified || regRes.user?.is_active) {
-                    if (invitationCode) {
-                        navigate('/onboarding?mode=join');
+                    if (organizationInvitationToken) {
+                        navigate(`/setup-company?join_token=${encodeURIComponent(organizationInvitationToken)}`);
                     } else if (regRes.needs_company_setup) {
                         navigate('/setup-company', {
                             state: { fromRegister: true, email: regRes.email || form.login_identifier },
@@ -252,7 +367,7 @@ export default function Login() {
                     }
                     return;
                 }
-                enterVerificationStep(regRes.email || form.login_identifier, invitationCode ? 'join' : 'create');
+                enterVerificationStep(regRes.email || form.login_identifier, organizationInvitationToken ? 'join' : 'create');
                 setSuccessMessage(
                     i18n.language.startsWith('zh')
                         ? `验证凭证已发送到 ${regRes.email || form.login_identifier}`
@@ -279,40 +394,12 @@ export default function Login() {
                     return;
                 }
 
-                const tokenRes = res as TokenResponse;
-                await setAuth(tokenRes.user, tokenRes.access_token);
-
-                // If the user arrived via an invitation link, join the invited company
-                // before redirecting. The /tenants/join endpoint handles:
-                // - Existing user with no tenant → assigns the tenant directly
-                // - Existing user with a tenant → creates a new User record for the new tenant
-                //   and returns a new access_token scoped to that tenant.
-                if (invitationCode) {
-                    try {
-                        const joinRes = await tenantApi.join(invitationCode);
-                        if (joinRes?.access_token) {
-                            // Store the new tenant-scoped token first so that
-                            // the subsequent /auth/me call uses the correct context.
-                            localStorage.setItem('token', joinRes.access_token);
-                            const meRes = await authApi.me();
-                            await setAuth(meRes, joinRes.access_token);
-                        }
-                        navigate('/onboarding?mode=join');
-                        return;
-                    } catch (joinErr: any) {
-                        // If joining fails (code already used, code invalid, already a member),
-                        // just continue into the user's existing company — don't block login.
-                        console.warn('[invitation] join failed, entering original company:', joinErr.message);
-                    }
-                }
-
-                if (tokenRes.user?.role === 'platform_admin' || tokenRes.user?.is_platform_admin) {
-                    navigate('/admin/platform-settings');
-                } else if (tokenRes.user && !tokenRes.user.tenant_id) {
-                    navigate('/setup-company');
-                } else {
-                    navigate('/');
-                }
+                // Organization membership is always an explicit post-login
+                // acceptance step. Login never consumes a company credential.
+                const destination = organizationInvitationToken
+                    ? `/setup-company?join_token=${encodeURIComponent(organizationInvitationToken)}`
+                    : '/';
+                await handleLoginResult(res, destination);
             }
         } catch (err: any) {
             // Handle structured verification error
@@ -373,15 +460,10 @@ export default function Login() {
                 return;
             }
 
-            const tokenRes = res as TokenResponse;
-            await setAuth(tokenRes.user, tokenRes.access_token);
-            if (tokenRes.user?.role === 'platform_admin' || tokenRes.user?.is_platform_admin) {
-                navigate('/admin/platform-settings');
-            } else if (tokenRes.user && !tokenRes.user.tenant_id) {
-                navigate('/setup-company');
-            } else {
-                navigate('/');
-            }
+            const destination = organizationInvitationToken
+                ? `/setup-company?join_token=${encodeURIComponent(organizationInvitationToken)}`
+                : '/';
+            await handleLoginResult(res, destination);
         } catch (err: any) {
             const msg = err.message || '';
             setError(msg || t('auth.loginFailed', 'Login failed'));
@@ -431,7 +513,18 @@ export default function Login() {
         }
     };
 
-    const shouldShowGlobalOAuth = !tenant?.sso_enabled && !isRegister && !showVerification;
+    const shouldShowGlobalOAuth = !tenant?.sso_enabled && !isRegister && !showVerification && !mfaFlow;
+
+    const mfaTitle = mfaFlow?.stage === 'setup'
+        ? (isZh ? '设置多因素验证' : 'Set up multi-factor authentication')
+        : mfaFlow?.stage === 'recovery'
+            ? (isZh ? '保存恢复码' : 'Save recovery codes')
+            : (isZh ? '完成多因素验证' : 'Complete multi-factor authentication');
+    const mfaSubtitle = mfaFlow?.stage === 'setup'
+        ? (isZh ? '高权限账号必须先绑定验证器，验证完成后才会签发访问令牌。' : 'Privileged accounts must bind an authenticator before an access token is issued.')
+        : mfaFlow?.stage === 'recovery'
+            ? (isZh ? '这些一次性恢复码只显示一次。保存后再进入产品。' : 'These one-time recovery codes are shown once. Save them before continuing.')
+            : (isZh ? '输入验证器动态码，或使用一枚尚未使用的恢复码。' : 'Enter an authenticator code or one unused recovery code.');
 
     return (
         <AtlasFrame onToggleLang={toggleLang}>
@@ -456,12 +549,16 @@ export default function Login() {
                     <div className="atlas-login-form-wrapper">
                     <div className="login-form-header">
                         <h2 className="login-form-title">
-                            {showVerification
+                            {mfaFlow
+                                ? mfaTitle
+                                : showVerification
                                 ? (isZh ? '验证邮箱' : 'Verify email')
                                 : (isRegister ? t('auth.register') : t('auth.login'))}
                         </h2>
                         <p className="login-form-subtitle">
-                            {showVerification
+                            {mfaFlow
+                                ? mfaSubtitle
+                                : showVerification
                                 ? (isZh
                                     ? `输入发送到 ${verificationEmail || form.login_identifier} 的验证凭证。`
                                     : `Enter the verification token sent to ${verificationEmail || form.login_identifier}.`)
@@ -492,14 +589,14 @@ export default function Login() {
                         </div>
                     )}
 
-                    {isRegister && passwordRegistrationAvailable === false && !showVerification && (
+                    {isRegister && passwordRegistrationAvailable === false && !showVerification && !mfaFlow && (
                         <div className="login-error">
                             <IconAlertTriangle size={16} stroke={1.8} />
                             {t('auth.registrationUnavailable')}
                         </div>
                     )}
 
-                    {tenant && tenant.sso_enabled && !isRegister && !showVerification && (
+                    {tenant && tenant.sso_enabled && !isRegister && !showVerification && !mfaFlow && (
                         <div style={{ marginBottom: '24px' }}>
                             <div style={{
                                 padding: '16px', borderRadius: '12px', background: 'rgba(59,130,246,0.08)',
@@ -521,38 +618,43 @@ export default function Login() {
                             )}
 
                             {!ssoLoading && ssoProviders.length > 0 && (
-                                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '12px' }}>
-                                    {ssoProviders.map(p => {
-                                        const meta = ssoMeta[p.provider_type] || { label: p.name || p.provider_type, icon: '' };
-                                        return (
-                                            <button
-                                                key={p.provider_type}
-                                                className="login-submit"
-                                                type="button"
-                                                disabled={ssoLoading}
-                                                style={{
-                                                    background: 'var(--bg-secondary)',
-                                                    color: 'var(--text-primary)',
-                                                    display: 'flex',
-                                                    alignItems: 'center',
-                                                    justifyContent: 'center',
-                                                    gap: '10px',
-                                                    border: '1px solid var(--border-subtle)',
-                                                }}
-                                                onClick={() => startSsoLogin(p.provider_type)}
-                                            >
-                                                {meta.icon ? (
-                                                    <img src={meta.icon} alt={meta.label} width={18} height={18} />
-                                                ) : (
-                                                    <span style={{ width: 18, height: 18, borderRadius: 4, background: 'var(--bg-tertiary)', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontSize: 10 }}>
-                                                        {(meta.label || '').slice(0, 1).toUpperCase()}
-                                                    </span>
-                                                )}
-                                                {meta.label || p.name || p.provider_type}
-                                            </button>
-                                        );
-                                    })}
-                                </div>
+                                <>
+                                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '12px' }}>
+                                        {ssoProviders.map(p => {
+                                            const meta = ssoMeta[p.provider_type] || { label: p.name || p.provider_type, icon: '' };
+                                            return (
+                                                <button
+                                                    key={p.provider_type}
+                                                    className="login-submit"
+                                                    type="button"
+                                                    disabled={ssoLoading}
+                                                    style={{
+                                                        background: 'var(--bg-secondary)',
+                                                        color: 'var(--text-primary)',
+                                                        display: 'flex',
+                                                        alignItems: 'center',
+                                                        justifyContent: 'center',
+                                                        gap: '10px',
+                                                        border: '1px solid var(--border-subtle)',
+                                                    }}
+                                                    onClick={() => startSsoLogin(p.provider_type)}
+                                                >
+                                                    {meta.icon ? (
+                                                        <img src={meta.icon} alt={meta.label} width={18} height={18} />
+                                                    ) : (
+                                                        <span style={{ width: 18, height: 18, borderRadius: 4, background: 'var(--bg-tertiary)', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontSize: 10 }}>
+                                                            {(meta.label || '').slice(0, 1).toUpperCase()}
+                                                        </span>
+                                                    )}
+                                                    {meta.label || p.name || p.provider_type}
+                                                </button>
+                                            );
+                                        })}
+                                    </div>
+                                    <div style={{ marginTop: '10px', fontSize: '11px', lineHeight: 1.5, color: 'var(--text-tertiary)', textAlign: 'center' }}>
+                                        {t('auth.tenantSsoPolicy', 'Company SSO follows company policy. JIT, when enabled, creates ordinary members only—never admins or owners.')}
+                                    </div>
+                                </>
                             )}
 
                             {!ssoLoading && ssoProviders.length === 0 && (
@@ -627,19 +729,104 @@ export default function Login() {
                             )}
 
                             {!oauthLoading && oauthProviders.length > 0 && (
-                                <div style={{
-                                    display: 'flex', alignItems: 'center', gap: '12px',
-                                    margin: '20px 0', color: 'var(--text-tertiary)', fontSize: '11px'
-                                }}>
-                                    <div style={{ flex: 1, height: '1px', background: 'var(--border-subtle)' }} />
-                                    {t('auth.or', 'or')}
-                                    <div style={{ flex: 1, height: '1px', background: 'var(--border-subtle)' }} />
-                                </div>
+                                <>
+                                    <div style={{ marginTop: '10px', fontSize: '11px', lineHeight: 1.5, color: 'var(--text-tertiary)', textAlign: 'center' }}>
+                                        {t('auth.publicOAuthSignInOnly', 'Google/GitHub only sign in an already linked account. They do not create an account or join a company. New users should register with email or use company SSO.')}
+                                    </div>
+                                    <div style={{
+                                        display: 'flex', alignItems: 'center', gap: '12px',
+                                        margin: '20px 0', color: 'var(--text-tertiary)', fontSize: '11px'
+                                    }}>
+                                        <div style={{ flex: 1, height: '1px', background: 'var(--border-subtle)' }} />
+                                        {t('auth.or', 'or')}
+                                        <div style={{ flex: 1, height: '1px', background: 'var(--border-subtle)' }} />
+                                    </div>
+                                </>
                             )}
                         </div>
                     )}
 
-                    {showVerification ? (
+                    {mfaFlow ? (
+                        mfaFlow.stage === 'recovery' ? (
+                            <div className="login-form" role="region" aria-label={mfaTitle}>
+                                <div className="login-recovery-grid">
+                                    {mfaFlow.recoveryCodes?.map((code) => (
+                                        <code key={code}>{code}</code>
+                                    ))}
+                                </div>
+                                <button className="login-secondary-action" type="button" onClick={() => void copyRecoveryCodes()}>
+                                    {isZh ? '复制全部恢复码' : 'Copy all recovery codes'}
+                                </button>
+                                <label className="login-recovery-confirmation">
+                                    <input
+                                        type="checkbox"
+                                        checked={mfaCodesSaved}
+                                        onChange={(event) => setMfaCodesSaved(event.target.checked)}
+                                    />
+                                    <span>{isZh ? '我已将恢复码保存到安全位置' : 'I saved the recovery codes in a secure place'}</span>
+                                </label>
+                                <button
+                                    className="login-submit"
+                                    type="button"
+                                    disabled={!mfaCodesSaved || loading}
+                                    onClick={() => void finishRecoveryStep()}
+                                >
+                                    {isZh ? '进入产品' : 'Continue'}
+                                    <IconArrowRight size={17} stroke={1.9} style={{ marginLeft: '6px' }} />
+                                </button>
+                            </div>
+                        ) : (
+                            <form onSubmit={handleMfaSubmit} className="login-form">
+                                {mfaFlow.stage === 'setup' && (
+                                    <div className="login-mfa-setup">
+                                        <p>{isZh ? '在验证器应用中扫描或手动输入下面的密钥。密钥不会写入浏览器存储。' : 'Add the key below to your authenticator app. It is never written to browser storage.'}</p>
+                                        <code>{mfaFlow.secret}</code>
+                                        {mfaFlow.provisioningUri && (
+                                            <a href={mfaFlow.provisioningUri}>{isZh ? '在验证器应用中打开' : 'Open in authenticator app'}</a>
+                                        )}
+                                    </div>
+                                )}
+                                <div className="login-field">
+                                    <label>{mfaFlow.stage === 'setup'
+                                        ? (isZh ? '6 位动态码' : '6-digit authenticator code')
+                                        : (isZh ? '动态码或恢复码' : 'Authenticator or recovery code')}</label>
+                                    <input
+                                        type="text"
+                                        value={mfaCode}
+                                        onChange={(event) => setMfaCode(event.target.value)}
+                                        required
+                                        autoFocus
+                                        inputMode="text"
+                                        autoComplete="one-time-code"
+                                        maxLength={64}
+                                        placeholder={mfaFlow.stage === 'setup' ? '123456' : (isZh ? '123456 或 XXXX-XXXX-XXXX-XXXX' : '123456 or XXXX-XXXX-XXXX-XXXX')}
+                                    />
+                                </div>
+                                <button className="login-submit" type="submit" disabled={loading || !mfaCode.trim()}>
+                                    {loading ? <span className="login-spinner" /> : (
+                                        <>
+                                            {isZh ? '验证并继续' : 'Verify and continue'}
+                                            <IconArrowRight size={17} stroke={1.9} style={{ marginLeft: '6px' }} />
+                                        </>
+                                    )}
+                                </button>
+                                <div className="login-verification-actions">
+                                    <button
+                                        type="button"
+                                        onClick={() => {
+                                            setMfaFlow(null);
+                                            setMfaCode('');
+                                            setForm((current) => ({ ...current, password: '' }));
+                                            setError('');
+                                        }}
+                                        disabled={loading}
+                                    >
+                                        {isZh ? '重新登录' : 'Start over'}
+                                    </button>
+                                </div>
+                            </form>
+                        )
+                    ) : showVerification ? (
                         <form onSubmit={handleVerifyEmail} className="login-form">
                             <div className="login-field">
                                 <label>{isZh ? '邮箱验证凭证' : 'Verification token'}</label>
@@ -714,18 +901,24 @@ export default function Login() {
 
                             {isRegister && registrationCodeRequired && (
                                 <div className="login-field">
-                                    <label>{t('auth.invitationCode', isZh ? '注册码' : 'Registration Code')}</label>
+                                    <label>{isZh ? '平台注册凭证' : 'Platform registration grant'}</label>
                                     <input
                                         type="text"
                                         value={registrationCode}
-                                        onChange={(e) => setRegistrationCode(e.target.value.toUpperCase())}
+                                        onChange={(e) => setRegistrationCode(e.target.value)}
                                         required
-                                        placeholder={t('auth.invitationCodePlaceholder', isZh ? '请输入注册码' : 'Enter registration code')}
+                                        placeholder={isZh ? '输入平台发放的注册凭证' : 'Enter a platform-issued registration grant'}
                                         autoComplete="off"
                                     />
                                     <div style={{ marginTop: '6px', fontSize: '12px', color: 'var(--text-tertiary)', lineHeight: 1.5 }}>
-                                        {t('auth.invitationHint')}
+                                        {isZh ? '只用于创建全局账号，不会授予任何公司的成员或管理员权限。' : 'This creates only a global account and grants no company membership or admin role.'}
                                     </div>
+                                </div>
+                            )}
+
+                            {organizationInvitationToken && (
+                                <div className="login-info-banner" role="status">
+                                    {isZh ? '账号创建或登录完成后，你会先查看并明确接受公司邀请；公司邀请不会替代平台注册凭证。' : 'After signup or login, you will review and explicitly accept the company invitation. It never replaces the platform registration grant.'}
                                 </div>
                             )}
 
@@ -838,10 +1031,8 @@ export default function Login() {
                                                 password: form.password,
                                                 tenant_id: firstTenant.tenant_id,
                                             });
-                                            const tokenRes = res as TokenResponse;
-                                            await setAuth(tokenRes.user, tokenRes.access_token);
                                             setTenantSelection(null);
-                                            navigate('/setup-company?from=tenant-selection');
+                                            await handleLoginResult(res, '/setup-company?from=tenant-selection');
                                         } catch (err: any) {
                                             setError(err.message || 'Failed');
                                             setTenantSelection(null);
@@ -902,7 +1093,7 @@ export default function Login() {
                         </div>
                     )}
 
-                    {!showVerification && (
+                    {!showVerification && !mfaFlow && (
                     <div className="login-switch">
                         {isRegister ? t('auth.hasAccount') : t('auth.noAccount')}{' '}
                         <a href="#" onClick={(e) => { e.preventDefault(); setIsRegister(!isRegister); setError(''); }}>

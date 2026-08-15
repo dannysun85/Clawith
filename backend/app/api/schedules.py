@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.permissions import check_agent_access, is_agent_creator, is_agent_expired
+from app.core.permissions import check_agent_access, is_agent_expired
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.schedule import AgentSchedule
@@ -57,7 +57,7 @@ async def list_schedules(
     db: AsyncSession = Depends(get_db),
 ):
     """List all schedules for an agent."""
-    await check_agent_access(db, current_user, agent_id)
+    await check_agent_access(db, current_user, agent_id, required_level="manage")
     result = await db.execute(
         select(AgentSchedule)
         .where(AgentSchedule.agent_id == agent_id)
@@ -86,9 +86,13 @@ async def create_schedule(
     db: AsyncSession = Depends(get_db),
 ):
     """Create a new schedule for an agent."""
-    agent, _access = await check_agent_access(db, current_user, agent_id)
-    if not is_agent_creator(current_user, agent):
-        raise HTTPException(status_code=403, detail="Only creator can manage schedules")
+    agent, _access = await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+        lock_authority=True,
+    )
     from app.services.scheduler import AUTOMATIC_SCHEDULE_EXECUTION_ENABLED
 
     if data.is_enabled and not AUTOMATIC_SCHEDULE_EXECUTION_ENABLED:
@@ -125,9 +129,13 @@ async def update_schedule(
     db: AsyncSession = Depends(get_db),
 ):
     """Update a schedule."""
-    agent, _access = await check_agent_access(db, current_user, agent_id)
-    if not is_agent_creator(current_user, agent):
-        raise HTTPException(status_code=403, detail="Only creator can manage schedules")
+    agent, _access = await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+        lock_authority=True,
+    )
 
     result = await db.execute(
         select(AgentSchedule).where(AgentSchedule.id == schedule_id, AgentSchedule.agent_id == agent_id)
@@ -166,9 +174,13 @@ async def delete_schedule(
     db: AsyncSession = Depends(get_db),
 ):
     """Delete a schedule."""
-    agent, _access = await check_agent_access(db, current_user, agent_id)
-    if not is_agent_creator(current_user, agent):
-        raise HTTPException(status_code=403, detail="Only creator can manage schedules")
+    _agent, _access = await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+        lock_authority=True,
+    )
 
     result = await db.execute(
         select(AgentSchedule).where(AgentSchedule.id == schedule_id, AgentSchedule.agent_id == agent_id)
@@ -189,9 +201,13 @@ async def trigger_schedule(
     db: AsyncSession = Depends(get_db),
 ):
     """Manually trigger a schedule execution."""
-    agent, _access = await check_agent_access(db, current_user, agent_id)
-    if not is_agent_creator(current_user, agent):
-        raise HTTPException(status_code=403, detail="Only creator can run schedules")
+    agent, _access = await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+        lock_authority=True,
+    )
     if is_agent_expired(agent):
         raise HTTPException(status_code=403, detail="Agent has expired and cannot be triggered.")
 
@@ -234,7 +250,7 @@ async def get_schedule_history(
     db: AsyncSession = Depends(get_db),
 ):
     """Get execution history for a schedule from activity logs."""
-    await check_agent_access(db, current_user, agent_id)
+    await check_agent_access(db, current_user, agent_id, required_level="manage")
     from app.models.activity_log import AgentActivityLog
     result = await db.execute(
         select(AgentActivityLog)

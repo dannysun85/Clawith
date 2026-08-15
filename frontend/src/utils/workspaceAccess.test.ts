@@ -5,8 +5,11 @@ import { authQueryScopeKey, tenantWorkspaceRedirect } from './workspaceAccess';
 const user = (overrides: Record<string, unknown> = {}) => ({
     id: 'user-1',
     tenant_id: 'tenant-1',
-    role: 'member',
-    is_platform_admin: false,
+    membership_id: 'user-1',
+    membership_role: 'member',
+    global_roles: [],
+    effective_capabilities: ['work.use'],
+    available_surfaces: ['work'],
     ...overrides,
 } as any);
 
@@ -18,13 +21,16 @@ describe('tenantWorkspaceRedirect', () => {
     it('keeps a global platform identity in the platform console', () => {
         expect(tenantWorkspaceRedirect(user({
             tenant_id: null,
-            role: 'platform_admin',
-            is_platform_admin: true,
-        }))).toBe('/admin/platform-settings');
+            membership_id: null,
+            membership_role: null,
+            global_roles: ['platform_operator'],
+            effective_capabilities: ['platform.tenants.manage'],
+            available_surfaces: ['platform_admin'],
+        }))).toBe('/admin/platform');
     });
 
     it('sends a tenantless non-platform identity to company setup', () => {
-        expect(tenantWorkspaceRedirect(user({ tenant_id: null }))).toBe('/setup-company');
+        expect(tenantWorkspaceRedirect(user({ tenant_id: null, membership_id: null, membership_role: null, available_surfaces: [] }))).toBe('/setup-company');
     });
 });
 

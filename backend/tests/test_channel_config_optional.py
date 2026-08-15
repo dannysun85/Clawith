@@ -99,7 +99,6 @@ async def test_new_dingtalk_channel_preserves_optional_agent_id(monkeypatch):
             )
         ),
     )
-    monkeypatch.setattr(dingtalk, "is_agent_creator", lambda _user, _agent: True)
     monkeypatch.setattr(
         dingtalk.ChannelConfigOut,
         "model_validate",

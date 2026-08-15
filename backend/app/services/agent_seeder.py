@@ -350,16 +350,18 @@ async def seed_default_agents():
     marker_ids = _parse_default_agent_marker(await _read_seed_marker())
     async with async_session() as db:
 
-        # Get platform admin as creator
+        # Legacy startup seeding is a company action. Never borrow global
+        # platform authority as an implicit tenant membership.
         admin_result = await db.execute(
-            select(User).where(User.role == "platform_admin").limit(1)
+            select(User).where(
+                User.role == "org_owner",
+                User.tenant_id.is_not(None),
+                User.is_active.is_(True),
+            ).limit(1)
         )
         admin = admin_result.scalar_one_or_none()
         if not admin:
-            logger.warning("[AgentSeeder] No platform admin found, skipping default agents")
-            return
-        if not admin.tenant_id:
-            logger.warning("[AgentSeeder] Platform admin has no tenant, skipping default agents")
+            logger.warning("[AgentSeeder] No company owner found, skipping default agents")
             return
 
         # DB-backed idempotency is the source of truth. The storage marker can
@@ -595,13 +597,18 @@ async def seed_okr_agent():
             await _append_seed_marker("okr_agent=existing")
             return
 
-        # Get platform admin as creator
+        # Legacy startup seeding remains tenant-owned and cannot use a global
+        # platform Identity as an implicit company administrator.
         admin_result = await db.execute(
-            select(User).where(User.role == "platform_admin").limit(1)
+            select(User).where(
+                User.role == "org_owner",
+                User.tenant_id.is_not(None),
+                User.is_active.is_(True),
+            ).limit(1)
         )
         admin = admin_result.scalar_one_or_none()
         if not admin:
-            logger.warning("[AgentSeeder] No platform admin, skipping OKR Agent creation")
+            logger.warning("[AgentSeeder] No company owner, skipping OKR Agent creation")
             return
 
         # Create OKR Agent

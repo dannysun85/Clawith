@@ -8,9 +8,14 @@ import uuid
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from loguru import logger
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from app.api.websocket import manager
-from app.core.security import decode_access_token
+from app.core.security import (
+    access_token_matches_identity,
+    decode_access_token,
+    mfa_access_error_code,
+)
 from app.database import async_session
 from app.models.group import Group, GroupMember
 from app.models.participant import Participant
@@ -22,8 +27,28 @@ router = APIRouter(tags=["websocket"])
 _MEMBERSHIP_REVALIDATE_SECONDS = 30.0
 
 
-async def _active_group_user(group_id: uuid.UUID, user_id: uuid.UUID) -> bool:
+async def _active_group_user(
+    group_id: uuid.UUID,
+    user_id: uuid.UUID,
+    payload: dict,
+) -> bool:
     async with async_session() as db:
+        principal_result = await db.execute(
+            select(User)
+            .where(User.id == user_id)
+            .options(selectinload(User.identity))
+        )
+        user = principal_result.scalar_one_or_none()
+        if (
+            user is None
+            or not user.is_active
+            or user.tenant_id is None
+            or user.identity is None
+            or not user.identity.is_active
+            or not access_token_matches_identity(payload, user.identity)
+            or mfa_access_error_code(payload, user) is not None
+        ):
+            return False
         result = await db.execute(
             select(User.id)
             .join(
@@ -36,7 +61,7 @@ async def _active_group_user(group_id: uuid.UUID, user_id: uuid.UUID) -> bool:
             )
             .join(Group, Group.id == GroupMember.group_id)
             .where(
-                User.id == user_id,
+                User.id == user.id,
                 User.is_active.is_(True),
                 User.tenant_id.is_not(None),
                 Group.id == group_id,
@@ -66,7 +91,7 @@ async def websocket_group(
             return
 
         try:
-            allowed = await _active_group_user(group_id, user_id)
+            allowed = await _active_group_user(group_id, user_id, payload)
         except Exception:
             logger.exception("[GroupWS] Membership lookup failed")
             await websocket.send_json({"type": "error", "content": "Setup failed"})
@@ -90,7 +115,7 @@ async def websocket_group(
                 except TimeoutError:
                     packet = None
                 try:
-                    still_allowed = await _active_group_user(group_id, user_id)
+                    still_allowed = await _active_group_user(group_id, user_id, payload)
                 except Exception:
                     logger.exception("[GroupWS] Membership revalidation failed")
                     await websocket.send_json({"type": "error", "content": "Setup failed"})

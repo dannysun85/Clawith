@@ -9,8 +9,10 @@ from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import attributes
 
 from app.models.identity import IdentityProvider
+from app.models.user import Identity
 from app.services.auth_provider import (
     DingTalkAuthProvider,
+    ExternalUserInfo,
     FeishuAuthProvider,
     GoogleWorkspaceAuthProvider,
 )
@@ -70,6 +72,17 @@ class _DummyDB:
         return _DummyResult(self._responses.pop(0))
 
 
+class _CreateDB:
+    def __init__(self):
+        self.added = []
+
+    def add(self, value):
+        self.added.append(value)
+
+    async def flush(self):
+        return None
+
+
 @pytest.mark.asyncio
 async def test_feishu_auth_provider_get_user_info():
     provider = FeishuAuthProvider(config={"app_id": "app-id", "app_secret": "app-secret"})
@@ -97,6 +110,35 @@ async def test_feishu_auth_provider_get_user_info():
     assert user_info.name == "Alice"
     assert user_info.email == "alice@example.com"
     assert user_info.mobile == "13800000000"
+
+
+@pytest.mark.asyncio
+async def test_sso_jit_membership_is_always_created_as_member():
+    provider = FeishuAuthProvider(config={"app_id": "app-id", "app_secret": "app-secret"})
+    identity = Identity(
+        id=uuid.uuid4(),
+        username="feishu-subject",
+        is_active=True,
+        password_login_enabled=False,
+        email_verified=False,
+    )
+    db = _CreateDB()
+    user_info = ExternalUserInfo(
+        provider_type="feishu",
+        provider_user_id="ou_123",
+        provider_union_id="on_456",
+        name="SSO Member",
+    )
+
+    with patch(
+        "app.services.auth_provider.create_isolated_external_identity",
+        AsyncMock(return_value=identity),
+    ):
+        user = await provider._create_new_user(db, user_info, str(uuid.uuid4()))
+
+    assert user.role == "member"
+    assert user.registration_source == "feishu"
+    assert user.identity is identity
 
 
 @pytest.mark.asyncio

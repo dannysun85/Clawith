@@ -18,6 +18,7 @@ import { useNavigate } from 'react-router';
 import { IconAlertTriangle } from '@tabler/icons-react';
 import { fetchJson } from '../services/api';
 import { useAuthStore } from '../stores';
+import { hasEffectiveCapability } from '../utils/productAccess';
 import { useDialog } from '../components/Dialog/DialogProvider';
 
 // ─── Type Definitions ────────────────────────────────────────────────────────
@@ -957,7 +958,7 @@ export default function OKR() {
     const navigate = useNavigate();
     const user = useAuthStore(s => s.user);
     const isChinese = i18n.language?.startsWith('zh');
-    const isAdmin = user && ['platform_admin', 'org_admin'].includes(user.role);
+    const isAdmin = hasEffectiveCapability(user, 'company.settings.manage');
     const okrRoleMode = isAdmin ? 'admin' : 'member';
     const queryClient = useQueryClient();
 
@@ -1731,7 +1732,7 @@ function ReportsTab({ isChinese }: { isChinese: boolean }) {
     const [expandedCompanyReportId, setExpandedCompanyReportId] = useState<string | null>(null);
     const [selectedMemberReportId, setSelectedMemberReportId] = useState<string | null>(null);
     const [memberSearch, setMemberSearch] = useState('');
-    const isAdmin = currentUser?.role === 'org_admin' || currentUser?.role === 'platform_admin';
+    const isAdmin = hasEffectiveCapability(currentUser, 'company.audit.view');
 
     const { data: companyReports = [], isLoading: companyLoading } = useQuery<CompanyReport[]>({
         queryKey: ['company-reports', reportType],

@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, Enum, ForeignKey, Integer, String, func
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, Enum, ForeignKey, Index, Integer, String, Text, func, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 from sqlalchemy.ext.associationproxy import association_proxy
@@ -66,6 +66,22 @@ class Identity(Base):
     
     # Verification status
     email_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # MFA belongs to the global Identity, not to an individual company
+    # membership. The TOTP seed is stored in an authenticated encrypted
+    # envelope; recovery codes live in a separate one-time ledger.
+    mfa_secret_envelope: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mfa_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default="false",
+        nullable=False,
+    )
+    mfa_confirmed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    mfa_last_totp_step: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -106,6 +122,12 @@ class User(Base):
             "preferred_chat_tier IS NULL OR preferred_chat_tier IN ('lite', 'pro', 'ultra')",
             name="ck_users_preferred_chat_tier",
         ),
+        Index(
+            "uq_users_one_org_owner_per_tenant",
+            "tenant_id",
+            unique=True,
+            postgresql_where=text("role = 'org_owner'"),
+        ),
     )
     # Note: Unique constraints for (tenant_id, username), (tenant_id, email) and (tenant_id, primary_mobile)
     # are handled via partial unique indexes in migration to allow NULL values
@@ -122,8 +144,13 @@ class User(Base):
     display_name: Mapped[str] = mapped_column(String(100), nullable=False)
     avatar_url: Mapped[str | None] = mapped_column(String(500))
     title: Mapped[str | None] = mapped_column(String(100))
+    # Membership-specific working context. The same Identity may intentionally
+    # use different profile details and hours in different companies.
+    timezone: Mapped[str | None] = mapped_column(String(50))
+    work_hours_start: Mapped[str | None] = mapped_column(String(5))
+    work_hours_end: Mapped[str | None] = mapped_column(String(5))
     role: Mapped[str] = mapped_column(
-        Enum("platform_admin", "org_admin", "agent_admin", "member", name="user_role_enum"),
+        Enum("platform_admin", "org_owner", "org_admin", "agent_admin", "member", name="user_role_enum"),
         default="member",
         nullable=False,
     )

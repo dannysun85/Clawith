@@ -174,6 +174,37 @@ async def authorize_sso_session(
         )
 
 
+async def fail_sso_session(
+    db: AsyncSession,
+    *,
+    sid: uuid.UUID,
+    provider_type: str,
+    error_msg: str,
+) -> bool:
+    """Persist a safe terminal error for the initiating browser.
+
+    Raw provider responses and exception strings must never be stored here;
+    callers pass a stable product-facing message and put only bounded error
+    codes in the audit trail.
+    """
+    result = await db.execute(
+        update(SSOScanSession)
+        .where(
+            SSOScanSession.id == sid,
+            SSOScanSession.status.in_(("pending", "scanned")),
+        )
+        .values(
+            status="completed",
+            provider_type=provider_type,
+            access_token=None,
+            error_msg=error_msg[:500],
+        )
+        .returning(SSOScanSession.id)
+        .execution_options(synchronize_session=False)
+    )
+    return result.scalar_one_or_none() is not None
+
+
 async def consume_authorized_sso_session(
     db: AsyncSession,
     sid: uuid.UUID,

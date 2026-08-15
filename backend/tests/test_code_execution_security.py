@@ -339,7 +339,7 @@ def test_masked_or_omitted_secret_never_overwrites_stored_value():
     assert merge_config_preserving_sensitive(existing, {}, schema) == {}
 
 
-def test_cross_tenant_tool_target_requires_platform_admin():
+def test_cross_tenant_tool_target_is_never_inferred_from_platform_authority():
     own_tenant = uuid.uuid4()
     foreign_tenant = uuid.uuid4()
     org_admin = SimpleNamespace(
@@ -347,22 +347,18 @@ def test_cross_tenant_tool_target_requires_platform_admin():
         role="org_admin",
         identity=None,
     )
-    platform_admin = SimpleNamespace(
+    platform_operator = SimpleNamespace(
         tenant_id=own_tenant,
-        role="platform_admin",
-        identity=None,
+        role="org_admin",
+        identity=SimpleNamespace(is_platform_admin=True),
     )
 
     with pytest.raises(HTTPException) as denied:
         tools_api._resolve_target_tenant_id(org_admin, str(foreign_tenant))
     assert denied.value.status_code == 403
-    assert (
-        tools_api._resolve_target_tenant_id(
-            platform_admin,
-            str(foreign_tenant),
-        )
-        == foreign_tenant
-    )
+    with pytest.raises(HTTPException) as platform_denied:
+        tools_api._resolve_target_tenant_id(platform_operator, str(foreign_tenant))
+    assert platform_denied.value.status_code == 403
 
 
 def test_only_platform_admin_can_modify_code_isolation_controls():
@@ -374,8 +370,8 @@ def test_only_platform_admin_can_modify_code_isolation_controls():
     )
     platform_admin = SimpleNamespace(
         tenant_id=org_admin.tenant_id,
-        role="platform_admin",
-        identity=None,
+        role="member",
+        identity=SimpleNamespace(is_platform_admin=True),
     )
 
     with pytest.raises(HTTPException) as denied:

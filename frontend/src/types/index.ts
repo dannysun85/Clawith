@@ -6,10 +6,27 @@ export interface User {
     email: string;
     display_name: string;
     avatar_url?: string;
-    role: 'platform_admin' | 'org_admin' | 'agent_admin' | 'member';
+    /** Legacy membership column retained for migration compatibility. */
+    role: 'platform_admin' | 'org_owner' | 'org_admin' | 'agent_admin' | 'member';
     is_platform_admin?: boolean;
-    tenant_id?: string;
+    tenant_id?: string | null;
+    membership_id?: string | null;
+    membership_role?: 'org_owner' | 'org_admin' | 'member' | null;
+    global_roles?: string[];
+    effective_capabilities?: string[];
+    available_surfaces?: Array<'work' | 'company_admin' | 'platform_admin'>;
+    pending_invitation_count?: number;
+    current_support_session?: {
+        id: string;
+        tenant_id: string;
+        scopes: string[];
+        reason: string;
+        expires_at: string;
+    } | null;
     title?: string;
+    timezone?: string | null;
+    work_hours_start?: string | null;
+    work_hours_end?: string | null;
     preferred_chat_tier?: 'lite' | 'pro' | 'ultra' | null;
     preferred_chat_tier_revision?: number;
     feishu_open_id?: string;

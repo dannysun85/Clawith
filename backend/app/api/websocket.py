@@ -20,6 +20,7 @@ from app.core.security import (
     access_token_matches_identity,
     decode_access_token,
     extract_websocket_access_token,
+    mfa_access_error_code,
     websocket_response_subprotocol,
 )
 from app.database import async_session
@@ -414,6 +415,23 @@ class WebSocketChatHandler:
                     logger.warning("[WS] Authentication principal unavailable")
                     await self.websocket.send_json({"type": "error", "content": "Account unavailable"})
                     await self.websocket.close(code=4001)
+                    return False
+                mfa_error = mfa_access_error_code(payload, self.user)
+                if mfa_error:
+                    message = (
+                        "Multi-factor authentication setup is required"
+                        if mfa_error == "mfa_setup_required"
+                        else "Multi-factor authentication is required"
+                    )
+                    await self.websocket.send_json(
+                        _runtime_error_packet(
+                            code=mfa_error,
+                            message=message,
+                            agent_id=self.agent_id,
+                            stage="request",
+                        )
+                    )
+                    await self.websocket.close(code=4003)
                     return False
                 self.auth_version = token_auth_version
 

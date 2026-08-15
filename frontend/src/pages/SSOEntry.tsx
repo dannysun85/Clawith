@@ -127,6 +127,14 @@ export default function SSOEntry() {
             <div style={{ padding: '40px', textAlign: 'center' }}>
                 <h3 style={{ color: 'var(--error)', display: 'inline-flex', alignItems: 'center', gap: '6px' }}><IconAlertTriangle size={18} stroke={1.8} /> {t('sso.error')}</h3>
                 <p>{error}</p>
+                <div style={{ display: 'flex', justifyContent: 'center', gap: '10px', marginTop: '20px', flexWrap: 'wrap' }}>
+                    <button className="btn btn-primary" type="button" onClick={() => navigate('/login', { replace: true })}>
+                        {t('sso.restart', 'Start again')}
+                    </button>
+                    <button className="btn btn-secondary" type="button" onClick={() => navigate('/', { replace: true })}>
+                        {t('sso.backToLogin', 'Back to login')}
+                    </button>
+                </div>
             </div>
         );
     }
@@ -145,6 +153,9 @@ export default function SSOEntry() {
         <div style={{ padding: '40px', textAlign: 'center' }}>
             <h2>{t('sso.loginTitle')}</h2>
             <p style={{ color: 'var(--text-secondary)', marginBottom: '30px' }}>{t('sso.selectLoginMethod')}</p>
+            <p style={{ color: 'var(--text-tertiary)', margin: '-18px auto 24px', maxWidth: '560px', fontSize: '12px', lineHeight: 1.6 }}>
+                {t('sso.memberOnlyPolicy', 'Company SSO uses this company’s identity policy. Any approved JIT account is created as an ordinary member, never an admin or owner.')}
+            </p>
             
             <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
                 {providers.map(p => (

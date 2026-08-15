@@ -108,9 +108,17 @@ async def test_delete_agent_marks_deleted_and_preserves_history(monkeypatch):
     remove_calls: list[uuid.UUID] = []
 
     async def fake_check_agent_access(
-        _db, _user, _agent_id, *, include_deleted=False
+        _db,
+        _user,
+        _agent_id,
+        *,
+        include_deleted=False,
+        required_level="use",
+        lock_authority=False,
     ):
         assert include_deleted is True
+        assert required_level == "manage"
+        assert lock_authority is True
         return agent, "manage"
 
     async def no_blockers(_db, checked_agent_id):
@@ -164,9 +172,17 @@ async def test_delete_agent_is_idempotent_and_retries_runtime_cleanup(monkeypatc
     remove_calls: list[uuid.UUID] = []
 
     async def fake_check_agent_access(
-        _db, _user, _agent_id, *, include_deleted=False
+        _db,
+        _user,
+        _agent_id,
+        *,
+        include_deleted=False,
+        required_level="use",
+        lock_authority=False,
     ):
         assert include_deleted is True
+        assert required_level == "manage"
+        assert lock_authority is True
         return agent, "manage"
 
     class FakeAgentManager:
@@ -193,9 +209,17 @@ async def test_delete_agent_keeps_logical_delete_when_container_removal_fails(
     db = RecordingDB(responses=[DummyResult(), DummyResult()])
 
     async def fake_check_agent_access(
-        _db, _user, _agent_id, *, include_deleted=False
+        _db,
+        _user,
+        _agent_id,
+        *,
+        include_deleted=False,
+        required_level="use",
+        lock_authority=False,
     ):
         assert include_deleted is True
+        assert required_level == "manage"
+        assert lock_authority is True
         return agent, "manage"
 
     async def no_blockers(_db, _agent_id):

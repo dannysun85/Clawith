@@ -13,7 +13,7 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.permissions import check_agent_access, is_agent_creator
+from app.core.permissions import check_agent_access
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.channel_config import ChannelConfig
@@ -106,9 +106,13 @@ async def configure_atlassian_channel(
     Required field: api_key (Bearer token starting with ATSTT, or Basic base64(email:token)).
     Optional: cloud_id (Atlassian cloud site ID for multi-site setups).
     """
-    agent, _ = await check_agent_access(db, current_user, agent_id)
-    if not is_agent_creator(current_user, agent):
-        raise HTTPException(status_code=403, detail="Only creator can configure channel")
+    await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+        lock_authority=True,
+    )
 
     api_key = (data.get("api_key") or "").strip()
     if not api_key:
@@ -172,7 +176,7 @@ async def get_atlassian_channel(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    await check_agent_access(db, current_user, agent_id)
+    await check_agent_access(db, current_user, agent_id, required_level="manage")
     result = await db.execute(
         select(ChannelConfig).where(
             ChannelConfig.agent_id == agent_id,
@@ -193,9 +197,13 @@ async def delete_atlassian_channel(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    agent, _ = await check_agent_access(db, current_user, agent_id)
-    if not is_agent_creator(current_user, agent):
-        raise HTTPException(status_code=403, detail="Only creator can remove channel")
+    await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+        lock_authority=True,
+    )
     await lock_atlassian_agent(agent_id, db)
     result = await db.execute(
         select(ChannelConfig).where(
@@ -218,7 +226,7 @@ async def test_atlassian_channel(
     db: AsyncSession = Depends(get_db),
 ):
     """Test connectivity to Atlassian Rovo MCP and list available tools."""
-    await check_agent_access(db, current_user, agent_id)
+    await check_agent_access(db, current_user, agent_id, required_level="manage")
     result = await db.execute(
         select(ChannelConfig).where(
             ChannelConfig.agent_id == agent_id,

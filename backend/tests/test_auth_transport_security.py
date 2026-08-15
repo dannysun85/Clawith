@@ -25,11 +25,15 @@ class _ScalarResult:
 
 
 class _DB:
-    def __init__(self, value):
+    def __init__(self, value, *, tenant=None):
         self.value = value
+        self.tenant = tenant
 
     async def execute(self, _statement):
         return _ScalarResult(self.value)
+
+    async def get(self, _model, _identifier):
+        return self.tenant
 
     async def commit(self):
         return None
@@ -167,6 +171,37 @@ async def test_authenticated_user_rejects_email_pending_membership(monkeypatch):
         )
 
     assert exc.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_suspended_tenant_keeps_recovery_auth_but_blocks_business_auth(monkeypatch):
+    user = SimpleNamespace(
+        id="00000000-0000-0000-0000-000000000004",
+        tenant_id="00000000-0000-0000-0000-000000000005",
+        is_active=True,
+        identity=SimpleNamespace(is_active=True, auth_version=0),
+    )
+    suspended_tenant = SimpleNamespace(is_active=False)
+    monkeypatch.setattr(
+        security_module,
+        "decode_access_token",
+        lambda _token: {"sub": user.id, "av": 0},
+    )
+
+    recovered = await security_module.get_authenticated_user(
+        credentials=SimpleNamespace(credentials="opaque-jwt"),
+        db=_DB(user, tenant=suspended_tenant),
+    )
+    assert recovered is user
+
+    with pytest.raises(HTTPException) as exc:
+        await security_module.get_current_user(
+            credentials=SimpleNamespace(credentials="opaque-jwt"),
+            db=_DB(user, tenant=suspended_tenant),
+        )
+
+    assert exc.value.status_code == 403
+    assert exc.value.detail == "Organization is unavailable"
 
 
 @pytest.mark.parametrize(

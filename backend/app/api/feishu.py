@@ -10,7 +10,7 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.permissions import check_agent_access, is_agent_creator, is_agent_expired
+from app.core.permissions import check_agent_access, is_agent_expired
 from app.config import get_settings
 from app.core.security import create_access_token, get_current_user, identity_auth_version
 from app.database import async_session as _async_session, get_db, transaction
@@ -251,9 +251,13 @@ async def configure_channel(
     db: AsyncSession = Depends(get_db),
 ):
     """Configure Feishu bot credentials for a digital employee (wizard step 5)."""
-    agent, _access = await check_agent_access(db, current_user, agent_id)
-    if not is_agent_creator(current_user, agent):
-        raise HTTPException(status_code=403, detail="Only creator can configure channel")
+    await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+        lock_authority=True,
+    )
 
     # Check existing
     result = await db.execute(select(ChannelConfig).where(
@@ -312,7 +316,7 @@ async def get_channel_config(
     db: AsyncSession = Depends(get_db),
 ):
     """Get Feishu channel configuration for an agent."""
-    await check_agent_access(db, current_user, agent_id)
+    await check_agent_access(db, current_user, agent_id, required_level="manage")
     result = await db.execute(select(ChannelConfig).where(
         ChannelConfig.agent_id == agent_id,
         ChannelConfig.channel_type == "feishu",
@@ -326,8 +330,14 @@ async def get_channel_config(
 
 
 @router.get("/agents/{agent_id}/channel/webhook-url")
-async def get_webhook_url(agent_id: uuid.UUID, request: Request, db: AsyncSession = Depends(get_db)):
+async def get_webhook_url(
+    agent_id: uuid.UUID,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """Get the webhook URL for this agent's Feishu bot."""
+    await check_agent_access(db, current_user, agent_id, required_level="manage")
     from app.services.platform_service import platform_service
     public_base = await platform_service.get_public_base_url(db, request)
     return {"webhook_url": f"{public_base}/api/channel/feishu/{agent_id}/webhook"}
@@ -340,9 +350,13 @@ async def delete_channel_config(
     db: AsyncSession = Depends(get_db),
 ):
     """Remove Feishu bot configuration for an agent."""
-    agent, _access = await check_agent_access(db, current_user, agent_id)
-    if not is_agent_creator(current_user, agent):
-        raise HTTPException(status_code=403, detail="Only creator can remove channel")
+    await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+        lock_authority=True,
+    )
     result = await db.execute(select(ChannelConfig).where(
         ChannelConfig.agent_id == agent_id,
         ChannelConfig.channel_type == "feishu",

@@ -9,6 +9,15 @@
 - 事实来源：`docs/product-line/01-09`、当前代码、测试、迁移与既有本地浏览器证据
 - 总目标：把“私人助手是默认任务入口、Agent 是长期执行员工、Deliverable 是正式产物、Workspace 是工作现场”落实为可恢复、可审计、可验收的完整产品链路。
 
+> 2026-08-15 增量目标：在不推翻上述任务/员工/交付链路的前提下，按
+> [`10-identity-membership-permission-product-plan.md`](./10-identity-membership-permission-product-plan.md)
+> 完成身份、公司成员、所有权、Agent 对象授权与三类产品面的重构。新的本地总目标由 `.omx/ultragoal/goals.json`
+> 的 G1–G6 跟踪；旧 R1 的“四类线性角色”表述由新合同取代。
+
+> 2026-08-16 增量目标：G1–G6 的本地实现与浏览器验收完成后，继续执行 G7–G12，补齐可审计邮件投递、
+> mail-first 公司邀请、Identity MFA、受支持企业 SSO 的本地协议往返、30 天后客户数据清理、注册入口收口与
+> immutable local candidate。详细合同见身份计划第 13 节；不把本地模拟、候选、外部 Provider 或生产状态混写。
+
 本计划只把有新证据的事项标记完成。`code_exists`、`tests_pass`、`local_browser_verified`、
 `provider_verified`、`commercially_usable_proven` 和 `production_verified` 保持严格分离。
 
@@ -17,7 +26,7 @@
 新的本地候选完成必须同时满足：
 
 1. 注册公司、加入公司、私人助手创建/跳过/失败恢复均幂等，跨租户隔离成立；
-2. 普通成员、`agent_admin`、`org_admin`、平台管理员的服务端权限和界面入口一致；
+2. 普通成员、Agent 受托管理者、`org_admin`、`org_owner`、平台运营者的服务端权限与界面入口一致；`agent_admin` 仅验证旧数据迁移兼容；
 3. `Intent → Task → Run → Artifact → Review → Approval → Delivery → Experience` 可刷新恢复，旧证据不会错误指向新产物；
 4. Agent、临时专家和 Group 三类执行路径都保留真实责任主体、对象 ID 和失败恢复信息；
 5. 图片、视频和 PPT 的工作流支持局部修订与正式交付，但没有真实 Provider/真人盲评证据时不宣称商用；
@@ -29,7 +38,7 @@
 
 | 目标 | 优先级 | 覆盖场景 | 实施范围 | 完成证据 |
 |---|---:|---|---|---|
-| R1 身份、Onboarding 与角色合同 | P0 | REG-01/02、AST-01/02/03、AGT-02、ENT-01 | 私人助手幂等、失败恢复、注册路径保持、tenant isolation、四类角色正负权限 | 定向测试、PostgreSQL 并发/约束证据、浏览器身份矩阵 |
+| R1 身份、Onboarding 与角色合同 | P0 | REG-01/02、AST-01/02/03、AGT-02、ENT-01、IAM-01–16 | 公司初始化与成员 Onboarding 分层、私人助手幂等、Identity/membership/object/surface 权限、所有权、邀请、停用/退出责任预检、tenant isolation、五类角色正负权限 | 定向/全量测试、PostgreSQL fresh/historical smoke、双租户浏览器身份矩阵 |
 | R2 任务恢复与 Group 协作 | P0 | WORK-01/02/03、GRP-01/02、DEL-02 | stale confirmation、重复提交、刷新/断网恢复、Group 参与者终态/部分失败/交接/审批、对象 ID 对照 | exactly-once 断言、读模型一致性、真实本地 Group 流 |
 | R3 产物、审批、OKR 与 Experience 生命周期 | P0 | REV-01/02、DEL-01、EXP-01、OKR evidence | Artifact 替换 supersede 旧 review/approval、OKR 证据失效、Experience draft/publish/source-back 权限 | 状态机测试、权限负向、浏览器来源回跳 |
 | R4 Provider readiness 治理 | P0 | SUB-01/02、ENT-02、VID-01、IMG-02 | 最后一次真实验证 receipt、能力恢复条件、路由/套餐/降级可解释、secret redaction、本地 Group planning/compact readiness | API/UI 合同、无付费 submit 证据、SaaS 管理页面 |
@@ -37,6 +46,58 @@
 | R6 非付费浏览器与候选冻结 | P0 | 全矩阵可在无付费 Provider 下执行的部分 | desktop/窄视口、双租户、多角色、旧深链、console/network、release identity | 验收记录、截图/对象 ID、完整门禁、独立代码/架构审查、新 SHA |
 
 ## 3. 执行顺序与停止条件
+
+### 2026-08-15 增量 Batch 0–6
+
+1. G1 产品合同与差距清单；
+2. G2 后端身份、成员与邀请领域；
+3. G3 服务端有效能力与对象授权；
+4. G4 前端产品面与完整流程；
+5. G5 Onboarding、数字员工中心与兼容迁移；
+6. G6 全量验证、清理、复测和独立审查。
+
+G1 未完成前不得修改角色数据库；G2/G3 的权限负向未通过前不得把新管理入口交给前端；G6 完成前不得将当前 dirty worktree 称为候选、部署或生产验证。
+
+2026-08-15 本地收口结果：G1–G6 的实现、迁移、后端/前端全量门禁、IAM-01–16 双 Tenant 五身份浏览器矩阵、QA 清理和两路独立终审均通过；code-reviewer 为 `APPROVE`，architect 为 `CLEAR`。本轮状态为 `local_browser_verified`，没有固化 immutable candidate、推送、部署或修改生产环境；外部 IdP 往返和 30 天到期物理删除继续作为显式外部门禁。
+
+### 2026-08-16 增量 Batch 7–12
+
+1. G7 冻结邮件、MFA、SSO/Social、purge、兼容和 candidate 合同，并映射模型/API/UI/迁移/测试；
+2. G8 建立持久邮件投递、统一三类系统邮件与 mail-first 公司邀请，完成重发/人工链接/本地 SMTP capture；
+3. G9 建立 Identity TOTP MFA、恢复码、登录 challenge、高权限默认强制、账户安全 UI 与会话热失效；
+4. G10 以测试专用本地 IdP 模拟受支持企业适配器的完整往返，锁死 JIT member 和 Social Signup 关闭策略；
+5. G11 建立公司删除 job、legal hold、dry-run、批次清理、最小墓碑与隔离 fixture 实删；
+6. G12 将 Web 注册切到 `/auth/register/init`，执行 IAM-01–24、全量测试/构建/迁移/浏览器矩阵、清理、
+   独立代码与架构终审，并在全部本地门禁通过后固化 immutable local candidate SHA。
+
+G8–G11 任一关键负向失败都不得由 G12 的全量测试数字掩盖；dirty worktree、未清理 QA fixture、缺失 release
+identity 或终审未清零时不得创建 candidate commit。真实 SMTP/IdP、推送、部署、生产迁移和生产浏览器流程仍需外部授权。
+
+2026-08-16 G8 本地结果：已实现持久 outbox、三类系统邮件统一排队、mail-first 公司邀请、状态/重试、
+旋转重发、撤销和密码二次认证人工链接。相关后端、前端、迁移与 loopback SMTP capture 通过；
+公司所有者浏览器流确认未配置时诚实失败、正常列表不回显 token、一次链接刷新即消失，QA 数据已清零。
+G8 状态限定为 `local_browser_verified + local_smtp_verified`，外部 SMTP Provider 继续保持未验证门禁。
+
+2026-08-16 G9 本地结果：已实现 Identity 级加密 TOTP、数据库单次 challenge、HMAC 恢复码、角色强制策略、
+`auth_version` 旧会话/WebSocket 失效、公司/平台管理员恢复边界、审计与账户安全/登录 UI。相关静态检查、
+迁移合同、前端生产构建、真实本地 PostgreSQL + HTTP 35 项生命周期 smoke 和公司所有者桌面浏览器流程通过，
+QA 数据已精确清零。G9 状态限定为 `local_browser_verified + local_http_postgres_verified`；G12 仍需完成
+390px、全量回归、迁移全链和 candidate SHA 绑定。
+
+2026-08-16 G10 本地结果：公共 Google/GitHub OAuth 保持 existing-identity sign-in-only，signup endpoint
+继续 `410`；Google Workspace/OIDC 适配器已具备一次性 opaque state、同浏览器绑定、nonce、PKCE S256、
+JWKS/RS256 token 校验、authorization code 防重放、JIT member-only 和安全错误恢复。测试专用 loopback IdP
+完成 46 项真实 HTTP 断言，后端定向回归 `102 passed`，前端合同 `7 passed`；桌面浏览器批准后以普通成员进入
+`/work`，页面无 error，fixture 已精确清零。G10 状态限定为
+`local_browser_verified + local_oidc_emulated`；真实企业 IdP、390px 与候选 SHA 仍归入外部门禁/G12。
+
+2026-08-16 G11 本地结果：已实现到期公司清理 job、legal/operations hold、动态 PostgreSQL 依赖 dry-run、
+部分文件失败重试、批次选择、最小墓碑和仅限一次性本地数据库的物理执行护栏。专用迁移/清理 smoke 完成
+32 项断言，后端定向回归 `105 passed`，前端 Node `125 passed`、Vitest `207 passed` 与生产构建通过；
+平台运营者桌面浏览器完成 dry-run、暂停和解除，页面没有物理删除按钮且无 console error，QA 数据和临时凭据
+均已清零。Web 注册已使用 `/auth/register/init`，旧路由保留显式兼容与弃用头。G11 状态限定为
+`local_browser_verified + isolated_postgres_purge_verified`；生产数据清理、390px、全量门禁、独立终审与候选 SHA
+仍归入外部门禁/G12。
 
 ### Batch 1 — 身份与权限
 
@@ -329,3 +390,17 @@ npm run build
 - 本轮又在本机权限上下文执行 `./restart.sh --source`：PostgreSQL、Backend、Frontend 和 Vite API proxy 均启动成功，`/api/health` 返回 `status=ok、version=1.11.14`，`/api/version` 返回 commit `1a81291a`、空 `release_id`。这只证明本地运行时可启动，不代表远程部署或真实 Provider 生成。
 - Benchmark CLI 新增逐次授权门禁：在隔离目录执行火山视频 case 且不传 `--confirm-paid-provider-call` 时，回执为 `explicit_paid_provider_call_authorization_required`，`provider_accepted=false`、`artifact_path=null`、`credential_id=null`；直接把 PPT case 交给该 CLI 则以 `presentation_requires_artifact_pair` fail closed。两种预检都没有选择凭据、没有发出 Provider 请求，也没有消耗额度。相关定向测试此前为 `24 passed`；本次补入普通成员媒体能力脱敏回归后，复跑 `creative_provider_benchmark.py`、`record_external_creative_benchmark.py` 与 `agent_media_capabilities_api.py` 共 `26 passed`，Ruff 与差异检查均通过。
 - 2026-08-02 目标续跑证据：`validate_multimodal_capability_matrix.py --json` 返回 `status=ready`、`errors=[]`、`route_policy_verified=true`，并明确保留 `provider_health_verified=false`；`audit_creative_benchmark_run.py` 的运行指纹仍为 `582d3f4b43bbf1b93e2e6274b029f20b6d32045c2a505b284ffc73f9c76059d6`，三种模态均为 `awaiting_human_review`，正式评审与商用结果均为 `0`。该次历史续跑未调用 Provider、未消耗 Credits、未修改远程环境；2026-08-04 的受控真实样本是后续独立证据。
+
+## 2026-08-16 G12 身份交付收口结果
+
+- 产品链路已经分为注册账号、新建公司、接受公司邀请、切换 membership 四条独立流程；注册 grant、组织邀请和
+  join link 使用不同对象与状态机，首位加入者不自动提权。
+- 公司所有者、公司管理员、普通成员、第二公司所有者、tenantless platform operator 的 desktop/390px 双公司
+  正负矩阵通过；页面无横向溢出，平台权、公司治理权和 Agent 对象权没有互相推导。
+- 最终树后端 `4496 passed`；前端 Node `125 passed`、Vitest `207 passed` 与 production build；Ruff、compileall、
+  capability/creative contracts、SMTP/MFA/OIDC/purge smoke 和完整 PostgreSQL migration 全部通过。
+- 独立 code review 为 `APPROVE`。架构审查首轮以启动级 `auth.py` 语法错误给出 `BLOCK`；修复 tenant-switch
+  redirect 后重新验证启动、认证/权限专项、全量与 HTTP/migration，复审为 `CLEAR`。
+- 所有浏览器、HTTP 与数据库 fixture 已清理。下一步只允许在这棵已验证的源树上创建一个本地 immutable commit，
+  再重启运行时并用 `/api/version`、页面 footer 与关键角色页面绑定 exact SHA；不得在 commit 前预写 SHA。
+- 真实 SMTP、真实企业 IdP、生产 purge、远程推送、部署和生产浏览器业务流仍是外部门禁，不属于本地 G12 完成声明。

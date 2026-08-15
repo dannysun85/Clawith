@@ -1,14 +1,14 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { IconClock, IconLink, IconShieldCheck, IconX } from '@tabler/icons-react';
-import { agentApi, fetchJson } from '../services/api';
+import { agentApi } from '../services/api';
 import { translateTemplate } from '../i18n/templateTranslations';
 import { useDialog } from './Dialog/DialogProvider';
-import TierSelector, { type SaasTier } from './TierSelector';
-import { canonicalizeModalities, MODALITIES } from '../constants/modalities';
 import { SUBSCRIPTION_UPGRADE_PATH } from '../hooks/useAgentCreationLimit';
+import { useAuthStore } from '../stores';
+import { hasEffectiveCapability } from '../utils/productAccess';
 
 interface Template {
     id: string;
@@ -37,7 +37,7 @@ interface Props {
     // (e.g. the Talent Market grid) open so they can pick again.
     onClose: () => void;
     // Creation succeeded — caller should close too. Navigation is handled here.
-    onDone?: () => void;
+    onDone?: (agent: { id: string; name: string }, openChat: boolean) => void;
 }
 
 type Visibility = 'company' | 'only_me' | 'custom';
@@ -49,56 +49,23 @@ export default function PostHireSettingsModal({ template, open, onClose, onDone 
     const navigate = useNavigate();
     const queryClient = useQueryClient();
     const dialog = useDialog();
+    const user = useAuthStore((state) => state.user);
     const isChinese = i18n.language.startsWith('zh');
+    const canCreateCompanyWide = hasEffectiveCapability(user, 'agent.create.company');
 
-    const [visibility, setVisibility] = useState<Visibility>('company');
-    const [preferredTier, setPreferredTier] = useState<SaasTier>('pro');
-    const [preferredModality, setPreferredModality] = useState('text');
+    const [visibility, setVisibility] = useState<Visibility>('only_me');
     const isDouyinTemplate = template?.name === DOUYIN_TEMPLATE_NAME;
-
-    const { data: entitlements } = useQuery({
-        queryKey: ['subscription-entitlements'],
-        queryFn: () => fetchJson<any | null>('/subscription/my-entitlements'),
-        enabled: open,
-        staleTime: 5 * 60 * 1000,
-    });
-    const allowedTiers = useMemo(
-        () => entitlements?.allowed_tiers?.length ? entitlements.allowed_tiers : ['lite', 'pro', 'ultra'],
-        [entitlements?.allowed_tiers],
-    );
-    const allowedModalities = useMemo(() => {
-        const canonical = canonicalizeModalities(entitlements?.allowed_modalities);
-        return canonical.length ? canonical : ['text'];
-    }, [entitlements?.allowed_modalities]);
-    const douyinPreferredTier = useMemo<SaasTier>(() => {
-        const tiers = allowedTiers as SaasTier[];
-        if (tiers.includes('pro')) return 'pro';
-        if (tiers.includes('lite')) return 'lite';
-        return tiers[0] || 'lite';
-    }, [allowedTiers]);
-    const douyinPreferredModality = useMemo(() => {
-        if (allowedModalities.includes('text')) return 'text';
-        return allowedModalities[0] || 'text';
-    }, [allowedModalities]);
-
-    useEffect(() => {
-        if (!open) return;
-        if (!allowedTiers.includes(preferredTier)) {
-            setPreferredTier((allowedTiers[0] as SaasTier) || 'lite');
-        }
-        if (!allowedModalities.includes(preferredModality)) {
-            setPreferredModality(allowedModalities[0] || 'text');
-        }
-    }, [open, allowedTiers, allowedModalities, preferredTier, preferredModality]);
+    const localizedTemplateName = template
+        ? translateTemplate(
+            { name: template.name, description: template.description || '', capability_bullets: [] },
+            isChinese,
+        ).name
+        : '';
 
     // Reset local form whenever the modal closes so the next open is clean.
     useEffect(() => {
-        if (!open) {
-            setVisibility('company');
-            setPreferredTier('pro');
-            setPreferredModality('text');
-        }
-    }, [open]);
+        if (open) setVisibility(canCreateCompanyWide ? 'company' : 'only_me');
+    }, [canCreateCompanyWide, open, template?.id]);
 
     useEffect(() => {
         if (!open) return;
@@ -110,13 +77,6 @@ export default function PostHireSettingsModal({ template, open, onClose, onDone 
     const hire = useMutation({
         mutationFn: (navigateAfter: boolean) => {
             if (!template) return Promise.reject(new Error('No template'));
-            const effectivePreferredTier = isDouyinTemplate ? douyinPreferredTier : preferredTier;
-            const effectivePreferredModality = isDouyinTemplate
-                ? douyinPreferredModality
-                : (preferredModality || 'text');
-            if (!effectivePreferredTier) {
-                return Promise.reject(new Error(t('postHire.modelRequired', '请选择模型档位')));
-            }
             // Localize name + role_description when the UI is in Chinese so
             // the agent persists with the same labels the user saw on the
             // Talent Market card. Without this, the DB stores the English
@@ -130,9 +90,7 @@ export default function PostHireSettingsModal({ template, open, onClose, onDone 
                 name: localized.name,
                 role_description: localized.description,
                 template_id: template.id,
-                preferred_tier: effectivePreferredTier,
-                preferred_modality: effectivePreferredModality,
-                permission_access_level: 'manage',
+                permission_access_level: 'use',
             };
             payload.permission_scope_type = visibility === 'company'
                 ? 'company'
@@ -144,8 +102,10 @@ export default function PostHireSettingsModal({ template, open, onClose, onDone 
         },
         onSuccess: ({ agent, navigateAfter }) => {
             queryClient.invalidateQueries({ queryKey: ['agents'] });
+            queryClient.invalidateQueries({ queryKey: ['workforce-topology'] });
             queryClient.invalidateQueries({ queryKey: ['subscription-seats'] });
-            (onDone || onClose)();
+            if (onDone) onDone(agent, navigateAfter);
+            else onClose();
             // "立即对话" → open directly on the chat tab (not the default status
             // tab). AgentDetail picks up the hash on mount.
             if (navigateAfter) navigate(`/agents/${agent.id}#chat`);
@@ -201,7 +161,7 @@ export default function PostHireSettingsModal({ template, open, onClose, onDone 
                             {t('postHire.title')}
                         </h3>
                         <p style={{ margin: '4px 0 0', fontSize: '12.5px', color: 'var(--text-secondary)' }}>
-                            {template.name}
+                            {localizedTemplateName}
                         </p>
                     </div>
                     <button onClick={onClose} className="btn btn-ghost" disabled={busy} style={{ padding: '4px' }}>
@@ -259,12 +219,14 @@ export default function PostHireSettingsModal({ template, open, onClose, onDone 
                             {t('postHire.visibility')}
                         </div>
                         <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                            <RadioRow
-                                selected={visibility === 'company'}
-                                onClick={() => !busy && setVisibility('company')}
-                                title={t('postHire.visibilityCompanyTitle')}
-                                hint={t('postHire.visibilityCompanyHint')}
-                            />
+                            {canCreateCompanyWide && (
+                                <RadioRow
+                                    selected={visibility === 'company'}
+                                    onClick={() => !busy && setVisibility('company')}
+                                    title={t('postHire.visibilityCompanyTitle')}
+                                    hint={t('postHire.visibilityCompanyHint')}
+                                />
+                            )}
                             <RadioRow
                                 selected={visibility === 'only_me'}
                                 onClick={() => !busy && setVisibility('only_me')}
@@ -278,34 +240,20 @@ export default function PostHireSettingsModal({ template, open, onClose, onDone 
                                 hint={t('postHire.visibilityCustomHint')}
                             />
                         </div>
+                        {!canCreateCompanyWide && (
+                            <p style={{ margin: '8px 0 0', fontSize: '11.5px', color: 'var(--text-tertiary)' }}>
+                                {isChinese
+                                    ? '公司范围的数字员工需要由公司管理员添加。'
+                                    : 'Company-wide employees must be added by a company administrator.'}
+                            </p>
+                        )}
                     </section>
 
-                    {!isDouyinTemplate && (
-                        <section>
-                            <div style={{ fontSize: '13px', fontWeight: 600, marginBottom: '8px' }}>
-                                {t('postHire.model', '模型档位')}
-                            </div>
-                            <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                                <TierSelector
-                                    value={preferredTier}
-                                    onChange={setPreferredTier}
-                                    allowedTiers={allowedTiers}
-                                    disabled={busy}
-                                />
-                                <select
-                                    className="form-input"
-                                    value={preferredModality}
-                                    onChange={e => setPreferredModality(e.target.value)}
-                                    disabled={busy}
-                                    style={{ width: '100%' }}
-                                >
-                                    {MODALITIES.filter((m) => allowedModalities.includes(m)).map((m) => (
-                                        <option key={m} value={m}>{m}</option>
-                                    ))}
-                                </select>
-                            </div>
-                        </section>
-                    )}
+                    <section style={{ fontSize: '11.5px', color: 'var(--text-tertiary)', lineHeight: 1.55 }}>
+                        {isChinese
+                            ? '运行档位和执行能力会根据公司套餐、岗位合同与当前可用性自动配置，创建后可在员工设置中查看。'
+                            : 'Runtime tier and capabilities are selected from company entitlements, the role contract, and current readiness. They remain inspectable in employee settings.'}
+                    </section>
 
                     {isDouyinTemplate && (
                         <DouyinSetupPanel disabled={busy} />

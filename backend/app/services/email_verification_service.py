@@ -161,9 +161,16 @@ class EmailVerificationService:
     ) -> None:
         """Send an email verification token using the configured template."""
         from app.services.system_email_service import send_system_email, render_email_template
+        from app.database import async_session
+        from app.services.platform_service import platform_service
+
+        async with async_session() as db:
+            base_url = await platform_service.get_public_base_url(db)
+        verification_url = await self.build_email_verification_url(base_url, verification_code)
 
         variables = {
             "display_name": display_name,
+            "verification_url": verification_url,
             "verification_code": verification_code,
             "expiry_minutes": str(expiry_minutes),
         }

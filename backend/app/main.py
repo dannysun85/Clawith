@@ -296,6 +296,7 @@ async def lifespan(app: FastAPI):
     from app.services.sso_scan_session_service import (
         start_sso_session_cleanup_daemon,
     )
+    from app.services.outbound_email_service import start_outbound_email_daemon
     from app.services.tool_seeder import seed_builtin_tools
     from app.services.template_seeder import seed_agent_templates
     from app.services.feishu_ws import feishu_ws_manager
@@ -568,6 +569,7 @@ async def lifespan(app: FastAPI):
                 ("billing_reconciliation", start_billing_reconciliation_daemon()),
                 ("approval_execution", start_approval_execution_daemon()),
                 ("sso_session_cleanup", start_sso_session_cleanup_daemon()),
+                ("outbound_email", start_outbound_email_daemon()),
             ]
             if settings.PRODUCTION_ISSUE_MONITOR_ENABLED:
                 worker_task_specs.append(
@@ -739,8 +741,13 @@ from app.api.production_issues import admin_router as production_issue_admin_rou
 from app.api.production_issues import client_router as production_issue_client_router  # noqa: E402
 from app.api.deliverables import router as deliverables_router  # noqa: E402
 from app.api.work import router as work_router  # noqa: E402
+from app.api.workforce_topology import router as workforce_topology_router  # noqa: E402
+from app.api.identity_governance import router as identity_governance_router  # noqa: E402
+from app.api.mfa import router as mfa_router  # noqa: E402
 
 app.include_router(auth_router, prefix=settings.API_PREFIX)
+app.include_router(mfa_router, prefix=settings.API_PREFIX)
+app.include_router(identity_governance_router, prefix=settings.API_PREFIX)
 app.include_router(agent_workforce_router, prefix=settings.API_PREFIX)
 app.include_router(agents_router, prefix=settings.API_PREFIX)
 app.include_router(tasks_router, prefix=settings.API_PREFIX)
@@ -798,6 +805,7 @@ app.include_router(production_issue_client_router, prefix=settings.API_PREFIX)
 app.include_router(production_issue_admin_router, prefix=settings.API_PREFIX)
 app.include_router(deliverables_router)
 app.include_router(work_router)
+app.include_router(workforce_topology_router, prefix=settings.API_PREFIX)
 
 
 @app.get("/api/health", response_model=HealthResponse, tags=["health"])

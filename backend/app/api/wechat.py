@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.core.permissions import check_agent_access, is_agent_creator
+from app.core.permissions import check_agent_access
 from app.core.security import get_current_user
 from app.database import get_db
 from app.models.channel_config import ChannelConfig
@@ -58,9 +58,7 @@ async def create_wechat_qrcode(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    agent, _ = await check_agent_access(db, current_user, agent_id)
-    if not is_agent_creator(current_user, agent):
-        raise HTTPException(status_code=403, detail="Only creator can configure channel")
+    await check_agent_access(db, current_user, agent_id, required_level="manage")
     # Release connection before slow HTTP call
     await db.close()
 
@@ -85,9 +83,7 @@ async def get_wechat_qrcode_status(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    agent, _ = await check_agent_access(db, current_user, agent_id)
-    if not is_agent_creator(current_user, agent):
-        raise HTTPException(status_code=403, detail="Only creator can configure channel")
+    await check_agent_access(db, current_user, agent_id, required_level="manage")
     # Release connection before slow HTTP call (timeout=40s)
     await db.close()
 
@@ -105,6 +101,15 @@ async def get_wechat_qrcode_status(
             raise HTTPException(status_code=resp.status_code, detail=str(payload)[:300])
 
     if payload.get("status") == "confirmed":
+        # The QR round-trip is slow and intentionally holds no database lock.
+        # Revalidate the live grant immediately before persisting credentials.
+        agent, _ = await check_agent_access(
+            db,
+            current_user,
+            agent_id,
+            required_level="manage",
+            lock_authority=True,
+        )
         result = await db.execute(
             select(ChannelConfig).where(
                 ChannelConfig.agent_id == agent_id,
@@ -163,9 +168,7 @@ async def get_wechat_qrcode_image(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    agent, _ = await check_agent_access(db, current_user, agent_id)
-    if not is_agent_creator(current_user, agent):
-        raise HTTPException(status_code=403, detail="Only creator can configure channel")
+    await check_agent_access(db, current_user, agent_id, required_level="manage")
 
     target_url = _validate_qrcode_proxy_url(url)
     async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
@@ -184,7 +187,7 @@ async def get_wechat_channel(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    await check_agent_access(db, current_user, agent_id)
+    await check_agent_access(db, current_user, agent_id, required_level="manage")
     result = await db.execute(
         select(ChannelConfig).where(
             ChannelConfig.agent_id == agent_id,
@@ -205,9 +208,13 @@ async def delete_wechat_channel(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    agent, _ = await check_agent_access(db, current_user, agent_id)
-    if not is_agent_creator(current_user, agent):
-        raise HTTPException(status_code=403, detail="Only creator can remove channel")
+    await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+        lock_authority=True,
+    )
 
     result = await db.execute(
         select(ChannelConfig).where(

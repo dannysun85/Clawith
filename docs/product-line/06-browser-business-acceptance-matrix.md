@@ -23,10 +23,11 @@
 |---|---|---|
 | 新公司创建者 | 注册、公司创建、私人助手、首个任务 | 全新 Identity/tenant，无历史缓存 |
 | 普通成员 | 日常任务、助理、员工、Group、产物 | `role=member` |
-| 公司管理员 | 成员、员工治理、模板、订阅、审批 | `role=org_admin`；本地可使用 `admin@reeftotem.ai`，密码不得写入文档/日志 |
-| Agent 管理员 | 受限员工配置 | `role=agent_admin`，只授予部分 Agent `manage` |
+| 公司管理员 | 成员、员工治理、模板、订阅、审批 | membership `role=org_admin`；凭据不得写入文档/日志 |
+| 公司所有者 | 唯一 owner、管理员任免、所有权、删除 | membership `role=org_owner`，与普通管理员分开验证 |
+| Agent 受托管理者 | 受限员工配置 | membership `role=member`，只对部分 Agent 授予对象级 `manage`；`agent_admin` 仅作旧数据兼容对照 |
 | 三名独立 reviewer | 图片/视频/PPT 人工质量检查 | 不同活跃 `Identity`，与创建者不同 |
-| 平台管理员 | Provider、模型、路由、账号池、生产问题 | 无租户也能进入 SaaS Admin |
+| 平台运营者 | Provider、模型、路由、账号池、生产问题 | 全局 platform role；无 membership 也能进入平台面，不因此获得公司治理权 |
 
 媒体业务流需准备：品牌文案、Logo、人物/产品参考图、合法测试音乐/配音脚本和明确的交付合同。不要为无关回归重复消耗付费 Provider Credits。
 
@@ -43,7 +44,7 @@
 | WORK-02 | 执行者路由 | 分别发起私人、一次性、长期、多方任务 | 路由到助理/临时专家/员工/Group；理由可理解 | 责任主体、route decision receipt |
 | WORK-03 | 刷新/断网恢复 | 任务运行中刷新/断网/重连 | 不重复付费、不丢状态、回到真实 Run | Run ID、Credits、provider receipt |
 | AGT-01 | 招聘员工 | 广场员工市场 → 选择模板 → 确认 → 创建 | 创建长期 Agent；职责清晰；Tool/Skill 不在普通必填项 | Agent/template/grant 记录 |
-| AGT-02 | 员工权限 | member 使用；agent_admin 管理授权 Agent；尝试未授权 Agent | use/manage 分离；负向请求 403/隐藏入口 | UI + API 权限证据 |
+| AGT-02 | 员工权限 | member 使用；受托管理者管理获授权 Agent；尝试未授权 Agent | membership role 不提升；use/manage 分离；负向请求 403/隐藏入口 | UI + API 权限证据 |
 | GRP-01 | Group 协作 | 创建 Group → 添加人/Agent → 会话 → @ → 文件协作 | 成员可见；非成员拒绝；Group Workspace 独立 | group/session/run/file IDs |
 | GRP-02 | Group 交接审批 | Agent 产出 → 人类 review/approval → 交付 | 责任主体、检查人和批准人可追溯 | timeline、review、approval receipt |
 | IMG-01 | 正式图片交付 | 工作说明 → 火山 Seedream → Artifact → 检查 → 批准 | 正确画幅/尺寸；Logo/文字合同；Provider/Credits/Artifact 一致 | 原图、hash、route snapshot、质量报告 |
@@ -173,3 +174,153 @@ SHA 绑定复验：
 
 本文件所在的最终证据提交不能在自身内容中写入自己的 SHA；其精确 SHA、`/api/version` 返回值和浏览器
 页脚对照由提交后的收口记录绑定。该 release-identity 对照属于候选冻结证据，不再反写成新的提交。
+
+## 11. IAM-01 至 IAM-16 身份与权限专项
+
+下一身份重构候选必须在本文件原有 REG/AST/AGT/ENT 场景之外，完整执行
+[`10-identity-membership-permission-product-plan.md`](./10-identity-membership-permission-product-plan.md) 第 8 节的 IAM-01 至 IAM-16：
+
+- 五类身份：普通成员、Agent 受托管理者、公司管理员、公司所有者、平台运营者；
+- 两个 Tenant：验证新增 membership、切换、缓存/WebSocket 收敛和跨租户 IDOR；
+- 三种入口状态：仅邀请、仅可创建公司、邀请与创建权益并存；
+- 高风险动作：管理员任免、所有权转移、成员停用、退出、支持会话和公司删除；
+- 主动退出：服务端先列出 Agent 所有权、任务、审批、交付、受托授权和个人凭证；未交接 Agent 硬阻断，完成后撤销 membership grant/凭证并安全切换或退出登录；
+- 管理停用：即使存在待交接责任也能在明确确认后立即切断 membership；只显示计数和公司可见对象，private Agent 与其任务/审批/交付细节必须脱敏；
+- 权限热变更：撤销 Agent manage、停用 membership、支持会话过期后旧页面和旧连接不可继续写；
+- 私人边界：所有公司和平台角色均不得读取非本人私人助手内容。
+
+每个场景必须同时取得 UI 正向、API 负向、审计事件和测试数据清理证据。现有 `agent_admin` 浏览器证据只证明旧兼容合同，不足以证明新对象能力与产品面合同完成。
+
+## 12. 2026-08-15 IAM G6 本地工作树验收记录
+
+本轮使用五类身份、两个临时 Tenant 和 desktop/390px 视口执行 IAM-01 至 IAM-16。运行时页脚显示的
+`v1.11.40 (61c2d721)` 只是当前工作树的基础 release identity；因为本轮实现尚未固化为 immutable
+candidate，不能把该 SHA 写成当前改动的候选证明。结论限定为 `local_browser_verified`，不代表已部署、
+生产已验证或商业流程已证明。
+
+| 场景 | 本地实跑结果 | 负向/边界证据 | 状态与缺口 |
+|---|---|---|---|
+| IAM-01 注册账号 | 注册凭证只创建账户身份和账户级权益，不隐式创建公司管理员 membership | 注册凭证与公司邀请使用不同对象、接口、状态机和审计动作 | `local_browser_verified` |
+| IAM-02 创建公司 | 账户权益创建 Alpha/Beta 两家公司，创建者原子成为唯一 `org_owner` | 无权益、重复幂等键和并发路径由 API/事务测试拒绝 | `local_browser_verified + tests_pass` |
+| IAM-03 发出邀请 | owner/admin 发出带 tenant、email、role、expiry 的公司邀请，并完成撤销 | member 与 Agent 受托管理者无邀请入口且 API 拒绝 | `local_browser_verified` |
+| IAM-04 接受邀请 | 新成员与已有身份均按邀请声明角色创建一次 membership；接受、撤销均有审计 | 错邮箱、过期、已撤销、重放和跨 Tenant 均拒绝 | `local_browser_verified + tests_pass` |
+| IAM-05 第二家公司 | 同一 Identity 同时保留 Alpha/Beta membership；主动退出 Alpha 后原子切到 Beta | Alpha 旧 token 返回 `401`，Beta 新 token 返回 `200`；旧公司数据不留在页面查询缓存 | `local_browser_verified` |
+| IAM-06 SSO/JIT | 本机 Alpha 未配置可用外部 IdP，公共 SSO provider 查询 fail-closed 返回 `403 Organization SSO is unavailable` | 自动化证明 JIT 新建用户固定为 `member`，不会因首位加入而升级管理员 | `tests_pass + local_config_negative`；真实外部 IdP 往返未验证 |
+| IAM-07 公司初始化 | 新建与加入路径均按服务端 `entry_mode` 进入公司资料、成员资料、私人助手、开工四步并可刷新恢复 | 重试不重复创建 Tenant、owner 或助手槽位 | `local_browser_verified` |
+| IAM-08 私人助手 | 每个 membership 使用独立私人助手；主动退出前正确要求删除本人未交接的私人助手 | owner/admin/platform operator/Agent 受托者读取他人私人助手 API 均拒绝 | `local_browser_verified` |
+| IAM-09 Agent use/manage | Product Manager Agent 完成 admin → 受托管理者 → admin 的授权、创建者移交和回流 | 未授权 manager 的 Agent GET/PATCH 均为 `403` | `local_browser_verified` |
+| IAM-10 公司管理面 | owner/admin 可进入公司管理；成员和 Agent 受托者仍保留员工工作面 | 普通成员与受托者的管理路由/API 拒绝；键盘 Tab/Enter 可进入“成员与邀请” | `local_browser_verified` |
+| IAM-11 所有权 | 两次目标确认式 ownership request/accept 均完成；公司删除进入 30 天可恢复期并完成 restore | org_admin 与 platform operator 不能替 owner 转移或删除公司 | `local_browser_verified`；到期物理删除未获授权、未执行 |
+| IAM-12 平台运营面 | tenantless platform operator 可进入独立运营面，不借用公司 membership | 公司角色不能进入平台 Provider/路由治理；平台身份不自动获得公司管理权 | `local_browser_verified` |
+| IAM-13 支持会话 | 创建 metadata/diagnostics 范围会话，只返回公司元数据与聚合计数，并记录 summary read 审计 | 跨 Tenant、过期/结束会话和私人 Agent 读取均 `403`；响应不含 email、token、内容或 Workspace | `local_browser_verified + tests_pass` |
+| IAM-14 权限热变更 | 开着 Agent 设置页撤销全部对象权限后，3 秒复核自动显示“访问权限已失效”，不再渲染保存/移交控件 | 旧 manager 会话 Agent GET/PATCH 均 `403`；React Query 后续 `403` 不再沿用旧成功数据提供编辑能力 | `local_browser_verified` |
+| IAM-15 停用/退出 | 管理停用/恢复与本人主动退出均实跑；退出先阻断责任对象，完成助手删除后切到仍有效公司 | 退出后的 Alpha membership/token 失效，Beta membership 保留；脱敏 preflight 不泄露 private 工作细节 | `local_browser_verified` |
+| IAM-16 旧数据迁移 | 角色、旧邀请码、owner 候选和 Agent grant 迁移合同均进入 PostgreSQL fresh/historical/downgrade/re-upgrade smoke | 不确定 owner 进入 resolution，不静默猜测；`agent_admin` 只迁移对象 grant，不获得公司治理权 | `migration_smoke_pass + tests_pass` |
+
+额外非功能证据：普通成员工作台、公司管理员管理面、公司所有者 ownership 面和平台运营面均在
+390px 视口无横向溢出；权限、邀请、支持、所有权、停用/恢复、退出、删除/恢复等动作留下对应审计事件。
+本轮 QA 数据已按固定 Tenant/User/Identity/Agent ID 清理并扫描所有 UUID 引用为零；8 个 Agent 工作区
+移入本机废纸篓以便恢复。浏览器录制保存在
+`/Users/sun/.config/browser-harness/agent-workspace/recordings/astra-g6-iam-20260815`。
+
+## 13. 2026-08-16 IAM-17/18 邮件交付增量验收
+
+本轮以专用本地公司所有者进入 `/company-admin/members`，实跑 mail-first 邀请、配置未就绪状态、
+旋转重发和密码二次认证后的单次人工链接。正常邀请列表只显示脱敏邮箱、角色、业务状态、投递状态和
+错误码，不回显原始 token；人工链接只在本次响应显示，刷新页面后消失。未配置 SMTP 时 UI 明确显示
+“邮件配置未就绪”，没有伪报发送成功；重发后旧邀请变为 `revoked/cancelled`，人工链接再次轮换旧凭证。
+
+持久化复核确认三次邀请动作分别留下 `organization_invitation_issued`、
+`organization_invitation_resent` 和 `organization_invitation_manual_link_issued` 审计；outbox 中没有明文
+`ORG-` 标记。页面控制台无 error。专用 Identity、User、Tenant、Onboarding、邀请、outbox 与审计记录
+均按固定 ID 精确清理，清理后关联记录计数为零。
+
+自动化证据包括：邮件/邀请相关后端 `109 passed`，前端合同 `12 passed`，Ruff、compileall、生产构建、
+PostgreSQL fresh/historical/downgrade/re-upgrade migration smoke，以及真实 PostgreSQL + loopback SMTP
+capture（`smtp_accepted`）。因此 IAM-17/18 当前结论是 `local_browser_verified + local_smtp_verified`；
+它不代表外部 SMTP Provider、真实收件箱、部署或生产验证。
+
+## 14. 2026-08-16 IAM-19/20 MFA 增量验收
+
+本轮将 MFA 固定在全局 `Identity`，而不是某一条 membership。`org_owner`、`org_admin` 与平台运营者的
+密码登录在未绑定时只返回短时 bootstrap challenge，不签发 access token；绑定后每次密码登录都必须用
+TOTP 或一次性恢复码完成二次验证。普通 member 可选择启用和关闭，但一旦启用，同一 Identity 的全部公司
+membership 都受同一套验证器和恢复码保护。
+
+真实本地 PostgreSQL + HTTP smoke 完成 35 项断言：确认式绑定、TOTP 登录、challenge 防重放、恢复码单次
+消费与轮换、旧 `auth_version` token 立即 `401`、高权限禁止关闭、普通成员可关闭、单公司普通成员的公司
+管理员恢复、多公司 Identity 必须平台运营者恢复、跨 Tenant 与管理员目标拒绝。19 条 MFA 审计记录只包含
+身份/方法/计数/范围元数据；TOTP seed 使用认证加密 envelope，恢复码只保存 Identity 域分离 HMAC。两次
+smoke 均精确删除 QA Identity/User/Tenant/challenge/recovery/audit，最终关联记录为零。
+
+桌面浏览器实跑了公司所有者首次登录 → 强制绑定 → 仅显示一次的 10 枚恢复码 → 明确勾选已保存 → 工作台，
+以及再次密码登录 → MFA challenge → 工作台；账户安全页正确显示 Identity 级说明、强制策略、启用时间、
+剩余恢复码和轮换入口，不为高权限账号展示关闭动作。页面截图和 DOM 均无控制台错误，专用浏览器 fixture
+清理后记录为零。自动化证据为 MFA/迁移合同 `24 passed`、Ruff、compileall 和前端生产构建通过。
+
+IAM-19/20 当前结论为 `local_browser_verified + local_http_postgres_verified`；390px 复验、全量回归和
+候选 SHA 绑定归入 G12。该结论不代表部署、生产验证或外部身份服务已验证。
+
+## 15. 2026-08-16 IAM-21/22 企业 SSO 增量验收
+
+G10 在现有 Google Workspace/OIDC 适配器上增加测试专用 loopback IdP，没有新增通用 OAuth2 产品入口。
+授权请求使用服务端保存且一次消费的 opaque state、同浏览器绑定、OIDC nonce 与 PKCE S256；callback 以
+JWKS/RS256 校验签名，并严格核对 issuer、audience、expiry、nonce、subject、verified email 和 hosted domain。
+授权码另有单次 claim，重复 code 即使配合新 state 也会拒绝并审计。
+
+真实本地 PostgreSQL + Redis + Vite + Backend + IdP HTTP smoke 完成 46 项断言：公共 Google/GitHub 注册入口
+保持 `410` 且不创建数据；错误 state、错浏览器、错 Tenant、state/code 重放、Provider 禁用均 fail closed；
+首次 JIT 只创建一个 `member` membership，不生成密码、不提升管理员或 owner，并返回可进入普通员工工作面的
+完整 access snapshot。相关后端定向回归为 `102 passed`，前端 SSO/MFA 合同为 `7 passed`，Ruff 与 compileall
+通过。
+
+桌面浏览器从公司登录页进入明确标注 `NOT A REAL PROVIDER` 的本地授权页，批准后落到 `/work`；侧栏显示
+“成员”，没有公司管理或平台运营入口。页面控制台没有 error，fixture 的 Tenant、User、Identity、membership、
+provider、SSO session 和审计均精确清理。IAM-21/22 结论为
+`local_browser_verified + local_oidc_emulated`；390px 复验和候选 SHA 绑定归入 G12，真实 Google Workspace
+管理员配置、外部网络往返与 `provider_verified` 仍未验证。
+
+## 16. 2026-08-16 IAM-23 到期清理增量验收
+
+G11 新增 `TenantDeletionJob`、`TenantDeletionHold` 与无 Tenant 外键的最小
+`TenantDeletionTombstone`。owner 发起删除仍只进入 30 天可恢复期；到期物理清理没有公共 API 或网页按钮，
+只允许受控 CLI/worker 在显式开发开关、loopback PostgreSQL、专用数据库名和隔离 Tenant slug 同时满足时执行。
+平台运营面只暴露队列、无删除 dry-run、法务/运营暂停和解除暂停，并明确提示 reason code 不得包含个人或业务内容。
+
+专用 PostgreSQL 演练完成 32 项断言：未到期拒绝、legal/operations hold 与幂等解除、未知跨租户依赖和
+无主键表阻断、schema drift、重复 dry-run、文件删除部分失败后重入、真实隔离清理、重复执行、其他 Tenant 与
+跨公司 Identity 保留、恢复竞态以及不含公司名称的墓碑 receipt。迁移还先构造过部分表结构并确认 upgrade
+fail closed，随后 fresh head 完成清理演练；临时数据库和文件目录均被销毁。
+
+桌面浏览器以临时平台运营者经 MFA 进入 `/admin/platform/companies`，看到到期公司和清理阶段，依次完成
+dry-run、operations hold 和 release；状态按 `scheduled → dry_run_passed → held → scheduled` 更新，页面无
+物理删除动作且控制台无 error。5 个临时 Identity/User、3 个 Tenant、hold/job/audit/challenge 和本机临时凭据
+文件已精确删除。相关后端定向回归为 `105 passed`，前端 Node `125 passed`、Vitest `207 passed`、生产构建、
+Ruff 与 compileall 均通过。
+
+IAM-23 当前结论为 `local_browser_verified + isolated_postgres_purge_verified`。它不代表生产数据已清理、已部署
+或生产恢复策略已获批准；G12 仍需完成全量门禁、desktop/390px 多角色矩阵、独立终审和候选 SHA 绑定。
+
+## 17. 2026-08-16 IAM-24 / G12 候选收口验收
+
+G12 在同一工作树完成了 desktop 与 390×844 两套浏览器矩阵。公司所有者、公司管理员、普通成员、第二公司
+所有者和 tenantless platform operator 均使用各自真实权限进入产品面；owner 可进入 ownership，公司管理员只能
+进入公司管理，普通成员只能进入工作面，第二公司所有者只看到第二家公司，platform operator 只能进入平台运营面。
+所有 390px 页面均无横向溢出；公司角色访问平台路由、普通成员访问公司管理、平台身份访问公司治理均被重定向或拒绝。
+
+当前最终树的自动化证据为：后端 `4496 passed`；前端 Node `125 passed`、Vitest `207 passed`（38 files）和
+TypeScript/Vite production build；Ruff、compileall、`git diff --check`；Agent capability contract
+（30 templates、17 skills、141 tools）与 creative v1 contract `115 passed`。真实本地 smoke 还包括 loopback SMTP、
+Identity MFA `35` 项断言和 `19` 条审计、OIDC emulator `46` 项断言、tenant purge `32` 项断言，以及 PostgreSQL
+fresh/historical/downgrade/re-upgrade migration 全链。
+
+独立 code reviewer 结论为 `APPROVE`。独立 architect 首轮发现 `auth.py` 的 tenant-switch redirect 存在启动级语法
+阻断；修复为先生成 `redirect_fragment` 再拼接 URL 后，API 编译、应用启动、认证/权限专项 `100 passed`、后端全量、
+OIDC HTTP smoke 和完整迁移均重新通过，architect 复审结论转为 `CLEAR`。这条记录保留失败发现与修复过程，不用最终
+通过结果覆盖曾经存在的 blocker。
+
+浏览器、HTTP 和一次性数据库 fixture 均已精确清理；未遗留 `clawith-g12*` 临时凭据文件或 G11/migration 专用数据库。
+本文件随本地 immutable candidate commit 一并固化；由于 commit 不能在自身内容中自指其最终 SHA，准确 SHA 必须由
+commit 创建后的 `/api/version`、页面 footer 和交付报告共同记录。当前证据仅支持
+`immutable_local_candidate + local_business_flow_proven`，不支持外部 SMTP、真实企业 IdP、生产 purge、已部署或
+`production_verified`。

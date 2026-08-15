@@ -15,6 +15,7 @@ from app.models.agent import Agent as AgentModel
 from app.models.plaza import PlazaPost, PlazaComment, PlazaLike
 from app.models.user import User
 from app.core.permissions import check_agent_access
+from app.services.access_control import is_company_governor
 
 router = APIRouter(prefix="/api/plaza", tags=["plaza"])
 
@@ -166,9 +167,11 @@ async def _resolve_authenticated_author(
         db,
         current_user,
         requested_author_id,
+        required_level="manage",
+        lock_authority=True,
     )
     if access_level != "manage":
-        raise HTTPException(403, "Manage access is required to act as an Agent")
+        raise HTTPException(403, "Manage access required to post as an Agent")
     if (
         agent.is_system
         or (getattr(agent, "access_mode", None) or "company") != "company"
@@ -180,25 +183,19 @@ async def _resolve_authenticated_author(
 def _effective_plaza_tenant_id(
     current_user: User,
     requested_tenant_id: str | uuid.UUID | None = None,
-    *,
-    allow_platform_global_read: bool = False,
-) -> str | None:
-    """Resolve a Plaza tenant without allowing tenantless member fail-open."""
-    if current_user.role == "platform_admin":
-        if requested_tenant_id:
-            try:
-                return str(uuid.UUID(str(requested_tenant_id)))
-            except ValueError as exc:
-                raise HTTPException(422, "Invalid tenant_id") from exc
-        if current_user.tenant_id:
-            return str(current_user.tenant_id)
-        if allow_platform_global_read:
-            return None
-        raise HTTPException(400, "tenant_id is required for this platform-admin write")
-
+) -> str:
+    """Resolve Plaza strictly from the active company membership."""
     if current_user.tenant_id is None:
         raise HTTPException(403, "An organization membership is required for Plaza")
-    return str(current_user.tenant_id)
+    effective_tenant_id = str(current_user.tenant_id)
+    if requested_tenant_id is not None:
+        try:
+            parsed_requested = str(uuid.UUID(str(requested_tenant_id)))
+        except ValueError as exc:
+            raise HTTPException(422, "Invalid tenant_id") from exc
+        if parsed_requested != effective_tenant_id:
+            raise HTTPException(403, "Cannot access another company's Plaza")
+    return effective_tenant_id
 
 
 # ── Routes ──────────────────────────────────────────
@@ -216,16 +213,10 @@ async def list_posts(
     System agent posts are excluded from the feed — system agents (is_system=True)
     communicate through internal Chat and reports rather than Plaza.
     """
-    # Enforce tenant from JWT; platform_admin can optionally specify a different tenant
-    effective_tenant_id = _effective_plaza_tenant_id(
-        current_user,
-        tenant_id,
-        allow_platform_global_read=True,
-    )
+    effective_tenant_id = _effective_plaza_tenant_id(current_user, tenant_id)
     async with async_session() as db:
         q = select(PlazaPost).order_by(desc(PlazaPost.created_at))
-        if effective_tenant_id:
-            q = q.where(PlazaPost.tenant_id == effective_tenant_id)
+        q = q.where(PlazaPost.tenant_id == effective_tenant_id)
         q = q.where(
             ~(
                 (PlazaPost.author_type == "agent")
@@ -251,12 +242,7 @@ async def plaza_stats(
     current_user: User = Depends(get_current_user),
 ):
     """Get plaza statistics scoped by tenant_id from JWT."""
-    # Enforce tenant from JWT; platform_admin can optionally specify a different tenant
-    effective_tenant_id = _effective_plaza_tenant_id(
-        current_user,
-        tenant_id,
-        allow_platform_global_read=True,
-    )
+    effective_tenant_id = _effective_plaza_tenant_id(current_user, tenant_id)
     async with async_session() as db:
         # Build base filters
         private_or_system_post = (
@@ -264,8 +250,7 @@ async def plaza_stats(
             & _hidden_agent_exists_for_author(PlazaPost.author_id)
         )
         post_filters = [~private_or_system_post]
-        if effective_tenant_id:
-            post_filters.append(PlazaPost.tenant_id == effective_tenant_id)
+        post_filters.append(PlazaPost.tenant_id == effective_tenant_id)
         # Total posts
         total_posts = (await db.execute(
             select(func.count(PlazaPost.id)).where(*post_filters)
@@ -349,14 +334,12 @@ async def create_post(body: PostCreate, current_user: User = Depends(get_current
 @router.get("/posts/{post_id}", response_model=PostDetail)
 async def get_post(post_id: uuid.UUID, current_user: User = Depends(get_current_user)):
     """Get a single post with its comments. Enforces tenant isolation."""
-    effective_tenant_id = _effective_plaza_tenant_id(
-        current_user,
-        allow_platform_global_read=True,
-    )
+    effective_tenant_id = _effective_plaza_tenant_id(current_user)
     async with async_session() as db:
-        q = select(PlazaPost).where(PlazaPost.id == post_id)
-        if current_user.role != "platform_admin":
-            q = q.where(PlazaPost.tenant_id == effective_tenant_id)
+        q = select(PlazaPost).where(
+            PlazaPost.id == post_id,
+            PlazaPost.tenant_id == effective_tenant_id,
+        )
         result = await db.execute(q)
         post = result.scalar_one_or_none()
         if not post:
@@ -394,10 +377,7 @@ async def get_post(post_id: uuid.UUID, current_user: User = Depends(get_current_
 @router.delete("/posts/{post_id}")
 async def delete_post(post_id: uuid.UUID, current_user: User = Depends(get_current_user)):
     """Delete a plaza post. Admins can delete any post; authors can delete their own. Enforces tenant isolation."""
-    effective_tenant_id = _effective_plaza_tenant_id(
-        current_user,
-        allow_platform_global_read=True,
-    )
+    effective_tenant_id = _effective_plaza_tenant_id(current_user)
     async with async_session() as db:
         result = await db.execute(
             select(PlazaPost)
@@ -407,11 +387,22 @@ async def delete_post(post_id: uuid.UUID, current_user: User = Depends(get_curre
         post = result.scalar_one_or_none()
         if not post:
             raise HTTPException(404, "Post not found")
-        if current_user.role != "platform_admin":
-            if str(post.tenant_id) != effective_tenant_id:
-                raise HTTPException(403, "No access to this post")
-        is_admin = current_user.role in ("platform_admin", "org_admin")
-        is_author = post.author_id == current_user.id
+        if str(post.tenant_id) != effective_tenant_id:
+            raise HTTPException(403, "No access to this post")
+        is_admin = is_company_governor(current_user)
+        is_author = post.author_type == "human" and post.author_id == current_user.id
+        if post.author_type == "agent" and not is_admin:
+            try:
+                await check_agent_access(
+                    db,
+                    current_user,
+                    post.author_id,
+                    required_level="manage",
+                    lock_authority=True,
+                )
+                is_author = True
+            except HTTPException:
+                is_author = False
         if not is_admin and not is_author:
             raise HTTPException(403, "Not allowed to delete this post")
         logger.info(f"Plaza post {post_id} deleted by user {current_user.id} (admin={is_admin})")
@@ -425,10 +416,7 @@ async def create_comment(post_id: uuid.UUID, body: CommentCreate, current_user: 
     """Add a comment to a post. Requires authentication; enforces tenant isolation."""
     if len(body.content.strip()) == 0:
         raise HTTPException(400, "Content cannot be empty")
-    effective_tenant_id = _effective_plaza_tenant_id(
-        current_user,
-        allow_platform_global_read=True,
-    )
+    effective_tenant_id = _effective_plaza_tenant_id(current_user)
     async with async_session() as db:
         author_id, author_type, author_name = await _resolve_authenticated_author(
             db,
@@ -444,9 +432,8 @@ async def create_comment(post_id: uuid.UUID, body: CommentCreate, current_user: 
         post = result.scalar_one_or_none()
         if not post:
             raise HTTPException(404, "Post not found")
-        if current_user.role != "platform_admin":
-            if str(post.tenant_id) != effective_tenant_id:
-                raise HTTPException(403, "No access to this post")
+        if str(post.tenant_id) != effective_tenant_id:
+            raise HTTPException(403, "No access to this post")
 
         comment = PlazaComment(
             post_id=post_id,
@@ -559,10 +546,7 @@ async def create_comment(post_id: uuid.UUID, body: CommentCreate, current_user: 
 @router.post("/posts/{post_id}/like")
 async def like_post(post_id: uuid.UUID, author_id: uuid.UUID, author_type: str = "human", current_user: User = Depends(get_current_user)):
     """Like a post (toggle). Requires authentication; enforces tenant isolation."""
-    effective_tenant_id = _effective_plaza_tenant_id(
-        current_user,
-        allow_platform_global_read=True,
-    )
+    effective_tenant_id = _effective_plaza_tenant_id(current_user)
     async with async_session() as db:
         resolved_author_id, resolved_author_type, _author_name = (
             await _resolve_authenticated_author(
@@ -582,9 +566,8 @@ async def like_post(post_id: uuid.UUID, author_id: uuid.UUID, author_type: str =
         post = result.scalar_one_or_none()
         if not post:
             raise HTTPException(404, "Post not found")
-        if current_user.role != "platform_admin":
-            if str(post.tenant_id) != effective_tenant_id:
-                raise HTTPException(403, "No access to this post")
+        if str(post.tenant_id) != effective_tenant_id:
+            raise HTTPException(403, "No access to this post")
         existing = await db.execute(
             select(PlazaLike).where(
                 PlazaLike.post_id == post_id,

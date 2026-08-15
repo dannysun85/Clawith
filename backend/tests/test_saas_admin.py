@@ -78,7 +78,7 @@ class AdminCompanyCreateDB:
                 value.created_at = datetime.now(timezone.utc)
 
 
-def _admin_user(email="admin@reeftotem.ai", role="platform_admin", identity_is_platform_admin=False):
+def _admin_user(email="admin@reeftotem.ai", role="platform_admin", identity_is_platform_admin=True):
     return SimpleNamespace(
         id=uuid.uuid4(),
         role=role,
@@ -140,8 +140,12 @@ async def test_saas_admin_rejects_other_platform_admin_email():
 
 
 @pytest.mark.asyncio
-async def test_saas_admin_rejects_owner_email_without_platform_admin_role():
-    user = _admin_user(email="admin@reeftotem.ai", role="org_admin")
+async def test_saas_admin_rejects_owner_email_without_platform_identity_grant():
+    user = _admin_user(
+        email="admin@reeftotem.ai",
+        role="org_admin",
+        identity_is_platform_admin=False,
+    )
 
     with pytest.raises(HTTPException) as exc:
         await saas_api.get_saas_admin(user)
@@ -231,24 +235,42 @@ async def test_initialize_free_subscriptions_creates_only_missing_tenants():
 async def test_legacy_admin_company_creation_initializes_free_subscription():
     db = AdminCompanyCreateDB()
     current_user = _admin_user()
+    invitation = SimpleNamespace(
+        raw_token="ORG-OWNER-INVITATION",
+        record=SimpleNamespace(
+            id=uuid.uuid4(),
+            target_email="owner@example.com",
+        ),
+    )
 
     with patch.object(
         admin_api,
         "ensure_free_subscription_for_tenant",
         AsyncMock(),
     ) as ensure_free:
-        result = await admin_api.create_company(
-            admin_api.CompanyCreateRequest(name="Release Gate Tenant"),
-            current_user=current_user,
-            db=db,
-        )
+        with patch(
+            "app.services.identity_governance.issue_organization_invitation",
+            AsyncMock(return_value=invitation),
+        ) as issue_invitation:
+            result = await admin_api.create_company(
+                admin_api.CompanyCreateRequest(
+                    name="Release Gate Tenant",
+                    owner_email="owner@example.com",
+                ),
+                current_user=current_user,
+                db=db,
+            )
 
     assert result.company.name == "Release Gate Tenant"
+    assert result.admin_invitation_code == "ORG-OWNER-INVITATION"
     ensure_free.assert_awaited_once_with(
         db,
         result.company.id,
         granted_by=current_user.id,
     )
+    issue_invitation.assert_awaited_once()
+    assert issue_invitation.await_args.kwargs["tenant_id"] == result.company.id
+    assert issue_invitation.await_args.kwargs["invited_role"] == "org_owner"
 
 
 def test_final_catalog_migration_preserves_one_agent_free_limit():

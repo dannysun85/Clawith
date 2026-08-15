@@ -40,15 +40,7 @@ async def _require_self_credential_access(
     private login that migration 099 deliberately stopped sharing.
     """
 
-    _agent, access_level = await check_agent_access(db, current_user, agent_id)
-    if access_level not in ("use", "manage") and current_user.role not in (
-        "platform_admin",
-        "org_admin",
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Use access required to manage your private credentials",
-        )
+    await check_agent_access(db, current_user, agent_id)
 
 
 def _to_response(cred: AgentCredential) -> dict:

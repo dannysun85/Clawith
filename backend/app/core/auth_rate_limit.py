@@ -307,3 +307,18 @@ def oauth_exchange_rate_limit_policy() -> AuthRateLimitPolicy:
         identity_window_seconds=60,
         global_window_seconds=60,
     )
+
+
+def mfa_rate_limit_policy() -> AuthRateLimitPolicy:
+    """Bound TOTP/recovery attempts independently from password work."""
+
+    settings = get_settings()
+    return AuthRateLimitPolicy(
+        operation="identity-mfa",
+        client_limit=settings.AUTH_MFA_CLIENT_LIMIT_PER_5_MINUTES,
+        identity_limit=settings.AUTH_MFA_IDENTITY_LIMIT_PER_5_MINUTES,
+        global_limit=settings.AUTH_MFA_GLOBAL_LIMIT_PER_MINUTE,
+        client_window_seconds=5 * 60,
+        identity_window_seconds=5 * 60,
+        global_window_seconds=60,
+    )

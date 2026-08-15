@@ -26,6 +26,7 @@ class FakeDB:
         self.flushed = False
         self.committed = False
         self.statements = []
+        self.added = []
 
     async def execute(self, _statement):
         self.statements.append(_statement)
@@ -36,6 +37,9 @@ class FakeDB:
 
     async def commit(self):
         self.committed = True
+
+    def add(self, value):
+        self.added.append(value)
 
 
 class SequenceDB(FakeDB):
@@ -60,51 +64,52 @@ def _stub_identity_login_namespace(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_org_admin_cannot_demote_platform_admin():
+async def test_org_admin_cannot_appoint_another_org_admin():
     tenant_id = uuid.uuid4()
     actor = SimpleNamespace(id=uuid.uuid4(), role="org_admin", tenant_id=tenant_id)
-    target = SimpleNamespace(id=uuid.uuid4(), role="platform_admin", tenant_id=tenant_id)
+    target = SimpleNamespace(id=uuid.uuid4(), role="member", tenant_id=tenant_id)
     db = FakeDB(target)
 
     with pytest.raises(HTTPException) as exc:
         await users.update_user_role(
             target.id,
-            users.RoleUpdate(role="member"),
+            users.RoleUpdate(role="org_admin"),
             actor,
             db,
         )
 
-    assert exc.value.status_code == 403
-    assert target.role == "platform_admin"
+    assert exc.value.status_code == 400
+    assert target.role == "member"
     assert db.committed is False
 
 
 @pytest.mark.asyncio
-async def test_org_admin_can_assign_agent_admin_inside_their_tenant():
+async def test_org_owner_can_appoint_org_admin_inside_company():
     tenant_id = uuid.uuid4()
-    actor = SimpleNamespace(id=uuid.uuid4(), role="org_admin", tenant_id=tenant_id)
+    actor = SimpleNamespace(id=uuid.uuid4(), role="org_owner", tenant_id=tenant_id)
     target = SimpleNamespace(
         id=uuid.uuid4(),
         role="member",
         tenant_id=tenant_id,
         is_active=True,
     )
-    db = FakeDB(target)
+    tenant = SimpleNamespace(id=tenant_id, owner_user_id=actor.id)
+    db = SequenceDB([target, tenant])
 
     result = await users.update_user_role(
         target.id,
-        users.RoleUpdate(role="agent_admin"),
+        users.RoleUpdate(role="org_admin"),
         actor,
         db,
     )
 
-    assert result["role"] == "agent_admin"
-    assert target.role == "agent_admin"
+    assert result["role"] == "org_admin"
+    assert target.role == "org_admin"
     assert db.committed is True
 
 
 @pytest.mark.asyncio
-async def test_org_admin_cannot_assign_agent_admin_outside_their_tenant():
+async def test_org_admin_cannot_assign_legacy_agent_admin_role():
     actor = SimpleNamespace(
         id=uuid.uuid4(),
         role="org_admin",
@@ -113,7 +118,7 @@ async def test_org_admin_cannot_assign_agent_admin_outside_their_tenant():
     target = SimpleNamespace(
         id=uuid.uuid4(),
         role="member",
-        tenant_id=uuid.uuid4(),
+        tenant_id=actor.tenant_id,
         is_active=True,
     )
     db = FakeDB(target)
@@ -126,13 +131,13 @@ async def test_org_admin_cannot_assign_agent_admin_outside_their_tenant():
             db,
         )
 
-    assert exc.value.status_code == 403
+    assert exc.value.status_code == 400
     assert target.role == "member"
     assert db.committed is False
 
 
 @pytest.mark.asyncio
-async def test_disabled_admin_role_change_does_not_block_on_active_admin_count():
+async def test_platform_operator_cannot_mutate_tenant_role_without_membership():
     tenant_id = uuid.uuid4()
     actor = SimpleNamespace(id=uuid.uuid4(), role="platform_admin", tenant_id=None)
     target = SimpleNamespace(
@@ -143,29 +148,31 @@ async def test_disabled_admin_role_change_does_not_block_on_active_admin_count()
     )
     db = FakeDB(target)
 
-    result = await users.update_user_role(
-        target.id,
-        users.RoleUpdate(role="member"),
-        actor,
-        db,
-    )
+    with pytest.raises(HTTPException) as exc:
+        await users.update_user_role(
+            target.id,
+            users.RoleUpdate(role="member"),
+            actor,
+            db,
+        )
 
-    assert result["role"] == "member"
-    assert target.role == "member"
-    assert len(db.statements) == 1
+    assert exc.value.status_code == 403
+    assert target.role == "org_admin"
+    assert len(db.statements) == 0
 
 
 @pytest.mark.asyncio
-async def test_last_active_admin_query_excludes_disabled_memberships():
+async def test_owner_role_is_changed_only_by_ownership_transfer():
     tenant_id = uuid.uuid4()
-    actor = SimpleNamespace(id=uuid.uuid4(), role="platform_admin", tenant_id=None)
+    actor = SimpleNamespace(id=uuid.uuid4(), role="org_owner", tenant_id=tenant_id)
     target = SimpleNamespace(
-        id=uuid.uuid4(),
-        role="org_admin",
+        id=actor.id,
+        role="org_owner",
         tenant_id=tenant_id,
         is_active=True,
     )
-    db = SequenceDB([target, 1])
+    tenant = SimpleNamespace(id=tenant_id, owner_user_id=target.id)
+    db = SequenceDB([target, tenant])
 
     with pytest.raises(HTTPException) as exc:
         await users.update_user_role(
@@ -175,8 +182,8 @@ async def test_last_active_admin_query_excludes_disabled_memberships():
             db,
         )
 
-    assert exc.value.status_code == 400
-    assert "users.is_active IS true" in str(db.statements[1])
+    assert exc.value.status_code == 409
+    assert target.role == "org_owner"
 
 
 @pytest.mark.asyncio
@@ -261,10 +268,15 @@ async def test_org_admin_cannot_change_global_identity_email(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_platform_admin_email_change_revokes_both_token_families(monkeypatch):
+async def test_platform_operator_cannot_change_company_member_identity_without_membership():
     tenant_id = uuid.uuid4()
     identity_id = uuid.uuid4()
-    actor = SimpleNamespace(id=uuid.uuid4(), role="platform_admin", tenant_id=None)
+    actor = SimpleNamespace(
+        id=uuid.uuid4(),
+        role="platform_admin",
+        tenant_id=None,
+        identity=SimpleNamespace(is_platform_admin=True),
+    )
     identity = SimpleNamespace(
         id=identity_id,
         email="old@example.com",
@@ -284,44 +296,20 @@ async def test_platform_admin_email_change_revokes_both_token_families(monkeypat
     )
     db = SequenceDB([target, identity, None])
 
-    from app.services import password_reset_service
-    from app.services.email_verification_service import email_verification_service
-    from app.services.registration_service import registration_service
+    with pytest.raises(HTTPException) as exc:
+        await organization.admin_update_user(
+            target.id,
+            UserUpdate(email="new@example.com"),
+            actor,
+            db,
+        )
 
-    invalidate_email = AsyncMock()
-    invalidate_reset = AsyncMock()
-    monkeypatch.setattr(
-        email_verification_service,
-        "invalidate_email_verification_tokens",
-        invalidate_email,
-    )
-    monkeypatch.setattr(
-        password_reset_service,
-        "invalidate_password_reset_tokens",
-        invalidate_reset,
-    )
-    monkeypatch.setattr(
-        registration_service,
-        "sync_org_member_contact_from_user",
-        AsyncMock(),
-    )
-    monkeypatch.setattr(organization.UserOut, "model_validate", lambda value: value)
-
-    result = await organization.admin_update_user(
-        target.id,
-        UserUpdate(email="new@example.com"),
-        actor,
-        db,
-    )
-
-    assert result is target
-    assert identity.email == "new@example.com"
-    assert identity.email_verified is False
-    assert identity.auth_version == 1
-    assert target.identity is identity
-    invalidate_email.assert_awaited_once_with(identity_id)
-    invalidate_reset.assert_awaited_once_with(identity_id)
-    assert db.flushed is True
+    assert exc.value.status_code == 403
+    assert identity.email == "old@example.com"
+    assert identity.email_verified is True
+    assert identity.auth_version == 0
+    assert db.statements == []
+    assert db.flushed is False
 
 
 @pytest.mark.asyncio
@@ -393,10 +381,15 @@ async def test_org_admin_full_form_with_unchanged_global_fields_updates_profile(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("role", "expected_status"),
-    [("member", 403), ("platform_admin", 400)],
+    [("member", 403), ("platform_admin", 403)],
 )
 async def test_tenantless_user_cannot_list_every_organization(role, expected_status):
-    actor = SimpleNamespace(id=uuid.uuid4(), role=role, tenant_id=None)
+    actor = SimpleNamespace(
+        id=uuid.uuid4(),
+        role=role,
+        tenant_id=None,
+        identity=SimpleNamespace(is_platform_admin=role == "platform_admin"),
+    )
     db = FakeDB(None)
 
     with pytest.raises(HTTPException) as exc:

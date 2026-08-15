@@ -18,9 +18,6 @@ from app.models.user import User
 from app.core.permissions import get_agent_access_level_for_user_id, is_agent_expired
 
 
-CHAT_SESSION_AUDIT_ROLES = frozenset({"platform_admin", "org_admin"})
-
-
 class ChatSessionAuthorizationError(PermissionError):
     """An exact user-owned conversation lane is no longer authorized."""
 
@@ -167,16 +164,14 @@ def can_audit_agent_chat_sessions(
 ) -> bool:
     """Return whether a user may cross another session owner's boundary.
 
-    ``agent_admin`` is deliberately not a company-wide audit role. It only
-    gains this visibility for an Agent that has an explicit effective
-    ``manage`` grant. Agent creators retain the same per-Agent authority.
+    Chat audit is an Agent-object authority, not a linear role-hierarchy
+    shortcut. Creators, company governors of non-private Agents, and explicit
+    delegated managers all arrive here with effective ``manage`` access.
+    Platform authority and the legacy ``agent_admin`` value grant nothing by
+    themselves.
     """
 
-    if user.role in CHAT_SESSION_AUDIT_ROLES:
-        return True
-    if agent is not None and str(agent.creator_id) == str(user.id):
-        return True
-    return user.role == "agent_admin" and agent_access_level == "manage"
+    return agent is not None and agent_access_level == "manage"
 
 
 async def require_authorized_agent_chat_session(

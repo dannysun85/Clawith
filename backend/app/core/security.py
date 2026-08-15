@@ -136,6 +136,7 @@ def create_access_token(
     expires_delta: timedelta | None = None,
     *,
     auth_version: int,
+    mfa_verified: bool = False,
 ) -> str:
     """Create a JWT access token."""
     expire = datetime.now(timezone.utc) + (
@@ -145,6 +146,7 @@ def create_access_token(
         "sub": user_id,
         "role": role,
         "av": max(0, int(auth_version)),
+        "mfa": bool(mfa_verified),
         "exp": expire,
     }
     return jwt.encode(to_encode, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
@@ -173,6 +175,44 @@ def access_token_matches_identity(payload: dict, identity: object) -> bool:
     except (TypeError, ValueError):
         return False
     return token_version >= 0 and identity_version >= 0 and token_version == identity_version
+
+
+def access_token_mfa_verified(payload: dict) -> bool:
+    """Accept only the literal boolean claim set after an MFA ceremony."""
+
+    return payload.get("mfa") is True
+
+
+def access_context_mfa_verified(user: object) -> bool:
+    """Read the assurance attached by an authentication dependency."""
+
+    return getattr(user, "_access_token_mfa_verified", False) is True
+
+
+def mfa_access_error_code(payload: dict, user: object) -> str | None:
+    """Return the MFA gate which blocks one business access token."""
+
+    from app.services.mfa_service import identity_requires_mfa
+
+    identity = getattr(user, "identity", None)
+    enabled = bool(getattr(identity, "mfa_enabled", False))
+    if enabled and not access_token_mfa_verified(payload):
+        return "mfa_challenge_required"
+    if identity_requires_mfa(user) and not enabled:
+        return "mfa_setup_required"
+    return None
+
+
+def _raise_mfa_access_error(code: str) -> None:
+    message = (
+        "Multi-factor authentication setup is required"
+        if code == "mfa_setup_required"
+        else "Multi-factor authentication is required"
+    )
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={"code": code, "message": message},
+    )
 
 
 def identity_auth_version(user_or_identity: object) -> int:
@@ -292,6 +332,10 @@ async def get_current_user_for_access_token(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Organization is unavailable",
             )
+    mfa_error = mfa_access_error_code(payload, user)
+    if mfa_error:
+        _raise_mfa_access_error(mfa_error)
+    user._access_token_mfa_verified = access_token_mfa_verified(payload)
     # Authentication is a read-only preflight. Release the pooled connection
     # before the endpoint performs CPU work or external network I/O.
     await db.commit()
@@ -354,6 +398,7 @@ async def get_authenticated_user(
         or not access_token_matches_identity(payload, user.identity)
     ):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+    user._access_token_mfa_verified = access_token_mfa_verified(payload)
     await db.commit()
     return user
 
@@ -386,14 +431,72 @@ async def get_verification_user(
         or not (user.is_active or user.activation_pending_email_verification)
     ):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+    user._access_token_mfa_verified = access_token_mfa_verified(payload)
     await db.commit()
     return user
 
 
 async def get_current_admin(current_user=Depends(get_current_user)):
-    """Dependency to require admin role (platform_admin or org_admin)."""
-    identity_is_platform_admin = bool(getattr(getattr(current_user, "identity", None), "is_platform_admin", False))
-    if current_user.role not in ("platform_admin", "org_admin") and not identity_is_platform_admin:
+    """Deprecated compatibility dependency for explicitly dual-scope APIs.
+
+    New routes must choose ``get_company_governor`` or
+    ``get_platform_operator``.  A resource API that intentionally supports
+    both authorities may use ``get_company_or_platform_admin`` and must still
+    enforce the concrete resource scope.
+    """
+    return await get_company_or_platform_admin(current_user)
+
+
+async def get_company_governor(current_user=Depends(get_current_user)):
+    """Require an active org_admin/org_owner membership in the current tenant."""
+    from app.services.access_control import is_company_governor
+
+    if not is_company_governor(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "company_governance_required",
+                "message": "Company governance access required",
+            },
+        )
+    return current_user
+
+
+async def get_company_owner(current_user=Depends(get_current_user)):
+    """Require the unique owner membership of the current tenant."""
+    from app.services.access_control import is_company_owner
+
+    if not is_company_owner(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "company_owner_required",
+                "message": "Company owner access required",
+            },
+        )
+    return current_user
+
+
+async def get_platform_operator(current_user=Depends(get_current_user)):
+    """Require global platform authority from Identity, never from membership."""
+    from app.services.access_control import is_platform_operator
+
+    if not is_platform_operator(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "platform_operator_required",
+                "message": "Platform operator access required",
+            },
+        )
+    return current_user
+
+
+async def get_company_or_platform_admin(current_user=Depends(get_current_user)):
+    """Require either explicit company governance or global platform authority."""
+    from app.services.access_control import is_company_governor, is_platform_operator
+
+    if not (is_company_governor(current_user) or is_platform_operator(current_user)):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
     return current_user
 
@@ -405,10 +508,9 @@ async def get_saas_admin(current_user=Depends(get_current_user)):
     pools, and model routes share this boundary. A tenant ``org_admin`` must
     never be able to mutate those platform-wide resources.
     """
-    identity_is_platform_admin = bool(
-        getattr(getattr(current_user, "identity", None), "is_platform_admin", False)
-    )
-    is_platform_admin = current_user.role == "platform_admin" or identity_is_platform_admin
+    from app.services.access_control import is_platform_operator
+
+    is_platform_admin = is_platform_operator(current_user)
     expected_email = (settings.SAAS_ADMIN_EMAIL or "").strip().lower()
     user_email = (getattr(current_user, "email", None) or "").strip().lower()
     if not is_platform_admin or not expected_email or user_email != expected_email:
@@ -419,20 +521,23 @@ async def get_saas_admin(current_user=Depends(get_current_user)):
     return current_user
 
 
-# Role hierarchy: higher index = more privileges
-ROLE_HIERARCHY = ["member", "agent_admin", "org_admin", "platform_admin"]
-
-
 def require_role(*allowed_roles: str):
-    """Factory to create a dependency that checks if the user has one of the allowed roles.
+    """Compatibility factory with exact, independent role axes.
 
-    Usage:
-        @router.post("/", dependencies=[Depends(require_role("org_admin", "platform_admin"))])
-        async def my_endpoint(...):
+    ``platform_admin`` maps only to the global Identity role. Membership roles
+    are exact and ``agent_admin`` grants nothing. New code should use the
+    named dependencies above so a route has one obvious authority boundary.
     """
     async def _check(current_user=Depends(get_current_user)):
-        identity_is_platform_admin = bool(getattr(getattr(current_user, "identity", None), "is_platform_admin", False))
-        if current_user.role not in allowed_roles and not ("platform_admin" in allowed_roles and identity_is_platform_admin):
+        from app.services.access_control import (
+            is_platform_operator,
+            normalized_membership_role,
+        )
+
+        membership_role = normalized_membership_role(current_user)
+        membership_allowed = membership_role is not None and membership_role in allowed_roles
+        platform_allowed = "platform_admin" in allowed_roles and is_platform_operator(current_user)
+        if not membership_allowed and not platform_allowed:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"需要以下角色之一: {', '.join(allowed_roles)}",

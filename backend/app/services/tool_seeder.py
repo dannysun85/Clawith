@@ -993,7 +993,7 @@ BUILTIN_TOOLS = [
                     "label": "Allow Network Access",
                     "type": "checkbox",
                     "default": False,
-                    "read_only_for_roles": ["agent_admin", "member"],
+                    "read_only_for_roles": ["org_owner", "org_admin", "agent_admin", "member"],
                 },
                 {
                     "key": "default_timeout",
@@ -1053,7 +1053,7 @@ BUILTIN_TOOLS = [
                     "label": "Allow Network Access",
                     "type": "checkbox",
                     "default": False,
-                    "read_only_for_roles": ["org_admin", "agent_admin", "member"],
+                    "read_only_for_roles": ["org_owner", "org_admin", "agent_admin", "member"],
                 },
                 {
                     "key": "default_timeout",

@@ -16,6 +16,16 @@ class AuditLog(Base):
     __tablename__ = "audit_logs"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "tenants.id",
+            ondelete="SET NULL",
+            name="fk_audit_logs_tenant_id_tenants",
+        ),
+        nullable=True,
+        index=True,
+    )
     user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
     agent_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("agents.id", ondelete="SET NULL")
@@ -141,9 +151,29 @@ class EnterpriseInfo(Base):
     """Centralized enterprise information with versioning for sync."""
 
     __tablename__ = "enterprise_info"
+    __table_args__ = (
+        Index(
+            "uq_enterprise_info_tenant_type",
+            "tenant_id",
+            "info_type",
+            unique=True,
+            postgresql_where=text("tenant_id IS NOT NULL"),
+            sqlite_where=text("tenant_id IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    info_type: Mapped[str] = mapped_column(String(50), nullable=False, unique=True)  # org_structure, company_profile, etc.
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "tenants.id",
+            ondelete="CASCADE",
+            name="fk_enterprise_info_tenant_id_tenants",
+        ),
+        nullable=True,
+        index=True,
+    )
+    info_type: Mapped[str] = mapped_column(String(50), nullable=False)  # org_structure, company_profile, etc.
     content: Mapped[dict] = mapped_column(JSON, nullable=False)
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     visible_roles: Mapped[list] = mapped_column(JSON, default=[])  # Which agent roles can see this

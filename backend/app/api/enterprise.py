@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 import uuid
 import hashlib
 from dataclasses import dataclass
@@ -16,15 +17,22 @@ from sqlalchemy.orm import aliased
 
 from app.config import get_settings
 from app.core.permissions import build_manageable_agents_query
-from app.core.security import encrypt_data, get_current_admin, get_current_user
+from app.core.security import (
+    encrypt_data,
+    get_company_governor,
+    get_company_or_platform_admin,
+    get_current_user,
+    get_platform_operator,
+)
 from app.database import async_session, get_db
 from app.models.org import OrgDepartment, OrgMember
 from app.models.identity import IdentityProvider
-from app.models.invitation_code import InvitationCode
+from app.models.identity_governance import OrganizationJoinLink
 from app.models.system_settings import SystemSetting
 from app.models.tenant import Tenant
 from app.models.user import Identity, User
 from app.services.org_sync_adapter import derive_member_department_paths
+from app.services.google_workspace_oauth import local_oidc_emulator_base_url
 from app.models.agent import Agent
 from app.models.llm import LLMModel
 from app.models.subscription import ModelRoute
@@ -103,8 +111,33 @@ def _validate_provider_token_limit(provider: str, value: int | None) -> None:
 
 
 def _is_platform_admin_user(user: User) -> bool:
-    """Return true for tenant-role or identity-level platform admins."""
-    return user.role == "platform_admin" or bool(getattr(getattr(user, "identity", None), "is_platform_admin", False))
+    """Return global platform authority from Identity only."""
+    from app.services.access_control import is_platform_operator
+
+    return is_platform_operator(user)
+
+
+def _is_platform_surface_operator(user: User) -> bool:
+    """Whether the caller is operating through the tenantless platform shell."""
+
+    return user.tenant_id is None and _is_platform_admin_user(user)
+
+
+def _require_identity_provider_scope(
+    user: User,
+    provider_tenant_id: uuid.UUID | None,
+) -> None:
+    """Match provider scope to one explicit product surface."""
+
+    if provider_tenant_id is None:
+        if not _is_platform_surface_operator(user):
+            raise HTTPException(status_code=403, detail="Global provider access requires the platform surface")
+        return
+
+    from app.services.access_control import is_company_governor
+
+    if user.tenant_id != provider_tenant_id or not is_company_governor(user):
+        raise HTTPException(status_code=403, detail="Company provider access denied")
 
 
 def _require_platform_model_admin(user: User) -> None:
@@ -397,7 +430,7 @@ async def _record_llm_tool_capability(
 @router.post("/llm-test")
 async def test_llm_model(
     data: LLMTestRequest,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_platform_operator),
 ):
     """Test connectivity and native structured tool calling independently."""
     import time
@@ -522,12 +555,10 @@ async def list_llm_models(
 ):
     """List real LLM models for the platform SaaS control plane."""
     _require_platform_model_admin(current_user)
-    # Authorization: non-platform admins can only see their own tenant's models
-    if tenant_id and current_user.role != "platform_admin":
-        if str(current_user.tenant_id) != tenant_id:
-            raise HTTPException(status_code=403, detail="Cannot access other tenant's models")
 
-    tid = tenant_id or str(current_user.tenant_id) if current_user.tenant_id else None
+    tid = tenant_id if tenant_id is not None else (
+        str(current_user.tenant_id) if current_user.tenant_id else None
+    )
     query = select(LLMModel).order_by(LLMModel.created_at.desc())
     if platform_only:
         query = query.where(LLMModel.tenant_id.is_(None))
@@ -550,7 +581,7 @@ async def add_llm_model(
     data: LLMModelCreate,
     tenant_id: str | None = None,
     platform: bool = False,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_platform_operator),
     db: AsyncSession = Depends(get_db),
 ):
     """Add a new LLM model. platform=true → platform-level (tenant_id=null, key from credential pool)."""
@@ -591,7 +622,7 @@ async def add_llm_model(
 @router.post("/llm-models/{model_id}/set-default", status_code=status.HTTP_204_NO_CONTENT)
 async def set_default_llm_model(
     model_id: uuid.UUID,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_platform_operator),
     db: AsyncSession = Depends(get_db),
 ):
     """Mark this model as the tenant's default for new agents."""
@@ -648,7 +679,7 @@ async def set_default_llm_model(
 async def remove_llm_model(
     model_id: uuid.UUID,
     force: bool = False,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_platform_operator),
     db: AsyncSession = Depends(get_db),
 ):
     """Remove an LLM model from the pool.
@@ -698,7 +729,7 @@ async def remove_llm_model(
 async def update_llm_model(
     model_id: uuid.UUID,
     data: LLMModelUpdate,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_platform_operator),
     db: AsyncSession = Depends(get_db),
 ):
     """Update an existing LLM model in the pool (admin)."""
@@ -777,7 +808,13 @@ async def list_enterprise_info(
     db: AsyncSession = Depends(get_db),
 ):
     """List all enterprise information entries."""
-    result = await db.execute(select(EnterpriseInfo).order_by(EnterpriseInfo.info_type))
+    if current_user.tenant_id is None:
+        raise HTTPException(status_code=403, detail="Company membership required")
+    result = await db.execute(
+        select(EnterpriseInfo)
+        .where(EnterpriseInfo.tenant_id == current_user.tenant_id)
+        .order_by(EnterpriseInfo.info_type)
+    )
     return [EnterpriseInfoOut.model_validate(e) for e in result.scalars().all()]
 
 
@@ -785,15 +822,25 @@ async def list_enterprise_info(
 async def update_enterprise_info(
     info_type: str,
     data: EnterpriseInfoUpdate,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_company_governor),
     db: AsyncSession = Depends(get_db),
 ):
     """Create or update enterprise information. Triggers sync to agents."""
+    if current_user.tenant_id is None:
+        raise HTTPException(status_code=403, detail="Company membership required")
     info = await enterprise_sync_service.update_enterprise_info(
-        db, info_type, data.content, data.visible_roles, current_user.id
+        db,
+        tenant_id=current_user.tenant_id,
+        info_type=info_type,
+        content=data.content,
+        visible_roles=data.visible_roles,
+        updated_by=current_user.id,
     )
     # Sync to all running agents
-    await enterprise_sync_service.sync_to_all_agents(db)
+    await enterprise_sync_service.sync_to_all_agents(
+        db,
+        tenant_id=current_user.tenant_id,
+    )
     return EnterpriseInfoOut.model_validate(info)
 
 
@@ -811,18 +858,20 @@ async def list_approvals(
     """List approval requests scoped to a tenant."""
     query = select(ApprovalRequest)
     # Scope by tenant: only show approvals for agents belonging to this tenant
-    tid = tenant_id or (str(current_user.tenant_id) if current_user.tenant_id else None)
+    if tenant_id and str(current_user.tenant_id or "") != tenant_id:
+        raise HTTPException(status_code=403, detail="Cannot access another company's approvals")
+    tid = str(current_user.tenant_id) if current_user.tenant_id else None
     if tid:
         tenant_agent_ids = select(Agent.id).where(Agent.tenant_id == tid)
         query = query.where(ApprovalRequest.agent_id.in_(tenant_agent_ids))
-    # Platform operators may audit the queue. Tenant users only see approvals
-    # for Agents they can manage; this keeps private assistants owner-only.
-    if not _is_platform_admin_user(current_user):
-        manageable_agent_ids = build_manageable_agents_query(
-            current_user,
-            tenant_id=current_user.tenant_id,
-        ).with_only_columns(Agent.id)
-        query = query.where(ApprovalRequest.agent_id.in_(manageable_agent_ids))
+    # Every business user sees only approvals for Agents they can manage.
+    # Platform authority never bypasses this object check and private
+    # assistants remain owner-only.
+    manageable_agent_ids = build_manageable_agents_query(
+        current_user,
+        tenant_id=current_user.tenant_id,
+    ).with_only_columns(Agent.id)
+    query = query.where(ApprovalRequest.agent_id.in_(manageable_agent_ids))
     if status_filter:
         query = query.where(ApprovalRequest.status == status_filter)
     response.headers["Cache-Control"] = "no-store"
@@ -875,18 +924,27 @@ async def list_audit_logs(
     agent_id: uuid.UUID | None = None,
     tenant_id: str | None = None,
     limit: int = 50,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_company_governor),
     db: AsyncSession = Depends(get_db),
 ):
     """List audit logs scoped to a tenant (admin only)."""
-    query = select(AuditLog).order_by(AuditLog.created_at.desc()).limit(limit)
-    # Scope by tenant: only show logs for agents belonging to this tenant
-    tid = tenant_id or (str(current_user.tenant_id) if current_user.tenant_id else None)
-    if tid:
-        tenant_agent_ids = select(Agent.id).where(Agent.tenant_id == tid)
-        query = query.where(AuditLog.agent_id.in_(tenant_agent_ids))
+    if tenant_id and str(current_user.tenant_id or "") != tenant_id:
+        raise HTTPException(status_code=403, detail="Cannot access another company's audit log")
+    tid = current_user.tenant_id
+    if tid is None:
+        raise HTTPException(status_code=403, detail="Company membership required")
+    tenant_agent_ids = select(Agent.id).where(Agent.tenant_id == tid)
+    tenant_user_ids = select(User.id).where(User.tenant_id == tid)
+    query = select(AuditLog).where(
+        or_(
+            AuditLog.tenant_id == tid,
+            AuditLog.agent_id.in_(tenant_agent_ids),
+            AuditLog.user_id.in_(tenant_user_ids),
+        )
+    )
     if agent_id:
         query = query.where(AuditLog.agent_id == agent_id)
+    query = query.order_by(AuditLog.created_at.desc()).limit(limit)
     result = await db.execute(query)
     return [AuditLogOut.model_validate(log) for log in result.scalars().all()]
 
@@ -896,16 +954,14 @@ async def list_audit_logs(
 @router.get("/stats")
 async def get_enterprise_stats(
     tenant_id: str | None = None,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_company_governor),
     db: AsyncSession = Depends(get_db),
 ):
     """Get enterprise dashboard statistics, optionally scoped to a tenant."""
     # Determine which tenant to filter by
-    tid = tenant_id
-    if tid and isinstance(tid, str):
-        tid = uuid.UUID(tid)
-    elif not tid:
-        tid = current_user.tenant_id
+    if tenant_id and str(current_user.tenant_id or "") != tenant_id:
+        raise HTTPException(status_code=403, detail="Cannot access another company's statistics")
+    tid = current_user.tenant_id
 
     # Base queries
     agent_q = select(func.count(Agent.id))
@@ -980,7 +1036,7 @@ async def get_tenant_quotas(
 @router.patch("/tenant-quotas")
 async def update_tenant_quotas(
     data: TenantQuotaUpdate,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_company_governor),
     db: AsyncSession = Depends(get_db),
 ):
     """Update tenant quota defaults (admin only). Enforces heartbeat floor on existing agents."""
@@ -1037,7 +1093,7 @@ class TestEmailRequest(BaseModel):
 @router.post("/system-email/test")
 async def send_test_email_endpoint(
     data: TestEmailRequest,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_platform_operator),
     db: AsyncSession = Depends(get_db),
 ):
     """Send a test email to verify SMTP configuration (admin only)."""
@@ -1073,7 +1129,7 @@ async def send_test_email_endpoint(
 
 @router.get("/email-templates")
 async def get_email_templates_endpoint(
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_platform_operator),
     db: AsyncSession = Depends(get_db),
 ):
     """Get email templates (current values + available variables per scenario)."""
@@ -1098,7 +1154,7 @@ class EmailTemplatesUpdate(BaseModel):
 @router.put("/email-templates")
 async def update_email_templates_endpoint(
     data: EmailTemplatesUpdate,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_platform_operator),
     db: AsyncSession = Depends(get_db),
 ):
     """Save email templates (admin only)."""
@@ -1145,9 +1201,10 @@ def _runtime_settings_tenant_id(current_user: User, requested_tenant_id: str | N
         tenant_id = uuid.UUID(str(raw_tenant_id))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Invalid tenant ID") from exc
-    if not _is_platform_admin_user(current_user):
-        if current_user.role != "org_admin" or current_user.tenant_id != tenant_id:
-            raise HTTPException(status_code=403, detail="Cannot manage another tenant's Runtime models")
+    from app.services.access_control import is_company_governor
+
+    if not is_company_governor(current_user) or current_user.tenant_id != tenant_id:
+        raise HTTPException(status_code=403, detail="Cannot manage another tenant's Runtime models")
     return tenant_id
 
 
@@ -1278,7 +1335,7 @@ async def get_notification_bar_public(
 @router.get("/system-settings/{key}")
 async def get_system_setting(
     key: str,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_platform_operator),
     db: AsyncSession = Depends(get_db),
 ):
     """Get a system setting by key."""
@@ -1307,7 +1364,7 @@ async def get_system_setting(
 async def update_system_setting(
     key: str,
     data: SettingUpdate,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_platform_operator),
     db: AsyncSession = Depends(get_db),
 ):
     """Create or update a system setting."""
@@ -1468,23 +1525,23 @@ async def list_identity_providers(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """List identity providers configured for the tenant."""
-    # Authorization: non-platform admins can only see their own tenant's providers
-    if tenant_id and not _is_platform_admin_user(current_user):
-        if str(current_user.tenant_id) != tenant_id:
-            raise HTTPException(status_code=403, detail="Cannot access other tenant's providers")
+    """List providers for the active company or the tenantless platform shell."""
+    if tenant_id and str(current_user.tenant_id or "") != tenant_id:
+        raise HTTPException(status_code=403, detail="Cannot access another company's providers")
 
     query = select(IdentityProvider).order_by(IdentityProvider.created_at.desc())
-    tid = tenant_id or (str(current_user.tenant_id) if current_user.tenant_id else None)
+    tid = str(current_user.tenant_id) if current_user.tenant_id else None
 
     if global_only:
-        if not _is_platform_admin_user(current_user):
+        if not _is_platform_surface_operator(current_user):
             raise HTTPException(status_code=403, detail="Only platform admin can access global identity providers")
         query = query.where(IdentityProvider.tenant_id.is_(None))
     elif tid:
         import uuid as _uuid
         query = query.where(IdentityProvider.tenant_id == _uuid.UUID(tid))
-    elif not _is_platform_admin_user(current_user):
+    elif _is_platform_surface_operator(current_user):
+        query = query.where(IdentityProvider.tenant_id.is_(None))
+    else:
         raise HTTPException(status_code=400, detail="tenant_id is required for identity providers")
 
     result = await db.execute(query)
@@ -1589,6 +1646,11 @@ def _clean_identity_provider_config(config: dict | None) -> dict:
     """Remove response-only metadata before persisting provider configuration."""
     cleaned = dict(config or {})
     cleaned.pop("_configured_secret_fields", None)
+    # Provider verification is operational evidence, never a tenant-editable
+    # configuration assertion.
+    cleaned.pop("provider_verified", None)
+    cleaned.pop("provider_verified_at", None)
+    cleaned.pop("_provider_verified_at", None)
     return cleaned
 
 
@@ -1600,6 +1662,8 @@ def _merge_identity_provider_config(
     merged = dict(existing or {})
     if incoming is not None:
         merged.update(_clean_identity_provider_config(incoming))
+    for key in ("provider_verified", "provider_verified_at", "_provider_verified_at"):
+        merged.pop(key, None)
     return merged
 
 
@@ -1705,7 +1769,43 @@ def validate_provider_config(
             status_code=422,
             detail="jit_provisioning_enabled must be a boolean",
         )
-    if jit_enabled and provider_type in {"google_workspace", "dingtalk"}:
+    if provider_type == "google_workspace":
+        try:
+            local_oidc_emulator_base_url(config)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    if jit_enabled and provider_type == "google_workspace":
+        raw_domains = config.get("jit_allowed_domains")
+        candidates = (
+            raw_domains.split(",")
+            if isinstance(raw_domains, str)
+            else raw_domains
+            if isinstance(raw_domains, list)
+            else []
+        )
+        domains: list[str] = []
+        for candidate in candidates:
+            domain = str(candidate).strip().casefold().rstrip(".")
+            if not domain:
+                continue
+            if not re.fullmatch(
+                r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+",
+                domain,
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail="jit_allowed_domains must contain bare DNS domains",
+                )
+            if domain not in domains:
+                domains.append(domain)
+        if not domains:
+            raise HTTPException(
+                status_code=422,
+                detail="Google Workspace JIT requires at least one verified hosted domain",
+            )
+        config["jit_allowed_domains"] = domains
+    if jit_enabled and provider_type == "dingtalk":
         raise HTTPException(
             status_code=422,
             detail=(
@@ -1772,6 +1872,53 @@ def _identity_provider_response(provider: IdentityProvider, sso_domain: str | No
     data = IdentityProviderOut.model_validate(provider).model_dump()
     data["config"] = _sanitize_identity_provider_config(provider.provider_type, provider.config)
     data["last_synced_at"] = (provider.config or {}).get("last_synced_at")
+    config = provider.config or {}
+    required_groups: dict[str, tuple[tuple[str, ...], ...]] = {
+        "google": (("client_id", "app_id"), ("client_secret", "app_secret")),
+        "github": (("client_id", "app_id"), ("client_secret", "app_secret")),
+        "feishu": (("app_id",), ("app_secret",)),
+        "dingtalk": (("app_key",), ("app_secret",)),
+        "wecom": (("corp_id", "app_id"), ("secret", "app_secret"), ("agent_id",)),
+        "google_workspace": (
+            ("client_id", "sso_client_id", "app_id"),
+            ("client_secret", "sso_client_secret", "app_secret"),
+        ),
+    }
+    groups = required_groups.get(str(provider.provider_type), ())
+    missing = [
+        "/".join(group)
+        for group in groups
+        if not any(str(config.get(key) or "").strip() for key in group)
+    ]
+    local_emulator_configured = bool(config.get("local_oidc_emulator_base_url"))
+    if not provider.is_active:
+        operational_status = "disabled"
+    elif missing:
+        operational_status = "missing_credentials"
+    elif not provider.sso_login_enabled:
+        operational_status = "configured_sso_disabled"
+    elif provider.provider_type == "google_workspace":
+        operational_status = "external_verification_pending"
+    else:
+        operational_status = "configuration_ready"
+    data["readiness"] = {
+        "operational_status": operational_status,
+        "missing_configuration": missing,
+        "sso_login": "enabled" if provider.sso_login_enabled and provider.is_active else "disabled",
+        "jit_policy": (
+            "member_only"
+            if config.get("jit_provisioning_enabled") is True
+            else "disabled"
+        ),
+        "provider_verified": False,
+        "provider_verification": (
+            "local_emulator_configured"
+            if local_emulator_configured
+            else "not_verified"
+            if provider.provider_type == "google_workspace"
+            else "not_recorded"
+        ),
+    }
     if sso_domain is not None:
         data["sso_domain"] = sso_domain
     return data
@@ -1780,7 +1927,7 @@ def _identity_provider_response(provider: IdentityProvider, sso_domain: str | No
 @router.post("/identity-providers", response_model=IdentityProviderOut)
 async def create_identity_provider(
     data: IdentityProviderCreate,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_company_or_platform_admin),
     db: AsyncSession = Depends(get_db),
 ):
     """Create a new identity provider (Admin only)."""
@@ -1792,21 +1939,20 @@ async def create_identity_provider(
             detail="Generic OAuth2/OIDC is not implemented in this release",
         )
 
-    # Validate and determine tenant_id
-    tid = data.tenant_id
-    is_platform_admin = _is_platform_admin_user(current_user)
-    if is_platform_admin:
-        # Platform admins can use any tenant_id (including None for global providers)
-        pass
-    else:
-        # Non-platform admins: use request tenant_id if provided, else fall back to user's tenant
-        if tid is None:
-            tid = current_user.tenant_id
-        elif str(tid) != str(current_user.tenant_id):
-            # Validate they can only manage their own tenant
+    # The selected surface fixes provider ownership. Company governors can
+    # create only in their current company; tenantless platform operators can
+    # create only global providers.
+    if current_user.tenant_id is not None:
+        if data.tenant_id is not None and data.tenant_id != current_user.tenant_id:
             raise HTTPException(status_code=403, detail="Can only create providers for your own tenant")
+        tid = current_user.tenant_id
+    else:
+        if data.tenant_id is not None:
+            raise HTTPException(status_code=403, detail="Platform operators cannot create tenant providers")
+        tid = None
+    _require_identity_provider_scope(current_user, tid)
 
-    if not tid and not (is_platform_admin and data.provider_type in {"google", "github"}):
+    if not tid and data.provider_type not in {"google", "github"}:
         raise HTTPException(status_code=400, detail="tenant_id is required to create an identity provider")
 
     config = _clean_identity_provider_config(data.config)
@@ -1861,7 +2007,7 @@ async def create_identity_provider(
 @router.post("/identity-providers/oauth2", response_model=IdentityProviderOut)
 async def create_oauth2_provider(
     data: IdentityProviderOAuth2Create,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_company_or_platform_admin),
     db: AsyncSession = Depends(get_db),
 ):
     """Create a new OAuth2 identity provider with simplified fields (app_id, app_secret, authorize_url, etc.)."""
@@ -1887,7 +2033,7 @@ class OAuth2ConfigUpdate(BaseModel):
 async def update_oauth2_provider(
     provider_id: uuid.UUID,
     data: OAuth2ConfigUpdate,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_company_or_platform_admin),
     db: AsyncSession = Depends(get_db),
 ):
     """Update an OAuth2 identity provider with simplified fields."""
@@ -1908,7 +2054,7 @@ class IdentityProviderUpdate(BaseModel):
 async def update_identity_provider(
     provider_id: uuid.UUID,
     data: IdentityProviderUpdate,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_company_or_platform_admin),
     db: AsyncSession = Depends(get_db),
 ):
     """Update an existing identity provider."""
@@ -1934,8 +2080,7 @@ async def update_identity_provider(
             ),
         )
 
-    if not _is_platform_admin_user(current_user) and provider.tenant_id != current_user.tenant_id:
-        raise HTTPException(status_code=403, detail="Not authorized to update this provider")
+    _require_identity_provider_scope(current_user, provider.tenant_id)
 
     if provider.tenant_id:
         await _acquire_sso_admin_lock(db)
@@ -2020,7 +2165,7 @@ async def update_identity_provider(
 @router.delete("/identity-providers/{provider_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_identity_provider(
     provider_id: uuid.UUID,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_company_or_platform_admin),
     db: AsyncSession = Depends(get_db),
 ):
     """Delete an identity provider."""
@@ -2034,8 +2179,7 @@ async def delete_identity_provider(
     if not provider:
         raise HTTPException(status_code=404, detail="Provider not found")
         
-    if not _is_platform_admin_user(current_user) and provider.tenant_id != current_user.tenant_id:
-        raise HTTPException(status_code=403, detail="Not authorized to delete this provider")
+    _require_identity_provider_scope(current_user, provider.tenant_id)
 
     if provider.tenant_id:
         await _acquire_sso_admin_lock(db)
@@ -2095,24 +2239,12 @@ async def list_org_departments(
     db: AsyncSession = Depends(get_db),
 ):
     """List all departments, optionally filtered by tenant or provider."""
-    # Tenant isolation rules:
-    # 1. If tenant_id param is explicitly provided:
-    #    - non-platform-admins: must match their own tenant_id
-    #    - platform_admin with a tenant in token: must match that tenant
-    #    - platform_admin without a tenant (global view): any tenant allowed
-    # 2. If tenant_id param is NOT provided:
-    #    - auto-scope to current_user.tenant_id when it is set (applies to ALL roles)
-    #    - only a platform_admin with NO tenant_id in token can query unrestricted
     effective_tenant_id = str(current_user.tenant_id) if current_user.tenant_id else None
-    is_global_admin = (current_user.role == "platform_admin" and not effective_tenant_id)
-
-    if tenant_id:
-        # Validate requested tenant against user context
-        if not is_global_admin and effective_tenant_id and effective_tenant_id != tenant_id:
-            raise HTTPException(status_code=403, detail="Cannot access other tenant's data")
-    else:
-        # Auto-scope: use the user's own tenant when available
-        tenant_id = effective_tenant_id  # None only for true global admin
+    if effective_tenant_id is None:
+        raise HTTPException(status_code=403, detail="Company membership required")
+    if tenant_id and tenant_id != effective_tenant_id:
+        raise HTTPException(status_code=403, detail="Cannot access other tenant's data")
+    tenant_id = effective_tenant_id
 
     query = select(OrgDepartment, IdentityProvider.name.label("provider_name"), IdentityProvider.provider_type).outerjoin(
         IdentityProvider, OrgDepartment.provider_id == IdentityProvider.id
@@ -2160,24 +2292,12 @@ async def list_org_members(
     db: AsyncSession = Depends(get_db),
 ):
     """List org members, optionally filtered by department, search, tenant, or provider."""
-    # Tenant isolation rules:
-    # 1. If tenant_id param is explicitly provided:
-    #    - non-platform-admins: must match their own tenant_id
-    #    - platform_admin with a tenant in token: must match that tenant
-    #    - platform_admin without a tenant (global view): any tenant allowed
-    # 2. If tenant_id param is NOT provided:
-    #    - auto-scope to current_user.tenant_id when it is set (applies to ALL roles)
-    #    - only a platform_admin with NO tenant_id in token can query unrestricted
     effective_tenant_id = str(current_user.tenant_id) if current_user.tenant_id else None
-    is_global_admin = (current_user.role == "platform_admin" and not effective_tenant_id)
-
-    if tenant_id:
-        # Validate requested tenant against user context
-        if not is_global_admin and effective_tenant_id and effective_tenant_id != tenant_id:
-            raise HTTPException(status_code=403, detail="Cannot access other tenant's data")
-    else:
-        # Auto-scope: use the user's own tenant when available
-        tenant_id = effective_tenant_id  # None only for true global admin
+    if effective_tenant_id is None:
+        raise HTTPException(status_code=403, detail="Company membership required")
+    if tenant_id and tenant_id != effective_tenant_id:
+        raise HTTPException(status_code=403, detail="Cannot access other tenant's data")
+    tenant_id = effective_tenant_id
 
     query = select(OrgMember, IdentityProvider.name.label("provider_name"), IdentityProvider.provider_type).outerjoin(
         IdentityProvider, OrgMember.provider_id == IdentityProvider.id
@@ -2239,7 +2359,7 @@ async def list_org_members(
 @router.post("/org/sync")
 async def trigger_org_sync(
     provider_id: str | None = None,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_company_governor),
     db: AsyncSession = Depends(get_db),
 ):
     """Manually trigger org structure sync from a specific identity provider."""
@@ -2261,7 +2381,7 @@ async def trigger_org_sync(
     if not provider.tenant_id:
         raise HTTPException(status_code=400, detail="Provider must be bound to a tenant")
 
-    if not _is_platform_admin_user(current_user) and provider.tenant_id != current_user.tenant_id:
+    if provider.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=403, detail="Cannot sync other tenant's provider")
 
     return await org_sync_service.sync_provider(db, provider_id)
@@ -2386,8 +2506,10 @@ class InvitationCodeCreate(BaseModel):
 
 
 def _require_tenant_admin(current_user: User) -> None:
-    """Check that the user is org_admin or platform_admin with a tenant."""
-    if current_user.role not in ("platform_admin", "org_admin"):
+    """Require a real company-governance membership."""
+    from app.services.access_control import is_company_governor
+
+    if not is_company_governor(current_user):
         raise HTTPException(status_code=403, detail="Requires admin privileges")
     if not current_user.tenant_id:
         raise HTTPException(status_code=400, detail="No company assigned")
@@ -2416,22 +2538,20 @@ async def create_invitation_codes(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Batch-create invitation codes for the current user's company."""
+    """Legacy route for explicit member-only organization join links."""
     _require_tenant_admin(current_user)
-    import random
-    import string
+    from app.services.identity_governance import issue_organization_join_link
 
     codes_created = []
     for _ in range(min(data.count, 100)):  # cap at 100 per batch
-        code_str = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
-        code = InvitationCode(
-            code=code_str,
+        issued = await issue_organization_join_link(
+            db,
             tenant_id=current_user.tenant_id,
             max_uses=data.max_uses,
-            created_by=current_user.id,
+            created_by_user_id=current_user.id,
+            expires_at=None,
         )
-        db.add(code)
-        codes_created.append(code_str)
+        codes_created.append(issued.raw_token)
 
     await db.commit()
     return {"created": len(codes_created), "codes": codes_created}
@@ -2450,9 +2570,7 @@ async def invite_users(
     if not data.emails:
         raise HTTPException(status_code=400, detail="No emails provided")
         
-    import random
-    import string
-    from app.services.system_email_service import send_company_invitation_email
+    from app.services.identity_governance import issue_organization_invitation
     from app.services.platform_service import platform_service
     from app.models.tenant import Tenant
     
@@ -2461,48 +2579,69 @@ async def invite_users(
     if not tenant:
         raise HTTPException(status_code=404, detail="Company not found")
 
-    await _ensure_invitation_email_enabled(db)
-
     base_url = await platform_service.get_public_base_url(db, request=request)
     
     invited_count = 0
-    codes = []
-    
     from app.core.identity_canonicalization import canonicalize_email
+
+    queued_deliveries = []
+    from app.services.outbound_email_service import (
+        delivery_public_payload,
+        dispatch_outbound_email,
+        enqueue_template_email,
+    )
+    from urllib.parse import urlencode
 
     for email in data.emails:
         email = canonicalize_email(email)
         if not email:
             continue
             
-        code_str = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
-        code = InvitationCode(
-            code=code_str,
+        issued = await issue_organization_invitation(
+            db,
             tenant_id=current_user.tenant_id,
-            max_uses=1,
-            created_by=current_user.id,
+            target_email=email,
+            invited_role="member",
+            invited_by_user_id=current_user.id,
         )
-        db.add(code)
-        codes.append(code)
-        
-        invite_url = f"{base_url}/login?code={code_str}&email={email}"
+        replaced_record_id = getattr(issued, "replaced_record_id", None)
+        if replaced_record_id:
+            from app.services.outbound_email_service import cancel_invitation_deliveries
+
+            await cancel_invitation_deliveries(db, replaced_record_id)
+        query = urlencode({"code": issued.raw_token, "email": email})
+        invite_url = f"{base_url}/login?{query}"
         
         inviter_name = current_user.display_name or current_user.username
         
-        # Use background task to send email
-        background_tasks.add_task(
-            send_company_invitation_email,
+        delivery = await enqueue_template_email(
+            db,
+            purpose="company_invitation",
             to=email,
-            inviter_name=inviter_name,
-            company_name=tenant.name,
-            invite_url=invite_url,
+            scenario_key="company_invitation",
+            variables={
+                "inviter_name": inviter_name,
+                "company_name": tenant.name,
+                "invite_url": invite_url,
+            },
+            tenant_id=current_user.tenant_id,
+            invitation_id=issued.record.id,
+            requested_by_user_id=current_user.id,
         )
+        queued_deliveries.append(delivery)
         invited_count += 1
 
     if invited_count > 0:
         await db.commit()
-        
-    return {"invited": invited_count, "message": "Invitations sent successfully"}
+        for delivery in queued_deliveries:
+            if delivery.status in {"queued", "retry_wait"}:
+                background_tasks.add_task(dispatch_outbound_email, delivery.id)
+
+    return {
+        "invited": invited_count,
+        "items": [delivery_public_payload(delivery) for delivery in queued_deliveries],
+        "message": "Invitations accepted for delivery",
+    }
 
 
 @router.get("/invitation-codes")
@@ -2513,34 +2652,34 @@ async def list_invitation_codes(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """List invitation codes for the current user's company."""
+    """Legacy-shaped list of organization join-link metadata."""
     _require_tenant_admin(current_user)
     from sqlalchemy import func as sqla_func
 
-    base_filter = InvitationCode.tenant_id == current_user.tenant_id
-    stmt = select(InvitationCode).where(base_filter)
-    count_stmt = select(sqla_func.count()).select_from(InvitationCode).where(base_filter)
+    base_filter = OrganizationJoinLink.tenant_id == current_user.tenant_id
+    stmt = select(OrganizationJoinLink).where(base_filter)
+    count_stmt = select(sqla_func.count()).select_from(OrganizationJoinLink).where(base_filter)
 
     if search:
-        stmt = stmt.where(InvitationCode.code.ilike(f"%{search}%"))
-        count_stmt = count_stmt.where(InvitationCode.code.ilike(f"%{search}%"))
+        stmt = stmt.where(OrganizationJoinLink.token_prefix.ilike(f"%{search}%"))
+        count_stmt = count_stmt.where(OrganizationJoinLink.token_prefix.ilike(f"%{search}%"))
 
     total_result = await db.execute(count_stmt)
     total = total_result.scalar() or 0
 
     offset = (max(page, 1) - 1) * page_size
     result = await db.execute(
-        stmt.order_by(InvitationCode.created_at.desc()).offset(offset).limit(page_size)
+        stmt.order_by(OrganizationJoinLink.created_at.desc()).offset(offset).limit(page_size)
     )
     codes = result.scalars().all()
     return {
         "items": [
             {
                 "id": str(c.id),
-                "code": c.code,
+                "code": f"{c.token_prefix}…",
                 "max_uses": c.max_uses,
                 "used_count": c.used_count,
-                "is_active": c.is_active,
+                "is_active": c.status == "active",
                 "created_at": c.created_at.isoformat() if c.created_at else None,
             }
             for c in codes
@@ -2557,28 +2696,28 @@ async def export_invitation_codes_csv(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Export invitation codes for the current user's company as CSV."""
+    """Export non-secret join-link metadata for the current company."""
     _require_tenant_admin(current_user)
     import csv
     import io
     from fastapi.responses import StreamingResponse
 
     result = await db.execute(
-        select(InvitationCode)
-        .where(InvitationCode.tenant_id == current_user.tenant_id)
-        .order_by(InvitationCode.created_at.asc())
+        select(OrganizationJoinLink)
+        .where(OrganizationJoinLink.tenant_id == current_user.tenant_id)
+        .order_by(OrganizationJoinLink.created_at.asc())
     )
     codes = result.scalars().all()
 
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["Code", "Max Uses", "Used Count", "Active", "Created At"])
+    writer.writerow(["Token Prefix", "Max Uses", "Used Count", "Status", "Created At"])
     for c in codes:
         writer.writerow([
-            c.code,
+            c.token_prefix,
             c.max_uses,
             c.used_count,
-            "Yes" if c.is_active else "No",
+            c.status,
             c.created_at.strftime("%Y-%m-%d %H:%M:%S") if c.created_at else "",
         ])
 
@@ -2600,14 +2739,15 @@ async def deactivate_invitation_code(
     _require_tenant_admin(current_user)
     import uuid as _uuid
     result = await db.execute(
-        select(InvitationCode).where(
-            InvitationCode.id == _uuid.UUID(code_id),
-            InvitationCode.tenant_id == current_user.tenant_id,
+        select(OrganizationJoinLink).where(
+            OrganizationJoinLink.id == _uuid.UUID(code_id),
+            OrganizationJoinLink.tenant_id == current_user.tenant_id,
         )
     )
     code = result.scalar_one_or_none()
     if not code:
         raise HTTPException(status_code=404, detail="Code not found")
-    code.is_active = False
+    if code.status == "active":
+        code.status = "revoked"
     await db.commit()
     return {"status": "deactivated"}

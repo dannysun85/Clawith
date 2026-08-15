@@ -196,7 +196,7 @@ async def test_handover_rejects_cross_tenant_or_inactive_target(monkeypatch):
             identity=SimpleNamespace(is_active=False),
         ),
     ):
-        db = _DB([agent, target])
+        db = _DB([agent, None, target])
         with pytest.raises(HTTPException) as exc:
             await advanced.handover_agent(
                 agent_id,
@@ -227,7 +227,7 @@ async def test_handover_rebuilds_manage_permission_and_relationship(monkeypatch)
         identity=SimpleNamespace(is_active=True),
         display_name="New owner",
     )
-    db = _DB([agent, new_creator, [], None])
+    db = _DB([agent, None, new_creator, [], None])
     monkeypatch.setattr(
         advanced,
         "check_agent_access",
@@ -259,3 +259,81 @@ async def test_handover_rebuilds_manage_permission_and_relationship(monkeypatch)
         agent,
         created_by_user_id=current_user.id,
     )
+
+
+@pytest.mark.asyncio
+async def test_handover_rejects_membership_personal_assistant(monkeypatch):
+    tenant_id = uuid.uuid4()
+    current_user = SimpleNamespace(id=uuid.uuid4())
+    agent = _agent(
+        uuid.uuid4(),
+        tenant_id,
+        current_user.id,
+        access_mode="private",
+    )
+    monkeypatch.setattr(
+        advanced,
+        "check_agent_access",
+        AsyncMock(return_value=(agent, "manage")),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await advanced.handover_agent(
+            agent.id,
+            advanced.HandoverRequest(new_creator_id=uuid.uuid4()),
+            current_user=current_user,
+            db=_DB([agent, uuid.uuid4()]),
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "personal_assistant_not_transferable"
+    assert agent.creator_id == current_user.id
+
+
+@pytest.mark.asyncio
+async def test_company_owner_can_reassign_non_private_agent(monkeypatch):
+    tenant_id = uuid.uuid4()
+    current_user = SimpleNamespace(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        role="org_owner",
+    )
+    old_creator_id = uuid.uuid4()
+    new_creator_id = uuid.uuid4()
+    agent = _agent(
+        uuid.uuid4(),
+        tenant_id,
+        old_creator_id,
+        access_mode="company",
+    )
+    new_creator = SimpleNamespace(
+        id=new_creator_id,
+        tenant_id=tenant_id,
+        is_active=True,
+        identity=SimpleNamespace(is_active=True),
+        display_name="Successor",
+    )
+    monkeypatch.setattr(
+        advanced,
+        "check_agent_access",
+        AsyncMock(return_value=(agent, "manage")),
+    )
+    ensure_relationships = AsyncMock(return_value=False)
+    monkeypatch.setattr(
+        access_relationships,
+        "ensure_access_granted_platform_relationships",
+        ensure_relationships,
+    )
+    db = _DB([agent, None, new_creator, [], None])
+
+    response = await advanced.handover_agent(
+        agent.id,
+        advanced.HandoverRequest(new_creator_id=new_creator_id),
+        current_user=current_user,
+        db=db,
+    )
+
+    assert response["status"] == "transferred"
+    assert agent.creator_id == new_creator_id
+    audit = next(item for item in db.added if item.__class__.__name__ == "AuditLog")
+    assert audit.details["company_owner_override"] is True

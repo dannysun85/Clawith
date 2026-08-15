@@ -19,6 +19,8 @@ import {
     shouldConfigureAgentChannels,
 } from '../utils/agentChannelSetup';
 import { buildOpenClawInstruction } from '../utils/openClawInstruction';
+import { useAuthStore } from '../stores';
+import { hasEffectiveCapability } from '../utils/productAccess';
 const STEPS = ['basicInfo', 'personality', 'skills', 'permissions', 'channel'] as const;
 const OPENCLAW_STEPS = ['basicInfo', 'permissions'] as const;
 
@@ -27,6 +29,9 @@ export default function AgentCreate() {
     const navigate = useNavigate();
     const location = useLocation();
     const queryClient = useQueryClient();
+    const user = useAuthStore((state) => state.user);
+    const canCreateCompanyWide = hasEffectiveCapability(user, 'agent.create.company');
+    const canCreatePrivate = hasEffectiveCapability(user, 'agent.create.private');
     const [step, setStep] = useState(0);
     const [error, setError] = useState('');
     const [upgradeUrl, setUpgradeUrl] = useState('');
@@ -48,7 +53,7 @@ export default function AgentCreate() {
         boundaries: '',
         preferred_tier: 'lite' as SaasTier,
         preferred_modality: 'text',
-        permission_scope_type: 'company',
+        permission_scope_type: canCreateCompanyWide ? 'company' : 'user',
         permission_access_level: 'use',
         max_tokens_per_day: '',
         max_tokens_per_month: '',
@@ -60,6 +65,15 @@ export default function AgentCreate() {
     const allowedTiers = useAllowedTiers();
     const agentCreationLimit = useAgentCreationLimit();
     const isChinese = i18n.language?.startsWith('zh') || false;
+
+    useEffect(() => {
+        const companyOnlyScope = form.permission_scope_type === 'company' || form.permission_scope_type === 'custom';
+        if (!canCreateCompanyWide && companyOnlyScope) {
+            setForm((current) => ({ ...current, permission_scope_type: canCreatePrivate ? 'user' : '' }));
+        } else if (!canCreatePrivate && form.permission_scope_type === 'user') {
+            setForm((current) => ({ ...current, permission_scope_type: canCreateCompanyWide ? 'company' : '' }));
+        }
+    }, [canCreateCompanyWide, canCreatePrivate, form.permission_scope_type]);
 
     useEffect(() => {
         if (!allowedTiers.length) return;
@@ -97,6 +111,7 @@ export default function AgentCreate() {
         },
         onSuccess: async (agent, variables) => {
             queryClient.invalidateQueries({ queryKey: ['agents'] });
+            queryClient.invalidateQueries({ queryKey: ['workforce-topology'] });
             queryClient.invalidateQueries({ queryKey: ['subscription-seats'] });
 
             // Bind every completed channel form through its provider endpoint.
@@ -124,7 +139,7 @@ export default function AgentCreate() {
             if (agent.api_key) {
                 setCreatedApiKey(agent.api_key);
             } else {
-                navigate(`/agents/${agent.id}`);
+                navigate(`/employees?view=directory&highlight=${agent.id}&created=1`);
             }
         },
         onError: (err: any) => {
@@ -287,7 +302,7 @@ export default function AgentCreate() {
         );
     }
 
-    if (!agentCreationLimit.isLoading && agentCreationLimit.isLimited) {
+    if ((canCreateCompanyWide || canCreatePrivate) && !agentCreationLimit.isLoading && agentCreationLimit.isLimited) {
         const limitText = agentLimitMessage(
             isChinese,
             agentCreationLimit.activeCount,
@@ -311,6 +326,27 @@ export default function AgentCreate() {
                         onClick={() => navigate(SUBSCRIPTION_UPGRADE_PATH)}
                     >
                         {t('subscription.goToDetail', isChinese ? '去套餐详情' : 'Go to subscription')}
+                    </button>
+                </div>
+            </div>
+        );
+    }
+
+    if (!canCreateCompanyWide && !canCreatePrivate) {
+        return (
+            <div>
+                <div className="page-header"><h1 className="page-title">{t('nav.newAgent')}</h1></div>
+                <div className="card" style={{ maxWidth: '640px' }}>
+                    <h3 style={{ margin: '0 0 8px', fontWeight: 600, fontSize: '16px' }}>
+                        {isChinese ? '当前没有创建权限' : 'Creation access is not available'}
+                    </h3>
+                    <p style={{ color: 'var(--text-secondary)', fontSize: '13px', lineHeight: 1.6 }}>
+                        {isChinese
+                            ? '公司策略未允许普通成员创建私有 Agent。你的私人助理仍可使用；如需公司数字员工，请联系公司管理员。'
+                            : 'Company policy does not allow members to create private Agents. Your private assistant remains available; ask a company admin for a company employee.'}
+                    </p>
+                    <button type="button" className="btn btn-secondary" onClick={() => navigate('/employees')}>
+                        {isChinese ? '返回数字员工中心' : 'Back to digital employees'}
                     </button>
                 </div>
             </div>
@@ -404,9 +440,15 @@ export default function AgentCreate() {
                         <label className="form-label">{t('wizard.step4.title')}</label>
                         <div style={{ display: 'flex', gap: '8px' }}>
                             {[
-                                { value: 'company', label: t('wizard.step4.companyWide'), desc: t('wizard.step4.companyWideDesc') },
-                                { value: 'user', label: t('wizard.step4.selfOnly'), desc: t('wizard.step4.selfOnlyDesc') },
-                                { value: 'custom', label: t('agent.settings.perm.custom', 'Custom'), desc: t('agent.settings.perm.customDesc', 'Only selected members and agents can see and use it. Plaza is disabled') },
+                                ...(canCreateCompanyWide
+                                    ? [{ value: 'company', label: t('wizard.step4.companyWide'), desc: t('wizard.step4.companyWideDesc') }]
+                                    : []),
+                                ...(canCreatePrivate
+                                    ? [{ value: 'user', label: t('wizard.step4.selfOnly'), desc: t('wizard.step4.selfOnlyDesc') }]
+                                    : []),
+                                ...(canCreateCompanyWide
+                                    ? [{ value: 'custom', label: t('agent.settings.perm.custom', 'Custom'), desc: t('agent.settings.perm.customDesc', 'Only selected members and agents can see and use it. Plaza is disabled') }]
+                                    : []),
                             ].map((scope) => (
                                 <label key={scope.value} style={{
                                     flex: 1, display: 'flex', alignItems: 'center', gap: '10px', padding: '12px',
@@ -598,9 +640,9 @@ export default function AgentCreate() {
                         <h3 style={{ marginBottom: '20px', fontWeight: 600, fontSize: '15px' }}>{t('wizard.step4.title')}</h3>
                         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '20px' }}>
                             {[
-                                { value: 'company', label: t('wizard.step4.companyWide'), desc: t('wizard.step4.companyWideDesc') },
-                                { value: 'user', label: t('wizard.step4.selfOnly'), desc: t('wizard.step4.selfOnlyDesc') },
-                                { value: 'custom', label: t('agent.settings.perm.custom', 'Custom'), desc: t('agent.settings.perm.customDesc', 'Only selected members and agents can see and use it. Plaza is disabled') },
+                                ...(canCreateCompanyWide ? [{ value: 'company', label: t('wizard.step4.companyWide'), desc: t('wizard.step4.companyWideDesc') }] : []),
+                                ...(canCreatePrivate ? [{ value: 'user', label: t('wizard.step4.selfOnly'), desc: t('wizard.step4.selfOnlyDesc') }] : []),
+                                ...(canCreateCompanyWide ? [{ value: 'custom', label: t('agent.settings.perm.custom', 'Custom'), desc: t('agent.settings.perm.customDesc', 'Only selected members and agents can see and use it. Plaza is disabled') }] : []),
                             ].map((scope) => (
                                 <label key={scope.value} style={{
                                     display: 'flex', alignItems: 'center', gap: '12px', padding: '14px',

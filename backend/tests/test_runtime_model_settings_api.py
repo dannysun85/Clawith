@@ -105,7 +105,7 @@ async def test_runtime_model_settings_reject_ineligible_models(
             ),
             tenant_id=str(tenant_id),
             current_user=SimpleNamespace(
-                role="platform_admin",
+                role="org_admin",
                 identity=None,
                 tenant_id=tenant_id,
             ),  # type: ignore[arg-type]
@@ -139,7 +139,7 @@ async def test_runtime_model_settings_accept_connection_verified_model_without_t
             ),
             tenant_id=str(tenant_id),
             current_user=SimpleNamespace(
-                role="platform_admin",
+                role="org_admin",
                 identity=None,
                 tenant_id=tenant_id,
             ),  # type: ignore[arg-type]

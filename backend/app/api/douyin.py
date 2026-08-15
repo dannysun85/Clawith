@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.core.permissions import build_visible_agents_query, check_agent_access
 from app.core.events import get_redis
-from app.core.security import get_current_admin, get_current_user
+from app.core.security import get_company_governor, get_current_user
 from app.database import get_db
 from app.models.audit import AuditLog
 from app.models.agent import Agent
@@ -94,7 +94,7 @@ async def list_douyin_accounts(
 @router.post("/oauth/start", response_model=DouyinOAuthStartOut)
 async def start_douyin_oauth(
     data: DouyinOAuthStartRequest,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_company_governor),
     db: AsyncSession = Depends(get_db),
 ):
     """Create an official Douyin OAuth authorization URL for the current tenant."""
@@ -126,7 +126,7 @@ async def douyin_oauth_callback(
 @router.delete("/accounts/{account_id}", status_code=204)
 async def disable_douyin_account(
     account_id: uuid.UUID,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_company_governor),
     db: AsyncSession = Depends(get_db),
 ):
     await douyin_operations_service.disable_account(db, current_user, account_id)
@@ -136,7 +136,7 @@ async def disable_douyin_account(
 @router.post("/accounts/{account_id}/sync", response_model=DouyinMetricSnapshotOut)
 async def sync_douyin_account(
     account_id: uuid.UUID,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_company_governor),
     db: AsyncSession = Depends(get_db),
 ):
     try:

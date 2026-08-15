@@ -38,7 +38,7 @@
 | PL-013 | P0 | 凭据写入、能力池和 Runtime 均校验 Agent Plan `plan_tier`；Small/Medium 不贡献或选择视频能力，Large/Max 路由标准 Seedance 2.0；当前本地 Large 已取得图片/视频/语音真实 Artifact | 生产凭证、生产真实调用和三人独立质量评审 | `local_provider_verified + production_unverified` |
 | PL-014 | P1 | SaaS media routes 已统一显示目标顺序、当前 Provider、主线路、正式/降级/不可用状态、建议动作与成本 | 最后一次真实 Provider 验证时间和 receipt 仍未持久展示 | `local_browser_verified_with_evidence_gap` |
 | PL-015 | P1 | 导航已分为工作、协作角色、组织；`/enterprise` 和 `/invitations` 统一受公司管理员守卫；普通成员、`agent_admin`、公司管理员矩阵已实跑；平台管理员在全局控制台可通过“进入公司工作区”选择有效公司成员身份，切换后真实进入租户 `/work`；公司管理员正向入口和 release identity 已复验 | 新候选上普通成员/`agent_admin` 再次登录；全新租户首次切换 | `local_browser_verified_with_role_gap` |
-| PL-016 | P0 | 当前工作树后端最新全量 `4240 passed`；能力合同、前端 Node `109 passed`、Vitest `162 passed`、生产构建、Ruff、`git diff --check` 和 Alembic 单一 head（`backfill_private_assistant_tpl`）均通过；上一轮 `cc6affe7` 候选的提交后复验仍可追溯，本轮新增凭证路由防错、机器 JSON 输出、平台租户切换、文字主/备 Provider 路由、产品上市 PPT 视觉意图识别和角色边界回归尚未固化为新的 immutable SHA | 新候选的完整迁移/浏览器收口和精确 SHA 绑定 | `local_business_flow_verified_with_evidence_gap` |
+| PL-016 | P0 | 当前 dirty worktree 后端全量 `4465 passed`；能力合同、创作合同、前端 Node `118 passed`、Vitest `207 passed`（38 files）、生产构建、Ruff、compileall、`git diff --check` 和 PostgreSQL fresh/historical/downgrade/re-upgrade smoke 均通过；Alembic 单一 head 为 `onboarding_product_settings`。IAM-01–16 双 Tenant、五身份、desktop/390px 浏览器矩阵、QA 清理与独立 code-reviewer/architect 终审均通过 | immutable candidate SHA、发布/生产证据仍需分别完成 | `local_browser_verified` |
 | PL-017 | P0 | 工作台已实现 preflight → confirmation fingerprint → 持久 Task；Group 等待参与者终态并聚合结果 | stale confirmation、重复提交、Group 部分失败与刷新恢复的完整门禁 | `targeted_tests_pass` |
 | PL-018 | P1 | OKR 可引用完成 Task 或带批准 Artifact 的成功 Deliverable，并保存不可变 evidence snapshot；本地 UI 已完成真实证据关联和来源回跳 | Artifact 替换、权限负向浏览器流 | `local_browser_verified` |
 | PL-019 | P0 | Agent 对象级 `manage` 已统一控制配置、审批查看/处理和 OpenClaw API Key；企业审批队列复用同一可管理对象查询，私人助手保持 owner-only；候选完整测试和定向 API 测试通过 | 新候选上 `agent_admin` 浏览器再次登录 | `candidate_tests_pass + prior_worktree_browser_verified` |
@@ -108,3 +108,32 @@ npm run build
 - `production_verified`：目标 release、配置、迁移、监控和生产业务流均核验。
 
 任何较低层级不得被包装成较高层级。
+
+## 8. 2026-08-15 身份与权限重构新增 P0
+
+| ID | 优先级 | 原始问题 | 当前本地实现状态（2026-08-15） |
+|---|---:|---|---|
+| IAM-P0-01 | P0 | `ROLE_HIERARCHY` 把 member、agent_admin、org_admin、platform_admin 排成单线 | 已改为 membership/global/object/surface 四层计算；后端全量与五身份浏览器正负矩阵通过 |
+| IAM-P0-02 | P0 | 自助创建允许已有成员新建 Tenant 并成为 `org_admin` | 已使用账户级 `company.create`，创建者原子成为唯一 `org_owner`；Alpha/Beta 两公司与幂等/并发负向通过 |
+| IAM-P0-03 | P0 | 公司没有活跃管理员时首位持码加入者自动成为 `org_admin` | first-joiner escalation 已移除；邀请角色由服务端凭证固定 |
+| IAM-P0-04 | P0 | 没有 owner，任意本公司 `org_admin` 可以永久删除 Tenant | owner 模型、确认式转移、30 天可恢复删除和受控到期 purge 已实现；真实删除只在一次性本地数据库夹具验证，生产清理仍需授权 |
+| IAM-P0-05 | P0 | 平台权分散在 User.role、Identity flag 和配置邮箱 | 全局 platform operator 与公司 membership 已分开，独立产品外壳与依赖已落地 |
+| IAM-P0-06 | P0 | 注册码与公司邀请码共用 InvitationCode，缺少 email/role/expiry/status | `RegistrationGrant`、`OrganizationInvitation`、`OrganizationJoinLink` 已分表/分状态机 |
+| IAM-P0-07 | P0 | `/me` 主要下发角色，前端多处重复判断 | `/me` 已下发 `effective_capabilities/available_surfaces`，新产品面按能力守卫 |
+| IAM-P0-08 | P0 | agent_admin 同时像成员角色又依赖 Agent manage | `AgentPermission use/manage` 为对象权威；兼容值无公司治理加权；admin → 受托者 → admin 委派/撤销与旧页面 fail-closed 已实跑 |
+| IAM-P0-09 | P0 | 成员退出/管理员停用只有确认框，没有责任清单，可能留下孤儿 Agent 或泄露 private 工作信息 | 两类服务端 preflight、立即停用/恢复、责任阻断、Agent/私人助手处置、跨公司 fallback 和 private 脱敏均已实跑 |
+
+2026-08-16 G12 已完成 IAM-01 至 IAM-24 的本地收口：G8 为 `local_smtp_verified`，G9 为
+`local_http_postgres_verified`，G10 为 `local_oidc_emulated`，G11 为 `isolated_postgres_purge_verified`；G12 的
+desktop/390px 五身份双公司矩阵、全量自动化、完整迁移、QA 清理和两路独立终审均通过。Web 注册使用
+`/auth/register/init`，旧 `/auth/register` 仅保留等价委托、弃用与 sunset 响应头。
+
+独立架构终审曾发现并阻断 `auth.py` 中 tenant-switch redirect 的未闭合 f-string；修复后当前树重新取得后端
+`4496 passed`、前端 Node `125 passed`、Vitest `207 passed`、生产 build、认证/权限专项 `100 passed`、OIDC
+`46` 项、MFA `35` 项、purge `32` 项和 PostgreSQL migration 全链通过，architect 由 `BLOCK` 转为 `CLEAR`；
+code reviewer 为 `APPROVE`。标准 pytest 入口固定为仓库的 `backend/.venv/bin/python -m pytest`，不以未加载项目
+插件的系统 Python 结果替代仓库门禁。
+
+本基线随本地 immutable candidate commit 固化；准确 SHA 在 commit 创建后通过 Git、`/api/version` 和页面 footer
+绑定，不回写到 commit 自身。真实外部 SMTP、真实企业 IdP、生产 purge、推送、部署和生产业务流仍未执行，因此候选
+不得称为已部署、生产已修复、`provider_verified` 或 `production_verified`。

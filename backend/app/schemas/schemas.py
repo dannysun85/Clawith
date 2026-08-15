@@ -3,7 +3,7 @@
 import re
 import uuid
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
@@ -131,6 +131,7 @@ class TenantChoice(BaseModel):
     tenant_name: str
     tenant_slug: str
     logo_url: str | None = None
+    membership_role: str | None = None
 
 
 class MultiTenantResponse(BaseModel):
@@ -174,14 +175,28 @@ class IdentityOut(BaseModel):
 class UserOut(BaseModel):
     id: uuid.UUID
     identity_id: uuid.UUID | None = None
+    # ``id`` remains the legacy membership identifier.  New clients should
+    # consume the explicit identity/membership/access contract below.
+    membership_id: uuid.UUID | None = None
     username: str | None = None
     email: str | None = None
     display_name: str
     avatar_url: str | None = None
     role: str
     is_platform_admin: bool = False
+    membership_role: Literal["member", "org_admin", "org_owner"] | None = None
+    global_roles: list[str] = Field(default_factory=list)
+    effective_capabilities: list[str] = Field(default_factory=list)
+    available_surfaces: list[Literal["work", "company_admin", "platform_admin"]] = Field(
+        default_factory=list
+    )
+    pending_invitation_count: int = 0
+    current_support_session: dict[str, Any] | None = None
     tenant_id: uuid.UUID | None = None
     title: str | None = None
+    timezone: str | None = None
+    work_hours_start: str | None = None
+    work_hours_end: str | None = None
     primary_mobile: str | None = None
     registration_source: str | None = None
     preferred_chat_tier: Literal["lite", "pro", "ultra"] | None = None
@@ -204,6 +219,7 @@ class IdentityProviderOut(BaseModel):
     updated_at: datetime | None = None
     created_at: datetime
     sso_domain: str | None = None
+    readiness: dict[str, Any] | None = None
 
     model_config = {"from_attributes": True}
 

@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import get_current_admin
+from app.core.security import get_platform_operator
 from app.database import get_db
 from app.models.agent import AgentTemplate, AgentTemplateEvaluation
 from app.models.audit import AuditLog
@@ -76,22 +76,14 @@ class AgentTemplateRollbackIn(BaseModel):
     reason: str = Field(min_length=3, max_length=500)
 
 
-def _require_platform_admin(current_user: User) -> None:
-    identity = getattr(current_user, "identity", None)
-    if current_user.role != "platform_admin" and not bool(
-        getattr(identity, "is_platform_admin", False)
-    ):
-        raise HTTPException(status_code=403, detail="Platform admin required")
-
-
 @router.get("/workforce-catalog")
 async def get_workforce_catalog(
     decision: WorkforceDecision | None = Query(default=None),
     pack: str | None = Query(default=None, min_length=1, max_length=100),
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_platform_operator),
 ):
     """Return the pinned 268-role decision catalog to administrators."""
-    del current_user
+    await get_platform_operator(current_user)
     catalog = load_agent_workforce_catalog()
     conditional_registry = load_workforce_conditional_registry()
     records = [
@@ -118,10 +110,10 @@ async def get_workforce_catalog(
 
 @router.get("/workforce-evaluation-fixtures")
 async def get_workforce_evaluation_fixtures(
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_platform_operator),
 ):
     """Return the versioned synthetic fixture set without running a Provider."""
-    del current_user
+    await get_platform_operator(current_user)
     return load_evaluation_fixtures()
 
 
@@ -129,11 +121,11 @@ async def get_workforce_evaluation_fixtures(
 async def record_agent_template_evaluation(
     template_id: uuid.UUID,
     data: AgentRoleEvaluationIn,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_platform_operator),
     db: AsyncSession = Depends(get_db),
 ):
     """Persist measured A/B evidence; this endpoint never runs paid models."""
-    _require_platform_admin(current_user)
+    await get_platform_operator(current_user)
     template_result = await db.execute(
         select(AgentTemplate).where(AgentTemplate.id == template_id)
     )
@@ -217,11 +209,11 @@ async def record_agent_template_evaluation(
 @router.get("/templates/{template_id}/evaluations")
 async def list_agent_template_evaluations(
     template_id: uuid.UUID,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_platform_operator),
     db: AsyncSession = Depends(get_db),
 ):
     """List immutable metric evidence and promotion/rollback receipts."""
-    _require_platform_admin(current_user)
+    await get_platform_operator(current_user)
     result = await db.execute(
         select(AgentTemplateEvaluation)
         .where(AgentTemplateEvaluation.template_id == template_id)
@@ -253,11 +245,11 @@ async def list_agent_template_evaluations(
 @router.post("/templates/enable-batch")
 async def enable_agent_template_batch(
     data: AgentTemplateEnableBatchIn,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_platform_operator),
     db: AsyncSession = Depends(get_db),
 ):
     """Enable at most ten evaluated candidates in one atomic local cohort."""
-    _require_platform_admin(current_user)
+    await get_platform_operator(current_user)
     template_ids = list(dict.fromkeys(data.template_ids))
     template_result = await db.execute(
         select(AgentTemplate).where(AgentTemplate.id.in_(template_ids))
@@ -330,11 +322,11 @@ async def enable_agent_template_batch(
 async def rollback_agent_template(
     template_id: uuid.UUID,
     data: AgentTemplateRollbackIn,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_platform_operator),
     db: AsyncSession = Depends(get_db),
 ):
     """Remove a promoted workforce candidate from new hires without deleting Agents."""
-    _require_platform_admin(current_user)
+    await get_platform_operator(current_user)
     template_result = await db.execute(
         select(AgentTemplate).where(AgentTemplate.id == template_id)
     )
@@ -385,11 +377,11 @@ async def rollback_agent_template(
 
 @router.post("/template-capabilities/reconcile")
 async def reconcile_template_capabilities(
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_platform_operator),
     db: AsyncSession = Depends(get_db),
 ):
     """Apply reviewed template Tool/MCP routes to existing Agents locally."""
-    _require_platform_admin(current_user)
+    await get_platform_operator(current_user)
     report = await reconcile_template_tool_grants(db)
     await db.commit()
     skill_sync = await push_default_skills_to_existing_agents()

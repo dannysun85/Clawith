@@ -45,6 +45,7 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
         }
         // Auto-logout on expired/invalid token (but not on auth endpoints — let them show errors)
         const isAuthEndpoint = url.startsWith('/auth/login')
+            || url.startsWith('/auth/mfa/')
             || url.startsWith('/auth/register')
             || url.startsWith('/auth/verify-email')
             || url.startsWith('/auth/resend-verification')
@@ -59,6 +60,15 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
         if (res.status === 401 && !isAuthEndpoint && !isCandidateTokenRequest) {
             clearAuthStorage();
             window.location.href = '/login';
+            throw apiError;
+        }
+        if (
+            res.status === 403
+            && (apiError.code === 'mfa_setup_required' || apiError.code === 'mfa_challenge_required')
+            && !url.startsWith('/auth/mfa/')
+            && window.location.pathname !== '/account/security'
+        ) {
+            window.location.href = `/account/security?reason=${encodeURIComponent(apiError.code)}`;
             throw apiError;
         }
         throw apiError;
@@ -161,6 +171,31 @@ export function uploadFileWithProgress(
 }
 
 // ─── Auth ─────────────────────────────────────────────
+export type MfaLoginChallenge = {
+    requires_mfa: boolean;
+    requires_mfa_setup: boolean;
+    challenge_token: string;
+    expires_in_seconds: number;
+};
+
+export type MfaSetupPayload = {
+    challenge_token: string;
+    secret: string;
+    provisioning_uri: string;
+    expires_in_seconds: number;
+};
+
+export type MfaTokenResponse = TokenResponse & {
+    recovery_codes?: string[];
+};
+
+export type MfaStatus = {
+    enabled: boolean;
+    required: boolean;
+    confirmed_at: string | null;
+    recovery_codes_remaining: number;
+};
+
 export const authApi = {
     registrationConfig: () =>
         request<{
@@ -169,10 +204,48 @@ export const authApi = {
         }>('/auth/registration-config'),
 
     register: (data: { username?: string; email: string; password: string; display_name: string; invitation_code?: string; provider?: string; provider_code?: string }) =>
-        request<{ user_id: string; email: string; access_token: string; message: string; user?: any; needs_company_setup: boolean }>('/auth/register', { method: 'POST', body: JSON.stringify(data) }),
+        request<{ user_id: string; email: string; access_token: string; message: string; user?: any; needs_company_setup: boolean }>('/auth/register/init', { method: 'POST', body: JSON.stringify(data) }),
 
     login: (data: { login_identifier: string; password: string; tenant_id?: string }) =>
-        request<TokenResponse | { requires_tenant_selection: boolean; login_identifier: string; tenants: any[] }>('/auth/login', { method: 'POST', body: JSON.stringify(data) }),
+        request<TokenResponse | MfaLoginChallenge | { requires_tenant_selection: boolean; login_identifier: string; tenants: any[] }>('/auth/login', { method: 'POST', body: JSON.stringify(data) }),
+
+    mfaStatus: () => request<MfaStatus>('/auth/mfa/status'),
+
+    startMfaSetup: (currentPassword: string) =>
+        request<MfaSetupPayload>('/auth/mfa/setup', {
+            method: 'POST',
+            body: JSON.stringify({ current_password: currentPassword }),
+        }),
+
+    startMfaBootstrap: (challengeToken: string) =>
+        request<MfaSetupPayload>('/auth/mfa/bootstrap/setup', {
+            method: 'POST',
+            body: JSON.stringify({ challenge_token: challengeToken }),
+        }),
+
+    confirmMfaSetup: (challengeToken: string, code: string) =>
+        request<MfaTokenResponse>('/auth/mfa/setup/confirm', {
+            method: 'POST',
+            body: JSON.stringify({ challenge_token: challengeToken, code }),
+        }),
+
+    verifyMfaChallenge: (challengeToken: string, code: string) =>
+        request<MfaTokenResponse>('/auth/mfa/challenge/verify', {
+            method: 'POST',
+            body: JSON.stringify({ challenge_token: challengeToken, code }),
+        }),
+
+    rotateMfaRecoveryCodes: (currentPassword: string, code: string) =>
+        request<{ access_token: string; recovery_codes: string[] }>('/auth/mfa/recovery-codes/rotate', {
+            method: 'POST',
+            body: JSON.stringify({ current_password: currentPassword, code }),
+        }),
+
+    disableMfa: (currentPassword: string, code: string) =>
+        request<{ ok: boolean; requires_setup: boolean; access_token: string | null }>('/auth/mfa/disable', {
+            method: 'POST',
+            body: JSON.stringify({ current_password: currentPassword, code }),
+        }),
 
     forgotPassword: (data: { email: string }) =>
         request<{ ok: boolean; message: string }>('/auth/forgot-password', { method: 'POST', body: JSON.stringify(data) }),
@@ -200,19 +273,85 @@ export const authApi = {
         request<{ ok: boolean; message: string }>('/auth/resend-verification', { method: 'POST', body: JSON.stringify({ email }) }),
 
     getMyTenants: () =>
-        request<any[]>('/auth/my-tenants'),
+        request<Array<{
+            tenant_id: string;
+            tenant_name: string;
+            tenant_slug: string;
+            logo_url: string | null;
+            membership_role: 'member' | 'org_admin' | 'org_owner';
+        }>>('/auth/my-tenants'),
 
     switchTenant: (tenantId: string) =>
         request<{ access_token: string; target_tenant_id: string; redirect_url?: string; message?: string }>('/auth/switch-tenant', { method: 'POST', body: JSON.stringify({ tenant_id: tenantId }) }),
 };
 
 // ─── Tenants ──────────────────────────────────────────
+export type TenantDepartureResult = {
+    status: string;
+    fallback_tenant_id?: string | null;
+    access_token?: string | null;
+    deletion_scheduled_for?: string | null;
+};
+
+export type TenantLeavePreflight = {
+    version: number;
+    tenant_id: string;
+    membership_id: string;
+    can_leave: boolean;
+    requires_acknowledgement: boolean;
+    blockers: Array<{ code: string; count: number; message: string }>;
+    summary: {
+        owned_agents: number;
+        open_tasks: number;
+        pending_approvals: number;
+        open_deliverables: number;
+        delegated_agents: number;
+        personal_credentials: number;
+        pending_ownership_transfers: number;
+    };
+    owned_agents: Array<{
+        id: string;
+        name: string;
+        status: string;
+        access_mode: string;
+        is_personal_assistant: boolean;
+        required_action: 'delete' | 'handover_or_delete';
+    }>;
+    open_tasks: Array<{ id: string; title: string; status: string; agent_id: string }>;
+    pending_approvals: Array<{ id: string; action_type: string; agent_id?: string | null }>;
+    open_deliverables: Array<{ id: string; status: string; work_type: string; agent_id: string }>;
+    delegated_agents: Array<{ id: string; name: string }>;
+    effects_on_leave: Record<string, string>;
+};
+
+export type TenantOwnershipTransfer = {
+    id: string;
+    tenant_id: string;
+    current_owner_user_id: string;
+    proposed_owner_user_id: string;
+    status: string;
+    expires_at: string;
+    accepted_at?: string | null;
+    cancelled_at?: string | null;
+    created_at: string;
+};
+
 export const tenantApi = {
-    selfCreate: (data: { name: string }) =>
-        request<any>('/tenants/self-create', { method: 'POST', body: JSON.stringify(data) }),
+    selfCreate: (data: { name: string; timezone?: string; country_region?: string }, idempotencyKey?: string) =>
+        request<any>('/tenants/self-create', {
+            method: 'POST',
+            headers: idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : undefined,
+            body: JSON.stringify(data),
+        }),
 
     join: (invitationCode: string) =>
         request<any>('/tenants/join', { method: 'POST', body: JSON.stringify({ invitation_code: invitationCode }) }),
+
+    acceptInvitation: (invitationId: string) =>
+        request<any>(`/tenants/invitations/${invitationId}/accept`, { method: 'POST' }),
+
+    declineInvitation: (invitationId: string) =>
+        request<{ status: string }>(`/tenants/invitations/${invitationId}/decline`, { method: 'POST' }),
 
     registrationConfig: () =>
         request<{ allow_self_create_company: boolean }>('/tenants/registration-config'),
@@ -223,8 +362,213 @@ export const tenantApi = {
     me: () =>
         request<{ id: string; name: string; default_model_id: string | null; [k: string]: any }>('/tenants/me'),
 
+    update: (tenantId: string, data: {
+        name?: string;
+        timezone?: string;
+        country_region?: string;
+        company_size?: string;
+        allow_member_private_agents?: boolean;
+        default_approval_policy?: string;
+    }) => request<any>(`/tenants/${tenantId}`, { method: 'PUT', body: JSON.stringify(data) }),
+
     tokenUsage: () =>
         request<any>('/tenants/me/token-usage'),
+
+    requestOwnershipTransfer: (tenantId: string, data: { new_owner_user_id: string; current_password: string }) =>
+        request<any>(`/tenants/${tenantId}/ownership-transfers`, { method: 'POST', body: JSON.stringify(data) }),
+
+    pendingOwnershipTransfer: (tenantId: string) =>
+        request<{ item: TenantOwnershipTransfer | null }>(`/tenants/${tenantId}/ownership-transfers/pending`),
+
+    acceptOwnershipTransfer: (tenantId: string, transferId: string) =>
+        request<any>(`/tenants/${tenantId}/ownership-transfers/${transferId}/accept`, { method: 'POST' }),
+
+    cancelOwnershipTransfer: (tenantId: string, transferId: string) =>
+        request<any>(`/tenants/${tenantId}/ownership-transfers/${transferId}`, { method: 'DELETE' }),
+
+    leavePreflight: (tenantId: string) =>
+        request<TenantLeavePreflight>(`/tenants/${tenantId}/leave-preflight`),
+
+    leave: (tenantId: string, acknowledgeResponsibilities = false) =>
+        request<TenantDepartureResult>(`/tenants/${tenantId}/leave`, {
+            method: 'POST',
+            body: JSON.stringify({
+                confirmation: 'LEAVE',
+                acknowledge_responsibilities: acknowledgeResponsibilities,
+            }),
+        }),
+
+    scheduleDeletion: (tenantId: string, data: { company_name: string; current_password: string }) =>
+        request<TenantDepartureResult>(`/tenants/${tenantId}`, { method: 'DELETE', body: JSON.stringify(data) }),
+
+    restore: (tenantId: string, currentPassword?: string) =>
+        request<any>(`/tenants/${tenantId}/restore`, {
+            method: 'POST',
+            body: JSON.stringify({ current_password: currentPassword || null }),
+        }),
+};
+
+export type PendingOrganizationInvitation = {
+    id: string;
+    tenant_id: string;
+    tenant_name: string;
+    role: 'member' | 'org_admin' | 'org_owner';
+    expires_at: string;
+    created_at: string;
+};
+
+export type OrganizationInvitation = {
+    id: string;
+    target_email: string;
+    role: 'member' | 'org_admin' | 'org_owner';
+    token_prefix: string;
+    status: string;
+    delivery_mode: 'email' | 'manual_link';
+    delivery_status: string;
+    delivery?: {
+        id: string;
+        status: string;
+        recipient_mask: string;
+        attempt_count: number;
+        max_attempts: number;
+        next_attempt_at?: string | null;
+        last_error_code?: string | null;
+        smtp_accepted_at?: string | null;
+    } | null;
+    expires_at: string;
+    accepted_at?: string | null;
+    created_at: string;
+};
+
+export const governanceApi = {
+    pendingInvitations: () =>
+        request<{ items: PendingOrganizationInvitation[] }>('/governance/me/pending-invitations'),
+
+    organizationInvitations: (tenantId: string) =>
+        request<{ items: OrganizationInvitation[] }>(`/governance/organizations/${tenantId}/invitations`),
+
+    createOrganizationInvitation: (
+        tenantId: string,
+        data: { email: string; role: 'member' | 'org_admin'; expires_in_days: number },
+        idempotencyKey = crypto.randomUUID(),
+    ) => request<OrganizationInvitation>(`/governance/organizations/${tenantId}/invitations`, {
+        method: 'POST',
+        headers: { 'Idempotency-Key': idempotencyKey },
+        body: JSON.stringify(data),
+    }),
+
+    resendOrganizationInvitation: (
+        tenantId: string,
+        invitationId: string,
+        idempotencyKey = crypto.randomUUID(),
+    ) => request<OrganizationInvitation>(`/governance/organizations/${tenantId}/invitations/${invitationId}/resend`, {
+        method: 'POST',
+        headers: { 'Idempotency-Key': idempotencyKey },
+    }),
+
+    issueOrganizationInvitationManualLink: (
+        tenantId: string,
+        invitationId: string,
+        currentPassword: string,
+    ) => request<OrganizationInvitation & { manual_url: string; one_time_display: true }>(
+        `/governance/organizations/${tenantId}/invitations/${invitationId}/manual-link`,
+        { method: 'POST', body: JSON.stringify({ current_password: currentPassword }) },
+    ),
+
+    revokeOrganizationInvitation: (tenantId: string, invitationId: string) =>
+        request<{ status: string }>(`/governance/organizations/${tenantId}/invitations/${invitationId}`, {
+            method: 'DELETE',
+        }),
+
+    joinLinks: (tenantId: string) =>
+        request<{ items: any[] }>(`/governance/organizations/${tenantId}/join-links`),
+
+    createJoinLink: (tenantId: string, data: { max_uses: number; expires_in_days: number }) =>
+        request<any>(`/governance/organizations/${tenantId}/join-links`, {
+            method: 'POST',
+            body: JSON.stringify(data),
+        }),
+
+    revokeJoinLink: (tenantId: string, linkId: string) =>
+        request<{ status: string }>(`/governance/organizations/${tenantId}/join-links/${linkId}`, {
+            method: 'DELETE',
+        }),
+
+    registrationGrants: () =>
+        request<{ items: any[] }>('/governance/platform/registration-grants'),
+
+    createRegistrationGrants: (data: { count: number; max_uses: number; expires_in_days: number | null }) =>
+        request<{ items: any[] }>('/governance/platform/registration-grants', {
+            method: 'POST',
+            body: JSON.stringify(data),
+        }),
+
+    revokeRegistrationGrant: (grantId: string) =>
+        request<{ status: string }>(`/governance/platform/registration-grants/${grantId}`, { method: 'DELETE' }),
+
+    createSupportSession: (data: {
+        tenant_id: string;
+        reason: string;
+        scopes: string[];
+        duration_minutes: number;
+    }) => request<any>('/governance/platform/support-sessions', {
+        method: 'POST',
+        body: JSON.stringify(data),
+    }),
+
+    endSupportSession: (sessionId: string) =>
+        request<{ status: string }>(`/governance/platform/support-sessions/${sessionId}`, { method: 'DELETE' }),
+
+    supportTenantSummary: (sessionId: string, tenantId: string) =>
+        request<{
+            support_session_id: string;
+            tenant_id: string;
+            scopes_applied: string[];
+            metadata?: {
+                name: string;
+                slug: string;
+                is_active: boolean;
+                timezone: string;
+                country_region: string;
+                sso_enabled: boolean;
+                created_at?: string;
+            };
+            diagnostics?: {
+                memberships_total: number;
+                memberships_active: number;
+                agents_total: number;
+                agents_active: number;
+            };
+        }>(`/governance/platform/support-sessions/${sessionId}/tenants/${tenantId}/summary`),
+
+    ownershipResolutions: () =>
+        request<{ items: any[] }>('/governance/platform/ownership-resolutions'),
+
+    resolveOwnership: (resolutionId: string, data: { owner_user_id: string; reason: string }) =>
+        request<any>(`/governance/platform/ownership-resolutions/${resolutionId}/resolve`, {
+            method: 'POST',
+            body: JSON.stringify(data),
+        }),
+};
+
+export const membershipApi = {
+    list: () => request<any[]>('/users/'),
+    updateRole: (userId: string, role: 'member' | 'org_admin') =>
+        request<any>(`/users/${userId}/role`, { method: 'PATCH', body: JSON.stringify({ role }) }),
+    deactivationPreflight: (userId: string) =>
+        request<TenantLeavePreflight>(`/users/${userId}/deactivation-preflight`),
+    deactivate: (userId: string, acknowledgeResponsibilities = false) =>
+        request<{ status: string }>(`/users/${userId}/deactivate`, {
+            method: 'POST',
+            body: JSON.stringify({ acknowledge_responsibilities: acknowledgeResponsibilities }),
+        }),
+    reactivate: (userId: string) =>
+        request<{ status: string }>(`/users/${userId}/reactivate`, { method: 'POST' }),
+    resetMfa: (userId: string, data: { current_password: string; reason: string }) =>
+        request<{ ok: boolean; target_user_id: string; requires_setup: boolean }>(`/auth/mfa/admin/reset/${userId}`, {
+            method: 'POST',
+            body: JSON.stringify(data),
+        }),
 };
 
 export const onboardingApi = {
@@ -234,7 +578,24 @@ export const onboardingApi = {
     start: (entryMode: 'create' | 'join') =>
         request<any>('/onboarding/start', { method: 'POST', body: JSON.stringify({ entry_mode: entryMode }) }),
 
-    createPersonalAssistant: (data: { name: string; personality: string; work_style: string; boundaries?: string }) =>
+    initializeCompany: (data: {
+        name: string;
+        timezone: string;
+        country_region: string;
+        company_size: string;
+        allow_member_private_agents: boolean;
+        default_approval_policy: string;
+    }) => request<any>('/onboarding/company', { method: 'POST', body: JSON.stringify(data) }),
+
+    completeProfile: (data: {
+        display_name: string;
+        title: string;
+        timezone: string;
+        work_hours_start: string;
+        work_hours_end: string;
+    }) => request<any>('/onboarding/profile', { method: 'POST', body: JSON.stringify(data) }),
+
+    createPersonalAssistant: (data: { name: string; personality: string; work_style: string; proactivity?: string; boundaries?: string }) =>
         request<any>('/onboarding/personal-assistant', { method: 'POST', body: JSON.stringify(data) }),
 
     complete: () =>
@@ -244,6 +605,53 @@ export const onboardingApi = {
 export const adminApi = {
     listCompanies: () =>
         request<any[]>('/admin/companies'),
+
+    listTenantDeletions: () =>
+        request<{
+            items: Array<{
+                tenant_id: string;
+                tenant_name: string;
+                is_active: boolean;
+                deletion_requested_at: string;
+                eligible_at: string;
+                is_due: boolean;
+                job_status: 'scheduled' | 'dry_run_passed' | 'purging' | 'held' | 'failed';
+                attempt_count: number;
+                last_error_code: string | null;
+                plan_digest: string | null;
+                holds: Array<{
+                    id: string;
+                    hold_type: 'legal' | 'operations';
+                    reason_code: string;
+                    created_at: string;
+                }>;
+            }>;
+            tombstones: Array<{
+                tenant_id: string;
+                purged_at: string;
+                reason_code: string;
+                receipt_hash: string;
+                rows_total: number;
+                schema_version: number;
+            }>;
+        }>('/admin/tenant-deletions'),
+
+    dryRunTenantDeletion: (tenantId: string) =>
+        request<any>(`/admin/tenant-deletions/${tenantId}/dry-run`, { method: 'POST' }),
+
+    createTenantDeletionHold: (
+        tenantId: string,
+        data: { hold_type: 'legal' | 'operations'; reason_code: string },
+    ) => request<any>(`/admin/tenant-deletions/${tenantId}/holds`, {
+        method: 'POST',
+        body: JSON.stringify(data),
+    }),
+
+    releaseTenantDeletionHold: (tenantId: string, holdId: string, reasonCode: string) =>
+        request<any>(`/admin/tenant-deletions/${tenantId}/holds/${holdId}/release`, {
+            method: 'POST',
+            body: JSON.stringify({ reason_code: reasonCode }),
+        }),
 
     createCompany: (data: { name: string }) =>
         request<any>('/admin/companies', { method: 'POST', body: JSON.stringify(data) }),
@@ -627,6 +1035,73 @@ export const enterpriseApi = {
 export const activityApi = {
     list: (agentId: string, limit = 50) =>
         request<any[]>(`/agents/${agentId}/activity?limit=${limit}`),
+};
+
+// ─── Workforce Topology ──────────────────────────────
+export type WorkforceTopologyWork = {
+    id: string;
+    title: string;
+    summary: string;
+    stage: 'executing' | 'review' | 'approval' | 'blocked' | 'completed';
+    active_count: number;
+    recently_completed_count: number;
+    deep_link: string;
+    updated_at: string;
+};
+
+export type WorkforceTopologyNode = {
+    id: string;
+    name: string;
+    avatar_url?: string | null;
+    role_description: string;
+    status: 'creating' | 'running' | 'idle' | 'stopped' | 'error' | string;
+    last_active_at?: string | null;
+    tokens_used_today: number;
+    cache_read_tokens_today: number;
+    max_tokens_per_day?: number | null;
+    is_expired: boolean;
+    is_system: boolean;
+    visibility: 'company' | 'private' | 'custom';
+    can_manage: boolean;
+    work?: WorkforceTopologyWork | null;
+};
+
+export type WorkforceTopologyRelationshipEdge = {
+    id: string;
+    source_agent_id: string;
+    target_agent_id: string;
+    relation: string;
+    updated_at?: string | null;
+};
+
+export type WorkforceTopologyActivityEdge = {
+    agent_a_id: string;
+    agent_b_id: string;
+    interaction_count: number;
+    last_activity_at: string;
+};
+
+export type WorkforceTopologyActivity = {
+    id: string;
+    agent_id: string;
+    summary: string;
+    created_at: string;
+};
+
+export type WorkforceTopology = {
+    company_id: string;
+    company_name: string;
+    window_hours: number;
+    generated_at: string;
+    nodes: WorkforceTopologyNode[];
+    relationship_edges: WorkforceTopologyRelationshipEdge[];
+    activity_edges: WorkforceTopologyActivityEdge[];
+    recent_activities: WorkforceTopologyActivity[];
+};
+
+export const workforceApi = {
+    topology: (windowHours = 24) =>
+        request<WorkforceTopology>(`/workforce/topology?window_hours=${windowHours}`),
 };
 
 // ─── Deliverable Workbench ───────────────────────────

@@ -183,7 +183,11 @@ async def test_create_tool_uses_internal_tenant_name_without_shadowing_builtin(
 @pytest.mark.asyncio
 async def test_global_mcp_create_rejects_query_credentials(monkeypatch):
     db = _Session([])
-    user = SimpleNamespace(tenant_id=None, role="platform_admin", identity=None)
+    user = SimpleNamespace(
+        tenant_id=None,
+        role="platform_admin",
+        identity=SimpleNamespace(is_platform_admin=True),
+    )
     payload = tools_api.ToolCreate(
         name="shared_search",
         display_name="Shared search",
@@ -785,7 +789,7 @@ def test_mcp_server_literal_route_rejects_legacy_userinfo_and_fragment():
 
     app = FastAPI()
     app.include_router(tools_api.router)
-    app.dependency_overrides[tools_api.get_current_admin] = current_admin
+    app.dependency_overrides[tools_api.get_company_or_platform_admin] = current_admin
     app.dependency_overrides[tools_api.get_db] = current_db
 
     with TestClient(app) as client:

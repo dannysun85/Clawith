@@ -19,6 +19,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 
 from app.api.auth import get_current_user
 from app.core.permissions import check_agent_access
+from app.services.access_control import is_company_governor
 from app.database import async_session
 from app.models.agent import Agent
 from app.models.deliverable import DeliverableRequest
@@ -110,12 +111,14 @@ class ReferenceStats(BaseModel):
 
 # ── Helpers ─────────────────────────────────────────
 
-def _effective_tenant_id(current_user: User) -> str | None:
-    return str(current_user.tenant_id) if current_user.tenant_id else None
+def _effective_tenant_id(current_user: User) -> str:
+    if current_user.tenant_id is None:
+        raise HTTPException(403, "A company membership is required")
+    return str(current_user.tenant_id)
 
 
 def _is_admin(current_user: User) -> bool:
-    return current_user.role in ("platform_admin", "org_admin")
+    return is_company_governor(current_user)
 
 
 async def _agent_creator_id(db, agent_id: uuid.UUID | None) -> uuid.UUID | None:
@@ -257,8 +260,7 @@ async def _get_entry_scoped(db, entry_id: uuid.UUID, current_user: User) -> Expe
     """Fetch an entry with tenant isolation only; mutation routes add permission checks."""
     q = select(ExperienceEntry).where(ExperienceEntry.id == entry_id)
     eff = _effective_tenant_id(current_user)
-    if eff and current_user.role != "platform_admin":
-        q = q.where(ExperienceEntry.tenant_id == eff)
+    q = q.where(ExperienceEntry.tenant_id == eff)
     entry = (await db.execute(q)).scalar_one_or_none()
     if not entry:
         raise HTTPException(404, "Experience entry not found")

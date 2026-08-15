@@ -197,9 +197,6 @@ async def check_conversation_quota(user_id: uuid.UUID) -> None:
         user = result.scalar_one_or_none()
         if not user:
             return
-        # Admin users are exempt
-        if user.role in ("platform_admin", "org_admin"):
-            return
         if not user.tenant_id:
             return
 
@@ -221,7 +218,7 @@ async def consume_conversation_quota(user_id: uuid.UUID) -> None:
     async with async_session() as db:
         result = await db.execute(select(User).where(User.id == user_id))
         user = result.scalar_one_or_none()
-        if not user or user.role in ("platform_admin", "org_admin") or not user.tenant_id:
+        if not user or not user.tenant_id:
             return
         tenant_id = user.tenant_id
 

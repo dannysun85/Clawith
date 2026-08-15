@@ -5,12 +5,14 @@ and concrete implementations for each supported provider.
 """
 
 import hmac
+import uuid
 from urllib.parse import quote, urlencode
 
 import httpx
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
+from jose import JWTError, jwt
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,7 +24,10 @@ from app.services.external_identity_policy import (
     external_user_can_authenticate,
     require_stable_external_subject,
 )
-from app.services.google_workspace_oauth import GOOGLE_HTTP_PROXY
+from app.services.google_workspace_oauth import (
+    GOOGLE_HTTP_PROXY,
+    local_oidc_emulator_base_url,
+)
 from app.services.identity_provider_lookup import get_preferred_identity_provider
 from loguru import logger
 
@@ -269,7 +274,7 @@ class BaseAuthProvider(ABC):
                 name=self.provider_type.capitalize(),
                 is_active=True,
                 config=self.config,
-                tenant_id=tenant_id,
+                tenant_id=uuid.UUID(tenant_id) if tenant_id else None,
             )
             db.add(provider)
             await db.flush()
@@ -317,7 +322,12 @@ class BaseAuthProvider(ABC):
             display_name=user_info.name or identity.username,
             avatar_url=user_info.avatar_url,
             registration_source=self.provider_type,
-            tenant_id=tenant_id,
+            # Keep the in-memory ORM value type aligned with PostgreSQL UUID.
+            # The identity linker compares this value before a refresh; leaving
+            # the caller's string here makes a legitimate same-tenant JIT flow
+            # look like a cross-tenant link attempt.
+            tenant_id=uuid.UUID(tenant_id) if tenant_id else None,
+            role="member",
             is_active=True,
             activation_pending_email_verification=False,
         )
@@ -784,6 +794,8 @@ class GoogleWorkspaceAuthProvider(BaseAuthProvider):
     GOOGLE_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
     GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
     GOOGLE_USER_INFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
+    GOOGLE_JWKS_URL = "https://www.googleapis.com/oauth2/v3/certs"
+    GOOGLE_ISSUERS = {"https://accounts.google.com", "accounts.google.com"}
     GOOGLE_SSO_SCOPE = "openid email profile"
     GOOGLE_ADMIN_SCOPES = [
         "openid",
@@ -798,6 +810,39 @@ class GoogleWorkspaceAuthProvider(BaseAuthProvider):
         self.client_id = self.config.get("client_id") or self.config.get("sso_client_id") or self.config.get("app_id")
         self.client_secret = self.config.get("client_secret") or self.config.get("sso_client_secret") or self.config.get("app_secret")
         self.scope = self.config.get("sso_scope") or self.config.get("scope") or self.GOOGLE_SSO_SCOPE
+        self.local_emulator_base_url = local_oidc_emulator_base_url(self.config)
+
+    @staticmethod
+    def _normalized_jit_domains(value: object) -> set[str]:
+        if isinstance(value, str):
+            candidates = value.split(",")
+        elif isinstance(value, list):
+            candidates = value
+        else:
+            return set()
+        return {
+            str(candidate).strip().casefold().rstrip(".")
+            for candidate in candidates
+            if str(candidate).strip()
+        }
+
+    def _tenant_jit_provisioning_allowed(self, user_info: ExternalUserInfo) -> bool:
+        """Allow JIT only from an exact, provider-attested Workspace domain."""
+        allowed_domains = self._normalized_jit_domains(
+            self.config.get("jit_allowed_domains")
+        )
+        email = str(user_info.email or "").strip().casefold()
+        email_domain = email.rsplit("@", 1)[-1] if "@" in email else ""
+        hosted_domain = str(user_info.raw_data.get("hd") or "").strip().casefold().rstrip(".")
+        return bool(
+            self.config.get("jit_provisioning_enabled") is True
+            and allowed_domains
+            and user_info.email_verified is True
+            and user_info.provider_user_id
+            and hosted_domain
+            and hosted_domain == email_domain
+            and hosted_domain in allowed_domains
+        )
 
     def _build_authorization_url(
         self,
@@ -807,23 +852,31 @@ class GoogleWorkspaceAuthProvider(BaseAuthProvider):
         scopes: str | list[str] | None = None,
         access_type: str = "online",
         prompt: str = "select_account",
+        authorization_url: str | None = None,
+        code_challenge: str | None = None,
+        nonce: str | None = None,
     ) -> str:
 
         scope_value = scopes or self.scope
         if isinstance(scope_value, list):
             scope_value = " ".join(scope_value)
 
-        params = (
-            f"client_id={quote(self.client_id or '')}"
-            f"&redirect_uri={quote(redirect_uri)}"
-            f"&response_type=code"
-            f"&scope={quote(scope_value)}"
-            f"&state={quote(state or '')}"
-            f"&access_type={quote(access_type)}"
-            f"&include_granted_scopes=true"
-            f"&prompt={quote(prompt)}"
-        )
-        return f"{self.GOOGLE_AUTHORIZE_URL}?{params}"
+        params = {
+            "client_id": self.client_id or "",
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "scope": scope_value,
+            "state": state or "",
+            "access_type": access_type,
+            "include_granted_scopes": "true",
+            "prompt": prompt,
+        }
+        if code_challenge:
+            params["code_challenge"] = code_challenge
+            params["code_challenge_method"] = "S256"
+        if nonce:
+            params["nonce"] = nonce
+        return f"{authorization_url or self.GOOGLE_AUTHORIZE_URL}?{urlencode(params)}"
 
     async def get_authorization_url(self, redirect_uri: str, state: str) -> str:
         return self._build_authorization_url(
@@ -832,6 +885,30 @@ class GoogleWorkspaceAuthProvider(BaseAuthProvider):
             scopes=self.scope,
             access_type="online",
             prompt="select_account",
+        )
+
+    async def get_sso_authorization_url(
+        self,
+        redirect_uri: str,
+        state: str,
+        *,
+        code_challenge: str,
+        nonce: str,
+    ) -> str:
+        authorization_url = (
+            f"{self.local_emulator_base_url}/authorize"
+            if self.local_emulator_base_url
+            else self.GOOGLE_AUTHORIZE_URL
+        )
+        return self._build_authorization_url(
+            redirect_uri,
+            state,
+            scopes=self.scope,
+            access_type="online",
+            prompt="select_account",
+            authorization_url=authorization_url,
+            code_challenge=code_challenge,
+            nonce=nonce,
         )
 
     async def get_admin_authorization_url(self, redirect_uri: str, state: str) -> str:
@@ -843,21 +920,111 @@ class GoogleWorkspaceAuthProvider(BaseAuthProvider):
             prompt="consent",
         )
 
-    async def exchange_code_for_token(self, code: str, redirect_uri: str | None = None) -> dict:
+    async def exchange_code_for_token(
+        self,
+        code: str,
+        redirect_uri: str | None = None,
+        *,
+        code_verifier: str | None = None,
+    ) -> dict:
+        token_url = (
+            f"{self.local_emulator_base_url}/token"
+            if code_verifier and self.local_emulator_base_url
+            else self.GOOGLE_TOKEN_URL
+        )
+        form = {
+            "code": code,
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "grant_type": "authorization_code",
+            "redirect_uri": redirect_uri or self.config.get("redirect_uri"),
+        }
+        if code_verifier:
+            form["code_verifier"] = code_verifier
         async with httpx.AsyncClient(timeout=15, proxy=GOOGLE_HTTP_PROXY) as client:
             resp = await client.post(
-                self.GOOGLE_TOKEN_URL,
-                data={
-                    "code": code,
-                    "client_id": self.client_id,
-                    "client_secret": self.client_secret,
-                    "grant_type": "authorization_code",
-                    "redirect_uri": redirect_uri or self.config.get("redirect_uri"),
-                },
+                token_url,
+                data=form,
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
             resp.raise_for_status()
             return resp.json()
+
+    async def verify_sso_id_token(self, id_token: str, *, expected_nonce: str) -> dict:
+        """Verify signature, audience, issuer, expiry and the request nonce."""
+        if not id_token or not self.client_id or not expected_nonce:
+            raise ValueError("OIDC token verification inputs are incomplete")
+        jwks_url = (
+            f"{self.local_emulator_base_url}/jwks"
+            if self.local_emulator_base_url
+            else self.GOOGLE_JWKS_URL
+        )
+        async with httpx.AsyncClient(timeout=15, proxy=GOOGLE_HTTP_PROXY) as client:
+            response = await client.get(jwks_url)
+            response.raise_for_status()
+            jwks = response.json()
+        try:
+            claims = jwt.decode(
+                id_token,
+                jwks,
+                algorithms=["RS256"],
+                audience=self.client_id,
+                options={"verify_iss": False},
+            )
+        except JWTError as exc:
+            raise ValueError("OIDC ID token signature or claims are invalid") from exc
+
+        allowed_issuers = (
+            {self.local_emulator_base_url}
+            if self.local_emulator_base_url
+            else self.GOOGLE_ISSUERS
+        )
+        issuer = str(claims.get("iss") or "")
+        nonce = str(claims.get("nonce") or "")
+        subject = str(claims.get("sub") or "")
+        if issuer not in allowed_issuers:
+            raise ValueError("OIDC ID token issuer is invalid")
+        if not nonce or not hmac.compare_digest(nonce, expected_nonce):
+            raise ValueError("OIDC ID token nonce is invalid")
+        if not subject:
+            raise ValueError("OIDC ID token subject is missing")
+        return claims
+
+    async def get_sso_user_info(
+        self,
+        access_token: str,
+        *,
+        id_token_claims: dict,
+    ) -> ExternalUserInfo:
+        user_info_url = (
+            f"{self.local_emulator_base_url}/userinfo"
+            if self.local_emulator_base_url
+            else self.GOOGLE_USER_INFO_URL
+        )
+        async with httpx.AsyncClient(timeout=15, proxy=GOOGLE_HTTP_PROXY) as client:
+            response = await client.get(
+                user_info_url,
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            response.raise_for_status()
+            info = response.json()
+        subject = str(info.get("sub") or "")
+        expected_subject = str(id_token_claims.get("sub") or "")
+        if not subject or not hmac.compare_digest(subject, expected_subject):
+            raise ValueError("OIDC userinfo subject does not match the ID token")
+        merged = dict(info)
+        for claim in ("hd", "email", "email_verified", "name", "picture"):
+            if claim not in merged and claim in id_token_claims:
+                merged[claim] = id_token_claims[claim]
+        return ExternalUserInfo(
+            provider_type=self.provider_type,
+            provider_user_id=subject,
+            name=merged.get("name", "") or merged.get("email", ""),
+            email=merged.get("email", ""),
+            email_verified=merged.get("email_verified") is True,
+            avatar_url=merged.get("picture", ""),
+            raw_data=merged,
+        )
 
     async def refresh_access_token(self, refresh_token: str) -> dict:
         async with httpx.AsyncClient(timeout=15, proxy=GOOGLE_HTTP_PROXY) as client:

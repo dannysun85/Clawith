@@ -38,6 +38,7 @@ import {
     parsePersistedChatAttachments,
 } from '../../utils/chatAttachmentPersistence';
 import { canAccessSaasAdmin } from '../../utils/saasAdmin';
+import { hasEffectiveCapability } from '../../utils/productAccess';
 import { displaySessionTitle } from '../../utils/sessionDisplay';
 import {
     customerSafeAssistantText,
@@ -705,18 +706,30 @@ type AccessUserCandidate = { id: string; name: string; username?: string; email?
 function AccessPermissionsPanel({
     agentId,
     permData,
+    permissionAccessError,
     canManage,
+    canForceHandover,
+    productRole,
     queryClient,
 }: {
     agentId: string;
     permData: any;
+    permissionAccessError: boolean;
     canManage: boolean;
+    canForceHandover: boolean;
+    productRole: string;
     queryClient: any;
 }) {
     const { t, i18n } = useTranslation();
     const isChinese = i18n.language?.startsWith('zh');
-    const canManagePermissions = permData?.can_manage ?? canManage;
+    // Never let a previously successful permissions query keep the editor
+    // writable after the authoritative Agent access level has been revoked.
+    // React Query intentionally retains prior data when a later 403 occurs.
+    const canManagePermissions = canManage
+        && !permissionAccessError
+        && (permData?.can_manage ?? canManage);
     const isOwner = permData?.is_owner ?? false;
+    const canHandover = isOwner || canForceHandover;
     const creatorId = permData?.creator_id ? String(permData.creator_id) : null;
     const currentScope = permData?.scope_type === 'user' ? 'private' : (permData?.scope_type || 'company');
     const currentAccessLevel = permData?.access_level || 'use';
@@ -726,6 +739,8 @@ function AccessPermissionsPanel({
     const [permissionError, setPermissionError] = useState<string | null>(null);
     const [userSearch, setUserSearch] = useState('');
     const [showUserDropdown, setShowUserDropdown] = useState(false);
+    const [handoverTargetId, setHandoverTargetId] = useState('');
+    const [handoverBusy, setHandoverBusy] = useState(false);
     const userSearchRef = useRef<HTMLDivElement | null>(null);
     const userAccess: AccessUser[] = (permData?.user_access || []).map((u: any) => ({
         id: u.id,
@@ -874,6 +889,37 @@ function AccessPermissionsPanel({
     };
 
     const visibleUserResults = candidates?.users || [];
+    const handoverCandidates = visibleUserResults.filter(user => user.id !== creatorId);
+    const handoverAgent = async () => {
+        if (!handoverTargetId || productRole === 'personal_assistant') return;
+        const target = handoverCandidates.find(user => user.id === handoverTargetId);
+        if (!target) return;
+        const confirmed = window.confirm(
+            isChinese
+                ? `确认把 Agent 所有权交给 ${target.name}？交接后你将不再是创建者。`
+                : `Handover Agent ownership to ${target.name}? You will no longer be the creator.`,
+        );
+        if (!confirmed) return;
+        setHandoverBusy(true);
+        setPermissionError(null);
+        try {
+            await fetchAuth(`/agents/${agentId}/handover`, {
+                method: 'POST',
+                body: JSON.stringify({ new_creator_id: handoverTargetId }),
+            });
+            setHandoverTargetId('');
+            await Promise.all([
+                queryClient.invalidateQueries({ queryKey: ['agent-permissions', agentId] }),
+                queryClient.invalidateQueries({ queryKey: ['agent', agentId] }),
+                queryClient.invalidateQueries({ queryKey: ['agents'] }),
+                queryClient.invalidateQueries({ queryKey: ['workforce-topology'] }),
+            ]);
+        } catch (error) {
+            setPermissionError(error instanceof Error ? error.message : String(error));
+        } finally {
+            setHandoverBusy(false);
+        }
+    };
 
     return (
         <div className="card" style={{ marginBottom: '12px' }}>
@@ -1097,6 +1143,48 @@ function AccessPermissionsPanel({
             {localScope !== 'company' && (
                 <div style={{ marginTop: '12px', fontSize: '11px', color: 'var(--text-tertiary)' }}>
                     {isChinese ? '非全公司可见的 Agent 不会出现在 Plaza，也不能在 Plaza 发布或评论。' : 'Agents that are not company-wide cannot view, post, or comment in Plaza.'}
+                </div>
+            )}
+
+            {canHandover && (
+                <div style={{ marginTop: '16px', paddingTop: '14px', borderTop: '1px solid var(--border-subtle)' }}>
+                    <div style={{ fontSize: '13px', fontWeight: 600, marginBottom: '6px' }}>
+                        {isChinese ? 'Agent 所有权交接' : 'Agent ownership handover'}
+                    </div>
+                    {productRole === 'personal_assistant' ? (
+                        <p style={{ margin: 0, fontSize: '12px', color: 'var(--text-tertiary)' }}>
+                            {isChinese ? '私人助理包含个人上下文，不能转交给其他成员。退出公司前请在下方危险操作中删除它。' : 'A personal assistant contains private context and cannot be handed over. Delete it in the danger zone before leaving the company.'}
+                        </p>
+                    ) : (
+                        <>
+                            <p style={{ margin: '0 0 10px', fontSize: '12px', color: 'var(--text-tertiary)' }}>
+                                {isChinese ? '离职或职责变化前，将创建者责任交给一名有效的本公司成员。授权与关系会同步重建。' : 'Before leaving or changing responsibilities, transfer creator ownership to an active company member. Grants and relationships are rebuilt.'}
+                            </p>
+                            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                                <select
+                                    className="input"
+                                    value={handoverTargetId}
+                                    onChange={event => setHandoverTargetId(event.target.value)}
+                                    style={{ flex: 1, minWidth: 0 }}
+                                >
+                                    <option value="">{isChinese ? '选择新创建者' : 'Select new creator'}</option>
+                                    {handoverCandidates.map(candidate => (
+                                        <option key={candidate.id} value={candidate.id}>
+                                            {candidate.name}{candidate.email ? ` · ${candidate.email}` : ''}
+                                        </option>
+                                    ))}
+                                </select>
+                                <button
+                                    type="button"
+                                    className="btn btn-secondary"
+                                    disabled={!handoverTargetId || handoverBusy}
+                                    onClick={() => void handoverAgent()}
+                                >
+                                    {handoverBusy ? '…' : (isChinese ? '确认交接' : 'Handover')}
+                                </button>
+                            </div>
+                        </>
+                    )}
                 </div>
             )}
 
@@ -2371,10 +2459,15 @@ export default function AgentDetailPage() {
         setActiveTab,
     } = useAgentDetailRoute({ agentId: id });
 
-    const { data: agent, isLoading } = useQuery({
+    const { data: agent, isLoading, isError: agentAccessError } = useQuery({
         queryKey: ['agent', id],
         queryFn: () => agentApi.get(id!),
         enabled: !!id,
+        // Settings are authority-bearing. Re-resolve object access while the
+        // editor is open so a manage -> use downgrade cannot leave stale
+        // controls enabled until the next navigation or manual refresh.
+        refetchInterval: activeTab === 'settings' ? 3000 : false,
+        retry: activeTab === 'settings' ? false : 3,
     });
     const { data: requestedWorkTask } = useQuery({
         queryKey: ['work-task', requestedTaskId],
@@ -2529,10 +2622,9 @@ export default function AgentDetailPage() {
     const setCurrentUser = useAuthStore((s) => s.setUser);
     /** Chat sidebar: who may list all sessions & read others' threads (matches backend scope=all). */
     const canViewAllAgentChatSessions =
-        currentUser?.role === 'platform_admin' ||
-        currentUser?.role === 'org_admin' ||
         agent?.creator_id === currentUser?.id ||
-        (currentUser?.role === 'agent_admin' && (agent as any)?.access_level === 'manage');
+        (agent as any)?.access_level === 'manage' ||
+        hasEffectiveCapability(currentUser, 'agent.manage.company');
     type SessionRuntimeKey = string;
     const wsMapRef = useRef<Record<SessionRuntimeKey, WebSocket>>({});
     const reconnectTimerRef = useRef<Record<SessionRuntimeKey, ReturnType<typeof setTimeout> | null>>({});
@@ -5712,10 +5804,12 @@ export default function AgentDetailPage() {
         }));
     }, [wsConnected, id, activeSession?.id, agent?.onboarded_for_me, agent?.deletion_state, effectiveTierReady, effectiveChatTier, effectiveChatModality, chatHistoryReadyRuntimeKey, chatMessages.length]);
 
-    const { data: permData } = useQuery({
+    const { data: permData, isError: permissionAccessError } = useQuery({
         queryKey: ['agent-permissions', id],
         queryFn: () => fetchAuth<any>(`/agents/${id}/permissions`),
         enabled: !!id && activeTab === 'settings',
+        refetchInterval: activeTab === 'settings' ? 3000 : false,
+        retry: false,
     });
 
 
@@ -5765,6 +5859,19 @@ export default function AgentDetailPage() {
             setTaskForm({ title: '', description: '', priority: 'medium', type: 'todo', supervision_target_name: '', remind_schedule: '', due_date: '' });
         },
     });
+
+    if (activeTab === 'settings' && agentAccessError) {
+        return (
+            <div
+                role="alert"
+                style={{ padding: '40px', color: 'var(--text-secondary)' }}
+            >
+                {i18n.language?.startsWith('zh')
+                    ? 'Agent 访问权限已失效，请返回数字员工中心。'
+                    : 'Your Agent access has expired. Return to the Digital Workforce.'}
+            </div>
+        );
+    }
 
     if (isLoading || !agent) {
         return <div style={{ padding: '40px', color: 'var(--text-tertiary)' }}>{t('common.loading')}</div>;
@@ -8778,7 +8885,10 @@ export default function AgentDetailPage() {
                                 <AccessPermissionsPanel
                                     agentId={id}
                                     permData={permData}
+                                    permissionAccessError={permissionAccessError}
                                     canManage={canManage}
+                                    canForceHandover={currentUser?.membership_role === 'org_owner' && permData?.scope_type !== 'private'}
+                                    productRole={agentProductRole}
                                     queryClient={queryClient}
                                 />
                             )}

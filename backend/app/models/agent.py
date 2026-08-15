@@ -3,7 +3,18 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, Integer, String, Text, func, text
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSON, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -125,10 +136,11 @@ class Agent(Base):
     # Access model:
     # - company: all platform users and non-private tenant agents can access; Plaza is enabled.
     # - private: only the creator can use/manage; hidden from Plaza.
-    # - custom: everyone can use it like company mode, but explicit user rows grant management; Plaza is disabled.
+    # - custom: creator/company governors plus explicitly permitted users can
+    #   use it; user rows grant use or management, and Plaza is disabled.
     access_mode: Mapped[str] = mapped_column(String(20), default="company", nullable=False)
-    # Legacy/default UI field. Runtime use access is determined by access_mode;
-    # custom user rows grant management and do not restrict who can use the agent.
+    # Legacy/default UI field. Runtime access is determined by access_mode and
+    # AgentPermission; this field is retained only for response compatibility.
     company_access_level: Mapped[str] = mapped_column(String(20), default="use", nullable=False)
 
     # Daily LLM call limit
@@ -181,7 +193,12 @@ class Agent(Base):
 
 
 class AgentPermission(Base):
-    """Access permission for a digital employee."""
+    """Access permission for a digital employee.
+
+    Database checks and partial unique indexes are migration-owned because the
+    historical smoke path builds current metadata at ``initial_schema`` before
+    replaying legacy duplicate rows that the head migration must normalize.
+    """
 
     __tablename__ = "agent_permissions"
 

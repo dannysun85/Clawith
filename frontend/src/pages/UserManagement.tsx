@@ -8,6 +8,7 @@ import LinearCopyButton from '../components/LinearCopyButton';
 import { useDialog } from '../components/Dialog/DialogProvider';
 import { IconEdit } from '@tabler/icons-react';
 import { fetchJson } from '../services/api';
+import { hasEffectiveCapability } from '../utils/productAccess';
 
 interface UserInfo {
     id: string;
@@ -39,8 +40,9 @@ const PAGE_SIZE = 15;
 export default function UserManagement() {
     const { t, i18n } = useTranslation();
     const isChinese = i18n.language?.startsWith('zh');
-    const { user: currentUser, setUser } = useAuthStore();
+    const { user: currentUser } = useAuthStore();
     const dialog = useDialog();
+    const canManageAdmins = hasEffectiveCapability(currentUser, 'company.admins.manage');
 
     const [users, setUsers] = useState<UserInfo[]>([]);
     const [loading, setLoading] = useState(true);
@@ -120,10 +122,6 @@ export default function UserManagement() {
             });
             setToast(isChinese ? 'Role updated' : 'Role updated');
             setTimeout(() => setToast(''), 2000);
-            // If changed own role, update auth store
-            if (userId === currentUser?.id) {
-                setUser({ ...currentUser, role: newRole as any });
-            }
             loadUsers();
         } catch (e: any) {
             const detail = (() => { try { return JSON.parse(e.message)?.detail; } catch { return e.message; } })();
@@ -303,7 +301,7 @@ export default function UserManagement() {
                                 <div style={{ fontSize: '11px', color: 'var(--text-secondary)' }}>{formatDate(user.created_at)}</div>
                                 {/* Role selector — only for admin users, not for platform_admin targets */}
                                 <div>
-                                    {currentUser?.role && ['platform_admin', 'org_admin'].includes(currentUser.role) && user.role !== 'platform_admin' ? (
+                                    {canManageAdmins && user.role !== 'org_owner' ? (
                                         <select
                                             className="form-input"
                                             value={user.role}
@@ -312,9 +310,7 @@ export default function UserManagement() {
                                                 const newRole = e.target.value;
                                                 const roleLabel = newRole === 'org_admin'
                                                     ? (isChinese ? '公司管理员' : 'Company Admin')
-                                                    : newRole === 'agent_admin'
-                                                        ? (isChinese ? 'Agent 管理员' : 'Agent Admin')
-                                                        : (isChinese ? '普通成员' : 'Member');
+                                                    : (isChinese ? '普通成员' : 'Member');
                                                 const confirmMsg = isChinese
                                                     ? `确认将 ${user.display_name || user.username} 的角色更改为${roleLabel}？`
                                                     : `Change ${user.display_name || user.username}'s role to ${roleLabel}?`;
@@ -324,12 +320,11 @@ export default function UserManagement() {
                                             style={{ fontSize: '11px', padding: '2px 4px', width: '100%', minWidth: 0 }}
                                         >
                                             <option value="member">{isChinese ? '普通成员' : 'Member'}</option>
-                                            <option value="agent_admin">{isChinese ? 'Agent 管理员' : 'Agent Admin'}</option>
                                             <option value="org_admin">{isChinese ? '公司管理员' : 'Company Admin'}</option>
                                         </select>
                                     ) : (
                                         <span style={{ fontSize: '11px', color: 'var(--text-secondary)' }}>
-                                            {user.role === 'platform_admin' ? 'Platform Admin'
+                                            {user.role === 'org_owner' ? (isChinese ? '公司所有者' : 'Company Owner')
                                                 : user.role === 'org_admin' ? (isChinese ? '公司管理员' : 'Company Admin')
                                                     : user.role === 'agent_admin' ? (isChinese ? 'Agent 管理员' : 'Agent Admin')
                                                         : (isChinese ? '普通成员' : 'Member')}

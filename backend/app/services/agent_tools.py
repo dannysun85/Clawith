@@ -22135,7 +22135,9 @@ async def _load_okr_request_context(
         "agent_is_designated_okr_agent": bool(agent and designated_okr_agent_id == agent.id),
         "requester": requester,
         "requester_user_id": user_id,
-        "requester_is_admin": bool(requester and requester.role in ("org_admin", "platform_admin")),
+        "requester_is_admin": bool(
+            requester and requester.role in ("org_owner", "org_admin")
+        ),
     }
 
 

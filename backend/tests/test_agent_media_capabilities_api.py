@@ -41,11 +41,11 @@ def _capability_rows() -> list[dict[str, object]]:
     ]
 
 
-def _user(role: str) -> SimpleNamespace:
+def _user(role: str, *, platform_operator: bool = False) -> SimpleNamespace:
     return SimpleNamespace(
         id=uuid.uuid4(),
         role=role,
-        identity=SimpleNamespace(is_platform_admin=False),
+        identity=SimpleNamespace(is_platform_admin=platform_operator),
     )
 
 
@@ -109,7 +109,7 @@ async def test_media_capability_endpoint_keeps_diagnostics_for_platform_admin():
         result = await agents_api.get_media_capabilities(
             agent_id=agent.id,
             tier="pro",
-            current_user=_user("platform_admin"),
+            current_user=_user("platform_admin", platform_operator=True),
             db=object(),
         )
 

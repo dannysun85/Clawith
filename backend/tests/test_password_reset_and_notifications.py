@@ -696,6 +696,11 @@ async def test_forgot_password_queues_background_email(monkeypatch):
 
     monkeypatch.setattr(password_reset_service, "create_password_reset_token", fake_create_password_reset_token)
     monkeypatch.setattr(password_reset_service, "build_password_reset_url", fake_build_password_reset_url)
+    delivery_id = uuid.uuid4()
+    monkeypatch.setattr(
+        "app.services.outbound_email_service.persist_template_email",
+        AsyncMock(return_value=SimpleNamespace(id=delivery_id, status="queued")),
+    )
 
     # Patch identity_dao.get_by_email to return our fake user
     from app.dao import identity_dao

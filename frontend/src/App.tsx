@@ -1,9 +1,8 @@
-import { Routes, Route, Navigate } from 'react-router';
+import { Routes, Route, Navigate, useLocation } from 'react-router';
 import { useAuthStore } from './stores';
 import { Suspense, lazy, useEffect, useLayoutEffect, useState, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { authApi, tenantApi } from './services/api';
-import { canAccessSaasAdmin } from './utils/saasAdmin';
 import {
     consumeTenantSwitchSessionFromUrl,
     resolveBootstrapToken,
@@ -11,6 +10,11 @@ import {
 import { validateCrossOriginTenantSwitch } from './utils/tenantSwitch';
 import { useQueryClient } from '@tanstack/react-query';
 import { authQueryScopeKey, tenantWorkspaceRedirect } from './utils/workspaceAccess';
+import {
+    hasProductSurface,
+    resolveProductEntry,
+    type ProductSurface,
+} from './utils/productAccess';
 
 // React StrictMode remounts the auth bootstrap in development.  Keep a
 // consumed cross-origin candidate in memory until one non-cancelled pass has
@@ -25,22 +29,23 @@ const Login = lazy(() => import('./pages/Login'));
 const ForgotPassword = lazy(() => import('./pages/ForgotPassword'));
 const ResetPassword = lazy(() => import('./pages/ResetPassword'));
 const VerifyEmail = lazy(() => import('./pages/VerifyEmail'));
-const CompanySetup = lazy(() => import('./pages/CompanySetup'));
+const CompanyAccess = lazy(() => import('./pages/CompanyAccess'));
+const AccountCompanies = lazy(() => import('./pages/AccountCompanies'));
+const AccountSecurity = lazy(() => import('./pages/AccountSecurity'));
+const SurfaceChooser = lazy(() => import('./pages/SurfaceChooser'));
 const Onboarding = lazy(() => import('./pages/Onboarding'));
 const Layout = lazy(() => import('./pages/Layout'));
 const Dashboard = lazy(() => import('./pages/Dashboard'));
+const Employees = lazy(() => import('./pages/Employees'));
 const Work = lazy(() => import('./pages/Work'));
 const Plaza = lazy(() => import('./pages/Plaza'));
 const AgentDetail = lazy(() => import('./pages/AgentDetail'));
 const AgentCreate = lazy(() => import('./pages/AgentCreate'));
 const Messages = lazy(() => import('./pages/Messages'));
-const EnterpriseSettings = lazy(() => import('./pages/EnterpriseSettings'));
-const InvitationCodes = lazy(() => import('./pages/InvitationCodes'));
-const AdminCompanies = lazy(() => import('./pages/AdminCompanies'));
-const AccountManagement = lazy(() => import('./pages/AccountManagement'));
+const CompanyAdmin = lazy(() => import('./pages/CompanyAdmin'));
+const PlatformOperations = lazy(() => import('./pages/PlatformOperations'));
 const SubscriptionDetail = lazy(() => import('./pages/SubscriptionDetail'));
 const BillingSuccess = lazy(() => import('./pages/BillingSuccess'));
-const SaasAdmin = lazy(() => import('./pages/SaasAdmin'));
 const OAuthCallback = lazy(() => import('./pages/OAuthCallback'));
 const SSOEntry = lazy(() => import('./pages/SSOEntry'));
 const OKR = lazy(() => import('./pages/OKR'));
@@ -51,12 +56,6 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
     const token = useAuthStore((s) => s.token);
     const user = useAuthStore((s) => s.user);
     if (!token) return <Navigate to="/login" replace />;
-    // Global platform administrators intentionally have no tenant. Do not trap
-    // them in tenant onboarding; their landing surface is the platform console.
-    if (user && !user.tenant_id && user.role !== 'platform_admin' && !(user as any).is_platform_admin) {
-        return <Navigate to="/setup-company" replace />;
-    }
-    
     // Force email verification if not active/verified
     if (user && !user.is_active) return <Navigate to="/verify-email" state={{ email: user.email }} replace />;
     
@@ -87,15 +86,91 @@ function AuthQueryScopeReset() {
 
 function CompanyAdminRoute({ children }: { children: React.ReactNode }) {
     const user = useAuthStore((s) => s.user);
-    const canAccessCompanySettings = user?.role === 'platform_admin' || user?.role === 'org_admin' || !!(user as any)?.is_platform_admin;
-    if (!canAccessCompanySettings) return <Navigate to="/" replace />;
+    if (!hasProductSurface(user, 'company_admin')) return <Navigate to={resolveProductEntry(user)} replace />;
     return <>{children}</>;
 }
 
-function SaasAdminRoute({ children }: { children: React.ReactNode }) {
+function PlatformAdminRoute({ children }: { children: React.ReactNode }) {
     const user = useAuthStore((s) => s.user);
-    if (!canAccessSaasAdmin(user)) return <Navigate to="/" replace />;
+    if (!hasProductSurface(user, 'platform_admin')) return <Navigate to={resolveProductEntry(user)} replace />;
     return <>{children}</>;
+}
+
+function ProductEntryRoute() {
+    const user = useAuthStore((state) => state.user);
+    const storedPreference = localStorage.getItem('preferred_product_surface');
+    const preferredSurface = (
+        storedPreference === 'work' || storedPreference === 'platform_admin'
+            ? storedPreference
+            : null
+    ) as ProductSurface | null;
+    return <Navigate to={resolveProductEntry(user, preferredSurface)} replace />;
+}
+
+function LegacyCompanyAdminRedirect() {
+    const location = useLocation();
+    const hash = location.hash.replace('#', '');
+    const sectionByHash: Record<string, string> = {
+        users: 'members', invites: 'members', approvals: 'approvals', audit: 'audit',
+        subscription: 'billing', info: 'settings', quotas: 'settings', org: 'integrations',
+        tools: 'integrations', skills: 'integrations', douyin: 'integrations', okr: 'integrations',
+    };
+    return <Navigate to={`/company-admin/${sectionByHash[hash] || 'settings'}`} replace />;
+}
+
+function LegacyPlatformRedirect() {
+    const location = useLocation();
+    const tab = new URLSearchParams(location.search).get('tab') || '';
+    const section = tab === 'accounts'
+        ? 'providers'
+        : tab === 'model-routes' || tab === 'media-routes'
+            ? 'routes'
+            : tab === 'production-issues'
+                ? 'health'
+                : tab === 'registration-codes'
+                    ? 'registration'
+                    : 'billing';
+    return <Navigate to={`/admin/platform/${section}${location.search}`} replace />;
+}
+
+function AuthAccessRefresh() {
+    const token = useAuthStore((state) => state.token);
+    const user = useAuthStore((state) => state.user);
+    const setUser = useAuthStore((state) => state.setUser);
+
+    useEffect(() => {
+        if (!token || !user) return;
+        let cancelled = false;
+        let refreshing = false;
+        const refresh = async () => {
+            if (refreshing || cancelled) return;
+            refreshing = true;
+            try {
+                const nextUser = await authApi.me();
+                if (!cancelled) setUser(nextUser);
+            } catch {
+                // The request layer owns 401 session cleanup. Transient network
+                // failures keep the last confirmed UI until the next refresh.
+            } finally {
+                refreshing = false;
+            }
+        };
+        const onFocus = () => void refresh();
+        const onVisibility = () => {
+            if (document.visibilityState === 'visible') void refresh();
+        };
+        const interval = window.setInterval(() => void refresh(), 15_000);
+        window.addEventListener('focus', onFocus);
+        document.addEventListener('visibilitychange', onVisibility);
+        return () => {
+            cancelled = true;
+            window.clearInterval(interval);
+            window.removeEventListener('focus', onFocus);
+            document.removeEventListener('visibilitychange', onVisibility);
+        };
+    }, [setUser, token, user?.id]);
+
+    return null;
 }
 
 /* ─── Notification Bar ─── */
@@ -366,6 +441,7 @@ export default function App() {
     return (
         <>
             <AuthQueryScopeReset />
+            <AuthAccessRefresh />
             <NotificationBar />
             <Suspense fallback={<div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', color: 'var(--text-tertiary)' }}>加载中...</div>}>
             <Routes>
@@ -375,12 +451,22 @@ export default function App() {
                 <Route path="/verify-email" element={<VerifyEmail />} />
                 <Route path="/oauth/callback/:provider" element={<OAuthCallback />} />
                 <Route path="/sso/entry" element={<SSOEntry />} />
-                <Route path="/setup-company" element={<CompanySetup />} />
-                <Route path="/admin/saas" element={<SaasAdminRoute><SaasAdmin /></SaasAdminRoute>} />
+                <Route path="/" element={<ProtectedRoute><ProductEntryRoute /></ProtectedRoute>} />
+                <Route path="/choose-surface" element={<ProtectedRoute><SurfaceChooser /></ProtectedRoute>} />
+                <Route path="/setup-company" element={<ProtectedRoute><CompanyAccess /></ProtectedRoute>} />
+                <Route path="/account/companies" element={<ProtectedRoute><AccountCompanies /></ProtectedRoute>} />
+                <Route path="/account/security" element={<ProtectedRoute><AccountSecurity /></ProtectedRoute>} />
+                <Route path="/company-admin/*" element={<ProtectedRoute><CompanyAdminRoute><CompanyAdmin /></CompanyAdminRoute></ProtectedRoute>} />
+                <Route path="/admin/platform/*" element={<ProtectedRoute><PlatformAdminRoute><PlatformOperations /></PlatformAdminRoute></ProtectedRoute>} />
+                <Route path="/enterprise" element={<ProtectedRoute><CompanyAdminRoute><LegacyCompanyAdminRedirect /></CompanyAdminRoute></ProtectedRoute>} />
+                <Route path="/invitations" element={<ProtectedRoute><CompanyAdminRoute><Navigate to="/company-admin/members" replace /></CompanyAdminRoute></ProtectedRoute>} />
+                <Route path="/admin/platform-settings" element={<ProtectedRoute><PlatformAdminRoute><Navigate to="/admin/platform/companies" replace /></PlatformAdminRoute></ProtectedRoute>} />
+                <Route path="/admin/saas" element={<ProtectedRoute><PlatformAdminRoute><LegacyPlatformRedirect /></PlatformAdminRoute></ProtectedRoute>} />
+                <Route path="/account" element={<ProtectedRoute><PlatformAdminRoute><Navigate to="/admin/platform/providers?tab=accounts" replace /></PlatformAdminRoute></ProtectedRoute>} />
                 <Route path="/onboarding" element={<ProtectedRoute><TenantWorkspaceRoute><Onboarding /></TenantWorkspaceRoute></ProtectedRoute>} />
-                <Route path="/" element={<ProtectedRoute><Layout /></ProtectedRoute>}>
-                    <Route index element={<Navigate to="/work" replace />} />
+                <Route element={<ProtectedRoute><TenantWorkspaceRoute><Layout /></TenantWorkspaceRoute></ProtectedRoute>}>
                     <Route path="work" element={<TenantWorkspaceRoute><Work /></TenantWorkspaceRoute>} />
+                    <Route path="employees" element={<TenantWorkspaceRoute><Employees /></TenantWorkspaceRoute>} />
                     <Route path="dashboard" element={<TenantWorkspaceRoute><Dashboard /></TenantWorkspaceRoute>} />
                     <Route path="plaza" element={<TenantWorkspaceRoute><Plaza /></TenantWorkspaceRoute>} />
                     <Route path="agents/new" element={<TenantWorkspaceRoute><AgentCreate /></TenantWorkspaceRoute>} />
@@ -393,11 +479,7 @@ export default function App() {
                     <Route path="groups/:groupId" element={<TenantWorkspaceRoute><GroupsPage /></TenantWorkspaceRoute>} />
                     <Route path="groups/:groupId/:sessionId" element={<TenantWorkspaceRoute><GroupsPage /></TenantWorkspaceRoute>} />
                     <Route path="messages" element={<TenantWorkspaceRoute><Messages /></TenantWorkspaceRoute>} />
-                    <Route path="enterprise" element={<TenantWorkspaceRoute><CompanyAdminRoute><EnterpriseSettings /></CompanyAdminRoute></TenantWorkspaceRoute>} />
                     <Route path="okr" element={<TenantWorkspaceRoute><OKR /></TenantWorkspaceRoute>} />
-                    <Route path="invitations" element={<TenantWorkspaceRoute><CompanyAdminRoute><InvitationCodes /></CompanyAdminRoute></TenantWorkspaceRoute>} />
-                    <Route path="admin/platform-settings" element={<AdminCompanies />} />
-                    <Route path="account" element={<SaasAdminRoute><AccountManagement /></SaasAdminRoute>} />
                     <Route path="account/subscription" element={<TenantWorkspaceRoute><SubscriptionDetail /></TenantWorkspaceRoute>} />
                     <Route path="billing/success" element={<TenantWorkspaceRoute><BillingSuccess /></TenantWorkspaceRoute>} />
                 </Route>

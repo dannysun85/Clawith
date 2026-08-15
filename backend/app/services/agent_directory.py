@@ -224,7 +224,7 @@ def _custom_human_authorized_condition(source: AgentModel):
             UserModel.id == OrgMember.user_id,
             UserModel.tenant_id == source.tenant_id,
             UserModel.is_active == True,  # noqa: E712
-            UserModel.role.in_(["platform_admin", "org_admin"]),
+            UserModel.role.in_(["org_owner", "org_admin"]),
         ),
         exists().where(
             AgentPermission.agent_id == source.id,
@@ -346,7 +346,7 @@ async def is_custom_human_authorized(
     if not row:
         return False
     role, permission_id = row
-    return role in ("platform_admin", "org_admin") or permission_id is not None
+    return role in ("org_owner", "org_admin") or permission_id is not None
 
 
 async def query_agent_directory(

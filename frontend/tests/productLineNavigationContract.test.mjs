@@ -4,6 +4,13 @@ import test from 'node:test';
 
 const app = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
 const layout = readFileSync(new URL('../src/pages/Layout.tsx', import.meta.url), 'utf8');
+const productAccess = readFileSync(new URL('../src/utils/productAccess.ts', import.meta.url), 'utf8');
+const api = readFileSync(new URL('../src/services/api.ts', import.meta.url), 'utf8');
+const companyAdmin = readFileSync(new URL('../src/pages/CompanyAdmin.tsx', import.meta.url), 'utf8');
+const companyAccess = readFileSync(new URL('../src/pages/CompanyAccess.tsx', import.meta.url), 'utf8');
+const accountCompanies = readFileSync(new URL('../src/pages/AccountCompanies.tsx', import.meta.url), 'utf8');
+const platformOperations = readFileSync(new URL('../src/pages/PlatformOperations.tsx', import.meta.url), 'utf8');
+const employees = readFileSync(new URL('../src/pages/Employees.tsx', import.meta.url), 'utf8');
 const onboarding = readFileSync(new URL('../src/pages/Onboarding.tsx', import.meta.url), 'utf8');
 const work = readFileSync(new URL('../src/pages/Work.tsx', import.meta.url), 'utf8');
 const plaza = readFileSync(new URL('../src/pages/Plaza.tsx', import.meta.url), 'utf8');
@@ -11,9 +18,12 @@ const editor = readFileSync(new URL('../src/components/ExperienceDraftEditor.tsx
 const agentDetail = readFileSync(new URL('../src/pages/agent-detail/AgentDetailPage.tsx', import.meta.url), 'utf8');
 
 test('the task workbench is the default entry while legacy routes remain available', () => {
-  assert.match(app, /<Navigate to="\/work" replace/);
+  assert.match(app, /resolveProductEntry\(user, preferredSurface\)/);
+  assert.match(productAccess, /work: '\/work'/);
+  assert.match(productAccess, /primarySurfaces\.length > 1.*'\/choose-surface'/s);
   assert.match(app, /path="work"/);
   assert.match(app, /path="dashboard"/);
+  assert.match(app, /path="employees"/);
   assert.match(app, /path="plaza"/);
   assert.match(onboarding, /navigate\('\/work'/);
   assert.match(onboarding, /createAssistant\(true\)/);
@@ -22,12 +32,86 @@ test('the task workbench is the default entry while legacy routes remain availab
 
 test('navigation names communicate distinct product responsibilities', () => {
   assert.match(layout, /'工作台'/);
+  assert.match(layout, /'团队'/);
+  assert.match(layout, /'经营'/);
+  assert.match(layout, /'管理'/);
   assert.match(layout, /'公司概览'/);
-  assert.match(layout, /'发现中心'/);
+  assert.match(layout, /'目标与复盘'/);
+  assert.match(layout, /'团队知识'/);
+  assert.match(layout, /'公司管理'/);
   assert.match(layout, /'协作群组'/);
   assert.match(layout, /'我的助理'/);
   assert.match(layout, /历史助理/);
-  assert.match(layout, /'Agent 员工'/);
+  assert.match(layout, /'数字员工'/);
+  assert.match(layout, /data-tour-target="operations-nav"/);
+  assert.match(layout, /data-tour-target="management-nav"/);
+  assert.match(layout, /to="\/employees"/);
+  assert.match(layout, /to="\/okr"/);
+  assert.match(layout, /to="\/plaza"/);
+  assert.match(layout, /to="\/company-admin"/);
+  assert.doesNotMatch(layout, /'协作角色'|'发现中心'|'企业设置'/);
+  assert.doesNotMatch(layout, /sortedAgents\.map/);
+});
+
+test('assistant navigation keeps one stable relationship and hides compatibility history by default', () => {
+  assert.match(layout, /useState\(false\).*legacyAssistantsOpen|legacyAssistantsOpen.*useState\(false\)/s);
+  assert.match(layout, /label: isChinese \? '我的助理' : 'My assistant'/);
+  assert.match(layout, /subtitle: personalAssistant\.name/);
+  assert.match(layout, /className="sidebar-legacy-toggle"/);
+  assert.match(layout, /aria-expanded=\{legacyAssistantsOpen\}/);
+  assert.match(layout, /legacyAssistantsOpen && !isSidebarCollapsed/);
+});
+
+test('digital employees own one center with network, full directory, and one hiring entry', () => {
+  assert.match(employees, /'network' \| 'directory'/);
+  assert.match(employees, /'available' \| 'managed' \| 'governance'/);
+  assert.match(employees, /<WorkforceTopology topology=\{scopedTopology\}/);
+  assert.match(employees, /topology=\{scopedTopology\}/);
+  assert.match(employees, /openTalentMarket/);
+  assert.match(layout, /view=directory&highlight=/);
+  assert.match(employees, /node\.can_manage/);
+  assert.match(employees, /'agent\.manage\.company'/);
+  assert.match(employees, /\/settings#settings/);
+});
+
+test('company creation and member onboarding are separate recoverable product stages', () => {
+  assert.match(companyAccess, /companyAuthorityConfirmed/);
+  assert.match(companyAccess, /timezone: companyTimezone/);
+  assert.match(companyAccess, /country_region: companyRegion/);
+  assert.match(companyAccess, /commitSameOriginTenantSwitch/);
+  assert.match(onboarding, /'company' \| 'profile' \| 'assistant' \| 'opening'/);
+  assert.match(onboarding, /onboardingApi\.initializeCompany/);
+  assert.match(onboarding, /onboardingApi\.completeProfile/);
+  assert.match(onboarding, /允许普通成员创建私有 Agent/);
+  assert.match(onboarding, /私人助理属于你在这家公司的成员身份/);
+  assert.match(onboarding, /Provider、模型、Skill 和 Tool 稍后/);
+  assert.doesNotMatch(onboarding, /setProvider|setModel|selectSkill|selectTool/);
+});
+
+test('membership changes validate scoped tokens and leave no legacy join modal', () => {
+  assert.match(accountCompanies, /fallback_tenant_id && result\.access_token/);
+  assert.match(accountCompanies, /commitSameOriginTenantSwitch/);
+  assert.match(accountCompanies, /tenantApi\.leavePreflight/);
+  assert.match(accountCompanies, /owned_agents/);
+  assert.match(accountCompanies, /确认并退出公司/);
+  assert.match(accountCompanies, /个人凭证失效/);
+  assert.match(accountCompanies, /tenant\.membership_role/);
+  assert.doesNotMatch(accountCompanies, /tenant\.role \|\| tenant\.membership_role/);
+  assert.match(companyAdmin, /fallback_tenant_id && result\.access_token/);
+  assert.match(companyAdmin, /commitSameOriginTenantSwitch/);
+  assert.match(companyAdmin, /membershipApi\.deactivationPreflight/);
+  assert.match(companyAdmin, /私人 Agent 内容不会向管理员开放/);
+  assert.match(companyAdmin, /navigate\('\/account\/companies'\)/);
+  assert.doesNotMatch(layout, /handleModalJoin|handleModalCreate|tenant-setup-modal/);
+});
+
+test('agent ownership handover is explicit and keeps private assistants non-transferable', () => {
+  assert.match(agentDetail, /Agent 所有权交接/);
+  assert.match(agentDetail, /\/agents\/\$\{agentId\}\/handover/);
+  assert.match(agentDetail, /new_creator_id: handoverTargetId/);
+  assert.match(agentDetail, /productRole === 'personal_assistant'/);
+  assert.match(agentDetail, /私人助理包含个人上下文，不能转交/);
+  assert.match(agentDetail, /canForceHandover=\{currentUser\?\.membership_role === 'org_owner'/);
 });
 
 test('agent detail preserves the server-owned product role instead of guessing from names', () => {
@@ -40,11 +124,54 @@ test('agent detail preserves the server-owned product role instead of guessing f
 test('company administration routes stay behind the company-admin boundary', () => {
   assert.match(
     app,
-    /path="enterprise" element={<TenantWorkspaceRoute><CompanyAdminRoute><EnterpriseSettings \/><\/CompanyAdminRoute><\/TenantWorkspaceRoute>}/,
+    /path="\/company-admin\/\*" element={<ProtectedRoute><CompanyAdminRoute><CompanyAdmin \/><\/CompanyAdminRoute><\/ProtectedRoute>}/,
   );
   assert.match(
     app,
-    /path="invitations" element={<TenantWorkspaceRoute><CompanyAdminRoute><InvitationCodes \/><\/CompanyAdminRoute><\/TenantWorkspaceRoute>}/,
+    /path="\/enterprise" element={<ProtectedRoute><CompanyAdminRoute><LegacyCompanyAdminRedirect \/><\/CompanyAdminRoute><\/ProtectedRoute>}/,
+  );
+  assert.match(app, /hasProductSurface\(user, 'company_admin'\)/);
+  assert.match(companyAdmin, /'company\.members\.view'/);
+  assert.match(companyAdmin, /'company\.ownership\.transfer'/);
+  assert.match(companyAdmin, /organizationInvitations/);
+  assert.match(companyAdmin, /requestOwnershipTransfer/);
+  assert.match(companyAdmin, /allow_member_private_agents/);
+  assert.match(companyAdmin, /default_approval_policy/);
+  assert.match(companyAdmin, /发送邮箱邀请/);
+  assert.match(companyAdmin, /SMTP 已接受（不代表对方已读）/);
+  assert.match(companyAdmin, /issueOrganizationInvitationManualLink/);
+  assert.match(companyAdmin, /current-password/);
+  assert.match(companyAdmin, /旧链接已失效并重新受理/);
+  assert.match(api, /'Idempotency-Key': idempotencyKey/);
+  assert.doesNotMatch(
+    companyAdmin,
+    /createOrganizationInvitation[\s\S]{0,500}result\.token/,
+  );
+});
+
+test('platform operations use an independent shell and separated registration grants', () => {
+  assert.match(app, /path="\/admin\/platform\/\*"/);
+  assert.match(app, /hasProductSurface\(user, 'platform_admin'\)/);
+  assert.match(platformOperations, /kind="platform"/);
+  assert.match(platformOperations, /platform\.registration\.manage/);
+  assert.match(platformOperations, /createRegistrationGrants/);
+  assert.match(platformOperations, /createSupportSession/);
+  assert.match(platformOperations, /supportTenantSummary/);
+  assert.match(platformOperations, /data-testid="support-tenant-summary"/);
+  assert.match(platformOperations, /data-testid="tenant-purge-queue"/);
+  assert.match(platformOperations, /执行无删除 dry-run/);
+  assert.match(platformOperations, /物理清理由受控执行器处理，不暴露网页按钮/);
+  assert.match(platformOperations, /createTenantDeletionHold/);
+  assert.match(platformOperations, /releaseTenantDeletionHold/);
+  assert.match(api, /'\/auth\/register\/init'/);
+  assert.match(api, /\/admin\/tenant-deletions\/\$\{tenantId\}\/dry-run/);
+  assert.doesNotMatch(platformOperations, /executeTenantPurge|物理删除按钮/);
+  assert.match(platformOperations, /不返回成员身份明细、Agent 内容、消息、附件或 Workspace 文件/);
+  assert.match(api, /support-sessions\/\$\{sessionId\}\/tenants\/\$\{tenantId\}\/summary/);
+  assert.match(platformOperations, /support never grants access|支持会话不授予/);
+  assert.doesNotMatch(
+    platformOperations,
+    /to: '\/employees'|to="\/employees"|to: '\/groups'|to="\/groups"|to: '\/assistant'|to="\/assistant"/,
   );
 });
 

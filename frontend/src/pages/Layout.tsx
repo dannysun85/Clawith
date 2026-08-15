@@ -4,8 +4,7 @@ import { Outlet, NavLink, useNavigate, useMatch, useLocation } from 'react-route
 import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useAuthStore } from '../stores';
-import { canAccessSaasAdmin } from '../utils/saasAdmin';
-import { agentApi, tenantApi, authApi, onboardingApi } from '../services/api';
+import { agentApi, authApi, onboardingApi } from '../services/api';
 import { useGroupUnread } from '../hooks/useGroupUnread';
 import { useToast } from '../components/Toast/ToastProvider';
 import {
@@ -30,9 +29,6 @@ import {
     IconUsersGroup,
     IconSearch,
     IconX,
-    IconPin,
-    IconPinnedOff,
-    IconArrowUpRight,
     IconBuilding,
     IconChevronUp,
     IconChevronRight,
@@ -49,6 +45,10 @@ import { AstraWordmark } from '../components/atlas';
 import { normalizeTenantRedirectUrl } from '../utils/authTransport';
 import { commitSameOriginTenantSwitch, validateTenantSwitchCandidate } from '../utils/tenantSwitch';
 import { partitionAgentRoles } from '../utils/productRoles';
+import {
+    hasProductSurface,
+    isPlatformOperator,
+} from '../utils/productAccess';
 
 const MOBILE_NAV_MEDIA_QUERY = '(max-width: 768px)';
 
@@ -324,21 +324,21 @@ function CompanyTourOverlay({ assistantId, isChinese, onDone }: { assistantId: s
         {
             selector: '[data-tour-target="agent-list"]',
             title: isChinese ? '助理与员工' : 'Assistant and employees',
-            body: isChinese ? '私人助理负责协调你的工作；长期 Agent 员工在独立列表中负责专业执行。' : 'Your private assistant coordinates your work; long-term Agent employees are listed separately for specialist execution.',
+            body: isChinese ? '私人助理负责协调你的工作；数字员工中心承载完整员工名册与协作网络。' : 'Your private assistant coordinates your work; the Digital Employee Center owns the complete roster and collaboration network.',
             pad: 8,
             radius: 14,
         },
         {
             selector: '[data-tour-target="hire-agent"]',
-            title: isChinese ? '新增员工' : 'Hire new employees',
-            body: isChinese ? '点击加号可以从 Talent Market 增加新的 agent 员工。' : 'Use the plus button to add new agent employees from the Talent Market.',
+            title: isChinese ? '数字员工中心' : 'Digital Employee Center',
+            body: isChinese ? '进入数字员工中心查看协作网络、完整名册，并按权限添加新员工。' : 'Open the Digital Employee Center to view the network, browse the full roster, and add employees when authorized.',
             pad: 7,
             radius: 10,
         },
         {
-            selector: '[data-tour-target="organization-nav"]',
-            title: isChinese ? '组织管理' : 'Organization management',
-            body: isChinese ? '公司概览只看运营状态，OKR 管目标与结果证据，发现中心用于沉淀经验和招聘长期 Agent 员工。' : 'Company overview shows operating health, OKR owns goals and result evidence, and Discover holds reusable experience and long-term Agent hiring.',
+            selector: '[data-tour-target="operations-nav"]',
+            title: isChinese ? '经营视角' : 'Operations view',
+            body: isChinese ? '公司概览查看运营状态，目标与复盘连接目标和结果证据，团队知识沉淀可复用经验。' : 'Company overview shows operating health, Goals & reviews connects goals with result evidence, and Team knowledge preserves reusable experience.',
             pad: 8,
             radius: 14,
         },
@@ -479,9 +479,9 @@ export default function Layout() {
     const activeAgentNestedMatch = useMatch('/agents/:id/*');
     const activeAgentRootMatch = useMatch('/agents/:id');
     const activeAgentId = activeAgentNestedMatch?.params.id || activeAgentRootMatch?.params.id;
-    const canAccessPlatformSettings = user?.role === 'platform_admin' || !!(user as any)?.is_platform_admin;
-    const canAccessSaas = canAccessSaasAdmin(user);
-    const canAccessCompanySettings = user?.role === 'platform_admin' || user?.role === 'org_admin' || !!(user as any)?.is_platform_admin;
+    const canAccessPlatformSettings = hasProductSurface(user, 'platform_admin');
+    const canAccessCompanySettings = hasProductSurface(user, 'company_admin');
+    const pendingInvitationCount = user?.pending_invitation_count || 0;
     const routeParams = new URLSearchParams(location.search);
     const showCompanyTour = routeParams.get('tour') === 'company';
     const tourAssistantId = routeParams.get('assistantId') || '';
@@ -500,13 +500,7 @@ export default function Layout() {
     const [notifCategory, setNotifCategory] = useState<string>('all');
     const [selectedNotification, setSelectedNotification] = useState<any | null>(null);
     const [showTenantMenu, setShowTenantMenu] = useState(false);
-    const [showTenantSetupModal, setShowTenantSetupModal] = useState(false);
     const [tenantSearch, setTenantSearch] = useState('');
-    const [joinInviteCode, setJoinInviteCode] = useState('');
-    const [createCompanyName, setCreateCompanyName] = useState('');
-    const [tenantFormLoading, setTenantFormLoading] = useState(false);
-    const [tenantFormError, setTenantFormError] = useState('');
-    const [allowSelfCreate, setAllowSelfCreate] = useState(true);
     const tenantSwitcherRef = useRef<HTMLDivElement>(null);
     const tenantMenuPortalRef = useRef<HTMLDivElement>(null);
     const [tenantMenuPos, setTenantMenuPos] = useState({ top: 0, left: 0, maxHeight: 520 });
@@ -604,7 +598,9 @@ export default function Layout() {
         }
     };
 
-    // Open the tenant switcher modal — also fetch self-create config
+    // Company membership changes are centralized in the account-level flow so
+    // RegistrationGrant, OrganizationInvitation, and OrganizationJoinLink are
+    // never presented as interchangeable credentials.
     const openTenantModal = () => {
         setShowTenantMenu(true);
         setTenantSearch('');
@@ -612,69 +608,7 @@ export default function Layout() {
 
     const openTenantSetupModal = () => {
         setShowTenantMenu(false);
-        setShowTenantSetupModal(true);
-        setJoinInviteCode('');
-        setCreateCompanyName('');
-        setTenantFormError('');
-        tenantApi.registrationConfig().then((d: any) => {
-            setAllowSelfCreate(d.allow_self_create_company);
-        }).catch(() => {});
-    };
-
-    // Join company via invite code (inside modal)
-    const handleModalJoin = async (e: React.FormEvent) => {
-        e.preventDefault();
-        setTenantFormError('');
-        setTenantFormLoading(true);
-        try {
-            const result = await tenantApi.join(joinInviteCode);
-            const candidateToken = result.access_token || localStorage.getItem('token');
-            await commitSameOriginTenantSwitch({
-                tenantId: result.tenant.id,
-                accessToken: candidateToken,
-                validateToken: authApi.me,
-                establishAuth: setAuth,
-                persistTenantId: (value) => localStorage.setItem('current_tenant_id', value),
-                clearTenantId: () => localStorage.removeItem('current_tenant_id'),
-                currentTenantId: () => localStorage.getItem('current_tenant_id'),
-                resolvedTenantId: (candidateUser) => candidateUser.tenant_id,
-            });
-            setShowTenantMenu(false);
-            setShowTenantSetupModal(false);
-            window.location.href = '/onboarding?mode=join';
-        } catch (err: any) {
-            setTenantFormError(err.message || 'Failed to join company');
-        } finally {
-            setTenantFormLoading(false);
-        }
-    };
-
-    // Create company (inside modal)
-    const handleModalCreate = async (e: React.FormEvent) => {
-        e.preventDefault();
-        setTenantFormError('');
-        setTenantFormLoading(true);
-        try {
-            const result = await tenantApi.selfCreate({ name: createCompanyName });
-            const candidateToken = result.access_token || localStorage.getItem('token');
-            await commitSameOriginTenantSwitch({
-                tenantId: result.tenant.id,
-                accessToken: candidateToken,
-                validateToken: authApi.me,
-                establishAuth: setAuth,
-                persistTenantId: (value) => localStorage.setItem('current_tenant_id', value),
-                clearTenantId: () => localStorage.removeItem('current_tenant_id'),
-                currentTenantId: () => localStorage.getItem('current_tenant_id'),
-                resolvedTenantId: (candidateUser) => candidateUser.tenant_id,
-            });
-            setShowTenantMenu(false);
-            setShowTenantSetupModal(false);
-            window.location.href = '/onboarding?mode=create';
-        } catch (err: any) {
-            setTenantFormError(err.message || 'Failed to create company');
-        } finally {
-            setTenantFormLoading(false);
-        }
+        navigate('/setup-company');
     };
 
     // Theme
@@ -698,6 +632,7 @@ export default function Layout() {
         typeof window !== 'undefined' && window.matchMedia(MOBILE_NAV_MEDIA_QUERY).matches
     ));
     const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+    const [legacyAssistantsOpen, setLegacyAssistantsOpen] = useState(false);
     const isSidebarCollapsed = storedSidebarCollapsed && !isMobileViewport;
 
     useEffect(() => {
@@ -734,7 +669,7 @@ export default function Layout() {
     useEffect(() => {
         if (
             isMobileViewport
-            && (showAccountSettings || showNotifications || showTenantSetupModal || showTalentMarket)
+            && (showAccountSettings || showNotifications || showTalentMarket)
         ) {
             setMobileSidebarOpen(false);
         }
@@ -743,28 +678,7 @@ export default function Layout() {
         showAccountSettings,
         showNotifications,
         showTalentMarket,
-        showTenantSetupModal,
     ]);
-
-    // Sidebar agent search & pin
-    const [sidebarSearch, setSidebarSearch] = useState('');
-    const [agentDrawerOpen, setAgentDrawerOpen] = useState(false);
-    const agentDrawerCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-    const [pinnedAgents, setPinnedAgents] = useState<Set<string>>(() => {
-        try {
-            const stored = localStorage.getItem('pinned_agents');
-            return stored ? new Set(JSON.parse(stored)) : new Set();
-        } catch { return new Set(); }
-    });
-    const togglePin = (agentId: string) => {
-        setPinnedAgents(prev => {
-            const next = new Set(prev);
-            if (next.has(agentId)) next.delete(agentId);
-            else next.add(agentId);
-            localStorage.setItem('pinned_agents', JSON.stringify([...next]));
-            return next;
-        });
-    };
 
     // Use user's own tenant_id directly (no switching)
     const currentTenant = user?.tenant_id || '';
@@ -821,7 +735,6 @@ export default function Layout() {
             agentLimitMessage(!!isChinese, agentCreationLimit.activeCount, agentCreationLimit.maxAgents),
             { duration: 5000 },
         );
-        setAgentDrawerOpen(false);
         setShowTalentMarket(false);
         navigate(SUBSCRIPTION_UPGRADE_PATH);
     }, [agentCreationLimit.activeCount, agentCreationLimit.maxAgents, isChinese, navigate, toast]);
@@ -834,23 +747,6 @@ export default function Layout() {
         setTalentMarketInitialSearch(options?.initialSearchQuery || '');
         setShowTalentMarket(true);
     }, [agentCreationLimit.isLimited, handleAgentLimitReached]);
-
-    const openAgentDrawer = useCallback(() => {
-        if (!isSidebarCollapsed) return;
-        if (agentDrawerCloseTimerRef.current) {
-            clearTimeout(agentDrawerCloseTimerRef.current);
-            agentDrawerCloseTimerRef.current = null;
-        }
-        setAgentDrawerOpen(true);
-    }, [isSidebarCollapsed]);
-
-    const scheduleCloseAgentDrawer = useCallback(() => {
-        if (agentDrawerCloseTimerRef.current) clearTimeout(agentDrawerCloseTimerRef.current);
-        agentDrawerCloseTimerRef.current = setTimeout(() => {
-            setAgentDrawerOpen(false);
-            agentDrawerCloseTimerRef.current = null;
-        }, 160);
-    }, []);
 
     const handleLogout = () => {
         logout();
@@ -891,12 +787,7 @@ export default function Layout() {
 
     useEffect(() => () => {
         if (langHoverCloseTimerRef.current) clearTimeout(langHoverCloseTimerRef.current);
-        if (agentDrawerCloseTimerRef.current) clearTimeout(agentDrawerCloseTimerRef.current);
     }, []);
-
-    useEffect(() => {
-        if (!isSidebarCollapsed) setAgentDrawerOpen(false);
-    }, [isSidebarCollapsed]);
 
     const updateLangSubmenuPosition = useCallback(() => {
         const el = accountDropdownRef.current;
@@ -1041,7 +932,8 @@ export default function Layout() {
                 onClick={openTenantSetupModal}
             >
                 <IconPlus size={17} stroke={1.6} />
-                <span>{isChinese ? '创建或加入新公司' : 'Create or join company'}</span>
+                <span>{isChinese ? '公司与邀请' : 'Companies and invitations'}</span>
+                {pendingInvitationCount > 0 && <span className="sidebar-item-badge">{pendingInvitationCount}</span>}
             </button>
             {canAccessCompanySettings && (
                 <button
@@ -1049,79 +941,49 @@ export default function Layout() {
                     className="tenant-switcher-action"
                     onClick={() => {
                         setShowTenantMenu(false);
-                        navigate('/enterprise');
+                        navigate('/company-admin');
                     }}
                 >
                     <IconSettings size={16} stroke={1.6} />
-                    <span>{isChinese ? '公司信息设置' : 'Company settings'}</span>
+                    <span>{isChinese ? '进入公司管理' : 'Open company administration'}</span>
                 </button>
             )}
         </div>,
         document.body,
     );
 
-    const q = sidebarSearch.trim().toLowerCase();
-    const matchesAgentSearch = (agent: any) => (
-        !q
-        || (agent.name || '').toLowerCase().includes(q)
-        || (agent.role_description || '').toLowerCase().includes(q)
-    );
-    const visiblePersonalAssistant = personalAssistant && matchesAgentSearch(personalAssistant)
-        ? personalAssistant
-        : null;
-    const sortVisibleAgents = (items: any[]) => [...items].filter((agent: any) => {
-        return matchesAgentSearch(agent);
-    }).sort((a: any, b: any) => {
-        const ap = pinnedAgents.has(a.id) ? 1 : 0;
-        const bp = pinnedAgents.has(b.id) ? 1 : 0;
-        if (ap !== bp) return bp - ap;
-        const aTime = a.created_at ? new Date(a.created_at).getTime() : 0;
-        const bTime = b.created_at ? new Date(b.created_at).getTime() : 0;
-        return bTime - aTime;
-    });
-    const visibleLegacyPersonalAssistants = sortVisibleAgents(legacyPersonalAssistants as any[]);
-    const sortedAgents = sortVisibleAgents(employeeAgents as any[]);
-
-    const agentSearchBox = (force = false) => (force || agents.length >= 5) && (
-        <div className="sidebar-agent-search">
-            <IconSearch size={14} stroke={2} className="sidebar-agent-search-icon" />
-            <input
-                id="sidebar-agent-search"
-                name="sidebar_agent_search"
-                type="text"
-                value={sidebarSearch}
-                onChange={e => setSidebarSearch(e.target.value)}
-                placeholder={isChinese ? '搜索...' : 'Search...'}
-                aria-label={isChinese ? '搜索智能体' : 'Search agents'}
-            />
-            {sidebarSearch && (
-                <button onClick={() => setSidebarSearch('')} aria-label={isChinese ? '清空搜索' : 'Clear search'}>
-                    <IconX size={14} stroke={2} />
-                </button>
-            )}
-        </div>
+    const sortedLegacyPersonalAssistants = useMemo(
+        () => [...legacyPersonalAssistants].sort((a: any, b: any) => {
+            const aTime = a.created_at ? new Date(a.created_at).getTime() : 0;
+            const bTime = b.created_at ? new Date(b.created_at).getTime() : 0;
+            return bTime - aTime;
+        }),
+        [legacyPersonalAssistants],
     );
 
-    const renderAgent = (agent: any, options?: { drawer?: boolean }) => {
+    useEffect(() => {
+        setLegacyAssistantsOpen(
+            !!activeAgentId && sortedLegacyPersonalAssistants.some((agent: any) => agent.id === activeAgentId),
+        );
+    }, [activeAgentId, sortedLegacyPersonalAssistants]);
+
+    const renderAgent = (
+        agent: any,
+        options?: { label?: string; subtitle?: string; identity?: boolean },
+    ) => {
         const badge = getAgentBadgeStatus(agent);
         const avatarChar = ((Array.from(agent.name || '?')[0] as string) || '?').toUpperCase();
         const unreadCount = Number(agent.unread_count || 0);
-        const showPin = !isSidebarCollapsed || options?.drawer;
+        const label = options?.label || agent.name;
         return (
-            <div key={agent.id} className={`sidebar-agent-item${agent.creator_id === user?.id ? ' owned' : ''}${options?.drawer ? ' drawer-agent' : ''}`}>
+            <div key={agent.id} className={`sidebar-agent-item${agent.creator_id === user?.id ? ' owned' : ''}`}>
                 <NavLink
                     to={`/agents/${agent.id}/chat`}
-                    className={({ isActive }) => `sidebar-item ${isActive || activeAgentId === agent.id ? 'active' : ''}`}
-                    title={agent.name}
-                    onClick={() => setAgentDrawerOpen(false)}
+                    className={({ isActive }) => `sidebar-item${options?.identity ? ' sidebar-item--identity' : ''} ${isActive || activeAgentId === agent.id ? 'active' : ''}`}
+                    title={options?.subtitle ? `${label} · ${options.subtitle}` : agent.name}
                 >
                     <span className="sidebar-item-icon" style={{ position: 'relative' }}>
                         <span className={`agent-avatar${agent.agent_type === 'openclaw' ? ' openclaw' : ''}`}>{avatarChar}</span>
-                        {agent.agent_type === 'openclaw' && (
-                            <span className="agent-avatar-link" style={{ display: 'flex' }}>
-                                <IconArrowUpRight size={10} stroke={2.5} />
-                            </span>
-                        )}
                         {badge && <span className={`agent-avatar-badge ${badge}`} />}
                         {unreadCount > 0 && (
                             <span className="sidebar-agent-unread">
@@ -1129,102 +991,75 @@ export default function Layout() {
                             </span>
                         )}
                     </span>
-                    <span className="sidebar-item-text">{agent.name}</span>
+                    {options?.subtitle ? (
+                        <span className="sidebar-item-copy">
+                            <span className="sidebar-item-text">{label}</span>
+                            <span className="sidebar-item-secondary">{options.subtitle}</span>
+                        </span>
+                    ) : (
+                        <span className="sidebar-item-text">{label}</span>
+                    )}
                 </NavLink>
-                {showPin && (
-                    <button
-                        onClick={e => { e.preventDefault(); e.stopPropagation(); togglePin(agent.id); }}
-                        className={`sidebar-pin-btn ${pinnedAgents.has(agent.id) ? 'pinned' : ''}`}
-                        title={pinnedAgents.has(agent.id) ? (isChinese ? '取消置顶' : 'Unpin') : (isChinese ? '置顶' : 'Pin to top')}
-                    >
-                        {pinnedAgents.has(agent.id) ? (
-                            <>
-                                <IconPin size={14} stroke={1.5} className="pin-default" />
-                                <IconPinnedOff size={14} stroke={1.5} className="pin-hover" />
-                            </>
-                        ) : (
-                            <IconPin size={14} stroke={1.5} className="pin-on" />
-                        )}
-                    </button>
-                )}
             </div>
         );
     };
 
-    const agentListContent = (drawer = false) => (
+    const agentListContent = () => (
         <>
-            <div className="sidebar-agent-header">
-                <span>{isChinese ? '我的助理' : 'My assistant'}</span>
-            </div>
-            {visiblePersonalAssistant && renderAgent(visiblePersonalAssistant, { drawer })}
-            {!personalAssistant && !q && (
+            {personalAssistant && renderAgent(personalAssistant, {
+                label: isChinese ? '我的助理' : 'My assistant',
+                subtitle: personalAssistant.name,
+                identity: true,
+            })}
+            {!personalAssistant && (
                 <div className="sidebar-agent-empty">
                     {isChinese ? '尚未创建私人助理' : 'No private assistant yet'}
                 </div>
             )}
-            {visibleLegacyPersonalAssistants.length > 0 && (
-                <>
-                    <div
-                        className="sidebar-agent-header"
-                        title={isChinese
-                            ? '旧版本保留的私人助理，可继续查看历史内容，但不属于当前“我的助理”或长期 Agent 员工。'
-                            : 'Assistants retained from earlier versions. They keep their history but are neither your current assistant nor long-term Agent employees.'}
-                    >
-                        <span>
-                            {isChinese
-                                ? `历史助理（${visibleLegacyPersonalAssistants.length}）`
-                                : `Previous assistants (${visibleLegacyPersonalAssistants.length})`}
-                        </span>
-                    </div>
-                    {visibleLegacyPersonalAssistants.map(agent => renderAgent(agent, { drawer }))}
-                </>
-            )}
-            <div className="sidebar-agent-header">
-                <span>{isChinese ? 'Agent 员工' : 'Agent employees'}</span>
-                <button
-                    type="button"
-                    data-tour-target="hire-agent"
-                    onClick={() => handleOpenTalentMarket()}
-                    title={agentCreationLimit.isLimited
-                        ? agentLimitMessage(!!isChinese, agentCreationLimit.activeCount, agentCreationLimit.maxAgents)
-                        : t('nav.hire', t('nav.newAgent'))}
-                >
-                    <IconPlus size={15} stroke={1.7} />
-                </button>
-            </div>
-            {agentSearchBox(drawer)}
-            {sortedAgents.map(agent => renderAgent(agent, { drawer }))}
-            {employeeAgents.length === 0 && !q && (
-                <div className="sidebar-agent-empty">
-                    {isChinese ? '还没有长期 Agent 员工' : 'No long-term Agent employees yet'}
+            {sortedLegacyPersonalAssistants.length > 0 && (
+                <div className="sidebar-legacy-assistants">
+                    {!isSidebarCollapsed && (
+                        <button
+                            type="button"
+                            className="sidebar-legacy-toggle"
+                            aria-expanded={legacyAssistantsOpen}
+                            onClick={() => setLegacyAssistantsOpen(open => !open)}
+                            title={isChinese
+                                ? '旧版本保留的私人助理，可继续查看历史内容，但不属于当前“我的助理”或数字员工。'
+                                : 'Assistants retained from earlier versions. They keep their history but are neither your current assistant nor digital employees.'}
+                        >
+                            {legacyAssistantsOpen
+                                ? <IconChevronDown size={14} stroke={1.7} />
+                                : <IconChevronRight size={14} stroke={1.7} />}
+                            <span>{isChinese ? '历史助理' : 'Previous assistants'}</span>
+                            <span className="sidebar-legacy-count">{sortedLegacyPersonalAssistants.length}</span>
+                        </button>
+                    )}
+                    {legacyAssistantsOpen && !isSidebarCollapsed && (
+                        <div
+                            className="sidebar-legacy-list"
+                            title={isChinese
+                                ? '历史助理仅用于回访旧会话和文件。'
+                                : 'Previous assistants are retained only for revisiting earlier conversations and files.'}
+                        >
+                            {sortedLegacyPersonalAssistants.map(agent => renderAgent(agent))}
+                        </div>
+                    )}
                 </div>
             )}
-            {agents.length > 0
-                && !visiblePersonalAssistant
-                && visibleLegacyPersonalAssistants.length === 0
-                && sortedAgents.length === 0
-                && q && (
-                <div className="sidebar-agent-empty">
-                    {isChinese ? '无匹配结果' : 'No matches'}
-                </div>
-            )}
+            <NavLink
+                to="/employees"
+                data-tour-target="hire-agent"
+                className={({ isActive }) => `sidebar-item sidebar-team-primary ${isActive ? 'active' : ''}`}
+                title={isChinese ? '数字员工' : 'Digital employees'}
+            >
+                <span className="sidebar-item-icon" style={{ display: 'flex' }}>
+                    <IconUsersGroup size={16} stroke={1.5} />
+                </span>
+                <span className="sidebar-item-text">{isChinese ? '数字员工' : 'Digital employees'}</span>
+                <span className="sidebar-item-badge">{employeeAgents.length}</span>
+            </NavLink>
         </>
-    );
-
-    const agentDrawer = isSidebarCollapsed && agentDrawerOpen && typeof document !== 'undefined' && createPortal(
-        <div
-            className="sidebar-agent-drawer"
-            onMouseEnter={openAgentDrawer}
-            onMouseLeave={scheduleCloseAgentDrawer}
-        >
-            <div className="sidebar-agent-drawer-header">
-                <span>{isChinese ? '助理与员工' : 'Assistant and employees'}</span>
-            </div>
-            <div className="sidebar-agent-drawer-list">
-                {agentListContent(true)}
-            </div>
-        </div>,
-        document.body,
     );
 
     return (
@@ -1312,18 +1147,16 @@ export default function Layout() {
                 <div
                     className="sidebar-scrollable"
                     data-tour-target="agent-list"
-                    onMouseEnter={openAgentDrawer}
-                    onMouseLeave={scheduleCloseAgentDrawer}
                 >
                     {!isSidebarCollapsed && (
-                        <div className="sidebar-section-title">{isChinese ? '协作角色' : 'Collaboration roles'}</div>
+                        <div className="sidebar-section-title">{isChinese ? '团队' : 'Team'}</div>
                     )}
                     {agentListContent()}
                 </div>
                 <div className="sidebar-divider" />
-                <div className="sidebar-section" data-tour-target="organization-nav">
+                <div className="sidebar-section" data-tour-target="operations-nav">
                     {!isSidebarCollapsed && (
-                        <div className="sidebar-section-title">{isChinese ? '组织' : 'Organization'}</div>
+                        <div className="sidebar-section-title">{isChinese ? '经营' : 'Operations'}</div>
                     )}
                     <NavLink to="/dashboard" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
                         <span className="sidebar-item-icon" style={{ display: 'flex' }}>{SidebarIcons.home}</span>
@@ -1337,23 +1170,31 @@ export default function Layout() {
                                 <circle cx="12" cy="12" r="2"/>
                             </svg>
                         </span>
-                        <span className="sidebar-item-text">{t('nav.okr', 'OKR')}</span>
+                        <span className="sidebar-item-text">{isChinese ? '目标与复盘' : 'Goals & reviews'}</span>
                     </NavLink>
                     <NavLink to="/plaza" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
                         <span className="sidebar-item-icon" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
                             <IconBuildingMonument size={14} stroke={1.5} />
                         </span>
-                        <span className="sidebar-item-text">{isChinese ? '发现中心' : 'Discover'}</span>
+                        <span className="sidebar-item-text">{isChinese ? '团队知识' : 'Team knowledge'}</span>
                     </NavLink>
-                    {canAccessCompanySettings && (
-                        <NavLink to="/enterprise" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
-                            <span className="sidebar-item-icon" style={{ display: 'flex' }}>
-                                <IconSettings size={15} stroke={1.5} />
-                            </span>
-                            <span className="sidebar-item-text">{isChinese ? '企业设置' : 'Company settings'}</span>
-                        </NavLink>
-                    )}
                 </div>
+                {canAccessCompanySettings && (
+                    <>
+                        <div className="sidebar-divider" />
+                        <div className="sidebar-section" data-tour-target="management-nav">
+                            {!isSidebarCollapsed && (
+                                <div className="sidebar-section-title">{isChinese ? '管理' : 'Management'}</div>
+                            )}
+                            <NavLink to="/company-admin" className={({ isActive }) => `sidebar-item ${isActive ? 'active' : ''}`}>
+                                <span className="sidebar-item-icon" style={{ display: 'flex' }}>
+                                    <IconSettings size={15} stroke={1.5} />
+                                </span>
+                                <span className="sidebar-item-text">{isChinese ? '公司管理' : 'Company administration'}</span>
+                            </NavLink>
+                        </div>
+                    </>
+                )}
                 </>}
 
                 <div className="sidebar-bottom">
@@ -1421,20 +1262,35 @@ export default function Layout() {
                                         <IconUser size={15} stroke={1.5} />
                                         <span>{isChinese ? '账户设置' : 'Account Settings'}</span>
                                     </button>
+                                    <button className="account-dropdown-item" onClick={() => { navigate('/account/security'); setShowAccountMenu(false); }}>
+                                        <IconKey size={15} stroke={1.5} />
+                                        <span>{isChinese ? '登录安全' : 'Login security'}</span>
+                                    </button>
+                                    <button className="account-dropdown-item" onClick={() => { navigate('/account/companies'); setShowAccountMenu(false); }}>
+                                        <IconBuilding size={15} stroke={1.5} />
+                                        <span>{isChinese ? '公司与邀请' : 'Companies & invitations'}</span>
+                                        {pendingInvitationCount > 0 && <span className="sidebar-item-badge">{pendingInvitationCount}</span>}
+                                    </button>
                                     <button className="account-dropdown-item" onClick={() => { navigate('/account/subscription'); setShowAccountMenu(false); }}>
                                         <IconReceipt size={15} stroke={1.5} />
                                         <span>{isChinese ? '套餐与用量' : 'Plan and usage'}</span>
                                     </button>
+                                    {canAccessCompanySettings && (
+                                        <button className="account-dropdown-item" onClick={() => { navigate('/company-admin'); setShowAccountMenu(false); }}>
+                                            <IconSettings size={15} stroke={1.5} />
+                                            <span>{isChinese ? '公司管理' : 'Company administration'}</span>
+                                        </button>
+                                    )}
                                     {canAccessPlatformSettings && (
-                                        <button className="account-dropdown-item" onClick={() => { navigate('/admin/platform-settings'); setShowAccountMenu(false); }}>
+                                        <button className="account-dropdown-item" onClick={() => { navigate('/admin/platform'); setShowAccountMenu(false); }}>
                                             <IconSettings size={15} stroke={1.5} />
                                             <span>{isChinese ? '平台运营' : 'Platform operations'}</span>
                                         </button>
                                     )}
-                                    {canAccessSaas && (
-                                        <button className="account-dropdown-item" onClick={() => { navigate('/admin/saas'); setShowAccountMenu(false); }}>
+                                    {canAccessPlatformSettings && hasProductSurface(user, 'work') && (
+                                        <button className="account-dropdown-item" onClick={() => { navigate('/choose-surface'); setShowAccountMenu(false); }}>
                                             <IconKey size={15} stroke={1.5} />
-                                            <span>{isChinese ? 'SaaS 能力治理' : 'SaaS capability governance'}</span>
+                                            <span>{isChinese ? '切换工作身份' : 'Switch product surface'}</span>
                                         </button>
                                     )}
                                     <div style={{ height: '1px', background: 'var(--border-subtle)', margin: '4px 0' }} />
@@ -1463,9 +1319,9 @@ export default function Layout() {
                                         {user?.display_name}
                                     </div>
                                     <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
-                                        {user?.role === 'platform_admin' ? t('roles.platformAdmin') :
-                                            user?.role === 'org_admin' ? t('roles.orgAdmin') :
-                                                user?.role === 'agent_admin' ? t('roles.agentAdmin') : t('roles.member')}
+                                        {user?.membership_role === 'org_owner' ? (isChinese ? '公司所有者' : 'Company owner') :
+                                            user?.membership_role === 'org_admin' ? t('roles.orgAdmin') :
+                                                isPlatformOperator(user) && !user?.membership_role ? t('roles.platformAdmin') : t('roles.member')}
                                     </div>
                                 </div>
                                 <IconChevronUp size={14} stroke={1.5} style={{
@@ -1479,61 +1335,7 @@ export default function Layout() {
                     </div>
                 </div>
             </nav>
-            {agentDrawer}
             {tenantMenuContent}
-
-            {showTenantSetupModal && (
-                <div className="tenant-setup-modal-backdrop" onClick={() => setShowTenantSetupModal(false)}>
-                    <div className="tenant-setup-modal" onClick={e => e.stopPropagation()}>
-                        <div className="tenant-setup-modal-header">
-                            <div>
-                                <h3>{isChinese ? '创建或加入新公司' : 'Create or Join Company'}</h3>
-                                <p>{isChinese ? '加入已有公司，或创建一个新的工作空间。' : 'Join an existing company or start a new workspace.'}</p>
-                            </div>
-                            <button type="button" onClick={() => setShowTenantSetupModal(false)} aria-label={isChinese ? '关闭' : 'Close'}>
-                                <IconX size={18} stroke={1.8} />
-                            </button>
-                        </div>
-
-                        {tenantFormError && <div className="tenant-setup-error">{tenantFormError}</div>}
-
-                        <form onSubmit={handleModalJoin} className="tenant-setup-section">
-                            <div className="tenant-setup-section-title">{isChinese ? '通过邀请码加入' : 'Join via invitation code'}</div>
-                            <div className="tenant-setup-row">
-                                <input
-                                    className="form-input"
-                                    value={joinInviteCode}
-                                    onChange={e => setJoinInviteCode(e.target.value)}
-                                    placeholder={isChinese ? '输入邀请码' : 'Enter invitation code'}
-                                />
-                                <button className="btn btn-primary" type="submit" disabled={tenantFormLoading || !joinInviteCode.trim()}>
-                                    {tenantFormLoading ? '...' : (isChinese ? '加入' : 'Join')}
-                                </button>
-                            </div>
-                        </form>
-
-                        {allowSelfCreate && (
-                            <>
-                                <div className="tenant-setup-divider"><span>{isChinese ? '或者' : 'OR'}</span></div>
-                                <form onSubmit={handleModalCreate} className="tenant-setup-section">
-                                    <div className="tenant-setup-section-title">{isChinese ? '创建新公司' : 'Create a new company'}</div>
-                                    <div className="tenant-setup-row">
-                                        <input
-                                            className="form-input"
-                                            value={createCompanyName}
-                                            onChange={e => setCreateCompanyName(e.target.value)}
-                                            placeholder={isChinese ? '公司名称' : 'Company name'}
-                                        />
-                                        <button className="btn btn-primary" type="submit" disabled={tenantFormLoading || !createCompanyName.trim()}>
-                                            {tenantFormLoading ? '...' : (isChinese ? '创建' : 'Create')}
-                                        </button>
-                                    </div>
-                                </form>
-                            </>
-                        )}
-                    </div>
-                </div>
-            )}
 
             {/* Notification Modal */}
             {showNotifications && (
@@ -1664,6 +1466,11 @@ export default function Layout() {
                 agentLimitReached={agentCreationLimit.isLimited}
                 agentLimitMessage={agentLimitMessage(!!isChinese, agentCreationLimit.activeCount, agentCreationLimit.maxAgents)}
                 onAgentLimitReached={handleAgentLimitReached}
+                onAgentCreated={(agent, openChat) => {
+                    if (!openChat) {
+                        navigate(`/employees?view=directory&highlight=${agent.id}&created=1`);
+                    }
+                }}
             />
             {showCompanyTour && (
                 <CompanyTourOverlay

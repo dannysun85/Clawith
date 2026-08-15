@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import {
     IconCheck,
@@ -10,13 +10,13 @@ import {
     IconUser,
     IconX,
 } from '@tabler/icons-react';
-import { agentApi, fetchJson } from '../services/api';
+import { agentApi } from '../services/api';
 import { useDialog } from './Dialog/DialogProvider';
 import LinearCopyButton from './LinearCopyButton';
-import TierSelector, { type SaasTier } from './TierSelector';
-import { canonicalizeModalities, MODALITIES } from '../constants/modalities';
 import { SUBSCRIPTION_UPGRADE_PATH } from '../hooks/useAgentCreationLimit';
 import { buildOpenClawInstruction } from '../utils/openClawInstruction';
+import { useAuthStore } from '../stores';
+import { hasEffectiveCapability } from '../utils/productAccess';
 
 type Mode = 'native' | 'openclaw';
 type Visibility = 'company' | 'only_me' | 'custom';
@@ -31,7 +31,7 @@ interface Props {
     open: boolean;
     initialMode?: Mode;
     onClose: () => void;
-    onDone?: () => void;
+    onDone?: (agent: CreatedAgent, openChat: boolean) => void;
 }
 
 export default function CustomAgentModal({ open, initialMode = 'native', onClose, onDone }: Props) {
@@ -39,44 +39,20 @@ export default function CustomAgentModal({ open, initialMode = 'native', onClose
     const navigate = useNavigate();
     const queryClient = useQueryClient();
     const dialog = useDialog();
+    const user = useAuthStore((state) => state.user);
+    const canCreateCompanyWide = hasEffectiveCapability(user, 'agent.create.company');
 
     const [mode, setMode] = useState<Mode>(initialMode);
     const [name, setName] = useState('');
     const [roleDescription, setRoleDescription] = useState('');
     const [visibility, setVisibility] = useState<Visibility>('only_me');
-    const [preferredTier, setPreferredTier] = useState<SaasTier>('pro');
-    const [preferredModality, setPreferredModality] = useState('text');
     const [createdExternal, setCreatedExternal] = useState<CreatedAgent | null>(null);
-
-    const { data: entitlements } = useQuery({
-        queryKey: ['subscription-entitlements'],
-        queryFn: () => fetchJson<any | null>('/subscription/my-entitlements'),
-        enabled: open,
-        staleTime: 5 * 60 * 1000,
-    });
-    const allowedTiers = useMemo(
-        () => entitlements?.allowed_tiers?.length ? entitlements.allowed_tiers : ['lite', 'pro', 'ultra'],
-        [entitlements?.allowed_tiers],
-    );
-    const allowedModalities = useMemo(() => {
-        const canonical = canonicalizeModalities(entitlements?.allowed_modalities);
-        return canonical.length ? canonical : ['text'];
-    }, [entitlements?.allowed_modalities]);
 
     useEffect(() => {
         if (!open) return;
         setMode(initialMode);
-    }, [open, initialMode]);
-
-    useEffect(() => {
-        if (!open) return;
-        if (!allowedTiers.includes(preferredTier)) {
-            setPreferredTier((allowedTiers[0] as SaasTier) || 'lite');
-        }
-        if (!allowedModalities.includes(preferredModality)) {
-            setPreferredModality(allowedModalities[0] || 'text');
-        }
-    }, [open, allowedTiers, allowedModalities, preferredTier, preferredModality]);
+        setVisibility(canCreateCompanyWide ? 'company' : 'only_me');
+    }, [canCreateCompanyWide, initialMode, open]);
 
     useEffect(() => {
         if (!open) {
@@ -84,8 +60,6 @@ export default function CustomAgentModal({ open, initialMode = 'native', onClose
             setName('');
             setRoleDescription('');
             setVisibility('only_me');
-            setPreferredTier('pro');
-            setPreferredModality('text');
             setCreatedExternal(null);
         }
     }, [open, initialMode]);
@@ -106,10 +80,6 @@ export default function CustomAgentModal({ open, initialMode = 'native', onClose
             if (!trimmedName) {
                 throw new Error(t('customAgentModal.nameRequired'));
             }
-            if (mode === 'native' && !preferredTier) {
-                throw new Error(t('customAgentModal.modelRequired', '请选择模型档位'));
-            }
-
             const currentTenant = localStorage.getItem('current_tenant_id');
             const payload: any = {
                 name: trimmedName,
@@ -121,23 +91,19 @@ export default function CustomAgentModal({ open, initialMode = 'native', onClose
                 tenant_id: currentTenant || undefined,
                 skill_ids: [],
             };
-
-            if (mode === 'native') {
-                payload.preferred_tier = preferredTier;
-                payload.preferred_modality = preferredModality || 'text';
-            }
-
             const agent = await agentApi.create(payload);
             return { agent, chatNow };
         },
         onSuccess: ({ agent, chatNow }: { agent: CreatedAgent; chatNow: boolean }) => {
             queryClient.invalidateQueries({ queryKey: ['agents'] });
+            queryClient.invalidateQueries({ queryKey: ['workforce-topology'] });
             queryClient.invalidateQueries({ queryKey: ['subscription-seats'] });
             if (mode === 'openclaw') {
                 setCreatedExternal(agent);
                 return;
             }
-            (onDone || onClose)();
+            if (onDone) onDone(agent, chatNow);
+            else onClose();
             if (chatNow) navigate(`/agents/${agent.id}#chat`);
         },
         onError: async (err: any) => {
@@ -173,7 +139,8 @@ export default function CustomAgentModal({ open, initialMode = 'native', onClose
         : '';
 
     const closeSuccess = () => {
-        (onDone || onClose)();
+        if (createdExternal && onDone) onDone(createdExternal, false);
+        else onClose();
         if (createdExternal) navigate(`/agents/${createdExternal.id}`);
     };
 
@@ -290,12 +257,14 @@ export default function CustomAgentModal({ open, initialMode = 'native', onClose
                                         {t('customAgentModal.visibility')}
                                     </div>
                                     <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                                        <RadioRow
-                                            selected={visibility === 'company'}
-                                            onClick={() => !busy && setVisibility('company')}
-                                            title={t('customAgentModal.visibilityCompany')}
-                                            hint={t('customAgentModal.visibilityCompanyHint')}
-                                        />
+                                        {canCreateCompanyWide && (
+                                            <RadioRow
+                                                selected={visibility === 'company'}
+                                                onClick={() => !busy && setVisibility('company')}
+                                                title={t('customAgentModal.visibilityCompany')}
+                                                hint={t('customAgentModal.visibilityCompanyHint')}
+                                            />
+                                        )}
                                         <RadioRow
                                             selected={visibility === 'only_me'}
                                             onClick={() => !busy && setVisibility('only_me')}
@@ -309,28 +278,21 @@ export default function CustomAgentModal({ open, initialMode = 'native', onClose
                                             hint={t('customAgentModal.visibilityCustomHint')}
                                         />
                                     </div>
+                                    {!canCreateCompanyWide && (
+                                        <p style={{ margin: '8px 0 0', fontSize: '11.5px', color: 'var(--text-tertiary)' }}>
+                                            {i18n.language?.startsWith('zh')
+                                                ? '公司范围的数字员工需要由公司管理员添加。'
+                                                : 'Company-wide employees must be added by a company administrator.'}
+                                        </p>
+                                    )}
                                 </section>
 
                                 {mode === 'native' && (
-                                    <Field label={t('customAgentModal.model', '模型档位')} required>
-                                        <TierSelector
-                                            value={preferredTier}
-                                            onChange={setPreferredTier}
-                                            allowedTiers={allowedTiers}
-                                            disabled={busy}
-                                        />
-                                        <select
-                                            className="form-input"
-                                            value={preferredModality}
-                                            onChange={(e) => setPreferredModality(e.target.value)}
-                                            disabled={busy}
-                                            style={{ width: '100%' }}
-                                        >
-                                            {MODALITIES.filter((m) => allowedModalities.includes(m)).map((m) => (
-                                                <option key={m} value={m}>{m}</option>
-                                            ))}
-                                        </select>
-                                    </Field>
+                                    <div style={{ fontSize: '11.5px', color: 'var(--text-tertiary)', lineHeight: 1.55 }}>
+                                        {i18n.language?.startsWith('zh')
+                                            ? '运行档位与能力会根据公司套餐和当前可用性自动配置，创建后可在员工设置中查看。'
+                                            : 'Runtime tier and capabilities are selected from company entitlements and current readiness, and remain inspectable in employee settings.'}
+                                    </div>
                                 )}
                             </div>
                         </div>

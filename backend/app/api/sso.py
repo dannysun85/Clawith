@@ -13,7 +13,6 @@ from app.core.auth_rate_limit import auth_rate_limit_client_key
 from app.core.security import _request_is_secure
 from app.database import get_db, transaction
 from app.models.identity import SSOScanSession, IdentityProvider
-from app.schemas.schemas import UserOut
 from app.services.external_identity_policy import external_user_can_authenticate
 from app.services.sso_scan_session_service import (
     consume_authorized_sso_session,
@@ -259,12 +258,19 @@ async def consume_sso_session(
                     "provider_type": session.provider_type,
                     "error_msg": "Account is disabled",
                 }
+            # SSO is an ordinary product login path. Return the same live
+            # membership/global-role capability snapshot as password and MFA
+            # login; a narrow legacy UserOut would leave available_surfaces
+            # empty and incorrectly route a valid JIT member to company setup.
+            from app.api.auth import serialize_user_with_access
+
+            serialized_user = await serialize_user_with_access(user)
             return {
                 "status": "authorized",
                 "provider_type": session.provider_type,
                 "error_msg": None,
                 "access_token": token,
-                "user": UserOut.model_validate(user).model_dump(),
+                "user": serialized_user.model_dump() if serialized_user else None,
             }
 
         result = await db.execute(
@@ -377,13 +383,22 @@ async def get_sso_config(sid: uuid.UUID, request: Request, db: AsyncSession = De
         elif p.provider_type == "google_workspace":
             from app.services.auth_provider import GoogleWorkspaceAuthProvider
             from app.services.google_workspace_oauth import (
+                create_google_sso_state,
                 get_google_redirect_uri,
-                sign_google_sso_state,
             )
             auth_provider = GoogleWorkspaceAuthProvider(provider=p, config=p.config or {})
             redir = await get_google_redirect_uri(db, p, request)
-            state = sign_google_sso_state(sid, p.id)
-            url = await auth_provider.get_authorization_url(redir, state)
+            authorization = await create_google_sso_state(
+                session_id=sid,
+                provider=p,
+                redirect_uri=redir,
+            )
+            url = await auth_provider.get_sso_authorization_url(
+                redir,
+                authorization.state,
+                code_challenge=authorization.code_challenge,
+                nonce=authorization.nonce,
+            )
             auth_urls.append({"provider_type": "google_workspace", "name": p.name, "url": url})
 
     return auth_urls

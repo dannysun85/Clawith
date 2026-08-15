@@ -266,6 +266,52 @@ async def test_org_admin_cannot_create_agent_in_another_tenant():
 
 
 @pytest.mark.asyncio
+async def test_member_cannot_create_company_wide_agent():
+    tenant_id = uuid.uuid4()
+    user = SimpleNamespace(
+        id=uuid.uuid4(),
+        role="member",
+        tenant_id=tenant_id,
+        identity=None,
+        quota_agent_ttl_hours=0,
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await agents_api.create_agent(
+            AgentCreate(name="Company Agent", permission_scope_type="company"),
+            background_tasks=BackgroundTasks(),
+            current_user=user,
+            db=FakeSession(),
+        )
+
+    assert exc.value.status_code == 403
+    assert exc.value.detail["code"] == "company_agent_creation_requires_admin"
+
+
+@pytest.mark.asyncio
+async def test_member_cannot_create_private_agent_when_company_policy_disables_it():
+    tenant_id = uuid.uuid4()
+    user = SimpleNamespace(
+        id=uuid.uuid4(),
+        role="member",
+        tenant_id=tenant_id,
+        identity=None,
+        quota_agent_ttl_hours=0,
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await agents_api.create_agent(
+            AgentCreate(name="Private Agent", permission_scope_type="private"),
+            background_tasks=BackgroundTasks(),
+            current_user=user,
+            db=FakeSession([False]),
+        )
+
+    assert exc.value.status_code == 403
+    assert exc.value.detail["code"] == "member_private_agent_creation_disabled"
+
+
+@pytest.mark.asyncio
 async def test_import_skill_returns_not_found_outside_agent_tenant():
     agent = SimpleNamespace(tenant_id=uuid.uuid4())
     db = FakeSession([])

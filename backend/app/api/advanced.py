@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.permissions import check_agent_access
-from app.core.security import get_current_user, get_current_admin
+from app.core.security import get_current_user
 from app.database import get_db
 from app.models.agent import Agent, AgentPermission, AgentTemplate
 from app.models.org import AgentRelationship, OrgMember
@@ -212,7 +212,7 @@ async def create_template(
 @router.delete("/templates/{template_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_template(
     template_id: uuid.UUID,
-    current_user: User = Depends(get_current_admin),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Delete a template (admin or creator)."""
@@ -220,6 +220,10 @@ async def delete_template(
     template = result.scalar_one_or_none()
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
+    from app.services.access_control import is_platform_operator
+
+    if template.created_by != current_user.id and not is_platform_operator(current_user):
+        raise HTTPException(status_code=403, detail="Only the creator or platform operator can delete this template")
     await db.delete(template)
 
 
@@ -245,8 +249,38 @@ async def handover_agent(
     locked_agent = (await db.execute(select(Agent).where(Agent.id == agent_id).with_for_update())).scalar_one_or_none()
     if locked_agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
-    if not is_agent_creator(current_user, locked_agent):
-        raise HTTPException(status_code=403, detail="Only creator can handover agent")
+    creator_handover = is_agent_creator(current_user, locked_agent)
+    owner_governance_handover = (
+        getattr(current_user, "role", None) == "org_owner"
+        and getattr(current_user, "tenant_id", None) == locked_agent.tenant_id
+        and (locked_agent.access_mode or "company") != "private"
+    )
+    if not creator_handover and not owner_governance_handover:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the creator, or the company owner for a non-private Agent, can handover ownership",
+        )
+
+    # A membership-linked private assistant contains personal context and is
+    # not a company asset that can be reassigned. The member must delete it
+    # explicitly before leaving; ordinary Agent employees may be handed over.
+    from app.models.onboarding import UserTenantOnboarding
+
+    assistant_result = await db.execute(
+        select(UserTenantOnboarding.id).where(
+            UserTenantOnboarding.tenant_id == locked_agent.tenant_id,
+            UserTenantOnboarding.user_id == current_user.id,
+            UserTenantOnboarding.personal_assistant_agent_id == locked_agent.id,
+        )
+    )
+    if assistant_result.scalar_one_or_none() is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "personal_assistant_not_transferable",
+                "message": "A personal assistant cannot be handed over; delete it before leaving the company",
+            },
+        )
 
     # A handover is an in-tenant ownership change. Cross-tenant moves require a
     # separate platform-admin migration workflow because billing, automation,
@@ -331,6 +365,7 @@ async def handover_agent(
             details={
                 "from_creator": str(old_creator_id),
                 "to_creator": str(data.new_creator_id),
+                "company_owner_override": owner_governance_handover,
             },
         )
     )

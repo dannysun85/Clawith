@@ -74,7 +74,7 @@ async def test_get_wecom_channel_reports_runtime_websocket_status(monkeypatch):
     config = make_channel(agent_id, connection_mode="websocket")
     db = RecordingDB([DummyResult(config)])
 
-    async def fake_check_agent_access(_db, _user, _agent_id):
+    async def fake_check_agent_access(_db, _user, _agent_id, **_kwargs):
         return object(), None
 
     class FakeManager:
@@ -99,7 +99,7 @@ async def test_get_wecom_channel_marks_webhook_mode_disconnected(monkeypatch):
     config = make_channel(agent_id, connection_mode="webhook")
     db = RecordingDB([DummyResult(config)])
 
-    async def fake_check_agent_access(_db, _user, _agent_id):
+    async def fake_check_agent_access(_db, _user, _agent_id, **_kwargs):
         return object(), None
 
     monkeypatch.setattr(wecom_api, "check_agent_access", fake_check_agent_access)
@@ -120,7 +120,7 @@ async def test_delete_wecom_channel_stops_runtime_client(monkeypatch):
     db = RecordingDB([DummyResult(config)])
     stop_calls = []
 
-    async def fake_check_agent_access(_db, _user, _agent_id):
+    async def fake_check_agent_access(_db, _user, _agent_id, **_kwargs):
         return SimpleNamespace(creator_id=creator.id), None
 
     async def fake_stop_client(aid):
@@ -150,7 +150,7 @@ async def test_configure_wecom_explicit_webhook_mode_clears_stale_websocket_cred
     tenant_id = uuid.uuid4()
     provision_provider = AsyncMock()
 
-    async def fake_check_agent_access(_db, _user, _agent_id):
+    async def fake_check_agent_access(_db, _user, _agent_id, **_kwargs):
         return SimpleNamespace(creator_id=creator.id, tenant_id=tenant_id), None
 
     def fake_create_task(coroutine):
@@ -159,7 +159,6 @@ async def test_configure_wecom_explicit_webhook_mode_clears_stale_websocket_cred
         return None
 
     monkeypatch.setattr(wecom_api, "check_agent_access", fake_check_agent_access)
-    monkeypatch.setattr(wecom_api, "is_agent_creator", lambda _user, _agent: True)
     monkeypatch.setattr(wecom_api.asyncio, "create_task", fake_create_task)
     monkeypatch.setattr(
         wecom_api.channel_user_service,
@@ -211,7 +210,7 @@ async def test_configure_wecom_explicit_websocket_mode_clears_stale_webhook_cred
     tenant_id = uuid.uuid4()
     provision_provider = AsyncMock()
 
-    async def fake_check_agent_access(_db, _user, _agent_id):
+    async def fake_check_agent_access(_db, _user, _agent_id, **_kwargs):
         return SimpleNamespace(creator_id=creator.id, tenant_id=tenant_id), None
 
     def fake_create_task(coroutine):
@@ -220,7 +219,6 @@ async def test_configure_wecom_explicit_websocket_mode_clears_stale_webhook_cred
         return None
 
     monkeypatch.setattr(wecom_api, "check_agent_access", fake_check_agent_access)
-    monkeypatch.setattr(wecom_api, "is_agent_creator", lambda _user, _agent: True)
     monkeypatch.setattr(wecom_api.asyncio, "create_task", fake_create_task)
     monkeypatch.setattr(
         wecom_api.channel_user_service,
