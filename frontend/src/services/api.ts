@@ -708,6 +708,17 @@ export const agentApi = {
     recover: (id: string) =>
         request<Agent>(`/agents/${id}/recover`, { method: 'POST' }),
 
+    updateLegacyAssistantDisposition: (
+        id: string,
+        data: {
+            action: 'archive' | 'convert_to_employee' | 'restore_history';
+            expected_disposition: 'active' | 'archived' | 'converted';
+        },
+    ) => request<Agent>(`/agents/${id}/legacy-assistant-disposition`, {
+        method: 'POST',
+        body: JSON.stringify(data),
+    }),
+
     metrics: (id: string) =>
         request<any>(`/agents/${id}/metrics`),
 

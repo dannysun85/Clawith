@@ -9,6 +9,7 @@ suffix="${USER//[^a-zA-Z0-9_]/_}_$$"
 db_name="clawith_g11_purge_${suffix}"
 partial_db_name="${db_name}_partial"
 storage_root="$(mktemp -d "${TMPDIR:-/tmp}/clawith-g11-purge.XXXXXX")"
+release_head="${MIGRATION_SMOKE_EXPECTED_HEAD:-legacy_assistant_lifecycle}"
 
 cleanup() {
   dropdb --if-exists --host "$db_host" --port "$db_port" --username "$db_user" "$db_name"
@@ -49,6 +50,6 @@ createdb --host "$db_host" --port "$db_port" --username "$db_user" "$db_name"
   export STORAGE_LOCAL_ROOT="$storage_root"
   export AGENT_DATA_DIR="$storage_root"
   .venv/bin/alembic upgrade head
-  .venv/bin/alembic current | grep -F 'tenant_deletion_purge (head)'
+  .venv/bin/alembic current | grep -F "${release_head} (head)"
   PYTHONPATH=. .venv/bin/python scripts/smoke_tenant_purge.py --storage-root "$storage_root"
 )

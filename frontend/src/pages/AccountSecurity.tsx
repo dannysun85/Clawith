@@ -12,6 +12,7 @@ import { useNavigate, useSearchParams } from 'react-router';
 import { useTranslation } from 'react-i18next';
 
 import { AstraWordmark } from '../components/atlas';
+import { MfaQrCode } from '../components/MfaQrCode';
 import { authApi, type MfaSetupPayload, type MfaStatus } from '../services/api';
 import { useAuthStore } from '../stores';
 import './productSurfaces.css';
@@ -182,10 +183,10 @@ export default function AccountSecurity() {
 
                 {setup && (
                     <section className="surface-card account-security__action">
-                        <header><span className="surface-card__icon"><IconKey size={21} /></span><div><h2>{isChinese ? '验证绑定' : 'Confirm setup'}</h2><p>{isChinese ? '将密钥加入验证器，再输入当前 6 位动态码。' : 'Add the key to your authenticator, then enter the current 6-digit code.'}</p></div></header>
-                        <div className="account-security__secret"><code>{setup.secret}</code><a href={setup.provisioning_uri}>{isChinese ? '在验证器应用中打开' : 'Open in authenticator app'}</a></div>
+                        <header><span className="surface-card__icon"><IconKey size={21} /></span><div><h2>{isChinese ? '验证首次绑定' : 'Confirm first-time setup'}</h2><p>{isChinese ? '系统确认当前 Identity 尚未绑定验证器。请先扫描二维码，再输入当前 6 位动态码。' : 'This Identity does not have an authenticator yet. Scan the QR code, then enter the current 6-digit code.'}</p></div></header>
+                        <MfaQrCode provisioningUri={setup.provisioning_uri} secret={setup.secret} isChinese={isChinese} />
                         <form className="surface-form" onSubmit={confirmSetup}>
-                            <label>{isChinese ? '6 位动态码' : '6-digit code'}<input type="text" value={setupCode} onChange={(event) => setSetupCode(event.target.value)} autoComplete="one-time-code" inputMode="numeric" maxLength={6} required /></label>
+                            <label>{isChinese ? '6 位动态码' : '6-digit code'}<input type="text" value={setupCode} onChange={(event) => setSetupCode(event.target.value.replace(/\D/g, '').slice(0, 6))} autoComplete="one-time-code" inputMode="numeric" maxLength={6} required /></label>
                             <div className="console-row-actions"><button type="submit" className="btn btn-primary" disabled={busy === 'setup-confirm'}>{isChinese ? '确认并启用' : 'Confirm and enable'}</button><button type="button" className="btn btn-ghost" onClick={() => { setSetup(null); setSetupCode(''); }}>{isChinese ? '取消' : 'Cancel'}</button></div>
                         </form>
                     </section>

@@ -353,7 +353,9 @@ export default function Work() {
             toast.success(isChinese ? '工作说明已确认，任务已进入执行队列' : 'Work statement confirmed; task queued');
         },
         onError: (error: any) => {
-            if (String(error?.message || '').includes('work_confirmation_stale')) setPreflight(null);
+            if (['work_confirmation_stale', 'work_capability_changed'].includes(String(error?.code || ''))) {
+                setPreflight(null);
+            }
             toast.error(isChinese ? '任务创建失败' : 'Could not create task', {
                 details: error?.message || String(error),
             });

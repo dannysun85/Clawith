@@ -21,6 +21,7 @@ AgentProductRole = Literal[
     "legacy_personal_assistant",
     "agent_employee",
 ]
+LegacyAssistantDisposition = Literal["active", "archived", "converted"]
 
 PRIVATE_ASSISTANT_ROLE_KEY = "private-assistant"
 PRIVATE_ASSISTANT_TEMPLATE_NAME = "Private Assistant"
@@ -41,6 +42,7 @@ def classify_agent_product_roles(
         elif (
             not getattr(agent, "is_system", False)
             and getattr(agent, "template_id", None) in private_assistant_template_ids
+            and getattr(agent, "legacy_assistant_state", None) != "converted"
         ):
             # Product-managed assistants created before the onboarding relation
             # are retained as history.  They are not long-term employee seats.
@@ -48,6 +50,21 @@ def classify_agent_product_roles(
         else:
             roles[agent.id] = "agent_employee"
     return roles
+
+
+def project_legacy_assistant_disposition(
+    agent: Agent,
+    *,
+    product_role: AgentProductRole | str | None,
+) -> LegacyAssistantDisposition | None:
+    """Expose an explicit lifecycle only for retained assistant objects."""
+
+    state = getattr(agent, "legacy_assistant_state", None)
+    if state == "converted":
+        return "converted"
+    if product_role == "legacy_personal_assistant":
+        return "archived" if state == "archived" else "active"
+    return None
 
 
 async def resolve_agent_product_roles(
@@ -95,5 +112,6 @@ __all__ = [
     "AgentProductRole",
     "PRIVATE_ASSISTANT_ROLE_KEY",
     "classify_agent_product_roles",
+    "project_legacy_assistant_disposition",
     "resolve_agent_product_roles",
 ]

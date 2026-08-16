@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response, status
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from sqlalchemy import exists, select, func, update, or_, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1087,7 +1087,7 @@ async def update_tenant_quotas(
 
 
 class TestEmailRequest(BaseModel):
-    email: str
+    email: EmailStr
 
 
 @router.post("/system-email/test")
@@ -1104,8 +1104,14 @@ async def send_test_email_endpoint(
     from app.services.system_email_service import send_test_email
 
     try:
-        await send_test_email(data.email, db=db)
-        return {"success": True, "message": f"Test email sent to {data.email}"}
+        recipient = str(data.email)
+        await send_test_email(recipient, db=db)
+        return {
+            "success": True,
+            "evidence_level": "smtp_accepted",
+            "recipient": recipient,
+            "message": f"SMTP server accepted the test message for {recipient}; inbox delivery is not proven.",
+        }
     except smtplib.SMTPAuthenticationError:
         raise HTTPException(
             status_code=400,

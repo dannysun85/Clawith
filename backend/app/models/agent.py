@@ -160,6 +160,11 @@ class Agent(Base):
         server_default=text("'{}'::json"),
     )
     template_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Explicit lifecycle for a private-assistant-template Agent retained from
+    # before the current onboarding relationship. NULL means retained history,
+    # "archived" disables execution, and "converted" makes it a roster employee.
+    # The database check constraint is migration-owned.
+    legacy_assistant_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
     # Heartbeat (proactive agent awareness)
     heartbeat_enabled: Mapped[bool] = mapped_column(Boolean, default=False)

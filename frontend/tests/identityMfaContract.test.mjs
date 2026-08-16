@@ -5,6 +5,7 @@ import test from 'node:test';
 const app = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
 const login = readFileSync(new URL('../src/pages/Login.tsx', import.meta.url), 'utf8');
 const security = readFileSync(new URL('../src/pages/AccountSecurity.tsx', import.meta.url), 'utf8');
+const qrCode = readFileSync(new URL('../src/components/MfaQrCode.tsx', import.meta.url), 'utf8');
 const companyAdmin = readFileSync(new URL('../src/pages/CompanyAdmin.tsx', import.meta.url), 'utf8');
 const api = readFileSync(new URL('../src/services/api.ts', import.meta.url), 'utf8');
 
@@ -32,8 +33,21 @@ test('login keeps MFA challenge, setup, and recovery acknowledgement inside one 
   assert.match(login, /if \(!mfaFlow\?\.tokenResponse \|\| !mfaCodesSaved\) return/);
   assert.match(login, /disabled={!mfaCodesSaved \|\| loading}/);
   assert.match(login, /navigator\.clipboard\.writeText\(mfaFlow\.recoveryCodes\.join\('\\n'\)\)/);
-  assert.match(login, /密钥不会写入浏览器存储/);
+  assert.match(login, /你尚未设置过 MFA/);
+  assert.match(login, /这是首次绑定，不是系统替你设置过/);
+  assert.match(login, /inputMode={mfaFlow\.stage === 'setup' \? 'numeric' : 'text'}/);
+  assert.match(login, /maxLength={mfaFlow\.stage === 'setup' \? 6 : 64}/);
   assert.doesNotMatch(login, /localStorage\.setItem\([^\n]*(?:secret|provisioning|recovery)/i);
+});
+
+test('MFA enrollment renders an in-memory QR code with an explicit manual fallback', () => {
+  assert.match(qrCode, /toDataURL\(provisioningUri/);
+  assert.match(qrCode, /alt={isChinese \? '多因素验证器绑定二维码'/);
+  assert.match(qrCode, /<details className="mfa-enrollment__manual">/);
+  assert.match(qrCode, /二维码和密钥只保留在当前页面内存中，不会写入浏览器存储/);
+  assert.doesNotMatch(qrCode, /localStorage|sessionStorage|indexedDB/);
+  assert.match(login, /<MfaQrCode/);
+  assert.match(security, /<MfaQrCode/);
 });
 
 test('identity security explains its global boundary and protects sensitive mutations', () => {

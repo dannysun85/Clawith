@@ -10,6 +10,7 @@ const companyAdmin = readFileSync(new URL('../src/pages/CompanyAdmin.tsx', impor
 const companyAccess = readFileSync(new URL('../src/pages/CompanyAccess.tsx', import.meta.url), 'utf8');
 const accountCompanies = readFileSync(new URL('../src/pages/AccountCompanies.tsx', import.meta.url), 'utf8');
 const platformOperations = readFileSync(new URL('../src/pages/PlatformOperations.tsx', import.meta.url), 'utf8');
+const platformSystemEmail = readFileSync(new URL('../src/pages/PlatformSystemEmail.tsx', import.meta.url), 'utf8');
 const employees = readFileSync(new URL('../src/pages/Employees.tsx', import.meta.url), 'utf8');
 const onboarding = readFileSync(new URL('../src/pages/Onboarding.tsx', import.meta.url), 'utf8');
 const work = readFileSync(new URL('../src/pages/Work.tsx', import.meta.url), 'utf8');
@@ -173,6 +174,23 @@ test('platform operations use an independent shell and separated registration gr
     platformOperations,
     /to: '\/employees'|to="\/employees"|to: '\/groups'|to="\/groups"|to: '\/assistant'|to="\/assistant"/,
   );
+});
+
+test('platform system email remains reachable, secret-safe, and testable', () => {
+  assert.match(platformOperations, /\/admin\/platform\/system-email/);
+  assert.match(platformOperations, /section === 'system-email'/);
+  assert.match(platformOperations, /platform\.registration\.manage/);
+  assert.match(platformSystemEmail, /\/enterprise\/system-settings\/system_email_platform/);
+  assert.match(platformSystemEmail, /method: 'PUT'/);
+  assert.match(platformSystemEmail, /\/enterprise\/system-email\/test/);
+  assert.match(platformSystemEmail, /CONFIGURED_SECRET_PLACEHOLDER/);
+  assert.match(platformSystemEmail, /type="password"/);
+  assert.match(platformSystemEmail, /SMTP 服务器已接受/);
+  assert.match(platformSystemEmail, /不代表对方已收件或已读/);
+  assert.match(platformSystemEmail, /evidence_level: 'smtp_accepted'/);
+  assert.match(platformSystemEmail, /savedConfigurationReady/);
+  assert.match(platformSystemEmail, /请先保存完整 SMTP 配置/);
+  assert.doesNotMatch(platformSystemEmail, /console\.(?:log|debug|info)\(/);
 });
 
 test('ordinary users choose business executors without provider or model controls', () => {

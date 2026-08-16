@@ -2,7 +2,7 @@
 
 ## 0. 文档状态
 
-- 日期：2026-08-03
+- 日期：2026-08-17
 - 已部署基线：Astra `v1.11.17`，commit `1286865f08a9b09ab4f3bccfd2875f08fd990b15`
 - 上游基线：Clawith `v1.11.3`
 - 状态：`next_slice_worktree_implemented`
@@ -32,18 +32,21 @@
 | PL-007 | P0 | 服务端 `/api/work` 聚合 Task/Run/Deliverable/Artifact；工作台和 Dashboard 共用 | 大数据分页、并发刷新与浏览器一致性 | `worktree_implemented` |
 | PL-008 | P0 | Work projection 分离 execution、artifact、review、approval、delivery 与 `user_stage` | blocked/failed/retry/approval 浏览器恢复 | `targeted_tests_pass` |
 | PL-009 | P1 | Work item 深链真实 Agent、Group session 和 Deliverable；Group Run 使用 `work-task:{task_id}` correlation | 跨入口对象 ID 对照和 Group 交接浏览器流 | `targeted_tests_pass` |
-| PL-010 | P1 | Experience 保存 tenant-scoped Task/Delivery 来源；Work 可跳转“沉淀为团队经验”；发现中心复用员工市场 | 权限负向、草稿发布、来源回跳浏览器流 | `worktree_implemented` |
+| PL-010 | P1 | Experience 保存 tenant-scoped Task/Delivery 来源；只接受同租户、归属一致且已完成的 Task 或已正式交付对象。发布后公司内可读，编辑生成独立 revision draft，发布修订再原子替换来源，撤回/草稿保持非公开；Work 可跳转“沉淀为团队经验”，发现中心复用员工市场。本轮 Experience/引用定向测试通过 | 仍需在最终角色浏览器矩阵验证草稿、发布、来源回跳、撤回和他人未发布内容 403 | `targeted_tests_pass + browser_pending` |
 | PL-011 | P0 | `promote_m3_text_primary` 已把 Lite/Pro/Ultra 的 MiniMax-M3 提升为文字 Primary，Agent Plan 保留安全 fallback；迁移 smoke 和 SaaS 路由浏览器证据已通过 | 真实 Provider route snapshot 需要费用授权 | `local_browser_verified` |
 | PL-012 | P0 | MiniMax-only 图片/视频已分类为非等价 `degraded`；正式 Deliverable 默认不提交付费任务，用户显式接受后才允许应急线路；Runtime 有同一门禁和 reason code | 真实主线路故障/恢复与付费对账需授权验证 | `local_browser_verified` |
 | PL-013 | P0 | 凭据写入、能力池和 Runtime 均校验 Agent Plan `plan_tier`；Small/Medium 不贡献或选择视频能力，Large/Max 路由标准 Seedance 2.0；当前本地 Large 已取得图片/视频/语音真实 Artifact | 生产凭证、生产真实调用和三人独立质量评审 | `local_provider_verified + production_unverified` |
 | PL-014 | P1 | SaaS media routes 已统一显示目标顺序、当前 Provider、主线路、正式/降级/不可用状态、建议动作与成本 | 最后一次真实 Provider 验证时间和 receipt 仍未持久展示 | `local_browser_verified_with_evidence_gap` |
 | PL-015 | P1 | 导航已分为工作、协作角色、组织；`/enterprise` 和 `/invitations` 统一受公司管理员守卫；普通成员、`agent_admin`、公司管理员矩阵已实跑；平台管理员在全局控制台可通过“进入公司工作区”选择有效公司成员身份，切换后真实进入租户 `/work`；公司管理员正向入口和 release identity 已复验 | 新候选上普通成员/`agent_admin` 再次登录；全新租户首次切换 | `local_browser_verified_with_role_gap` |
-| PL-016 | P0 | 当前 dirty worktree 后端全量 `4465 passed`；能力合同、创作合同、前端 Node `118 passed`、Vitest `207 passed`（38 files）、生产构建、Ruff、compileall、`git diff --check` 和 PostgreSQL fresh/historical/downgrade/re-upgrade smoke 均通过；Alembic 单一 head 为 `onboarding_product_settings`。IAM-01–16 双 Tenant、五身份、desktop/390px 浏览器矩阵、QA 清理与独立 code-reviewer/architect 终审均通过 | immutable candidate SHA、发布/生产证据仍需分别完成 | `local_browser_verified` |
-| PL-017 | P0 | 工作台已实现 preflight → confirmation fingerprint → 持久 Task；Group 等待参与者终态并聚合结果 | stale confirmation、重复提交、Group 部分失败与刷新恢复的完整门禁 | `targeted_tests_pass` |
-| PL-018 | P1 | OKR 可引用完成 Task 或带批准 Artifact 的成功 Deliverable，并保存不可变 evidence snapshot；本地 UI 已完成真实证据关联和来源回跳 | Artifact 替换、权限负向浏览器流 | `local_browser_verified` |
+| PL-016 | P0 | 2026-08-17 最终工作树后端全量 `4507 passed`；能力合同（30 templates、17 skills、141 tools、114 runtime-typed）、六模态矩阵、创作合同 `115 passed`、前端 Node `134 passed`、Vitest `208 passed`（38 files）、生产构建（6459 modules）、Ruff、compileall、`git diff --check` 均通过。PostgreSQL fresh/historical/downgrade/re-upgrade 与 tenant purge smoke 到唯一 `legacy_assistant_lifecycle (head)`；六身份、多 Tenant、desktop/390px 浏览器正负矩阵及 QA 数据清理完成；独立测试工程师为 `PASS_WITH_EXTERNAL_GATES`，code reviewer 为 `APPROVE`，architect 为 `CLEAR` | 本地 candidate SHA 只能在提交后绑定；发布/生产证据仍需分别完成 | `local_business_flow_proven + independent_qa_passed` |
+| PL-017 | P0 | 工作台已实现 preflight → confirmation fingerprint → 持久 Task，并以同一 `client_request_id` 安全重试；Runtime、Artifact、Review、Approval 与 Delivery 保持独立权威状态。前端已按结构化 `error.code` 处理确认过期和能力变化。2026-08-17 浏览器在不指定 Provider/model/Skill/Tool 的情况下提交业务意图，能力不可用时返回 `unavailable` 并明确不创建 Task、不扣 Credits；刷新保留草稿但要求重新 preflight。重复提交、过期确认、失败/取消恢复由后端/前端生命周期自动化覆盖 | 本轮未获授权调用真实 Provider；完整执行终态与网络中断浏览器恢复仍由独立 QA 复核，Group 部分失败归入 PL-024 | `local_browser_verified_without_provider_execution` |
+| PL-018 | P1 | OKR 可引用完成 Task 或带批准 Artifact 的成功 Deliverable，并保存不可变 evidence snapshot；实时有效性会把已替换 Artifact 标为失效，但不篡改历史快照；Task 与 Deliverable 必须属于同一 Work 链。本轮 OKR 证据和日报路由定向测试通过 | Artifact 替换、权限负向与来源回跳仍需最终浏览器复验 | `targeted_tests_pass + prior_browser_verified` |
 | PL-019 | P0 | Agent 对象级 `manage` 已统一控制配置、审批查看/处理和 OpenClaw API Key；企业审批队列复用同一可管理对象查询，私人助手保持 owner-only；候选完整测试和定向 API 测试通过 | 新候选上 `agent_admin` 浏览器再次登录 | `candidate_tests_pass + prior_worktree_browser_verified` |
 | PL-020 | P1 | 修复浏览器恢复/`localhost` 与 `127.0.0.1` 主机切换后 HttpOnly 媒体会话未续期的问题：App 启动时即使用户已在内存中，也会重新建立同源浏览器会话；图片、音频、视频、PDF 的原生预览不再因 bearer API 正常但媒体 URL 401 而失效 | 生产域名、反向代理和跨子域 Cookie 策略仍需在 E4 生产验收中验证 | `local_browser_verified` |
-| PL-021 | P0 | Agent 列表与详情 API 均以 viewer-specific onboarding 关系和内置模板身份下发 `product_role`；当前 companion、历史助理、长期员工分别展示；Private Assistant 模板设为 `not_recruitable`，阻止未来从员工市场重复创建。本地真实浏览器已验证当前助理详情为“我的助理”、员工详情为“Agent 员工”、18 名员工统计/选择器和不含 Private Assistant 的招聘市场 | 本地没有历史助理 fixture，仍需补历史分组的视觉验收；后续实现显式归档/转员工流程 | `local_browser_verified_normal_state + production_problem_verified` |
+| PL-021 | P0 | Agent 列表与详情 API 已能识别当前 companion、历史助理和长期员工；Private Assistant 模板不可从员工市场重复招聘。creator-only 归档/恢复/转员工/撤回状态机具备乐观并发、审计、席位门禁、运行约束和独立整理区，原 Agent ID、会话、Workspace、深链与默认私有范围不变。2026-08-17 PostgreSQL migration smoke 通过；owner 在真实浏览器完成 `archive → restore → convert_to_employee → return_to_history` 往返，其他身份只看到其被授权的员工，390px 员工页无横向溢出 | 席位不足、并发 expected-state 冲突、他人/跨租户负向由自动化覆盖；独立 QA 仍需复测 | `local_browser_verified + migration_smoke_pass` |
+| PL-022 | P0 | Identity MFA、challenge、恢复码、角色强制和会话失效已存在；登录和账户安全页使用同一内存 QR 组件，明确说明角色策略触发的首次设置，手工密钥折叠显示，setup 输入限制为 6 位数字。2026-08-17 HTTP/PostgreSQL smoke 再次通过 `35` 项断言和 `19` 条审计；owner 浏览器登录成功，账户安全页在 desktop/390px 正确显示 MFA 已启用且无横向溢出 | 首次扫码/恢复码浏览器流沿用 IAM-19 证据；本轮未重新绑定真实验证器，独立 QA 仍需复核组件和敏感信息不落 storage | `local_http_postgres_verified + current_security_page_browser_verified` |
+| PL-023 | P1 | 系统邮件已进入独立平台导航；SMTP secret 加密落库且只回占位符，测试收件地址由后端校验。测试按钮只依据上一次已保存的完整配置启用，接口与 UI 统一返回 `smtp_accepted` 证据，明确不代表收件箱到达或已读。2026-08-17 platform operator 在 desktop/390px 实跑该页面，无已保存完整配置时按钮保持禁用；公司身份不能进入平台页；loopback SMTP + PostgreSQL 再次通过 | 真实外部收件箱未验证且本轮未发送，不能由本地 `smtp_accepted` 代替 | `local_browser_verified + local_smtp_verified + external_inbox_unverified` |
+| PL-024 | P0 | Group Task 固化有序参与者快照，第一个 Agent 是唯一第一责任人，其余为协作者；所有参与者终态后才聚合，部分失败保持 Task `pending` 并逐人说明结果。`work-task:{task_id}` 贯穿 Run，工作台同时保留 Group 现场深链和第一责任 Agent 的正式交付入口；Workspace 使用版本/CAS，Deliverable 修订保留旧执行、Artifact 与评审谱系，Artifact hash 变化会使旧审批 fail-closed。Group/交付定向 205 项及 7 项高风险场景、前端 Group/交付 Node 32 项通过 | 2026-08-17 未为浏览器复测调用真实模型；真实多人执行、部分失败后的重试、修改请求与批准的动态浏览器链仍由独立 QA 在无外部费用边界内复核 | `targeted_tests_pass + prior_browser_verified` |
 
 ## 3. 不属于“靠代码直接修好”的外部门禁
 
@@ -62,7 +65,7 @@
   `/enterprise`、`/account/subscription` 深链继续工作。
 - 工作台只聚合和深链，不成为第二套 Runtime、Credits、Approval 或 Artifact 状态源。
 - 私人助手仍是 `Agent` 执行主体，但通过 onboarding 关系识别；不按名称或自由文本角色猜测。
-- 历史助理保留原 Agent ID、会话、Workspace、权限和深链；只改变产品分组与员工计数，不自动删除、合并或转员工。
+- 历史助理保留原 Agent ID、会话、Workspace 和深链。归档只停止执行并隐藏于员工花名册；转员工必须由原创建者显式确认、通过名额检查并留下审计，且不得自动扩大原有访问范围。
 - 临时专家是 Task/Run 级执行策略，不出现在数字员工花名册，不继承长期记忆、Trigger 或 Channel。
 - Provider 路由、fallback、Credits 和 Artifact 必须 exactly-once；`acceptance_unknown` 禁止重复提交。
 - 普通用户不看到或选择 Provider/model/API Key；平台管理员可以看到真实诊断事实。
@@ -72,7 +75,7 @@
 1. **已完成实现批次**：文字 Primary、私人助手边界、工作台与对象链、Group 关联执行、Experience 来源、导航职责和 OKR 证据已进入本地工作树。
 2. **已完成验证批次**：完整后端/前端门禁、PostgreSQL 迁移 smoke、非付费工作树浏览器矩阵、旧深链与角色负向验证。
 3. **已完成修复批次**：PL-012 的媒体降级语义和付费前重新确认已落到 preflight、Runtime 与 SaaS UI；PL-014 已统一当前 readiness 解释，但“最后真实验证 receipt”仍作为显式证据缺口保留。
-4. **上一候选收口批次**：反冗余清理、代码审查、架构审查、完整门禁、实现提交和 SHA 绑定管理员浏览器复验对应上一轮 `cc6affe7`；当前工作树有后续未提交修复，不能沿用旧 SHA 作为发布候选。
+4. **候选收口批次**：上一轮 `cc6affe7` 只保留为历史证据；本轮已重新执行反冗余清理、代码审查、架构审查、完整门禁和独立 QA，新的 candidate identity 只能使用本轮提交后的真实 SHA，不能沿用旧 SHA。
 5. **授权后批次**：真实 Provider 与豆包 Benchmark、发布、生产迁移和生产业务流均需单独费用/生产授权。
 
 ## 6. 回归基线

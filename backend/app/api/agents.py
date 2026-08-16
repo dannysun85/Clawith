@@ -30,7 +30,14 @@ from app.models.douyin import DouyinOperation, DouyinPublishJob
 from app.models.media_generation import MediaGenerationTask
 from app.models.subscription import CreditReservation
 from app.models.user import User
-from app.schemas.schemas import AgentCreate, AgentOut, AgentUpdate, ApprovalAction, ApprovalRequestOut
+from app.schemas.schemas import (
+    AgentCreate,
+    AgentOut,
+    AgentUpdate,
+    ApprovalAction,
+    ApprovalRequestOut,
+    LegacyAssistantDispositionUpdate,
+)
 from app.services.media_generation import UNRESOLVED_MEDIA_STATUSES
 from app.services.access_relationships import ensure_access_granted_platform_relationships
 from app.services.quota_guard import check_agent_creation_quota, QuotaExceeded, quota_error_payload
@@ -54,7 +61,10 @@ from app.services.agent_capability_readiness import (
     agent_runtime_capability_readiness,
     template_capability_contract,
 )
-from app.services.product_roles import resolve_agent_product_roles
+from app.services.product_roles import (
+    project_legacy_assistant_disposition,
+    resolve_agent_product_roles,
+)
 from app.services.access_control import is_company_governor, is_platform_operator
 from app.services.company_product_policy import default_agent_autonomy_policy
 from app.models.onboarding import UserTenantOnboarding
@@ -154,7 +164,7 @@ async def _is_product_managed_private_assistant(
     )
     if linked_result.scalar_one_or_none() is not None:
         return True
-    if agent.template_id is None:
+    if agent.template_id is None or getattr(agent, "legacy_assistant_state", None) == "converted":
         return False
     template_result = await db.execute(
         select(AgentTemplate).where(AgentTemplate.id == agent.template_id)
@@ -168,6 +178,75 @@ async def _is_product_managed_private_assistant(
             or template.name == PRIVATE_ASSISTANT_TEMPLATE_NAME
         )
     )
+
+
+async def _legacy_assistant_origin(
+    db: AsyncSession,
+    agent: Agent,
+) -> tuple[bool, bool]:
+    """Return whether an Agent is current and whether it has legacy-assistant origin."""
+
+    linked_result = await db.execute(
+        select(UserTenantOnboarding.id)
+        .where(UserTenantOnboarding.personal_assistant_agent_id == agent.id)
+        .limit(1)
+    )
+    is_current = linked_result.scalar_one_or_none() is not None
+    if agent.template_id is None or agent.is_system:
+        return is_current, False
+    template_result = await db.execute(
+        select(AgentTemplate).where(AgentTemplate.id == agent.template_id)
+    )
+    template = template_result.scalar_one_or_none()
+    is_legacy_origin = bool(
+        template
+        and template.is_builtin
+        and (
+            template.role_key == PRIVATE_ASSISTANT_ROLE_KEY
+            or template.name == PRIVATE_ASSISTANT_TEMPLATE_NAME
+        )
+    )
+    return is_current, is_legacy_origin
+
+
+_LEGACY_ASSISTANT_TRANSITIONS = {
+    "archive": ({"active"}, "archived"),
+    "convert_to_employee": ({"active", "archived"}, "converted"),
+    "restore_history": ({"archived", "converted"}, "active"),
+}
+
+
+def _resolve_legacy_assistant_transition(
+    *,
+    action: str,
+    expected_disposition: str,
+    current_disposition: str,
+) -> tuple[str, bool]:
+    """Resolve a state change, allowing only a safe replay of the same action."""
+
+    allowed_sources, target = _LEGACY_ASSISTANT_TRANSITIONS[action]
+    if expected_disposition not in allowed_sources:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "legacy_assistant_transition_invalid",
+                "action": action,
+                "expected_disposition": expected_disposition,
+                "current_disposition": current_disposition,
+            },
+        )
+    if current_disposition == target:
+        return target, True
+    if current_disposition != expected_disposition:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "legacy_assistant_state_changed",
+                "expected_disposition": expected_disposition,
+                "current_disposition": current_disposition,
+            },
+        )
+    return target, False
 
 
 async def _validate_active_agent_model(
@@ -320,6 +399,10 @@ def _serialize_agent_out(
     payload = AgentOut.model_validate(agent).model_dump()
     payload["unread_count"] = unread_count
     payload["product_role"] = product_role
+    payload["legacy_assistant_disposition"] = project_legacy_assistant_disposition(
+        agent,
+        product_role=product_role,
+    )
     model = AgentOut.model_validate(payload)
     _apply_release_capabilities(model)
     return model
@@ -415,6 +498,10 @@ async def _agent_to_out(
     model = AgentOut.model_validate(agent)
     model.onboarded_for_me = await is_onboarded(db, agent.id, viewer_id)
     model.product_role = product_role
+    model.legacy_assistant_disposition = project_legacy_assistant_disposition(
+        agent,
+        product_role=product_role,
+    )
     _apply_release_capabilities(model)
     return model
 
@@ -1124,6 +1211,143 @@ async def get_agent(
     return out
 
 
+@router.post(
+    "/{agent_id}/legacy-assistant-disposition",
+    response_model=AgentOut,
+)
+async def update_legacy_assistant_disposition(
+    agent_id: uuid.UUID,
+    data: LegacyAssistantDispositionUpdate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Archive, restore, or explicitly convert a retained personal assistant."""
+
+    agent, _access_level = await check_agent_access(
+        db,
+        current_user,
+        agent_id,
+        required_level="manage",
+        lock_authority=True,
+    )
+    if agent.creator_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "legacy_assistant_owner_required",
+                "message": "Only the original creator can change a retained assistant's lifecycle.",
+            },
+        )
+
+    is_current, is_legacy_origin = await _legacy_assistant_origin(db, agent)
+    if is_current:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "current_personal_assistant_protected",
+                "message": "The current personal assistant cannot be archived or converted here.",
+            },
+        )
+    if not is_legacy_origin:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "legacy_assistant_origin_required",
+                "message": "This Agent is not a retained personal assistant.",
+            },
+        )
+
+    current_disposition = getattr(agent, "legacy_assistant_state", None) or "active"
+    target_disposition, is_replay = _resolve_legacy_assistant_transition(
+        action=data.action,
+        expected_disposition=data.expected_disposition,
+        current_disposition=current_disposition,
+    )
+
+    if not is_replay:
+        if data.action == "convert_to_employee":
+            try:
+                await check_agent_creation_quota(
+                    current_user.id,
+                    tenant_id=agent.tenant_id,
+                    db=db,
+                )
+            except QuotaExceeded as exc:
+                raise HTTPException(
+                    status_code=(
+                        status.HTTP_402_PAYMENT_REQUIRED
+                        if exc.quota_type == "max_agents"
+                        else status.HTTP_403_FORBIDDEN
+                    ),
+                    detail=quota_error_payload(exc),
+                ) from exc
+            agent.legacy_assistant_state = "converted"
+        elif data.action == "archive":
+            stopped = await agent_manager.stop_container(agent)
+            if not stopped:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail={
+                        "code": "legacy_assistant_runtime_stop_failed",
+                        "message": "The assistant runtime could not be stopped; no archive state was saved.",
+                    },
+                )
+            agent.status = "stopped"
+            agent.heartbeat_enabled = False
+            agent.legacy_assistant_state = "archived"
+        else:
+            # Restore only changes the product disposition. Runtime remains
+            # stopped until the creator explicitly starts or repairs it.
+            agent.legacy_assistant_state = None
+            if current_disposition == "converted":
+                # A converted employee may have been shared later. Returning
+                # it to private history must close that access again.
+                await db.execute(
+                    delete(AgentPermission).where(AgentPermission.agent_id == agent.id)
+                )
+                agent.access_mode = "private"
+                agent.company_access_level = "manage"
+                db.add(
+                    AgentPermission(
+                        agent_id=agent.id,
+                        scope_type="user",
+                        scope_id=agent.creator_id,
+                        access_level="manage",
+                    )
+                )
+
+        db.add(
+            AuditLog(
+                tenant_id=agent.tenant_id,
+                user_id=current_user.id,
+                agent_id=agent.id,
+                action="legacy_assistant_disposition_changed",
+                details={
+                    "resource_id": str(agent.id),
+                    "previous_disposition": current_disposition,
+                    "disposition": target_disposition,
+                    "requested_action": data.action,
+                    "access_mode": agent.access_mode,
+                    "employee_seat_reserved": target_disposition == "converted",
+                },
+            )
+        )
+        await db.commit()
+
+    product_roles = await resolve_agent_product_roles(
+        db,
+        viewer_id=current_user.id,
+        tenant_id=agent.tenant_id,
+        agents=[agent],
+    )
+    return await _agent_to_out(
+        db,
+        agent,
+        current_user.id,
+        product_role=product_roles.get(agent.id, "agent_employee"),
+    )
+
+
 @router.get("/{agent_id}/media-capabilities")
 async def get_media_capabilities(
     agent_id: uuid.UUID,
@@ -1744,6 +1968,14 @@ async def start_agent(
             status_code=status.HTTP_409_CONFLICT,
             detail="Agent deletion is pending provider cleanup and cannot be started",
         )
+    if getattr(agent, "legacy_assistant_state", None) == "archived":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "legacy_assistant_archived",
+                "message": "Restore this retained assistant before starting it.",
+            },
+        )
 
     from app.services.agent_manager import agent_manager
 
@@ -1775,6 +2007,14 @@ async def recover_agent(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Agent deletion is pending provider cleanup and cannot be recovered",
+        )
+    if getattr(agent, "legacy_assistant_state", None) == "archived":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "legacy_assistant_archived",
+                "message": "Restore this retained assistant before repairing it.",
+            },
         )
 
     try:

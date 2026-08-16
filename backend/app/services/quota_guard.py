@@ -15,7 +15,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, or_, select, text
 
 from app.database import async_session
 from app.services.entitlements import get_tenant_entitlements
@@ -571,11 +571,18 @@ async def _count_active_tenant_agents(tenant_id: uuid.UUID, db=None) -> int:
 
     System agents such as OKR Agent are platform infrastructure. They must not
     consume a tenant's purchased Agent seats. A personal assistant linked by
-    UserTenantOnboarding is a per-user companion slot and is excluded by ID;
-    names, templates and free-form role descriptions are not trusted.
+    UserTenantOnboarding is a per-user companion slot and is excluded by ID.
+    Retained built-in private-assistant instances are excluded until the creator
+    explicitly converts one to an employee; names and free-form descriptions are
+    never trusted. A converted assistant reserves a seat even while stopped so a
+    later start cannot silently exceed the plan.
     """
-    from app.models.agent import Agent
+    from app.models.agent import Agent, AgentTemplate
     from app.models.onboarding import UserTenantOnboarding
+    from app.services.product_roles import (
+        PRIVATE_ASSISTANT_ROLE_KEY,
+        PRIVATE_ASSISTANT_TEMPLATE_NAME,
+    )
 
     async def _count(session) -> int:
         personal_assistant_ids = select(
@@ -584,13 +591,28 @@ async def _count_active_tenant_agents(tenant_id: uuid.UUID, db=None) -> int:
             UserTenantOnboarding.tenant_id == tenant_id,
             UserTenantOnboarding.personal_assistant_agent_id.isnot(None),
         )
+        private_assistant_template_ids = select(AgentTemplate.id).where(
+            AgentTemplate.is_builtin.is_(True),
+            or_(
+                AgentTemplate.role_key == PRIVATE_ASSISTANT_ROLE_KEY,
+                AgentTemplate.name == PRIVATE_ASSISTANT_TEMPLATE_NAME,
+            ),
+        )
         result = await session.execute(
             select(Agent).where(
                 Agent.tenant_id == tenant_id,
-                Agent.status.notin_(("stopped", "error")),
+                or_(
+                    Agent.status.notin_(("stopped", "error")),
+                    Agent.legacy_assistant_state == "converted",
+                ),
                 Agent.is_expired == False,  # noqa: E712
                 Agent.is_system == False,  # noqa: E712
                 ~Agent.id.in_(personal_assistant_ids),
+                or_(
+                    Agent.template_id.is_(None),
+                    ~Agent.template_id.in_(private_assistant_template_ids),
+                    Agent.legacy_assistant_state == "converted",
+                ),
             )
         )
         return len(result.scalars().all())

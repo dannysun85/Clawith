@@ -73,6 +73,7 @@ export interface Agent {
     deletion_state?: 'active' | 'cleanup_pending';
     access_mode?: 'company' | 'private' | 'custom';
     product_role?: 'personal_assistant' | 'legacy_personal_assistant' | 'agent_employee';
+    legacy_assistant_disposition?: 'active' | 'archived' | 'converted' | null;
     company_access_level?: 'use' | 'manage';
     is_system?: boolean;
     is_expired?: boolean;

@@ -57,16 +57,25 @@ def _many_result(values):
 
 
 @pytest.mark.asyncio
-async def test_employee_seat_count_excludes_only_onboarding_linked_assistants():
+async def test_employee_seat_count_excludes_unconverted_private_assistant_templates():
     tenant_id = uuid.uuid4()
     db = MagicMock()
     db.execute = AsyncMock(return_value=_scalars_result([SimpleNamespace(id=uuid.uuid4())]))
 
     assert await quota_guard._count_active_tenant_agents(tenant_id, db) == 1
 
-    statement = str(db.execute.await_args.args[0])
+    statement = str(
+        db.execute.await_args.args[0].compile(
+            compile_kwargs={"literal_binds": True},
+        )
+    )
     assert "user_tenant_onboarding" in statement
     assert "personal_assistant_agent_id" in statement
+    assert "agent_templates" in statement
+    assert "agent_templates.role_key" in statement
+    assert "agent_templates.name" in statement
+    assert "legacy_assistant_state" in statement
+    assert "converted" in statement
     assert "agents.role_description" not in statement.split("WHERE", 1)[1]
 
 

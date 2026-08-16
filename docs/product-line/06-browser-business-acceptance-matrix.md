@@ -1,7 +1,7 @@
 # 浏览器业务验收矩阵
 
 - 状态：`acceptance-contract`
-- 日期：2026-07-31
+- 日期：2026-08-17
 - 目的：下一产品线每个切片都必须通过真实浏览器业务流，不以单元测试、API smoke 或文件存在代替
 
 ## 1. 验收层级
@@ -40,6 +40,10 @@
 | AST-01 | 命名私人助手 | 设置名称/风格/边界 → 完成 | 导航显示“我的助理 · 名称”；角色固定；不混入员工列表 | DOM、Agent access_mode、onboarding link |
 | AST-02 | 跳过定制 | 点击跳过 → 进入工作台 | 创建安全默认助手；不是无响应；可稍后修改 | Agent ID、默认设置、刷新后保持 |
 | AST-03 | 助手故障恢复 | 模拟创建失败 → 进入工作台 → 重试 | 不阻塞工作台；不重复创建；错误可理解 | 故障提示、幂等重试记录 |
+| MFA-UX-01 | 高权限首次 MFA 设置 | owner/admin 首次登录 → 扫描二维码或展开手工密钥 → 验证 → 保存恢复码 → 再次登录 | 明确说明这是角色策略触发的首次设置，不暗示用户已设置；二维码与密钥来自同一 `otpauth`；动态码仅 6 位；密钥不写入浏览器持久存储 | desktop/390px DOM、验证器实测、storage 检查、审计事件 |
+| MFA-UX-02 | MFA 恢复与负向 | 错码/重放 → 恢复码 → 管理员恢复边界 | 错码和重放拒绝；恢复码单次使用；跨公司/越权恢复拒绝；旧会话失效 | HTTP/UI 状态、审计、权限负向 |
+| LEGACY-AST-01 | 历史助理归档与恢复 | 历史助理 → 归档 → 打开历史记录 → 恢复 | 原 Agent/session/Workspace/深链保留；归档后不可启动执行且不占员工名额；恢复幂等 | Agent ID 对照、状态/配额、审计、刷新恢复 |
+| LEGACY-AST-02 | 历史助理转员工与撤回 | 历史助理 → 确认名额和隐私 → 转为员工 → 撤回到历史 | 转换后才进入拓扑并占员工名额；默认访问范围不扩大；超额在转换前拒绝；撤回后不在员工花名册 | topology/list/API/DB、403、quota、audit |
 | WORK-01 | 首次自然语言任务 | 工作台描述结果并附文件 → 澄清 → 确认 | 用户不选 Skill/Tool/Provider；生成稳定 Intent/Task/Run | 页面录屏、对象 ID 链、请求 payload |
 | WORK-02 | 执行者路由 | 分别发起私人、一次性、长期、多方任务 | 路由到助理/临时专家/员工/Group；理由可理解 | 责任主体、route decision receipt |
 | WORK-03 | 刷新/断网恢复 | 任务运行中刷新/断网/重连 | 不重复付费、不丢状态、回到真实 Run | Run ID、Credits、provider receipt |
@@ -136,6 +140,10 @@ known_gaps:
 - 图片、视频、PPT 的“能调用”与“达到商用”分别有真实 Artifact 和盲评证据。
 - 本地通过、已部署、生产验证和商业流程证明被分别记录。
 - 未具备的能力保持关闭或明确 degraded，不向客户展示假完成。
+
+最终独立测试工程师还必须提交：场景逐项结果、candidate SHA、身份/Tenant、关键对象 ID、截图或录屏路径、
+console/network 异常、fixture 清理结果和未执行的外部门禁。任何 P0/P1 失败都必须复现、修复并由测试工程师
+重新执行；实现者自己的定向测试不能替代该签收。
 
 ## 9. 2026-08-01 本地工作树验收记录
 
@@ -324,3 +332,35 @@ OIDC HTTP smoke 和完整迁移均重新通过，architect 复审结论转为 `C
 commit 创建后的 `/api/version`、页面 footer 和交付报告共同记录。当前证据仅支持
 `immutable_local_candidate + local_business_flow_proven`，不支持外部 SMTP、真实企业 IdP、生产 purge、已部署或
 `production_verified`。
+
+## 18. 2026-08-17 G7 本地集成与浏览器业务流收口
+
+本轮证据绑定未提交的本地工作树，基础运行时 release identity 为 `v1.11.40 (73714112)`；因此结论是
+`local_browser_verified`，不能外推为 immutable candidate、已部署或生产已验证。测试没有调用真实 SMTP，
+没有发送外部邮件，也没有调用付费模型 Provider。
+
+自动化门禁全部新鲜执行：后端 `4507 passed`；前端 Node `133 passed`、Vitest `208 passed`（38 files）与
+production build（6459 modules）；Ruff、compileall、`git diff --check`；能力合同为 30 templates、17 skills、
+141 tools、114 runtime-typed，六模态矩阵 ready，creative v1 contract `115 passed`。PostgreSQL
+fresh/historical/downgrade/re-upgrade 与 tenant purge 演练均到唯一 `legacy_assistant_lifecycle (head)`；本地
+loopback SMTP、MFA HTTP/PostgreSQL（35 assertions、19 audit rows）与 OIDC emulator（46 assertions）均通过。
+
+浏览器使用一次性 fixture 覆盖 owner、org_admin、member、Agent 管理受托者、第二 Tenant owner 和 tenantless
+platform operator：
+
+- owner 在 `/employees` 看见当前私人助理、长期员工与历史助理整理区，并完成
+  `archive → restore → convert_to_employee → return_to_history` 往返；Agent ID、聊天和 Workspace 深链保持稳定；
+- Agent 管理受托者只看见获授 `manage` 的数字员工，可进入其设置并管理权限；读取私人助理、其他 Agent 或第二
+  Tenant 均为 `403`，公司与平台管理路由不可达；
+- org_admin 可进入公司管理但不能进入平台运营；member 只保留员工工作面；第二公司 owner 只看到其 Tenant；
+  platform operator 只看到平台运营、公司列表和系统邮件，不借用任何公司 membership；
+- 注册凭证与公司邀请在平台页面继续明确为两类对象；系统邮件页未保存完整配置时“发送测试邮件”保持禁用；
+- 工作台只输入业务意图，不要求用户选择 Provider、model、Skill 或 Tool；本地无可用执行能力时 preflight 返回
+  `unavailable`，明确不创建 Task、不扣 Credits；刷新后草稿保留但必须重新 preflight；
+- `/work`、`/employees`、`/company-admin`、`/account/security` 与平台系统邮件页在 390px 下均无横向溢出；
+  公司身份访问平台路由、普通成员访问公司管理和跨 Tenant API 均被拒绝。
+
+录屏位于
+`/Users/sun/.config/browser-harness/agent-workspace/recordings/clawith-g7-20260817`（123 frames）。fixture 清理
+后本轮 tag 关联的 Identity、Tenant、Agent 均为 0。Group 的真实多人 Provider 执行、真实外部收件箱、真实 Google
+Workspace、付费生成、发布和生产业务流仍是外部门禁；这些未执行项不会被本轮自动化或本地 emulator 冒充。

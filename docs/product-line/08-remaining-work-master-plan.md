@@ -2,9 +2,9 @@
 
 ## 0. 计划基线
 
-- 日期：2026-08-03
-- 已部署基线：`v1.11.17` / `1286865f08a9b09ab4f3bccfd2875f08fd990b15`
-- 当前实现状态：`main` 位于已部署基线，含未提交的下一切片角色分类；尚未形成新的 immutable candidate SHA
+- 日期：2026-08-17
+- 已部署基线：Astra `v1.11.17` / `1286865f08a9b09ab4f3bccfd2875f08fd990b15`（历史生产事实，本地未复验）
+- 本轮实施起始基线：Clawith `737141127511c916e599eecbb18a4de16859b771`；后续实现与验证均以该提交上的本地工作树为对象
 - 分支：`main`（仅本地，未推送、未发布）
 - 事实来源：`docs/product-line/01-09`、当前代码、测试、迁移与既有本地浏览器证据
 - 总目标：把“私人助手是默认任务入口、Agent 是长期执行员工、Deliverable 是正式产物、Workspace 是工作现场”落实为可恢复、可审计、可验收的完整产品链路。
@@ -21,6 +21,21 @@
 本计划只把有新证据的事项标记完成。`code_exists`、`tests_pass`、`local_browser_verified`、
 `provider_verified`、`commercially_usable_proven` 和 `production_verified` 保持严格分离。
 
+### 0.1 2026-08-17 当前事实与剩余主线
+
+本轮不再把“邮件已收到”当作整个产品的前置条件。邮件、外部 IdP、付费 Provider 和生产部署分别保留为
+外部门禁；本地产品落地围绕首次使用、数字员工、任务协作、正式交付和企业治理推进。
+
+| 类型 | 当前事实 | 本轮动作 | 完成口径 |
+|---|---|---|---|
+| 已有且需复验 | 注册/新建公司/员工加入已由服务端 `entry_mode` 分流；注册 grant 与公司邀请分表；私人助手幂等初始化；员工拓扑与招聘；Work/Task/Group/Deliverable/Artifact/Experience/OKR；套餐和 Provider readiness 治理 | 保留现有对象与界面，补齐自动化与真实浏览器全流程证据 | 同一最终工作树的测试、迁移、desktop/390px 浏览器矩阵通过 |
+| 本地实现收口 | MFA 二维码与首次设置解释、历史助理 disposition 状态机、权限/审计/名额/UI、Work 过期确认恢复和系统邮件平台页均已实现 | 保持身份、membership、公司角色、平台角色和 Agent 对象权分层 | 定向测试、权限负向、迁移 smoke 和浏览器正反流程通过 |
+| 最终验证收口 | 整库测试、完整迁移、全业务浏览器矩阵、独立测试工程师复验、代码与架构终审均已通过 | 仅在所有门禁通过后创建本地不可变提交，并在提交后绑定真实 SHA | P0/P1 无未解释失败，QA 数据清零；code reviewer `APPROVE`，architect `CLEAR` |
+| 外部门禁 | 真实外部邮箱收件、真实企业 IdP、付费 Provider/真人商用质量、推送、部署和生产业务流 | 仅在另行授权后执行 | 不以本地模拟、SMTP accepted 或历史截图冒充 |
+
+本轮 durable 目标记录在 `.omx/ultragoal/goals.json`，审计轨迹记录在
+`.omx/ultragoal/ledger.jsonl`。最终测试工程师必须覆盖本矩阵全部非付费产品流程；不能只复测本轮新增页面。
+
 ## 1. 成功标准
 
 新的本地候选完成必须同时满足：
@@ -32,7 +47,7 @@
 5. 图片、视频和 PPT 的工作流支持局部修订与正式交付，但没有真实 Provider/真人盲评证据时不宣称商用；
 6. Provider、模型、套餐、降级和故障切换由平台治理，普通用户只选择业务能力；
 7. 后端、前端、迁移、合同校验、非付费多角色浏览器矩阵和独立评审通过；
-8. 固化新的 immutable candidate SHA，且所有证据绑定该 SHA；当前工作树状态不满足此项。
+8. 固化新的 immutable candidate SHA，并在提交后用 Git、`/api/version` 和页面 footer 绑定该 SHA；提交内容不得预写自指 SHA。
 
 ## 2. 本地实施目标
 
@@ -404,3 +419,20 @@ npm run build
 - 所有浏览器、HTTP 与数据库 fixture 已清理。下一步只允许在这棵已验证的源树上创建一个本地 immutable commit，
   再重启运行时并用 `/api/version`、页面 footer 与关键角色页面绑定 exact SHA；不得在 commit 前预写 SHA。
 - 真实 SMTP、真实企业 IdP、生产 purge、远程推送、部署和生产浏览器业务流仍是外部门禁，不属于本地 G12 完成声明。
+
+## 2026-08-17 当前落地批次（G1–G9）
+
+- G1 已把身份、初始化、数字员工、工作、Group、交付、Experience、OKR、套餐、Provider 与系统邮件的剩余项重新
+  映射为角色、对象、状态和可执行验收合同；历史计划不再自动等同于完成。
+- G2–G6 已完成共享 MFA QR 体验、私人助理/历史助理与数字员工生命周期、工作确认结构化错误恢复、Group/正式
+  交付边界，以及 Experience/OKR/经营治理和系统邮件 `smtp_accepted` 语义收口。
+- G7 已完成后端 `4507 passed`、前端 Node `133 passed`、Vitest `208 passed`、production build、能力/创作合同、
+  Ruff、compileall、完整 PostgreSQL migration、tenant purge、loopback SMTP、MFA 与 OIDC emulator；六身份、两个
+  Tenant、desktop/390px 浏览器正负矩阵与历史助理状态往返均通过，QA fixture 已精确清理。
+- G8 独立测试工程师完成全产品 UltraQA，并在最终清理后再次执行后端 `4507 passed`、前端 Node `134 passed`、
+  Vitest `208 passed`、production build 和历史助理 seat-limit 的真实 MFA 浏览器/API 复验；结论为
+  `PASS_WITH_EXTERNAL_GATES`，fixture 与数据库残留均清零。
+- G9 已完成 changed-files 反冗余清理、完整 PostgreSQL migration 与 tenant purge 重跑、全量回归和独立终审；
+  code reviewer 为 `APPROVE`，architect 为 `CLEAR`。本节是候选提交创建前的冻结记录；准确 candidate SHA 不能在
+  同一提交中自指，必须由提交后的 Git、`/api/version` 和页面 footer 共同给出。
+- 真实 SMTP 收件箱、真实企业 IdP、真实付费 Provider、发布与生产验收继续作为独立外部门禁，不属于这次本地完成承诺。

@@ -5,6 +5,7 @@ import pytest
 
 from app.services.product_roles import (
     classify_agent_product_roles,
+    project_legacy_assistant_disposition,
     resolve_agent_product_roles,
 )
 
@@ -42,11 +43,13 @@ def _agent(
     agent_id: uuid.UUID | None = None,
     template_id: uuid.UUID | None = None,
     is_system: bool = False,
+    legacy_assistant_state: str | None = None,
 ):
     return SimpleNamespace(
         id=agent_id or uuid.uuid4(),
         template_id=template_id,
         is_system=is_system,
+        legacy_assistant_state=legacy_assistant_state,
     )
 
 
@@ -82,6 +85,35 @@ def test_onboarding_relation_wins_over_template_and_system_agents_are_not_legacy
 
     assert roles[current_without_template.id] == "personal_assistant"
     assert roles[system_with_template.id] == "agent_employee"
+
+
+def test_explicit_conversion_moves_legacy_assistant_into_employee_roster() -> None:
+    assistant_template_id = uuid.uuid4()
+    converted = _agent(
+        template_id=assistant_template_id,
+        legacy_assistant_state="converted",
+    )
+    archived = _agent(
+        template_id=assistant_template_id,
+        legacy_assistant_state="archived",
+    )
+
+    roles = classify_agent_product_roles(
+        [converted, archived],
+        personal_assistant_agent_id=None,
+        private_assistant_template_ids={assistant_template_id},
+    )
+
+    assert roles[converted.id] == "agent_employee"
+    assert roles[archived.id] == "legacy_personal_assistant"
+    assert project_legacy_assistant_disposition(
+        converted,
+        product_role=roles[converted.id],
+    ) == "converted"
+    assert project_legacy_assistant_disposition(
+        archived,
+        product_role=roles[archived.id],
+    ) == "archived"
 
 
 @pytest.mark.asyncio

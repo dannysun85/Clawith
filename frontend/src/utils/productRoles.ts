@@ -1,6 +1,7 @@
 type AgentIdentity = {
     id: string;
     product_role?: 'personal_assistant' | 'legacy_personal_assistant' | 'agent_employee';
+    legacy_assistant_disposition?: 'active' | 'archived' | 'converted' | null;
 };
 
 export type AgentRolePartition<T extends AgentIdentity> = {
@@ -38,7 +39,9 @@ export function partitionAgentRoles<T extends AgentIdentity>(
             continue;
         }
         if (agent.product_role === 'legacy_personal_assistant') {
-            legacyPersonalAssistants.push(agent);
+            if (agent.legacy_assistant_disposition !== 'archived') {
+                legacyPersonalAssistants.push(agent);
+            }
         } else {
             employees.push(agent);
         }

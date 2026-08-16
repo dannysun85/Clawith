@@ -20,6 +20,7 @@ import {
     IconCheck,
 } from '@tabler/icons-react';
 import { AtlasFrame, OriginPlate } from '../components/atlas';
+import { MfaQrCode } from '../components/MfaQrCode';
 import { deriveRegistrationIdentity } from '../utils/registrationIdentity';
 
 export default function Login() {
@@ -521,7 +522,7 @@ export default function Login() {
             ? (isZh ? '保存恢复码' : 'Save recovery codes')
             : (isZh ? '完成多因素验证' : 'Complete multi-factor authentication');
     const mfaSubtitle = mfaFlow?.stage === 'setup'
-        ? (isZh ? '高权限账号必须先绑定验证器，验证完成后才会签发访问令牌。' : 'Privileged accounts must bind an authenticator before an access token is issued.')
+        ? (isZh ? '你尚未设置过 MFA。当前角色策略要求首次登录先绑定验证器，完成后才会签发访问令牌。' : 'You have not set up MFA yet. Your current role policy requires authenticator enrollment before an access token is issued.')
         : mfaFlow?.stage === 'recovery'
             ? (isZh ? '这些一次性恢复码只显示一次。保存后再进入产品。' : 'These one-time recovery codes are shown once. Save them before continuing.')
             : (isZh ? '输入验证器动态码，或使用一枚尚未使用的恢复码。' : 'Enter an authenticator code or one unused recovery code.');
@@ -779,11 +780,12 @@ export default function Login() {
                             <form onSubmit={handleMfaSubmit} className="login-form">
                                 {mfaFlow.stage === 'setup' && (
                                     <div className="login-mfa-setup">
-                                        <p>{isZh ? '在验证器应用中扫描或手动输入下面的密钥。密钥不会写入浏览器存储。' : 'Add the key below to your authenticator app. It is never written to browser storage.'}</p>
-                                        <code>{mfaFlow.secret}</code>
-                                        {mfaFlow.provisioningUri && (
-                                            <a href={mfaFlow.provisioningUri}>{isZh ? '在验证器应用中打开' : 'Open in authenticator app'}</a>
-                                        )}
+                                        <p>{isZh ? '这是首次绑定，不是系统替你设置过。请扫描二维码；无法扫码时再展开手工密钥。' : 'This is first-time enrollment, not a setup performed for you. Scan the QR code, or expand the manual key if needed.'}</p>
+                                        <MfaQrCode
+                                            provisioningUri={mfaFlow.provisioningUri}
+                                            secret={mfaFlow.secret}
+                                            isChinese={isZh}
+                                        />
                                     </div>
                                 )}
                                 <div className="login-field">
@@ -793,12 +795,16 @@ export default function Login() {
                                     <input
                                         type="text"
                                         value={mfaCode}
-                                        onChange={(event) => setMfaCode(event.target.value)}
+                                        onChange={(event) => setMfaCode(
+                                            mfaFlow.stage === 'setup'
+                                                ? event.target.value.replace(/\D/g, '').slice(0, 6)
+                                                : event.target.value,
+                                        )}
                                         required
                                         autoFocus
-                                        inputMode="text"
+                                        inputMode={mfaFlow.stage === 'setup' ? 'numeric' : 'text'}
                                         autoComplete="one-time-code"
-                                        maxLength={64}
+                                        maxLength={mfaFlow.stage === 'setup' ? 6 : 64}
                                         placeholder={mfaFlow.stage === 'setup' ? '123456' : (isZh ? '123456 或 XXXX-XXXX-XXXX-XXXX' : '123456 or XXXX-XXXX-XXXX-XXXX')}
                                     />
                                 </div>

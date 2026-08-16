@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
     IconList,
     IconMessage,
@@ -15,14 +15,21 @@ import { useTranslation } from 'react-i18next';
 import { useNavigate, useOutletContext, useSearchParams } from 'react-router';
 
 import WorkforceTopology from '../components/WorkforceTopology/WorkforceTopology';
+import LegacyAssistantOrganizer, {
+    type LegacyAssistantAction,
+} from '../components/LegacyAssistantOrganizer';
+import { useDialog } from '../components/Dialog/DialogProvider';
 import {
+    ApiError,
     workforceApi,
     agentApi,
     type WorkforceTopology as WorkforceTopologyData,
     type WorkforceTopologyNode,
 } from '../services/api';
 import { useAuthStore } from '../stores';
+import type { Agent } from '../types';
 import { hasEffectiveCapability } from '../utils/productAccess';
+import { SUBSCRIPTION_UPGRADE_PATH } from '../hooks/useAgentCreationLimit';
 import './employees.css';
 
 type LayoutOutletContext = {
@@ -40,6 +47,22 @@ function isEmployeeView(value: string | null): value is EmployeeView {
 
 function isEmployeeScope(value: string | null): value is EmployeeScope {
     return value === 'available' || value === 'managed' || value === 'governance';
+}
+
+function upgradeUrlFromError(error: unknown): string {
+    if (!(error instanceof ApiError)) return '';
+
+    for (const candidate of [error.details, error.detail]) {
+        if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue;
+        const detail = candidate as Record<string, unknown>;
+        if (typeof detail.upgrade_url === 'string' && detail.upgrade_url) return detail.upgrade_url;
+        if (detail.details && typeof detail.details === 'object' && !Array.isArray(detail.details)) {
+            const nestedUrl = (detail.details as Record<string, unknown>).upgrade_url;
+            if (typeof nestedUrl === 'string' && nestedUrl) return nestedUrl;
+        }
+    }
+
+    return error.status === 402 ? SUBSCRIPTION_UPGRADE_PATH : '';
 }
 
 function relativeTime(value: string | null | undefined, isChinese: boolean): string {
@@ -278,6 +301,8 @@ function EmployeeDirectory({
 export default function Employees() {
     const { i18n } = useTranslation();
     const navigate = useNavigate();
+    const queryClient = useQueryClient();
+    const dialog = useDialog();
     const outletContext = useOutletContext<LayoutOutletContext | null>();
     const [searchParams, setSearchParams] = useSearchParams();
     const isChinese = i18n.language?.startsWith('zh') ?? false;
@@ -286,7 +311,7 @@ export default function Employees() {
     const canCreatePrivateAgent = hasEffectiveCapability(user, 'agent.create.private');
     const canCreateAgent = canCreateCompanyAgent || canCreatePrivateAgent;
     const canGovernAgents = hasEffectiveCapability(user, 'agent.manage.company');
-    const currentTenant = localStorage.getItem('current_tenant_id') || '';
+    const currentTenant = user?.tenant_id || localStorage.getItem('current_tenant_id') || '';
     const requestedView = searchParams.get('view');
     const mobileDefault = typeof window !== 'undefined' && window.matchMedia('(max-width: 768px)').matches;
     const view: EmployeeView = isEmployeeView(requestedView)
@@ -301,7 +326,10 @@ export default function Employees() {
         : 'available';
     const creationComplete = searchParams.get('created') === '1';
     const [recoveryBusyId, setRecoveryBusyId] = useState<string | null>(null);
+    const [legacyBusyId, setLegacyBusyId] = useState<string | null>(null);
     const [actionError, setActionError] = useState('');
+    const [actionSuccess, setActionSuccess] = useState('');
+    const [upgradeUrl, setUpgradeUrl] = useState('');
 
     const {
         data: topology,
@@ -315,6 +343,25 @@ export default function Employees() {
         retry: false,
         refetchInterval: (query) => query.state.status === 'error' ? false : 15_000,
     });
+
+    const { data: allAgents = [] } = useQuery({
+        queryKey: ['agents', currentTenant],
+        queryFn: () => agentApi.list(currentTenant || undefined),
+        enabled: Boolean(currentTenant),
+        retry: false,
+    });
+
+    const retainedAssistants = useMemo(
+        () => (allAgents as Agent[])
+            .filter((agent) => (
+                agent.creator_id === user?.id
+                && agent.legacy_assistant_disposition != null
+            ))
+            .sort((left, right) => (
+                new Date(right.created_at).getTime() - new Date(left.created_at).getTime()
+            )),
+        [allAgents, user?.id],
+    );
 
     const setView = (nextView: EmployeeView) => {
         const next = new URLSearchParams(searchParams);
@@ -347,6 +394,64 @@ export default function Employees() {
             setActionError(nextError instanceof Error ? nextError.message : String(nextError));
         } finally {
             setRecoveryBusyId(null);
+        }
+    };
+
+    const updateLegacyAssistant = async (agent: Agent, action: LegacyAssistantAction) => {
+        const disposition = agent.legacy_assistant_disposition ?? 'active';
+        const confirmation = action === 'archive'
+            ? (isChinese
+                ? '归档后会停止执行并从侧栏隐藏；旧对话、文件、Workspace、Agent ID 和深链都会保留，也不会占用员工名额。'
+                : 'Archiving stops execution and hides the assistant from the sidebar. Conversations, files, Workspace, Agent ID, and deep links remain, and no employee seat is used.')
+            : action === 'convert_to_employee'
+                ? (isChinese
+                    ? '转为数字员工会占用 1 个员工名额。当前仅自己可见的范围不会自动扩大；需要共享时可在转为员工后另行授权。'
+                    : 'Conversion reserves one employee seat. Private access is not expanded automatically; sharing can be configured after conversion.')
+                : disposition === 'converted'
+                    ? (isChinese
+                        ? '撤回后不再占用员工名额，并恢复为仅自己可见的历史助理；转为员工后增加的共享授权会被移除。运行不会自动启动。'
+                        : 'Returning to history releases the employee seat, restores private-only history, and removes sharing added after conversion. Runtime does not start automatically.')
+                    : (isChinese
+                        ? '恢复后会重新出现在历史助理入口；运行不会自动启动，旧内容和对象 ID 保持不变。'
+                        : 'Restoring brings back the previous-assistant entry. Runtime does not start automatically, and old content and object IDs remain unchanged.');
+        const confirmed = await dialog.confirm(confirmation, {
+            title: action === 'archive'
+                ? (isChinese ? '归档历史助理' : 'Archive previous assistant')
+                : action === 'convert_to_employee'
+                    ? (isChinese ? '转为数字员工' : 'Convert to digital employee')
+                    : (isChinese ? '恢复为历史助理' : 'Return to previous assistants'),
+            danger: action === 'archive',
+            confirmLabel: action === 'archive'
+                ? (isChinese ? '确认归档' : 'Archive')
+                : action === 'convert_to_employee'
+                    ? (isChinese ? '确认占用名额并转换' : 'Reserve seat and convert')
+                    : (isChinese ? '确认恢复' : 'Restore'),
+        });
+        if (!confirmed) return;
+
+        setLegacyBusyId(agent.id);
+        setActionError('');
+        setActionSuccess('');
+        setUpgradeUrl('');
+        try {
+            await agentApi.updateLegacyAssistantDisposition(agent.id, {
+                action,
+                expected_disposition: disposition,
+            });
+            setActionSuccess(action === 'archive'
+                ? (isChinese ? '历史助理已归档，旧内容仍可从这里访问。' : 'Previous assistant archived; old content remains available here.')
+                : action === 'convert_to_employee'
+                    ? (isChinese ? '已转为数字员工，并计入员工名额。' : 'Converted to a digital employee and counted as a seat.')
+                    : (isChinese ? '已恢复为历史助理。' : 'Returned to previous assistants.'));
+            await Promise.all([
+                queryClient.invalidateQueries({ queryKey: ['agents'] }),
+                queryClient.invalidateQueries({ queryKey: ['workforce-topology'] }),
+            ]);
+        } catch (nextError: unknown) {
+            setActionError(nextError instanceof Error ? nextError.message : String(nextError));
+            setUpgradeUrl(upgradeUrlFromError(nextError));
+        } finally {
+            setLegacyBusyId(null);
         }
     };
 
@@ -460,7 +565,23 @@ export default function Employees() {
                 </div>
             )}
 
-            {actionError && <div className="employees-page__error" role="alert">{actionError}</div>}
+            {actionError && (
+                <div className="employees-page__error" role="alert">
+                    <span>{actionError}</span>
+                    {upgradeUrl && (
+                        <button type="button" className="btn btn-secondary" onClick={() => navigate(upgradeUrl)}>
+                            {isChinese ? '查看套餐' : 'View plans'}
+                        </button>
+                    )}
+                </div>
+            )}
+            {actionSuccess && <div className="employees-page__success" role="status">{actionSuccess}</div>}
+
+            <LegacyAssistantOrganizer
+                agents={retainedAssistants}
+                busyAgentId={legacyBusyId}
+                onAction={(agent, action) => void updateLegacyAssistant(agent, action)}
+            />
 
             {isLoading ? (
                 <div className="employees-page__state">{isChinese ? '正在加载数字员工…' : 'Loading digital employees…'}</div>

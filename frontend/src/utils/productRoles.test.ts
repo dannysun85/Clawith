@@ -40,6 +40,25 @@ describe('partitionAgentRoles', () => {
         expect(result.employees.map((agent) => agent.id)).toEqual(['same-name']);
     });
 
+    it('hides archived retained assistants while converted assistants remain employees', () => {
+        const result = partitionAgentRoles([
+            {
+                id: 'archived',
+                product_role: 'legacy_personal_assistant' as const,
+                legacy_assistant_disposition: 'archived' as const,
+            },
+            {
+                id: 'converted',
+                product_role: 'agent_employee' as const,
+                legacy_assistant_disposition: 'converted' as const,
+            },
+        ], null);
+
+        expect(result.personalAssistant).toBeNull();
+        expect(result.legacyPersonalAssistants).toEqual([]);
+        expect(result.employees.map((agent) => agent.id)).toEqual(['converted']);
+    });
+
     it('fails closed when the server marks more than one current assistant', () => {
         const ambiguous = [
             { id: 'first', product_role: 'personal_assistant' as const },

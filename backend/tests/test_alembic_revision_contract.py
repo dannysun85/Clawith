@@ -23,12 +23,13 @@ def test_revision_ids_fit_the_default_alembic_version_column() -> None:
 
 
 def test_release_migration_graph_has_one_expected_head() -> None:
-    assert _script_directory().get_heads() == ["tenant_deletion_purge"]
+    assert _script_directory().get_heads() == ["legacy_assistant_lifecycle"]
 
 
 def test_release_head_preserves_both_upgrade_lineages() -> None:
     script = _script_directory()
-    release_head = script.get_revision("tenant_deletion_purge")
+    release_head = script.get_revision("legacy_assistant_lifecycle")
+    tenant_deletion_revision = script.get_revision("tenant_deletion_purge")
     identity_mfa_revision = script.get_revision("identity_mfa")
     outbound_email_revision = script.get_revision("outbound_email_delivery")
     onboarding_revision = script.get_revision("onboarding_product_settings")
@@ -65,7 +66,8 @@ def test_release_head_preserves_both_upgrade_lineages() -> None:
     task_status_revision = script.get_revision("align_task_failed_status")
     merge_revision = script.get_revision("merge_v111_astra_heads")
 
-    assert release_head._normalized_down_revisions == ("identity_mfa",)
+    assert release_head._normalized_down_revisions == ("tenant_deletion_purge",)
+    assert tenant_deletion_revision._normalized_down_revisions == ("identity_mfa",)
     assert identity_mfa_revision._normalized_down_revisions == ("outbound_email_delivery",)
     assert outbound_email_revision._normalized_down_revisions == (
         "onboarding_product_settings",
@@ -134,8 +136,13 @@ def test_postgres_migration_smoke_targets_the_release_head() -> None:
     smoke = (BACKEND_ROOT.parent / "scripts/postgres-migration-smoke.sh").read_text(
         encoding="utf-8"
     )
+    purge_smoke = (
+        BACKEND_ROOT.parent / "scripts/tenant-purge-postgres-smoke.sh"
+    ).read_text(encoding="utf-8")
 
-    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-tenant_deletion_purge' in smoke
+    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-legacy_assistant_lifecycle' in smoke
+    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-legacy_assistant_lifecycle' in purge_smoke
+    assert 'grep -F "${release_head} (head)"' in purge_smoke
     assert "restore_runtime_chat_foreign_key" in smoke
     assert "DROP CONSTRAINT IF EXISTS fk_agent_runs_tenant_session_chat_sessions" in smoke
     assert "partial allowance table unexpectedly passed migration" in smoke
@@ -155,6 +162,20 @@ def test_tenant_deletion_purge_migration_is_minimal_reentrant_and_reversible() -
     assert "found partial tables" in migration
     assert "deletion_scheduled_for IS NOT NULL" in migration
     assert "op.drop_table" in migration
+
+
+def test_legacy_assistant_lifecycle_migration_is_constrained_and_reversible() -> None:
+    migration = (
+        BACKEND_ROOT
+        / "alembic/versions/202608171000_add_legacy_assistant_lifecycle.py"
+    ).read_text(encoding="utf-8")
+
+    assert 'down_revision: str | Sequence[str] | None = "tenant_deletion_purge"' in migration
+    assert '"legacy_assistant_state"' in migration
+    assert "legacy_assistant_state IN ('archived', 'converted')" in migration
+    assert "op.create_check_constraint" in migration
+    assert "op.drop_constraint" in migration
+    assert "op.drop_column" in migration
 
 
 def test_onboarding_product_settings_migration_preserves_existing_company_entry() -> None:

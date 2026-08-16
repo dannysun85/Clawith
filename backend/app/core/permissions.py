@@ -594,6 +594,7 @@ def is_agent_executable(agent: Agent) -> bool:
         getattr(agent, "status", None) in {"running", "idle"}
         and getattr(agent, "deleted_at", None) is None
         and getattr(agent, "deletion_requested_at", None) is None
+        and getattr(agent, "legacy_assistant_state", None) != "archived"
         and not is_agent_expired(agent)
     )
 

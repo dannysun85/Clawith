@@ -350,6 +350,11 @@ class AgentOut(BaseModel):
         "legacy_personal_assistant",
         "agent_employee",
     ] | None = None
+    legacy_assistant_disposition: Literal[
+        "active",
+        "archived",
+        "converted",
+    ] | None = None
     access_mode: str = "company"
     company_access_level: str = "use"
     llm_calls_today: int = 0
@@ -406,6 +411,11 @@ class AgentUpdate(BaseModel):
     heartbeat_active_hours: str | None = None
     timezone: str | None = None
     expires_at: datetime | None = None  # Admin only — extend agent expiry
+
+
+class LegacyAssistantDispositionUpdate(BaseModel):
+    action: Literal["archive", "convert_to_employee", "restore_history"]
+    expected_disposition: Literal["active", "archived", "converted"]
 
 
 class AgentStatusOut(BaseModel):

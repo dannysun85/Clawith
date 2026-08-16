@@ -6,6 +6,7 @@ import {
     IconHome,
     IconKey,
     IconLifebuoy,
+    IconMail,
     IconReceipt,
     IconRoute,
     IconShieldCheck,
@@ -25,6 +26,7 @@ import { hasEffectiveCapability, hasProductSurface } from '../utils/productAcces
 import { normalizeTenantRedirectUrl } from '../utils/authTransport';
 import { commitSameOriginTenantSwitch, validateTenantSwitchCandidate } from '../utils/tenantSwitch';
 import SaasAdmin from './SaasAdmin';
+import PlatformSystemEmail from './PlatformSystemEmail';
 
 type CompanySummary = {
     id: string;
@@ -322,6 +324,7 @@ export default function PlatformOperations() {
         { to: '/admin/platform', exact: true, label: isChinese ? '运营概览' : 'Overview', icon: <IconHome size={17} /> },
         ...(hasEffectiveCapability(user, 'platform.tenants.manage') ? [{ to: '/admin/platform/companies', label: isChinese ? '租户与生命周期' : 'Tenants & lifecycle', icon: <IconBuilding size={17} /> }] : []),
         ...(hasEffectiveCapability(user, 'platform.registration.manage') ? [{ to: '/admin/platform/registration', label: isChinese ? '注册授权' : 'Registration grants', icon: <IconKey size={17} /> }] : []),
+        ...(hasEffectiveCapability(user, 'platform.registration.manage') ? [{ to: '/admin/platform/system-email', label: isChinese ? '系统邮件' : 'System email', icon: <IconMail size={17} /> }] : []),
         ...(hasEffectiveCapability(user, 'platform.billing.manage') ? [{ to: '/admin/platform/billing?tab=plans', label: isChinese ? '套餐与 Credits' : 'Plans & Credits', icon: <IconWallet size={17} /> }] : []),
         ...(hasEffectiveCapability(user, 'platform.providers.manage') ? [
             { to: '/admin/platform/providers?tab=accounts', label: isChinese ? 'Provider 账号池' : 'Provider accounts', icon: <IconDatabase size={17} /> },
@@ -335,6 +338,7 @@ export default function PlatformOperations() {
     const content = useMemo(() => {
         if (section === 'companies') return <PlatformCompanies companies={companies} loading={companiesQuery.isLoading} />;
         if (section === 'registration') return <RegistrationGrants />;
+        if (section === 'system-email') return <PlatformSystemEmail />;
         if (section === 'support') return <SupportSessions companies={companies} />;
         if (section === 'ownership') return <OwnershipResolutions />;
         if (['billing', 'providers', 'routes', 'health'].includes(section)) return <SaasAdmin />;
