@@ -127,6 +127,24 @@ class UsageOut(BaseModel):
     credits_balance: int = 0
 
 
+class PersonalUsageOut(BaseModel):
+    """Only usage that can be attributed to the current membership.
+
+    The tenant quota tables are company aggregates, so they are deliberately
+    excluded.  Credit ledger rows with an exact ``user_id`` provide the only
+    safe P0 attribution; the status remains partial until calls/messages/token
+    counters gain membership-level accounting.
+    """
+
+    attribution_status: str = "partial"
+    attribution_note: str
+    consumed_credits: int = 0
+    attributed_transactions: int = 0
+    llm_calls_limit: int = 0
+    message_limit: int = 0
+    max_triggers: int = 0
+
+
 class CreditBalanceOut(BaseModel):
     """Tenant credit balance."""
 
@@ -243,6 +261,13 @@ class BillingProfileIn(BaseModel):
     country: str | None = None
     email: str | None = None
     phone: str | None = None
+
+
+class BillingConfigOut(BaseModel):
+    """Frontend billing display config (payment provider + FX rate)."""
+
+    provider: str
+    usd_cny_rate: float
 
 
 class CheckoutSubscribeIn(BaseModel):

@@ -594,22 +594,13 @@ async def _record_agent_setup_error(
 
 @router.get("/", response_model=list[AgentOut])
 async def list_agents(
-    tenant_id: uuid.UUID | None = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """List all agents the current user has access to."""
-    if tenant_id and tenant_id != current_user.tenant_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Can only list agents in your own company",
-        )
-
-    requested_tenant_id = current_user.tenant_id
-
     stmt = build_visible_agents_query(
         current_user,
-        tenant_id=requested_tenant_id,
+        tenant_id=current_user.tenant_id,
     ).order_by(Agent.created_at.desc())
 
     result = await db.execute(stmt)
@@ -628,7 +619,7 @@ async def list_agents(
     product_roles = await resolve_agent_product_roles(
         db,
         viewer_id=current_user.id,
-        tenant_id=requested_tenant_id,
+        tenant_id=current_user.tenant_id,
         agents=agents,
     )
     out: list[AgentOut] = []

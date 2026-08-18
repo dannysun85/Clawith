@@ -273,7 +273,8 @@ class Settings(BaseSettings):
     DOUYIN_DIRECT_PUBLISH_ENABLED: bool = False
 
     # Billing checkout provider. "manual" keeps local/admin-only orders; "stripe"
-    # creates real Checkout Sessions and requires signed webhooks.
+    # creates real Checkout Sessions and requires signed webhooks; "wechat" creates
+    # WeChat Pay V3 Native (扫码) orders and requires the WECHAT_PAY_* settings.
     BILLING_PROVIDER: str = "manual"
     STRIPE_SECRET_KEY: str = ""
     STRIPE_WEBHOOK_SECRET: str = ""
@@ -282,6 +283,17 @@ class Settings(BaseSettings):
     STRIPE_CANCEL_URL: str = ""
     BILLING_SUCCESS_URL: str = ""
     BILLING_CANCEL_URL: str = ""
+    # WeChat Pay V3 (Native 扫码支付). All values come from the merchant platform.
+    WECHAT_PAY_APPID: str = ""
+    WECHAT_PAY_MCHID: str = ""
+    WECHAT_PAY_SERIAL_NO: str = ""  # merchant API certificate serial number
+    WECHAT_PAY_PRIVATE_KEY: str = ""  # apiclient_key.pem content ("\n" escapes allowed)
+    WECHAT_PAY_PRIVATE_KEY_PATH: str = ""  # alternative to WECHAT_PAY_PRIVATE_KEY
+    WECHAT_PAY_API_V3_KEY: str = ""  # 32-byte APIv3 key, decrypts webhook resources
+    WECHAT_PAY_NOTIFY_URL: str = ""  # defaults to PUBLIC_BASE_URL + webhook path
+    WECHAT_PAY_API_BASE_URL: str = "https://api.mch.weixin.qq.com"
+    # WeChat Pay only settles in CNY; USD-priced plans/packs convert at this rate.
+    BILLING_USD_CNY_RATE: float = 7.2
     BILLING_RECONCILIATION_INTERVAL_SECONDS: int = 60 * 60 * 24
     BILLING_RESERVATION_EXPIRY_SWEEP_SECONDS: int = 60 * 10
     MEDIA_GENERATION_POLL_INTERVAL_SECONDS: int = 15
@@ -300,6 +312,16 @@ class Settings(BaseSettings):
     DELIVERABLE_CREATIVE_QUALITY_GATE_REQUIRED: bool = False
     DELIVERABLE_CREATIVE_QUALITY_GATE_TENANT_IDS: str = ""
     DELIVERABLE_CREATIVE_QUALITY_GATE_AGENT_IDS: str = ""
+    # Poster v2 is an explicit tenant/Agent canary.  Keeping the global switch
+    # false preserves the v1 launcher contract for every existing deployment.
+    DELIVERABLE_POSTER_V2_ENABLED: bool = False
+    DELIVERABLE_POSTER_V2_TENANT_IDS: str = ""
+    DELIVERABLE_POSTER_V2_AGENT_IDS: str = ""
+    # Automated candidate QA defaults to shadow (reports only, no lifecycle
+    # effect); "enforcing" applies only to allowlisted tenants/Agents.
+    DELIVERABLE_CREATIVE_QA_ENFORCEMENT: str = "shadow"
+    DELIVERABLE_CREATIVE_QA_TENANT_IDS: str = ""
+    DELIVERABLE_CREATIVE_QA_AGENT_IDS: str = ""
     PRODUCTION_ISSUE_MONITOR_ENABLED: bool = True
     PRODUCTION_ISSUE_MONITOR_INTERVAL_SECONDS: int = 30
     PRODUCTION_ISSUE_ALERT_THRESHOLD: int = 1

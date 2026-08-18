@@ -4591,7 +4591,13 @@ async def _execute_tool_impl(
             result = await _install_skill(agent_id, ws, arguments)
         # ── OKR Tools ──
         elif tool_name == "get_okr":
-            result = await _get_okr(agent_id, arguments)
+            outcome = await _get_okr_outcome(
+                agent_id,
+                arguments,
+                user_id,
+                own_only=False,
+            )
+            result = outcome.result_summary
         elif tool_name == "get_my_okr":
             result = await _get_my_okr(agent_id, arguments)
         elif tool_name == "update_kr_content":
@@ -21661,6 +21667,7 @@ def _okr_period_ref(
 async def _get_okr_outcome(
     agent_id: uuid.UUID | None,
     arguments: dict,
+    user_id: uuid.UUID | None = None,
     *,
     own_only: bool,
 ) -> ToolExecutionOutcome:
@@ -21674,11 +21681,18 @@ async def _get_okr_outcome(
         return _typed_failure(period_error, "invalid_tool_arguments")
 
     try:
-        from app.models.agent import Agent as AgentModel
+        from app.models.agent import Agent as AgentModel, AgentPermission
         from app.models.okr import OKRKeyResult, OKRObjective, OKRSettings
+        from app.models.org import OrgMember
+        from app.models.user import User as UserModel
 
         async with async_session() as db:
-            agent_result = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
+            agent_result = await db.execute(
+                select(AgentModel).where(
+                    AgentModel.id == agent_id,
+                    AgentModel.deleted_at.is_(None),
+                )
+            )
             agent = agent_result.scalar_one_or_none()
             if agent is None:
                 return _typed_failure(
@@ -21702,6 +21716,15 @@ async def _get_okr_outcome(
                     settings.period_length_days,
                 )
 
+            request_context = await _load_okr_request_context(db, agent_id, user_id)
+            requester = request_context.get("requester")
+            requester_user_id = request_context.get("requester_user_id")
+            requester_is_admin = bool(request_context.get("requester_is_admin"))
+            is_designated = bool(
+                request_context.get("agent_is_designated_okr_agent")
+                or getattr(settings, "okr_agent_id", None) == agent_id
+            )
+
             objective_query = select(OKRObjective).where(
                 OKRObjective.tenant_id == agent.tenant_id,
                 OKRObjective.period_start >= period_start,
@@ -21713,6 +21736,92 @@ async def _get_okr_outcome(
                     OKRObjective.owner_type == "agent",
                     OKRObjective.owner_id == agent_id,
                 )
+                scope = "agent_self"
+            elif is_designated and requester_is_admin and requester is not None:
+                visible_human_ids = select(UserModel.id).where(
+                    UserModel.tenant_id == agent.tenant_id,
+                    UserModel.is_active.is_(True),
+                )
+                visible_member_ids = select(OrgMember.id).where(
+                    OrgMember.tenant_id == agent.tenant_id,
+                    OrgMember.status == "active",
+                )
+                visible_agent_ids = select(AgentModel.id).where(
+                    AgentModel.tenant_id == agent.tenant_id,
+                    AgentModel.deleted_at.is_(None),
+                    or_(
+                        AgentModel.creator_id == requester.id,
+                        AgentModel.access_mode.in_(["company", "custom"]),
+                    ),
+                )
+                objective_query = objective_query.where(
+                    or_(
+                        OKRObjective.owner_type == "company",
+                        (
+                            (OKRObjective.owner_type == "user")
+                            & or_(
+                                OKRObjective.owner_id.in_(visible_human_ids),
+                                OKRObjective.owner_id.in_(visible_member_ids),
+                            )
+                        ),
+                        (
+                            (OKRObjective.owner_type == "agent")
+                            & OKRObjective.owner_id.in_(visible_agent_ids)
+                        ),
+                    )
+                )
+                scope = "tenant_governance_visible"
+            elif is_designated and requester_user_id is not None:
+                linked_member_ids = select(OrgMember.id).where(
+                    OrgMember.tenant_id == agent.tenant_id,
+                    OrgMember.user_id == requester_user_id,
+                    OrgMember.status == "active",
+                )
+                granted_agent_ids = select(AgentPermission.agent_id).where(
+                    AgentPermission.scope_type == "user",
+                    AgentPermission.scope_id == requester_user_id,
+                    AgentPermission.access_level.in_(["use", "manage"]),
+                )
+                visible_agent_ids = select(AgentModel.id).where(
+                    AgentModel.tenant_id == agent.tenant_id,
+                    AgentModel.deleted_at.is_(None),
+                    or_(
+                        AgentModel.creator_id == requester_user_id,
+                        AgentModel.access_mode == "company",
+                        (
+                            (AgentModel.access_mode == "custom")
+                            & AgentModel.id.in_(granted_agent_ids)
+                        ),
+                    ),
+                )
+                objective_query = objective_query.where(
+                    or_(
+                        OKRObjective.owner_type == "company",
+                        (
+                            (OKRObjective.owner_type == "user")
+                            & or_(
+                                OKRObjective.owner_id == requester_user_id,
+                                OKRObjective.owner_id.in_(linked_member_ids),
+                            )
+                        ),
+                        (
+                            (OKRObjective.owner_type == "agent")
+                            & OKRObjective.owner_id.in_(visible_agent_ids)
+                        ),
+                    )
+                )
+                scope = "company_requester_and_usable_agents"
+            else:
+                objective_query = objective_query.where(
+                    or_(
+                        OKRObjective.owner_type == "company",
+                        (
+                            (OKRObjective.owner_type == "agent")
+                            & (OKRObjective.owner_id == agent_id)
+                        ),
+                    )
+                )
+                scope = "company_and_agent_self"
             objective_result = await db.execute(objective_query.order_by(OKRObjective.created_at))
             objectives = objective_result.scalars().all()
             result_ref = _okr_period_ref(
@@ -21722,15 +21831,15 @@ async def _get_okr_outcome(
                 owner_id=agent_id if own_only else None,
             )
             if not objectives:
-                scope = "your" if own_only else "organization"
                 return _typed_success(
-                    f"No {scope} OKRs found for {period_start.isoformat()} through {period_end.isoformat()}.",
+                    f"No visible OKRs found for {period_start.isoformat()} through {period_end.isoformat()}.",
                     result_ref=result_ref,
                     metadata={
                         "period_start": period_start.isoformat(),
                         "period_end": period_end.isoformat(),
                         "objective_count": 0,
                         "kr_count": 0,
+                        "visibility_scope": scope,
                     },
                 )
 
@@ -21763,6 +21872,7 @@ async def _get_okr_outcome(
                     "period_end": period_end.isoformat(),
                     "objective_count": len(objectives),
                     "kr_count": len(key_results),
+                    "visibility_scope": scope,
                 },
             )
     except Exception as exc:
@@ -21819,9 +21929,19 @@ async def _okr_transaction_outcome(
     arguments: dict,
 ) -> ToolExecutionOutcome:
     if tool_name == "get_okr":
-        return await _get_okr_outcome(agent_id, arguments, own_only=False)
+        return await _get_okr_outcome(
+            agent_id,
+            arguments,
+            user_id,
+            own_only=False,
+        )
     if tool_name == "get_my_okr":
-        return await _get_okr_outcome(agent_id, arguments, own_only=True)
+        return await _get_okr_outcome(
+            agent_id,
+            arguments,
+            user_id,
+            own_only=True,
+        )
     if tool_name == "get_okr_settings":
         return await _get_okr_settings_outcome(agent_id)
     if tool_name in {"update_kr_progress", "update_any_kr_progress"}:
@@ -21855,158 +21975,20 @@ async def _okr_transaction_outcome(
     )
 
 
-async def _get_okr(agent_id: uuid.UUID | None, arguments: dict) -> str:
-    """Return the full OKR board for the current period as formatted text.
+async def _get_okr(
+    agent_id: uuid.UUID | None,
+    arguments: dict,
+    user_id: uuid.UUID | None = None,
+) -> str:
+    """Compatibility wrapper over the principal-aware typed OKR read."""
 
-    Includes company-level O+KR and every member's individual O+KR.
-    This is a read-only tool available to all agents.
-    """
-    # Resolve tenant_id from the calling agent
-    if not agent_id:
-        return "OKR tools require agent context."
-    explicit_start, explicit_end, period_error = _explicit_okr_period(arguments)
-    if period_error:
-        return period_error
-
-    try:
-        from app.database import async_session
-        from app.models.agent import Agent
-        from app.models.okr import OKRObjective, OKRKeyResult, OKRSettings
-        from app.models.org import OrgMember
-        from app.models.user import User
-        from sqlalchemy import select as _select
-
-        async with async_session() as db:
-            # Look up the agent's tenant
-            agent_result = await db.execute(
-                _select(Agent).where(
-                    Agent.id == agent_id,
-                    Agent.deleted_at.is_(None),
-                )
-            )
-            agent = agent_result.scalar_one_or_none()
-            if not agent:
-                return "Agent not found."
-
-            tenant_id = agent.tenant_id
-
-            # Get OKR settings to determine period
-            settings_result = await db.execute(_select(OKRSettings).where(OKRSettings.tenant_id == tenant_id))
-            settings = settings_result.scalar_one_or_none()
-
-            if not settings or not settings.enabled:
-                return "OKR is not enabled for your organization."
-
-            # Compute period bounds
-            if explicit_start is not None and explicit_end is not None:
-                ps = explicit_start
-                pe = explicit_end
-            else:
-                ps, pe = _compute_okr_period_bounds(
-                    settings.period_frequency,
-                    settings.period_length_days,
-                )
-
-            # Fetch all active objectives
-            obj_result = await db.execute(
-                _select(OKRObjective)
-                .where(
-                    OKRObjective.tenant_id == tenant_id,
-                    OKRObjective.period_start >= ps,
-                    OKRObjective.period_end <= pe,
-                    OKRObjective.status != "archived",
-                )
-                .order_by(OKRObjective.owner_type, OKRObjective.created_at)
-            )
-            objectives = obj_result.scalars().all()
-
-            if not objectives:
-                return f"No OKRs found for the current period ({ps} – {pe})."
-
-            # Fetch all KRs
-            obj_ids = [o.id for o in objectives]
-            kr_result = await db.execute(
-                _select(OKRKeyResult).where(OKRKeyResult.objective_id.in_(obj_ids)).order_by(OKRKeyResult.created_at)
-            )
-            all_krs = kr_result.scalars().all()
-
-            krs_by_obj: dict = {}
-            for kr in all_krs:
-                krs_by_obj.setdefault(str(kr.objective_id), []).append(kr)
-
-            # Resolve readable owner names so the OKR Agent can reason about
-            # members by display name instead of raw UUIDs.
-            user_owner_ids = [o.owner_id for o in objectives if o.owner_type == "user" and o.owner_id]
-            agent_owner_ids = [o.owner_id for o in objectives if o.owner_type == "agent" and o.owner_id]
-
-            user_names: dict[uuid.UUID, str] = {}
-            if user_owner_ids:
-                u_result = await db.execute(_select(User.id, User.display_name).where(User.id.in_(user_owner_ids)))
-                user_names = {row.id: (row.display_name or "") for row in u_result.fetchall()}
-
-                unresolved_ids = [oid for oid in user_owner_ids if oid not in user_names]
-                if unresolved_ids:
-                    m_result = await db.execute(
-                        _select(OrgMember.id, OrgMember.name).where(OrgMember.id.in_(unresolved_ids))
-                    )
-                    for row in m_result.fetchall():
-                        user_names[row.id] = row.name or ""
-
-            agent_names: dict[uuid.UUID, str] = {}
-            if agent_owner_ids:
-                a_result = await db.execute(_select(Agent.id, Agent.name).where(Agent.id.in_(agent_owner_ids)))
-                agent_names = {row.id: (row.name or "") for row in a_result.fetchall()}
-
-            def _resolve_owner_label(obj: OKRObjective) -> str:
-                if obj.owner_type == "company":
-                    return "Company"
-                if not obj.owner_id:
-                    return f"{obj.owner_type}:unassigned"
-                if obj.owner_type == "user":
-                    return user_names.get(obj.owner_id) or f"user:{obj.owner_id}"
-                if obj.owner_type == "agent":
-                    return agent_names.get(obj.owner_id) or f"agent:{obj.owner_id}"
-                return f"{obj.owner_type}:{obj.owner_id}"
-
-        # Format output
-        lines = [f"# OKR Board — {ps} to {pe}\n"]
-
-        company_objs = [o for o in objectives if o.owner_type == "company"]
-        member_objs = [o for o in objectives if o.owner_type != "company"]
-
-        if company_objs:
-            lines.append("## Company Objectives")
-            for o in company_objs:
-                krs = krs_by_obj.get(str(o.id), [])
-                pct = 0
-                if krs:
-                    pct = int(sum(min(k.current_value / k.target_value, 1) for k in krs) / len(krs) * 100)
-                lines.append(f"\n**O: {o.title}** [{pct}%]  objective_id={o.id}")
-                for kr in krs:
-                    lines.append(
-                        f"  - KR ({kr.status}): {kr.title}  "
-                        f"[{kr.current_value}/{kr.target_value} {kr.unit or ''}]  "
-                        f" kr_id={kr.id}"
-                    )
-
-        if member_objs:
-            lines.append("\n## Member Objectives")
-            for o in member_objs:
-                owner_label = _resolve_owner_label(o)
-                krs = krs_by_obj.get(str(o.id), [])
-                lines.append(f"\n**{owner_label}** | O: {o.title}  objective_id={o.id}")
-                for kr in krs:
-                    lines.append(
-                        f"  - KR ({kr.status}): {kr.title}  "
-                        f"[{kr.current_value}/{kr.target_value} {kr.unit or ''}]  "
-                        f" kr_id={kr.id}"
-                    )
-
-        return "\n".join(lines)
-
-    except Exception as e:
-        logger.exception(f"[OKR] get_okr failed for agent {agent_id}")
-        return f"Failed to retrieve OKR data: {str(e)[:200]}"
+    outcome = await _get_okr_outcome(
+        agent_id,
+        arguments,
+        user_id,
+        own_only=False,
+    )
+    return outcome.result_summary
 
 
 async def _get_my_okr(agent_id: uuid.UUID | None, arguments: dict) -> str:
@@ -22115,12 +22097,28 @@ async def _load_okr_request_context(
     from app.models.okr import OKRSettings
     from app.models.user import User as UserModel
 
-    ag_res = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
+    ag_res = await db.execute(
+        select(AgentModel).where(
+            AgentModel.id == agent_id,
+            AgentModel.deleted_at.is_(None),
+        )
+    )
     agent = ag_res.scalar_one_or_none()
     requester = None
     if user_id:
-        user_res = await db.execute(select(UserModel).where(UserModel.id == user_id))
-        requester = user_res.scalar_one_or_none()
+        user_res = await db.execute(
+            select(UserModel).where(
+                UserModel.id == user_id,
+                UserModel.is_active.is_(True),
+            )
+        )
+        candidate_requester = user_res.scalar_one_or_none()
+        if (
+            candidate_requester is not None
+            and agent is not None
+            and candidate_requester.tenant_id == agent.tenant_id
+        ):
+            requester = candidate_requester
     designated_okr_agent_id = None
     if agent:
         settings_res = await db.execute(
@@ -22134,7 +22132,7 @@ async def _load_okr_request_context(
         "agent_is_system": bool(agent and agent.is_system),
         "agent_is_designated_okr_agent": bool(agent and designated_okr_agent_id == agent.id),
         "requester": requester,
-        "requester_user_id": user_id,
+        "requester_user_id": requester.id if requester else None,
         "requester_is_admin": bool(
             requester and requester.role in ("org_owner", "org_admin")
         ),
@@ -28126,6 +28124,7 @@ async def _generate_image_minimax_durable(
     allow_degraded_fallback: bool = False,
     deliverable_request_id: uuid.UUID | None = None,
     expected_overlay_blocks_sha256: str | None = None,
+    poster_v2_unit_binding=None,
 ) -> ToolExecutionOutcome | str:
     """Run one provider image attempt through the durable media state machine."""
 
@@ -28253,6 +28252,9 @@ async def _generate_image_minimax_durable(
                 "deliverable_request_id": (
                     str(deliverable_request_id) if deliverable_request_id else None
                 ),
+                "deliverable_candidate_unit_key": (
+                    poster_v2_unit_binding.unit_key if poster_v2_unit_binding else None
+                ),
                 "expected_overlay_blocks_sha256": expected_overlay_blocks_sha256,
                 "provider_size": agent_plan_size or provider_size,
                 # Provider-native image dimensions are not a customer
@@ -28263,9 +28265,23 @@ async def _generate_image_minimax_durable(
                 **brand_metadata,
             },
             provider=provider,
+            deliverable_execution_id=(
+                poster_v2_unit_binding.execution_id if poster_v2_unit_binding else None
+            ),
+            deliverable_unit_id=(
+                poster_v2_unit_binding.unit_id if poster_v2_unit_binding else None
+            ),
         )
         recovery_key = str((created_task.request_metadata or {}).get("recovery_asset_storage_key") or "")
         task_created = True
+        if poster_v2_unit_binding is not None:
+            from app.services.prompt_compiler import mark_poster_v2_candidate_submitted
+
+            await mark_poster_v2_candidate_submitted(
+                poster_v2_unit_binding,
+                tenant_id=tenant_id,
+                media_task_id=created_task.id,
+            )
         if brand_asset:
             assert brand_extension is not None
             await _finish_durable_media_side_effect(
@@ -33195,6 +33211,7 @@ async def _generate_image(
     minimax_tier: str | None = None
     minimax_tenant_id: uuid.UUID | None = None
     formal_poster_contract: _FormalPosterCopyContract | None = None
+    poster_v2_unit_binding = None
     minimax_credit_cost = 0
     image_bytes = b""
 
@@ -33246,6 +33263,18 @@ async def _generate_image(
                 allow_degraded_fallback=allow_degraded_fallback,
                 formal_request_id=deliverable_request_scope_id.get(),
             )
+            if formal_poster_contract is not None:
+                from app.services.prompt_compiler import (
+                    resolve_poster_v2_candidate_unit,
+                )
+
+                poster_v2_unit_binding = await resolve_poster_v2_candidate_unit(
+                    tenant_id=minimax_tenant_id,
+                    agent_id=agent_id,
+                    request_id=formal_poster_contract.request_id,
+                    save_path=save_path,
+                    prompt=str(prompt or ""),
+                )
             await _check_minimax_credit_amount(minimax_tenant_id, minimax_credit_cost)
         except MediaContractError as exc:
             return _minimax_tool_result(
@@ -33370,6 +33399,7 @@ async def _generate_image(
                         if formal_poster_contract
                         else None
                     ),
+                    poster_v2_unit_binding=poster_v2_unit_binding,
                 )
             except MediaProviderSafeFallback as exc:
                 provider_errors.append(f"{candidate}:{type(exc.error).__name__}")

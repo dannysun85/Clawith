@@ -168,6 +168,15 @@ async def _seed(path: Path) -> dict[str, object]:
         }
         db.add_all(users.values())
         await db.flush()
+        owner_secondary_membership = User(
+            identity_id=identities["owner"].id,
+            tenant_id=secondary.id,
+            display_name="Browser Owner (Secondary Member)",
+            role="member",
+            is_active=True,
+        )
+        db.add(owner_secondary_membership)
+        await db.flush()
         primary.owner_user_id = users["owner"].id
         primary.initialized_by_user_id = users["owner"].id
         secondary.owner_user_id = users["second_owner"].id
@@ -258,6 +267,9 @@ async def _seed(path: Path) -> dict[str, object]:
                 "purge": str(purge.id),
             },
             "agents": {name: str(agent.id) for name, agent in agents.items()},
+            "additional_memberships": {
+                "owner_secondary": str(owner_secondary_membership.id),
+            },
         }
         # Persist the cleanup receipt before committing the fixture. If the
         # commit outcome is uncertain, the known IDs remain available to the
@@ -279,6 +291,10 @@ async def _cleanup(path: Path) -> dict[str, object]:
     agents = payload.get("agents", {})
     identity_ids = [uuid.UUID(value["id"]) for value in identities.values()]
     user_ids = [uuid.UUID(value["user_id"]) for value in identities.values()]
+    user_ids.extend(
+        uuid.UUID(value)
+        for value in payload.get("additional_memberships", {}).values()
+    )
     tenant_ids = [uuid.UUID(value) for value in tenants.values()]
     agent_ids = [uuid.UUID(value) for value in agents.values()]
 

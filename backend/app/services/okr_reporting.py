@@ -174,6 +174,7 @@ async def list_company_members(tenant_id: uuid.UUID) -> list[CompanyMember]:
                 Agent.is_system == False,  # noqa: E712
                 Agent.status.notin_(["stopped", "error"]),
                 Agent.deleted_at.is_(None),
+                Agent.access_mode == "company",
             )
         )
 
@@ -217,6 +218,7 @@ async def list_tracked_okr_members(tenant_id: uuid.UUID) -> list[CompanyMember]:
             .join(OrgMember, AgentRelationship.member_id == OrgMember.id)
             .where(
                 AgentRelationship.agent_id == settings.okr_agent_id,
+                OrgMember.tenant_id == tenant_id,
                 OrgMember.status == "active",
             )
         )
@@ -228,9 +230,11 @@ async def list_tracked_okr_members(tenant_id: uuid.UUID) -> list[CompanyMember]:
             )
             .where(
                 AgentAgentRelationship.agent_id == settings.okr_agent_id,
+                Agent.tenant_id == tenant_id,
                 Agent.is_system == False,  # noqa: E712
                 Agent.status.notin_(["stopped", "error"]),
                 Agent.deleted_at.is_(None),
+                Agent.access_mode == "company",
             )
         )
 

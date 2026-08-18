@@ -18,7 +18,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent_tool_execution import AgentToolExecution
-from app.models.deliverable import DeliverableArtifactRevision, DeliverableRequest
+from app.models.deliverable import (
+    DeliverableArtifactRevision,
+    DeliverableExecutionUnit,
+    DeliverableRequest,
+)
 from app.config import get_settings
 from app.services.deliverable_quality_gate import (
     DeliverableQualityGateError,
@@ -695,6 +699,26 @@ async def reconcile_runtime_deliverable_artifacts(
         if request.work_type == "poster"
         else ((), None)
     )
+    # FR-I5 (enforcing only): candidates whose automated QA failed are never
+    # registered as the final artifact.  Shadow mode records reports without
+    # changing reconciliation; v1 requests never take this branch.
+    poster_v2_failed_candidates: set[str] = set()
+    if (
+        request.work_type == "poster"
+        and request.workflow_id == "builtin.poster.v2"
+        and request.current_execution_id is not None
+    ):
+        failed_qa_result = await db.execute(
+            select(DeliverableExecutionUnit).where(
+                DeliverableExecutionUnit.tenant_id == request.tenant_id,
+                DeliverableExecutionUnit.execution_id == request.current_execution_id,
+                DeliverableExecutionUnit.stage_key == "candidate_qa",
+                DeliverableExecutionUnit.status == "failed",
+            )
+        )
+        poster_v2_failed_candidates = {
+            unit.unit_key for unit in failed_qa_result.scalars().all()
+        }
     verified_by_type: dict[str, _VerifiedArtifact] = {}
     poster_receipt_facts: dict[str, dict[str, str]] = {}
     observed_errors: dict[str, set[str]] = {artifact_type: set() for artifact_type in required_types}
@@ -762,6 +786,22 @@ async def reconcile_runtime_deliverable_artifacts(
                     )
                     if workspace_path is None:
                         continue
+                    if poster_v2_failed_candidates:
+                        from app.services.prompt_compiler import (
+                            poster_v2_candidate_unit_key,
+                        )
+
+                        failed_unit_key = poster_v2_candidate_unit_key(workspace_path)
+                        if (
+                            failed_unit_key is not None
+                            and failed_unit_key in poster_v2_failed_candidates
+                        ):
+                            observed_errors[artifact_type].add("invalid")
+                            failure_codes.setdefault(
+                                artifact_type,
+                                "deliverable_candidate_qa_failed",
+                            )
+                            continue
                     if artifact_type == "png" and request.work_type == "poster":
                         receipt_facts = _poster_copy_receipt_facts(
                             request,

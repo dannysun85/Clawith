@@ -9134,6 +9134,7 @@ select:focus {
 
 .deliverable-request-card {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--space-2);
   margin: 0 var(--space-3) var(--space-2);
@@ -9186,6 +9187,44 @@ select:focus {
   font-style: normal;
   font-weight: 700;
 }
+
+.deliverable-request-card__clarification {
+  flex-basis: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-2) 0 0;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+.deliverable-request-card__clarification .btn {
+  align-self: flex-start;
+}
+
+.deliverable-candidate-wall {
+  margin-top: var(--space-3);
+}
+
+.deliverable-candidate-wall__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.deliverable-candidate-card {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space-2);
+  border: 1px solid var(--border-subtle, rgba(127, 127, 127, 0.25));
+  border-radius: var(--radius-md);
+}
+
+.deliverable-candidate-card strong { font-size: var(--text-sm); }
+.deliverable-candidate-card small { color: var(--text-secondary); font-size: var(--text-xs); }
+.deliverable-candidate-card[data-status="failed"] { opacity: 0.7; }
 
 @media (max-width: 900px) {
   .deliverable-drawer-layer { padding: var(--space-2); }

@@ -1,17 +1,23 @@
-"""Subscription APIs (阶段0: plans, entitlements, subscriptions, admin assign, usage).
+"""Subscription APIs (plans, entitlements, subscriptions, usage, checkout).
 
-No payment in 阶段0 — admin assigns plans manually. Payment integration in 阶段2.
-See SUBSCRIPTION_IMPLEMENTATION_DESIGN.md §3 / §9.
+Checkout supports manual (admin-handled), Stripe, and WeChat Pay Native
+providers via BILLING_PROVIDER. See SUBSCRIPTION_IMPLEMENTATION_DESIGN.md §3/§4/§9.
 """
 
 import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import get_company_governor, get_current_user, get_saas_admin
+from app.config import get_settings
+from app.core.security import (
+    get_company_billing_manager,
+    get_company_billing_viewer,
+    get_current_user,
+    get_saas_admin,
+)
 from app.database import get_db
 from app.models.agent import Agent
 from app.models.subscription import (
@@ -26,6 +32,7 @@ from app.models.subscription import (
 from app.models.user import User
 from app.schemas.subscription import (
     AssignPlanIn,
+    BillingConfigOut,
     BillingProfileIn,
     BillingProfileOut,
     CheckoutSubscribeIn,
@@ -35,6 +42,7 @@ from app.schemas.subscription import (
     CreditTransactionOut,
     EntitlementsOut,
     PaymentOrderOut,
+    PersonalUsageOut,
     PlanCreateIn,
     PlanOut,
     PlanUpdateIn,
@@ -71,6 +79,16 @@ def _client_user_label(user: object | None) -> str | None:
         if value:
             return str(value)
     return None
+
+
+@router.get("/config", response_model=BillingConfigOut)
+async def get_billing_config(current_user: User = Depends(get_current_user)):
+    """Frontend billing display config: active payment provider + USD→CNY rate."""
+    settings = get_settings()
+    return BillingConfigOut(
+        provider=(settings.BILLING_PROVIDER or "manual").lower(),
+        usd_cny_rate=settings.BILLING_USD_CNY_RATE,
+    )
 
 
 @router.get("/plans", response_model=list[PlanOut])
@@ -198,7 +216,7 @@ async def get_my_entitlements(
 
 @router.get("/subscriptions", response_model=SubscriptionOut | None)
 async def get_my_subscription(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_company_billing_viewer),
     db: AsyncSession = Depends(get_db),
 ):
     """Get current tenant's subscription."""
@@ -296,9 +314,48 @@ async def assign_subscription(
     return out
 
 
+@router.get("/usage/me", response_model=PersonalUsageOut)
+async def get_personal_usage(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return only consumption exactly attributable to this membership."""
+    if not current_user.tenant_id:
+        return PersonalUsageOut(
+            attribution_status="unavailable",
+            attribution_note="No active company membership is available.",
+        )
+
+    result = await db.execute(
+        select(
+            func.coalesce(func.sum(-CreditTransaction.delta), 0),
+            func.count(CreditTransaction.id),
+        ).where(
+            CreditTransaction.tenant_id == current_user.tenant_id,
+            CreditTransaction.user_id == current_user.id,
+            CreditTransaction.reason == "consume",
+            CreditTransaction.delta < 0,
+        )
+    )
+    consumed_credits, attributed_transactions = result.one()
+    ent = await get_tenant_entitlements(current_user.tenant_id)
+    return PersonalUsageOut(
+        attribution_status="partial",
+        attribution_note=(
+            "Only ledger consumption with an exact membership attribution is shown; "
+            "company calls, messages, tokens, balances, and other members are excluded."
+        ),
+        consumed_credits=int(consumed_credits or 0),
+        attributed_transactions=int(attributed_transactions or 0),
+        llm_calls_limit=ent.max_llm_calls_per_day if ent else 0,
+        message_limit=ent.message_limit if ent else 0,
+        max_triggers=ent.max_triggers if ent else 0,
+    )
+
+
 @router.get("/usage", response_model=UsageOut | None)
 async def get_my_usage(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_company_billing_viewer),
     db: AsyncSession = Depends(get_db),
 ):
     """Get current tenant's usage today (for subscription tab display)."""
@@ -331,7 +388,7 @@ async def get_my_usage(
 
 @router.get("/credits", response_model=CreditBalanceOut)
 async def get_credits(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_company_billing_viewer),
     db: AsyncSession = Depends(get_db),
 ):
     """Get current tenant's credit balance."""
@@ -345,7 +402,7 @@ async def get_credits(
 async def get_credit_transactions(
     page: int = 1,
     limit: int = 50,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_company_billing_manager),
     db: AsyncSession = Depends(get_db),
 ):
     """Get current tenant's credit transaction ledger."""
@@ -395,7 +452,7 @@ async def get_credit_transactions(
 async def get_my_orders(
     page: int = 1,
     limit: int = 50,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_company_billing_manager),
     db: AsyncSession = Depends(get_db),
 ):
     """Get current tenant's payment/subscription orders for the client order-history tab."""
@@ -423,7 +480,7 @@ async def list_credit_packs(
 
 @router.get("/seats", response_model=SeatUsageOut)
 async def get_seats(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_company_billing_viewer),
     db: AsyncSession = Depends(get_db),
 ):
     """Get current tenant's Agent seat usage.
@@ -450,7 +507,7 @@ async def get_seats(
 
 @router.get("/summary", response_model=SubscriptionSummaryOut)
 async def get_subscription_summary(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_company_billing_viewer),
     db: AsyncSession = Depends(get_db),
 ):
     """Return the server-side billing/usage summary used by client subscription pages."""
@@ -503,7 +560,7 @@ async def get_subscription_summary(
 @router.post("/checkout/subscribe", response_model=PaymentOrderOut, status_code=status.HTTP_201_CREATED)
 async def checkout_subscribe(
     data: CheckoutSubscribeIn,
-    current_user: User = Depends(get_company_governor),
+    current_user: User = Depends(get_company_billing_manager),
     db: AsyncSession = Depends(get_db),
 ):
     """Create a subscription checkout order."""
@@ -553,7 +610,7 @@ async def checkout_subscribe(
 @router.post("/checkout/topup", response_model=PaymentOrderOut, status_code=status.HTTP_201_CREATED)
 async def checkout_topup(
     data: CheckoutTopupIn,
-    current_user: User = Depends(get_company_governor),
+    current_user: User = Depends(get_company_billing_manager),
     db: AsyncSession = Depends(get_db),
 ):
     """Create a credit top-up checkout order."""
@@ -592,7 +649,7 @@ async def checkout_topup(
 @router.get("/checkout/{order_id}/status", response_model=PaymentOrderOut)
 async def get_checkout_status(
     order_id: uuid.UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_company_billing_manager),
     db: AsyncSession = Depends(get_db),
 ):
     """Get payment order status."""
@@ -632,12 +689,15 @@ async def billing_webhook(
             await reconcile_tenant_agent_plan_selections(order.tenant_id)
             await restore_stopped_agents(order.tenant_id)
             await enforce_agent_limit(order.tenant_id)
+    if provider_name.lower() == "wechat":
+        # WeChat Pay expects this acknowledgement shape on HTTP 200; non-200 retries.
+        return {"code": "SUCCESS", "message": "成功"}
     return result
 
 
 @router.get("/billing/profile", response_model=BillingProfileOut | None)
 async def get_billing_profile(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_company_billing_manager),
     db: AsyncSession = Depends(get_db),
 ):
     """Get tenant billing profile."""
@@ -652,10 +712,10 @@ async def get_billing_profile(
 @router.put("/billing/profile", response_model=BillingProfileOut)
 async def update_billing_profile(
     data: BillingProfileIn,
-    current_user: User = Depends(get_company_governor),
+    current_user: User = Depends(get_company_billing_manager),
     db: AsyncSession = Depends(get_db),
 ):
-    """Update tenant billing profile (org_admin+)."""
+    """Update tenant billing profile (company owner only)."""
     if not current_user.tenant_id:
         raise HTTPException(status_code=400, detail="User has no tenant")
 

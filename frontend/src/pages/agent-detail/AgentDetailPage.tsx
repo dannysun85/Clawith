@@ -8225,7 +8225,15 @@ export default function AgentDetailPage() {
                                                                 continue;
                                                             }
                                                             flushGroup();
-                                                            grouped.push({ type: 'msg', msg, i });
+                                                            const isAssistantEmpty = msg.role === 'assistant'
+                                                                && !msg.content?.trim()
+                                                                && !msg.thinking?.trim()
+                                                                && !msg.runtimeError
+                                                                && !msg.fileName
+                                                                && !msg.imageUrl;
+                                                            if (!isAssistantEmpty) {
+                                                                grouped.push({ type: 'msg', msg, i });
+                                                            }
                                                         }
                                                     }
                                                     flushGroup(); // flush any trailing group
@@ -8432,6 +8440,19 @@ export default function AgentDetailPage() {
                                                         <DeliverableRequestCard
                                                             request={pendingDeliverable.request}
                                                             launchable={pendingDeliverable.launchable}
+                                                            onUpdated={(updated) => {
+                                                                queryClient.setQueryData<DeliverableRequest[]>(
+                                                                    ['deliverable-requests', id, activeSession?.id],
+                                                                    (current = []) => current.map((item) => (
+                                                                        item.id === updated.id ? updated : item
+                                                                    )),
+                                                                );
+                                                                setPendingDeliverable((current) => (
+                                                                    current && current.request.id === updated.id
+                                                                        ? { ...current, request: updated }
+                                                                        : current
+                                                                ));
+                                                            }}
                                                             onOpen={() => {
                                                                 if (!pendingDeliverable.launchable) {
                                                                     toast.info(pendingDeliverable.request.goal);

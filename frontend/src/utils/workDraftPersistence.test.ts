@@ -26,11 +26,12 @@ class MemoryStorage {
 }
 
 const draft: PersistedWorkDraft = {
-    version: 1,
+    version: 2,
     title: 'Prepare launch',
     intent: 'Prepare a launch brief',
     workType: 'presentation',
     priority: 'high',
+    routingMode: 'manual',
     executorKind: 'group',
     agentId: '',
     expertRole: '',

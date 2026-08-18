@@ -18,7 +18,7 @@ import { useNavigate } from 'react-router';
 import { IconAlertTriangle } from '@tabler/icons-react';
 import { fetchJson } from '../services/api';
 import { useAuthStore } from '../stores';
-import { hasEffectiveCapability } from '../utils/productAccess';
+import { hasEffectiveCapability, productAccessSignature } from '../utils/productAccess';
 import { useDialog } from '../components/Dialog/DialogProvider';
 
 // ─── Type Definitions ────────────────────────────────────────────────────────
@@ -958,8 +958,9 @@ export default function OKR() {
     const navigate = useNavigate();
     const user = useAuthStore(s => s.user);
     const isChinese = i18n.language?.startsWith('zh');
-    const isAdmin = hasEffectiveCapability(user, 'company.settings.manage');
+    const isAdmin = hasEffectiveCapability(user, 'company.okr.manage');
     const okrRoleMode = isAdmin ? 'admin' : 'member';
+    const accessSignature = useMemo(() => productAccessSignature(user), [user]);
     const queryClient = useQueryClient();
 
     const [selectedPeriod, setSelectedPeriod] = useState<Period | null>(null);
@@ -970,7 +971,7 @@ export default function OKR() {
 
     // Fetch OKR settings — always fresh on mount so toggling the switch is reflected immediately
     const { data: settings, isLoading: settingsLoading } = useQuery<OKRSettings>({
-        queryKey: ['okr-settings'],
+        queryKey: ['okr-settings', accessSignature],
         queryFn: () => fetchJson<OKRSettings>('/okr/settings'),
         staleTime: 0,
         refetchOnWindowFocus: true,
@@ -978,7 +979,7 @@ export default function OKR() {
 
     // Fetch periods (only when enabled)
     const { data: periods = [] } = useQuery<Period[]>({
-        queryKey: ['okr-periods'],
+        queryKey: ['okr-periods', accessSignature],
         queryFn: () => fetchJson<Period[]>('/okr/periods'),
         enabled: !!settings?.enabled,
     });
@@ -1017,7 +1018,7 @@ export default function OKR() {
 
     // Fetch objectives for selected period — fresh on mount/focus so OKR Agent creation is visible
     const { data: objectives = [], isLoading: objLoading } = useQuery<Objective[]>({
-        queryKey: ['okr-objectives', selectedPeriod?.start, selectedPeriod?.end],
+        queryKey: ['okr-objectives', accessSignature, selectedPeriod?.start, selectedPeriod?.end],
         queryFn: () => fetchJson<Objective[]>(
             `/okr/objectives?period_start=${selectedPeriod!.start}&period_end=${selectedPeriod!.end}`
         ),
@@ -1027,7 +1028,7 @@ export default function OKR() {
     });
 
     const { data: evidenceOptions = [] } = useQuery<OKREvidenceOption[]>({
-        queryKey: ['okr-evidence'],
+        queryKey: ['okr-evidence', accessSignature],
         queryFn: () => fetchJson<OKREvidenceOption[]>('/okr/evidence?limit=100'),
         enabled: !!settings?.enabled && !!isAdmin,
         staleTime: 0,
@@ -1452,12 +1453,17 @@ function MembersWithoutOKRPanel({
     periodEnd: string;
 }) {
     const queryClient = useQueryClient();
+    const currentUser = useAuthStore((state) => state.user);
+    const accessSignature = useMemo(
+        () => productAccessSignature(currentUser),
+        [currentUser],
+    );
     const [nudging, setNudging] = React.useState(false);
     const [nudgeResult, setNudgeResult] = React.useState<string | null>(null);
 
     // Always refetch on mount — list must be live after admin adds/removes OKR Agent relationships
     const { data, isLoading } = useQuery<MembersWithoutOKRData>({
-        queryKey: ['okr-members-without-okr', periodStart, periodEnd],
+        queryKey: ['okr-members-without-okr', accessSignature, periodStart, periodEnd],
         queryFn: () => fetchJson<MembersWithoutOKRData>('/okr/members-without-okr'),
         staleTime: 0,
         refetchOnWindowFocus: true,
@@ -1732,16 +1738,24 @@ function ReportsTab({ isChinese }: { isChinese: boolean }) {
     const [expandedCompanyReportId, setExpandedCompanyReportId] = useState<string | null>(null);
     const [selectedMemberReportId, setSelectedMemberReportId] = useState<string | null>(null);
     const [memberSearch, setMemberSearch] = useState('');
-    const isAdmin = hasEffectiveCapability(currentUser, 'company.audit.view');
+    const isAdmin = hasEffectiveCapability(currentUser, 'company.okr.reports.view_all');
+    const accessSignature = useMemo(
+        () => productAccessSignature(currentUser),
+        [currentUser],
+    );
+
+    useEffect(() => {
+        if (!isAdmin && view !== 'member') setView('member');
+    }, [isAdmin, view]);
 
     const { data: companyReports = [], isLoading: companyLoading } = useQuery<CompanyReport[]>({
-        queryKey: ['company-reports', reportType],
+        queryKey: ['company-reports', accessSignature, reportType],
         queryFn: () => fetchJson<CompanyReport[]>(`/okr/company-reports?report_type=${reportType}`),
-        enabled: view === 'company',
+        enabled: isAdmin && view === 'company',
     });
 
     const { data: memberReports = [], isLoading: memberLoading } = useQuery<MemberDailyReportItem[]>({
-        queryKey: ['member-daily-reports', selectedDate],
+        queryKey: ['member-daily-reports', accessSignature, selectedDate],
         queryFn: () => fetchJson<MemberDailyReportItem[]>(`/okr/member-daily-reports?report_date=${selectedDate}`),
         enabled: view === 'member',
     });
@@ -1805,8 +1819,12 @@ function ReportsTab({ isChinese }: { isChinese: boolean }) {
                     border: '1px solid var(--border-subtle)',
                 }}>
                     {[
-                        { key: 'company', zh: '公司汇总', en: 'Company Reports' },
-                        { key: 'member', zh: '成员日报', en: 'Member Daily Reports' },
+                        ...(isAdmin ? [{ key: 'company', zh: '公司汇总', en: 'Company Reports' }] : []),
+                        {
+                            key: 'member',
+                            zh: isAdmin ? '成员日报' : '我的日报与 Agent 摘要',
+                            en: isAdmin ? 'Member Daily Reports' : 'My Reports & Agent Summaries',
+                        },
                     ].map(item => (
                         <button
                             key={item.key}

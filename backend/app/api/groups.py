@@ -24,6 +24,7 @@ from app.models.audit import AuditLog, ChatMessage
 from app.models.group import GroupMember
 from app.models.participant import Participant
 from app.models.user import User
+from app.schemas.work import GroupTaskSummaryOut
 from app.services import group_chat_service
 from app.services import group_file_service
 from app.services import group_message_service
@@ -41,6 +42,7 @@ from app.services.group_chat_service import GroupChatServiceError
 from app.services.group_file_service import GroupFileServiceError
 from app.services.group_message_service import GroupMessageServiceError
 from app.services.group_realtime import publish_group_message_created
+from app.services.group_task_projection import load_group_task_summaries
 from app.services.participant_identity import get_or_create_user_participant
 from app.services.storage import guess_content_type
 
@@ -598,6 +600,48 @@ async def get_group(
         )
     except GroupChatServiceError as exc:
         raise _translate_domain_error(exc) from exc
+
+
+@router.get("/{group_id}/tasks", response_model=list[GroupTaskSummaryOut])
+async def list_group_tasks(
+    group_id: uuid.UUID,
+    session_id: uuid.UUID | None = Query(default=None),
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return viewer-authorized formal Task projections for this Group."""
+
+    tenant_id = _tenant_id(current_user)
+    participant = await _current_participant(db, current_user)
+    try:
+        if session_id is not None:
+            await group_chat_service.authorize_group_session(
+                db,
+                tenant_id=tenant_id,
+                group_id=group_id,
+                session_id=session_id,
+                participant_id=participant.id,
+                human_only=True,
+            )
+        else:
+            await group_chat_service.authorize_group_member(
+                db,
+                tenant_id=tenant_id,
+                group_id=group_id,
+                participant_id=participant.id,
+                human_only=True,
+            )
+    except GroupChatServiceError as exc:
+        raise _translate_domain_error(exc) from exc
+    return await load_group_task_summaries(
+        db,
+        tenant_id=tenant_id,
+        group_id=group_id,
+        session_id=session_id,
+        limit=limit,
+        user=current_user,
+    )
 
 
 @router.patch("/{group_id}", response_model=GroupOut)

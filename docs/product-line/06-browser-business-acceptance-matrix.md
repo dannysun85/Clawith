@@ -364,3 +364,87 @@ platform operator：
 `/Users/sun/.config/browser-harness/agent-workspace/recordings/clawith-g7-20260817`（123 frames）。fixture 清理
 后本轮 tag 关联的 Identity、Tenant、Agent 均为 0。Group 的真实多人 Provider 执行、真实外部收件箱、真实 Google
 Workspace、付费生成、发布和生产业务流仍是外部门禁；这些未执行项不会被本轮自动化或本地 emulator 冒充。
+
+## 19. 2026-08-18 四类 P0 新增验收合同
+
+本节是新合同，不回写第 18 节的历史 QA 结论。当前状态均为 `not_run`，只有新的实现与新鲜证据才能更新。
+详细产品边界见 `12-four-p0-product-closure-plan-2026-08-18.md`。
+
+| ID | 正向浏览器流程 | 负向/旁路断言 | 当前状态 |
+|---|---|---|---|
+| BILL-01 | member 打开“我的用量”，看到个人安全投影和 entitlements | Network 不请求公司 summary/ledger/orders/profile | `not_run` |
+| BILL-02 | — | member 直调敏感 billing API 为 403，敏感 DB/Provider 零调用 | `not_run` |
+| BILL-03 | admin 只看公司聚合；owner 看完整账单管理 | admin manage 403；platform role 不继承 tenant billing | `not_run` |
+| BILL-04 | owner 查看 current tenant order | foreign order ID 为 404，无 actor/payment/PII | `not_run` |
+| BILL-05 | member 仍可看 plans/packs/entitlements | 权限收紧不误伤 Runtime entitlement | `not_run` |
+| BILL-06 | 同一 Identity 切换两个 tenant | 无旧余额、订单、流水或 query cache | `not_run` |
+| OKR-01 | 两名 member 都看 company Objective 和各自用户内容 | 不能互看用户目标、KR、evidence、日报 | `not_run` |
+| OKR-02 | Agent manager 看被授权 Agent 投影 | 无其他 Agent/人类日报 | `not_run` |
+| OKR-03 | admin 管理 current tenant OKR | 不可见/foreign ID 为 404，owner name 不泄漏 | `not_run` |
+| OKR-04 | admin 执行管理型 outreach | member 为 403，且 chat/background task/LLM 零调用 | `not_run` |
+| OKR-05 | admin 写合法 owner/target | foreign/nonexistent target 失败且零 commit | `not_run` |
+| OKR-06 | REST 与 Agent Tool 显示相同 viewer scope | Tool 不返回 full-board 旁路 | `not_run` |
+| OKR-07 | GET settings/periods | 零 insert/update/commit | `not_run` |
+| OKR-08 | tenant member 按角色读取 | platform-only 无 membership 时无 tenant 内容 | `not_run` |
+| OVR-01 | member 打开公司概览的个人投影 | 不请求 token aggregate，不显示公司 token/cache/Credits | `not_run` |
+| OVR-02 | member 查看 viewer-scoped topology | 三个资源字段为 `null`，前端不做 node 求和 fallback | `not_run` |
+| OVR-03 | Agent manager 看被管理 Agent 非财务摘要 | 不显示公司资源总量 | `not_run` |
+| OVR-04 | admin/owner 看 current tenant 聚合 | SQL 与 UI 不混入其他 tenant | `not_run` |
+| OVR-05 | dual-scope 身份进入 tenant | platform role 不继承 analytics | `not_run` |
+| OVR-06 | tenant/capability 热切换 | 旧卡片、Query cache、WS 增量不可见 | `not_run` |
+| WORK-01 | 用户只输入 intent/约束，系统提议 executor 并解释 | 不显示 Provider/model/Skill/Tool | `not_run` |
+| WORK-02 | 用户在高级设置手工覆盖 | private/stopped/expired/foreign 候选不可选 | `not_run` |
+| WORK-03 | 推荐后改变 intent/ACL/readiness | 旧 fingerprint 失效；重放不重复 Task/Run/Credits | `not_run` |
+| WORK-04 | reviewer/final approver/L3 approver/recovery 各自处理 inbox | 无关用户无 action | `not_run` |
+| WORK-05 | Run failed 后 Task 回 pending | creator attention 仍存在且可幂等恢复 | `not_run` |
+| WORK-06 | `/work/:taskId` 查看全部 attempts/revisions/Group children | 不把部分成功误判完成 | `not_run` |
+| WORK-07 | 从 action link 调原领域 API | 撤权后的旧页面 mutation fail closed | `not_run` |
+| WORK-08 | AgentDetail formal delivery handoff | 旧 getTask 响应与深链不回归 | `not_run` |
+| WORK-09 | 被授权用户打开 detail/inbox | foreign tenant、无关 admin/manager 均无数据 | `not_run` |
+| CROSS-01 | 同一 Identity 双 membership 完整切换 | 所有页面、API、cache、WS 只认 current tenant | `not_run` |
+| CROSS-02 | platform operator + 普通 membership | 不继承 billing/OKR/analytics/private Work | `not_run` |
+| CROSS-03 | foreign object IDs 跨域直达 | 响应、日志、后台任务均无泄漏 | `not_run` |
+| CROSS-04 | 撤权、停用、切 tenant 后继续操作旧页面 | 轮询、mutation、WS、Tool、action link 全部 fail closed | `not_run` |
+
+最终浏览器矩阵必须同时覆盖 desktop 与 390px，并记录 Network、角色、tenant/object IDs、稳定错误码、
+release identity 和 fixture 清理证据。provider-free P0 可用本地 stub；不允许为了通过本节触发真实支付、外联或
+付费 Provider。
+
+## 20. 2026-08-19 工作台与协作群组 P0 收口验收
+
+本轮保持左侧导航和既有 Agent 消息界面不变，完成的是两个产品面的任务闭环：工作台作为当前用户的统一任务控制面，
+协作群组作为多人和 Agent 的可见协作现场。两者读取同一条
+`Task -> AgentRun/Event -> Deliverable/Artifact -> Review -> Approval -> Delivery` 真相链，Group 没有第二套任务
+状态机。普通消息、`@Agent` 执行和 Workspace 文件均不自动创建 Task；只有用户从一条已持久化消息执行显式确认，才会
+创建带稳定来源、唯一 `primary_owner` 和可选 collaborators 的正式任务。
+
+本节先绑定最终提交前工作树。它随本地 candidate commit 一并固化，但 commit 无法在自身内容中自指最终 SHA；准确 SHA
+必须在提交后通过 `/api/version`、页面 footer 和最终报告补充证明。本轮没有调用真实邮件、支付、外部服务或付费 Provider，
+也没有部署或修改生产。
+
+| 场景 | 正向与状态证据 | 负向/恢复证据 | 结论 |
+|---|---|---|---|
+| WORK-01/02 | 普通用户只提交业务意图；服务端给出可解释 executor proposal，高级设置保留 manual override | private/stopped/foreign/无权限候选 fail closed；旧显式 executor payload 保持兼容 | `tests_pass + local_browser_verified` |
+| WORK-04/05 | `/work` 显示“待我处理 / 进行中 / 最近完成”；失败 Run 向 creator 投影 `task_recovery`，retry 生成新 attempt | 无权用户没有 action；旧 action 在撤权/移除后 fail closed | `tests_pass + local_browser_verified` |
+| WORK-06 | `/work/:taskId` 展示任务来源、独立状态轴、全部 Runtime attempts、正式交付事实和原现场深链 | `run_failed` 后的 `delivery_succeeded` 只显示为“执行失败 · 结果通知已送达”，不误判执行成功 | `tests_pass + local_browser_verified` |
+| GRP-01/02/03 | Group 消息保留原样；显式“创建正式任务”先开确认面板并选择唯一第一责任 Agent | 普通消息、`@Agent`、关闭/取消面板均零正式 Task；system/hidden/foreign source 不可转换 | `tests_pass + isolated_postgres_browser_verified` |
+| GRP-04/05 | 显式转换保存服务端来源快照、primary owner/collaborators、TaskLog 和稳定 Task/Run ID | 同 `client_request_id` 与同 source message 重放返回既有 Task；最终仅 1 Task / 1 首 Run / 0 重复 Credits | `tests_pass + isolated_postgres_verified` |
+| GRP-06/08/09 | active Group 成员读取 collaboration-safe Task/Run 投影，creator 读取完整详情 | non-member/removed member/cross-tenant/篡改 session 或 message 均 403/404/422，Artifact/Review/Approval/Delivery 详情不越权 | `tests_pass + hostile_api_verified` |
+| GRP-07/10/12 | Group“关联任务”与 Work 详情双向深链；desktop 与 390px 均显示责任 Agent、失败、待处理和结果通知状态 | 必要 participant 失败不显示完成；页面无横向溢出 | `local_browser_verified` |
+
+独立测试工程师保留了两次拒绝签收的历史，而不是用最终通过覆盖：第一轮发现
+`run_created -> run_failed -> delivery_succeeded` 被 UI 混成“执行失败”和“Runtime 成功”；修复 lifecycle/notification
+分轴后，第二轮又因 Group 卡片只显示失败、未显示“结果通知已送达”而 `FAIL`。补齐 Group 卡片双状态后，第三轮在隔离
+PostgreSQL、backend `8029`、frontend `3038` 和本地 Runtime stub 上 `PASS`：WorkDetail 与 Group card 的 desktop/390px
+都显示失败、可恢复和通知已送达，普通消息/`@Agent` 不自动建 Task，显式转换、幂等和 cross-tenant `404` 均通过。
+
+新鲜自动化证据为：后端 Ruff、compileall 和 full regression（最终独立 reviewer `4656 passed`）；前端 Node
+`147 passed`、Vitest `209 passed`（38 files）与 TypeScript/Vite production build（6465 modules）；相关 Work/Group
+回归 `19 passed`；`git diff --check`；PostgreSQL fresh/historical/downgrade/re-upgrade migration smoke。独立 code reviewer
+最终结论为 `APPROVE`，P0/P1 为 0。
+
+第三轮隔离数据库、token/state/evidence 文件和 `8029/3038` 进程均已删除，数据库/端口残留为 0。浏览器记录保存在
+`/Users/sun/.config/browser-harness/agent-workspace/recordings/clawith-p0-g7`；主流程补充记录保存在
+`/Users/sun/.config/browser-harness/agent-workspace/recordings/clawith-g12-work-group-e2e`。本节最高只支持
+`local_business_flow_proven`；`immutable_local_candidate` 需提交后 release identity 复核，`deployed` 与
+`production_verified` 仍为 false。

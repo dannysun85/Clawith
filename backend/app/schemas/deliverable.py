@@ -320,6 +320,36 @@ class DeliverableApprovalReadinessOut(BaseModel):
     receipt_ref: str | None = None
 
 
+class CandidateQaSummaryOut(BaseModel):
+    schema_version: str | None = None
+    status: str | None = None
+    score: int | None = None
+    artifact_sha256: str | None = None
+    checks: list[dict[str, Any]] = Field(default_factory=list)
+    subject_similarity: dict[str, Any] = Field(default_factory=dict)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class DeliverableBriefOut(BaseModel):
+    schema_version: str
+    status: Literal["draft", "clarifying", "confirmed"]
+    missing_fields: list[str] = Field(default_factory=list)
+    brief_sha256: str | None = None
+    candidate_count: int | None = None
+    brief: dict[str, Any] | None = None
+    updated_at: datetime | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class DeliverableClarificationIn(BaseModel):
+    expected_version: int = Field(ge=1)
+    answers: dict[str, Any] = Field(default_factory=dict, max_length=20)
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class DeliverableExecutionUnitOut(BaseModel):
     id: uuid.UUID
     execution_id: uuid.UUID
@@ -340,6 +370,7 @@ class DeliverableExecutionUnitOut(BaseModel):
     input_snapshot: dict[str, Any]
     result_snapshot: dict[str, Any]
     quality_evaluation: dict[str, Any]
+    qa_summary: CandidateQaSummaryOut | None = None
     last_error_code: str | None = None
     next_retry_at: datetime | None = None
     started_at: datetime | None = None

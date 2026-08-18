@@ -11,6 +11,7 @@ import type {
     GroupSession,
     GroupSessionSummary,
     GroupTextFile,
+    GroupTaskSummary,
     GroupWorkspaceEntry,
     ParticipantType,
 } from '../types/group';
@@ -49,6 +50,11 @@ export const groupApi = {
     remove: (groupId: string) => fetchJson<void>(`/groups/${groupId}`, { method: 'DELETE' }),
 
     members: (groupId: string) => fetchJson<GroupMember[]>(`/groups/${groupId}/members`),
+
+    tasks: (groupId: string, sessionId?: string) =>
+        fetchJson<GroupTaskSummary[]>(
+            `/groups/${groupId}/tasks${qs({ session_id: sessionId })}`,
+        ),
 
     tenantMemberCandidates: (participantType: ParticipantType) =>
         fetchJson<GroupMemberCandidate[]>(

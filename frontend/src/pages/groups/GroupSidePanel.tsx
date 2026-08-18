@@ -5,9 +5,10 @@ import { groupApi } from '../../services/groupApi';
 import GroupTextFileEditor from './GroupTextFileEditor';
 import GroupWorkspaceTab from './GroupWorkspaceTab';
 import GroupMemoryTab from './GroupMemoryTab';
+import GroupTasksTab from './GroupTasksTab';
 import type { GroupMember } from '../../types/group';
 
-type PanelTab = 'members' | 'announcement' | 'workspace' | 'memory';
+type PanelTab = 'tasks' | 'members' | 'announcement' | 'workspace' | 'memory';
 
 const PANEL_WIDTH_KEY = 'groups.panelWidth';
 // Default sized by measurement, not taste: a long realistic member name — 12 CJK chars plus the
@@ -22,6 +23,7 @@ const clampWidth = (value: number) =>
 
 interface GroupSidePanelProps {
     groupId: string;
+    sessionId?: string;
     groupName: string;
     members: GroupMember[];
     onInvite: () => void;
@@ -37,6 +39,7 @@ interface GroupSidePanelProps {
  */
 export default function GroupSidePanel({
     groupId,
+    sessionId,
     groupName,
     members,
     onInvite,
@@ -101,6 +104,7 @@ export default function GroupSidePanel({
     );
 
     const TABS: { key: PanelTab; label: string }[] = [
+        { key: 'tasks', label: t('groups.linkedTasks', '关联任务') },
         { key: 'members', label: `${t('groups.members', '成员')} · ${members.length}` },
         { key: 'announcement', label: t('groups.announcement', '群公告') },
         { key: 'workspace', label: t('groups.workspace', '文件') },
@@ -128,7 +132,12 @@ export default function GroupSidePanel({
                     >
                         <IconSettings size={16} stroke={1.7} />
                     </button>
-                    <button type="button" className="group-icon-btn" onClick={onClose}>
+                    <button
+                        type="button"
+                        className="group-icon-btn"
+                        title={t('groups.closePanel', '关闭面板')}
+                        onClick={onClose}
+                    >
                         <IconX size={16} stroke={1.7} />
                     </button>
                 </div>
@@ -150,6 +159,10 @@ export default function GroupSidePanel({
             </div>
 
             <div className="group-panel-body">
+                {tab === 'tasks' && (
+                    <GroupTasksTab groupId={groupId} sessionId={sessionId} />
+                )}
+
                 {tab === 'members' && (
                     <>
                         <button type="button" className="group-invite-btn" onClick={onInvite}>

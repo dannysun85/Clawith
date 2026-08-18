@@ -237,6 +237,25 @@ describe('deliverable composer selection', () => {
         expect(requestCanLaunchFromComposer(request({ status: 'running' }))).toBe(false);
     });
 
+    it('launches the v2 poster pipeline only with its exact version pair', () => {
+        expect(requestCanLaunchFromComposer(request({
+            workflow_id: 'builtin.poster.v2',
+            workflow_version: '2.0.0',
+            work_type: 'poster',
+        }))).toBe(true);
+        expect(requestCanLaunchFromComposer(request({
+            workflow_id: 'builtin.poster.v2',
+            workflow_version: '1.0.0',
+            work_type: 'poster',
+        }))).toBe(false);
+        expect(requestCanLaunchFromComposer(request({
+            workflow_id: 'builtin.poster.v2',
+            workflow_version: '2.0.0',
+            work_type: 'poster',
+            status: 'running',
+        }))).toBe(false);
+    });
+
     it('restores only the newest non-dismissed ready request', () => {
         const running = request({ id: 'running', status: 'running', agent_run_id: 'run-1' });
         const dismissed = request({ id: 'dismissed' });

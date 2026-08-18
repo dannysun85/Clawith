@@ -95,6 +95,7 @@ def test_group_router_exposes_management_and_read_state_boundaries() -> None:
 
     assert ("POST", "/api/groups") in routes
     assert ("GET", "/api/groups/{group_id}/members") in routes
+    assert ("GET", "/api/groups/{group_id}/tasks") in routes
     assert ("GET", "/api/groups/{group_id}/member-candidates") in routes
     assert ("GET", "/api/groups/member-candidates") in routes
     assert ("POST", "/api/groups/{group_id}/sessions") in routes

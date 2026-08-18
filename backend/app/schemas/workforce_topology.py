@@ -33,8 +33,8 @@ class WorkforceTopologyNodeOut(BaseModel):
     role_description: str = ""
     status: str
     last_active_at: datetime | None = None
-    tokens_used_today: int = 0
-    cache_read_tokens_today: int = 0
+    tokens_used_today: int | None = None
+    cache_read_tokens_today: int | None = None
     max_tokens_per_day: int | None = None
     is_expired: bool = False
     is_system: bool = False

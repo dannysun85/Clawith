@@ -1,11 +1,15 @@
 """Feishu OAuth and Channel API routes."""
 
 import asyncio
+import hashlib
+import hmac
+import json
 import time
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
+from lark_oapi.core.utils import AESCipher
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -45,6 +49,50 @@ _USER_RESOLUTION_ERROR_TIP = (
     "抱歉，我暂时无法稳定识别你的飞书账号，已停止本次处理以避免重复创建账号。"
     "请稍后重试，或联系管理员检查飞书 Contact API 权限。"
 )
+
+
+def _verify_and_decode_feishu_callback(
+    body_bytes: bytes,
+    headers: dict[str, str],
+    config: ChannelConfig,
+) -> dict | None:
+    """Authenticate a Feishu callback before any event data is consumed."""
+    try:
+        envelope = json.loads(body_bytes)
+        if not isinstance(envelope, dict):
+            return None
+
+        encrypt_key = (config.encrypt_key or "").strip()
+        encrypted = envelope.get("encrypt")
+        if encrypted:
+            if not encrypt_key:
+                return None
+            payload = json.loads(AESCipher(encrypt_key).decrypt_str(encrypted))
+        else:
+            payload = envelope
+        if not isinstance(payload, dict):
+            return None
+
+        verification_token = (config.verification_token or "").strip()
+        actual_token = str((payload.get("header") or {}).get("token") or "")
+        if not verification_token or not hmac.compare_digest(actual_token, verification_token):
+            return None
+
+        event_type = str((payload.get("header") or {}).get("event_type") or "")
+        if encrypt_key and event_type != "url_verification":
+            timestamp = headers.get("x-lark-request-timestamp", "")
+            nonce = headers.get("x-lark-request-nonce", "")
+            signature = headers.get("x-lark-signature", "")
+            if not timestamp or not nonce or not signature:
+                return None
+            expected = hashlib.sha256(
+                (timestamp + nonce + encrypt_key).encode() + body_bytes
+            ).hexdigest()
+            if not hmac.compare_digest(signature, expected):
+                return None
+        return payload
+    except (UnicodeDecodeError, ValueError, TypeError):
+        return None
 
 _FEISHU_GROUP_ACTIVATION_MODES = frozenset({"mention", "always", "silent"})
 _FEISHU_BOT_IDENTITY_TTL_SECONDS = 600.0
@@ -537,7 +585,22 @@ async def feishu_event_webhook(
                 "use authenticated websocket mode"
             ),
         )
-    body = await request.json()
+    body_bytes = await request.body()
+    async with _async_session() as db:
+        result = await db.execute(
+            select(ChannelConfig).where(
+                ChannelConfig.agent_id == agent_id,
+                ChannelConfig.channel_type == "feishu",
+            )
+        )
+        config = result.scalar_one_or_none()
+    if not config:
+        return Response(status_code=status.HTTP_404_NOT_FOUND)
+
+    body = _verify_and_decode_feishu_callback(body_bytes, dict(request.headers), config)
+    if body is None:
+        logger.warning("[Feishu] Rejected unauthenticated callback for {}", agent_id)
+        return Response(status_code=status.HTTP_401_UNAUTHORIZED)
 
     # Handle verification challenge
     if "challenge" in body:

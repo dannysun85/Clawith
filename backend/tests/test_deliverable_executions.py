@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import hashlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 import uuid
@@ -505,3 +506,172 @@ async def test_revision_approval_records_old_and_new_execution_lineage(monkeypat
     assert receipts[0].target_units == ["shot-02"]
     assert request.status == "ready"
     assert request.version == 4
+
+
+@pytest.mark.asyncio
+async def test_candidate_count_is_tier_bound_in_unit_blueprints() -> None:
+    # FR-I3: the tier default is the ceiling; spec may only tune it down.
+    pro = _request(work_type="poster", spec={"candidate_count": 4})
+    pro_units = execution_unit_blueprints(pro)
+    assert [
+        unit.unit_key for unit in pro_units if unit.stage_key == "candidate_generate"
+    ] == ["candidate-01", "candidate-02"]
+
+    ultra = _request(work_type="poster", spec={"candidate_count": 1})
+    ultra.tier = "ultra"
+    ultra_units = execution_unit_blueprints(ultra)
+    assert [
+        unit.unit_key for unit in ultra_units if unit.stage_key == "candidate_generate"
+    ] == ["candidate-01"]
+
+    lite = _request(work_type="poster", spec={"candidate_count": 3})
+    lite.tier = "lite"
+    lite_units = execution_unit_blueprints(lite)
+    assert [
+        unit.unit_key for unit in lite_units if unit.stage_key == "candidate_generate"
+    ] == ["candidate-01"]
+
+
+def _v2_poster_request() -> DeliverableRequest:
+    request = _request(
+        work_type="poster",
+        spec={
+            "channel": "social",
+            "aspect_ratio": "3:4",
+            "style": "commercial",
+            "audience": "25-35 岁都市白领",
+        },
+    )
+    request.workflow_id = "builtin.poster.v2"
+    request.workflow_version = "2.0.0"
+    return request
+
+
+def _candidate_qa_harness(request: DeliverableRequest, image_bytes: bytes):
+    from app.models.agent_tool_execution import AgentToolExecution
+
+    run_id = uuid.uuid4()
+    execution, units = build_execution_shadow(
+        request,
+        execution_number=1,
+        kind="initial",
+        idempotency_key=request.client_request_id,
+        current_stage="running",
+    )
+    execution.status = "running"
+    request.current_execution_id = execution.id
+    candidate_units = [
+        unit for unit in units if unit.unit_key == "candidate-01"
+    ]
+    versioned_path = (
+        f"workspace/deliverables/{request.id}/candidates/candidate-01_ab12cd34ef56.png"
+    )
+    tool_execution = AgentToolExecution(
+        id=uuid.uuid4(),
+        tenant_id=request.tenant_id,
+        run_id=run_id,
+        tool_call_id="call-1",
+        tool_name="generate_image_minimax",
+        assistant_message_id="msg-1",
+        arguments_hash="f" * 64,
+        status="succeeded",
+        result_metadata={
+            "artifact_refs": [
+                f"workspace://{request.agent_id}/{versioned_path}",
+            ]
+        },
+    )
+    from app.services.storage import agent_storage_key
+
+    class _FakeStorage:
+        async def read_bytes(self, key):
+            assert key == agent_storage_key(request.agent_id, versioned_path)
+            return image_bytes
+
+    db = _Session(execution, candidate_units, [tool_execution])
+    return db, run_id, candidate_units, _FakeStorage()
+
+
+def _qa_png_bytes() -> bytes:
+    import io
+
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (768, 1024), (240, 244, 248)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_poster_v2_candidate_qa_binds_hash_report_in_shadow_mode(
+    monkeypatch,
+) -> None:
+    from app.services.candidate_qa import evaluate_poster_v2_candidates
+
+    image_bytes = _qa_png_bytes()
+    request = _v2_poster_request()
+    db, run_id, candidate_units, storage = _candidate_qa_harness(request, image_bytes)
+    monkeypatch.setattr(
+        "app.services.candidate_qa.get_storage_backend",
+        lambda: storage,
+    )
+
+    reports = await evaluate_poster_v2_candidates(
+        db,  # type: ignore[arg-type]
+        request=request,
+        run_id=run_id,
+    )
+
+    assert len(reports) == 1
+    report = reports[0]
+    expected_sha = hashlib.sha256(image_bytes).hexdigest()
+    assert report.artifact_sha256 == expected_sha
+    qa_unit = next(unit for unit in candidate_units if unit.stage_key == "candidate_qa")
+    generate_unit = next(
+        unit for unit in candidate_units if unit.stage_key == "candidate_generate"
+    )
+    assert qa_unit.quality_evaluation["candidate_qa"]["artifact_sha256"] == expected_sha
+    assert qa_unit.quality_evaluation["enforcement"] == "shadow"
+    # Shadow mode records only; lifecycle state is never changed by QA.
+    assert qa_unit.status == "pending"
+    assert generate_unit.status == "succeeded"
+    assert generate_unit.result_snapshot["artifact_sha256"] == expected_sha
+
+
+@pytest.mark.asyncio
+async def test_poster_v2_candidate_qa_enforcing_fails_bad_candidates(
+    monkeypatch,
+) -> None:
+    from types import SimpleNamespace as _NS
+
+    from app.services.candidate_qa import evaluate_poster_v2_candidates
+
+    request = _v2_poster_request()
+    db, run_id, candidate_units, storage = _candidate_qa_harness(
+        request,
+        b"corrupt-not-an-image",
+    )
+    monkeypatch.setattr(
+        "app.services.candidate_qa.get_storage_backend",
+        lambda: storage,
+    )
+    monkeypatch.setattr(
+        "app.services.candidate_qa.get_settings",
+        lambda: _NS(
+            DELIVERABLE_CREATIVE_QA_ENFORCEMENT="enforcing",
+            DELIVERABLE_CREATIVE_QA_TENANT_IDS=str(request.tenant_id),
+            DELIVERABLE_CREATIVE_QA_AGENT_IDS="",
+        ),
+    )
+
+    reports = await evaluate_poster_v2_candidates(
+        db,  # type: ignore[arg-type]
+        request=request,
+        run_id=run_id,
+    )
+
+    assert reports[0].status == "failed"
+    qa_unit = next(unit for unit in candidate_units if unit.stage_key == "candidate_qa")
+    assert qa_unit.status == "failed"
+    assert qa_unit.last_error_code == "candidate_qa_failed"
+    assert qa_unit.quality_evaluation["enforcement"] == "enforcing"

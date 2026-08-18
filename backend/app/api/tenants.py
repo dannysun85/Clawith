@@ -29,6 +29,7 @@ from app.core.security import (
     access_context_mfa_verified,
     create_access_token,
     get_authenticated_user,
+    get_company_analytics_viewer,
     get_company_governor,
     get_current_user,
     get_platform_operator,
@@ -904,10 +905,15 @@ async def get_my_tenant(
 
 @router.get("/me/token-usage")
 async def get_my_tenant_token_usage(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_company_analytics_viewer),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return aggregate token and prompt-cache usage for the current company."""
+    """Return current-company resource usage to a membership-scoped governor.
+
+    Deleted Agents are historical records and therefore do not participate in
+    the current-company aggregate.  System Agents remain included because they
+    consume the same tenant resource pool.
+    """
     if not current_user.tenant_id:
         raise HTTPException(status_code=404, detail="User is not in a tenant")
 
@@ -922,7 +928,10 @@ async def get_my_tenant_token_usage(
             sqla_func.coalesce(sqla_func.sum(Agent.cache_creation_tokens_today), 0).label("cache_creation_today"),
             sqla_func.coalesce(sqla_func.sum(Agent.cache_creation_tokens_month), 0).label("cache_creation_month"),
             sqla_func.coalesce(sqla_func.sum(Agent.cache_creation_tokens_total), 0).label("cache_creation_total"),
-        ).where(Agent.tenant_id == current_user.tenant_id)
+        ).where(
+            Agent.tenant_id == current_user.tenant_id,
+            Agent.deleted_at.is_(None),
+        )
     )).one()
 
     def bucket(total: int, cache_read: int, cache_creation: int) -> dict:

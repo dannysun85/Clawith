@@ -37,7 +37,6 @@ class PostCreate(BaseModel):
     author_id: uuid.UUID
     author_type: str = "human"  # "agent" or "human"
     author_name: str
-    tenant_id: uuid.UUID | None = None
 
 
 class CommentCreate(BaseModel):
@@ -293,10 +292,7 @@ async def create_post(body: PostCreate, current_user: User = Depends(get_current
     """Create a new plaza post. Requires authentication; tenant_id enforced from JWT."""
     if len(body.content.strip()) == 0:
         raise HTTPException(400, "Content cannot be empty")
-    effective_tenant_id = _effective_plaza_tenant_id(
-        current_user,
-        body.tenant_id,
-    )
+    effective_tenant_id = _effective_plaza_tenant_id(current_user)
     async with async_session() as db:
         author_id, author_type, author_name = await _resolve_authenticated_author(
             db,

@@ -37,7 +37,15 @@ def _task_log_id(run_id: uuid.UUID, checkpoint_id: str) -> uuid.UUID:
     return uuid.uuid5(run_id, f"task-terminal:{checkpoint_id}")
 
 
-def _group_task_log_id(task_id: uuid.UUID) -> uuid.UUID:
+def _group_task_log_id(task_id: uuid.UUID, attempt_source_id: str) -> uuid.UUID:
+    """Return one terminal receipt identity per immutable Group attempt."""
+
+    return uuid.uuid5(task_id, f"group-task-terminal:{attempt_source_id}")
+
+
+def _legacy_group_task_log_id(task_id: uuid.UUID) -> uuid.UUID:
+    """Return the pre-retry receipt identity used by the original attempt."""
+
     return uuid.uuid5(task_id, "group-task-terminal")
 
 
@@ -260,10 +268,22 @@ class TaskRuntimeCompletionHandler:
                 ).scalar_one_or_none()
                 if task is None:
                     return
-                receipt_id = _group_task_log_id(task.id)
+                attempt_source_id = stored_run.source_id
+                if not attempt_source_id:
+                    raise TaskRuntimeCompletionError(
+                        "group_task_attempt_missing",
+                        "terminal Group Task Run has no immutable attempt source",
+                    )
+                receipt_id = _group_task_log_id(task.id, attempt_source_id)
+                receipt_ids = [receipt_id]
+                initial_source_id = str(
+                    uuid.uuid5(task.id, "group-work-task-message")
+                )
+                if attempt_source_id == initial_source_id:
+                    receipt_ids.append(_legacy_group_task_log_id(task.id))
                 existing_receipt = (
                     await db.execute(
-                        select(TaskLog.id).where(TaskLog.id == receipt_id)
+                        select(TaskLog.id).where(TaskLog.id.in_(receipt_ids))
                     )
                 ).scalar_one_or_none()
                 if existing_receipt is not None:
@@ -276,6 +296,7 @@ class TaskRuntimeCompletionHandler:
                             .where(
                                 AgentRun.tenant_id == run.tenant_id,
                                 AgentRun.correlation_id == correlation_id,
+                                AgentRun.source_id == attempt_source_id,
                                 AgentRun.system_role.is_(None),
                             )
                             .order_by(AgentRun.created_at, AgentRun.id)

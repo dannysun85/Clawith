@@ -104,13 +104,19 @@ def _request(**overrides):
 def test_builtin_workflow_manifests_are_versioned_and_unique() -> None:
     workflows = list_workflow_manifests()
 
-    assert [workflow.work_type for workflow in workflows] == [
-        "presentation",
-        "poster",
-        "video",
+    assert [workflow.workflow_id for workflow in workflows] == [
+        "builtin.presentation.v1",
+        "builtin.poster.v1",
+        "builtin.video.v1",
+        "builtin.poster.v2",
     ]
     assert len({workflow.workflow_id for workflow in workflows}) == len(workflows)
-    assert all(workflow.workflow_version == "1.0.0" for workflow in workflows)
+    assert [workflow.workflow_version for workflow in workflows] == [
+        "1.0.0",
+        "1.0.0",
+        "1.0.0",
+        "2.0.0",
+    ]
     assert require_workflow("presentation").launch_policy == "agent_runtime"
     assert require_workflow("poster").launch_policy == "agent_runtime"
     assert require_workflow("video").launch_policy == "agent_runtime"
@@ -118,6 +124,10 @@ def test_builtin_workflow_manifests_are_versioned_and_unique() -> None:
 
 @pytest.mark.asyncio
 async def test_launcher_lists_only_workflows_executable_by_this_agent(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.services.deliverable_workflows.poster_v2_workflow_allowed",
+        lambda *_args, **_kwargs: False,
+    )
     monkeypatch.setattr(
         "app.services.deliverable_workflows.resolve_route",
         AsyncMock(return_value=SimpleNamespace()),

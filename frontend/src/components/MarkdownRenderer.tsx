@@ -26,6 +26,12 @@ function escapeAttribute(str: string): string {
     return escapeHtml(str).replace(/'/g, '&#39;');
 }
 
+function sanitizeCodeLanguage(language: string): string {
+    // A fence info string is untrusted Markdown input. Only retain characters
+    // valid for the single syntax-highlighting class we generate from it.
+    return /^[A-Za-z0-9][A-Za-z0-9_+.#-]{0,63}$/.test(language) ? language : '';
+}
+
 function isAgentDownloadUrl(url: string): boolean {
     const raw = url.trim().replace(/^<|>$/g, '');
     try {
@@ -212,7 +218,7 @@ export function markdownToHtml(
             if (!inCodeBlock) {
                 flushList(); flushBlockquote(); flushTable();
                 inCodeBlock = true;
-                codeLang = line.slice(3).trim();
+                codeLang = sanitizeCodeLanguage(line.slice(3).trim());
                 codeLines = [];
             } else {
                 const codeContent = escapeHtml(codeLines.join('\n'));

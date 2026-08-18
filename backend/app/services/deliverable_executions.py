@@ -25,6 +25,7 @@ from app.models.deliverable import (
     DeliverableExecutionUnit,
     DeliverableRequest,
 )
+from app.services.creative_briefs import candidate_count_for_policy
 
 
 class DeliverableExecutionError(RuntimeError):
@@ -92,6 +93,7 @@ def safe_preflight_snapshot(preflight: Mapping[str, Any]) -> dict[str, Any]:
         "normalized_spec",
         "credit_estimate",
         "creates_reservation",
+        "creative_brief",
     }
     snapshot = {
         key: preflight[key]
@@ -105,10 +107,9 @@ def safe_preflight_snapshot(preflight: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _candidate_count(request: DeliverableRequest) -> int:
-    configured = (request.spec or {}).get("candidate_count")
-    if isinstance(configured, int) and not isinstance(configured, bool):
-        return max(1, min(configured, 4))
-    return {"lite": 1, "pro": 2, "ultra": 3}.get(request.tier, 1)
+    """FR-I3: the tier default is authoritative; spec may only tune it down."""
+
+    return candidate_count_for_policy(request.tier, request.spec)
 
 
 def _slide_count(request: DeliverableRequest) -> int:

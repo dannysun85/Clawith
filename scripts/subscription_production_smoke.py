@@ -4,10 +4,11 @@
 This smoke intentionally requires real credentials. It validates the money
 surface through HTTP instead of unit-test fixtures:
 
-1. tenant user can read subscription summary, ledger, orders, plans, packs;
-2. platform admin can run read-only ledger/payment reconciliation;
-3. platform admin can export order and credit CSVs;
-4. release identity is bound to the isolated candidate slot.
+1. company owner can read aggregates and owner-only billing data;
+2. ordinary member can read only entitlements and attributed personal usage;
+3. ordinary member is rejected from every sensitive billing endpoint;
+4. platform admin can run read-only ledger/payment reconciliation and exports;
+5. release identity is bound to the isolated candidate slot.
 
 The browser portion is intentionally implemented by the pinned, isolated
 ``deploy/browser-smoke`` image. This standard-library runner never injects
@@ -15,6 +16,7 @@ credentials into JavaScript or process arguments.
 
 Environment variables:
   SMOKE_TENANT_EMAIL / SMOKE_TENANT_PASSWORD / SMOKE_TENANT_ID
+  SMOKE_MEMBER_EMAIL / SMOKE_MEMBER_PASSWORD
   SMOKE_PLATFORM_ADMIN_EMAIL / SMOKE_PLATFORM_ADMIN_PASSWORD
   SMOKE_API_BASE (default: http://127.0.0.1:3008/api)
   SMOKE_FRONTEND_URL (default: http://127.0.0.1:3008)
@@ -40,6 +42,8 @@ REQUIRED_CREDENTIAL_KEYS = {
     "SMOKE_TENANT_EMAIL",
     "SMOKE_TENANT_PASSWORD",
     "SMOKE_TENANT_ID",
+    "SMOKE_MEMBER_EMAIL",
+    "SMOKE_MEMBER_PASSWORD",
     "SMOKE_PLATFORM_ADMIN_EMAIL",
     "SMOKE_PLATFORM_ADMIN_PASSWORD",
 }
@@ -255,6 +259,10 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
         args.tenant_password or credentials.get("SMOKE_TENANT_PASSWORD") or os.getenv("SMOKE_TENANT_PASSWORD")
     )
     tenant_id_value = args.tenant_id or credentials.get("SMOKE_TENANT_ID") or os.getenv("SMOKE_TENANT_ID")
+    member_email = args.member_email or credentials.get("SMOKE_MEMBER_EMAIL") or os.getenv("SMOKE_MEMBER_EMAIL")
+    member_password = (
+        args.member_password or credentials.get("SMOKE_MEMBER_PASSWORD") or os.getenv("SMOKE_MEMBER_PASSWORD")
+    )
     admin_email = (
         args.platform_admin_email
         or credentials.get("SMOKE_PLATFORM_ADMIN_EMAIL")
@@ -281,6 +289,11 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
         bool(admin_email and admin_password),
         "platform_admin_credentials_configured",
         "Set SMOKE_PLATFORM_ADMIN_EMAIL and SMOKE_PLATFORM_ADMIN_PASSWORD",
+    )
+    require(
+        bool(member_email and member_password),
+        "member_credentials_configured",
+        "Set SMOKE_MEMBER_EMAIL and SMOKE_MEMBER_PASSWORD",
     )
 
     expected_identity = (args.expected_version, args.expected_commit, args.expected_release_id)
@@ -356,6 +369,13 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 {"code": "unexpected_tenant_context"},
             )
             summary["checks"].append("tenant_scope_ok")
+            capabilities = set(body.get("effective_capabilities") or [])
+            require(
+                {"company.billing.view", "company.billing.manage"}.issubset(capabilities),
+                "tenant_billing_manage_capability",
+                {"code": "company_owner_billing_capabilities_required"},
+            )
+            summary["checks"].append("tenant_billing_manage_capability_ok")
         summary["checks"].append(f"{stage}_ok")
         if stage == "client_subscription_summary":
             require(
@@ -371,6 +391,59 @@ def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 "seats_used": body.get("seats_used"),
                 "seats_total": body.get("seats_total"),
             }
+
+    member_login = login(
+        api_base,
+        member_email,
+        member_password,
+        "member_login",
+        tenant_id=tenant_id,
+    )
+    member_token = member_login["access_token"]
+    summary["checks"].append("member_login_ok")
+
+    status, member_me = call_api("GET", api_base, "/auth/me", token=member_token)
+    member_capabilities = set(member_me.get("effective_capabilities") or []) if isinstance(member_me, dict) else set()
+    require(
+        status == 200
+        and str(member_me.get("tenant_id")) == tenant_id
+        and "company.billing.view" not in member_capabilities
+        and "company.billing.manage" not in member_capabilities,
+        "member_scope",
+        {"code": "ordinary_member_without_billing_authority_required", "status": status},
+    )
+    for path in [
+        "/subscription/plans",
+        "/subscription/credit-packs",
+        "/subscription/my-entitlements",
+        "/subscription/usage/me",
+    ]:
+        status, body = call_api("GET", api_base, path, token=member_token)
+        require(status == 200, "member_personal_usage", {"path": path, "status": status})
+        if path == "/subscription/usage/me":
+            require(
+                isinstance(body, dict)
+                and "consumed_credits" in body
+                and not {"balance", "orders", "transactions", "tokens_used"}.intersection(body),
+                "member_personal_usage",
+                {"code": "unsafe_personal_usage_projection"},
+            )
+    summary["checks"].append("member_personal_usage_ok")
+
+    sensitive_paths = [
+        "/subscription/subscriptions",
+        "/subscription/usage",
+        "/subscription/credits",
+        "/subscription/seats",
+        "/subscription/summary",
+        "/subscription/credit-transactions",
+        "/subscription/orders",
+        "/subscription/billing/profile",
+    ]
+    for path in sensitive_paths:
+        status, _ = call_api("GET", api_base, path, token=member_token)
+        require(status == 403, "member_sensitive_billing_denied", {"path": path, "status": status})
+    summary["checks"].append("member_sensitive_billing_denied_ok")
 
     status, body = call_api(
         "POST",
@@ -451,6 +524,8 @@ def main() -> int:
     parser.add_argument("--tenant-email", default=None)
     parser.add_argument("--tenant-password", default=None)
     parser.add_argument("--tenant-id", default=None)
+    parser.add_argument("--member-email", default=None)
+    parser.add_argument("--member-password", default=None)
     parser.add_argument("--platform-admin-email", default=None)
     parser.add_argument("--platform-admin-password", default=None)
     parser.add_argument("--credentials-file", default=None)

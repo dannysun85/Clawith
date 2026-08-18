@@ -8,6 +8,7 @@ const COMPOSER_LAUNCHABLE_WORKFLOWS = new Set([
     'builtin.poster.v1@1.0.0',
     'builtin.presentation.v1@1.0.0',
     'builtin.video.v1@1.0.0',
+    'builtin.poster.v2@2.0.0',
 ]);
 
 const WORK_TASK_TO_DELIVERABLE_TYPE: Partial<Record<string, DeliverableWorkType>> = {

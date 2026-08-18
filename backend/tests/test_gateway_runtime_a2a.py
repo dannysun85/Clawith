@@ -14,7 +14,7 @@ from app.api import gateway
 from app.models.agent import Agent
 from app.models.audit import ChatMessage
 from app.models.gateway_message import GatewayMessage
-from app.schemas.schemas import GatewayReportRequest, GatewaySendMessageRequest
+from app.schemas.schemas import AgentOut, GatewayReportRequest, GatewaySendMessageRequest
 from app.services.agent_runtime.a2a_runtime import (
     GatewayA2ARuntimeCompletion,
     GatewayA2ARuntimeIntake,
@@ -46,18 +46,62 @@ class _Result:
 class _Session:
     def __init__(self, *results: object) -> None:
         self.results = deque(results)
+        self.statements: list[object] = []
         self.commits = 0
         self.rollbacks = 0
 
     async def execute(self, _statement) -> _Result:
+        self.statements.append(_statement)
         value = self.results.popleft()
         return _Result([] if value is None else [value])
+
+    async def get(self, _model, _identity):
+        return SimpleNamespace(is_active=True)
 
     async def commit(self) -> None:
         self.commits += 1
 
     async def rollback(self) -> None:
         self.rollbacks += 1
+
+
+@pytest.mark.asyncio
+async def test_gateway_authentication_hashes_presented_key_before_lookup(monkeypatch) -> None:
+    agent = SimpleNamespace(
+        status="running",
+        is_expired=False,
+        expires_at=None,
+        tenant_id=uuid.uuid4(),
+        creator_id=uuid.uuid4(),
+    )
+    db = _Session(agent)
+    monkeypatch.setattr(gateway, "get_agent_access_level_for_user_id", AsyncMock(return_value="owner"))
+
+    authenticated = await gateway._get_agent_by_key("oc-plaintext-key", db)
+
+    assert authenticated is agent
+    assert len(db.statements) == 1
+    params = db.statements[0].compile().params
+    assert gateway._hash_key("oc-plaintext-key") in params.values()
+    assert "oc-plaintext-key" not in params.values()
+
+
+@pytest.mark.asyncio
+async def test_gateway_rejects_stored_hash_as_presented_key() -> None:
+    stored_hash = gateway._hash_key("oc-plaintext-key")
+    db = _Session(None)
+
+    with pytest.raises(gateway.HTTPException, match="Invalid API key") as exc_info:
+        await gateway._get_agent_by_key(stored_hash, db)
+
+    assert exc_info.value.status_code == 401
+    assert len(db.statements) == 1
+    params = db.statements[0].compile().params
+    assert stored_hash not in params.values()
+
+
+def test_agent_output_never_serializes_api_key_hash() -> None:
+    assert "api_key_hash" not in AgentOut.model_json_schema()["properties"]
 
 
 class _ReportSession:

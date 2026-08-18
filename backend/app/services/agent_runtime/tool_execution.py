@@ -83,6 +83,7 @@ _RESULT_METADATA_KEYS = frozenset(
         "period_end",
         "objective_count",
         "kr_count",
+        "visibility_scope",
         "objective_id",
         "kr_id",
         "report_id",

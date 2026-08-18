@@ -19,6 +19,7 @@ POST      /api/okr/trigger-member-outreach         (P4 onboarding: fire OKR Agen
 
 import uuid
 from datetime import date, datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from loguru import logger
@@ -28,12 +29,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import get_current_user
 from app.config import get_settings
+from app.core.permissions import can_manage_agent, can_use_agent
+from app.core.security import get_company_okr_manager
 from app.database import async_session
 from app.models.agent import Agent
 from app.models.deliverable import DeliverableArtifactRevision, DeliverableRequest
 from app.models.identity import IdentityProvider
 from app.models.okr import (
     CompanyReport,
+    MemberDailyReport,
     OKRKeyResult,
     OKRObjective,
     OKRProgressLog,
@@ -41,8 +45,10 @@ from app.models.okr import (
     WorkReport,
 )
 from app.models.task import Task
+from app.models.org import OrgMember
 from app.models.user import User
 from app.services.access_control import is_company_governor
+from app.services.okr_access import can_view_objective, resolve_okr_visibility
 
 router = APIRouter(prefix="/api/okr", tags=["okr"])
 runtime_settings = get_settings()
@@ -134,6 +140,59 @@ async def _get_or_create_settings(db, tenant_id: uuid.UUID) -> OKRSettings:
         db.add(settings)
         await db.flush()
     return settings
+
+
+async def _get_settings_read_only(db, tenant_id: uuid.UUID) -> OKRSettings:
+    """Return persisted settings or an unpersisted default projection.
+
+    Read routes must never create configuration rows or lock cadence as a
+    side-effect of a GET request.
+    """
+
+    result = await db.execute(
+        select(OKRSettings).where(OKRSettings.tenant_id == tenant_id)
+    )
+    settings = result.scalar_one_or_none()
+    if settings is not None:
+        return settings
+    return OKRSettings(
+        tenant_id=tenant_id,
+        enabled=False,
+        first_enabled_at=None,
+        daily_report_enabled=False,
+        daily_report_time="18:00",
+        daily_report_skip_non_workdays=True,
+        weekly_report_enabled=False,
+        weekly_report_day=4,
+        period_frequency="quarterly",
+        period_length_days=None,
+        okr_agent_id=None,
+    )
+
+
+async def _get_visible_objective(
+    db,
+    *,
+    objective_id: uuid.UUID,
+    user,
+) -> OKRObjective:
+    """Load a visible objective and use 404 for both missing and forbidden."""
+
+    objective = (
+        await db.execute(
+            select(OKRObjective).where(
+                OKRObjective.id == objective_id,
+                OKRObjective.tenant_id == user.tenant_id,
+                OKRObjective.status != "archived",
+            )
+        )
+    ).scalar_one_or_none()
+    if objective is None:
+        raise HTTPException(404, "Objective not found")
+    visibility = await resolve_okr_visibility(db, user)
+    if not can_view_objective(objective, visibility):
+        raise HTTPException(404, "Objective not found")
+    return objective
 
 
 async def _sync_okr_report_triggers(db, settings: OKRSettings) -> None:
@@ -485,7 +544,6 @@ class MemberDailyReportUpsert(BaseModel):
     content: str
     member_type: str | None = None
     member_id: str | None = None
-    source: str = "manual"
 
 
 class CompanyReportOut(BaseModel):
@@ -806,12 +864,11 @@ async def _resolve_progress_evidence(
 async def get_okr_settings(user=Depends(get_current_user)):
     """Return OKR configuration for the current tenant."""
     async with async_session() as db:
-        settings = await _get_or_create_settings(db, user.tenant_id)
+        settings = await _get_settings_read_only(db, user.tenant_id)
 
         # Also resolve the OKR Agent ID so the UI can show the chat button
         okr_agent_id_str = str(settings.okr_agent_id) if settings.okr_agent_id else None
 
-        await db.commit()
         return OKRSettingsOut(
             enabled=settings.enabled,
             first_enabled_at=settings.first_enabled_at.isoformat() if settings.first_enabled_at else None,
@@ -828,7 +885,10 @@ async def get_okr_settings(user=Depends(get_current_user)):
 
 
 @router.put("/settings", response_model=OKRSettingsOut)
-async def update_okr_settings(body: OKRSettingsUpdate, user=Depends(get_current_user)):
+async def update_okr_settings(
+    body: OKRSettingsUpdate,
+    user=Depends(get_company_okr_manager),
+):
     """Update OKR configuration. Org admins only."""
     if not is_company_governor(user):
         raise HTTPException(403, "Only org admins can modify OKR settings")
@@ -908,7 +968,7 @@ async def update_okr_settings(body: OKRSettingsUpdate, user=Depends(get_current_
 
 
 @router.post("/sync-relationships")
-async def sync_okr_relationships(user=Depends(get_current_user)):
+async def sync_okr_relationships(user=Depends(get_company_okr_manager)):
     """Manually re-sync the OKR Agent's relationship network.
 
     Connects the OKR Agent to all active OrgMembers (org-structure-synced humans)
@@ -946,7 +1006,7 @@ async def list_periods(user=Depends(get_current_user)):
     the selectable history even if OKR is later disabled and re-enabled.
     """
     async with async_session() as db:
-        settings = await _get_or_create_settings(db, user.tenant_id)
+        settings = await _get_settings_read_only(db, user.tenant_id)
         first_enabled_at = settings.first_enabled_at
         if first_enabled_at is None and settings.enabled:
             earliest_result = await db.execute(
@@ -964,8 +1024,6 @@ async def list_periods(user=Depends(get_current_user)):
                 )
             else:
                 first_enabled_at = datetime.now(timezone.utc)
-            settings.first_enabled_at = first_enabled_at
-        await db.commit()
 
     freq = settings.period_frequency
     length = settings.period_length_days
@@ -1054,7 +1112,7 @@ def _obj_to_out(
 @router.get("/evidence", response_model=list[OKREvidenceOut])
 async def list_okr_evidence(
     limit: int = Query(default=50, ge=1, le=100),
-    user=Depends(get_current_user),
+    user=Depends(get_company_okr_manager),
 ):
     """List tenant-owned, terminal work that an admin may cite as OKR evidence."""
     if not _is_okr_admin(user):
@@ -1069,6 +1127,11 @@ async def list_okr_evidence(
                     .where(
                         Task.tenant_id == user.tenant_id,
                         Agent.tenant_id == user.tenant_id,
+                        Agent.deleted_at.is_(None),
+                        or_(
+                            Agent.creator_id == user.id,
+                            Agent.access_mode.in_(["company", "custom"]),
+                        ),
                         Task.status == "done",
                     )
                     .order_by(Task.completed_at.desc(), Task.updated_at.desc())
@@ -1084,6 +1147,11 @@ async def list_okr_evidence(
                     .where(
                         DeliverableRequest.tenant_id == user.tenant_id,
                         Agent.tenant_id == user.tenant_id,
+                        Agent.deleted_at.is_(None),
+                        or_(
+                            Agent.creator_id == user.id,
+                            Agent.access_mode.in_(["company", "custom"]),
+                        ),
                         DeliverableRequest.status == "succeeded",
                     )
                     .order_by(
@@ -1174,11 +1242,10 @@ async def list_objectives(
 
     async with async_session() as db:
         if not period_start or not period_end:
-            settings = await _get_or_create_settings(db, user.tenant_id)
+            settings = await _get_settings_read_only(db, user.tenant_id)
             ps, pe = _compute_current_period(
                 settings.period_frequency, settings.period_length_days
             )
-            await db.commit()
         else:
             ps = date.fromisoformat(period_start)
             pe = date.fromisoformat(period_end)
@@ -1193,16 +1260,23 @@ async def list_objectives(
             )
             .order_by(OKRObjective.owner_type, OKRObjective.created_at)
         )
-        objectives = result.scalars().all()
+        visibility = await resolve_okr_visibility(db, user)
+        objectives = [
+            objective
+            for objective in result.scalars().all()
+            if can_view_objective(objective, visibility)
+        ]
 
         # Fetch all KRs for these objectives in one query
         obj_ids = [o.id for o in objectives]
-        krs_result = await db.execute(
-            select(OKRKeyResult)
-            .where(OKRKeyResult.objective_id.in_(obj_ids))
-            .order_by(OKRKeyResult.created_at)
-        )
-        all_krs = krs_result.scalars().all()
+        all_krs: list[OKRKeyResult] = []
+        if obj_ids:
+            krs_result = await db.execute(
+                select(OKRKeyResult)
+                .where(OKRKeyResult.objective_id.in_(obj_ids))
+                .order_by(OKRKeyResult.created_at)
+            )
+            all_krs = krs_result.scalars().all()
 
         latest_evidence_by_kr: dict[uuid.UUID, dict] = {}
         kr_ids = [kr.id for kr in all_krs]
@@ -1251,7 +1325,10 @@ async def list_objectives(
         user_names: dict[uuid.UUID, str] = {}
         if user_owner_ids:
             u_result = await db.execute(
-                select(User.id, User.display_name).where(User.id.in_(user_owner_ids))
+                select(User.id, User.display_name).where(
+                    User.id.in_(user_owner_ids),
+                    User.tenant_id == user.tenant_id,
+                )
             )
             user_names = {row.id: (row.display_name or "") for row in u_result.fetchall()}
 
@@ -1262,7 +1339,8 @@ async def list_objectives(
             if unresolved_ids:
                 m_result = await db.execute(
                     select(OrgMember.id, OrgMember.name).where(
-                        OrgMember.id.in_(unresolved_ids)
+                        OrgMember.id.in_(unresolved_ids),
+                        OrgMember.tenant_id == user.tenant_id,
                     )
                 )
                 for row in m_result.fetchall():
@@ -1271,7 +1349,11 @@ async def list_objectives(
         agent_names: dict[uuid.UUID, str] = {}
         if agent_owner_ids:
             a_result = await db.execute(
-                select(Agent.id, Agent.name).where(Agent.id.in_(agent_owner_ids))
+                select(Agent.id, Agent.name).where(
+                    Agent.id.in_(agent_owner_ids),
+                    Agent.tenant_id == user.tenant_id,
+                    Agent.deleted_at.is_(None),
+                )
             )
             agent_names = {row.id: (row.name or "") for row in a_result.fetchall()}
 
@@ -1297,7 +1379,10 @@ async def list_objectives(
 
 
 @router.post("/objectives", response_model=ObjectiveOut)
-async def create_objective(body: ObjectiveCreate, user=Depends(get_current_user)):
+async def create_objective(
+    body: ObjectiveCreate,
+    user=Depends(get_company_okr_manager),
+):
     """Create a new Objective."""
     from app.models.org import OrgMember
 
@@ -1307,14 +1392,30 @@ async def create_objective(body: ObjectiveCreate, user=Depends(get_current_user)
     async with async_session() as db:
         resolved_owner_id: uuid.UUID | None = None
 
+        if body.owner_type not in {"company", "user", "agent"}:
+            raise HTTPException(422, "owner_type must be company, user, or agent")
+        if body.owner_type == "company" and body.owner_id:
+            raise HTTPException(422, "company objectives cannot have owner_id")
+        if body.owner_type != "company" and not body.owner_id:
+            raise HTTPException(422, "personal and Agent objectives require owner_id")
+
         if body.owner_id:
-            candidate = uuid.UUID(body.owner_id)
+            try:
+                candidate = uuid.UUID(body.owner_id)
+            except ValueError as exc:
+                raise HTTPException(422, "owner_id must be a UUID") from exc
 
             if body.owner_type == "user":
                 # Verify the UUID is a real User.id — if not, check if it's an
                 # OrgMember.id and transparently resolve to the linked user_id.
                 # This guards against OKR Agent accidentally passing OrgMember.id.
-                user_check = await db.execute(select(User.id).where(User.id == candidate))
+                user_check = await db.execute(
+                    select(User.id).where(
+                        User.id == candidate,
+                        User.tenant_id == user.tenant_id,
+                        User.is_active.is_(True),
+                    )
+                )
                 if user_check.scalar_one_or_none():
                     resolved_owner_id = candidate
                 else:
@@ -1322,13 +1423,23 @@ async def create_objective(body: ObjectiveCreate, user=Depends(get_current_user)
                     member_check = await db.execute(
                         select(OrgMember.id, OrgMember.user_id).where(
                             OrgMember.id == candidate,
+                            OrgMember.tenant_id == user.tenant_id,
+                            OrgMember.status == "active",
                         )
                     )
                     member_row = member_check.first()
                     if member_row:
                         if member_row.user_id:
-                            # Linked member: use the platform user_id
-                            resolved_owner_id = member_row.user_id
+                            linked_user = await db.execute(
+                                select(User.id).where(
+                                    User.id == member_row.user_id,
+                                    User.tenant_id == user.tenant_id,
+                                    User.is_active.is_(True),
+                                )
+                            )
+                            resolved_owner_id = linked_user.scalar_one_or_none()
+                            if resolved_owner_id is None:
+                                raise HTTPException(422, "owner is not an active member of this tenant")
                             logger.info(
                                 f"[create_objective] Resolved OrgMember.id {candidate} "
                                 f"→ user_id {resolved_owner_id}"
@@ -1347,7 +1458,18 @@ async def create_objective(body: ObjectiveCreate, user=Depends(get_current_user)
                             422,
                             f"owner_id '{body.owner_id}' does not match any User or OrgMember in this tenant",
                         )
-            else:
+            elif body.owner_type == "agent":
+                target_agent = (
+                    await db.execute(
+                        select(Agent).where(
+                            Agent.id == candidate,
+                            Agent.tenant_id == user.tenant_id,
+                            Agent.deleted_at.is_(None),
+                        )
+                    )
+                ).scalar_one_or_none()
+                if target_agent is None or not await can_manage_agent(db, user, target_agent):
+                    raise HTTPException(422, "owner_id does not match a manageable Agent in this tenant")
                 resolved_owner_id = candidate
 
         obj = OKRObjective(
@@ -1369,22 +1491,18 @@ async def create_objective(body: ObjectiveCreate, user=Depends(get_current_user)
 async def update_objective(
     objective_id: uuid.UUID,
     body: ObjectiveUpdate,
-    user=Depends(get_current_user),
+    user=Depends(get_company_okr_manager),
 ):
     """Update an Objective's title, description or status."""
     if not _is_okr_admin(user):
         raise _dashboard_write_forbidden()
 
     async with async_session() as db:
-        result = await db.execute(
-            select(OKRObjective).where(
-                OKRObjective.id == objective_id,
-                OKRObjective.tenant_id == user.tenant_id,
-            )
+        obj = await _get_visible_objective(
+            db,
+            objective_id=objective_id,
+            user=user,
         )
-        obj = result.scalar_one_or_none()
-        if not obj:
-            raise HTTPException(404, "Objective not found")
 
         if body.title is not None:
             obj.title = body.title
@@ -1401,22 +1519,18 @@ async def update_objective(
 @router.delete("/objectives/{objective_id}")
 async def delete_objective(
     objective_id: uuid.UUID,
-    user=Depends(get_current_user),
+    user=Depends(get_company_okr_manager),
 ):
     """Soft delete an Objective (set status to archived)."""
     if not _is_okr_admin(user):
         raise _dashboard_write_forbidden()
 
     async with async_session() as db:
-        result = await db.execute(
-            select(OKRObjective).where(
-                OKRObjective.id == objective_id,
-                OKRObjective.tenant_id == user.tenant_id,
-            )
+        obj = await _get_visible_objective(
+            db,
+            objective_id=objective_id,
+            user=user,
         )
-        obj = result.scalar_one_or_none()
-        if not obj:
-            raise HTTPException(404, "Objective not found")
 
         # Soft delete
         obj.status = "archived"
@@ -1436,15 +1550,11 @@ async def list_key_results(
 ):
     """List all KRs for the given Objective."""
     async with async_session() as db:
-        # Verify objective belongs to this tenant
-        obj_result = await db.execute(
-            select(OKRObjective).where(
-                OKRObjective.id == objective_id,
-                OKRObjective.tenant_id == user.tenant_id,
-            )
+        await _get_visible_objective(
+            db,
+            objective_id=objective_id,
+            user=user,
         )
-        if not obj_result.scalar_one_or_none():
-            raise HTTPException(404, "Objective not found")
 
         result = await db.execute(
             select(OKRKeyResult)
@@ -1460,22 +1570,18 @@ async def list_key_results(
 async def create_key_result(
     objective_id: uuid.UUID,
     body: KeyResultCreate,
-    user=Depends(get_current_user),
+    user=Depends(get_company_okr_manager),
 ):
     """Create a new Key Result under the specified Objective."""
     if not _is_okr_admin(user):
         raise _dashboard_write_forbidden()
 
     async with async_session() as db:
-        # Verify objective belongs to this tenant
-        obj_result = await db.execute(
-            select(OKRObjective).where(
-                OKRObjective.id == objective_id,
-                OKRObjective.tenant_id == user.tenant_id,
-            )
+        await _get_visible_objective(
+            db,
+            objective_id=objective_id,
+            user=user,
         )
-        if not obj_result.scalar_one_or_none():
-            raise HTTPException(404, "Objective not found")
 
         kr = OKRKeyResult(
             objective_id=objective_id,
@@ -1494,7 +1600,7 @@ async def create_key_result(
 async def update_key_result(
     kr_id: uuid.UUID,
     body: KeyResultUpdate,
-    user=Depends(get_current_user),
+    user=Depends(get_company_okr_manager),
 ):
     """Update a Key Result's fields or current progress value.
 
@@ -1516,7 +1622,10 @@ async def update_key_result(
         row = result.first()
         if not row:
             raise HTTPException(404, "Key Result not found")
-        kr, _ = row
+        kr, objective = row
+        visibility = await resolve_okr_visibility(db, user)
+        if not can_view_objective(objective, visibility):
+            raise HTTPException(404, "Key Result not found")
 
         prev_value = kr.current_value
 
@@ -1552,7 +1661,7 @@ async def update_key_result(
 async def update_kr_progress_endpoint(
     kr_id: uuid.UUID,
     body: ProgressUpdate,
-    user=Depends(get_current_user),
+    user=Depends(get_company_okr_manager),
 ):
     """Convenience endpoint for updating only the current progress value.
 
@@ -1574,7 +1683,10 @@ async def update_kr_progress_endpoint(
         row = result.first()
         if not row:
             raise HTTPException(404, "Key Result not found")
-        kr, _ = row
+        kr, objective = row
+        visibility = await resolve_okr_visibility(db, user)
+        if not can_view_objective(objective, visibility):
+            raise HTTPException(404, "Key Result not found")
 
         source_task_id, source_deliverable_request_id, evidence_snapshot = (
             await _resolve_progress_evidence(
@@ -1621,7 +1733,7 @@ async def update_kr_progress_endpoint(
 @router.delete("/key-results/{kr_id}")
 async def delete_key_result(
     kr_id: uuid.UUID,
-    user=Depends(get_current_user),
+    user=Depends(get_company_okr_manager),
 ):
     """Hard delete a key result."""
     from app.models.okr import OKRProgressLog
@@ -1641,7 +1753,10 @@ async def delete_key_result(
         row = result.first()
         if not row:
             raise HTTPException(404, "Key Result not found")
-        kr, _ = row
+        kr, objective = row
+        visibility = await resolve_okr_visibility(db, user)
+        if not can_view_objective(objective, visibility):
+            raise HTTPException(404, "Key Result not found")
 
         # Manual cascade delete logs
         await db.execute(delete(OKRProgressLog).where(OKRProgressLog.kr_id == kr_id))
@@ -1679,7 +1794,106 @@ async def list_member_daily_reports(
     from app.services.okr_reporting import list_member_daily_reports_for_date
 
     target_day = date.fromisoformat(report_date) if report_date else date.today()
-    items = await list_member_daily_reports_for_date(user.tenant_id, target_day)
+    if is_company_governor(user):
+        items = await list_member_daily_reports_for_date(user.tenant_id, target_day)
+        async with async_session() as db:
+            visibility = await resolve_okr_visibility(db, user)
+        items = [
+            item
+            for item in items
+            if (
+                item["member_type"] == "user"
+                and uuid.UUID(item["member_id"]) in visibility.user_owner_ids
+            )
+            or (
+                item["member_type"] == "agent"
+                and uuid.UUID(item["member_id"]) in visibility.agent_owner_ids
+            )
+        ]
+    else:
+        async with async_session() as db:
+            visibility = await resolve_okr_visibility(db, user)
+            visible_agent_ids = list(visibility.agent_owner_ids)
+            reports = (
+                await db.execute(
+                    select(MemberDailyReport).where(
+                        MemberDailyReport.tenant_id == user.tenant_id,
+                        MemberDailyReport.report_date == target_day,
+                        or_(
+                            (
+                                (MemberDailyReport.member_type == "user")
+                                & (MemberDailyReport.member_id == user.id)
+                            ),
+                            (
+                                (MemberDailyReport.member_type == "agent")
+                                & MemberDailyReport.member_id.in_(visible_agent_ids)
+                            ),
+                        ),
+                    )
+                )
+            ).scalars().all()
+            report_map = {
+                (report.member_type, report.member_id): report
+                for report in reports
+            }
+            agents = []
+            if visible_agent_ids:
+                agents = (
+                    await db.execute(
+                        select(Agent).where(
+                            Agent.id.in_(visible_agent_ids),
+                            Agent.tenant_id == user.tenant_id,
+                            Agent.deleted_at.is_(None),
+                        )
+                    )
+                ).scalars().all()
+        report = report_map.get(("user", user.id))
+        items = [
+            {
+                "member_type": "user",
+                "member_id": str(user.id),
+                "display_name": user.display_name,
+                "avatar_url": user.avatar_url,
+                "group_label": user.title or "Members",
+                "status": report.status if report else "missing",
+                "content": report.content if report else "",
+                "submitted_at": (
+                    report.submitted_at.isoformat()
+                    if report and report.submitted_at
+                    else None
+                ),
+                "updated_at": (
+                    report.updated_at.isoformat()
+                    if report and report.updated_at
+                    else None
+                ),
+            }
+        ]
+        for agent in agents:
+            agent_report = report_map.get(("agent", agent.id))
+            if agent_report is None:
+                continue
+            items.append(
+                {
+                    "member_type": "agent",
+                    "member_id": str(agent.id),
+                    "display_name": agent.name,
+                    "avatar_url": agent.avatar_url,
+                    "group_label": "Digital Employees",
+                    "status": agent_report.status,
+                    "content": agent_report.content,
+                    "submitted_at": (
+                        agent_report.submitted_at.isoformat()
+                        if agent_report.submitted_at
+                        else None
+                    ),
+                    "updated_at": (
+                        agent_report.updated_at.isoformat()
+                        if agent_report.updated_at
+                        else None
+                    ),
+                }
+            )
     return [
         MemberDailyReportOut(
             id=f"{item['member_type']}:{item['member_id']}:{target_day.isoformat()}",
@@ -1705,8 +1919,9 @@ async def upsert_member_daily_report(
 ):
     """Create or update a member daily report.
 
-    Regular members can only edit their own user report.
-    Org admins and platform admins may specify a tenant member explicitly.
+    Members can edit their own human report.  A concrete Agent manager may
+    edit that Agent's normalized report; company governance may edit visible
+    tenant members but still does not bypass the private-Agent boundary.
     """
     from app.services.okr_reporting import (
         list_tracked_okr_members,
@@ -1715,13 +1930,58 @@ async def upsert_member_daily_report(
 
     target_member_type = body.member_type or "user"
     if body.member_id:
-        target_member_id = uuid.UUID(body.member_id)
+        try:
+            target_member_id = uuid.UUID(body.member_id)
+        except ValueError as exc:
+            raise HTTPException(422, "member_id must be a UUID") from exc
     else:
         target_member_id = user.id
 
-    if not is_company_governor(user):
-        if target_member_type != "user" or target_member_id != user.id:
+    target_agent_meta = None
+    if target_member_type == "user":
+        if not is_company_governor(user) and target_member_id != user.id:
             raise HTTPException(403, "You can only submit your own daily report")
+        if is_company_governor(user):
+            async with async_session() as db:
+                target_exists = (
+                    await db.execute(
+                        select(User.id).where(
+                            User.id == target_member_id,
+                            User.tenant_id == user.tenant_id,
+                            User.is_active.is_(True),
+                        )
+                    )
+                ).scalar_one_or_none()
+                if target_exists is None:
+                    target_exists = (
+                        await db.execute(
+                            select(OrgMember.id).where(
+                                OrgMember.id == target_member_id,
+                                OrgMember.tenant_id == user.tenant_id,
+                                OrgMember.status == "active",
+                            )
+                        )
+                    ).scalar_one_or_none()
+                if target_exists is None:
+                    raise HTTPException(404, "Daily report member not found")
+    elif target_member_type == "agent":
+        async with async_session() as db:
+            target_agent = (
+                await db.execute(
+                    select(Agent).where(
+                        Agent.id == target_member_id,
+                        Agent.tenant_id == user.tenant_id,
+                        Agent.deleted_at.is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+            if target_agent is None or not await can_use_agent(db, user, target_agent):
+                raise HTTPException(404, "Daily report member not found")
+            if not await can_manage_agent(db, user, target_agent):
+                raise HTTPException(403, "Agent management access required")
+            target_agent_meta = target_agent
+    else:
+        raise HTTPException(422, "member_type must be user or agent")
 
     report_date = date.fromisoformat(body.report_date)
     report = await _upsert(
@@ -1730,13 +1990,25 @@ async def upsert_member_daily_report(
         member_id=target_member_id,
         report_date=report_date,
         content=body.content,
-        source=body.source,
+        source="manual",
     )
     member_map = {
         (member.member_type, str(member.member_id)): member
         for member in await list_tracked_okr_members(user.tenant_id)
     }
     member_meta = member_map.get((report.member_type, str(report.member_id)))
+    if member_meta is None and target_agent_meta is not None:
+        member_meta = SimpleNamespace(
+            display_name=target_agent_meta.name,
+            avatar_url=target_agent_meta.avatar_url,
+            group_label="Digital Employees",
+        )
+    elif member_meta is None and report.member_type == "user" and report.member_id == user.id:
+        member_meta = SimpleNamespace(
+            display_name=user.display_name,
+            avatar_url=user.avatar_url,
+            group_label=user.title or "Members",
+        )
     return MemberDailyReportOut(
         id=str(report.id),
         member_type=report.member_type,
@@ -1756,7 +2028,7 @@ async def upsert_member_daily_report(
 async def list_company_reports_api(
     report_type: str | None = None,
     limit: int = 50,
-    user=Depends(get_current_user),
+    user=Depends(get_company_okr_manager),
 ):
     """List company-level reports from the new reporting pipeline."""
     from app.services.okr_reporting import list_company_reports
@@ -1768,7 +2040,7 @@ async def list_company_reports_api(
 @router.post("/company-reports/regenerate", response_model=CompanyReportOut)
 async def regenerate_company_report(
     body: CompanyReportRegenerate,
-    user=Depends(get_current_user),
+    user=Depends(get_company_okr_manager),
 ):
     """Rebuild a single company report for a target period."""
     if not is_company_governor(user):
@@ -1797,7 +2069,7 @@ async def regenerate_company_report(
 async def list_reports(
     report_type: str | None = None,  # "daily" | "weekly" | None for both
     limit: int = 50,
-    user=Depends(get_current_user),
+    user=Depends(get_company_okr_manager),
 ):
     """List work reports for the current tenant, newest first."""
     async with async_session() as db:
@@ -1832,7 +2104,7 @@ async def list_reports(
 
 
 @router.get("/members-without-okr")
-async def members_without_okr(user=Depends(get_current_user)):
+async def members_without_okr(user=Depends(get_company_okr_manager)):
     """Return tracked members (those in OKR Agent's relationship list) who lack
     OKRs in the current period.  Also returns:
     - okr_agent_id        : UUID of the OKR Agent for the chat-link button
@@ -1840,19 +2112,21 @@ async def members_without_okr(user=Depends(get_current_user)):
     - tracked_user_ids    : UUIDs of all tracked platform users (for UI filtering)
     - tracked_agent_ids   : UUIDs of all tracked agents (for UI filtering)
     """
+    if not is_company_governor(user):
+        raise HTTPException(403, "Only org admins can inspect missing OKRs")
+
     from app.models.agent import Agent
     from app.models.org import AgentRelationship, AgentAgentRelationship, OrgMember
     from app.models.user import User
 
     async with async_session() as db:
-        settings = await _get_or_create_settings(db, user.tenant_id)
+        settings = await _get_settings_read_only(db, user.tenant_id)
         if not settings.enabled:
             raise HTTPException(403, "OKR is not enabled for this tenant")
 
         ps, pe = _compute_current_period(
             settings.period_frequency, settings.period_length_days
         )
-        await db.commit()
 
     async with async_session() as db:
         # ── Check if a company-level OKR exists this period ──────────────────
@@ -1881,7 +2155,7 @@ async def members_without_okr(user=Depends(get_current_user)):
         covered_ids: set[uuid.UUID] = {row[0] for row in existing_result.fetchall()}
 
         # ── Get the OKR Agent from Settings ──────────────────────────────────
-        settings = await _get_or_create_settings(db, user.tenant_id)
+        settings = await _get_settings_read_only(db, user.tenant_id)
         okr_agent_id_val: uuid.UUID | None = settings.okr_agent_id
         okr_agent_id_str: str | None = str(okr_agent_id_val) if okr_agent_id_val else None
 
@@ -1909,6 +2183,7 @@ async def members_without_okr(user=Depends(get_current_user)):
                 .outerjoin(IdentityProvider, OrgMember.provider_id == IdentityProvider.id)
                 .where(
                     AgentRelationship.agent_id == okr_agent_id_val,
+                    OrgMember.tenant_id == user.tenant_id,
                     OrgMember.status == "active",
                 )
             )).fetchall()
@@ -1989,8 +2264,11 @@ async def members_without_okr(user=Depends(get_current_user)):
                 .join(AgentAgentRelationship, AgentAgentRelationship.target_agent_id == Agent.id)
                 .where(
                     AgentAgentRelationship.agent_id == okr_agent_id_val,
+                    Agent.tenant_id == user.tenant_id,
                     Agent.is_system == False,  # noqa: E712
                     Agent.status.notin_(["stopped", "error"]),
+                    Agent.deleted_at.is_(None),
+                    Agent.access_mode == "company",
                 )
             )
             for row in agent_rel_result.fetchall():
@@ -2014,6 +2292,8 @@ async def members_without_okr(user=Depends(get_current_user)):
                     Agent.tenant_id == user.tenant_id,
                     Agent.is_system == False,  # noqa: E712
                     Agent.status.notin_(["stopped", "error"]),
+                    Agent.deleted_at.is_(None),
+                    Agent.access_mode == "company",
                 )
             )
             for row in agent_result.fetchall():
@@ -2135,7 +2415,7 @@ async def members_without_okr(user=Depends(get_current_user)):
 
 
 @router.post("/trigger-member-outreach")
-async def trigger_member_outreach(user=Depends(get_current_user)):
+async def trigger_member_outreach(user=Depends(get_company_okr_manager)):
     """Admin-initiated trigger: instruct the OKR Agent to contact all tracked
     members who haven't set their OKRs for the current period.
 
@@ -2148,6 +2428,9 @@ async def trigger_member_outreach(user=Depends(get_current_user)):
 
     Returns immediately with status=accepted.
     """
+    if not is_company_governor(user):
+        raise HTTPException(403, "Only org admins can trigger member outreach")
+
     import asyncio
     from sqlalchemy import or_
     from app.models.agent import Agent
@@ -2157,7 +2440,7 @@ async def trigger_member_outreach(user=Depends(get_current_user)):
     from app.models.user import User
 
     async with async_session() as db:
-        settings = await _get_or_create_settings(db, user.tenant_id)
+        settings = await _get_settings_read_only(db, user.tenant_id)
         if not settings.enabled:
             raise HTTPException(403, "OKR is not enabled for this tenant")
 
@@ -2172,6 +2455,7 @@ async def trigger_member_outreach(user=Depends(get_current_user)):
         okr_agent_result = await db.execute(
             select(Agent).where(
                 Agent.id == settings.okr_agent_id,
+                Agent.tenant_id == user.tenant_id,
                 Agent.deleted_at.is_(None),
             )
         )
@@ -2223,6 +2507,7 @@ async def trigger_member_outreach(user=Depends(get_current_user)):
             .join(OrgMember, AgentRelationship.member_id == OrgMember.id)
             .where(
                 AgentRelationship.agent_id == okr_agent.id,
+                OrgMember.tenant_id == user.tenant_id,
                 OrgMember.status == "active",
             )
         )
@@ -2235,9 +2520,11 @@ async def trigger_member_outreach(user=Depends(get_current_user)):
                 AgentAgentRelationship.target_agent_id == Agent.id,
             ).where(
                 AgentAgentRelationship.agent_id == okr_agent.id,
+                Agent.tenant_id == user.tenant_id,
                 Agent.is_system == False,  # noqa: E712
                 Agent.status.notin_(["stopped", "error"]),
                 Agent.deleted_at.is_(None),
+                Agent.access_mode == "company",
             )
         )
         tracked_agents = agent_rel_result.scalars().all()
@@ -2259,6 +2546,12 @@ async def trigger_member_outreach(user=Depends(get_current_user)):
                     sess_result = await db.execute(
                         select(ChatSession.user_id).where(
                             ChatSession.agent_id == okr_agent.id,
+                            ChatSession.user_id.in_(
+                                select(User.id).where(
+                                    User.tenant_id == user.tenant_id,
+                                    User.is_active.is_(True),
+                                )
+                            ),
                             or_(*[ChatSession.external_conv_id == p for p in patterns]),
                         ).limit(1)
                     )
@@ -2285,7 +2578,10 @@ async def trigger_member_outreach(user=Depends(get_current_user)):
         # ── Build prompt context for each member without OKR ─────────────────
         # Also resolve admin username for the final summary message
         admin_result = await db.execute(
-            select(User.display_name).where(User.id == user.id)
+            select(User.display_name).where(
+                User.id == user.id,
+                User.tenant_id == user.tenant_id,
+            )
         )
         admin_row = admin_result.first()
         admin_username = (admin_row.display_name if admin_row else None) or str(user.id)
@@ -2333,7 +2629,10 @@ async def trigger_member_outreach(user=Depends(get_current_user)):
         if platform_uid:
             async with async_session() as db2:
                 u_res = await db2.execute(
-                    select(User.display_name).where(User.id == platform_uid)
+                    select(User.display_name).where(
+                        User.id == platform_uid,
+                        User.tenant_id == user.tenant_id,
+                    )
                 )
                 u_row = u_res.first()
             if u_row and u_row.display_name:
@@ -2466,7 +2765,7 @@ Contact the {len(members_to_contact)} member(s) below who have NOT set their OKR
 
 
 @router.post("/trigger-daily-collection")
-async def trigger_daily_collection(user=Depends(get_current_user)):
+async def trigger_daily_collection(user=Depends(get_company_okr_manager)):
     """Admin-triggered daily collection for legacy OKR tracking rows only."""
     if not is_company_governor(user):
         raise HTTPException(403, "Only org admins can trigger daily collection")

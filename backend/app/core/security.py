@@ -477,6 +477,66 @@ async def get_company_owner(current_user=Depends(get_current_user)):
     return current_user
 
 
+async def get_company_billing_viewer(current_user=Depends(get_current_user)):
+    """Require membership-scoped access to company billing aggregates."""
+    from app.services.access_control import is_company_governor
+
+    if not is_company_governor(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "company_billing_view_required",
+                "message": "Company billing view access required",
+            },
+        )
+    return current_user
+
+
+async def get_company_billing_manager(current_user=Depends(get_current_user)):
+    """Require the owner-scoped company billing management boundary."""
+    from app.services.access_control import is_company_owner
+
+    if not is_company_owner(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "company_billing_manage_required",
+                "message": "Company billing management access required",
+            },
+        )
+    return current_user
+
+
+async def get_company_analytics_viewer(current_user=Depends(get_current_user)):
+    """Require membership-scoped access to company resource aggregates."""
+    from app.services.access_control import is_company_governor
+
+    if not is_company_governor(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "company_analytics_view_required",
+                "message": "Company analytics access required",
+            },
+        )
+    return current_user
+
+
+async def get_company_okr_manager(current_user=Depends(get_current_user)):
+    """Require membership-scoped authority over company OKR administration."""
+    from app.services.access_control import is_company_governor
+
+    if not is_company_governor(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "company_okr_manage_required",
+                "message": "Company OKR management access required",
+            },
+        )
+    return current_user
+
+
 async def get_platform_operator(current_user=Depends(get_current_user)):
     """Require global platform authority from Identity, never from membership."""
     from app.services.access_control import is_platform_operator

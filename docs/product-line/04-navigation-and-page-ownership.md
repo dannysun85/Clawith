@@ -1,7 +1,7 @@
 # 导航与页面归属事实基线
 
-- 状态：`navigation-v2-local-validated`
-- 日期：2026-08-15
+- 状态：`navigation-v2-validated + four-p0-scope-frozen`
+- 日期：2026-08-18
 - 目的：给每个一级入口一个唯一职责，清除“功能都有，但用户不知道从哪里开始”的问题
 
 ## 1. 当前路由事实
@@ -17,14 +17,14 @@
 | 页面/入口 | 当前真实职责 | 重叠/错位 | 目标归属 | 处理决定 |
 |---|---|---|---|---|
 | Workbench | 任务捕获、工作说明确认、执行者/能力预检、跨 Runtime 工作索引 | 新入口，不能演变为第二套 Runtime | 默认任务入口 | `/` 默认进入；只创建/读取真实 Task、Run、Deliverable 与 Artifact |
-| Dashboard | 长期 Agent 状态、服务端 Work 摘要、Token 和全局活动 | 曾与完整员工管理和新增员工流程重叠 | 公司运营概览 | 保留 `/dashboard`；只做运营摘要并深链 `/employees`；私人助手不计入员工统计 |
-| OKR | 目标、KR、看板、日报和管理员设置链接；进度可引用已完成工作证据 | 不能从 Agent 自述自动完成 KR | 经营 / 目标与复盘 | 保留 `/okr`；仅接受完成 Task 或带批准 Artifact 的成功 Deliverable |
+| Dashboard | viewer-scoped Agent/Work 摘要；公司资源聚合仅对 `company.analytics.view` | 普通 member 当前仍可从 token API/topology 重建公司资源 | 按权限裁剪的运营概览 | 保留 `/dashboard`；member 只看个人/可见对象，admin/owner 才看公司 token/cache；深链 `/employees` |
+| OKR | 目标、KR、看板、日报和管理员设置链接；进度可引用已完成工作证据 | 当前列表/报告/Agent Tool 缺对象级 viewer policy | 经营 / 目标与复盘 | 保留 `/okr`；company Objective 对成员公开，个人/Agent/日报按本人、对象 grant、admin/owner 裁剪 |
 | Plaza | 团队/我的 Experience；当前页面仍可进入员工市场 | 经验与招聘共享入口但不共享生命周期 | 经营 / 团队知识 | 保留 `/plaza` 和现有 Talent Market 兼容流程；不混合 Experience 与 Agent 模板数据模型，后续再迁移市场入口 |
 | Groups | 群组树、会话、消息、成员、Workspace；可接收工作台 Group Task | 不应被当成组织架构或无责任人的黑盒编排 | 可见多人协作 | 保留；每项工作固定 Task、owner Agent、session、参与者与 correlation |
 | Digital Employees | `/employees` 的协作网络、完整可见名册、筛选和添加入口 | 不能把完整名册继续塞进侧栏或公司概览 | 长期角色管理 | 桌面默认协作网络，移动默认员工名册；对话和有权限的设置继续深链既有 Agent 页面 |
 | Agents | `/agents/:id/chat|directory|settings` | Agent 详情仍承载较多专业设置 | 单个员工的执行与配置现场 | 旧 Agent 深链、权限与设置保持，不再承担公司级员工索引 |
 | Enterprise | info/users/invites/org/tools/skills/approvals/audit/okr/subscription 等 | 租户治理与平台路由曾混在一起；页面过宽 | 公司治理控制面 | 保留管理员入口；Provider/model 永远跳 SaaS Admin |
-| Subscription | `/account/subscription` 用量/流水/订单；Enterprise 有购买/计划 | 两处都叫套餐 | 成员可见“套餐与用量” + 管理员“购买与配置” | 共享数据源；前者读用量与账单，后者管理订阅；互相深链 |
+| Subscription | `/account/subscription` 当前混合个人用量、公司汇总、流水和订单 | 普通 member 可读取 tenant 财务与其他消费主体 | member“我的用量” + admin“公司套餐与用量” + owner“账单管理” | 共享账本但使用不同服务端投影；admin 只有 billing.view，owner 才有 billing.manage |
 | Deliverable | chat 中发起、结果卡、右侧详情、独立 reviewer 路由，并由工作台跨员工聚合 | 必须保持结果属于产出者，不能再次挤入 composer | 正式产物生命周期 | 不做孤立文件库；Agent/Group 时间线报告，右侧详情检查与交付 |
 | Workspace | Agent/Group 侧栏文件、预览、编辑和版本 | 用户易误认为正式交付或公司网盘 | 工作现场 | 保留现有所有权；Artifact 指向 Workspace 文件；不替代 Deliverable |
 
@@ -48,7 +48,7 @@
   团队知识
 
 账户
-  套餐与用量
+  我的用量
   设置
 ```
 
@@ -59,7 +59,8 @@
   企业管理
 
 账户
-  套餐与用量
+  公司套餐与用量（billing.view）
+  账单管理（仅 billing.manage）
 ```
 
 ### 3.3 平台管理员增加
@@ -87,12 +88,14 @@ SaaS 能力治理
 
 ### 仪表盘
 
-- 只展示公司级健康和运营摘要：员工活跃、工作量、风险、目标进展、Credits 趋势。
+- member 只展示自己的工作、行动、产出与 viewer-scoped Agent；不请求或重建公司 token/cache/Credits。
+- org_admin/org_owner 通过 `company.analytics.view` 增加公司级健康、工作量、风险、目标和资源聚合。
 - 点击数据必须进入权威对象页面，不在 Dashboard 内复制管理流程。
 
 ### OKR
 
 - 拥有 Objective、KR、报告和 OKR 政策。
+- company Objective 对当前 tenant 成员可读；用户目标/日报只对本人和 admin/owner，Agent 对象按 `use/manage` grant 投影；管理版公司复盘仅 admin/owner。
 - 可以引用 Delivery/Artifact 作为进展证据；不能从 Agent 文本自动把 KR 标为完成。
 
 ### 广场
@@ -118,7 +121,8 @@ SaaS 能力治理
 ### 企业设置、套餐、SaaS 管理
 
 - 企业设置只管理租户策略与资源。
-- 套餐与用量向成员解释权益、Credits 和订单，不暴露 Provider Key。
+- “我的用量”只向 member 解释个人可归因用量与 entitlements，不显示公司余额、流水、订单、支付主体或 Provider Key。
+- org_admin 的 `company.billing.view` 只提供公司套餐、Seats 与聚合用量；org_owner 的 `company.billing.manage` 才提供订单、账单资料、支付与续费。
 - SaaS 管理拥有 Provider、模型、路由、账号池和全局计费规则。
 
 ## 5. Deliverable 与 Workspace 的展示规则

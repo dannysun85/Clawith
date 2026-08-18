@@ -132,6 +132,8 @@ async def enqueue_task_runtime(
     if task.type == "supervision":
         occurrence_id = execution_id or uuid.uuid4()
         source_execution_id = f"task:{task.id}:supervision:{occurrence_id}"
+    elif execution_id is not None:
+        source_execution_id = f"task:{task.id}:attempt:{execution_id}"
     else:
         source_execution_id = f"task:{task.id}"
 
@@ -201,13 +203,14 @@ async def enqueue_group_task_runtime(
     *,
     task: Task,
     primary_agent: Agent,
+    execution_id: uuid.UUID | None = None,
     settings_override: Settings | None = None,
 ) -> RunHandle:
-    """Start one confirmed Work task through the native Group Runtime."""
-    if task.origin_type != "workbench" or task.executor_kind != "group":
+    """Start one confirmed Work or Group-message task through Group Runtime."""
+    if task.origin_type not in {"workbench", "group"} or task.executor_kind != "group":
         raise TaskRuntimeIntakeError(
             "group_task_contract_invalid",
-            "Only a confirmed Group workbench Task may use Group Runtime intake",
+            "Only a confirmed Work or Group-message Task may use Group Runtime intake",
         )
     if not task.confirmation_fingerprint or task.confirmed_at is None:
         raise TaskRuntimeIntakeError(
@@ -252,7 +255,14 @@ async def enqueue_group_task_runtime(
             sender_participant_id=_snapshot_uuid(snapshot, "sender_participant_id"),
             content=_task_goal(task),
             mention_participant_ids=mention_participant_ids,
-            message_id=uuid.uuid5(task.id, "group-work-task-message"),
+            message_id=uuid.uuid5(
+                task.id,
+                (
+                    f"group-work-task-message:{execution_id}"
+                    if execution_id is not None
+                    else "group-work-task-message"
+                ),
+            ),
             correlation_id=f"work-task:{task.id}",
             work_task_id=task.id,
             application_tools_enabled=_application_tools_enabled_for_task(task),

@@ -209,6 +209,7 @@ Clawith/
 
 **参考（`.agents/reference/`）——纯事实性知识，按需拆分自本文件**
 
+- `.agents/reference/upstream-clawith-sync.md` — 上游 Clawith 分叉基点（v1.11.1）、已并入历史、tag 红线与检查更新固定流程
 - `.agents/reference/creative-deliverables-capability.md` — 当前图片、视频、PPT 实现基线、质量方案、调用链与降级矩阵
 - `.agents/reference/agency-agents-zh-provenance.md` — 首批外部 Agent 角色的固定版本、筛选映射、MIT 来源和 Astra 重写边界
 - `.agents/reference/clawith-v1.11.3-upgrade.md` — 上游 v1.11.3 语义升级范围、Astra 保留项、拒绝项和验证门禁

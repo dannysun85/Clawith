@@ -1,7 +1,7 @@
 import type { WorkTaskDraft } from '../services/api';
 
 
-const VERSION = 1;
+const VERSION = 2;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const WORK_TYPES = new Set<WorkTaskDraft['work_type']>([
     'general',
@@ -11,7 +11,7 @@ const WORK_TYPES = new Set<WorkTaskDraft['work_type']>([
     'document',
 ]);
 const PRIORITIES = new Set(['low', 'medium', 'high', 'urgent']);
-const EXECUTOR_KINDS = new Set<WorkTaskDraft['executor_kind']>([
+const EXECUTOR_KINDS = new Set<NonNullable<WorkTaskDraft['executor_kind']>>([
     'personal_assistant',
     'agent_employee',
     'temporary_expert',
@@ -24,7 +24,8 @@ export interface PersistedWorkDraft {
     intent: string;
     workType: WorkTaskDraft['work_type'];
     priority: 'low' | 'medium' | 'high' | 'urgent';
-    executorKind: WorkTaskDraft['executor_kind'];
+    routingMode: 'auto' | 'manual';
+    executorKind: NonNullable<WorkTaskDraft['executor_kind']>;
     agentId: string;
     expertRole: string;
     groupId: string;
@@ -55,7 +56,8 @@ export function loadWorkDraft(
             || typeof value.intent !== 'string'
             || !WORK_TYPES.has(value.workType as WorkTaskDraft['work_type'])
             || !PRIORITIES.has(String(value.priority))
-            || !EXECUTOR_KINDS.has(value.executorKind as WorkTaskDraft['executor_kind'])
+            || !['auto', 'manual'].includes(String(value.routingMode))
+            || !EXECUTOR_KINDS.has(value.executorKind as NonNullable<WorkTaskDraft['executor_kind']>)
             || typeof value.agentId !== 'string'
             || typeof value.expertRole !== 'string'
             || typeof value.groupId !== 'string'

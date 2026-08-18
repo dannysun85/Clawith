@@ -38,6 +38,8 @@ from app.schemas.deliverable import (
     DeliverableApprovalReadinessOut,
     DeliverableApprovalReceiptOut,
     DeliverableArtifactOut,
+    DeliverableBriefOut,
+    DeliverableClarificationIn,
     DeliverableExecutionOut,
     DeliverableExecutionUnitOut,
     DeliverablePreflightIn,
@@ -52,6 +54,15 @@ from app.schemas.deliverable import (
     DeliverableRequestOut,
     DeliverableRequestUpdate,
 )
+from app.services.candidate_qa import qa_summary_from_evaluation
+from app.services.creative_briefs import (
+    CREATIVE_BRIEF_SCHEMA_VERSION,
+    POSTER_V2_WORKFLOW_ID,
+    brief_projection,
+    compile_creative_brief,
+    current_request_brief,
+    upsert_request_creative_brief,
+)
 from app.services.deliverable_artifacts import (
     DeliverableArtifactError,
     approve_deliverable_artifacts,
@@ -62,6 +73,7 @@ from app.services.deliverable_executions import (
     add_initial_execution_shadow,
     bind_artifacts_to_current_execution,
     create_revision_execution,
+    current_execution,
     ensure_execution_shadow,
     execution_units,
     project_execution_lifecycle,
@@ -143,7 +155,18 @@ async def _execution_out(
                 if field not in {"units", "approvals"}
             },
             "units": [
-                DeliverableExecutionUnitOut.model_validate(unit)
+                DeliverableExecutionUnitOut.model_validate(
+                    {
+                        **{
+                            field: getattr(unit, field)
+                            for field in DeliverableExecutionUnitOut.model_fields
+                            if field != "qa_summary"
+                        },
+                        # Read-only sanitized projection; prompt text is never
+                        # part of quality_evaluation.
+                        "qa_summary": qa_summary_from_evaluation(unit.quality_evaluation),
+                    }
+                )
                 for unit in units
             ],
             "approvals": [
@@ -151,6 +174,50 @@ async def _execution_out(
                 for receipt in approvals
             ],
         }
+    )
+
+
+async def _apply_brief_projection(
+    db: AsyncSession,
+    request: DeliverableRequest,
+    *,
+    execution: DeliverableExecution | None = None,
+):
+    """Persist the v2 creative brief and park incomplete briefs fail-closed.
+
+    A confirmed brief leaves the launch preflight untouched; a clarifying brief
+    keeps the request ``ready`` but blocks the execution with a
+    ``brief_missing:<field>`` reason so no Provider task can be created.
+    """
+
+    brief_row = await upsert_request_creative_brief(db, request)
+    if brief_row is None:
+        return None
+    if execution is None and request.current_execution_id is not None:
+        execution = await current_execution(db, request, lock=True)
+    if execution is not None:
+        if brief_row.status == "confirmed":
+            if execution.status == "blocked" and str(
+                execution.blocked_reason or ""
+            ).startswith("brief_missing:"):
+                execution.status = "ready"
+                execution.blocked_reason = None
+        else:
+            execution.status = "blocked"
+            first_missing = next(iter(brief_row.missing_fields or []), "unknown")
+            execution.blocked_reason = f"brief_missing:{first_missing}"[:200]
+    return brief_row
+
+
+def _brief_out_from_row(brief_row) -> DeliverableBriefOut:
+    return DeliverableBriefOut(
+        schema_version=brief_row.schema_version,
+        status=brief_row.status,
+        missing_fields=list(brief_row.missing_fields or []),
+        brief_sha256=brief_row.brief_sha256,
+        candidate_count=(brief_row.brief or {}).get("candidate_policy", {}).get("effective"),
+        brief=brief_row.brief or None,
+        updated_at=brief_row.updated_at,
     )
 
 
@@ -738,6 +805,10 @@ async def create_deliverable_request(
             # its units have been inserted so the FK cannot race its parent.
             request.current_execution_id = execution.id
             await db.flush()
+            # FR-I1: v2 poster requests persist their structured brief here;
+            # an incomplete brief parks the execution as blocked.
+            if await _apply_brief_projection(db, request, execution=execution) is not None:
+                await db.flush()
     except IntegrityError:
         concurrent_result = await db.execute(
             select(DeliverableRequest).where(
@@ -1723,8 +1794,75 @@ async def update_deliverable_request(
     request.spec = next_spec
     request.tier = data.tier or request.tier
     request.version += 1
+    await _apply_brief_projection(db, request)
     await db.flush()
     return await _request_out(db, request)
+
+
+@router.get("/requests/{request_id}/brief", response_model=DeliverableBriefOut)
+async def get_deliverable_brief(
+    request_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    request = await _owned_request(db, request_id=request_id, user=current_user)
+    brief_row = await current_request_brief(db, request)
+    if brief_row is not None:
+        return _brief_out_from_row(brief_row)
+    if request.workflow_id != POSTER_V2_WORKFLOW_ID:
+        raise HTTPException(
+            status_code=404,
+            detail="Creative brief is only available for v2 deliverable requests",
+        )
+    brief, missing_fields = compile_creative_brief(
+        request.goal,
+        request.spec,
+        request.inputs,
+        tier=request.tier,
+        delivery_formats=request.output_contract or ("png",),
+    )
+    projection = brief_projection(brief, missing_fields)
+    return DeliverableBriefOut(
+        schema_version=CREATIVE_BRIEF_SCHEMA_VERSION,
+        status=projection["status"],
+        missing_fields=list(projection["missing_fields"]),
+        brief_sha256=projection.get("brief_sha256"),
+        candidate_count=projection.get("candidate_count"),
+        brief=brief.model_dump(mode="json") if brief is not None else None,
+    )
+
+
+@router.post("/requests/{request_id}/clarifications", response_model=DeliverableBriefOut)
+async def submit_deliverable_clarifications(
+    request_id: uuid.UUID,
+    data: DeliverableClarificationIn,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    request = await _owned_request(db, request_id=request_id, user=current_user, lock=True)
+    if request.status not in {"draft", "ready"} or request.agent_run_id is not None:
+        raise HTTPException(status_code=409, detail="Launched deliverable requests cannot be edited")
+    if request.version != data.expected_version:
+        raise HTTPException(status_code=409, detail="Deliverable request changed; reload before editing")
+    workflow = require_workflow(request.work_type, request.workflow_id, request.workflow_version)
+    if workflow.workflow_id != POSTER_V2_WORKFLOW_ID:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "deliverable_clarification_not_applicable",
+                "message": "Clarifications only apply to v2 deliverable requests",
+            },
+        )
+    merged_spec = {**dict(request.spec or {}), **dict(data.answers)}
+    try:
+        next_spec = validate_workflow_spec(workflow, merged_spec)
+    except DeliverableWorkflowError as exc:
+        raise _workflow_error(exc) from exc
+    request.spec = next_spec
+    request.version += 1
+    brief_row = await _apply_brief_projection(db, request)
+    await db.flush()
+    return _brief_out_from_row(brief_row)
 
 
 @router.post("/requests/{request_id}/actions", response_model=DeliverableRequestOut)

@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import {
     IconArrowRight,
+    IconAlertCircle,
     IconCheck,
     IconFileDescription,
     IconPhoto,
@@ -17,7 +18,9 @@ import {
 import {
     agentApi,
     workApi,
+    type WorkExecutorKind,
     type WorkItem,
+    type WorkNextAction,
     type WorkTaskDraft,
     type WorkTaskPreflight,
 } from '../services/api';
@@ -72,6 +75,34 @@ const STAGE_LABELS: Record<string, { zh: string; en: string }> = {
 function stageLabel(stage: string, isChinese: boolean) {
     const label = STAGE_LABELS[stage] || { zh: stage, en: stage };
     return isChinese ? label.zh : label.en;
+}
+
+function inboxActionLabel(action: WorkNextAction, isChinese: boolean) {
+    const labels: Record<WorkNextAction['kind'], { zh: string; en: string }> = {
+        quality_review: { zh: '提交质量检查', en: 'Submit quality review' },
+        runtime_approval: { zh: '处理运行期审批', en: 'Review Runtime approval' },
+        delivery_approval: { zh: '批准或要求修改', en: 'Approve or request changes' },
+        task_recovery: { zh: '恢复失败任务', en: 'Recover failed task' },
+        delivery_recovery: { zh: '处理交付阻塞', en: 'Resolve delivery issue' },
+    };
+    return isChinese ? labels[action.kind].zh : labels[action.kind].en;
+}
+
+function executorReasonLabel(
+    proposal: WorkTaskPreflight['executor_proposal'],
+    isChinese: boolean,
+) {
+    if (proposal.reason_codes.includes('manual_override')) {
+        return isChinese ? '按你的高级设置指定' : 'Selected in advanced settings';
+    }
+    if (proposal.reason_codes.includes('low_confidence_personal_assistant_fallback')) {
+        return isChinese
+            ? '任务没有足够明确的专业角色匹配，由个人助理负责协调'
+            : 'No specialist match was strong enough, so your assistant will coordinate';
+    }
+    return isChinese
+        ? '根据任务目标、角色职责和当前可执行状态匹配'
+        : 'Matched from the task goal, role responsibilities, and current readiness';
 }
 
 function WorkCard({ item, isChinese }: { item: WorkItem; isChinese: boolean }) {
@@ -133,6 +164,11 @@ function WorkCard({ item, isChinese }: { item: WorkItem; isChinese: boolean }) {
                 </div>
             )}
             <div className="work-card-actions">
+                {item.task_id && (
+                    <button type="button" className="is-primary" onClick={() => navigate(`/work/${item.task_id}`)}>
+                        {isChinese ? '查看任务详情' : 'View task detail'}
+                    </button>
+                )}
                 <button type="button" onClick={() => navigate(item.deep_link)}>
                     {item.executor_kind === 'group'
                         ? (isChinese ? '打开协作现场' : 'Open Group workspace')
@@ -182,7 +218,9 @@ export default function Work() {
     const [intent, setIntent] = useState(restoredDraft?.intent || '');
     const [workType, setWorkType] = useState<WorkTaskDraft['work_type']>(restoredDraft?.workType || 'general');
     const [priority, setPriority] = useState<'low' | 'medium' | 'high' | 'urgent'>(restoredDraft?.priority || 'medium');
-    const [executorKind, setExecutorKind] = useState<WorkTaskDraft['executor_kind']>(restoredDraft?.executorKind || 'personal_assistant');
+    const [routingMode, setRoutingMode] = useState<'auto' | 'manual'>(restoredDraft?.routingMode || 'auto');
+    const [advancedExecutor, setAdvancedExecutor] = useState(restoredDraft?.routingMode === 'manual');
+    const [executorKind, setExecutorKind] = useState<WorkExecutorKind>(restoredDraft?.executorKind || 'personal_assistant');
     const [agentId, setAgentId] = useState(restoredDraft?.agentId || '');
     const [expertRole, setExpertRole] = useState(restoredDraft?.expertRole || '');
     const [groupId, setGroupId] = useState(restoredDraft?.groupId || '');
@@ -193,6 +231,7 @@ export default function Work() {
         draftKey: string;
         result: WorkTaskPreflight;
     } | null>(null);
+    const [workView, setWorkView] = useState<'attention' | 'active' | 'completed'>('attention');
     const previousDraftStorageKey = useRef(draftStorageKey);
     const restoringTenantDraft = useRef(false);
 
@@ -207,6 +246,8 @@ export default function Work() {
         setIntent(next?.intent || '');
         setWorkType(next?.workType || 'general');
         setPriority(next?.priority || 'medium');
+        setRoutingMode(next?.routingMode || 'auto');
+        setAdvancedExecutor(next?.routingMode === 'manual');
         setExecutorKind(next?.executorKind || 'personal_assistant');
         setAgentId(next?.agentId || '');
         setExpertRole(next?.expertRole || '');
@@ -228,11 +269,12 @@ export default function Work() {
             return;
         }
         saveWorkDraft(window.sessionStorage, draftStorageKey, {
-            version: 1,
+            version: 2,
             title,
             intent,
             workType,
             priority,
+            routingMode,
             executorKind,
             agentId,
             expertRole,
@@ -252,13 +294,27 @@ export default function Work() {
         groupSessionId,
         intent,
         priority,
+        routingMode,
         title,
         workType,
     ]);
 
     const workQuery = useQuery({
-        queryKey: ['work-index', user?.tenant_id],
+        queryKey: ['work-index', user?.id, user?.tenant_id],
         queryFn: () => workApi.list(20),
+        enabled: !!user?.id && !!user?.tenant_id,
+        refetchInterval: 15_000,
+    });
+    const inboxQuery = useQuery({
+        queryKey: ['work-inbox', user?.id, user?.tenant_id],
+        queryFn: () => workApi.getInbox({ limit: 50 }),
+        enabled: !!user?.id && !!user?.tenant_id,
+        refetchInterval: 15_000,
+    });
+    const inboxCountQuery = useQuery({
+        queryKey: ['work-inbox-count', user?.id, user?.tenant_id],
+        queryFn: () => workApi.getInboxCount(),
+        enabled: !!user?.id && !!user?.tenant_id,
         refetchInterval: 15_000,
     });
     const agentsQuery = useQuery({
@@ -269,17 +325,17 @@ export default function Work() {
     const groupsQuery = useQuery({
         queryKey: ['work-groups', user?.tenant_id],
         queryFn: () => groupApi.list(),
-        enabled: !!user?.tenant_id && executorKind === 'group',
+        enabled: !!user?.tenant_id && routingMode === 'manual' && executorKind === 'group',
     });
     const groupSessionsQuery = useQuery({
         queryKey: ['work-group-sessions', groupId],
         queryFn: () => groupApi.sessions(groupId),
-        enabled: executorKind === 'group' && !!groupId,
+        enabled: routingMode === 'manual' && executorKind === 'group' && !!groupId,
     });
     const groupMembersQuery = useQuery({
         queryKey: ['work-group-members', groupId],
         queryFn: () => groupApi.members(groupId),
-        enabled: executorKind === 'group' && !!groupId,
+        enabled: routingMode === 'manual' && executorKind === 'group' && !!groupId,
     });
     const roles = useMemo(
         () => partitionAgentRoles(
@@ -288,19 +344,30 @@ export default function Work() {
         ),
         [agentsQuery.data, workQuery.data?.personal_assistant_agent_id],
     );
+    const workBuckets = useMemo(() => {
+        const items = workQuery.data?.items || [];
+        const completedStages = new Set(['completed', 'delivery', 'cancelled']);
+        return {
+            active: items.filter((item) => !completedStages.has(item.user_stage)),
+            completed: items.filter((item) => completedStages.has(item.user_stage)),
+        };
+    }, [workQuery.data?.items]);
 
     const taskDraft = useMemo<WorkTaskDraft>(() => ({
         title: title.trim() || intent.trim().split(/\n/)[0].slice(0, 80),
         intent: intent.trim(),
         work_type: workType,
         priority,
-        executor_kind: executorKind,
-        ...(executorKind === 'agent_employee' ? { agent_id: agentId } : {}),
-        ...(executorKind === 'temporary_expert' ? { expert_role: expertRole.trim() } : {}),
-        ...(executorKind === 'group' ? {
-            group_id: groupId,
-            group_session_id: groupSessionId,
-            group_agent_participant_ids: groupAgentParticipantIds,
+        routing_mode: routingMode,
+        ...(routingMode === 'manual' ? {
+            executor_kind: executorKind,
+            ...(executorKind === 'agent_employee' ? { agent_id: agentId } : {}),
+            ...(executorKind === 'temporary_expert' ? { expert_role: expertRole.trim() } : {}),
+            ...(executorKind === 'group' ? {
+                group_id: groupId,
+                group_session_id: groupSessionId,
+                group_agent_participant_ids: groupAgentParticipantIds,
+            } : {}),
         } : {}),
     }), [
         agentId,
@@ -311,11 +378,13 @@ export default function Work() {
         groupSessionId,
         intent,
         priority,
+        routingMode,
         title,
         workType,
     ]);
     const taskDraftKey = JSON.stringify(taskDraft);
     const confirmedPreflight = preflight?.draftKey === taskDraftKey ? preflight.result : null;
+    const executorProposal = confirmedPreflight?.executor_proposal || null;
 
     const preflightTask = useMutation({
         mutationFn: async ({ draft, draftKey }: { draft: WorkTaskDraft; draftKey: string }) => ({
@@ -346,10 +415,16 @@ export default function Work() {
             setTitle('');
             setIntent('');
             setWorkType('general');
+            setRoutingMode('auto');
+            setAdvancedExecutor(false);
             setExpertRole('');
             setPreflight(null);
             setClientRequestId(createRandomUUID());
-            await queryClient.invalidateQueries({ queryKey: ['work-index'] });
+            await Promise.all([
+                queryClient.invalidateQueries({ queryKey: ['work-index'] }),
+                queryClient.invalidateQueries({ queryKey: ['work-inbox'] }),
+                queryClient.invalidateQueries({ queryKey: ['work-inbox-count'] }),
+            ]);
             toast.success(isChinese ? '工作说明已确认，任务已进入执行队列' : 'Work statement confirmed; task queued');
         },
         onError: (error: any) => {
@@ -363,9 +438,9 @@ export default function Work() {
     });
 
     const canPrepare = intent.trim().length >= 3
-        && (executorKind !== 'agent_employee' || !!agentId)
-        && (executorKind !== 'temporary_expert' || expertRole.trim().length >= 3)
-        && (executorKind !== 'group' || (
+        && (routingMode === 'auto' || executorKind !== 'agent_employee' || !!agentId)
+        && (routingMode === 'auto' || executorKind !== 'temporary_expert' || expertRole.trim().length >= 3)
+        && (routingMode === 'auto' || executorKind !== 'group' || (
             !!groupId
             && !!groupSessionId
             && groupAgentParticipantIds.length > 0
@@ -419,16 +494,38 @@ export default function Work() {
                         rows={5}
                     />
                     <div className="work-composer-controls">
-                        <label>
-                            <span>{isChinese ? '由谁执行' : 'Executor'}</span>
-                            <select value={executorKind} onChange={(event) => setExecutorKind(event.target.value as typeof executorKind)}>
-                                <option value="personal_assistant">{isChinese ? '我的助理协调' : 'My assistant coordinates'}</option>
-                                <option value="agent_employee">{isChinese ? '指定 Agent 员工' : 'Choose an Agent employee'}</option>
-                                <option value="temporary_expert">{isChinese ? '临时专家' : 'Temporary expert'}</option>
-                                <option value="group">{isChinese ? 'Group 多人协作' : 'Group collaboration'}</option>
-                            </select>
-                        </label>
-                        {executorKind === 'agent_employee' && (
+                        <div className="work-routing-mode">
+                            <span>{isChinese ? '执行方式' : 'Routing'}</span>
+                            <strong>{routingMode === 'auto'
+                                ? (isChinese ? '系统自动匹配执行者' : 'System selects the executor')
+                                : (isChinese ? '按你的指定执行' : 'Use my manual selection')}</strong>
+                        </div>
+                        <button
+                            type="button"
+                            className="work-advanced-executor"
+                            onClick={() => {
+                                const next = !advancedExecutor;
+                                setAdvancedExecutor(next);
+                                setRoutingMode(next ? 'manual' : 'auto');
+                                setPreflight(null);
+                            }}
+                        >
+                            {advancedExecutor
+                                ? (isChinese ? '恢复自动匹配' : 'Use automatic routing')
+                                : (isChinese ? '高级：指定执行者' : 'Advanced: choose executor')}
+                        </button>
+                        {advancedExecutor && (
+                            <label>
+                                <span>{isChinese ? '由谁执行' : 'Executor'}</span>
+                                <select value={executorKind} onChange={(event) => setExecutorKind(event.target.value as WorkExecutorKind)}>
+                                    <option value="personal_assistant">{isChinese ? '我的助理协调' : 'My assistant coordinates'}</option>
+                                    <option value="agent_employee">{isChinese ? '指定 Agent 员工' : 'Choose an Agent employee'}</option>
+                                    <option value="temporary_expert">{isChinese ? '临时专家（助理运行期角色）' : 'Temporary expert (assistant run role)'}</option>
+                                    <option value="group">{isChinese ? 'Group 多人协作' : 'Group collaboration'}</option>
+                                </select>
+                            </label>
+                        )}
+                        {advancedExecutor && executorKind === 'agent_employee' && (
                             <label>
                                 <span>{isChinese ? 'Agent 员工' : 'Agent employee'}</span>
                                 <select value={agentId} onChange={(event) => setAgentId(event.target.value)}>
@@ -437,7 +534,7 @@ export default function Work() {
                                 </select>
                             </label>
                         )}
-                        {executorKind === 'temporary_expert' && (
+                        {advancedExecutor && executorKind === 'temporary_expert' && (
                             <label className="work-expert-role">
                                 <span>{isChinese ? '专家角色' : 'Expert role'}</span>
                                 <input
@@ -470,7 +567,7 @@ export default function Work() {
                             <IconArrowRight size={17} stroke={1.8} />
                         </button>
                     </div>
-                    {executorKind === 'group' && (
+                    {advancedExecutor && executorKind === 'group' && (
                         <section className="work-group-config">
                             <div className="work-group-selectors">
                                 <label>
@@ -559,6 +656,19 @@ export default function Work() {
                                         : confirmedPreflight.capability_status}
                                 </span>
                             </div>
+                            {executorProposal && (
+                                <div className="work-executor-proposal">
+                                    <strong>{routingMode === 'auto'
+                                        ? (isChinese
+                                            ? `系统已选择：${executorProposal.agent_name}`
+                                            : `System selected: ${executorProposal.agent_name}`)
+                                        : (isChinese
+                                            ? `你已指定：${executorProposal.agent_name}`
+                                            : `You selected: ${executorProposal.agent_name}`)}</strong>
+                                    <span>{executorReasonLabel(executorProposal, isChinese)}</span>
+                                    <small>{isChinese ? '路由置信度' : 'Routing confidence'} · {Math.round(executorProposal.confidence * 100)}%</small>
+                                </div>
+                            )}
                             <div className="work-confirmation-objective">
                                 <strong>{confirmedPreflight.work_statement.title}</strong>
                                 <p>{confirmedPreflight.work_statement.objective}</p>
@@ -632,28 +742,108 @@ export default function Work() {
                         <h2>{isChinese ? '我的工作' : 'My work'}</h2>
                         <p>{isChinese ? '任务、执行、产物、检查、批准和交付是不同状态。' : 'Tasks, runs, artifacts, reviews, approvals and delivery remain distinct.'}</p>
                     </div>
-                    <button type="button" onClick={() => workQuery.refetch()} disabled={workQuery.isFetching}>
-                        <IconRefresh size={16} className={workQuery.isFetching ? 'is-spinning' : ''} />
+                    <button
+                        type="button"
+                        onClick={() => void Promise.all([
+                            workQuery.refetch(),
+                            inboxQuery.refetch(),
+                            inboxCountQuery.refetch(),
+                        ])}
+                        disabled={workQuery.isFetching || inboxQuery.isFetching || inboxCountQuery.isFetching}
+                    >
+                        <IconRefresh
+                            size={16}
+                            className={workQuery.isFetching || inboxQuery.isFetching || inboxCountQuery.isFetching ? 'is-spinning' : ''}
+                        />
                         {isChinese ? '刷新' : 'Refresh'}
                     </button>
                 </div>
-                {workQuery.isError && (
+                <div className="work-view-tabs" role="tablist" aria-label={isChinese ? '工作视图' : 'Work views'}>
+                    <button
+                        type="button"
+                        role="tab"
+                        aria-selected={workView === 'attention'}
+                        className={workView === 'attention' ? 'is-active' : ''}
+                        onClick={() => setWorkView('attention')}
+                    >
+                        <IconAlertCircle size={15} />
+                        {isChinese ? '待我处理' : 'Needs my attention'}
+                        <span>{inboxCountQuery.data?.count || 0}</span>
+                    </button>
+                    <button
+                        type="button"
+                        role="tab"
+                        aria-selected={workView === 'active'}
+                        className={workView === 'active' ? 'is-active' : ''}
+                        onClick={() => setWorkView('active')}
+                    >
+                        {isChinese ? '进行中' : 'In progress'}
+                        <span>{workBuckets.active.length}</span>
+                    </button>
+                    <button
+                        type="button"
+                        role="tab"
+                        aria-selected={workView === 'completed'}
+                        className={workView === 'completed' ? 'is-active' : ''}
+                        onClick={() => setWorkView('completed')}
+                    >
+                        {isChinese ? '最近完成' : 'Recently completed'}
+                        <span>{workBuckets.completed.length}</span>
+                    </button>
+                </div>
+                {(workQuery.isError || (workView === 'attention' && inboxQuery.isError)) && (
                     <div className="work-empty work-empty--error">
-                        {isChinese ? '工作索引加载失败，请重试。' : 'Could not load the work index. Please retry.'}
+                        {isChinese ? '工作事实加载失败，请重试。' : 'Could not load the work facts. Please retry.'}
                     </div>
                 )}
-                {!workQuery.isLoading && !workQuery.isError && (workQuery.data?.items.length || 0) === 0 && (
+                {workView === 'attention' && !inboxQuery.isLoading && !inboxQuery.isError && (inboxQuery.data?.items.length || 0) === 0 && (
                     <div className="work-empty">
                         <IconCheck size={24} />
-                        <strong>{isChinese ? '还没有工作记录' : 'No work yet'}</strong>
-                        <span>{isChinese ? '从上方描述第一项业务结果。' : 'Describe your first outcome above.'}</span>
+                        <strong>{isChinese ? '当前没有待你处理的动作' : 'Nothing needs your attention'}</strong>
+                        <span>{isChinese ? '审批、质量检查或失败恢复出现时，会从权威事实进入这里。' : 'Approvals, quality reviews and recoveries appear here from authoritative facts.'}</span>
                     </div>
                 )}
-                <div className="work-list">
-                    {(workQuery.data?.items || []).map((item) => (
-                        <WorkCard key={`${item.kind}:${item.id}`} item={item} isChinese={isChinese} />
-                    ))}
-                </div>
+                {workView === 'attention' && (
+                    <div className="work-inbox-list">
+                        {(inboxQuery.data?.items || []).map((action) => (
+                            <article className="work-inbox-card" key={action.id}>
+                                <div>
+                                    <span>{inboxActionLabel(action, isChinese)}</span>
+                                    <h3>{action.title}</h3>
+                                    <p>{action.reason_code}</p>
+                                    <small>{new Date(action.created_at).toLocaleString()}</small>
+                                </div>
+                                <button
+                                    type="button"
+                                    onClick={() => navigate(
+                                        action.kind === 'task_recovery' && action.task_id
+                                            ? `/work/${action.task_id}`
+                                            : action.action_url,
+                                    )}
+                                >
+                                    {isChinese ? '去处理' : 'Open action'}
+                                    <IconArrowRight size={16} />
+                                </button>
+                            </article>
+                        ))}
+                    </div>
+                )}
+                {workView !== 'attention' && !workQuery.isLoading && !workQuery.isError && workBuckets[workView].length === 0 && (
+                    <div className="work-empty">
+                        <IconCheck size={24} />
+                        <strong>{workView === 'active'
+                            ? (isChinese ? '当前没有进行中的工作' : 'No work is in progress')
+                            : (isChinese ? '还没有最近完成的工作' : 'No recently completed work')}</strong>
+                        <span>{isChinese ? '从上方描述一项业务结果。' : 'Describe a business outcome above.'}</span>
+                    </div>
+                )}
+                {workView !== 'attention' && (
+                    <div className="work-list">
+                        {workBuckets[workView].map((item) => (
+                            <WorkCard key={`${item.kind}:${item.id}`} item={item} isChinese={isChinese} />
+                        ))}
+                    </div>
+                )}
                 {roles.personalAssistant && (
                     <button
                         type="button"

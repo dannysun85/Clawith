@@ -1,8 +1,8 @@
 import { Fragment, useCallback, useEffect, useLayoutEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
-import { IconRobot } from '@tabler/icons-react';
+import { IconChecklist, IconRobot } from '@tabler/icons-react';
 import MarkdownRenderer from '../../components/MarkdownRenderer';
-import type { GroupMember, GroupMessage } from '../../types/group';
+import type { GroupMember, GroupMessage, GroupTaskSummary } from '../../types/group';
 
 interface MessageStreamProps {
     sessionId: string;
@@ -15,6 +15,9 @@ interface MessageStreamProps {
     runningAgents: Array<{ id: string; name: string }>;
     onLoadMore: () => void;
     onLatestMessageSeen: (messageId: string) => void;
+    onCreateTask: (message: GroupMessage) => void;
+    linkedTaskByMessageId: ReadonlyMap<string, GroupTaskSummary>;
+    onOpenTask: (taskId: string) => void;
 }
 
 const timeFormat = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' });
@@ -55,6 +58,9 @@ export default function MessageStream({
     runningAgents,
     onLoadMore,
     onLatestMessageSeen,
+    onCreateTask,
+    linkedTaskByMessageId,
+    onOpenTask,
 }: MessageStreamProps) {
     const { t } = useTranslation();
     const scrollRef = useRef<HTMLDivElement>(null);
@@ -161,6 +167,7 @@ export default function MessageStream({
                 const name = message.sender_name
                     ?? member?.display_name
                     ?? t('groups.unknownSender', '未知成员');
+                const linkedTask = linkedTaskByMessageId.get(message.id);
 
                 return (
                     <div key={message.id} className={`group-message ${isMine ? 'mine' : ''}`}>
@@ -196,6 +203,27 @@ export default function MessageStream({
                                         {renderContentWithMentions(message.content, message.mentions)}
                                     </span>}
                             </div>
+                            {linkedTask ? (
+                                <button
+                                    type="button"
+                                    className="group-message-create-task is-linked"
+                                    onClick={() => onOpenTask(linkedTask.task_id)}
+                                    title={t('groups.openLinkedTask', '打开已关联的正式任务')}
+                                >
+                                    <IconChecklist size={13} />
+                                    {t('groups.linkedTask', '已关联任务')} · {linkedTask.title}
+                                </button>
+                            ) : (
+                                <button
+                                    type="button"
+                                    className="group-message-create-task"
+                                    onClick={() => onCreateTask(message)}
+                                    title={t('groups.createFormalTask', '从消息创建正式任务')}
+                                >
+                                    <IconChecklist size={13} />
+                                    {t('groups.createTask', '创建任务')}
+                                </button>
+                            )}
                         </div>
                     </div>
                 );

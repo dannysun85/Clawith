@@ -367,6 +367,8 @@ def today_in_tenant_tz(tenant) -> date:
 
 ### 4.3 国内支付方案(支付宝/微信)
 
+> **已实现(微信支付 Native)**: `services/billing_provider.py::WeChatBillingProvider`,`BILLING_PROVIDER=wechat` 启用;下单走 V3 Native 返回 `code_url`,前端扫码弹窗 + `/subscription/checkout/{order_id}/status` 轮询;回调 `/api/subscription/billing/webhook/wechat` 用 APIv3 密钥 AEAD 解密验真,并回查订单接口确认终态。微信仅支持 CNY,USD 定价按 `BILLING_USD_CNY_RATE`(默认 7.2)换算下单与展示。续费仍为"到期手动续"(无委托代扣)。
+
 Stripe 无国内可用,国内需自建订阅原语:
 - **订阅 = 首次支付 + 记录 `period_end` + 定时任务(cron)到期前发起续费扣款**。
   - 复用现有 `services/trigger_daemon.py`(Aware Engine 调度器)做续费提醒 + 自动扣款。

@@ -124,6 +124,33 @@ async def test_migrated_tools_have_native_typed_validation_failures(
     assert outcome.error_code == "invalid_tool_arguments"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "file_path",
+    (
+        "../other-agent/workspace/secret.txt",
+        "workspace/../../other-agent/workspace/secret.txt",
+        r"workspace\\..\\..\\other-agent\\workspace\\secret.txt",
+    ),
+)
+async def test_send_file_to_agent_rejects_parent_traversal_before_storage_access(
+    monkeypatch,
+    file_path: str,
+) -> None:
+    def forbidden_storage_access():
+        raise AssertionError("storage must not be accessed for a traversal path")
+
+    monkeypatch.setattr(agent_tools, "get_storage_backend", forbidden_storage_access)
+
+    outcome = await agent_tools._send_file_to_agent_outcome(
+        uuid.uuid4(),
+        {"target_agent_id": str(uuid.uuid4()), "file_path": file_path},
+    )
+
+    assert outcome.status == "failed"
+    assert outcome.error_code == "invalid_workspace_path"
+
+
 def test_minimax_typed_lifecycle_facts_do_not_infer_status_from_display_text() -> None:
     agent_id = uuid.uuid4()
     record_id = uuid.uuid4()

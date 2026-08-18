@@ -529,6 +529,7 @@ async def build_workforce_topology(
     )
     manageable_ids = {agent.id for agent in manageable_agents}
     company_auditor = user.role in COMPANY_AUDIT_ROLES
+    can_view_company_analytics = company_auditor
     auditable_ids = employee_ids if company_auditor else manageable_ids
     since = datetime.now(timezone.utc) - timedelta(hours=window_hours)
     work_by_agent = await _load_topology_work_summaries(
@@ -675,9 +676,9 @@ async def build_workforce_topology(
                 role_description=agent.role_description or "",
                 status=agent.status,
                 last_active_at=agent.last_active_at,
-                tokens_used_today=agent.tokens_used_today or 0,
-                cache_read_tokens_today=agent.cache_read_tokens_today or 0,
-                max_tokens_per_day=agent.max_tokens_per_day,
+                tokens_used_today=(agent.tokens_used_today or 0) if can_view_company_analytics else None,
+                cache_read_tokens_today=(agent.cache_read_tokens_today or 0) if can_view_company_analytics else None,
+                max_tokens_per_day=agent.max_tokens_per_day if can_view_company_analytics else None,
                 is_expired=bool(agent.is_expired),
                 is_system=bool(agent.is_system),
                 visibility=(

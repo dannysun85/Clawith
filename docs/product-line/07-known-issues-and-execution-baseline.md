@@ -140,3 +140,18 @@ code reviewer 为 `APPROVE`。标准 pytest 入口固定为仓库的 `backend/.v
 本基线随本地 immutable candidate commit 固化；准确 SHA 在 commit 创建后通过 Git、`/api/version` 和页面 footer
 绑定，不回写到 commit 自身。真实外部 SMTP、真实企业 IdP、生产 purge、推送、部署和生产业务流仍未执行，因此候选
 不得称为已部署、生产已修复、`provider_verified` 或 `production_verified`。
+
+## 9. 2026-08-18 四类新增 P0
+
+2026-08-17 的独立 QA 是历史合同证据，不覆盖下列新定义的角色数据和 Workbench 行动合同。完整产品合同与
+验收编号见 `12-four-p0-product-closure-plan-2026-08-18.md`。
+
+| ID | 优先级 | 新发现 | 目标状态 | 当前状态 |
+|---|---:|---|---|---|
+| PL-025 | P0 | 普通 member 可读取 tenant 级套餐、Credits、流水、订单与账单主体 | membership-scoped billing.view/manage；member-safe 个人投影；admin/owner 分层 | `scope_frozen + implementation_pending` |
+| PL-026 | P0 | OKR/日报/复盘缺对象级 viewer policy，REST/Agent Tool 不一致，普通 member 可触发管理型 outreach | company/本人/Agent object grant 投影；管理动作在敏感读取与后台任务前 fail closed | `scope_frozen + implementation_pending` |
+| PL-027 | P0 | Dashboard token aggregate 与 topology node 字段向普通 member 暴露公司资源 | `company.analytics.view`；member topology 资源字段为 `null`；删除前端聚合 fallback | `scope_frozen + implementation_pending` |
+| PL-028 | P0 | Work 没有统一产品详情和权威 action inbox，首屏仍要求用户选择 executor | deterministic auto proposal；additive detail/inbox；保留单一 Runtime 与旧 getTask/manual 行为 | `scope_frozen + implementation_pending` |
+
+完成 PL-025–028 必须同时通过 `BILL-*`、`OKR-*`、`OVR-*`、`WORK-*`、`CROSS-*` 新鲜证据。
+本节建立问题和验收范围，不代表实现、测试、本地浏览器或生产已经完成。

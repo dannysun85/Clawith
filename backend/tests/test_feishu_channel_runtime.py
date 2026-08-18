@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime
 from types import SimpleNamespace
 import uuid
@@ -46,6 +47,40 @@ class _SessionFactory:
 
     def __call__(self):
         return next(self.sessions)
+
+
+def test_feishu_callback_rejects_missing_or_mismatched_verification_token() -> None:
+    config = SimpleNamespace(verification_token="expected", encrypt_key="")
+
+    assert feishu._verify_and_decode_feishu_callback(
+        b'{"header":{"token":"unexpected"}}', {}, config  # type: ignore[arg-type]
+    ) is None
+
+
+def test_feishu_callback_accepts_a_matching_verification_token() -> None:
+    config = SimpleNamespace(verification_token="expected", encrypt_key="")
+    payload = b'{"header":{"token":"expected","event_type":"im.message.receive_v1"}}'
+
+    assert feishu._verify_and_decode_feishu_callback(payload, {}, config) == {
+        "header": {"token": "expected", "event_type": "im.message.receive_v1"}
+    }
+
+
+def test_feishu_callback_rejects_an_invalid_signed_request() -> None:
+    config = SimpleNamespace(verification_token="expected", encrypt_key="encrypt-key")
+    payload = b'{"header":{"token":"expected","event_type":"im.message.receive_v1"}}'
+    headers = {
+        "x-lark-request-timestamp": "1",
+        "x-lark-request-nonce": "2",
+        "x-lark-signature": "invalid",
+    }
+
+    assert feishu._verify_and_decode_feishu_callback(payload, headers, config) is None
+
+    headers["x-lark-signature"] = hashlib.sha256(
+        b"12encrypt-key" + payload
+    ).hexdigest()
+    assert feishu._verify_and_decode_feishu_callback(payload, headers, config) is not None
 
 
 def _runtime(tenant_id: uuid.UUID) -> ChatRuntimeIntake:

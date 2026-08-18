@@ -584,6 +584,151 @@ class DeliverableApprovalReceipt(Base):
     )
 
 
+class DeliverableCreativeBrief(Base):
+    """Structured, hash-bound creative brief for one deliverable execution."""
+
+    __tablename__ = "deliverable_creative_briefs"
+    __table_args__ = (
+        CheckConstraint(
+            "modality IN ('image', 'video', 'presentation')",
+            name="ck_deliverable_creative_briefs_modality",
+        ),
+        CheckConstraint(
+            "status IN ('draft', 'clarifying', 'confirmed')",
+            name="ck_deliverable_creative_briefs_status",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "request_id",
+            "execution_id",
+            "schema_version",
+            name="uq_deliverable_creative_briefs_execution_schema",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "request_id"],
+            ["deliverable_requests.tenant_id", "deliverable_requests.id"],
+            name="fk_deliverable_creative_briefs_tenant_request",
+            ondelete="CASCADE",
+        ),
+        Index(
+            "ix_deliverable_creative_briefs_tenant_created",
+            "tenant_id",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", name="fk_deliverable_creative_briefs_tenant", ondelete="CASCADE"),
+        nullable=False,
+    )
+    request_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    execution_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "deliverable_executions.id",
+            name="fk_deliverable_creative_briefs_execution",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+    modality: Mapped[str] = mapped_column(String(24), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="draft", server_default=text("'draft'")
+    )
+    brief: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    source_inventory: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    missing_fields: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    brief_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_by_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "agent_runs.id",
+            name="fk_deliverable_creative_briefs_run",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class DeliverablePromptCompilation(Base):
+    """Versioned, reproducible prompt-compilation receipt bound to one unit."""
+
+    __tablename__ = "deliverable_prompt_compilations"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "execution_id",
+            "unit_id",
+            "compiler_version",
+            name="uq_deliverable_prompt_compilations_unit_version",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "request_id"],
+            ["deliverable_requests.tenant_id", "deliverable_requests.id"],
+            name="fk_deliverable_prompt_compilations_tenant_request",
+            ondelete="CASCADE",
+        ),
+        Index(
+            "ix_deliverable_prompt_compilations_tenant_created",
+            "tenant_id",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", name="fk_deliverable_prompt_compilations_tenant", ondelete="CASCADE"),
+        nullable=False,
+    )
+    request_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    execution_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "deliverable_executions.id",
+            name="fk_deliverable_prompt_compilations_execution",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+    unit_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "deliverable_execution_units.id",
+            name="fk_deliverable_prompt_compilations_unit",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+    compiler_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    brief_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    compiled_prompt_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    compiled_prompt_path: Mapped[str] = mapped_column(String(1000), nullable=False)
+    provider_target: Mapped[str] = mapped_column(String(50), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class DeliverableQualityReview(Base):
     """One immutable-artifact review batch managed by the Astra control plane."""
 

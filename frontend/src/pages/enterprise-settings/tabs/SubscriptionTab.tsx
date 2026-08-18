@@ -4,7 +4,12 @@ import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router';
 import { IconCheck, IconShoppingCart } from '@tabler/icons-react';
 import { fetchJson } from '../utils/fetchJson';
+import { WeChatPayModal } from '../../../components/WeChatPayModal';
+import { useBillingConfig } from '../../../hooks/useBillingConfig';
 import { Entitlements } from '../../../hooks/useLlmModels';
+import { DEFAULT_USD_CNY_RATE, formatMoneyCny, toCnyCents } from '../../../utils/money';
+import { useAuthStore } from '../../../stores';
+import { hasEffectiveCapability, productAccessSignature } from '../../../utils/productAccess';
 
 interface Usage {
     period_date: string;
@@ -68,11 +73,6 @@ const STATUS_LABEL: Record<string, string> = {
     none: '无订阅(使用默认配额)',
 };
 
-const formatMoney = (currency: string, cents: number) => {
-    const prefix = currency === 'CNY' ? '¥' : '$';
-    return `${prefix}${(cents / 100).toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
-};
-
 const planDisplayName = (plan: Plan) => {
     const mapped: Record<string, string> = {
         free: '免费版',
@@ -113,32 +113,43 @@ const boostDiscountLine = (plan: Plan) => {
     return discount > 0 ? `加餐包 ${discount}% off` : null;
 };
 
-const formatUnitPrice = (currency: string, priceCents: number, credits: number) => {
+const formatUnitPrice = (currency: string, priceCents: number, credits: number, usdCnyRate: number) => {
     if (!credits) return '';
-    const prefix = currency === 'CNY' ? '¥' : '$';
-    const unit = (priceCents / 100 / credits * 100).toFixed(2);
-    return `(${prefix}${unit}/100)`;
+    const unit = ((toCnyCents(currency, priceCents, usdCnyRate) / 100 / credits) * 100).toFixed(2);
+    return `(¥${unit}/100)`;
 };
 
 export default function SubscriptionTab({ showMarketplace = true }: { showMarketplace?: boolean }) {
     const { t } = useTranslation();
     const qc = useQueryClient();
     const navigate = useNavigate();
+    const user = useAuthStore((state) => state.user);
     const [billingPeriod, setBillingPeriod] = useState<'monthly' | 'yearly'>('monthly');
     const [lastOrder, setLastOrder] = useState<PaymentOrder | null>(null);
+    const [wechatPay, setWechatPay] = useState<{ orderId: string; codeUrl: string; amountCents: number; currency: string } | null>(null);
+    const { data: billingConfig } = useBillingConfig();
+    const cnyRate = billingConfig?.usd_cny_rate ?? DEFAULT_USD_CNY_RATE;
+    const tenantId = user?.tenant_id || null;
+    const membershipId = user?.membership_id || user?.id || null;
+    const accessSignature = productAccessSignature(user);
+    const canViewCompanyBilling = hasEffectiveCapability(user, 'company.billing.view');
+    const canManageCompanyBilling = hasEffectiveCapability(user, 'company.billing.manage');
 
     const { data: ent } = useQuery({
-        queryKey: ['subscription-entitlements'],
+        queryKey: ['subscription-entitlements', tenantId, membershipId, accessSignature],
         queryFn: () => fetchJson<Entitlements | null>('/subscription/my-entitlements'),
+        enabled: Boolean(tenantId),
     });
     const { data: usage } = useQuery({
-        queryKey: ['subscription-usage'],
+        queryKey: ['subscription-usage', tenantId, membershipId, accessSignature],
         queryFn: () => fetchJson<Usage | null>('/subscription/usage'),
+        enabled: Boolean(tenantId && canViewCompanyBilling),
         refetchInterval: 30000,
     });
     const { data: seats } = useQuery({
-        queryKey: ['subscription-seats'],
+        queryKey: ['subscription-seats', tenantId, membershipId, accessSignature],
         queryFn: () => fetchJson<SeatUsage>('/subscription/seats'),
+        enabled: Boolean(tenantId && canViewCompanyBilling),
     });
     const { data: plans = [] } = useQuery({
         queryKey: ['plans'],
@@ -163,6 +174,17 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
     const handleCheckoutOrder = (order: PaymentOrder) => {
         setLastOrder(order);
         invalidateBillingQueries();
+        if (order.provider === 'wechat') {
+            if (order.session_url) {
+                setWechatPay({
+                    orderId: order.id,
+                    codeUrl: order.session_url,
+                    amountCents: order.amount_cents,
+                    currency: order.currency,
+                });
+            }
+            return;
+        }
         if (order.session_url) {
             window.location.assign(order.session_url);
             return;
@@ -172,19 +194,36 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
         }
     };
 
+    const wechatPayModal = wechatPay ? (
+        <WeChatPayModal
+            orderId={wechatPay.orderId}
+            codeUrl={wechatPay.codeUrl}
+            amountCents={wechatPay.amountCents}
+            currency={wechatPay.currency}
+            onPaid={invalidateBillingQueries}
+            onClose={() => setWechatPay(null)}
+        />
+    ) : null;
+
     const checkoutSubscribe = useMutation({
-        mutationFn: (planId: string) => fetchJson<PaymentOrder>('/subscription/checkout/subscribe', {
-            method: 'POST',
-            body: JSON.stringify({ plan_id: planId, period: billingPeriod, seats: 1 }),
-        }),
+        mutationFn: (planId: string) => {
+            if (!canManageCompanyBilling) throw new Error('company.billing.manage is required');
+            return fetchJson<PaymentOrder>('/subscription/checkout/subscribe', {
+                method: 'POST',
+                body: JSON.stringify({ plan_id: planId, period: billingPeriod, seats: 1 }),
+            });
+        },
         onSuccess: handleCheckoutOrder,
     });
 
     const checkoutTopup = useMutation({
-        mutationFn: (creditPackId: string) => fetchJson<PaymentOrder>('/subscription/checkout/topup', {
-            method: 'POST',
-            body: JSON.stringify({ credit_pack_id: creditPackId }),
-        }),
+        mutationFn: (creditPackId: string) => {
+            if (!canManageCompanyBilling) throw new Error('company.billing.manage is required');
+            return fetchJson<PaymentOrder>('/subscription/checkout/topup', {
+                method: 'POST',
+                body: JSON.stringify({ credit_pack_id: creditPackId }),
+            });
+        },
         onSuccess: handleCheckoutOrder,
     });
 
@@ -254,10 +293,10 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
                                     <div>
                                         <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginBottom: 10 }}>{planDisplayName(plan)}</div>
                                         <div style={{ display: 'flex', alignItems: 'baseline', gap: 7, minHeight: 42 }}>
-                                            <span style={{ fontSize: 32, lineHeight: 1, fontWeight: 750 }}>{formatMoney(plan.currency, price.current)}</span>
+                                            <span style={{ fontSize: 32, lineHeight: 1, fontWeight: 750 }}>{formatMoneyCny(plan.currency, price.current, cnyRate)}</span>
                                             <span style={{ color: 'var(--text-tertiary)', fontSize: 12 }}>/ {billingPeriod === 'yearly' ? t('common.year', '年') : t('common.month', '月')}</span>
                                             {price.original > price.current && (
-                                                <span style={{ color: 'var(--text-tertiary)', fontSize: 12, textDecoration: 'line-through' }}>{formatMoney(plan.currency, price.original)}</span>
+                                                <span style={{ color: 'var(--text-tertiary)', fontSize: 12, textDecoration: 'line-through' }}>{formatMoneyCny(plan.currency, price.original, cnyRate)}</span>
                                             )}
                                         </div>
                                         <div style={{ color: plan.price_cents > 0 ? 'var(--success)' : 'var(--text-tertiary)', fontSize: 12, marginTop: 8 }}>
@@ -284,11 +323,15 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
 
                                     <button
                                         className={isCurrent ? 'btn btn-secondary' : 'btn btn-primary'}
-                                        disabled={isCurrent || checkoutSubscribe.isPending}
+                                        disabled={isCurrent || checkoutSubscribe.isPending || !canManageCompanyBilling}
                                         style={{ marginTop: 'auto', width: '100%', justifyContent: 'center' }}
                                         onClick={() => checkoutSubscribe.mutate(plan.id)}
                                     >
-                                        {isCurrent ? t('enterprise.subscription.current', '当前使用的套餐') : t('enterprise.subscription.upgrade', '升级')}
+                                        {isCurrent
+                                            ? t('enterprise.subscription.current', '当前使用的套餐')
+                                            : canManageCompanyBilling
+                                                ? t('enterprise.subscription.upgrade', '升级')
+                                                : t('enterprise.subscription.ownerOnly', '仅公司所有者可购买')}
                                     </button>
                                 </div>
                             );
@@ -313,12 +356,14 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
                                     <span style={{ color: 'var(--text-tertiary)', fontSize: 12 }}>额度</span>
                                 </div>
                                 <div style={{ color: 'var(--text-secondary)', fontWeight: 700 }}>
-                                    {formatMoney(pack.currency, pack.price_cents)}
-                                    <span style={{ color: 'var(--text-tertiary)', fontSize: 12, marginLeft: 5 }}>{formatUnitPrice(pack.currency, pack.price_cents, pack.credits)}</span>
+                                    {formatMoneyCny(pack.currency, pack.price_cents, cnyRate)}
+                                    <span style={{ color: 'var(--text-tertiary)', fontSize: 12, marginLeft: 5 }}>{formatUnitPrice(pack.currency, pack.price_cents, pack.credits, cnyRate)}</span>
                                 </div>
-                                <button className="btn btn-primary" disabled={checkoutTopup.isPending} style={{ marginTop: 8, width: '100%', justifyContent: 'center' }} onClick={() => checkoutTopup.mutate(pack.id)}>
+                                <button className="btn btn-primary" disabled={checkoutTopup.isPending || !canManageCompanyBilling} style={{ marginTop: 8, width: '100%', justifyContent: 'center' }} onClick={() => checkoutTopup.mutate(pack.id)}>
                                     <IconShoppingCart size={15} />
-                                    {t('enterprise.subscription.buyNow', '立即购买')}
+                                    {canManageCompanyBilling
+                                        ? t('enterprise.subscription.buyNow', '立即购买')
+                                        : t('enterprise.subscription.ownerOnly', '仅公司所有者可购买')}
                                 </button>
                             </div>
                         ))}
@@ -337,6 +382,7 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
                         </div>
                     )}
                 </section>
+                {wechatPayModal}
             </div>
         );
     }
@@ -432,7 +478,7 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
                                     <div>
                                         <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginBottom: 8 }}>{plan.name}</div>
                                         <div style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
-                                            <span style={{ fontSize: 30, fontWeight: 700 }}>{formatMoney(plan.currency, displayPrice)}</span>
+                                            <span style={{ fontSize: 30, fontWeight: 700 }}>{formatMoneyCny(plan.currency, displayPrice, cnyRate)}</span>
                                             <span style={{ color: 'var(--text-tertiary)', fontSize: 12 }}>/ {billingPeriod === 'yearly' ? t('common.year', '年') : t('common.month', '月')}</span>
                                         </div>
                                         <div style={{ color: 'var(--success)', fontSize: 12 }}>{plan.period || 'monthly'} · {t('enterprise.subscription.billed', '按时计费')}</div>
@@ -446,11 +492,15 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
                                     </div>
                                     <button
                                         className={isCurrent ? 'btn btn-secondary' : 'btn btn-primary'}
-                                        disabled={isCurrent || checkoutSubscribe.isPending}
+                                        disabled={isCurrent || checkoutSubscribe.isPending || !canManageCompanyBilling}
                                         style={{ marginTop: 'auto' }}
                                         onClick={() => checkoutSubscribe.mutate(plan.id)}
                                     >
-                                        {isCurrent ? t('enterprise.subscription.current', '当前使用的套餐') : t('enterprise.subscription.upgrade', '升级')}
+                                        {isCurrent
+                                            ? t('enterprise.subscription.current', '当前使用的套餐')
+                                            : canManageCompanyBilling
+                                                ? t('enterprise.subscription.upgrade', '升级')
+                                                : t('enterprise.subscription.ownerOnly', '仅公司所有者可购买')}
                                     </button>
                                 </div>
                             );
@@ -468,9 +518,11 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
                             <div key={pack.id} className="card" style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
                                 <strong>{pack.name}</strong>
                                 <div style={{ fontSize: 22, fontWeight: 700 }}>{pack.credits.toLocaleString()} <span style={{ color: 'var(--text-tertiary)', fontSize: 12 }}>额度</span></div>
-                                <div style={{ color: 'var(--text-secondary)', fontWeight: 600 }}>{formatMoney(pack.currency, pack.price_cents)}</div>
-                                <button className="btn btn-primary" disabled={checkoutTopup.isPending} onClick={() => checkoutTopup.mutate(pack.id)}>
-                                    {t('enterprise.subscription.buyNow', '立即购买')}
+                                <div style={{ color: 'var(--text-secondary)', fontWeight: 600 }}>{formatMoneyCny(pack.currency, pack.price_cents, cnyRate)}</div>
+                                <button className="btn btn-primary" disabled={checkoutTopup.isPending || !canManageCompanyBilling} onClick={() => checkoutTopup.mutate(pack.id)}>
+                                    {canManageCompanyBilling
+                                        ? t('enterprise.subscription.buyNow', '立即购买')
+                                        : t('enterprise.subscription.ownerOnly', '仅公司所有者可购买')}
                                 </button>
                             </div>
                         ))}
@@ -490,6 +542,7 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
                     )}
                 </>
             )}
+            {wechatPayModal}
         </div>
     );
 }

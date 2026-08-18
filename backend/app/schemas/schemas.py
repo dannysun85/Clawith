@@ -369,7 +369,6 @@ class AgentOut(BaseModel):
     deletion_state: str = "active"
     unread_count: int = 0
     has_api_key: bool = False
-    api_key_hash: str | None = None
     # True when the current viewer already has an onboarding row for this
     # agent. Computed per-request by the API layer from the junction table;
     # not an ORM attribute, so callers must set it explicitly. Defaults to

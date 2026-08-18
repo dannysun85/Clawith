@@ -14,7 +14,11 @@ import {
     IconSettings,
     IconUsers,
 } from '@tabler/icons-react';
-import { fetchJson } from '../services/api';
+import { fetchJson, subscriptionApi } from '../services/api';
+import { useBillingConfig } from '../hooks/useBillingConfig';
+import { DEFAULT_USD_CNY_RATE, formatMoneyCny } from '../utils/money';
+import { useAuthStore } from '../stores';
+import { hasEffectiveCapability, productAccessSignature } from '../utils/productAccess';
 
 const PAGE_SIZE = 20;
 
@@ -77,10 +81,8 @@ type PaymentOrder = {
     paid_at?: string | null;
 };
 
-const formatMoney = (currency: string, cents: number) => {
-    const prefix = currency === 'CNY' ? '¥' : '$';
-    return `${prefix}${(cents / 100).toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
-};
+type PersonalUsage = Awaited<ReturnType<typeof subscriptionApi.getMyUsage>>;
+type Entitlements = Awaited<ReturnType<typeof subscriptionApi.getEntitlements>>;
 
 const titleCasePlan = (code?: string | null) => {
     if (!code) return 'Free';
@@ -144,25 +146,48 @@ export const transactionActionLabel = (tx: CreditTransaction) => {
 export default function SubscriptionDetail() {
     const { t } = useTranslation();
     const navigate = useNavigate();
+    const user = useAuthStore((state) => state.user);
     const [activeTab, setActiveTab] = useState<'ledger' | 'orders'>('ledger');
     const [ledgerPage, setLedgerPage] = useState(1);
     const [orderPage, setOrderPage] = useState(1);
 
+    const tenantId = user?.tenant_id || null;
+    const membershipId = user?.membership_id || user?.id || null;
+    const accessSignature = productAccessSignature(user);
+    const canViewCompanyBilling = hasEffectiveCapability(user, 'company.billing.view');
+    const canManageCompanyBilling = hasEffectiveCapability(user, 'company.billing.manage');
+    const { data: billingConfig } = useBillingConfig();
+    const cnyRate = billingConfig?.usd_cny_rate ?? DEFAULT_USD_CNY_RATE;
+
+    const { data: myUsage } = useQuery<PersonalUsage>({
+        queryKey: ['subscription-my-usage', tenantId, membershipId, accessSignature],
+        queryFn: subscriptionApi.getMyUsage,
+        enabled: Boolean(tenantId && membershipId),
+        refetchInterval: 30000,
+    });
+    const { data: entitlements } = useQuery<Entitlements>({
+        queryKey: ['subscription-my-entitlements', tenantId, membershipId, accessSignature],
+        queryFn: subscriptionApi.getEntitlements,
+        enabled: Boolean(tenantId && membershipId),
+    });
     const { data: summary } = useQuery({
-        queryKey: ['subscription-summary'],
+        queryKey: ['subscription-summary', tenantId, membershipId, accessSignature],
         queryFn: () => fetchJson<SubscriptionSummary>('/subscription/summary'),
+        enabled: Boolean(tenantId && canViewCompanyBilling),
         refetchInterval: 30000,
     });
     const { data: transactions = [] } = useQuery({
-        queryKey: ['subscription-credit-transactions', ledgerPage],
+        queryKey: ['subscription-credit-transactions', tenantId, membershipId, accessSignature, ledgerPage],
         queryFn: () => fetchJson<CreditTransaction[]>(`/subscription/credit-transactions?page=${ledgerPage}&limit=${PAGE_SIZE}`),
+        enabled: Boolean(tenantId && canManageCompanyBilling),
     });
     const { data: orders = [] } = useQuery({
-        queryKey: ['subscription-orders', orderPage],
+        queryKey: ['subscription-orders', tenantId, membershipId, accessSignature, orderPage],
         queryFn: () => fetchJson<PaymentOrder[]>(`/subscription/orders?page=${orderPage}&limit=${PAGE_SIZE}`),
+        enabled: Boolean(tenantId && canManageCompanyBilling),
     });
 
-    const planName = titleCasePlan(summary?.plan_code);
+    const planName = titleCasePlan(summary?.plan_code || entitlements?.plan_code);
     const creditsTotal = summary?.total_granted ?? 0;
     const creditsUsed = summary?.consumed_credits ?? 0;
     const creditsProgress = creditsTotal > 0 ? Math.max(0, Math.min(100, (creditsUsed / creditsTotal) * 100)) : 0;
@@ -174,8 +199,14 @@ export default function SubscriptionDetail() {
     return (
         <div className="subscription-detail-page" style={{ maxWidth: 1040, margin: '0 auto', padding: '32px 18px 48px' }}>
             <div className="subscription-detail-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16, marginBottom: 20 }}>
-                <h1 className="page-title" style={{ margin: 0 }}>{t('subscription.detail.title', '套餐详情')}</h1>
-                <div className="subscription-detail-actions" style={{ display: 'flex', gap: 10 }}>
+                <h1 className="page-title" style={{ margin: 0 }}>
+                    {canManageCompanyBilling
+                        ? t('subscription.detail.billingManagement', '账单管理')
+                        : canViewCompanyBilling
+                            ? t('subscription.detail.companyUsage', '套餐与公司用量')
+                            : t('subscription.detail.myUsage', '我的用量')}
+                </h1>
+                {canManageCompanyBilling && <div className="subscription-detail-actions" style={{ display: 'flex', gap: 10 }}>
                     <button className="btn btn-secondary" type="button" onClick={() => setActiveTab('orders')}>
                         <IconReceipt size={16} />
                         {t('subscription.detail.billingManagement', '账单管理')}
@@ -184,12 +215,36 @@ export default function SubscriptionDetail() {
                         <IconSettings size={16} />
                         {t('subscription.detail.manageSubscription', '管理订阅')}
                     </button>
-                </div>
+                </div>}
             </div>
 
             <section className="card subscription-usage-card" style={{ padding: 32, marginBottom: 26 }}>
-                <h2 style={{ margin: '0 0 28px', fontSize: 20, fontWeight: 700 }}>{t('subscription.detail.usageTitle', '套餐使用情况')}</h2>
-                <div className="subscription-usage-grid" style={{ display: 'grid', gridTemplateColumns: 'minmax(280px, 0.9fr) minmax(360px, 1.35fr)', gap: 24 }}>
+                <h2 style={{ margin: '0 0 28px', fontSize: 20, fontWeight: 700 }}>
+                    {canViewCompanyBilling
+                        ? t('subscription.detail.usageTitle', '套餐使用情况')
+                        : t('subscription.detail.personalUsageTitle', '仅显示可归因给我的用量')}
+                </h2>
+                {!canViewCompanyBilling ? (
+                    <div style={{ display: 'grid', gap: 14 }}>
+                        <UsageMetric
+                            icon={<IconBolt size={20} />}
+                            accent="var(--text-primary)"
+                            title={t('subscription.detail.myAttributedCredits', '我消耗的 Credits')}
+                            value={(myUsage?.consumed_credits ?? 0).toLocaleString()}
+                            suffix={t('subscription.detail.points', '积分')}
+                            progress={0}
+                            testId="subscription-my-attributed-credits"
+                        />
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 12 }}>
+                            <UsageMetric icon={<IconBolt size={20} />} accent="var(--text-secondary)" title={t('subscription.detail.dailyLlmLimit', '公司分配的每日 LLM 上限')} value={(myUsage?.llm_calls_limit ?? entitlements?.max_llm_calls_per_day ?? 0).toLocaleString()} suffix="Calls" progress={0} />
+                            <UsageMetric icon={<IconChartBar size={20} />} accent="var(--text-secondary)" title={t('subscription.detail.messageLimit', '消息上限')} value={(myUsage?.message_limit ?? entitlements?.message_limit ?? 0).toLocaleString()} suffix="Messages" progress={0} />
+                            <UsageMetric icon={<IconUsers size={20} />} accent="var(--text-secondary)" title={t('subscription.detail.triggerLimit', '触发器上限')} value={(myUsage?.max_triggers ?? entitlements?.max_triggers ?? 0).toLocaleString()} suffix="Triggers" progress={0} />
+                        </div>
+                        <p style={{ margin: 0, color: 'var(--text-tertiary)', fontSize: 13 }}>
+                            {myUsage?.attribution_note || t('subscription.detail.attributionUnavailable', '公司汇总、余额、其他成员和支付信息不会在这里显示。')}
+                        </p>
+                    </div>
+                ) : <div className="subscription-usage-grid" style={{ display: 'grid', gridTemplateColumns: 'minmax(280px, 0.9fr) minmax(360px, 1.35fr)', gap: 24 }}>
                     <div className="subscription-plan-card" style={{ border: '1px solid var(--border-subtle)', borderRadius: 12, minHeight: 178, padding: 24, background: 'var(--bg-secondary)' }}>
                         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
                             <div style={iconBoxStyle}>
@@ -237,10 +292,10 @@ export default function SubscriptionDetail() {
                             progress={seatProgress}
                         />
                     </div>
-                </div>
+                </div>}
             </section>
 
-            <section>
+            {canManageCompanyBilling && <section>
                 <div style={{ display: 'flex', gap: 24, borderBottom: '1px solid var(--border-subtle)', marginBottom: 24 }}>
                     <TabButton active={activeTab === 'ledger'} onClick={() => setActiveTab('ledger')} icon={<IconChartBar size={16} />}>
                         {t('subscription.detail.ledger', '消耗明细')}
@@ -322,7 +377,7 @@ export default function SubscriptionDetail() {
                                                     <div style={{ color: 'var(--text-tertiary)', fontSize: 11, marginTop: 4 }}>{parts.time}</div>
                                                 </TableCell>
                                                 <TableCell>{orderDescription(order)}</TableCell>
-                                                <TableCell align="right">{formatMoney(order.currency, order.amount_cents)}</TableCell>
+                                                <TableCell align="right">{formatMoneyCny(order.currency, order.amount_cents, cnyRate)}</TableCell>
                                                 <TableCell>
                                                     <span style={{ display: 'inline-flex', alignItems: 'center', borderRadius: 999, padding: '4px 10px', background: 'var(--bg-secondary)', color: 'var(--text-secondary)', fontWeight: 650, fontSize: 12 }}>
                                                         {orderStatusLabel(order.status)}
@@ -345,7 +400,15 @@ export default function SubscriptionDetail() {
                         />
                     </div>
                 )}
-            </section>
+            </section>}
+            {canViewCompanyBilling && !canManageCompanyBilling && (
+                <section className="card" style={{ padding: 20, color: 'var(--text-secondary)' }}>
+                    {t(
+                        'subscription.detail.ownerOnlyNotice',
+                        '公司用量可供管理员查看；流水、订单、支付主体和续费仅公司所有者可访问。',
+                    )}
+                </section>
+            )}
         </div>
     );
 }

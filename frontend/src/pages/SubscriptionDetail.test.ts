@@ -1,6 +1,21 @@
-import { describe, expect, test } from 'vitest';
+import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
 
-import { transactionActionLabel } from './SubscriptionDetail';
+
+let transactionActionLabel: typeof import('./SubscriptionDetail').transactionActionLabel;
+
+beforeAll(async () => {
+    vi.stubGlobal('localStorage', {
+        getItem: () => null,
+        setItem: () => undefined,
+        removeItem: () => undefined,
+        clear: () => undefined,
+    });
+    ({ transactionActionLabel } = await import('./SubscriptionDetail'));
+});
+
+afterAll(() => {
+    vi.unstubAllGlobals();
+});
 
 
 describe('subscription incident refunds', () => {

@@ -123,6 +123,30 @@ def _is_platform_surface_operator(user: User) -> bool:
     return user.tenant_id is None and _is_platform_admin_user(user)
 
 
+def _require_system_setting_access(key: str, current_user: User) -> None:
+    """Authorize access to a platform setting or a tenant company introduction.
+
+    ``system_settings`` is a global key/value table and can contain credentials.
+    The sole tenant-scoped key family exposed through this API is
+    ``company_intro_<tenant UUID>``; organization administrators may manage
+    only their own tenant's entry. All other keys require a platform admin.
+    """
+    company_intro_prefix = "company_intro_"
+    if key.startswith(company_intro_prefix):
+        try:
+            tenant_id = uuid.UUID(key.removeprefix(company_intro_prefix))
+        except ValueError:
+            tenant_id = None
+        if tenant_id is not None and current_user.tenant_id == tenant_id:
+            from app.services.access_control import is_company_governor
+
+            if is_company_governor(current_user):
+                return
+    if _is_platform_admin_user(current_user):
+        return
+    raise HTTPException(status_code=403, detail="Platform admin access required for system settings")
+
+
 def _require_identity_provider_scope(
     user: User,
     provider_tenant_id: uuid.UUID | None,
@@ -1341,7 +1365,7 @@ async def get_notification_bar_public(
 @router.get("/system-settings/{key}")
 async def get_system_setting(
     key: str,
-    current_user: User = Depends(get_platform_operator),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Get a system setting by key."""
@@ -1350,6 +1374,7 @@ async def get_system_setting(
         mask_system_setting_value,
     )
 
+    _require_system_setting_access(key, current_user)
     if is_sensitive_system_setting(key) and not _is_platform_admin_user(current_user):
         raise HTTPException(
             status_code=403,
@@ -1370,7 +1395,7 @@ async def get_system_setting(
 async def update_system_setting(
     key: str,
     data: SettingUpdate,
-    current_user: User = Depends(get_platform_operator),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Create or update a system setting."""
@@ -1380,6 +1405,7 @@ async def update_system_setting(
         mask_system_setting_value,
     )
 
+    _require_system_setting_access(key, current_user)
     # Platform-level settings (e.g. PUBLIC_BASE_URL) require platform_admin
     if (
         key == "platform" or is_sensitive_system_setting(key)

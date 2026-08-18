@@ -108,6 +108,40 @@ async def test_todo_registration_updates_task_in_same_caller_session() -> None:
 
 
 @pytest.mark.asyncio
+async def test_work_retry_uses_a_new_idempotent_runtime_attempt_identity() -> None:
+    task, agent = _records()
+    task.origin_type = "workbench"
+    task.confirmation_fingerprint = "a" * 64
+    task.confirmed_at = datetime(2026, 8, 19, tzinfo=UTC)
+    session = _Session()
+    attempt_id = uuid.uuid4()
+    handle = RunHandle(
+        tenant_id=agent.tenant_id,
+        run_id=uuid.uuid4(),
+        thread_id=str(uuid.uuid4()),
+        command_id=uuid.uuid4(),
+        runtime_type="langgraph",
+        created=True,
+    )
+
+    with patch(
+        "app.services.task_executor.RuntimeCommandIntake.start_run",
+        new=AsyncMock(return_value=handle),
+    ) as start_run:
+        await enqueue_task_runtime(
+            session,  # type: ignore[arg-type]
+            task=task,
+            agent=agent,
+            execution_id=attempt_id,
+            settings_override=_settings(enabled=True),
+        )
+
+    command = start_run.await_args.args[0]
+    assert command.source_execution_id == f"task:{task.id}:attempt:{attempt_id}"
+    assert command.idempotency_key == f"start:task:{task.id}:attempt:{attempt_id}"
+
+
+@pytest.mark.asyncio
 async def test_confirmed_creative_workbench_task_is_a_tool_free_brief_run() -> None:
     task, agent = _records()
     task.origin_type = "workbench"
@@ -204,9 +238,12 @@ async def test_unconfirmed_workbench_task_cannot_enter_runtime() -> None:
 
 
 @pytest.mark.asyncio
-async def test_confirmed_group_task_enters_native_group_runtime_with_stable_identity() -> None:
+@pytest.mark.parametrize("origin_type", ["workbench", "group"])
+async def test_confirmed_group_task_enters_native_group_runtime_with_stable_identity(
+    origin_type: str,
+) -> None:
     task, agent = _records()
-    task.origin_type = "workbench"
+    task.origin_type = origin_type
     task.executor_kind = "group"
     task.confirmation_fingerprint = "a" * 64
     task.confirmed_at = datetime(2026, 8, 1, tzinfo=UTC)

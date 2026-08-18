@@ -1027,6 +1027,8 @@ async def create_minimax_sync_media_task_record(
     output_path: str,
     request_metadata: dict,
     provider: str = "minimax",
+    deliverable_execution_id: uuid.UUID | None = None,
+    deliverable_unit_id: uuid.UUID | None = None,
 ) -> MediaGenerationTask:
     """Atomically persist a sync media task and its pre-provider Credits hold."""
 
@@ -1085,6 +1087,8 @@ async def create_minimax_sync_media_task_record(
             credential_id=credential_id,
             reservation_id=reservation.id if reservation else None,
             origin_session_id=validated_session_id,
+            deliverable_execution_id=deliverable_execution_id,
+            deliverable_unit_id=deliverable_unit_id,
             provider=normalized_provider,
             modality=normalized_modality,
             model=model,

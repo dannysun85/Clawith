@@ -76,8 +76,10 @@ from app.models.agent_tool_execution import AgentToolExecution  # noqa: F401
 from app.models.deliverable import (  # noqa: F401
     DeliverableApprovalReceipt,
     DeliverableArtifactRevision,
+    DeliverableCreativeBrief,
     DeliverableExecution,
     DeliverableExecutionUnit,
+    DeliverablePromptCompilation,
     DeliverableQualityReview,
     DeliverableQualityReviewAssignment,
     DeliverableQualityReviewEvidence,

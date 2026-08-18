@@ -277,6 +277,9 @@ async def test_member_topology_excludes_assistant_and_unmanageable_relationships
     assert [node.name for node in result.nodes] == ["Owned Agent", "Company Agent"]
     assert [node.can_manage for node in result.nodes] == [True, False]
     assert [node.visibility for node in result.nodes] == ["company", "company"]
+    assert all(node.tokens_used_today is None for node in result.nodes)
+    assert all(node.cache_read_tokens_today is None for node in result.nodes)
+    assert all(node.max_tokens_per_day is None for node in result.nodes)
     assert result.relationship_edges == []
     assert [activity.summary for activity in result.recent_activities] == [
         "Private creator-visible summary",
@@ -344,6 +347,9 @@ async def test_company_admin_receives_visible_relationships_and_merged_activity_
 
     assert len(result.relationship_edges) == 1
     assert all(node.can_manage for node in result.nodes)
+    assert [node.tokens_used_today for node in result.nodes] == [120, 120]
+    assert [node.cache_read_tokens_today for node in result.nodes] == [24, 24]
+    assert [node.max_tokens_per_day for node in result.nodes] == [1000, 1000]
     assert result.relationship_edges[0].relation == "supervisor"
     assert len(result.activity_edges) == 1
     assert result.activity_edges[0].interaction_count == 3

@@ -193,11 +193,13 @@ test('platform system email remains reachable, secret-safe, and testable', () =>
   assert.doesNotMatch(platformSystemEmail, /console\.(?:log|debug|info)\(/);
 });
 
-test('ordinary users choose business executors without provider or model controls', () => {
-  assert.match(work, /executorKind/);
+test('the workbench proposes an explainable executor while keeping manual override advanced', () => {
+  assert.match(work, /routingMode/);
+  assert.match(work, /executorProposal/);
+  assert.match(work, /advancedExecutor/);
   assert.match(work, /personal_assistant/);
   assert.match(work, /agent_employee/);
-  assert.match(work, /temporary_expert/);
+  assert.match(work, /系统已选择|System selected/);
   assert.doesNotMatch(work, /name="provider"|name="model"|setProvider|setModel/);
   assert.match(work, /delivery_mode === 'formal_deliverable'/);
   assert.match(work, /本任务只整理 brief/);

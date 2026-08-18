@@ -18,6 +18,7 @@ import { useTranslation } from 'react-i18next';
 import { useToast } from '../Toast/ToastProvider';
 import {
     deliverableApi,
+    type DeliverableBrief,
     type DeliverableExecution,
     type DeliverableExecutionUnit,
     type DeliverablePreflight,
@@ -57,6 +58,7 @@ interface DeliverableRequestCardProps {
     launchable: boolean;
     onRemove: () => void;
     onOpen: () => void;
+    onUpdated?: (request: DeliverableRequest) => void;
 }
 
 interface DeliverableReviewCardProps {
@@ -85,10 +87,30 @@ function preflightReasonLabel(reason: string, isZh: boolean) {
         degraded_route_requires_confirmation: ['当前只有应急质量线路，需要明确确认质量降级', 'Only an emergency-quality route is available and requires explicit confirmation'],
         video_post_production_tool_unavailable: ['当前数字员工缺少视频后期工具', 'The Agent lacks a video post-production tool'],
         workflow_execution_not_enabled: ['该工作流尚未开放执行', 'Workflow execution is not enabled'],
+        deliverable_poster_v2_not_allowlisted: ['多候选图片流程尚未对该账号开放', 'The multi-candidate image pipeline is not enabled for this account'],
     };
+    if (reason.startsWith('brief_missing:')) {
+        const field = reason.slice('brief_missing:'.length);
+        const fieldLabel = BRIEF_FIELD_LABELS[field];
+        const name = fieldLabel ? fieldLabel[isZh ? 0 : 1] : field;
+        return isZh ? `工作说明缺少要素：${name}` : `The brief is missing: ${name}`;
+    }
     const label = labels[reason];
     return label ? label[isZh ? 0 : 1] : reason;
 }
+
+const BRIEF_FIELD_LABELS: Record<string, [string, string]> = {
+    purpose: ['用途', 'Purpose'],
+    channel: ['使用渠道', 'Channel'],
+    audience: ['目标受众', 'Audience'],
+    aspect_ratio: ['画面比例', 'Aspect ratio'],
+    style: ['视觉风格', 'Visual style'],
+    exact_copy_blocks: ['精确文案', 'Exact copy'],
+    brand_assets: ['品牌资产', 'Brand assets'],
+    reference_assets: ['参考素材', 'Reference assets'],
+    redraw_scope: ['允许重绘范围', 'Redraw scope'],
+    prohibitions: ['禁止项', 'Prohibitions'],
+};
 
 function deliverableErrorLabel(code: string, isZh: boolean) {
     const labels: Record<string, [string, string]> = {
@@ -319,11 +341,18 @@ export function DeliverableLauncher({
         const label = isZh ? field.label_zh : field.label_en;
         const placeholder = isZh ? field.placeholder_zh : field.placeholder_en;
         const value = spec[field.key] ?? '';
-        if (field.kind === 'textarea') {
+        if (field.kind === 'textarea' || field.kind === 'json') {
             return (
                 <label key={field.key} className="deliverable-field deliverable-field--full">
                     <span>{label} {field.required && <em>*</em>}</span>
                     <textarea value={value} onChange={(event) => updateField(field.key, event.target.value)} placeholder={placeholder} rows={3} />
+                    {field.kind === 'json' && (
+                        <small>
+                            {isZh
+                                ? '结构化 JSON 数组，可留空；保存时由服务端校验。'
+                                : 'Structured JSON array; optional. Validated by the server on save.'}
+                        </small>
+                    )}
                 </label>
             );
         }
@@ -615,9 +644,17 @@ export function DeliverableLauncher({
     );
 }
 
-export function DeliverableRequestCard({ request, launchable, onRemove, onOpen }: DeliverableRequestCardProps) {
+export function DeliverableRequestCard({ request, launchable, onRemove, onOpen, onUpdated }: DeliverableRequestCardProps) {
     const { i18n } = useTranslation();
     const isZh = i18n.language?.startsWith('zh');
+    const toast = useToast();
+    const [clarifyOpen, setClarifyOpen] = useState(false);
+    const [brief, setBrief] = useState<DeliverableBrief | null>(null);
+    const [briefLoading, setBriefLoading] = useState(false);
+    const [answers, setAnswers] = useState<Record<string, string>>({});
+    const [clarifyError, setClarifyError] = useState('');
+    const [clarifySaving, setClarifySaving] = useState(false);
+    const clarifying = request.current_stage === 'brief_clarifying';
     const label = {
         presentation: isZh ? 'PPT 演示文稿' : 'Presentation',
         poster: isZh ? '海报 / 图片' : 'Poster / Image',
@@ -626,19 +663,118 @@ export function DeliverableRequestCard({ request, launchable, onRemove, onOpen }
         spreadsheet: isZh ? '表格' : 'Spreadsheet',
     }[request.work_type];
 
+    const openClarification = async () => {
+        setClarifyOpen(true);
+        if (brief || briefLoading) return;
+        setBriefLoading(true);
+        setClarifyError('');
+        try {
+            setBrief(await deliverableApi.brief(request.id));
+        } catch (nextError) {
+            setClarifyError(nextError instanceof Error ? nextError.message : String(nextError));
+        } finally {
+            setBriefLoading(false);
+        }
+    };
+
+    const submitClarification = async () => {
+        setClarifySaving(true);
+        setClarifyError('');
+        try {
+            const answersPayload = Object.fromEntries(
+                Object.entries(answers).filter(([, value]) => value.trim()),
+            );
+            const updatedBrief = await deliverableApi.clarify(request.id, {
+                expected_version: request.version,
+                answers: answersPayload,
+            });
+            setBrief(updatedBrief);
+            if (updatedBrief.status === 'confirmed') {
+                toast.success(isZh ? '工作说明已补齐，可在对话中启动' : 'Brief completed and ready to launch');
+            }
+            if (onUpdated) {
+                onUpdated(await deliverableApi.get(request.id));
+            }
+            if (updatedBrief.status === 'confirmed') {
+                setClarifyOpen(false);
+            }
+        } catch (nextError) {
+            setClarifyError(nextError instanceof Error ? nextError.message : String(nextError));
+        } finally {
+            setClarifySaving(false);
+        }
+    };
+
     return (
         <div className="deliverable-request-card" data-status={request.status}>
             <span className="deliverable-request-card__icon">{WORK_TYPE_ICONS[request.work_type] || <IconSparkles size={18} />}</span>
             <button type="button" className="deliverable-request-card__body" onClick={onOpen}>
                 <span>
                     <strong>{label}</strong>
-                    <small>{launchable ? (isZh ? '工作说明已保存 · 发送后启动' : 'Brief saved · send to launch') : (isZh ? '工作说明已保存 · 暂不启动生成' : 'Brief saved · generation not started')}</small>
+                    <small>
+                        {clarifying
+                            ? (isZh ? '工作说明待补充 · 暂不启动生成' : 'Brief needs details · generation not started')
+                            : launchable
+                                ? (isZh ? '工作说明已保存 · 发送后启动' : 'Brief saved · send to launch')
+                                : (isZh ? '工作说明已保存 · 暂不启动生成' : 'Brief saved · generation not started')}
+                    </small>
                 </span>
                 <em>{request.tier.toUpperCase()}</em>
             </button>
+            {clarifying && (
+                <button
+                    type="button"
+                    className="deliverable-icon-button"
+                    onClick={() => (clarifyOpen ? setClarifyOpen(false) : void openClarification())}
+                    aria-label={isZh ? '补充工作说明' : 'Complete the brief'}
+                    title={isZh ? '补充工作说明' : 'Complete the brief'}
+                >
+                    <IconAlertCircle size={16} stroke={1.75} />
+                </button>
+            )}
             <button type="button" className="deliverable-icon-button" onClick={onRemove} aria-label={isZh ? '从本次发送中移除' : 'Remove from this message'}>
                 <IconX size={16} stroke={1.75} />
             </button>
+            {clarifying && clarifyOpen && (
+                <div className="deliverable-request-card__clarification">
+                    {briefLoading && <small>{isZh ? '正在读取待补充要素…' : 'Loading missing details…'}</small>}
+                    {brief && brief.missing_fields.length > 0 && (
+                        <>
+                            <small>
+                                {isZh ? '补齐以下要素后才能开始制作：' : 'Complete these details before production:'}
+                            </small>
+                            {brief.missing_fields.map((field) => {
+                                const fieldLabel = BRIEF_FIELD_LABELS[field];
+                                const fieldName = fieldLabel ? fieldLabel[isZh ? 0 : 1] : field;
+                                return (
+                                    <label key={field} className="deliverable-field deliverable-field--full">
+                                        <span>{fieldName}</span>
+                                        <input
+                                            type="text"
+                                            value={answers[field] ?? ''}
+                                            onChange={(event) => setAnswers((current) => ({ ...current, [field]: event.target.value }))}
+                                        />
+                                    </label>
+                                );
+                            })}
+                            <button
+                                type="button"
+                                className="btn btn-primary"
+                                disabled={clarifySaving || Object.values(answers).every((value) => !value.trim())}
+                                onClick={() => void submitClarification()}
+                            >
+                                {clarifySaving
+                                    ? (isZh ? '保存中…' : 'Saving…')
+                                    : (isZh ? '保存补充信息' : 'Save answers')}
+                            </button>
+                        </>
+                    )}
+                    {brief && brief.missing_fields.length === 0 && (
+                        <small>{isZh ? '要素已补齐。' : 'All details are complete.'}</small>
+                    )}
+                    {clarifyError && <small role="alert">{clarifyError}</small>}
+                </div>
+            )}
         </div>
     );
 }
@@ -765,6 +901,15 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
     const currentExecution = executions.find((item) => item.id === request.current_execution_id)
         || executions[0];
     const revisionUnits = uniqueRevisionUnits(currentExecution?.units || []);
+    const candidateWallUnits = (currentExecution?.units || []).filter(
+        (unit) => unit.stage_key === 'candidate_generate',
+    );
+    const candidateQaByKey = new Map(
+        (currentExecution?.units || [])
+            .filter((unit) => unit.stage_key === 'candidate_qa')
+            .map((unit) => [unit.unit_key, unit]),
+    );
+    const showCandidateWall = request.workflow_id === 'builtin.poster.v2' && candidateWallUnits.length > 0;
     const unitProgress = (currentExecution?.units || []).reduce(
         (summary, unit) => {
             summary.total += 1;
@@ -1129,6 +1274,33 @@ export function DeliverableReviewCard({ request, onUpdated }: DeliverableReviewC
                     </small>
                 )}
             </section>
+            {showCandidateWall && (
+                <section className="deliverable-candidate-wall" aria-label={isZh ? '候选方案' : 'Candidates'}>
+                    <header>
+                        <strong>{isZh ? `候选方案（${candidateWallUnits.length}）` : `Candidates (${candidateWallUnits.length})`}</strong>
+                    </header>
+                    <div className="deliverable-candidate-wall__grid">
+                        {candidateWallUnits.map((unit) => {
+                            const qaUnit = candidateQaByKey.get(unit.unit_key);
+                            const qa = qaUnit?.qa_summary;
+                            return (
+                                <div key={unit.unit_key} className="deliverable-candidate-card" data-status={unit.status}>
+                                    <strong>{revisionUnitLabel(unit.unit_key, isZh)}</strong>
+                                    <small>{unit.status}</small>
+                                    {qa && (
+                                        <small title={qa.artifact_sha256 || undefined}>
+                                            {isZh ? '自动 QA：' : 'Automated QA: '}
+                                            {qa.status ?? '—'}
+                                            {typeof qa.score === 'number' ? ` · ${qa.score}` : ''}
+                                            {qa.artifact_sha256 ? ` · #${qa.artifact_sha256.slice(0, 8)}` : ''}
+                                        </small>
+                                    )}
+                                </div>
+                            );
+                        })}
+                    </div>
+                </section>
+            )}
             {previewArtifact && (
                 <section className="deliverable-review-card__preview" aria-label={isZh ? '交付文件预览' : 'Deliverable preview'}>
                     {previewArtifactType === 'mp4' && (

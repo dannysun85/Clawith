@@ -5,9 +5,12 @@ import {
     fetchJson,
     tenantApi,
     workforceApi,
+    type TenantTokenUsage,
     type WorkforceTopologyActivity,
     type WorkforceTopologyNode,
 } from '../services/api';
+import { useAuthStore } from '../stores';
+import { hasEffectiveCapability, productAccessSignature } from '../utils/productAccess';
 
 /* ────── Inline SVG Icons (monochrome) ────── */
 
@@ -80,21 +83,21 @@ const formatTokens = (n: number) => {
  * mini donut chart and KR status breakdown, links to OKR page.
  * Renders nothing when OKR is disabled or loading.
  */
-function OKRSummaryCard() {
+function OKRSummaryCard({ accessSignature }: { accessSignature: string }) {
     const { i18n } = useTranslation();
     const navigate = useNavigate();
     const isChinese = i18n.language?.startsWith('zh');
 
     // Load settings first
     const { data: settings } = useQuery({
-        queryKey: ['okr-settings-dash'],
+        queryKey: ['okr-settings-dash', accessSignature],
         queryFn: () => fetchJson<{ enabled: boolean }>('/okr/settings'),
         staleTime: 60000,
     });
 
     // Load current-period objectives (only when OKR enabled)
     const { data: objectives = [] } = useQuery<any[]>({
-        queryKey: ['okr-objectives-dash'],
+        queryKey: ['okr-objectives-dash', accessSignature],
         queryFn: async () => {
             // Fetch periods first to get the current period
             const periods = await fetchJson<any[]>('/okr/periods');
@@ -209,7 +212,17 @@ function OKRSummaryCard() {
 
 /* ────── Summary Stats Bar ────── */
 
-function StatsBar({ agents, windowHours, tokenUsage }: { agents: WorkforceTopologyNode[]; windowHours: number; tokenUsage?: any }) {
+function StatsBar({
+    agents,
+    windowHours,
+    tokenUsage,
+    canViewCompanyAnalytics,
+}: {
+    agents: WorkforceTopologyNode[];
+    windowHours: number;
+    tokenUsage?: TenantTokenUsage;
+    canViewCompanyAnalytics: boolean;
+}) {
     const { t } = useTranslation();
     const totalAgents = agents.length;
     const activeAgents = agents.filter(a => a.status === 'running' || a.status === 'idle').length;
@@ -218,29 +231,32 @@ function StatsBar({ agents, windowHours, tokenUsage }: { agents: WorkforceTopolo
         (sum, agent) => sum + (agent.work?.recently_completed_count ?? 0),
         0,
     );
-    const totalTokensToday = tokenUsage?.today?.total_tokens ?? agents.reduce((sum, a) => sum + (a.tokens_used_today || 0), 0);
-    const cacheReadToday = tokenUsage?.today?.cache_read_tokens ?? agents.reduce((sum, a) => sum + (a.cache_read_tokens_today || 0), 0);
-    const cacheHitRate = totalTokensToday > 0 ? Math.round((cacheReadToday / totalTokensToday) * 100) : 0;
+    const totalTokensToday = tokenUsage?.today.total_tokens;
+    const cacheReadToday = tokenUsage?.today.cache_read_tokens;
+    const cacheHitRate = tokenUsage ? Math.round(tokenUsage.today.cache_hit_rate * 100) : null;
     const recentlyActive = agents.filter(a => {
         if (!a.last_active_at) return false;
         return Date.now() - new Date(a.last_active_at).getTime() < 3600000;
     }).length;
 
+    const resourceStats = canViewCompanyAnalytics ? [{
+        icon: Icons.zap,
+        label: t('dashboard.stats.todayTokens'),
+        value: totalTokensToday == null ? '—' : formatTokens(totalTokensToday),
+        sub: tokenUsage
+            ? `Cache ${formatTokens(cacheReadToday ?? 0)} · ${cacheHitRate}%`
+            : t('common.loading'),
+    }] : [];
     const stats = [
         { icon: Icons.users, label: t('dashboard.stats.agents'), value: totalAgents, sub: t('dashboard.stats.online', { count: activeAgents }) },
         { icon: Icons.tasks, label: t('dashboard.stats.activeTasks'), value: pendingTasks, sub: t('dashboard.stats.completedRecent', { count: completedRecently, hours: windowHours }) },
-        {
-            icon: Icons.zap,
-            label: t('dashboard.stats.todayTokens'),
-            value: formatTokens(totalTokensToday),
-            sub: `Cache ${formatTokens(cacheReadToday)} · ${cacheHitRate}%`,
-        },
+        ...resourceStats,
         { icon: Icons.clock, label: t('dashboard.stats.recentlyActive'), value: recentlyActive, sub: t('dashboard.stats.lastHour') },
     ];
 
     return (
         <div style={{
-            display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '1px',
+            display: 'grid', gridTemplateColumns: `repeat(${stats.length}, minmax(0, 1fr))`, gap: '1px',
             background: 'var(--border-subtle)', borderRadius: 'var(--radius-lg)',
             overflow: 'hidden', marginBottom: '24px',
             border: '1px solid var(--border-subtle)',
@@ -329,7 +345,10 @@ function ActivityFeed({
 export default function Dashboard() {
     const { t, i18n } = useTranslation();
     const navigate = useNavigate();
-    const currentTenant = localStorage.getItem('current_tenant_id') || '';
+    const user = useAuthStore((state) => state.user);
+    const currentTenant = user?.tenant_id || localStorage.getItem('current_tenant_id') || '';
+    const accessSignature = productAccessSignature(user);
+    const canViewCompanyAnalytics = hasEffectiveCapability(user, 'company.analytics.view');
 
     const {
         data: topology,
@@ -337,15 +356,16 @@ export default function Dashboard() {
         isError: isTopologyError,
         refetch: refetchTopology,
     } = useQuery({
-        queryKey: ['workforce-topology', currentTenant, 24],
+        queryKey: ['workforce-topology', currentTenant, accessSignature, 24],
         queryFn: () => workforceApi.topology(24),
         refetchInterval: 15000,
     });
     const employeeAgents = topology?.nodes ?? [];
 
     const { data: tokenUsage } = useQuery({
-        queryKey: ['tenant-token-usage', currentTenant],
+        queryKey: ['tenant-token-usage', currentTenant, accessSignature],
         queryFn: () => tenantApi.tokenUsage(),
+        enabled: canViewCompanyAnalytics,
         refetchInterval: 15000,
     });
 
@@ -417,10 +437,11 @@ export default function Dashboard() {
                         agents={employeeAgents}
                         windowHours={topology!.window_hours}
                         tokenUsage={tokenUsage}
+                        canViewCompanyAnalytics={canViewCompanyAnalytics}
                     />
 
                     {/* OKR Summary (P3) — only shown when OKR is enabled */}
-                    <OKRSummaryCard />
+                    <OKRSummaryCard accessSignature={accessSignature} />
 
                     {/* Recent Activity */}
                     <div style={{

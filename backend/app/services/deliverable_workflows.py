@@ -15,9 +15,22 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.models.agent_run import AgentRun
-from app.models.deliverable import DeliverableExecution, DeliverableRequest
+from app.models.deliverable import (
+    DeliverableExecution,
+    DeliverableExecutionUnit,
+    DeliverableRequest,
+)
 from app.models.tool import AgentTool, Tool
+from app.services.creative_briefs import (
+    POSTER_V2_WORKFLOW_ID,
+    brief_projection,
+    candidate_count_for_policy,
+    compile_creative_brief,
+    poster_v2_rollout_allowed,
+    upsert_request_creative_brief,
+)
 from app.services.deliverable_artifacts import reconcile_runtime_deliverable_artifacts
 from app.services.deliverable_executions import (
     bind_artifacts_to_current_execution,
@@ -55,7 +68,7 @@ class WorkflowField(BaseModel):
     key: str = Field(pattern=r"^[a-z][a-z0-9_]*$")
     label_zh: str
     label_en: str
-    kind: Literal["text", "textarea", "number", "select"]
+    kind: Literal["text", "textarea", "number", "select", "json"]
     required: bool = False
     default: str | int | None = None
     minimum: int | None = None
@@ -215,9 +228,77 @@ _WORKFLOWS = (
         required_capability="video",
         launch_policy="agent_runtime",
     ),
+    WorkflowManifest(
+        workflow_id="builtin.poster.v2",
+        workflow_version="2.0.0",
+        work_type="poster",
+        label_zh="海报 / 图片（多候选）",
+        label_en="Poster / Image (multi-candidate)",
+        description_zh="结构化工作说明驱动，按档位生成多个候选并通过自动 QA。",
+        description_en="Structured-brief driven, tier-bound candidates with automated QA.",
+        fields=[
+            WorkflowField(
+                key="channel", label_zh="使用渠道", label_en="Channel", kind="select", required=True,
+                default="social", options=["social", "ecommerce", "print"],
+            ),
+            WorkflowField(
+                key="aspect_ratio", label_zh="画面比例", label_en="Aspect ratio", kind="select", required=True,
+                default="3:4", options=["1:1", "3:4", "9:16", "16:9"],
+            ),
+            WorkflowField(
+                key="audience", label_zh="目标受众", label_en="Audience", kind="text",
+                placeholder_zh="例如：25–35 岁都市白领", placeholder_en="e.g. urban professionals aged 25–35",
+            ),
+            WorkflowField(
+                key="style", label_zh="视觉风格", label_en="Visual style", kind="text", required=True,
+                default="commercial", placeholder_zh="例如：高端商业广告", placeholder_en="e.g. premium commercial campaign",
+            ),
+            WorkflowField(
+                key="exact_copy", label_zh="精确文案", label_en="Exact copy", kind="textarea",
+                placeholder_zh="需要逐字保留的中英文文案", placeholder_en="Copy that must be preserved exactly",
+            ),
+            WorkflowField(
+                key="exact_copy_blocks", label_zh="结构化精确文案", label_en="Structured exact copy", kind="json",
+                placeholder_zh='[{"role":"title","text":"…"}]', placeholder_en='[{"role":"title","text":"…"}]',
+            ),
+            WorkflowField(
+                key="brand_assets", label_zh="品牌资产", label_en="Brand assets", kind="json",
+                placeholder_zh='[{"path":"workspace/…/logo.png","position":"top"}]',
+                placeholder_en='[{"path":"workspace/…/logo.png","position":"top"}]',
+            ),
+            WorkflowField(
+                key="reference_assets", label_zh="参考素材", label_en="Reference assets", kind="json",
+                placeholder_zh='[{"path":"workspace/…/product.png","kind":"exact_asset"}]',
+                placeholder_en='[{"path":"workspace/…/product.png","kind":"exact_asset"}]',
+            ),
+            WorkflowField(
+                key="prohibitions", label_zh="禁止项", label_en="Prohibitions", kind="textarea",
+                placeholder_zh="每行一条禁止出现的元素", placeholder_en="One prohibited element per line",
+            ),
+            WorkflowField(
+                key="redraw_scope", label_zh="允许重绘范围", label_en="Redraw scope", kind="select",
+                default="full_creative", options=["background_only", "style_adaptation", "full_creative"],
+            ),
+            WorkflowField(
+                key="candidate_count", label_zh="候选数量", label_en="Candidates", kind="number",
+                minimum=1, maximum=4,
+                placeholder_zh="只能向下调整档位默认候选数", placeholder_en="May only tune the tier default down",
+            ),
+            _fallback_policy_field(),
+        ],
+        approval_policy=["composition", "final"],
+        output_contract=["png"],
+        required_capability="image",
+        launch_policy="agent_runtime",
+    ),
 )
 
-WORKFLOW_BY_TYPE = {workflow.work_type: workflow for workflow in _WORKFLOWS}
+# The first manifest registered for a work type stays the default for that
+# type; later (v2+) manifests are only reachable by explicit workflow_id.
+WORKFLOW_BY_TYPE: dict[str, WorkflowManifest] = {}
+for _workflow in _WORKFLOWS:
+    WORKFLOW_BY_TYPE.setdefault(_workflow.work_type, _workflow)
+del _workflow
 WORKFLOW_BY_ID = {workflow.workflow_id: workflow for workflow in _WORKFLOWS}
 
 
@@ -229,6 +310,17 @@ class DeliverableWorkflowError(ValueError):
 
 def list_workflow_manifests() -> list[WorkflowManifest]:
     return list(_WORKFLOWS)
+
+
+def poster_v2_workflow_allowed(tenant_id: uuid.UUID, agent_id: uuid.UUID) -> bool:
+    settings = get_settings()
+    return poster_v2_rollout_allowed(
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        enabled=settings.DELIVERABLE_POSTER_V2_ENABLED,
+        tenant_ids=settings.DELIVERABLE_POSTER_V2_TENANT_IDS,
+        agent_ids=settings.DELIVERABLE_POSTER_V2_AGENT_IDS,
+    )
 
 
 async def list_agent_launchable_workflows(
@@ -248,7 +340,15 @@ async def list_agent_launchable_workflows(
         return []
 
     available: list[WorkflowManifest] = []
+    poster_v2_allowed = poster_v2_workflow_allowed(tenant_id, agent_id)
     for workflow in _WORKFLOWS:
+        # The v2 poster pipeline replaces the v1 manifest for allowlisted
+        # tenants/Agents only; by default the v1 contract is the only poster
+        # workflow ever listed.
+        if workflow.workflow_id == POSTER_V2_WORKFLOW_ID and not poster_v2_allowed:
+            continue
+        if workflow.workflow_id == "builtin.poster.v1" and poster_v2_allowed:
+            continue
         if workflow.launch_policy != "agent_runtime":
             continue
         if (
@@ -283,11 +383,14 @@ def require_workflow(
     workflow_id: str | None = None,
     workflow_version: str | None = None,
 ) -> WorkflowManifest:
-    workflow = WORKFLOW_BY_TYPE.get(str(work_type or "").strip().lower())
+    normalized_type = str(work_type or "").strip().lower()
+    workflow = WORKFLOW_BY_TYPE.get(normalized_type)
     if workflow is None:
         raise DeliverableWorkflowError("unsupported_work_type", "Unsupported deliverable type")
-    if workflow_id is not None and workflow_id != workflow.workflow_id:
-        raise DeliverableWorkflowError("workflow_mismatch", "Workflow does not match the work type")
+    if workflow_id is not None:
+        workflow = WORKFLOW_BY_ID.get(workflow_id)
+        if workflow is None or workflow.work_type != normalized_type:
+            raise DeliverableWorkflowError("workflow_mismatch", "Workflow does not match the work type")
     if workflow_version is not None and workflow_version != workflow.workflow_version:
         raise DeliverableWorkflowError("workflow_version_mismatch", "Workflow version is not supported")
     return workflow
@@ -323,6 +426,24 @@ def validate_workflow_spec(workflow: WorkflowManifest, spec: dict[str, Any]) -> 
                 raise DeliverableWorkflowError("invalid_spec_field", f"{key} is below the minimum")
             if field.maximum is not None and value > field.maximum:
                 raise DeliverableWorkflowError("invalid_spec_field", f"{key} exceeds the maximum")
+        elif field.kind == "json":
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except ValueError as exc:
+                    raise DeliverableWorkflowError(
+                        "invalid_spec_field", f"{key} must be valid JSON"
+                    ) from exc
+            if isinstance(value, str) or not isinstance(value, (list, dict)):
+                raise DeliverableWorkflowError(
+                    "invalid_spec_field", f"{key} must be a JSON array or object"
+                )
+            try:
+                json.dumps(value, ensure_ascii=False)
+            except (TypeError, ValueError) as exc:
+                raise DeliverableWorkflowError(
+                    "invalid_spec_field", f"{key} must be JSON serializable"
+                ) from exc
         elif not isinstance(value, str):
             raise DeliverableWorkflowError("invalid_spec_field", f"{key} must be text")
         if field.options and str(value) not in field.options:
@@ -550,6 +671,41 @@ def build_deliverable_prompt(request: DeliverableRequest) -> str:
         == "allow_degraded"
     )
     allow_degraded_literal = str(allow_degraded_fallback).lower()
+    if request.work_type == "poster" and request.workflow_id == POSTER_V2_WORKFLOW_ID:
+        candidate_count = candidate_count_for_policy(request.tier, request.spec)
+        candidate_instructions: list[str] = []
+        for index in range(1, candidate_count + 1):
+            unit_key = f"candidate-{index:02d}"
+            prompt_path = f"workspace/deliverables/{request.id}/prompts/{unit_key}.txt"
+            candidate_instructions.append(
+                f"For {unit_key}: read the server-compiled provider prompt from '{prompt_path}' with "
+                "read_file, then call generate_image_minimax exactly once with that file's content passed "
+                "verbatim as the prompt argument (never write, rewrite, extend, translate, or summarize it), "
+                f"save_path='workspace/deliverables/{request.id}/candidates/{unit_key}.png', "
+                "aspect_ratio=spec.aspect_ratio, execution_strategy='commercial_quality', "
+                f"allow_degraded_fallback={allow_degraded_literal}, and overlay_blocks set to "
+                "DELIVERABLE_REQUEST.exact_copy_blocks unchanged. The server rejects a rewritten prompt or a "
+                "different save_path before any paid provider request."
+            )
+        return (
+            "You are executing a persisted Astra Deliverable Request under the v2 multi-candidate poster "
+            "pipeline. Treat the following JSON as the authoritative product brief. Do not choose or reveal "
+            "a provider/model. Use only enabled tools and keep every artifact under workspace/deliverables/"
+            f"{request.id}/. The server has compiled one provider prompt per candidate; your job is managed "
+            "orchestration only, never prompt authorship. Execute these candidate steps in order, one managed "
+            "Tool call each: "
+            + " ".join(candidate_instructions)
+            + " Every candidate call is independently durable and owns its own provider fallback and "
+            "recovery, so call the Tool exactly once per candidate and never retry manually. The managed "
+            "provider creates only the text-free visual background; Astra's server composes the exact copy "
+            "blocks with installed real fonts on every candidate. Never overlay the same copy again yourself. "
+            "Create only formats explicitly listed in output_contract. If no provider accepts a candidate, "
+            "record the failure for that candidate and continue with the remaining candidates; if every "
+            "candidate fails, stop without claiming delivery. Do not read the binary images. The final "
+            "response must report every candidate's exact versioned PNG workspace path, and never claim "
+            "success until the registered artifact contract confirms it.\n"
+            f"DELIVERABLE_REQUEST={json.dumps(contract, ensure_ascii=False, sort_keys=True)}"
+        )
     if request.work_type == "poster":
         return (
             "You are executing a persisted Astra Deliverable Request. Treat the following JSON as "
@@ -922,6 +1078,18 @@ def _credit_estimate(workflow: WorkflowManifest, tier: str, spec: dict[str, Any]
         }
     if workflow.work_type == "poster":
         credits = minimax_image_credits("image-01", images=1)
+        if workflow.workflow_id == POSTER_V2_WORKFLOW_ID:
+            # FR-I3: the candidate count is bound to the tier; deterministic
+            # compose adds no Provider cost, so minimum == maximum.
+            candidates = candidate_count_for_policy(tier, spec)
+            return {
+                "mode": "estimate",
+                "minimum": credits * candidates,
+                "maximum": credits * candidates,
+                "billing_unit": f"{candidates}_candidate_images",
+                "candidates": candidates,
+                "per_candidate_credits": credits,
+            }
         return {
             "mode": "estimate",
             "minimum": credits,
@@ -987,6 +1155,22 @@ async def preflight_workflow(
                 )
             except MediaContractError:
                 reasons.append("poster_layout_unfit")
+
+    creative_brief_projection: dict[str, Any] | None = None
+    if workflow.workflow_id == POSTER_V2_WORKFLOW_ID:
+        # FR-I1: an incomplete brief parks the request in the clarification
+        # state; no prompt is compiled and no Credits are reserved.
+        if not poster_v2_workflow_allowed(tenant_id, agent_id):
+            reasons.append("deliverable_poster_v2_not_allowlisted")
+        brief, missing_fields = compile_creative_brief(
+            goal,
+            normalized_spec,
+            inputs,
+            tier=normalized_tier,
+            delivery_formats=workflow.output_contract,
+        )
+        creative_brief_projection = brief_projection(brief, missing_fields)
+        reasons.extend(f"brief_missing:{field}" for field in missing_fields)
 
     try:
         await resolve_route(tenant_id, normalized_tier, "text")
@@ -1131,7 +1315,7 @@ async def preflight_workflow(
     }
     reasons = list(dict.fromkeys(reasons))
     hard_reasons = [reason for reason in reasons if reason not in soft_reasons]
-    return {
+    result: dict[str, Any] = {
         "available": not hard_reasons,
         "launchable": not reasons and workflow.launch_policy == "agent_runtime",
         "reasons": reasons,
@@ -1142,6 +1326,86 @@ async def preflight_workflow(
         "credit_estimate": _credit_estimate(workflow, normalized_tier, normalized_spec),
         "creates_reservation": False,
     }
+    if creative_brief_projection is not None:
+        result["creative_brief"] = creative_brief_projection
+    return result
+
+
+async def _prepare_poster_v2_compilations(
+    db: AsyncSession,
+    *,
+    request: DeliverableRequest,
+    execution: DeliverableExecution | None,
+) -> None:
+    """Compile and persist every candidate prompt before a v2 poster launch."""
+
+    from app.services.prompt_compiler import (
+        TIER_QUALITY_SIZE,
+        compile_image_prompt,
+        record_prompt_compilation,
+        store_compiled_prompt,
+    )
+
+    brief, missing_fields = compile_creative_brief(
+        request.goal,
+        request.spec,
+        request.inputs,
+        tier=request.tier,
+        delivery_formats=request.output_contract or ("png",),
+    )
+    if brief is None:
+        raise DeliverableWorkflowError(
+            "deliverable_brief_incomplete",
+            "Creative brief is incomplete: " + ", ".join(missing_fields),
+        )
+    if execution is None:
+        raise DeliverableWorkflowError(
+            "deliverable_execution_missing",
+            "v2 poster launch requires an active execution",
+        )
+    unit_result = await db.execute(
+        select(DeliverableExecutionUnit)
+        .where(
+            DeliverableExecutionUnit.tenant_id == request.tenant_id,
+            DeliverableExecutionUnit.execution_id == execution.id,
+            DeliverableExecutionUnit.stage_key == "candidate_generate",
+        )
+        .order_by(DeliverableExecutionUnit.unit_key)
+    )
+    units = tuple(unit_result.scalars().all())
+    if not units:
+        raise DeliverableWorkflowError(
+            "deliverable_execution_missing",
+            "v2 poster execution has no candidate units",
+        )
+    strategy_order = media_provider_order_for_image_strategy("commercial_quality")
+    provider_target = str(strategy_order[0]) if strategy_order else "minimax"
+    quality_size = TIER_QUALITY_SIZE.get(request.tier, "2K")
+    for unit in units:
+        candidate_index = int(str(unit.unit_key).rsplit("-", 1)[-1])
+        compiled = compile_image_prompt(
+            brief,
+            provider_target=provider_target,
+            candidate_index=candidate_index,
+            quality_size=quality_size,
+        )
+        prompt_path = await store_compiled_prompt(
+            agent_id=request.agent_id,
+            request_id=request.id,
+            unit_key=unit.unit_key,
+            content=compiled.neutral_prompt,
+        )
+        await record_prompt_compilation(
+            db,
+            tenant_id=request.tenant_id,
+            request_id=request.id,
+            execution_id=execution.id,
+            unit_id=unit.id,
+            compiled=compiled,
+            compiled_prompt_path=prompt_path,
+        )
+    await upsert_request_creative_brief(db, request, execution_id=execution.id)
+    await db.flush()
 
 
 @dataclass(slots=True)
@@ -1149,8 +1413,6 @@ class PreparedDeliverableLaunch:
     request: DeliverableRequest
     prompt: str
     execution: DeliverableExecution | None = None
-
-
 async def prepare_deliverable_launch(
     db: AsyncSession,
     *,
@@ -1219,6 +1481,14 @@ async def prepare_deliverable_launch(
             raise DeliverableWorkflowError(
                 "deliverable_preflight_failed",
                 f"Deliverable capability check failed: {reason}",
+            )
+        if workflow.workflow_id == POSTER_V2_WORKFLOW_ID:
+            # FR-I2: compile every candidate prompt before the run starts so
+            # the Runtime only ever injects server-owned prompt file paths.
+            await _prepare_poster_v2_compilations(
+                db,
+                request=request,
+                execution=execution,
             )
         request.launch_message_id = message_id
         request.status = "running"
@@ -1342,6 +1612,10 @@ async def sync_deliverable_lifecycle(
             .with_for_update()
         )
         for candidate in candidates_result.scalars().all():
+            if candidate.workflow_id == POSTER_V2_WORKFLOW_ID:
+                from app.services.candidate_qa import evaluate_poster_v2_candidates
+
+                await evaluate_poster_v2_candidates(db, request=candidate, run_id=run_id)
             reconciliation = await reconcile_runtime_deliverable_artifacts(
                 db,
                 request=candidate,
@@ -1409,6 +1683,10 @@ async def sync_deliverable_lifecycle(
         "presentation",
         "video",
     }:
+        if request.workflow_id == POSTER_V2_WORKFLOW_ID:
+            from app.services.candidate_qa import evaluate_poster_v2_candidates
+
+            await evaluate_poster_v2_candidates(db, request=request, run_id=run_id)
         reconciliation = await reconcile_runtime_deliverable_artifacts(
             db,
             request=request,

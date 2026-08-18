@@ -55,6 +55,7 @@ class _Session:
     def __init__(self, *results: object) -> None:
         self.results = deque(results)
         self.added: list[object] = []
+        self.executed: list[object] = []
         self.flushes = 0
 
     async def __aenter__(self):
@@ -66,7 +67,8 @@ class _Session:
     def begin(self) -> _Transaction:
         return _Transaction()
 
-    async def execute(self, _statement) -> _ScalarResult:
+    async def execute(self, statement) -> _ScalarResult:
+        self.executed.append(statement)
         return _ScalarResult(self.results.popleft())
 
     def add(self, value: object) -> None:
@@ -326,10 +328,36 @@ async def test_completed_group_run_waits_for_all_participants_and_projects_resul
     assert task.completed_at == completed_at
     log = session.added[0]
     assert isinstance(log, TaskLog)
-    assert log.id == uuid.uuid5(task.id, "group-task-terminal")
+    assert log.id == uuid.uuid5(
+        task.id,
+        f"group-task-terminal:{stored_run.source_id}",
+    )
     assert "Group 协作任务完成" in log.content
     assert "Researcher" in log.content
     assert "three verified findings" in log.content
+
+
+@pytest.mark.asyncio
+async def test_initial_group_attempt_accepts_the_legacy_terminal_receipt() -> None:
+    run, checkpoint, stored_run, task = _records(source_type="chat")
+    task.executor_kind = "group"
+    task.group_id = uuid.uuid4()
+    correlation_id = f"work-task:{task.id}"
+    run = replace(run, correlation_id=correlation_id)
+    stored_run.source_type = "chat"
+    stored_run.source_id = str(uuid.uuid5(task.id, "group-work-task-message"))
+    stored_run.correlation_id = correlation_id
+    legacy_receipt_id = uuid.uuid5(task.id, "group-task-terminal")
+    session = _Session(stored_run, task, legacy_receipt_id)
+    handler = TaskRuntimeCompletionHandler(
+        session_factory=_SessionFactory(session),  # type: ignore[arg-type]
+    )
+
+    await handler.handle(run=run, checkpoint=checkpoint)
+
+    assert task.status == "doing"
+    assert session.added == []
+    assert session.flushes == 0
 
 
 @pytest.mark.asyncio
@@ -431,6 +459,56 @@ async def test_group_partial_failure_keeps_task_pending_and_names_each_outcome()
     assert "Three source-backed findings are ready." in log.content
     assert "Reviewer · 执行失败" in log.content
     assert "原因：model_call_failed" in log.content
+
+
+@pytest.mark.asyncio
+async def test_group_retry_reconciles_only_the_current_attempt() -> None:
+    run, checkpoint, stored_run, task = _records(source_type="chat", status="failed")
+    task.executor_kind = "group"
+    task.group_id = uuid.uuid4()
+    correlation_id = f"work-task:{task.id}"
+    retry_source_id = str(uuid.uuid4())
+    run = replace(run, correlation_id=correlation_id)
+    stored_run.source_type = "chat"
+    stored_run.source_id = retry_source_id
+    stored_run.correlation_id = correlation_id
+    failed = AgentRunEvent(
+        id=uuid.uuid4(),
+        tenant_id=run.tenant_id,
+        run_id=stored_run.id,
+        agent_id=task.agent_id,
+        event_type="run_failed",
+        summary="Runtime Run failed",
+        payload={"status": "failed", "error_code": "model_call_failed"},
+        artifact_refs=[],
+        idempotency_key="retry-terminal",
+    )
+    session = _Session(
+        stored_run,
+        task,
+        None,
+        [stored_run],
+        [failed],
+        [],
+        [],
+    )
+    handler = TaskRuntimeCompletionHandler(
+        session_factory=_SessionFactory(session),  # type: ignore[arg-type]
+    )
+
+    await handler.handle(run=run, checkpoint=checkpoint)
+
+    assert task.status == "pending"
+    assert task.completed_at is None
+    log = session.added[0]
+    assert isinstance(log, TaskLog)
+    assert log.id == uuid.uuid5(
+        task.id,
+        f"group-task-terminal:{retry_source_id}",
+    )
+    participant_query = str(session.executed[3])
+    assert "agent_runs.source_id" in participant_query
+    assert "agent_runs.correlation_id" in participant_query
 
 
 @pytest.mark.asyncio

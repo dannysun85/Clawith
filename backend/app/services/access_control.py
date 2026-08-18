@@ -40,6 +40,13 @@ SURFACE_PLATFORM_ADMIN = "platform_admin"
 MEMBERSHIP_ROLES = frozenset({"member", "org_admin", "org_owner"})
 COMPANY_GOVERNANCE_ROLES = frozenset({"org_admin", "org_owner"})
 
+# IdentityCapabilityGrant is account-global.  Only capabilities whose product
+# meaning is explicitly global may be projected from it.  Tenant finance,
+# analytics, OKR, settings, or other company authority must come from the
+# active membership (or a future tenant-scoped grant model), never from a
+# grant attached to the same Identity in another company.
+GLOBAL_IDENTITY_CAPABILITIES = frozenset({"company.create"})
+
 MEMBER_CAPABILITIES = frozenset(
     {
         "work.use",
@@ -56,7 +63,10 @@ COMPANY_ADMIN_CAPABILITIES = frozenset(
         "company.settings.manage",
         "company.audit.view",
         "company.billing.view",
-        "company.billing.manage",
+        "company.analytics.view",
+        "company.okr.view_all",
+        "company.okr.reports.view_all",
+        "company.okr.manage",
         "agent.create.company",
         "agent.manage.company",
     }
@@ -67,6 +77,7 @@ COMPANY_OWNER_CAPABILITIES = frozenset(
         "company.admins.manage",
         "company.ownership.transfer",
         "company.delete",
+        "company.billing.manage",
     }
 )
 
@@ -230,7 +241,8 @@ async def resolve_effective_access(db: AsyncSession, user: User) -> EffectiveAcc
     identity_id = getattr(user, "identity_id", None) or getattr(identity, "id", None)
     membership_role = normalized_membership_role(user)
     global_roles: set[str] = set()
-    capabilities = await _identity_capabilities(db, identity_id=identity_id)
+    identity_capabilities = await _identity_capabilities(db, identity_id=identity_id)
+    capabilities = identity_capabilities.intersection(GLOBAL_IDENTITY_CAPABILITIES)
     surfaces: set[str] = set()
 
     if membership_role is not None and getattr(user, "is_active", True):

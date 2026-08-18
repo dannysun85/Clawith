@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate, useParams } from 'react-router';
+import { useNavigate, useParams, useSearchParams } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
+    IconArrowLeft,
     IconChevronDown,
     IconChevronRight,
     IconLayoutSidebarLeftCollapse,
@@ -32,6 +33,7 @@ import GroupSidePanel from './GroupSidePanel';
 import GroupSettingsModal from './GroupSettingsModal';
 import InviteMemberModal from './InviteMemberModal';
 import CreateGroupModal from './CreateGroupModal';
+import CreateGroupTaskModal from './CreateGroupTaskModal';
 import InlineEdit from './InlineEdit';
 import type { GroupMessage, GroupSession } from '../../types/group';
 import './groups.css';
@@ -73,9 +75,11 @@ const mergeMessages = (previous: GroupMessage[], incoming: GroupMessage[]): Grou
 export default function GroupsPage() {
     const { t } = useTranslation();
     const navigate = useNavigate();
+    const [searchParams] = useSearchParams();
     const toast = useToast();
     const queryClient = useQueryClient();
     const { groupId, sessionId } = useParams<{ groupId?: string; sessionId?: string }>();
+    const showGroupList = searchParams.get('view') === 'list';
     const currentUser = useAuthStore((state) => state.user);
 
     const [messages, setMessages] = useState<GroupMessage[]>([]);
@@ -102,6 +106,7 @@ export default function GroupsPage() {
     const [deletingSession, setDeletingSession] = useState<GroupSession | null>(null);
     const [deletingGroup, setDeletingGroup] = useState(false);
     const [showSettings, setShowSettings] = useState(false);
+    const [taskSourceMessage, setTaskSourceMessage] = useState<GroupMessage | null>(null);
     const groupActivityRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const appliedRealtimeMessageIdsRef = useRef<Set<string>>(new Set());
     const latestRealtimeMessageBySessionRef = useRef<Map<string, GroupMessage>>(new Map());
@@ -174,6 +179,26 @@ export default function GroupsPage() {
     const activeGroupId = activeGroup?.id;
     const activeSessionId = activeSession?.id;
 
+    const { data: linkedTasks = [] } = useQuery({
+        queryKey: ['group-tasks', currentUser?.tenant_id, activeGroupId, activeSessionId],
+        queryFn: () => groupApi.tasks(activeGroupId!, activeSessionId),
+        enabled: Boolean(currentUser?.tenant_id && activeGroupId && activeSessionId),
+        refetchInterval: (query) => (
+            query.state.data?.some((task) => (
+                task.status_axes.execution === 'queued'
+                || task.status_axes.execution === 'running'
+                || task.status_axes.execution === 'waiting'
+            )) ? 5_000 : false
+        ),
+    });
+    const linkedTaskByMessageId = useMemo(
+        () => new Map(
+            linkedTasks
+                .filter((task) => task.source_message_id)
+                .map((task) => [task.source_message_id!, task]),
+        ),
+        [linkedTasks],
+    );
     const { data: activeRunStates = [], refetch: refetchActiveRuns } = useQuery({
         queryKey: ['group-active-runs', groupId, sessionId],
         queryFn: () => groupApi.activeRuns(groupId!, sessionId!),
@@ -259,10 +284,10 @@ export default function GroupsPage() {
 
     // Land on a group, then on a session, so the pane is never pointing at nothing.
     useEffect(() => {
-        if (groupsReady && !groupId && groups.length > 0) {
+        if (groupsReady && !groupId && groups.length > 0 && !showGroupList) {
             navigate(`/groups/${groups[0].id}`, { replace: true });
         }
-    }, [groupId, groups, groupsReady, navigate]);
+    }, [groupId, groups, groupsReady, navigate, showGroupList]);
 
     useEffect(() => {
         if (groupsReady && groupId && !activeGroup) {
@@ -467,6 +492,10 @@ export default function GroupsPage() {
 
     const toggleGroups = persistToggle('groups.groupsCollapsed', setGroupsCollapsed);
     const togglePanel = persistToggle('groups.showPanel', setShowPanel);
+    const closePanel = () => {
+        localStorage.setItem('groups.showPanel', '0');
+        setShowPanel(false);
+    };
 
     const toggleGroupExpand = (id: string) => setExpandedGroups((current) => {
         const next = new Set(current);
@@ -609,7 +638,7 @@ export default function GroupsPage() {
         try {
             await groupApi.remove(groupId);
             setDeletingGroup(false);
-            setShowPanel(false);
+            closePanel();
             const remaining = await refetchGroups();
             const next = remaining.data?.find((group) => group.id !== groupId);
             navigate(next ? `/groups/${next.id}` : '/groups', { replace: true });
@@ -625,7 +654,7 @@ export default function GroupsPage() {
     );
 
     return (
-        <div className="groups-page">
+        <div className={`groups-page ${activeGroup && activeSession ? 'has-active-session' : ''}`}>
             <div className={`group-column tree ${groupsCollapsed ? 'collapsed' : ''}`}>
                 {groupsCollapsed ? (
                     <button
@@ -810,6 +839,14 @@ export default function GroupsPage() {
                 {activeGroup && activeSession ? (
                     <>
                         <header className="group-main-header">
+                            <button
+                                type="button"
+                                className="group-icon-btn group-mobile-back"
+                                title={t('groups.backToGroups', '返回群聊列表')}
+                                onClick={() => navigate('/groups?view=list')}
+                            >
+                                <IconArrowLeft size={17} stroke={1.8} />
+                            </button>
                             <div className="group-main-heading">
                                 <div className="group-main-title">{activeSession.title}</div>
                                 <div className="group-main-subtitle">
@@ -843,6 +880,9 @@ export default function GroupsPage() {
                             runningAgents={runningAgents}
                             onLoadMore={() => void loadMore()}
                             onLatestMessageSeen={markLatestMessageSeen}
+                            onCreateTask={setTaskSourceMessage}
+                            linkedTaskByMessageId={linkedTaskByMessageId}
+                            onOpenTask={(taskId) => navigate(`/work/${taskId}`)}
                         />
 
                         <MessageComposer
@@ -865,11 +905,31 @@ export default function GroupsPage() {
             {showPanel && activeGroup && (
                 <GroupSidePanel
                     groupId={activeGroup.id}
+                    sessionId={activeSession?.id}
                     groupName={activeGroup.name}
                     members={members}
                     onInvite={() => setShowInvite(true)}
                     onOpenSettings={() => setShowSettings(true)}
-                    onClose={() => setShowPanel(false)}
+                    onClose={closePanel}
+                />
+            )}
+
+            {taskSourceMessage && activeGroup && activeSession && (
+                <CreateGroupTaskModal
+                    groupId={activeGroup.id}
+                    groupName={activeGroup.name}
+                    sessionId={activeSession.id}
+                    sessionTitle={activeSession.title}
+                    sourceMessage={taskSourceMessage}
+                    members={members}
+                    onClose={() => setTaskSourceMessage(null)}
+                    onCreated={(taskId) => {
+                        setTaskSourceMessage(null);
+                        void queryClient.invalidateQueries({
+                            queryKey: ['group-tasks', currentUser?.tenant_id, activeGroup.id],
+                        });
+                        navigate(`/work/${taskId}`);
+                    }}
                 />
             )}
 

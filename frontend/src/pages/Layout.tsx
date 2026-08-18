@@ -46,6 +46,7 @@ import { normalizeTenantRedirectUrl } from '../utils/authTransport';
 import { commitSameOriginTenantSwitch, validateTenantSwitchCandidate } from '../utils/tenantSwitch';
 import { partitionAgentRoles } from '../utils/productRoles';
 import {
+    hasEffectiveCapability,
     hasProductSurface,
     isPlatformOperator,
 } from '../utils/productAccess';
@@ -1273,7 +1274,9 @@ export default function Layout() {
                                     </button>
                                     <button className="account-dropdown-item" onClick={() => { navigate('/account/subscription'); setShowAccountMenu(false); }}>
                                         <IconReceipt size={15} stroke={1.5} />
-                                        <span>{isChinese ? '套餐与用量' : 'Plan and usage'}</span>
+                                        <span>{hasEffectiveCapability(user, 'company.billing.view')
+                                            ? (isChinese ? '套餐与公司用量' : 'Plan and company usage')
+                                            : (isChinese ? '我的用量' : 'My usage')}</span>
                                     </button>
                                     {canAccessCompanySettings && (
                                         <button className="account-dropdown-item" onClick={() => { navigate('/company-admin'); setShowAccountMenu(false); }}>
@@ -1444,7 +1447,7 @@ export default function Layout() {
                 </div>
             )}
 
-            <main className={`main-content${isChatPage ? ' chat-page' : ''}${isAgentSettingsPage ? ' agent-settings-page' : ''}`}>
+            <main className={`main-content${isChatPage ? ' chat-page' : ''}${isAgentSettingsPage ? ' agent-settings-page' : ''}${isGroupsPage ? ' groups-shell' : ''}`}>
                 <Outlet context={{ openTalentMarket: handleOpenTalentMarket }} />
             </main>
 

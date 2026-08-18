@@ -1,0 +1,416 @@
+"""Structured creative briefs for v2 deliverable workflows (FR-I1).
+
+The compiler in this module is a pure function: it never calls a Provider,
+never reserves Credits, and never invents missing brief elements.  An
+incomplete brief is reported through the clarification seam instead of being
+silently padded.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+import hashlib
+import json
+from typing import Any, Literal
+import uuid
+
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.deliverable import DeliverableCreativeBrief, DeliverableRequest
+from app.services.poster_contract import poster_exact_copy_blocks
+
+
+CREATIVE_BRIEF_SCHEMA_VERSION = "creative-brief-v1"
+POSTER_V2_WORKFLOW_ID = "builtin.poster.v2"
+
+TIER_CANDIDATE_DEFAULTS = {"lite": 1, "pro": 2, "ultra": 3}
+MAX_CANDIDATE_COUNT = 4
+REDRAW_SCOPES = ("background_only", "style_adaptation", "full_creative")
+
+_IMAGE_INPUT_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
+
+
+class ExactCopyBlock(BaseModel):
+    role: str = Field(min_length=1, max_length=32)
+    text: str = Field(min_length=1, max_length=500)
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class BrandAssetRef(BaseModel):
+    path: str = Field(min_length=1, max_length=1000)
+    position: str | None = Field(default=None, max_length=32)
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class ReferenceAssetRef(BaseModel):
+    path: str = Field(min_length=1, max_length=1000)
+    kind: Literal["exact_asset", "creative_reference"] = "creative_reference"
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class CandidatePolicy(BaseModel):
+    """Tier-bound candidate count; a request may only tune the count down."""
+
+    tier: str = Field(min_length=1, max_length=20)
+    tier_default: int = Field(ge=1, le=MAX_CANDIDATE_COUNT)
+    requested: int | None = Field(default=None, ge=1, le=MAX_CANDIDATE_COUNT)
+    effective: int = Field(ge=1, le=MAX_CANDIDATE_COUNT)
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class CreativeBrief(BaseModel):
+    """Provider-neutral customer brief; provider/model fields are forbidden."""
+
+    purpose: str = Field(min_length=1, max_length=2000)
+    channel: str = Field(min_length=1, max_length=64)
+    audience: str = Field(min_length=1, max_length=500)
+    aspect_ratio: str = Field(min_length=1, max_length=16)
+    style: str = Field(min_length=1, max_length=200)
+    exact_copy_blocks: tuple[ExactCopyBlock, ...] = ()
+    brand_assets: tuple[BrandAssetRef, ...] = ()
+    reference_assets: tuple[ReferenceAssetRef, ...] = ()
+    redraw_scope: Literal["background_only", "style_adaptation", "full_creative"] = "full_creative"
+    prohibitions: tuple[str, ...] = ()
+    candidate_policy: CandidatePolicy
+    delivery_formats: tuple[str, ...] = ("png",)
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+def candidate_count_for_policy(tier: str, spec: Mapping[str, Any] | None) -> int:
+    """Authoritative candidate count: the tier default may only be tuned down."""
+
+    tier_default = TIER_CANDIDATE_DEFAULTS.get(str(tier or "").strip().lower(), 1)
+    configured = (spec or {}).get("candidate_count")
+    if isinstance(configured, bool) or not isinstance(configured, int):
+        return tier_default
+    return max(1, min(configured, tier_default, MAX_CANDIDATE_COUNT))
+
+
+def brief_sha256(brief: CreativeBrief) -> str:
+    canonical = json.dumps(
+        brief.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _text(value: object) -> str:
+    return str(value or "").strip()
+
+
+def _workspace_asset_path(value: object) -> str:
+    path = _text(value).replace("\\", "/").lstrip("/")
+    if not path or ".." in path.split("/"):
+        return ""
+    if path.startswith("uploads/"):
+        path = f"workspace/{path}"
+    if not path.startswith("workspace/"):
+        return ""
+    return path
+
+
+def _input_reference_assets(
+    inputs: Sequence[Mapping[str, Any] | object] | None,
+) -> tuple[ReferenceAssetRef, ...]:
+    assets: list[ReferenceAssetRef] = []
+    seen: set[str] = set()
+    for item in inputs or ():
+        value = item.get("path") if isinstance(item, Mapping) else getattr(item, "path", None)
+        path = _workspace_asset_path(value)
+        normalized = path.casefold()
+        if not path or not normalized.endswith(_IMAGE_INPUT_SUFFIXES) or normalized in seen:
+            continue
+        seen.add(normalized)
+        assets.append(ReferenceAssetRef(path=path, kind="creative_reference"))
+    return tuple(assets)
+
+
+def _brand_assets(value: object, missing: list[str]) -> tuple[BrandAssetRef, ...]:
+    if value in (None, ""):
+        return ()
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        missing.append("brand_assets")
+        return ()
+    assets: list[BrandAssetRef] = []
+    for index, entry in enumerate(value):
+        if not isinstance(entry, Mapping):
+            missing.append(f"brand_assets[{index}]")
+            continue
+        path = _workspace_asset_path(entry.get("path"))
+        if not path:
+            missing.append(f"brand_assets[{index}].path")
+            continue
+        position = _text(entry.get("position")) or None
+        assets.append(BrandAssetRef(path=path, position=position))
+    return tuple(assets)
+
+
+def _reference_assets(value: object, missing: list[str]) -> tuple[ReferenceAssetRef, ...]:
+    if value in (None, ""):
+        return ()
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        missing.append("reference_assets")
+        return ()
+    assets: list[ReferenceAssetRef] = []
+    for index, entry in enumerate(value):
+        if not isinstance(entry, Mapping):
+            missing.append(f"reference_assets[{index}]")
+            continue
+        path = _workspace_asset_path(entry.get("path"))
+        if not path:
+            missing.append(f"reference_assets[{index}].path")
+            continue
+        kind = _text(entry.get("kind")) or "creative_reference"
+        if kind not in {"exact_asset", "creative_reference"}:
+            missing.append(f"reference_assets[{index}].kind")
+            continue
+        assets.append(ReferenceAssetRef(path=path, kind=kind))
+    return tuple(assets)
+
+
+def _prohibitions(value: object) -> tuple[str, ...]:
+    if value in (None, ""):
+        return ()
+    if isinstance(value, str):
+        lines: Sequence[object] = value.splitlines()
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        lines = value
+    else:
+        return ()
+    return tuple(dict.fromkeys(item for item in (_text(line) for line in lines) if item))
+
+
+def compile_creative_brief(
+    goal: str,
+    spec: Mapping[str, Any] | None,
+    inputs: Sequence[Mapping[str, Any] | object] | None,
+    *,
+    tier: str | None = None,
+    delivery_formats: Sequence[str] = ("png",),
+) -> tuple[CreativeBrief | None, tuple[str, ...]]:
+    """Compile a structured brief; missing elements are reported, never invented.
+
+    Returns ``(None, missing_fields)`` when a required element is absent so the
+    caller can park the request in the clarification state before any prompt is
+    compiled or any Credits are reserved.
+    """
+
+    normalized_spec = dict(spec or {})
+    missing: list[str] = []
+
+    purpose = _text(normalized_spec.get("purpose")) or _text(goal)
+    if not purpose:
+        missing.append("purpose")
+    channel = _text(normalized_spec.get("channel"))
+    if not channel:
+        missing.append("channel")
+    audience = _text(normalized_spec.get("audience"))
+    if not audience:
+        missing.append("audience")
+    aspect_ratio = _text(normalized_spec.get("aspect_ratio"))
+    if not aspect_ratio:
+        missing.append("aspect_ratio")
+    style = _text(normalized_spec.get("style")) or "commercial"
+    redraw_scope = _text(normalized_spec.get("redraw_scope")) or "full_creative"
+    if redraw_scope not in REDRAW_SCOPES:
+        missing.append("redraw_scope")
+
+    try:
+        copy_blocks = tuple(
+            ExactCopyBlock(role=block["role"], text=block["text"])
+            for block in poster_exact_copy_blocks(normalized_spec)
+        )
+    except Exception:
+        copy_blocks = ()
+        missing.append("exact_copy_blocks")
+
+    brand_assets = _brand_assets(normalized_spec.get("brand_assets"), missing)
+    reference_assets = _reference_assets(normalized_spec.get("reference_assets"), missing)
+    input_assets = _input_reference_assets(inputs)
+    known_paths = {asset.path.casefold() for asset in reference_assets}
+    reference_assets += tuple(
+        asset for asset in input_assets if asset.path.casefold() not in known_paths
+    )
+
+    if missing:
+        return None, tuple(dict.fromkeys(missing))
+
+    normalized_tier = str(tier or "").strip().lower() or "pro"
+    tier_default = TIER_CANDIDATE_DEFAULTS.get(normalized_tier, 1)
+    configured = normalized_spec.get("candidate_count")
+    requested = (
+        configured
+        if isinstance(configured, int) and not isinstance(configured, bool)
+        else None
+    )
+    brief = CreativeBrief(
+        purpose=purpose[:2000],
+        channel=channel,
+        audience=audience,
+        aspect_ratio=aspect_ratio,
+        style=style,
+        exact_copy_blocks=copy_blocks,
+        brand_assets=brand_assets,
+        reference_assets=reference_assets,
+        redraw_scope=redraw_scope,
+        prohibitions=_prohibitions(normalized_spec.get("prohibitions")),
+        candidate_policy=CandidatePolicy(
+            tier=normalized_tier,
+            tier_default=tier_default,
+            requested=requested,
+            effective=candidate_count_for_policy(normalized_tier, normalized_spec),
+        ),
+        delivery_formats=tuple(
+            str(item).strip().lower() for item in delivery_formats if str(item).strip()
+        )
+        or ("png",),
+    )
+    return brief, ()
+
+
+def brief_projection(
+    brief: CreativeBrief | None,
+    missing_fields: Sequence[str],
+) -> dict[str, Any]:
+    """Secret-free brief projection for preflight snapshots and API reads."""
+
+    projection: dict[str, Any] = {
+        "schema_version": CREATIVE_BRIEF_SCHEMA_VERSION,
+        "status": "confirmed" if brief is not None else "clarifying",
+        "missing_fields": list(missing_fields),
+    }
+    if brief is not None:
+        projection["brief_sha256"] = brief_sha256(brief)
+        projection["candidate_count"] = brief.candidate_policy.effective
+    return projection
+
+
+def poster_v2_rollout_allowed(
+    *,
+    tenant_id: uuid.UUID | str | None,
+    agent_id: uuid.UUID | str | None,
+    enabled: bool,
+    tenant_ids: str,
+    agent_ids: str,
+) -> bool:
+    """v2 poster orchestration is allowlist-gated like the quality gate flags."""
+
+    if not enabled:
+        return False
+
+    def parse(raw: str) -> set[str]:
+        return {item.strip() for item in str(raw or "").split(",") if item.strip()}
+
+    return str(tenant_id) in parse(tenant_ids) or str(agent_id) in parse(agent_ids)
+
+
+async def current_request_brief(
+    db: AsyncSession,
+    request: DeliverableRequest,
+) -> DeliverableCreativeBrief | None:
+    result = await db.execute(
+        select(DeliverableCreativeBrief)
+        .where(
+            DeliverableCreativeBrief.tenant_id == request.tenant_id,
+            DeliverableCreativeBrief.request_id == request.id,
+        )
+        .order_by(DeliverableCreativeBrief.created_at.desc(), DeliverableCreativeBrief.id.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def upsert_request_creative_brief(
+    db: AsyncSession,
+    request: DeliverableRequest,
+    *,
+    execution_id: uuid.UUID | None = None,
+    created_by_run_id: uuid.UUID | None = None,
+) -> DeliverableCreativeBrief | None:
+    """Compile and persist the v2 poster brief; no-op for non-v2 requests.
+
+    An incomplete brief keeps the request launchable-as-draft only: the request
+    stays ``ready`` but its stage becomes ``brief_clarifying`` and the current
+    execution is parked as ``blocked`` with a ``brief_missing:<field>`` reason,
+    so no prompt is compiled and no Provider task or reservation can be created.
+    """
+
+    if request.workflow_id != POSTER_V2_WORKFLOW_ID:
+        return None
+    brief, missing = compile_creative_brief(
+        request.goal,
+        request.spec,
+        request.inputs,
+        tier=request.tier,
+        delivery_formats=request.output_contract or ("png",),
+    )
+    resolved_execution_id = execution_id or request.current_execution_id
+    existing = None
+    if resolved_execution_id is not None:
+        result = await db.execute(
+            select(DeliverableCreativeBrief).where(
+                DeliverableCreativeBrief.tenant_id == request.tenant_id,
+                DeliverableCreativeBrief.request_id == request.id,
+                DeliverableCreativeBrief.execution_id == resolved_execution_id,
+                DeliverableCreativeBrief.schema_version == CREATIVE_BRIEF_SCHEMA_VERSION,
+            )
+        )
+        existing = result.scalar_one_or_none()
+    status = "confirmed" if brief is not None else "clarifying"
+    payload = brief.model_dump(mode="json") if brief is not None else {}
+    digest = brief_sha256(brief) if brief is not None else hashlib.sha256(b"{}").hexdigest()
+    if existing is None:
+        existing = DeliverableCreativeBrief(
+            id=uuid.uuid4(),
+            tenant_id=request.tenant_id,
+            request_id=request.id,
+            execution_id=resolved_execution_id,
+            modality="image",
+            schema_version=CREATIVE_BRIEF_SCHEMA_VERSION,
+            status=status,
+            brief=payload,
+            source_inventory=[],
+            missing_fields=list(missing),
+            brief_sha256=digest,
+            created_by_run_id=created_by_run_id,
+        )
+        db.add(existing)
+    else:
+        existing.status = status
+        existing.brief = payload
+        existing.missing_fields = list(missing)
+        existing.brief_sha256 = digest
+        if created_by_run_id is not None:
+            existing.created_by_run_id = created_by_run_id
+    request.current_stage = "brief_confirmed" if brief is not None else "brief_clarifying"
+    return existing
+
+
+__all__ = [
+    "CREATIVE_BRIEF_SCHEMA_VERSION",
+    "MAX_CANDIDATE_COUNT",
+    "POSTER_V2_WORKFLOW_ID",
+    "REDRAW_SCOPES",
+    "TIER_CANDIDATE_DEFAULTS",
+    "BrandAssetRef",
+    "CandidatePolicy",
+    "CreativeBrief",
+    "ExactCopyBlock",
+    "ReferenceAssetRef",
+    "brief_projection",
+    "brief_sha256",
+    "candidate_count_for_policy",
+    "compile_creative_brief",
+    "current_request_brief",
+    "poster_v2_rollout_allowed",
+    "upsert_request_creative_brief",
+]

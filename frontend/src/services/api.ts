@@ -336,6 +336,19 @@ export type TenantOwnershipTransfer = {
     created_at: string;
 };
 
+export type TenantTokenUsageBucket = {
+    total_tokens: number;
+    cache_read_tokens: number;
+    cache_creation_tokens: number;
+    cache_hit_rate: number;
+};
+
+export type TenantTokenUsage = {
+    today: TenantTokenUsageBucket;
+    month: TenantTokenUsageBucket;
+    total: TenantTokenUsageBucket;
+};
+
 export const tenantApi = {
     selfCreate: (data: { name: string; timezone?: string; country_region?: string }, idempotencyKey?: string) =>
         request<any>('/tenants/self-create', {
@@ -372,7 +385,7 @@ export const tenantApi = {
     }) => request<any>(`/tenants/${tenantId}`, { method: 'PUT', body: JSON.stringify(data) }),
 
     tokenUsage: () =>
-        request<any>('/tenants/me/token-usage'),
+        request<TenantTokenUsage>('/tenants/me/token-usage'),
 
     requestOwnershipTransfer: (tenantId: string, data: { new_owner_user_id: string; current_password: string }) =>
         request<any>(`/tenants/${tenantId}/ownership-transfers`, { method: 'POST', body: JSON.stringify(data) }),
@@ -783,17 +796,25 @@ export type WorkItem = {
     updated_at: string;
 };
 
+export type WorkExecutorKind = 'personal_assistant' | 'agent_employee' | 'temporary_expert' | 'group';
+
 export type WorkTaskDraft = {
     title: string;
     intent: string;
     work_type: 'general' | 'image' | 'video' | 'presentation' | 'document';
     priority: 'low' | 'medium' | 'high' | 'urgent';
-    executor_kind: 'personal_assistant' | 'agent_employee' | 'temporary_expert' | 'group';
+    routing_mode?: 'auto' | 'manual';
+    executor_kind?: WorkExecutorKind;
     agent_id?: string;
     expert_role?: string;
     group_id?: string;
     group_session_id?: string;
     group_agent_participant_ids?: string[];
+    source_kind?: 'workbench' | 'group_message';
+    source_group_id?: string;
+    source_session_id?: string;
+    source_message_id?: string;
+    source_message_cursor?: string;
 };
 
 export type WorkTaskPreflight = {
@@ -804,6 +825,17 @@ export type WorkTaskPreflight = {
     approval_required: boolean;
     reasons: string[];
     next_action?: string | null;
+    executor_proposal: {
+        policy_version: string;
+        chosen_executor_kind: WorkExecutorKind;
+        agent_id: string;
+        agent_name: string;
+        reason_codes: string[];
+        confidence: number;
+        candidates_considered: Array<Record<string, unknown>>;
+        capability_snapshot: Record<string, unknown>;
+        fallback?: Record<string, unknown> | null;
+    };
     work_statement: {
         version: number;
         objective: string;
@@ -813,7 +845,7 @@ export type WorkTaskPreflight = {
         delivery_mode: 'task_only';
         priority: WorkTaskDraft['priority'];
         executor: {
-            kind: WorkTaskDraft['executor_kind'];
+            kind: WorkExecutorKind;
             agent_id: string;
             agent_name: string;
             expert_role?: string | null;
@@ -852,10 +884,145 @@ export type WorkIndex = {
     next_cursor?: string | null;
 };
 
+export type WorkStatusAxes = {
+    execution: 'not_started' | 'queued' | 'running' | 'waiting' | 'completed' | 'failed' | 'cancelled';
+    artifact: 'missing' | 'candidate' | 'approved' | 'rejected' | 'superseded';
+    quality: 'not_required' | 'open' | 'passed' | 'blocked' | 'incomplete' | 'superseded';
+    runtime_approval: 'not_required' | 'pending' | 'approved' | 'rejected' | 'executing' | 'succeeded' | 'failed' | 'ambiguous';
+    delivery_approval: 'not_required' | 'pending' | 'approved' | 'request_changes' | 'cancelled';
+    delivery: 'not_requested' | 'pending' | 'reconciling' | 'delivered' | 'failed' | 'cancelled';
+};
+
+export type WorkNextAction = {
+    id: string;
+    task_id?: string | null;
+    kind: 'quality_review' | 'runtime_approval' | 'delivery_approval' | 'task_recovery' | 'delivery_recovery';
+    status: 'open';
+    title: string;
+    reason_code: string;
+    source_type: string;
+    source_id: string;
+    action_url: string;
+    created_at: string;
+    due_at?: string | null;
+    version?: string | null;
+};
+
+export type WorkTimelineEvent = {
+    id: string;
+    type: string;
+    occurred_at: string;
+    source_type: string;
+    source_id: string;
+    status?: string | null;
+    title: string;
+    summary?: string | null;
+    actor_type?: string | null;
+    actor_id?: string | null;
+    metadata: Record<string, unknown>;
+};
+
+export type WorkTaskDetail = {
+    detail_scope: 'full' | 'collaboration';
+    summary: WorkItem;
+    status_axes: WorkStatusAxes;
+    timeline: WorkTimelineEvent[];
+    next_actions: WorkNextAction[];
+    runs: Array<{
+        id: string;
+        agent_id?: string | null;
+        parent_run_id?: string | null;
+        root_run_id?: string | null;
+        run_kind: string;
+        latest_event?: string | null;
+        delivery_status: string;
+        created_at: string;
+        updated_at: string;
+    }>;
+    deliverables: Array<{
+        id: string;
+        agent_id: string;
+        session_id: string;
+        work_type: string;
+        status: string;
+        current_stage: string;
+        current_execution_id?: string | null;
+        version: number;
+        created_at: string;
+        updated_at: string;
+    }>;
+    artifacts: Array<WorkArtifact & {
+        request_id: string;
+        execution_id?: string | null;
+        artifact_key: string;
+        mime_type?: string | null;
+        content_hash: string;
+        created_at: string;
+    }>;
+    reviews: Array<{
+        id: string;
+        request_id: string;
+        status: string;
+        modality: string;
+        minimum_reviewers: number;
+        assigned_reviewer_count: number;
+        current_user_assignment_status?: string | null;
+        version: number;
+        created_at: string;
+        updated_at: string;
+    }>;
+    approvals: Array<{
+        id: string;
+        kind: 'runtime' | 'delivery';
+        source_id: string;
+        status: string;
+        action_type: string;
+        execution_status?: string | null;
+        created_at: string;
+        resolved_at?: string | null;
+    }>;
+    links: Record<string, string>;
+};
+
+export type PersonalSubscriptionUsage = {
+    attribution_status: 'partial' | 'unavailable';
+    attribution_note: string;
+    consumed_credits: number;
+    attributed_transactions: number;
+    llm_calls_limit: number;
+    message_limit: number;
+    max_triggers: number;
+};
+
+export const subscriptionApi = {
+    getMyUsage: () => request<PersonalSubscriptionUsage>('/subscription/usage/me'),
+    getEntitlements: () => request<{
+        plan_code?: string | null;
+        max_agents: number;
+        max_llm_calls_per_day: number;
+        message_limit: number;
+        max_triggers: number;
+        subscription_status?: string | null;
+        period_end?: string | null;
+    } | null>('/subscription/my-entitlements'),
+};
+
 export const workApi = {
     list: (limit = 50) => request<WorkIndex>(`/work?limit=${limit}`),
 
     getTask: (taskId: string) => request<WorkItem>(`/work/tasks/${taskId}`),
+
+    getTaskDetail: (taskId: string) => request<WorkTaskDetail>(`/work/tasks/${taskId}/detail`),
+
+    getInbox: (params: { limit?: number; cursor?: string; kind?: WorkNextAction['kind'] } = {}) => {
+        const query = new URLSearchParams();
+        query.set('limit', String(params.limit || 50));
+        if (params.cursor) query.set('cursor', params.cursor);
+        if (params.kind) query.set('kind', params.kind);
+        return request<{ items: WorkNextAction[]; next_cursor?: string | null }>(`/work/inbox?${query}`);
+    },
+
+    getInboxCount: () => request<{ count: number }>('/work/inbox/count'),
 
     preflightTask: (data: WorkTaskDraft) => request<WorkTaskPreflight>('/work/tasks/preflight', {
         method: 'POST',
@@ -868,6 +1035,15 @@ export const workApi = {
     }) => request<{ item: WorkItem; created: boolean }>('/work/tasks', {
         method: 'POST',
         body: JSON.stringify(data),
+    }),
+
+    retryTask: (taskId: string, clientRequestId: string) => request<{
+        item: WorkItem;
+        run_id: string;
+        created: boolean;
+    }>(`/work/tasks/${taskId}/retry`, {
+        method: 'POST',
+        body: JSON.stringify({ client_request_id: clientRequestId }),
     }),
 };
 
@@ -1067,8 +1243,8 @@ export type WorkforceTopologyNode = {
     role_description: string;
     status: 'creating' | 'running' | 'idle' | 'stopped' | 'error' | string;
     last_active_at?: string | null;
-    tokens_used_today: number;
-    cache_read_tokens_today: number;
+    tokens_used_today: number | null;
+    cache_read_tokens_today: number | null;
     max_tokens_per_day?: number | null;
     is_expired: boolean;
     is_system: boolean;
@@ -1122,7 +1298,7 @@ export interface DeliverableWorkflowField {
     key: string;
     label_zh: string;
     label_en: string;
-    kind: 'text' | 'textarea' | 'number' | 'select';
+    kind: 'text' | 'textarea' | 'number' | 'select' | 'json';
     required: boolean;
     default: string | number | null;
     minimum: number | null;
@@ -1152,6 +1328,30 @@ export interface DeliverableCreditEstimate {
     minimum: number | null;
     maximum: number | null;
     billing_unit: string;
+    candidates?: number;
+    per_candidate_credits?: number;
+}
+
+export interface DeliverableCreativeBriefSummary {
+    schema_version: string;
+    status: 'draft' | 'clarifying' | 'confirmed';
+    missing_fields: string[];
+    brief_sha256?: string | null;
+    candidate_count?: number | null;
+}
+
+export interface DeliverableBrief extends DeliverableCreativeBriefSummary {
+    brief: Record<string, unknown> | null;
+    updated_at: string | null;
+}
+
+export interface CandidateQaSummary {
+    schema_version: string | null;
+    status: string | null;
+    score: number | null;
+    artifact_sha256: string | null;
+    checks: Array<{ name: string; status: string }>;
+    subject_similarity: Record<string, unknown>;
 }
 
 export interface DeliverablePreflight {
@@ -1166,6 +1366,7 @@ export interface DeliverablePreflight {
     normalized_spec: Record<string, string | number>;
     credit_estimate: DeliverableCreditEstimate;
     creates_reservation: false;
+    creative_brief?: DeliverableCreativeBriefSummary;
 }
 
 export interface DeliverableArtifactRevision {
@@ -1201,6 +1402,7 @@ export interface DeliverableExecutionUnit {
     input_snapshot: Record<string, unknown>;
     result_snapshot: Record<string, unknown>;
     quality_evaluation: Record<string, unknown>;
+    qa_summary?: CandidateQaSummary | null;
     last_error_code: string | null;
     next_retry_at: string | null;
     started_at: string | null;
@@ -1387,6 +1589,14 @@ export const deliverableApi = {
     executions: (requestId: string) => request<DeliverableExecution[]>(
         `/deliverables/requests/${requestId}/executions`,
     ),
+    brief: (requestId: string) => request<DeliverableBrief>(
+        `/deliverables/requests/${requestId}/brief`,
+    ),
+    clarify: (requestId: string, data: { expected_version: number; answers: Record<string, string | number> }) =>
+        request<DeliverableBrief>(`/deliverables/requests/${requestId}/clarifications`, {
+            method: 'POST',
+            body: JSON.stringify(data),
+        }),
     artifactDownloadUrl: (artifactId: string, options?: { inline?: boolean }) => {
         const query = new URLSearchParams();
         if (options?.inline) query.set('inline', 'true');

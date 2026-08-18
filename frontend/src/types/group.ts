@@ -126,3 +126,56 @@ export interface GroupSessionSummary {
     workspace_refs: unknown[];
     covered_through_message_id: string | null;
 }
+
+export interface GroupTaskSummary {
+    task_id: string;
+    title: string;
+    intent: string;
+    task_status: string;
+    user_stage: string;
+    status_axes: {
+        execution: string;
+        artifact: string;
+        quality: string;
+        runtime_approval: string;
+        delivery_approval: string;
+        delivery: string;
+    };
+    primary_owner_agent_id: string;
+    primary_owner_agent_name: string;
+    participants: Array<{
+        agent_id: string;
+        agent_name: string;
+        responsibility: 'primary_owner' | 'collaborator';
+    }>;
+    runs: Array<{
+        id: string;
+        agent_id: string | null;
+        agent_name: string | null;
+        parent_run_id: string | null;
+        root_run_id: string | null;
+        run_kind: string;
+        latest_event: string | null;
+        delivery_status: string;
+        created_at: string;
+        updated_at: string;
+    }>;
+    group_id: string;
+    group_session_id: string | null;
+    source_message_id: string | null;
+    source_message_cursor: string | null;
+    latest_update: string | null;
+    latest_update_at: string | null;
+    next_actions: Array<{
+        id: string;
+        kind: 'quality_review' | 'runtime_approval' | 'delivery_approval' | 'task_recovery' | 'delivery_recovery';
+        title: string;
+        reason_code: string;
+        action_url: string;
+    }>;
+    work_link: string;
+    group_link: string | null;
+    created_by: string;
+    created_at: string;
+    updated_at: string;
+}
