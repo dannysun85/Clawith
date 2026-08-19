@@ -274,10 +274,19 @@ async def expire_stale_credit_reservations(
 async def reconcile_pending_payment_orders(
     db: AsyncSession | None = None,
 ) -> PaymentReconciliationReport:
-    """Identify pending non-manual orders that likely missed a provider webhook."""
-    if db is None:
+    """Sync pending non-manual orders with their provider and flag gaps.
+
+    Orders older than the 10-minute grace window are re-queried server-to-server
+    so a missed webhook (unreachable notify_url) still finalizes the order.
+    """
+    own_session = db is None
+    if own_session:
         async with async_session() as session:
-            return await reconcile_pending_payment_orders(session)
+            report = await reconcile_pending_payment_orders(session)
+            await session.commit()
+            return report
+
+    from app.services.billing_events import sync_pending_order_from_provider
 
     result = await db.execute(
         select(PaymentOrder).where(
@@ -287,6 +296,8 @@ async def reconcile_pending_payment_orders(
     )
     orders = list(result.scalars().all())
     report = PaymentReconciliationReport(checked_orders=len(orders))
+    now = datetime.now(timezone.utc)
+    grace_cutoff = now - timedelta(minutes=10)
     for order in orders:
         if not order.provider_session_id:
             report.issues.append(
@@ -297,6 +308,35 @@ async def reconcile_pending_payment_orders(
                     provider=order.provider,
                     status=order.status,
                     message="non-manual pending order has no provider_session_id",
+                )
+            )
+            continue
+        # Give fresh orders the webhook (and the status-poll sync) time to land.
+        if order.created_at and order.created_at > grace_cutoff:
+            continue
+        try:
+            changed = await sync_pending_order_from_provider(db, order)
+        except Exception:
+            logger.exception(
+                "[billing] provider sync failed during reconciliation order_id={} provider={}",
+                order.id,
+                order.provider,
+            )
+            continue
+        if changed:
+            logger.info(
+                "[billing] pending order recovered via provider query order_id={} provider={}",
+                order.id,
+                order.provider,
+            )
+            report.issues.append(
+                PaymentReconciliationIssue(
+                    code="recovered_via_provider_query",
+                    order_id=order.id,
+                    tenant_id=order.tenant_id,
+                    provider=order.provider,
+                    status="synced",
+                    message="pending order state was recovered by querying the provider",
                 )
             )
     if report.issues:

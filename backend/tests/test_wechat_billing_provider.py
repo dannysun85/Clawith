@@ -25,6 +25,7 @@ def _settings(**overrides):
         WECHAT_PAY_API_V3_KEY=API_V3_KEY,
         WECHAT_PAY_NOTIFY_URL="https://example.com/api/subscription/billing/webhook/wechat",
         WECHAT_PAY_API_BASE_URL="https://api.mch.weixin.qq.com",
+        WECHAT_PAY_ORDER_EXPIRE_MINUTES=120,
         BILLING_USD_CNY_RATE=7.2,
         PUBLIC_BASE_URL="https://example.com",
         BILLING_PROVIDER="wechat",
@@ -124,14 +125,35 @@ async def test_create_subscription_checkout_converts_usd_to_cny():
     result = await provider.create_subscription_checkout(order=order, plan=plan, period="monthly", seats=1)
 
     assert result.provider == "wechat"
-    assert result.session_id == str(order.id)
+    assert result.session_id == order.id.hex
     assert result.session_url == "weixin://wxpay/bizpayurl?pr=abc123"
     assert captured["method"] == "POST"
     assert captured["path"] == "/v3/pay/transactions/native"
     payload = captured["payload"]
-    assert payload["out_trade_no"] == str(order.id)
+    # WeChat Pay caps out_trade_no at 32 chars: use the UUID's hex form, not the
+    # 36-char hyphenated string (which WeChat rejects with PARAM_ERROR).
+    assert payload["out_trade_no"] == order.id.hex
+    assert len(payload["out_trade_no"]) <= 32
+    assert payload["out_trade_no"].isalnum()
     assert payload["amount"] == {"total": round(16000 * 7.2), "currency": "CNY"}
     assert payload["notify_url"] == "https://example.com/api/subscription/billing/webhook/wechat"
+    assert "time_expire" in payload
+
+
+async def test_create_native_order_omits_time_expire_when_disabled():
+    provider = _make_provider(WECHAT_PAY_ORDER_EXPIRE_MINUTES=0)
+    order = _order(amount_cents=7000, currency="CNY")
+    plan = Plan(id=order.plan_id, code="pro", name="Pro")
+
+    captured = {}
+
+    async def fake_request(method, path, payload=None):
+        captured["payload"] = payload
+        return {"code_url": "weixin://wxpay/bizpayurl?pr=abc123"}
+
+    provider._request = fake_request  # type: ignore[assignment]
+    await provider.create_subscription_checkout(order=order, plan=plan, period="monthly", seats=1)
+    assert "time_expire" not in captured["payload"]
 
 
 async def test_create_topup_checkout_keeps_cny_amount():
@@ -267,3 +289,47 @@ def test_payment_origin_gate_skips_without_public_base_url():
 
     with patch("app.api.subscription.get_settings", return_value=_gate_settings(public_base_url="")):
         _enforce_payment_origin(_gate_request("opc.reeftotem.ai"))
+
+
+async def test_query_order_state_maps_trade_states():
+    provider = _make_provider()
+    order = _order(status="pending")
+    provider._request = AsyncMock(  # type: ignore[assignment]
+        return_value={"trade_state": "SUCCESS", "transaction_id": "4200007777"}
+    )
+
+    state = await provider.query_order_state(order)
+
+    assert state is not None
+    assert state.order_id == order.id
+    assert state.status == "paid"
+    assert state.provider_payment_id == "4200007777"
+    provider._request.assert_awaited_once_with(
+        "GET", f"/v3/pay/transactions/out-trade-no/{order.id.hex}?mchid=1230000109"
+    )
+
+
+async def test_query_order_state_maps_closed_to_canceled():
+    provider = _make_provider()
+    order = _order(status="pending")
+    provider._request = AsyncMock(return_value={"trade_state": "CLOSED"})  # type: ignore[assignment]
+
+    state = await provider.query_order_state(order)
+
+    assert state is not None
+    assert state.status == "canceled"
+
+
+async def test_query_order_state_returns_none_on_api_error():
+    provider = _make_provider()
+    order = _order(status="pending")
+    provider._request = AsyncMock(side_effect=ValueError("ORDERNOTEXIST"))  # type: ignore[assignment]
+
+    assert await provider.query_order_state(order) is None
+
+
+async def test_manual_provider_query_order_state_unsupported():
+    from app.services.billing_provider import BillingProvider
+
+    provider = BillingProvider()
+    assert await provider.query_order_state(_order()) is None

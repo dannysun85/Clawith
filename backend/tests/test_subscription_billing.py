@@ -1,5 +1,5 @@
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -1542,3 +1542,280 @@ async def test_plan_credits_are_periodic_balance_grants_not_token_budget():
         patch.object(quota_guard, "_get_tenant_usage", AsyncMock(return_value=(999_999, 0))),
     ):
         await quota_guard.check_tenant_token_credits(tenant_id)
+
+
+@pytest.mark.asyncio
+async def test_finalize_order_yearly_period_grants_365_days():
+    from app.services.billing_events import finalize_order_in_session
+
+    plan = Plan(id=uuid.uuid4(), code="pro", name="Pro", is_active=True, price_cents=2000)
+    order = PaymentOrder(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        type="subscribe",
+        plan_id=plan.id,
+        period="yearly",
+        amount_cents=19200,
+        currency="CNY",
+        provider="wechat",
+        status="pending",
+    )
+    db = MockDB(get_map={(Plan, plan.id): plan}, execute_results=[DummyResult(None)])
+    now = datetime.now(timezone.utc)
+
+    await finalize_order_in_session(db, order, paid_at=now)
+
+    assert order.status == "paid"
+    sub = next(item for item in db.added if isinstance(item, Subscription))
+    assert sub.period_end - sub.period_start >= timedelta(days=364)
+
+
+@pytest.mark.asyncio
+async def test_finalize_order_monthly_period_grants_30_days():
+    from app.services.billing_events import finalize_order_in_session
+
+    plan = Plan(id=uuid.uuid4(), code="pro", name="Pro", is_active=True, price_cents=2000)
+    order = PaymentOrder(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        type="subscribe",
+        plan_id=plan.id,
+        period="monthly",
+        amount_cents=2000,
+        currency="CNY",
+        provider="wechat",
+        status="pending",
+    )
+    db = MockDB(get_map={(Plan, plan.id): plan}, execute_results=[DummyResult(None)])
+    now = datetime.now(timezone.utc)
+
+    await finalize_order_in_session(db, order, paid_at=now)
+
+    sub = next(item for item in db.added if isinstance(item, Subscription))
+    assert timedelta(days=29) <= sub.period_end - sub.period_start <= timedelta(days=31)
+
+
+@pytest.mark.asyncio
+async def test_finalize_order_renewal_stacks_remaining_time():
+    from app.services.billing_events import finalize_order_in_session
+
+    plan = Plan(id=uuid.uuid4(), code="pro", name="Pro", is_active=True, price_cents=2000)
+    now = datetime.now(timezone.utc)
+    existing = Subscription(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        plan_id=plan.id,
+        status="active",
+        period_start=now - timedelta(days=25),
+        period_end=now + timedelta(days=5),
+    )
+    order = PaymentOrder(
+        id=uuid.uuid4(),
+        tenant_id=existing.tenant_id,
+        type="subscribe",
+        plan_id=plan.id,
+        period="monthly",
+        amount_cents=2000,
+        currency="CNY",
+        provider="wechat",
+        status="pending",
+    )
+    db = MockDB(get_map={(Plan, plan.id): plan}, execute_results=[DummyResult(existing)])
+
+    await finalize_order_in_session(db, order, paid_at=now)
+
+    # 5 remaining days + 30 new days, not a restart from now.
+    assert timedelta(days=34) <= existing.period_end - now <= timedelta(days=36)
+
+
+@pytest.mark.asyncio
+async def test_checkout_subscribe_yearly_uses_feature_price_and_seats():
+    tenant_id = uuid.uuid4()
+    plan = Plan(
+        id=uuid.uuid4(),
+        code="pro",
+        name="Pro",
+        is_active=True,
+        price_cents=20_00,
+        currency="CNY",
+        features={"yearly_price_cents": 192_00},
+    )
+    user = SimpleNamespace(id=uuid.uuid4(), tenant_id=tenant_id)
+    checkout = SimpleNamespace(
+        provider="wechat",
+        session_id="ordersession",
+        session_url="weixin://wxpay/bizpayurl?pr=x",
+        payment_id=None,
+    )
+    provider = SimpleNamespace(create_subscription_checkout=AsyncMock(return_value=checkout))
+    db = MockDB(get_map={(Plan, plan.id): plan})
+
+    with patch.object(subscription_api, "get_billing_provider", return_value=provider, create=True):
+        order = await subscription_api.checkout_subscribe(
+            CheckoutSubscribeIn(plan_id=plan.id, period="yearly", seats=3),
+            SimpleNamespace(headers={"host": "localhost"}),
+            current_user=user,
+            db=db,
+        )
+
+    assert order.period == "yearly"
+    assert order.amount_cents == 192_00 * 3
+
+
+@pytest.mark.asyncio
+async def test_checkout_subscribe_yearly_defaults_to_twenty_percent_off():
+    tenant_id = uuid.uuid4()
+    plan = Plan(
+        id=uuid.uuid4(),
+        code="pro",
+        name="Pro",
+        is_active=True,
+        price_cents=20_00,
+        currency="CNY",
+        features=None,
+    )
+    user = SimpleNamespace(id=uuid.uuid4(), tenant_id=tenant_id)
+    checkout = SimpleNamespace(
+        provider="wechat",
+        session_id="ordersession",
+        session_url="weixin://wxpay/bizpayurl?pr=x",
+        payment_id=None,
+    )
+    provider = SimpleNamespace(create_subscription_checkout=AsyncMock(return_value=checkout))
+    db = MockDB(get_map={(Plan, plan.id): plan})
+
+    with patch.object(subscription_api, "get_billing_provider", return_value=provider, create=True):
+        order = await subscription_api.checkout_subscribe(
+            CheckoutSubscribeIn(plan_id=plan.id, period="yearly", seats=1),
+            SimpleNamespace(headers={"host": "localhost"}),
+            current_user=user,
+            db=db,
+        )
+
+    # Frontend default: 12 months minus the 20% yearly discount.
+    assert order.amount_cents == round(20_00 * 12 * 0.8)
+
+
+@pytest.mark.asyncio
+async def test_checkout_subscribe_rejects_invalid_period_and_seats():
+    tenant_id = uuid.uuid4()
+    plan = Plan(id=uuid.uuid4(), code="pro", name="Pro", is_active=True, price_cents=20_00)
+    user = SimpleNamespace(id=uuid.uuid4(), tenant_id=tenant_id)
+    db = MockDB(get_map={(Plan, plan.id): plan})
+
+    with pytest.raises(HTTPException) as period_exc:
+        await subscription_api.checkout_subscribe(
+            CheckoutSubscribeIn(plan_id=plan.id, period="weekly", seats=1),
+            SimpleNamespace(headers={"host": "localhost"}),
+            current_user=user,
+            db=db,
+        )
+    assert period_exc.value.status_code == 400
+
+    with pytest.raises(HTTPException) as seats_exc:
+        await subscription_api.checkout_subscribe(
+            CheckoutSubscribeIn(plan_id=plan.id, period="monthly", seats=0),
+            SimpleNamespace(headers={"host": "localhost"}),
+            current_user=user,
+            db=db,
+        )
+    assert seats_exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_sync_pending_order_from_provider_finalizes_paid():
+    from app.services.billing_events import PaymentProviderEventState, sync_pending_order_from_provider
+
+    plan = Plan(id=uuid.uuid4(), code="pro", name="Pro", is_active=True, price_cents=2000)
+    order = PaymentOrder(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        type="topup",
+        credits=10_000,
+        amount_cents=1500,
+        currency="CNY",
+        provider="wechat",
+        provider_session_id="",
+        status="pending",
+    )
+    state = PaymentProviderEventState(
+        provider="wechat",
+        event_id=f"query:{order.id}",
+        event_type="QUERY",
+        order_id=order.id,
+        status="paid",
+        provider_session_id=order.id.hex,
+        provider_payment_id="4200001234",
+    )
+    provider = SimpleNamespace(query_order_state=AsyncMock(return_value=state))
+    db = MockDB(get_map={(Plan, plan.id): plan}, execute_results=[DummyResult(order)])
+
+    with patch("app.services.billing_provider.get_billing_provider", return_value=provider):
+        changed = await sync_pending_order_from_provider(db, order)
+
+    assert changed is True
+    assert order.status == "paid"
+    assert order.provider_payment_id == "4200001234"
+
+
+@pytest.mark.asyncio
+async def test_sync_pending_order_from_provider_ignores_unsupported_provider():
+    from app.services.billing_events import sync_pending_order_from_provider
+
+    order = PaymentOrder(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        type="topup",
+        credits=10_000,
+        amount_cents=1500,
+        currency="CNY",
+        provider="manual",
+        status="pending",
+    )
+    db = MockDB()
+
+    assert await sync_pending_order_from_provider(db, order) is False
+
+
+@pytest.mark.asyncio
+async def test_get_checkout_status_syncs_pending_wechat_order():
+    from app.services.billing_events import PaymentProviderEventState
+
+    plan = Plan(id=uuid.uuid4(), code="pro", name="Pro", is_active=True, price_cents=2000)
+    order = PaymentOrder(
+        id=uuid.uuid4(),
+        tenant_id=uuid.uuid4(),
+        type="topup",
+        credits=10_000,
+        amount_cents=1500,
+        currency="CNY",
+        provider="wechat",
+        provider_session_id="",
+        status="pending",
+    )
+    state = PaymentProviderEventState(
+        provider="wechat",
+        event_id=f"query:{order.id}",
+        event_type="QUERY",
+        order_id=order.id,
+        status="paid",
+        provider_session_id=order.id.hex,
+        provider_payment_id="4200005678",
+    )
+    provider = SimpleNamespace(query_order_state=AsyncMock(return_value=state))
+    user = SimpleNamespace(id=uuid.uuid4(), tenant_id=order.tenant_id)
+    db = MockDB(
+        get_map={(PaymentOrder, order.id): order, (Plan, plan.id): plan},
+        execute_results=[DummyResult(order)],
+    )
+
+    with (
+        patch("app.services.billing_provider.get_billing_provider", return_value=provider),
+        patch.object(subscription_api, "_apply_paid_subscribe_effects", new=AsyncMock()) as effects,
+    ):
+        result = await subscription_api.get_checkout_status(order.id, current_user=user, db=db)
+
+    assert result is order
+    assert order.status == "paid"
+    assert order.provider_payment_id == "4200005678"
+    effects.assert_awaited_once_with(order)

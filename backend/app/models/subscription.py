@@ -200,6 +200,8 @@ class PaymentOrder(Base):
     )
     type: Mapped[str] = mapped_column(String(20), nullable=False)  # subscribe / topup
     plan_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("plans.id"), nullable=True)
+    period: Mapped[str] = mapped_column(String(20), nullable=False, default="monthly", server_default="monthly")
+    # monthly / yearly - drives subscription length when the order is finalized
     credits: Mapped[int | None] = mapped_column(Integer, nullable=True)  # topup amount
     amount_cents: Mapped[int] = mapped_column(Integer, nullable=False)
     currency: Mapped[str] = mapped_column(String(10), nullable=False, default="CNY")

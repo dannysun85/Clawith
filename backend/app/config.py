@@ -292,6 +292,8 @@ class Settings(BaseSettings):
     WECHAT_PAY_API_V3_KEY: str = ""  # 32-byte APIv3 key, decrypts webhook resources
     WECHAT_PAY_NOTIFY_URL: str = ""  # defaults to PUBLIC_BASE_URL + webhook path
     WECHAT_PAY_API_BASE_URL: str = "https://api.mch.weixin.qq.com"
+    # Native order validity sent as time_expire; 0 keeps WeChat's 2h default.
+    WECHAT_PAY_ORDER_EXPIRE_MINUTES: int = 120
     # WeChat Pay only settles in CNY; USD-priced plans/packs convert at this rate.
     BILLING_USD_CNY_RATE: float = 7.0
     BILLING_RECONCILIATION_INTERVAL_SECONDS: int = 60 * 60 * 24

@@ -585,6 +585,31 @@ async def get_subscription_summary(
     )
 
 
+def _yearly_price_cents(plan: Plan) -> int:
+    """Yearly unit price mirroring frontend SubscriptionTab.planPrice('yearly')."""
+    features = plan.features if isinstance(plan.features, dict) else {}
+    configured = features.get("yearly_price_cents")
+    if isinstance(configured, (int, float)) and configured > 0:
+        return int(configured)
+    original = features.get("yearly_original_price_cents")
+    if not isinstance(original, (int, float)) or original <= 0:
+        original = plan.price_cents * 12
+    discount = features.get("yearly_discount_percent")
+    if not isinstance(discount, (int, float)):
+        discount = 20 if plan.price_cents > 0 else 0
+    return max(1, round(original * (1 - discount / 100)))
+
+
+async def _apply_paid_subscribe_effects(order: PaymentOrder) -> None:
+    """Post-payment side effects shared by the webhook and poll-sync paths."""
+    if order.type == "subscribe" and order.status == "paid":
+        from app.services.subscription_lifecycle import enforce_agent_limit, restore_stopped_agents
+
+        await reconcile_tenant_agent_plan_selections(order.tenant_id)
+        await restore_stopped_agents(order.tenant_id)
+        await enforce_agent_limit(order.tenant_id)
+
+
 @router.post("/checkout/subscribe", response_model=PaymentOrderOut, status_code=status.HTTP_201_CREATED)
 async def checkout_subscribe(
     data: CheckoutSubscribeIn,
@@ -601,16 +626,24 @@ async def checkout_subscribe(
     if not plan or not plan.is_active:
         raise HTTPException(status_code=404, detail="Plan not found")
 
-    # Simple price logic: yearly = 10 months equivalent
+    # Price logic mirrors the frontend SubscriptionTab: yearly uses the plan's
+    # features.yearly_price_cents when configured, else 12 months minus the
+    # yearly_discount_percent (default 20%). Amount scales with seats.
+    if data.period not in ("monthly", "yearly"):
+        raise HTTPException(status_code=400, detail="period must be monthly or yearly")
+    if data.seats < 1:
+        raise HTTPException(status_code=400, detail="seats must be at least 1")
     if data.period == "yearly":
-        amount_cents = plan.price_cents * 10
+        unit_cents = _yearly_price_cents(plan)
     else:
-        amount_cents = plan.price_cents
+        unit_cents = plan.price_cents
+    amount_cents = unit_cents * data.seats
 
     order = PaymentOrder(
         tenant_id=current_user.tenant_id,
         type="subscribe",
         plan_id=plan.id,
+        period=data.period,
         amount_cents=amount_cents,
         currency=plan.currency,
         status="pending",
@@ -684,10 +717,27 @@ async def get_checkout_status(
     current_user: User = Depends(get_company_billing_manager),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get payment order status."""
+    """Get payment order status, syncing pending orders from the provider.
+
+    The WeChat Pay frontend modal polls this endpoint every 2s while the QR
+    code is open; when the notify webhook was missed, this server-to-server
+    query is what confirms the payment.
+    """
     order = await db.get(PaymentOrder, order_id)
     if not order or order.tenant_id != current_user.tenant_id:
         raise HTTPException(status_code=404, detail="Order not found")
+    if order.status == "pending":
+        from app.services.billing_events import sync_pending_order_from_provider
+
+        try:
+            changed = await sync_pending_order_from_provider(db, order)
+        except Exception:
+            # Polling must never fail because the provider is unreachable.
+            changed = False
+        if changed:
+            await db.commit()
+            await db.refresh(order)
+            await _apply_paid_subscribe_effects(order)
     return order
 
 
@@ -715,12 +765,8 @@ async def billing_webhook(
     order_id = result.get("order_id")
     if order_id:
         order = await db.get(PaymentOrder, uuid.UUID(str(order_id)))
-        if order and order.type == "subscribe" and order.status == "paid":
-            from app.services.subscription_lifecycle import enforce_agent_limit, restore_stopped_agents
-
-            await reconcile_tenant_agent_plan_selections(order.tenant_id)
-            await restore_stopped_agents(order.tenant_id)
-            await enforce_agent_limit(order.tenant_id)
+        if order:
+            await _apply_paid_subscribe_effects(order)
     if provider_name.lower() == "wechat":
         # WeChat Pay expects this acknowledgement shape on HTTP 200; non-200 retries.
         return {"code": "SUCCESS", "message": "成功"}

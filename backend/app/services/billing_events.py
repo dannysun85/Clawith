@@ -65,12 +65,16 @@ async def finalize_order_in_session(
             )
             existing_sub = existing.scalar_one_or_none()
             now = order.paid_at or _utcnow()
-            period_end = now + timedelta(days=30)
+            period_days = 365 if (order.period or "monthly") == "yearly" else 30
             if existing_sub:
                 existing_sub.plan_id = order.plan_id
                 existing_sub.status = "active"
-                existing_sub.period_end = period_end
                 existing_sub.cancel_at_period_end = False
+                # Renewals stack on unexpired time instead of restarting from now.
+                base = now
+                if existing_sub.period_end and existing_sub.period_end > base:
+                    base = existing_sub.period_end
+                existing_sub.period_end = base + timedelta(days=period_days)
                 sub = existing_sub
             else:
                 sub = Subscription(
@@ -78,7 +82,7 @@ async def finalize_order_in_session(
                     plan_id=order.plan_id,
                     status="active",
                     period_start=now,
-                    period_end=period_end,
+                    period_end=now + timedelta(days=period_days),
                 )
                 db.add(sub)
             if plan.credits_per_period:
@@ -178,3 +182,47 @@ async def process_billing_webhook_event(
         webhook_event.status = "failed"
         webhook_event.error = str(exc)[:500]
         raise
+
+
+async def sync_pending_order_from_provider(db: AsyncSession, order: PaymentOrder) -> bool:
+    """Pull a pending order's state from the provider server-to-server.
+
+    Recovers orders whose webhook was missed (notify_url unreachable, dropped
+    callback) by querying the provider directly and applying the same state
+    machine as ``process_billing_webhook_event``. Returns True when the order
+    changed; the caller owns the commit.
+    """
+    from app.services.billing_provider import get_billing_provider
+
+    if order.status != "pending" or not order.provider or order.provider == "manual":
+        return False
+    try:
+        provider = get_billing_provider(order.provider)
+    except ValueError:
+        return False
+    state = await provider.query_order_state(order)
+    if state is None or state.order_id != order.id:
+        return False
+
+    locked_result = await db.execute(
+        select(PaymentOrder).where(PaymentOrder.id == order.id).with_for_update(skip_locked=True)
+    )
+    locked = locked_result.scalar_one_or_none()
+    if locked is None or locked.status != "pending":
+        return False
+
+    if state.status == "paid":
+        await finalize_order_in_session(
+            db,
+            locked,
+            actor_user_id=None,
+            provider_payment_id=state.provider_payment_id,
+            paid_at=_utcnow(),
+        )
+        return True
+    if state.status in {"failed", "canceled"}:
+        locked.status = "failed" if state.status == "failed" else "canceled"
+        if state.provider_payment_id:
+            locked.provider_payment_id = state.provider_payment_id
+        return True
+    return False

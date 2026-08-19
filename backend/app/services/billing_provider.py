@@ -9,6 +9,7 @@ import json
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -56,6 +57,10 @@ class BillingProvider:
 
     async def load_remote_event_state(self, event: dict):
         raise ValueError("Manual billing provider has no remote event state")
+
+    async def query_order_state(self, order: PaymentOrder):
+        """Server-to-server order status query; None means unsupported."""
+        return None
 
 
 class StripeBillingProvider(BillingProvider):
@@ -221,6 +226,9 @@ class WeChatBillingProvider(BillingProvider):
       merchant APIv3 key: only WeChat can produce a ciphertext that decrypts
       under it. ``load_remote_event_state`` additionally re-queries the order
       state server-to-server, per SUBSCRIPTION_IMPLEMENTATION_DESIGN.md §4.4.
+    - ``out_trade_no`` uses the order UUID's 32-char hex form: WeChat Pay caps
+      ``out_trade_no`` at 32 characters, so the hyphenated 36-char UUID string
+      is rejected with PARAM_ERROR.
     """
 
     name = "wechat"
@@ -250,7 +258,7 @@ class WeChatBillingProvider(BillingProvider):
         seats: int,
     ) -> CheckoutSessionResult:
         code_url = await self._create_native_order(order, f"{plan.name} 套餐订阅")
-        return CheckoutSessionResult(provider=self.name, session_id=str(order.id), session_url=code_url)
+        return CheckoutSessionResult(provider=self.name, session_id=order.id.hex, session_url=code_url)
 
     async def create_topup_checkout(
         self,
@@ -259,7 +267,7 @@ class WeChatBillingProvider(BillingProvider):
         pack: CreditPack,
     ) -> CheckoutSessionResult:
         code_url = await self._create_native_order(order, f"{pack.name} 额度充值")
-        return CheckoutSessionResult(provider=self.name, session_id=str(order.id), session_url=code_url)
+        return CheckoutSessionResult(provider=self.name, session_id=order.id.hex, session_url=code_url)
 
     async def verify_webhook(self, payload: bytes, signature: str | None) -> dict:
         try:
@@ -301,14 +309,7 @@ class WeChatBillingProvider(BillingProvider):
             pass  # fall back to the AEAD-authenticated webhook body
 
         trade_state = str(state.get("trade_state") or "")
-        order_status = {
-            "SUCCESS": "paid",
-            "NOTPAY": "pending",
-            "USERPAYING": "pending",
-            "CLOSED": "canceled",
-            "REVOKED": "canceled",
-            "PAYERROR": "failed",
-        }.get(trade_state, "pending")
+        order_status = self._order_status_from_trade_state(trade_state)
         return PaymentProviderEventState(
             provider=self.name,
             event_id=str(event.get("id")),
@@ -318,6 +319,42 @@ class WeChatBillingProvider(BillingProvider):
             provider_session_id=out_trade_no,
             provider_payment_id=state.get("transaction_id"),
         )
+
+    async def query_order_state(self, order: PaymentOrder):
+        """Query WeChat for the order's current trade state (missed-webhook recovery)."""
+        try:
+            remote = await self._request(
+                "GET",
+                f"/v3/pay/transactions/out-trade-no/{order.id.hex}?mchid={self.settings.WECHAT_PAY_MCHID}",
+            )
+        except ValueError:
+            # ORDERNOTEXIST / network failure: leave the order pending.
+            return None
+        if not remote:
+            return None
+        from app.services.billing_events import PaymentProviderEventState
+
+        trade_state = str(remote.get("trade_state") or "")
+        return PaymentProviderEventState(
+            provider=self.name,
+            event_id=f"query:{order.id}",
+            event_type="QUERY",
+            order_id=order.id,
+            status=self._order_status_from_trade_state(trade_state),
+            provider_session_id=order.id.hex,
+            provider_payment_id=remote.get("transaction_id"),
+        )
+
+    @staticmethod
+    def _order_status_from_trade_state(trade_state: str) -> str:
+        return {
+            "SUCCESS": "paid",
+            "NOTPAY": "pending",
+            "USERPAYING": "pending",
+            "CLOSED": "canceled",
+            "REVOKED": "canceled",
+            "PAYERROR": "failed",
+        }.get(trade_state, "pending")
 
     def _load_private_key(self) -> RSAPrivateKey:
         pem = self.settings.WECHAT_PAY_PRIVATE_KEY.replace("\\n", "\n").strip()
@@ -382,10 +419,14 @@ class WeChatBillingProvider(BillingProvider):
             "appid": self.settings.WECHAT_PAY_APPID,
             "mchid": self.settings.WECHAT_PAY_MCHID,
             "description": description[:127],
-            "out_trade_no": str(order.id),
+            "out_trade_no": order.id.hex,
             "notify_url": self._notify_url(),
             "amount": {"total": self._cny_total(order), "currency": "CNY"},
         }
+        expire_minutes = int(self.settings.WECHAT_PAY_ORDER_EXPIRE_MINUTES)
+        if expire_minutes > 0:
+            expires_at = datetime.now(timezone.utc) + timedelta(minutes=expire_minutes)
+            payload["time_expire"] = expires_at.isoformat()
         result = await self._request("POST", "/v3/pay/transactions/native", payload)
         code_url = str(result.get("code_url") or "")
         if not code_url:
