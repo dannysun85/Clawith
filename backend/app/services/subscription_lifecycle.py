@@ -14,7 +14,7 @@
 
 import asyncio
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from loguru import logger
 from sqlalchemy import select
@@ -133,11 +133,37 @@ async def expire_subscriptions() -> int:
         )
         expired.extend(r2.scalars().all())
 
+        applied = 0
         for s in expired:
+            if s.scheduled_plan_id:
+                # A paid downgrade was scheduled: apply it instead of expiring.
+                scheduled_plan = await db.get(Plan, s.scheduled_plan_id)
+                if scheduled_plan and scheduled_plan.is_active:
+                    period_days = 365 if (s.scheduled_period or "monthly") == "yearly" else 30
+                    base = s.period_end if s.period_end and s.period_end > now else now
+                    s.plan_id = scheduled_plan.id
+                    s.status = "active"
+                    s.period_end = base + timedelta(days=period_days)
+                    s.scheduled_plan_id = None
+                    s.scheduled_period = None
+                    if scheduled_plan.credits_per_period:
+                        await grant_credits_in_session(
+                            db,
+                            tenant_id=s.tenant_id,
+                            amount=scheduled_plan.credits_per_period,
+                            reason="subscribe",
+                            granted_by=None,
+                            ref_type="plan",
+                            ref_id=scheduled_plan.id,
+                        )
+                    applied += 1
+                    continue
             s.status = "expired"
         if expired:
             await db.commit()
-            logger.info(f"[subscription_lifecycle] expired {len(expired)} subscription(s)")
+            logger.info(
+                f"[subscription_lifecycle] expired {len(expired) - applied}, applied scheduled downgrade {applied}"
+            )
 
     # max_agents drops to tenant default on expiry → stop excess agents
     for s in expired:

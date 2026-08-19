@@ -330,4 +330,62 @@ describe('SaaS plan generation feature helpers', () => {
             },
         });
     });
+
+    it('writes yearly pricing through dedicated editor fields into features', () => {
+        const plan = {
+            updated_at: '2026-07-13T12:00:00Z',
+            allowed_modalities: ['text'],
+            allowed_tiers: ['lite'],
+            max_agents: 2,
+            max_llm_calls_per_day: 100,
+            message_limit: 20,
+            message_period: 'monthly',
+            max_triggers: 5,
+            credits_per_period: 1000,
+            price_cents: 2000,
+            features: {
+                recommended: true,
+                yearly_price_cents: 19200,
+                yearly_discount_percent: 20,
+            },
+            is_active: true,
+        };
+        const form = planToEditorForm(plan);
+        expect(form.yearly_price_cents).toBe(19200);
+        expect(form.yearly_discount_percent).toBe(20);
+
+        form.yearly_price_cents = 18000;
+        expect(buildPlanUpdatePayload(form, plan)).toEqual({
+            expected_updated_at: '2026-07-13T12:00:00Z',
+            features: {
+                recommended: true,
+                yearly_price_cents: 18000,
+                yearly_discount_percent: 20,
+            },
+        });
+    });
+
+    it('derives yearly editor defaults from the monthly price when unset', () => {
+        const plan = {
+            updated_at: '2026-07-13T12:00:00Z',
+            allowed_modalities: ['text'],
+            allowed_tiers: ['lite'],
+            max_agents: 2,
+            max_llm_calls_per_day: 100,
+            message_limit: 20,
+            message_period: 'monthly',
+            max_triggers: 5,
+            credits_per_period: 1000,
+            price_cents: 2000,
+            features: null,
+            is_active: true,
+        };
+        const form = planToEditorForm(plan);
+        expect(form.yearly_price_cents).toBe(Math.round(2000 * 12 * 0.8));
+        expect(form.yearly_discount_percent).toBe(20);
+        // Unchanged yearly fields do not trigger a features write.
+        expect(buildPlanUpdatePayload(form, plan)).toEqual({
+            expected_updated_at: '2026-07-13T12:00:00Z',
+        });
+    });
 });

@@ -87,6 +87,13 @@ def _payment_host() -> str | None:
     return urlparse(get_settings().PUBLIC_BASE_URL or "").hostname
 
 
+def _request_hostname(request: Request) -> str:
+    """Public hostname of this request, preferring the proxy-forwarded host."""
+    forwarded = (request.headers.get("x-forwarded-host") or "").split(",")[0].strip()
+    raw = forwarded or (request.headers.get("host") or "")
+    return raw.split(":")[0].lower()
+
+
 def _enforce_payment_origin(request: Request) -> None:
     """Real-money checkout must be initiated from the public payment domain.
 
@@ -94,13 +101,17 @@ def _enforce_payment_origin(request: Request) -> None:
     order created from another domain would still be charged there; reject it
     before any order row or provider call exists. Manual billing (admin-handled)
     and unconfigured PUBLIC_BASE_URL skip the gate.
+
+    Behind nginx the app sees an internal Host; honor X-Forwarded-Host so a
+    customer on the public product domain is not 403'd after the SPA already
+    confirmed it matches payment_host.
     """
     if (get_settings().BILLING_PROVIDER or "manual").lower() == "manual":
         return
     public_host = _payment_host()
     if not public_host:
         return
-    request_host = (request.headers.get("host") or "").split(":")[0].lower()
+    request_host = _request_hostname(request)
     if request_host != public_host.lower():
         raise HTTPException(
             status_code=403,
@@ -545,6 +556,7 @@ async def get_subscription_summary(
     tenant_id = current_user.tenant_id
     sub = await get_active_subscription(tenant_id)
     plan = await db.get(Plan, sub.plan_id) if sub else None
+    scheduled_plan = await db.get(Plan, sub.scheduled_plan_id) if sub and sub.scheduled_plan_id else None
     ent = await get_tenant_entitlements(tenant_id)
     balance = await get_credit_balance(tenant_id)
 
@@ -569,6 +581,8 @@ async def get_subscription_summary(
         subscription_status=sub.status if sub else None,
         period_start=sub.period_start if sub else None,
         period_end=sub.period_end if sub else None,
+        scheduled_plan_code=scheduled_plan.code if scheduled_plan else None,
+        scheduled_period=sub.scheduled_period if sub else None,
         period_grant=period_grant,
         topup_grants=topup_grants,
         consumed_credits=consumed_credits,
@@ -610,6 +624,52 @@ async def _apply_paid_subscribe_effects(order: PaymentOrder) -> None:
         await enforce_agent_limit(order.tenant_id)
 
 
+async def _classify_plan_change(
+    db: AsyncSession, tenant_id: uuid.UUID, plan: Plan, period: str
+) -> str:
+    """Classify a plan purchase against the tenant's current subscription.
+
+    Drives finalize semantics: upgrade / renew / period_switch apply at once;
+    downgrade is scheduled to period_end so paid higher-tier time is kept.
+    """
+    now = datetime.now(timezone.utc)
+    result = await db.execute(
+        select(Subscription).where(
+            Subscription.tenant_id == tenant_id,
+            Subscription.status.in_(("active", "trialing")),
+        )
+    )
+    sub = result.scalar_one_or_none()
+    if not sub or (sub.period_end and sub.period_end < now):
+        return "new"
+
+    current_plan = await db.get(Plan, sub.plan_id)
+    if not current_plan:
+        return "new"
+    if plan.tier > current_plan.tier:
+        return "upgrade"
+    if plan.tier < current_plan.tier:
+        return "downgrade"
+
+    current_period = None
+    last_order_result = await db.execute(
+        select(PaymentOrder)
+        .where(
+            PaymentOrder.tenant_id == tenant_id,
+            PaymentOrder.type == "subscribe",
+            PaymentOrder.status == "paid",
+        )
+        .order_by(PaymentOrder.paid_at.desc())
+        .limit(1)
+    )
+    last_order = last_order_result.scalar_one_or_none()
+    if last_order:
+        current_period = last_order.period
+    if current_period and current_period != period:
+        return "period_switch"
+    return "renew"
+
+
 @router.post("/checkout/subscribe", response_model=PaymentOrderOut, status_code=status.HTTP_201_CREATED)
 async def checkout_subscribe(
     data: CheckoutSubscribeIn,
@@ -639,11 +699,14 @@ async def checkout_subscribe(
         unit_cents = plan.price_cents
     amount_cents = unit_cents * data.seats
 
+    change_kind = await _classify_plan_change(db, current_user.tenant_id, plan, data.period)
+
     order = PaymentOrder(
         tenant_id=current_user.tenant_id,
         type="subscribe",
         plan_id=plan.id,
         period=data.period,
+        change_kind=change_kind,
         amount_cents=amount_cents,
         currency=plan.currency,
         status="pending",

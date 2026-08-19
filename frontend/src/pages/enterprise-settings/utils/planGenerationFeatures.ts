@@ -32,6 +32,8 @@ export interface PlanEditorForm {
     max_triggers: number;
     credits_per_period: number;
     price_cents: number;
+    yearly_price_cents: number;
+    yearly_discount_percent: number;
     features: string;
     is_active: boolean;
 }
@@ -95,6 +97,8 @@ export function getOtherPlanFeatures(features: PlanFeatures): Record<string, unk
     const {
         generation_modalities: _generationModalities,
         generation_tiers: _generationTiers,
+        yearly_price_cents: _yearlyPriceCents,
+        yearly_discount_percent: _yearlyDiscountPercent,
         ...otherFeatures
     } = features;
     return otherFeatures;
@@ -130,6 +134,13 @@ export function parseOtherPlanFeatures(raw: string): Record<string, unknown> {
 
 export function planToEditorForm(plan: PlanEditorSnapshot): PlanEditorForm {
     const generation = getPlanGenerationSettings(plan.features, plan.allowed_modalities, plan.allowed_tiers);
+    const features = plan.features ?? {};
+    const yearlyPrice = typeof features.yearly_price_cents === 'number' && features.yearly_price_cents > 0
+        ? features.yearly_price_cents
+        : Math.round(plan.price_cents * 12 * 0.8);
+    const yearlyDiscount = typeof features.yearly_discount_percent === 'number'
+        ? features.yearly_discount_percent
+        : (plan.price_cents > 0 ? 20 : 0);
     return {
         allowed_modalities: plan.allowed_modalities || [],
         allowed_tiers: plan.allowed_tiers || [],
@@ -142,6 +153,8 @@ export function planToEditorForm(plan: PlanEditorSnapshot): PlanEditorForm {
         max_triggers: plan.max_triggers,
         credits_per_period: plan.credits_per_period,
         price_cents: plan.price_cents,
+        yearly_price_cents: yearlyPrice,
+        yearly_discount_percent: yearlyDiscount,
         features: formatOtherPlanFeatures(plan.features),
         is_active: plan.is_active,
     };
@@ -205,14 +218,28 @@ export function buildPlanUpdatePayload(
         throw new Error('媒体生成档位配置格式异常，请先调整媒体生成档位选项后再保存');
     }
 
+    const yearlyChanged =
+        form.yearly_price_cents !== original.yearly_price_cents ||
+        form.yearly_discount_percent !== original.yearly_discount_percent;
+
     if (
         generationModalitiesChanged ||
         generationTiersChanged ||
         form.features !== original.features ||
         freezeFallbackModalities ||
-        freezeFallbackTiers
+        freezeFallbackTiers ||
+        yearlyChanged
     ) {
         const nextFeatures: Record<string, unknown> = { ...otherFeatures };
+        // Yearly pricing lives in features but is edited via dedicated fields;
+        // preserve untouched values when the yearly fields were not edited.
+        if (yearlyChanged) {
+            nextFeatures.yearly_price_cents = form.yearly_price_cents;
+            nextFeatures.yearly_discount_percent = form.yearly_discount_percent;
+        } else {
+            if (hasFeature('yearly_price_cents')) nextFeatures.yearly_price_cents = featureSource.yearly_price_cents;
+            if (hasFeature('yearly_discount_percent')) nextFeatures.yearly_discount_percent = featureSource.yearly_discount_percent;
+        }
 
         if (generationModalitiesChanged) {
             nextFeatures.generation_modalities = [

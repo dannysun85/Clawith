@@ -207,6 +207,8 @@ class PaymentOrderOut(BaseModel):
     provider_payment_id: str | None = None
     session_url: str | None = None
     status: str
+    period: str | None = None
+    change_kind: str | None = None
     created_at: datetime
     paid_at: datetime | None = None
 
@@ -221,6 +223,8 @@ class SubscriptionSummaryOut(BaseModel):
     subscription_status: str | None = None
     period_start: datetime | None = None
     period_end: datetime | None = None
+    scheduled_plan_code: str | None = None  # downgrade scheduled for period_end
+    scheduled_period: str | None = None
     period_grant: int = 0
     topup_grants: int = 0
     consumed_credits: int = 0

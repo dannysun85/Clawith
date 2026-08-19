@@ -326,6 +326,18 @@ function PlanCard({
                     </label>
                     <input className="form-input" type="number" value={form.credits_per_period} onChange={(e) => setForm((f) => ({ ...f, credits_per_period: Number(e.target.value) }))} placeholder="0=不限" />
                 </div>
+                <div>
+                    <label className="form-label" style={{ fontSize: 12 }} title="年付价格（分），前端与后端下单共用此值">
+                        {t('enterprise.plans.yearlyPrice', '年付价格(分)')}
+                    </label>
+                    <input className="form-input" type="number" value={form.yearly_price_cents} onChange={(e) => setForm((f) => ({ ...f, yearly_price_cents: Number(e.target.value) }))} />
+                </div>
+                <div>
+                    <label className="form-label" style={{ fontSize: 12 }} title="年付折扣百分比，用于展示划线价">
+                        {t('enterprise.plans.yearlyDiscount', '年付折扣(%)')}
+                    </label>
+                    <input className="form-input" type="number" value={form.yearly_discount_percent} onChange={(e) => setForm((f) => ({ ...f, yearly_discount_percent: Number(e.target.value) }))} />
+                </div>
                 <div style={{ gridColumn: 'span 2' }}>
                     <label className="form-label" style={{ fontSize: 12 }} title="套餐特性 JSON，如 {&quot;priority_support&quot;: true}">
                         {t('enterprise.plans.features', '其他特性 (JSON)')}

@@ -21,11 +21,20 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 
+def _column_exists(table: str, column: str) -> bool:
+    # 001_initial_schema does create_all from current ORM metadata, so fresh
+    # databases already carry this column; only backfill when it is missing.
+    return column in {
+        column_info["name"] for column_info in sa.inspect(op.get_bind()).get_columns(table)
+    }
+
+
 def upgrade() -> None:
-    op.add_column(
-        "payment_orders",
-        sa.Column("period", sa.String(length=20), nullable=False, server_default="monthly"),
-    )
+    if not _column_exists("payment_orders", "period"):
+        op.add_column(
+            "payment_orders",
+            sa.Column("period", sa.String(length=20), nullable=False, server_default="monthly"),
+        )
 
 
 def downgrade() -> None:

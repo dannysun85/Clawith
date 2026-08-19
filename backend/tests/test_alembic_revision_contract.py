@@ -23,12 +23,13 @@ def test_revision_ids_fit_the_default_alembic_version_column() -> None:
 
 
 def test_release_migration_graph_has_one_expected_head() -> None:
-    assert _script_directory().get_heads() == ["payment_order_period"]
+    assert _script_directory().get_heads() == ["subscription_change_kind"]
 
 
 def test_release_head_preserves_both_upgrade_lineages() -> None:
     script = _script_directory()
-    release_head = script.get_revision("payment_order_period")
+    release_head = script.get_revision("subscription_change_kind")
+    payment_order_period_revision = script.get_revision("payment_order_period")
     selection_receipts_revision = script.get_revision("deliverable_selection_receipts")
     creative_brief_revision = script.get_revision("creative_brief_receipts")
     legacy_assistant_revision = script.get_revision("legacy_assistant_lifecycle")
@@ -69,7 +70,8 @@ def test_release_head_preserves_both_upgrade_lineages() -> None:
     task_status_revision = script.get_revision("align_task_failed_status")
     merge_revision = script.get_revision("merge_v111_astra_heads")
 
-    assert release_head._normalized_down_revisions == ("deliverable_selection_receipts",)
+    assert release_head._normalized_down_revisions == ("payment_order_period",)
+    assert payment_order_period_revision._normalized_down_revisions == ("deliverable_selection_receipts",)
     assert selection_receipts_revision._normalized_down_revisions == ("creative_brief_receipts",)
     assert creative_brief_revision._normalized_down_revisions == ("legacy_assistant_lifecycle",)
     assert legacy_assistant_revision._normalized_down_revisions == ("tenant_deletion_purge",)
@@ -146,8 +148,8 @@ def test_postgres_migration_smoke_targets_the_release_head() -> None:
         BACKEND_ROOT.parent / "scripts/tenant-purge-postgres-smoke.sh"
     ).read_text(encoding="utf-8")
 
-    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-payment_order_period' in smoke
-    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-payment_order_period' in purge_smoke
+    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-subscription_change_kind' in smoke
+    assert 'MIGRATION_SMOKE_EXPECTED_HEAD:-subscription_change_kind' in purge_smoke
     assert 'grep -F "${release_head} (head)"' in purge_smoke
     assert "restore_runtime_chat_foreign_key" in smoke
     assert "DROP CONSTRAINT IF EXISTS fk_agent_runs_tenant_session_chat_sessions" in smoke

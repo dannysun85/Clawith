@@ -84,6 +84,11 @@ class Subscription(Base):
     seats: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     stripe_sub_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     cancel_at_period_end: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Scheduled downgrade: takes effect at period_end instead of immediately (3.6)
+    scheduled_plan_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("plans.id"), nullable=True
+    )
+    scheduled_period: Mapped[str | None] = mapped_column(String(20), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -202,6 +207,8 @@ class PaymentOrder(Base):
     plan_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("plans.id"), nullable=True)
     period: Mapped[str] = mapped_column(String(20), nullable=False, default="monthly", server_default="monthly")
     # monthly / yearly - drives subscription length when the order is finalized
+    change_kind: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # subscribe only: new / renew / period_switch / upgrade / downgrade
     credits: Mapped[int | None] = mapped_column(Integer, nullable=True)  # topup amount
     amount_cents: Mapped[int] = mapped_column(Integer, nullable=False)
     currency: Mapped[str] = mapped_column(String(10), nullable=False, default="CNY")

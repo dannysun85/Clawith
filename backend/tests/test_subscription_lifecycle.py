@@ -190,7 +190,9 @@ async def test_restore_noop_when_no_slots():
 async def test_expire_marks_past_period_end_and_enforces():
     """active sub past period_end → marked expired + enforce_agent_limit called."""
     now = datetime.now(timezone.utc)
-    sub_expired = SimpleNamespace(tenant_id=uuid.uuid4(), status="active", period_end=now - timedelta(days=1))
+    sub_expired = SimpleNamespace(
+        tenant_id=uuid.uuid4(), status="active", period_end=now - timedelta(days=1), scheduled_plan_id=None
+    )
     # First execute → active/trialing/canceled past period_end; second → past_due (empty)
     sess, fake_db = _session_with_execute([_scalars_result([sub_expired]), _scalars_result([])])
     with sess, patch.object(subscription_lifecycle, "enforce_agent_limit", AsyncMock()) as enforce_mock:

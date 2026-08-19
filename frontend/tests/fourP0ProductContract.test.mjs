@@ -34,8 +34,9 @@ test('billing navigation distinguishes personal usage from company finance', () 
   assert.match(subscription, /enabled:\s*Boolean\(tenantId && canViewCompanyBilling\)/);
   assert.match(subscription, /enabled:\s*Boolean\(tenantId && canManageCompanyBilling\)/);
   assert.match(subscription, /productAccessSignature\(user\)/);
-  assert.match(subscriptionTab, /company\.billing\.manage is required/);
-  assert.match(subscriptionTab, /disabled=\{[^}]*!canManageCompanyBilling/);
+  assert.match(subscriptionTab, /if \(!canManageCompanyBilling\) \{/);
+  assert.match(subscriptionTab, /仅公司所有者可购买/);
+  assert.match(subscriptionTab, /if \(!canManageCompanyBilling\) \{[\s\S]{0,140}disabled: true/);
 });
 
 test('okr projects member-safe data and gates company reporting by tenant capability', () => {

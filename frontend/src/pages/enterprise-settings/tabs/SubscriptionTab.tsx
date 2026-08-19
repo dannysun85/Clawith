@@ -5,7 +5,9 @@ import { useNavigate } from 'react-router';
 import { IconCheck, IconShoppingCart } from '@tabler/icons-react';
 import { fetchJson } from '../utils/fetchJson';
 import { WeChatPayModal } from '../../../components/WeChatPayModal';
+import { useToast } from '../../../components/Toast/ToastProvider';
 import { useBillingConfig } from '../../../hooks/useBillingConfig';
+import { normalizeUnknownError } from '../../../services/apiError';
 import { Entitlements } from '../../../hooks/useLlmModels';
 import { DEFAULT_USD_CNY_RATE, formatMoneyCny, toCnyCents } from '../../../utils/money';
 import { useAuthStore } from '../../../stores';
@@ -31,6 +33,7 @@ interface Plan {
     id: string;
     code: string;
     name: string;
+    tier: number;
     period: string;
     price_cents: number;
     currency: string;
@@ -62,6 +65,8 @@ interface PaymentOrder {
     currency: string;
     status: string;
     session_url?: string | null;
+    period?: string | null;
+    change_kind?: string | null;
 }
 
 const STATUS_LABEL: Record<string, string> = {
@@ -127,7 +132,8 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
     const [billingPeriod, setBillingPeriod] = useState<'monthly' | 'yearly'>('monthly');
     const [lastOrder, setLastOrder] = useState<PaymentOrder | null>(null);
     const [wechatPay, setWechatPay] = useState<{ orderId: string; codeUrl: string; amountCents: number; currency: string } | null>(null);
-    const { data: billingConfig } = useBillingConfig();
+    const toast = useToast();
+    const { data: billingConfig, isLoading: billingConfigLoading } = useBillingConfig();
     const cnyRate = billingConfig?.usd_cny_rate ?? DEFAULT_USD_CNY_RATE;
 
     /** Real-money checkout only runs on the public payment domain; redirect there first. */
@@ -135,7 +141,7 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
         const host = billingConfig?.payment_host;
         if (!host || billingConfig?.provider === 'manual') return false;
         if (window.location.hostname.toLowerCase() === host.toLowerCase()) return false;
-        window.location.assign(`https://${host}${window.location.pathname}${window.location.hash}`);
+        window.location.assign(`https://${host}${window.location.pathname}${window.location.search}${window.location.hash}`);
         return true;
     };
     const tenantId = user?.tenant_id || null;
@@ -143,6 +149,18 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
     const accessSignature = productAccessSignature(user);
     const canViewCompanyBilling = hasEffectiveCapability(user, 'company.billing.view');
     const canManageCompanyBilling = hasEffectiveCapability(user, 'company.billing.manage');
+    const requireCheckoutReady = () => {
+        if (!canManageCompanyBilling) {
+            throw new Error(t('enterprise.subscription.ownerOnly', '仅公司所有者可购买'));
+        }
+        if (billingConfigLoading) {
+            throw new Error(t('enterprise.subscription.configLoading', '支付配置加载中，请稍后再试'));
+        }
+        return redirectToPaymentDomain();
+    };
+    const reportCheckoutError = (error: unknown) => {
+        toast.error(normalizeUnknownError(error).message);
+    };
 
     const { data: ent } = useQuery({
         queryKey: ['subscription-entitlements', tenantId, membershipId, accessSignature],
@@ -169,6 +187,11 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
         queryKey: ['subscription-credit-packs'],
         queryFn: () => fetchJson<CreditPack[]>('/subscription/credit-packs'),
         enabled: showMarketplace,
+    });
+    const { data: summary } = useQuery({
+        queryKey: ['subscription-summary', tenantId, membershipId, accessSignature],
+        queryFn: () => fetchJson<{ period_start?: string | null; period_end?: string | null; scheduled_plan_code?: string | null } | null>('/subscription/summary'),
+        enabled: Boolean(tenantId && canViewCompanyBilling),
     });
 
     const invalidateBillingQueries = () => {
@@ -216,31 +239,81 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
 
     const checkoutSubscribe = useMutation({
         mutationFn: (planId: string) => {
-            if (!canManageCompanyBilling) throw new Error('company.billing.manage is required');
-            if (redirectToPaymentDomain()) return new Promise<PaymentOrder>(() => {});
+            if (requireCheckoutReady()) return new Promise<PaymentOrder>(() => {});
             return fetchJson<PaymentOrder>('/subscription/checkout/subscribe', {
                 method: 'POST',
                 body: JSON.stringify({ plan_id: planId, period: billingPeriod, seats: 1 }),
             });
         },
         onSuccess: handleCheckoutOrder,
+        onError: reportCheckoutError,
     });
 
     const checkoutTopup = useMutation({
         mutationFn: (creditPackId: string) => {
-            if (!canManageCompanyBilling) throw new Error('company.billing.manage is required');
-            if (redirectToPaymentDomain()) return new Promise<PaymentOrder>(() => {});
+            if (requireCheckoutReady()) return new Promise<PaymentOrder>(() => {});
             return fetchJson<PaymentOrder>('/subscription/checkout/topup', {
                 method: 'POST',
                 body: JSON.stringify({ credit_pack_id: creditPackId }),
             });
         },
         onSuccess: handleCheckoutOrder,
+        onError: reportCheckoutError,
     });
 
     const status = ent?.subscription_status || 'none';
     const planCode = ent?.plan_code || 'free';
     const sortedPlans = useMemo(() => [...plans].sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0)), [plans]);
+
+    // Plan-change semantics (server classifies the same way at checkout):
+    // same plan+period → renew; same plan other period → period switch;
+    // higher tier → upgrade now; lower tier → downgrade scheduled to period end.
+    const currentPlan = sortedPlans.find((p) => p.code === planCode || p.id === ent?.plan_id) || null;
+    const currentPeriod: 'monthly' | 'yearly' = (() => {
+        if (summary?.period_start && summary?.period_end) {
+            const days = (new Date(summary.period_end).getTime() - new Date(summary.period_start).getTime()) / 86400000;
+            return days > 60 ? 'yearly' : 'monthly';
+        }
+        return 'monthly';
+    })();
+    const scheduledPlanCode = summary?.scheduled_plan_code || null;
+
+    const planAction = (plan: Plan): { label: string; disabled: boolean; primary: boolean } => {
+        if (!canManageCompanyBilling) {
+            return { label: t('enterprise.subscription.ownerOnly', '仅公司所有者可购买'), disabled: true, primary: false };
+        }
+        const isCurrentPlan = plan.code === planCode || plan.id === ent?.plan_id;
+        if (isCurrentPlan) {
+            if (plan.price_cents === 0) {
+                return { label: t('enterprise.subscription.current', '当前使用的套餐'), disabled: true, primary: false };
+            }
+            if (billingPeriod === currentPeriod) {
+                return { label: t('enterprise.subscription.renew', '续费'), disabled: false, primary: false };
+            }
+            return {
+                label: billingPeriod === 'yearly'
+                    ? t('enterprise.subscription.switchYearly', '转年付')
+                    : t('enterprise.subscription.switchMonthly', '转月付'),
+                disabled: false,
+                primary: true,
+            };
+        }
+        if (currentPlan && plan.tier > currentPlan.tier) {
+            return { label: t('enterprise.subscription.upgrade', '升级'), disabled: false, primary: true };
+        }
+        if (currentPlan && plan.tier < currentPlan.tier) {
+            return { label: t('enterprise.subscription.downgrade', '降级（下个周期生效）'), disabled: false, primary: false };
+        }
+        return { label: t('enterprise.subscription.upgrade', '升级'), disabled: false, primary: true };
+    };
+
+    const CHANGE_KIND_TEXT: Record<string, string> = {
+        new: t('enterprise.subscription.orderNew', '订阅订单已创建'),
+        renew: t('enterprise.subscription.orderRenew', '续费订单已创建'),
+        period_switch: t('enterprise.subscription.orderPeriodSwitch', '周期变更订单已创建'),
+        upgrade: t('enterprise.subscription.orderUpgrade', '升级订单已创建，支付成功后立即生效'),
+        downgrade: t('enterprise.subscription.orderDowngrade', '降级订单已创建，支付成功后将于当前周期末生效'),
+    };
 
     if (showMarketplace) {
         return (
@@ -251,6 +324,11 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
                         <p style={{ margin: '0 0 22px', color: 'var(--text-tertiary)', fontSize: 13 }}>
                             {t('enterprise.subscription.marketDesc', '选择适合团队的方案，随时可切换。')}
                         </p>
+                        {scheduledPlanCode && (
+                            <p style={{ margin: '0 0 16px', color: 'var(--warning)', fontSize: 13 }}>
+                                {t('enterprise.subscription.scheduledDowngrade', '已预约降级为 {{plan}}，将于当前周期结束后生效').replace('{{plan}}', scheduledPlanCode)}
+                            </p>
+                        )}
                         <div style={{ display: 'inline-flex', alignItems: 'center', gap: 12, borderBottom: '1px solid var(--border-subtle)' }}>
                             {(['monthly', 'yearly'] as const).map((period) => (
                                 <button
@@ -277,7 +355,7 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
 
                     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(190px, 1fr))', gap: 16, maxWidth: 1240, margin: '0 auto 36px' }}>
                         {sortedPlans.map((plan) => {
-                            const isCurrent = plan.code === planCode || plan.id === ent?.plan_id;
+                            const action = planAction(plan);
                             const recommended = plan.features?.recommended === true || plan.code === 'pro';
                             const price = planPrice(plan, billingPeriod);
                             const boostLine = boostDiscountLine(plan);
@@ -333,16 +411,12 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
                                     </div>
 
                                     <button
-                                        className={isCurrent ? 'btn btn-secondary' : 'btn btn-primary'}
-                                        disabled={isCurrent || checkoutSubscribe.isPending || !canManageCompanyBilling}
+                                        className={action.primary ? 'btn btn-primary' : 'btn btn-secondary'}
+                                        disabled={action.disabled || checkoutSubscribe.isPending}
                                         style={{ marginTop: 'auto', width: '100%', justifyContent: 'center' }}
                                         onClick={() => checkoutSubscribe.mutate(plan.id)}
                                     >
-                                        {isCurrent
-                                            ? t('enterprise.subscription.current', '当前使用的套餐')
-                                            : canManageCompanyBilling
-                                                ? t('enterprise.subscription.upgrade', '升级')
-                                                : t('enterprise.subscription.ownerOnly', '仅公司所有者可购买')}
+                                        {action.label}
                                     </button>
                                 </div>
                             );
@@ -382,7 +456,7 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
 
                     {lastOrder && (
                         <div style={{ margin: '18px auto 0', maxWidth: 920, border: '1px solid var(--border-subtle)', borderRadius: 8, padding: 12, background: 'var(--bg-secondary)', fontSize: 13 }}>
-                            {t('enterprise.subscription.orderCreated', '订单已创建')}:
+                            {(lastOrder.change_kind && CHANGE_KIND_TEXT[lastOrder.change_kind]) || t('enterprise.subscription.orderCreated', '订单已创建')}:
                             <span style={{ marginLeft: 8, fontFamily: 'var(--font-mono)' }}>{lastOrder.id}</span>
                             <span style={{ marginLeft: 8, color: 'var(--text-tertiary)' }}>{lastOrder.status}</span>
                             {lastOrder.provider === 'manual' && (
@@ -482,10 +556,10 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
 
                     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: 16, marginBottom: 32 }}>
                         {sortedPlans.map((plan) => {
-                            const isCurrent = plan.code === planCode || plan.id === ent?.plan_id;
+                            const action = planAction(plan);
                             const displayPrice = billingPeriod === 'yearly' ? plan.price_cents * 10 : plan.price_cents;
                             return (
-                                <div key={plan.id} className="card" style={{ minHeight: 250, display: 'flex', flexDirection: 'column', gap: 12, borderColor: isCurrent ? 'var(--text-primary)' : undefined }}>
+                                <div key={plan.id} className="card" style={{ minHeight: 250, display: 'flex', flexDirection: 'column', gap: 12, borderColor: action.disabled && !action.primary ? 'var(--text-primary)' : undefined }}>
                                     <div>
                                         <div style={{ fontSize: 12, color: 'var(--text-tertiary)', marginBottom: 8 }}>{plan.name}</div>
                                         <div style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
@@ -502,16 +576,12 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
                                         <div><Check /> {plan.allowed_modalities?.join(', ') || 'all'} Modality</div>
                                     </div>
                                     <button
-                                        className={isCurrent ? 'btn btn-secondary' : 'btn btn-primary'}
-                                        disabled={isCurrent || checkoutSubscribe.isPending || !canManageCompanyBilling}
+                                        className={action.primary ? 'btn btn-primary' : 'btn btn-secondary'}
+                                        disabled={action.disabled || checkoutSubscribe.isPending}
                                         style={{ marginTop: 'auto' }}
                                         onClick={() => checkoutSubscribe.mutate(plan.id)}
                                     >
-                                        {isCurrent
-                                            ? t('enterprise.subscription.current', '当前使用的套餐')
-                                            : canManageCompanyBilling
-                                                ? t('enterprise.subscription.upgrade', '升级')
-                                                : t('enterprise.subscription.ownerOnly', '仅公司所有者可购买')}
+                                        {action.label}
                                     </button>
                                 </div>
                             );
@@ -541,7 +611,7 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
 
                     {lastOrder && (
                         <div className="card" style={{ marginTop: 16, background: 'var(--bg-secondary)', fontSize: 13 }}>
-                            {t('enterprise.subscription.orderCreated', '订单已创建')}:
+                            {(lastOrder.change_kind && CHANGE_KIND_TEXT[lastOrder.change_kind]) || t('enterprise.subscription.orderCreated', '订单已创建')}:
                             <span style={{ marginLeft: 8, fontFamily: 'var(--font-mono)' }}>{lastOrder.id}</span>
                             <span style={{ marginLeft: 8, color: 'var(--text-tertiary)' }}>{lastOrder.status}</span>
                             {lastOrder.provider === 'manual' && (

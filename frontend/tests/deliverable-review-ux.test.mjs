@@ -43,7 +43,7 @@ test('failed delivery with a downloadable artifact is labeled as partial, not co
 test('completed deliverable is rendered in the chat timeline, never inside the composer', () => {
   const resultCard = agentDetailPage.indexOf('{trackedDeliverables.map((request) => (');
   const composer = agentDetailPage.indexOf('<div ref={chatInputAreaRef} className="chat-input-area"');
-  const pendingBrief = agentDetailPage.indexOf('{pendingDeliverable && (');
+  const pendingBrief = agentDetailPage.indexOf('{pendingDeliverable && !pendingRequestCardHidden && (');
 
   assert.ok(resultCard >= 0, 'tracked deliverable result must be rendered');
   assert.ok(composer >= 0, 'chat composer must exist');

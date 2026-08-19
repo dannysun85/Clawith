@@ -1,3 +1,30 @@
+# v1.11.42 — Subscription Lifecycle and Creative Deliverables v2
+
+## Subscription lifecycle
+
+- Plan purchases are classified at checkout (new / renew / period switch /
+  upgrade / downgrade) and stored on the order; yearly pricing honors the
+  plan's configured yearly price and discount instead of a flat 10x estimate.
+- Upgrades and renewals apply immediately and stack on unexpired time;
+  downgrades are scheduled and applied at period end by the lifecycle daemon,
+  so paid higher-tier time is never discarded.
+- The market page offers explicit 续费 / 转年付 / 升级 / 降级（下个周期生效）
+  actions, and the SaaS admin plan form edits yearly pricing directly.
+- WeChat Pay uses the 32-char hex out_trade_no, syncs pending orders from the
+  provider when the QR modal polls, and the payment-domain gate honors the
+  proxy-forwarded host.
+
+## Creative deliverables v2 (canary-off)
+
+- Poster/video/presentation v2 pipelines ship behind allowlist flags that stay
+  off by default: structured briefs, storyboard/outline approvals, per-shot
+  units, and candidate QA. The v1 pipelines remain the default.
+
+## Operations
+
+- Includes Alembic migrations up to `subscription_change_kind`.
+- Rollback is the normal immutable-release rollback to v1.11.41.
+
 # v1.11.41 — WeChat Pay Checkout and Four-P0 Product Closure
 
 ## Payments

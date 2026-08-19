@@ -66,10 +66,19 @@ async def finalize_order_in_session(
             existing_sub = existing.scalar_one_or_none()
             now = order.paid_at or _utcnow()
             period_days = 365 if (order.period or "monthly") == "yearly" else 30
+            if order.change_kind == "downgrade" and existing_sub:
+                # Downgrades never discard paid higher-tier time: the new plan
+                # is scheduled and applied by the lifecycle daemon at period_end.
+                # Credits are granted at activation, not at payment.
+                existing_sub.scheduled_plan_id = order.plan_id
+                existing_sub.scheduled_period = order.period or "monthly"
+                return order
             if existing_sub:
                 existing_sub.plan_id = order.plan_id
                 existing_sub.status = "active"
                 existing_sub.cancel_at_period_end = False
+                existing_sub.scheduled_plan_id = None
+                existing_sub.scheduled_period = None
                 # Renewals stack on unexpired time instead of restarting from now.
                 base = now
                 if existing_sub.period_end and existing_sub.period_end > base:

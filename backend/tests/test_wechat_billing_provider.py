@@ -277,6 +277,32 @@ def test_payment_origin_gate_ignores_request_port():
         _enforce_payment_origin(_gate_request("opc.rama-server.com:8443"))
 
 
+def test_payment_origin_gate_honors_forwarded_host():
+    from app.api.subscription import _enforce_payment_origin
+
+    request = SimpleNamespace(headers={
+        "host": "backend:8000",
+        "x-forwarded-host": "opc.rama-server.com",
+    })
+    with patch("app.api.subscription.get_settings", return_value=_gate_settings()):
+        _enforce_payment_origin(request)
+
+
+def test_payment_origin_gate_rejects_mismatched_forwarded_host():
+    from fastapi import HTTPException
+
+    from app.api.subscription import _enforce_payment_origin
+
+    request = SimpleNamespace(headers={
+        "host": "backend:8000",
+        "x-forwarded-host": "opc.reeftotem.ai",
+    })
+    with patch("app.api.subscription.get_settings", return_value=_gate_settings()):
+        with pytest.raises(HTTPException) as exc_info:
+            _enforce_payment_origin(request)
+    assert exc_info.value.status_code == 403
+
+
 def test_payment_origin_gate_skips_manual_provider():
     from app.api.subscription import _enforce_payment_origin
 
