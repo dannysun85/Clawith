@@ -53,7 +53,7 @@ from app.schemas.subscription import (
     UsageOut,
 )
 from app.services.billing_events import process_billing_webhook_event
-from app.services.billing_provider import get_billing_provider
+from app.services.billing_provider import get_billing_provider, resolved_payment_base_url
 from app.services.credit_service import (
     SUBSCRIPTION_PLAN_CHANGE_REF_TYPE,
     get_credit_balance,
@@ -83,8 +83,12 @@ def _client_user_label(user: object | None) -> str | None:
 
 
 def _payment_host() -> str | None:
-    """Hostname of PUBLIC_BASE_URL — the only origin allowed to start real-money checkout."""
-    return urlparse(get_settings().PUBLIC_BASE_URL or "").hostname
+    """Hostname allowed to start real-money checkout.
+
+    PAYMENT_BASE_URL wins over PUBLIC_BASE_URL so extra product hosts can
+    serve the app while WeChat Pay stays on the merchant callback domain.
+    """
+    return urlparse(resolved_payment_base_url(get_settings()) or "").hostname
 
 
 def _request_hostname(request: Request) -> str:
@@ -97,14 +101,15 @@ def _request_hostname(request: Request) -> str:
 def _enforce_payment_origin(request: Request) -> None:
     """Real-money checkout must be initiated from the public payment domain.
 
-    Non-manual providers fix callback/success URLs from PUBLIC_BASE_URL, so an
-    order created from another domain would still be charged there; reject it
-    before any order row or provider call exists. Manual billing (admin-handled)
-    and unconfigured PUBLIC_BASE_URL skip the gate.
+    Non-manual providers fix callback/success URLs from PAYMENT_BASE_URL (else
+    PUBLIC_BASE_URL), so an order created from another domain would still be
+    charged there; reject it before any order row or provider call exists.
+    Manual billing (admin-handled) and an unconfigured payment origin skip
+    the gate.
 
     Behind nginx the app sees an internal Host; honor X-Forwarded-Host so a
-    customer on the public product domain is not 403'd after the SPA already
-    confirmed it matches payment_host.
+    customer on a product alias is not 403'd after the SPA already confirmed
+    it matches payment_host.
     """
     if (get_settings().BILLING_PROVIDER or "manual").lower() == "manual":
         return

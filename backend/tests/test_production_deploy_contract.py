@@ -195,6 +195,33 @@ def test_provider_egress_proxy_is_explicitly_propagated_to_every_backend_path():
     assert ".Values.backend.env.httpProxy" in helm_backend
 
 
+def test_wechat_pay_env_is_propagated_on_backend_compose_paths():
+    production = (ROOT / "deploy/astra-poc/docker-compose.prod.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "PAYMENT_BASE_URL: ${PAYMENT_BASE_URL:-https://opc.rama-server.com}" in production
+    assert "BILLING_PROVIDER: ${BILLING_PROVIDER:-manual}" in production
+    assert "WECHAT_PAY_APPID: ${WECHAT_PAY_APPID:-}" in production
+    assert "WECHAT_PAY_NOTIFY_URL: ${WECHAT_PAY_NOTIFY_URL:-}" in production
+    assert production.count("PAYMENT_BASE_URL: ${") == 1
+    assert "<<: *backend-environment" in production
+
+    for compose_file in (
+        ROOT / "docker-compose.yml",
+        ROOT / "deploy/docker-compose.yml",
+        ROOT / "deploy/docker-compose-multi.yml",
+    ):
+        compose = compose_file.read_text(encoding="utf-8")
+        assert "PAYMENT_BASE_URL: ${PAYMENT_BASE_URL:-}" in compose, compose_file
+        assert "BILLING_PROVIDER: ${BILLING_PROVIDER:-manual}" in compose, compose_file
+        assert "WECHAT_PAY_NOTIFY_URL: ${WECHAT_PAY_NOTIFY_URL:-}" in compose, compose_file
+
+    for env_example in (ROOT / ".env.example", ROOT / "deploy/.env.example"):
+        example = env_example.read_text(encoding="utf-8")
+        assert "PAYMENT_BASE_URL=" in example
+        assert "BILLING_PROVIDER=" in example
+
+
 def test_production_code_execution_defaults_fail_closed():
     compose = (ROOT / "deploy/astra-poc/docker-compose.prod.yml").read_text(encoding="utf-8")
 

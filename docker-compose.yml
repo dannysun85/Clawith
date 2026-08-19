@@ -70,6 +70,17 @@ services:
       # Required when deployed behind a reverse proxy (e.g. Nginx, Cloudflare).
       # If not set, the server infers the URL from the incoming request host.
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      PAYMENT_BASE_URL: ${PAYMENT_BASE_URL:-}
+      BILLING_PROVIDER: ${BILLING_PROVIDER:-manual}
+      BILLING_USD_CNY_RATE: ${BILLING_USD_CNY_RATE:-7}
+      WECHAT_PAY_APPID: ${WECHAT_PAY_APPID:-}
+      WECHAT_PAY_MCHID: ${WECHAT_PAY_MCHID:-}
+      WECHAT_PAY_SERIAL_NO: ${WECHAT_PAY_SERIAL_NO:-}
+      WECHAT_PAY_PRIVATE_KEY: ${WECHAT_PAY_PRIVATE_KEY:-}
+      WECHAT_PAY_PRIVATE_KEY_PATH: ${WECHAT_PAY_PRIVATE_KEY_PATH:-}
+      WECHAT_PAY_API_V3_KEY: ${WECHAT_PAY_API_V3_KEY:-}
+      WECHAT_PAY_NOTIFY_URL: ${WECHAT_PAY_NOTIFY_URL:-}
+      WECHAT_PAY_ORDER_EXPIRE_MINUTES: ${WECHAT_PAY_ORDER_EXPIRE_MINUTES:-120}
       # Explicit Provider egress proxy; empty is the safe default. This must be
       # identical for API and worker processes when the deployment needs it.
       HTTP_PROXY: ${HTTP_PROXY:-}

@@ -272,7 +272,9 @@ class BillingConfigOut(BaseModel):
 
     provider: str
     usd_cny_rate: float
-    # Hostname of PUBLIC_BASE_URL: real-money checkout is only accepted from it.
+    # Hostname of PAYMENT_BASE_URL (else PUBLIC_BASE_URL): real-money checkout
+    # is only accepted from it. Product aliases such as opc.reeftotem.ai may
+    # serve the app, but checkout must happen on this host.
     payment_host: str | None = None
 
 

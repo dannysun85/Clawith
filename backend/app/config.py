@@ -254,6 +254,11 @@ class Settings(BaseSettings):
     FEISHU_APP_SECRET: str = ""
     FEISHU_REDIRECT_URI: str = ""
     PUBLIC_BASE_URL: str = ""
+    # Dedicated origin for real-money checkout and payment callbacks. Empty
+    # falls back to PUBLIC_BASE_URL so a product can be served on extra hosts
+    # (for example opc.reeftotem.ai) while WeChat Pay stays on the merchant
+    # callback domain (opc.rama-server.com).
+    PAYMENT_BASE_URL: str = ""
     HTTP_PROXY: str = ""
     # Public webhook transports stay fail-closed until their provider-native
     # authentication contract is implemented and regression-tested. Feishu
@@ -290,7 +295,7 @@ class Settings(BaseSettings):
     WECHAT_PAY_PRIVATE_KEY: str = ""  # apiclient_key.pem content ("\n" escapes allowed)
     WECHAT_PAY_PRIVATE_KEY_PATH: str = ""  # alternative to WECHAT_PAY_PRIVATE_KEY
     WECHAT_PAY_API_V3_KEY: str = ""  # 32-byte APIv3 key, decrypts webhook resources
-    WECHAT_PAY_NOTIFY_URL: str = ""  # defaults to PUBLIC_BASE_URL + webhook path
+    WECHAT_PAY_NOTIFY_URL: str = ""  # defaults to PAYMENT_BASE_URL or PUBLIC_BASE_URL + webhook path
     WECHAT_PAY_API_BASE_URL: str = "https://api.mch.weixin.qq.com"
     # Native order validity sent as time_expire; 0 keeps WeChat's 2h default.
     WECHAT_PAY_ORDER_EXPIRE_MINUTES: int = 120

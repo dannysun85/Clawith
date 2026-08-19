@@ -12,6 +12,10 @@ import { Entitlements } from '../../../hooks/useLlmModels';
 import { DEFAULT_USD_CNY_RATE, formatMoneyCny, toCnyCents } from '../../../utils/money';
 import { useAuthStore } from '../../../stores';
 import { hasEffectiveCapability, productAccessSignature } from '../../../utils/productAccess';
+import {
+    buildPaymentDomainRedirectUrl,
+    needsPaymentDomainRedirect,
+} from '../../../utils/paymentCheckout';
 
 interface Usage {
     period_date: string;
@@ -129,6 +133,7 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
     const qc = useQueryClient();
     const navigate = useNavigate();
     const user = useAuthStore((state) => state.user);
+    const token = useAuthStore((state) => state.token);
     const [billingPeriod, setBillingPeriod] = useState<'monthly' | 'yearly'>('monthly');
     const [lastOrder, setLastOrder] = useState<PaymentOrder | null>(null);
     const [wechatPay, setWechatPay] = useState<{ orderId: string; codeUrl: string; amountCents: number; currency: string } | null>(null);
@@ -136,12 +141,15 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
     const { data: billingConfig, isLoading: billingConfigLoading } = useBillingConfig();
     const cnyRate = billingConfig?.usd_cny_rate ?? DEFAULT_USD_CNY_RATE;
 
-    /** Real-money checkout only runs on the public payment domain; redirect there first. */
+    /** Real-money checkout only runs on the public payment domain; carry the session across hosts. */
     const redirectToPaymentDomain = () => {
         const host = billingConfig?.payment_host;
-        if (!host || billingConfig?.provider === 'manual') return false;
-        if (window.location.hostname.toLowerCase() === host.toLowerCase()) return false;
-        window.location.assign(`https://${host}${window.location.pathname}${window.location.search}${window.location.hash}`);
+        if (!host || !needsPaymentDomainRedirect(host, window.location.hostname)) return false;
+        window.location.assign(buildPaymentDomainRedirectUrl({
+            paymentHost: host,
+            currentHref: window.location.href,
+            sessionToken: token,
+        }));
         return true;
     };
     const tenantId = user?.tenant_id || null;
@@ -214,6 +222,11 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
                     amountCents: order.amount_cents,
                     currency: order.currency,
                 });
+            } else {
+                toast.error(t(
+                    'enterprise.subscription.wechatQrMissing',
+                    '微信支付未返回付款二维码，请稍后重试或联系平台管理员',
+                ));
             }
             return;
         }
@@ -526,6 +539,31 @@ export default function SubscriptionTab({ showMarketplace = true }: { showMarket
 
             {showMarketplace && (
                 <>
+                    {billingConfig?.payment_host && needsPaymentDomainRedirect(billingConfig.payment_host, window.location.hostname) && (
+                        <div className="card" style={{ marginBottom: 16, background: 'var(--bg-secondary)', fontSize: 13 }}>
+                            {t(
+                                'enterprise.subscription.paymentDomainHint',
+                                '支付必须在 {{host}} 完成。请先跳转后再购买，当前登录会一并带过去。',
+                                { host: billingConfig.payment_host },
+                            )}
+                            <button
+                                type="button"
+                                className="btn btn-primary"
+                                style={{ marginLeft: 12 }}
+                                onClick={() => redirectToPaymentDomain()}
+                            >
+                                {t('enterprise.subscription.goToPaymentDomain', '前往支付页')}
+                            </button>
+                        </div>
+                    )}
+                    {(billingConfig?.provider || 'manual') === 'manual' && (
+                        <div className="card" style={{ marginBottom: 16, background: 'var(--bg-secondary)', fontSize: 13 }}>
+                            {t(
+                                'enterprise.subscription.manualProviderHint',
+                                '当前未开通微信支付，下单后由平台管理员处理，不会出现付款二维码。',
+                            )}
+                        </div>
+                    )}
                     <section style={{ textAlign: 'center', marginBottom: 24 }}>
                         <h2 style={{ margin: '0 0 6px', fontSize: 22 }}>{t('enterprise.subscription.marketTitle', '和你一起成长的套餐')}</h2>
                         <p style={{ margin: '0 0 18px', color: 'var(--text-tertiary)', fontSize: 13 }}>

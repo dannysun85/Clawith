@@ -54,6 +54,9 @@ services:
       ALLOW_UNVERIFIED_LOCAL_SIGNUP: "false"
       CORS_ORIGINS: ${CORS_ORIGINS:?CORS_ORIGINS is required}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?PUBLIC_BASE_URL is required}
+      # Checkout and WeChat notify stay on the payment origin even when the
+      # product is also served from opc.reeftotem.ai.
+      PAYMENT_BASE_URL: ${PAYMENT_BASE_URL:-https://opc.rama-server.com}
       # Provider egress is an explicit release setting. Keep this value
       # identical for the API and inherited worker environment; leave empty
       # when the host has direct public DNS/egress.

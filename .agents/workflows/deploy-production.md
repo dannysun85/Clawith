@@ -117,6 +117,10 @@ network subnet、规则顺序和 watchdog marker；缺失或漂移时停止发�
 - 后端、worker、前端健康；全局只有一个活动 worker；Nginx 配置有效。
 - 用真实浏览器验证登录、Agent 聊天、模型档位保持、工具开关、文件/媒体加载、
   Credits 扣减与失败退款；`tests pass` 不能替代业务流证明。
+- 产品域名 `opc.reeftotem.ai` 与支付域名 `opc.rama-server.com` 均可打开应用；
+  套餐购买与微信 Native 回调只走 `PAYMENT_BASE_URL`（默认后者）。生产 `.env`
+  必须是 `BILLING_PROVIDER=wechat` 且 `WECHAT_PAY_*` 完整，否则市场页只会生成
+  人工 pending 单，不会出现付款二维码。`CORS_ORIGINS` 需同时包含这两个 origin。
 - 检查生产问题监控、错误率、队列积压、Credits ledger drift 和媒体任务超时。
 - Code 未获独立授权时，验证平台开关为 false、tenant 白名单为空、历史 Agent
   Code 分配已由迁移关闭。

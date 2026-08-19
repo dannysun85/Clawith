@@ -23,6 +23,18 @@ from app.config import get_settings
 from app.models.subscription import CreditPack, PaymentOrder, Plan
 
 
+def resolved_payment_base_url(settings: object | None = None) -> str:
+    """Public origin for checkout, success URLs, and payment webhooks.
+
+    PAYMENT_BASE_URL wins so extra product hosts can serve the app while
+    WeChat Pay callbacks stay on the merchant-registered domain.
+    """
+    cfg = settings or get_settings()
+    return str(
+        getattr(cfg, "PAYMENT_BASE_URL", "") or getattr(cfg, "PUBLIC_BASE_URL", "") or ""
+    ).rstrip("/")
+
+
 @dataclass(slots=True)
 class CheckoutSessionResult:
     provider: str
@@ -200,18 +212,18 @@ class StripeBillingProvider(BillingProvider):
         configured = self.settings.STRIPE_SUCCESS_URL or self.settings.BILLING_SUCCESS_URL
         if configured:
             return configured.replace("{order_id}", str(order.id))
-        base = (self.settings.PUBLIC_BASE_URL or "").rstrip("/")
+        base = resolved_payment_base_url(self.settings)
         if not base:
-            raise ValueError("PUBLIC_BASE_URL or STRIPE_SUCCESS_URL is required for Stripe checkout")
+            raise ValueError("PAYMENT_BASE_URL, PUBLIC_BASE_URL or STRIPE_SUCCESS_URL is required for Stripe checkout")
         return f"{base}/billing/success?order_id={order.id}"
 
     def _cancel_url(self, order: PaymentOrder) -> str:
         configured = self.settings.STRIPE_CANCEL_URL or self.settings.BILLING_CANCEL_URL
         if configured:
             return configured.replace("{order_id}", str(order.id))
-        base = (self.settings.PUBLIC_BASE_URL or "").rstrip("/")
+        base = resolved_payment_base_url(self.settings)
         if not base:
-            raise ValueError("PUBLIC_BASE_URL or STRIPE_CANCEL_URL is required for Stripe checkout")
+            raise ValueError("PAYMENT_BASE_URL, PUBLIC_BASE_URL or STRIPE_CANCEL_URL is required for Stripe checkout")
         return f"{base}/account/subscription?order_id={order.id}&status=canceled"
 
 
@@ -401,9 +413,11 @@ class WeChatBillingProvider(BillingProvider):
         configured = self.settings.WECHAT_PAY_NOTIFY_URL
         if configured:
             return configured
-        base = (self.settings.PUBLIC_BASE_URL or "").rstrip("/")
+        base = resolved_payment_base_url(self.settings)
         if not base:
-            raise ValueError("WECHAT_PAY_NOTIFY_URL or PUBLIC_BASE_URL is required for WeChat Pay")
+            raise ValueError(
+                "WECHAT_PAY_NOTIFY_URL, PAYMENT_BASE_URL, or PUBLIC_BASE_URL is required for WeChat Pay"
+            )
         return f"{base}/api/subscription/billing/webhook/wechat"
 
     def _cny_total(self, order: PaymentOrder) -> int:

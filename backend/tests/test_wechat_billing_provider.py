@@ -10,7 +10,11 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from app.models.subscription import CreditPack, PaymentOrder, Plan
-from app.services.billing_provider import WeChatBillingProvider, get_billing_provider
+from app.services.billing_provider import (
+    WeChatBillingProvider,
+    get_billing_provider,
+    resolved_payment_base_url,
+)
 
 API_V3_KEY = "0123456789abcdef0123456789abcdef"
 
@@ -28,6 +32,7 @@ def _settings(**overrides):
         WECHAT_PAY_ORDER_EXPIRE_MINUTES=120,
         BILLING_USD_CNY_RATE=7.2,
         PUBLIC_BASE_URL="https://example.com",
+        PAYMENT_BASE_URL="",
         BILLING_PROVIDER="wechat",
     )
     base.update(overrides)
@@ -240,15 +245,23 @@ async def test_load_remote_event_state_ignores_missing_out_trade_no():
     assert state.status == "ignored"
 
 
-# --- Payment-domain gate (checkout must be initiated from PUBLIC_BASE_URL) ---
+# --- Payment-domain gate (checkout must be initiated from the payment origin) ---
 
 
 def _gate_request(host: str):
     return SimpleNamespace(headers={"host": host})
 
 
-def _gate_settings(provider: str = "wechat", public_base_url: str = "https://opc.rama-server.com"):
-    return SimpleNamespace(BILLING_PROVIDER=provider, PUBLIC_BASE_URL=public_base_url)
+def _gate_settings(
+    provider: str = "wechat",
+    public_base_url: str = "https://opc.rama-server.com",
+    payment_base_url: str = "",
+):
+    return SimpleNamespace(
+        BILLING_PROVIDER=provider,
+        PUBLIC_BASE_URL=public_base_url,
+        PAYMENT_BASE_URL=payment_base_url,
+    )
 
 
 def test_payment_origin_gate_rejects_non_payment_domain():
@@ -315,6 +328,41 @@ def test_payment_origin_gate_skips_without_public_base_url():
 
     with patch("app.api.subscription.get_settings", return_value=_gate_settings(public_base_url="")):
         _enforce_payment_origin(_gate_request("opc.reeftotem.ai"))
+
+
+def test_payment_origin_gate_uses_payment_base_url_not_product_url():
+    from fastapi import HTTPException
+
+    from app.api.subscription import _enforce_payment_origin, _payment_host
+
+    settings = _gate_settings(
+        public_base_url="https://opc.reeftotem.ai",
+        payment_base_url="https://opc.rama-server.com",
+    )
+    with patch("app.api.subscription.get_settings", return_value=settings):
+        assert _payment_host() == "opc.rama-server.com"
+        _enforce_payment_origin(_gate_request("opc.rama-server.com"))
+        with pytest.raises(HTTPException) as exc_info:
+            _enforce_payment_origin(_gate_request("opc.reeftotem.ai"))
+    assert exc_info.value.status_code == 403
+    assert "opc.rama-server.com" in str(exc_info.value.detail)
+
+
+def test_resolved_payment_base_url_prefers_payment_origin():
+    settings = _settings(
+        PUBLIC_BASE_URL="https://opc.reeftotem.ai",
+        PAYMENT_BASE_URL="https://opc.rama-server.com/",
+    )
+    assert resolved_payment_base_url(settings) == "https://opc.rama-server.com"
+
+
+async def test_notify_url_prefers_payment_base_url():
+    provider = _make_provider(
+        WECHAT_PAY_NOTIFY_URL="",
+        PUBLIC_BASE_URL="https://opc.reeftotem.ai",
+        PAYMENT_BASE_URL="https://opc.rama-server.com",
+    )
+    assert provider._notify_url() == "https://opc.rama-server.com/api/subscription/billing/webhook/wechat"
 
 
 async def test_query_order_state_maps_trade_states():

@@ -4,7 +4,7 @@ import { fetchJson } from '../services/api';
 export interface BillingConfig {
     provider: string;
     usd_cny_rate: number;
-    /** Hostname of the public payment domain; real-money checkout is only accepted there. */
+    /** Hostname of PAYMENT_BASE_URL (else PUBLIC_BASE_URL); real-money checkout is only accepted there. */
     payment_host?: string | null;
 }
 

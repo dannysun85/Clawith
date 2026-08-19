@@ -11,8 +11,12 @@
 - The market page offers explicit 续费 / 转年付 / 升级 / 降级（下个周期生效）
   actions, and the SaaS admin plan form edits yearly pricing directly.
 - WeChat Pay uses the 32-char hex out_trade_no, syncs pending orders from the
-  provider when the QR modal polls, and the payment-domain gate honors the
-  proxy-forwarded host.
+  provider when the QR modal polls, and checkout is gated to `PAYMENT_BASE_URL`
+  (default `https://opc.rama-server.com`) even when the product is also served
+  from `opc.reeftotem.ai`. The SPA carries the current session onto that host.
+- `BILLING_PROVIDER=manual` no longer pretends to be WeChat Pay: the market
+  page states that no QR will appear, and a wechat checkout without `code_url`
+  fails loudly. Compose files now pass `WECHAT_PAY_*` into the backend.
 
 ## Creative deliverables v2 (canary-off)
 
